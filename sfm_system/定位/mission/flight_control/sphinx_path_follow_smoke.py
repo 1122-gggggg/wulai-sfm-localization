@@ -149,6 +149,17 @@ def main() -> int:
     )
     args = parser.parse_args()
 
+    # This script arms motors with NO safety switch / localization gates. It is a
+    # Sphinx SIMULATOR smoke test only: refuse any non-sim IP (a real ANAFI is at
+    # 192.168.42.1 / 192.168.53.1) unless explicitly overridden for bench testing.
+    if not str(args.ip).startswith("10.202.") and os.environ.get("SFM_ALLOW_LEGACY_FLIGHT") != "1":
+        raise SystemExit(
+            f"sphinx_path_follow_smoke: --ip {args.ip} is not a Sphinx sim address (10.202.x.x). "
+            "This smoke test arms motors without the flight safety stack; for real hardware use "
+            "path_follow_flight.py --fly. Set SFM_ALLOW_LEGACY_FLIGHT=1 only for controlled legacy testing."
+        )
+    print("[mode] SPHINX-SMOKE: simulator-only arming path (sim IP enforced)", flush=True)
+
     drone = olympe.Drone(args.ip)
     if not drone.connect():
         raise SystemExit(f"could not connect to Sphinx ANAFI at {args.ip}")

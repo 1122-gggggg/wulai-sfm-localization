@@ -1564,6 +1564,8 @@ def main() -> None:
     ap.add_argument("--layout-selftest", action="store_true")
     ap.add_argument("--selftest", action="store_true")
     args = ap.parse_args()
+    print("[mode] REPLAY/UI: no drone commands -- this app uses a sim backend and never "
+          "sends TakeOff/PCMD/Landing/Emergency to a real drone", flush=True)
     # AnafiProfile is a frozen dataclass; set in place so FFmpegFrameStream + the app's
     # read timing pick up the requested stream rate.
     object.__setattr__(ANAFI, "stream_fps", float(args.stream_fps))

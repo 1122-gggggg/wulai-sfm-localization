@@ -42,6 +42,7 @@ offset); online motion refinement corrects it from there. Speeds are tiny.
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import os
 import signal
@@ -347,7 +348,43 @@ class LoopHooks:
     stream_healthy: callable | None = None  # () -> bool; false means live stream stale/lost
     stream_status: callable | None = None   # () -> str; operator log detail
     loop_beat: callable | None = None       # () -> None; watchdog heartbeat, called every tick
+    pose_info: callable | None = None       # () -> dict; localizer last_info (LOGGING ONLY)
+    log_tick: callable | None = None        # (dict) -> None; structured per-tick command log
     now: callable = time.monotonic
+
+
+class CommandLog:
+    """JSONL per-tick command log for pre-real-flight review.
+
+    One line per control tick: gate status, block reason, and the FINAL PCMD (or
+    null when autonomy sent nothing). `sink` says where commands went:
+    dry-run / replay-mock / olympe. Logging must never disturb the control loop:
+    the file is line-buffered and run_loop swallows log exceptions.
+    """
+
+    def __init__(self, path: str | Path, sink: str):
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._f = self.path.open("w", buffering=1, encoding="utf-8")
+        self.sink = sink
+
+    def __call__(self, rec: dict) -> None:
+        rec["sink"] = self.sink
+        self._f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+    def event(self, **kw) -> None:
+        self(kw)
+
+    def close(self) -> None:
+        try:
+            self._f.close()
+        except Exception:
+            pass
+
+
+def default_cmd_log_path(tag: str) -> Path:
+    return (LOC_ROOT / "outputs" / "flight_logs"
+            / f"{tag}_cmdlog_{time.strftime('%Y%m%d_%H%M%S')}.jsonl")
 
 
 class SafetyMonitor:
@@ -486,20 +523,43 @@ def run_loop(hooks: LoopHooks, ctrl, waypoints, yaw_sign: int = 1, verbose: bool
     last_safety_mode = "AUTO"
     manual_requested = False
 
+    def emit(rec, pcmd, blocked, why):
+        """Structured per-tick command record. Must never disturb the loop."""
+        if hooks.log_tick is None:
+            return
+        rec["pcmd"] = None if pcmd is None else [int(v) for v in pcmd]
+        rec["blocked"] = bool(blocked)
+        rec["reason"] = str(why)
+        if hooks.pose_info is not None:
+            try:
+                info = hooks.pose_info() or {}
+                rec["loc"] = {k: info.get(k) for k in
+                              ("frame", "idx", "mode", "next_mode", "inliers", "reproj_rms", "weak")}
+            except Exception:
+                pass
+        try:
+            hooks.log_tick(rec)
+        except Exception:
+            pass
+
     while True:
         t0 = hooks.now()
         if hooks.loop_beat is not None:
             hooks.loop_beat()
         safety_mode = hooks.safety_poll() if hooks.safety_poll is not None else "AUTO"
+        rec = {"step": steps, "t": round(t0, 3), "safety": safety_mode}
         if safety_mode == "EMERGENCY":
             reason = "EMERGENCY command -> motor cut"
+            emit(rec, None, True, reason)
             break
         if safety_mode == "LAND":
             hooks.send_pcmd(0, 0, 0, 0)
             reason = "safety LAND command -> land"
+            emit(rec, (0, 0, 0, 0), True, reason)
             break
         if safety_mode == "HOVER":
             hooks.send_pcmd(0, 0, 0, 0)
+            emit(rec, (0, 0, 0, 0), True, "safety HOVER: zero PCMD")
             steps += 1
             dt = hooks.now() - t0
             if dt < period:
@@ -507,6 +567,7 @@ def run_loop(hooks: LoopHooks, ctrl, waypoints, yaw_sign: int = 1, verbose: bool
             continue
         if safety_mode == "MANUAL":
             last_safety_mode = safety_mode                # MANUAL: send NOTHING (SkyController pilot has the sticks)
+            emit(rec, None, True, "MANUAL: autonomy sends nothing (pilot has the sticks)")
             steps += 1
             dt = hooks.now() - t0
             if dt < period:
@@ -519,10 +580,14 @@ def run_loop(hooks: LoopHooks, ctrl, waypoints, yaw_sign: int = 1, verbose: bool
             hooks.send_pcmd(0, 0, 0, 0)
             stream_lost_since = stream_lost_since or now
             lost_since = None
+            rec["stream_ok"] = False
             if now - stream_lost_since >= STREAM_LOST_LAND_S:
                 reason = (f"stream lost {now - stream_lost_since:.1f}s "
                           f">= {STREAM_LOST_LAND_S:.0f}s -> land")
+                emit(rec, (0, 0, 0, 0), True, reason)
                 break
+            emit(rec, (0, 0, 0, 0), True,
+                 f"stream stale/lost {now - stream_lost_since:.1f}s -> hover")
             if verbose and now - last_stream_warn > 1.0:
                 detail = hooks.stream_status() if hooks.stream_status is not None else "stream stale/lost"
                 print(
@@ -557,7 +622,13 @@ def run_loop(hooks: LoopHooks, ctrl, waypoints, yaw_sign: int = 1, verbose: bool
             math.isfinite(float(v)) for v in (ploc.x, ploc.y, ploc.z, ploc.stamp))
         if ploc is not None and not pose_finite and verbose:
             print("[safety] NON_FINITE_POSE_REJECT: localizer returned NaN/inf -> hover", flush=True)
+        if ploc is not None and pose_finite:
+            rec["pose"] = [round(float(ploc.x), 3), round(float(ploc.y), 3), round(float(ploc.z), 3)]
+            rec["pose_age"] = round(now - float(ploc.stamp), 3)
+        elif ploc is not None:
+            rec["pose"] = "non-finite"
         fresh = pose_finite and (now - ploc.stamp) <= POSE_STALE_S
+        jump_rejected = False
         if fresh and last_good is not None:
             # Outlier gate: one spurious PnP pose must not steer the drone.
             # A single fix jumping > MAX_POSE_JUMP_U is rejected (hover); if the
@@ -574,6 +645,8 @@ def run_loop(hooks: LoopHooks, ctrl, waypoints, yaw_sign: int = 1, verbose: bool
                 else:
                     pending_jump = cand
                     fresh = False
+                    jump_rejected = True
+                    rec["jump_reject_u"] = round(float(np.linalg.norm(cand - prev)), 2)
                     if verbose:
                         print(f"[safety] POSE_JUMP_REJECT: fix jumped "
                               f"{float(np.linalg.norm(cand - prev)):.2f}u > {MAX_POSE_JUMP_U}u; "
@@ -583,7 +656,10 @@ def run_loop(hooks: LoopHooks, ctrl, waypoints, yaw_sign: int = 1, verbose: bool
         if fresh:
             last_good = ploc            # lost_since resets only on a GOOD fix (drive branch), so the
                                         # low-conf timer accumulates across fresh-but-weak frames too
-        elif last_good is not None and (now - last_good.stamp) <= POSE_STALE_S:
+        elif (not jump_rejected) and last_good is not None and (now - last_good.stamp) <= POSE_STALE_S:
+            # Missed/stale fix within the freshness window -> keep last accepted pose.
+            # NOT on a jump reject: a contradicting fix means high uncertainty; hover
+            # this tick (as documented above) instead of driving on the previous pose.
             ploc, fresh = last_good, True
 
         # Low confidence (WEAK, or PnP inliers below threshold) OR no fresh fix -> HOVER and
@@ -599,6 +675,11 @@ def run_loop(hooks: LoopHooks, ctrl, waypoints, yaw_sign: int = 1, verbose: bool
             if hooks.force_relocalize is not None:
                 hooks.force_relocalize()                  # ask the tracker to run MegaLoc
             waited = now - lost_since
+            emit(rec, (0, 0, 0, 0), True,
+                 ("low confidence" if low_conf else
+                  "pose jump rejected" if "jump_reject_u" in rec else
+                  "no fresh pose (lost/stale/PnP fail/non-finite)")
+                 + f" -> hover ({waited:.1f}s)")
             if (not manual_requested and waited >= LOST_MANUAL_S
                     and hooks.request_manual is not None and hooks.request_manual()):
                 manual_requested = True
@@ -629,22 +710,30 @@ def run_loop(hooks: LoopHooks, ctrl, waypoints, yaw_sign: int = 1, verbose: bool
             hdg = heading.heading(oyaw)
             if hdg is None:
                 hooks.send_pcmd(0, 0, 0, 0)                # heading unknown -> hover
+                emit(rec, (0, 0, 0, 0), True, "heading unavailable -> hover")
             else:
                 pose = rpf.Pose(x=ploc.x, y=ploc.y, z=ploc.z, yaw=hdg, stamp=ploc.stamp)
                 cmd = ctrl.step(pose, now)
                 roll, pitch, yaw, gaz = rpf.command_to_body_percent(
                     cmd, pose, yaw_sign=yaw_sign)
+                rec["heading_deg"] = round(math.degrees(hdg), 1)
+                rec["path_error_u"] = round(float(cmd.path_error), 3)
+                rec["progress"] = round(float(cmd.progress), 4)
+                rec["action"] = cmd.status
                 if cmd.path_error > MAX_ROUTE_DEVIATION_U:
                     # Route-corridor bound: never REJOIN across long distances.
                     hooks.send_pcmd(0, 0, 0, 0)
                     reason = (f"route deviation {cmd.path_error:.2f}u "
                               f"> {MAX_ROUTE_DEVIATION_U}u -> land")
+                    emit(rec, (0, 0, 0, 0), True, reason)
                     break
                 if cmd.should_land or ctrl.state in ("LANDING", "DONE"):
                     hooks.send_pcmd(0, 0, 0, 0)
                     reason = "route complete -> land"
+                    emit(rec, (0, 0, 0, 0), True, reason)
                     break
                 hooks.send_pcmd(roll, pitch, yaw, gaz)
+                emit(rec, (roll, pitch, yaw, gaz), False, cmd.status)
                 if verbose and steps % 10 == 0:
                     print(f"[{cmd.status:26s}] pos=({ploc.x:5.1f},{ploc.y:5.1f},{ploc.z:4.1f}) "
                           f"hdg={math.degrees(hdg):6.1f} err={cmd.path_error:4.2f} "
@@ -717,12 +806,15 @@ def build_controller():
 # ---------------------------------------------------------------------------
 # Real flight
 
-def fly(ip: str, yaw_sign: int, gimbal_pitch: float, controller: str, safety_file: str):
+def fly(ip: str, yaw_sign: int, gimbal_pitch: float, controller: str, safety_file: str,
+        cmd_log_path: str = ""):
     import olympe_frame_source as ofs
     from olympe.messages.ardrone3.Piloting import TakeOff, PCMD, Landing, Emergency
     from olympe.messages.ardrone3.PilotingState import FlyingStateChanged
 
     ctrl, wp = build_controller()
+    clog = CommandLog(cmd_log_path or default_cmd_log_path("fly"), sink="olympe")
+    print(f"[fly] structured command log: {clog.path}", flush=True)
     safety = SafetySwitch(
         safety_file,
         allow_manual=manual_override_available(ip, controller),
@@ -754,7 +846,9 @@ def fly(ip: str, yaw_sign: int, gimbal_pitch: float, controller: str, safety_fil
         loc.ensure_models()                          # load MegaLoc/XFeat NOW (on the ground)
 
         def send_pcmd(roll, pitch, yaw, gaz):
-            drone(PCMD(1, int(roll), int(pitch), int(yaw), int(gaz), 0))
+            # Single wire to the drone: clamp to the PCMD percent domain [-100, 100].
+            r, p, y, g = (max(-100, min(100, int(v))) for v in (roll, pitch, yaw, gaz))
+            drone(PCMD(1, r, p, y, g, 0))
 
         # Independent safety authority + stall watchdog: polls the safety switch and
         # can issue LAND/EMERGENCY/hover from its own thread even while the main loop
@@ -809,6 +903,8 @@ def fly(ip: str, yaw_sign: int, gimbal_pitch: float, controller: str, safety_fil
                     else f"last 720p frame age={age:.2f}s"
                 ))(grab.last_frame_age()),
                 loop_beat=monitor.beat,
+                pose_info=lambda: dict(loc.last_info),
+                log_tick=clog,
             )
             # run_loop returns when route done / lost / (Ctrl-C flips stop -> next hover then we break)
             reason = _run_until(hooks, ctrl, wp, yaw_sign, stop)
@@ -855,6 +951,11 @@ def fly(ip: str, yaw_sign: int, gimbal_pitch: float, controller: str, safety_fil
                 drone.disconnect()
             except Exception:
                 pass
+        try:
+            clog.event(event="terminal", reason=reason)
+        except Exception:
+            pass
+        clog.close()
 
 
 def _run_until(hooks, ctrl, wp, yaw_sign, stop):
@@ -919,7 +1020,7 @@ def grab_only(ip: str, secs: float, controller: str):
 # ---------------------------------------------------------------------------
 # Dry-run: toy dynamics + a fake localizer, to exercise the loop with no hardware
 
-def dry_run(yaw_sign: int, steps: int = 12000):
+def dry_run(yaw_sign: int, steps: int = 12000, cmd_log_path: str = ""):
     """Closed loop against a kinematic ANAFI stand-in in raw-GLOMAP frame.
 
     Body command -> world motion using the SAME sign conventions the real PCMD
@@ -960,13 +1061,17 @@ def dry_run(yaw_sign: int, steps: int = 12000):
         S.t += dt
 
     # inject the sim time into run_loop so freshness math lines up
+    clog = CommandLog(cmd_log_path or default_cmd_log_path("dryrun"), sink="dry-run")
     hooks = LoopHooks(get_pose=get_pose, olympe_yaw=lambda: None,
-                      send_pcmd=send_pcmd, now=lambda: S.t)
+                      send_pcmd=send_pcmd, log_tick=clog, now=lambda: S.t)
     # cap iterations so a logic bug can't spin forever
     reason = _run_capped(hooks, ctrl, wp, yaw_sign, steps)
+    clog.event(event="terminal", reason=reason)
+    clog.close()
     _d, _n, _seg, s = rpf.project_to_path(S.C, ctrl.wp, ctrl.cum)
     print(f"[dry] end={reason}  progress={s/ctrl.path_len*100:4.0f}%  "
           f"final_pos=({S.C[0]:.2f},{S.C[1]:.2f},{S.C[2]:.2f})  state={ctrl.state}")
+    print(f"[dry] structured command log: {clog.path}")
     return ctrl.state, s / ctrl.path_len
 
 
@@ -1173,16 +1278,24 @@ def main():
     ap.add_argument("--safety-file", default=SAFETY_FILE,
                     help="write auto/hover/manual/land here for runtime safety switching")
     ap.add_argument("--secs", type=float, default=20.0, help="--grab-only duration")
+    ap.add_argument("--cmd-log", default="",
+                    help="JSONL per-tick command log path (default: auto under 定位/outputs/flight_logs/)")
     args = ap.parse_args()
 
     if args.selftest:
+        print("[mode] SELFTEST: no drone -- pure-python checks, no Olympe import, no motors", flush=True)
         selftest()
     elif args.dry_run:
-        dry_run(args.yaw_sign)
+        print("[mode] DRY-RUN: mock commands only -- no drone connection, no real Olympe command", flush=True)
+        dry_run(args.yaw_sign, cmd_log_path=args.cmd_log)
     elif args.grab_only:
+        print("[mode] GRAB-ONLY: live stream, props off, no arming -- connects and localizes, "
+              "never sends TakeOff/PCMD", flush=True)
         grab_only(args.ip, args.secs, args.controller)
     elif args.fly:
-        fly(args.ip, args.yaw_sign, args.gimbal_pitch, args.controller, args.safety_file)
+        print("[mode] FLY: REAL DRONE COMMANDS ENABLED -- TakeOff/PCMD/Landing/Emergency live", flush=True)
+        fly(args.ip, args.yaw_sign, args.gimbal_pitch, args.controller, args.safety_file,
+            cmd_log_path=args.cmd_log)
 
 
 if __name__ == "__main__":

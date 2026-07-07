@@ -19,3 +19,6 @@ __pycache__/
 *.pyo
 .DS_Store
 *.swp
+
+# --- runtime flight logs / benchmark outputs (regenerated each run) ---
+sfm_system/定位/outputs/

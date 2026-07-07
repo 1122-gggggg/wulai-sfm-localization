@@ -41,6 +41,12 @@ DRONE_IP_REAL = "192.168.42.1"
 DRONE_IP_SKYCTRL = "192.168.53.1"
 DRONE_IP_SIM = "10.202.0.1"
 
+# A stuck decoder that keeps re-delivering the SAME frame defeats the staleness
+# check (fresh timestamps, frozen picture): localization returns a constant pose
+# while the drone physically drifts. Real decoded video has sensor noise, so
+# byte-identical consecutive frames only happen on a pipeline freeze/duplication.
+FROZEN_DUP_FRAMES = 15          # consecutive identical frames -> stream unhealthy (~0.5s @30fps)
+
 
 # ----------------------------- connection ----------------------------------
 def connect(ip: str = DRONE_IP_REAL, controller: str = "auto"):
@@ -90,6 +96,9 @@ class OlympePdrawGrabber:
         self._latest = None          # RGB uint8 HxWx3
         self._stamp = 0.0
         self._n = 0                  # frames received (for fps)
+        self._digest = None          # sparse pixel sample of the last stored frame
+        self._dup_n = 0              # consecutive identical frames (freeze detector)
+        self._frozen_warned = False
         self._t0 = None
         self._cvt = None             # lazy: {olympe format -> cv2 code}
         self._default_code = None
@@ -185,10 +194,24 @@ class OlympePdrawGrabber:
 
     # ---- store / read (the frame_source contract) ----
     def _store(self, rgb: np.ndarray):
+        digest = rgb[::64, ::64].tobytes()   # ~720B sample; identical only if the frame repeats
         with self._lock:
+            if digest == self._digest:
+                self._dup_n += 1
+                warn = self._dup_n == FROZEN_DUP_FRAMES and not self._frozen_warned
+                if warn:
+                    self._frozen_warned = True
+            else:
+                self._digest = digest
+                self._dup_n = 0
+                self._frozen_warned = False   # recovered; warn again on the next freeze
+                warn = False
             self._latest = rgb
             self._stamp = time.monotonic()
             self._n += 1
+        if warn:
+            print(f"[olympe_frame_source] stream FROZEN: {FROZEN_DUP_FRAMES} identical "
+                  "consecutive frames; treating as unhealthy (controller hovers)", flush=True)
 
     def __call__(self):
         with self._lock:
@@ -196,6 +219,8 @@ class OlympePdrawGrabber:
                 return None
             if time.monotonic() - self._stamp > self.stale_s:
                 return None                            # stale -> controller HOVERs
+            if self._dup_n >= FROZEN_DUP_FRAMES:
+                return None                            # frozen -> controller HOVERs
             return self._latest.copy()
 
     def last_frame_age(self) -> float | None:
@@ -205,6 +230,9 @@ class OlympePdrawGrabber:
             return time.monotonic() - self._stamp
 
     def is_healthy(self) -> bool:
+        with self._lock:
+            if self._dup_n >= FROZEN_DUP_FRAMES:
+                return False                           # frozen picture with fresh stamps
         age = self.last_frame_age()
         return age is not None and age <= self.stale_s
 
@@ -291,6 +319,7 @@ def _selftest():
     """Pure-python: the frame_source freshness/None contract (no olympe/cv2)."""
     g = OlympePdrawGrabber.__new__(OlympePdrawGrabber)
     g._lock = threading.Lock(); g._latest = None; g._stamp = 0.0; g._n = 0
+    g._digest = None; g._dup_n = 0; g._frozen_warned = False
     g.stale_s = 0.1
     assert g() is None, "no frame yet -> None"
     frame = (np.arange(720 * 1280 * 3, dtype=np.uint8) % 255).reshape(720, 1280, 3)
@@ -302,7 +331,15 @@ def _selftest():
     g._stamp = time.monotonic() - 1.0                 # force stale
     assert g() is None, "stale frame -> None (controller HOVERs)"
     assert not g.is_healthy(), "stale stream should be unhealthy"
-    print("olympe_frame_source self-test: OK (None-before-frame, fresh copy, stale->None, stale->unhealthy)")
+    # frozen stream: the SAME frame re-delivered with fresh stamps must go unhealthy
+    for _ in range(FROZEN_DUP_FRAMES + 1):
+        g._store(frame)
+    assert g() is None, "frozen (duplicated) frames -> None (controller HOVERs)"
+    assert not g.is_healthy(), "frozen stream should be unhealthy despite fresh stamps"
+    g._store(frame.copy() + 1)                        # a genuinely new frame recovers
+    assert g() is not None and g.is_healthy(), "new distinct frame -> healthy again"
+    print("olympe_frame_source self-test: OK (None-before-frame, fresh copy, stale->None, "
+          "stale->unhealthy, frozen->unhealthy, distinct-frame recovery)")
 
 
 def _smoke_live(ip: str, secs: float, controller: str):
