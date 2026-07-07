@@ -10,6 +10,7 @@ All model logs are redirected to stderr so stdout remains machine-readable.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import sys
@@ -50,6 +51,18 @@ def read_exact(stream, size: int) -> bytes:
     return b"".join(chunks)
 
 
+@contextlib.contextmanager
+def redirect_native_stdout_to_stderr():
+    """Route native fd-1 logs away from the JSON stdout pipe."""
+    saved = os.dup(1)
+    try:
+        os.dup2(2, 1)
+        yield
+    finally:
+        os.dup2(saved, 1)
+        os.close(saved)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--width", type=int, default=1280)
@@ -60,41 +73,43 @@ def main() -> None:
     ap.add_argument("--max-frames", type=int, default=0)
     args = ap.parse_args()
 
-    json_out = sys.stdout
+    json_fd = os.dup(sys.stdout.fileno())
+    json_out = os.fdopen(json_fd, "w", encoding="utf-8", buffering=1)
     sys.stdout = sys.stderr
     sys.path.insert(0, str(Path(args.deploy_dir)))
 
-    from path_follow_flight import CAM_720, production_config
-    from production_xfeat_tracker import MegaLocLayer, ProductionXFeatTracker
-    from reloc_localizer_xfeat import Camera, DEVICE, XFeatRelocMap
-    import torch
+    with redirect_native_stdout_to_stderr(), contextlib.redirect_stdout(sys.stderr):
+        from path_follow_flight import CAM_720, production_config
+        from production_xfeat_tracker import MegaLocLayer, ProductionXFeatTracker
+        from reloc_localizer_xfeat import Camera, DEVICE, XFeatRelocMap
+        import torch
 
-    xmap = XFeatRelocMap.load(args.bundle)
-    cache = Path(args.megaloc_cache) if args.megaloc_cache else None
-    if cache is None:
-        print("[live_worker] using bundle ref_global MegaLoc descriptors", file=sys.stderr, flush=True)
-        megaloc = MegaLocLayer(xmap.ref_global, input_size=322, device=DEVICE)
-    elif cache.exists():
-        try:
-            megaloc = MegaLocLayer.load_cache(cache, xmap.ref_names, input_size=322, device=DEVICE)
-        except Exception as exc:
-            print(f"[live_worker] MegaLoc cache incompatible ({exc}); using bundle ref_global", file=sys.stderr, flush=True)
+        xmap = XFeatRelocMap.load(args.bundle)
+        cache = Path(args.megaloc_cache) if args.megaloc_cache else None
+        if cache is None:
+            print("[live_worker] using bundle ref_global MegaLoc descriptors", file=sys.stderr, flush=True)
             megaloc = MegaLocLayer(xmap.ref_global, input_size=322, device=DEVICE)
-    else:
-        print(f"[live_worker] MegaLoc cache missing: {cache}; using bundle ref_global", file=sys.stderr, flush=True)
-        megaloc = MegaLocLayer(xmap.ref_global, input_size=322, device=DEVICE)
+        elif cache.exists():
+            try:
+                megaloc = MegaLocLayer.load_cache(cache, xmap.ref_names, input_size=322, device=DEVICE)
+            except Exception as exc:
+                print(f"[live_worker] MegaLoc cache incompatible ({exc}); using bundle ref_global", file=sys.stderr, flush=True)
+                megaloc = MegaLocLayer(xmap.ref_global, input_size=322, device=DEVICE)
+        else:
+            print(f"[live_worker] MegaLoc cache missing: {cache}; using bundle ref_global", file=sys.stderr, flush=True)
+            megaloc = MegaLocLayer(xmap.ref_global, input_size=322, device=DEVICE)
 
-    cam = Camera(*CAM_720)
-    tracker = ProductionXFeatTracker(
-        xmap, megaloc, frame_source=lambda: None, query_cam=cam, cfg=production_config()
-    )
-    print(
-        f"[live_worker] ready device={DEVICE} cuda={torch.cuda.get_device_name(0) if torch.cuda.is_available() else None} "
-        f"bundle={args.bundle}",
-        file=sys.stderr,
-        flush=True,
-    )
-    tracker.ensure_models()
+        cam = Camera(*CAM_720)
+        tracker = ProductionXFeatTracker(
+            xmap, megaloc, frame_source=lambda: None, query_cam=cam, cfg=production_config()
+        )
+        print(
+            f"[live_worker] ready device={DEVICE} cuda={torch.cuda.get_device_name(0) if torch.cuda.is_available() else None} "
+            f"bundle={args.bundle}",
+            file=sys.stderr,
+            flush=True,
+        )
+        tracker.ensure_models()
 
     frame_size = int(args.width) * int(args.height) * 3
     seq = 0
@@ -108,7 +123,8 @@ def main() -> None:
         frame = np.frombuffer(raw, dtype=np.uint8).reshape((args.height, args.width, 3)).copy()
         t0 = time.perf_counter()
         try:
-            pose = tracker.localize_frame(frame)
+            with redirect_native_stdout_to_stderr(), contextlib.redirect_stdout(sys.stderr):
+                pose = tracker.localize_frame(frame)
             wall_ms = (time.perf_counter() - t0) * 1000.0
             info = dict(tracker.last_info)
             # A non-finite pose (NaN/inf) would serialize as the bare token `NaN`

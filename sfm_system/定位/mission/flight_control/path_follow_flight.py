@@ -166,8 +166,12 @@ class SafetySwitch:
         self._last_print = 0.0
         if self.path:
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            if not self.path.exists():
-                self.path.write_text("auto\n")
+            # Always reset to AUTO on startup (atomic) so a stale land/emergency left in the shared
+            # file by a previous run cannot be polled by this mission's first tick.
+            _tmp = self.path.with_suffix(self.path.suffix + ".tmp")
+            _tmp.write_text("auto\n")
+            os.replace(_tmp, self.path)
+            self._mtime_ns = self.path.stat().st_mtime_ns
         print(
             "[safety] commands: a/auto, h/hover, m/manual, l/land, e/emergency(motor cut); "
             f"file={self.path or 'disabled'} manual_allowed={self.allow_manual}",
@@ -273,6 +277,13 @@ class HeadingEstimator:
         self._last_motion_heading = h
         if olympe_yaw is not None:
             self.offset = _wrap(h - olympe_yaw)
+
+    def mark_teleport(self) -> None:
+        """Discard the previous position so the NEXT update() computes no displacement.
+        Call on a confirmed relocation jump: a position teleport is not real motion, and
+        feeding its displacement would corrupt the learned yaw offset (wrong PCMD direction).
+        The offset itself is a physical yaw->map calibration and is deliberately preserved."""
+        self._last_C = None
 
     def update(self, C: np.ndarray, olympe_yaw: float | None):
         """Refine the offset from the latest localized map position."""
@@ -495,9 +506,7 @@ def run_loop(hooks: LoopHooks, ctrl, waypoints, yaw_sign: int = 1, verbose: bool
                 time.sleep(period - dt)
             continue
         if safety_mode == "MANUAL":
-            if last_safety_mode != "MANUAL":
-                hooks.send_pcmd(0, 0, 0, 0)
-            last_safety_mode = safety_mode
+            last_safety_mode = safety_mode                # MANUAL: send NOTHING (SkyController pilot has the sticks)
             steps += 1
             dt = hooks.now() - t0
             if dt < period:
@@ -559,6 +568,7 @@ def run_loop(hooks: LoopHooks, ctrl, waypoints, yaw_sign: int = 1, verbose: bool
                 if (pending_jump is not None
                         and float(np.linalg.norm(cand - pending_jump)) <= MAX_POSE_JUMP_U):
                     pending_jump = None
+                    heading.mark_teleport()   # don't let the relocation jump pollute the yaw offset
                     if verbose:
                         print("[safety] POSE_JUMP confirmed by consecutive fix; accepting relocation", flush=True)
                 else:

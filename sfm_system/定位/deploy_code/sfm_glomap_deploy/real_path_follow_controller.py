@@ -423,7 +423,10 @@ def command_to_body_percent(cmd: Command, pose: Pose, max_pitch: int = 8,
     yaw_err = wrap_angle(cmd.yaw_target - pose.yaw)
     yaw_cmd = yaw_sign * max(-1.0, min(1.0, k_yaw * yaw_err)) * max_yaw
     facing = max(0.0, math.cos(yaw_err))
-    speed_frac = min(1.0, float(np.linalg.norm(cmd.vel_map)) / max(1e-9, 1.2))
+    # pitch reacts to HORIZONTAL motion only (X/Z); the vertical Y component drives gaz below.
+    # (Using the full 3D norm made a pure altitude correction produce spurious forward pitch.)
+    horiz_speed = math.hypot(float(cmd.vel_map[0]), float(cmd.vel_map[2]))
+    speed_frac = min(1.0, horiz_speed / max(1e-9, 1.2))
     pitch_cmd = max_pitch * speed_frac * facing
     # Current GLOMAP up is -Y; positive vertical desire means target y lower.
     gaz_cmd = max(-1.0, min(1.0, k_vert * (-cmd.vel_map[1]))) * max_gaz

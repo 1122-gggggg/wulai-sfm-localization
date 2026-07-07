@@ -75,6 +75,7 @@ POSE_JUMP_U = float(os.environ.get("SFM_MAX_POSE_JUMP_U", "1.5"))  # reject fixe
 LOC_LOW_INLIERS = int(os.environ.get("SFM_LOW_CONF_INLIERS", "60"))    # below -> low-confidence alert
 LOC_HIGH_REPROJ = float(os.environ.get("SFM_LOC_HIGH_REPROJ", "4.0"))  # above -> low-confidence alert
 HEALTH_COLOR = {"OK": "#3fbf7f", "LOW": "#e0a92e", "FAIL": "#e2483d"}
+NO_LOC_DEDUP_U = float(os.environ.get("SFM_NO_LOC_DEDUP_U", "1.0"))  # merge no-loc markers within this
 
 
 def load_route_glomap(path_json: str) -> list:
@@ -587,21 +588,10 @@ class OperatorApp(tk.Tk):
         self._map_dirty_key = None       # skip map re-render+PhotoImage when nothing drawn changed
         self._video_dirty_key = None     # skip video re-render+PhotoImage when the frame/overlays are unchanged
         self.default_map_center, self.map_radius = self._map_view_bounds(map_points)
-        # Danger plane: up == -y (GLOMAP). Above the map's up-side coverage edge there are ~no
-        # reference points, so localization fails there. Draw a light-red horizontal plane at that
-        # height. Default = the cloud's low-y (up-side) percentile; tune with SFM_DANGER_HEIGHT_Y
-        # (absolute y) or SFM_DANGER_PCTL, disable with SFM_DANGER_PLANE=0.
-        self.danger_plane_on = os.environ.get("SFM_DANGER_PLANE", "1") != "0"
-        _env_h = os.environ.get("SFM_DANGER_HEIGHT_Y")
-        if _env_h is not None:
-            self.danger_height_y = float(_env_h)
-        elif len(map_points):
-            self.danger_height_y = float(np.percentile(map_points[:, 1], float(os.environ.get("SFM_DANGER_PCTL", "2"))))
-        else:
-            self.danger_height_y = None
-        if self.danger_height_y is not None:
-            print(f"[operator] danger plane at map y={self.danger_height_y:.2f} "
-                  f"(above it = no localization coverage; SFM_DANGER_HEIGHT_Y to tune)")
+        # Permanent no-localization markers: each time localization fails, drop a red dot at the
+        # last-known position (deduped within NO_LOC_DEDUP_U) so the operator builds a persistent
+        # map of where localization can't hold. Never capped/cleared.
+        self.no_loc_markers: list[np.ndarray] = []
         self.map_center = self.default_map_center.copy()
         self.pivot_point = self.map_center.copy()
         self.map_yaw = DEFAULT_MAP_YAW
@@ -799,6 +789,17 @@ class OperatorApp(tk.Tk):
     def write_log(self, text: str) -> None:
         self.log.insert("1.0", f"{time.strftime('%H:%M:%S')} {text}\n")
 
+    def _record_no_loc(self) -> None:
+        """Drop a permanent red marker at the last-known position when localization fails
+        (deduped within NO_LOC_DEDUP_U so a sustained failure = one dot, not thousands)."""
+        p = self.live_last_xyz
+        if p is None:
+            return
+        for q in self.no_loc_markers:
+            if float(np.linalg.norm(p - q)) <= NO_LOC_DEDUP_U:
+                return
+        self.no_loc_markers.append(np.asarray(p, dtype=float).copy())
+
     def update_localization_metrics(self, result: dict) -> None:
         now = time.monotonic()
         self.live_result_times.append(now)
@@ -825,6 +826,7 @@ class OperatorApp(tk.Tk):
         weak = self.loc_stage.upper() in ("WEAK_TRACK", "LOST", "FAIL", "TRACK_FAIL", "TRACK_LOST")
         if not result.get("success"):
             self.loc_health = "FAIL"
+            self._record_no_loc()
         elif inliers < LOC_LOW_INLIERS or (reproj is not None and reproj > LOC_HIGH_REPROJ) or weak:
             self.loc_health = "LOW"
         else:
@@ -1054,27 +1056,19 @@ class OperatorApp(tk.Tk):
             self.map_base_cache_key = key
         return self.map_base_cache
 
-    def _draw_danger_plane(self, img: Image.Image, width: int, height: int) -> Image.Image:
-        """Light-red translucent horizontal plane at the map-coverage ceiling (up == -y).
-        Space above it (toward -y) has no reference points -> localization danger zone."""
-        H = self.danger_height_y
-        r = self.map_radius * 1.5
-        cx, cz = float(self.map_center[0]), float(self.map_center[2])
-        corners = np.array([[cx - r, H, cz - r], [cx + r, H, cz - r],
-                            [cx + r, H, cz + r], [cx - r, H, cz + r]], dtype=float)
-        v = self.transform_xyz(corners)
-        scale = min(width, height) * 0.46 * self.map_zoom / self.map_radius
-        poly = [(int(width * 0.5 + self.map_pan[0] + p[0] * scale),
-                 int(height * 0.5 + self.map_pan[1] - p[1] * scale)) for p in v]
-        overlay = Image.new("RGBA", (width, height), (0, 0, 0, 0))
-        ImageDraw.Draw(overlay).polygon(poly, fill=(255, 90, 90, 70), outline=(255, 90, 90, 170))
-        return Image.alpha_composite(img.convert("RGBA"), overlay).convert("RGB")
-
     def render_map(self, width: int, height: int, st: DroneState) -> Image.Image:
         img = self.map_base_image(width, height).copy()
-        if self.danger_plane_on and self.danger_height_y is not None:
-            img = self._draw_danger_plane(img, width, height)
         draw = ImageDraw.Draw(img)
+
+        # permanent no-localization markers (red): every spot where localization has failed,
+        # accumulated over the flight (drawn under the live track so the track stays readable).
+        if self.no_loc_markers:
+            mv = self.transform_xyz(np.asarray(self.no_loc_markers, dtype=float))
+            msc = min(width, height) * 0.46 * self.map_zoom / self.map_radius
+            for mp in mv:
+                mx = int(width * 0.5 + self.map_pan[0] + mp[0] * msc)
+                my = int(height * 0.5 + self.map_pan[1] - mp[1] * msc)
+                draw.ellipse((mx - 5, my - 5, mx + 5, my + 5), fill="#ff2a2a", outline="#ffffff")
 
         # Batch route + flown-track + health-marker points through ONE transform_xyz
         # call (was hundreds of per-point project_world calls per tick).
@@ -1140,9 +1134,8 @@ class OperatorApp(tk.Tk):
         draw.text((10, 50), f"zoom={self.map_zoom:.2f} yaw={math.degrees(self.map_yaw)%360:.0f} "
                   f"pitch={math.degrees(self.map_pitch)%360:.0f} roll={math.degrees(self.map_roll)%360:.0f}",
                   fill="#a7b0b8")
-        if self.danger_plane_on and self.danger_height_y is not None:
-            draw.text((10, 70), f"淺紅平面 = 定位涵蓋上限 (y={self.danger_height_y:.1f})；其上 = 無定位/飛行危險區",
-                      fill="#ff8a8a")
+        if self.no_loc_markers:
+            draw.text((10, 70), f"紅點 = 無法定位位置（{len(self.no_loc_markers)} 處，永久標記）", fill="#ff6a6a")
         return img
 
     def draw_detections(self, draw: ImageDraw.ImageDraw, scale: float, ox: int, oy: int,
@@ -1329,6 +1322,7 @@ class OperatorApp(tk.Tk):
                         f"{float(np.linalg.norm(xyz - self.live_last_xyz)):.2f}u > {POSE_JUMP_U}u; "
                         "trajectory break, skipped")
                     self.loc_health = "FAIL"                 # discontinuous fix -> operator alert
+                    self._record_no_loc()
                     continue                                 # discontinuous -> don't consider this fix
             else:
                 self._live_pending = None
@@ -1469,6 +1463,7 @@ class OperatorApp(tk.Tk):
             id(self.history[-1]) if self.history else 0,
             id(self.history[0]) if self.history else 0,
             len(self.route_pts),
+            len(self.no_loc_markers),
             pose_key,
             int(st.inliers),
             None if st.reproj is None else round(float(st.reproj), 4),

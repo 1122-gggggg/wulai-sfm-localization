@@ -1000,6 +1000,16 @@ class ProductionXFeatTracker(Localizer):
                                "flow_stage": "track_lowconf", "weak": True, "accepted": False}
             return None
         center, yaw = _pose_center_yaw_from_ret(ret)
+        # max_jump gate (same intent as the deep _gate): a KLT/PnP flip can look inlier/reproj
+        # consistent yet jump far. Tracked motion is always small, so a big jump from the last
+        # published center is not published (hover + deep refresh next frame).
+        if (self.state.last_center is not None
+                and float(np.linalg.norm(center - self.state.last_center)) > self.cfg.max_jump):
+            self._flow_2d = None
+            self._last_info = {"mode": "FLOW_TRACK", "next_mode": "FLOW_TRACK", "inliers": inl,
+                               "reproj_rms": reproj, "flow_stage": "jump_reject", "weak": True,
+                               "accepted": False}
+            return None
         pose = Pose(x=float(center[0]), y=float(center[1]), z=float(center[2]),
                     yaw=float(yaw), stamp=time.monotonic())
         self._flow_2d, self._flow_3d, self._flow_gray = n2d, n3d, gray

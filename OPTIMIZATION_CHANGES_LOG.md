@@ -143,3 +143,26 @@
 
 ### 驗證
 compile 全過、**flight selftest 9 項全過**、flow 定位 **bit-identical**、mirror check OK、介面正常(flow=1)。
+
+---
+
+## 七、第二輪 Codex 稽核修正 + UI
+
+### 定位精度(不降 FPS)
+- **加權 PnP**(Codex 首推):flow PnP 只在有「真正 FB 離群漂移點」時把它們排除於 pose solve 之外(絕對門檻保護 → 乾淨畫面**零回歸**、單解不加第二次 solve → FPS 不降)。實測乾淨片精度 bit-noise、13/250 幀觸發。
+
+### 飛行安全(Codex 第二輪)
+- **#3 MANUAL 完全靜默**:移除進 MANUAL 時的一次 zero PCMD(不搶飛手)。
+- **#4 安全檔啟動原子重設 auto**:防舊 run 殘留的 land/emergency 被新任務第一輪 poll。
+- **#1 重定位跳點不污染 heading**:`HeadingEstimator.mark_teleport()` 跳過該幀位移更新,保留已學 yaw offset。
+- **#2 flow 加 max_jump gate**:KLT/PnP 翻轉跳太遠不發布。
+- **#8 pitch 只看水平 X/Z**:純垂直修正不再產生假前傾(gaz 管 Y)。
+- **#6 worker fd-level stdout 轉向**:原生 lib(如 LightGlue 載入訊息)不再污染 JSON IPC。
+- **#12 requirements 補** huggingface_hub/safetensors/kornia pin。
+- 暫緩(有理由):#5 worker IPC timeout、#7 boot lock timeout(UI robustness,較大改動)、#9 temporal cache inliers(需 benchmark)、#10 tobytes(非瓶頸)、#11 python probe(env override 已覆蓋)。
+
+### 操作介面
+- **無法定位永久標記**:每次定位失敗在最後已知位置留**紅點**(NO_LOC_DEDUP_U 去重),永久累積,取代先前的危險平面。
+
+### 備份
+code-only 私有 repo: github.com/1122-gggggg/wulai-sfm-localization(大檔 gitignore)。
