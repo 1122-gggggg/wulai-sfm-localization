@@ -1,0 +1,21 @@
+# --- large binaries (exceed GitHub 100MB limit; not source) ---
+*.pt
+*.pth
+*.bin
+*.ply
+*.npy
+*.tar.zst
+torch_hub_cache/
+
+# --- video / media ---
+*.MP4
+*.mp4
+*.mov
+*.avi
+
+# --- python / OS caches ---
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+*.swp

@@ -1,0 +1,139 @@
+{
+  "_note": "GLOMAP-estimated intrinsics that the fused map poses + reloc_map_fused.pt were solved with. Set the query camera to the entry matching your shooting resolution so build==query intrinsics.",
+  "model": "SIMPLE_RADIAL",
+  "param_order": [
+    "f",
+    "cx",
+    "cy",
+    "k1"
+  ],
+  "distortion": "COLMAP SIMPLE_RADIAL: r2=(x^2+y^2); x_d=x*(1+k1*r2). pinhole + 1 radial term.",
+  "cameras": {
+    "sc1_AB_720": {
+      "camera_id": 1,
+      "width": 1280,
+      "height": 720,
+      "params": [
+        934.139423,
+        640.0,
+        360.0,
+        0.001061
+      ],
+      "K": [
+        [
+          934.139423,
+          0.0,
+          640.0
+        ],
+        [
+          0.0,
+          934.139423,
+          360.0
+        ],
+        [
+          0.0,
+          0.0,
+          1.0
+        ]
+      ],
+      "k1": 0.00106122
+    },
+    "sc2_ABdownleft_1080": {
+      "camera_id": 2,
+      "width": 1920,
+      "height": 1080,
+      "params": [
+        1401.495827,
+        960.0,
+        540.0,
+        0.001509
+      ],
+      "K": [
+        [
+          1401.495827,
+          0.0,
+          960.0
+        ],
+        [
+          0.0,
+          1401.495827,
+          540.0
+        ],
+        [
+          0.0,
+          0.0,
+          1.0
+        ]
+      ],
+      "k1": 0.00150897
+    },
+    "sc3_BA2_4k_to1080": {
+      "camera_id": 3,
+      "width": 1920,
+      "height": 1080,
+      "params": [
+        1401.850925,
+        960.0,
+        540.0,
+        0.002613
+      ],
+      "K": [
+        [
+          1401.850925,
+          0.0,
+          960.0
+        ],
+        [
+          0.0,
+          1401.850925,
+          540.0
+        ],
+        [
+          0.0,
+          0.0,
+          1.0
+        ]
+      ],
+      "k1": 0.00261306
+    },
+    "sc4_BA_1080": {
+      "camera_id": 4,
+      "width": 1920,
+      "height": 1080,
+      "params": [
+        1401.812326,
+        960.0,
+        540.0,
+        0.002235
+      ],
+      "K": [
+        [
+          1401.812326,
+          0.0,
+          960.0
+        ],
+        [
+          0.0,
+          1401.812326,
+          540.0
+        ],
+        [
+          0.0,
+          0.0,
+          1.0
+        ]
+      ],
+      "k1": 0.00223479
+    }
+  },
+  "query_recommended": {
+    "1920x1080": {
+      "use_scene": "sc2_ABdownleft_1080",
+      "note": "sc2/3/4 cams near-identical (f~1401.5-1401.85, cx=960=W/2, cy=540=H/2)"
+    },
+    "1280x720": {
+      "use_scene": "sc1_AB_720",
+      "note": "f=934.14, cx=640=W/2, cy=360=H/2"
+    }
+  }
+}
