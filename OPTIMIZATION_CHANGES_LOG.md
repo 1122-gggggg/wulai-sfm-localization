@@ -42,6 +42,7 @@
 | 8 | **flow max_jump 閘** | flow 無跳點檢查 → 跳離上次發布中心 > `max_jump` 不發布 | 增安全 |
 | 9 | **時序快取重建短路** | 每強幀重建 anchor cache(GPU→CPU→GPU) → seed ref 未變時只刷新 age、不重建 | ✅ bit-identical |
 | 10 | **ref cache LRU** | 滿 700 整包 `clear()`(長航線 latency spike) → 丟最舊一個 | ✅ |
+| 11 | **`xfeat_topk_track` 1300→1700**(2026-07-07 benchmark 優化 pass) | TRACK 每幀抽 1300 個 XFeat 特徵 → 1700。P0710071 512 幀 720p 串流實測:成功 492→501(96.1%→97.9%)、median inliers 189→258、reproj RMS 2.934→2.900、LOST+WEAK 83→66、LG fallback 232→169、p50/p90/p95 延遲 −6.7%/−10.7%/−21%。機制:NN 快路徑通過率 269→335,省下 ~68ms 的 LighterGlue fallback 多於多抽特徵的 ~2ms。1500/1900/2048 皆較差(bracket 驗證)。 | 品質↑速度↑ |
 
 **累積:7.6 → 47–87 fps**(deep 部分 7.6→13.9 為 bit-identical;flow 再 ×3.5)。
 
@@ -126,6 +127,8 @@
 - `sfm_system/定位/sync_mirror_check.sh`:兩份鏡像 drift 檢查。
 - `.gitignore`:排除大檔(*.pt/*.bin/*.ply/torch_hub_cache/影片/__pycache__)。
 - `OPTIMIZATION_CHANGES_LOG.md`(本檔)。
+- `sfm_system/定位/validation/compare_benchmarks.py`(2026-07-07):兩份 benchmark JSON 差異 + speed/accuracy 接受準則判定(容忍度可調,`--json-out` 存判定)。
+- benchmark/tracker 新增診斷欄位(2026-07-07,純記錄不影響行為):每幀 `xfeat_extract_count`/`lg_call_count`/`lg_reuse_count`/`nn_call_count`/`megaloc_call_count`、`pnp_failed`、`jump_rejected`、`inlier_coverage`(5×3 格覆蓋率)、`quality_score`(綜合品質分,僅記錄)、`load_ms`、p95 percentile、`intrinsics_check`(benchmark vs 生產 720p 內參一致性,焦距差 >2% 硬警告)。
 
 ---
 
@@ -140,9 +143,23 @@
 
 ## 九、暫緩項目(有理由,未做)
 - **起飛前重力對齊檢查**:起飛 hover 後拿 PnP 相機姿態比對 IMU 重力,地圖 -Y 與真實重力差 >2-3° 就禁 AUTO。**真機才用**,需一次真機 hover 校正 IMU→相機座標慣例,故未實作。
-- **#9 temporal cache 用 validated inliers 而非 full-ref**:品質/調參取捨,需 benchmark 才知優劣。
 - **#10 frame.tobytes 複製**:實測 IPC ~55-83MB/s 遠低於 pipe 頻寬,非瓶頸。
 - **#11 mission_pipeline python probe-import**:`SFM_LOCALIZER_PYTHON` env override 已是逃生口,大致涵蓋。
+
+## 九之一、2026-07-07 benchmark 優化 pass:已測試但**否決**的候選(勿盲目重試)
+
+基準與最終結果:`定位/outputs/optimization_baseline.json` / `optimization_final.json`(P0710071 512 幀,720p,RTX 5060 Laptop)。比較工具:`定位/validation/compare_benchmarks.py`(接受準則 + 可調容忍度)。品質指標跨 run **完全 deterministic**;延遲有 ~5% 熱漂移,故計時結論皆用前後夾測(bracketed A/B)。
+
+| 候選 | 結果 | 否決原因 |
+|---|---|---|
+| **2D/3D 對應點去重**(`dedup_corr`,保留 flag 預設關) | 否決 | 對應點 median **46.8% 是重複**(cache+多 ref 同 landmark),但所有 inlier 門檻(fast-accept≥100、weak≥30/50/80、seed≥150)都是照「含重複計數」校準的;去重後 inlier 掉到門檻下 → 成功率 −4.5pp、LOST+WEAK +30。門檻屬安全參數不動,故整案否決。 |
+| **temporal cache 改用 validated inliers seed**(`temporal_cache_seed_mode=inliers`,保留 flag 預設關;即舊「暫緩 #9」) | 否決 | LOST+WEAK −16 但成功 492→488(尾段難路段 −9/+5)。 |
+| `nn_min_score` 0.85→0.80 / 0.82 | 否決 | 0.80:成功 −3;0.82:單獨用全過但延遲無改善,疊在 topk1700 上反而成功 501→491。 |
+| `temporal_cache_min_score` 0.85→0.80 | 否決 | LOST+WEAK +9、成功 −1。 |
+| `temporal_cache_max_age` 2→3(疊在 topk1700) | 否決 | 成功 501→486。 |
+| `temporal_cache_seed_min_inliers` 150→100(疊在 topk1700) | 否決 | p50 最佳(19.8ms)、LOST+WEAK 最少(50)但成功 501→494。 |
+| `xfeat_topk_track` 1500 / 1900 / 2048 | 否決 | 1700 為 bracket 驗證後的最佳點(1500:495;1900:495;2048:492)。 |
+| 移除 runtime `_sync()` / 預先 normalize ref 描述子 | 未重試 | 前一輪已實測 0 提升並還原(見表二「—」列)。 |
 
 ---
 

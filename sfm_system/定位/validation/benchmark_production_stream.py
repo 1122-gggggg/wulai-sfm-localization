@@ -87,6 +87,42 @@ def robust_1080_camera_params(model_path: Path, orig_size: tuple[int, int]) -> l
     return [1401.8, w0 / 2.0, h0 / 2.0, 0.002]
 
 
+def intrinsics_check(cam) -> dict:
+    """Cross-check the benchmark query camera against the production runtime
+    intrinsics (deploy_code map_intrinsics.json 720p entry, which CAM_720 in
+    path_follow_flight.py mirrors). The benchmark frames come from a 1080p
+    recording, so f/cx/cy should agree with the scaled map values; k may
+    legitimately differ (recording pipeline vs Olympe 720p stream)."""
+    out = {"benchmark_cam": {"model": cam.model, "width": cam.width,
+                             "height": cam.height, "params": list(cam.params)}}
+    mi = ROOT / "deploy_code" / "sfm_glomap_deploy" / "map_intrinsics.json"
+    try:
+        data = json.loads(mi.read_text(encoding="utf-8"))
+        cams = data.get("cameras", {})
+        prod = next((c for c in cams.values()
+                     if int(c.get("width", 0)) == 1280 and int(c.get("height", 0)) == 720
+                     and len(c.get("params", [])) >= 4), None) if isinstance(cams, dict) else None
+        if prod is None:
+            out["warning"] = f"no usable 1280x720 entry in {mi}"
+            return out
+        out["production_720_cam"] = {"width": 1280, "height": 720, "params": list(prod["params"])}
+        # focal scales with image width; rescale the 1280-wide production focal
+        # to the actual stream width before comparing
+        f_bench = float(cam.params[0])
+        f_prod = float(prod["params"][0]) * (float(cam.width) / 1280.0)
+        rel = abs(f_bench - f_prod) / max(f_prod, 1e-9)
+        out["focal_rel_diff"] = rel
+        out["focal_consistent_2pct"] = bool(rel <= 0.02)
+        if rel > 0.02:
+            print(f"WARNING: benchmark focal {f_bench:.1f} vs production focal scaled to "
+                  f"{cam.width}px = {f_prod:.1f} differs by {100*rel:.1f}% (>2%) - "
+                  "check camera source", flush=True)
+        out["k_bench_vs_prod"] = [float(cam.params[3]), float(prod["params"][3])]
+    except Exception as exc:                       # unreadable/malformed json must not kill the run
+        out["warning"] = f"intrinsics check failed: {exc!r}"
+    return out
+
+
 def pct(vals, p):
     vals = [float(v) for v in vals if v is not None and np.isfinite(v)]
     if not vals:
@@ -97,12 +133,13 @@ def pct(vals, p):
 def stat(vals):
     vals = [float(v) for v in vals if v is not None and np.isfinite(v)]
     if not vals:
-        return {"median": None, "p75": None, "p90": None, "mean": None}
+        return {"median": None, "p75": None, "p90": None, "p95": None, "mean": None}
     arr = np.asarray(vals, float)
     return {
         "median": float(np.median(arr)),
         "p75": float(np.percentile(arr, 75)),
         "p90": float(np.percentile(arr, 90)),
+        "p95": float(np.percentile(arr, 95)),
         "mean": float(np.mean(arr)),
     }
 
@@ -211,7 +248,7 @@ def main():
     ap.add_argument("--near-pool", type=int, default=24)
     ap.add_argument("--radius", type=float, default=0.8)
     ap.add_argument("--max-yaw-diff", type=float, default=90.0)
-    ap.add_argument("--track-xfeat-topk", type=int, default=1300)
+    ap.add_argument("--track-xfeat-topk", type=int, default=1700)
     ap.add_argument("--acquire-xfeat-topk", type=int, default=2048)
     ap.add_argument("--matcher-mode", choices=["nn_then_lg", "lighterglue", "nn"], default="nn_then_lg")
     ap.add_argument("--nn-min-score", type=float, default=0.85)
@@ -220,6 +257,9 @@ def main():
     ap.add_argument("--adaptive-accept-reproj", type=float, default=3.5)
     ap.add_argument("--max-corr-per-ref", type=int, default=0)
     ap.add_argument("--max-corr-total", type=int, default=0)
+    ap.add_argument("--dedup-corr", action="store_true",
+                    help="drop duplicate 2D/3D correspondences before PnP")
+    ap.add_argument("--cache-seed-mode", choices=["full_ref", "inliers"], default="full_ref")
     ap.add_argument("--disable-temporal-cache", action="store_true")
     ap.add_argument("--temporal-cache-min-anchors", type=int, default=80)
     ap.add_argument("--temporal-cache-max-anchors", type=int, default=2048)
@@ -296,6 +336,8 @@ def main():
         adaptive_accept_reproj=args.adaptive_accept_reproj,
         max_corr_per_ref=args.max_corr_per_ref,
         max_corr_total=args.max_corr_total,
+        dedup_corr=args.dedup_corr,
+        temporal_cache_seed_mode=args.cache_seed_mode,
         temporal_cache_enabled=not args.disable_temporal_cache,
         temporal_cache_min_anchors=args.temporal_cache_min_anchors,
         temporal_cache_max_anchors=args.temporal_cache_max_anchors,
@@ -320,7 +362,9 @@ def main():
     rows = []
     t_all0 = time.perf_counter()
     for i, path in enumerate(frames, 1):
+        t_load0 = time.perf_counter()
         frame, _orig, _stream = load_rgb_resized(path, args.resize_width)
+        load_ms = (time.perf_counter() - t_load0) * 1000.0
         sync(); t0 = time.perf_counter()
         pose = tracker.localize_frame(frame)
         sync(); wall_ms = (time.perf_counter() - t0) * 1000.0
@@ -330,6 +374,7 @@ def main():
             "frame": path.name,
             "success": pose is not None,
             "wall_ms": wall_ms,
+            "load_ms": load_ms,
             "pose": None if pose is None else {"x": pose.x, "y": pose.y, "z": pose.z, "yaw": pose.yaw},
             **info,
         }
@@ -369,6 +414,20 @@ def main():
             1 for r in rows if r.get("temporal_cache_attempted")),
         "nn_fast_accept": int(by_stage.get("nn_fast_accept", 0)),
         "lg_fallback": int(by_stage.get("lg_adaptive_after_nn", 0) + by_stage.get("lg_full_after_nn", 0)),
+        "pnp_failures": sum(1 for r in rows if r.get("pnp_failed")),
+        "jump_rejections": sum(1 for r in rows if r.get("jump_rejected")),
+        "xfeat_extracts_total": sum(int(r.get("xfeat_extract_count") or 0) for r in rows),
+        "lg_calls_total": sum(int(r.get("lg_call_count") or 0) for r in rows),
+        "lg_reuse_total": sum(int(r.get("lg_reuse_count") or 0) for r in rows),
+        "nn_calls_total": sum(int(r.get("nn_call_count") or 0) for r in rows),
+        "megaloc_calls_total": sum(int(r.get("megaloc_call_count") or 0) for r in rows),
+        "xfeat_extracts_per_frame": sum(int(r.get("xfeat_extract_count") or 0) for r in rows) / max(n, 1),
+        "lg_calls_per_frame": sum(int(r.get("lg_call_count") or 0) for r in rows) / max(n, 1),
+        "megaloc_calls_per_frame": sum(int(r.get("megaloc_call_count") or 0) for r in rows) / max(n, 1),
+        "corr3d_pre_dedup": stat([r.get("corr3d_pre_dedup") for r in rows]),
+        "inlier_coverage": stat([r.get("inlier_coverage") for r in rows]),
+        "quality_score": stat([r.get("quality_score") for r in rows]),
+        "load_ms": stat([r.get("load_ms") for r in rows]),
         "wall_ms": stat([r.get("wall_ms") for r in rows]),
         "wall_ms_steady_excluding_first5": stat([r.get("wall_ms") for r in steady]),
         "fps_from_median_wall": None if pct([r.get("wall_ms") for r in rows], 50) is None else 1000.0 / pct([r.get("wall_ms") for r in rows], 50),
@@ -388,6 +447,7 @@ def main():
         "cuda_name": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
         "bundle_meta": xmap.meta,
         "query_camera": {"model": cam.model, "width": cam.width, "height": cam.height, "params": cam.params},
+        "intrinsics_check": intrinsics_check(cam),
         "summary": summary,
         "rows": rows,
     }

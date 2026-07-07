@@ -749,7 +749,8 @@ def run_loop(hooks: LoopHooks, ctrl, waypoints, yaw_sign: int = 1, verbose: bool
 # Builders
 
 def production_config():
-    """The LOCKED production sweep (user's final decision, 2026-06). These already
+    """The LOCKED production sweep (user's final decision, 2026-06; xfeat_topk_track
+    1300->1700 by benchmark-driven pass 2026-07-07, see ProductionConfig note). These
     match ProductionConfig() defaults; pinned here so the deployment entrypoint is
     self-documenting and a future default change can't silently alter real flights.
         BOOT_INIT/LOST : MegaLoc top30 -> XFeat -> LighterGlue -> PnP
@@ -760,7 +761,7 @@ def production_config():
         matcher_mode="nn_then_lg", nn_min_score=0.85,
         adaptive_first_topk=3, adaptive_accept_inliers=100, adaptive_accept_reproj=3.5,
         local_topk=5, weak_local_topk=8,
-        xfeat_topk_track=1300, xfeat_topk_acquire=2048,
+        xfeat_topk_track=1700, xfeat_topk_acquire=2048,
         boot_global_topk=30, lost_global_topk=30, weak_global_topk=0,
         pnp_ransac_max_error=5.0,
         max_reproj_error_track=6.0, max_reproj_error_acquire=5.0,

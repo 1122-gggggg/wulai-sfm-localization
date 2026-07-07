@@ -100,15 +100,20 @@ def scaled_simple_radial_camera(width0: int, height0: int, params0: list[float],
                   [f * sx, cx * sx, cy * sy, k])
 
 
-def mutual_nn_pairs(q_desc: torch.Tensor, r_desc: torch.Tensor, min_score: float = 0.8) -> torch.Tensor:
+def mutual_nn_pairs(q_desc: torch.Tensor, r_desc: torch.Tensor, min_score: float = 0.8,
+                    with_scores: bool = False):
     """Mutual-nearest-neighbour descriptor matches for XFeat descriptors.
 
     Returns an int64 tensor of shape (K,2), [query_idx, ref_idx].  This is the
     cheap alternative to LighterGlue for a fast first pass; PnP/RANSAC remains
-    the geometric verifier.
+    the geometric verifier.  With with_scores=True also returns the (K,) cosine
+    similarity of each pair (used by correspondence dedup to keep the best match).
     """
     if q_desc.ndim != 2 or r_desc.ndim != 2 or len(q_desc) == 0 or len(r_desc) == 0:
-        return torch.empty((0, 2), dtype=torch.long, device=q_desc.device)
+        empty = torch.empty((0, 2), dtype=torch.long, device=q_desc.device)
+        if with_scores:
+            return empty, torch.empty((0,), dtype=torch.float32, device=q_desc.device)
+        return empty
     qd = F.normalize(q_desc.float(), dim=-1)
     rd = F.normalize(r_desc.float(), dim=-1)
     sim = qd @ rd.T
@@ -117,7 +122,39 @@ def mutual_nn_pairs(q_desc: torch.Tensor, r_desc: torch.Tensor, min_score: float
     qi = torch.arange(sim.shape[0], device=sim.device)
     scores = sim[qi, best_r]
     ok = (best_q[best_r] == qi) & (scores >= float(min_score))
-    return torch.stack([qi[ok], best_r[ok]], dim=1).long()
+    pairs = torch.stack([qi[ok], best_r[ok]], dim=1).long()
+    if with_scores:
+        return pairs, scores[ok]
+    return pairs
+
+
+def dedup_correspondence_indices(pts2d: np.ndarray, pts3d: np.ndarray,
+                                 scores: np.ndarray) -> np.ndarray:
+    """Indices keeping one correspondence per 2D keypoint and per 3D anchor.
+
+    Preference: higher score first (NN cosine similarity; LighterGlue matches
+    all carry score 1.0, so ties keep the earlier = higher-priority candidate).
+    Non-finite 2D rows are dropped.  3D anchors are identified by their xyz
+    bytes, which also collapses the same landmark reached via the temporal
+    cache and via a direct ref, or via multiple refs sharing a triangulated
+    point.  PnP/RANSAC inlier counts then count distinct observations instead
+    of double-counting repeats.
+    """
+    idx = np.flatnonzero(np.isfinite(pts2d).all(axis=1))
+    if len(idx) == 0:
+        return idx
+    # np.unique(return_index) keeps the FIRST occurrence, so order rows by
+    # (-score, original index): best score wins, ties keep the earlier row.
+    # (np.unique also re-orders its output, so re-sort before the second pass --
+    # a bare stable argsort on scores would inherit that lexicographic order.)
+    order = idx[np.lexsort((idx, -scores[idx]))]
+    _, f1 = np.unique(pts2d[order], axis=0, return_index=True)
+    keep = order[f1]
+    keep = keep[np.lexsort((keep, -scores[keep]))]
+    _, f2 = np.unique(pts3d[keep], axis=0, return_index=True)
+    keep = keep[f2]
+    keep.sort()
+    return keep
 
 
 @dataclass
@@ -131,7 +168,10 @@ class ProductionConfig:
     covis_per_ref: int = 20
     radius: float = 0.8
     max_yaw_diff_deg: float = 90.0
-    xfeat_topk_track: int = 1300
+    # 1300->1700 (2026-07-07): benchmark-proven on the P0710071 512-frame stream;
+    # success 492->501, median inliers 189->258, LG fallbacks 232->169, p50/p90 wall
+    # latency -6%/-7%. 1500/1900/2048 were all worse. See outputs/optimization_*.json.
+    xfeat_topk_track: int = 1700
     xfeat_topk_acquire: int = 2048
     min_conf: float = 0.1
     acquire_min_inliers: int = 80
@@ -156,7 +196,11 @@ class ProductionConfig:
     adaptive_accept_reproj: float = 3.5
     max_corr_per_ref: int = 0     # 0 = unlimited
     max_corr_total: int = 0       # 0 = unlimited; spatially diversified before PnP
+    dedup_corr: bool = False      # drop duplicate 2D/3D correspondences before PnP
     temporal_cache_enabled: bool = True
+    # "full_ref": seed anchors from all keypoints of the used refs (default);
+    # "inliers": seed from this frame's PnP-validated inliers when available.
+    temporal_cache_seed_mode: str = "full_ref"
     temporal_cache_min_anchors: int = 80
     temporal_cache_max_anchors: int = 2048
     temporal_cache_max_age: int = 2
@@ -429,6 +473,8 @@ class ProductionXFeatTracker(Localizer):
         self.temporal_cache = TemporalAnchorCache()
         self._xfeat = None
         self._last_info: dict = {}
+        # diagnostics only: per-frame model-call counters (reset each localize_frame)
+        self._frame_counters: dict = {}
         self._last_inl_2d = None       # accepted inlier query 2D (for optical-flow seeding)
         self._last_inl_3d = None       # accepted inlier map 3D
         self._last_seed_refs: tuple = ()  # last temporal-cache seed ref-set (skip identical rebuilds)
@@ -455,6 +501,7 @@ class ProductionXFeatTracker(Localizer):
         return self._xfeat
 
     def _global_candidates(self, frame: np.ndarray, k: int) -> tuple[list[int], float]:
+        self._frame_counters["megaloc_call_count"] = self._frame_counters.get("megaloc_call_count", 0) + 1
         return self.meg.topk(frame, k)
 
     def _track_candidates(self, weak: bool = False) -> list[int]:
@@ -641,6 +688,7 @@ class ProductionXFeatTracker(Localizer):
             q_dev, qkp = q_cache["q_dev"], q_cache["qkp"]
         else:
             q_feats = extract_xfeat(xfeat, frame, xfeat_topk)
+            self._frame_counters["xfeat_extract_count"] = self._frame_counters.get("xfeat_extract_count", 0) + 1
             q_dev = _to_device_feats(q_feats)
             qkp = q_feats["keypoints"].detach().cpu().numpy()
             if q_cache is not None:
@@ -649,6 +697,7 @@ class ProductionXFeatTracker(Localizer):
 
         pts2d: list[np.ndarray] = []
         pts3d: list[np.ndarray] = []
+        corr_scores: list[np.ndarray] = []   # per-correspondence match score (dedup priority)
         corr_ref_ids: list[int] = []
         corr_ref_kp_ids: list[int] = []
         _sync(); t0 = time.perf_counter()
@@ -663,12 +712,14 @@ class ProductionXFeatTracker(Localizer):
                 and self.temporal_cache.age <= self.cfg.temporal_cache_max_age
             ):
                 info["temporal_cache_attempted"] = True
-                pairs_t = mutual_nn_pairs(
+                pairs_t, scores_t = mutual_nn_pairs(
                     q_dev["descriptors"],
                     self.temporal_cache.descriptors,
                     self.cfg.temporal_cache_min_score,
+                    with_scores=True,
                 )
                 pairs = pairs_t.detach().cpu().numpy()
+                pair_scores = scores_t.detach().cpu().numpy()
                 info["temporal_cache_raw_matches"] = int(len(pairs))
                 info["raw_matches"] += int(len(pairs))
                 if len(pairs):
@@ -683,6 +734,7 @@ class ProductionXFeatTracker(Localizer):
                         qa_c = pairs[:, 0].astype(int)[finite]
                         pts2d.append(qkp[qa_c])
                         pts3d.append(cache_xyz[finite])
+                        corr_scores.append(pair_scores[finite].astype(np.float32))
                         corr_ref_ids.extend(cache_ref_ids[finite].astype(int).tolist())
                         corr_ref_kp_ids.extend([-1] * int(finite.sum()))
                     temporal_refs = sorted(set(int(r) for r in cache_ref_ids if int(r) >= 0))
@@ -702,13 +754,19 @@ class ProductionXFeatTracker(Localizer):
                 self._ref_dev_cache[ref_id] = r_dev
             else:
                 self._ref_dev_cache.move_to_end(ref_id)
+            pair_scores = None
             if active_matcher == "nn":
-                pairs_t = mutual_nn_pairs(q_dev["descriptors"], r_dev["descriptors"], self.cfg.nn_min_score)
+                pairs_t, scores_t = mutual_nn_pairs(q_dev["descriptors"], r_dev["descriptors"],
+                                                    self.cfg.nn_min_score, with_scores=True)
                 pairs = pairs_t.detach().cpu().numpy()
+                pair_scores = scores_t.detach().cpu().numpy()
+                self._frame_counters["nn_call_count"] = self._frame_counters.get("nn_call_count", 0) + 1
             elif lg_pairs_in is not None and ref_id in lg_pairs_in:
                 pairs = lg_pairs_in[ref_id]              # reuse this ref's LG match from the adaptive pass
+                self._frame_counters["lg_reuse_count"] = self._frame_counters.get("lg_reuse_count", 0) + 1
             else:
                 _mk0, _mk1, pairs = xfeat.match_lighterglue(q_dev, r_dev, min_conf=self.cfg.min_conf)
+                self._frame_counters["lg_call_count"] = self._frame_counters.get("lg_call_count", 0) + 1
             if lg_pairs_out is not None and active_matcher != "nn":
                 lg_pairs_out[ref_id] = pairs
             info["raw_matches"] += int(len(pairs))
@@ -716,16 +774,22 @@ class ProductionXFeatTracker(Localizer):
                 pr = np.asarray(pairs)
                 qa_i = pr[:, 0].astype(int)
                 rb_i = pr[:, 1].astype(int)
+                if pair_scores is None:
+                    # LighterGlue exposes no per-match score; constant 1.0 means dedup
+                    # ties resolve by candidate order (earlier = higher priority).
+                    pair_scores = np.ones(len(pr), dtype=np.float32)
                 Xr = ref.xyz[rb_i]
                 fin = ~np.isnan(Xr).any(axis=1)
-                qa_i, rb_i, Xr = qa_i[fin], rb_i[fin], Xr[fin]
+                qa_i, rb_i, Xr, sc_i = qa_i[fin], rb_i[fin], Xr[fin], pair_scores[fin]
                 if self.cfg.max_corr_per_ref > 0 and len(qa_i) > self.cfg.max_corr_per_ref:
                     qa_i = qa_i[:self.cfg.max_corr_per_ref]
                     rb_i = rb_i[:self.cfg.max_corr_per_ref]
                     Xr = Xr[:self.cfg.max_corr_per_ref]
+                    sc_i = sc_i[:self.cfg.max_corr_per_ref]
                 if len(qa_i):
                     pts2d.append(qkp[qa_i])
                     pts3d.append(Xr)
+                    corr_scores.append(sc_i.astype(np.float32))
                     corr_ref_ids.extend([ref_id] * len(qa_i))
                     corr_ref_kp_ids.extend(rb_i.tolist())
                     info["used_refs"].append(ref_id)
@@ -736,6 +800,15 @@ class ProductionXFeatTracker(Localizer):
                      if pts2d else np.zeros((0, 2), float))
         pts3d_arr = (np.concatenate(pts3d, axis=0).astype(float)
                      if pts3d else np.zeros((0, 3), float))
+        if self.cfg.dedup_corr and len(pts3d_arr):
+            sc_all = np.concatenate(corr_scores, axis=0)
+            keep = dedup_correspondence_indices(pts2d_arr, pts3d_arr, sc_all)
+            if len(keep) != len(pts3d_arr):
+                info["corr3d_pre_dedup"] = int(len(pts3d_arr))
+                pts2d_arr = pts2d_arr[keep]
+                pts3d_arr = pts3d_arr[keep]
+                corr_ref_ids = np.asarray(corr_ref_ids, np.int32)[keep].tolist()
+                corr_ref_kp_ids = np.asarray(corr_ref_kp_ids, np.int32)[keep].tolist()
         info["corr3d"] = int(len(pts3d_arr))
         if len(pts3d_arr) < min_corr:
             info["inliers"] = 0
@@ -753,6 +826,7 @@ class ProductionXFeatTracker(Localizer):
         ret = pycolmap.estimate_and_refine_absolute_pose(
             pts2d_arr, pts3d_arr, cam, estimation_options=est_opts)
         _sync(); info["pnp_ms"] = (time.perf_counter() - t0) * 1000.0
+        info["pnp_failed"] = ret is None
         info["inliers"] = 0 if ret is None else int(ret.get("num_inliers", 0))
         info["reproj_rms"] = None if ret is None else self._estimate_reproj_rms(ret, pts2d_arr, pts3d_arr)
         # additive hook: expose the accepted inlier 2D<->3D so an optical-flow tracker can
@@ -764,6 +838,11 @@ class ProductionXFeatTracker(Localizer):
             self._last_inl_2d, self._last_inl_3d = pts2d_arr.astype(np.float32), pts3d_arr.astype(np.float32)
         else:
             self._last_inl_2d = self._last_inl_3d = None
+        # diagnostics only: fraction of occupied 5x3 grid cells among inlier keypoints
+        if self._last_inl_2d is not None and len(self._last_inl_2d):
+            gx = np.clip((self._last_inl_2d[:, 0] * 5.0 / max(self.cam.width, 1)).astype(int), 0, 4)
+            gy = np.clip((self._last_inl_2d[:, 1] * 3.0 / max(self.cam.height, 1)).astype(int), 0, 2)
+            info["inlier_coverage"] = float(len(np.unique(gy * 5 + gx)) / 15.0)
         if ret is not None and self.cfg.max_corr_total <= 0 and all(kp >= 0 for kp in corr_ref_kp_ids):
             payload = self._cache_payload_from_ref_inliers(
                 ret, pts3d_arr, corr_ref_ids, corr_ref_kp_ids, active_matcher)
@@ -881,6 +960,7 @@ class ProductionXFeatTracker(Localizer):
             jump = float(np.linalg.norm(center - pred))
             info["jump_from_pred"] = jump
             if jump > self.cfg.max_jump:
+                info["jump_rejected"] = True
                 return False, False, pose
         weak = ninl < self.cfg.track_min_inliers or ninl < self.cfg.good_inliers
         return True, weak, pose
@@ -1051,6 +1131,7 @@ class ProductionXFeatTracker(Localizer):
         xfeat = self.ensure_models()
         _ = xfeat
         start = time.perf_counter()
+        self._frame_counters = {}          # diagnostics only, merged into last_info below
         mode = self.state.mode
         vpr_ms = 0.0
         if mode == "BOOT_INIT":
@@ -1219,16 +1300,25 @@ class ProductionXFeatTracker(Localizer):
                 and (reproj is None or reproj <= self.cfg.temporal_cache_seed_max_reproj)
             )
             if seed_ok:
-                seed_refs = tuple(int(r) for r in (info.get("used_refs") or info.get("candidates", [])[:3]))
-                if seed_refs and seed_refs == self._last_seed_refs and len(self.temporal_cache) > 0:
-                    self.temporal_cache.age = 0          # same refs -> reuse cache, skip CPU gather + re-upload
-                    cache_updated = True
-                else:
-                    ref_payload = self._cache_payload_from_refs(
-                        seed_refs, str(info.get("composite_stage", "success_refs")))
-                    cache_updated = self._set_temporal_cache(ref_payload or cache_payload)
+                if self.cfg.temporal_cache_seed_mode == "inliers" and cache_payload:
+                    # seed from this frame's PnP-validated inliers (smaller,
+                    # higher-precision anchor set); falls through to full-ref
+                    # seeding when no inlier payload exists (e.g. the cache
+                    # itself contributed correspondences this frame).
+                    cache_updated = self._set_temporal_cache(cache_payload)
                     if cache_updated:
-                        self._last_seed_refs = seed_refs
+                        self._last_seed_refs = ()        # inlier seeds are not a ref-set
+                if not cache_updated:
+                    seed_refs = tuple(int(r) for r in (info.get("used_refs") or info.get("candidates", [])[:3]))
+                    if seed_refs and seed_refs == self._last_seed_refs and len(self.temporal_cache) > 0:
+                        self.temporal_cache.age = 0      # same refs -> reuse cache, skip CPU gather + re-upload
+                        cache_updated = True
+                    else:
+                        ref_payload = self._cache_payload_from_refs(
+                            seed_refs, str(info.get("composite_stage", "success_refs")))
+                        cache_updated = self._set_temporal_cache(ref_payload or cache_payload)
+                        if cache_updated:
+                            self._last_seed_refs = seed_refs
             if not cache_updated:
                 self._age_temporal_cache()
             info["accepted"] = True
@@ -1238,6 +1328,24 @@ class ProductionXFeatTracker(Localizer):
         info["temporal_cache_size_after"] = int(len(self.temporal_cache))
         info["temporal_cache_age_after"] = int(self.temporal_cache.age)
         info["temporal_cache_source_stage"] = self.temporal_cache.source_stage
+        info.update(self._frame_counters)
+        # diagnostics only: composite localization quality in [0,1] from existing
+        # metrics (inliers, corr, reproj, coverage, temporal consistency, weak).
+        # Logged for benchmark/UI; nothing gates on it.
+        if info.get("accepted"):
+            inl = int(info.get("inliers", 0) or 0)
+            corr = int(info.get("corr3d", 0) or 0)
+            rms = info.get("reproj_rms")
+            cov = info.get("inlier_coverage")
+            jump = info.get("jump_from_pred")
+            consistency = 1.0 if jump is None else max(0.0, 1.0 - jump / max(self.cfg.max_jump, 1e-6))
+            info["quality_score"] = round(
+                0.35 * min(1.0, inl / 120.0)
+                + 0.15 * min(1.0, corr / 300.0)
+                + 0.20 * (1.0 - min(1.0, (3.0 if rms is None else float(rms)) / 6.0))
+                + 0.10 * (0.5 if cov is None else float(cov))
+                + 0.10 * consistency
+                + 0.10 * (0.0 if info.get("weak") else 1.0), 4)
         info["next_mode"] = self.state.mode
         info["bad_count"] = int(self.state.bad_count)
         info["fail_count"] = int(self.state.fail_count)
