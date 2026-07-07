@@ -11,6 +11,7 @@ import json
 import math
 import os
 import queue
+import select
 import subprocess
 import struct
 import sys
@@ -334,24 +335,46 @@ class LiveWorkerClient:
     """
 
     def __init__(self, cmd: list, width: int, height: int, log_path: str,
-                 thread_name: str, label: str, error_defaults: dict | None = None):
+                 thread_name: str, label: str, error_defaults: dict | None = None,
+                 timeout_s: float = 8.0):
         self.width = int(width)
         self.height = int(height)
         self.label = label
         self.error_defaults = error_defaults or {}
+        self.cmd = cmd
+        self.log_path = log_path
+        self.timeout_s = float(os.environ.get("SFM_WORKER_TIMEOUT_S", timeout_s))
+        self.restart_warmup_s = 20.0     # after a restart, skip submits while the worker reloads models
+        self._last_restart = 0.0
         self.pending: queue.Queue[tuple[int, str, bytes]] = queue.Queue(maxsize=1)
         self.results: queue.Queue[dict] = queue.Queue()
         self.in_flight = False
         self._lock = threading.Lock()
-        self.proc = subprocess.Popen(
-            cmd,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=open(log_path, "w", encoding="utf-8"),
-            bufsize=0,
-        )
+        self.proc = self._spawn("w")
         self.thread = threading.Thread(target=self._loop, name=thread_name, daemon=True)
         self.thread.start()
+
+    def _spawn(self, mode: str) -> subprocess.Popen:
+        return subprocess.Popen(
+            self.cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=open(self.log_path, mode, encoding="utf-8"), bufsize=0)
+
+    def _restart(self) -> None:
+        """Respawn a hung/exited worker so localization can recover. Cooldown-guarded so a
+        freshly-restarted worker (which needs ~15s to reload models) is not thrashed."""
+        now = time.monotonic()
+        if now - self._last_restart < 30.0:
+            return
+        self._last_restart = now
+        try:
+            self.proc.kill()
+        except Exception:
+            pass
+        try:
+            self.proc = self._spawn("a")
+            print(f"[operator] {self.label} worker restarted after stall/exit", flush=True)
+        except Exception as exc:
+            print(f"[operator] {self.label} worker restart failed: {exc!r}", flush=True)
 
     def _error_result(self, seq: int, frame_name: str, error: str) -> dict:
         payload = {
@@ -376,6 +399,11 @@ class LiveWorkerClient:
                     raise RuntimeError(f"{self.label} worker pipe closed")
                 self.proc.stdin.write(raw)
                 self.proc.stdin.flush()
+                # bound the read: a hung worker (e.g. GPU stall in localize) must not block
+                # this thread forever (would freeze localization on the last result).
+                ready, _, _ = select.select([self.proc.stdout], [], [], self.timeout_s)
+                if not ready:
+                    raise TimeoutError(f"{self.label} worker stalled > {self.timeout_s:.0f}s")
                 line = self.proc.stdout.readline()
                 if not line:
                     raise RuntimeError(f"{self.label} worker exited")
@@ -383,6 +411,9 @@ class LiveWorkerClient:
                 payload["display_seq"] = seq
                 payload["frame_name"] = frame_name
                 self.results.put(payload)
+            except (TimeoutError, RuntimeError, BrokenPipeError, OSError) as exc:
+                self.results.put(self._error_result(seq, frame_name, repr(exc)))
+                self._restart()                      # hung/exited worker -> respawn (cooldown-guarded)
             except Exception as exc:
                 self.results.put(self._error_result(seq, frame_name, repr(exc)))
             finally:
@@ -390,6 +421,8 @@ class LiveWorkerClient:
                     self.in_flight = False
 
     def submit(self, seq: int, frame_name: str, frame: Image.Image) -> bool:
+        if time.monotonic() - self._last_restart < self.restart_warmup_s:
+            return False                             # worker reloading models after a restart
         if self.proc.poll() is not None:
             self.results.put(self._error_result(
                 seq, frame_name, f"{self.label} worker exited code={self.proc.returncode}"))
@@ -611,15 +644,21 @@ class OperatorApp(tk.Tk):
         self.after(100, self.tick)
 
     def boot_holding(self) -> bool:
-        return not self.boot_lock_done
+        return self.inspecting and not self.boot_lock_done
 
     def update_boot_lock(self) -> None:
         if self.boot_lock_done:
+            return
+        if not self.inspecting:                 # boot lock only engages after 開始巡檢 (AUTO consent)
             return
         now = time.monotonic()
         if self.boot_lock_start is None:
             self.boot_lock_start = now
             self.write_log("BOOT_INIT: holding first 720p frame until live MegaLoc/PnP lock")
+        elif now - self.boot_lock_start >= self.boot_lock_s:
+            self.boot_lock_done = True           # timeout: release the hold so the UI never freezes
+            self.write_log(f"BOOT_INIT: no lock in {self.boot_lock_s:.1f}s; releasing hold "
+                           "(localization keeps trying, stream resumes)")
 
     @staticmethod
     def _derive_motion_headings(rows: list[dict]) -> list[float | None]:

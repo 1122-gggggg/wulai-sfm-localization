@@ -159,7 +159,9 @@ compile 全過、**flight selftest 9 項全過**、flow 定位 **bit-identical**
 - **#8 pitch 只看水平 X/Z**:純垂直修正不再產生假前傾(gaz 管 Y)。
 - **#6 worker fd-level stdout 轉向**:原生 lib(如 LightGlue 載入訊息)不再污染 JSON IPC。
 - **#12 requirements 補** huggingface_hub/safetensors/kornia pin。
-- 暫緩(有理由):#5 worker IPC timeout、#7 boot lock timeout(UI robustness,較大改動)、#9 temporal cache inliers(需 benchmark)、#10 tobytes(非瓶頸)、#11 python probe(env override 已覆蓋)。
+- **#5 worker IPC timeout + 重啟**:`LiveWorkerClient` 讀取加 `select` timeout(`SFM_WORKER_TIMEOUT_S`,預設 8s);worker 卡死 → 標 FAIL 解除凍結 + cooldown 重啟(重啟後 warmup 期間跳過 submit,避免重載模型時 thrash)。實測假卡死 worker → 2s timeout → FAIL + 重啟。
+- **#7 boot lock timeout + 只在巡檢後**:boot lock 只在「開始巡檢」後啟動,且 `boot_lock_s` 到期未鎖定就釋放(畫面不再永久凍結)。
+- 暫緩(有理由):#9 temporal cache inliers(需 benchmark)、#10 tobytes(非瓶頸)、#11 python probe(env override 已覆蓋)。
 
 ### 操作介面
 - **無法定位永久標記**:每次定位失敗在最後已知位置留**紅點**(NO_LOC_DEDUP_U 去重),永久累積,取代先前的危險平面。
