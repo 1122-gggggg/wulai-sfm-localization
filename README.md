@@ -24,6 +24,8 @@
 
 真機入口不會選擇預設場域。只有在 profile 的地圖、定位 bundle、相機內參與安全航線位於同一座標系，且已由操作人員完成安全驗證後，才能進行真機操作。
 
+烏來與河濱的可下載場域資料見 [MAP_ASSETS.md](MAP_ASSETS.md)。
+
 ## 固定的 EDM 正式參數
 
 `定位演算法/configs/edm_production_profile.json` 是所有場域共用的正式設定：1024×576、PyTorch CUDA FP16、coarse top-k 3225、confidence 0.2、TRACK/WEAK/LOST top-k 1/3/5、BOOT MegaLoc top-k 10、batch size 2、LOST grace 12、recovery bank/scan 192/2、correspondence 上限 900、inliers 80/50/30。MegaLoc 只在 BOOT 與每個 LOST episode 各執行一次，temporal reference 關閉，PnP acquire/track/RANSAC gate 固定為 5/6/5。
