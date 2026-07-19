@@ -1,0 +1,30 @@
+{
+  "schema": "edm-deployment-profile/v1",
+  "name": "edm_rtx5060_production",
+  "status": "final validated production parameters",
+  "matcher": {
+    "coarse_topk": 3225,
+    "mconf_thr": 0.2,
+    "fp16": true,
+    "input_size": [1024, 576]
+  },
+  "tracker": {
+    "global_retrieval_policy": "boot_and_lost_once",
+    "boot_global_topk": 10,
+    "match_batch_size": 2,
+    "local_topk": 1,
+    "weak_local_topk": 3,
+    "lost_local_topk": 5,
+    "lost_local_grace_frames": 12,
+    "recovery_bank_size": 192,
+    "recovery_scan_topk": 2,
+    "use_temporal_reference": false,
+    "max_corr_total": 900,
+    "acquire_min_inliers": 80,
+    "track_min_inliers": 50,
+    "weak_min_inliers": 30,
+    "max_reproj_error_acquire": 5.0,
+    "max_reproj_error_track": 6.0,
+    "pnp_ransac_max_error": 5.0
+  }
+}

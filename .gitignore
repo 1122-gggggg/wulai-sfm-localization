@@ -1,24 +1,15 @@
-# --- large binaries (exceed GitHub 100MB limit; not source) ---
-*.pt
-*.pth
-*.bin
-*.ply
-*.npy
-*.tar.zst
-torch_hub_cache/
+# Local environments, maps, model weights, and generated runtime artifacts.
+.venv/
+env/
+outputs/
+.codegraph/
+地圖檔/maps/*
+!地圖檔/maps/.gitkeep
+地圖檔/bundles/*
+!地圖檔/bundles/.gitkeep
+定位演算法/deploy_code/runtime/EDM/weights/*
+!定位演算法/deploy_code/runtime/EDM/weights/.gitignore
+定位演算法/validation/report_*/
 
-# --- video / media ---
-*.MP4
-*.mp4
-*.mov
-*.avi
-
-# --- python / OS caches ---
-__pycache__/
-*.pyc
-*.pyo
-.DS_Store
-*.swp
-
-# --- runtime flight logs / benchmark outputs (regenerated each run) ---
-sfm_system/定位/outputs/
+**/__pycache__/
+**/.pytest_cache/
