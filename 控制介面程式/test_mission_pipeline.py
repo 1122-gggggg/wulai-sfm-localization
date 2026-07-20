@@ -20,6 +20,13 @@ mission_pipeline = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(mission_pipeline)
 
 
+@pytest.fixture(autouse=True)
+def clear_site_asset_environment(monkeypatch):
+    monkeypatch.delenv("SFM_SITE_PROFILE", raising=False)
+    for name in mission_pipeline._SITE_ASSET_ENV_VARS:
+        monkeypatch.delenv(name, raising=False)
+
+
 def _args(**overrides):
     values = {
         "site_profile": "",
