@@ -127,13 +127,14 @@ resize, localization, detection, display, and logging never run in that
 callback. Pdraw keeps two decoder buffers for decoder progress, while the
 application has exactly one pending frame; those are different layers.
 
-The UI passes the owned contiguous RGB array to each enabled worker through a
-`memoryview`, and each worker reuses one fixed-size input `bytearray`. TRACK runs
-localization as fast as the worker becomes free; YOLO remains off by default and
-runs every three frames when explicitly enabled. Frames arriving while a model
-is busy are discarded rather than queued.
+The UI copies the newest contiguous RGB array into the inactive slot of a
+two-slot shared-memory buffer; the localization worker receives only a one-byte
+slot index and reads that frame zero-copy. Completed results wake Tk through a
+file descriptor, with a low-rate poll retained as fallback. Optional YOLO keeps
+the compatible pipe/fixed-`bytearray` path. TRACK runs as fast as the worker
+becomes free, and busy periods retain only the newest frame.
 
-`loc_metrics_*.jsonl` records callback, YUV view, preprocess, pipe, worker,
+`loc_metrics_*.jsonl` records callback, YUV view, preprocess, IPC, worker,
 localization, response, and UI timestamps in host monotonic nanoseconds, plus
 derived `callback_to_*_ms` values and mapped source-frame age. The HUD shows
 core latency, callback-to-localization/UI latency, stream backlog age, and the

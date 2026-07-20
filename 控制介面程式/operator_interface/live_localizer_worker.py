@@ -2,7 +2,7 @@
 """Persistent stdin/stdout production localizer worker.
 
 Protocol:
-  input  : optional SFM1 mode header, then raw RGB width*height*3 bytes
+  input  : optional SFM1 mode header, then raw RGB bytes or one shared-memory slot byte
   output : one JSON line per frame
 
 All model logs are redirected to stderr so stdout remains machine-readable.
@@ -14,6 +14,7 @@ import contextlib
 import dataclasses
 import json
 import math
+from multiprocessing import shared_memory
 import os
 import sys
 import time
@@ -63,14 +64,16 @@ DEFAULT_NEUFLOW_WEIGHTS = Path(os.environ.get(
 
 EDM_PROFILE_SCHEMA = "edm-deployment-profile/v1"
 EDM_REQUIRED_MATCHER_KEYS = {
-    "coarse_topk", "mconf_thr", "fp16", "input_size",
+    "coarse_topk", "mconf_thr", "fp16", "input_size", "reference_cache_size",
 }
 EDM_REQUIRED_TRACKER_KEYS = {
     "global_retrieval_policy", "boot_global_topk", "match_batch_size",
+    "acquire_initial_topk",
     "local_topk", "weak_local_topk", "lost_local_topk",
     "lost_local_grace_frames", "recovery_bank_size", "recovery_scan_topk",
     "use_temporal_reference", "max_corr_total", "acquire_min_inliers",
     "track_min_inliers", "weak_min_inliers",
+    "max_reproj_error_acquire", "max_reproj_error_track", "prediction_max_dt",
 }
 
 
@@ -108,6 +111,9 @@ def load_edm_production_profile(path: str | Path) -> dict:
     if matcher["input_size"] != [1024, 576]:
         raise ValueError(
             f"EDM matcher input_size must be [1024, 576] for this deployment: {source}")
+    cache_size = matcher["reference_cache_size"]
+    if isinstance(cache_size, bool) or not isinstance(cache_size, int) or cache_size < 0:
+        raise ValueError(f"EDM matcher reference_cache_size must be non-negative: {source}")
     return raw
 
 
@@ -172,6 +178,18 @@ def frame_view_from_rgb_bytes(
     if len(raw) != expected:
         raise ValueError(f"RGB frame size mismatch: {len(raw)}/{expected}")
     return np.frombuffer(raw, dtype=np.uint8).reshape((int(height), int(width), 3))
+
+
+def frame_view_from_shared_memory(buffer, slot: int, slots: int,
+                                  width: int, height: int) -> np.ndarray:
+    """Return the selected zero-copy frame slot after validating its bounds."""
+    slot = int(slot)
+    slots = int(slots)
+    if slot < 0 or slot >= slots:
+        raise ValueError(f"shared frame slot {slot} outside [0,{slots})")
+    frame_size = int(width) * int(height) * 3
+    start = slot * frame_size
+    return frame_view_from_rgb_bytes(buffer[start:start + frame_size], width, height)
 
 
 def resolve_force_track_ref(requested: int, ref_count: int) -> int:
@@ -299,6 +317,8 @@ def main() -> None:
     ap.add_argument("--megaloc-cache", default=DEFAULT_MEGALOC)
     ap.add_argument("--deploy-dir", default=str(DEPLOY_DIR))
     ap.add_argument("--max-frames", type=int, default=0)
+    ap.add_argument("--frame-shm-name", default="")
+    ap.add_argument("--frame-shm-slots", type=int, default=0)
     ap.add_argument(
         "--localizer-backend",
         choices=("auto", "edm", "xfeat"),
@@ -373,6 +393,10 @@ def main() -> None:
         help="Validated edm-deployment-profile/v1 JSON applied to matcher and tracker.",
     )
     args = ap.parse_args()
+    if bool(args.frame_shm_name) != (args.frame_shm_slots > 0):
+        ap.error("--frame-shm-name and positive --frame-shm-slots must be used together")
+    if args.frame_shm_slots > 255:
+        ap.error("--frame-shm-slots must fit in one byte")
     try:
         query_camera_override = resolve_query_camera_override(
             args.query_camera_model,
@@ -454,6 +478,7 @@ def main() -> None:
                     mconf_thr=float(matcher_cfg["mconf_thr"]),
                     topk=int(matcher_cfg["coarse_topk"]),
                     fp16=bool(matcher_cfg["fp16"]),
+                    reference_cache_size=int(matcher_cfg["reference_cache_size"]),
                 )
                 matcher_tag = (
                     f"torch_{'fp16' if matcher_cfg['fp16'] else 'fp32'}"
@@ -469,11 +494,14 @@ def main() -> None:
                 f"track/weak/lost={cfg.local_topk}/{cfg.weak_local_topk}/"
                 f"{getattr(cfg, 'lost_local_topk', 'n/a')} "
                 f"boot_topk={cfg.boot_global_topk} "
+                f"staged_first={getattr(cfg, 'acquire_initial_topk', 'n/a')} "
                 f"batch={getattr(cfg, 'match_batch_size', 'n/a')} "
                 f"lost_grace={getattr(cfg, 'lost_local_grace_frames', 'n/a')} "
                 f"recovery_bank/scan={getattr(cfg, 'recovery_bank_size', 'n/a')}/"
                 f"{getattr(cfg, 'recovery_scan_topk', 'n/a')} "
                 f"max_corr={cfg.max_corr_total} "
+                f"reproj_gate={getattr(cfg, 'max_reproj_error_acquire', 'n/a')}/"
+                f"{getattr(cfg, 'max_reproj_error_track', 'n/a')} "
                 f"min_inliers={cfg.acquire_min_inliers}/{cfg.track_min_inliers}/{cfg.weak_min_inliers}",
                 file=sys.stderr, flush=True,
             )
@@ -652,7 +680,14 @@ def main() -> None:
                 )
 
     frame_size = int(args.width) * int(args.height) * 3
-    frame_buffer = bytearray(frame_size)
+    frame_buffer = None if args.frame_shm_name else bytearray(frame_size)
+    frame_shm = (
+        shared_memory.SharedMemory(name=args.frame_shm_name, create=False)
+        if args.frame_shm_name else None
+    )
+    if frame_shm is not None and len(frame_shm.buf) < frame_size * args.frame_shm_slots:
+        frame_shm.close()
+        raise RuntimeError("shared frame memory is smaller than the declared slot count")
     # CUDA events require a synchronization to read. Keep them strictly opt-in;
     # production never inserts a device-wide/per-frame timing fence.
     gpu_timing_profiled = (
@@ -696,17 +731,27 @@ def main() -> None:
             except ValueError as exc:
                 print(f"[live_worker] {exc}", file=sys.stderr, flush=True)
                 break
-        frame_bytes = read_exact_into(sys.stdin.buffer, frame_buffer)
-        if not frame_bytes:
-            break
-        if frame_bytes != frame_size:
-            print(f"[live_worker] partial frame: {frame_bytes}/{frame_size}", file=sys.stderr, flush=True)
-            break
+        if frame_shm is None:
+            assert frame_buffer is not None
+            frame_bytes = read_exact_into(sys.stdin.buffer, frame_buffer)
+            if not frame_bytes:
+                break
+            if frame_bytes != frame_size:
+                print(f"[live_worker] partial frame: {frame_bytes}/{frame_size}", file=sys.stderr, flush=True)
+                break
+            frame = frame_view_from_rgb_bytes(frame_buffer, args.width, args.height)
+        else:
+            slot_byte = read_exact(sys.stdin.buffer, 1)
+            if not slot_byte:
+                break
+            frame = frame_view_from_shared_memory(
+                frame_shm.buf, slot_byte[0], args.frame_shm_slots,
+                args.width, args.height,
+            )
         worker_read_done_mono_ns = time.monotonic_ns()
         worker_read_done_mono = worker_read_done_mono_ns * 1e-9
-        # The fixed buffer is not refilled until synchronous localization
-        # returns, so this writable contiguous view needs no second 720p copy.
-        frame = frame_view_from_rgb_bytes(frame_buffer, args.width, args.height)
+        # The parent never overwrites the active slot until this synchronous request
+        # returns, so both pipe and shared-memory paths need no second 720p copy.
         wall_t0 = time.perf_counter()
         core_t0: float | None = None
         worker_core_start_mono: float | None = None
@@ -813,6 +858,11 @@ def main() -> None:
                 "camera_axes_world": info.get("camera_axes_world"),
                 "camera_forward_world": info.get("camera_forward_world"),
                 "reproj_rms": info.get("reproj_rms"),
+                "inlier_ratio": info.get("inlier_ratio"),
+                "inlier_grid_cells": info.get("inlier_grid_cells"),
+                "requested_reference_count": info.get("requested_reference_count"),
+                "staged_early_stop": info.get("staged_early_stop"),
+                "rejected": info.get("rejected"),
                 "composite_stage": info.get("composite_stage"),
                 "vpr_ms": info.get("vpr_ms"),
                 "feature_ms": info.get("feature_ms"),
@@ -877,6 +927,10 @@ def main() -> None:
         seq += 1
         if args.max_frames and seq >= args.max_frames:
             break
+    if frame_shm is not None:
+        if "frame" in locals():
+            del frame
+        frame_shm.close()
 
 
 if __name__ == "__main__":

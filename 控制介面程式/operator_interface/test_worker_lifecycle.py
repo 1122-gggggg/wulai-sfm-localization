@@ -4,6 +4,7 @@ import json
 import importlib.util
 import inspect
 import io
+import select
 import sys
 import threading
 import time
@@ -29,8 +30,8 @@ def _wait_for(predicate, timeout: float = 2.0) -> bool:
     return bool(predicate())
 
 
-def test_default_overlay_uses_the_production_route() -> None:
-    assert app.DEFAULT_ROUTE.resolve() == app._RIVER_ROUTE.resolve()
+def test_default_overlay_uses_the_portable_route_fallback() -> None:
+    assert app.DEFAULT_ROUTE.resolve() == app._DEFAULT_ROUTE_FALLBACK.resolve()
 
 
 def test_heading_arrow_polygon_points_at_the_current_heading() -> None:
@@ -246,11 +247,9 @@ def test_live_localizer_client_passes_profile_query_camera(monkeypatch) -> None:
 def test_shipped_edm_production_profile_pins_validated_parameters() -> None:
     profile_path = (
         Path(__file__).resolve().parents[2]
-        / "EDM"
-        / "edm_target_site_rtx5060_ready_20260719"
-        / "deploy"
-        / "profiles"
-        / "balanced_rtx5060_candidate.json"
+        / "定位演算法"
+        / "configs"
+        / "edm_production_profile.json"
     )
 
     profile = localizer_worker.load_edm_production_profile(profile_path)
@@ -260,7 +259,12 @@ def test_shipped_edm_production_profile_pins_validated_parameters() -> None:
         "mconf_thr": 0.2,
         "fp16": True,
         "input_size": [1024, 576],
+        "reference_cache_size": 32,
     }
+    assert profile["tracker"]["acquire_initial_topk"] == 2
+    assert profile["tracker"]["max_reproj_error_acquire"] == 5.0
+    assert profile["tracker"]["max_reproj_error_track"] == 6.0
+    assert profile["tracker"]["prediction_max_dt"] == 0.25
     assert profile["tracker"]["local_topk"] == 1
     assert profile["tracker"]["weak_local_topk"] == 3
     assert profile["tracker"]["lost_local_topk"] == 5
@@ -686,6 +690,8 @@ def test_operator_anafi_profile_matches_simulator_contract() -> None:
         app.SYSTEM_ROOT / "模擬器" /
         "sphinx_anafi_path_convergence" / "anafi_profile.py"
     )
+    if not profile_path.is_file():
+        pytest.skip("simulator profile is not shipped in the portable repository")
     spec = importlib.util.spec_from_file_location("_operator_test_anafi_profile", profile_path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
@@ -751,6 +757,70 @@ def test_live_rgb_worker_input_is_a_zero_copy_memoryview() -> None:
     assert raw.nbytes == frame.nbytes
     frame[0, 0, 0] = 73
     assert raw[0] == 73
+
+
+def test_non_calibrated_zoom_pauses_localization_before_submit() -> None:
+    logs = []
+    operator = SimpleNamespace(
+        inspecting=True,
+        localizer=SimpleNamespace(busy=lambda: pytest.fail("must not submit at non-1x zoom")),
+        video_frame=object(),
+        video_display_index=1,
+        backend=SimpleNamespace(state=SimpleNamespace(zoom=1.5)),
+        _zoom_localization_paused=False,
+        write_log=logs.append,
+    )
+
+    app.OperatorApp.submit_current_frame_for_localization(operator)
+
+    assert operator._zoom_localization_paused
+    assert "1.5x" in logs[0]
+    assert app.localization_zoom_is_calibrated(1.0)
+    assert not app.localization_zoom_is_calibrated(float("nan"))
+
+
+def test_shared_frame_worker_coalesces_latest_slot_and_notifies(tmp_path: Path) -> None:
+    worker = """
+import argparse, json, sys, time
+from multiprocessing import shared_memory
+p = argparse.ArgumentParser()
+p.add_argument('--frame-shm-name', required=True)
+p.add_argument('--frame-shm-slots', required=True, type=int)
+a = p.parse_args()
+shm = shared_memory.SharedMemory(name=a.frame_shm_name)
+try:
+    for index in range(2):
+        slot = sys.stdin.buffer.read(1)
+        if not slot:
+            break
+        if index == 0:
+            time.sleep(0.1)
+        start = slot[0] * 6
+        print(json.dumps({'success': False, 'pixel_sum': sum(shm.buf[start:start + 6])}), flush=True)
+finally:
+    shm.close()
+"""
+    client = app.LiveWorkerClient(
+        [sys.executable, "-c", worker], 2, 1,
+        str(tmp_path / "shared.log"), "shared-worker", "shared",
+        timeout_s=1.0, use_shared_frames=True,
+    )
+    client.restart_warmup_s = 0.0
+    try:
+        assert client.submit(1, "first", np.full((1, 2, 3), 1, np.uint8))
+        assert _wait_for(client.busy)
+        assert client.submit(2, "middle", np.full((1, 2, 3), 2, np.uint8))
+        assert client.submit(3, "latest", np.full((1, 2, 3), 3, np.uint8))
+        ready, _, _ = select.select([client.result_notify_fd], [], [], 2.0)
+        assert ready
+        assert _wait_for(lambda: client.results.qsize() == 2)
+        client.drain_result_notifications()
+        results = client.poll_results()
+    finally:
+        client.close()
+    assert [(row["display_seq"], row["pixel_sum"]) for row in results] == [
+        (1, 6), (3, 18),
+    ]
 
 
 @pytest.mark.parametrize(
@@ -909,6 +979,20 @@ def test_ply_sampling_never_exceeds_requested_limit(tmp_path: Path) -> None:
     rows = "".join(f"{i} 0 0 1 2 3\n" for i in range(101))
     ply.write_text(header + rows, encoding="ascii")
     assert len(app.read_ply_points(ply, max_points=100)) <= 100
+
+
+def test_ply_reader_uses_rgb_after_normals(tmp_path: Path) -> None:
+    ply = tmp_path / "normals.ply"
+    ply.write_text(
+        "ply\nformat ascii 1.0\nelement vertex 1\n"
+        "property float x\nproperty float y\nproperty float z\n"
+        "property float nx\nproperty float ny\nproperty float nz\n"
+        "property uchar red\nproperty uchar green\nproperty uchar blue\nend_header\n"
+        "1 2 3 0.1 0.2 0.3 4 5 6\n",
+        encoding="ascii",
+    )
+
+    assert app.read_ply_points(ply, max_points=1).tolist() == [[1, 2, 3, 4, 5, 6]]
 
 
 def test_partial_worker_response_times_out_and_recovers(tmp_path: Path) -> None:

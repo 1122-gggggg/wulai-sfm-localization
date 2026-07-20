@@ -24,6 +24,7 @@ import atexit
 import hashlib
 import json
 import math
+from multiprocessing import shared_memory
 import os
 import queue
 import select
@@ -95,6 +96,16 @@ def default_worker_python(env_var: str) -> str:
     if from_env:
         return from_env
     return sys.executable
+
+
+def localization_zoom_is_calibrated(zoom: float, calibrated_zoom: float = 1.0,
+                                    tolerance: float = 1e-3) -> bool:
+    """True only when the stream uses the intrinsics calibrated for localization."""
+    try:
+        value = float(zoom)
+    except (TypeError, ValueError):
+        return False
+    return math.isfinite(value) and abs(value - calibrated_zoom) <= tolerance
 
 
 SYSTEM_ROOT = _WS.root
@@ -980,17 +991,28 @@ class LiveWorkerClient:
 
     def __init__(self, cmd: list, width: int, height: int, log_path: str,
                  thread_name: str, label: str, error_defaults: dict | None = None,
-                 timeout_s: float = 8.0):
+                 timeout_s: float = 8.0, use_shared_frames: bool = False):
         self.width = int(width)
         self.height = int(height)
         self.label = label
         self.error_defaults = error_defaults or {}
-        self.cmd = cmd
+        self.cmd = list(cmd)
         self.log_path = log_path
         self.timeout_s = float(os.environ.get("SFM_WORKER_TIMEOUT_S", timeout_s))
         self.restart_warmup_s = float(os.environ.get("SFM_WORKER_WARMUP_S", "20"))
         self._last_restart = 0.0
         self._spawned_at = 0.0
+        self._frame_size = self.width * self.height * 3
+        self._frame_shm_slots = 2 if use_shared_frames else 0
+        self._frame_shm: shared_memory.SharedMemory | None = None
+        self._active_shm_slot: int | None = None
+        if self._frame_shm_slots:
+            self._frame_shm = shared_memory.SharedMemory(
+                create=True, size=self._frame_size * self._frame_shm_slots)
+            self.cmd.extend([
+                "--frame-shm-name", self._frame_shm.name,
+                "--frame-shm-slots", str(self._frame_shm_slots),
+            ])
         # Capacity-1 pipeline: never queue old work. While the worker is busy,
         # submit() overwrites a single coalesce slot so the next run uses the
         # newest frame (drop intermediate frames).
@@ -1004,9 +1026,41 @@ class LiveWorkerClient:
         self._lock = threading.Lock()
         self._proc_lock = threading.RLock()
         self._closed = threading.Event()
-        self.proc = self._spawn("w")
-        self.thread = threading.Thread(target=self._loop, name=thread_name, daemon=True)
-        self.thread.start()
+        self._result_notify_read_fd, self._result_notify_write_fd = os.pipe()
+        os.set_blocking(self._result_notify_read_fd, False)
+        os.set_blocking(self._result_notify_write_fd, False)
+        try:
+            self.proc = self._spawn("w")
+            self.thread = threading.Thread(target=self._loop, name=thread_name, daemon=True)
+            self.thread.start()
+        except Exception:
+            os.close(self._result_notify_read_fd)
+            os.close(self._result_notify_write_fd)
+            if self._frame_shm is not None:
+                self._frame_shm.close()
+                self._frame_shm.unlink()
+            raise
+
+    @property
+    def result_notify_fd(self) -> int:
+        return self._result_notify_read_fd
+
+    def _publish_result(self, payload: dict) -> None:
+        self.results.put(payload)
+        try:
+            os.write(self._result_notify_write_fd, b"\x01")
+        except (BlockingIOError, BrokenPipeError, OSError):
+            pass
+
+    def drain_result_notifications(self) -> None:
+        while True:
+            try:
+                if not os.read(self._result_notify_read_fd, 4096):
+                    break
+            except BlockingIOError:
+                break
+            except OSError:
+                break
 
     def _spawn(self, mode: str) -> subprocess.Popen:
         log = open(self.log_path, mode, encoding="utf-8")
@@ -1198,6 +1252,11 @@ class LiveWorkerClient:
 
     def _take_work_item(self):
         """Pop one work item: prefer coalesce (newest), else pending queue."""
+        if self._frame_shm is not None:
+            try:
+                return self.pending.get(timeout=0.1)
+            except queue.Empty:
+                return None
         with self._lock:
             if self._coalesce is not None:
                 item = self._coalesce
@@ -1215,8 +1274,9 @@ class LiveWorkerClient:
                 continue
             seq, frame_name, prefix, raw, timing = item
             self._mark_mono(timing, "client_dequeue_mono")
-            with self._lock:
-                self.in_flight = True
+            if self._frame_shm is None:
+                with self._lock:
+                    self.in_flight = True
             try:
                 with self._proc_lock:
                     proc = self.proc
@@ -1225,7 +1285,8 @@ class LiveWorkerClient:
                 self._mark_mono(timing, "client_write_start_mono")
                 if prefix:
                     self._write_all(proc, prefix)
-                self._write_all(proc, raw)
+                self._write_all(
+                    proc, bytes((int(raw),)) if self._frame_shm is not None else raw)
                 self._mark_mono(timing, "client_write_done_mono")
                 line = self._readline_with_timeout(proc)
                 self._mark_mono(timing, "client_response_mono")
@@ -1233,27 +1294,35 @@ class LiveWorkerClient:
                 payload["display_seq"] = seq
                 payload["frame_name"] = frame_name
                 self._attach_client_timing(payload, timing)
-                self.results.put(payload)
+                self._publish_result(payload)
             except (TimeoutError, RuntimeError, BrokenPipeError, OSError,
                     json.JSONDecodeError) as exc:
                 if not self._closed.is_set():
                     self._mark_mono(timing, "client_response_mono")
                     payload = self._error_result(seq, frame_name, repr(exc))
                     self._attach_client_timing(payload, timing)
-                    self.results.put(payload)
+                    self._publish_result(payload)
                     self._restart()                  # hung/exited worker -> respawn (cooldown-guarded)
             except Exception as exc:
                 if not self._closed.is_set():
                     self._mark_mono(timing, "client_response_mono")
                     payload = self._error_result(seq, frame_name, repr(exc))
                     self._attach_client_timing(payload, timing)
-                    self.results.put(payload)
+                    self._publish_result(payload)
             finally:
                 with self._lock:
-                    self.in_flight = False
                     # Promote coalesced newest frame into the capacity-1 queue.
                     nxt = self._coalesce
                     self._coalesce = None
+                    if self._frame_shm is not None:
+                        if nxt is None:
+                            self.in_flight = False
+                            self._active_shm_slot = None
+                        else:
+                            self.in_flight = True
+                            self._active_shm_slot = int(nxt[3])
+                    else:
+                        self.in_flight = False
                 if nxt is not None:
                     try:
                         while True:
@@ -1280,7 +1349,7 @@ class LiveWorkerClient:
         with self._proc_lock:
             proc = self.proc
         if proc.poll() is not None:
-            self.results.put(self._error_result(
+            self._publish_result(self._error_result(
                 seq, frame_name, f"{self.label} worker exited code={proc.returncode}"))
             self._restart()
             return False
@@ -1292,18 +1361,46 @@ class LiveWorkerClient:
               and frame.flags["C_CONTIGUOUS"]):
             raw = memoryview(frame).cast("B")
         else:
-            raw = frame.tobytes()
-        # Copy raw into owned bytes when coalescing so a reused UI buffer cannot
-        # change under a deferred request.
-        if not isinstance(raw, (bytes, bytearray)):
-            raw = bytes(raw)
-        else:
-            raw = bytes(raw)
+            raw = memoryview(frame.tobytes())
         timing = dict(timing_metadata or {})
         prefix = self._request_prefix(timing)  # snapshot control state at this frame boundary
         timing["timing_clock"] = "host_monotonic_seconds"
         timing["timing_clock_ns"] = "host_monotonic_ns"
         self._mark_mono(timing, "client_submit_mono")
+        if raw.nbytes != self._frame_size:
+            return False
+        if self._frame_shm is not None:
+            with self._lock:
+                if self.in_flight:
+                    assert self._active_shm_slot is not None
+                    slot = 1 - self._active_shm_slot
+                else:
+                    slot = 0
+                start = slot * self._frame_size
+                self._frame_shm.buf[start:start + self._frame_size] = raw
+                item = (seq, frame_name, prefix, slot, timing)
+                if self.in_flight:
+                    if self._coalesce is not None:
+                        self._coalesce_drops += 1
+                    self._coalesce = item
+                    return True
+                self.in_flight = True
+                self._active_shm_slot = slot
+                try:
+                    while True:
+                        self.pending.get_nowait()
+                        self._coalesce_drops += 1
+                except queue.Empty:
+                    pass
+                try:
+                    self.pending.put_nowait(item)
+                except queue.Full:
+                    self.in_flight = False
+                    self._active_shm_slot = None
+                    return False
+                return True
+        # Pipe workers need an owned snapshot because the UI may reuse its frame buffer.
+        raw = bytes(raw)
         item = (seq, frame_name, prefix, raw, timing)
         with self._lock:
             if self.in_flight:
@@ -1348,6 +1445,18 @@ class LiveWorkerClient:
             except (OSError, subprocess.SubprocessError):
                 pass
         self.thread.join(timeout=2.0)
+        for fd in (self._result_notify_read_fd, self._result_notify_write_fd):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if self._frame_shm is not None:
+            self._frame_shm.close()
+            try:
+                self._frame_shm.unlink()
+            except FileNotFoundError:
+                pass
+            self._frame_shm = None
 
 
 class LiveLocalizerClient(LiveWorkerClient):
@@ -1412,7 +1521,8 @@ class LiveLocalizerClient(LiveWorkerClient):
             cmd.extend(["--force-track-ref", str(int(force_track_ref))])
         super().__init__(cmd, width, height,
                          "/tmp/sfm_live_localizer_worker.log",
-                         "live-localizer-client", "localizer")
+                         "live-localizer-client", "localizer",
+                         use_shared_frames=True)
 
     @property
     def benchmark_mode(self) -> str:
@@ -1486,17 +1596,20 @@ def read_ply_points(path: Path, max_points: int) -> np.ndarray:
         n_vertices = int(vertex_line.split()[-1]) if vertex_line else 0
         limit = max(1, int(max_points))
         step = max(1, (n_vertices + limit - 1) // limit)
+        has_normals = "property float nx" in header
 
         points = []
         if fmt == "binary_little_endian":
-            rec = struct.Struct("<fffBBB")
+            rec = struct.Struct("<ffffffBBB" if has_normals else "<fffBBB")
             for i in range(n_vertices):
                 raw = f.read(rec.size)
                 if len(raw) != rec.size:
                     break
                 if i % step != 0:
                     continue
-                x, y, z, r, g, b = rec.unpack(raw)
+                values = rec.unpack(raw)
+                x, y, z = values[:3]
+                r, g, b = values[-3:]
                 points.append((x, y, z, r, g, b))
         elif fmt == "ascii":
             for i in range(n_vertices):
@@ -1506,10 +1619,11 @@ def read_ply_points(path: Path, max_points: int) -> np.ndarray:
                 if i % step != 0:
                     continue
                 vals = raw.split()
-                if len(vals) >= 6:
+                if len(vals) >= (9 if has_normals else 6):
+                    rgb = vals[-3:]
                     points.append((
                         float(vals[0]), float(vals[1]), float(vals[2]),
-                        int(vals[3]), int(vals[4]), int(vals[5]),
+                        int(rgb[0]), int(rgb[1]), int(rgb[2]),
                     ))
         else:
             raise ValueError(f"unsupported PLY format: {fmt}")
@@ -1631,6 +1745,7 @@ class OperatorApp(tk.Tk):
         self._submit_busy_attempts = 0
         self._last_busy_skip_index = -1
         self._submit_ok = 0
+        self._zoom_localization_paused = False
         self.live_last_xyz: np.ndarray | None = None
         self.pose_stabilizer = TemporalPoseStabilizer() if pose_stabilize else None
         self._live_pending: np.ndarray | None = None   # continuity gate: jump awaiting a confirming fix
@@ -1713,6 +1828,17 @@ class OperatorApp(tk.Tk):
         self.configure(bg="#111316")
         self._build_ui()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self._loc_file_handler_registered = False
+        if localizer is not None and hasattr(self, "createfilehandler"):
+            try:
+                self.createfilehandler(
+                    localizer.result_notify_fd, tk.READABLE,
+                    self._on_localizer_result_ready,
+                )
+                self._loc_file_handler_registered = True
+                self._loc_result_poll_ms = 100
+            except (AttributeError, OSError, tk.TclError):
+                pass
         # ------------------------------------------------------------------
         # 【飛行按鍵 — 禁止隨意修改】改壞會造成無人機意外（起飛／失控／不降）
         # Space=全方向懸停 | Esc=交回搖桿凍結 PC | 關窗→_on_close 強制降落
@@ -1755,8 +1881,18 @@ class OperatorApp(tk.Tk):
 
     def poll_localization_results(self) -> None:
         """Drain completed poses independently of the heavier render cadence."""
+        localizer = getattr(self, "localizer", None)
+        drain = getattr(localizer, "drain_result_notifications", None)
+        if callable(drain):
+            drain()
         self.update_live_results()
         self.after(self._loc_result_poll_ms, self.poll_localization_results)
+
+    def _on_localizer_result_ready(self, _fd: int, _mask: int) -> None:
+        if self.localizer is None:
+            return
+        self.localizer.drain_result_notifications()
+        self.update_live_results()
 
     def boot_holding(self) -> bool:
         return self.inspecting and not self.boot_lock_done
@@ -2755,9 +2891,14 @@ class OperatorApp(tk.Tk):
                 "inliers": result.get("inliers"),
                 "n_corr": result.get("n_corr"),
                 "reference_count": result.get("reference_count"),
+                "requested_reference_count": result.get("requested_reference_count"),
+                "staged_early_stop": result.get("staged_early_stop"),
+                "rejected": result.get("rejected"),
                 "candidate_mode": result.get("candidate_mode"),
                 "global_retrieval_calls": result.get("global_retrieval_calls"),
                 "reproj_rms": result.get("reproj_rms"),
+                "inlier_ratio": result.get("inlier_ratio"),
+                "inlier_grid_cells": result.get("inlier_grid_cells"),
                 "neuflow_stage": result.get("neuflow_stage"),
                 "neuflow_anchor_count": result.get("neuflow_anchor_count"),
                 "neuflow_flow_ms": result.get("neuflow_flow_ms"),
@@ -3166,7 +3307,7 @@ class OperatorApp(tk.Tk):
         arr[:] = (0x15, 0x18, 0x1c)   # "#15181c"
         scale = min(width, height) * 0.46 * self.map_zoom / self.map_radius
 
-        step = max(1, len(self.map_points) // 70000)
+        step = max(1, len(self.map_points) // 250000)
         pts = self.map_points[::step]
         if len(pts):
             view = self.transform_xyz(pts[:, :3])
@@ -3266,7 +3407,7 @@ class OperatorApp(tk.Tk):
             frustum = camera_frustum_world_points(
                 camera_center,
                 camera_axes,
-                length=self.map_radius * 0.02,
+                length=self.map_radius * 0.015,
                 hfov_deg=ANAFI.video_hfov_deg,
                 aspect_ratio=STREAM_WIDTH / STREAM_HEIGHT,
             )
@@ -3546,6 +3687,19 @@ class OperatorApp(tk.Tk):
             return
         if self.video_display_index < 0:
             return
+        zoom = getattr(
+            getattr(getattr(self, "backend", None), "state", None), "zoom", 1.0)
+        if not localization_zoom_is_calibrated(zoom):
+            if not getattr(self, "_zoom_localization_paused", False):
+                self._zoom_localization_paused = True
+                if hasattr(self, "write_log"):
+                    self.write_log(
+                        f"定位暫停：相機縮放 {zoom!s}x 未校正；回到 1.0x 自動恢復")
+            return
+        if getattr(self, "_zoom_localization_paused", False):
+            self._zoom_localization_paused = False
+            if hasattr(self, "write_log"):
+                self.write_log("定位恢復：相機縮放已回到校正值 1.0x")
         # Held-frame retries (file/video flight pipeline):
         # - BOOT_INIT: freeze on the first 720p frame. MegaLoc runs once; later
         #   attempts reuse its candidates until lock (or boot-lock timeout).
@@ -4086,7 +4240,7 @@ def main() -> None:
         ),
     )
     ap.add_argument("--map-ply", default=None)
-    ap.add_argument("--max-points", type=int, default=90000)
+    ap.add_argument("--max-points", type=int, default=250000)
     ap.add_argument("--video", default=str(DEFAULT_VIDEO) if DEFAULT_VIDEO.exists() else "")
     ap.add_argument("--video-stride", type=int, default=1,
                     help="1 means ANAFI-like 720p30 stream; >1 keeps every Nth source frame")
@@ -4489,7 +4643,8 @@ def main() -> None:
             print(
                 f"[operator] TRACK/WEAK matcher = EDM (detector-free), "
                 f"{topk} ref/frame (local_topk={topk}), engine={edm_m}; "
-                f"BOOT/LOST acquisition = MegaLoc top-10 -> EDM; profile={profile_txt}",
+                f"BOOT/LOST acquisition = MegaLoc top-2, then top-10 fallback; "
+                f"profile={profile_txt}",
                 flush=True,
             )
         else:

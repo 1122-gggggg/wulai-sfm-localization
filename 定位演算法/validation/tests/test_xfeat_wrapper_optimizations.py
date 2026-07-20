@@ -7,9 +7,12 @@ import torch
 
 
 XFEAT_REPO = (
-    Path(__file__).resolve().parents[4]
+    Path(__file__).resolve().parents[2]
     / "torch_hub_cache/verlab_accelerated_features_main"
 )
+if not XFEAT_REPO.is_dir():
+    import pytest
+    pytest.skip("XFeat torch_hub_cache is optional and not shipped", allow_module_level=True)
 if str(XFEAT_REPO) not in sys.path:
     sys.path.insert(0, str(XFEAT_REPO))
 

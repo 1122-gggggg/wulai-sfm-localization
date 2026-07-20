@@ -6,11 +6,13 @@
     "coarse_topk": 3225,
     "mconf_thr": 0.2,
     "fp16": true,
-    "input_size": [1024, 576]
+    "input_size": [1024, 576],
+    "reference_cache_size": 32
   },
   "tracker": {
     "global_retrieval_policy": "boot_and_lost_once",
     "boot_global_topk": 10,
+    "acquire_initial_topk": 2,
     "match_batch_size": 2,
     "local_topk": 1,
     "weak_local_topk": 3,
@@ -25,6 +27,7 @@
     "weak_min_inliers": 30,
     "max_reproj_error_acquire": 5.0,
     "max_reproj_error_track": 6.0,
+    "prediction_max_dt": 0.25,
     "pnp_ransac_max_error": 5.0
   }
 }

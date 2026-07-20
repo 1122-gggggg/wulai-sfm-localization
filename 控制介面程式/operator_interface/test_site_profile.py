@@ -215,13 +215,16 @@ def test_final_edm_profile_pins_the_validated_runtime_parameters() -> None:
         "mconf_thr": 0.2,
         "fp16": True,
         "input_size": [1024, 576],
+        "reference_cache_size": 32,
     }
     tracker = profile["tracker"]
     assert (tracker["local_topk"], tracker["weak_local_topk"], tracker["lost_local_topk"]) == (1, 3, 5)
     assert (tracker["boot_global_topk"], tracker["match_batch_size"]) == (10, 2)
+    assert tracker["acquire_initial_topk"] == 2
     assert (tracker["lost_local_grace_frames"], tracker["recovery_bank_size"], tracker["recovery_scan_topk"]) == (12, 192, 2)
     assert tracker["use_temporal_reference"] is False
     assert (tracker["max_reproj_error_acquire"], tracker["max_reproj_error_track"], tracker["pnp_ransac_max_error"]) == (5.0, 6.0, 5.0)
+    assert tracker["prediction_max_dt"] == 0.25
 
 
 def test_safety_command_bypasses_invalid_site_profile(

@@ -3,6 +3,7 @@
 env/
 outputs/
 .codegraph/
+**/torch_hub_cache/
 地圖檔/maps/*
 !地圖檔/maps/.gitkeep
 地圖檔/bundles/*

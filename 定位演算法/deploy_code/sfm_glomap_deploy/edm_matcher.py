@@ -24,6 +24,7 @@ Input contract: grayscale, /255, (B,1,H,W), H and W divisible by 32.
 """
 from __future__ import annotations
 
+from collections import OrderedDict
 import sys
 from pathlib import Path
 
@@ -69,7 +70,8 @@ class EDMMatcher:
 
     def __init__(self, ckpt: str | Path = DEFAULT_CKPT, cfg_path: str | Path = DEFAULT_CFG,
                  mconf_thr: float = 0.2, topk: int | None = None, border_rm: int = 2,
-                 device: str = "cuda", fp16: bool = True):
+                 device: str = "cuda", fp16: bool = True,
+                 reference_cache_size: int = 32):
         # fp16 autocast + channels_last: 1.6x faster with byte-identical match counts on
         # this site (tests/bench_edm_speed.py: 3085 matches/ref either way). On by default
         # because EDM pays a full forward per reference and that cost is the whole budget.
@@ -90,6 +92,10 @@ class EDMMatcher:
         self.device = device
         self.topk = cfg.EDM.COARSE.TOPK
         self.mconf_thr = mconf_thr
+        self.reference_cache_size = max(0, int(reference_cache_size))
+        self._reference_tensor_cache: OrderedDict[
+            int, tuple[object, torch.Tensor]
+        ] = OrderedDict()
 
         self.fp16 = fp16 and device.startswith("cuda")
         model = EDM(config=lower_config(cfg)["edm"])
@@ -119,6 +125,21 @@ class EDMMatcher:
 
     def to_tensor(self, gray: np.ndarray) -> torch.Tensor:
         return torch.from_numpy(gray)[None][None].to(self.device).float() / 255.0
+
+    def reference_tensor(self, source) -> torch.Tensor:
+        """Return a cached device tensor for an immutable map reference image."""
+        key = id(source)
+        cached = self._reference_tensor_cache.get(key)
+        if cached is not None and cached[0] is source:
+            self._reference_tensor_cache.move_to_end(key)
+            return cached[1]
+        tensor = self.to_tensor(self.load_gray(source))
+        if self.reference_cache_size > 0:
+            self._reference_tensor_cache[key] = (source, tensor)
+            self._reference_tensor_cache.move_to_end(key)
+            while len(self._reference_tensor_cache) > self.reference_cache_size:
+                self._reference_tensor_cache.popitem(last=False)
+        return tensor
 
     # ---------- cells ----------
     @staticmethod
@@ -183,7 +204,10 @@ class EDMMatcher:
     def match_many_to_one(self, imgs0: list, img1) -> list[dict]:
         """K references (image0, batched) vs ONE query (image1, tiled). The localizer path."""
         b = len(imgs0)
-        t0 = torch.cat([self.to_tensor(self.load_gray(i)) for i in imgs0], dim=0)
+        if b == 0:
+            return []
+        references = [self.reference_tensor(source) for source in imgs0]
+        t0 = references[0] if b == 1 else torch.cat(references, dim=0)
         t1 = self.to_tensor(self.load_gray(img1)).repeat(b, 1, 1, 1)
         batch = {"image0": t0, "image1": t1}
         with self._autocast():

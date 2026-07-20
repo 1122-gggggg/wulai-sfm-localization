@@ -134,6 +134,7 @@ class EDMTrackerAdapter(Localizer):
         st.misses = int(self.state.fail_count)
         if seeded:
             st.velocity = None
+            st.last_capture_stamp = None
 
     def _pull_state(self) -> None:
         st, s = self.trk.st, self.state
@@ -151,7 +152,7 @@ class EDMTrackerAdapter(Localizer):
         # conversion and its MegaLoc pre-step both assume it).
         bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
         self._push_state()
-        info = self.trk.localize(bgr)
+        info = self.trk.localize(bgr, capture_stamp=capture_stamp)
         self._pull_state()
 
         pose = None
@@ -176,7 +177,9 @@ class EDMTrackerAdapter(Localizer):
             "mode": info["state_in"],
             "next_mode": info["state_out"],
             "inliers": int(info.get("inliers", 0) or 0),
-            "reproj_rms": None,      # EDM's PnP path does not estimate it
+            "reproj_rms": info.get("reproj_rms"),
+            "inlier_ratio": info.get("inlier_ratio"),
+            "inlier_grid_cells": info.get("inlier_grid_cells"),
             "vpr_ms": info.get("vpr_ms"),
             "feature_ms": None,      # detector-free: no separate feature stage
             "match_ms": info.get("match_ms"),
@@ -184,6 +187,8 @@ class EDMTrackerAdapter(Localizer):
             "n_corr": info.get("n_corr"),
             "refs": info.get("refs"),
             "reference_count": len(info.get("refs") or []),
+            "requested_reference_count": info.get("requested_reference_count"),
+            "staged_early_stop": info.get("staged_early_stop"),
             "candidate_mode": info.get("candidate_mode"),
             "global_retrieval_calls": info.get("global_retrieval_calls"),
             "rejected": info.get("rejected"),

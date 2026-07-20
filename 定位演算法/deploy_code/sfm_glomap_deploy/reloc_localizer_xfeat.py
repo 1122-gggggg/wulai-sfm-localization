@@ -52,17 +52,20 @@ def _package_root() -> Path:
         runtime = Path(env_ws).expanduser().resolve() / "執行環境"
         if (runtime / "torch_hub_cache").is_dir():
             return runtime
+        if runtime.is_dir():
+            return runtime
     for parent in Path(__file__).resolve().parents:
         if (parent / "torch_hub_cache").is_dir():
             return parent
         runtime = parent / "執行環境"
         if (runtime / "torch_hub_cache").is_dir():
             return runtime
-    raise RuntimeError(
-        "torch_hub_cache not found above reloc_localizer_xfeat.py "
-        "(looked for torch_hub_cache/ and 執行環境/torch_hub_cache/; "
-        "set SFM_WORKSPACE_ROOT or SFM_TORCH_HUB_CACHE)"
-    )
+        if runtime.is_dir():
+            return runtime
+    # Keep bundle validation and pure tracker utilities importable in the
+    # portable repository. Actual model loading still reports the missing
+    # local torch.hub repository when XFeat or MegaLoc is requested.
+    return Path(__file__).resolve().parents[3] / "執行環境"
 
 
 PACKAGE_ROOT = _package_root()

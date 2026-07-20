@@ -136,21 +136,22 @@ class EDMLocalizer:
         ref_names: list[str],
         batch_size: int | None = None,
     ):
-        """-> (pts2d in camera px, pts3d in map units, per-ref match counts)."""
+        """-> (camera-pixel 2D, map 3D, confidence, per-ref match counts)."""
         by_ref = self.correspondences_by_ref(query_gray, ref_names, batch_size=batch_size)
         p2 = [row[0] for row in by_ref if len(row[0])]
         p3 = [row[1] for row in by_ref if len(row[1])]
-        counts = [row[2] for row in by_ref]
+        confidence = [row[2] for row in by_ref if len(row[2])]
+        counts = [row[3] for row in by_ref]
         if not p2:
-            return np.zeros((0, 2)), np.zeros((0, 3)), counts
-        return np.concatenate(p2), np.concatenate(p3), counts
+            return np.zeros((0, 2)), np.zeros((0, 3)), np.zeros(0), counts
+        return np.concatenate(p2), np.concatenate(p3), np.concatenate(confidence), counts
 
     def correspondences_by_ref(
         self,
         query_gray: np.ndarray,
         ref_names: list[str],
         batch_size: int | None = None,
-    ) -> list[tuple[np.ndarray, np.ndarray, int]]:
+    ) -> list[tuple[np.ndarray, np.ndarray, np.ndarray, int]]:
         """Return 2D/3D correspondences separately for each reference.
 
         Keeping these boundaries lets EDM-only map recovery score each unrelated
@@ -169,7 +170,7 @@ class EDMLocalizer:
         reference_images: list[np.ndarray],
         xyz_luts: list[np.ndarray],
         batch_size: int | None = None,
-    ) -> list[tuple[np.ndarray, np.ndarray, int]]:
+    ) -> list[tuple[np.ndarray, np.ndarray, np.ndarray, int]]:
         """Match arbitrary reference images whose coarse cells carry map-frame 3D."""
         if len(reference_images) != len(xyz_luts):
             raise ValueError("reference_images and xyz_luts must have equal length")
@@ -180,25 +181,31 @@ class EDMLocalizer:
             results.extend(
                 self.matcher.match_many_to_one(images, query_gray)
             )
-        out: list[tuple[np.ndarray, np.ndarray, int]] = []
+        out: list[tuple[np.ndarray, np.ndarray, np.ndarray, int]] = []
         for xyz_lut, r in zip(xyz_luts, results):
             k0, k1 = r["mkpts0"], r["mkpts1"]
+            confidence = np.asarray(r["mconf"], dtype=np.float32)
             if len(k0) == 0:
-                out.append((np.zeros((0, 2)), np.zeros((0, 3)), 0))
+                out.append((np.zeros((0, 2)), np.zeros((0, 3)), np.zeros(0), 0))
                 continue
             # keep direction-01 only: the reference side must sit on its cell centre,
             # which is the anchor the map build triangulated.
             d01 = ~EDMMatcher.is_refined(k0)
             if not d01.any():
-                out.append((np.zeros((0, 2)), np.zeros((0, 3)), 0))
+                out.append((np.zeros((0, 2)), np.zeros((0, 3)), np.zeros(0), 0))
                 continue
             cells = EDMMatcher.cell_ids(k0[d01])
             xyz = xyz_lut[cells]
             ok = np.isfinite(xyz).all(1)
             if ok.any():
-                out.append((k1[d01][ok] * self.scale, xyz[ok], int(ok.sum())))
+                out.append((
+                    k1[d01][ok] * self.scale,
+                    xyz[ok],
+                    confidence[d01][ok],
+                    int(ok.sum()),
+                ))
             else:
-                out.append((np.zeros((0, 2)), np.zeros((0, 3)), 0))
+                out.append((np.zeros((0, 2)), np.zeros((0, 3)), np.zeros(0), 0))
         return out
 
     def localize(self, frame_bgr: np.ndarray, ref_names: list[str] | None = None,
@@ -210,7 +217,7 @@ class EDMLocalizer:
                 cv2.cvtColor(frame_bgr, cv2.COLOR_GRAY2RGB)
             ref_names = self.retrieve(rgb, self.topk, exclude=exclude)
 
-        p2, p3, counts = self.correspondences(gray, ref_names)
+        p2, p3, _confidence, counts = self.correspondences(gray, ref_names)
         if len(p3) < 6:
             return None
         cam = pycolmap.Camera(model=self.cam.model, width=self.cam.width,

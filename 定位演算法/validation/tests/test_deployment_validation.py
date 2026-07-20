@@ -13,7 +13,7 @@ import torch
 
 
 VALIDATION = Path(__file__).resolve().parents[1]
-PACKAGE_ROOT = Path(__file__).resolve().parents[4]
+PACKAGE_ROOT = Path(__file__).resolve().parents[3]
 
 
 def load_module(name: str, path: Path):
@@ -297,7 +297,7 @@ def test_intrinsics_are_loaded_from_json_without_sparse_model(tmp_path):
 def test_operator_worker_defaults_to_current_validated_interpreter(monkeypatch):
     app = load_module(
         "flight_operator_interpreter_test",
-        VALIDATION.parent / "mission" / "operator_interface" / "flight_operator_app.py",
+        PACKAGE_ROOT / "控制介面程式" / "operator_interface" / "flight_operator_app.py",
     )
     monkeypatch.delenv("SFM_LOCALIZER_PYTHON", raising=False)
     assert app.default_worker_python("SFM_LOCALIZER_PYTHON") == sys.executable
@@ -306,7 +306,7 @@ def test_operator_worker_defaults_to_current_validated_interpreter(monkeypatch):
 
 
 def test_mission_pipeline_defaults_to_current_validated_interpreter(monkeypatch):
-    path = VALIDATION.parent / "mission" / "mission_pipeline.py"
+    path = PACKAGE_ROOT / "控制介面程式" / "mission_pipeline.py"
     monkeypatch.delenv("SFM_LOCALIZER_PYTHON", raising=False)
     mission = load_module("mission_pipeline_interpreter_current", path)
     assert mission.DEFAULT_PYTHON == sys.executable
@@ -317,7 +317,10 @@ def test_mission_pipeline_defaults_to_current_validated_interpreter(monkeypatch)
 
 
 def test_manifest_detects_content_and_file_set_changes(tmp_path):
-    manifest = load_module("package_manifest", PACKAGE_ROOT / "tools" / "package_manifest.py")
+    manifest_path = PACKAGE_ROOT / "tools" / "package_manifest.py"
+    if not manifest_path.is_file():
+        pytest.skip("package-manifest tooling is not shipped in the portable repository")
+    manifest = load_module("package_manifest", manifest_path)
     (tmp_path / "nested").mkdir()
     (tmp_path / "a.txt").write_text("a", encoding="utf-8")
     (tmp_path / "nested" / "b.txt").write_text("b", encoding="utf-8")
@@ -392,7 +395,7 @@ def test_production_flight_uses_calibrated_720p_full_opencv_camera(monkeypatch):
         "max_yaw_diff_deg": 90.0,
         "xfeat_topk_track": 1700,
         "xfeat_topk_acquire": 2048,
-        "matcher_mode": "nn_then_lg",
+        "matcher_mode": "lighterglue",
         "acquire_matcher_mode": "lighterglue",
         "nn_min_score": 0.85,
         "adaptive_first_topk": 3,

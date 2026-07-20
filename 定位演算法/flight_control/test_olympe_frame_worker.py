@@ -25,9 +25,9 @@ def _load_module(name: str, relative: str):
 
 MODULES = [
     _load_module("mission_olympe_frame_source_worker_test",
-                 "mission/flight_control/olympe_frame_source.py"),
+                 "定位演算法/flight_control/olympe_frame_source.py"),
     _load_module("deploy_olympe_frame_source_worker_test",
-                 "deploy_code/sfm_glomap_deploy/olympe_frame_source.py"),
+                 "定位演算法/deploy_code/sfm_glomap_deploy/olympe_frame_source.py"),
 ]
 
 

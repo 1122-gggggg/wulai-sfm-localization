@@ -475,6 +475,7 @@ def test_candidate_pass_defers_inlier_payload_materialization(monkeypatch):
 
 def test_composite_fallback_keeps_temporal_diagnostics_and_aggregates_timings(monkeypatch):
     tracker = _composite_tracker()
+    tracker.cfg.matcher_mode = "nn_then_lg"
     monkeypatch.setattr(pxt, "_LOC_TIMING", False)
     pass_infos = [
         {
@@ -895,6 +896,7 @@ def test_candidate_pass_reports_unique_query_inliers(monkeypatch):
 @pytest.mark.parametrize("unique_inliers, expected_passes", [(99, 2), (100, 1)])
 def test_nn_fast_accept_uses_unique_query_inliers(unique_inliers, expected_passes):
     tracker = _composite_tracker()
+    tracker.cfg.matcher_mode = "nn_then_lg"
     pose = pxt.Pose(0.0, 0.0, 0.0, 0.0, stamp=1.0)
     calls = []
 
