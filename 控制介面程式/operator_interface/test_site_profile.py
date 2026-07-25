@@ -181,7 +181,7 @@ def test_mission_pipeline_uses_the_same_profile_route_and_bundle(
     )
 
     selected = mission_pipeline.resolve_mission_site_assets(
-        args, argparse.ArgumentParser()
+        args, argparse.ArgumentParser(), mode="dry-run"
     )
 
     assert selected is not None
