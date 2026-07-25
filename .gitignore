@@ -8,9 +8,18 @@ outputs/
 !地圖檔/maps/.gitkeep
 地圖檔/bundles/*
 !地圖檔/bundles/.gitkeep
+地圖檔/mission_routes/*
+!地圖檔/mission_routes/.gitkeep
+# 場域資產包：每個場域的地圖、bundle、航線與報告都是該場域私有資料，
+# 只有說明文件進版控，讓 repo 記錄格式而不攜帶任何場域資料。
+地圖檔/場域/*/
+!地圖檔/場域/README.md
 定位演算法/deploy_code/runtime/EDM/weights/*
 !定位演算法/deploy_code/runtime/EDM/weights/.gitignore
 定位演算法/validation/report_*/
+模擬器/測試影片/
+封存/
 
 **/__pycache__/
 **/.pytest_cache/
+.cursor/

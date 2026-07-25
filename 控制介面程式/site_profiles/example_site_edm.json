@@ -5,7 +5,7 @@
   "localizer": "edm",
   "localizer_deploy_dir": "../../定位演算法/deploy_code/sfm_glomap_deploy",
   "localizer_profile": "../../定位演算法/configs/edm_production_profile.json",
-  "map_reference_poses": "../../地圖檔/maps/your_site_ref_poses.json",
+  "map_reference_poses": "../../地圖檔/場域/your_site/maps/your_site_ref_poses.json",
   "query_camera": {
     "model": "PINHOLE",
     "width": 1280,
@@ -13,10 +13,10 @@
     "params": [1000.0, 1000.0, 640.0, 360.0]
   },
   "assets": {
-    "map_ply": "../../地圖檔/maps/your_site.ply",
+    "map_ply": "../../地圖檔/場域/your_site/maps/your_site.ply",
     "route_json": null,
     "poles_json": null,
-    "localization_bundle": "../../地圖檔/bundles/your_site_reloc_map_edm.pt",
+    "localization_bundle": "../../地圖檔/場域/your_site/bundles/your_site_reloc_map_edm.pt",
     "megaloc_cache": null,
     "track_landmarks": null
   }

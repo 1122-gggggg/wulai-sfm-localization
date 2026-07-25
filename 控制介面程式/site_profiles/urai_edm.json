@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "site_id": "urai_edm_v1",
+  "display_name": "烏來（目標場域）EDM v1 — 2026-07-19 驗證",
+  "localizer": "edm",
+  "localizer_deploy_dir": "../../定位演算法/deploy_code/sfm_glomap_deploy",
+  "localizer_profile": "../../定位演算法/configs/edm_production_profile.json",
+  "map_reference_poses": "../../地圖檔/場域/urai/maps/edm_v1/target_site_ref_poses.json",
+  "query_camera": {
+    "model": "PINHOLE",
+    "width": 1280,
+    "height": 720,
+    "params": [
+      931.2057783503648,
+      931.2057783503648,
+      640.0,
+      360.0
+    ]
+  },
+  "assets": {
+    "map_ply": "../../地圖檔/場域/urai/maps/edm_v1/target_site_v1_dense.ply",
+    "route_json": null,
+    "poles_json": null,
+    "localization_bundle": "../../地圖檔/場域/urai/bundles/target_site_v1_reloc_map_edm.pt",
+    "megaloc_cache": null,
+    "track_landmarks": null
+  }
+}

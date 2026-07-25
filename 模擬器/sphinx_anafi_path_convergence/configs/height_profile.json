@@ -1,0 +1,11 @@
+{
+  "pattern": "s_curve",
+  "segment_length_m": 4.0,
+  "height_amp_m": 1.5,
+  "start_radius_m": 5.0,
+  "num_trials": 20,
+  "duration": 60.0,
+  "random_seed": 42,
+  "rejoin_algorithm": "adaptive_lookahead",
+  "horizontal_control_mode": "hybrid"
+}

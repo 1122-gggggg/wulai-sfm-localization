@@ -1,0 +1,14 @@
+[core]
+	repositoryformatversion = 0
+	filemode = true
+	bare = false
+	logallrefupdates = true
+[remote "origin"]
+	url = https://github.com/1122-gggggg/wulai-sfm-localization.git
+	fetch = +refs/heads/*:refs/remotes/origin/*
+[branch "master"]
+	remote = localize_real
+	merge = refs/heads/master
+[remote "localize_real"]
+	url = https://github.com/1122-gggggg/localize_real.git
+	fetch = +refs/heads/*:refs/remotes/localize_real/*

@@ -23,7 +23,7 @@ for a in "$@"; do
 done
 if [[ "$HAS_PROFILE" -eq 0 && -z "${SFM_SITE_PROFILE:-}" ]]; then
   echo "[真機串流] ERROR: 必須用 --site-profile 或 SFM_SITE_PROFILE 明確選擇場域" >&2
-  echo "[真機串流] 請選擇含同座標地圖、定位 bundle 與已驗證安全航線的 site profile" >&2
+  echo "[真機串流] 請選擇含同座標地圖、定位 bundle 與已驗證安全航線的 site profile（urai_edm 目前 route=null，只允許離線 replay）" >&2
   exit 2
 fi
 

@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "site_id": "river_site_edm",
+  "display_name": "河濱場域 EDM",
+  "localizer": "edm",
+  "localizer_deploy_dir": "../../定位演算法/deploy_code/sfm_glomap_deploy",
+  "localizer_profile": "../../定位演算法/configs/edm_profiles/river_site.json",
+  "map_reference_poses": "../../地圖檔/場域/river_site/maps/river_site_ref_poses.json",
+  "query_camera": {
+    "model": "PINHOLE",
+    "width": 1280,
+    "height": 720,
+    "params": [
+      1000.8124857902368,
+      1007.5681084778566,
+      670.8167724609375,
+      358.71917724609375
+    ]
+  },
+  "assets": {
+    "map_ply": "../../地圖檔/場域/river_site/maps/river_site_realrgb_dense_trimmed.ply",
+    "route_json": "../../地圖檔/場域/river_site/routes/river_site_safezone/flight_path.json",
+    "poles_json": null,
+    "localization_bundle": "../../地圖檔/場域/river_site/bundles/river_site_reloc_map_edm.pt",
+    "megaloc_cache": null,
+    "track_landmarks": null
+  }
+}

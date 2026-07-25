@@ -14,7 +14,7 @@ ROOT="$(cd "$CTRL_DIR/.." && pwd)"
 OI="$CTRL_DIR/operator_interface"
 PY="${SFM_UI_PYTHON:-$ROOT/.venv/bin/python}"
 VIDEO_DIR="${VIDEO_DIR:-$ROOT/模擬器/測試影片}"
-SITE_PROFILE="${SFM_SITE_PROFILE:-$CTRL_DIR/site_profiles/example_site_edm.json}"
+SITE_PROFILE="${SFM_SITE_PROFILE:-$CTRL_DIR/site_profiles/urai_edm.json}"
 # Target EDM verified balance: TRACK=1, LOW/WEAK=3.
 LOCAL_TOPK="${LOCAL_TOPK:-1}"
 STREAM_FPS="${STREAM_FPS:-30}"
@@ -47,7 +47,16 @@ usage() {
   LOST_HOLD_TIMEOUT_MS   LOST 凍幀逾時放行（預設 15000）
   LOC_BENCH_TRACK=1      改純 TRACK 測速（跳過 MegaLoc / 不走飛行管線）
   POSE_STABILIZE=1       發布三幀一致性過濾姿態（原始 PnP 仍寫入遺測）
-  SFM_SITE_PROFILE       site profile（預設 example_site_edm，請改成你的場域設定）
+  SFM_SITE_PROFILE       site profile（預設 烏來 EDM v1；換場域改這個變數即可）
+  ANAFI_LINK_SIM=1       模擬 ANAFI 實機無線串流畫質（白皮書 v1.4 §5.2）
+                         720p H264 main profile 5 Mb/s、45 slices×16px、intra-refresh
+                         錄影檔碼率比實機高 5-12 倍，不開這個會高估定位表現
+  ANAFI_LINK_KBPS        串流碼率 kbps（預設 5000，即白皮書的 up to 5 Mb/s）
+  ANAFI_LINK_LATENCY_MS  端到端延遲 ms（白皮書 280；純 replay 只影響時間戳語意）
+  ANAFI_LINK_LOSS_PCT    slice 丟包率 %（模擬 Wi-Fi 遺失 + error concealment）
+  SFM_HOLD_ON_LOW_CONF=1 精度優先：連續低信心即暫停串流（等同懸停），
+                         held frame 改走 LOST recovery（高 top-k + MegaLoc）
+  SFM_LOW_CONF_HOLD_RESULTS  連續幾次低信心才懸停（預設 2）
 
 可用測試片（\$VIDEO_DIR）:
 EOF
@@ -136,6 +145,17 @@ export QT_QPA_PLATFORM="${QT_QPA_PLATFORM:-xcb}"
 
 echo "[影片模擬串流] video=$VIDEO_PATH"
 echo "[影片模擬串流] profile=$SITE_PROFILE topk=$LOCAL_TOPK stream_fps=$STREAM_FPS"
+if [[ "${SFM_HOLD_ON_LOW_CONF:-0}" == "1" ]]; then
+  echo "[影片模擬串流] 精度優先：連續 ${SFM_LOW_CONF_HOLD_RESULTS:-2} 次低信心即懸停（串流暫停）並升級為 LOST recovery"
+fi
+if [[ -n "${ANAFI_LINK_LATENCY_MS:-}" || -n "${ANAFI_LINK_LOSS_PCT:-}" ]]; then
+  echo "[影片模擬串流] 鏈路劣化：延遲 ${ANAFI_LINK_LATENCY_MS:-0} ms、丟包 ${ANAFI_LINK_LOSS_PCT:-0} %"
+fi
+if [[ "${ANAFI_LINK_SIM:-0}" == "1" ]]; then
+  echo "[影片模擬串流] ANAFI 串流模擬：H264 main ${ANAFI_LINK_KBPS:-5000} kbps + intra-refresh（貼近實機畫質）"
+else
+  echo "[影片模擬串流] 未開串流模擬：畫質優於實機（ANAFI_LINK_SIM=1 可開啟）"
+fi
 echo "[影片模擬串流] 無真機連線、無起飛指令"
 cd "$OI"
 exec "$PY" "${ARGS[@]}" "${EXTRA[@]}"

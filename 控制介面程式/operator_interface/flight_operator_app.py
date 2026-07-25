@@ -21,12 +21,14 @@ from __future__ import annotations
 
 import argparse
 import atexit
+import collections
 import hashlib
 import json
 import math
 from multiprocessing import shared_memory
 import os
 import queue
+import random
 import select
 import signal
 import subprocess
@@ -141,6 +143,40 @@ LIVE_DETECTION_STATUS_PATH = Path("/tmp/sfm_flight_operator_detection_status.jso
 # Fixed gravity-cal path: re-open loads this; re-calibrate overwrites it.
 GRAVITY_CAL_DIR = _WS.flight_logs
 GRAVITY_CAL_LATEST = GRAVITY_CAL_DIR / "gravity_cal_latest.json"
+def resolve_anafi_link_sim() -> dict | None:
+    """ANAFI live-link simulation for the file stream, off unless asked for.
+
+    White paper v1.4 §5.2: 720p, H264 main profile, up to 5 Mb/s, 45 slices of
+    16 px height with periodic intra-refresh, 280 ms end to end. Recorded source
+    files are far higher bitrate than the radio link, so replaying them raw makes
+    the localizer look better than it will in flight.
+    """
+    if os.environ.get("ANAFI_LINK_SIM", "0").strip() not in {"1", "true", "TRUE", "yes"}:
+        return None
+    try:
+        kbps = int(float(os.environ.get("ANAFI_LINK_KBPS", "5000")))
+    except ValueError:
+        kbps = 5000
+    if kbps <= 0:
+        return None
+    def _num(name: str, default: float) -> float:
+        try:
+            return max(0.0, float(os.environ.get(name, default)))
+        except ValueError:
+            return default
+
+    return {
+        "kbps": kbps,
+        "profile": os.environ.get("ANAFI_LINK_PROFILE", "main"),
+        "intra_refresh": os.environ.get("ANAFI_LINK_INTRA_REFRESH", "1").strip()
+        not in {"0", "false", "FALSE", "no"},
+        # 0 disables; 280 ms is the white paper's end-to-end figure.
+        "latency_ms": _num("ANAFI_LINK_LATENCY_MS", 0.0),
+        "loss_pct": _num("ANAFI_LINK_LOSS_PCT", 0.0),
+        "loss_seed": int(_num("ANAFI_LINK_LOSS_SEED", 20260726)),
+    }
+
+
 STREAM_WIDTH = 1280
 STREAM_HEIGHT = 720
 ROUTE_COLOR = "#ff3ea5"          # planned drawn route overlay (distinct from the flown track)
@@ -514,10 +550,15 @@ class LostHoldPolicy:
     """
 
     def __init__(self, max_attempts: int = 5, timeout_s: float = 10.0,
-                 low_confidence_results: int = 2):
+                 low_confidence_results: int = 2,
+                 hold_on_low_confidence: bool = False):
         self.max_attempts = max(1, int(max_attempts))
         self.timeout_s = max(0.0, float(timeout_s))
         self.low_confidence_results = max(1, int(low_confidence_results))
+        # Accuracy-first option: hold on a run of low-confidence fixes instead of
+        # flying on them, so the held frame is retried through LOST recovery
+        # (lost_local_topk + one MegaLoc) rather than TRACK's single reference.
+        self.hold_on_low_confidence = bool(hold_on_low_confidence)
         self.active = False
         self.armed = True
         self.attempts = 0
@@ -564,6 +605,14 @@ class LostHoldPolicy:
             return None
         if success:
             self.low_streak = self.low_streak + 1 if low_confidence else 0
+            if (self.hold_on_low_confidence
+                    and self.low_streak >= self.low_confidence_results):
+                self.active = True
+                self.attempts = 0
+                self.frame_index = int(frame_index)
+                self.started = float(now)
+                self.low_streak = 0
+                return "ENGAGE_LOW_CONF"
             return None
         self.low_streak = 0
         if str(next_mode) != "LOST":
@@ -917,29 +966,163 @@ class DroneBackend:
 
 
 class FFmpegFrameStream:
+    """Decode a file to 720p RGB frames, optionally through an ANAFI-like radio link.
+
+    Without link_sim the source is only rescaled, so the localizer sees near-original
+    detail -- optimistic compared to the real drone. With link_sim the frames are
+    re-encoded to the ANAFI v1.4 live-stream contract (white paper §5.2: 720p, H264
+    main profile, up to 5 Mb/s, 45 slices of 16 px with periodic intra-refresh) and
+    decoded back, so EDM sees the same compression artefacts it will see in flight.
+    """
+
     def __init__(self, video_path: Path, width: int, height: int, stride: int = 1,
-                 fps: float = ANAFI.stream_fps, loop: bool = True):
+                 fps: float = ANAFI.stream_fps, loop: bool = True,
+                 link_sim: dict | None = None):
         self.video_path = Path(video_path)
         self.width = int(width)
         self.height = int(height)
         self.stride = max(1, int(stride))
         self.fps = float(fps)
         self.loop = bool(loop)
+        self.link_sim = dict(link_sim) if link_sim else None
         self.proc: subprocess.Popen | None = None
+        self.enc_proc: subprocess.Popen | None = None
+        self._nal_thread: threading.Thread | None = None
+        # End-to-end link latency, expressed as a frame backlog (280 ms at 30 fps ~ 8).
+        latency_ms = float((self.link_sim or {}).get("latency_ms", 0.0) or 0.0)
+        self.delay_frames = int(round(latency_ms * self.fps / 1000.0)) if latency_ms > 0 else 0
+        self._delay_buf: collections.deque = collections.deque()
         self.frame_size = self.width * self.height * 3
         self.output_index = 0
         self.last_frame_name = ""
         if self.video_path.exists():
             self.start()
 
+    def _encoder_argv(self, vf: str) -> list:
+        sim = self.link_sim or {}
+        kbps = int(sim.get("kbps", 5000))
+        slices = int(sim.get("slices", max(1, self.height // 16)))
+        x264opts = f"slices={slices}:bframes=0"
+        if sim.get("intra_refresh", True):
+            x264opts = "intra-refresh=1:" + x264opts
+        return [
+            "ffmpeg", "-hide_banner", "-loglevel", "error",
+            "-i", str(self.video_path),
+            "-vf", vf,
+            "-vsync", "vfr",
+            "-c:v", "libx264",
+            "-profile:v", str(sim.get("profile", "main")),
+            "-preset", "veryfast", "-tune", "zerolatency",
+            "-pix_fmt", "yuv420p",
+            "-b:v", f"{kbps}k", "-maxrate", f"{kbps}k",
+            "-bufsize", f"{max(1, kbps // 4)}k",
+            "-x264opts", x264opts,
+            "-f", "h264", "pipe:1",
+        ]
+
+    @staticmethod
+    def _pump_nals(src, dst, loss_pct: float, seed: int) -> None:
+        """Copy an Annex-B H264 stream, dropping a fraction of the slice NALs.
+
+        Models Wi-Fi packet loss: the decoder still produces a frame but conceals the
+        missing slices, which is what the real link does (white paper §5.2.1.3). SPS/PPS
+        and IDR slices are never dropped -- losing those kills the stream rather than
+        degrading it, which is not the failure mode we want to reproduce.
+        """
+        rng = random.Random(seed)
+        buf = bytearray()
+        try:
+            while True:
+                chunk = src.read(1 << 16)
+                if not chunk:
+                    break
+                buf += chunk
+                starts = []
+                i = 0
+                while True:
+                    j = buf.find(b"\x00\x00\x01", i)
+                    if j < 0:
+                        break
+                    starts.append(j)
+                    i = j + 3
+                if len(starts) < 2:
+                    continue
+                out = bytearray()
+                for a, b in zip(starts, starts[1:]):
+                    nal = buf[a:b]
+                    nal_type = nal[3] & 0x1F if len(nal) > 3 else 0
+                    if nal_type == 1 and rng.random() < loss_pct / 100.0:
+                        continue
+                    out += nal
+                if out:
+                    dst.write(out)
+                    dst.flush()
+                del buf[:starts[-1]]
+            if buf:
+                dst.write(bytes(buf))
+                dst.flush()
+        except (BrokenPipeError, ValueError, OSError):
+            pass
+        finally:
+            try:
+                dst.close()
+            except (BrokenPipeError, OSError):
+                pass
+
     def start(self) -> None:
         self.close()
         self.output_index = 0
         self.last_frame_name = ""
+        self._delay_buf.clear()
         if self.stride > 1:
             vf = f"select=not(mod(n\\,{self.stride})),scale={self.width}:{self.height}"
         else:
             vf = f"fps={self.fps:g},scale={self.width}:{self.height}"
+        if self.link_sim:
+            # Radio-link simulation: encode to the ANAFI stream contract, then decode.
+            self.enc_proc = subprocess.Popen(
+                self._encoder_argv(vf),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+            )
+            loss_pct = float(self.link_sim.get("loss_pct", 0.0) or 0.0)
+            dec_stdin = self.enc_proc.stdout
+            if loss_pct > 0.0:
+                # Drop slice NALs between encoder and decoder.
+                self.proc = subprocess.Popen(
+                    [
+                        "ffmpeg", "-hide_banner", "-loglevel", "error",
+                        "-err_detect", "ignore_err",
+                        "-f", "h264", "-i", "pipe:0",
+                        "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1",
+                    ],
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                )
+                self._nal_thread = threading.Thread(
+                    target=self._pump_nals,
+                    args=(dec_stdin, self.proc.stdin, loss_pct,
+                          int(self.link_sim.get("loss_seed", 20260726))),
+                    name="anafi-nal-loss", daemon=True,
+                )
+                self._nal_thread.start()
+                return
+            self.proc = subprocess.Popen(
+                [
+                    "ffmpeg", "-hide_banner", "-loglevel", "error",
+                    "-f", "h264", "-i", "pipe:0",
+                    "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1",
+                ],
+                stdin=dec_stdin,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+            )
+            # Only the decoder reads the encoder pipe; drop our handle so the encoder
+            # gets SIGPIPE when the decoder goes away.
+            if self.enc_proc.stdout is not None:
+                self.enc_proc.stdout.close()
+            return
         self.proc = subprocess.Popen(
             [
                 "ffmpeg", "-hide_banner", "-loglevel", "error",
@@ -955,15 +1138,18 @@ class FFmpegFrameStream:
         )
 
     def close(self) -> None:
-        if self.proc is not None:
-            self.proc.terminate()
+        for attr in ("proc", "enc_proc"):
+            proc = getattr(self, attr, None)
+            if proc is None:
+                continue
+            proc.terminate()
             try:
-                self.proc.wait(timeout=1.0)
+                proc.wait(timeout=1.0)
             except subprocess.TimeoutExpired:
-                self.proc.kill()
-            self.proc = None
+                proc.kill()
+            setattr(self, attr, None)
 
-    def next_frame(self) -> Image.Image | None:
+    def _read_raw(self) -> bytes | None:
         if self.proc is None or self.proc.stdout is None:
             return None
         raw = self.proc.stdout.read(self.frame_size)
@@ -975,6 +1161,24 @@ class FFmpegFrameStream:
                 raw = self.proc.stdout.read(self.frame_size)
             if len(raw) != self.frame_size:
                 return None
+        return raw
+
+    def next_frame(self) -> Image.Image | None:
+        raw = self._read_raw()
+        if raw is None:
+            return None
+        if self.delay_frames > 0:
+            # Hold a fixed backlog so the consumer always sees a frame captured
+            # delay_frames earlier, matching the link's end-to-end latency.
+            self._delay_buf.append(raw)
+            while len(self._delay_buf) <= self.delay_frames:
+                nxt = self._read_raw()
+                if nxt is None:
+                    break
+                self._delay_buf.append(nxt)
+            if not self._delay_buf:
+                return None
+            raw = self._delay_buf.popleft()
         self.output_index += 1
         self.last_frame_name = f"frame_{self.output_index:06d}.jpg"
         return Image.frombytes("RGB", (self.width, self.height), raw)
@@ -1943,7 +2147,14 @@ class OperatorApp(tk.Tk):
             attempts_before if event and event.startswith("RELEASE")
             else self.lost_hold.attempts
         )
-        if event == "ENGAGE_FAIL":
+        if event == "ENGAGE_LOW_CONF":
+            self.write_log(
+                f"低信心懸停：連續 {self.lost_hold.low_confidence_results} 次低信心定位"
+                f"（inliers<{LOC_LOW_INLIERS} 或 reproj>{LOC_HIGH_REPROJ} 或 WEAK）。"
+                f"串流暫停於 {self.video_display_frame_name or self.video_display_index}，"
+                "改走 LOST recovery（提高 local top-k + 一次 MegaLoc）以求更高精度"
+                f"（總嘗試上限 {self.lost_hold.max_attempts} 次）")
+        elif event == "ENGAGE_FAIL":
             self.write_log(
                 "LOST_HOLD 進入：tracker 已進入 LOST。串流暫停於 "
                 f"{self.video_display_frame_name or self.video_display_index}，"
@@ -4318,6 +4529,19 @@ def main() -> None:
     ap.add_argument("--lost-hold-max-attempts", type=int, default=5,
                     help="total LOST recovery attempts before the held stream is released")
     ap.add_argument(
+        "--hold-on-low-confidence",
+        action="store_true",
+        default=os.environ.get("SFM_HOLD_ON_LOW_CONF", "0").strip()
+        in {"1", "true", "TRUE", "yes"},
+        help=(
+            "Accuracy first: hold the stream after a run of low-confidence fixes "
+            "instead of flying on them. The held frame is retried through LOST "
+            "recovery (higher local top-k plus one MegaLoc). Real-flight equivalent "
+            "is a hover. Off by default -- this changes the validated LOW/WEAK "
+            "behaviour, which only raises local top-k and keeps moving."
+        ),
+    )
+    ap.add_argument(
         "--low-confidence-hold-results",
         type=int,
         default=int(os.environ.get("SFM_LOW_CONF_HOLD_RESULTS", "2")),
@@ -4595,14 +4819,16 @@ def main() -> None:
                   flush=True)
             video_stream = FFmpegFrameStream(
                 Path(args.video), STREAM_WIDTH, STREAM_HEIGHT,
-                stride=args.video_stride, fps=ANAFI.stream_fps)
+                stride=args.video_stride, fps=ANAFI.stream_fps,
+                link_sim=resolve_anafi_link_sim())
         print(f"[live] command log -> {cmd_log}", flush=True)
     else:
         backend = DroneBackend()
         if args.video:
             video_stream = FFmpegFrameStream(
                 Path(args.video), STREAM_WIDTH, STREAM_HEIGHT,
-                stride=args.video_stride, fps=ANAFI.stream_fps)
+                stride=args.video_stride, fps=ANAFI.stream_fps,
+                link_sim=resolve_anafi_link_sim())
 
     localizer = None
     # Live drone + live localizer: only when we have frames (drone stream or file).
@@ -4697,14 +4923,25 @@ def main() -> None:
             max_attempts=int(args.lost_hold_max_attempts),
             timeout_s=max(0, int(args.lost_hold_timeout_ms)) / 1000.0,
             low_confidence_results=int(args.low_confidence_hold_results),
+            hold_on_low_confidence=bool(args.hold_on_low_confidence),
         )
-        print(
-            "[operator] LOST hold ON (file stream): LOW/WEAK only raises local topk; "
-            "pause only after LOST and run MegaLoc once per LOST episode; retry EDM "
-            f"on the held frame up to {lost_hold.max_attempts}x "
-            f"(timeout {lost_hold.timeout_s:.1f}s), then release",
-            flush=True,
-        )
+        if lost_hold.hold_on_low_confidence:
+            print(
+                "[operator] 精度優先 hold ON (file stream): 連續 "
+                f"{lost_hold.low_confidence_results} 次低信心即暫停串流（等同懸停），"
+                "held frame 改走 LOST recovery（提高 local top-k + 每個 episode 一次 "
+                f"MegaLoc）；最多重試 {lost_hold.max_attempts} 次 "
+                f"(timeout {lost_hold.timeout_s:.1f}s) 後放行",
+                flush=True,
+            )
+        else:
+            print(
+                "[operator] LOST hold ON (file stream): LOW/WEAK only raises local topk; "
+                "pause only after LOST and run MegaLoc once per LOST episode; retry EDM "
+                f"on the held frame up to {lost_hold.max_attempts}x "
+                f"(timeout {lost_hold.timeout_s:.1f}s), then release",
+                flush=True,
+            )
     app = OperatorApp(backend, points, video_stream=video_stream, localizer=localizer,
                       detector=detector, detect_every_n_frames=args.detect_every_n_frames,
                       loc_every_n_frames=args.loc_every_n_frames,

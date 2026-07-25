@@ -1,0 +1,18 @@
+# Requires CPython 3.10.x (validated with Python 3.10.12).
+# CUDA 12.8 PyTorch wheels are hosted on the official PyTorch index, not PyPI.
+--extra-index-url https://download.pytorch.org/whl/cu128
+
+torch==2.11.0+cu128
+torchvision==0.26.0+cu128
+numpy==2.2.6
+opencv-python==4.13.0.92
+pillow==12.3.0
+pycolmap==4.0.4
+# Load-bearing for the package-local XFeat / LighterGlue / MegaLoc stack:
+safetensors==0.8.0
+kornia==0.8.2
+# System-level (not pip): ffmpeg, tkinter (python3-tk)
+# XFeat / LighterGlue / MegaLoc: package-local torch.hub repos in torch_hub_cache/
+# Optional: scipy enables the sparse-cloud collision monitor in
+# real_path_follow_controller (guarded import; absent = monitor unavailable)
+# scipy==1.17.1

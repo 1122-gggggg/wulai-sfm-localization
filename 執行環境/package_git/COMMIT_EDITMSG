@@ -1,0 +1,4 @@
+Forbid AI/LLM agents from takeoff; human-only UI press
+
+Document operator order: only the human may press 起飛. Agents and
+language models must refuse takeoff even if asked in chat.

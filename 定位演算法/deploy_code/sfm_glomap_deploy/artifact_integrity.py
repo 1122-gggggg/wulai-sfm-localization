@@ -9,7 +9,7 @@ from pathlib import Path
 KNOWN_SHA256 = {
     "current_reloc_map_updated_v3.pt": "8227e3bd37d4d99966ae1fb307060f9bc8e38e6e5269ab918f64b87957c6ccab",
     "football_field_reloc_map_xfeat_tri.pt": "1c1774318a71ac29870f78ccb67001150edd934141e4aa288765e745e72db46f",
-    # river_site XFeat transfer package (河濱測試/xfeaat+lightglue分支)
+    # river_site XFeat transfer package (地圖檔/場域/river_site/bundles/xfeat)
     "river_site_reloc_map_xfeat_tri.pt": "4a51fb1ab8157a44fca5831a2b6f2a1c5c0a90654557308765537af2c8f4a10a",
 }
 
