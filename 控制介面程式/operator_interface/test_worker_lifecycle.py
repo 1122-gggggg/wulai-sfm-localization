@@ -1057,3 +1057,45 @@ def test_close_allows_worker_to_exit_cleanly_on_stdin_eof(tmp_path: Path) -> Non
     client.close()
     assert client.proc.returncode == 0
     assert not client.thread.is_alive()
+
+
+def test_attached_frame_shm_survives_worker_death(tmp_path):
+    """A killed worker must not take the operator's frame buffer with it.
+
+    CPython's resource_tracker unlinks any SharedMemory the process touched, so a
+    worker that merely attached used to destroy the operator-owned segment on its
+    way out. Every replacement worker then failed to attach and died, and
+    localization stopped completely.
+    """
+    import subprocess
+    import sys
+    import time
+    from multiprocessing import shared_memory
+
+    shm = shared_memory.SharedMemory(create=True, size=4096)
+    try:
+        child = (
+            "import sys, time\n"
+            f"sys.path.insert(0, {str(Path(__file__).resolve().parent)!r})\n"
+            "from live_localizer_worker import attach_frame_shm\n"
+            "attach_frame_shm(sys.argv[1])\n"
+            "print('attached', flush=True)\n"
+            "time.sleep(30)\n"
+        )
+        proc = subprocess.Popen(
+            [sys.executable, "-c", child, shm.name], stdout=subprocess.PIPE)
+        try:
+            assert proc.stdout.readline().strip() == b"attached"
+            proc.terminate()
+            proc.wait(timeout=10)
+            time.sleep(0.5)
+            survivor = shared_memory.SharedMemory(name=shm.name, create=False)
+            survivor.close()
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+            if proc.stdout is not None:
+                proc.stdout.close()
+    finally:
+        shm.close()
+        shm.unlink()

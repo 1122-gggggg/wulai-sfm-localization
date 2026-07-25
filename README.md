@@ -118,6 +118,22 @@ ANAFI_LINK_SIM=1 ANAFI_LINK_LATENCY_MS=280 ANAFI_LINK_LOSS_PCT=1.0 \
 held frame 改走 LOST recovery（提高 local top-k + 每個 episode 一次 MegaLoc）。
 預設關閉。實機端對應的是 `SFM_GATE_WEAK`（預設開啟，WEAK fix 直接 hover）。
 
+## 共享記憶體傳幀
+
+畫面透過共享記憶體送給 localizer worker（`SFM_SHARED_FRAMES=0` 可改用 pipe，較慢）。
+
+worker 只是**附加**這塊由操作介面建立的記憶體，所以 `attach_frame_shm()` 會把它從
+CPython 的 `resource_tracker` 取消註冊。不這樣做的話，任何被殺掉的 worker 會在退出時
+unlink 掉這塊記憶體 —— 而 client 只在 `__init__` 建立一次、重啟不重建，於是之後每個
+worker 都會 `FileNotFoundError: /psm_*` 而死，定位完全停擺（`candidate_mode` 全 null）。
+由建立者負責 unlink，worker 只負責 detach。
+
+worker 啟動要載入數百 MB 的 bundle 與模型，可能超過 stall timeout 而被重啟；
+`SFM_WORKER_WARMUP_S`（預設 20 秒）可以放寬啟動寬限，大型 bundle 建議 90。
+
+worker 自己的錯誤在 `/tmp/sfm_live_localizer_worker.log`，操作介面的 stdout
+只會顯示 `restarted after stall/exit`，看不出原因。
+
 ## 演算法只有一份
 
 | 路徑 | 角色 |

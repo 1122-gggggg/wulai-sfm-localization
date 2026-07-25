@@ -11,7 +11,9 @@
 
 ## 各包狀態
 
-- **urai** — 現行 EDM v1，2026-07-19 在 RTX 5060 完成 replay 驗證。交付包代號是
+- **urai** — 現行 EDM v1，2026-07-19 在 RTX 5060 完成 replay 驗證。
+  座標系已於 2026-07-26 修正重力對齊（舊 T_align 偏 22.51°），見
+  `urai/maps/edm_v1/座標系與尺度.md`；該組座標已定案。交付包代號是
   `target_site`，檔名保留該前綴。舊的 glomap/XFeat 重建資產已移除，只留航線
   （在舊座標系，不能直接用於 EDM 地圖）。
 - **river_site** — EDM bundle 可用，有安全航線。

@@ -1170,13 +1170,13 @@ class FFmpegFrameStream:
         if self.delay_frames > 0:
             # Hold a fixed backlog so the consumer always sees a frame captured
             # delay_frames earlier, matching the link's end-to-end latency.
+            #
+            # The backlog fills one frame per call. Draining it synchronously here
+            # instead would block the UI thread for delay_frames reads on the very
+            # first tick, and the localizer worker -- still loading its bundle --
+            # gets torn down as a stalled worker, taking its frame shm with it.
             self._delay_buf.append(raw)
-            while len(self._delay_buf) <= self.delay_frames:
-                nxt = self._read_raw()
-                if nxt is None:
-                    break
-                self._delay_buf.append(nxt)
-            if not self._delay_buf:
+            if len(self._delay_buf) <= self.delay_frames:
                 return None
             raw = self._delay_buf.popleft()
         self.output_index += 1
@@ -1723,10 +1723,16 @@ class LiveLocalizerClient(LiveWorkerClient):
         else:
             cmd.append("--runtime-benchmark-control")
             cmd.extend(["--force-track-ref", str(int(force_track_ref))])
+        # Shared-memory frame transport is faster, but it does not survive a worker
+        # restart: the killed worker's resource_tracker unlinks the segment on the
+        # way out, so every replacement worker then fails to attach it and dies in
+        # turn. SFM_SHARED_FRAMES=0 falls back to piping frames, which is slower
+        # but recovers from a restart.
         super().__init__(cmd, width, height,
                          "/tmp/sfm_live_localizer_worker.log",
                          "live-localizer-client", "localizer",
-                         use_shared_frames=True)
+                         use_shared_frames=os.environ.get(
+                             "SFM_SHARED_FRAMES", "1").strip() not in {"0", "false", "no"})
 
     @property
     def benchmark_mode(self) -> str:

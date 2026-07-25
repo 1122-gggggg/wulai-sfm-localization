@@ -14,7 +14,7 @@ import contextlib
 import dataclasses
 import json
 import math
-from multiprocessing import shared_memory
+from multiprocessing import resource_tracker, shared_memory
 import os
 import sys
 import time
@@ -141,6 +141,28 @@ def resolve_localizer_backend(requested: str, bundle: Path) -> str:
     if "edm" in name:
         return "edm"
     return "xfeat"
+
+
+def attach_frame_shm(name: str):
+    """Attach the operator's frame buffer without taking ownership of it.
+
+    CPython registers every SharedMemory it touches with resource_tracker, which
+    unlinks the segment when *this* process dies -- even though the operator
+    created it and is still using it. So killing a worker (a stalled one gets
+    SIGTERM while it is still loading its bundle) destroyed the buffer, and every
+    replacement worker then died on FileNotFoundError attaching a segment that no
+    longer existed. The operator only creates the segment once, so nothing ever
+    recovered and localization stopped entirely.
+
+    The creator stays responsible for unlinking; we only detach.
+    """
+    shm = shared_memory.SharedMemory(name=name, create=False)
+    try:
+        resource_tracker.unregister(shm._name, "shared_memory")  # noqa: SLF001
+    except Exception:
+        # Older/newer CPython may not track it; attaching still works either way.
+        pass
+    return shm
 
 
 def read_exact_into(stream, data: bytearray) -> int:
@@ -682,8 +704,7 @@ def main() -> None:
     frame_size = int(args.width) * int(args.height) * 3
     frame_buffer = None if args.frame_shm_name else bytearray(frame_size)
     frame_shm = (
-        shared_memory.SharedMemory(name=args.frame_shm_name, create=False)
-        if args.frame_shm_name else None
+        attach_frame_shm(args.frame_shm_name) if args.frame_shm_name else None
     )
     if frame_shm is not None and len(frame_shm.buf) < frame_size * args.frame_shm_slots:
         frame_shm.close()

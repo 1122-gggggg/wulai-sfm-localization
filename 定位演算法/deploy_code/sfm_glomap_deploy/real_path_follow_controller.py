@@ -107,9 +107,12 @@ class ControlConfig:
     speed: float = 1.2                  # map-units/sec
     lookahead: float = 0.8              # map-units ahead on route after rejoin
     rejoin_tol: float = 0.45            # cross-track error before REJOIN
-    arrive: float = 1.0                 # absolute cap for end tolerance
+    # Map-unit arrival tolerance. Scale-dependent like radius/max_jump: 0.1 was
+    # chosen against urai EDM v1, whose camera track spans 6.07 map units and
+    # whose consecutive references sit 0.027 apart. Re-derive it per site.
+    arrive: float = 0.1                 # absolute cap for end tolerance
     arrive_fraction: float = 0.02       # end tolerance <= 2% of route length
-    min_arrive: float = 0.20            # but never smaller than this map-unit value
+    min_arrive: float = 0.1             # but never smaller than this map-unit value
     inspect_waypoints: tuple[int, ...] = (9, 10, 11, 15)  # 1-based labels in current 15-point route
     inspect_radius: float = 0.75        # map-unit trigger around each label
     inspect_resume_margin: float = 0.25 # arclength margin after last inspected wp
