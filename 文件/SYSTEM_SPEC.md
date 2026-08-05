@@ -472,8 +472,8 @@ class FrameSource(Protocol):
 - 右側顯示目前 source、frame sequence、source age、stream FPS、localization FPS、p95 latency、inliers、reprojection、TRACK/WEAK/LOST。
 - **2026-08-03 操作員決定**：移除地圖上方的固定管線摘要列（與「定位儀表」面板重複）。
   定位結果抵達 UI 的 5 秒滾動 FPS、串流 5 秒滾動 FPS、submit-to-UI 端到端延遲與其
-  5 秒 p95 現在只存在於控制區的「定位儀表」面板。**已知代價**：該面板位於可捲動的
-  控制區內，捲動後即不可見。計數語意不變 —— SIM 標示「實機鏈路模擬」，計數點位於
+  5 秒 p95 現在只存在於控制區的「定位資訊」分頁。分頁不使用上下或左右捲軸；切換到
+  其他分頁時該儀表不顯示。計數語意不變 —— SIM 標示「實機鏈路模擬」，計數點位於
   720p30／H.264 Main／5 Mb/s／280 ms backlog／選用丟包模擬之後，且須等 EDM 結果抵達
   UI 才計數；REAL 由 PDRAW 影格經 EDM 到 UI 的實際結果計數；無可信樣本顯示 `N/A`，
   不得以核心理論吞吐量替代端到端 FPS。`format_pipeline_metrics_summary()` 與
@@ -481,7 +481,7 @@ class FrameSource(Protocol):
   直接接回 `_build_ui` 即可。
 - 影格年齡與位姿年齡改由飛行列右側的固定讀數提供，隨門檻變色（350／750 ms）。
 - SIM 到 EOF 時畫面保持最後一幀並明確顯示 `EOF_HOLD`，不再增加 frame sequence。
-- 可捲動控制區必須有獨立「飛控遙測（Olympe 讀回）」面板，顯示飛控融合
+- 「飛控與限制」分頁必須有獨立「飛控遙測（Olympe 讀回）」面板，顯示飛控融合
   roll/pitch/yaw、相對起飛點高度、AGL、NED 地速、GPS 位置／精度／衛星、
   heading/RTH、風／震動／懸停警告、RSSI／鏈路品質與 IMU／barometer／GPS 等感測器
   健康。這些值只從 Olympe event cache 讀取，不得被當成定位結果或 PCMD 回應。

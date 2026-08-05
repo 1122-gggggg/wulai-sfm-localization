@@ -175,9 +175,9 @@ proof that aircraft motion had already changed.
 
 **2026-08-03, operator decision:** the fixed summary bar above the map and the
 permanent top SIM/REAL identity strip were removed as duplicates. Those rates now
-appear only in the定位儀表 panel inside the scrollable控制 pane, and SIM/REAL
-identity only in the video HUD, so neither is visible when the pane is scrolled
-away or when there is no frame to draw. `format_pipeline_metrics_summary()` and
+appear in the **定位資訊** tab, and SIM/REAL identity only in the video HUD, so
+neither is visible while another tab is selected or when there is no frame to
+draw. `format_pipeline_metrics_summary()` and
 `OperatorApp.pipeline_metrics_summary()` are kept (test-only now) so the bar can
 be reattached to `_build_ui`. The counting semantics below are unchanged and still
 describe what the定位儀表 numbers mean: localization results arriving at the UI per
@@ -190,8 +190,8 @@ counts the corresponding PDRAW-to-EDM-to-UI results. Missing or expired
 measurements are `N/A`; core model throughput is kept separate and is never
 presented as end-to-end FPS.
 
-The scrollable **飛控遙測（Olympe 讀回）** panel shows the flight-state
-cache independently of visual localization: fused roll/pitch/yaw, altitude above
+The **飛控與限制** tab contains **飛控遙測（Olympe 讀回）**, which shows the
+flight-state cache independently of visual localization: fused roll/pitch/yaw, altitude above
 takeoff, AGL, NED ground speed, GPS fix/location/accuracy/satellites, heading/RTH,
 wind/vibration/hover warnings, Wi-Fi/link quality, and IMU/barometer/GPS/etc.
 sensor health. These are read-only Olympe event-cache values. Original ANAFI's
@@ -208,11 +208,11 @@ Everything below runs on the Tk main thread, which is also the thread that hands
 frames to the localizer, so per-tick waste there is not free.
 
 - Flight actions (手動/搖桿, 恢復電腦控制, 懸停, 原地降落, 緊急停止電腦動作) and the
-  pose/frame age readout sit in a fixed bar **above** the控制 pane. That pane is a
-  fixed 320 px region with its own scrollbars, so anything inside it can be
-  scrolled off screen; abort actions must not be. Command strings and bindings are
-  unchanged. `test_operator_render_perf.py` asserts every one of those actions has
-  at least one instance outside a scrollable canvas.
+  pose/frame age readout sit in a fixed bar **above** the control tabs. The fixed
+  295 px pane has six tabs and no horizontal or vertical scrollbar: 操作與定位、
+  定位資訊、飛控與限制、校正、場域資產、系統紀錄. Command strings and bindings are
+  unchanged. `test_operator_render_perf.py` verifies every tab fits the minimum
+  980×640 client area and every abort action remains outside the selectable tabs.
 - Localization alerts (LOCALIZATION LOST, LOW CONFIDENCE, LOST hold) live only in
   the video panel (`render_video`) and in `loc_health_label`. **2026-08-03 operator
   decision:** the top-level banner was removed as duplicated by the middle of the

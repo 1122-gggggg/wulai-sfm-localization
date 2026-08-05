@@ -120,13 +120,17 @@ def test_incident_banner_only_occupies_a_row_when_something_is_wrong(operator) -
     assert operator.incident_banner.winfo_manager() == ""
 
 
-def test_flight_actions_are_not_inside_the_scrollable_pane(operator) -> None:
-    """原地降落 / 緊急停止 must not be scrollable off screen."""
+def test_controls_use_tabs_without_scrollbars_and_flight_actions_stay_visible(
+    operator,
+) -> None:
+    """All panels use fixed tabs; abort actions remain outside those tabs."""
     wanted = {"懸停", "原地降落", "緊急停止電腦動作", "手動/搖桿 (Esc)"}
     found: dict[str, list] = {label: [] for label in wanted}
+    descendants = []
 
     def walk(widget) -> None:
         for child in widget.winfo_children():
+            descendants.append(child)
             try:
                 label = child.cget("text")
             except Exception:
@@ -135,23 +139,65 @@ def test_flight_actions_are_not_inside_the_scrollable_pane(operator) -> None:
                 found[label].append(child)
             walk(child)
 
-    def scrollable(widget) -> bool:
+    def inside_control_tabs(widget) -> bool:
         node = widget
         while node is not None and node is not operator:
-            if isinstance(node, tk.Canvas):
+            if node is operator.controls_notebook:
                 return True
             node = node.master
         return False
 
     walk(operator)
+    assert not any(
+        isinstance(widget, (tk.Scrollbar, app.ttk.Scrollbar))
+        for widget in descendants
+    )
+    assert tuple(
+        operator.controls_notebook.tab(tab_id, "text")
+        for tab_id in operator.controls_notebook.tabs()
+    ) == (
+        "操作與定位",
+        "定位資訊",
+        "飛控與限制",
+        "校正",
+        "場域資產",
+        "系統紀錄",
+    )
+
     # 懸停 deliberately exists twice: the flight row and the nudge pad centre.
-    # The requirement is that every action is reachable without scrolling.
+    # At least one instance of every abort action must stay above the tabs.
     for label, widgets in found.items():
         assert widgets, f"missing flight control: {label}"
-        assert any(not scrollable(widget) for widget in widgets), (
-            f"every '{label}' button sits inside a scrollable canvas "
-            "and can be scrolled off screen"
+        assert any(not inside_control_tabs(widget) for widget in widgets), (
+            f"every '{label}' button sits inside a selectable tab"
         )
+
+
+def test_each_control_tab_fits_the_minimum_window_without_clipping(operator) -> None:
+    operator.geometry("980x640")
+    operator.update_idletasks()
+    root_left = operator.winfo_rootx()
+    root_top = operator.winfo_rooty()
+    root_right = root_left + operator.winfo_width()
+    root_bottom = root_top + operator.winfo_height()
+
+    for tab_id in operator.controls_notebook.tabs():
+        operator.controls_notebook.select(tab_id)
+        operator.update_idletasks()
+        stack = [operator.nametowidget(tab_id)]
+        while stack:
+            parent = stack.pop()
+            children = parent.winfo_children()
+            stack.extend(children)
+            for child in children:
+                if not child.winfo_ismapped():
+                    continue
+                left = child.winfo_rootx()
+                top = child.winfo_rooty()
+                right = left + child.winfo_width()
+                bottom = top + child.winfo_height()
+                assert root_left <= left <= right <= root_right
+                assert root_top <= top <= bottom <= root_bottom
 
 
 def test_long_route_draws_a_bounded_number_of_dots(operator, monkeypatch) -> None:

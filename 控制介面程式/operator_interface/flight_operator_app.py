@@ -3041,6 +3041,8 @@ class OperatorApp(tk.Tk):
         style.configure("Panel.TFrame", background="#1a1d21")
         style.configure("TLabel", background="#111316", foreground="#f0f3f5")
         style.configure("TButton", padding=(10, 6))
+        style.configure("TNotebook", background="#1a1d21", borderwidth=0)
+        style.configure("TNotebook.Tab", padding=(12, 6))
 
         live = self._is_live_backend()
         # 2026-08-03, operator decision: the permanent top identity strip and the
@@ -3068,7 +3070,7 @@ class OperatorApp(tk.Tk):
         mid.rowconfigure(0, weight=1)
 
         self.map_label = tk.Canvas(mid, bg="#15181c", highlightthickness=0, bd=0,
-                                   width=440, height=300)
+                                   width=440, height=240)
         self.map_label.grid(row=0, column=0, sticky="nsew", padx=(0, 5))
         self.map_label.bind("<ButtonPress-1>", self.on_map_press)
         self.map_label.bind("<B1-Motion>", self.on_map_drag)
@@ -3084,13 +3086,11 @@ class OperatorApp(tk.Tk):
         self.map_label.bind("<Button-4>", self.on_map_wheel)
         self.map_label.bind("<Button-5>", self.on_map_wheel)
         self.video_label = tk.Canvas(mid, bg="#08090b", highlightthickness=0, bd=0,
-                                     width=440, height=300)
+                                     width=440, height=240)
         self.video_label.grid(row=0, column=1, sticky="nsew", padx=(5, 0))
 
-        # Flight actions and the two ages an operator reacts to live OUTSIDE the
-        # scrollable控制 pane below: that pane is a fixed 320 px with its own
-        # scrollbars, so scrolling it could take 原地降落 / 緊急停止 off screen.
-        # SYSTEM_SPEC 8 does not require these to sit inside the scroll region.
+        # Flight actions and the two ages an operator reacts to live stay outside
+        # the tabbed control pane, so 原地降落 / 緊急停止 are always visible.
         flight_bar = ttk.Frame(self, style="Panel.TFrame")
         flight_bar.pack(fill="x", padx=10, pady=(0, 4))
         self.loc_age_var = DedupStringVar(value="位姿 - | 影格 -")
@@ -3117,63 +3117,54 @@ class OperatorApp(tk.Tk):
         )
         self.status.pack(side="right", padx=(8, 0))
 
-        controls = ttk.Frame(self, style="Panel.TFrame", width=920, height=320)
-        controls.pack(fill="x", padx=10, pady=10)
+        controls = ttk.Frame(self, style="Panel.TFrame", width=920, height=295)
+        controls.pack(fill="x", padx=10, pady=(4, 6))
         controls.pack_propagate(False)
-        controls.columnconfigure(0, weight=1)
-        controls.rowconfigure(0, weight=1)
-        controls_canvas = tk.Canvas(
-            controls,
-            bg="#1a1d21",
-            bd=0,
-            highlightthickness=0,
-            yscrollincrement=24,
-        )
-        controls_canvas.grid(row=0, column=0, sticky="nsew")
-        controls_vscroll = ttk.Scrollbar(
-            controls, orient="vertical", command=controls_canvas.yview
-        )
-        controls_vscroll.grid(row=0, column=1, sticky="ns")
-        controls_hscroll = ttk.Scrollbar(
-            controls, orient="horizontal", command=controls_canvas.xview
-        )
-        controls_hscroll.grid(row=1, column=0, sticky="ew")
-        controls_canvas.configure(
-            xscrollcommand=controls_hscroll.set,
-            yscrollcommand=controls_vscroll.set,
-        )
-        bottom = ttk.Frame(controls_canvas, style="Panel.TFrame")
-        controls_window = controls_canvas.create_window(
-            (0, 0), window=bottom, anchor="nw"
-        )
+        control_notebook = ttk.Notebook(controls)
+        control_notebook.pack(fill="both", expand=True)
+        operation_tab = ttk.Frame(control_notebook, style="Panel.TFrame")
+        localization_tab = ttk.Frame(control_notebook, style="Panel.TFrame")
+        aircraft_tab = ttk.Frame(control_notebook, style="Panel.TFrame")
+        calibration_tab = ttk.Frame(control_notebook, style="Panel.TFrame")
+        site_tab = ttk.Frame(control_notebook, style="Panel.TFrame")
+        log_tab = ttk.Frame(control_notebook, style="Panel.TFrame")
+        for tab, label in (
+            (operation_tab, "操作與定位"),
+            (localization_tab, "定位資訊"),
+            (aircraft_tab, "飛控與限制"),
+            (calibration_tab, "校正"),
+            (site_tab, "場域資產"),
+            (log_tab, "系統紀錄"),
+        ):
+            control_notebook.add(tab, text=label)
+        self.controls_notebook = control_notebook
 
-        def sync_controls_scrollregion(_event=None) -> None:
-            controls_canvas.configure(scrollregion=controls_canvas.bbox("all"))
+        operation_tab.columnconfigure(0, weight=1)
+        operation_tab.columnconfigure(1, minsize=300)
+        operation_tab.rowconfigure(1, weight=1)
+        localization_tab.columnconfigure(0, weight=1)
+        localization_tab.rowconfigure(0, weight=1)
+        aircraft_tab.columnconfigure(0, weight=1)
+        aircraft_tab.rowconfigure(1, weight=1)
+        calibration_tab.columnconfigure(0, weight=1)
+        calibration_tab.columnconfigure(1, weight=1)
+        site_tab.columnconfigure(0, weight=1)
+        site_tab.rowconfigure(0, weight=1)
+        log_tab.columnconfigure(0, weight=1)
+        log_tab.rowconfigure(0, weight=1)
 
-        def fit_controls_width(event) -> None:
-            controls_canvas.itemconfigure(
-                controls_window,
-                width=max(int(event.width), int(bottom.winfo_reqwidth())),
-            )
-            sync_controls_scrollregion()
-
-        bottom.bind("<Configure>", sync_controls_scrollregion)
-        controls_canvas.bind("<Configure>", fit_controls_width)
-        self.controls_canvas = controls_canvas
-
-        # Parent is flight_bar (always visible), not the scrollable bottom pane.
+        # Parent is flight_bar (always visible), not the tabbed control pane.
         # Button labels, command strings and lambdas below are unchanged.
         flight = ttk.LabelFrame(flight_bar, text="飛行模式")
         flight.pack(side="left", fill="x", expand=True)
-        mission = ttk.LabelFrame(bottom, text="任務控制")
-        mission.grid(row=1, column=0, sticky="ew", padx=6, pady=(0, 6))
-        camera = ttk.LabelFrame(bottom, text="鏡頭")
-        camera.grid(row=2, column=0, sticky="ew", padx=6, pady=(0, 6))
-        telemetry = ttk.LabelFrame(bottom, text="定位儀表")
-        telemetry.grid(row=3, column=0, sticky="ew", padx=6, pady=(0, 6))
-        anafi_panel = ttk.LabelFrame(bottom, text="ANAFI / 控制權")
-        anafi_panel.grid(row=4, column=0, sticky="ew", padx=6, pady=(0, 6))
-        bottom.columnconfigure(0, weight=1)
+        mission = ttk.LabelFrame(operation_tab, text="任務控制")
+        mission.grid(row=0, column=0, sticky="ew", padx=6, pady=(4, 3))
+        camera = ttk.LabelFrame(operation_tab, text="鏡頭")
+        camera.grid(row=1, column=0, sticky="new", padx=6, pady=3)
+        telemetry = ttk.LabelFrame(localization_tab, text="定位儀表")
+        telemetry.grid(row=0, column=0, sticky="nsew", padx=6, pady=(4, 5))
+        anafi_panel = ttk.LabelFrame(aircraft_tab, text="ANAFI / 控制權")
+        anafi_panel.grid(row=0, column=0, sticky="ew", padx=6, pady=(4, 3))
 
         # 【飛行按鈕 — 禁止隨意改】起飛 / 原地降落 / 懸停 / Esc 手動。見 SAFETY.md。
         # 尤其「起飛」「原地降落」指令名與語意不可改壞，否則可能意外起飛或不降。
@@ -3228,8 +3219,8 @@ class OperatorApp(tk.Tk):
 
         nudge_title = ("微移（按住移動／放開懸停）" if live
                        else "微移方向（模擬）")
-        nudge = ttk.LabelFrame(bottom, text=nudge_title)
-        nudge.grid(row=0, column=1, rowspan=4, sticky="nsew", padx=6, pady=6)
+        nudge = ttk.LabelFrame(operation_tab, text=nudge_title)
+        nudge.grid(row=0, column=1, rowspan=2, sticky="nsew", padx=6, pady=(4, 5))
         for text, r, c in (
             ("左上後", 0, 0), ("上", 0, 1), ("右上後", 0, 2),
             ("左上前", 1, 0), ("前", 1, 1), ("右上前", 1, 2),
@@ -3422,11 +3413,11 @@ class OperatorApp(tk.Tk):
 
         # ---- Firmware magnetometer calibration (human-guided, motors stay off) ----
         magnetometer = ttk.LabelFrame(
-            bottom,
+            calibration_tab,
             text="韌體羅盤校正（只允許 landed；使用者手持旋轉）",
         )
         magnetometer.grid(
-            row=5, column=0, columnspan=2, sticky="ew", padx=6, pady=(0, 6)
+            row=0, column=0, sticky="nsew", padx=6, pady=(4, 5)
         )
         if self._is_live_backend():
             drone_mag_initial = "飛機羅盤：等待 Olympe 韌體狀態讀回"
@@ -3494,10 +3485,10 @@ class OperatorApp(tk.Tk):
 
         # ---- Passive gravity / attitude check (does not calibrate firmware) ----
         grav = ttk.LabelFrame(
-            bottom,
+            calibration_tab,
             text="姿態／重力檢查（只讀；不寫入飛機）",
         )
-        grav.grid(row=4, column=1, sticky="nsew", padx=6, pady=(0, 6))
+        grav.grid(row=0, column=1, sticky="nsew", padx=6, pady=(4, 5))
         self.gravity_status_var = DedupStringVar(
             value="待命：依序旋轉機身，僅記錄姿態並分析重力一致性")
         self.gravity_att_var = DedupStringVar(value="att roll/pitch/yaw = -")
@@ -3521,9 +3512,11 @@ class OperatorApp(tk.Tk):
             wraplength=280, font=("Sans", 8),
         ).pack(anchor="w", padx=6, pady=(0, 4))
 
-        olympe_telemetry = ttk.LabelFrame(bottom, text="飛控遙測（Olympe 讀回）")
+        olympe_telemetry = ttk.LabelFrame(
+            aircraft_tab, text="飛控遙測（Olympe 讀回）"
+        )
         olympe_telemetry.grid(
-            row=6, column=0, columnspan=2, sticky="ew", padx=6, pady=(0, 6)
+            row=1, column=0, sticky="nsew", padx=6, pady=(3, 5)
         )
         self.olympe_state_var = DedupStringVar(value="飛行 ? | 警示 ? | 航向 ? | RTH ?/?")
         self.olympe_attitude_var = DedupStringVar(value="飛控融合姿態 -")
@@ -3558,16 +3551,22 @@ class OperatorApp(tk.Tk):
         ).pack(anchor="w", padx=8, pady=(3, 5))
 
         self.site_assets_panel = SiteAssetsPanel(
-            bottom,
+            site_tab,
             actions=self.site_asset_actions,
             request_apply=self.request_site_profile_restart,
         )
         self.site_assets_panel.grid(
-            row=7, column=0, columnspan=2, sticky="ew", padx=6, pady=(0, 6)
+            row=0, column=0, sticky="nsew", padx=6, pady=(4, 5)
         )
 
-        self.log = tk.Text(bottom, height=4, bg="#15181c", fg="#a7b0b8", insertbackground="#f0f3f5")
-        self.log.grid(row=8, column=0, columnspan=2, sticky="ew", padx=6, pady=(0, 6))
+        self.log = tk.Text(
+            log_tab,
+            height=4,
+            bg="#15181c",
+            fg="#a7b0b8",
+            insertbackground="#f0f3f5",
+        )
+        self.log.grid(row=0, column=0, sticky="nsew", padx=6, pady=(4, 5))
         self.write_log("ready")
         if GravityCalibrator is None:
             self.gravity_status_var.set("姿態／重力檢查模組載入失敗（gravity_calibration.py）")
