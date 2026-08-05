@@ -1,6 +1,114 @@
 # Deploy Localization To Another PC
 
-## Minimum Runtime Package
+## Current workspace: simulated interface transfer
+
+This workspace uses the following portable boundary. Create the fixed program/runtime
+package with `tools/export_simulator_package.py`, then import only a complete site
+asset package and one or more simulation videos on the target PC:
+
+```text
+localization/
+├── 控制介面程式/          UI, worker, launchers, site profiles
+├── 定位演算法/          EDM deployment code and pinned model code
+├── 模擬器/parrot_stimulate/src/anafi_pcmd_sim/
+│                         authoritative scale-free controller imported by the UI
+├── 執行環境/torch_hub_cache/ offline MegaLoc/XFeat repositories and weights
+├── 地圖檔/場域/<site>/       map PLY, EDM bundle, optional display/route metadata
+└── 模擬器/測試影片/           imported simulation video(s)
+```
+
+For the current selector/UI, a new site needs a profile JSON, a display PLY, the
+matching EDM localization bundle, and `query_camera` calibrated for the imported
+video's actual resolution/crop pipeline. The bundle is the numerical localization
+map; the PLY is required by the profile and UI but is not used for pose estimation.
+A PLY by itself is therefore not enough. Keep the profile JSON in
+`控制介面程式/site_profiles/` when PLY auto-matching is wanted, and preserve
+its relative asset paths.
+
+Site-specific assets have these boundaries:
+
+| Profile field | Replace for a new site? | Runtime role |
+|---|---:|---|
+| `assets.localization_bundle` | yes | required EDM reference images, descriptors, 3D anchors, and MegaLoc reference descriptors |
+| `assets.map_ply` | yes | required selector/UI display map; not the EDM pose-estimation map |
+| `query_camera` | yes | required by portable full-runtime; must match the simulation video pipeline |
+| `localizer_profile` | only when site-tuned | optional EDM thresholds/config; otherwise the fixed default is used |
+| `map_reference_poses` | optional for ground localization | UI reference-bound PLY filtering; also required before flight readiness |
+| `assets.route_json` | optional | route overlay; required only for flight readiness |
+| `assets.poles_json` | optional | inspection overlay/waypoints only |
+| `assets.megaloc_cache` | no | ignored by EDM because descriptors are stored in the EDM bundle |
+| `assets.track_landmarks` | no | legacy XFeat field; leave `null` for EDM |
+
+Update the profile paths and SHA-256 values for every supplied asset. A site-tuned
+`localizer_profile` must remain under `定位演算法/configs/`; fixed EDM/MegaLoc model
+weights, UI code, and the Parrot simulator do not change when switching sites.
+
+Keep `模擬器/parrot_stimulate/src/anafi_pcmd_sim/scale_free_control.py` with the
+program package. The operator UI imports this authoritative safety controller at
+startup; it is not optional simulator test data.
+
+The export package writes root-level `MANIFEST.tsv`, `SHA256SUMS`, and
+`PORTABLE_PACKAGE.json`. Verify them before installing:
+
+```bash
+python tools/package_manifest.py verify
+```
+
+From the source workspace, bind the actual exported directory to the validation
+receipt before transfer:
+
+```bash
+./驗證系統.sh --portable-package /path/to/portable_localization
+
+# Formal release: stage a known site into the actual export, install its lock,
+# launch its own selector/UI, require a valid pose, then remove staged assets.
+./驗證系統.sh --portable-package /path/to/portable_localization \
+  --clean-install --ui-smoke
+```
+
+The portable runtime intentionally excludes `定位演算法/EDM工具包`. Build a new
+EDM bundle in the source workspace, then import the completed site package; the
+target runtime is not a map-building environment.
+
+Install the validated Python runtime from the workspace root:
+
+```bash
+bash tools/install_runtime.sh
+```
+
+`requirements.txt` keeps the readable direct pins. The installer consumes
+`requirements-lock.txt`, which fixes transitive versions and package hashes for
+CPython 3.10 on x86_64 manylinux 2.31 or newer.
+
+System prerequisites are CPython 3.10 with `venv/ensurepip` support (Ubuntu/Debian
+usually packages this as `python3.10-venv`), `ffmpeg`, `python3-tk`, an
+X11/XWayland desktop, and an NVIDIA driver with working CUDA. The validated target
+GPU is NVIDIA RTX 5060 with CUDA 12.8 PyTorch wheels; other GPUs are unsupported
+until separately validated. Before launching, the simulator checks the profile,
+imported video, EDM checkpoint, MegaLoc weights, Python modules, bundle structure,
+camera, full model loading, GUI/worker imports, and CUDA:
+
+The first `tools/install_runtime.sh` run requires network access and several GB of
+free space for the pinned PyTorch/CUDA and Python wheels. Once installation is
+complete, the simulator can run offline when all fixed models and site assets are
+present.
+
+```bash
+./控制介面程式/影片模擬串流/選擇啟動.sh
+# If the video directory contains multiple files:
+VIDEO=/absolute/path/to/replay.mp4 ./控制介面程式/影片模擬串流/啟動.sh
+```
+
+This is the offline simulated interface only. It never loads the real-flight
+backend, sends Olympe commands, or performs takeoff.
+
+## Historical transfer-package layout (legacy)
+
+The following package paths describe the older `sfm_system/定位` layout and are
+kept only as historical reference. For the current workspace, follow
+**Current workspace: simulated interface transfer** above.
+
+## Minimum Runtime Package (legacy)
 
 For localization only, copy these as real files. Use `rsync -aL` so symlinks in
 `bundles/` and `maps/` are dereferenced.

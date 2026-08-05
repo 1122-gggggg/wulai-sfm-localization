@@ -1,9 +1,12 @@
 # Local environments, maps, model weights, and generated runtime artifacts.
 .venv/
 env/
-outputs/
+outputs/*
+!outputs/README.md
 .codegraph/
 **/torch_hub_cache/
+# Compiled EDM coarse-tail kernels. Regenerable (~5 s cold) and machine-specific.
+執行環境/inductor_cache/
 地圖檔/maps/*
 !地圖檔/maps/.gitkeep
 地圖檔/bundles/*
@@ -17,8 +20,10 @@ outputs/
 定位演算法/deploy_code/runtime/EDM/weights/*
 !定位演算法/deploy_code/runtime/EDM/weights/.gitignore
 定位演算法/validation/report_*/
-模擬器/測試影片/
-封存/
+模擬器/測試影片/*
+!模擬器/測試影片/README.md
+# 舊模擬器封存已刪除；保留 ignore guard，避免未來封存誤進版控。
+模擬器/封存/
 
 **/__pycache__/
 **/.pytest_cache/

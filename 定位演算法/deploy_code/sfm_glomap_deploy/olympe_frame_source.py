@@ -134,6 +134,11 @@ class OlympePdrawGrabber:
         self._convert_last_s = 0.0
         self._convert_max_s = 0.0
         self._convert_inflight = 0
+        self._source_width_px = None
+        self._source_height_px = None
+        self._output_width_px = None
+        self._output_height_px = None
+        self._decoded_pixel_format = None
 
     # ---- lifecycle ----
     def start(self):
@@ -292,6 +297,14 @@ class OlympePdrawGrabber:
             return False
         code = self._formats().get(yuv_frame.format(), self._default_code)
         rgb = cv2.cvtColor(arr, code)             # -> RGB HxWx3 uint8
+        try:
+            decoded_pixel_format = str(yuv_frame.format())
+        except Exception:
+            decoded_pixel_format = None
+        with self._lock:
+            self._source_height_px = int(rgb.shape[0])
+            self._source_width_px = int(rgb.shape[1])
+            self._decoded_pixel_format = decoded_pixel_format
         if self.resize is not None and (rgb.shape[1], rgb.shape[0]) != self.resize:
             rgb = cv2.resize(rgb, self.resize)
         preprocess_done_mono_ns = time.monotonic_ns()
@@ -450,6 +463,8 @@ class OlympePdrawGrabber:
         digest = rgb[::64, ::64].tobytes()   # ~720B sample; identical only if the frame repeats
         stored_timing = dict(timing or {})
         stored_timing["frame_store_mono_ns"] = time.monotonic_ns()
+        output_height_px = int(rgb.shape[0])
+        output_width_px = int(rgb.shape[1])
         with self._lock:
             if digest == self._digest:
                 self._dup_n += 1
@@ -467,6 +482,8 @@ class OlympePdrawGrabber:
             self._stored_source_ntp_us = source_us
             self._receipt_stamp = receipt
             self._latest_timing = stored_timing
+            self._output_height_px = output_height_px
+            self._output_width_px = output_width_px
             self._n += 1
         if warn:
             print(f"[olympe_frame_source] stream FROZEN: {FROZEN_DUP_FRAMES} identical "
@@ -587,6 +604,35 @@ class OlympePdrawGrabber:
     def fps(self) -> float:
         dt = (time.monotonic() - self._t0) if self._t0 else 0.0
         return self._n / dt if dt > 0 else 0.0
+
+    @property
+    def stream_metadata(self) -> dict:
+        """Return JSON-safe observed PDrAW/decode metadata.
+
+        Raw callbacks expose decoded YUV rather than the coded elementary
+        stream, so H.264 is recorded as the configured ANAFI/PDrAW input
+        contract and is deliberately not labeled as directly observed.
+        """
+        with self._lock:
+            source_ntp_us = getattr(self, "_stored_source_ntp_us", None)
+            return {
+                "codec": "H.264",
+                "codec_evidence": "configured-pdraw-input-contract",
+                "codec_observed": False,
+                "pdraw_media_name": str(self.media_name),
+                "pdraw_stream_mode": self._stream_mode,
+                "decoded_pixel_format": self._decoded_pixel_format,
+                "source_width_px": self._source_width_px,
+                "source_height_px": self._source_height_px,
+                "output_width_px": self._output_width_px,
+                "output_height_px": self._output_height_px,
+                "observed_fps": float(self.fps),
+                "source_timestamp_capable": (
+                    isinstance(source_ntp_us, int) and source_ntp_us > 0
+                ),
+                "source_timestamp_trusted": self._source_timing_trusted_locked(),
+                "stamp_source": self._stamp_source,
+            }
 
     @property
     def frame_pipeline_stats(self) -> dict:

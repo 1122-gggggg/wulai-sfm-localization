@@ -1,0 +1,257 @@
+#!/usr/bin/env python3
+"""Read-only structure and storage audit for the localization workspace."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+from collections.abc import Iterable
+from pathlib import Path
+from typing import Any
+
+REQUIRED_DIRECTORIES = (
+    "定位演算法",
+    "控制介面程式",
+    "地圖檔",
+    "模擬器",
+    "執行環境",
+    "outputs",
+    "文件",
+    "tools",
+)
+REQUIRED_FILES = (
+    "README.md",
+    "MANIFEST.tsv",
+    "SHA256SUMS",
+    "requirements.txt",
+    "requirements-lock.txt",
+    "requirements-test.txt",
+    "文件/README.md",
+    "文件/ARCHITECTURE.md",
+    "文件/SYSTEM_SPEC.md",
+    "文件/WORKSPACE_AUDIT.md",
+    "tools/README.md",
+    "tools/install_runtime.sh",
+    "tools/test_clean_install.sh",
+    "tools/simulated_ui_smoke.sh",
+    "tools/export_simulator_package.py",
+    "tools/package_manifest.py",
+    "tools/simulator_preflight.py",
+    "tools/system_validation.py",
+    "驗證系統.sh",
+    "模擬器/parrot_stimulate/pyproject.toml",
+    "模擬器/parrot_stimulate/firmware/manifest.json",
+    "模擬器/parrot_stimulate/firmware/anafi-pc.ext2.zip",
+    "模擬器/parrot_stimulate/src/anafi_pcmd_sim/scale_free_control.py",
+    "控制介面程式/影片模擬串流/選擇啟動.sh",
+    "控制介面程式/影片模擬串流/選擇啟動.py",
+)
+CANONICAL_ENTRYPOINTS = (
+    "控制介面程式/影片模擬串流/啟動.sh",
+    "控制介面程式/真機串流/啟動.sh",
+    "控制介面程式/mission_pipeline.py",
+    "定位演算法/deploy_code/sfm_glomap_deploy/production_edm_tracker.py",
+    "定位演算法/configs/edm_production_profile.json",
+    "定位演算法/validation/check_runtime_mirrors.py",
+)
+GENERATED_TOP_LEVEL = {
+    ".codegraph",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".venv",
+    "__pycache__",
+}
+OUTPUT_GOVERNANCE_FILES = {
+    "README.md",
+    "EXPERIMENT_BACKLOG.md",
+    "EXPERIMENT_LEDGER.md",
+    "EXPERIMENT_RECORD_TEMPLATE.json",
+    "LAB_MANUAL_FLIGHT_CHECKLIST_20260710.md",
+    "PROJECT_REVIEW_20260719.md",
+    "測試組合效能比較_20260715.md",
+}
+OUTPUT_EVIDENCE_PREFIXES = (
+    "edm_",
+    "exact_latency_",
+    "localization_fps_",
+    "onnx_flow_",
+    "optimization_",
+    "regression_",
+    "reverse_topk_",
+    "video720_",
+)
+
+
+def _walk_without_following_links(root: Path) -> Iterable[tuple[Path, os.stat_result]]:
+    for current, directories, files in os.walk(root, followlinks=False):
+        current_path = Path(current)
+        for name in [*directories, *files]:
+            path = current_path / name
+            try:
+                yield path, path.lstat()
+            except FileNotFoundError:
+                continue
+
+
+def directory_size(path: Path) -> int:
+    if path.is_symlink():
+        return 0
+    if path.is_file():
+        return path.stat().st_size
+    total = 0
+    for child, stat in _walk_without_following_links(path):
+        if child.is_symlink() or not child.is_file():
+            continue
+        total += stat.st_size
+    return total
+
+
+def classify_output(name: str) -> str:
+    if name in OUTPUT_GOVERNANCE_FILES:
+        return "governance"
+    if name == "flight_logs":
+        return "operations"
+    if name in {"validation", "validation_receipts", "production_stream_bench"}:
+        return "validation"
+    if name.startswith(OUTPUT_EVIDENCE_PREFIXES):
+        return "experiment_evidence"
+    return "unclassified"
+
+
+def audit_workspace(root: str | Path, *, include_sizes: bool = True) -> dict[str, Any]:
+    workspace = Path(root).expanduser().resolve()
+    missing_directories = [
+        name for name in REQUIRED_DIRECTORIES if not (workspace / name).is_dir()
+    ]
+    required_paths = (*REQUIRED_FILES, *CANONICAL_ENTRYPOINTS)
+    missing_files = [
+        name for name in required_paths if not (workspace / name).is_file()
+    ]
+
+    symlinks: list[dict[str, Any]] = []
+    broken_symlinks: list[str] = []
+    if workspace.is_dir():
+        for path, _stat in _walk_without_following_links(workspace):
+            if not path.is_symlink():
+                continue
+            relative = str(path.relative_to(workspace))
+            target = os.readlink(path)
+            resolved = path.resolve(strict=False)
+            exists = resolved.exists()
+            symlinks.append({"path": relative, "target": target, "valid": exists})
+            if not exists:
+                broken_symlinks.append(relative)
+
+    top_level_sizes: dict[str, int] = {}
+    if include_sizes and workspace.is_dir():
+        for path in sorted(workspace.iterdir(), key=lambda item: item.name):
+            if path.name == ".git":
+                continue
+            top_level_sizes[path.name] = directory_size(path)
+
+    output_classes: dict[str, list[str]] = {
+        "operations": [],
+        "validation": [],
+        "experiment_evidence": [],
+        "governance": [],
+        "unclassified": [],
+    }
+    output_root = workspace / "outputs"
+    if output_root.is_dir():
+        for path in sorted(output_root.iterdir(), key=lambda item: item.name):
+            output_classes[classify_output(path.name)].append(path.name)
+
+    usage_target = workspace if workspace.exists() else workspace.parent
+    usage = shutil.disk_usage(usage_target)
+    structural_failures = [
+        *(f"missing directory: {name}" for name in missing_directories),
+        *(f"missing file: {name}" for name in missing_files),
+        *(f"broken symlink: {name}" for name in broken_symlinks),
+    ]
+    return {
+        "schema": "localization-workspace-audit/v1",
+        "root": str(workspace),
+        "ok": not structural_failures,
+        "structural_failures": structural_failures,
+        "missing_directories": missing_directories,
+        "missing_files": missing_files,
+        "symlinks": symlinks,
+        "top_level_bytes": top_level_sizes,
+        "output_classes": output_classes,
+        "generated_top_level": sorted(
+            name for name in GENERATED_TOP_LEVEL if (workspace / name).exists()
+        ),
+        "disk": {
+            "total_bytes": usage.total,
+            "used_bytes": usage.used,
+            "free_bytes": usage.free,
+            "free_percent": usage.free / usage.total * 100.0 if usage.total else 0.0,
+        },
+    }
+
+
+def _gib(value: int) -> float:
+    return value / (1024**3)
+
+
+def format_human(report: dict[str, Any]) -> str:
+    lines = [
+        f"workspace: {report['root']}",
+        f"layout: {'OK' if report['ok'] else 'FAIL'}",
+        (
+            "disk: "
+            f"{_gib(report['disk']['free_bytes']):.2f} GiB free "
+            f"({report['disk']['free_percent']:.1f}%)"
+        ),
+    ]
+    sizes = report.get("top_level_bytes", {})
+    if sizes:
+        lines.append("largest top-level entries:")
+        for name, size in sorted(sizes.items(), key=lambda item: item[1], reverse=True)[
+            :10
+        ]:
+            lines.append(f"  {name}: {_gib(size):.2f} GiB")
+    unclassified = report["output_classes"]["unclassified"]
+    lines.append(f"output entries not classified: {len(unclassified)}")
+    for failure in report["structural_failures"]:
+        lines.append(f"ERROR: {failure}")
+    for name in unclassified:
+        lines.append(f"WARN: outputs/{name}")
+    return "\n".join(lines)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--root",
+        default=str(Path(__file__).resolve().parents[1]),
+        help="workspace root (default: parent of tools/)",
+    )
+    parser.add_argument("--json", action="store_true", help="emit JSON")
+    parser.add_argument(
+        "--no-sizes",
+        action="store_true",
+        help="skip recursive top-level size accounting",
+    )
+    parser.add_argument(
+        "--strict-output-names",
+        action="store_true",
+        help="fail when outputs/ contains an unclassified top-level entry",
+    )
+    args = parser.parse_args()
+    report = audit_workspace(args.root, include_sizes=not args.no_sizes)
+    print(
+        json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True)
+        if args.json
+        else format_human(report)
+    )
+    failed = not report["ok"]
+    if args.strict_output_names and report["output_classes"]["unclassified"]:
+        failed = True
+    raise SystemExit(1 if failed else 0)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,16 @@
+{
+  "schema": "edm-site-replay-quality-baseline/v1",
+  "video": "/home/allen/下載/P1190119.MP4",
+  "video_sha256": "600bbf70227311cab079d77fcb896f97e6d3e55f6bc40b5bef01d74b65f7826c",
+  "evidence": "outputs/validation/edm_p119_pnp_ab_20260802/pnp_cap_900_full.json",
+  "thresholds": {
+    "frames": 2934,
+    "min_successes": 1686,
+    "min_track": 2244,
+    "max_lost": 139,
+    "min_inliers_p50": 693.0,
+    "min_inliers_p95": 875.0,
+    "max_reproj_rms_p95": 2.9565321621751037,
+    "max_limited_jump_unconfirmed": 1187
+  }
+}

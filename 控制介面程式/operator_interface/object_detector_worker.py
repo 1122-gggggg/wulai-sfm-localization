@@ -25,6 +25,11 @@ _CTRL = Path(__file__).resolve().parents[1]
 if str(_CTRL) not in _sys.path:
     _sys.path.insert(0, str(_CTRL))
 from workspace_layout import workspace_from_file  # noqa: E402
+from backend_contract import InterfaceMode  # noqa: E402
+from runtime_safety import (  # noqa: E402
+    configure_offline_environment,
+    install_network_guard,
+)
 
 _WS = workspace_from_file(__file__)
 SYSTEM_ROOT = _WS.root
@@ -92,6 +97,8 @@ def box_payload(result) -> list[dict]:
 
 
 def main() -> None:
+    configure_offline_environment()
+    install_network_guard(InterfaceMode.SIMULATED_STREAM)
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--width", type=int, default=1280)
     ap.add_argument("--height", type=int, default=720)

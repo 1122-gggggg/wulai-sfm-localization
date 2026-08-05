@@ -338,7 +338,7 @@ def main() -> None:
     ap.add_argument("--with-video", action="store_true",
                     help="also sample PDRAW frames for fps/age (no arm)")
     ap.add_argument("--out", default="",
-                    help="JSONL path; default under 定位/outputs/flight_logs/")
+                    help="JSONL path; default under outputs/flight_logs/")
     ap.add_argument("--summarize", default="",
                     help="only summarize an existing JSONL and exit")
     args = ap.parse_args()
@@ -350,7 +350,7 @@ def main() -> None:
     if args.out:
         out = Path(args.out)
     else:
-        root = Path(__file__).resolve().parents[2]  # .../定位
+        root = Path(__file__).resolve().parents[2]  # workspace/package root
         stamp = time.strftime("%Y%m%d_%H%M%S")
         out = root / "outputs" / "flight_logs" / f"telemetry_{stamp}.jsonl"
 

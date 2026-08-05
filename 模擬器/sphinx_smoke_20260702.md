@@ -38,12 +38,16 @@ The package keeps reusable wheels in:
 
 ## Sphinx Runtime Smoke
 
-Command intent:
+Historical command intent (do not reuse the old `#latest` selector):
 
 ```bash
-sphinx --datalog-quiet "/opt/parrot-sphinx/usr/share/sphinx/drones/anafi.drone"::firmware="https://firmware.parrot.com/Versions/anafi/pc/%23latest/images/anafi-pc.ext2.zip"
-parrot-ue4-empty
+export FIRMWARE_URL="https://firmware.parrot.com/Versions/anafi/pc/<reviewed-version>/images/anafi-pc.ext2.zip"
+./模擬器/launch_sphinx_anafi_empty.sh
 ```
+
+The maintained launcher now rejects a missing selector and `#latest`; use one
+reviewed, explicit Parrot firmware URL for reproducible runs. It starts both
+Sphinx and the offscreen UE4 renderer.
 
 Observed progress:
 

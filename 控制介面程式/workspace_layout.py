@@ -106,6 +106,10 @@ class Workspace:
         return self.maps / "mission_routes"
 
     @property
+    def site_packages(self) -> Path:
+        return self.maps / "場域"
+
+    @property
     def flight_logs(self) -> Path:
         return self.outputs / "flight_logs"
 

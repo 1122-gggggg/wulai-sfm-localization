@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "site_id": "football_field_edm",
   "display_name": "足球場 EDM",
   "localizer": "edm",
@@ -16,6 +16,21 @@
       640.0,
       360.0
     ]
+  },
+  "asset_sha256": {
+    "map_ply": "8fba3ae305909546fff45140170678116f74c70b01a47ef00a89bd5baa8f48e0",
+    "localization_bundle": "6577e2ad1e60e35bab7e55c85726f533afe5cfc6766a752140249f86034381e3",
+    "route_json": null,
+    "map_reference_poses": "254d38e6ede2d19fdc6c68495c5171177adb63ce264110ef333bf26779f163e9",
+    "localizer_profile": "959aecc09d6775303ec7240023dc54a10f03e9ace62416dc2322c65caf7fef91",
+    "poles_json": null
+  },
+  "flight": {
+    "approved": false,
+    "coordinate_frame_id": null,
+    "route_clearance_approved": false,
+    "approval_note": "Blocked until replay validation, an approved scale-free route contract, and a route-clearance review are complete.",
+    "controller": null
   },
   "assets": {
     "map_ply": "../../地圖檔/場域/football_field/maps/ff_a1/ff_a1_rgb.ply",

@@ -21,6 +21,7 @@ directory is needed at flight time.
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -28,10 +29,43 @@ import cv2
 import numpy as np
 import torch
 
+from artifact_integrity import verify_sha256
 from edm_matcher import EDM_W, EDMMatcher
 
 MEGALOC_INPUT = 322
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+MEGALOC_REVISION = "7cb9f7970d366fdf059963d04d372e503e8e9df9"
+MEGALOC_WEIGHTS_SHA256 = (
+    "d4f9f2bcb60018f91eb6a8e061ed054fd55654e10c2569cf13841ea986ffb4f8"
+)
+MEGALOC_HUBCONF_SHA256 = (
+    "0ebf9fc9c455ca38b9e52c69bcfee4b136a0f8872fdfc4307d00469013228b98"
+)
+MEGALOC_MODEL_SOURCE_SHA256 = (
+    "3cbf1d20515b1da423998a8edab787031eaa7bb273c5a86a5c41c4f6d84e2a6d"
+)
+
+
+def _torch_hub_cache() -> Path:
+    configured = os.environ.get("SFM_TORCH_HUB_CACHE", "").strip()
+    if configured:
+        return Path(configured).expanduser().resolve()
+    for parent in Path(__file__).resolve().parents:
+        direct = parent / "torch_hub_cache"
+        if direct.is_dir():
+            return direct
+        runtime = parent / "執行環境" / "torch_hub_cache"
+        if runtime.is_dir():
+            return runtime
+    return Path(__file__).resolve().parents[3] / "執行環境" / "torch_hub_cache"
+
+
+TORCH_HUB_DIR = _torch_hub_cache()
+MEGALOC_REPO_DIR = TORCH_HUB_DIR / "gmberton_MegaLoc_main"
+MEGALOC_WEIGHTS = (
+    TORCH_HUB_DIR / "checkpoints" / "megaloc" / MEGALOC_REVISION
+    / "model.safetensors"
+)
 
 
 @dataclass
@@ -46,16 +80,48 @@ class EDMRelocMap:
     covis: dict | None = None
 
     @staticmethod
-    def load(path: str | Path) -> "EDMRelocMap":
-        b = torch.load(str(path), map_location="cpu", weights_only=False)
-        if str(b["meta"].get("feature", "")).lower() != "edm":
-            raise ValueError(f"not an EDM bundle: feature={b['meta'].get('feature')!r}")
+    def load(
+        path: str | Path,
+        expected_sha256: str | None = None,
+    ) -> "EDMRelocMap":
+        artifact = Path(path)
+        verify_sha256(artifact, expected_sha256)
+        dtypes = (
+            np.float16,
+            np.float32,
+            np.float64,
+            np.uint8,
+            np.int32,
+            np.int64,
+            np.bool_,
+        )
+        numpy_safe_globals = [
+            np._core.multiarray._reconstruct,
+            np._core.multiarray.scalar,
+            np.ndarray,
+            np.dtype,
+            *(type(np.dtype(dtype)) for dtype in dtypes),
+        ]
+        with torch.serialization.safe_globals(numpy_safe_globals):
+            b = torch.load(
+                artifact,
+                map_location="cpu",
+                weights_only=True,
+                mmap=True,
+            )
+        b = _validate_edm_bundle_schema(b)
         names = list(b["ref_names"])
         xyz, imgs = {}, {}
         for name in names:
             e = b["refs"][name]
             xyz[name] = np.asarray(e["xyz_by_cell"], np.float32)
-            imgs[name] = cv2.imdecode(np.asarray(e["image_jpg"], np.uint8), cv2.IMREAD_GRAYSCALE)
+            decoded = cv2.imdecode(
+                np.asarray(e["image_jpg"], np.uint8),
+                cv2.IMREAD_GRAYSCALE,
+            )
+            if decoded is None or decoded.shape != (576, 1024):
+                raise ValueError(f"EDM reference image failed to decode at 1024x576: {name}")
+            imgs[name] = decoded
         g = np.asarray(b["ref_global"], np.float32)
         g /= np.linalg.norm(g, axis=1, keepdims=True) + 1e-12
         return EDMRelocMap(
@@ -66,6 +132,85 @@ class EDMRelocMap:
         )
 
 
+def _validate_edm_bundle_schema(bundle: object) -> dict:
+    if not isinstance(bundle, dict):
+        raise ValueError("EDM relocation bundle must be a dictionary")
+    required = {"meta", "ref_names", "ref_global", "refs"}
+    allowed = required | {"ref_centers", "ref_yaws", "covis"}
+    if not required.issubset(bundle) or not set(bundle).issubset(allowed):
+        raise ValueError(
+            f"unexpected EDM bundle keys: {sorted(set(bundle) - allowed)}; "
+            f"missing: {sorted(required - set(bundle))}"
+        )
+    meta = bundle["meta"]
+    if not isinstance(meta, dict) or str(meta.get("feature", "")).lower() != "edm":
+        feature = None if not isinstance(meta, dict) else meta.get("feature")
+        raise ValueError(f"not an EDM bundle: feature={feature!r}")
+    names = bundle["ref_names"]
+    refs = bundle["refs"]
+    if (not isinstance(names, list) or not names
+            or not all(isinstance(name, str) and name for name in names)
+            or len(names) != len(set(names))):
+        raise ValueError("EDM bundle ref_names must be unique non-empty strings")
+    if not isinstance(refs, dict) or set(refs) != set(names):
+        raise ValueError("EDM bundle refs do not exactly match ref_names")
+    dimensions = (
+        meta.get("edm_grid_w"),
+        meta.get("edm_grid_h"),
+        meta.get("edm_input_w"),
+        meta.get("edm_input_h"),
+    )
+    if (not all(isinstance(value, int) and not isinstance(value, bool) and value > 0
+                for value in dimensions)
+            or dimensions != (128, 72, 1024, 576)):
+        raise ValueError("EDM bundle grid/input dimensions are incompatible with this runtime")
+    grid_w, grid_h, input_w, input_h = dimensions
+    ref_global = bundle["ref_global"]
+    if (not isinstance(ref_global, np.ndarray) or ref_global.ndim != 2
+            or ref_global.shape[0] != len(names) or ref_global.shape[1] == 0
+            or not np.issubdtype(ref_global.dtype, np.floating)
+            or not np.isfinite(ref_global).all()
+            or np.any(np.linalg.norm(ref_global, axis=1) <= 1e-12)):
+        raise ValueError("EDM bundle ref_global has an invalid shape, dtype, or value")
+    cell_count = grid_w * grid_h
+    for name in names:
+        entry = refs[name]
+        if not isinstance(entry, dict) or set(entry) != {"xyz_by_cell", "image_jpg"}:
+            raise ValueError(f"invalid EDM reference entry: {name}")
+        xyz = entry["xyz_by_cell"]
+        image_jpg = entry["image_jpg"]
+        if (not isinstance(xyz, np.ndarray) or xyz.shape != (cell_count, 3)
+                or xyz.dtype != np.float32):
+            raise ValueError(f"invalid EDM xyz_by_cell: {name}")
+        valid_xyz_rows = np.isfinite(xyz).all(axis=1) | np.isnan(xyz).all(axis=1)
+        if np.isinf(xyz).any() or not valid_xyz_rows.all():
+            raise ValueError(f"invalid non-finite EDM anchors: {name}")
+        if (not isinstance(image_jpg, np.ndarray) or image_jpg.ndim != 1
+                or image_jpg.dtype != np.uint8 or image_jpg.size == 0):
+            raise ValueError(f"invalid embedded EDM reference image: {name}")
+    for key, shape in (("ref_centers", (len(names), 3)), ("ref_yaws", (len(names),))):
+        value = bundle.get(key)
+        if value is not None and (
+            not isinstance(value, np.ndarray)
+            or value.shape != shape
+            or not np.issubdtype(value.dtype, np.floating)
+            or not np.isfinite(value).all()
+        ):
+            raise ValueError(f"invalid EDM bundle {key}")
+    covis = bundle.get("covis")
+    if covis is not None:
+        if not isinstance(covis, dict) or set(covis) != set(names):
+            raise ValueError("invalid EDM bundle covis keys")
+        for index, name in enumerate(names):
+            neighbors = covis[name]
+            if (not isinstance(neighbors, list)
+                    or any(type(value) is not int or value < 0 or value >= len(names)
+                           for value in neighbors)
+                    or index in neighbors or len(neighbors) != len(set(neighbors))):
+                raise ValueError(f"invalid EDM bundle covis neighbors: {name}")
+    return bundle
+
+
 class MegaLocQuery:
     """Same retrieval front-end as the XFeat localizer -- the bundle's ref_global is MegaLoc."""
 
@@ -74,8 +219,18 @@ class MegaLocQuery:
         from torchvision import transforms as T
         self._Image = Image
         self.device = device
-        self.model = torch.hub.load("gmberton/MegaLoc", "get_trained_model",
-                                    trust_repo=True).eval().to(device)
+        verify_sha256(MEGALOC_REPO_DIR / "hubconf.py", MEGALOC_HUBCONF_SHA256)
+        verify_sha256(
+            MEGALOC_REPO_DIR / "megaloc_model.py", MEGALOC_MODEL_SOURCE_SHA256
+        )
+        verify_sha256(MEGALOC_WEIGHTS, MEGALOC_WEIGHTS_SHA256)
+        torch.hub.set_dir(str(TORCH_HUB_DIR))
+        self.model = torch.hub.load(
+            str(MEGALOC_REPO_DIR),
+            "get_trained_model",
+            source="local",
+            weights_path=str(MEGALOC_WEIGHTS),
+        ).eval().to(device)
         self.tf = T.Compose([
             T.Resize((input_size, input_size), interpolation=T.InterpolationMode.BICUBIC),
             T.ToTensor(),

@@ -11,12 +11,14 @@ the only place the two conventions meet. Nothing upstream of it changes.
 from __future__ import annotations
 
 import time
+from collections import deque
 from dataclasses import dataclass, field
 
 import cv2
 import numpy as np
 
 from pose_types import Localizer, Pose
+from edm_profile import apply_edm_tracker_profile, load_edm_production_profile  # noqa: F401
 from production_edm_tracker import EDMConfig, ProductionEDMTracker
 from reloc_localizer_edm import Camera, EDMRelocMap  # noqa: F401  (re-exported for the worker)
 
@@ -76,7 +78,8 @@ class InertTemporalCache:
 
 class EDMTrackerAdapter(Localizer):
     def __init__(self, reloc_map: EDMRelocMap, camera: Camera,
-                 cfg: EDMConfig | None = None, megaloc=None, matcher=None):
+                 cfg: EDMConfig | None = None, megaloc=None, matcher=None,
+                 frame_source=lambda: None):
         # matcher: EDMMatcher (torch FP16) or EDMOnnxMatcher (ORT CUDA/TensorRT).
         # None -> ProductionEDMTracker builds the default torch EDMMatcher.
         self.trk = ProductionEDMTracker(
@@ -87,6 +90,7 @@ class EDMTrackerAdapter(Localizer):
         )
         self.map = reloc_map
         self.cfg = self.trk.cfg
+        self.frame_source = frame_source
         self.state = RuntimeState()
         self.temporal_cache = InertTemporalCache()
         self._last_info: dict = {}
@@ -114,7 +118,14 @@ class EDMTrackerAdapter(Localizer):
         s.last_center = s.prev_center = None
         s.last_yaw = s.prev_yaw = None
         s.last_refs = []
-        self.trk.st = type(self.trk.st)()
+        self.trk.st = type(self.trk.st)(
+            accepted_step_norms=deque(
+                maxlen=self.cfg.adaptive_jump_history_size
+            ),
+            observed_capture_dts=deque(
+                maxlen=self.cfg.adaptive_jump_history_size
+            ),
+        )
 
     # ---------- state mirror ----------
     # self.state is the worker-facing mirror; self.trk.st is EDM's own. Push before each
@@ -192,7 +203,27 @@ class EDMTrackerAdapter(Localizer):
             "candidate_mode": info.get("candidate_mode"),
             "global_retrieval_calls": info.get("global_retrieval_calls"),
             "rejected": info.get("rejected"),
+            "limited_jump": info.get("limited_jump"),
+            "limited_jump_confirmed": info.get("limited_jump_confirmed", False),
             "camera_axes_world": camera_axes_world,
             "camera_forward_world": camera_forward_world,
         }
         return pose
+
+    def get_pose(self) -> Pose | None:
+        sample = self.frame_source()
+        if sample is None:
+            return None
+        if isinstance(sample, tuple):
+            if len(sample) != 2:
+                self._last_info = {
+                    "mode": self.state.mode,
+                    "next_mode": self.state.mode,
+                    "error": "invalid_frame_sample",
+                    "inliers": 0,
+                }
+                return None
+            frame, capture_stamp = sample
+        else:
+            frame, capture_stamp = sample, time.monotonic()
+        return self.localize_frame(frame, capture_stamp=capture_stamp)

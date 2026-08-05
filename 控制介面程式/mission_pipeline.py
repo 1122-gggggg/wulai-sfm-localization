@@ -14,12 +14,17 @@ another site's map, bundle, camera, or route.
 from __future__ import annotations
 
 import argparse
+import hashlib
+import hmac
+import json
+import math
 import os
 import subprocess
 import sys
+from dataclasses import asdict
 from pathlib import Path
 
-from site_profile import SiteProfile, load_site_profile
+from site_profile import SiteProfile, flight_readiness_errors, load_site_profile
 from workspace_layout import workspace_from_file
 
 
@@ -51,6 +56,7 @@ DRAW_SCRIPTS = {
 }
 
 _PROFILE_FREE_MODES = {"flight-selftest"}
+AUTONOMOUS_ROUTE_EXTERNAL_APPROVAL_LOCKED = True
 _ROUTE_MUST_EXIST_MODES = {
     "draw-wires",
     "label-route",
@@ -58,7 +64,6 @@ _ROUTE_MUST_EXIST_MODES = {
     "sync-path",
     "plan-path",
     "dry-run",
-    "grab-only",
     "fly",
 }
 _POLES_MUST_EXIST_MODES = {
@@ -66,8 +71,6 @@ _POLES_MUST_EXIST_MODES = {
     "sync-poles",
     "plan-path",
     "dry-run",
-    "grab-only",
-    "fly",
 }
 _SITE_ASSET_ENV_VARS = (
     "SFM_MAP_PLY",
@@ -76,7 +79,17 @@ _SITE_ASSET_ENV_VARS = (
     "SFM_RELOC_BUNDLE",
     "SFM_MEGALOC_CACHE",
     "SFM_TRACK_LANDMARKS",
+    "SFM_LOCALIZER_BACKEND",
+    "SFM_LOCALIZER_DEPLOY_DIR",
+    "SFM_LOCALIZER_PROFILE",
+    "SFM_QUERY_CAMERA_JSON",
+    "SFM_BUNDLE_SHA256",
+    "SFM_FLIGHT_CONTRACT_JSON",
 )
+
+
+def _reject_json_constant(value: str):
+    raise ValueError(f"non-finite JSON number is not allowed: {value}")
 
 
 def _profile_mission_path(profile: SiteProfile, filename: str) -> Path:
@@ -95,6 +108,148 @@ def _require_existing_asset(
             f"mission mode {mode!r} requires existing {label}: {path}; "
             "create it with the authoring modes first or fix the site profile"
         )
+
+
+def _verify_sha256(path: Path, expected: str, label: str) -> None:
+    digest = hashlib.sha256()
+    try:
+        with path.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(8 * 1024 * 1024), b""):
+                digest.update(chunk)
+    except OSError as exc:
+        raise ValueError(f"cannot hash {label} {path}: {exc}") from exc
+    actual = digest.hexdigest()
+    if not hmac.compare_digest(actual, expected):
+        raise ValueError(
+            f"{label} SHA-256 mismatch: expected {expected}, got {actual} ({path})"
+        )
+
+
+def _validate_flight_route(profile: SiteProfile) -> None:
+    assert profile.flight is not None
+    assert profile.route_json is not None
+    try:
+        route = json.loads(
+            profile.route_json.read_text(encoding="utf-8"),
+            parse_constant=_reject_json_constant,
+        )
+    except OSError as exc:
+        raise ValueError(f"cannot read flight route {profile.route_json}: {exc}") from exc
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise ValueError(f"invalid flight route JSON {profile.route_json}: {exc}") from exc
+    expected = {
+        "schema": "sfm-flight-route/v1",
+        "site_id": profile.site_id,
+        "coordinate_frame_id": profile.flight.coordinate_frame_id,
+        "units": "map",
+        "purpose": "flight",
+    }
+    if not isinstance(route, dict):
+        raise ValueError("flight route root must be an object")
+    for key, value in expected.items():
+        if route.get(key) != value:
+            raise ValueError(
+                f"flight route {key} must be {value!r}, got {route.get(key)!r}"
+            )
+    if route.get("closed") is not False:
+        raise ValueError(
+            f"flight route closed must be False, got {route.get('closed')!r}"
+        )
+    if route.get("frame") not in {"aligned", "glomap"}:
+        raise ValueError("flight route frame must be 'aligned' or 'glomap'")
+    waypoints = route.get("waypoints")
+    if not isinstance(waypoints, list) or len(waypoints) < 2:
+        raise ValueError("flight route must contain at least two waypoints")
+    parsed_waypoints = []
+    for index, waypoint in enumerate(waypoints):
+        if (
+            not isinstance(waypoint, list)
+            or len(waypoint) != 3
+            or any(
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+                for value in waypoint
+            )
+        ):
+            raise ValueError(
+                f"flight route waypoint[{index}] must be a finite numeric 3-vector"
+            )
+        parsed_waypoints.append(tuple(float(value) for value in waypoint))
+    for index, (start, end) in enumerate(
+        zip(parsed_waypoints[:-1], parsed_waypoints[1:])
+    ):
+        length_sq = sum((b - a) ** 2 for a, b in zip(start, end))
+        if length_sq <= 1e-18:
+            raise ValueError(f"flight route segment {index}->{index + 1} has zero length")
+
+
+def validate_profile_flight_assets(profile: SiteProfile) -> None:
+    """Validate a future scale-free flight package without unlocking execution."""
+    errors = flight_readiness_errors(profile)
+    if errors:
+        note = "" if profile.flight is None else profile.flight.approval_note
+        suffix = f"; note: {note}" if note else ""
+        raise ValueError("site is not approved for autonomous flight: " + "; ".join(errors) + suffix)
+    assert profile.flight is not None
+    assert profile.route_json is not None
+    assert profile.map_reference_poses is not None
+    assert profile.query_camera is not None
+    deploy_path = str(DEPLOY)
+    if deploy_path not in sys.path:
+        sys.path.append(deploy_path)
+    from production_localizer_factory import validate_camera_tuple
+
+    camera = profile.query_camera
+    validate_camera_tuple(
+        (camera.model, camera.width, camera.height, list(camera.params))
+    )
+    _validate_flight_route(profile)
+    checks = (
+        (
+            profile.localization_bundle,
+            profile.asset_sha256.localization_bundle,
+            "localization_bundle",
+        ),
+        (profile.route_json, profile.asset_sha256.route_json, "route_json"),
+        (
+            profile.map_reference_poses,
+            profile.asset_sha256.map_reference_poses,
+            "map_reference_poses",
+        ),
+    )
+    if profile.localizer_profile is not None:
+        checks += (
+            (
+                profile.localizer_profile,
+                profile.asset_sha256.localizer_profile,
+                "localizer_profile",
+            ),
+        )
+    controller = profile.flight.controller
+    assert controller is not None
+    if controller.inspect_waypoints:
+        assert profile.poles_json is not None
+        checks += (
+            (
+                profile.poles_json,
+                profile.asset_sha256.poles_json,
+                "poles_json",
+            ),
+        )
+    for path, expected, label in checks:
+        assert path is not None and expected is not None
+        _verify_sha256(path, expected, label)
+
+
+def validate_profile_for_flight(profile: SiteProfile) -> None:
+    """Keep every autonomous route entry point locked pending external approval."""
+    if AUTONOMOUS_ROUTE_EXTERNAL_APPROVAL_LOCKED:
+        raise ValueError(
+            "autonomous route flight is LOCKED pending external approval, two-person "
+            "checklist, props-off yaw/PCMD tests, and low-altitude validation"
+        )
+    validate_profile_flight_assets(profile)
 
 
 def resolve_mission_site_assets(
@@ -131,6 +286,12 @@ def resolve_mission_site_assets(
             profile = load_site_profile(profile_arg)
         except ValueError as exc:
             parser.error(str(exc))
+
+        if mode == "fly":
+            try:
+                validate_profile_for_flight(profile)
+            except ValueError as exc:
+                parser.error(str(exc))
 
         route = profile.route_json or _profile_mission_path(profile, "flight_path.json")
         poles = profile.poles_json or _profile_mission_path(profile, "poles.json")
@@ -173,7 +334,7 @@ def resolve_mission_site_assets(
     return None
 
 
-def env_with_mission(args) -> dict[str, str]:
+def env_with_mission(args, profile: SiteProfile | None = None) -> dict[str, str]:
     env = os.environ.copy()
     python_paths = [str(FLIGHT), str(DEPLOY)]
     if SCRIPTS.is_dir():
@@ -196,6 +357,45 @@ def env_with_mission(args) -> dict[str, str]:
         env["SFM_SITE_PROFILE"] = args.site_profile
     else:
         env.pop("SFM_SITE_PROFILE", None)
+    if profile is not None:
+        env["SFM_LOCALIZER_BACKEND"] = profile.localizer
+        env["SFM_LOCALIZER_DEPLOY_DIR"] = str(profile.localizer_deploy_dir or DEPLOY)
+        env["SFM_LOCALIZER_PROFILE"] = str(profile.localizer_profile or "")
+        env["SFM_BUNDLE_SHA256"] = profile.asset_sha256.localization_bundle or ""
+        if profile.query_camera is not None:
+            env["SFM_QUERY_CAMERA_JSON"] = json.dumps(asdict(profile.query_camera))
+        else:
+            env.pop("SFM_QUERY_CAMERA_JSON", None)
+        if profile.flight is not None:
+            env["SFM_FLIGHT_CONTRACT_JSON"] = json.dumps({
+                "schema_version": profile.schema_version,
+                "approved": profile.flight.approved,
+                "site_id": profile.site_id,
+                "coordinate_frame_id": profile.flight.coordinate_frame_id,
+                "route_clearance_approved": profile.flight.route_clearance_approved,
+                "approval_note": profile.flight.approval_note,
+                "controller": (
+                    None if profile.flight.controller is None
+                    else asdict(profile.flight.controller)
+                ),
+                "query_camera": (
+                    None if profile.query_camera is None
+                    else asdict(profile.query_camera)
+                ),
+                "localization_bundle_sha256": (
+                    profile.asset_sha256.localization_bundle
+                ),
+                "route_sha256": profile.asset_sha256.route_json,
+                "map_reference_poses": (
+                    None if profile.map_reference_poses is None
+                    else str(profile.map_reference_poses)
+                ),
+                "map_reference_poses_sha256": profile.asset_sha256.map_reference_poses,
+                "localizer_profile_sha256": profile.asset_sha256.localizer_profile,
+                "poles_sha256": profile.asset_sha256.poles_json,
+            })
+        else:
+            env.pop("SFM_FLIGHT_CONTRACT_JSON", None)
     return env
 
 
@@ -293,7 +493,7 @@ def main() -> None:
             flush=True,
         )
 
-    env = env_with_mission(args)
+    env = env_with_mission(args, site_profile)
 
     if args.mode == "launch-blender":
         run([args.python, str(AUTHOR / "blender_mcp_launch.py"), *passthrough], env)

@@ -20,12 +20,22 @@ import numpy as np
 
 os.environ.setdefault("PYOPENGL_PLATFORM", "glx")
 
-import olympe
-from olympe.messages.ardrone3.Piloting import Landing, PCMD, TakeOff
-from olympe.messages.ardrone3.PilotingState import FlyingStateChanged
 
-EXPERIMENT_DIR = Path(__file__).resolve().parents[2] / "experiments" / "sphinx_anafi_path_convergence"
+def _find_workspace_root() -> Path:
+    for parent in Path(__file__).resolve().parents:
+        if (
+            (parent / "定位演算法").is_dir()
+            and (parent / "模擬器" / "sphinx_anafi_path_convergence").is_dir()
+        ):
+            return parent
+    raise RuntimeError("could not locate localization workspace root")
+
+
+WORKSPACE_ROOT = _find_workspace_root()
+EXPERIMENT_DIR = WORKSPACE_ROOT / "模擬器" / "sphinx_anafi_path_convergence"
+FLIGHT_CONTROL_DIR = WORKSPACE_ROOT / "定位演算法" / "flight_control"
 sys.path.insert(0, str(EXPERIMENT_DIR))
+sys.path.insert(0, str(FLIGHT_CONTROL_DIR))
 from telemetry_sources import SphinxTelemetrySource  # noqa: E402
 
 import real_path_follow_controller as rpf
@@ -134,6 +144,10 @@ def main() -> int:
     # simulator smoke test only and has no real-aircraft escape hatch.
     args.ip = require_sphinx_ip(args.ip)
     print("[mode] SPHINX-SMOKE: simulator-only arming path (sim IP enforced)", flush=True)
+
+    import olympe
+    from olympe.messages.ardrone3.Piloting import Landing, PCMD, TakeOff
+    from olympe.messages.ardrone3.PilotingState import FlyingStateChanged
 
     drone = olympe.Drone(args.ip)
     if not drone.connect():

@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "site_id": "your_site_edm",
   "display_name": "Your site EDM profile",
   "localizer": "edm",
@@ -11,6 +11,21 @@
     "width": 1280,
     "height": 720,
     "params": [1000.0, 1000.0, 640.0, 360.0]
+  },
+  "asset_sha256": {
+    "map_ply": null,
+    "localization_bundle": null,
+    "route_json": null,
+    "map_reference_poses": null,
+    "localizer_profile": null,
+    "poles_json": null
+  },
+  "flight": {
+    "approved": false,
+    "coordinate_frame_id": null,
+    "route_clearance_approved": false,
+    "approval_note": "Template only. Fill and independently verify every scale-free flight field before approval.",
+    "controller": null
   },
   "assets": {
     "map_ply": "../../地圖檔/場域/your_site/maps/your_site.ply",

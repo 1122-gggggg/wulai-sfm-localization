@@ -11,9 +11,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
-import dataclasses
 import json
-import math
 from multiprocessing import resource_tracker, shared_memory
 import os
 import sys
@@ -36,6 +34,11 @@ _CTRL = Path(__file__).resolve().parents[1]
 if str(_CTRL) not in _sys.path:
     _sys.path.insert(0, str(_CTRL))
 from workspace_layout import workspace_from_file  # noqa: E402
+from backend_contract import InterfaceMode  # noqa: E402
+from runtime_safety import (  # noqa: E402
+    configure_offline_environment,
+    install_network_guard,
+)
 
 _WS = workspace_from_file(__file__)
 SYSTEM_ROOT = _WS.root  # workspace root (replaces old sfm_system parent layout)
@@ -43,6 +46,8 @@ LOC_ROOT = _WS.algorithms  # algorithmic root
 DEPLOY_DIR = _WS.deploy_code
 if not DEPLOY_DIR.exists():
     DEPLOY_DIR = _WS.algorithms / "source" / "sfm_glomap" / "deploy"
+if str(DEPLOY_DIR) not in sys.path:
+    sys.path.insert(0, str(DEPLOY_DIR))
 VALIDATION_DIR = _WS.validation
 PACKAGE_ROOT = _WS.runtime
 DEFAULT_BUNDLE = Path(os.environ.get(
@@ -62,72 +67,10 @@ DEFAULT_NEUFLOW_WEIGHTS = Path(os.environ.get(
     str(DEFAULT_NEUFLOW_REPO / "neuflow_mixed.pth"),
 ))
 
-EDM_PROFILE_SCHEMA = "edm-deployment-profile/v1"
-EDM_REQUIRED_MATCHER_KEYS = {
-    "coarse_topk", "mconf_thr", "fp16", "input_size", "reference_cache_size",
-}
-EDM_REQUIRED_TRACKER_KEYS = {
-    "global_retrieval_policy", "boot_global_topk", "match_batch_size",
-    "acquire_initial_topk",
-    "local_topk", "weak_local_topk", "lost_local_topk",
-    "lost_local_grace_frames", "recovery_bank_size", "recovery_scan_topk",
-    "use_temporal_reference", "max_corr_total", "acquire_min_inliers",
-    "track_min_inliers", "weak_min_inliers",
-    "max_reproj_error_acquire", "max_reproj_error_track", "prediction_max_dt",
-}
-
-
-def load_edm_production_profile(path: str | Path) -> dict:
-    """Load the validated EDM runtime contract before any model is allocated."""
-    source = Path(path).expanduser().resolve()
-    try:
-        raw = json.loads(source.read_text(encoding="utf-8"))
-    except OSError as exc:
-        raise ValueError(f"cannot read EDM production profile {source}: {exc}") from exc
-    except json.JSONDecodeError as exc:
-        raise ValueError(f"invalid EDM production profile JSON {source}: {exc}") from exc
-    if not isinstance(raw, dict) or raw.get("schema") != EDM_PROFILE_SCHEMA:
-        raise ValueError(
-            f"EDM production profile schema must be {EDM_PROFILE_SCHEMA}: {source}")
-    matcher = raw.get("matcher")
-    tracker = raw.get("tracker")
-    if not isinstance(matcher, dict) or not isinstance(tracker, dict):
-        raise ValueError(f"EDM production profile needs matcher and tracker objects: {source}")
-    missing_matcher = sorted(EDM_REQUIRED_MATCHER_KEYS - matcher.keys())
-    missing_tracker = sorted(EDM_REQUIRED_TRACKER_KEYS - tracker.keys())
-    if missing_matcher or missing_tracker:
-        raise ValueError(
-            f"incomplete EDM production profile {source}: "
-            f"matcher={missing_matcher}, tracker={missing_tracker}")
-    coarse_topk = matcher["coarse_topk"]
-    mconf_thr = matcher["mconf_thr"]
-    if isinstance(coarse_topk, bool) or not isinstance(coarse_topk, int) or coarse_topk <= 0:
-        raise ValueError(f"EDM matcher coarse_topk must be a positive integer: {source}")
-    if (isinstance(mconf_thr, bool) or not isinstance(mconf_thr, (int, float))
-            or not math.isfinite(float(mconf_thr)) or not 0.0 <= float(mconf_thr) <= 1.0):
-        raise ValueError(f"EDM matcher mconf_thr must be within [0,1]: {source}")
-    if not isinstance(matcher["fp16"], bool):
-        raise ValueError(f"EDM matcher fp16 must be boolean: {source}")
-    if matcher["input_size"] != [1024, 576]:
-        raise ValueError(
-            f"EDM matcher input_size must be [1024, 576] for this deployment: {source}")
-    cache_size = matcher["reference_cache_size"]
-    if isinstance(cache_size, bool) or not isinstance(cache_size, int) or cache_size < 0:
-        raise ValueError(f"EDM matcher reference_cache_size must be non-negative: {source}")
-    return raw
-
-
-def apply_edm_tracker_profile(cfg, profile: dict) -> None:
-    """Apply only fields declared by the selected package's EDMConfig."""
-    tracker = profile["tracker"]
-    allowed = {field.name for field in dataclasses.fields(cfg)}
-    unknown = sorted(set(tracker) - allowed)
-    if unknown:
-        raise ValueError(
-            "EDM production profile is incompatible with the selected deployment; "
-            f"unknown tracker fields: {unknown}")
-    for name, value in tracker.items():
-        setattr(cfg, name, value)
+from edm_profile import (  # noqa: E402
+    apply_edm_tracker_profile,
+    load_edm_production_profile,
+)
 
 
 def resolve_localizer_backend(requested: str, bundle: Path) -> str:
@@ -141,6 +84,15 @@ def resolve_localizer_backend(requested: str, bundle: Path) -> str:
     if "edm" in name:
         return "edm"
     return "xfeat"
+
+
+def require_edm_cuda(torch_module) -> None:
+    """Fail clearly instead of letting the production EDM matcher crash mid-load."""
+    if not torch_module.cuda.is_available():
+        raise RuntimeError(
+            "EDM production localization requires a working CUDA device; "
+            "check nvidia-smi and reboot after an NVIDIA driver update"
+        )
 
 
 def attach_frame_shm(name: str):
@@ -246,10 +198,9 @@ def resolve_query_camera_override(
             "query camera resolution must match the worker stream: "
             f"camera={width}x{height} stream={stream_width}x{stream_height}"
         )
-    parsed = [float(value) for value in params]
-    if not np.isfinite(parsed).all():
-        raise ValueError("query camera params must be finite")
-    return model.strip().upper(), int(width), int(height), parsed
+    from production_localizer_factory import validate_camera_tuple
+
+    return validate_camera_tuple((model, width, height, params))
 
 
 def apply_xfeat_runtime_overrides(cfg, *, matcher_mode: str, local_topk: int) -> None:
@@ -328,6 +279,8 @@ def redirect_native_stdout_to_stderr():
 
 
 def main() -> None:
+    configure_offline_environment()
+    install_network_guard(InterfaceMode.SIMULATED_STREAM)
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--width", type=int, default=1280)
     ap.add_argument("--height", type=int, default=720)
@@ -336,11 +289,21 @@ def main() -> None:
     ap.add_argument("--query-camera-height", type=int, default=0)
     ap.add_argument("--query-camera-params", type=float, nargs="+", default=None)
     ap.add_argument("--bundle", default=str(DEFAULT_BUNDLE))
+    ap.add_argument(
+        "--bundle-sha256",
+        default="",
+        help="trusted SHA-256 for the selected localization bundle",
+    )
     ap.add_argument("--megaloc-cache", default=DEFAULT_MEGALOC)
     ap.add_argument("--deploy-dir", default=str(DEPLOY_DIR))
     ap.add_argument("--max-frames", type=int, default=0)
     ap.add_argument("--frame-shm-name", default="")
     ap.add_argument("--frame-shm-slots", type=int, default=0)
+    ap.add_argument(
+        "--startup-handshake",
+        action="store_true",
+        help="Emit one JSON ready event after models are loaded, before reading frames.",
+    )
     ap.add_argument(
         "--localizer-backend",
         choices=("auto", "edm", "xfeat"),
@@ -414,6 +377,11 @@ def main() -> None:
         default="",
         help="Validated edm-deployment-profile/v1 JSON applied to matcher and tracker.",
     )
+    ap.add_argument(
+        "--production-profile-sha256",
+        default="",
+        help="trusted SHA-256 for --production-profile",
+    )
     args = ap.parse_args()
     if bool(args.frame_shm_name) != (args.frame_shm_slots > 0):
         ap.error("--frame-shm-name and positive --frame-shm-slots must be used together")
@@ -446,9 +414,14 @@ def main() -> None:
         ):
             if enabled:
                 ap.error(f"{flag} is XFeat-only; use --localizer-backend xfeat")
+        if args.production_profile_sha256 and not args.production_profile:
+            ap.error("--production-profile-sha256 requires --production-profile")
     elif args.production_profile:
         ap.error("--production-profile is EDM-only")
+    elif args.production_profile_sha256:
+        ap.error("--production-profile-sha256 is EDM-only")
 
+    startup_started = time.perf_counter()
     json_fd = os.dup(sys.stdout.fileno())
     json_out = os.fdopen(json_fd, "w", encoding="utf-8", buffering=1)
     sys.stdout = sys.stderr
@@ -467,10 +440,9 @@ def main() -> None:
         import torch
 
         if backend == "edm":
-            from edm_localizer_adapter import (
-                CAM_720_EDM, EDMTrackerAdapter, production_edm_config,
-            )
-            from reloc_localizer_edm import Camera, DEVICE, EDMRelocMap
+            require_edm_cuda(torch)
+            from edm_localizer_adapter import CAM_720_EDM
+            from production_localizer_factory import build_production_localizer
 
             if args.megaloc_cache:
                 print(
@@ -478,40 +450,27 @@ def main() -> None:
                     "EDM retrieval reads the bundle's own MegaLoc ref_global",
                     file=sys.stderr, flush=True,
                 )
-            xmap = EDMRelocMap.load(args.bundle)
-            cam = Camera(*(query_camera_override or CAM_720_EDM))
-            cfg = production_edm_config()
-            edm_profile = None
-            if args.production_profile:
-                edm_profile = load_edm_production_profile(args.production_profile)
-                apply_edm_tracker_profile(cfg, edm_profile)
-            if args.local_topk and args.local_topk > 0:
-                cfg.local_topk = int(args.local_topk)
-                cfg.weak_local_topk = max(int(args.local_topk), cfg.weak_local_topk)
-            if edm_profile is None:
-                edm_matcher = None
-                matcher_tag = "torch_fp16_defaults"
-                profile_name = "defaults"
-            else:
-                from edm_matcher import EDMMatcher
-
-                matcher_cfg = edm_profile["matcher"]
-                edm_matcher = EDMMatcher(
-                    mconf_thr=float(matcher_cfg["mconf_thr"]),
-                    topk=int(matcher_cfg["coarse_topk"]),
-                    fp16=bool(matcher_cfg["fp16"]),
-                    reference_cache_size=int(matcher_cfg["reference_cache_size"]),
-                )
-                matcher_tag = (
-                    f"torch_{'fp16' if matcher_cfg['fp16'] else 'fp32'}"
-                    f"_coarse{matcher_cfg['coarse_topk']}"
-                )
-                profile_name = str(edm_profile.get("name") or "unnamed")
-            tracker = EDMTrackerAdapter(xmap, cam, cfg=cfg, matcher=edm_matcher)
-            tracker_variant = (
-                f"production_edm_{profile_name}_topk{cfg.local_topk}_{matcher_tag}")
+            built = build_production_localizer(
+                backend="edm",
+                bundle=args.bundle,
+                bundle_sha256=args.bundle_sha256 or None,
+                frame_source=lambda: None,
+                camera_tuple=query_camera_override or CAM_720_EDM,
+                production_profile=args.production_profile or None,
+                production_profile_sha256=(
+                    args.production_profile_sha256 or None
+                ),
+                local_topk=int(args.local_topk),
+            )
+            tracker = built.tracker
+            xmap = built.reloc_map
+            cam = built.camera
+            cfg = built.config
+            tracker_variant = built.variant
+            DEVICE = built.device
+            edm_matcher = tracker.trk.loc.matcher
             print(
-                f"[live_worker] EDM profile={profile_name} matcher={matcher_tag} "
+                f"[live_worker] EDM tracker={tracker_variant} "
                 f"mconf={getattr(edm_matcher, 'mconf_thr', 0.2)} "
                 f"track/weak/lost={cfg.local_topk}/{cfg.weak_local_topk}/"
                 f"{getattr(cfg, 'lost_local_topk', 'n/a')} "
@@ -623,7 +582,7 @@ def main() -> None:
             )
 
         print(
-            f"[live_worker] ready backend={backend} device={DEVICE} "
+            f"[live_worker] initializing backend={backend} device={DEVICE} "
             f"cuda={torch.cuda.get_device_name(0) if torch.cuda.is_available() else None} "
             f"bundle={args.bundle} tracker={tracker_variant} refs={len(xmap.ref_names)} "
             f"query_camera={cam.model}:{cam.width}x{cam.height}",
@@ -700,6 +659,23 @@ def main() -> None:
                     file=sys.stderr,
                     flush=True,
                 )
+
+    startup_ms = (time.perf_counter() - startup_started) * 1000.0
+    print(
+        f"[live_worker] ready backend={backend} device={DEVICE} "
+        f"tracker={tracker_variant} startup_ms={startup_ms:.1f}",
+        file=sys.stderr,
+        flush=True,
+    )
+    if args.startup_handshake:
+        json_out.write(json.dumps({
+            "event": "ready",
+            "backend": backend,
+            "device": DEVICE,
+            "tracker_variant": tracker_variant,
+            "startup_ms": startup_ms,
+        }, ensure_ascii=False) + "\n")
+        json_out.flush()
 
     frame_size = int(args.width) * int(args.height) * 3
     frame_buffer = None if args.frame_shm_name else bytearray(frame_size)
@@ -884,6 +860,10 @@ def main() -> None:
                 "requested_reference_count": info.get("requested_reference_count"),
                 "staged_early_stop": info.get("staged_early_stop"),
                 "rejected": info.get("rejected"),
+                "limited_jump": info.get("limited_jump"),
+                "limited_jump_confirmed": info.get(
+                    "limited_jump_confirmed", False
+                ),
                 "composite_stage": info.get("composite_stage"),
                 "vpr_ms": info.get("vpr_ms"),
                 "feature_ms": info.get("feature_ms"),

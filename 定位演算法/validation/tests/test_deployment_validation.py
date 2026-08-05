@@ -205,6 +205,104 @@ def test_stream_audit_detects_early_decode_stop(monkeypatch):
     assert audit.decode_errors == 1
 
 
+def test_stream_audit_rejects_declared_and_decodable_count_disagreement():
+    audit_mod = load_module("stream_integrity_count_mismatch", VALIDATION / "stream_integrity.py")
+    audit = audit_mod.StreamAudit(
+        expected_raw_frames=1,
+        expected_source="ffprobe_nb_read_frames",
+        capture_opened=True,
+        reported_raw_frames=2,
+        decoded_raw_frames=1,
+        sampled_frames=1,
+    )
+
+    audit.finish()
+
+    assert audit.decode_complete is False
+    assert audit.decode_errors == 1
+
+
+def test_site_replay_full_run_fails_closed_on_incomplete_decode():
+    benchmark = load_module(
+        "benchmark_edm_site_replay_exit",
+        VALIDATION / "benchmark_edm_site_replay.py",
+    )
+    audit_mod = load_module("stream_integrity_benchmark_exit", VALIDATION / "stream_integrity.py")
+    audit = audit_mod.StreamAudit(decode_complete=False, decode_errors=1)
+
+    assert benchmark._result_exit_code(1, audit, all_frames_requested=True) == 3
+    assert benchmark._result_exit_code(
+        1,
+        audit,
+        all_frames_requested=True,
+        decode_accepted=True,
+    ) == 0
+    assert benchmark._result_exit_code(1, audit, all_frames_requested=False) == 0
+    assert benchmark._result_exit_code(0, audit, all_frames_requested=True) == 2
+
+
+def test_site_replay_quality_gate_rejects_baseline_regressions():
+    benchmark = load_module(
+        "benchmark_edm_site_replay_quality",
+        VALIDATION / "benchmark_edm_site_replay.py",
+    )
+    baseline = {
+        "thresholds": {
+            "frames": 100,
+            "min_successes": 80,
+            "min_track": 90,
+            "max_lost": 2,
+            "min_inliers_p50": 50.0,
+            "min_inliers_p95": 70.0,
+            "max_reproj_rms_p95": 3.0,
+            "max_limited_jump_unconfirmed": 10,
+        }
+    }
+    summary = {
+        "frames": 100,
+        "successes": 79,
+        "state_counts": {"TRACK": 89, "LOST": 3},
+        "rejection_counts": {"limited_jump_unconfirmed": 11},
+        "inliers": {"p50": 49.0, "p95": 69.0},
+        "reproj_rms": {"p95": 3.1},
+    }
+
+    failures = benchmark.evaluate_quality(summary, baseline)
+
+    assert len(failures) == 7
+    assert any("successes" in item for item in failures)
+    assert any("limited_jump_unconfirmed" in item for item in failures)
+
+
+def test_site_replay_quality_gate_accepts_equal_or_better_result():
+    benchmark = load_module(
+        "benchmark_edm_site_replay_quality_pass",
+        VALIDATION / "benchmark_edm_site_replay.py",
+    )
+    baseline = {
+        "thresholds": {
+            "frames": 100,
+            "min_successes": 80,
+            "min_track": 90,
+            "max_lost": 2,
+            "min_inliers_p50": 50.0,
+            "min_inliers_p95": 70.0,
+            "max_reproj_rms_p95": 3.0,
+            "max_limited_jump_unconfirmed": 10,
+        }
+    }
+    summary = {
+        "frames": 100,
+        "successes": 81,
+        "state_counts": {"TRACK": 91, "LOST": 1},
+        "rejection_counts": {"limited_jump_unconfirmed": 9},
+        "inliers": {"p50": 51.0, "p95": 71.0},
+        "reproj_rms": {"p95": 2.9},
+    }
+
+    assert benchmark.evaluate_quality(summary, baseline) == []
+
+
 def test_megaloc_cache_binds_descriptors_to_exact_names_and_hash(tmp_path, monkeypatch):
     deploy = VALIDATION.parent / "deploy_code" / "sfm_glomap_deploy"
     monkeypatch.syspath_prepend(str(deploy))
@@ -317,9 +415,7 @@ def test_mission_pipeline_defaults_to_current_validated_interpreter(monkeypatch)
 
 
 def test_manifest_detects_content_and_file_set_changes(tmp_path):
-    manifest_path = PACKAGE_ROOT / "tools" / "package_manifest.py"
-    if not manifest_path.is_file():
-        pytest.skip("package-manifest tooling is not shipped in the portable repository")
+    manifest_path = PACKAGE_ROOT / "執行環境" / "tools" / "package_manifest.py"
     manifest = load_module("package_manifest", manifest_path)
     (tmp_path / "nested").mkdir()
     (tmp_path / "a.txt").write_text("a", encoding="utf-8")
@@ -362,6 +458,9 @@ def test_football_field_bundle_hash_is_trusted():
 
     assert integrity.KNOWN_SHA256["football_field_reloc_map_xfeat_tri.pt"] == (
         "1c1774318a71ac29870f78ccb67001150edd934141e4aa288765e745e72db46f"
+    )
+    assert integrity.KNOWN_SHA256["edm_outdoor.ckpt"] == (
+        "f686bebdd9705bf6918621a1a83695f83d698cbd8c3eed932847fe3678d13a97"
     )
 
 

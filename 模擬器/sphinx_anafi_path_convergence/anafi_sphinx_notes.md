@@ -12,16 +12,17 @@ Launch (same script production uses):
 
 ```bash
 systemctl start firmwared          # once per boot; launcher also checks/starts it
-sfm_system/定位/mission/flight_control/launch_sphinx_anafi_empty.sh --check
-sfm_system/定位/mission/flight_control/launch_sphinx_anafi_empty.sh
+export FIRMWARE_URL='<reviewed explicit ANAFI PC firmware revision URL>'
+定位演算法/flight_control/launch_sphinx_anafi_empty.sh --check
+定位演算法/flight_control/launch_sphinx_anafi_empty.sh
 # = sphinx anafi.drone::firmware=<anafi-pc.ext2.zip>
 #   + exact UE4 binary with -RenderOffScreen on this machine
 ```
 
 Olympe connects to `10.202.0.1` (Sphinx virtual ANAFI).
-The default firmware selector contains `#latest`; it is not immutable. Live
-summaries record observed Sphinx, firmware and Olympe versions and explicitly
-set `fully_reproducible=false` until an image revision/hash is pinned.
+The launcher rejects missing selectors and `#latest`. Live summaries record the
+explicit selector when `FIRMWARE_URL` is also exported in the harness shell, plus
+the observed Sphinx, firmware and Olympe versions.
 
 ## White-paper profile
 

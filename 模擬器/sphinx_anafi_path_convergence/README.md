@@ -36,8 +36,7 @@ Pure-Python tests (no Sphinx needed):
 
 ```bash
 /home/allen/localization/.venv/bin/pytest -q \
-  sfm_system/定位/experiments/sphinx_anafi_path_convergence/tests
-# expected: 167 passed
+  模擬器/sphinx_anafi_path_convergence/tests
 ```
 
 The three runnable surfaces are deliberately different:
@@ -51,8 +50,9 @@ The three runnable surfaces are deliberately different:
 Start the real Sphinx ANAFI software-in-the-loop stack in a separate terminal:
 
 ```bash
-sfm_system/定位/mission/flight_control/launch_sphinx_anafi_empty.sh --check
-sfm_system/定位/mission/flight_control/launch_sphinx_anafi_empty.sh
+export FIRMWARE_URL='<reviewed explicit ANAFI PC firmware revision URL>'
+定位演算法/flight_control/launch_sphinx_anafi_empty.sh --check
+定位演算法/flight_control/launch_sphinx_anafi_empty.sh
 # wait for [ready] and "All drones instantiated"; retry the full stack if
 # Sphinx reports "All drones dropped"
 ```
@@ -61,21 +61,21 @@ On this machine the launcher intentionally uses the exact offscreen UE4 binary
 with `-RenderOffScreen`; the plain `parrot-ue4-empty` launcher is unstable on
 the installed RTX 5060/driver. It starts/checks `firmwared`, waits up to 45 s
 for both `All drones instantiated` and `10.202.0.1`, and cleans up both child
-process groups with bounded TERM then KILL fallback. The default firmware URL
-contains `#latest` and is not pinned. Launcher logs and Sphinx summaries record
-the observed Sphinx, firmware and Olympe versions; exact reproduction must not
-be claimed until the firmware image is pinned by content hash/revision.
+process groups with bounded TERM then KILL fallback. The launcher has no default
+firmware selector and rejects `#latest`; `FIRMWARE_URL` must name a reviewed
+explicit revision. Export the same value in the harness shell so summaries record
+it with the observed Sphinx, firmware and Olympe versions.
 
 Compare algorithms in Sphinx ANAFI simulation:
 
 ```bash
-python3 sfm_system/定位/experiments/sphinx_anafi_path_convergence/run_sphinx_anafi_convergence.py \
+python3 模擬器/sphinx_anafi_path_convergence/run_sphinx_anafi_convergence.py \
   --backend sphinx \
   --pattern s_curve --start-radius-m 5.0 --num-trials 20 \
   --initial-yaw-mode route --random-yaw-error-deg 15 \
   --rejoin-algorithm compare \
   --duration 60 --random-seed 42 \
-  --out sfm_system/定位/experiments/sphinx_anafi_path_convergence/outputs/algorithm_compare_scurve
+  --out 模擬器/sphinx_anafi_path_convergence/outputs/algorithm_compare_scurve
 ```
 
 Height-changing route:
@@ -108,6 +108,12 @@ No Sphinx available? Wide sweeps use the clearly labeled kinematic
 approximation (`--backend kinematic`); Sphinx remains the ANAFI-dynamics
 validation step. If Sphinx is not running, `--backend sphinx` fails with a
 clear message; the tests above still run.
+
+Every `summary.json` contains `validation_scope`. It always marks these trials
+as control-only and ineligible as end-to-end system evidence: the current empty
+scene does not reproduce a mapped environment, simulator camera frames do not
+drive the production EDM localizer, and the Sphinx path uses firmware-fused
+telemetry rather than independent simulator truth.
 
 Kinematic compare mode is paired: each algorithm receives the same scenario
 ID, random seed, start quadrant/offset, yaw error and perturbation. Sphinx uses
@@ -150,7 +156,7 @@ For fast visual iteration on the waypoint algorithm, generate a self-contained
 browser replay from the same Python controller code and the kinematic plant:
 
 ```bash
-cd sfm_system/定位/experiments/sphinx_anafi_path_convergence
+cd 模擬器/sphinx_anafi_path_convergence
 /home/allen/localization/.venv/bin/python make_browser_sandbox.py \
   --algorithm translational_waypoint --route-style complex \
   --num-waypoints 10 --return-to-start --map-size-m 20 --duration 220 --seed 7 \

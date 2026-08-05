@@ -25,8 +25,15 @@ class StreamAudit:
     decode_errors: int = 0
 
     def finish(self) -> None:
-        if self.expected_raw_frames is not None:
-            self.decode_complete = self.decoded_raw_frames == self.expected_raw_frames
+        bounds = {
+            count
+            for count in (self.expected_raw_frames, self.reported_raw_frames)
+            if count is not None
+        }
+        if bounds:
+            self.decode_complete = all(
+                self.decoded_raw_frames == count for count in bounds
+            )
             if not self.decode_complete:
                 self.decode_errors += 1
 

@@ -1,4 +1,5 @@
 # Requires CPython 3.10.x (validated with Python 3.10.12).
+# Production GPU contract: NVIDIA RTX 5060 with a CUDA 12.8-capable driver.
 # CUDA 12.8 PyTorch wheels are hosted on the official PyTorch index, not PyPI.
 --extra-index-url https://download.pytorch.org/whl/cu128
 
@@ -8,9 +9,17 @@ numpy==2.2.6
 opencv-python==4.13.0.92
 pillow==12.3.0
 pycolmap==4.0.4
+# Olympe's wire schema is bound to this protobuf release.
+protobuf==3.19.4
+parrot-olympe==8.4.0
 # Load-bearing for the package-local XFeat / LighterGlue / MegaLoc stack:
 safetensors==0.8.0
 kornia==0.8.2
+# Direct imports of the bundled EDM production matcher.
+einops==0.8.2
+joblib==1.5.3
+loguru==0.7.3
+yacs==0.1.8
 # System-level (not pip): ffmpeg, tkinter (python3-tk)
 # XFeat / LighterGlue / MegaLoc: package-local torch.hub repos in torch_hub_cache/
 # Optional: scipy enables the sparse-cloud collision monitor in

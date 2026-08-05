@@ -1,0 +1,20 @@
+[Unit]
+Description=Run one armed ANAFI Sphinx PCMD diagonal-flight probe at boot
+ConditionPathExists=@PROJECT_DIR@/.boot-probe.armed
+
+[Service]
+Type=oneshot
+WorkingDirectory=@PROJECT_DIR@
+Environment=HOME=%h
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=ANAFI_PCMD_SIM_PROJECT_DIR=@PROJECT_DIR@
+Environment=PYTHONUNBUFFERED=1
+UMask=0077
+Nice=10
+TimeoutStartSec=5min
+ExecStart=@PROJECT_DIR@/scripts/boot_probe_once.sh
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

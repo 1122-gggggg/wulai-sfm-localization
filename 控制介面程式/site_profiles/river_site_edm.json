@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "site_id": "river_site_edm",
   "display_name": "河濱場域 EDM",
   "localizer": "edm",
@@ -16,6 +16,21 @@
       670.8167724609375,
       358.71917724609375
     ]
+  },
+  "asset_sha256": {
+    "map_ply": "6c587e38542a824fe0757c9ee720d07a9ba4d8c1040e77e828c592f8de755b51",
+    "localization_bundle": "39a817936c0ba314a739701411f974672a94f126830f9f5b9a7a4efdfee08117",
+    "route_json": "ded9da402222e12025a0bdfedbbc0f2e5305ac1ba9363f7d5a8f7bbb673c9014",
+    "map_reference_poses": "7cdef7e233453bb6addaf7ba4a724fffc3d4dea2b2610e2d9c6429c2b65537ea",
+    "localizer_profile": "724e35e0340ad1d694ad785d24617bddf17d5ea820796fba9e537790234e730d",
+    "poles_json": null
+  },
+  "flight": {
+    "approved": false,
+    "coordinate_frame_id": null,
+    "route_clearance_approved": false,
+    "approval_note": "The current route is a display overlay, not an approved flown mission path.",
+    "controller": null
   },
   "assets": {
     "map_ply": "../../地圖檔/場域/river_site/maps/river_site_realrgb_dense_trimmed.ply",

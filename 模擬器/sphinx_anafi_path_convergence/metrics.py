@@ -141,6 +141,7 @@ def compute_trial_metrics(ticks: list[dict], *, ideal_success_error_m: float = 0
     labels, reasons = [], []
     if trivial:
         labels.append("trivial_start_on_path")
+        reasons.append("trivial_start_on_path")
     if completed:
         labels.append("completed_route")
     if aborted and abort_reason == "horizontal_hard_abort":
@@ -175,7 +176,8 @@ def compute_trial_metrics(ticks: list[dict], *, ideal_success_error_m: float = 0
     if pcmd_max > 100:
         reasons.append("pcmd_out_of_range")
 
-    passed = (converged and follow_reached and corridor_ratio >= min_corridor_time_ratio
+    passed = (not trivial and converged and follow_reached
+              and corridor_ratio >= min_corridor_time_ratio
               and not aborted and osc_per_min <= osc_flips_per_min_limit
               and pitch_zero_ratio <= pitch_zero_ratio_limit
               and (progress_after_conv is None or progress_after_conv > 0.02

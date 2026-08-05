@@ -1,0 +1,490 @@
+"""Typed in-process contract shared by simulated and real operator backends.
+
+The existing string command API remains as a compatibility shim for older tests and
+tools. New operator code must construct :class:`ControlRequest` so unknown actions,
+missing payloads, and non-human takeoff requests are rejected before dispatch.
+"""
+from __future__ import annotations
+
+import math
+import time
+import uuid
+from dataclasses import dataclass, field
+from enum import Enum
+from types import MappingProxyType
+from typing import Any, Mapping, Protocol, runtime_checkable
+
+
+class InterfaceMode(str, Enum):
+    SIMULATED_STREAM = "simulated-stream"
+    REAL_FLIGHT = "real-flight"
+
+
+class ControlAction(str, Enum):
+    TAKEOFF = "takeoff"
+    LAND = "land"
+    HOVER = "hover"
+    MANUAL = "manual"
+    PC_CONTROL = "pc_control"
+    NUDGE_BEGIN = "nudge_begin"
+    NUDGE_HEARTBEAT = "nudge_heartbeat"
+    NUDGE_END = "nudge_end"
+    NUDGE_CLEAR = "nudge_clear"
+    EMERGENCY_STOP = "emergency_stop"
+    LAND_NOW = "land_now"
+    APPLY_LIMITS = "apply_limits"
+    SET_AUTO_SPEED_LIMIT = "set_auto_speed_limit"
+    START_LOCALIZATION = "start_localization"
+    START_AUTO = "start_auto"
+    BOOT_LOCK = "boot_lock"
+    GIMBAL_PITCH = "gimbal_pitch"
+    ZOOM = "zoom"
+    CAMERA_RESET = "camera_reset"
+    RECORD_ARM = "record_arm"
+    RECORD_DISARM = "record_disarm"
+    RECORD_START = "record_start"
+    RECORD_STOP = "record_stop"
+    DRONE_MAGNETOMETER_START = "drone_magnetometer_start"
+    DRONE_MAGNETOMETER_CANCEL = "drone_magnetometer_cancel"
+    SKYCONTROLLER_MAGNETOMETER_START = "skycontroller_magnetometer_start"
+    SKYCONTROLLER_MAGNETOMETER_CANCEL = "skycontroller_magnetometer_cancel"
+
+
+class FailureReason(str, Enum):
+    STREAM_STALE = "stream_stale"
+    LOCALIZATION_WEAK = "localization_weak"
+    LOCALIZATION_LOST = "localization_lost"
+    POSE_STALE = "pose_stale"
+    WORKER_EXIT = "worker_exit"
+    WORKER_STALL = "worker_stall"
+    UI_HEARTBEAT_LOST = "ui_heartbeat_lost"
+    CONTROL_LINK_LOST = "control_link_lost"
+    CONTROLLER_DISCONNECTED = "controller_disconnected"
+    BATTERY_CRITICAL = "battery_critical"
+    ALTITUDE_LIMIT = "altitude_limit"
+    DISTANCE_LIMIT = "distance_limit"
+    INVALID_TELEMETRY = "invalid_telemetry"
+    DISK_OR_LOG_FAILURE = "disk_or_log_failure"
+    EMERGENCY_STOP = "emergency_stop"
+    SHUTDOWN = "shutdown"
+
+
+class InvalidControlRequest(ValueError):
+    pass
+
+
+@dataclass(frozen=True)
+class EmptyPayload:
+    pass
+
+
+@dataclass(frozen=True)
+class NudgePayload:
+    direction: str
+
+    def __post_init__(self) -> None:
+        if not self.direction.strip():
+            raise InvalidControlRequest("nudge direction is required")
+
+
+@dataclass(frozen=True)
+class NudgeHeartbeatPayload:
+    directions: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if not self.directions or any(not value.strip() for value in self.directions):
+            raise InvalidControlRequest("active nudge directions are required")
+
+
+@dataclass(frozen=True)
+class LimitsPayload:
+    max_altitude_m: float
+    max_distance_m: float
+    distance_geofence: bool = True
+
+    def __post_init__(self) -> None:
+        if self.max_altitude_m <= 0.0 or self.max_distance_m <= 0.0:
+            raise InvalidControlRequest("firmware limits must be positive")
+
+
+@dataclass(frozen=True)
+class ScalarPayload:
+    value: float
+
+
+@dataclass(frozen=True)
+class TogglePayload:
+    enabled: bool
+
+
+ControlPayload = (
+    EmptyPayload
+    | NudgePayload
+    | NudgeHeartbeatPayload
+    | LimitsPayload
+    | ScalarPayload
+    | TogglePayload
+)
+
+
+_NO_PAYLOAD_ACTIONS = {
+    ControlAction.TAKEOFF,
+    ControlAction.LAND,
+    ControlAction.HOVER,
+    ControlAction.MANUAL,
+    ControlAction.PC_CONTROL,
+    ControlAction.EMERGENCY_STOP,
+    ControlAction.LAND_NOW,
+    ControlAction.START_LOCALIZATION,
+    ControlAction.START_AUTO,
+    ControlAction.BOOT_LOCK,
+    ControlAction.CAMERA_RESET,
+    ControlAction.RECORD_DISARM,
+    ControlAction.RECORD_START,
+    ControlAction.RECORD_STOP,
+    ControlAction.NUDGE_CLEAR,
+    ControlAction.DRONE_MAGNETOMETER_START,
+    ControlAction.DRONE_MAGNETOMETER_CANCEL,
+    ControlAction.SKYCONTROLLER_MAGNETOMETER_START,
+    ControlAction.SKYCONTROLLER_MAGNETOMETER_CANCEL,
+}
+
+
+_LEGACY_ACTIONS = {
+    "takeoff": ControlAction.TAKEOFF,
+    "land": ControlAction.LAND,
+    "hover": ControlAction.HOVER,
+    "manual": ControlAction.MANUAL,
+    "pc_control": ControlAction.PC_CONTROL,
+    "resume_pc": ControlAction.PC_CONTROL,
+    "nudge_begin": ControlAction.NUDGE_BEGIN,
+    "nudge_press": ControlAction.NUDGE_BEGIN,
+    "nudge_heartbeat": ControlAction.NUDGE_HEARTBEAT,
+    "nudge_end": ControlAction.NUDGE_END,
+    "nudge_release": ControlAction.NUDGE_END,
+    "nudge_clear": ControlAction.NUDGE_CLEAR,
+    "emergency_stop": ControlAction.EMERGENCY_STOP,
+    "land_now": ControlAction.LAND_NOW,
+    "firmware_limits_apply": ControlAction.APPLY_LIMITS,
+    "auto_speed_limit_apply": ControlAction.SET_AUTO_SPEED_LIMIT,
+    "start_localization": ControlAction.START_LOCALIZATION,
+    "auto": ControlAction.START_AUTO,
+    "start_auto": ControlAction.START_AUTO,
+    "boot_lock": ControlAction.BOOT_LOCK,
+    "gimbal_pitch": ControlAction.GIMBAL_PITCH,
+    "zoom": ControlAction.ZOOM,
+    "camera_reset": ControlAction.CAMERA_RESET,
+    "reset_camera": ControlAction.CAMERA_RESET,
+    "鏡頭預設": ControlAction.CAMERA_RESET,
+    "回復預設": ControlAction.CAMERA_RESET,
+    "record_arm": ControlAction.RECORD_ARM,
+    "record_on_takeoff": ControlAction.RECORD_ARM,
+    "record_disarm": ControlAction.RECORD_DISARM,
+    "record_start": ControlAction.RECORD_START,
+    "record_stop": ControlAction.RECORD_STOP,
+    "drone_magnetometer_start": ControlAction.DRONE_MAGNETOMETER_START,
+    "drone_magnetometer_cancel": ControlAction.DRONE_MAGNETOMETER_CANCEL,
+    "skycontroller_magnetometer_start": ControlAction.SKYCONTROLLER_MAGNETOMETER_START,
+    "skycontroller_magnetometer_cancel": ControlAction.SKYCONTROLLER_MAGNETOMETER_CANCEL,
+}
+
+
+@dataclass(frozen=True)
+class ControlRequest:
+    action: ControlAction
+    payload: ControlPayload = field(default_factory=EmptyPayload)
+    request_id: str = field(default_factory=lambda: uuid.uuid4().hex)
+    submitted_mono_ns: int = field(default_factory=time.monotonic_ns)
+    human_origin: bool = False
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.action, ControlAction):
+            raise InvalidControlRequest("action must be a ControlAction")
+        if not self.request_id.strip():
+            raise InvalidControlRequest("request_id is required")
+        if self.submitted_mono_ns <= 0:
+            raise InvalidControlRequest("submitted_mono_ns must be positive")
+        if self.action in _NO_PAYLOAD_ACTIONS and not isinstance(
+            self.payload, EmptyPayload
+        ):
+            raise InvalidControlRequest(f"{self.action.value} does not accept a payload")
+        expected = {
+            ControlAction.NUDGE_BEGIN: NudgePayload,
+            ControlAction.NUDGE_END: NudgePayload,
+            ControlAction.NUDGE_HEARTBEAT: NudgeHeartbeatPayload,
+            ControlAction.APPLY_LIMITS: LimitsPayload,
+            ControlAction.GIMBAL_PITCH: ScalarPayload,
+            ControlAction.ZOOM: ScalarPayload,
+            ControlAction.SET_AUTO_SPEED_LIMIT: ScalarPayload,
+            ControlAction.RECORD_ARM: TogglePayload,
+        }.get(self.action)
+        if expected is not None and not isinstance(self.payload, expected):
+            raise InvalidControlRequest(
+                f"{self.action.value} requires {expected.__name__}"
+            )
+
+    @classmethod
+    def create(
+        cls,
+        action: ControlAction,
+        *,
+        payload: ControlPayload | None = None,
+        human_origin: bool,
+    ) -> "ControlRequest":
+        return cls(
+            action=action,
+            payload=payload if payload is not None else EmptyPayload(),
+            human_origin=bool(human_origin),
+        )
+
+    @classmethod
+    def from_legacy(
+        cls, name: str, *, human_origin: bool, **payload: Any
+    ) -> "ControlRequest":
+        normalized = str(name or "").strip()
+        action = _LEGACY_ACTIONS.get(normalized)
+        if action is None and normalized.startswith("nudge_"):
+            suffix = normalized[6:]
+            if suffix:
+                action = ControlAction.NUDGE_BEGIN
+                payload = {"dir": suffix, **payload}
+        if action is None:
+            raise InvalidControlRequest(f"unknown control action: {name!r}")
+
+        parsed: ControlPayload
+        if action in {ControlAction.NUDGE_BEGIN, ControlAction.NUDGE_END}:
+            parsed = NudgePayload(str(payload.get("dir") or payload.get("name") or ""))
+        elif action is ControlAction.NUDGE_HEARTBEAT:
+            raw = payload.get("dirs", payload.get("directions", ()))
+            if isinstance(raw, str):
+                values = (raw,)
+            else:
+                try:
+                    values = tuple(str(item) for item in raw)
+                except TypeError as exc:
+                    raise InvalidControlRequest(
+                        "nudge heartbeat directions must be iterable"
+                    ) from exc
+            parsed = NudgeHeartbeatPayload(values)
+        elif action is ControlAction.APPLY_LIMITS:
+            try:
+                parsed = LimitsPayload(
+                    float(payload["max_altitude_m"]),
+                    float(payload["max_distance_m"]),
+                    bool(payload.get("distance_geofence", True)),
+                )
+            except (KeyError, TypeError, ValueError) as exc:
+                raise InvalidControlRequest(
+                    "apply_limits requires numeric max_altitude_m and max_distance_m"
+                ) from exc
+        elif action in {
+            ControlAction.GIMBAL_PITCH,
+            ControlAction.ZOOM,
+            ControlAction.SET_AUTO_SPEED_LIMIT,
+        }:
+            key = {
+                ControlAction.GIMBAL_PITCH: "pitch",
+                ControlAction.ZOOM: "zoom",
+                ControlAction.SET_AUTO_SPEED_LIMIT: "speed_limit_mps",
+            }[action]
+            try:
+                parsed = ScalarPayload(float(payload[key]))
+            except (KeyError, TypeError, ValueError) as exc:
+                raise InvalidControlRequest(f"{action.value} requires {key}") from exc
+        elif action is ControlAction.RECORD_ARM:
+            parsed = TogglePayload(bool(payload.get("enabled", payload.get("value", True))))
+        else:
+            parsed = EmptyPayload()
+        return cls.create(action, payload=parsed, human_origin=human_origin)
+
+    def legacy_call(self) -> tuple[str, dict[str, Any]]:
+        name = self.action.value
+        payload: dict[str, Any] = {}
+        if self.action is ControlAction.APPLY_LIMITS:
+            assert isinstance(self.payload, LimitsPayload)
+            name = "firmware_limits_apply"
+            payload = {
+                "max_altitude_m": self.payload.max_altitude_m,
+                "max_distance_m": self.payload.max_distance_m,
+                "distance_geofence": self.payload.distance_geofence,
+            }
+        elif self.action in {ControlAction.NUDGE_BEGIN, ControlAction.NUDGE_END}:
+            assert isinstance(self.payload, NudgePayload)
+            payload = {"dir": self.payload.direction}
+        elif self.action is ControlAction.NUDGE_HEARTBEAT:
+            assert isinstance(self.payload, NudgeHeartbeatPayload)
+            payload = {"dirs": self.payload.directions}
+        elif self.action is ControlAction.GIMBAL_PITCH:
+            assert isinstance(self.payload, ScalarPayload)
+            payload = {"pitch": self.payload.value}
+        elif self.action is ControlAction.ZOOM:
+            assert isinstance(self.payload, ScalarPayload)
+            payload = {"zoom": self.payload.value}
+        elif self.action is ControlAction.SET_AUTO_SPEED_LIMIT:
+            assert isinstance(self.payload, ScalarPayload)
+            name = "auto_speed_limit_apply"
+            payload = {"speed_limit_mps": self.payload.value}
+        elif self.action is ControlAction.RECORD_ARM:
+            assert isinstance(self.payload, TogglePayload)
+            payload = {"enabled": self.payload.enabled}
+        return name, payload
+
+
+@dataclass(frozen=True)
+class ControlResult:
+    accepted: bool
+    executed: bool
+    reason_code: str
+    ack: Mapping[str, Any]
+    readback: Mapping[str, Any]
+    resulting_state: Any
+    completed_mono_ns: int = field(default_factory=time.monotonic_ns)
+    raw_result: Any = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "ack", MappingProxyType(dict(self.ack)))
+        object.__setattr__(self, "readback", MappingProxyType(dict(self.readback)))
+
+    @classmethod
+    def rejected(cls, reason_code: str, state: Any) -> "ControlResult":
+        return cls(False, False, reason_code, {}, {}, state)
+
+    @classmethod
+    def completed(
+        cls, state: Any, *, raw_result: Any = None, reason_code: str = "OK"
+    ) -> "ControlResult":
+        accepted = raw_result is not False
+        return cls(
+            accepted,
+            accepted,
+            reason_code if accepted else "BACKEND_REJECTED",
+            {"accepted": accepted},
+            {},
+            state,
+            raw_result=raw_result,
+        )
+
+
+@dataclass(frozen=True)
+class SessionConfig:
+    session_id: str
+    interface_mode: InterfaceMode
+    site_profile: str
+    site_profile_sha256: str
+    asset_sha256: Mapping[str, str]
+    runtime_profile_sha256: str
+    source: str
+    offline: bool
+    site_profile_schema_version: int = 0
+    autonomous_speed_limit_mps: float = 0.30
+    autonomous_locked: bool = True
+    firmware_limits: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not self.session_id.strip():
+            raise ValueError("session_id is required")
+        if not isinstance(self.interface_mode, InterfaceMode):
+            raise ValueError("interface_mode must be fixed to one known interface")
+        if self.site_profile_schema_version < 0:
+            raise ValueError("site_profile_schema_version cannot be negative")
+        if not math.isfinite(self.autonomous_speed_limit_mps) or (
+            self.autonomous_speed_limit_mps <= 0.0
+        ):
+            raise ValueError("autonomous_speed_limit_mps must be finite and positive")
+        object.__setattr__(self, "asset_sha256", MappingProxyType(dict(self.asset_sha256)))
+        object.__setattr__(
+            self, "firmware_limits", MappingProxyType(dict(self.firmware_limits))
+        )
+
+
+@dataclass(frozen=True)
+class FramePacket:
+    rgb: Any
+    sequence: int
+    source_timestamp_ns: int | None
+    host_receipt_mono_ns: int
+    source_identity: str
+    eof: bool = False
+    timing: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "timing", MappingProxyType(dict(self.timing)))
+
+
+class LegacyFrameSourceAdapter:
+    """Expose existing PIL/numpy frame sources through the typed packet contract."""
+
+    def __init__(self, source: Any, source_identity: str):
+        self.source = source
+        self.source_identity = str(source_identity)
+        self._last_rgb: Any = None
+        self._eof_emitted = False
+
+    def next_frame(self, *, only_new: bool = True) -> FramePacket | None:
+        try:
+            frame = self.source.next_frame(only_new=only_new)
+        except TypeError:
+            frame = self.source.next_frame()
+        eof = bool(getattr(self.source, "eof", False))
+        if frame is None:
+            if not eof or self._last_rgb is None or self._eof_emitted:
+                return None
+            frame = self._last_rgb
+            self._eof_emitted = True
+        else:
+            self._last_rgb = frame
+
+        stamp = getattr(self.source, "last_stamp", None)
+        try:
+            source_ns = int(round(float(stamp) * 1_000_000_000))
+        except (TypeError, ValueError, OverflowError):
+            source_ns = None
+        return FramePacket(
+            rgb=frame,
+            sequence=int(getattr(self.source, "output_index", 0) or 0),
+            source_timestamp_ns=source_ns,
+            host_receipt_mono_ns=time.monotonic_ns(),
+            source_identity=self.source_identity,
+            eof=eof,
+            timing=dict(getattr(self.source, "last_timing", {}) or {}),
+        )
+
+    def close(self) -> None:
+        self.source.close()
+
+
+@dataclass(frozen=True)
+class StartResult:
+    started: bool
+    reason_code: str
+
+
+@dataclass(frozen=True)
+class CloseResult:
+    closed: bool
+    reason_code: str
+
+
+@runtime_checkable
+class FrameSource(Protocol):
+    def next_frame(self, *, only_new: bool = True) -> FramePacket | None: ...
+
+    def close(self) -> None: ...
+
+
+@runtime_checkable
+class OperatorBackend(Protocol):
+    mode: InterfaceMode
+    is_live: bool
+    state: Any
+    video: FrameSource | None
+
+    def start(self, config: SessionConfig) -> StartResult: ...
+
+    def poll(self, now_mono_ns: int | None = None) -> Any: ...
+
+    def command(self, request: ControlRequest) -> ControlResult: ...
+
+    def fail_safe(self, reason: FailureReason) -> ControlResult: ...
+
+    def close(self, reason: str) -> CloseResult: ...

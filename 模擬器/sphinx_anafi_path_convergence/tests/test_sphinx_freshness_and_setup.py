@@ -7,11 +7,14 @@ from controllers import ALGORITHM_ORDER
 from route_geometry import RouteModel
 from run_sphinx_anafi_convergence import (
     TrialSetupError,
+    _firmware_selector_is_explicit,
+    _require_explicit_sphinx_firmware_selector,
     _goto,
     _product_version_message,
     apply_backend_interpretation,
     build_trial_plan,
     parse_args,
+    system_validation_scope,
 )
 from telemetry_sources import OlympeStateTracker, SphinxTelemetrySource
 
@@ -87,6 +90,54 @@ def test_fused_position_reference_keeps_event_stamp_and_is_not_called_truth():
     assert ref is not None and ref.stamp == 20.0
     assert src.get_fused_reference(20.4).stamp == 20.0
     assert not hasattr(src, "get_truth")
+
+
+def test_controller_trials_cannot_claim_end_to_end_system_validation():
+    sphinx = system_validation_scope("sphinx")
+    kinematic = system_validation_scope("kinematic")
+
+    assert not sphinx["visual_localization_closed_loop"]
+    assert not sphinx["independent_pose_reference"]
+    assert not sphinx["eligible_as_end_to_end_system_evidence"]
+    assert kinematic["independent_pose_reference"]
+    assert not kinematic["eligible_as_end_to_end_system_evidence"]
+
+
+def test_only_explicit_official_firmware_selector_counts_as_pinned():
+    explicit = (
+        "https://firmware.parrot.com/Versions/anafi/pc/1.2.3/"
+        "images/anafi-pc.ext2.zip"
+    )
+    assert _firmware_selector_is_explicit(explicit)
+    assert not _firmware_selector_is_explicit("")
+    assert not _firmware_selector_is_explicit(
+        "https://firmware.parrot.com/Versions/anafi/pc/%23latest/"
+        "images/anafi-pc.ext2.zip"
+    )
+    assert not _firmware_selector_is_explicit(
+        "https://firmware.parrot.com/Versions/anafi/pc/latest/"
+        "images/anafi-pc.ext2.zip"
+    )
+    assert not _firmware_selector_is_explicit(
+        "https://firmware.parrot.com/Versions/anafi/pc/"
+    )
+    assert not _firmware_selector_is_explicit(
+        "https://firmware.parrot.com/Versions/anafi/pc/1.2.3/"
+    )
+    assert not _firmware_selector_is_explicit("https://example.invalid/anafi.ext2.zip")
+
+
+def test_sphinx_run_refuses_unpinned_firmware_before_connect(monkeypatch):
+    monkeypatch.delenv("FIRMWARE_URL", raising=False)
+    with pytest.raises(SystemExit, match="explicit reviewed"):
+        _require_explicit_sphinx_firmware_selector()
+
+    explicit = (
+        "https://firmware.parrot.com/Versions/anafi/pc/1.2.3/"
+        "images/anafi-pc.ext2.zip"
+    )
+    monkeypatch.setenv("FIRMWARE_URL", explicit)
+    assert _require_explicit_sphinx_firmware_selector() == explicit
 
 
 def test_state_only_fallback_refreshes_only_when_payload_changes():

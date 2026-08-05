@@ -17,6 +17,12 @@ not be used as the current recommendation. Individual Sphinx connectivity,
 takeoff, telemetry and landing evidence remains valid, but the fused telemetry
 channel used there was not independent simulator ground truth.
 
+**Metric correction, 2026-07-29.** A trial whose initial cross-track error is
+already inside the success corridor is now labeled `trivial_start_on_path`,
+fails the convergence criterion, and is excluded from comparison aggregates.
+All retained aggregates below predate this correction and are historical only;
+rerun the raw scenarios before quoting pass rates or rankings.
+
 ```text
 Sphinx validation scale: meters
 Real monocular SfM map scale: arbitrary units
@@ -25,12 +31,12 @@ Real altitude scale: arbitrary map units, not meters
 
 ---
 
-## 0. Current paired clean baseline (2026-07-10)
+## 0. Historical paired clean baseline (2026-07-10; rerun required)
 
 Command: `configs/algorithm_compare.json` with explicit
 `--backend=kinematic`. This ran 20 shared scenarios per algorithm, 200 trials
 total, using the white-paper profile and conservative controller PCMD caps.
-All 200 trials passed and completed the route. The retained generated summary
+The old metric reported all 200 trials as passed and route-complete. The retained summary
 and trial aggregates are under `outputs/paired_profile_baseline_20260710/`;
 the 203 MB per-tick log was intentionally pruned.
 
@@ -56,7 +62,7 @@ independent pose reference are still required for a flight-controller choice.
 ## 1. Files changed / added
 
 All new code is isolated under
-`sfm_system/定位/experiments/sphinx_anafi_path_convergence/`:
+`模擬器/sphinx_anafi_path_convergence/`:
 
 ```
 README.md  RESULTS.md  anafi_sphinx_notes.md  .gitignore
@@ -109,9 +115,9 @@ validate scene rendering, hloc, camera images, or real visual localization.
 
 ## 4. Companion simulator files changed
 
-`mission/flight_control/launch_sphinx_anafi_empty.sh` now uses the verified
+`定位演算法/flight_control/launch_sphinx_anafi_empty.sh` now uses the verified
 offscreen UE4 path with readiness checks and process-group cleanup.
-`mission/flight_control/sphinx_path_follow_smoke.py` now enforces the simulator
+`定位演算法/flight_control/sphinx_path_follow_smoke.py` now enforces the simulator
 network with `ipaddress`. No real-flight arming entrypoint was added or used.
 
 ## 5. Candidate algorithms implemented (ten)

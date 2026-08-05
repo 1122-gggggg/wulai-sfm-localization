@@ -53,3 +53,44 @@ def test_live_stream_uses_atomic_no_copy_sample_with_timing():
     stream = LiveAnafiVideoStream(Grabber())
     assert stream.next_frame() is frame
     assert stream.last_timing == {"frame_callback_enter_mono_ns": 123}
+
+
+def test_live_stream_reports_observed_frame_and_pdraw_metadata():
+    frame = np.zeros((720, 1280, 3), dtype=np.uint8)
+
+    class Grabber:
+        fps = 29.5
+        stream_metadata = {
+            "codec": "H.264",
+            "codec_evidence": "configured-pdraw-input-contract",
+            "codec_observed": False,
+            "pdraw_media_name": "DefaultVideo",
+            "pdraw_stream_mode": "play",
+            "source_width_px": 1920,
+            "source_height_px": 1080,
+            "source_timestamp_capable": True,
+            "source_timestamp_trusted": True,
+            "stamp_source": "ntp-mapped",
+        }
+
+        @staticmethod
+        def peek_stamp():
+            return 4.0
+
+        @staticmethod
+        def latest_frame_with_timing():
+            return frame, 4.0, {"frame_callback_enter_mono_ns": 456}
+
+    stream = LiveAnafiVideoStream(Grabber())
+    assert stream.next_frame() is frame
+
+    metadata = stream.metadata_snapshot()
+    assert metadata["codec"] == "H.264"
+    assert metadata["codec_observed"] is False
+    assert metadata["source_width_px"] == 1920
+    assert metadata["source_height_px"] == 1080
+    assert metadata["ui_frame_width_px"] == 1280
+    assert metadata["ui_frame_height_px"] == 720
+    assert metadata["observed_fps"] == 29.5
+    assert metadata["frames_delivered"] == 1
+    assert metadata["source_timestamp_capable"] is True

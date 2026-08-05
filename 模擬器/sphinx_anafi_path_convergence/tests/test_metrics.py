@@ -96,6 +96,8 @@ def test_trivial_start_flagged():
     m = compute_trial_metrics(run_ticks(ct=0.2))
     assert m["trivial_start_on_path"]
     assert "trivial_start_on_path" in m["labels"]
+    assert "trivial_start_on_path" in m["failure_reasons"]
+    assert not m["pass"]
 
 
 def test_early_late_segment_switch_counted():
@@ -116,6 +118,8 @@ def test_aggregation_and_ranking():
         ticks = run_ticks(n=400, ct=0.2 if ok else 2.5,
                           pcmd=(0, 6, 1, 0), transitions=1)
         if ok:
+            for i, tick in enumerate(ticks[:40]):
+                tick["cross_track"] = max(0.2, 1.0 - i * 0.02)
             ticks[-1]["mode"] = "COMPLETED"
         return {"algorithm": algo, "yaw_error_deg": yaw, "perturbation": pert,
                 "metrics": compute_trial_metrics(ticks)}

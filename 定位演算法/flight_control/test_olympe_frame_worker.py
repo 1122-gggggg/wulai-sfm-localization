@@ -80,6 +80,27 @@ def _assert_balanced(*frames):
 
 
 @pytest.mark.parametrize("module", MODULES, ids=("mission", "deploy"))
+def test_stream_metadata_distinguishes_configured_codec_from_observed_frames(module):
+    grabber = _grabber(module)
+    grabber._t0 = time.monotonic() - 1.0
+    grabber._store(
+        np.zeros((720, 1280, 3), dtype=np.uint8),
+        stamp=time.monotonic(),
+        stamp_source="ntp-mapped",
+        source_ntp_us=1_000_000,
+    )
+
+    metadata = grabber.stream_metadata
+    assert metadata["codec"] == "H.264"
+    assert metadata["codec_evidence"] == "configured-pdraw-input-contract"
+    assert metadata["codec_observed"] is False
+    assert metadata["output_width_px"] == 1280
+    assert metadata["output_height_px"] == 720
+    assert metadata["source_timestamp_capable"] is True
+    assert metadata["source_timestamp_trusted"] is True
+
+
+@pytest.mark.parametrize("module", MODULES, ids=("mission", "deploy"))
 def test_latest_frame_replaces_pending_without_blocking_callback(module):
     grabber = _grabber(module)
     entered = threading.Event()

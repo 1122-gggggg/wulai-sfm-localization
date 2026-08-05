@@ -4,6 +4,7 @@ import json
 import importlib.util
 import inspect
 import io
+import queue
 import select
 import sys
 import threading
@@ -34,6 +35,171 @@ def test_default_overlay_uses_the_portable_route_fallback() -> None:
     assert app.DEFAULT_ROUTE.resolve() == app._DEFAULT_ROUTE_FALLBACK.resolve()
 
 
+def test_pipeline_metrics_summary_uses_operator_visible_rates_and_e2e_latency() -> None:
+    text = app.format_pipeline_metrics_summary(
+        localization_fps=7.25,
+        stream_fps=29.94,
+        e2e_ms=143.21,
+        e2e_p95_ms=188.76,
+        frame_age_ms=41.55,
+    )
+
+    assert text == (
+        "定位端到端 FPS 7.2 | 影像串流 FPS 29.9 | "
+        "端到端延遲 143.2 ms | p95（近 5 秒）188.8 ms | 影格年齡 41.5 ms"
+    )
+
+
+def test_pipeline_metrics_summary_marks_unavailable_measurements() -> None:
+    text = app.format_pipeline_metrics_summary(
+        localization_fps=None,
+        stream_fps=None,
+        e2e_ms=None,
+        e2e_p95_ms=None,
+        frame_age_ms=None,
+    )
+
+    assert text == (
+        "定位端到端 FPS N/A | 影像串流 FPS N/A | "
+        "端到端延遲 N/A | p95（近 5 秒）N/A | 影格年齡 N/A"
+    )
+
+
+def test_rolling_event_fps_expires_when_deliveries_stop() -> None:
+    recent, rate = app._rolling_event_fps([94.0, 95.0, 96.0], now=96.0)
+    assert recent == [94.0, 95.0, 96.0]
+    assert rate == pytest.approx(1.0)
+
+    recent, rate = app._rolling_event_fps(recent, now=102.0)
+    assert recent == []
+    assert rate == 0.0
+
+
+def test_localization_metrics_prunes_e2e_samples_without_crashing(monkeypatch) -> None:
+    monkeypatch.setattr(app.time, "monotonic", lambda: 100.0)
+    operator = SimpleNamespace(
+        live_result_times=[],
+        loc_fps=0.0,
+        loc_latency_ms=None,
+        loc_wall_ms=None,
+        loc_e2e_ms=None,
+        _loc_e2e_ms_samples=[(94.0, 80.0)],
+        loc_core_fps=0.0,
+        loc_stage="-",
+        _loc_wall_ms_samples=[],
+        loc_health="OK",
+        _loc_fail_count=0,
+        _loc_ok_count=0,
+        loc_pose_updated_mono=None,
+        loc_health_inliers=0,
+        loc_health_reproj=None,
+        loc_hold_engage_count=0,
+        loc_recovery_fix_count=0,
+        loc_recovery_text="",
+        _append_loc_metrics=lambda _result: None,
+    )
+
+    app.OperatorApp.update_localization_metrics(
+        operator,
+        {
+            "success": True,
+            "inliers": app.LOC_LOW_INLIERS,
+            "core_wall_ms": 50.0,
+            "wall_ms": 70.0,
+            "e2e_submit_to_ui_ms": 90.0,
+            "mode": "TRACK",
+            "next_mode": "TRACK",
+        },
+    )
+
+    assert operator._loc_e2e_ms_samples == [(100.0, 90.0)]
+    assert operator.loc_e2e_ms == 90.0
+
+
+def test_low_confidence_hold_is_an_engagement_event() -> None:
+    assert "ENGAGE_LOW_CONF" in app.CONFIDENCE_HOLD_ENGAGE_EVENTS
+    assert "ENGAGE_LOW" not in app.CONFIDENCE_HOLD_ENGAGE_EVENTS
+
+
+def test_pipeline_metrics_expire_old_e2e_samples() -> None:
+    operator = SimpleNamespace(
+        inspecting=True,
+        loc_fps=8.0,
+        stream_fps_instant=30.0,
+        live_result_times=[97.0, 97.125, 97.25],
+        _stream_frame_times=[99.90, 99.95, 100.0],
+        loc_e2e_ms=120.0,
+        _loc_e2e_ms_samples=[(93.0, 80.0), (98.0, 110.0), (99.0, 120.0)],
+        video_frame=object(),
+        _video_frame_stamp=99.9,
+        _is_live_backend=lambda: False,
+    )
+
+    text = app.OperatorApp.pipeline_metrics_summary(operator, now=100.0)
+
+    assert operator._loc_e2e_ms_samples == [(98.0, 110.0), (99.0, 120.0)]
+    assert text.startswith("定位端到端 FPS（實機鏈路模擬） 8.0")
+    assert "p95（近 5 秒）120.0 ms" in text
+    assert "影格年齡 100.0 ms" in text
+
+
+def test_pipeline_metrics_mark_simulated_eof_as_stopped() -> None:
+    operator = SimpleNamespace(
+        inspecting=True,
+        loc_fps=12.7,
+        stream_fps_instant=26.0,
+        live_result_times=[99.8, 99.9, 100.0],
+        _stream_frame_times=[99.90, 99.95, 100.0],
+        loc_e2e_ms=95.8,
+        _loc_e2e_ms_samples=[(99.0, 95.8)],
+        video_frame=object(),
+        _video_frame_stamp=99.9,
+        current_state=SimpleNamespace(stream="EOF_HOLD"),
+        _is_live_backend=lambda: False,
+    )
+
+    text = app.OperatorApp.pipeline_metrics_summary(operator, now=100.0)
+
+    assert text.startswith("定位端到端 FPS（實機鏈路模擬） N/A")
+    assert "影像串流 FPS 0.0" in text
+    assert "端到端延遲 N/A" in text
+    assert text.endswith("狀態 影片已播完，保留最後一幀")
+
+
+def test_pillow_overlay_font_resolves_to_a_cjk_capable_local_font() -> None:
+    font_path = app.resolve_pil_ui_font_path()
+
+    assert font_path is not None
+    assert font_path.is_file()
+    assert "CJK" in font_path.name or "NotoSansTC" in font_path.name
+
+
+def test_simulated_video_hud_never_claims_to_be_live() -> None:
+    simulated = app.video_hud_identity(False, "LIVE")
+    real = app.video_hud_identity(True, "MANUAL")
+
+    assert simulated == "SIMULATED ANAFI | mode=SIM"
+    assert "LIVE" not in simulated
+    assert real == "REAL ANAFI | mode=MANUAL"
+    assert app.operator_mode_label(False, "LIVE") == "SIM"
+    assert app.operator_mode_label(True, "MANUAL") == "MANUAL"
+    assert app.localization_fps_metric_label(False) == "定位端到端 FPS（實機鏈路模擬）"
+    assert app.localization_fps_metric_label(True) == "定位端到端 FPS（實機）"
+
+
+def test_worker_result_backlog_keeps_only_the_newest_items(monkeypatch) -> None:
+    client = app.LiveWorkerClient.__new__(app.LiveWorkerClient)
+    client.results = queue.Queue(maxsize=2)
+    client._result_notify_write_fd = -1
+    monkeypatch.setattr(app.os, "write", lambda *_args: 1)
+
+    client._publish_result({"seq": 1})
+    client._publish_result({"seq": 2})
+    client._publish_result({"seq": 3})
+
+    assert [row["seq"] for row in client.poll_results()] == [2, 3]
+
+
 def test_heading_arrow_polygon_points_at_the_current_heading() -> None:
     arrow = app.heading_arrow_polygon(100.0, 80.0, 120.0, 80.0)
 
@@ -41,6 +207,35 @@ def test_heading_arrow_polygon_points_at_the_current_heading() -> None:
     tip, *body = arrow
     assert tip == (118.0, 80.0)
     assert all(point[0] < tip[0] for point in body)
+
+
+def test_route_visibility_toggle_does_not_remove_loaded_route() -> None:
+    operator = app.OperatorApp.__new__(app.OperatorApp)
+    operator.route_pts = [(0.0, 0.0, 0.0), (1.0, 0.0, 0.0)]
+    operator.route_visible = True
+    operator.show_route_var = SimpleNamespace(get=lambda: False)
+    operator._map_dirty_key = ("cached",)
+    redraws = []
+    operator.redraw_map_only = lambda: redraws.append(True)
+
+    app.OperatorApp.set_route_visibility(operator)
+
+    assert not operator.route_visible
+    assert operator.route_pts == [(0.0, 0.0, 0.0), (1.0, 0.0, 0.0)]
+    assert operator._map_dirty_key is None
+    assert redraws == [True]
+
+
+def test_boot_hold_waits_for_worker_even_when_timed_hold_is_disabled() -> None:
+    operator = SimpleNamespace(
+        inspecting=True,
+        boot_lock_done=True,
+        localizer=SimpleNamespace(ready=False),
+    )
+
+    assert app.OperatorApp.boot_holding(operator)
+    operator.localizer.ready = True
+    assert not app.OperatorApp.boot_holding(operator)
 
 
 def test_heading_arrow_polygon_skips_zero_length_heading() -> None:
@@ -90,6 +285,36 @@ def test_worker_python_defaults_to_current_runtime(monkeypatch: pytest.MonkeyPat
     assert app.default_worker_python("SFM_TEST_WORKER_PYTHON") == "/explicit/python"
 
 
+@pytest.mark.parametrize(
+    ("requested", "legacy_live", "expected", "is_live"),
+    (
+        ("simulated-stream", False, "simulated-stream", False),
+        ("real-flight", False, "real-flight", True),
+        ("", False, "simulated-stream", False),
+        ("", True, "real-flight", True),
+    ),
+)
+def test_operator_interface_modes_are_exactly_two_and_mutually_exclusive(
+    requested: str, legacy_live: bool, expected: str, is_live: bool,
+) -> None:
+    mode, resolved_live = app.resolve_operator_interface(
+        requested, legacy_live, ""
+    )
+
+    assert mode == expected
+    assert resolved_live is is_live
+
+
+def test_real_flight_interface_rejects_video_file_fallback() -> None:
+    with pytest.raises(ValueError, match="accepts only the ANAFI PDRAW stream"):
+        app.resolve_operator_interface("real-flight", False, "/tmp/replay.mp4")
+
+
+def test_simulated_interface_rejects_legacy_live_flag() -> None:
+    with pytest.raises(ValueError, match="cannot be combined"):
+        app.resolve_operator_interface("simulated-stream", True, "")
+
+
 def test_auto_inspect_enables_feed_without_backend_command() -> None:
     class FakeOperator:
         _begin_inspection_feed = app.OperatorApp._begin_inspection_feed
@@ -105,6 +330,7 @@ def test_auto_inspect_enables_feed_without_backend_command() -> None:
             self.stream_fps_instant = 9.0
             self._lifetime_stream_fps = 9.0
             self._stream_frame_times = []
+            self._loc_e2e_ms_samples = []
             self.logs = []
             self.backend_calls = []
             self.backend = SimpleNamespace(
@@ -142,6 +368,15 @@ def test_live_localizer_mode_header_rejects_invalid_input() -> None:
         localizer_protocol.encode_mode("fly")
 
 
+def test_edm_worker_fails_clearly_when_cuda_is_unavailable() -> None:
+    fake_torch = SimpleNamespace(
+        cuda=SimpleNamespace(is_available=lambda: False),
+    )
+
+    with pytest.raises(RuntimeError, match="requires a working CUDA device"):
+        localizer_worker.require_edm_cuda(fake_torch)
+
+
 def test_timed_localizer_header_round_trip() -> None:
     header = localizer_protocol.encode_request("auto", 123.456)
 
@@ -175,6 +410,7 @@ def test_live_localizer_client_passes_neuflow_flag_only_when_enabled(
 
     def fake_worker_init(_self, cmd, *_args, **_kwargs) -> None:
         captured["cmd"] = cmd
+        captured["kwargs"] = _kwargs
 
     monkeypatch.setattr(app.LiveWorkerClient, "__init__", fake_worker_init)
 
@@ -188,6 +424,8 @@ def test_live_localizer_client_passes_neuflow_flag_only_when_enabled(
     )
 
     assert ("--neuflow-track" in captured["cmd"]) is enabled
+    assert "--startup-handshake" in captured["cmd"]
+    assert captured["kwargs"]["expect_ready_event"] is True
 
 
 def test_live_localizer_client_passes_projection_sidecar(monkeypatch) -> None:
@@ -329,8 +567,39 @@ def test_live_localizer_switches_mode_without_restarting_worker(tmp_path: Path) 
     assert client.proc.pid == pid
 
 
+def test_ready_handshake_blocks_submit_until_model_is_loaded(tmp_path: Path) -> None:
+    worker = (
+        "import json,sys,time; "
+        "time.sleep(0.15); "
+        "print(json.dumps({'event':'ready','startup_ms':150.0}),flush=True); "
+        "raw=sys.stdin.buffer.read(3); "
+        "print(json.dumps({'success':bool(raw)}),flush=True)"
+    )
+    client = app.LiveWorkerClient(
+        [sys.executable, "-c", worker],
+        1,
+        1,
+        str(tmp_path / "ready-worker.log"),
+        "ready-worker",
+        "ready",
+        timeout_s=1.0,
+        expect_ready_event=True,
+    )
+    client.restart_warmup_s = 1.0
+    try:
+        assert not client.ready
+        assert not client.submit(1, "early", Image.new("RGB", (1, 1)))
+        assert _wait_for(lambda: client.ready)
+        assert client.startup_info["startup_ms"] == 150.0
+        assert client.submit(2, "ready", Image.new("RGB", (1, 1)))
+        assert _wait_for(lambda: not client.results.empty())
+        assert client.poll_results()[0]["success"] is True
+    finally:
+        client.close()
+
+
 @pytest.mark.parametrize("mode", ["global", "weak", "track"])
-def test_localization_benchmark_buttons_never_touch_backend(mode: str) -> None:
+def test_offline_localization_benchmark_control_never_touches_backend(mode: str) -> None:
     class FakeLocalizer:
         def __init__(self):
             self.calls = []
@@ -363,6 +632,7 @@ def test_localization_benchmark_buttons_never_touch_backend(mode: str) -> None:
             self.stream_fps_instant = 0.0
             self._lifetime_stream_fps = 0.0
             self._stream_frame_times = []
+            self._loc_e2e_ms_samples = []
             self.loc_benchmark_requested = "auto"
             self._loc_benchmark_pending = None
             self.loc_benchmark_mode_var = FakeVar()
@@ -512,7 +782,7 @@ def test_stream_lost_display_precedes_busy_localizer_status() -> None:
     result = app.OperatorApp.state_from_live(operator, state)
     assert result.stream == "LOST"
     assert result.loc == "STREAM_LOST"
-    assert result.tracker_state == "STREAM_LOST_HOVER"
+    assert result.tracker_state == "STREAM_LOST_MANUAL"
 
 
 def test_ui_arrival_timing_uses_submit_and_neutral_source_stamp_names() -> None:
@@ -549,8 +819,7 @@ def test_composite_stage_does_not_hide_weak_tracker_state() -> None:
 
 
 def test_confidence_hold_does_not_engage_on_low_results() -> None:
-    policy = app.LostHoldPolicy(
-        max_attempts=3, timeout_s=10.0, low_confidence_results=2)
+    policy = app.LostHoldPolicy(max_attempts=3, timeout_s=10.0)
 
     assert policy.on_result(
         success=True, low_confidence=True, strong_relocalize=False, next_mode="TRACK",
@@ -562,8 +831,7 @@ def test_confidence_hold_does_not_engage_on_low_results() -> None:
 
 
 def test_confidence_hold_engages_only_after_tracker_is_lost() -> None:
-    policy = app.LostHoldPolicy(
-        max_attempts=3, timeout_s=10.0, low_confidence_results=2)
+    policy = app.LostHoldPolicy(max_attempts=3, timeout_s=10.0)
 
     assert policy.on_result(
         success=False, low_confidence=False, strong_relocalize=False,
@@ -573,6 +841,45 @@ def test_confidence_hold_engages_only_after_tracker_is_lost() -> None:
         success=False, low_confidence=False, strong_relocalize=False,
         next_mode="LOST", frame_index=20, now=2.0) == "ENGAGE_FAIL"
     assert policy.active
+
+
+def test_real_low_confidence_escalation_hands_off_and_requests_megaloc_once() -> None:
+    fail_safe_calls = []
+    relocalize_calls = []
+    operator = app.OperatorApp.__new__(app.OperatorApp)
+    operator.lost_hold = app.LostHoldPolicy(
+        max_attempts=3,
+        timeout_s=10.0,
+        low_confidence_results=2,
+        hold_on_low_confidence=True,
+    )
+    operator.inspecting = True
+    operator.video_display_frame_name = "frame_000011.jpg"
+    operator.video_display_index = 11
+    operator._is_live_backend = lambda: True
+    operator.backend = SimpleNamespace(
+        fail_safe=lambda reason: fail_safe_calls.append(reason)
+    )
+    operator.localizer = SimpleNamespace(
+        request_relocalize=lambda: relocalize_calls.append(True)
+    )
+    operator.write_log = lambda _message: None
+
+    for index in range(2):
+        result = {
+            "success": True,
+            "inliers": 20,
+            "reproj_rms": 2.0,
+            "next_mode": "WEAK_TRACK",
+            "mode": "WEAK_TRACK",
+        }
+        operator._apply_lost_hold_result(result)
+        if index == 0:
+            assert fail_safe_calls == []
+            assert relocalize_calls == []
+
+    assert fail_safe_calls == [app.FailureReason.LOCALIZATION_WEAK]
+    assert relocalize_calls == [True]
 
 
 def test_metrics_keep_wall_compatibility_and_explicit_core_timing() -> None:
@@ -595,6 +902,11 @@ def test_metrics_keep_wall_compatibility_and_explicit_core_timing() -> None:
         "hold_kind": "lost",
         "relocalize_requested": True,
         "confidence_hold_event": "RELEASE_FIX",
+        "limited_jump": {
+            "confirmation_model": "constant_velocity",
+            "confirmation_residual": 0.04,
+        },
+        "limited_jump_confirmed": True,
         "pose": {"x": 1.0, "y": 2.0, "z": 3.0, "yaw_raw": 0.5},
     })
     record = json.loads(sink.getvalue())
@@ -605,6 +917,8 @@ def test_metrics_keep_wall_compatibility_and_explicit_core_timing() -> None:
     assert record["hold_retry"] is True
     assert record["relocalize_requested"] is True
     assert record["confidence_hold_event"] == "RELEASE_FIX"
+    assert record["limited_jump"]["confirmation_model"] == "constant_velocity"
+    assert record["limited_jump_confirmed"] is True
     assert record["pose"]["z"] == 3.0
     assert record["submit_skip_busy"] == 2
     assert record["submit_busy_attempts"] == 5

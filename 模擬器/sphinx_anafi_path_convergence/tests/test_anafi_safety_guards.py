@@ -1,4 +1,5 @@
 """Simulator-only safety guards. These tests run WITHOUT Sphinx/Olympe."""
+import os
 import re
 import subprocess
 import sys
@@ -11,7 +12,8 @@ from telemetry_sources import (BANNER, REAL_ANAFI_IP, SKYCONTROLLER_IP,
                                check_simulator_ip)
 
 EXPERIMENT_DIR = Path(__file__).resolve().parents[1]
-LOCALIZATION_ROOT = EXPERIMENT_DIR.parents[1]
+WORKSPACE_ROOT = EXPERIMENT_DIR.parents[1]
+FLIGHT_CONTROL_DIR = WORKSPACE_ROOT / "定位演算法" / "flight_control"
 SOURCES = sorted(EXPERIMENT_DIR.glob("*.py"))
 
 
@@ -97,7 +99,7 @@ def test_conservative_default_limits():
 
 
 def test_sphinx_smoke_uses_event_freshness_for_pose_and_stream_health():
-    text = (LOCALIZATION_ROOT / "mission" / "flight_control" / "sphinx_path_follow_smoke.py").read_text()
+    text = (FLIGHT_CONTROL_DIR / "sphinx_path_follow_smoke.py").read_text()
     assert "SphinxTelemetrySource" in text
     assert "stream_healthy=source.telemetry_healthy" in text
     assert "stream_healthy=lambda: True" not in text
@@ -110,7 +112,7 @@ def test_sphinx_smoke_uses_event_freshness_for_pose_and_stream_health():
     ("--side", "-1"),
 ])
 def test_sphinx_smoke_rejects_unsafe_numeric_limits_before_connect(option, value):
-    script = LOCALIZATION_ROOT / "mission" / "flight_control" / "sphinx_path_follow_smoke.py"
+    script = FLIGHT_CONTROL_DIR / "sphinx_path_follow_smoke.py"
     proc = subprocess.run(
         [sys.executable, str(script), option, value],
         text=True, capture_output=True, timeout=10,
@@ -120,8 +122,31 @@ def test_sphinx_smoke_rejects_unsafe_numeric_limits_before_connect(option, value
 
 
 def test_sphinx_launcher_requires_instantiation_and_has_bounded_kill_cleanup():
-    text = (LOCALIZATION_ROOT / "mission" / "flight_control" / "launch_sphinx_anafi_empty.sh").read_text()
+    text = (FLIGHT_CONTROL_DIR / "launch_sphinx_anafi_empty.sh").read_text()
     assert "All drones instantiated" in text
     assert "kill -KILL" in text
     assert "CLEANUP_TIMEOUT_S" in text
-    assert "firmware selector is unpinned" in text
+    assert '== *"latest"*' in text
+    assert "explicit revision and firmware image path" in text
+    assert "latest is forbidden" in text
+
+
+@pytest.mark.parametrize(
+    "selector",
+    [
+        "",
+        "https://firmware.parrot.com/Versions/anafi/pc/%23latest/images/anafi-pc.ext2.zip",
+        "https://firmware.parrot.com/Versions/anafi/pc/latest/images/anafi-pc.ext2.zip",
+    ],
+)
+def test_sphinx_launcher_rejects_missing_or_latest_firmware(selector):
+    script = FLIGHT_CONTROL_DIR / "launch_sphinx_anafi_empty.sh"
+    proc = subprocess.run(
+        ["bash", str(script), "--check"],
+        env={**os.environ, "FIRMWARE_URL": selector, "PATH": "/usr/bin:/bin"},
+        text=True, capture_output=True, timeout=10,
+    )
+    assert proc.returncode != 0
+    assert "explicit" in (proc.stdout + proc.stderr) or "latest" in (
+        proc.stdout + proc.stderr
+    )

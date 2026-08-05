@@ -23,7 +23,9 @@ from __future__ import annotations
 
 import math
 import time
+from collections import deque
 from dataclasses import dataclass, field
+from typing import Sequence
 
 import numpy as np
 import pycolmap
@@ -70,6 +72,7 @@ class EDMConfig:
     adaptive_jump_bootstrap: float = 0.02
     adaptive_jump_ceiling: float = 0.008
     adaptive_jump_min_history: int = 20
+    adaptive_jump_history_size: int = 120
     weak_after: int = 2
     lost_after: int = 2
     # EDM emits thousands of correspondences; PnP cost is linear in them and RANSAC
@@ -77,6 +80,90 @@ class EDMConfig:
     # the pose toward whichever image region happened to match densely.
     max_corr_total: int = 900
     corr_grid: int = 8
+
+    def __post_init__(self) -> None:
+        self.validate()
+
+    def validate(self) -> None:
+        if self.global_retrieval_policy not in {"boot_once", "boot_and_lost_once"}:
+            raise ValueError(
+                "global_retrieval_policy must be 'boot_once' or 'boot_and_lost_once'"
+            )
+        positive_ints = (
+            "boot_global_topk",
+            "acquire_initial_topk",
+            "match_batch_size",
+            "temporal_map_topk",
+            "local_topk",
+            "weak_local_topk",
+            "lost_local_topk",
+            "near_pool",
+            "covis_per_ref",
+            "acquire_min_inliers",
+            "track_min_inliers",
+            "weak_min_inliers",
+            "adaptive_jump_min_history",
+            "adaptive_jump_history_size",
+            "weak_after",
+            "lost_after",
+            "corr_grid",
+        )
+        for name in positive_ints:
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"{name} must be a positive integer")
+        nonnegative_ints = (
+            "lost_local_grace_frames",
+            "recovery_bank_size",
+            "recovery_scan_topk",
+            "max_corr_total",
+        )
+        for name in nonnegative_ints:
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"{name} must be a non-negative integer")
+        if not isinstance(self.use_temporal_reference, bool):
+            raise ValueError("use_temporal_reference must be boolean")
+        positive_floats = (
+            "radius",
+            "max_yaw_diff_deg",
+            "max_reproj_error_acquire",
+            "max_reproj_error_track",
+            "pnp_ransac_max_error",
+            "max_jump",
+            "prediction_max_dt",
+            "adaptive_jump_factor",
+            "adaptive_jump_floor",
+            "adaptive_jump_bootstrap",
+            "adaptive_jump_ceiling",
+        )
+        for name in positive_floats:
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ValueError(f"{name} must be numeric")
+            if not math.isfinite(float(value)) or float(value) <= 0.0:
+                raise ValueError(f"{name} must be finite and > 0")
+        if self.acquire_initial_topk > self.boot_global_topk:
+            raise ValueError("acquire_initial_topk cannot exceed boot_global_topk")
+        if self.local_topk > self.weak_local_topk or self.local_topk > self.lost_local_topk:
+            raise ValueError("weak/lost local top-k cannot be smaller than TRACK local_topk")
+        if self.adaptive_jump_min_history > self.adaptive_jump_history_size:
+            raise ValueError(
+                "adaptive_jump_min_history cannot exceed adaptive_jump_history_size"
+            )
+        if self.adaptive_jump_floor > self.adaptive_jump_ceiling:
+            raise ValueError("adaptive_jump_floor cannot exceed adaptive_jump_ceiling")
+        if self.adaptive_jump_ceiling > self.adaptive_jump_bootstrap:
+            raise ValueError(
+                "adaptive_jump_bootstrap cannot be smaller than adaptive_jump_ceiling"
+            )
+        for name in (
+            "adaptive_jump_floor",
+            "adaptive_jump_bootstrap",
+            "adaptive_jump_ceiling",
+        ):
+            if float(getattr(self, name)) > float(self.max_jump):
+                raise ValueError(f"{name} cannot exceed max_jump")
 
 
 @dataclass
@@ -89,7 +176,16 @@ class RuntimeState:
     last_refs: list = field(default_factory=list)
     misses: int = 0
     frame: int = 0
-    accepted_step_norms: list[float] = field(default_factory=list)
+    accepted_step_norms: deque[float] = field(
+        default_factory=lambda: deque(maxlen=120)
+    )
+    observed_capture_dts: deque[float] = field(
+        default_factory=lambda: deque(maxlen=120)
+    )
+    last_observed_capture_stamp: float | None = None
+    pending_limited_center: np.ndarray | None = None
+    pending_limited_stamp: float | None = None
+    pending_limited_limit: float | None = None
     boot_refs: list[str] = field(default_factory=list)
     global_retrieval_calls: int = 0
     lost_global_retrieval_done: bool = False
@@ -161,34 +257,69 @@ def build_temporal_lut(
     return lut
 
 
-def adaptive_jump_limit(step_history: list[float], cfg: EDMConfig) -> float:
-    """Return a trajectory-scale envelope, bounded by the hard teleport gate."""
+def adaptive_jump_limit(
+    step_history: Sequence[float],
+    cfg: EDMConfig,
+    *,
+    capture_dt: float | None = None,
+    capture_dt_history: Sequence[float] = (),
+) -> float:
+    """Return a trajectory envelope adjusted for skipped-frame capture time."""
     if len(step_history) < cfg.adaptive_jump_min_history:
-        return min(
+        base_limit = min(
             cfg.max_jump,
-            cfg.adaptive_jump_ceiling,
             cfg.adaptive_jump_bootstrap,
         )
-    typical = float(np.median(np.asarray(step_history, dtype=float)))
-    return min(
-        cfg.max_jump,
-        cfg.adaptive_jump_ceiling,
-        max(cfg.adaptive_jump_floor, cfg.adaptive_jump_factor * typical),
+    else:
+        typical = float(np.median(np.asarray(step_history, dtype=float)))
+        base_limit = min(
+            cfg.max_jump,
+            cfg.adaptive_jump_ceiling,
+            max(cfg.adaptive_jump_floor, cfg.adaptive_jump_factor * typical),
+        )
+
+    valid_dts = np.asarray(
+        [
+            value
+            for value in capture_dt_history
+            if math.isfinite(float(value)) and float(value) > 1e-6
+        ],
+        dtype=float,
     )
+    if (
+        capture_dt is None
+        or not math.isfinite(float(capture_dt))
+        or float(capture_dt) <= 1e-6
+        or len(valid_dts) < cfg.adaptive_jump_min_history
+    ):
+        return base_limit
+
+    typical_dt = float(np.median(valid_dts))
+    effective_dt = min(float(capture_dt), float(cfg.prediction_max_dt))
+    time_scale = max(1.0, effective_dt / typical_dt)
+    return min(float(cfg.max_jump), base_limit * time_scale)
 
 
 def limit_center_step(
     previous: np.ndarray,
     candidate: np.ndarray,
-    step_history: list[float],
+    step_history: Sequence[float],
     cfg: EDMConfig,
+    *,
+    capture_dt: float | None = None,
+    capture_dt_history: Sequence[float] = (),
 ) -> tuple[np.ndarray, dict]:
     """Limit an isolated PnP center spike without turning it into a teleport."""
     previous = np.asarray(previous, dtype=float)
     candidate = np.asarray(candidate, dtype=float)
     delta = candidate - previous
     raw_step = float(np.linalg.norm(delta))
-    limit = adaptive_jump_limit(step_history, cfg)
+    limit = adaptive_jump_limit(
+        step_history,
+        cfg,
+        capture_dt=capture_dt,
+        capture_dt_history=capture_dt_history,
+    )
     if raw_step <= limit or raw_step == 0.0:
         return candidate, {"limited": False, "raw_step": raw_step, "limit": limit}
     center = previous + delta * (limit / raw_step)
@@ -280,11 +411,15 @@ class ProductionEDMTracker:
     def __init__(self, reloc_map: EDMRelocMap, camera: Camera, cfg: EDMConfig | None = None,
                  matcher: EDMMatcher | None = None, megaloc=None):
         self.cfg = cfg or EDMConfig()
+        self.cfg.validate()
         self.map = reloc_map
         self.cam = camera
         self.loc = EDMLocalizer(reloc_map, camera, matcher=matcher, megaloc=megaloc,
                                 pnp_max_error=self.cfg.pnp_ransac_max_error)
-        self.st = RuntimeState()
+        self.st = RuntimeState(
+            accepted_step_norms=deque(maxlen=self.cfg.adaptive_jump_history_size),
+            observed_capture_dts=deque(maxlen=self.cfg.adaptive_jump_history_size),
+        )
         self.centers = None if reloc_map.ref_centers is None else np.asarray(reloc_map.ref_centers, np.float32)
         self.yaws = None if reloc_map.ref_yaws is None else np.asarray(reloc_map.ref_yaws, np.float32)
         self.name_of = {i: n for i, n in enumerate(reloc_map.ref_names)}
@@ -294,6 +429,23 @@ class ProductionEDMTracker:
         )
         self.temporal_gray: np.ndarray | None = None
         self.temporal_xyz_by_cell: np.ndarray | None = None
+        self._pcam: pycolmap.Camera | None = None
+        self._pnp_options: pycolmap.AbsolutePoseEstimationOptions | None = None
+
+    def _pose_estimation_context(
+        self,
+    ) -> tuple[pycolmap.Camera, pycolmap.AbsolutePoseEstimationOptions]:
+        if getattr(self, "_pcam", None) is None:
+            self._pcam = pycolmap.Camera(
+                model=self.cam.model,
+                width=self.cam.width,
+                height=self.cam.height,
+                params=self.cam.params,
+            )
+        if getattr(self, "_pnp_options", None) is None:
+            self._pnp_options = pycolmap.AbsolutePoseEstimationOptions()
+            self._pnp_options.ransac.max_error = self.cfg.pnp_ransac_max_error
+        return self._pcam, self._pnp_options
 
     # ---------- candidate selection ----------
     def _predict_center(self, capture_stamp: float | None = None):
@@ -374,6 +526,13 @@ class ProductionEDMTracker:
         capture_stamp = float(capture_stamp)
         if not math.isfinite(capture_stamp):
             raise ValueError("capture_stamp must be finite")
+        previous_observed_stamp = self.st.last_observed_capture_stamp
+        if previous_observed_stamp is None or capture_stamp > previous_observed_stamp:
+            if previous_observed_stamp is not None:
+                self.st.observed_capture_dts.append(
+                    capture_stamp - previous_observed_stamp
+                )
+            self.st.last_observed_capture_stamp = capture_stamp
         self.st.frame += 1
         gray = EDMMatcher.load_gray(frame_bgr)
 
@@ -462,10 +621,7 @@ class ProductionEDMTracker:
         pose_metrics = {
             "reproj_rms": None, "inlier_ratio": 0.0, "inlier_grid_cells": 0,
         }
-        pcam = pycolmap.Camera(model=self.cam.model, width=self.cam.width,
-                               height=self.cam.height, params=self.cam.params)
-        opts = pycolmap.AbsolutePoseEstimationOptions()
-        opts.ransac.max_error = cfg.pnp_ransac_max_error
+        pcam, opts = self._pose_estimation_context()
         t_pnp = 0.0
 
         def estimate_pose(points2d: np.ndarray, points3d: np.ndarray,
@@ -597,12 +753,18 @@ class ProductionEDMTracker:
         info.update(pose_metrics)
 
         if ret is None or int(ret["num_inliers"]) < min_inl:
+            self.st.pending_limited_center = None
+            self.st.pending_limited_stamp = None
+            self.st.pending_limited_limit = None
             info["inliers"] = 0 if ret is None else int(ret["num_inliers"])
             self._on_miss(info)
             return info
 
         if (info["reproj_rms"] is None
                 or float(info["reproj_rms"]) > float(reproj_limit)):
+            self.st.pending_limited_center = None
+            self.st.pending_limited_stamp = None
+            self.st.pending_limited_limit = None
             info["inliers"] = int(ret["num_inliers"])
             info["rejected"] = (
                 "reprojection_unavailable" if info["reproj_rms"] is None
@@ -619,33 +781,111 @@ class ProductionEDMTracker:
         yaw = float(math.atan2(fwd[1], fwd[0]))
         info["inliers"] = int(ret["num_inliers"])
 
-        # Two-layer trajectory gate. Extreme centers are rejected. Smaller isolated
-        # PnP spikes are limited to a robust trajectory-scale envelope so they cannot
-        # become accepted ghost teleports or force an otherwise healthy track LOST.
+        # Two-layer trajectory gate. Extreme centers are rejected. A smaller jump
+        # outside the adaptive envelope must repeat before it is accepted; clipping
+        # every isolated PnP spike would turn bad poses into a slowly drifting TRACK.
         if self.st.center is not None and info["state_in"] != "LOST":
+            capture_dt = (
+                None if self.st.last_capture_stamp is None
+                else capture_stamp - self.st.last_capture_stamp
+            )
             raw_step = float(np.linalg.norm(C - self.st.center))
             if raw_step > cfg.max_jump:
+                self.st.pending_limited_center = None
+                self.st.pending_limited_stamp = None
+                self.st.pending_limited_limit = None
+                info["limited_jump"] = {
+                    "raw_step": raw_step,
+                    "limit": float(cfg.max_jump),
+                    "capture_dt": capture_dt,
+                    "confirmation_model": None,
+                    "confirmation_residual": None,
+                    "confirmation_limit": None,
+                }
                 info["rejected"] = "jump"
                 self._on_miss(info)
                 return info
-            C, jump_info = limit_center_step(
-                self.st.center, C, self.st.accepted_step_norms, cfg
+            _limited_center, jump_info = limit_center_step(
+                self.st.center,
+                C,
+                self.st.accepted_step_norms,
+                cfg,
+                capture_dt=capture_dt,
+                capture_dt_history=self.st.observed_capture_dts,
             )
             if jump_info["limited"]:
                 info["limited_jump"] = {
                     "raw_step": jump_info["raw_step"],
                     "limit": jump_info["limit"],
+                    "capture_dt": capture_dt,
+                    "confirmation_model": None,
+                    "confirmation_residual": None,
+                    "confirmation_limit": None,
                 }
+                pending = self.st.pending_limited_center
+                pending_stamp = self.st.pending_limited_stamp
+                confirmation_limit = max(
+                    float(jump_info["limit"]),
+                    float(self.st.pending_limited_limit or 0.0),
+                )
+                confirmation_model = None
+                confirmation_residual = None
+                if pending is not None:
+                    stationary_residual = float(np.linalg.norm(C - pending))
+                    confirmation_model = "stationary"
+                    confirmation_residual = stationary_residual
+                    if (
+                        self.st.last_capture_stamp is not None
+                        and pending_stamp is not None
+                    ):
+                        first_dt = pending_stamp - self.st.last_capture_stamp
+                        next_dt = capture_stamp - pending_stamp
+                        if (
+                            math.isfinite(first_dt)
+                            and math.isfinite(next_dt)
+                            and first_dt > 1e-6
+                            and next_dt >= 0.0
+                        ):
+                            velocity = (pending - self.st.center) / first_dt
+                            predicted = pending + velocity * next_dt
+                            motion_residual = float(np.linalg.norm(C - predicted))
+                            if motion_residual < stationary_residual:
+                                confirmation_model = "constant_velocity"
+                                confirmation_residual = motion_residual
+                info["limited_jump"].update({
+                    "confirmation_model": confirmation_model,
+                    "confirmation_residual": confirmation_residual,
+                    "confirmation_limit": confirmation_limit,
+                })
+                agrees = (
+                    confirmation_residual is not None
+                    and confirmation_residual <= confirmation_limit
+                )
+                if not agrees:
+                    self.st.pending_limited_center = np.asarray(C, dtype=float).copy()
+                    self.st.pending_limited_stamp = capture_stamp
+                    self.st.pending_limited_limit = float(jump_info["limit"])
+                    info["rejected"] = "limited_jump_unconfirmed"
+                    self._on_miss(info)
+                    return info
+                info["limited_jump_confirmed"] = True
+                self.st.pending_limited_center = None
+                self.st.pending_limited_stamp = None
+                self.st.pending_limited_limit = None
+            else:
+                self.st.pending_limited_center = None
+                self.st.pending_limited_stamp = None
+                self.st.pending_limited_limit = None
 
         previous_center = self.st.center
         previous_stamp = self.st.last_capture_stamp
         step = None if previous_center is None else (C - previous_center)
         measured_velocity = None
         if step is not None:
-            self.st.accepted_step_norms.append(float(np.linalg.norm(step)))
             dt = None if previous_stamp is None else capture_stamp - previous_stamp
             if (info["state_in"] != "LOST" and dt is not None
                     and math.isfinite(dt) and dt > 1e-6):
+                self.st.accepted_step_norms.append(float(np.linalg.norm(step)))
                 measured_velocity = step / dt
         self.st.velocity = (
             measured_velocity
@@ -660,15 +900,19 @@ class ProductionEDMTracker:
         self.st.lost_frames = 0
         self.st.lost_global_retrieval_done = False
         self.st.state = "TRACK"
-        inlier_mask = np.asarray(
-            ret.get("inlier_mask", np.ones(len(pose_points3d), dtype=bool)),
-            dtype=bool,
-        )
-        self.temporal_xyz_by_cell = build_temporal_lut(
-            pose_points2d, pose_points3d, inlier_mask,
-            camera_to_edm_scale=self.loc.scale,
-        )
-        self.temporal_gray = gray.copy()
+        if cfg.use_temporal_reference:
+            inlier_mask = np.asarray(
+                ret.get("inlier_mask", np.ones(len(pose_points3d), dtype=bool)),
+                dtype=bool,
+            )
+            self.temporal_xyz_by_cell = build_temporal_lut(
+                pose_points2d, pose_points3d, inlier_mask,
+                camera_to_edm_scale=self.loc.scale,
+            )
+            self.temporal_gray = gray.copy()
+        else:
+            self.temporal_xyz_by_cell = None
+            self.temporal_gray = None
         info.update({"state_out": "TRACK", "center": C, "yaw": yaw, "R": R, "ok": True})
         return info
 
@@ -679,6 +923,9 @@ class ProductionEDMTracker:
         elif self.st.state == "WEAK_TRACK" and self.st.misses >= self.cfg.weak_after + self.cfg.lost_after:
             self.st.state = "LOST"
             self.st.velocity = None
+            self.st.pending_limited_center = None
+            self.st.pending_limited_stamp = None
+            self.st.pending_limited_limit = None
             self.st.lost_global_retrieval_done = False
         if self.st.state == "LOST":
             self.st.lost_frames += 1

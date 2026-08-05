@@ -1,0 +1,32 @@
+[project]
+name = "anafi-pcmd-sim"
+version = "0.1.0"
+description = "Sphinx-only PCMD diagonal-flight probe for Parrot ANAFI"
+readme = "README.md"
+authors = [
+    { name = "LeeYi", email = "khes60122@gmail.com" }
+]
+requires-python = ">=3.11,<3.12"
+dependencies = [
+    "parrot-olympe[rendering]==8.4.0",
+]
+
+[project.scripts]
+anafi-pcmd-sim = "anafi_pcmd_sim:main"
+
+[build-system]
+requires = ["uv_build>=0.11.16,<0.12.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "ruff>=0.16.1",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"

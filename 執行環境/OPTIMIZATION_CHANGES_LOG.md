@@ -4,6 +4,10 @@
 
 > 說明:原始的自壓縮封存檔已在初期清理時刪除,git 基線 commit 是調校中途才建立的,所以本檔不是機械式 `git diff`,而是**逐項對照的策展記錄**,每項都已對照現行程式碼確認。GitHub 備份:私有 repo `github.com/1122-gggggg/wulai-sfm-localization`(僅程式碼,大檔 gitignore)。
 
+> 2026-07-29 狀態：以下是 XFeat／光流時期的歷史調校紀錄，不再代表目前 EDM
+> runtime 或操作介面。現行設定、安全契約與驗證結果以 workspace 根目錄
+> `README.md` 為準；現行 UI 的「開始定位」只啟動定位，不代表 AUTO 同意或自主巡檢。
+
 ---
 
 ## 一、總覽對照表
@@ -199,3 +203,60 @@
 
 **仍未解**：本專案沒有非衛星絕對 ground truth，因此「移除 NN 提升絕對準度」只能以
 「不再偏離全量 LG 參考」表述，不能宣稱公分級絕對精度改善。
+
+---
+
+## 十二、2026-08-03：EDM reference backbone 特徵快取（**已接受**）
+
+EDM 用一次 backbone 呼叫處理 `cat([image0, image1])`（`edm.py:56`）。localizer 一律
+把地圖參考當 image0、把同一張 query 複製成 image1（`match_many_to_one`），所以每幀都在
+重算「只取決於不可變地圖影像」的參考特徵。eval() 下 BatchNorm 走既存統計，參考特徵因此
+是 image-local、可跨幀保留。
+
+**改動**：`edm_matcher.py` 新增 reference backbone 特徵 LRU（預設 16 筆、8.16 MiB/筆
+fp16，約 130 MiB）、hit/miss/eviction 計數與 `reference_feature_cache_stats()`；
+`benchmark_edm_site_replay.py` 每列記錄 `refs` 與該幀的 cache 增量。
+`SFM_EDM_REF_FEATURE_CACHE=0` 可完全關閉。
+
+**P119 replay A/B/A（河濱 river_site profile 724e35e0、2934 幀、RTX 5060）**
+
+| | cache off (A) | cache off (A2) | cache on (B) |
+|---|---:|---:|---:|
+| wall p50 | 51.09 ms | 52.01 ms | **49.29 ms（−4.4%）** |
+| wall p95 | 118.18 | 119.96 | **102.79（−13.7%）** |
+| processing FPS | 14.92 | 14.72 | **15.84（+6.9%）** |
+| 成功 | 1955 | 1955 | 2059 |
+| inliers p50 | 690.5 | 690.5 | 693.0 |
+
+夾測漂移 1.8%。A 與 A2 成功數完全相同，再次確認品質指標跨 run deterministic。
+
+**收益集中在多參考路徑**（同 mode 同 refcount 的逐幀對照）：TRACK 1 ref 的 match 只有
+−1.5%（28.43→27.99 ms），WEAK 3 refs −14.4%（88.37→75.62），LOST 10 refs −19%。
+b=1 時省下的是「batch-2 backbone 換成 batch-1」約 3 ms，再扣掉組裝 4 層特徵的 cat +
+`contiguous(channels_last)`，淨值很小。**隔離 microbenchmark 當時給的 TRACK −15.7% 沒有
+在完整管線上兌現，以 replay 數字為準。**
+
+**兩個設計決定（都有量測支撐）**
+1. 每張影像一律以 batch=1 抽特徵。把 miss 和 query 併成一次呼叫在冷幀更快（冷幀變成與
+   upstream 逐位元相同、+2.0%），但那會讓一幀的匹配結果取決於「當時剛好有哪些參考在
+   快取裡」，`match_many_to_one` 就不再是輸入的純函數。這裡選確定性。代價是冷幀 TRACK
+   +5.6%、WEAK −1.8%。
+2. 組裝後必須 `contiguous(channels_last)`。cat 一個 expand 過的 query 會靜默產生 NCHW，
+   餵進 neck 的損失大於快取的收益（修正前冷幀 TRACK 是 +26%）。
+
+**與 upstream 的數值差**：warm 路徑約 1% 的 anchor cell 會換人，共用 cell 的 query 點
+平均位移約 0.005 px、最大 0.073 px（真實地圖影像三組 pair）。原因是 query 改成單獨抽
+特徵，屬於 upstream 本來就存在的 fp16 batch-shape 敏感度（同一組 pair 在 b=1 與 b=2 之間
+的差異同一量級）。
+
+**不要據此宣稱品質變好**：B 的 quality gate 由 fail 轉 pass，但 inliers p50 剛好落在
+門檻值 693.0 上，且成功幀 +104 來自狀態機串聯（限跳閘的硬門檻把一個邊界幀翻面 →
+TRACK/WEAK 切換 → 參考集改變）。這是這條管線對次像素擾動敏感的證據，不是定位品質提升。
+
+**測試**：`定位演算法/validation/tests/test_reference_feature_cache.py`（純度：cache hit 與
+miss 逐位元相同；anchor 與未快取 backbone 的一致度；hit/miss/eviction 帳；env 關閉後
+不掛 patch；channels_last 回歸守門）。
+
+**未做**：LOST recovery 掃描 192 筆 bank 會打穿 16 筆 LRU（B 有 83 次 eviction）；容量
+尚未依場域調校。另 `reference_cache_size=32` 的 fp32 輸入 tensor 另佔約 72 MiB，有了特徵
+快取後只有 miss 才需要，可再縮。

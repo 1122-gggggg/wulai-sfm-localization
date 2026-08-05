@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "site_id": "urai_edm_v1",
   "display_name": "烏來（目標場域）EDM v1 — 2026-07-19 驗證",
   "localizer": "edm",
@@ -16,6 +16,21 @@
       640.0,
       360.0
     ]
+  },
+  "asset_sha256": {
+    "map_ply": "495042e13a5185c816ff710c5c2e47a768cceb5b98d6959b250ac34af9c60908",
+    "localization_bundle": "b32866d6595ca30b89e7cf6cef6dacbb4692f3c4992b759d833488c31b489d05",
+    "route_json": null,
+    "map_reference_poses": "b463515edc149a932cc5ff0e99a62ffa7a67e75ff36add9c1b3f2da1dd46ca6c",
+    "localizer_profile": "f5a486b922f7c4a5671daf867f630e9dd614cb68ac7aa1d6e028324e8c23b3e6",
+    "poles_json": null
+  },
+  "flight": {
+    "approved": false,
+    "coordinate_frame_id": null,
+    "route_clearance_approved": false,
+    "approval_note": "Blocked until a scale-free flight route, route-clearance review, coordinate ID, and props-off yaw-sign test exist.",
+    "controller": null
   },
   "assets": {
     "map_ply": "../../地圖檔/場域/urai/maps/edm_v1/target_site_v1_dense.ply",

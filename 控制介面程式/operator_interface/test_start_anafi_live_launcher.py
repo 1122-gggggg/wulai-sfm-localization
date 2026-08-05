@@ -9,8 +9,8 @@ from pathlib import Path
 
 import pytest
 
-
 SCRIPT = Path(__file__).with_name("start_anafi_live.sh")
+APP = SCRIPT.with_name("flight_operator_app.py")
 LAUNCH_ENV = {
     "CTRL",
     "DISPLAY",
@@ -28,13 +28,14 @@ LAUNCH_ENV = {
     "SFM_MAX_DISTANCE_M",
     "SFM_MAX_PERFORMANCE",
     "SFM_CPU_THREADS",
+    "SFM_SITE_PROFILE",
     "SFM_UI_PYTHON",
     "VENV",
     "WAYLAND_DISPLAY",
 }
 
 
-def run_launcher(**overrides: str) -> subprocess.CompletedProcess[str]:
+def run_launcher(*args: str, **overrides: str) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy()
     for name in LAUNCH_ENV:
         env.pop(name, None)
@@ -44,7 +45,7 @@ def run_launcher(**overrides: str) -> subprocess.CompletedProcess[str]:
         **overrides,
     })
     return subprocess.run(
-        [str(SCRIPT)],
+        [str(SCRIPT), *args],
         cwd=SCRIPT.parent,
         env=env,
         text=True,
@@ -69,7 +70,7 @@ def test_direct_ip_derives_drone_and_preserves_benchmark_flags():
     assert result.returncode == 0, result.stderr
     assert "--ip 192.168.42.1 --controller drone" in result.stdout
     assert "--no-live-detect" in result.stdout
-    assert "--max-altitude-m 30 --max-distance-m 100 --distance-geofence" in result.stdout
+    assert "--max-altitude-m 50 --max-distance-m 100 --distance-geofence" in result.stdout
     assert "--auto-inspect --boot-lock-ms 0" in result.stdout
     assert "--loc-force-track-bench" in result.stdout
     assert "--loc-every-n-frames 2" in result.stdout
@@ -183,7 +184,12 @@ def test_live_max_performance_is_best_effort_and_wraps_app(tmp_path: Path):
     ) in calls
     assert "gamemoderun" in calls
     assert "threads 4/4/4/4" in calls
-    assert any(line.startswith("python -u flight_operator_app.py --live") for line in calls)
+    assert any(
+        line.startswith(
+            f"python -u {APP} --interface real-flight"
+        )
+        for line in calls
+    )
     assert "continuing without it" in result.stderr
 
 
@@ -388,8 +394,28 @@ def test_live_max_performance_zero_skips_all_tuning(tmp_path: Path):
 
     assert result.returncode == 0, result.stderr
     assert call_log.read_text().splitlines() == [
-        "python -u flight_operator_app.py --live --ip 192.168.42.1 "
-        "--controller drone --no-live-detect --max-altitude-m 30 "
-        "--max-distance-m 100 --distance-geofence --nudge-pct 8 "
-        "--nudge-pulse-s 0.20"
+        (
+            f"python -u {APP} --interface real-flight "
+            "--ip 192.168.42.1 "
+            "--controller drone --no-live-detect --max-altitude-m 50 "
+            "--max-distance-m 100 --distance-geofence --nudge-pct 8 "
+            "--nudge-pulse-s 0.20"
+        )
     ]
+
+
+@pytest.mark.parametrize(
+    "args",
+    (
+        ("--video", "/tmp/replay.mp4"),
+        ("--video=/tmp/replay.mp4",),
+        ("--interface", "simulated-stream"),
+        ("--interface=simulated-stream",),
+    ),
+)
+def test_real_launcher_rejects_cross_interface_arguments(args: tuple[str, ...]):
+    result = run_launcher(*args)
+
+    assert result.returncode == 2
+    assert "rejects cross-interface argument" in result.stderr
+    assert "dry-run command" not in result.stdout

@@ -1,4 +1,16 @@
-# Localization Runtime Tuning Transfer Package
+# Legacy Runtime Tuning Package (historical)
+
+本文件下方的 `sfm_system/定位` 路徑是舊版調參包參考，不是目前工作區的發布格式。
+目前可攜式模擬介面請從工作區根目錄執行：
+
+```bash
+python tools/export_simulator_package.py /path/to/portable_localization
+cd /path/to/portable_localization
+python tools/package_manifest.py verify
+```
+
+目前發布包的 authoritative manifest 是發布包根目錄的 `MANIFEST.tsv` 與
+`SHA256SUMS`；本資料夾內的 manifest 只描述這個 legacy runtime 子資料夾。
 
 這個資料夾是要搬到另一台電腦的定位調參包。用途是調整定位 runtime 組合，例如把
 LightGlue 改成 NN、`nn_then_lg`，或調整 topK、threshold、PnP gate、temporal
@@ -360,6 +372,11 @@ export SFM_LOCALIZER_PYTHON="$PWD/.venv/bin/python"
 .venv/bin/python -m pip install -r requirements_test.txt
 ```
 
+不要把 EDM 的 ONNX 匯出／簡化 requirements 裝進這個 Olympe runtime
+virtualenv。Olympe 8.4.0 鎖定 protobuf 3.19.4，而新版 ONNX 需要 protobuf 4；
+匯出工具請用 `定位演算法/deploy_code/runtime/EDM/deploy/requirements_deploy.txt`
+另建環境。主環境可以保留不衝突的 ONNX Runtime 來執行既有模型。
+
 `requirements_runtime.txt` 已包含 PyTorch CUDA 12.8 官方 wheel index：
 
 ```text
@@ -369,6 +386,8 @@ numpy 2.2.6
 opencv-python 4.13.0.92
 pillow 12.3.0
 pycolmap 4.0.4
+protobuf 3.19.4
+parrot-olympe 8.4.0
 ```
 
 另需系統層：ffmpeg、tkinter（UI 用）。XFeat / LighterGlue / MegaLoc 不是

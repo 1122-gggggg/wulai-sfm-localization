@@ -1,8 +1,8 @@
 {
   "schema": "edm-deployment-profile/v1",
   "name": "river_site",
-  "status": "scale-calibrated 2026-07-26; RTX 5060 replay measurement required",
-  "base": "定位演算法/configs/edm_production_profile.json（tracker 19 欄逐項相同，只覆寫 5 個尺度欄位）",
+  "status": "scale-calibrated 2026-07-26; RTX 5060 P119 replay measured 2934/2935 frames 2026-08-02; decode incomplete; max_corr_total=900 retained",
+  "base": "定位演算法/configs/edm_production_profile.json（完整 tracker 契約，只覆寫 5 個尺度欄位）",
   "map_scale": {
     "S": 1.900843,
     "definition": "2·p95(‖center − componentwise_median‖) over the 454 EDM references",
@@ -27,10 +27,15 @@
     "recovery_bank_size": 192,
     "recovery_scan_topk": 2,
     "use_temporal_reference": false,
+    "temporal_map_topk": 1,
+    "near_pool": 24,
+    "covis_per_ref": 20,
     "max_corr_total": 900,
+    "corr_grid": 8,
     "acquire_min_inliers": 80,
     "track_min_inliers": 50,
     "weak_min_inliers": 30,
+    "max_yaw_diff_deg": 90.0,
     "max_reproj_error_acquire": 5.0,
     "max_reproj_error_track": 6.0,
     "prediction_max_dt": 0.25,
@@ -38,15 +43,20 @@
 
     "radius": 0.304135,
     "max_jump": 0.760337,
+    "adaptive_jump_factor": 8.0,
     "adaptive_jump_floor": 0.00114051,
     "adaptive_jump_bootstrap": 0.00760337,
-    "adaptive_jump_ceiling": 0.00304135
+    "adaptive_jump_ceiling": 0.00304135,
+    "adaptive_jump_min_history": 20,
+    "adaptive_jump_history_size": 120,
+    "weak_after": 2,
+    "lost_after": 2
   },
   "field_notes": {
     "scale_dependent": [
       "radius = 0.16·S", "max_jump = 0.40·S", "adaptive_jump_floor = 0.0006·S",
       "adaptive_jump_bootstrap = 0.004·S", "adaptive_jump_ceiling = 0.0016·S"
     ],
-    "diff_vs_shared": "與 edm_production_profile.json 的唯一差異就是上面五個尺度欄位；matcher 與其餘 19 個 tracker 欄位逐項相同。"
+    "diff_vs_shared": "與 edm_production_profile.json 的唯一 runtime 差異就是上面五個尺度欄位；matcher 與其餘 tracker 欄位逐項相同。"
   }
 }

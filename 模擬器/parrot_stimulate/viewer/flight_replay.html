@@ -1,0 +1,164 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ANAFI 路徑飛行重播</title>
+  <style>
+    :root { color-scheme: dark; font-family: Inter, "Noto Sans TC", sans-serif; }
+    * { box-sizing: border-box; }
+    body { margin: 0; overflow: hidden; background: #071019; color: #eaf7f4; }
+    canvas { display: block; width: 100vw; height: 100vh; cursor: grab; touch-action: none; }
+    canvas.dragging { cursor: grabbing; }
+    .topbar, .hud, .legend {
+      position: fixed; z-index: 2; border: 1px solid #28445a; border-radius: 12px;
+      background: rgba(7, 16, 25, .88); box-shadow: 0 12px 40px #0008;
+      backdrop-filter: blur(8px);
+    }
+    .topbar { top: 16px; left: 16px; right: 16px; display: flex; gap: 12px; align-items: center; padding: 12px 16px; }
+    h1 { margin: 0 12px 0 0; font-size: 18px; white-space: nowrap; }
+    button, select { border: 1px solid #3a627b; border-radius: 8px; background: #102838; color: #fff; padding: 7px 12px; }
+    button:hover, select:hover { background: #17405a; }
+    .hint { color: #7ca9be; font-size: 12px; white-space: nowrap; }
+    input[type="range"] { min-width: 160px; flex: 1; accent-color: #ffb703; }
+    .hud { top: 82px; left: 16px; width: 360px; padding: 14px 16px; }
+    .hud-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 7px 16px; font-variant-numeric: tabular-nums; }
+    .label { color: #7ca9be; font-size: 12px; }
+    .value { font-size: 15px; margin-top: 2px; }
+    .wide { grid-column: 1 / -1; }
+    .phase { color: #55d6be; font-weight: 700; }
+    .estimate { color: #7aa2ff; }
+    .legend { right: 16px; bottom: 16px; padding: 10px 14px; font-size: 13px; line-height: 1.8; }
+    .dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 7px; }
+    .error { position: fixed; inset: 0; display: grid; place-items: center; color: #ff8a9a; font-size: 18px; padding: 30px; }
+  </style>
+</head>
+<body>
+  <canvas id="scene" aria-label="三維飛行路徑；拖曳旋轉視角，滾輪縮放"></canvas>
+  <div class="topbar">
+    <h1>Parrot ANAFI 4K 飛行重播</h1>
+    <button id="toggle" type="button">暫停</button>
+    <button id="restart" type="button">重新播放</button>
+    <button id="resetView" type="button">重設視角</button>
+    <span class="hint">拖曳旋轉 · 滾輪縮放</span>
+    <label for="speed">速度</label>
+    <select id="speed"><option value="1">1×</option><option value="2">2×</option><option value="5" selected>5×</option><option value="10">10×</option></select>
+    <input id="timeline" aria-label="飛行時間軸" type="range" min="0" value="0" step="1">
+    <span id="counter">0 / 0</span>
+  </div>
+  <section class="hud" aria-label="飛行遙測">
+    <div class="hud-grid">
+      <div><div class="label">階段</div><div id="phase" class="value phase">載入中</div></div>
+      <div><div class="label">目標點</div><div id="waypoint" class="value">-</div></div>
+      <div><div class="label">真值位置 ENU (m)</div><div id="truePosition" class="value">-</div></div>
+      <div><div class="label">估計位置 ENU (m)</div><div id="estimatedPosition" class="value estimate">-</div></div>
+      <div><div class="label">真值目標距離</div><div id="trueDistance" class="value">-</div></div>
+      <div><div class="label">估計目標距離</div><div id="estimatedDistance" class="value estimate">-</div></div>
+      <div><div class="label">真值相機 yaw</div><div id="trueYaw" class="value">-</div></div>
+      <div><div class="label">估計相機 yaw</div><div id="estimatedYaw" class="value estimate">-</div></div>
+      <div><div class="label">估計轉向誤差</div><div id="angle" class="value">-</div></div>
+      <div><div class="label">位置估計誤差</div><div id="positionError" class="value">-</div></div>
+      <div><div class="label">yaw 估計誤差</div><div id="yawError" class="value">-</div></div>
+      <div><div class="label">定位年齡 / 信心</div><div id="localizationHealth" class="value">-</div></div>
+      <div><div class="label">估計速度</div><div id="estimatedSpeed" class="value">-</div></div>
+      <div><div class="label">到點連續確認</div><div id="arrivalConfirmation" class="value">-</div></div>
+      <div><div class="label">安全狀態</div><div id="safetyState" class="value">-</div></div>
+      <div><div class="label">Sphinx 風擾動</div><div id="wind" class="value">-</div></div>
+      <div class="wide"><div class="label">控制器送出的 PCMD (R / P / Y / G)</div><div id="pcmd" class="value">-</div></div>
+    </div>
+  </section>
+  <div class="legend">
+    <div><span class="dot" style="background:#55d6be"></span>規劃三維路徑</div>
+    <div><span class="dot" style="background:#ffb703"></span>已飛行軌跡</div>
+    <div><span class="dot" style="background:#ff5d73"></span>目前無人機</div>
+    <div><span class="dot" style="background:#7aa2ff"></span>控制器估計位置／朝向</div>
+    <div><span class="dot" style="background:#b8f35d"></span>目前目標點</div>
+  </div>
+  <script>
+    const canvas = document.querySelector('#scene');
+    const ctx = canvas.getContext('2d');
+    const ui = Object.fromEntries(['phase','waypoint','truePosition','estimatedPosition','trueDistance','estimatedDistance','trueYaw','estimatedYaw','angle','positionError','yawError','localizationHealth','estimatedSpeed','arrivalConfirmation','safetyState','wind','pcmd','counter','timeline','toggle','restart','resetView','speed'].map(id => [id, document.querySelector('#' + id)]));
+    let plan, rows, frame = 0, playing = true, speed = 5, lastTime = performance.now();
+    const defaultView = {azimuth:-Math.PI*3/4, elevation:.48, zoom:1};
+    const view = {...defaultView};
+    let drag = null;
+
+    function parseCsv(text) {
+      const lines = text.trim().split(/\r?\n/); const keys = lines.shift().split(',');
+      return lines.map(line => Object.fromEntries(line.split(',').map((value, index) => [keys[index], value])));
+    }
+    function n(row, key) { return Number(row[key]); }
+    function resize() { canvas.width = innerWidth * devicePixelRatio; canvas.height = innerHeight * devicePixelRatio; ctx.setTransform(devicePixelRatio,0,0,devicePixelRatio,0,0); }
+    addEventListener('resize', resize); resize();
+
+    function bounds() {
+      const points = plan.waypoints.concat(rows.flatMap(r => [
+        {x_m:n(r,'camera_x_m'), y_m:n(r,'camera_y_m'), z_m:n(r,'camera_z_m')},
+        {x_m:n(r,'estimated_camera_x_m'), y_m:n(r,'estimated_camera_y_m'), z_m:n(r,'estimated_camera_z_m')}
+      ]));
+      const xs=points.map(p=>p.x_m), ys=points.map(p=>p.y_m), zs=points.map(p=>p.z_m);
+      return {minX:Math.min(...xs)-1,maxX:Math.max(...xs)+1,minY:Math.min(...ys)-1,maxY:Math.max(...ys)+1,minZ:0,maxZ:Math.max(...zs)+.5};
+    }
+    function projector() {
+      const b=bounds(), cx=(b.minX+b.maxX)/2, cy=(b.minY+b.maxY)/2, cz=(b.minZ+b.maxZ)/2;
+      const span=Math.max(b.maxX-b.minX,b.maxY-b.minY,b.maxZ-b.minZ), scale=Math.min(innerWidth,innerHeight)*.62/span*view.zoom;
+      const sinA=Math.sin(view.azimuth), cosA=Math.cos(view.azimuth), sinE=Math.sin(view.elevation), cosE=Math.cos(view.elevation);
+      return (x,y,z) => {
+        const dx=x-cx, dy=y-cy, dz=z-cz;
+        const horizontal=-sinA*dx+cosA*dy;
+        const depth=cosA*dx+sinA*dy;
+        const vertical=-sinE*depth+cosE*dz;
+        return {x:innerWidth*.58+horizontal*scale, y:innerHeight*.56-vertical*scale};
+      };
+    }
+    function line(points, color, width=2, dashed=false) {
+      if (!points.length) return; ctx.beginPath(); points.forEach((p,i)=>i?ctx.lineTo(p.x,p.y):ctx.moveTo(p.x,p.y));
+      ctx.setLineDash(dashed?[6,6]:[]); ctx.strokeStyle=color; ctx.lineWidth=width; ctx.stroke(); ctx.setLineDash([]);
+    }
+    function draw() {
+      if (!rows) return; ctx.clearRect(0,0,innerWidth,innerHeight); const project=projector(), b=bounds();
+      const grid=[]; ctx.strokeStyle='#173143'; ctx.lineWidth=1;
+      for(let x=Math.ceil(b.minX);x<=Math.floor(b.maxX);x++){ line([project(x,b.minY,0),project(x,b.maxY,0)],'#173143',1); }
+      for(let y=Math.ceil(b.minY);y<=Math.floor(b.maxY);y++){ line([project(b.minX,y,0),project(b.maxX,y,0)],'#173143',1); }
+      line(plan.waypoints.map(p=>project(p.x_m,p.y_m,p.z_m)),'#55d6be',3);
+      line(rows.slice(0,Math.floor(frame)+1).map(r=>project(n(r,'camera_x_m'),n(r,'camera_y_m'),n(r,'camera_z_m'))),'#ffb703',2);
+      plan.waypoints.forEach((p,i)=>{ const s=project(p.x_m,p.y_m,p.z_m); ctx.beginPath(); ctx.arc(s.x,s.y,6,0,Math.PI*2); ctx.fillStyle=i===Number(rows[Math.floor(frame)].waypoint_index)?'#b8f35d':'#55d6be'; ctx.fill(); ctx.fillStyle='#dcecf2'; ctx.font='12px sans-serif'; ctx.fillText(`P${i+1} z=${p.z_m.toFixed(2)}`,s.x+9,s.y-8); });
+      const r=rows[Math.floor(frame)], drone=project(n(r,'camera_x_m'),n(r,'camera_y_m'),n(r,'camera_z_m')), estimate=project(n(r,'estimated_camera_x_m'),n(r,'estimated_camera_y_m'),n(r,'estimated_camera_z_m')), target=project(n(r,'target_x_m'),n(r,'target_y_m'),n(r,'target_z_m'));
+      line([estimate,target],'#b8f35d',1,true); ctx.beginPath(); ctx.arc(drone.x,drone.y,9,0,Math.PI*2); ctx.fillStyle='#ff5d73'; ctx.fill(); ctx.strokeStyle='#fff'; ctx.lineWidth=2; ctx.stroke();
+      ctx.beginPath(); ctx.arc(estimate.x,estimate.y,6,0,Math.PI*2); ctx.fillStyle='#7aa2ff'; ctx.fill();
+      const yaw=n(r,'camera_yaw_enu_deg')*Math.PI/180, tip=project(n(r,'camera_x_m')+Math.cos(yaw)*.55,n(r,'camera_y_m')+Math.sin(yaw)*.55,n(r,'camera_z_m'));
+      const estimatedYaw=n(r,'estimated_camera_yaw_enu_deg')*Math.PI/180, estimatedTip=project(n(r,'estimated_camera_x_m')+Math.cos(estimatedYaw)*.55,n(r,'estimated_camera_y_m')+Math.sin(estimatedYaw)*.55,n(r,'estimated_camera_z_m'));
+      line([drone,tip],'#fff',3); line([estimate,estimatedTip],'#7aa2ff',2); updateHud(r);
+    }
+    function updateHud(r) {
+      ui.phase.textContent=({turn:'轉向修正',translate:'平移',brake:'減速懸停',hover:'路徑點懸停',localization_lost:'定位遺失懸停',safety_hover:'安全懸停'})[r.phase]||r.phase;
+      ui.waypoint.textContent=`P${Number(r.waypoint_index)+1} / ${plan.waypoints.length}`;
+      ui.truePosition.textContent=`${n(r,'camera_x_m').toFixed(2)}, ${n(r,'camera_y_m').toFixed(2)}, ${n(r,'camera_z_m').toFixed(2)}`;
+      ui.estimatedPosition.textContent=`${n(r,'estimated_camera_x_m').toFixed(2)}, ${n(r,'estimated_camera_y_m').toFixed(2)}, ${n(r,'estimated_camera_z_m').toFixed(2)}`;
+      ui.trueDistance.textContent=`${n(r,'true_distance_m').toFixed(3)} m`; ui.estimatedDistance.textContent=`${n(r,'estimated_distance_m').toFixed(3)} m`;
+      ui.trueYaw.textContent=`${n(r,'camera_yaw_enu_deg').toFixed(2)}°`; ui.estimatedYaw.textContent=`${n(r,'estimated_camera_yaw_enu_deg').toFixed(2)}°`; ui.angle.textContent=`${n(r,'camera_turn_angle_enu_deg').toFixed(2)}°`;
+      ui.positionError.textContent=`${n(r,'position_error_m').toFixed(3)} m`; ui.yawError.textContent=`${n(r,'yaw_error_deg').toFixed(2)}°`;
+      ui.localizationHealth.textContent=`${n(r,'localization_pose_age_s').toFixed(2)} s / ${n(r,'localization_confidence').toFixed(2)}`;
+      ui.estimatedSpeed.textContent=`${n(r,'estimated_speed_m_s').toFixed(3)} m/s`;
+      ui.arrivalConfirmation.textContent=`${r.arrival_confirmation_count} / ${plan.controller.arrival_confirmation_updates}`;
+      ui.safetyState.textContent=r.safety_state;
+      ui.wind.textContent=`突發偏移 ≤${n(r,'wind_maximum_displacement_m').toFixed(2)} m`; ui.pcmd.textContent=[r.pcmd_roll,r.pcmd_pitch,r.pcmd_yaw,r.pcmd_gaz].join(' / ');
+      ui.counter.textContent=`${Math.floor(frame)+1} / ${rows.length}`; ui.timeline.value=Math.floor(frame);
+    }
+    function animate(now) { const dt=Math.min((now-lastTime)/1000,.1); lastTime=now; if(playing&&rows){ frame+=dt*speed; if(frame>=rows.length-1){frame=rows.length-1;playing=false;ui.toggle.textContent='播放';} draw(); } requestAnimationFrame(animate); }
+    ui.toggle.onclick=()=>{playing=!playing;ui.toggle.textContent=playing?'暫停':'播放';lastTime=performance.now();};
+    ui.restart.onclick=()=>{frame=0;playing=true;ui.toggle.textContent='暫停';}; ui.speed.onchange=()=>speed=Number(ui.speed.value);
+    ui.resetView.onclick=()=>{Object.assign(view,defaultView);draw();};
+    ui.timeline.oninput=()=>{frame=Number(ui.timeline.value);draw();};
+    canvas.addEventListener('pointerdown',event=>{drag={pointerId:event.pointerId,x:event.clientX,y:event.clientY,azimuth:view.azimuth,elevation:view.elevation};canvas.setPointerCapture(event.pointerId);canvas.classList.add('dragging');});
+    canvas.addEventListener('pointermove',event=>{if(!drag||event.pointerId!==drag.pointerId)return;view.azimuth=drag.azimuth+(event.clientX-drag.x)*.008;view.elevation=Math.max(-Math.PI/2+.05,Math.min(Math.PI/2-.05,drag.elevation+(drag.y-event.clientY)*.006));draw();});
+    function finishDrag(event){if(!drag||event.pointerId!==drag.pointerId)return;drag=null;canvas.classList.remove('dragging');}
+    canvas.addEventListener('pointerup',finishDrag); canvas.addEventListener('pointercancel',finishDrag);
+    canvas.addEventListener('wheel',event=>{event.preventDefault();view.zoom=Math.max(.35,Math.min(3.5,view.zoom*Math.exp(-event.deltaY*.001)));draw();},{passive:false});
+
+    const run=new URLSearchParams(location.search).get('run');
+    if(!run){ document.body.innerHTML='<div class="error">缺少 run 查詢參數</div>'; }
+    else Promise.all([fetch(run+'/route_plan.json').then(r=>r.json()),fetch(run+'/pcmd_log.csv').then(r=>r.text())]).then(([p,csv])=>{plan=p;rows=parseCsv(csv);ui.timeline.max=rows.length-1;draw();requestAnimationFrame(animate);}).catch(error=>{document.body.innerHTML=`<div class="error">無法載入飛行資料：${error.message}</div>`;});
+  </script>
+</body>
+</html>

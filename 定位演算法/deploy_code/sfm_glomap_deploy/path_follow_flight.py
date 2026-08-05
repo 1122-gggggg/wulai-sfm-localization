@@ -6,8 +6,8 @@ sim-validated separately; this file joins them into a single runnable real-fligh
 entrypoint on ONE Olympe connection:
 
     OlympePdrawGrabber (720p live stream)              [olympe_frame_source.py]
-      -> ProductionXFeatTracker                        [production_xfeat_tracker.py]
-             MegaLoc(top30) -> XFeat -> LighterGlue -> PnP,  BOOT_INIT -> TRACK
+      -> site-selected EDM or XFeat production tracker
+             MegaLoc retrieval -> local matching -> PnP, BOOT_INIT -> TRACK
       -> map-frame heading fusion  (Olympe yaw  <->  map-motion direction)
       -> RouteAutoController.step(pose) -> Command      [real_path_follow_controller.py]
              FOLLOW / REJOIN-nearest-point / LAND  (keeps drone ON the drawn route)
@@ -34,8 +34,7 @@ SAFETY  -- real flight is irreversible and can injure people or destroy the dron
   --selftest  : pure-python checks (heading fusion + PCMD sign sanity). No deps.
   --dry-run   : no drone; a toy dynamics model closes the loop to exercise logic.
   --grab-only : connect + localize on the LIVE stream, PROPS OFF, never arms motors.
-  --fly       : arms + flies. Open space, human on the manual-override controller,
-                AFTER verifying PCMD signs (--yaw-sign) on YOUR airframe.
+  --fly       : LOCKED pending external approval. This legacy metric controller cannot arm.
 Take off with the drone NOSE POINTED ALONG THE ROUTE START (that seeds the heading
 offset); online motion refinement corrects it from there. Speeds are tiny.
 """
@@ -59,20 +58,34 @@ FLIGHT_ROOT = Path(__file__).resolve().parent
 
 
 def _find_system_root(start: Path) -> Path:
-    # This file ships in three places (source deploy dir, transfer-package
-    # deploy_code/, transfer-package mission/flight_control/); a fixed
-    # parents[N] depth is only right for one of them. Walk up instead.
+    configured = os.environ.get("SFM_WORKSPACE_ROOT", "").strip()
+    if configured:
+        root = Path(configured).expanduser().resolve()
+        if (root / "定位演算法").is_dir() and (root / "控制介面程式").is_dir():
+            return root
     for p in [start, *start.parents]:
+        if (p / "定位演算法").is_dir() and (p / "控制介面程式").is_dir():
+            return p
         if p.name == "sfm_system":
             return p
     return start.parents[3] if len(start.parents) > 3 else start
 
 
 SYSTEM_ROOT = _find_system_root(FLIGHT_ROOT)
-LOC_ROOT = SYSTEM_ROOT / "定位"
-MISSION_ROOT = LOC_ROOT / "mission"
+LOC_ROOT = (
+    SYSTEM_ROOT / "定位演算法"
+    if (SYSTEM_ROOT / "定位演算法").is_dir()
+    else SYSTEM_ROOT / "定位"
+)
+MISSION_ROOT = (
+    SYSTEM_ROOT / "控制介面程式"
+    if (SYSTEM_ROOT / "控制介面程式").is_dir()
+    else LOC_ROOT / "mission"
+)
 SOURCE_ROOT = LOC_ROOT / "source" / "sfm_glomap"
 DEPLOY_ROOT = LOC_ROOT / "deploy_code" / "sfm_glomap_deploy"
+if DEPLOY_ROOT.is_dir() and str(DEPLOY_ROOT) not in sys.path:
+    sys.path.append(str(DEPLOY_ROOT))
 FOOTBALL_FIELD_ROOT = Path("/home/allen/足球場")
 FOOTBALL_FIELD_BUNDLE = (
     FOOTBALL_FIELD_ROOT / "bundles" / "football_field_reloc_map_xfeat_tri.pt"
@@ -108,6 +121,10 @@ XBUN = os.environ.get("SFM_RELOC_BUNDLE", str(DEFAULT_BUNDLE))
 MEG = os.environ.get("SFM_MEGALOC_CACHE", str(DEFAULT_MEGALOC_CACHE))
 PATH_JSON = os.environ.get("SFM_FLIGHT_PATH_JSON", str(DEFAULT_PATH_JSON))
 POLES_JSON = os.environ.get("SFM_POLES_JSON", str(DEFAULT_POLES_JSON))
+LOCALIZER_BACKEND = os.environ.get("SFM_LOCALIZER_BACKEND", "xfeat").strip().lower()
+LOCALIZER_PROFILE = os.environ.get("SFM_LOCALIZER_PROFILE", "").strip()
+BUNDLE_SHA256 = os.environ.get("SFM_BUNDLE_SHA256", "").strip()
+FLIGHT_CONTRACT_JSON = os.environ.get("SFM_FLIGHT_CONTRACT_JSON", "").strip()
 
 DRONE_IP_REAL = "192.168.42.1"
 DRONE_IP_SKYCTRL = "192.168.53.1"
@@ -125,6 +142,47 @@ CAM_720 = (
         -0.1198628127364991, 0.0, 0.0, 0.0,
     ],
 )
+
+
+def _reject_json_constant(value: str):
+    raise ValueError(f"non-finite JSON number is not allowed: {value}")
+
+
+def query_camera_from_environment(default=CAM_720, *, required: bool = False):
+    raw = os.environ.get("SFM_QUERY_CAMERA_JSON", "").strip()
+    if not raw:
+        if required:
+            raise ValueError("flight contract requires an explicit query camera")
+        return default
+    try:
+        value = json.loads(raw, parse_constant=_reject_json_constant)
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise ValueError(f"invalid SFM_QUERY_CAMERA_JSON: {exc}") from exc
+    if not isinstance(value, dict) or set(value) != {"model", "width", "height", "params"}:
+        raise ValueError(
+            "SFM_QUERY_CAMERA_JSON must contain model, width, height, and params"
+        )
+    return value["model"], value["width"], value["height"], value["params"]
+
+
+def flight_contract_from_environment(*, require_approved: bool) -> dict | None:
+    if require_approved:
+        raise ValueError(
+            "autonomous route flight is LOCKED pending external approval; "
+            "the retired metric controller cannot be armed"
+        )
+    if not FLIGHT_CONTRACT_JSON:
+        return None
+    try:
+        contract = json.loads(
+            FLIGHT_CONTRACT_JSON,
+            parse_constant=_reject_json_constant,
+        )
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise ValueError(f"invalid SFM_FLIGHT_CONTRACT_JSON: {exc}") from exc
+    if not isinstance(contract, dict):
+        raise ValueError("SFM_FLIGHT_CONTRACT_JSON must be an object")
+    return contract
 
 
 def _env_float(name: str, default: float, *, minimum: float, maximum: float) -> float:
@@ -709,7 +767,7 @@ class CommandLog:
 
 
 def default_cmd_log_path(tag: str) -> Path:
-    return (LOC_ROOT / "outputs" / "flight_logs"
+    return (SYSTEM_ROOT / "outputs" / "flight_logs"
             / f"{tag}_cmdlog_{time.strftime('%Y%m%d_%H%M%S')}.jsonl")
 
 
@@ -1134,6 +1192,13 @@ def run_loop(hooks: LoopHooks, ctrl, waypoints, yaw_sign: int = 1, verbose: bool
     import real_path_follow_controller as rpf
 
     heading = HeadingEstimator()
+    pcmd_controller = (
+        rpf.YawAlignedPcmdController(ctrl.cfg) if ctrl is not None else None
+    )
+
+    def reset_pcmd_controller():
+        if pcmd_controller is not None:
+            pcmd_controller.reset()
     period = 1.0 / CTRL_HZ
     last_good = None
     uncertain_since = None
@@ -1213,6 +1278,7 @@ def run_loop(hooks: LoopHooks, ctrl, waypoints, yaw_sign: int = 1, verbose: bool
             emit(rec, actual, True, reason)
             break
         if safety_mode == "HOVER":
+            reset_pcmd_controller()
             _sent, _why, actual = send_command((0, 0, 0, 0))
             emit(rec, actual, True, "safety HOVER: authorized zero PCMD")
             steps += 1
@@ -1221,6 +1287,7 @@ def run_loop(hooks: LoopHooks, ctrl, waypoints, yaw_sign: int = 1, verbose: bool
                 time.sleep(period - dt)
             continue
         if safety_mode == "MANUAL":
+            reset_pcmd_controller()
             last_safety_mode = safety_mode                # MANUAL: send NOTHING (SkyController pilot has the sticks)
             emit(rec, None, True, "MANUAL: autonomy sends nothing (pilot has the sticks)")
             steps += 1
@@ -1232,6 +1299,7 @@ def run_loop(hooks: LoopHooks, ctrl, waypoints, yaw_sign: int = 1, verbose: bool
 
         now = hooks.now()
         if hooks.stream_healthy is not None and not hooks.stream_healthy():
+            reset_pcmd_controller()
             _sent, _why, actual = send_command((0, 0, 0, 0))
             stream_lost_since = stream_lost_since or now
             uncertain_since = None
@@ -1287,12 +1355,14 @@ def run_loop(hooks: LoopHooks, ctrl, waypoints, yaw_sign: int = 1, verbose: bool
             emit(rec, actual, True, reason)
             break
         if final_safety == "HOVER":
+            reset_pcmd_controller()
             _sent, _why, actual = send_command((0, 0, 0, 0))
             emit(rec, actual, True,
                  "safety changed to HOVER during inference -> zero PCMD")
             steps += 1
             continue
         if final_safety == "MANUAL":
+            reset_pcmd_controller()
             emit(rec, None, True,
                  "safety changed to MANUAL during inference -> autonomy sends nothing")
             steps += 1
@@ -1303,6 +1373,7 @@ def run_loop(hooks: LoopHooks, ctrl, waypoints, yaw_sign: int = 1, verbose: bool
         except Exception:
             stream_ok_after_inference = False
         if not stream_ok_after_inference:
+            reset_pcmd_controller()
             _sent, _why, actual = send_command((0, 0, 0, 0))
             stream_lost_since = stream_lost_since or now
             uncertain_since = None
@@ -1366,6 +1437,7 @@ def run_loop(hooks: LoopHooks, ctrl, waypoints, yaw_sign: int = 1, verbose: bool
             (GATE_WEAK and hooks.pose_is_weak is not None and hooks.pose_is_weak())
             or (hooks.pose_confidence is not None and hooks.pose_confidence() < LOW_CONF_INLIERS)))
         if low_conf or not fresh:
+            reset_pcmd_controller()
             recovery_good_fixes = 0
             _sent, _why, actual = send_command((0, 0, 0, 0))
             current_limit = WEAK_HOVER_LAND_S if low_conf else LOST_LAND_S
@@ -1402,6 +1474,7 @@ def run_loop(hooks: LoopHooks, ctrl, waypoints, yaw_sign: int = 1, verbose: bool
             continue
         else:
             if uncertain_since is not None and recovery_good_fixes + 1 < RECOVERY_GOOD_FIXES:
+                reset_pcmd_controller()
                 recovery_good_fixes += 1
                 _sent, _why, actual = send_command((0, 0, 0, 0))
                 emit(
@@ -1424,8 +1497,9 @@ def run_loop(hooks: LoopHooks, ctrl, waypoints, yaw_sign: int = 1, verbose: bool
             manual_requested = False
             C = np.array([ploc.x, ploc.y, ploc.z], float)
             if not seeded:
-                # seed heading from route start (operator points nose along path[0->goal])
-                _d, _n, _seg, s0 = rpf.project_to_path(C, ctrl.wp, ctrl.cum)
+                # Seed only from the controller's continuity-bounded route window.
+                # A global nearest-segment lookup can pick a later crossing branch.
+                _d, _n, _seg, s0 = ctrl._project_with_progress(C)
                 goal, _gi = rpf.point_at_s(ctrl.wp, ctrl.cum,
                                            min(ctrl.path_len, s0 + ctrl.cfg.lookahead))
                 heading.seed_from_path(C, goal, oyaw)
@@ -1433,17 +1507,33 @@ def run_loop(hooks: LoopHooks, ctrl, waypoints, yaw_sign: int = 1, verbose: bool
             heading.update(C, oyaw)
             hdg = heading.heading(oyaw)
             if hdg is None:
+                reset_pcmd_controller()
                 _sent, _why, actual = send_command((0, 0, 0, 0))
                 emit(rec, actual, True, "heading unavailable -> hover")
             else:
                 pose = rpf.Pose(x=ploc.x, y=ploc.y, z=ploc.z, yaw=hdg, stamp=ploc.stamp)
                 cmd = ctrl.step(pose, now)
-                roll, pitch, yaw, gaz = rpf.command_to_body_percent(
-                    cmd, pose, yaw_sign=yaw_sign)
+                if cmd.look_at_pole is not None:
+                    reset_pcmd_controller()
+                    roll, pitch, yaw, gaz = rpf.command_to_body_percent(
+                        cmd,
+                        pose,
+                        config=ctrl.cfg,
+                        yaw_sign=yaw_sign,
+                    )
+                else:
+                    roll, pitch, yaw, gaz = pcmd_controller.update(
+                        cmd,
+                        pose,
+                        now,
+                        target_key=ctrl.active_segment,
+                        yaw_sign=yaw_sign,
+                    )
                 rec["heading_deg"] = round(math.degrees(hdg), 1)
                 rec["path_error_u"] = round(float(cmd.path_error), 3)
                 rec["progress"] = round(float(cmd.progress), 4)
                 rec["action"] = cmd.status
+                rec["pcmd_phase"] = pcmd_controller.phase
                 if cmd.path_error > MAX_ROUTE_DEVIATION_U:
                     # Route-corridor bound: never REJOIN across long distances.
                     _sent, _why, actual = send_command((0, 0, 0, 0))
@@ -1535,7 +1625,8 @@ def run_loop(hooks: LoopHooks, ctrl, waypoints, yaw_sign: int = 1, verbose: bool
                     elif verbose and steps % 10 == 0:
                         print(f"[{cmd.status:26s}] pos=({ploc.x:5.1f},{ploc.y:5.1f},{ploc.z:4.1f}) "
                               f"hdg={math.degrees(hdg):6.1f} err={cmd.path_error:4.2f} "
-                              f"prog={cmd.progress:4.2f} PCMD(p={pitch:+d},y={yaw:+d},g={gaz:+d})")
+                              f"prog={cmd.progress:4.2f} phase={pcmd_controller.phase} "
+                              f"PCMD(r={roll:+d},p={pitch:+d},y={yaw:+d},g={gaz:+d})")
         steps += 1
         dt = hooks.now() - t0
         if dt < period:
@@ -1559,59 +1650,55 @@ def production_config():
     anchor cache is only consulted by the NN fast pass, so it is now inert; its
     settings are kept so matcher_mode="nn_then_lg" stays reproducible for benchmarks.
     """
-    from production_xfeat_tracker import ProductionConfig
-    return ProductionConfig(
-        matcher_mode="lighterglue", acquire_matcher_mode="lighterglue",
-        nn_min_score=0.85, min_conf=0.1,
-        adaptive_first_topk=3, adaptive_accept_inliers=100, adaptive_accept_reproj=3.5,
-        local_topk=5, weak_local_topk=8, near_pool=24, covis_per_ref=20,
-        radius=0.8, max_yaw_diff_deg=90.0,
-        xfeat_topk_track=1700, xfeat_topk_acquire=2048,
-        boot_global_topk=30, lost_global_topk=30, weak_global_topk=0,
-        acquire_min_inliers=80, track_min_inliers=50, weak_min_inliers=30,
-        good_inliers=80, pnp_ransac_max_error=5.0, pnp_ransac_random_seed=-1,
-        max_reproj_error_track=6.0, max_reproj_error_acquire=5.0,
-        acquire_max_jump=1.25, acquire_max_yaw_diff_deg=90.0,
-        max_jump=2.0, max_speed_mps=10.0, jump_slack_m=0.4,
-        lost_pure_global_after_s=3.0, weak_after=2, lost_after=2,
-        max_corr_total=0, max_corr_per_ref=0, dedup_corr=False,
-        flow_enabled=False,
-        temporal_cache_enabled=True, temporal_cache_seed_mode="full_ref",
-        temporal_cache_min_anchors=80,
-        temporal_cache_max_anchors=2048,
-        temporal_cache_max_age=2,
-        temporal_cache_min_score=0.85,
-        temporal_cache_seed_min_inliers=150,
-        temporal_cache_seed_max_reproj=3.5,
-    )
+    from production_localizer_factory import production_xfeat_config
+
+    return production_xfeat_config()
 
 
-def build_localizer(frame_source, cam_tuple=CAM_720):
-    from production_xfeat_tracker import ProductionXFeatTracker, MegaLocLayer
-    from reloc_localizer_xfeat import XFeatRelocMap, Camera
-    xmap = XFeatRelocMap.load(XBUN)          # fixed-pose triangulated XFeat layer, 1920 refs
-    if xmap.ref_centers is None or len(xmap.ref_centers) != len(xmap.ref_names):
-        raise SystemExit(
-            f"bundle tracking metadata mismatch: refs={len(xmap.ref_names)} "
-            f"ref_centers={0 if xmap.ref_centers is None else len(xmap.ref_centers)}. "
-            "Regenerate/augment tracking metadata before real flight deployment."
+def build_localizer(frame_source, cam_tuple=None):
+    from production_localizer_factory import build_production_localizer
+
+    contract = flight_contract_from_environment(require_approved=False) or {}
+    contract_camera = contract.get("query_camera")
+    if cam_tuple is None and isinstance(contract_camera, dict):
+        cam_tuple = (
+            contract_camera.get("model"),
+            contract_camera.get("width"),
+            contract_camera.get("height"),
+            contract_camera.get("params"),
         )
-    try:
-        meg = MegaLocLayer.load_cache(Path(MEG), xmap.ref_names, input_size=322)
-    except Exception as exc:
-        print(f"[flight] MegaLoc cache unavailable/incompatible ({exc}); using bundle ref_global")
-        meg = MegaLocLayer(xmap.ref_global, input_size=322)
-    cam = Camera(*cam_tuple)
-    return ProductionXFeatTracker(xmap, meg, frame_source=frame_source,
-                                  query_cam=cam, cfg=production_config())
+    bundle_sha256 = contract.get("localization_bundle_sha256") or BUNDLE_SHA256
+    if (
+        contract.get("approved") is True
+        and BUNDLE_SHA256
+        and BUNDLE_SHA256.strip().lower() != str(bundle_sha256).strip().lower()
+    ):
+        raise ValueError(
+            "SFM_BUNDLE_SHA256 does not match the approved flight contract"
+        )
+    built = build_production_localizer(
+        backend=LOCALIZER_BACKEND,
+        bundle=XBUN,
+        frame_source=frame_source,
+        camera_tuple=cam_tuple or query_camera_from_environment(),
+        bundle_sha256=bundle_sha256 or None,
+        megaloc_cache=MEG or None,
+        production_profile=LOCALIZER_PROFILE or None,
+        production_profile_sha256=contract.get("localizer_profile_sha256"),
+    )
+    print(
+        f"[localizer] backend={built.backend} variant={built.variant} "
+        f"camera={built.camera.model}:{built.camera.width}x{built.camera.height}",
+        flush=True,
+    )
+    return built.tracker
 
 
 def build_controller():
-    import real_path_follow_controller as rpf
-    wp = rpf.load_waypoints(PATH_JSON)
-    poles = rpf.load_poles(POLES_JSON)
-    ctrl = rpf.RouteAutoController(wp, poles)
-    return ctrl, wp
+    raise RuntimeError(
+        "legacy autonomous controller is LOCKED pending external approval; "
+        "map-to-metre conversion has been retired"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1620,10 +1707,10 @@ def build_controller():
 def fly(ip: str, yaw_sign: int, gimbal_pitch: float, controller: str, safety_file: str,
         cmd_log_path: str = "", max_altitude_m: float | None = None,
         max_distance_m: float | None = None, distance_geofence: bool = True):
-    import olympe_frame_source as ofs
-    from olympe.messages.ardrone3.Piloting import TakeOff, PCMD, Landing, Emergency
-    from olympe.messages.ardrone3.PilotingState import FlyingStateChanged
-
+    raise SystemExit(
+        "autonomous route flight is LOCKED pending external approval; "
+        "no connection or flight command was issued"
+    )
     if max_altitude_m is None or max_distance_m is None:
         raise SystemExit(
             "--fly requires explicit --max-altitude-m and --max-distance-m")
@@ -1642,6 +1729,10 @@ def fly(ip: str, yaw_sign: int, gimbal_pitch: float, controller: str, safety_fil
         if sig is not None:
             signal.signal(sig, lambda *_: stop.__setitem__("f", True))
     ctrl, wp = build_controller()
+    import olympe_frame_source as ofs
+    from olympe.messages.ardrone3.Piloting import TakeOff, PCMD, Landing, Emergency
+    from olympe.messages.ardrone3.PilotingState import FlyingStateChanged
+
     clog = CommandLog(cmd_log_path or default_cmd_log_path("fly"), sink="olympe")
     print(f"[fly] structured command log: {clog.path}", flush=True)
     safety = SafetySwitch(
@@ -1813,7 +1904,7 @@ def fly(ip: str, yaw_sign: int, gimbal_pitch: float, controller: str, safety_fil
                 if time.monotonic() - float(capture_stamp) > STREAM_STALE_S:
                     return False
                 import cv2
-                out_dir = LOC_ROOT / "outputs" / "flight_inspections"
+                out_dir = SYSTEM_ROOT / "outputs" / "flight_inspections"
                 out_dir.mkdir(parents=True, exist_ok=True)
                 out = out_dir / (f"wp{int(meta['waypoint']):02d}_pole{int(meta['pole_id']):02d}_"
                                  f"{time.strftime('%Y%m%d_%H%M%S')}_{time.time_ns() % 1_000_000_000:09d}.jpg")
@@ -2081,17 +2172,17 @@ def selftest():
     # 2) PCMD sign sanity: facing the goal -> forward pitch>0, small yaw; behind -> yaw drives, no forward
     pose = rpf.Pose(x=0, y=0, z=0, yaw=0.0)      # facing +X
     ahead = rpf.Command("FOLLOW", np.array([1.2, 0.0, 0.0]), yaw_target=0.0,
-                        goal=np.zeros(3), path_error=0.0, progress=0.0)
+                        goal=np.array([1.2, 0.0, 0.0]), path_error=0.0, progress=0.0)
     r, p, y, g = rpf.command_to_body_percent(ahead, pose)
     assert p > 0 and abs(y) < 3 and r == 0, (r, p, y, g)
     behind = rpf.Command("FOLLOW", np.array([-1.2, 0.0, 0.0]), yaw_target=math.pi,
-                         goal=np.zeros(3), path_error=0.0, progress=0.0)
+                         goal=np.array([-1.2, 0.0, 0.0]), path_error=0.0, progress=0.0)
     r, p, y, g = rpf.command_to_body_percent(behind, pose)
-    assert p == 0 and abs(y) == 25, ("should spin in place, not fly backward", r, p, y, g)
+    assert p == 0 and abs(y) == 20, ("should spin in place, not fly backward", r, p, y, g)
 
     # 3) +gaz == up (-Y): a "go up" command (target y lower) yields gaz>0
     up = rpf.Command("FOLLOW", np.array([0.0, -1.0, 0.0]), yaw_target=0.0,
-                     goal=np.zeros(3), path_error=0.0, progress=0.0)
+                     goal=np.array([0.0, -1.0, 0.0]), path_error=0.0, progress=0.0)
     _, _, _, g = rpf.command_to_body_percent(up, pose)
     assert g > 0, f"+gaz should be ascend, got {g}"
 
@@ -2235,7 +2326,7 @@ def main():
     mode.add_argument("--selftest", action="store_true", help="pure-python checks, no deps")
     mode.add_argument("--dry-run", action="store_true", help="toy dynamics, no drone")
     mode.add_argument("--grab-only", action="store_true", help="live localize, PROPS OFF, no arm")
-    mode.add_argument("--fly", action="store_true", help="ARM + FLY (open space, safety pilot!)")
+    mode.add_argument("--fly", action="store_true", help="LOCKED pending external approval")
     ap.add_argument("--ip", default=DRONE_IP_REAL,
                     help=f"real {DRONE_IP_REAL} / skyctrl {DRONE_IP_SKYCTRL} / sphinx {DRONE_IP_SIM}")
     ap.add_argument("--yaw-sign", type=int, default=1, choices=(-1, 1),
@@ -2254,7 +2345,7 @@ def main():
                     help="write auto/hover/manual/land here for runtime safety switching")
     ap.add_argument("--secs", type=float, default=20.0, help="--grab-only duration")
     ap.add_argument("--cmd-log", default="",
-                    help="JSONL per-tick command log path (default: auto under 定位/outputs/flight_logs/)")
+                    help="JSONL per-tick command log path (default: outputs/flight_logs/)")
     args = ap.parse_args()
 
     if args.selftest:
@@ -2268,7 +2359,7 @@ def main():
               "never sends TakeOff/PCMD", flush=True)
         grab_only(args.ip, args.secs, args.controller)
     elif args.fly:
-        print("[mode] FLY: REAL DRONE COMMANDS ENABLED -- TakeOff/PCMD/Landing/Emergency live", flush=True)
+        print("[mode] FLY: LOCKED -- no connection or command will be issued", flush=True)
         fly(args.ip, args.yaw_sign, args.gimbal_pitch, args.controller, args.safety_file,
             cmd_log_path=args.cmd_log,
             max_altitude_m=args.max_altitude_m,

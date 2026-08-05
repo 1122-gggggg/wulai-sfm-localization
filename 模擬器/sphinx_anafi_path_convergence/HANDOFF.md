@@ -1,9 +1,9 @@
 # HANDOFF — Sphinx ANAFI path-convergence experiment
 
 Read this first, then `README.md` (how to run) and `RESULTS.md` (findings).
-Most code lives under `sfm_system/定位/experiments/sphinx_anafi_path_convergence/`.
+Most code lives under `模擬器/sphinx_anafi_path_convergence/`.
 The only companion files are the simulator-only launcher and smoke test under
-`mission/flight_control/`. Do not change real-flight or deploy entrypoints.
+`定位演算法/flight_control/`. Do not change real-flight or deploy entrypoints.
 
 ## What this is
 
@@ -15,11 +15,11 @@ compared; the user's requested design is `translational_waypoint`.
 ## Status
 
 - 10 controllers implemented over a shared state machine (`controllers.py`).
-- **167 pytest tests pass** (`/home/allen/localization/.venv/bin/python -m pytest -q tests`).
-- Current paired clean kinematic baseline completed: 200/200 trials passed and
-  completed. `adaptive_lookahead` led the composite score (157.91), while
-  `translational_waypoint` ranked third (157.51) with fewer yaw reversals.
-  Older robustness tables are pre-pairing historical evidence and must be
+- All pure-Python tests pass
+  (`/home/allen/localization/.venv/bin/python -m pytest -q tests`).
+- The 2026-07-10 paired kinematic baseline used the old metric that could accept
+  a trivial start already inside the corridor. The runner now fails and excludes
+  those trials, so the old 200/200 result and ranking are historical and must be
   rerun before choosing a controller.
 - Sphinx ANAFI proven live: connect, takeoff, real telemetry (GPS ~1.2 Hz,
   attitude/velocity ~5.3 Hz), PCMD→motion with correct signs, harness ran
@@ -54,19 +54,19 @@ a route-controller bug.
 ## How to launch Sphinx (exact, this machine)
 
 ```bash
-# Check dependencies and observed Sphinx version:
-sfm_system/定位/mission/flight_control/launch_sphinx_anafi_empty.sh --check
+# Select one reviewed, explicit firmware revision:
+export FIRMWARE_URL='<reviewed explicit ANAFI PC firmware revision URL>'
+定位演算法/flight_control/launch_sphinx_anafi_empty.sh --check
 
 # Start firmwared, Sphinx core and the known-working offscreen UE4 renderer:
-sfm_system/定位/mission/flight_control/launch_sphinx_anafi_empty.sh
+定位演算法/flight_control/launch_sphinx_anafi_empty.sh
 # Continue only after it sees BOTH "All drones instantiated" and 10.202.0.1.
 # "All drones dropped" fails startup. Cleanup has bounded TERM -> KILL fallback.
 ```
 
-The default firmware selector contains `#latest`, so it is unpinned. Each live
-harness summary records observed Sphinx, ANAFI firmware and Olympe versions and
-sets `fully_reproducible=false`. Do not claim exact reproduction until the
-firmware image is pinned by immutable revision/hash.
+The launcher rejects missing selectors and `#latest`. Export the same explicit
+`FIRMWARE_URL` in the harness shell; otherwise the summary keeps
+`fully_reproducible=false` even though it still records observed runtime versions.
 
 Retry loop that fits the flaky boot window: `scratchpad/*.sh` in the session
 scratchpad (`start_sphinx.sh`, `start_ue4.sh`, `sphinx_retry.sh`) show a
@@ -77,7 +77,7 @@ retry the whole stack a few times; it is probabilistic.
 ## Run the harness against Sphinx
 
 ```bash
-cd sfm_system/定位/experiments/sphinx_anafi_path_convergence
+cd 模擬器/sphinx_anafi_path_convergence
 /home/allen/localization/.venv/bin/python run_sphinx_anafi_convergence.py \
   --backend sphinx --pattern line --segment-length-m 3.0 --num-trials 2 \
   --rejoin-algorithm translational_waypoint --random-yaw-error-deg 10 \

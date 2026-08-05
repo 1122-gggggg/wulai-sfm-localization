@@ -8,6 +8,7 @@ from types import ModuleType, SimpleNamespace
 import pytest
 
 import olympe_live_backend as backend_module
+from backend_contract import ControlAction, ControlRequest, InterfaceMode, SessionConfig
 
 
 class _Message:
@@ -63,8 +64,17 @@ class _FakeDrone:
         self.source_readback_override: str | None = None
         self.flight_state = "hovering"
         self.connected = True
+        self.managed_drone_connected = True
         self.battery_pct = 100.0
         self.gps_fixed = 1
+        self.home_latitude = 25.0
+        self.home_longitude = 121.0
+        self.home_altitude = 12.0
+        self.home_reachable = True
+        self.rth_success = True
+        self.rth_auto_trigger_mode = "on"
+        self.rth_delay_s = 1
+        self.rth_ending_behavior = "landing"
         self.setting_ack = {
             "MaxAltitude": True,
             "MaxDistance": True,
@@ -82,6 +92,16 @@ class _FakeDrone:
         self.landing_success = True
         self.takeoff_success = True
         self.takeoff_wait_hook = None
+        self.drone_calibration_required = 0
+        self.drone_calibration_started = False
+        self.drone_calibration_axis = "none"
+        self.drone_calibration_x_done = True
+        self.drone_calibration_y_done = True
+        self.drone_calibration_z_done = True
+        self.drone_calibration_failed = False
+        self.drone_calibration_ack = True
+        self.controller_calibration_state = "Calibrated"
+        self.controller_calibration_ack = True
 
     @staticmethod
     def _first(message):
@@ -120,6 +140,27 @@ class _FakeDrone:
                     self.setting_states[state_name][field] = first.kwargs[argument]
 
             return _Expectation(ok, apply_setting)
+        if first.name == "set_auto_trigger_mode":
+            return _Expectation(
+                True,
+                lambda: setattr(
+                    self, "rth_auto_trigger_mode", first.kwargs["mode"]
+                ),
+            )
+        if first.name == "set_delay":
+            return _Expectation(
+                True,
+                lambda: setattr(self, "rth_delay_s", first.kwargs["delay"]),
+            )
+        if first.name == "set_ending_behavior":
+            return _Expectation(
+                True,
+                lambda: setattr(
+                    self, "rth_ending_behavior", first.kwargs["ending_behavior"]
+                ),
+            )
+        if first.name == "return_to_home":
+            return _Expectation(self.rth_success)
         if first.name == "Landing":
             return _Expectation(
                 self.landing_success,
@@ -136,6 +177,42 @@ class _FakeDrone:
                     self.takeoff_wait_hook()
 
             return _Expectation(self.takeoff_success, finish_takeoff)
+        if first.name == "MagnetoCalibration":
+            requested = int(first.kwargs.get("calibrate", 0))
+
+            def update_drone_calibration():
+                if not self.drone_calibration_ack:
+                    return
+                self.drone_calibration_started = bool(requested)
+                self.drone_calibration_axis = "xAxis" if requested else "none"
+                if requested:
+                    self.drone_calibration_x_done = False
+                    self.drone_calibration_y_done = False
+                    self.drone_calibration_z_done = False
+                    self.drone_calibration_failed = False
+
+            return _Expectation(
+                self.drone_calibration_ack,
+                update_drone_calibration,
+            )
+        if first.name == "StartCalibration":
+            def start_controller_calibration():
+                if self.controller_calibration_ack:
+                    self.controller_calibration_state = "CalibratingX"
+
+            return _Expectation(
+                self.controller_calibration_ack,
+                start_controller_calibration,
+            )
+        if first.name == "AbortCalibration":
+            def abort_controller_calibration():
+                if self.controller_calibration_ack:
+                    self.controller_calibration_state = "NotCalibrated"
+
+            return _Expectation(
+                self.controller_calibration_ack,
+                abort_controller_calibration,
+            )
         return _Expectation(True)
 
     def get_state(self, message_type):
@@ -150,12 +227,102 @@ class _FakeDrone:
             return {"percent": self.battery_pct}
         if name == "GPSFixStateChanged":
             return {"fixed": self.gps_fixed}
+        if name == "ProductNameChanged":
+            return {"name": "ANAFI"}
+        if name == "ProductModel":
+            return {"model": "ANAFI_4K"}
+        if name == "ProductVersionChanged":
+            return {"software": "1.8.2", "hardware": "1"}
+        if name == "ProductSerialHighChanged":
+            return {"high": "PI"}
+        if name == "ProductSerialLowChanged":
+            return {"low": "000001"}
+        if name == "BoardIdChanged":
+            return {"id": "anafi-hw"}
+        if name == "ProductSerialChanged":
+            return {"serialNumber": "SC3-000001"}
+        if name == "ProductVariantChanged":
+            return {"variant": "SkyController3"}
+        if name == "HomeChanged" or name == "home_location":
+            return {
+                "latitude": self.home_latitude,
+                "longitude": self.home_longitude,
+                "altitude": self.home_altitude,
+            }
+        if name == "ReturnHomeDelayChanged":
+            return {"delay": 10}
+        if name == "ReturnHomeMinAltitudeChanged":
+            return {"value": 20.0, "min": 20.0, "max": 100.0}
+        if name == "home_reachability":
+            return {"status": "reachable" if self.home_reachable else "not_reachable"}
+        if name == "auto_trigger_mode":
+            return {"mode": self.rth_auto_trigger_mode}
+        if name == "delay":
+            return {"delay": self.rth_delay_s, "min": 1, "max": 120}
+        if name == "ending_behavior":
+            return {"ending_behavior": self.rth_ending_behavior}
+        if name == "connection_state":
+            return {
+                "state": "connected" if self.managed_drone_connected else "disconnected"
+            }
         if name in self.setting_states:
             return dict(self.setting_states[name])
         if name == "AttitudeChanged":
             return {"roll": 0.0, "pitch": 0.0, "yaw": 0.0}
+        if name == "MagnetoCalibrationRequiredState":
+            return {"required": self.drone_calibration_required}
+        if name == "MagnetoCalibrationStartedChanged":
+            return {"started": int(self.drone_calibration_started)}
+        if name == "MagnetoCalibrationAxisToCalibrateChanged":
+            return {"axis": self.drone_calibration_axis}
+        if name == "MagnetoCalibrationStateChanged":
+            return {
+                "xAxisCalibration": int(self.drone_calibration_x_done),
+                "yAxisCalibration": int(self.drone_calibration_y_done),
+                "zAxisCalibration": int(self.drone_calibration_z_done),
+                "calibrationFailed": int(self.drone_calibration_failed),
+            }
+        if name == "MagnetoCalibrationStateV2":
+            return {"state": self.controller_calibration_state}
         if name == "AltitudeChanged":
             return {"altitude": 0.0}
+        if name == "AltitudeAboveGroundChanged":
+            return {"altitude": 1.2}
+        if name == "SpeedChanged":
+            return {"speedX": 0.18, "speedY": 0.24, "speedZ": -0.04}
+        if name == "GpsLocationChanged":
+            return {
+                "latitude": 25.012345,
+                "longitude": 121.543210,
+                "altitude": 12.5,
+                "latitude_accuracy": 1,
+                "longitude_accuracy": 2,
+                "altitude_accuracy": 3,
+            }
+        if name == "AlertStateChanged":
+            return {"state": "none"}
+        if name == "NavigateHomeStateChanged":
+            return {"state": "available", "reason": "enabled"}
+        if name == "HeadingLockedStateChanged":
+            return {"state": "ok"}
+        if name == "HoveringWarning":
+            return {"no_gps_too_dark": 0, "no_gps_too_high": 1}
+        if name == "WindStateChanged":
+            return {"state": "warning"}
+        if name == "VibrationLevelChanged":
+            return {"state": "ok"}
+        if name == "NumberOfSatelliteChanged":
+            return {"numberOfSatellite": 14}
+        if name == "WifiSignalChanged":
+            return {"rssi": -55}
+        if name == "LinkSignalQuality":
+            return {"value": 0x84}
+        if name == "SensorsStatesListChanged":
+            return {
+                "IMU": {"sensorName": "IMU", "sensorState": 1},
+                "barometer": {"sensorName": "barometer", "sensorState": 1},
+                "GPS": {"sensorName": "GPS", "sensorState": 0},
+            }
         return {}
 
     def connection_state(self):
@@ -169,6 +336,9 @@ class _FakeDrone:
 class _FakeLog:
     def __init__(self):
         self.records: list[tuple[str, dict]] = []
+        self.healthy = True
+        self.durable = True
+        self.path = None
 
     def event(self, event: str, **fields) -> None:
         self.records.append((event, fields))
@@ -184,6 +354,7 @@ def _install_fake_olympe(monkeypatch: pytest.MonkeyPatch) -> None:
         "olympe.messages.ardrone3",
         "olympe.messages.common",
         "olympe.messages.skyctrl",
+        "olympe.messages.drone_manager",
         "olympe.features",
     )
     for name in package_names:
@@ -201,6 +372,18 @@ def _install_fake_olympe(monkeypatch: pytest.MonkeyPatch) -> None:
             "FlyingStateChanged": _message_factory("FlyingStateChanged"),
             "AttitudeChanged": _message_factory("AttitudeChanged"),
             "AltitudeChanged": _message_factory("AltitudeChanged"),
+            "SpeedChanged": _message_factory("SpeedChanged"),
+            "AltitudeAboveGroundChanged": _message_factory("AltitudeAboveGroundChanged"),
+            "GpsLocationChanged": _message_factory("GpsLocationChanged"),
+            "AlertStateChanged": _message_factory("AlertStateChanged"),
+            "NavigateHomeStateChanged": _message_factory("NavigateHomeStateChanged"),
+            "HeadingLockedStateChanged": _message_factory("HeadingLockedStateChanged"),
+            "HoveringWarning": _message_factory("HoveringWarning"),
+            "WindStateChanged": _message_factory("WindStateChanged"),
+            "VibrationLevelChanged": _message_factory("VibrationLevelChanged"),
+        },
+        "olympe.messages.ardrone3.GPSState": {
+            "NumberOfSatelliteChanged": _message_factory("NumberOfSatelliteChanged"),
         },
         "olympe.messages.ardrone3.PilotingSettings": {
             "MaxAltitude": _message_factory("MaxAltitude"),
@@ -224,12 +407,51 @@ def _install_fake_olympe(monkeypatch: pytest.MonkeyPatch) -> None:
         },
         "olympe.messages.common.CommonState": {
             "BatteryStateChanged": _message_factory("BatteryStateChanged"),
+            "WifiSignalChanged": _message_factory("WifiSignalChanged"),
+            "LinkSignalQuality": _message_factory("LinkSignalQuality"),
+            "SensorsStatesListChanged": _message_factory("SensorsStatesListChanged"),
+        },
+        "olympe.messages.common.Calibration": {
+            "MagnetoCalibration": _message_factory("MagnetoCalibration"),
+        },
+        "olympe.messages.common.CalibrationState": {
+            name: _message_factory(name) for name in (
+                "MagnetoCalibrationRequiredState",
+                "MagnetoCalibrationStartedChanged",
+                "MagnetoCalibrationAxisToCalibrateChanged",
+                "MagnetoCalibrationStateChanged",
+            )
+        },
+        "olympe.messages.skyctrl.Calibration": {
+            "StartCalibration": _message_factory("StartCalibration"),
+            "AbortCalibration": _message_factory("AbortCalibration"),
+        },
+        "olympe.messages.skyctrl.CalibrationState": {
+            "MagnetoCalibrationStateV2": _message_factory(
+                "MagnetoCalibrationStateV2"
+            ),
         },
         "olympe.messages.skyctrl.CoPiloting": {
             "setPilotingSource": _message_factory("setPilotingSource"),
         },
         "olympe.messages.skyctrl.CoPilotingState": {
             "pilotingSource": _message_factory("pilotingSource"),
+        },
+        "olympe.messages.common.SettingsState": {
+            name: _message_factory(name) for name in (
+                "ProductNameChanged",
+                "ProductVersionChanged",
+                "ProductSerialHighChanged",
+                "ProductSerialLowChanged",
+                "BoardIdChanged",
+            )
+        },
+        "olympe.messages.skyctrl.SettingsState": {
+            name: _message_factory(name) for name in (
+                "ProductSerialChanged",
+                "ProductVersionChanged",
+                "ProductVariantChanged",
+            )
         },
         "olympe.messages.camera": {
             "stop_recording": _message_factory("stop_recording"),
@@ -238,7 +460,33 @@ def _install_fake_olympe(monkeypatch: pytest.MonkeyPatch) -> None:
         "olympe.features.media": {
             "download_media": _message_factory("download_media"),
         },
+        "olympe.messages.rth": {
+            name: _message_factory(name) for name in (
+                "home_location",
+                "home_reachability",
+                "auto_trigger_mode",
+                "delay",
+                "ending_behavior",
+                "return_to_home",
+                "set_auto_trigger_mode",
+                "set_delay",
+                "set_ending_behavior",
+            )
+        },
+        "olympe.messages.drone_manager": {
+            "connection_state": _message_factory("connection_state"),
+        },
     }
+    modules["olympe.messages.common.CommonState"]["ProductModel"] = (
+        _message_factory("ProductModel")
+    )
+    modules["olympe.messages.ardrone3.GPSSettingsState"].update({
+        name: _message_factory(name) for name in (
+            "HomeChanged",
+            "ReturnHomeDelayChanged",
+            "ReturnHomeMinAltitudeChanged",
+        )
+    })
     for name, attributes in modules.items():
         module = ModuleType(name)
         for key, value in attributes.items():
@@ -250,6 +498,20 @@ def _install_fake_olympe(monkeypatch: pytest.MonkeyPatch) -> None:
 def make_backend(monkeypatch: pytest.MonkeyPatch, tmp_path):
     _install_fake_olympe(monkeypatch)
     monkeypatch.setattr(backend_module, "_DEFAULT_RECORD_DIR", tmp_path)
+    # Unit tests must not inherit the workstation's current free-space state.
+    # Dedicated storage-guard tests override this stub with warning/critical
+    # results; production still uses the real 5% fail-closed threshold.
+    monkeypatch.setattr(
+        backend_module,
+        "assess_disk_space",
+        lambda _path: SimpleNamespace(
+            free_bytes=50 * 1024**3,
+            free_percent=50.0,
+            warning=False,
+            takeoff_blocked=False,
+            reason="ok",
+        ),
+    )
     monkeypatch.setattr(
         backend_module.OlympeLiveBackend, "_connect", lambda self: None,
     )
@@ -281,13 +543,168 @@ def make_backend(monkeypatch: pytest.MonkeyPatch, tmp_path):
             distance_geofence=distance_geofence,
             min_takeoff_battery_pct=min_takeoff_battery_pct,
             require_gps_for_geofence=require_gps_for_geofence,
+            approved_aircraft_firmware=("1.8.2",),
+            approved_controller_firmware=("1.8.2",),
+            approved_olympe_versions=("8.4.0",),
             with_video=with_video,
         )
         backend.log = _FakeLog()
         backend.drone = _FakeDrone()
+        backend._stick_monitor = SimpleNamespace(
+            is_active=lambda: False,
+            stop=lambda: None,
+        )
+        backend.state.stick_monitor_ok = True
         return backend
 
     return make
+
+
+def test_inventory_reads_and_logs_actual_connected_hardware(make_backend):
+    backend = make_backend()
+
+    inventory = backend.read_connection_inventory()
+
+    assert inventory["aircraft"]["name"] == "ANAFI"
+    assert inventory["aircraft"]["serial"] == "PI000001"
+    assert inventory["aircraft"]["software"] == "1.8.2"
+    assert inventory["controller"]["serial"] == "SC3-000001"
+    assert inventory["home"]["valid"] is True
+    assert inventory["lost_link"]["return_home_delay_s"] == 1
+    assert inventory["takeoff_inventory_ready"] is True
+    assert backend.state.home_valid is True
+    assert backend.state.rth_policy_valid is True
+    assert any(event == "hardware_inventory" for event, _ in backend.log.records)
+
+
+def test_real_backend_typed_session_start_is_not_shadowed(make_backend):
+    backend = make_backend()
+    config = SessionConfig(
+        session_id="real-session",
+        interface_mode=InterfaceMode.REAL_FLIGHT,
+        site_profile="/tmp/site.json",
+        site_profile_sha256="a" * 64,
+        asset_sha256={},
+        runtime_profile_sha256="b" * 64,
+        source="192.168.53.1",
+        offline=True,
+    )
+
+    assert callable(backend.start)
+    assert backend.start(config).started
+
+
+def test_video_inventory_is_logged_once_after_first_observed_frame(make_backend):
+    backend = make_backend()
+
+    class VideoStream:
+        output_index = 1
+
+        @staticmethod
+        def metadata_snapshot():
+            return {
+                "codec": "H.264",
+                "codec_evidence": "configured-pdraw-input-contract",
+                "codec_observed": False,
+                "ui_frame_width_px": 1280,
+                "ui_frame_height_px": 720,
+                "observed_fps": 29.5,
+                "source_timestamp_capable": True,
+                "source_timestamp_trusted": True,
+            }
+
+    backend.video_stream = VideoStream()
+
+    assert backend._maybe_log_video_inventory()
+    assert not backend._maybe_log_video_inventory()
+    records = [fields for event, fields in backend.log.records if event == "video_inventory"]
+    assert len(records) == 1
+    assert records[0]["codec"] == "H.264"
+    assert backend.connection_inventory["video"]["ui_frame_width_px"] == 1280
+
+
+def test_preflight_blocks_firmware_not_in_approved_receipt(make_backend):
+    backend = make_backend(max_altitude_m=30.0, max_distance_m=100.0)
+    backend.drone.flight_state = "landed"
+    backend.approved_aircraft_firmware = frozenset({"different-version"})
+
+    assert not backend._takeoff_preflight()
+    assert "aircraft firmware" in backend.state.preflight_reason
+    assert "TakeOff" not in backend.drone.events
+
+
+def test_preflight_blocks_unhealthy_safety_log(make_backend):
+    backend = make_backend(max_altitude_m=30.0, max_distance_m=100.0)
+    backend.drone.flight_state = "landed"
+    backend.log.healthy = False
+
+    assert not backend._takeoff_preflight()
+    assert "safety log" in backend.state.preflight_reason
+    assert "TakeOff" not in backend.drone.events
+
+
+def test_preflight_blocks_critical_disk_pressure(
+    make_backend, monkeypatch: pytest.MonkeyPatch,
+):
+    backend = make_backend(max_altitude_m=30.0, max_distance_m=100.0)
+    backend.drone.flight_state = "landed"
+    monkeypatch.setattr(
+        backend_module,
+        "assess_disk_space",
+        lambda _path: SimpleNamespace(
+            takeoff_blocked=True,
+            warning=True,
+            free_bytes=4 * 1024**3,
+            free_percent=4.0,
+            reason="critical disk test",
+        ),
+    )
+
+    assert not backend._takeoff_preflight()
+    assert backend.state.preflight_reason == "critical disk test"
+    assert "TakeOff" not in backend.drone.events
+
+
+def test_runtime_log_failure_zeros_motion_and_hands_to_manual_once(make_backend):
+    backend = make_backend()
+    backend.drone.flight_state = "flying"
+    backend.pilot_sticks = False
+    backend.log.healthy = False
+
+    assert backend._check_runtime_storage_health(10.0) is False
+    first_zero_count = len(backend.drone.pcmds)
+    assert first_zero_count >= 1
+    assert backend.drone.pcmds[-1][1:5] == (0, 0, 0, 0)
+    assert backend.pilot_sticks is True
+    assert backend.state.active_incident == "disk_or_log_failure"
+
+    assert backend._check_runtime_storage_health(12.0) is False
+    assert len(backend.drone.pcmds) == first_zero_count
+
+
+def test_runtime_critical_disk_pressure_zeros_motion_and_never_auto_resumes(
+    make_backend, monkeypatch: pytest.MonkeyPatch,
+):
+    backend = make_backend()
+    backend.drone.flight_state = "flying"
+    backend.pilot_sticks = False
+    monkeypatch.setattr(
+        backend_module,
+        "assess_disk_space",
+        lambda _path: SimpleNamespace(
+            takeoff_blocked=True,
+            warning=True,
+            free_bytes=4 * 1024**3,
+            free_percent=4.0,
+            reason="critical disk during flight",
+        ),
+    )
+
+    assert backend._check_runtime_storage_health(10.0) is False
+    assert backend.drone.pcmds[-1][1:5] == (0, 0, 0, 0)
+    assert backend.state.mode == "MANUAL"
+    assert backend.state.active_incident == "disk_or_log_failure"
+    assert backend.state.disk_warning is True
 
 
 @pytest.mark.parametrize(
@@ -432,6 +849,27 @@ def test_ui_firmware_limit_command_returns_apply_result(make_backend):
     ) is False
 
 
+def test_autonomous_speed_limit_is_landed_only_and_keeps_real_auto_locked(
+    make_backend,
+):
+    backend = make_backend()
+    backend.drone.flight_state = "landed"
+    backend.state.autonomous_approval_valid = True
+
+    assert backend.command(
+        "auto_speed_limit_apply", speed_limit_mps=0.2
+    ) is True
+    assert backend.state.autonomous_speed_limit_mps == pytest.approx(0.2)
+    assert backend.state.autonomous_approval_valid is False
+    assert backend.state.autonomous_locked is True
+
+    backend.drone.flight_state = "flying"
+    assert backend.command(
+        "auto_speed_limit_apply", speed_limit_mps=0.1
+    ) is False
+    assert backend.state.autonomous_speed_limit_mps == pytest.approx(0.2)
+
+
 def test_takeoff_preflight_retries_transient_connect_state_cache_failure(make_backend):
     backend = make_backend(max_altitude_m=20.0, max_distance_m=80.0)
     backend.drone.flight_state = ""
@@ -514,6 +952,152 @@ def test_poll_displays_all_current_firmware_readbacks(make_backend):
     assert state.max_tilt_deg == pytest.approx(12.0)
     assert state.max_vertical_speed_mps == pytest.approx(0.7)
     assert state.max_rotation_speed_dps == pytest.approx(15.0)
+    assert state.airspeed_mps == pytest.approx(0.3)
+    assert state.ground_speed_mps == pytest.approx(0.3)
+    assert state.speed_north_mps == pytest.approx(0.18)
+    assert state.speed_east_mps == pytest.approx(0.24)
+    assert state.speed_down_mps == pytest.approx(-0.04)
+    assert state.agl_altitude_m == pytest.approx(1.2)
+    assert state.gps_latitude_deg == pytest.approx(25.012345)
+    assert state.gps_longitude_deg == pytest.approx(121.543210)
+    assert state.gps_altitude_m == pytest.approx(12.5)
+    assert state.gps_satellites == 14
+    assert state.heading_state == "ok"
+    assert state.alert_state == "none"
+    assert state.navigate_home_state == "available"
+    assert state.wind_state == "warning"
+    assert state.vibration_state == "ok"
+    assert state.hover_no_gps_too_high is True
+    assert state.wifi_rssi_dbm == -55
+    assert state.link_signal_quality_raw == 0x84
+    assert state.sensor_states == {"IMU": True, "barometer": True, "GPS": False}
+    assert state.drone_magnetometer_required == 0
+    assert state.drone_magnetometer_started is False
+    assert state.drone_magnetometer_axis == "none"
+    assert state.drone_magnetometer_x_done is True
+    assert state.skycontroller_magnetometer_state == "Calibrated"
+
+
+def test_drone_magnetometer_calibration_is_human_landed_only_and_never_takes_off(
+        make_backend):
+    backend = make_backend()
+    automated = backend.command(ControlRequest.create(
+        ControlAction.DRONE_MAGNETOMETER_START,
+        human_origin=False,
+    ))
+    assert not automated.accepted
+    assert automated.reason_code == "HUMAN_ORIGIN_REQUIRED"
+
+    request = ControlRequest.create(
+        ControlAction.DRONE_MAGNETOMETER_START,
+        human_origin=True,
+    )
+    airborne = backend.command(request)
+    assert not airborne.accepted
+    assert "MagnetoCalibration" not in backend.drone.events
+
+    backend.drone.flight_state = "landed"
+    started = backend.command(request)
+
+    assert started.accepted and started.executed
+    assert "PCMD" in backend.drone.events
+    assert "MagnetoCalibration" in backend.drone.events
+    assert "TakeOff" not in backend.drone.events
+    assert backend.state.drone_magnetometer_started is True
+    assert backend.state.drone_magnetometer_axis == "xAxis"
+    assert backend.state.preflight_ok is False
+
+    cancelled = backend.command(ControlRequest.create(
+        ControlAction.DRONE_MAGNETOMETER_CANCEL,
+        human_origin=True,
+    ))
+    assert cancelled.accepted
+    assert backend.state.drone_magnetometer_started is False
+
+
+def test_skycontroller_magnetometer_calibration_is_separate_and_landed_only(
+        make_backend):
+    backend = make_backend()
+    backend.drone.flight_state = "landed"
+
+    started = backend.command(ControlRequest.create(
+        ControlAction.SKYCONTROLLER_MAGNETOMETER_START,
+        human_origin=True,
+    ))
+
+    assert started.accepted
+    assert backend.state.skycontroller_magnetometer_state == "CalibratingX"
+    assert "StartCalibration" in backend.drone.events
+    assert "TakeOff" not in backend.drone.events
+
+    cancelled = backend.command(ControlRequest.create(
+        ControlAction.SKYCONTROLLER_MAGNETOMETER_CANCEL,
+        human_origin=True,
+    ))
+    assert cancelled.accepted
+    assert backend.state.skycontroller_magnetometer_state == "NotCalibrated"
+
+    direct = make_backend(skycontroller=False)
+    direct.drone.flight_state = "landed"
+    rejected = direct.command(ControlRequest.create(
+        ControlAction.SKYCONTROLLER_MAGNETOMETER_START,
+        human_origin=True,
+    ))
+    assert not rejected.accepted
+    assert "StartCalibration" not in direct.drone.events
+
+
+@pytest.mark.parametrize(
+    ("drone_required", "controller_state", "reason"),
+    [
+        (None, "Calibrated", "state is unavailable"),
+        (1, "Calibrated", "aircraft magnetometer calibration is required"),
+        (0, "NotCalibrated", "SkyController magnetometer calibration is required"),
+        (0, "CalibratingY", "SkyController magnetometer calibration is in progress"),
+    ],
+)
+def test_takeoff_preflight_blocks_unusable_magnetometer_state(
+        make_backend, drone_required, controller_state, reason):
+    backend = make_backend(max_altitude_m=10.0, max_distance_m=50.0)
+    backend.drone.flight_state = "landed"
+    backend.drone.drone_calibration_required = drone_required
+    backend.drone.controller_calibration_state = controller_state
+
+    assert not backend._takeoff_preflight()
+
+    assert reason in backend.state.preflight_reason
+    assert "TakeOff" not in backend.drone.events
+
+
+def test_recommended_drone_calibration_warns_but_does_not_block_takeoff_preflight(
+        make_backend):
+    backend = make_backend(max_altitude_m=10.0, max_distance_m=50.0)
+    backend.drone.flight_state = "landed"
+    backend.drone.drone_calibration_required = 2
+
+    assert backend._takeoff_preflight()
+
+    warnings = [
+        fields for event, fields in backend.log.records
+        if event == "magnetometer_calibration_warning"
+    ]
+    assert warnings and warnings[-1]["requirement"] == "recommended"
+
+
+def test_autonomous_request_is_rejected_first_when_magnetometer_is_required(
+        make_backend):
+    backend = make_backend()
+    backend.drone.drone_calibration_required = 1
+
+    result = backend.command(ControlRequest.create(
+        ControlAction.START_AUTO,
+        human_origin=True,
+    ))
+
+    assert not result.accepted
+    assert result.reason_code == "MAGNETOMETER_CALIBRATION_REQUIRED"
+    assert backend.command("start_auto") is False
+    assert backend.drone.source_requests == []
 
 
 def test_takeoff_preflight_success_checks_video_battery_gps_source_and_limits(
@@ -614,6 +1198,239 @@ def test_failed_pc_source_does_not_enable_pcmd_or_auto_state(make_backend):
     assert backend.state.mode != "AUTO"
     assert backend.state.tracker_state == "SOURCE_FAIL"
     assert "PCMD" not in backend.drone.events
+
+
+def test_stream_loss_zeros_pcmd_and_hands_back_to_skycontroller(make_backend):
+    backend = make_backend()
+    backend.pilot_sticks = False
+    backend.state.mode = "AUTO"
+
+    backend.stream_lost_hover("test stale")
+
+    assert backend.drone.pcmds[-1][1:5] == (0, 0, 0, 0)
+    assert backend.drone.source_requests[-1] == "SkyController"
+    assert backend.pilot_sticks is True
+    assert backend.state.mode == "MANUAL"
+    assert backend.state.tracker_state == "STREAM_LOST_MANUAL"
+
+
+def test_display_frame_lag_does_not_trigger_when_decoder_is_fresh(make_backend):
+    backend = make_backend()
+    backend.video_stream = SimpleNamespace(last_stamp=99.0)
+    backend.grabber = SimpleNamespace(
+        last_frame_age=lambda: 0.05,
+        frame_pipeline_stats={"duplicate_run": 0, "frozen": False},
+    )
+
+    assert not backend._evaluate_video_health(100.1)
+    assert backend.state.active_incident == ""
+
+
+def test_decoder_frame_age_triggers_even_when_display_stamp_is_fresh(make_backend):
+    backend = make_backend()
+    backend.pilot_sticks = False
+    backend.video_stream = SimpleNamespace(last_stamp=100.05)
+    backend.grabber = SimpleNamespace(
+        last_frame_age=lambda: 0.80,
+        frame_pipeline_stats={"duplicate_run": 0, "frozen": False},
+    )
+
+    assert backend._evaluate_video_health(100.1)
+    assert backend.state.active_incident == "stream_stale"
+
+
+def test_stream_monitor_arms_only_after_first_decoded_frame(make_backend):
+    backend = make_backend()
+    backend.pilot_sticks = False
+    backend.video_stream = SimpleNamespace(last_stamp=0.0)
+    backend.grabber = SimpleNamespace(
+        last_frame_age=lambda: None,
+        frame_pipeline_stats={"duplicate_run": 0, "frozen": False},
+    )
+
+    assert not backend._evaluate_video_health(100.0)
+    assert backend.state.active_incident == ""
+
+
+def test_frozen_stream_health_triggers_manual_handoff_once(make_backend):
+    backend = make_backend()
+    backend.pilot_sticks = False
+    backend.state.mode = "AUTO"
+    backend.video_stream = SimpleNamespace(last_stamp=100.0)
+    backend.grabber = SimpleNamespace(
+        last_frame_age=lambda: 0.05,
+        frame_pipeline_stats={"duplicate_run": 15, "frozen": True},
+    )
+
+    assert backend._evaluate_video_health(100.1)
+    first_events = list(backend.drone.events)
+    assert backend.pilot_sticks is True
+    assert backend.state.active_incident == "stream_stale"
+
+    assert not backend._evaluate_video_health(100.2)
+    assert backend.drone.events == first_events
+
+
+def test_emergency_stop_cancels_nudges_zeros_and_latches_manual(make_backend):
+    backend = make_backend()
+    backend.pilot_sticks = False
+    backend._nudge_held.update({"前", "上"})
+
+    result = backend.command("emergency_stop")
+
+    assert result is True
+    assert not backend._nudge_held
+    assert backend.drone.pcmds[-1][1:5] == (0, 0, 0, 0)
+    assert backend.pilot_sticks is True
+    assert backend.state.mode == "MANUAL"
+    assert backend.state.tracker_state == "EMERGENCY_MANUAL"
+
+
+def test_total_link_loss_requires_three_failed_polls_and_sends_no_host_commands(
+    make_backend,
+):
+    backend = make_backend()
+    backend.pilot_sticks = False
+    backend._link_was_ok = True
+    backend.drone.connected = False
+    before = list(backend.drone.events)
+
+    base_ns = time.monotonic_ns()
+    for index in range(2):
+        state = backend.poll(base_ns + index * 200_000_000)
+        assert state.link_status == "DEGRADED"
+        assert state.active_incident != "control_link_lost"
+        assert backend.drone.events == before
+
+    state = backend.poll(base_ns + 400_000_000)
+
+    assert state.link_status == "LOST"
+    assert state.mode == "MANUAL"
+    assert state.tracker_state == "LINK_LOST_ONBOARD"
+    assert state.active_incident == "control_link_lost"
+    assert backend.pilot_sticks is True
+    assert backend.drone.events == before
+
+
+def test_skycontroller_drone_wifi_loss_uses_the_same_three_poll_debounce(
+    make_backend,
+):
+    backend = make_backend()
+    backend.pilot_sticks = False
+    backend._link_was_ok = True
+    backend.drone.connected = True
+    backend.drone.managed_drone_connected = False
+    before = list(backend.drone.events)
+    base_ns = time.monotonic_ns()
+
+    backend.poll(base_ns)
+    backend.poll(base_ns + 200_000_000)
+    state = backend.poll(base_ns + 400_000_000)
+
+    assert state.link_status == "LOST"
+    assert state.active_incident == "control_link_lost"
+    assert backend.drone.events == before
+
+
+def test_lost_link_policy_is_written_only_while_landed_and_read_back(make_backend):
+    backend = make_backend()
+    backend.drone.flight_state = "landed"
+    backend.drone.rth_auto_trigger_mode = "off"
+    backend.drone.rth_delay_s = 10
+    backend.drone.rth_ending_behavior = "hovering"
+
+    assert backend._configure_lost_link_policy_if_safe()
+
+    assert backend.drone.rth_auto_trigger_mode == "on"
+    assert backend.drone.rth_delay_s == 1
+    assert backend.drone.rth_ending_behavior == "landing"
+    assert backend.state.rth_policy_configured is True
+
+
+def test_lost_link_policy_write_is_refused_while_airborne(make_backend):
+    backend = make_backend()
+    backend.drone.flight_state = "flying"
+
+    assert not backend._configure_lost_link_policy_if_safe()
+    assert "set_auto_trigger_mode" not in backend.drone.events
+    assert backend.state.rth_policy_configured is False
+
+
+def test_critical_battery_requests_rth_once_when_home_is_reachable(make_backend):
+    backend = make_backend(max_altitude_m=50.0, max_distance_m=100.0)
+    backend.drone.flight_state = "flying"
+    backend.state.flight_state = "flying"
+    backend.state.battery_pct = 10.0
+    backend.state.drone_altitude_m = 5.0
+    backend.state.max_altitude_m = 50.0
+    backend.state.distance_from_home_m = 10.0
+    backend.state.max_distance_m = 100.0
+
+    assert backend._evaluate_runtime_safety()
+    backend._runtime_safety_action_thread.join(timeout=1.0)
+
+    assert "return_to_home" in backend.drone.events
+    assert "Landing" not in backend.drone.events
+    assert backend.state.active_incident == "battery_critical"
+    assert backend._runtime_safety_action_latched
+    before = list(backend.drone.events)
+    assert not backend._evaluate_runtime_safety()
+    assert backend.drone.events == before
+
+
+def test_critical_battery_lands_when_home_is_not_reachable(make_backend):
+    backend = make_backend(max_altitude_m=50.0, max_distance_m=100.0)
+    backend.drone.flight_state = "flying"
+    backend.drone.home_reachable = False
+    backend.state.flight_state = "flying"
+    backend.state.battery_pct = 9.0
+
+    assert backend._evaluate_runtime_safety()
+    backend._runtime_safety_action_thread.join(timeout=1.0)
+
+    assert "return_to_home" not in backend.drone.events
+    assert "Landing" in backend.drone.events
+
+
+def test_failed_rth_command_falls_back_to_in_place_landing(make_backend):
+    backend = make_backend(max_altitude_m=50.0, max_distance_m=100.0)
+    backend.drone.flight_state = "flying"
+    backend.drone.rth_success = False
+    backend.state.flight_state = "flying"
+    backend.state.battery_pct = 10.0
+
+    assert backend._evaluate_runtime_safety()
+    backend._runtime_safety_action_thread.join(timeout=1.0)
+
+    assert "return_to_home" in backend.drone.events
+    assert "Landing" in backend.drone.events
+
+
+@pytest.mark.parametrize(
+    ("altitude_m", "distance_m", "expected_reason"),
+    (
+        (49.0, 10.0, "altitude_limit"),
+        (5.0, 95.0, "distance_limit"),
+    ),
+)
+def test_runtime_geofence_uses_confirmed_proactive_margins(
+    make_backend, altitude_m, distance_m, expected_reason,
+):
+    backend = make_backend(max_altitude_m=50.0, max_distance_m=100.0)
+    backend.drone.flight_state = "flying"
+    backend.state.flight_state = "flying"
+    backend.state.battery_pct = 90.0
+    backend.state.drone_altitude_m = altitude_m
+    backend.state.max_altitude_m = 50.0
+    backend.state.distance_from_home_m = distance_m
+    backend.state.max_distance_m = 100.0
+    scheduled = []
+    backend._schedule_runtime_safety_action = (
+        lambda reason: scheduled.append(reason) or True
+    )
+
+    assert backend._evaluate_runtime_safety()
+    assert scheduled == [expected_reason]
 
 
 def test_manual_authority_blocks_hover_and_nudge_without_reclaim(make_backend):
@@ -895,6 +1712,65 @@ def test_axes_active_deadzone():
     assert not backend_module.axes_active({0: 2000})  # equal to default deadzone
     assert backend_module.axes_active({0: 2001})
     assert backend_module.axes_active({3: -5000, 0: 0})
+
+
+def test_stick_monitor_reports_an_unexpected_device_disconnect(monkeypatch):
+    disconnected = []
+    monitor = backend_module.SkyControllerStickMonitor(
+        lambda _axes: None,
+        on_disconnect=disconnected.append,
+        poll_s=0.001,
+    )
+    monitor._fd = 123
+    monitor.healthy = True
+
+    def unplugged(_fd, _size):
+        raise OSError("device unplugged")
+
+    monkeypatch.setattr(backend_module.os, "read", unplugged)
+    monitor._loop()
+
+    assert len(disconnected) == 1
+    assert "device unplugged" in disconnected[0]
+    assert monitor.healthy is False
+
+
+def test_stick_monitor_disconnect_lands_when_the_control_link_still_works(
+    make_backend,
+):
+    backend = make_backend()
+    backend.drone.flight_state = "flying"
+    backend.state.flight_state = "flying"
+
+    backend._on_stick_monitor_disconnect("device unplugged")
+    backend._runtime_safety_action_thread.join(timeout=1.0)
+
+    assert backend.state.stick_monitor_ok is False
+    assert "Landing" in backend.drone.events
+    assert backend.state.active_incident == "controller_disconnected"
+
+
+def test_pc_control_is_refused_when_stick_monitor_is_unavailable(make_backend):
+    backend = make_backend()
+    backend._stick_monitor = None
+    backend.state.stick_monitor_ok = False
+
+    assert not backend.take_pc_control()
+    assert backend.pilot_sticks is True
+    assert backend.state.tracker_state == "STICK_MONITOR_FAIL"
+    assert "Controller" not in backend.drone.source_requests
+
+
+def test_takeoff_preflight_is_blocked_when_stick_monitor_is_unavailable(
+    make_backend,
+):
+    backend = make_backend(max_altitude_m=50.0, max_distance_m=100.0)
+    backend.drone.flight_state = "landed"
+    backend._stick_monitor = None
+    backend.state.stick_monitor_ok = False
+
+    assert not backend._takeoff_preflight()
+    assert "stick monitor" in backend.state.preflight_reason
 
 
 def test_stick_override_reclaims_skycontroller_when_pc_controls(make_backend):

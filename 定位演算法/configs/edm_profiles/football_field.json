@@ -2,7 +2,7 @@
   "schema": "edm-deployment-profile/v1",
   "name": "football_field",
   "status": "scale-calibrated 2026-07-25; RTX 5060 replay measurement required",
-  "base": "足球場交付包 balanced_rtx5060_candidate（tracker 14 欄逐項相同）",
+  "base": "足球場交付包 balanced_rtx5060_candidate（完整 tracker 契約）",
   "map_scale": {
     "S": 1.840396,
     "definition": "2·p95(‖center − componentwise_median‖) over the 505 EDM references",
@@ -26,31 +26,38 @@
     "recovery_bank_size": 192,
     "recovery_scan_topk": 2,
     "use_temporal_reference": false,
+    "temporal_map_topk": 1,
+    "near_pool": 24,
+    "covis_per_ref": 20,
     "max_corr_total": 900,
+    "corr_grid": 8,
     "acquire_min_inliers": 80,
     "track_min_inliers": 50,
     "weak_min_inliers": 30,
 
     "acquire_initial_topk": 2,
+    "max_yaw_diff_deg": 90.0,
     "max_reproj_error_acquire": 5.0,
     "max_reproj_error_track": 6.0,
+    "pnp_ransac_max_error": 5.0,
     "prediction_max_dt": 0.25,
 
     "radius": 0.294463,
     "max_jump": 0.736159,
+    "adaptive_jump_factor": 8.0,
     "adaptive_jump_floor": 0.00110424,
     "adaptive_jump_bootstrap": 0.00736159,
-    "adaptive_jump_ceiling": 0.00294463
+    "adaptive_jump_ceiling": 0.00294463,
+    "adaptive_jump_min_history": 20,
+    "adaptive_jump_history_size": 120,
+    "weak_after": 2,
+    "lost_after": 2
   },
   "field_notes": {
     "scale_dependent": [
       "radius = 0.16·S", "max_jump = 0.40·S", "adaptive_jump_floor = 0.0006·S",
       "adaptive_jump_bootstrap = 0.004·S", "adaptive_jump_ceiling = 0.0016·S"
     ],
-    "schema_required_fill": [
-      "acquire_initial_topk", "max_reproj_error_acquire", "max_reproj_error_track",
-      "prediction_max_dt", "matcher.reference_cache_size"
-    ],
-    "schema_required_fill_note": "交付包的 balanced profile 缺這 5 個 schema 必填欄位，會被 load_edm_production_profile 擋下。填入的值與 EDMConfig / EDMMatcher 的 dataclass 預設完全相同，因此不改變行為，只是讓 profile 合法。單位是像素、秒與快取筆數，與地圖尺度無關。"
+    "schema_note": "profile 明列全部 EDMConfig runtime 欄位，避免程式預設值變更時靜默改變部署行為。"
   }
 }

@@ -22,6 +22,7 @@ import argparse
 import csv
 import json
 import math
+import os
 import subprocess
 import sys
 import time
@@ -331,6 +332,7 @@ def run_kinematic(args, plan, route_c0, out_dir: Path, scale: ScaleContext) -> l
                 "start_offset_m": radius,
                 "start_bearing_rel_route_deg": math.degrees(rel),
                 "quadrant": spec["quadrant"],
+                "valid_for_comparison": not m["trivial_start_on_path"],
                 "metrics": m,
             })
             print(f"[trial {spec['trial_id']:03d}] {spec['algorithm']:28s} "
@@ -356,6 +358,32 @@ def _sphinx_cli_version() -> str | None:
     return output.splitlines()[0] if output else None
 
 
+def _firmware_selector_is_explicit(value: str) -> bool:
+    selector = str(value).strip().lower()
+    prefix = "https://firmware.parrot.com/versions/anafi/pc/"
+    if not selector.startswith(prefix) or "latest" in selector:
+        return False
+    parts = selector[len(prefix):].split("/")
+    return (
+        len(parts) == 3
+        and bool(parts[0])
+        and parts[1] == "images"
+        and parts[2].endswith(".zip")
+        and all(part not in {".", ".."} for part in parts)
+        and not any(char in selector for char in "?#")
+    )
+
+
+def _require_explicit_sphinx_firmware_selector() -> str:
+    selector = os.environ.get("FIRMWARE_URL", "").strip()
+    if not _firmware_selector_is_explicit(selector):
+        raise SystemExit(
+            "Sphinx runs require FIRMWARE_URL with an explicit reviewed Parrot "
+            "firmware revision; missing, malformed, and latest selectors are refused"
+        )
+    return selector
+
+
 def _sphinx_runtime_metadata(drone, olympe_module, ProductVersionChanged) -> dict:
     try:
         firmware_state = drone.get_state(ProductVersionChanged)
@@ -367,15 +395,19 @@ def _sphinx_runtime_metadata(drone, olympe_module, ProductVersionChanged) -> dic
         olympe_version = version("parrot-olympe")
     except Exception:
         olympe_version = str(getattr(olympe_module, "__version__", "unknown"))
+    firmware_selector = os.environ.get("FIRMWARE_URL", "").strip()
+    firmware_image_pinned = _firmware_selector_is_explicit(firmware_selector)
     return {
         "sphinx_version": _sphinx_cli_version() or "unknown",
         "firmware_version": firmware_version,
         "olympe_version": olympe_version,
-        "firmware_selector": "external launcher; default contains #latest",
-        "firmware_image_pinned": False,
+        "firmware_selector": firmware_selector or "not provided to harness process",
+        "firmware_image_pinned": firmware_image_pinned,
         "reproducibility_note": (
-            "The default launcher uses an unpinned #latest firmware selector. "
-            "Runtime versions are recorded, but this run is not exactly reproducible."
+            "Explicit firmware selector and runtime versions were recorded."
+            if firmware_image_pinned else
+            "FIRMWARE_URL was not provided to this harness process; runtime versions "
+            "were recorded, but exact firmware selection is not reproducible."
         ),
     }
 
@@ -387,6 +419,7 @@ def _product_version_message():
 
 
 def run_sphinx(args, plan, out_dir: Path, scale: ScaleContext) -> list[dict]:
+    _require_explicit_sphinx_firmware_selector()
     import olympe
     from olympe.messages.ardrone3.Piloting import Landing, PCMD, TakeOff, moveBy
     from olympe.messages.ardrone3.PilotingState import FlyingStateChanged
@@ -399,7 +432,7 @@ def run_sphinx(args, plan, out_dir: Path, scale: ScaleContext) -> list[dict]:
     if not drone.connect(retry=3):
         raise SystemExit(
             f"could not connect to Sphinx ANAFI at {args.ip}. Is Sphinx running? "
-            "Start it with mission/flight_control/launch_sphinx_anafi_empty.sh "
+            "Start it with 定位演算法/flight_control/launch_sphinx_anafi_empty.sh "
             "(sphinx anafi.drone + parrot-ue4-empty). Pure-Python tests run without it: "
             "pytest -q tests/")
 
@@ -522,7 +555,8 @@ def run_sphinx(args, plan, out_dir: Path, scale: ScaleContext) -> list[dict]:
                     "backend": meta["backend"], "perturbation": spec["perturbation"],
                     "yaw_error_deg": spec["yaw_error_deg"], "start_offset_m": radius,
                     "start_bearing_rel_route_deg": math.degrees(rel),
-                    "quadrant": spec["quadrant"], "valid_for_comparison": True,
+                    "quadrant": spec["quadrant"],
+                    "valid_for_comparison": not m["trivial_start_on_path"],
                     **setup, "metrics": m,
                 })
                 print(f"[sphinx trial {spec['trial_id']:03d}] {spec['algorithm']:28s} "
@@ -912,6 +946,25 @@ def apply_backend_interpretation(summary: dict, args, trials: list[dict]) -> Non
         summary["fully_reproducible"] = True
 
 
+def system_validation_scope(backend: str) -> dict:
+    """Machine-readable guard against treating a controller trial as E2E evidence."""
+    return {
+        "control_only": True,
+        "visual_localization_closed_loop": False,
+        "independent_pose_reference": backend == "kinematic",
+        "eligible_as_end_to_end_system_evidence": False,
+        "blocking_requirements": [
+            "simulator scene rendered from the same mapped environment",
+            "production EDM localizer driven by simulator camera frames",
+            (
+                "independent simulator truth separate from controller telemetry"
+                if backend == "sphinx"
+                else "Parrot Sphinx firmware and dynamics"
+            ),
+        ],
+    }
+
+
 def main(argv=None) -> int:
     args = parse_args(argv)
     print_sim_banner()
@@ -959,6 +1012,7 @@ def main(argv=None) -> int:
         if args.backend == "sphinx"
         else "first-order kinematic approximation; not Sphinx physics or firmware"
     )
+    summary["validation_scope"] = system_validation_scope(args.backend)
     summary["scale"] = {
         "sphinx_validation_scale": "meters",
         "real_sfm_map_scale": "arbitrary units",

@@ -22,6 +22,18 @@ if [[ "$DRY_RUN" != "0" && "$DRY_RUN" != "1" ]]; then
   echo "[start] ERROR: SFM_LAUNCH_DRY_RUN must be 0 or 1" >&2
   exit 2
 fi
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+source "$OI/resolve_display.sh"
+configure_operator_display "$DRY_RUN"
+for arg in "$@"; do
+  case "$arg" in
+    --interface|--interface=*|--video|--video=*)
+      echo "[start] ERROR: real-flight launcher rejects cross-interface argument: $arg" >&2
+      echo "[start] Use 控制介面程式/影片模擬串流/啟動.sh for video files" >&2
+      exit 2
+      ;;
+  esac
+done
 MAX_PERFORMANCE="${SFM_MAX_PERFORMANCE:-1}"
 if [[ "$MAX_PERFORMANCE" != "0" && "$MAX_PERFORMANCE" != "1" ]]; then
   echo "[start] ERROR: SFM_MAX_PERFORMANCE must be 0 or 1" >&2
@@ -164,9 +176,8 @@ else
   echo "  NO SkyController — laptop is sole controller"
   echo "  Esc freezes PC PCMD; 恢復電腦控制 resumes; close/Ctrl‑C = land"
 fi
-cd "$OI"
 # Optional env:
-#   LOC_BENCH=1        -> auto 開始巡檢 + no boot-lock (BOOT_INIT/MegaLoc path; NO takeoff)
+#   LOC_BENCH=1        -> auto 開始定位 + no boot-lock (BOOT_INIT/MegaLoc path; NO takeoff)
 #   LOC_BENCH_TRACK=1  -> same + force TRACK path each frame (no MegaLoc; in-flight FPS)
 #   LOCAL_TOPK=N       -> explicit TRACK local_topk override (0/profile default)
 #   SFM_SITE_PROFILE=  -> required site profile JSON unless passed on the CLI
@@ -210,10 +221,10 @@ if [[ "$MAX_PERFORMANCE" == "1" ]]; then
 fi
 CMD=(
   "${CMD_PREFIX[@]}"
-  "$UI_PYTHON" -u flight_operator_app.py --live
+  "$UI_PYTHON" -u "$OI/flight_operator_app.py" --interface real-flight
   --ip "$IP" --controller "$CTRL"
   --no-live-detect
-  --max-altitude-m "${SFM_MAX_ALTITUDE_M:-30}"
+  --max-altitude-m "${SFM_MAX_ALTITUDE_M:-50}"
   --max-distance-m "${SFM_MAX_DISTANCE_M:-100}"
   --distance-geofence
   --nudge-pct "${NUDGE_PCT:-8}"

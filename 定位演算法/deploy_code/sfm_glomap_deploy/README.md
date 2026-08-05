@@ -1,6 +1,9 @@
 # ANAFI 自動飛行安全操作
 
-真機唯一入口為 `path_follow_flight.py --fly`。起飛前必須完成 `--selftest`、`--dry-run`、Sphinx 模擬與拆槳實驗，並由人類安全員全程監看。
+正式部署時只允許由 mission pipeline 先驗證 site profile、資產 SHA-256、
+公制尺度、座標系與航線淨空核准，再呼叫本目錄的 `path_follow_flight.py --fly`。
+未核准 profile 必須拒飛。起飛前仍須完成 `--selftest`、`--dry-run`、Sphinx
+模擬與拆槳實驗，並由人類安全員全程監看。
 
 ## Firmware 高度／距離上限
 
@@ -50,7 +53,7 @@ printf 'auto\n' > "${SFM_SAFETY_FILE:-/tmp/sfm_drone_safety.cmd}"
 2. 目前這一幀必須有可用的 Olympe body-yaw telemetry 與 map-frame 校正；機身 yaw 對準電桿水平 bearing，誤差不超過 6 度。
 3. 依相機與電桿目標的相對高度計算 gimbal absolute pitch；target 在實際 bounds 內，且回讀的 `pitch_absolute` 與 target 相差不超過 3 度。
 4. gimbal 確認後記錄 source NTP baseline，同時等待 host receipt 與 source clock 都前進至少 `SFM_INSPECTION_PIPELINE_DRAIN_S`（預設 1 秒；280 ms 只是白皮書下限），排除確認前曝光但延遲抵達的 frame；最後 frame 仍須不超過 0.5 秒。
-5. JPEG 實際寫入 `sfm_system/定位/outputs/flight_inspections/`。
+5. JPEG 實際寫入 workspace/package root 的 `outputs/flight_inspections/`。
 
 任一步失敗時 waypoint 保持 pending。對準或擷取超過 15 秒，以及抵達終點仍有 pending 巡檢，都會 fail closed 並降落；短暫抖出巡檢半徑不會重置 deadline。目前對應 15 點航線的有效巡檢標籤為 9、10、11、15。
 
@@ -59,8 +62,17 @@ printf 'auto\n' > "${SFM_SAFETY_FILE:-/tmp/sfm_drone_safety.cmd}"
 ## 驗證
 
 ```bash
-pytest -q sfm_system/定位/mission/flight_control/test_flight_safety_gates.py
-python sfm_system/定位/mission/flight_control/path_follow_flight.py --selftest
-python sfm_system/定位/mission/flight_control/path_follow_flight.py --dry-run
-sfm_system/定位/sync_mirror_check.sh
+pytest -q 定位演算法/flight_control/test_flight_safety_gates.py
+python 控制介面程式/mission_pipeline.py --mode flight-selftest
+python 定位演算法/validation/check_runtime_mirrors.py
+python 定位演算法/validation/offline_model_smoke.py --model edm
+python 定位演算法/validation/benchmark_edm_site_replay.py \
+  --require-cuda --max-frames 3 \
+  --site-profile 控制介面程式/site_profiles/river_site_edm.json \
+  --video /path/to/P1190119.MP4 --out /tmp/edm_gpu_smoke.json
 ```
+
+完整重播與 PnP correspondence cap A/B 使用同一支
+`benchmark_edm_site_replay.py`，分別傳入 `--max-corr-total 450`、`600`、
+`750`、`900`。結果會保存影片、site profile、bundle 與 localizer profile
+的 SHA-256，以及逐幀拒絕原因、跳躍確認、品質與延遲資料。

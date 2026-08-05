@@ -5,7 +5,7 @@ Every test drives the REAL path_follow_flight.run_loop / SafetyMonitor /
 command_to_body_percent / OlympePdrawGrabber logic with mock hooks. No olympe,
 no torch, no GPU, no hardware.
 
-Run:  pytest -q sfm_system/定位/mission/flight_control/test_flight_safety_gates.py
+Run:  pytest -q 定位演算法/flight_control/test_flight_safety_gates.py
 """
 from __future__ import annotations
 
@@ -113,6 +113,49 @@ def test_fly_is_the_only_arming_entrypoint():
     # every arming/movement Olympe message used by the module must live in fly()
     for token in ("TakeOff", "Emergency"):
         assert module_src.count(f"drone({token}") == fly_src.count(f"drone({token}")
+
+
+def test_flight_localizer_uses_site_selected_edm_factory(monkeypatch):
+    captured = {}
+    tracker = object()
+
+    def fake_build(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(
+            tracker=tracker,
+            backend="edm",
+            variant="fixture",
+            camera=SimpleNamespace(model="PINHOLE", width=1280, height=720),
+        )
+
+    monkeypatch.setitem(
+        sys.modules,
+        "production_localizer_factory",
+        SimpleNamespace(build_production_localizer=fake_build),
+    )
+    monkeypatch.setattr(pff, "LOCALIZER_BACKEND", "edm")
+    monkeypatch.setattr(pff, "LOCALIZER_PROFILE", "/tmp/edm-profile.json")
+    monkeypatch.setattr(pff, "BUNDLE_SHA256", "a" * 64)
+    monkeypatch.setattr(pff, "FLIGHT_CONTRACT_JSON", json.dumps({
+        "localizer_profile_sha256": "b" * 64,
+    }))
+    monkeypatch.setenv("SFM_QUERY_CAMERA_JSON", json.dumps({
+        "model": "PINHOLE",
+        "width": 1280,
+        "height": 720,
+        "params": [900.0, 900.0, 640.0, 360.0],
+    }))
+
+    assert pff.build_localizer(lambda: None) is tracker
+    assert captured["backend"] == "edm"
+    assert captured["camera_tuple"][0] == "PINHOLE"
+    assert captured["bundle_sha256"] == "a" * 64
+    assert captured["production_profile_sha256"] == "b" * 64
+
+
+def test_legacy_autonomous_controller_is_external_approval_locked():
+    with pytest.raises(RuntimeError, match="LOCKED pending external approval"):
+        pff.build_controller()
 
 
 # ---------------------------------------------------------------------------
@@ -462,9 +505,48 @@ def test_route_deviation_lands():
 
 
 def test_route_completion_lands():
-    sent, reason, _ = run_ticks(20, lambda st: fresh_pose(st, x=7.99))
+    sent, reason, _ = run_ticks(
+        40,
+        lambda st: fresh_pose(st, x=min(7.99, 0.5 * st["tick"])),
+    )
     assert reason == "route complete -> land"
     assert sent[-1] == ZERO
+
+
+def test_route_completion_rejects_a_single_jump_to_the_end():
+    wp = [np.array([0.0, 0.0, 0.0]), np.array([8.0, 0.0, 0.0])]
+    ctrl = rpf.RouteAutoController(
+        wp,
+        poles=[],
+        config=rpf.ControlConfig(inspect_waypoints=()),
+    )
+    cmd = ctrl.step(rpf.Pose(7.99, 0.0, 0.0, 0.0, stamp=1.0), now=1.0)
+    assert not cmd.should_land
+    assert cmd.progress < 0.5
+
+
+def test_progress_does_not_snap_to_a_nearby_return_branch():
+    wp = [
+        np.array([0.0, 0.0, 0.0]),
+        np.array([4.0, 0.0, 0.0]),
+        np.array([4.0, 0.0, 0.5]),
+        np.array([0.0, 0.0, 0.5]),
+    ]
+    ctrl = rpf.RouteAutoController(
+        wp,
+        poles=[],
+        config=rpf.ControlConfig(
+            inspect_waypoints=(),
+            segment_window=2,
+            progress_jump_slack=1.0,
+        ),
+    )
+    ctrl.step(rpf.Pose(0.2, 0.0, 0.0, 0.0, stamp=1.0), now=1.0)
+    cmd = ctrl.step(rpf.Pose(0.2, 0.0, 0.49, 0.0, stamp=1.05), now=1.05)
+
+    assert cmd.progress < 0.5
+    assert ctrl.active_segment == 0
+    assert not cmd.should_land
 
 
 def test_invalid_route_rejected(tmp_path):
@@ -472,6 +554,45 @@ def test_invalid_route_rejected(tmp_path):
     bad.write_text(json.dumps({"waypoints": [[0.0, 0.0, 0.0]]}))
     with pytest.raises(ValueError):
         rpf.load_waypoints(bad)
+
+
+def test_flight_route_contract_binds_site_frame_and_coordinate_id(tmp_path):
+    route = tmp_path / "route.json"
+    route.write_text(json.dumps({
+        "schema": "sfm-flight-route/v1",
+        "site_id": "alpha",
+        "coordinate_frame_id": "alpha-v1",
+        "frame": "glomap",
+        "units": "map",
+        "purpose": "flight",
+        "closed": False,
+        "waypoints": [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
+    }), encoding="utf-8")
+
+    points = rpf.load_waypoints(
+        route,
+        expected_site_id="alpha",
+        expected_coordinate_frame_id="alpha-v1",
+        require_flight_contract=True,
+    )
+    assert np.allclose(points[1], [1.0, 0.0, 0.0])
+    with pytest.raises(ValueError, match="coordinate_frame_id"):
+        rpf.load_waypoints(
+            route,
+            expected_site_id="alpha",
+            expected_coordinate_frame_id="different",
+            require_flight_contract=True,
+        )
+    raw = json.loads(route.read_text(encoding="utf-8"))
+    raw["closed"] = 0
+    route.write_text(json.dumps(raw), encoding="utf-8")
+    with pytest.raises(ValueError, match="closed"):
+        rpf.load_waypoints(
+            route,
+            expected_site_id="alpha",
+            expected_coordinate_frame_id="alpha-v1",
+            require_flight_contract=True,
+        )
 
 
 @pytest.mark.parametrize("waypoints", [
@@ -733,6 +854,8 @@ def test_pending_inspection_at_route_end_aborts_instead_of_infinite_auto():
             "base": np.array([1.0, 0.0, 0.0]), "top": np.array([1.0, -1.0, 0.0])}
     ctrl = rpf.RouteAutoController(
         wp, [pole], rpf.ControlConfig(inspect_waypoints=(2,), inspect_radius=0.2))
+    ctrl.step(rpf.Pose(0.4, 0.0, 0.0, 0.0, stamp=1.0), now=1.0)
+    ctrl.step(rpf.Pose(1.4, 0.0, 0.0, 0.0, stamp=1.5), now=1.5)
     cmd = ctrl.step(rpf.Pose(3.0, 0.0, 0.0, 0.0, stamp=2.0), now=2.0)
     assert cmd.should_land and cmd.action == "ABORT"
     assert "pending inspection" in cmd.status.lower()
@@ -1513,6 +1636,67 @@ def test_no_nonzero_command_reuse_after_loss():
 
 # ---------------------------------------------------------------------------
 # PCMD conversion
+
+def test_pcmd_turns_in_place_before_translation():
+    pose = rpf.Pose(0.0, 0.0, 0.0, yaw=0.0)
+    cmd = rpf.Command(
+        "FOLLOW",
+        np.array([1.0, 0.0, 1.0]),
+        yaw_target=np.pi / 4.0,
+        goal=np.array([1.0, 0.0, 1.0]),
+        path_error=0.0,
+        progress=0.0,
+    )
+
+    assert rpf.command_to_body_percent(cmd, pose) == (0, 0, 20, 0)
+    assert rpf.command_to_body_percent(cmd, pose, yaw_sign=-1) == (0, 0, -20, 0)
+
+
+@pytest.mark.parametrize("goal, expected", [
+    ([1.0, -1.0, -1.0], (6, 6, 0, 6)),
+    ([1.0, 1.0, -1.0], (6, 6, 0, -6)),
+])
+def test_pcmd_normalizes_right_forward_vertical_diagonals(goal, expected):
+    pose = rpf.Pose(0.0, 0.0, 0.0, yaw=0.0)
+    cmd = rpf.Command(
+        "FOLLOW",
+        np.asarray(goal, dtype=float),
+        yaw_target=0.0,
+        goal=np.asarray(goal, dtype=float),
+        path_error=0.0,
+        progress=0.0,
+    )
+
+    assert rpf.command_to_body_percent(
+        cmd,
+        pose,
+        require_yaw_alignment=False,
+    ) == expected
+
+
+def test_yaw_alignment_requires_three_quiet_updates_then_translates():
+    cfg = rpf.ControlConfig(inspect_waypoints=())
+    control = rpf.YawAlignedPcmdController(cfg)
+    cmd = rpf.Command(
+        "FOLLOW",
+        np.array([1.0, 0.0, 0.0]),
+        yaw_target=0.0,
+        goal=np.array([1.0, 0.0, 0.0]),
+        path_error=0.0,
+        progress=0.0,
+    )
+
+    for now in (0.0, 0.05, 0.10, 0.15):
+        pose = rpf.Pose(0.0, 0.0, 0.0, yaw=0.0, stamp=now)
+        assert control.update(cmd, pose, now, target_key=0) == ZERO
+    assert control.phase == "yaw_alignment_confirmed"
+
+    pose = rpf.Pose(0.0, 0.0, 0.0, yaw=0.0, stamp=0.20)
+    assert control.update(cmd, pose, 0.20, target_key=0)[1] > 0
+    assert control.phase == "translate"
+
+    assert control.update(cmd, pose, 0.25, target_key=1) == ZERO
+    assert control.phase == "yaw_alignment_hold"
 
 def test_pcmd_conversion_bounds():
     pose = rpf.Pose(0.0, 0.0, 0.0, yaw=0.3)

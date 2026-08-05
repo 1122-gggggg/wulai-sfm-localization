@@ -21,7 +21,7 @@ Sphinx/Olympe backend for Parrot ANAFI firmware/control-state validation.
 ## Reproduction Command
 
 ```bash
-cd sfm_system/定位/experiments/sphinx_anafi_path_convergence
+cd 模擬器/sphinx_anafi_path_convergence
 /home/allen/localization/.venv/bin/python make_browser_sandbox.py \
   --algorithm translational_waypoint \
   --route-style complex \
