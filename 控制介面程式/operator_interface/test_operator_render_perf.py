@@ -320,6 +320,34 @@ def test_no_control_tab_is_clipped_by_the_fixed_control_pane(operator) -> None:
                     )
 
 
+def test_each_gravity_guide_phase_fits_the_fixed_control_pane(operator) -> None:
+    notebook = operator.controls_notebook
+    pane = notebook.master
+    calibration_tab = operator._preflight_tabs["compass"]
+    notebook.select(calibration_tab)
+
+    for geometry in ("1440x900", "980x640"):
+        operator.geometry(geometry)
+        for phase in app.PHASES:
+            operator.gravity_guide_var.set(
+                app.gravity_phase_guidance(phase, sample_count=15, span_deg=90.0)
+            )
+            operator.update_idletasks()
+            pane_bottom = pane.winfo_rooty() + pane.winfo_height()
+            stack = [calibration_tab]
+            while stack:
+                parent = stack.pop()
+                children = parent.winfo_children()
+                stack.extend(children)
+                for child in children:
+                    if child.winfo_ismapped():
+                        bottom = child.winfo_rooty() + child.winfo_height()
+                        assert bottom <= pane_bottom, (
+                            f"{geometry} {phase}: gravity guide clips by "
+                            f"{bottom - pane_bottom}px"
+                        )
+
+
 def test_shrinking_the_window_takes_height_from_the_map_not_the_controls(operator) -> None:
     """The control pane is fixed-height; the map/video pane is the elastic one."""
     notebook = operator.controls_notebook

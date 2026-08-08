@@ -124,6 +124,10 @@ from real_path_follow_controller import (  # type: ignore
 )
 try:
     from gravity_calibration import (  # type: ignore
+        MIN_PITCH_SPAN_DEG,
+        MIN_ROLL_SPAN_DEG,
+        MIN_SAMPLES_PER_PHASE,
+        MIN_YAW_SPAN_DEG,
         PHASE_LABELS,
         PHASES,
         GravityCalibrator,
@@ -136,6 +140,10 @@ except Exception:  # pragma: no cover - import path issues should not block the 
         "roll": "左右側傾",
     }
     PHASES = ("yaw", "pitch", "roll")
+    MIN_SAMPLES_PER_PHASE = 15
+    MIN_YAW_SPAN_DEG = 90.0
+    MIN_PITCH_SPAN_DEG = 25.0
+    MIN_ROLL_SPAN_DEG = 25.0
     GravityCalibrator = None  # type: ignore
     attitude_to_body_gravity = None  # type: ignore
 
@@ -1456,6 +1464,44 @@ def magnetometer_axis_guide(axis_raw: object) -> tuple[str, str, str] | None:
     if key.endswith("axis"):
         key = key[:-4]
     return MAGNETOMETER_AXIS_GUIDE.get(key)
+
+
+def gravity_phase_guidance(
+    phase: str | None, *, sample_count: int = 0, span_deg: float = 0.0
+) -> str:
+    """Operator-facing instruction and live progress for one passive phase."""
+    if phase not in PHASES:
+        return (
+            "準備：拆除螺旋槳、確認飛機 landed，雙手托住機身。\n"
+            "按「開始檢查」後依序做：水平旋轉 → 前後俯仰 → 左右側傾。"
+        )
+    guide = {
+        "yaw": (
+            "1/3 YAW 水平旋轉",
+            "機身保持水平，繞垂直軸慢慢轉一整圈",
+            float(MIN_YAW_SPAN_DEG),
+            "下一階段",
+        ),
+        "pitch": (
+            "2/3 PITCH 前後俯仰",
+            "機頭先抬高再壓低，做出明顯的前後俯仰",
+            float(MIN_PITCH_SPAN_DEG),
+            "下一階段",
+        ),
+        "roll": (
+            "3/3 ROLL 左右側傾",
+            "機身先向左再向右側傾，做出明顯的左右滾轉",
+            float(MIN_ROLL_SPAN_DEG),
+            "完成並分析",
+        ),
+    }
+    title, motion, target_deg, next_button = guide[phase]
+    return (
+        f"{title}：{motion}。\n"
+        f"進度：樣本 {max(0, int(sample_count))}/{MIN_SAMPLES_PER_PHASE}；"
+        f"角度變化 {max(0.0, float(span_deg)):.0f}°/{target_deg:.0f}°。"
+        f"兩項達標後按「{next_button}」。"
+    )
 
 
 def format_magnetometer_calibration(state: DroneState) -> dict[str, str]:
@@ -4072,8 +4118,16 @@ class OperatorApp(tk.Tk):
         grav.grid(row=0, column=1, sticky="nsew", padx=6, pady=(4, 5))
         self.gravity_status_var = DedupStringVar(
             value="待命：依序旋轉機身，僅記錄姿態並分析重力一致性")
+        self.gravity_guide_var = DedupStringVar(value=gravity_phase_guidance(None))
         self.gravity_att_var = DedupStringVar(value="att roll/pitch/yaw = -")
         self.gravity_g_var = DedupStringVar(value="g_body = -")
+        ttk.Label(
+            grav,
+            textvariable=self.gravity_guide_var,
+            wraplength=430,
+            justify="left",
+            font=("Sans", 8, "bold"),
+        ).pack(anchor="w", fill="x", padx=6, pady=(2, 4))
         # Keep detailed calibration status for the workflow and logs, but present
         # only the live attitude / gravity-vector row in this compact panel.
         # One row, not two: the panel was 23 px taller than the minimum window
@@ -4155,6 +4209,7 @@ class OperatorApp(tk.Tk):
         self.write_log("ready")
         if GravityCalibrator is None:
             self.gravity_status_var.set("姿態／重力檢查模組載入失敗（gravity_calibration.py）")
+            self.gravity_guide_var.set("姿態／重力檢查不可用，請勿繼續操作。")
         else:
             self._load_gravity_cal_into_ui()
         self._update_preflight_guide(self.backend.state)
@@ -5080,6 +5135,7 @@ class OperatorApp(tk.Tk):
             return
         self.gravity_cal.start()
         self._set_gravity_phase("yaw")
+        self.gravity_guide_var.set(gravity_phase_guidance("yaw"))
         label = PHASE_LABELS.get("yaw", "yaw")
         mode = "真機姿態" if self._is_live_backend() else "模擬姿態"
         self.gravity_status_var.set(
@@ -5098,6 +5154,7 @@ class OperatorApp(tk.Tk):
             self.gravity_finish()
             return
         self._set_gravity_phase(nxt)
+        self.gravity_guide_var.set(gravity_phase_guidance(nxt))
         idx = PHASES.index(nxt) + 1
         mode = "真機姿態" if self._is_live_backend() else "模擬姿態"
         self.gravity_status_var.set(
@@ -5118,6 +5175,15 @@ class OperatorApp(tk.Tk):
         out.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         self.gravity_result_path = out
         self._apply_gravity_display(payload, source_path=out, note="已覆寫")
+        if payload.get("ok"):
+            self.gravity_guide_var.set(
+                "檢查完成：PASS。三階段動作與姿態覆蓋皆達標。"
+            )
+        else:
+            self.gravity_guide_var.set(
+                "檢查完成：FAIL。至少一個階段的樣本或角度不足；"
+                "請按「開始檢查」並依三階段指引重新操作。"
+            )
         self.write_log(f"gravity_cal: {'PASS' if payload.get('ok') else 'FAIL'} -> {out} (overwrite)")
         self.write_log(payload.get("map_up_hint", "") or "")
 
@@ -5128,6 +5194,7 @@ class OperatorApp(tk.Tk):
         # After cancel, restore last saved result on disk (if any).
         if not self._load_gravity_cal_into_ui():
             self.gravity_status_var.set("已取消。待命：開始後依序旋轉機身")
+            self.gravity_guide_var.set(gravity_phase_guidance(None))
             self.gravity_att_var.set("att roll/pitch/yaw = -")
             self.gravity_g_var.set("g_body = -")
         self.write_log("gravity_cal: cancelled")
@@ -5194,6 +5261,14 @@ class OperatorApp(tk.Tk):
             except Exception as exc:
                 self.write_log(f"gravity_cal: migrate failed: {exc!r}")
         self._apply_gravity_display(payload, source_path=path, note="已載入")
+        if hasattr(self, "gravity_guide_var"):
+            state = "PASS" if payload.get("ok") else "FAIL"
+            action = (
+                "三階段皆已達標。"
+                if payload.get("ok")
+                else "請按「開始檢查」並依三階段指引重新操作。"
+            )
+            self.gravity_guide_var.set(f"已載入上次結果：{state}。{action}")
         self.write_log(f"gravity_cal: loaded {path}")
         return True
 
@@ -5557,6 +5632,15 @@ class OperatorApp(tk.Tk):
             self.gravity_cal.add_sample(roll, pitch, yaw)
             phase = self.gravity_cal.phase or "?"
             n = len(self.gravity_cal.samples_for(phase))
+            phase_result = self.gravity_cal.analyze_phase(phase)
+            span = {
+                "yaw": phase_result.yaw_span_deg,
+                "pitch": phase_result.pitch_span_deg,
+                "roll": phase_result.roll_span_deg,
+            }.get(phase, 0.0)
+            self.gravity_guide_var.set(
+                gravity_phase_guidance(phase, sample_count=n, span_deg=span)
+            )
             # lightweight live status (phase label kept; append sample count)
             base = self.gravity_status_var.get().split("\n")[0]
             self.gravity_status_var.set(f"{base}\n本階段樣本 {n}")

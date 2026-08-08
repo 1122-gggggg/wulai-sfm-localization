@@ -22,6 +22,7 @@ from flight_operator_app import (
     _positive_env_int,
     format_magnetometer_calibration,
     format_olympe_telemetry,
+    gravity_phase_guidance,
     next_tick_deadline,
     video_hud_identity,
 )
@@ -415,6 +416,25 @@ def test_ui_separates_firmware_magnetometer_calibration_from_passive_gravity_che
     assert "建議" in status["drone"]
     assert "Y/pitch" in status["drone"]
     assert "進行中：Z 軸" in status["controller"]
+
+
+def test_gravity_guide_tells_the_operator_each_motion_and_next_action() -> None:
+    ready = gravity_phase_guidance(None)
+    assert "拆除螺旋槳" in ready and "landed" in ready
+    assert "水平旋轉 → 前後俯仰 → 左右側傾" in ready
+
+    yaw = gravity_phase_guidance("yaw", sample_count=12, span_deg=46.4)
+    assert "1/3 YAW" in yaw and "保持水平" in yaw and "轉一整圈" in yaw
+    assert "樣本 12/15" in yaw and "角度變化 46°/90°" in yaw
+    assert "下一階段" in yaw
+
+    pitch = gravity_phase_guidance("pitch", sample_count=18, span_deg=31.0)
+    assert "2/3 PITCH" in pitch and "機頭先抬高再壓低" in pitch
+    assert "角度變化 31°/25°" in pitch and "下一階段" in pitch
+
+    roll = gravity_phase_guidance("roll", sample_count=20, span_deg=28.0)
+    assert "3/3 ROLL" in roll and "先向左再向右側傾" in roll
+    assert "角度變化 28°/25°" in roll and "完成並分析" in roll
 
 
 def test_focus_loss_clears_all_holds_and_backend_nudges():
