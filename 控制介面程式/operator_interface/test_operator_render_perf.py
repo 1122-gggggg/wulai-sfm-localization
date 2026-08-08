@@ -320,11 +320,21 @@ def test_no_control_tab_is_clipped_by_the_fixed_control_pane(operator) -> None:
                     )
 
 
-def test_each_gravity_guide_phase_fits_the_fixed_control_pane(operator) -> None:
+def test_calibration_results_and_each_gravity_phase_fit_the_control_pane(operator) -> None:
     notebook = operator.controls_notebook
     pane = notebook.master
     calibration_tab = operator._preflight_tabs["compass"]
     notebook.select(calibration_tab)
+    operator.drone_magnetometer_var.set(app.format_magnetometer_calibration(
+        app.DroneState(
+            drone_magnetometer_required=0,
+            drone_magnetometer_started=False,
+            drone_magnetometer_x_done=True,
+            drone_magnetometer_y_done=True,
+            drone_magnetometer_z_done=True,
+            drone_magnetometer_failed=False,
+        )
+    )["drone"])
 
     for geometry in ("1440x900", "980x640"):
         operator.geometry(geometry)

@@ -418,6 +418,35 @@ def test_ui_separates_firmware_magnetometer_calibration_from_passive_gravity_che
     assert "進行中：Z 軸" in status["controller"]
 
 
+def test_magnetometer_status_shows_reusable_and_latest_firmware_result() -> None:
+    valid = format_magnetometer_calibration(DroneState(
+        drone_magnetometer_required=0,
+        drone_magnetometer_started=False,
+        drone_magnetometer_x_done=True,
+        drone_magnetometer_y_done=True,
+        drone_magnetometer_z_done=True,
+        drone_magnetometer_failed=False,
+    ))["drone"]
+    assert "最新讀回校正結果：PASS" in valid
+    assert "X/Y/Z 已完成" in valid and "可沿用" in valid
+
+    recommended = format_magnetometer_calibration(DroneState(
+        drone_magnetometer_required=2,
+        drone_magnetometer_started=False,
+        drone_magnetometer_failed=False,
+    ))["drone"]
+    assert "機上既有校正結果：可沿用" in recommended
+    assert "韌體建議重新校正" in recommended
+
+    failed = format_magnetometer_calibration(DroneState(
+        drone_magnetometer_required=1,
+        drone_magnetometer_started=False,
+        drone_magnetometer_failed=True,
+    ))["drone"]
+    assert "最新讀回校正結果：FAIL" in failed
+    assert "不可沿用" in failed
+
+
 def test_gravity_guide_tells_the_operator_each_motion_and_next_action() -> None:
     ready = gravity_phase_guidance(None)
     assert "拆除螺旋槳" in ready and "landed" in ready

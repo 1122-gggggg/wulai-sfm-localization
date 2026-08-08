@@ -1508,6 +1508,13 @@ def format_magnetometer_calibration(state: DroneState) -> dict[str, str]:
     """Format aircraft/controller firmware calibration without guessing state."""
     required = getattr(state, "drone_magnetometer_required", None)
     requirement = {0: "有效", 1: "必需", 2: "建議"}.get(required, "未知")
+    started = getattr(state, "drone_magnetometer_started", None) is True
+    failed = getattr(state, "drone_magnetometer_failed", None) is True
+    axis_results = (
+        getattr(state, "drone_magnetometer_x_done", None),
+        getattr(state, "drone_magnetometer_y_done", None),
+        getattr(state, "drone_magnetometer_z_done", None),
+    )
     axis_raw = str(getattr(state, "drone_magnetometer_axis", "unknown") or "unknown")
     axis_key = axis_raw.rsplit(".", 1)[-1].replace("_", "").lower()
     axis = {
@@ -1523,19 +1530,29 @@ def format_magnetometer_calibration(state: DroneState) -> dict[str, str]:
     def done(value: object) -> str:
         return "✓" if value is True else ("·" if value is False else "?")
 
-    if getattr(state, "drone_magnetometer_failed", None) is True:
+    if failed:
         progress = "失敗，請移離金屬／磁場干擾後重試"
-    elif getattr(state, "drone_magnetometer_started", None) is True:
+        result = "最新讀回校正結果：FAIL（韌體回報失敗），不可沿用"
+    elif started:
         progress = f"進行中：目前 {axis}"
+        result = "最新讀回校正結果：進行中；完成後會自動更新"
     elif required == 0:
-        progress = "未進行"
-    else:
+        progress = "待命"
+        detail = "X/Y/Z 已完成" if all(value is True for value in axis_results) else "韌體回報有效"
+        result = f"最新讀回校正結果：PASS（{detail}），可沿用"
+    elif required == 2:
+        progress = "待命，可選擇重新校正"
+        result = "機上既有校正結果：可沿用；韌體建議重新校正"
+    elif required == 1:
         progress = "等待使用者開始"
+        result = "機上既有校正結果：不可沿用；必須完成重新校正"
+    else:
+        progress = "等待韌體狀態讀回"
+        result = "校正結果：未知，尚不能判定是否可沿用"
     drone = (
         f"飛機羅盤：{requirement} | {progress} | "
-        f"X{done(getattr(state, 'drone_magnetometer_x_done', None))} "
-        f"Y{done(getattr(state, 'drone_magnetometer_y_done', None))} "
-        f"Z{done(getattr(state, 'drone_magnetometer_z_done', None))}"
+        f"X{done(axis_results[0])} Y{done(axis_results[1])} Z{done(axis_results[2])}\n"
+        f"{result}"
     )
 
     controller_raw = str(
