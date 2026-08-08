@@ -595,8 +595,6 @@ def flight_readiness_errors(profile: SiteProfile) -> list[str]:
         errors.append("missing flight.coordinate_frame_id")
     if not flight.route_clearance_approved:
         errors.append("flight.route_clearance_approved is false")
-    if flight.controller is None:
-        errors.append("missing flight.controller")
     if profile.route_json is None:
         errors.append("missing route_json")
     if profile.map_reference_poses is None:

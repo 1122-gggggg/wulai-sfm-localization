@@ -24,10 +24,8 @@ def _load_module(name: str, relative: str):
 
 
 MODULES = [
-    _load_module("mission_olympe_frame_source_worker_test",
+    _load_module("canonical_olympe_frame_source_worker_test",
                  "定位演算法/flight_control/olympe_frame_source.py"),
-    _load_module("deploy_olympe_frame_source_worker_test",
-                 "定位演算法/deploy_code/sfm_glomap_deploy/olympe_frame_source.py"),
 ]
 
 
@@ -79,7 +77,7 @@ def _assert_balanced(*frames):
     assert all(frame.unref_calls == 1 for frame in frames)
 
 
-@pytest.mark.parametrize("module", MODULES, ids=("mission", "deploy"))
+@pytest.mark.parametrize("module", MODULES, ids=("canonical",))
 def test_stream_metadata_distinguishes_configured_codec_from_observed_frames(module):
     grabber = _grabber(module)
     grabber._t0 = time.monotonic() - 1.0
@@ -100,7 +98,7 @@ def test_stream_metadata_distinguishes_configured_codec_from_observed_frames(mod
     assert metadata["source_timestamp_trusted"] is True
 
 
-@pytest.mark.parametrize("module", MODULES, ids=("mission", "deploy"))
+@pytest.mark.parametrize("module", MODULES, ids=("canonical",))
 def test_latest_frame_replaces_pending_without_blocking_callback(module):
     grabber = _grabber(module)
     entered = threading.Event()
@@ -142,7 +140,7 @@ def test_latest_frame_replaces_pending_without_blocking_callback(module):
                for frame in (frames[0], frames[2]) for name in frame.info_threads)
 
 
-@pytest.mark.parametrize("module", MODULES, ids=("mission", "deploy"))
+@pytest.mark.parametrize("module", MODULES, ids=("canonical",))
 def test_pdraw_callback_does_not_read_metadata_or_convert(module):
     grabber = _grabber(module)
     grabber._accept_frames = True
@@ -158,7 +156,7 @@ def test_pdraw_callback_does_not_read_metadata_or_convert(module):
     _assert_balanced(frame)
 
 
-@pytest.mark.parametrize("module", MODULES, ids=("mission", "deploy"))
+@pytest.mark.parametrize("module", MODULES, ids=("canonical",))
 def test_blocked_metadata_worker_never_holds_the_callback_lock(module):
     grabber = _grabber(module)
     info_entered = threading.Event()
@@ -188,7 +186,7 @@ def test_blocked_metadata_worker_never_holds_the_callback_lock(module):
     _assert_balanced(first, second)
 
 
-@pytest.mark.parametrize("module", MODULES, ids=("mission", "deploy"))
+@pytest.mark.parametrize("module", MODULES, ids=("canonical",))
 def test_flush_releases_pending_and_waits_for_inflight_unref(module):
     grabber = _grabber(module)
     entered = threading.Event()
@@ -232,7 +230,7 @@ def test_flush_releases_pending_and_waits_for_inflight_unref(module):
     assert grabber.frame_pipeline_stats["flush_drops"] == 2
 
 
-@pytest.mark.parametrize("module", MODULES, ids=("mission", "deploy"))
+@pytest.mark.parametrize("module", MODULES, ids=("canonical",))
 def test_stop_releases_pending_rejects_late_callback_and_joins_worker(module):
     grabber = _grabber(module)
     entered = threading.Event()
@@ -276,7 +274,7 @@ def test_stop_releases_pending_rejects_late_callback_and_joins_worker(module):
     assert grabber._frame_worker is None
 
 
-@pytest.mark.parametrize("module", MODULES, ids=("mission", "deploy"))
+@pytest.mark.parametrize("module", MODULES, ids=("canonical",))
 def test_store_still_enforces_stale_and_frozen_contract(module):
     grabber = _grabber(module)
     frame = np.zeros((8, 8, 3), dtype=np.uint8)
@@ -292,7 +290,7 @@ def test_store_still_enforces_stale_and_frozen_contract(module):
     assert not grabber.is_healthy()
 
 
-@pytest.mark.parametrize("module", MODULES, ids=("mission", "deploy"))
+@pytest.mark.parametrize("module", MODULES, ids=("canonical",))
 def test_live_ui_sample_reuses_owned_rgb_and_carries_monotonic_nodes(module):
     grabber = _grabber(module)
     frame = np.zeros((8, 8, 3), dtype=np.uint8)

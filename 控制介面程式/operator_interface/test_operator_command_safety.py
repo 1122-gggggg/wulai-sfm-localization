@@ -189,6 +189,112 @@ def test_preflight_route_step_requires_visible_hash_verified_route(tmp_path) -> 
     assert "顯示規劃路徑" in reason
 
 
+def test_route_selection_is_logged_before_the_snapshot_is_bound(
+    tmp_path, monkeypatch
+) -> None:
+    route = tmp_path / "route.json"
+    route.write_text("{}", encoding="utf-8")
+    snapshot = SimpleNamespace(
+        path=route.resolve(),
+        sha256="a" * 64,
+        site_id="river_site_edm",
+        coordinate_frame_id="river_site_glomap",
+        waypoints=((0.0, 0.0, 0.0), (1.0, 0.0, 0.0)),
+        controller_waypoints=lambda: [
+            np.array([0.0, 0.0, 0.0]),
+            np.array([1.0, 0.0, 0.0]),
+        ],
+    )
+    events = []
+
+    class RouteLock:
+        active = False
+        snapshot = None
+
+        def bind(self, value):
+            events.append(("bind", value))
+            self.snapshot = value
+
+    class SessionLogs:
+        def command(self, event, **fields):
+            events.append((event, fields))
+            return True
+
+    operator = OperatorApp.__new__(OperatorApp)
+    operator.mission_route_lock = RouteLock()
+    operator.session_logs = SessionLogs()
+    operator.site_profile_path = tmp_path / "profile.json"
+    operator._active_site_map_frame = lambda: None
+    operator.show_route_var = SimpleNamespace(set=lambda _value: None)
+    operator.redraw_map_only = lambda: None
+    monkeypatch.setattr(
+        app,
+        "load_site_profile",
+        lambda _path: SimpleNamespace(
+            site_id="river_site_edm",
+            flight=SimpleNamespace(coordinate_frame_id="river_site_glomap"),
+        ),
+    )
+    monkeypatch.setattr(app, "file_sha256", lambda _path: snapshot.sha256)
+    monkeypatch.setattr(
+        app, "capture_mission_route_snapshot", lambda *_args, **_kwargs: snapshot
+    )
+
+    count = operator._show_route_overlay(route)
+
+    assert count == 2
+    assert events[0] == (
+        "route_selected",
+        {
+            "route_path": str(route.resolve()),
+            "route_sha256": "a" * 64,
+            "site_id": "river_site_edm",
+            "coordinate_frame_id": "river_site_glomap",
+            "waypoint_count": 2,
+        },
+    )
+    assert events[1] == ("bind", snapshot)
+
+
+def test_route_selection_is_not_bound_when_the_audit_log_fails(
+    tmp_path, monkeypatch
+) -> None:
+    route = tmp_path / "route.json"
+    route.write_text("{}", encoding="utf-8")
+    snapshot = SimpleNamespace(
+        path=route.resolve(),
+        sha256="a" * 64,
+        site_id="river_site_edm",
+        coordinate_frame_id="river_site_glomap",
+        waypoints=((0.0, 0.0, 0.0), (1.0, 0.0, 0.0)),
+    )
+    bound = []
+    operator = OperatorApp.__new__(OperatorApp)
+    operator.mission_route_lock = SimpleNamespace(
+        active=False, bind=bound.append
+    )
+    operator.session_logs = SimpleNamespace(command=lambda *_args, **_kwargs: False)
+    operator.site_profile_path = tmp_path / "profile.json"
+    operator._active_site_map_frame = lambda: None
+    monkeypatch.setattr(
+        app,
+        "load_site_profile",
+        lambda _path: SimpleNamespace(
+            site_id="river_site_edm",
+            flight=SimpleNamespace(coordinate_frame_id="river_site_glomap"),
+        ),
+    )
+    monkeypatch.setattr(app, "file_sha256", lambda _path: snapshot.sha256)
+    monkeypatch.setattr(
+        app, "capture_mission_route_snapshot", lambda *_args, **_kwargs: snapshot
+    )
+
+    with pytest.raises(ValueError, match="耐久記錄"):
+        operator._show_route_overlay(route)
+
+    assert bound == []
+
+
 def test_start_auto_dispatches_the_selected_route_identity_and_locks_it() -> None:
     operator = _bare_app()
     operator.inspecting = True

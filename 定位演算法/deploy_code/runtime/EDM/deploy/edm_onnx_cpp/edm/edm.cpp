@@ -2,7 +2,7 @@
 
 namespace realsee
 {
-    EDM::EDM(std::string &model_path)
+    EDM::EDM(const std::string &model_path)
     {
         // Create environment and session
         env = Ort::Env(ORT_LOGGING_LEVEL_WARNING, "edm");
@@ -20,13 +20,8 @@ namespace realsee
         // sessionOption.AppendExecutionProvider_CUDA(cuda_options);
 
         // Start session
-        session = new Ort::Session(env, model_path.c_str(), sessionOption);
+        session = std::make_unique<Ort::Session>(env, model_path.c_str(), sessionOption);
         options = Ort::RunOptions{nullptr};
-    }
-
-    EDM::~EDM()
-    {
-        delete session;
     }
 
     bool EDM::pre_process(cv::Mat img0, cv::Mat img1, float *oneInput_)
@@ -58,13 +53,13 @@ namespace realsee
 
     bool EDM::match(cv::Mat &img0, cv::Mat &img1, std::vector<cv::KeyPoint> &kepts0, std::vector<cv::KeyPoint> &kepts1)
     {
-        float *oneInput_ = new float[2 * inputW * inputH];
+        std::vector<float> oneInput(2 * inputW * inputH);
 
-        pre_process(img0, img1, oneInput_);
+        pre_process(img0, img1, oneInput.data());
 
         Ort::Value inputTensor = Ort::Value::CreateTensor<float>(
             Ort::MemoryInfo::CreateCpu(OrtDeviceAllocator, OrtMemTypeCPU),
-            oneInput_,
+            oneInput.data(),
             2 * inputW * inputH,
             inputNodeDims.data(),
             inputNodeDims.size());

@@ -36,6 +36,14 @@ def test_production_offline_smoke_requires_edm_not_research_xfeat() -> None:
     workspace = steps["workspace_layout"]
     assert workspace.argv[-2:] == ("--strict-output-names", "--no-sizes")
 
+    assert steps["root_ruff_check"].argv[-3:] == ("ruff", "check", ".")
+    assert steps["root_ruff_format"].argv[2:5] == ("ruff", "format", "--check")
+    assert steps["maintainability_budget"].argv[-1].endswith(
+        "tools/check_maintainability.py"
+    )
+    assert "--cov" in steps["root_pytest"].argv
+    assert "--timeout=300" in steps["root_pytest"].argv
+
 
 def test_parrot_simulator_validation_stays_in_its_python311_environment() -> None:
     module = _load_validation_module()

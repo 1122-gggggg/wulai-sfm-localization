@@ -28,8 +28,13 @@ def test_manifest_excludes_editor_and_transient_release_files() -> None:
         Path("audit/final_validation.md"),
         Path(".cursor/session.json"),
         Path("env/bin/python"),
+        Path(".coverage"),
+        Path(".coverage.host.123.random"),
+        Path("coverage.xml"),
+        Path("htmlcov/index.html"),
     ):
         assert not included(path)
+    assert included(Path(".coveragerc"))
 
 
 def test_release_tools_have_one_authoritative_implementation() -> None:
@@ -52,9 +57,7 @@ def test_manifest_round_trip(tmp_path: Path) -> None:
     )
 
 
-def test_export_rejects_a_destination_inside_the_source(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_export_rejects_a_destination_inside_the_source(tmp_path: Path, monkeypatch) -> None:
     source = tmp_path / "source"
     source.mkdir()
     monkeypatch.setattr(export_simulator_package, "ROOT", source)

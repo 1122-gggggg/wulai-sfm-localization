@@ -240,7 +240,6 @@ def run_session(*, ip: str, controller: str, secs: float, hz: float,
                 n += 1
                 if n % max(1, int(hz)) == 0:
                     f.flush()
-                    att = row.get("piloting.attitude")
                     alt = row.get("piloting.altitude")
                     fly = row.get("piloting.flying_state")
                     bat = row.get("common.battery") or row.get("battery.capacity")

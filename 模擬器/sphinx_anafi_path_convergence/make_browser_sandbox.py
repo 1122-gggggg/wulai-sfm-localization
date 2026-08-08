@@ -18,7 +18,7 @@ from pathlib import Path
 import numpy as np
 
 from anafi_profile import ANAFI_PROFILE
-from controllers import ABORT_OR_MANUAL, COMPLETED, ALGORITHM_ORDER, make_controller
+from controllers import ALGORITHM_ORDER, make_controller
 from metrics import compute_trial_metrics
 from route_geometry import RouteModel, heading_of, horiz, sample_start_offset, wrap_angle
 from run_sphinx_anafi_convergence import DT, _ground_truth_augment, run_trial

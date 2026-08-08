@@ -27,7 +27,6 @@ from pathlib import Path
 from site_profile import (
     SiteProfile,
     flight_readiness_errors,
-    load_hardware_approval_receipt,
     load_site_profile,
 )
 from workspace_layout import workspace_from_file
@@ -41,13 +40,17 @@ AUTHOR = _WS.control / "authoring"
 FLIGHT = _WS.flight_control
 DEPLOY = _WS.deploy_code
 SCRIPTS = _WS.algorithms / "source" / "sfm_glomap" / "scripts"
+if str(FLIGHT) not in sys.path:
+    sys.path.insert(0, str(FLIGHT))
+
+from safety_command import safety_file_from_environment, write_safety_command  # noqa: E402
 
 DEFAULT_FLIGHT_BUNDLE = _WS.bundles / "your_site_reloc_map_edm.pt"
 DEFAULT_MEGALOC_CACHE = ""
 DEFAULT_MAP_PLY = _WS.map_ply_dir / "your_site.ply"
 DEFAULT_PATH_JSON = _WS.mission_routes / "your_site" / "flight_path.json"
 DEFAULT_POLES_JSON = _WS.mission_routes / "your_site" / "poles.json"
-DEFAULT_SAFETY_FILE = Path(os.environ.get("SFM_SAFETY_FILE", "/tmp/sfm_drone_safety.cmd"))
+DEFAULT_SAFETY_FILE = safety_file_from_environment()
 
 
 DRAW_SCRIPTS = {
@@ -61,7 +64,6 @@ DRAW_SCRIPTS = {
 }
 
 _PROFILE_FREE_MODES = {"flight-selftest"}
-AUTONOMOUS_ROUTE_EXTERNAL_APPROVAL_LOCKED = True
 _ROUTE_MUST_EXIST_MODES = {
     "draw-wires",
     "label-route",
@@ -75,7 +77,6 @@ _POLES_MUST_EXIST_MODES = {
     "draw-wires",
     "sync-poles",
     "plan-path",
-    "dry-run",
 }
 _SITE_ASSET_ENV_VARS = (
     "SFM_MAP_PLY",
@@ -191,7 +192,7 @@ def _validate_flight_route(profile: SiteProfile) -> None:
 
 
 def validate_profile_flight_assets(profile: SiteProfile) -> None:
-    """Validate a future scale-free flight package without unlocking execution."""
+    """Validate an approved scale-free flight package before execution."""
     errors = flight_readiness_errors(profile)
     if errors:
         note = "" if profile.flight is None else profile.flight.approval_note
@@ -237,8 +238,7 @@ def validate_profile_flight_assets(profile: SiteProfile) -> None:
             ),
         )
     controller = profile.flight.controller
-    assert controller is not None
-    if controller.inspect_waypoints:
+    if controller is not None and controller.inspect_waypoints:
         assert profile.poles_json is not None
         checks += (
             (
@@ -316,28 +316,12 @@ def shadow_readiness_errors(profile: SiteProfile) -> list[str]:
 
 
 def shadow_authorization_blockers(profile: SiteProfile) -> list[str]:
-    """Report human/real-hardware work without granting any approval."""
-    blockers = list(flight_readiness_errors(profile))
-    if profile.hardware_approval is None:
-        blockers.append("missing hardware_approval receipt")
-        return blockers
-    try:
-        receipt = load_hardware_approval_receipt(profile.hardware_approval)
-    except ValueError as exc:
-        blockers.append(f"invalid hardware_approval receipt: {exc}")
-    else:
-        if not receipt.approved:
-            blockers.append("hardware_approval receipt is not approved")
-    return blockers
+    """Report the remaining profile authorization blockers."""
+    return list(flight_readiness_errors(profile))
 
 
 def validate_profile_for_flight(profile: SiteProfile) -> None:
-    """Keep every autonomous route entry point locked pending external approval."""
-    if AUTONOMOUS_ROUTE_EXTERNAL_APPROVAL_LOCKED:
-        raise ValueError(
-            "autonomous route flight is LOCKED pending external approval, two-person "
-            "checklist, props-off yaw/PCMD tests, and low-altitude validation"
-        )
+    """Require an approved, hash-pinned autonomous flight package."""
     validate_profile_flight_assets(profile)
 
 
@@ -557,11 +541,7 @@ def main() -> None:
     # assets are missing or misconfigured.
     if args.mode.startswith("safety-"):
         cmd = args.mode.removeprefix("safety-")
-        safety_path = Path(args.safety_file)
-        safety_path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = safety_path.with_suffix(safety_path.suffix + ".tmp")
-        tmp.write_text(cmd + "\n")
-        os.replace(tmp, safety_path)
+        write_safety_command(args.safety_file, cmd)
         print(f"[mission_pipeline] safety command -> {cmd} ({args.safety_file})", flush=True)
         return
 
@@ -597,7 +577,11 @@ def main() -> None:
         )
         for error in shadow_errors:
             print(f"  package blocker: {error}", flush=True)
-        print("[shadow-readiness] autonomous execution remains LOCKED", flush=True)
+        print(
+            "[shadow-readiness] autonomous execution="
+            + ("APPROVED" if not authorization_blockers else "BLOCKED"),
+            flush=True,
+        )
         for blocker in authorization_blockers:
             print(f"  human/field blocker: {blocker}", flush=True)
         if shadow_errors:

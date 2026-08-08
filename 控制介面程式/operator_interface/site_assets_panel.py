@@ -189,6 +189,9 @@ class SiteAssetsPanel(ttk.LabelFrame):
                 text=item.label,
                 command=lambda path=item.path: self._preview_existing_route(path),
             )
+            if not item.flight_ready:
+                button.state(["disabled"])
+                self._permanently_disabled.add(button)
             button.pack(side="left", padx=(0, 6))
             self._buttons.append(button)
         return row + 1
@@ -204,6 +207,10 @@ class SiteAssetsPanel(ttk.LabelFrame):
         """
         if self.request_route_preview is None:
             self.status_var.set("航線顯示尚未接上")
+            return
+        safe, reason = self.flight_state_check()
+        if not safe:
+            self.status_var.set(f"航線選擇已拒絕：{reason}")
             return
         try:
             self.status_var.set(self.request_route_preview(path))

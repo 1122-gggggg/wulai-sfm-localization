@@ -20,7 +20,6 @@ import hashlib
 import json
 import math
 import os
-import statistics
 import sys
 import time
 from pathlib import Path
@@ -31,13 +30,14 @@ import torch
 
 from camera_intrinsics import load_scaled_simple_radial
 
-# This file is shipped both inside deploy_code/sfm_glomap_deploy/ (imports work
-# from the script dir) and as a real file under 定位/validation/ in the transfer
-# package, where the tracker modules live one level up in deploy_code/. Make the
-# sibling imports work from either location without requiring PYTHONPATH.
+# The benchmark lives under validation while localization and flight helpers
+# each have a single owner. Resolve both explicitly without requiring PYTHONPATH.
 _HERE = Path(__file__).resolve().parent
-for _cand in (_HERE, _HERE.parent / "deploy_code" / "sfm_glomap_deploy"):
-    if (_cand / "production_xfeat_tracker.py").exists() and str(_cand) not in sys.path:
+for _cand in (
+    _HERE.parent / "deploy_code" / "sfm_glomap_deploy",
+    _HERE.parent / "flight_control",
+):
+    if _cand.is_dir() and str(_cand) not in sys.path:
         sys.path.insert(0, str(_cand))
 
 from production_xfeat_tracker import (

@@ -1045,6 +1045,19 @@ def test_metrics_keep_wall_compatibility_and_explicit_core_timing() -> None:
     assert record["submit_busy_attempts"] == 5
 
 
+def test_operator_and_worker_parsers_are_side_effect_free() -> None:
+    operator_parser = app.build_argument_parser()
+    worker_parser = localizer_worker.build_argument_parser()
+
+    operator_args = operator_parser.parse_args(["--video", "sample.mp4"])
+    worker_args = worker_parser.parse_args(["--frame-shm-name", "", "--frame-shm-slots", "0"])
+
+    assert operator_args.video == "sample.mp4"
+    assert operator_args.live is False
+    assert worker_args.width == 1280
+    assert worker_args.localizer_backend in {"auto", "edm", "xfeat"}
+
+
 def test_temporal_pose_stabilizer_suppresses_single_frame_flip() -> None:
     stabilizer = app.TemporalPoseStabilizer(
         tau_s=0.15, max_speed_u_s=2.0, step_slack_u=0.03, max_step_u=0.15)

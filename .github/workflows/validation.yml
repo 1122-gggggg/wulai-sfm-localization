@@ -15,7 +15,45 @@ jobs:
           python-version: "3.10"
       - name: Install hash-locked test dependencies
         run: python -m pip install --require-hashes -r requirements-test-lock.txt
-      - name: Root lint baseline
-        run: ruff check .
-      - name: Root tests with bounded runtime
-        run: python -m pytest -q --timeout=300 --cov --cov-config="$GITHUB_WORKSPACE/pyproject.toml" --cov-report=term-missing --cov-fail-under=0
+      - name: First-party code quality gates
+        run: |
+          ruff check .
+          ruff format --check \
+            tools/check_maintainability.py \
+            tools/test_check_maintainability.py \
+            tools/test_documentation_contract.py \
+            定位演算法/flight_control/safety_command.py \
+            定位演算法/validation/check_runtime_mirrors.py \
+            定位演算法/validation/tests/test_runtime_mirrors.py \
+            定位演算法/validation/tests/test_edm_cpp_resource_safety.py \
+            控制介面程式/operator_interface/localization_metrics.py \
+            控制介面程式/operator_interface/test_localization_metrics.py
+          python tools/check_maintainability.py
+      - name: Release metadata and workspace contracts
+        run: |
+          python tools/package_manifest.py verify --root .
+          python 定位演算法/validation/check_runtime_mirrors.py
+          python tools/workspace_audit.py --strict-output-names --no-sizes
+          python 控制介面程式/validate_system_profiles.py
+      - name: Root tests with expanded first-party coverage
+        run: python -m pytest -q --timeout=300 --cov --cov-config="$GITHUB_WORKSPACE/pyproject.toml" --cov-report=term-missing
+
+  parrot-simulator:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: 模擬器/parrot_stimulate
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install hash-locked simulator test dependencies
+        run: python -m pip install --require-hashes -r requirements-test-lock.txt
+      - name: Simulator tests
+        run: PYTHONPATH=src python -m pytest -q
+      - name: Simulator lint and format
+        run: |
+          python -m ruff check .
+          python -m ruff format --check .

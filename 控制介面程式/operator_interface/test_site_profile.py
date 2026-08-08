@@ -253,13 +253,15 @@ def test_hardware_approval_receipt_is_hash_verified(tmp_path: Path) -> None:
         load_hardware_approval_receipt(profile.hardware_approval)
 
 
-def test_all_shipped_profiles_are_scale_free_and_unapproved() -> None:
+def test_all_shipped_profiles_are_scale_free_and_only_river_is_approved() -> None:
     profiles_dir = Path(__file__).resolve().parents[1] / "site_profiles"
     for path in profiles_dir.glob("*.json"):
         raw = json.loads(path.read_text(encoding="utf-8"))
         assert raw["schema_version"] == 2, path
         assert "map_units_per_meter" not in raw.get("flight", {}), path
-        assert raw["flight"]["approved"] is False, path
+        approved = path.name == "river_site_edm.json"
+        assert raw["flight"]["approved"] is approved, path
+        assert raw["flight"]["route_clearance_approved"] is approved, path
         profile = load_site_profile(path, validate_files=False)
         assert profile.schema_version == 2
 

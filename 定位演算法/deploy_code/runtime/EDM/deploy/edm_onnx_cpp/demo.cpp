@@ -74,6 +74,7 @@ int main(int argc, char *argv[])
     if (argc != 5)
     {
         cout << "usage: ./demo img0_path img1_path out_path model_path\n";
+        return 1;
     }
 
     std::string img_path0 = argv[1];

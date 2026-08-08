@@ -37,6 +37,17 @@ P119_VIDEO = Path(
     )
 ).expanduser()
 P119_QUALITY_BASELINE = ROOT / "定位演算法/validation/baselines/p119_edm_quality.json"
+ROOT_FORMAT_SCOPE = (
+    "tools/check_maintainability.py",
+    "tools/test_check_maintainability.py",
+    "tools/test_documentation_contract.py",
+    "定位演算法/flight_control/safety_command.py",
+    "定位演算法/validation/check_runtime_mirrors.py",
+    "定位演算法/validation/tests/test_runtime_mirrors.py",
+    "定位演算法/validation/tests/test_edm_cpp_resource_safety.py",
+    "控制介面程式/operator_interface/localization_metrics.py",
+    "控制介面程式/operator_interface/test_localization_metrics.py",
+)
 RELEASE_FILES = (
     "requirements.txt",
     "requirements-lock.txt",
@@ -57,6 +68,7 @@ RELEASE_FILES = (
     "tools/test_portable_runtime.sh",
     "tools/simulated_ui_smoke.sh",
     "tools/simulator_preflight.py",
+    "tools/check_maintainability.py",
     "tools/export_simulator_package.py",
     "tools/package_manifest.py",
     "tools/release_contract.py",
@@ -270,7 +282,46 @@ def _steps(
 ) -> list[Step]:
     uv = shutil.which("uv") or "uv"
     steps = [
-        Step("root_pytest", (str(ROOT_PYTHON), "-m", "pytest", "-q"), str(ROOT), 2400),
+        Step(
+            "root_ruff_check",
+            (str(ROOT_PYTHON), "-m", "ruff", "check", "."),
+            str(ROOT),
+            300,
+        ),
+        Step(
+            "root_ruff_format",
+            (
+                str(ROOT_PYTHON),
+                "-m",
+                "ruff",
+                "format",
+                "--check",
+                *ROOT_FORMAT_SCOPE,
+            ),
+            str(ROOT),
+            300,
+        ),
+        Step(
+            "maintainability_budget",
+            (str(ROOT_PYTHON), str(ROOT / "tools/check_maintainability.py")),
+            str(ROOT),
+            300,
+        ),
+        Step(
+            "root_pytest",
+            (
+                str(ROOT_PYTHON),
+                "-m",
+                "pytest",
+                "-q",
+                "--timeout=300",
+                "--cov",
+                f"--cov-config={ROOT / 'pyproject.toml'}",
+                "--cov-report=term-missing",
+            ),
+            str(ROOT),
+            2400,
+        ),
         Step(
             "parrot_pytest",
             (str(PARROT_PYTHON), "-m", "pytest", "-q"),
@@ -290,7 +341,7 @@ def _steps(
             300,
         ),
         Step(
-            "runtime_mirrors",
+            "runtime_module_ownership",
             (
                 str(ROOT_PYTHON),
                 str(ROOT / "定位演算法/validation/check_runtime_mirrors.py"),

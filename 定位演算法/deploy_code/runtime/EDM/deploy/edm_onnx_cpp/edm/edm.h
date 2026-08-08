@@ -7,7 +7,9 @@
  * description: C++ inference demo for paper: EDM: Efficient Deep Feature Matching
  */
 #include <iostream>
+#include <memory>
 #include <string>
+#include <vector>
 #include <opencv2/opencv.hpp>
 #include <onnxruntime_cxx_api.h>
 
@@ -17,9 +19,9 @@ namespace realsee
     class EDM
     {
     public:
-        EDM(std::string &model_path);
+        explicit EDM(const std::string &model_path);
 
-        ~EDM();
+        ~EDM() = default;
 
         bool pre_process(cv::Mat img0, cv::Mat img1, float *oneInput_);
         bool match(cv::Mat &img0, cv::Mat &img1, std::vector<cv::KeyPoint> &kepts0, std::vector<cv::KeyPoint> &kepts1);
@@ -27,7 +29,7 @@ namespace realsee
 
     private:
         Ort::Env env;
-        Ort::Session *session;
+        std::unique_ptr<Ort::Session> session;
         Ort::RunOptions options;
 
         std::vector<const char *> inputNodeNames = {"input"};

@@ -162,7 +162,7 @@ class PoleCruise:
         # altitude hold on the carrot's height
         gaz_cmd = _clamp(K_ALT * (carrot[2] - P[2]), -1, 1) * ALT_GAZ
 
-        info = (f"NAV->fwd" if pidx is None
+        info = ("NAV->fwd" if pidx is None
                 else f"LOCK pole#{pidx} blend={blend:.2f}")
         return (int(round(roll_cmd)), int(round(pitch_cmd)), int(round(yaw_cmd)),
                 int(round(gaz_cmd)), round(GIMBAL_SIGN * gimbal, 1), info)

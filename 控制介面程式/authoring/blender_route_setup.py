@@ -18,7 +18,6 @@ then heights are adjusted per waypoint from a side view with G then Z.
 """
 import json
 import os
-import sys
 
 import bpy
 import numpy as np

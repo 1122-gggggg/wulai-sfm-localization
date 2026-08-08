@@ -73,6 +73,7 @@ from localization_contract import (
     InvalidLocalizationResult,
     LocalizationResult,
 )
+from localization_metrics import build_localization_metric_record
 from live_safety_config import (
     DEFAULT_MAX_ROTATION_SPEED_DEGS,
     DEFAULT_MAX_TILT_DEG,
@@ -5576,6 +5577,16 @@ class OperatorApp(tk.Tk):
             expected_coordinate_frame_id=coordinate_frame_id,
             map_frame=self._active_site_map_frame() or LEGACY_MAP_FRAME,
         )
+        session_logs = self.__dict__.get("session_logs")
+        if session_logs is not None and not session_logs.command(
+            "route_selected",
+            route_path=str(snapshot.path),
+            route_sha256=snapshot.sha256,
+            site_id=snapshot.site_id,
+            coordinate_frame_id=snapshot.coordinate_frame_id,
+            waypoint_count=len(snapshot.waypoints),
+        ):
+            raise ValueError("無法耐久記錄航線選擇，已拒絕綁定")
         route_lock.bind(snapshot)
         points = snapshot.controller_waypoints()
         self.route_pts = points
@@ -5600,11 +5611,20 @@ class OperatorApp(tk.Tk):
         except Exception as exc:
             self.write_log(f"route preview rejected: {exc}")
             return f"航線顯示失敗（{name}）：{exc}"
+        snapshot = self.mission_route_lock.snapshot
+        if snapshot is None:
+            self.write_log("route preview rejected: route binding produced no snapshot")
+            return f"航線顯示失敗（{name}）：綁定後沒有路線快照"
         self.write_log(
-            f"route selected: {count} waypoints; existing autonomy approval gates remain"
+            "route selected: "
+            f"path={snapshot.path} sha256={snapshot.sha256} "
+            f"site_id={snapshot.site_id} "
+            f"coordinate_frame_id={snapshot.coordinate_frame_id} "
+            f"waypoints={count}; existing autonomy approval gates remain"
         )
         return (
-            f"已選定並顯示 {name}（{count} 點）；AUTO 開始後將鎖定此航線，"
+            f"已選定並綁定 {name}（{count} 點，SHA-256 {snapshot.sha256[:12]}…）；"
+            "AUTO 開始後將鎖定此航線，"
             "仍須通過既有飛行核准閘門"
         )
 
@@ -5738,129 +5758,14 @@ class OperatorApp(tk.Tk):
             return
         try:
             metric_mono_ns = time.monotonic_ns()
-            rec = {
-                "t_mono": metric_mono_ns * 1e-9,
-                "t_mono_ns": metric_mono_ns,
-                "success": bool(result.get("success")),
-                "wall_ms": result.get("wall_ms"),
-                # core_wall_ms excludes stdin/frame-copy/IPC and, for forced
-                # TRACK bench, excludes the synthetic prior reset.
-                "core_wall_ms": result.get("core_wall_ms", result.get("wall_ms")),
-                "timing_clock": result.get("timing_clock"),
-                "client_submit_mono": result.get("client_submit_mono"),
-                "client_dequeue_mono": result.get("client_dequeue_mono"),
-                "client_write_start_mono": result.get("client_write_start_mono"),
-                "client_write_done_mono": result.get("client_write_done_mono"),
-                "worker_read_done_mono": result.get("worker_read_done_mono"),
-                "worker_core_start_mono": result.get("worker_core_start_mono"),
-                "worker_core_done_mono": result.get("worker_core_done_mono"),
-                "client_response_mono": result.get("client_response_mono"),
-                "ui_arrival_mono": result.get("ui_arrival_mono"),
-                "frame_callback_enter_mono_ns": result.get("frame_callback_enter_mono_ns"),
-                "frame_preprocess_start_mono_ns": result.get("frame_preprocess_start_mono_ns"),
-                "frame_yuv_ready_mono_ns": result.get("frame_yuv_ready_mono_ns"),
-                "frame_preprocess_done_mono_ns": result.get("frame_preprocess_done_mono_ns"),
-                "frame_store_mono_ns": result.get("frame_store_mono_ns"),
-                "ui_serialize_start_mono_ns": result.get("ui_serialize_start_mono_ns"),
-                "ui_serialize_done_mono_ns": result.get("ui_serialize_done_mono_ns"),
-                "client_submit_mono_ns": result.get("client_submit_mono_ns"),
-                "client_dequeue_mono_ns": result.get("client_dequeue_mono_ns"),
-                "client_write_start_mono_ns": result.get("client_write_start_mono_ns"),
-                "client_write_done_mono_ns": result.get("client_write_done_mono_ns"),
-                "worker_read_done_mono_ns": result.get("worker_read_done_mono_ns"),
-                "worker_core_start_mono_ns": result.get("worker_core_start_mono_ns"),
-                "worker_core_done_mono_ns": result.get("worker_core_done_mono_ns"),
-                "client_response_mono_ns": result.get("client_response_mono_ns"),
-                "ui_arrival_mono_ns": result.get("ui_arrival_mono_ns"),
-                "ui_serialize_ms": result.get("ui_serialize_ms"),
-                "client_queue_wait_ms": result.get("client_queue_wait_ms"),
-                "client_pipe_write_ms": result.get("client_pipe_write_ms"),
-                "submit_to_worker_read_ms": result.get("submit_to_worker_read_ms"),
-                "worker_done_to_client_ms": result.get("worker_done_to_client_ms"),
-                "client_roundtrip_ms": result.get("client_roundtrip_ms"),
-                "ui_poll_delay_ms": result.get("ui_poll_delay_ms"),
-                "e2e_submit_to_ui_ms": result.get("e2e_submit_to_ui_ms"),
-                "source_frame_stamp_mono": result.get("source_frame_stamp_mono"),
-                "source_stamp_semantics": result.get("source_stamp_semantics"),
-                "hold_retry": result.get("hold_retry"),
-                "hold_kind": result.get("hold_kind"),
-                "source_stamp_age_at_submit_ms": result.get("source_stamp_age_at_submit_ms"),
-                "source_stamp_age_at_ui_ms": result.get("source_stamp_age_at_ui_ms"),
-                "callback_to_preprocess_start_ms": result.get("callback_to_preprocess_start_ms"),
-                "yuv_view_ms": result.get("yuv_view_ms"),
-                "frame_preprocess_ms": result.get("frame_preprocess_ms"),
-                "preprocess_done_to_submit_ms": result.get("preprocess_done_to_submit_ms"),
-                "callback_to_submit_ms": result.get("callback_to_submit_ms"),
-                "callback_to_inference_start_ms": result.get("callback_to_inference_start_ms"),
-                "callback_to_localization_done_ms": result.get("callback_to_localization_done_ms"),
-                "callback_to_ui_ms": result.get("callback_to_ui_ms"),
-                "gpu_span_ms": result.get("gpu_span_ms"),
-                "gpu_timing_profiled": result.get("gpu_timing_profiled"),
-                "tracker_variant": result.get("tracker_variant"),
-                "display_seq": result.get("display_seq"),
-                "pose": result.get("pose"),
-                "pose_raw": result.get("pose_raw"),
-                "pose_filter": result.get("pose_filter"),
-                "vpr_ms": result.get("vpr_ms"),
-                "feature_ms": result.get("feature_ms"),
-                "match_ms": result.get("match_ms"),
-                "pnp_ms": result.get("pnp_ms"),
-                "mode": result.get("mode"),
-                "next_mode": result.get("next_mode"),
-                "composite_stage": result.get("composite_stage"),
-                "inliers": result.get("inliers"),
-                "n_corr": result.get("n_corr"),
-                "reference_count": result.get("reference_count"),
-                "requested_reference_count": result.get("requested_reference_count"),
-                "staged_early_stop": result.get("staged_early_stop"),
-                "rejected": result.get("rejected"),
-                "limited_jump": result.get("limited_jump"),
-                "limited_jump_confirmed": result.get(
-                    "limited_jump_confirmed", False
-                ),
-                "candidate_mode": result.get("candidate_mode"),
-                "global_retrieval_calls": result.get("global_retrieval_calls"),
-                "reproj_rms": result.get("reproj_rms"),
-                "inlier_ratio": result.get("inlier_ratio"),
-                "inlier_grid_cells": result.get("inlier_grid_cells"),
-                "neuflow_stage": result.get("neuflow_stage"),
-                "neuflow_anchor_count": result.get("neuflow_anchor_count"),
-                "neuflow_flow_ms": result.get("neuflow_flow_ms"),
-                "neuflow_gpu_ms": result.get("neuflow_gpu_ms"),
-                "projection_fallback": result.get("projection_fallback"),
-                "projection_reason": result.get("projection_reason"),
-                "projection_radius_px": result.get("projection_radius_px"),
-                "projection_anchor_count": result.get("projection_anchor_count"),
-                "projection_visible_count": result.get("projection_visible_count"),
-                "projection_match_count": result.get("projection_match_count"),
-                "projection_best_inliers": result.get("projection_best_inliers"),
-                "projection_project_ms": result.get("projection_project_ms"),
-                "projection_feature_ms": result.get("projection_feature_ms"),
-                "projection_match_ms": result.get("projection_match_ms"),
-                "frame_name": result.get("frame_name"),
-                "error": result.get("error"),
-                "loc_fps": round(self.loc_fps, 3),
-                "submit_ok": self._submit_ok,
-                "submit_skip_busy": self._submit_skip_busy,
-                "submit_busy_attempts": self._submit_busy_attempts,
-                "force_track_bench": result.get("force_track_bench"),
-                "force_track_label": result.get("force_track_label"),
-                "force_track_ref_requested": result.get("force_track_ref_requested"),
-                "force_track_ref_resolved": result.get("force_track_ref_resolved"),
-                "force_track_seed_ms": result.get("force_track_seed_ms"),
-                "benchmark_mode_requested": result.get("benchmark_mode_requested"),
-                "benchmark_mode_active": result.get("benchmark_mode_active"),
-                "relocalize_requested": result.get("relocalize_requested"),
-                "confidence_low": result.get("confidence_low"),
-                "confidence_hold_event": result.get("confidence_hold_event"),
-                "confidence_hold_active": result.get("confidence_hold_active"),
-                "confidence_low_streak": result.get("confidence_low_streak"),
-                "confidence_hold_attempts": result.get("confidence_hold_attempts"),
-                "benchmark_prior_kind": result.get("benchmark_prior_kind"),
-                "benchmark_prior_ref": result.get("benchmark_prior_ref"),
-                "benchmark_setup_ms": result.get("benchmark_setup_ms"),
-                "benchmark_seeded": result.get("benchmark_seeded"),
-            }
+            rec = build_localization_metric_record(
+                result,
+                metric_mono_ns=metric_mono_ns,
+                loc_fps=self.loc_fps,
+                submit_ok=self._submit_ok,
+                submit_skip_busy=self._submit_skip_busy,
+                submit_busy_attempts=self._submit_busy_attempts,
+            )
             session_logs = getattr(self, "session_logs", None)
             if session_logs is not None:
                 if not session_logs.localization("pose_result", **rec):
@@ -7734,7 +7639,8 @@ class OperatorApp(tk.Tk):
         self.after(delay_ms, self.tick)
 
 
-def main() -> None:
+def build_argument_parser() -> argparse.ArgumentParser:
+    """Build the operator CLI without starting UI, models, or hardware."""
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument(
         "--site-profile",
@@ -7984,6 +7890,11 @@ def main() -> None:
                     help="skip PDRAW video (control+telemetry only)")
     ap.add_argument("--cmd-log", default="",
                     help="JSONL path for live command log")
+    return ap
+
+
+def main() -> None:
+    ap = build_argument_parser()
     args = ap.parse_args()
     try:
         args.interface_mode, args.live = resolve_operator_interface(
@@ -8366,7 +8277,6 @@ def main() -> None:
     live_backend = None
     if args.live:
         from olympe_live_backend import OlympeLiveBackend
-        log_dir = _WS.flight_logs
         cmd_log = session_logs.directory / "commands.jsonl"
         live_backend = OlympeLiveBackend(
             DroneState,

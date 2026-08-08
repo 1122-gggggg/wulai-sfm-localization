@@ -1,10 +1,4 @@
-  RUN_DIR="$(mktemp -d /tmp/localization-real-ui-XXXXXX)"
-  .venv/bin/python 控制介面程式/operator_interface/flight_operator_app.py \
-    --interface real-flight \
-    --site-profile 控制介面程式/site_profiles/river_site_edm.json \
-    --ip 192.168.53.1 \
-    --controller skycontroller3 \
-    --live-localize \
-    --no-live-detect \
-    --no-auto-pc-control \
-    --cmd-log "$RUN_DIR/commands.jsonl"
+  cd /home/allen/localization
+  IP=192.168.53.1 CTRL=skycontroller3 \
+  ./控制介面程式/真機串流/啟動.sh \
+    --site-profile /home/allen/localization/控制介面程式/site_profiles/river_site_edm.json

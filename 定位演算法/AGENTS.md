@@ -28,10 +28,10 @@
 Esc freeze semantics unless the operator **explicitly** requested that change.
 Wrong edits can cause mid-air accidents.
 
-Protected files (see `mission/SAFETY.md` table):
+Protected files (see `控制介面程式/SAFETY.md` table):
 
-- `mission/operator_interface/olympe_live_backend.py` — `takeoff_cmd` / `land_cmd` / `cleanup`
-- `mission/operator_interface/flight_operator_app.py` — 飛行按鈕 + 按鍵綁定 + `_on_close`
-- `mission/flight_control/manual_nudge_pilot.py` (`NUDGE_DIRS`, `NUDGE_PCT`)
+- `控制介面程式/operator_interface/olympe_live_backend.py` — `takeoff_cmd` / `land_cmd` / `cleanup`
+- `控制介面程式/operator_interface/flight_operator_app.py` — 飛行按鈕 + 按鍵綁定 + `_on_close`
+- `定位演算法/flight_control/manual_nudge_pilot.py` (`NUDGE_DIRS`, `NUDGE_PCT`)
 
-Details: `mission/SAFETY.md`.
+Details: `控制介面程式/SAFETY.md`.

@@ -1,6 +1,6 @@
 # 工作區完整稽核與優化清單
 
-初始稽核日期：2026-08-03；更新日期：2026-08-07。範圍：
+初始稽核日期：2026-08-03；更新日期：2026-08-08。範圍：
 `/home/allen/localization`。2026-08-05 經操作員明確授權，已永久刪除 35 組
 `__pycache__`、pytest／ruff cache、`執行環境/inductor_cache/`，以及原本位於
 `模擬器/封存/parrot_stimulate_standalone_20260803/` 的 7.5 GiB 舊獨立工作樹。
@@ -9,9 +9,14 @@
 
 ## 結論
 
-正式 EDM runtime、兩個串流入口、site profile、8 組相容 mirror、場域資產 SHA、
-離線模型與安全驗證已有明確邊界。目錄混亂主要來自大量必要資料與歷史證據，不是
-存在多套正在執行的 EDM。安全做法是固定所有權與資料生命週期，不是直接搬檔。
+正式 EDM runtime、兩個串流入口、site profile、場域資產 SHA、離線模型與安全驗證
+已有明確邊界。2026-08-08 已移除 flight/deploy 之間的 Python runtime 副本，改由
+11 個明確 owner 與 module-ownership gate 防止重複回流；安全命令檔也統一到
+owner-private 路徑。P119 固定 SHA 全片重播通過既有品質 gate，第一方 coverage
+門檻提升為 50.00%。
+
+下列容量數字、測試數與優化清單保留 2026-08-07 的盤點口徑；它們是歷史證據，
+不是即時狀態。現行結果以 `./驗證系統.sh` receipt 與本次維護稽核為準。
 
 刪除後檔案系統約有 18.2 GiB／13.0% 可用空間；主要目錄大小如下：
 
@@ -30,7 +35,7 @@
 - 三個實際 site profile 均能解析且 `flight.approved=false`。
 - 沒有 broken symlink；EDM 工具包使用有效 symlink 指向唯一實作。研究候補方法
   直接由 `定位演算法/` 管理，不再建立頂層重複索引。
-- 8 組刻意保留的 runtime mirror 逐 byte 相同，並有測試阻止 drift。
+- runtime 共用模組各有唯一 owner；檢查會拒絕缺檔、重複副本與未分類同名檔。
 - 主測試 820 passed、1 skipped；Parrot Python 3.11 測試 86 passed，且本機固定
   firmware manifest/SHA preflight 通過。
 - CUDA fail-closed、EDM checkpoint／bundle／profile SHA 與離線載入正常。

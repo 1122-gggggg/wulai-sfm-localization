@@ -17,6 +17,7 @@ EXCLUDED_PARTS = {
     ".mypy_cache",
     ".tox",
     ".venv",
+    "htmlcov",
     "env",
     "__pycache__",
     "artifacts",
@@ -32,7 +33,7 @@ EXCLUDED_PARTS = {
     ".cursor",
     "audit",
 }
-EXCLUDED_NAMES = {".DS_Store", "Thumbs.db", "desktop.ini"}
+EXCLUDED_NAMES = {".coverage", "coverage.xml", ".DS_Store", "Thumbs.db", "desktop.ini"}
 EXCLUDED_SUFFIXES = {".pyc", ".pyo", ".swp", ".swo", ".tmp", ".bak", ".orig", ".rej"}
 EXCLUDED_PREFIXES = (
     "地圖檔/",
@@ -55,6 +56,7 @@ def included(relative: Path) -> bool:
         value not in CONTROL_FILES
         and not any(part in EXCLUDED_PARTS for part in relative.parts)
         and relative.name not in EXCLUDED_NAMES
+        and not relative.name.startswith(".coverage.")
         and not relative.name.endswith("~")
         and relative.suffix not in EXCLUDED_SUFFIXES
         and not any(value.startswith(prefix) for prefix in EXCLUDED_PREFIXES)
@@ -126,9 +128,7 @@ def verify(root: str | Path) -> list[str]:
     issues: list[str] = []
     expected_by_path = {entry.path: entry for entry in expected}
     try:
-        actual_paths = {
-            path.relative_to(root).as_posix(): path for path in package_files(root)
-        }
+        actual_paths = {path.relative_to(root).as_posix(): path for path in package_files(root)}
     except ValueError as exc:
         return [str(exc)]
 
@@ -141,15 +141,13 @@ def verify(root: str | Path) -> list[str]:
         path = actual_paths[name]
         if path.stat().st_size != expected_entry.size:
             issues.append(
-                f"size mismatch: {name} expected={expected_entry.size} "
-                f"actual={path.stat().st_size}"
+                f"size mismatch: {name} expected={expected_entry.size} actual={path.stat().st_size}"
             )
             continue
         actual_digest = digest(path)
         if actual_digest != expected_entry.sha256:
             issues.append(
-                f"SHA-256 mismatch: {name} expected={expected_entry.sha256} "
-                f"actual={actual_digest}"
+                f"SHA-256 mismatch: {name} expected={expected_entry.sha256} actual={actual_digest}"
             )
 
     expected_sums = "".join(f"{entry.sha256}  ./{entry.path}\n" for entry in expected)

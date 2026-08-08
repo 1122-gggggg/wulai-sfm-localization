@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""Validate shipped site-profile schemas, assets, digests, and safety locks."""
+"""Validate shipped site-profile schemas, assets, digests, and approvals."""
 from __future__ import annotations
 
 import hashlib
 import json
-import sys
 from pathlib import Path
 
 from site_profile import SCHEMA_VERSION, load_site_profile
@@ -13,6 +12,7 @@ from site_profile import SCHEMA_VERSION, load_site_profile
 ROOT = Path(__file__).resolve().parent
 PROFILES = ROOT / "site_profiles"
 TEMPLATE_NAMES = {"example_site_edm.json"}
+APPROVED_PROFILE_NAMES = {"river_site_edm.json"}
 
 
 def _digest(path: Path) -> str:
@@ -41,8 +41,12 @@ def validate() -> tuple[list[dict[str, object]], list[str]]:
             )
         if "map_units_per_meter" in raw.get("flight", {}):
             failures.append(f"{source.name}: metric map scale is prohibited")
-        if profile.flight is None or profile.flight.approved:
-            failures.append(f"{source.name}: flight.approved must remain false")
+        approved = bool(profile.flight and profile.flight.approved)
+        expected_approved = source.name in APPROVED_PROFILE_NAMES
+        if approved is not expected_approved:
+            failures.append(
+                f"{source.name}: flight.approved must be {expected_approved}"
+            )
 
         checked = 0
         for key, path in (

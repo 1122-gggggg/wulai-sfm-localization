@@ -8,10 +8,12 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-# The editor resolves the site's measured basis from the flight-control module;
-# put its deployed copy on the path the same way the application does.
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]
-                       / "定位演算法" / "deploy_code" / "sfm_glomap_deploy"))
+# The editor resolves the site's measured basis from the canonical flight-control
+# owner, matching the application after runtime mirrors were removed.
+sys.path.insert(
+    0,
+    str(Path(__file__).resolve().parents[2] / "定位演算法" / "flight_control"),
+)
 
 import real_path_follow_controller as rpf
 import local_site_assets as lsa
@@ -637,6 +639,30 @@ def test_describe_site_routes_marks_display_only_and_legacy_routes(tmp_path):
     assert "2 點" in by_name["flight.json"].label
 
 
+def test_existing_route_selection_is_refused_until_landed(tmp_path):
+    import site_assets_panel as sap
+
+    route = _write_route(tmp_path / "routes" / "flight.json")
+    statuses = []
+    selected = []
+    panel = SimpleNamespace(
+        request_route_preview=lambda path: selected.append(path) or "selected",
+        flight_state_check=lambda: (False, "飛機尚未確認 landed"),
+        status_var=SimpleNamespace(set=statuses.append),
+    )
+
+    sap.SiteAssetsPanel._preview_existing_route(panel, route)
+
+    assert selected == []
+    assert statuses == ["航線選擇已拒絕：飛機尚未確認 landed"]
+
+    panel.flight_state_check = lambda: (True, "")
+    sap.SiteAssetsPanel._preview_existing_route(panel, route)
+
+    assert selected == [route]
+    assert statuses[-1] == "selected"
+
+
 def test_site_pack_root_comes_from_the_map_not_the_profile_location(tmp_path):
     """A system profile's parent is site_profiles/, not the site it describes.
 
@@ -709,6 +735,7 @@ def test_route_buttons_draw_the_route_and_never_import_it():
         actions=SimpleNamespace(
             import_route=lambda src: pytest.fail("preview must not import")),
         request_route_preview=lambda path: previewed.append(path) or "已顯示",
+        flight_state_check=lambda: (True, ""),
         status_var=SimpleNamespace(set=status.append),
         _run=lambda *a, **k: pytest.fail("preview must not run an import action"),
     )
@@ -728,6 +755,7 @@ def test_route_button_failure_reports_instead_of_killing_the_callback():
 
     panel = SimpleNamespace(
         request_route_preview=explode,
+        flight_state_check=lambda: (True, ""),
         status_var=SimpleNamespace(set=status.append),
     )
     sap.SiteAssetsPanel._preview_existing_route(panel, Path("/tmp/bad.json"))

@@ -65,7 +65,15 @@ def _package_root() -> Path:
     # Keep bundle validation and pure tracker utilities importable in the
     # portable repository. Actual model loading still reports the missing
     # local torch.hub repository when XFeat or MegaLoc is requested.
-    return Path(__file__).resolve().parents[3] / "執行環境"
+    algorithm_root = next(
+        (
+            parent
+            for parent in Path(__file__).resolve().parents
+            if parent.name in {"定位演算法", "定位"}
+        ),
+        Path(__file__).resolve().parents[2],
+    )
+    return algorithm_root.parent / "執行環境"
 
 
 PACKAGE_ROOT = _package_root()

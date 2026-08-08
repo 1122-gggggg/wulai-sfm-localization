@@ -37,7 +37,7 @@ from dataclasses import dataclass, field, replace
 
 import numpy as np
 
-from route_geometry import (RouteModel, Projection, adaptive_lookahead, heading_of,
+from route_geometry import (RouteModel, adaptive_lookahead, heading_of,
                             horiz, wrap_angle)
 
 # state names (spec)

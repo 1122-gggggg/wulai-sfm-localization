@@ -10,22 +10,34 @@ exclude = [
   "outputs",
   "地圖檔",
   "執行環境/package_git",
+  # Imported upstream source. It is pinned and smoke-tested, but not restyled.
+  "定位演算法/deploy_code/runtime",
+  "定位演算法/EDM工具包",
 ]
 
 [tool.ruff.lint]
-# The repository-wide baseline is intentionally narrow. CI runs these rules on
-# every Python file until the legacy code has a separately reviewed strict baseline.
-select = ["E9", "F63", "F7", "F82"]
+# Full Pyflakes catches dead imports, name shadowing, undefined names, and other
+# correctness issues in first-party code. Syntax errors remain an explicit gate.
+select = ["E9", "F"]
 
 [tool.coverage.run]
 branch = true
-source = ["tools", "定位演算法/validation"]
+source = [
+  "tools",
+  "控制介面程式",
+  "定位演算法/validation",
+  "定位演算法/flight_control",
+  "定位演算法/deploy_code/sfm_glomap_deploy",
+]
 omit = [
   "*/tests/*",
   "*/test_*.py",
 ]
 
 [tool.coverage.report]
-# Coverage is collected for trend data; no unrealistic release threshold is set.
-fail_under = 0
+# Removing committed runtime mirrors made the first-party measurement meaningful:
+# the 2026-08-08 suite covers 53.55%. Keep 50% as a regression floor while
+# high-risk modules receive focused tests.
+fail_under = 50
+precision = 2
 show_missing = true

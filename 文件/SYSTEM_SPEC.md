@@ -3,13 +3,13 @@
 | 欄位 | 內容 |
 |---|---|
 | 文件狀態 | 歷史設計與安全決策記錄；現行執行契約以根 README、site profile schema 與 preflight 為準 |
-| 規格版本 | 0.1 |
-| 日期 | 2026-08-02，Asia/Taipei |
+| 規格版本 | 0.2 |
+| 日期 | 2026-08-08，Asia/Taipei |
 | 適用工作區 | `/home/allen/localization` |
 | 規格範圍 | 建圖、定位、控制介面、模擬串流、真機接口、安全、測試、部署、監控 |
 | 實作限制 | 本文件保留 To-Be 與當時 As-Is 背景；不得覆蓋現行 fail-closed 程式契約 |
 
-> 2026-08-03 發布註記：第 3 節的 As-Is 原為 2026-08-02 盤點。下列已改成
+> 2026-08-08 維護註記：第 3 節的 As-Is 原為 2026-08-02 盤點。下列已改成
 > 目前實作的關鍵事實；其他分階段與待辦表保留為歷史規劃，不是執行時預設值。
 
 ## 1. 決策摘要
@@ -71,7 +71,7 @@
 | 系統維護者 | 離線 | 建圖、更新 profile／SHA、執行測試與部署；不得自動觸發真機起飛 |
 | 獨立審核者 | 發布前 | 審核整個系統、測試證據與未處理風險，不直接操作真機 |
 
-## 3. As-Is：2026-08-02 盤點（關鍵契約已更新至 2026-08-03）
+## 3. As-Is：2026-08-02 盤點（關鍵契約已更新至 2026-08-08）
 
 本節描述 2026-08-02 工作區實際狀態，不把後續要求誤寫成已實作功能。
 
@@ -116,7 +116,7 @@ Pose + TRACK / WEAK_TRACK / LOST
 - `控制介面程式/`：site profile、任務入口、桌面 UI、worker protocol、兩個串流 launcher。
 - `定位演算法/deploy_code/sfm_glomap_deploy/`：正式 EDM runtime、bundle loader、tracker adapter。
 - `定位演算法/flight_control/`：真機路徑控制、安全監控、Olympe 串流與手動工具。
-- `定位演算法/validation/`：replay、效能、硬體監控、mirror 與部署檢查。
+- `定位演算法/validation/`：replay、效能、硬體監控、module ownership 與部署檢查。
 - `地圖檔/場域/<site>/`：每個場域的 map、bundle、route、report，不納入 Git。
 - `模擬器/parrot_stimulate/`：獨立 Python 3.11 Sphinx／PCMD 響應與路徑安全測試工具，不是第三個操作接口，也不能連真機。
 
@@ -163,15 +163,18 @@ Pose + TRACK / WEAK_TRACK / LOST
 | 實際可解碼 | 2,934 幀，已確認為已知不完整來源 |
 | GPU | RTX 5060 Laptop GPU |
 | profile | 河濱 EDM，`max_corr_total=900` |
-| 成功 pose | 1,686／2,934，57.4642% |
-| 狀態數 | TRACK 2,244；WEAK_TRACK 551；LOST 139 |
-| processing FPS | 11.7024 |
-| wall p50／p95 | 57.134／158.126 ms |
-| LOST inference p95／max | 519.554／530.750 ms；每次在下一個 decoded frame 回到 TRACK |
-| inliers p50／p95 | 693／875 |
-| reprojection RMS p95 | 2.9565 px |
+| 成功 pose | 2,051／2,934，69.9046% |
+| 狀態數 | TRACK 2,658；WEAK_TRACK 260；LOST 16 |
+| processing FPS | 22.9831 |
+| wall p50／p95 | 32.023／77.845 ms |
+| inliers p50／p95 | 706／880 |
+| reprojection RMS p95 | 2.9355 px |
+| limited jump | confirmed 303；unconfirmed 818 |
 
-基準證據為 `outputs/validation/edm_p119_pnp_ab_20260802/pnp_cap_900_full.json`。該檔產生時尚未把 stream-integrity verdict 寫入 artifact，因此它只能作為演算法／效能基準，不能代表完整解碼驗收成功。
+2026-08-08 使用固定 SHA 原片、河濱 site/localizer profile 與
+`validation/baselines/p119_edm_quality.json` 完整重播；品質 gate 通過，且 2,935／2,934
+已知不完整例外被明確接受。baseline 的門檻仍保留 2026-08-02 證據值，未因本次結果
+放寬。任何不同 SHA 或不同解碼數都必須 fail closed。
 
 最近一次循環 UI 記錄的 TRACK submit-to-UI p95 約 116.05 ms，但它未正確包含 280 ms 模擬鏈路的 capture-before-delay 時間，且來源有循環，所以只作資訊，不作正式端到端門檻。
 
@@ -208,11 +211,10 @@ Pose + TRACK / WEAK_TRACK / LOST
 - 系統維持手動啟動。
 - 已有 `驗證系統.sh` 單一驗證入口；根 Python 3.10 與 `parrot_stimulate` Python
   3.11 維持分離，由入口依序執行。
-- 2026-08-03 最近一次核心驗證：主工作區 757 passed、1 skipped；`parrot_stimulate`
-  86 passed；runtime mirrors 8/8；ruff、firmware preflight、`pip check`、flight selftest、profile/SHA、
-  workspace layout、CUDA 與完全離線 EDM／MegaLoc 通過。最近一次 P119 全片驗證的
-  完整性通過既定 2935/2934 waiver；品質回歸僅 `inliers p50=690` 未達既有 693
-  gate，因此該份 P119 receipt 誠實標為 failed，門檻未放寬。
+- 2026-08-08 的維護驗證已加入 Ruff `E9/F`、第一方 coverage `50.00%` 門檻、
+  runtime module ownership gate 與獨立 Python 3.11 `parrot_stimulate` CI job。
+  P119 全片 replay 通過既有品質門檻；完整測試數與 coverage 以最近一次
+  `./驗證系統.sh` receipt 為準，不在規格中硬編一個會過期的測試數。
 
 ## 4. To-Be：目標架構
 
@@ -838,173 +840,6 @@ Launcher 行為：
 4. 找不到可用桌面時清楚失敗，不在背景啟動無人可見的真機 UI。
 5. dry-run 顯示選到的 display、Python、mode、profile 與完整安全摘要，但不連接飛機。
 
-### 16.3 單一驗證入口
-
-To-Be 提供一個不連真機、不起飛的入口，例如：
-
-```bash
-./驗證系統.sh
-```
-
-它依序執行並彙整：
-
-1. 主 Python 3.10 `pytest -q`。
-2. Python 3.11 `parrot_stimulate` tests、ruff check、format check。
-3. runtime mirror check。
-4. flight selftest。
-5. 主環境及模擬環境 dependency check。
-6. offline model smoke。
-7. artifact/SHA/profile schema validation。
-8. CUDA/GPU smoke；沒有 GPU 時整體 production verdict 失敗，但可另外輸出 offline-only 診斷。
-9. 選配 P119 full regression；已知 incomplete verdict 必須明確呈現。
-
-輸出 machine-readable receipt，任何必須項失敗時整體 exit code 非零。
-
-## 17. 測試矩陣
-
-| ID | 層級 | 測試 | 環境 | 通過條件 |
-|---|---|---|---|---|
-| T-001 | Unit | site profile/schema/SHA/coordinate frame | CPU | 完整接受，缺漏與混用 fail closed |
-| T-002 | Unit | backend typed command/state contract | CPU | SIM/REAL contract tests 全通過，未知 command 明確拒絕 |
-| T-003 | Unit | launcher cross-interface rejection | CPU | SIM 拒 real flags；REAL 拒 video |
-| T-004 | Integration | DISPLAY 探測 `:0`／`:1`／Wayland／無桌面 | 桌面 mock | 選可用桌面；無桌面 fail |
-| T-005 | Integration | P119 default + EOF hold | RTX 5060 | 2,934 decoded，最後 sequence 不再增加、不循環、顯示 known incomplete |
-| T-006 | Integration | nominal/loss-1/loss-3/loss-5 | RTX 5060 | 每個 preset 有 manifest、無 crash、事件與品質報告完整 |
-| T-007 | Integration | shared-memory worker lifecycle | RTX 5060 | stall/kill/restart 後可恢復，owner buffer 不被 worker unlink |
-| T-008 | Regression | P119 EDM `max_corr_total=900` | RTX 5060 | 第 12 節所有品質／效能 gate 通過 |
-| T-009 | Human QA | 固定影格、所有 LOST、完整軌跡 | UI | 操作員簽核，不產生公尺精度 claim |
-| T-010 | Security | 完全離線模型載入 | 網路阻斷 | 無 DNS/socket；缺 cache fail closed |
-| T-011 | Security | SIM Olympe/network isolation | CPU | Olympe 未 import、無外部 socket、無真機 command |
-| T-012 | Safety | CUDA unavailable／wrong GPU | CPU/mock | production localization、REAL takeoff blocked |
-| T-013 | Safety | nudge press/release/focus loss/UI freeze | mock backend | ≤250 ms 零 PCMD，無 stale resend |
-| T-014 | Safety | stream/pose/worker failure | mock + Sphinx | ≤100 ms observation-to-zero，切人工，不 auto-resume |
-| T-015 | Safety | stick takeover | SkyController props-off | 任一 deliberate stick input 立即取回 |
-| T-016 | Safety | height/distance write and limit | mock + props-off | landed-only、bounds、ack/readback、越界命令被 clamp |
-| T-017 | Safety | total link loss B1 | props-off/ground first | onboard hover/reconnect；GPS/Home 有效走 RTH policy，否則驗證的 land policy |
-| T-018 | Hardware | device inventory | 真機地面 | model/serial/firmware/controller/video/RTH 全部記錄 |
-| T-019 | Simulation | PCMD response ± axes | Sphinx | 符號、stop time、braking、TTL receipt 完整 |
-| T-020 | Simulation | deterministic route worst-case | Sphinx | 全部固定案例安全終止，loss 後零 PCMD |
-| T-021 | Field | 真機 PCMD response | 拆槳後低高度 | 建立 speed response receipt，證明 0.30 m/s guard |
-| T-022 | Field | ground/low-altitude manual controls | 真機 | 起降、hover、nudge、Esc、Space、E-stop、land 通過 |
-| T-023 | Field | 真機 EDM | 人工飛行 | pose/影像/latency/LOST 記錄與人工判讀通過 |
-| T-024 | Operations | log retention/disk pressure | temp filesystem | 可刪 log 按策略清理，永久 safety log 不刪，低空間阻止起飛 |
-| T-025 | Operations | reboot後手動啟動 | deployment host | 不自啟；SIM/REAL 可透過自動 DISPLAY 探測啟動 |
-| T-026 | Release | unified validation receipt | 離線 | 所有 required gate 一個命令得到非歧義 verdict |
-
-任何真機測試都由現場人員實際操作起飛。自動測試、agent 或 LLM 不得觸發 TakeOff、非零 PCMD 或自由飛行。
-
-## 18. Gap analysis
-
-| 優先級 | 現況 | To-Be | 所需工作 |
-|---|---|---|---|
-| P0 | link loss 只顯示；stream stale 只 hover | 所有感知／worker故障先零 PCMD再交人工；total link 用 B1 | 統一 fail-safe contract、獨立 supervisor、測試 |
-| P0 | 連線未完整記錄設備／firmware／RTH | 現場讀取並記錄，未知值阻止 PC control takeoff | device inventory 與 preflight gate |
-| P0 | UI 無明確 E-stop | 醒目的 movement E-stop + 獨立 LAND_NOW | UI/backend typed action、鎖存與測試 |
-| P0 | autonomous schema／controller 要求 metric scale | 永久無 map metric scale；方向 unit vector + airframe speed guard 0.30 m/s | site schema v2、scale-free controller adapter、舊入口保持鎖定 |
-| P0 | route controller 有兩套邏輯 | `parrot_stimulate` 與真機共用權威核心 | 抽出最小共用 controller，雙環境 adapter tests |
-| P0 | 無真機 PCMD response receipt | 速度上限不可只靠百分比推測 | props-off、ground、low-altitude response workflow |
-| P0 | 無 log retention，磁碟 91% | 保留策略 + 低磁碟 fail closed | retention manager、disk monitor、部署容量處理 |
-| P0 | offline smoke 有，runtime OS allowlist 無 | SIM 無網路；REAL 只可 ANAFI 私網 | launcher sandbox/firewall policy 與測試 |
-| P1 | SIM 要求明確 video、預設 urai | 河濱 + P119 預設 | launcher default 與 SHA gate |
-| P1 | FFmpeg EOF 自動 loop | 最後一幀 `EOF_HOLD` | FrameSource EOF contract、UI state、測試 |
-| P1 | link simulation 非預設 | 5 Mb/s、280 ms、0% nominal，1/3/5% presets | launcher preset 與 manifest |
-| P1 | `DISPLAY=:1` fallback | 自動辨識有效 desktop | display resolver 與 dry-run tests |
-| P1 | SIM/REAL 共用深色外觀 | 藍 SIM、紅橘 REAL 永久識別 | UI theme/status strip |
-| P1 | backend 以 duck typing + command string 為主 | typed Python contract + explicit result | Protocol/dataclass/enum，surgical adapter |
-| P1 | 多個驗證命令 | 單一 validation entry + receipt | wrapper 與跨 Python test aggregation |
-| P1 | current P119 artifact 無 integrity verdict | known-incomplete waiver 與非正常完整 verdict | 重跑 benchmark、寫入 audit fields |
-| P2 | `scale-calibrated` 字樣易混淆 | `scene-threshold-calibrated`，清楚非公尺 | profile/docs 術語修正 |
-| P2 | source-to-UI timestamp 未含人工 link delay | capture-before-link 到 UI 的可信 p95 | FramePacket timestamp 擴充、B0 receipt |
-| P2 | 硬體 monitor 是獨立 CLI | UI/session summary 整合 read-only health | process supervisor 與 health aggregation |
-| P2 | mirror source trees 需人工同步 | 單一 package/source owner | 發布後的結構收斂，不與安全功能混改 |
-| P2 | working tree 無 release receipt | 可重現 manifest、commit/tag 或 immutable package | 操作員核准後建立 release 流程 |
-
-## 19. 分階段交付計畫
-
-### Phase 0：規格確認
-
-- 操作員審核並確認本文件。
-- 確認前不修改程式。
-
-驗收：本文件涵蓋指定範圍，沒有未解的產品決策；現場才能取得的資料列為 receipt，不再當成訪談問題。
-
-### Phase 1：接口契約與 P0 安全基礎
-
-- 建立 shared Python backend contract 與 immutable session config。
-- 統一故障後 hover/manual handoff、E-stop、total-link state。
-- 加入設備／firmware／RTH inventory 與 preflight fail-closed。
-- 保持 real autonomous 按鈕鎖定，不改真機起飛安全路徑。
-
-驗收：unit/integration safety tests 全通過；不需也不得真機起飛。
-
-### Phase 2：模擬接口與 UI
-
-- 河濱／P119 預設、nominal link、1/3/5% presets。
-- EOF last-frame hold。
-- DISPLAY 自動探測。
-- SIM／REAL theme、永久 REAL 警告、route 預設隱藏確認。
-
-驗收：P119 完整 UI run 不循環，2,934 幀 known-incomplete receipt；跨接口隔離測試通過。
-
-### Phase 3：可觀測性、離線與部署
-
-- session manifest、incident、安全 log、retention、disk pressure。
-- runtime offline network allowlist。
-- 單一 validation entry 與 release receipt。
-- 處理目前 91% 磁碟使用率。
-
-驗收：無網路 full smoke、低磁碟測試、雙 Python 驗證及整體 receipt 通過。
-
-### Phase 4：定位回歸與控制器整合
-
-- 固定 P119 B0 與 visual review artifact。
-- 保留 `max_corr_total=900`，不得為通過測試而放寬品質 gate。
-- 共用 `parrot_stimulate` waypoint controller 核心。
-- 建立無 map metric scale的方向控制與 airframe speed guard，但 real auto 仍鎖定。
-
-驗收：第 12 節 KPI、Sphinx response/worst-case、全部 unit/integration tests 通過。
-
-### Phase 5：真機地面與人工低高度測試
-
-- 現場讀取 hardware/firmware。
-- 拆槳 axis/yaw/stick/E-stop 測試。
-- 人工起飛完成 PCMD response、0.30 m/s guard、braking、stream/worker failure handoff、EDM 定位。
-
-驗收：由人類操作，所有 receipt 完整；任何失敗均保持 `flight.approved=false`。
-
-### Phase 6：自主飛行外部核准
-
-- 完成 route 淨空、兩人確認、安全監控員、checklist 與全部第 10.2 節證據。
-- 由操作員核准 profile/SHA 並明確設定 `flight.approved=true`。
-- 先進行最低高度、最短 route、0.30 m/s 上限的漸進測試。
-
-驗收：任一 gate 缺失都不得進入 autonomous。
-
-### Phase 7：獨立最終審核與修正
-
-- 將完整系統、diff、spec traceability、測試 receipts 與未解風險交給 Claude Opus 5 Max。
-- 審核結果分類為 blocker、safety、quality、performance、maintainability。
-- Codex 只執行操作員接受且能追溯至本規格的修正，重新跑所有受影響測試。
-- 若 Claude Opus 5 Max 無法使用，先向操作員報告並取得替代審核者授權。
-
-## 20. Definition of Done
-
-本任務的程式實作只有在下列條件全部成立時才算完成：
-
-- 只有兩個操作接口，cross-mode、hot-switch 與 file/live fallback 都被測試拒絕。
-- SIM 預設河濱 + P119 + nominal link，EOF 停最後一幀，controls 只改模擬狀態。
-- REAL 永久醒目警告，連線時記錄實際 hardware／firmware，無 file fallback。
-- planned route 預設隱藏，trajectory／frustum／axes 保留。
-- 所有感知／worker故障先停止 PC 動作並交人工；total link 的 B1 policy 有現場證據。
-- 高度／距離落地可調、ack/readback，越界不自動 RTH；lost-link RTH 保持獨立。
-- 正式 EDM 無 CUDA即 fail closed，完全離線，asset/model/profile SHA 全驗證。
-- P119 品質／效能不低於第 12 節基準；人工影像審查通過且不做 ground-truth claim。
-- 無 map metric scale；未來 route 使用方向正規化與飛機端 0.30 m/s speed guard。沒有真機 response receipt 前 autonomous 保持鎖定。
-- logging、retention、disk pressure、single validation receipt 完成。
-- 主 Python 3.10 與 `parrot_stimulate` Python 3.11 維持隔離且一鍵驗證。
-- 所有真機起飛均由操作員在 UI 親手執行，agent／腳本沒有旁路。
-- 所有 site profile 在外部核准前仍為 `flight.approved=false`。
-- Claude Opus 5 Max 最終審核及後續核准修正完成，或已由操作員書面同意替代審核方案。
 
 ## 21. 參考
 

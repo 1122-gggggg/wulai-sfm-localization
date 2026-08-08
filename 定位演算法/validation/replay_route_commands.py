@@ -30,11 +30,9 @@ import sys
 from pathlib import Path
 
 _HERE = Path(__file__).resolve().parent
-for _cand in (_HERE.parent / "mission" / "flight_control",
-              _HERE.parent / "deploy_code" / "sfm_glomap_deploy"):
-    if (_cand / "path_follow_flight.py").exists() and str(_cand) not in sys.path:
-        sys.path.insert(0, str(_cand))
-        break
+_FLIGHT_CONTROL = _HERE.parent / "flight_control"
+if str(_FLIGHT_CONTROL) not in sys.path:
+    sys.path.insert(0, str(_FLIGHT_CONTROL))
 
 
 def main() -> int:

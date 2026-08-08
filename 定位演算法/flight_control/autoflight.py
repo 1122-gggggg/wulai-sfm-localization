@@ -26,12 +26,18 @@ from __future__ import annotations
 import argparse
 import math
 import signal
+import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 
-from plan_path import SDFGrid, plan_tour, smooth
+DEPLOY_ROOT = Path(__file__).resolve().parents[1] / "deploy_code" / "sfm_glomap_deploy"
+if DEPLOY_ROOT.is_dir() and str(DEPLOY_ROOT) not in sys.path:
+    sys.path.append(str(DEPLOY_ROOT))
+
+from plan_path import SDFGrid, plan_tour
 
 # ----------------------------- CONFIG --------------------------------------
 DRONE_IP = "192.168.42.1"     # ANAFI WiFi; SkyController -> 192.168.53.1

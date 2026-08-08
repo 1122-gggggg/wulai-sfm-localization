@@ -1,5 +1,3 @@
-import numpy as np
-
 from metrics import (aggregate_trials, compute_trial_metrics, first_hold_time,
                      rank_algorithms, stop_and_go_transitions, yaw_flip_count)
 

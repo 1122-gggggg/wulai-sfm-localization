@@ -41,7 +41,6 @@ from __future__ import annotations
 import argparse
 import atexit
 import json
-import math
 import signal
 import sys
 import threading
@@ -49,7 +48,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 
 # PCMD percent for one "little nudge" pulse (clamped later).

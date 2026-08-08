@@ -10,7 +10,6 @@ straighten with G/S, not R.
 Run (Blender up):
   python3 scripts/blender_send.py codefile scripts/sync_poles.py
 """
-import json
 import os
 
 import bpy

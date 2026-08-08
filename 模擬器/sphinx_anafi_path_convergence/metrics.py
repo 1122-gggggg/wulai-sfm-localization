@@ -7,8 +7,6 @@ factor (scale_utils).
 """
 from __future__ import annotations
 
-import math
-
 import numpy as np
 
 from controllers import (ABORT_OR_MANUAL, COMPLETED, LOST_OR_UNCERTAIN,

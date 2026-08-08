@@ -12,7 +12,6 @@ import json
 import os
 
 import bpy
-from mathutils import Vector
 
 ROOT = os.environ.get("SFM_MAP_ROOT", "").strip()
 if not ROOT:

@@ -81,7 +81,6 @@ from live_safety_config import (  # noqa: E402
     DEFAULT_RTH_MIN_ALTITUDE_M,
     DEFAULT_STREAM_LOSS_GRACE_S,
     LiveSafetyConfig,
-    NUDGE_PCT_MAX,
     NUDGE_TTL_MAX_S,
 )
 

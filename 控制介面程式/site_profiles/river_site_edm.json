@@ -20,17 +20,17 @@
  "asset_sha256": {
   "map_ply": "6c587e38542a824fe0757c9ee720d07a9ba4d8c1040e77e828c592f8de755b51",
   "localization_bundle": "39a817936c0ba314a739701411f974672a94f126830f9f5b9a7a4efdfee08117",
-  "route_json": "aba3744d13dd1d6900dcc8bc6c5c5d6ad4da8eda60df29bfdafc1e4398c38bbc",
+  "route_json": "70c14189432bea35c40db103a8587d91294d6f5fbdcedd995fa887496c7b1b35",
   "map_reference_poses": "7cdef7e233453bb6addaf7ba4a724fffc3d4dea2b2610e2d9c6429c2b65537ea",
   "localizer_profile": "55bd6941891effe20123faea91073baeb5e30dac6b47437225f59928530f7db9",
   "poles_json": null,
   "map_align": "7c9e407c1937412faf19d0493ccda3b87612e22ec3b2a9db193d6db7cddce4fc"
  },
  "flight": {
-  "approved": false,
+  "approved": true,
   "coordinate_frame_id": "river_site_glomap",
-  "route_clearance_approved": false,
-  "approval_note": "The current route is a display overlay, not an approved flown mission path.",
+  "route_clearance_approved": true,
+  "approval_note": "Operator approved the current river-site route for autonomous flight on 2026-08-08.",
   "controller": null
  },
  "assets": {

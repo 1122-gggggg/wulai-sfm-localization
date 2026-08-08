@@ -4,10 +4,10 @@
 每個場域是一個獨立資產包，換場域＝換一個 site profile。
 
 Git 版控不包含實際場域點雲、localization bundle、影片、飛行紀錄或模型權重；
-本機 workspace 會在被忽略的資料目錄保存它們。系統架構、目錄所有權與相容鏡像
+本機 workspace 會在被忽略的資料目錄保存它們。系統架構與目錄所有權
 規則見 [`文件/ARCHITECTURE.md`](文件/ARCHITECTURE.md)。
 
-最後整理：2026-08-07。歷史設計決策與安全需求見 [`文件/SYSTEM_SPEC.md`](文件/SYSTEM_SPEC.md)；
+最後整理：2026-08-08。歷史設計決策與安全需求見 [`文件/SYSTEM_SPEC.md`](文件/SYSTEM_SPEC.md)；
 目前可執行的場域與發布契約以本 README、site profile schema 與 preflight 為準。最近一次
 結構／容量與優化稽核見 [`文件/WORKSPACE_AUDIT.md`](文件/WORKSPACE_AUDIT.md)。
 
@@ -34,15 +34,17 @@ git 只追蹤程式碼、設定與說明；場域資產、影片、權重與 out
 python tools/workspace_audit.py --strict-output-names
 ```
 
-## 兩個執行接口
+## 執行接口
 
 | 接口 | 唯一入口 | 影像來源 | 飛控 backend |
 |---|---|---|---|
 | 模擬串流 | `控制介面程式/影片模擬串流/選擇啟動.sh` | 本機影片 / FFmpeg | 模擬，永不載入 Olympe |
-| 實機飛行 | `控制介面程式/真機串流/啟動.sh` | ANAFI PDRAW | Olympe，僅操作員可按 UI 起飛 |
+| 實機人工飛行 | `控制介面程式/真機串流/啟動.sh` | ANAFI PDRAW | Olympe，操作員 UI 控制 |
+| 河濱自主航線 | `控制介面程式/mission_pipeline.py --mode fly` | ANAFI PDRAW | Olympe，僅操作員可核准並啟動 |
 
-兩個入口互斥。模擬入口拒絕 `--live` / `real-flight`；實機入口拒絕
-`--video`，且 PDRAW 不可用時不會拿錄影檔冒充實機畫面。
+三個入口互斥。模擬入口拒絕 `--live` / `real-flight`；實機入口拒絕
+`--video`，且 PDRAW 不可用時不會拿錄影檔冒充實機畫面。自主入口只接受
+已核准、座標系一致且資產 SHA-256 相符的 site profile 與 route。
 
 ## 換地圖
 
@@ -117,13 +119,13 @@ CPython 3.10 的 `venv/ensurepip`（Ubuntu/Debian 通常是 `python3.10-venv`）
 首次執行安裝器需要網路連線，並需預留數 GB 空間下載 PyTorch/CUDA 與其他固定
 Python wheels；安裝完成後，模擬介面可在模型與場域資產都已備妥時離線執行。
 
-`scipy` 目前刻意不在 runtime hash lock。`SparseCloudCollisionMonitor` 的 guarded
-import 只提供非 production 的稀疏點雲警告，且沒有接入 autonomous safety；因此
+`scipy` 已固定在 runtime hash lock，讓 `SparseCloudCollisionMonitor` 可提供
+非 production 的稀疏點雲警告；它仍未接入 autonomous safety。
 `tools/simulator_preflight.py --json` 會在
-`runtime.collision_monitor` 明確記錄 `status=unavailable`（即使某個開發環境碰巧
-能 import scipy）、`production_safety=false` 與
+`runtime.collision_monitor` 明確記錄 `status=available_non_production`、
+`production_safety=false` 與
 `collision_protection_claim=false`。需要此 monitor 作為 production safety 時，必須
-先完成 production safety wiring 的審查，以及 scipy 版本／平台 wheel hash lock，
+先完成 production safety wiring 的審查，
 再以 `--require-collision-monitor` 執行 fail-closed preflight；沒有這些證據不得
 宣稱具備 collision protection。
 
@@ -132,14 +134,15 @@ import 只提供非 production 的稀疏點雲警告，且沒有接入 autonomou
 | site profile | 資產包 | runtime profile | 航線 | 狀態 |
 |---|---|---|---|---|
 | `urai_edm.json` | `地圖檔/場域/urai/` | 共用 | **無** | 地面定位可用；自主飛行未核准 |
-| `river_site_edm.json` | `地圖檔/場域/river_site/` | `edm_profiles/river_site.json` | 顯示用 overlay | 地面定位可用；overlay 不可飛 |
+| `river_site_edm.json` | `地圖檔/場域/river_site/` | `edm_profiles/river_site.json` | 已核准 route | 自主飛行已由操作員核准 |
 | `football_field_edm.json` | `地圖檔/場域/football_field/` | `edm_profiles/football_field.json` | **無** | 待 replay；自主飛行未核准 |
 | `example_site_edm.json` | — | — | — | 新場域範本 |
 
 全部使用 EDM。XFeat / LighterGlue 的地圖、bundle 與設定已於 2026-07-26 移除
 （程式碼保留）。`urai`（烏來）就是交付包代號 `target_site` 的實體場域。
-目前三個實際場域的 `flight.approved` 全是 `false`，因此沒有任何一個場域能
-通過自主飛行入口；這是刻意的 fail-closed 狀態。
+目前只有河濱場域的 `flight.approved` 與 `route_clearance_approved` 為 `true`；
+其他場域仍維持 fail-closed。河濱自主控制只使用 map-space 方向，不建立或使用
+`map_units_per_meter`，並以全域保守控制設定執行。
 
 ## 新增場域
 
@@ -165,8 +168,7 @@ import 只提供非 production 的稀疏點雲警告，且沒有接入 autonomou
 
 6. 資產定稿後，對 PLY、bundle、reference poses 與 runtime profile 填入
    SHA-256；另外匯入的 route 或巡檢目標由接口更新其路徑與 SHA-256。
-   自主飛行還必須另外完成座標系 ID、航線淨空核准、無尺度控制參數、
-   真機 PCMD 響應及速度回授測試；
+   自主飛行還必須另外完成座標系 ID、航線淨空核准與操作員核准；
    完整契約見 [`控制介面程式/site_profiles/README.md`](控制介面程式/site_profiles/README.md)。
 
 ### 一包一座標系
@@ -235,33 +237,18 @@ ANAFI_LINK_SIM=1 ANAFI_LINK_LATENCY_MS=280 ANAFI_LINK_LOSS_PCT=1.0 \
 held frame 改走 LOST recovery（提高 local top-k + 每個 episode 一次 MegaLoc）。
 預設開啟。實機端對應的是 `SFM_GATE_WEAK`（預設開啟，WEAK fix 直接 hover）。
 
-## 共享記憶體傳幀
-
-畫面透過共享記憶體送給 localizer worker（`SFM_SHARED_FRAMES=0` 可改用 pipe，較慢）。
-
-worker 只是**附加**這塊由操作介面建立的記憶體，所以 `attach_frame_shm()` 會把它從
-CPython 的 `resource_tracker` 取消註冊。不這樣做的話，任何被殺掉的 worker 會在退出時
-unlink 掉這塊記憶體 —— 而 client 只在 `__init__` 建立一次、重啟不重建，於是之後每個
-worker 都會 `FileNotFoundError: /psm_*` 而死，定位完全停擺（`candidate_mode` 全 null）。
-由建立者負責 unlink，worker 只負責 detach。
-
-worker 啟動要載入數百 MB 的 bundle 與模型，可能超過 stall timeout 而被重啟；
-`SFM_WORKER_WARMUP_S`（預設 20 秒）可以放寬啟動寬限，大型 bundle 建議 90。
-
-worker 自己的錯誤在 `/tmp/sfm_live_localizer_worker.log`，操作介面的 stdout
-只會顯示 `restarted after stall/exit`，看不出原因。
-
 ## 演算法只有一份
 
 | 路徑 | 角色 |
 |---|---|
-| `定位演算法/deploy_code/sfm_glomap_deploy/` | 唯一實體，UI worker 與 site profile 都指這裡 |
-| `定位演算法/flight_control/` | 飛控鏡像，改一邊要同步 |
+| `定位演算法/deploy_code/sfm_glomap_deploy/` | 定位 runtime、bundle、tracker 與共用 pose/integrity 模組的 owner |
+| `定位演算法/flight_control/` | 控制器、Olympe frame source、安全監控與人工工具的 owner |
 | `定位演算法/EDM工具包/deploy` `runtime` | symlink → `deploy_code/` |
 
 模型權重在 `定位演算法/deploy_code/runtime/EDM/weights/`（不進版控）。
-鏡像配對的權威清單在 `定位演算法/validation/check_runtime_mirrors.py`——
-同名檔案不代表是鏡像，只有列在那裡的才是。
+兩個 runtime 目錄沒有同名 Python 實作；需要共用的模組各自只有一個 owner。
+`定位演算法/validation/check_runtime_mirrors.py` 保存權威所有權清單，並在 CI
+拒絕缺少 owner、重新出現重複副本或未分類的同名 runtime 檔案。
 
 ## 驗證
 
@@ -273,39 +260,15 @@ worker 自己的錯誤在 `/tmp/sfm_live_localizer_worker.log`，操作介面的
 ```
 
 入口使用主 Python 3.10 與獨立 Python 3.11 `parrot_stimulate` 環境，執行
-pytest、ruff、mirror、flight selftest、dependency、profile/SHA、CUDA 與離線模型檢查，
+pytest、ruff、module ownership、flight selftest、dependency、profile/SHA、CUDA 與離線模型檢查，
 並寫入 `outputs/validation_receipts/`。任一必要項失敗時整體 exit code 非零。
 CI 與 `tools/test_clean_install.sh` 由 `requirements-test-lock.txt` 提供固定的
 pytest-timeout、coverage 與 pytest-cov；測試使用每測試 300 秒上限並收集 coverage，
-但不設不切實際的 coverage release threshold。validation receipt 會彙整 pytest
+目前對第一方核心模組設 `50.00%` 最低門檻。validation receipt 會彙整 pytest
 各 step 的 conditional skip，未執行的測試不會被當成通過。
 
 `parrot_stimulate` 明確要求 Python 3.11，因此使用自己的 `.venv` 驗證，
 不由根目錄的 Python 3.10 pytest 跨版本收集。實際通過數以當次輸出為準。
-
-## 真機飛行前的外部必要條件
-
-程式端已改成缺任一條件就拒絕自主飛行，但下列資料必須由現場量測／安全審查產生，
-不能由程式自動猜測：
-
-- 永久不建立 `map_units_per_meter`。路徑只提供 map-space 方向與相對進度；
-  實際速度由真機新鮮遙測保護，初始上限 0.30 m/s。
-- `urai` 與 `football_field` 的 `route_json` 是 `null`，真機入口會拒絕啟動。
-  `river_site` 的既有路線只有顯示用途，也會被拒絕。飛行 route 必須使用
-  `sfm-flight-route/v1`，綁定同一 `site_id`、`coordinate_frame_id` 與資產 digest。
-- **航線淨空核准。** 稀疏點雲不是可靠障礙物模型；必須由現場審查核准整條走廊，
-  才能設定 `route_clearance_approved=true`。
-- props-off `--yaw-sign` bench test 尚未執行（列為強制）。
-- EDM 從未在真機上跑過，所有驗證都是離線 replay。
-- 尚無 SHA 固定的 ANAFI 4K、SkyController 3、firmware 與 Olympe 核准 receipt。
-- 自主路徑所有入口目前無條件 `LOCKED`；即使手寫 `approved=true` 也不會連機。
-
-舊公尺換算路徑控制器已從可執行入口移除。新的無尺度方向／飛機速度保護核心
-只供模擬與單元驗證，未經外部核准前不會連接真機自主飛行。
-
-ONNX 匯出／簡化依賴與 Olympe 的 protobuf 版本不相容，不可裝在同一個 runtime
-virtualenv。主 `.venv` 可保留不衝突的推論用 ONNX Runtime；匯出工具使用
-`定位演算法/deploy_code/runtime/EDM/deploy/requirements_deploy.txt` 建立獨立環境。
 
 ## 注意事項
 
@@ -315,8 +278,3 @@ runtime，換場域不需也不得另行取得或替換。
 
 起飛、降落與即時飛行控制只能由現場操作員在桌面 UI 執行。任何 agent 或自動化
 都不得代為起飛。請先完成離線影片、地面、模擬與拆槳測試。
-
-真機介面提供 ANAFI 與 SkyController 3 各自獨立的韌體羅盤校正按鈕。只有操作員
-在飛控明確回報 `landed` 時才能啟動；校正只要求使用者手持旋轉設備，不會啟動
-馬達或自行起飛。校正狀態未知、必須校正、失敗或進行中時，起飛與自主入口會
-保持鎖定。

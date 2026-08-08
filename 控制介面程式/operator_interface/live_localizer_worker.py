@@ -49,6 +49,9 @@ if not DEPLOY_DIR.exists():
     DEPLOY_DIR = _WS.algorithms / "source" / "sfm_glomap" / "deploy"
 if str(DEPLOY_DIR) not in sys.path:
     sys.path.insert(0, str(DEPLOY_DIR))
+FLIGHT_DIR = _WS.algorithms / "flight_control"
+if str(FLIGHT_DIR) not in sys.path:
+    sys.path.append(str(FLIGHT_DIR))
 VALIDATION_DIR = _WS.validation
 PACKAGE_ROOT = _WS.runtime
 DEFAULT_BUNDLE = Path(os.environ.get(
@@ -69,8 +72,8 @@ DEFAULT_NEUFLOW_WEIGHTS = Path(os.environ.get(
 ))
 
 from edm_profile import (  # noqa: E402
-    apply_edm_tracker_profile,
-    load_edm_production_profile,
+    apply_edm_tracker_profile as apply_edm_tracker_profile,  # noqa: F401 - compatibility export
+    load_edm_production_profile as load_edm_production_profile,  # noqa: F401 - compatibility export
 )
 
 
@@ -305,9 +308,8 @@ def redirect_native_stdout_to_stderr():
         os.close(saved)
 
 
-def main() -> None:
-    configure_offline_environment()
-    install_network_guard(InterfaceMode.SIMULATED_STREAM)
+def build_argument_parser() -> argparse.ArgumentParser:
+    """Build the worker CLI without loading CUDA models or changing process I/O."""
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--width", type=int, default=1280)
     ap.add_argument("--height", type=int, default=720)
@@ -414,6 +416,13 @@ def main() -> None:
         default="",
         help="trusted SHA-256 for --production-profile",
     )
+    return ap
+
+
+def main() -> None:
+    configure_offline_environment()
+    install_network_guard(InterfaceMode.SIMULATED_STREAM)
+    ap = build_argument_parser()
     args = ap.parse_args()
     if bool(args.frame_shm_name) != (args.frame_shm_slots > 0):
         ap.error("--frame-shm-name and positive --frame-shm-slots must be used together")

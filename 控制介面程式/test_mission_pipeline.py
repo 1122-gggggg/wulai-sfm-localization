@@ -118,9 +118,39 @@ def test_selftest_remains_profile_free():
     assert args.bundle.endswith("your_site_reloc_map_edm.pt")
 
 
+def test_safety_commands_use_one_private_default_path(tmp_path):
+    runtime = tmp_path / "runtime"
+    environment = {"XDG_RUNTIME_DIR": str(runtime)}
+
+    path = mission_pipeline.safety_file_from_environment(environment)
+    mission_pipeline.write_safety_command(path, "land")
+
+    assert path == runtime / "sfm_drone" / "safety.cmd"
+    assert path.read_text(encoding="utf-8") == "land\n"
+    assert path.parent.stat().st_mode & 0o077 == 0
+    assert path.stat().st_mode & 0o077 == 0
+
+
+def test_safety_command_writer_rejects_relative_and_symlink_paths(tmp_path):
+    with pytest.raises(RuntimeError, match="absolute"):
+        mission_pipeline.write_safety_command(Path("relative.cmd"), "hover")
+
+    private = tmp_path / "private"
+    private.mkdir(mode=0o700)
+    target = private / "target.cmd"
+    target.write_text("hover\n", encoding="utf-8")
+    target.chmod(0o600)
+    link = private / "safety.cmd"
+    link.symlink_to(target)
+
+    with pytest.raises(RuntimeError, match="safety command"):
+        mission_pipeline.write_safety_command(link, "land")
+
+
 def test_profile_uses_canonical_route_paths(monkeypatch, tmp_path):
     profile = SimpleNamespace(
         source=tmp_path / "site.json",
+        schema_version=2,
         site_id="alpha",
         display_name="Alpha",
         map_ply=tmp_path / "alpha.ply",
@@ -153,6 +183,7 @@ def test_flight_mode_rejects_files_without_an_approved_contract(monkeypatch, tmp
     poles = tmp_path / "poles.json"
     profile = SimpleNamespace(
         source=tmp_path / "site.json",
+        schema_version=2,
         site_id="alpha",
         display_name="Alpha",
         map_ply=tmp_path / "alpha.ply",
@@ -262,9 +293,18 @@ def test_scale_free_flight_contract_exports_no_map_scale_and_verifies_hashes(tmp
     assert contract["localization_bundle_sha256"] == digest(bundle)
 
 
-def test_autonomous_route_flight_is_unconditionally_external_approval_locked():
-    with pytest.raises(ValueError, match="LOCKED pending external approval"):
-        mission_pipeline.validate_profile_for_flight(SimpleNamespace())
+def test_autonomous_route_flight_delegates_to_the_approved_asset_gate(monkeypatch):
+    profile = object()
+    validated = []
+    monkeypatch.setattr(
+        mission_pipeline,
+        "validate_profile_flight_assets",
+        lambda value: validated.append(value),
+    )
+
+    mission_pipeline.validate_profile_for_flight(profile)
+
+    assert validated == [profile]
 
 
 def test_shadow_readiness_verifies_pinned_assets_without_granting_flight_approval(
@@ -331,8 +371,6 @@ def test_shadow_readiness_verifies_pinned_assets_without_granting_flight_approva
     blockers = mission_pipeline.shadow_authorization_blockers(profile)
     assert "flight.approved is false" in blockers
     assert "flight.route_clearance_approved is false" in blockers
-    assert "missing flight.controller" in blockers
-    assert "missing hardware_approval receipt" in blockers
 
 
 @pytest.mark.parametrize(

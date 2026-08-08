@@ -1,9 +1,18 @@
 # ANAFI 自動飛行安全操作
 
-真機自主入口為 `控制介面程式/mission_pipeline.py --mode fly`；它會先驗證
-site profile、資產 SHA-256、公制尺度、座標系與航線淨空核准，再進入本目錄的
-`path_follow_flight.py --fly`。目前隨附場域全部未核准。起飛前仍必須完成
-`--selftest`、`--dry-run`、Sphinx 模擬與拆槳實驗，並由人類安全員全程監看。
+河濱自主航線已由操作員於 2026-08-08 核准。`控制介面程式/mission_pipeline.py
+--mode fly` 會先驗證 site profile、route schema、座標系與所有資產 SHA-256，再進入
+本目錄的 `path_follow_flight.py --fly`。控制器只使用 map-space 單位方向與全域保守
+設定，不建立 map-to-metre 尺度，也不要求場域專用 `flight.controller`。
+
+```bash
+.venv/bin/python 控制介面程式/mission_pipeline.py \
+  --site-profile 控制介面程式/site_profiles/river_site_edm.json \
+  --mode fly --controller skycontroller3 \
+  --max-altitude-m <METERS> --max-distance-m <METERS>
+```
+
+此命令只能由現場操作員執行；agent 不得執行 `--fly` 或代為授權 AUTO。
 
 ## Firmware 高度／距離上限
 
@@ -11,12 +20,6 @@ site profile、資產 SHA-256、公制尺度、座標系與航線淨空核准，
 firmware 公布的 min/max 比對，再逐項送出並回讀確認。距離圍欄預設以
 `--distance-geofence` 開啟；起飛前另外要求電池至少 30% 且 GPS 已 fix。
 任一狀態缺失或不一致都拒絕起飛。
-
-```bash
-python path_follow_flight.py --fly \
-  --max-altitude-m <METERS> --max-distance-m <METERS> \
-  --distance-geofence
-```
 
 距離圍欄只阻止飛越上限，不會自動返航。`NavigateHome` 是獨立的 RTH
 操作；本程式不會因碰到 geofence 而自行呼叫它。
@@ -29,9 +32,17 @@ SafetySwitch 預設 fail closed：
 - 既有的 `hover`、`manual`、`land` 或 `emergency` 不會被覆寫。
 - 每次啟動 `--fly` 後，operator 確認場地、航線、串流與人工接管均就緒，必須在 30 秒內重新寫入一次 `auto`。前一次任務留下的 `auto` 視為過期，程式不會連線或起飛。
 
+預設檔案是 `${XDG_RUNTIME_DIR}/sfm_drone/safety.cmd`；沒有
+`XDG_RUNTIME_DIR` 時為 `~/.local/state/sfm_drone/safety.cmd`。目錄必須只允許
+owner 存取，檔案不得是 symlink 或可被 group/other 寫入。不要直接以 shell 覆寫；
+使用具原子寫入與權限驗證的統一入口，例如：
+
 ```bash
-printf 'auto\n' > "${SFM_SAFETY_FILE:-/tmp/sfm_drone_safety.cmd}"
+python 控制介面程式/mission_pipeline.py --mode safety-hover
 ```
+
+`safety-auto` 只寫入本次執行的新鮮 authority token。操作員在已核准的 `--fly`
+啟動後 30 秒內親自寫入時，runner 才會繼續連線與飛行；agent 不得代為執行。
 
 推論中切換 HOVER/MANUAL/LAND/EMERGENCY、串流中斷或終止信號時，每一筆自主 PCMD（包括零 PCMD）都會先經過同一把 authority lock 重新檢查。MANUAL 與 EMERGENCY 會完全停止 PCMD；`SIGINT`、`SIGTERM` 與 `SIGHUP` 由獨立安全監視線程執行停止與降落。終止動作只允許 `NONE → LAND → EMERGENCY` 單向升級；即使指令檔隨後變回 AUTO/HOVER/MANUAL，也不會取消已鎖存的動作。Landing／Emergency callback 若丟出例外或明確回傳 `False`，監視線程會限頻重試；只有 callback 成功才標記已執行，Emergency 永遠維持最高優先。
 

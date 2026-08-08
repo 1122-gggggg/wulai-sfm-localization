@@ -90,15 +90,19 @@ def _temporal_diagnostics(info: dict) -> dict:
 
 def _apply_pass_timings(info: dict, passes: list[tuple[str, dict]]) -> None:
     snapshots = [
-        (label, {field: pass_info.get(field) for field in _PASS_TIMING_FIELDS})
+        (label, {timing_field: pass_info.get(timing_field) for timing_field in _PASS_TIMING_FIELDS})
         for label, pass_info in passes
     ]
     for label, timing in snapshots:
-        for field, value in timing.items():
-            info[f"{label}_{field}"] = value
-    for field in _PASS_TIMING_FIELDS:
-        values = [timing[field] for _, timing in snapshots if timing[field] is not None]
-        info[field] = sum(float(value) for value in values) if values else None
+        for timing_field, value in timing.items():
+            info[f"{label}_{timing_field}"] = value
+    for timing_field in _PASS_TIMING_FIELDS:
+        values = [
+            timing[timing_field]
+            for _, timing in snapshots
+            if timing[timing_field] is not None
+        ]
+        info[timing_field] = sum(float(value) for value in values) if values else None
     info["timing_synced"] = bool(_LOC_TIMING)
 
 

@@ -12,7 +12,6 @@ from __future__ import annotations
 import builtins
 import ast
 import hashlib
-import importlib.util
 import inspect
 import json
 import math
@@ -176,9 +175,57 @@ def test_flight_localizer_uses_site_selected_edm_factory(monkeypatch):
     assert captured["map_frame"] is measured_frame
 
 
-def test_legacy_autonomous_controller_is_external_approval_locked():
-    with pytest.raises(RuntimeError, match="LOCKED pending external approval"):
-        pff.build_controller()
+def test_approved_route_builds_the_global_scale_free_controller(tmp_path, monkeypatch):
+    route = tmp_path / "route.json"
+    route.write_text(
+        json.dumps(
+            {
+                "schema": "sfm-flight-route/v1",
+                "site_id": "river",
+                "coordinate_frame_id": "river-frame",
+                "frame": "glomap",
+                "units": "map",
+                "purpose": "flight",
+                "closed": False,
+                "waypoints": [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
+                "arrive_radius_map_units": 0.02,
+            }
+        ),
+        encoding="utf-8",
+    )
+    alignment = tmp_path / "T_align_gravity.json"
+    alignment.write_text(
+        json.dumps(
+            {
+                "schema": "sfm-align/v2",
+                "gravity_glomap": [0.0, 1.0, 0.0],
+                "R": [[1.0, 0.0, 0.0], [0.0, 0.0, 1.0], [0.0, -1.0, 0.0]],
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(pff, "PATH_JSON", str(route))
+    monkeypatch.setattr(pff, "MAP_ALIGN", str(alignment))
+    monkeypatch.setattr(
+        pff,
+        "FLIGHT_CONTRACT_JSON",
+        json.dumps(
+            {
+                "schema_version": 2,
+                "approved": True,
+                "route_clearance_approved": True,
+                "site_id": "river",
+                "coordinate_frame_id": "river-frame",
+                "route_sha256": hashlib.sha256(route.read_bytes()).hexdigest(),
+            }
+        ),
+    )
+
+    controller, waypoints = pff.build_controller()
+
+    assert len(waypoints) == 2
+    assert controller.cfg.inspect_waypoints == ()
+    assert controller.cfg.waypoint_arrive_radius == pytest.approx(0.02)
 
 
 # ---------------------------------------------------------------------------
@@ -3039,20 +3086,10 @@ def test_legacy_entrypoints_stay_locked_even_when_legacy_env_is_enabled(monkeypa
     with pytest.raises(SystemExit, match="permanently locked"):
         ofs.run_real(object(), None, None, None)
 
-    deploy_path = (Path(__file__).resolve().parents[1]
-                   / "deploy_code" / "sfm_glomap_deploy" / "olympe_frame_source.py")
-    spec = importlib.util.spec_from_file_location("deploy_olympe_frame_source", deploy_path)
-    assert spec is not None and spec.loader is not None
-    deploy_ofs = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(deploy_ofs)
-    with pytest.raises(SystemExit, match="permanently locked"):
-        deploy_ofs.run_real(object(), None, None, None)
-
-
-def test_deploy_frame_source_shares_live_hard_lock_and_timestamp_safety():
-    deploy_path = (Path(__file__).resolve().parents[1]
-                   / "deploy_code" / "sfm_glomap_deploy" / "olympe_frame_source.py")
-    source = deploy_path.read_text(encoding="utf-8")
+def test_canonical_frame_source_has_live_hard_lock_and_timestamp_safety():
+    source = (Path(__file__).resolve().parent / "olympe_frame_source.py").read_text(
+        encoding="utf-8"
+    )
     assert "SFM_ALLOW_LEGACY_FLIGHT" not in source
     assert "TakeOff()" not in source
     assert ".wait()" not in source
@@ -3068,24 +3105,22 @@ def test_frame_source_has_no_unreferenced_coded_decoder_helpers():
         "_init_pyav_decoder", "_avcc_to_annexb", "_decode_h264_payload",
         "_coded_payload_bytes", "_coded_avcc_cb", "_coded_bytestream_cb",
     }
-    for path in (
-        Path(__file__).resolve().parent / "olympe_frame_source.py",
-        Path(__file__).resolve().parents[1]
-        / "deploy_code" / "sfm_glomap_deploy" / "olympe_frame_source.py",
-    ):
-        source = path.read_text(encoding="utf-8")
-        assert "if skipped_stale" not in source
-        tree = ast.parse(source, filename=str(path))
-        definitions = {
-            node.name for node in ast.walk(tree)
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        }
-        calls = {
-            node.func.id for node in ast.walk(tree)
-            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
-        }
-        assert not (dead_names & definitions), f"dead helpers remain in {path}"
-        assert not (dead_names & calls), f"dead helper calls remain in {path}"
+    path = Path(__file__).resolve().parent / "olympe_frame_source.py"
+    source = path.read_text(encoding="utf-8")
+    assert "if skipped_stale" not in source
+    tree = ast.parse(source, filename=str(path))
+    definitions = {
+        node.name
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    calls = {
+        node.func.id
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+    }
+    assert not (dead_names & definitions), f"dead helpers remain in {path}"
+    assert not (dead_names & calls), f"dead helper calls remain in {path}"
 
 
 def test_sphinx_smoke_is_simulator_only_and_uses_bounded_waits():

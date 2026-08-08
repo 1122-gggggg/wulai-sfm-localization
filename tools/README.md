@@ -4,6 +4,7 @@
 |---|---|
 | `system_validation.py` | 編排主系統與 `parrot_stimulate` 的完整純地面驗證 |
 | `workspace_audit.py` | 唯讀檢查目錄、必要檔案、symlink、output 命名與容量 |
+| `check_maintainability.py` | 以分區 C901 預算阻止複雜度熱點數量或最壞值回升 |
 | `simulator_preflight.py` | 模擬介面啟動前檢查 Python、CUDA、模型、場域資產與影片 |
 | `install_runtime.sh` | 用 `requirements-lock.txt` 的 transitive pins/hashes 建立乾淨 CPython 3.10 venv |
 | `export_simulator_package.py` | 匯出固定程式/runtime，排除 venv、outputs、地圖與影片並產生 manifest |

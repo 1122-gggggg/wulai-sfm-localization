@@ -466,8 +466,12 @@ def test_football_field_bundle_hash_is_trusted():
 
 def test_production_flight_uses_calibrated_720p_full_opencv_camera(monkeypatch):
     deploy = VALIDATION.parent / "deploy_code" / "sfm_glomap_deploy"
+    flight_control = VALIDATION.parent / "flight_control"
     monkeypatch.syspath_prepend(str(deploy))
-    flight = load_module("path_follow_flight_football", deploy / "path_follow_flight.py")
+    monkeypatch.syspath_prepend(str(flight_control))
+    flight = load_module(
+        "path_follow_flight_football", flight_control / "path_follow_flight.py"
+    )
 
     assert flight.CAM_720 == (
         "FULL_OPENCV",

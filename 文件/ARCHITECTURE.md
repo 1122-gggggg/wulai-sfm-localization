@@ -70,28 +70,24 @@ Pose + BOOT_INIT / TRACK / WEAK_TRACK / LOST
 上述唯一落點；`python tools/workspace_audit.py --strict-output-names` 檢查結構、
 symlink、容量與未分類 output。
 
-## 目前保留的相容鏡像
+## 共用 runtime 模組的唯一所有權
 
-在完成 packaging 前，少數檔案仍需同時出現在部署包與飛控目錄。其邏輯 owner 如下：
+部署與飛控入口都可能把兩個 runtime 目錄加入 `sys.path`，因此同名 Python 檔會使
+匯入結果依路徑順序而變。每個共用模組只保留一份權威實作：
 
-| 邏輯 owner | 相容 mirror |
+| owner 目錄 | 權威模組 |
 |---|---|
-| `deploy_code/.../artifact_integrity.py` | `flight_control/artifact_integrity.py` |
-| `flight_control/autoflight.py` | `deploy_code/.../autoflight.py` |
-| `deploy_code/.../megaloc_cache.py` | `flight_control/megaloc_cache.py` |
-| `flight_control/path_follow_flight.py` | `deploy_code/.../path_follow_flight.py` |
-| `flight_control/plan_path.py` | `deploy_code/.../plan_path.py` |
-| `deploy_code/.../pose_types.py` | `flight_control/pose_types.py` |
-| `deploy_code/.../production_xfeat_tracker.py` | `flight_control/production_xfeat_tracker.py` |
-| `flight_control/real_path_follow_controller.py` | `deploy_code/.../real_path_follow_controller.py` |
+| `deploy_code/sfm_glomap_deploy/` | `artifact_integrity.py`、`megaloc_cache.py`、`pose_types.py`、`production_xfeat_tracker.py`、`reloc_localizer_xfeat.py` |
+| `flight_control/` | `autoflight.py`、`manual_nudge_pilot.py`、`olympe_frame_source.py`、`path_follow_flight.py`、`plan_path.py`、`real_path_follow_controller.py` |
 
-修改時先改 owner，再同步 mirror；CI 由下列命令阻止 drift：
+呼叫端直接從 owner 匯入，另一個目錄不得再放相容副本。CI 由下列命令驗證 owner
+存在、舊副本沒有回流，且沒有未分類的同名 runtime 檔案：
 
 ```bash
 python 定位演算法/validation/check_runtime_mirrors.py
 ```
 
-名稱相同但未列入表中的檔案是獨立實作，不可假設可以互相覆蓋；目前包括 `olympe_frame_source.py` 與 `reloc_localizer_xfeat.py`。
+兩個目錄都保有各自的 `README.md`，內容描述不同責任，這是唯一允許的同名檔案。
 
 ## 支援的入口
 
@@ -115,37 +111,3 @@ python 控制介面程式/mission_pipeline.py \
 ```
 
 正式任務模式預設要求 `--site-profile`。`--allow-legacy-assets` 僅供已審查的遷移作業，不是正式部署介面。`flight-selftest` 與 `safety-*` 命令刻意保持 profile-free，確保缺失資產時仍能執行純邏輯檢查或安全動作。
-
-### 操作介面
-
-真機使用 `控制介面程式/operator_interface/flight_operator_app.py`。`demo_stub_http_server.py` 只提供模擬 HTTP API，不連接 Olympe，也不得作為真機入口。
-
-## 安全邊界
-
-- 起飛只能由現場操作員在桌面 UI 親自執行。
-- 自動化不得呼叫 TakeOff 或替操作員寫入起飛授權。
-- `fly` 前必須完成 self-test、dry-run、模擬、拆槳測試與現場安全審查。
-- WEAK、LOST、stale pose、stale stream 或 watchdog timeout 必須導向零 PCMD、懸停、人工接管或降落，不得繼續沿用舊命令。
-- 場域資產不完整、路徑不存在或 profile 與 per-asset override 混用時，入口必須 fail closed。
-
-### 稀疏點雲 monitor 與 reproducibility
-
-`SparseCloudCollisionMonitor` 的 SciPy import 是 optional，且目前沒有接入
-autonomous route 或其他 production safety path。`requirements-lock.txt` 未 pin
-scipy，因此即使開發 venv 恰好能 import `scipy`，clean lock-only runtime 仍必須把
-此能力記為 `unavailable`。`tools/simulator_preflight.py --json` 與 system validation
-receipt 會記錄 `runtime.collision_monitor`、`production_safety=false` 及
-`collision_protection_claim=false`，不把它當作碰撞保護。
-
-若將來 production 明確需要這個 monitor，先完成 safety wiring 審查，並以官方 lock
-產生流程加入受審查的 scipy pin 與平台 wheel hashes，再使用
-`--require-collision-monitor`；缺少任一項時 preflight 必須 fail closed。離線維護時
-不得猜測或手寫 scipy wheel hash。
-
-## 後續收斂順序
-
-1. 以 mirror check 維持現有部署包一致性。
-2. 將部署包改成由單一 source tree 建置，不再提交鏡像 Python 檔。
-3. 把 EDM 上游程式移到明確的 `third_party/EDM` 邊界，保留本專案 adapter 與 tracker glue。
-4. 統一成可安裝的 Python package 與單一 CLI。
-5. 移除 `--allow-legacy-assets` 及所有舊場域 fallback。

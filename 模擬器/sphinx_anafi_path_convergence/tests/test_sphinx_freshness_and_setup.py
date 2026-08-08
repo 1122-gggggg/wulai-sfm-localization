@@ -4,7 +4,6 @@ import numpy as np
 import pytest
 
 from controllers import ALGORITHM_ORDER
-from route_geometry import RouteModel
 from run_sphinx_anafi_convergence import (
     TrialSetupError,
     _firmware_selector_is_explicit,

@@ -30,7 +30,7 @@ SAFETY  -- real flight is irreversible and can injure people or destroy the dron
   --selftest  : pure-python checks (heading fusion + PCMD sign sanity). No deps.
   --dry-run   : no drone; a toy dynamics model closes the loop to exercise logic.
   --grab-only : connect + localize on the LIVE stream, PROPS OFF, never arms motors.
-  --fly       : LOCKED pending external approval. This legacy metric controller cannot arm.
+  --fly       : approved site-profile flight with runtime safety and firmware limits.
 The aircraft's initial nose direction is measured, never assumed from the route.
 """
 from __future__ import annotations
@@ -41,7 +41,6 @@ import math
 import os
 import signal
 import select
-import stat
 import sys
 import threading
 import time
@@ -80,8 +79,18 @@ MISSION_ROOT = (
 )
 SOURCE_ROOT = LOC_ROOT / "source" / "sfm_glomap"
 DEPLOY_ROOT = LOC_ROOT / "deploy_code" / "sfm_glomap_deploy"
+if str(FLIGHT_ROOT) not in sys.path:
+    sys.path.insert(0, str(FLIGHT_ROOT))
 if DEPLOY_ROOT.is_dir() and str(DEPLOY_ROOT) not in sys.path:
     sys.path.append(str(DEPLOY_ROOT))
+
+from safety_command import (  # noqa: E402
+    default_safety_file as _default_safety_file,  # noqa: F401 - compatibility API
+    prepare_safety_file as _prepare_safety_file,
+    safety_file_from_environment as _safety_file_from_environment,
+    validate_safety_directory as _validate_safety_directory,
+    validate_safety_file_stat as _validate_safety_file_stat,
+)
 # 2026-08-06 audit: a hard-coded /home/allen/足球場 probe used to sit here and,
 # whenever that developer-specific directory happened to exist, silently swapped
 # DEFAULT_BUNDLE and DEFAULT_MEGALOC_CACHE to the football-field site regardless of
@@ -155,13 +164,25 @@ def query_camera_from_environment(default=CAM_720, *, required: bool = False):
     return value["model"], value["width"], value["height"], value["params"]
 
 
+def _require_approved_flight_contract(contract: dict) -> None:
+    blockers = []
+    if contract.get("schema_version") != 2:
+        blockers.append("schema_version must be 2")
+    if contract.get("approved") is not True:
+        blockers.append("flight approval is missing")
+    if contract.get("route_clearance_approved") is not True:
+        blockers.append("route clearance approval is missing")
+    for key in ("site_id", "coordinate_frame_id", "route_sha256"):
+        if not str(contract.get(key) or "").strip():
+            blockers.append(f"{key} is missing")
+    if blockers:
+        raise ValueError("autonomous flight contract rejected: " + "; ".join(blockers))
+
+
 def flight_contract_from_environment(*, require_approved: bool) -> dict | None:
-    if require_approved:
-        raise ValueError(
-            "autonomous route flight is LOCKED pending external approval; "
-            "the retired metric controller cannot be armed"
-        )
     if not FLIGHT_CONTRACT_JSON:
+        if require_approved:
+            raise ValueError("autonomous flight requires an explicit approved flight contract")
         return None
     try:
         contract = json.loads(
@@ -172,6 +193,8 @@ def flight_contract_from_environment(*, require_approved: bool) -> dict | None:
         raise ValueError(f"invalid SFM_FLIGHT_CONTRACT_JSON: {exc}") from exc
     if not isinstance(contract, dict):
         raise ValueError("SFM_FLIGHT_CONTRACT_JSON must be an object")
+    if require_approved:
+        _require_approved_flight_contract(contract)
     return contract
 
 
@@ -259,71 +282,7 @@ INSPECTION_PIPELINE_DRAIN_S = _env_float(
 GIMBAL_PITCH_DEG = -10.0    # camera tilt vs horizon; slightly down, like the map refs
 
 
-def _default_safety_file() -> Path:
-    """Return an owner-only per-user safety command path.
-
-    ``/tmp`` is intentionally not used: its shared, world-writable namespace
-    allows another user or process to replace a safety command between polls.
-    Prefer the OS per-user runtime directory and use a private state directory
-    only when that environment is unavailable (for example, a local test).
-    """
-    runtime = os.environ.get("XDG_RUNTIME_DIR", "").strip()
-    base = Path(runtime).expanduser() if runtime else (
-        Path.home() / ".local" / "state")
-    if not base.is_absolute():
-        base = Path.home() / ".local" / "state"
-    return base / "sfm_drone" / "safety.cmd"
-
-
-def _safety_file_from_environment() -> Path:
-    configured = os.environ.get("SFM_SAFETY_FILE", "").strip()
-    if not configured:
-        return _default_safety_file()
-    path = Path(configured).expanduser()
-    if not path.is_absolute():
-        raise RuntimeError("SFM_SAFETY_FILE must be an absolute path")
-    return path
-
-
 SAFETY_FILE = str(_safety_file_from_environment())
-
-
-def _validate_safety_directory(path: Path, *, create: bool = False) -> None:
-    if create:
-        path.mkdir(parents=True, exist_ok=True, mode=0o700)
-    try:
-        st = path.lstat()
-    except FileNotFoundError as exc:
-        raise RuntimeError(f"safety directory does not exist: {path}") from exc
-    if (not stat.S_ISDIR(st.st_mode) or stat.S_ISLNK(st.st_mode)
-            or st.st_uid != os.getuid() or st.st_mode & 0o077):
-        raise RuntimeError(
-            f"safety directory must be an owner-only directory: {path}")
-
-
-def _validate_safety_file_stat(path: Path, st) -> None:
-    if (stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode)
-            or st.st_uid != os.getuid() or st.st_mode & 0o022
-            or not st.st_mode & 0o200):
-        raise RuntimeError(
-            f"safety command must be an owner-owned file without group/other write: {path}")
-
-
-def _prepare_safety_file(path: Path):
-    _validate_safety_directory(path.parent, create=True)
-    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0)
-    try:
-        fd = os.open(path, flags, 0o600)
-    except FileExistsError:
-        pass
-    else:
-        try:
-            os.write(fd, b"hover\n")
-        finally:
-            os.close(fd)
-    st = path.lstat()
-    _validate_safety_file_stat(path, st)
-    return st
 
 
 class SafetySwitch:
@@ -1535,7 +1494,6 @@ def run_loop(hooks: LoopHooks, ctrl, waypoints, yaw_sign: int = 1, verbose: bool
     inspection_started = {}
     steps = 0
     reason = "stopped"
-    last_safety_mode = "AUTO"
     manual_requested = False
 
     def emit(rec, pcmd, blocked, why):
@@ -1612,15 +1570,12 @@ def run_loop(hooks: LoopHooks, ctrl, waypoints, yaw_sign: int = 1, verbose: bool
             continue
         if safety_mode == "MANUAL":
             reset_pcmd_controller()
-            last_safety_mode = safety_mode                # MANUAL: send NOTHING (SkyController pilot has the sticks)
             emit(rec, None, True, "MANUAL: autonomy sends nothing (pilot has the sticks)")
             steps += 1
             dt = hooks.now() - t0
             if dt < period:
                 time.sleep(period - dt)
             continue
-        last_safety_mode = safety_mode
-
         # The physical override. Checked every tick, before anything pose-derived,
         # because it is the pilot taking the aircraft back: nothing the autonomy is
         # in the middle of computing may delay it. Zero PCMD goes out FIRST, while
@@ -2083,11 +2038,36 @@ def build_localizer(frame_source, cam_tuple=None):
     return built.tracker
 
 
-def build_controller():
-    raise RuntimeError(
-        "legacy autonomous controller is LOCKED pending external approval; "
-        "map-to-metre conversion has been retired"
+def build_controller(*, require_approved: bool = True):
+    """Build the global scale-free direction controller for an approved route."""
+    import real_path_follow_controller as rpf
+
+    contract = flight_contract_from_environment(require_approved=require_approved)
+    if contract is None:
+        if require_approved:
+            raise ValueError("route control requires an explicit site flight contract")
+        map_frame = rpf.load_map_frame(MAP_ALIGN) if MAP_ALIGN else rpf.LEGACY_MAP_FRAME
+        waypoints = rpf.load_waypoints(PATH_JSON, map_frame=map_frame)
+    else:
+        for key in ("site_id", "coordinate_frame_id", "route_sha256"):
+            if not str(contract.get(key) or "").strip():
+                raise ValueError(f"route control contract is missing {key}")
+        if not MAP_ALIGN:
+            raise ValueError("autonomous flight requires a measured map alignment")
+        map_frame = rpf.load_map_frame(MAP_ALIGN)
+        snapshot = rpf.capture_mission_route_snapshot(
+            PATH_JSON,
+            expected_sha256=str(contract["route_sha256"]),
+            expected_site_id=str(contract["site_id"]),
+            expected_coordinate_frame_id=str(contract["coordinate_frame_id"]),
+            map_frame=map_frame,
+        )
+        waypoints = snapshot.controller_waypoints()
+    config = rpf.config_for_route(
+        PATH_JSON,
+        rpf.ControlConfig(inspect_waypoints=(), map_frame=map_frame),
     )
+    return rpf.RouteAutoController(waypoints, poles=[], config=config), waypoints
 
 
 # ---------------------------------------------------------------------------
@@ -2096,10 +2076,6 @@ def build_controller():
 def fly(ip: str, yaw_sign: int, gimbal_pitch: float, controller: str, safety_file: str,
         cmd_log_path: str = "", max_altitude_m: float | None = None,
         max_distance_m: float | None = None, distance_geofence: bool = True):
-    raise SystemExit(
-        "autonomous route flight is LOCKED pending external approval; "
-        "no connection or flight command was issued"
-    )
     if max_altitude_m is None or max_distance_m is None:
         raise SystemExit(
             "--fly requires explicit --max-altitude-m and --max-distance-m")
@@ -2477,22 +2453,18 @@ def dry_run(yaw_sign: int, steps: int = 12000, cmd_log_path: str = ""):
     """Closed loop against a kinematic ANAFI stand-in in raw-GLOMAP frame.
 
     Body command -> world motion using the SAME sign conventions the real PCMD
-    mapping assumes: +pitch = forward along heading, +gaz = up (-Y), +yaw = turn.
-    A perfect localizer returns the sim state; heading fusion is skipped (no Olympe
-    yaw) so run_loop falls back to the motion heading -- which is exactly what we
-    want to smoke-test.
+    mapping assumes: +pitch = forward, +roll = body-right, +gaz = measured map-up,
+    and +yaw = turn. A perfect localizer returns the simulated motion heading.
     """
     import real_path_follow_controller as rpf
     # pure path-follow smoke test: no poles / no inspection stops, so this exercises
     # the wiring + FOLLOW/REJOIN/LAND terminal, not the (separately-validated) look-at
     # inspection behavior.
-    wp = rpf.load_waypoints(PATH_JSON)
-    ctrl = rpf.RouteAutoController(wp, poles=[],
-                                   config=rpf.ControlConfig(inspect_waypoints=()))
+    ctrl, wp = build_controller(require_approved=False)
 
     # start on the first waypoint, heading roughly toward the second
     C = wp[0].astype(float).copy()
-    h = math.atan2(wp[1][2] - wp[0][2], wp[1][0] - wp[0][0])
+    h = ctrl.cfg.map_frame.heading(wp[1] - wp[0])
     KP, KG, KY = 0.06, 0.05, 0.06     # per-% per-step response (matches autoflight._Sim)
 
     class _State:
@@ -2502,7 +2474,7 @@ def dry_run(yaw_sign: int, steps: int = 12000, cmd_log_path: str = ""):
 
     def get_pose():
         p = rpf.Pose(x=float(S.C[0]), y=float(S.C[1]), z=float(S.C[2]),
-                     yaw=0.0, stamp=S.t)     # yaw here is ignored by run_loop's fusion
+                     yaw=S.h, stamp=S.t)
         return p
 
     def send_pcmd(roll, pitch, yaw, gaz):
@@ -2510,9 +2482,17 @@ def dry_run(yaw_sign: int, steps: int = 12000, cmd_log_path: str = ""):
         # apply it a second time or a wrong sign looks correct in dry-run.
         S.h = _wrap(S.h + KY * yaw * dt)                 # yaw turns heading
         fwd = KP * pitch * dt
-        S.C[0] += fwd * math.cos(S.h)                    # +pitch -> forward in X/Z
-        S.C[2] += fwd * math.sin(S.h)
-        S.C[1] += -KG * gaz * dt                         # +gaz -> up == -Y
+        forward_map = (
+            math.cos(S.h) * ctrl.cfg.map_frame.east
+            + math.sin(S.h) * ctrl.cfg.map_frame.north
+        )
+        right_map = (
+            math.sin(S.h) * ctrl.cfg.map_frame.east
+            - math.cos(S.h) * ctrl.cfg.map_frame.north
+        )
+        S.C += fwd * forward_map
+        S.C += KP * roll * dt * right_map
+        S.C += KG * gaz * dt * ctrl.cfg.map_frame.up
         S.t += dt
 
     # inject the sim time into run_loop so freshness math lines up
@@ -2719,7 +2699,7 @@ def main():
     mode.add_argument("--selftest", action="store_true", help="pure-python checks, no deps")
     mode.add_argument("--dry-run", action="store_true", help="toy dynamics, no drone")
     mode.add_argument("--grab-only", action="store_true", help="live localize, PROPS OFF, no arm")
-    mode.add_argument("--fly", action="store_true", help="LOCKED pending external approval")
+    mode.add_argument("--fly", action="store_true", help="approved autonomous route flight")
     ap.add_argument("--ip", default=DRONE_IP_REAL,
                     help=f"real {DRONE_IP_REAL} / skyctrl {DRONE_IP_SKYCTRL} / sphinx {DRONE_IP_SIM}")
     ap.add_argument("--yaw-sign", type=int, default=1, choices=(-1, 1),
@@ -2752,7 +2732,7 @@ def main():
               "never sends TakeOff/PCMD", flush=True)
         grab_only(args.ip, args.secs, args.controller)
     elif args.fly:
-        print("[mode] FLY: LOCKED -- no connection or command will be issued", flush=True)
+        print("[mode] FLY: approved route with runtime safety authority", flush=True)
         fly(args.ip, args.yaw_sign, args.gimbal_pitch, args.controller, args.safety_file,
             cmd_log_path=args.cmd_log,
             max_altitude_m=args.max_altitude_m,

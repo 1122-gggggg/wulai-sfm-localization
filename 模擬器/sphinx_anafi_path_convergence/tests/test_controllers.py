@@ -321,7 +321,6 @@ def test_align_timeout():
 
 def test_route_completion():
     ctrl = make_sc(waypoint_hover_s=0.0)
-    r = ctrl.route
     t = 0.0
     advance_to_follow(ctrl)
     t = 1.2
@@ -705,7 +704,6 @@ def test_translational_waypoint_align_can_use_custom_yaw_target():
 
 def test_translational_completes_route():
     route = line_route()
-    plant_free = None  # use closed loop helper below
     from telemetry_sources import KinematicAnafi
     plant = KinematicAnafi(np.array([-1.0, -2.0, 1.5]), math.radians(12))
     ctrl = make_controller("translational_waypoint", route)

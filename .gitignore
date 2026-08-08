@@ -27,4 +27,8 @@ outputs/*
 
 **/__pycache__/
 **/.pytest_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
 .cursor/

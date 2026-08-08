@@ -36,7 +36,7 @@ from anafi_profile import ANAFI_PROFILE
 from controllers import (ABORT_OR_MANUAL, COMPLETED, ALGORITHM_ORDER,
                          make_controller)
 from metrics import aggregate_trials, compute_trial_metrics, rank_algorithms
-from route_geometry import (RouteModel, build_route, heading_of, horiz,
+from route_geometry import (RouteModel, build_route,
                             sample_start_offset, wrap_angle)
 from scale_utils import NO_SCALE_WARNING, ScaleContext, provisional_map_unit_thresholds
 from telemetry_sources import (SPHINX_IP_DEFAULT, HeadingEstimator, KinematicAnafi,

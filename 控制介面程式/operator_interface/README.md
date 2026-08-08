@@ -80,7 +80,7 @@ press the takeoff button.**
 按鈕；這不會自動起飛，按下後後端仍會重新執行完整 fail-closed preflight。
 
 ```bash
-cd .../mission/operator_interface
+cd .../localization/控制介面程式/operator_interface
 # stop any other Olympe session first (single connection)
 python3 flight_operator_app.py --interface real-flight \
   --ip 192.168.53.1 --controller skycontroller3 \
@@ -288,14 +288,14 @@ receipts exist.
 Self-test without opening a GUI:
 
 ```bash
-cd .../sfm_system/定位/mission/operator_interface
+cd .../localization/控制介面程式/operator_interface
 python3 flight_operator_app.py --selftest --max-points 30000
 ```
 
 Run the desktop app:
 
 ```bash
-cd .../sfm_system/定位/mission/operator_interface
+cd .../localization/控制介面程式/operator_interface
 python3 flight_operator_app.py --max-points 90000
 ```
 
@@ -476,7 +476,7 @@ This is useful for remote monitoring or quick browser review, but is not the
 preferred real-flight control surface.
 
 ```bash
-cd .../sfm_system/定位/mission/operator_interface
+cd .../localization/控制介面程式/operator_interface
 python3 serve_flight_interface.py --host 127.0.0.1 --port 8765
 ```
 
