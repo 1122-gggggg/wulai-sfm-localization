@@ -1069,6 +1069,54 @@ class SafetyMonitor:
         if self._thread.is_alive() and threading.current_thread() is not self._thread:
             self._thread.join(timeout=max(0.2, self._timeout))
 
+    def request_manual_override(self) -> tuple[bool, str]:
+        """Zero autonomy, then confirm that the physical pilot owns the sticks."""
+        with self._io_lock:
+            if self.terminal_action != "NONE":
+                return False, f"terminal action {self.terminal_action} already latched"
+            if self.mode == "MANUAL" and self._piloting_source == "SkyController":
+                return True, "manual override already active"
+
+            self._desired_pcmd = (0, 0, 0, 0)
+            self._desired_valid = False
+            zero_ok = self._send_counted(0, 0, 0, 0)
+            try:
+                manual_ok = bool(
+                    self._piloting_source_cb is not None
+                    and self._safety is not None
+                    and self._safety.force("manual")
+                )
+            except Exception as exc:
+                manual_ok = False
+                self.last_piloting_source_error = repr(exc)
+            self.mode = "MANUAL" if manual_ok else "HOVER"
+            if not manual_ok:
+                self._latch_terminal(
+                    "LAND", "stick override has no confirmed manual pilot -> land"
+                )
+                self._control_wake.set()
+                return False, self.reason
+            if not self._ensure_piloting_source("SkyController"):
+                self._latch_terminal(
+                    "LAND", "stick override handoff to SkyController failed -> land"
+                )
+                self._control_wake.set()
+                return False, self.reason
+            self._control_wake.set()
+            return True, (
+                "zero PCMD + SkyController manual override"
+                if zero_ok
+                else "SkyController manual override; zero PCMD send failed"
+            )
+
+    def request_land(self, reason: str) -> None:
+        """Wake the independent safety thread with an irreversible LAND request."""
+        with self._io_lock:
+            self._desired_pcmd = (0, 0, 0, 0)
+            self._desired_valid = True
+            self._latch_terminal("LAND", reason)
+            self._control_wake.set()
+
     def arming_allowed(self, stream_healthy, stop_requested) -> tuple[bool, str]:
         """Atomically refresh safety input and authorize the imminent TakeOff call."""
         with self._io_lock:
@@ -1464,6 +1512,89 @@ class SafetyMonitor:
                 if callback_request is not None:
                     self._attempt_callback(*callback_request)
                 continue
+
+
+def _handle_physical_stick_override(safety_monitor: SafetyMonitor, _axes) -> None:
+    accepted, detail = safety_monitor.request_manual_override()
+    if detail != "manual override already active":
+        print(f"[safety] physical stick override: {detail}", flush=True)
+    if not accepted:
+        safety_monitor.request_land(
+            "physical stick override could not confirm manual control -> land"
+        )
+
+
+def _handle_stick_monitor_disconnect(
+        safety_monitor: SafetyMonitor, reason: str) -> None:
+    print(f"[safety] stick monitor disconnected ({reason}) -> land", flush=True)
+    safety_monitor.request_land("SkyController stick monitor disconnected -> land")
+
+
+def _stick_monitor_has_all_axes(stick_monitor, required_axes: set[int]) -> bool:
+    axes_deadline = time.monotonic() + 1.0
+    while (stick_monitor.healthy
+           and not required_axes.issubset(stick_monitor.snapshot_axes())
+           and time.monotonic() < axes_deadline):
+        time.sleep(0.01)
+    return bool(
+        stick_monitor.healthy
+        and required_axes.issubset(stick_monitor.snapshot_axes())
+    )
+
+
+def start_skycontroller_stick_override(drone, safety_monitor: SafetyMonitor):
+    """Arm the shared SC3 HID override before granting the PC piloting authority."""
+    operator_root = MISSION_ROOT / "operator_interface"
+    if str(operator_root) not in sys.path:
+        sys.path.insert(0, str(operator_root))
+    from olympe_live_backend import SkyControllerStickMonitor, _STICK_FLIGHT_AXES
+
+    stick_monitor = SkyControllerStickMonitor(
+        on_active=lambda axes: _handle_physical_stick_override(
+            safety_monitor, axes),
+        on_disconnect=lambda reason: _handle_stick_monitor_disconnect(
+            safety_monitor, reason),
+    )
+    if not stick_monitor.start():
+        raise RuntimeError(
+            "SkyController stick monitor unavailable; refusing autonomous takeoff"
+    )
+    try:
+        required_axes = set(_STICK_FLIGHT_AXES)
+        if not _stick_monitor_has_all_axes(stick_monitor, required_axes):
+            raise RuntimeError(
+                "SkyController stick monitor did not publish all flight axes; "
+                "refusing autonomous takeoff"
+            )
+        if stick_monitor.is_active():
+            safety_monitor.request_manual_override()
+            raise RuntimeError(
+                "SkyController sticks are deflected; refusing autonomous takeoff"
+            )
+        set_piloting_source(drone, "Controller")
+        if not stick_monitor.healthy or safety_monitor.mode == "MANUAL":
+            set_piloting_source(drone, "SkyController")
+            raise RuntimeError(
+                "stick override changed during PC handoff; refusing autonomous takeoff"
+            )
+    except BaseException:
+        stick_monitor.stop()
+        raise
+    print(
+        f"[safety] physical stick override armed at 50 Hz: "
+        f"{stick_monitor.device_name or stick_monitor.resolved_path}",
+        flush=True,
+    )
+    return stick_monitor
+
+
+def stop_skycontroller_stick_override(stick_monitor) -> None:
+    if stick_monitor is None:
+        return
+    try:
+        stick_monitor.stop()
+    except Exception as exc:
+        print(f"[fly] warning: could not stop stick monitor: {exc}", flush=True)
 
 
 def run_loop(hooks: LoopHooks, ctrl, waypoints, yaw_sign: int = 1, verbose: bool = True):
@@ -2129,6 +2260,7 @@ def fly(ip: str, yaw_sign: int, gimbal_pitch: float, controller: str, safety_fil
     drone = None
     grab = None
     monitor = None
+    stick_monitor = None
     must_land = False
     reason = ""
     via_skycontroller = False
@@ -2157,10 +2289,6 @@ def fly(ip: str, yaw_sign: int, gimbal_pitch: float, controller: str, safety_fil
         loc = build_localizer(grab)
         loc.ensure_models()                          # load MegaLoc/XFeat NOW (on the ground)
         ground_speed = OlympeGroundSpeedTracker(drone)
-        if via_skycontroller:
-            # Only after landed preflight and all heavy ground loading succeeds
-            # may the app take PCMD ownership in preparation for TakeOff.
-            set_piloting_source(drone, "Controller")
 
         def send_pcmd(roll, pitch, yaw, gaz):
             # Single wire to the drone: clamp to the PCMD percent domain [-100, 100].
@@ -2182,7 +2310,12 @@ def fly(ip: str, yaw_sign: int, gimbal_pitch: float, controller: str, safety_fil
                 if via_skycontroller else None),
             max_translation_pcmd=ctrl.cfg.max_translation_pcmd,
             max_yaw_pcmd=ctrl.cfg.max_yaw_pcmd,
-        ).start()
+        )
+        if via_skycontroller:
+            # Only after landed preflight, heavy model loading, and the physical
+            # stick monitor are ready may the PC acquire authority for TakeOff.
+            stick_monitor = start_skycontroller_stick_override(drone, monitor)
+        monitor.start()
 
         # user's flow: TAKEOFF -> hover -> gimbal -> BOOT_INIT MegaLoc lock -> START AUTO.
         # We lock WHILE HOVERING (camera at flight height/view, like the map refs), not
@@ -2290,6 +2423,7 @@ def fly(ip: str, yaw_sign: int, gimbal_pitch: float, controller: str, safety_fil
                 pose_confidence=lambda: int(dict(loc.last_info).get("inliers", 0) or 0),
                 force_relocalize=lambda: setattr(loc.state, "mode", "LOST"),  # run MegaLoc next deep frame
                 request_manual=(lambda: safety.force("manual")) if safety.allow_manual else (lambda: False),
+                stick_active=getattr(stick_monitor, "is_active", None),
                 olympe_yaw=lambda: olympe_yaw_of(drone),
                 # Once the monitor has commanded LAND/EMERGENCY, a loop resuming from a
                 # blocked get_pose() must NOT send a countermanding nonzero PCMD.
@@ -2318,6 +2452,7 @@ def fly(ip: str, yaw_sign: int, gimbal_pitch: float, controller: str, safety_fil
                 reason = monitor.reason or reason
         print(f"[fly] {reason}")
     finally:
+        stop_skycontroller_stick_override(stick_monitor)
         if monitor is not None:
             monitor.stop()
             if monitor.reason:

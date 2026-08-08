@@ -1775,10 +1775,15 @@ def test_fly_confirms_controller_before_pcmd_takeoff_and_waits_for_landed():
     initial_sticks_i = src.index('set_piloting_source(drone, "SkyController")')
     preflight_i = src.index("configure_flight_preflight")
     models_i = src.index("loc.ensure_models()")
-    controller_i = src.index('set_piloting_source(drone, "Controller")')
+    pcmd_def_i = src.index("def send_pcmd")
+    controller_i = src.index("start_skycontroller_stick_override")
     takeoff_i = src.index("TakeOff() >>")
-    assert initial_sticks_i < preflight_i < models_i < controller_i
-    assert controller_i < src.index("def send_pcmd") < src.index("SafetyMonitor(") < takeoff_i
+    assert initial_sticks_i < preflight_i < models_i < pcmd_def_i < controller_i
+    assert src.index("SafetyMonitor(") < controller_i < src.index("monitor.start()") < takeoff_i
+    helper = inspect.getsource(pff.start_skycontroller_stick_override)
+    assert helper.index("stick_monitor.start()") < helper.index(
+        'set_piloting_source(drone, "Controller")'
+    )
     restore_i = src.rindex('set_piloting_source(drone, "SkyController")')
     assert restore_i < src.rindex("drone.disconnect()")
     assert "--fly requires explicit --max-altitude-m and --max-distance-m" in src
@@ -2060,6 +2065,58 @@ def test_termination_signal_lands_even_when_control_loop_is_blocked():
     assert ZERO in sent and "termination signal" in mon.reason
 
 
+def test_physical_stick_override_zeroes_then_confirms_manual_source():
+    events = []
+
+    class _Safety:
+        mode = "AUTO"
+
+        def force(self, token):
+            assert token == "manual"
+            self.mode = "MANUAL"
+            return True
+
+    safety = _Safety()
+    mon = pff.SafetyMonitor(
+        lambda *cmd: events.append(("pcmd", tuple(cmd))),
+        safety,
+        piloting_source_cb=lambda source: events.append(("source", source)) or True,
+        timeout_s=0.06,
+    )
+    mon.mode = "AUTO"
+    mon._desired_pcmd = (0, 8, 0, 0)
+    mon._desired_valid = True
+
+    accepted, reason = mon.request_manual_override()
+
+    assert accepted and "SkyController manual override" in reason
+    assert events == [("pcmd", ZERO), ("source", "SkyController")]
+    assert mon.mode == "MANUAL" and not mon._desired_valid
+
+
+def test_physical_stick_override_source_failure_latches_land():
+    class _Safety:
+        mode = "AUTO"
+
+        def force(self, _token):
+            self.mode = "MANUAL"
+            return True
+
+    mon = pff.SafetyMonitor(
+        lambda *_cmd: None,
+        _Safety(),
+        piloting_source_cb=lambda _source: False,
+        timeout_s=0.06,
+    )
+    mon.mode = "AUTO"
+
+    accepted, reason = mon.request_manual_override()
+
+    assert not accepted
+    assert mon.terminal_action == "LAND" and mon.terminated.is_set()
+    assert "handoff" in reason
+
+
 def test_non_finite_safety_environment_value_rejected(monkeypatch):
     monkeypatch.setenv("SFM_TEST_SAFETY", "nan")
     with pytest.raises(ValueError):
@@ -2081,6 +2138,18 @@ def test_takeoff_has_final_arming_gate_cleanup_and_termination_signals():
     assert "inspection_sample_after" in src and "INSPECTION_PIPELINE_DRAIN_S" in src
     for sig in ("SIGINT", "SIGTERM", "SIGHUP"):
         assert sig in src
+
+
+def test_fly_arms_and_cleans_up_physical_stick_override_before_takeoff():
+    src = inspect.getsource(pff.fly)
+    assert src.index("start_skycontroller_stick_override") < src.index("monitor.start()")
+    assert src.index("monitor.start()") < src.index("schedule_authorized_takeoff")
+    assert 'stick_active=getattr(stick_monitor, "is_active", None)' in src
+    assert src.index("stop_skycontroller_stick_override") < src.index("monitor.stop()")
+
+    helper = inspect.getsource(pff.start_skycontroller_stick_override)
+    assert "if not stick_monitor.start()" in helper
+    assert "refusing autonomous takeoff" in helper
 
 
 @pytest.mark.parametrize("mode, stream_ok, stop, terminated", [

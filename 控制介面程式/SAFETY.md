@@ -13,3 +13,6 @@ AI 代理人、語言模型（Claude / GPT / Grok / Codex 等）代為執行。*
 - 河濱 profile 與目前 route 已由操作員於 2026-08-08 核准；其他場域仍 fail closed。
 - HOVER／MANUAL／LAND／EMERGENCY、firmware 高度與距離限制、距離 geofence、
   BOOT pose lock、stream/pose/watchdog timeout 均維持強制啟用。
+- 河濱自主 `--fly` 只有在 SkyController 3 USB HID 搖桿監視器成功武裝後
+  才可取得 PC 控制權。飛行搖桿偏轉會由獨立 50 Hz callback 先歸零 PCMD，
+  再確認交回 `SkyController`；監視器缺失、斷線或交接失敗均 fail closed。

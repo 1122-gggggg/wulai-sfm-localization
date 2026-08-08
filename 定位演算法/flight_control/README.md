@@ -52,6 +52,12 @@ python 控制介面程式/mission_pipeline.py --mode safety-hover
 清成零；之後即使狀態恢復 AUTO，也不會重新送出舊的非零命令。指令 JSONL
 同時保存 desired 更新與實際 PCMD 呼叫的 `monotonic_ns` 時間戳。
 
+使用 SkyController 3 時，`--fly` 在取得 PC 飛行權限前必須先成功啟動
+SC USB HID 搖桿監視器；找不到搖桿裝置或起飛前搖桿已偏轉都會拒絕起飛。
+自主飛行中任一飛行軸離開 deadzone 時，獨立 50 Hz callback 會先送零
+PCMD，再回讀確認 piloting source 已交回 `SkyController`；交接失敗或監視器
+中途斷線會鎖存 LAND。此路徑不依賴主感知迴圈，即使同步推論阻塞仍能交回搖桿。
+
 ## BOOT 定位鎖定
 
 起飛後只會懸停定位，必須在 25 秒內同時滿足：
