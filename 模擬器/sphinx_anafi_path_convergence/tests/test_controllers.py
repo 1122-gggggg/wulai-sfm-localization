@@ -513,6 +513,40 @@ def test_translational_first_target_is_second_waypoint():
     assert ctrl.k == 1                                 # connects start -> P1 (2nd point)
 
 
+def test_translational_aligns_before_first_segment_then_translates_without_yaw():
+    ctrl = make_trans(segment_align_yaw_tolerance_deg=3.0)
+
+    turning = ctrl.step(pose(0.0, -2.0, 0.0, 0.0), math.pi / 2, 0.0)
+    assert turning.mode == SEGMENT_ALIGN
+    assert turning.roll == turning.pitch == turning.gaz == 0
+    assert turning.yaw < 0
+    assert turning.info["align_to_wp"] == 1
+    assert ctrl.k == 1
+
+    aligned = ctrl.step(pose(0.0, -2.0, 0.0, 0.1), 0.0, 0.1)
+    assert aligned.mode == NEXT_SEGMENT
+    assert aligned.pcmd == (0, 0, 0, 0)
+
+    translating = ctrl.step(pose(0.0, -2.0, 0.0, 0.2), 0.0, 0.2)
+    assert translating.mode == SEGMENT_FOLLOW
+    assert translating.pitch > 0
+    assert translating.yaw == 0
+
+
+def test_translational_alignment_timeout_aborts_instead_of_translating():
+    ctrl = make_trans(
+        segment_align_yaw_tolerance_deg=3.0,
+        segment_align_timeout_s=0.1,
+    )
+
+    turning = ctrl.step(pose(0.0, -2.0, 0.0, 0.0), math.pi / 2, 0.0)
+    assert turning.mode == SEGMENT_ALIGN
+    timed_out = ctrl.step(pose(0.0, -2.0, 0.0, 0.2), math.pi / 2, 0.2)
+    assert timed_out.mode == ABORT_OR_MANUAL
+    assert timed_out.pcmd == (0, 0, 0, 0)
+    assert timed_out.info["abort_reason"] == "segment_alignment_timeout"
+
+
 def test_translational_no_yaw_during_segment():
     ctrl = make_trans()
     # heading 0 (north); target wp[1] at x=4 ahead -> pure forward, zero yaw/roll
@@ -583,8 +617,10 @@ def test_translational_route_tube_exit_aborts_to_manual_hover():
 
 def test_translational_waypoint_align_uses_camera_yaw_offset():
     ctrl = make_trans(camera_yaw_offset_deg=90.0)
-    ctrl.step(pose(3.8, -2.0, 0.0, 0.0), 0.0, 0.0)
-    ctrl.step(pose(3.8, -2.0, 0.0, 1.2), 0.0, 1.2)
+    # At take-off the camera ray is already aligned with the first leg when the
+    # body is -90 deg and the camera mounting offset is +90 deg.
+    ctrl.step(pose(0.0, -2.0, 0.0, 0.0), -math.pi / 2, 0.0)
+    ctrl.step(pose(3.8, -2.0, 0.0, 1.2), -math.pi / 2, 1.2)
     cmd = ctrl.step(pose(3.8, -2.0, 0.0, 2.5), -math.pi / 2, 2.5)
     assert cmd.mode == NEXT_SEGMENT
     assert ctrl.k == 2

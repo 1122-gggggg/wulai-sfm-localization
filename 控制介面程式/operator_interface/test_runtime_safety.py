@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import runtime_safety
 from backend_contract import InterfaceMode
 from runtime_safety import (
     SessionLogs,
@@ -52,12 +53,21 @@ def test_retention_deletes_only_eligible_old_logs_and_never_current_session(
     old.mkdir()
     current.mkdir()
     eligible = old / "localization.jsonl"
+    telemetry = old / "telemetry.jsonl"
+    performance = old / "performance.jsonl"
+    video_metrics = old / "video_metrics.jsonl"
     permanent = old / "incidents.jsonl"
     current_eligible = current / "localization.jsonl"
-    for path in (eligible, permanent, current_eligible):
+    for path in (
+        eligible, telemetry, performance, video_metrics,
+        permanent, current_eligible,
+    ):
         path.write_bytes(b"x" * 32)
     old_time = time.time() - 40 * 86400
     os.utime(eligible, (old_time, old_time))
+    os.utime(telemetry, (old_time, old_time))
+    os.utime(performance, (old_time, old_time))
+    os.utime(video_metrics, (old_time, old_time))
     os.utime(permanent, (old_time, old_time))
     os.utime(current_eligible, (old_time, old_time))
 
@@ -71,9 +81,32 @@ def test_retention_deletes_only_eligible_old_logs_and_never_current_session(
 
     assert eligible in result.removed
     assert not eligible.exists()
+    assert telemetry in result.removed
+    assert not telemetry.exists()
+    assert performance in result.removed
+    assert not performance.exists()
+    assert video_metrics in result.removed
+    assert not video_metrics.exists()
     assert permanent.exists()
     assert current_eligible.exists()
     assert (tmp_path / "retention_audit.jsonl").is_file()
+
+
+def test_disk_pressure_blocks_when_percent_is_critical_even_above_five_gib(
+    tmp_path: Path,
+) -> None:
+    status = assess_disk_space(
+        tmp_path,
+        usage=lambda _path: SimpleNamespace(
+            total=200 * 1024**3,
+            used=191 * 1024**3,
+            free=9 * 1024**3,
+        ),
+    )
+
+    assert status.free_bytes > runtime_safety.CRITICAL_FREE_BYTES
+    assert status.free_percent < runtime_safety.CRITICAL_FREE_PERCENT
+    assert status.takeoff_blocked is True
 
 
 def test_session_logs_create_required_files_and_dual_timestamps(tmp_path: Path) -> None:
@@ -100,6 +133,44 @@ def test_session_logs_create_required_files_and_dual_timestamps(tmp_path: Path) 
     assert (session.directory / "telemetry.jsonl").is_file()
     assert (session.directory / "incidents.jsonl").is_file()
     assert summary["reason"] == "test_complete"
+
+
+def test_session_summary_reports_latency_extrema_and_unresolved_incidents(
+    tmp_path: Path,
+) -> None:
+    session = SessionLogs.create(
+        tmp_path,
+        mode=InterfaceMode.SIMULATED_STREAM,
+        manifest={},
+    )
+    session.localization("pose_result", e2e_submit_to_ui_ms=10.0)
+    session.localization("pose_result", e2e_submit_to_ui_ms=30.0)
+    session.localization("pose_result", e2e_submit_to_ui_ms=20.0)
+    session.incident("worker_exit", resolved=False)
+    session.close(reason="test_complete")
+
+    summary = json.loads((session.directory / "session_summary.json").read_text())
+    assert summary["metrics"]["p95_ms"] == pytest.approx(30.0)
+    assert summary["metrics"]["max_ms"] == pytest.approx(30.0)
+    assert summary["unresolved"]["count"] == 1
+    assert summary["unresolved"]["events"] == ["worker_exit"]
+
+
+def test_session_logs_do_not_claim_durable_when_fsync_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_fsync(_fd: int) -> None:
+        raise OSError("fsync unavailable")
+
+    monkeypatch.setattr(runtime_safety.os, "fsync", fail_fsync)
+    session = SessionLogs.create(
+        tmp_path,
+        mode=InterfaceMode.REAL_FLIGHT,
+        manifest={},
+    )
+
+    assert session.durable is False
+    assert session.healthy is False
 
 
 def test_flight_safety_commands_are_copied_to_permanent_incidents(

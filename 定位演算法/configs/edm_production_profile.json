@@ -31,6 +31,8 @@
     "acquire_min_inliers": 80,
     "track_min_inliers": 50,
     "weak_min_inliers": 30,
+    "min_inlier_ratio": 0.15,
+    "min_inlier_grid_cells": 6,
     "max_reproj_error_acquire": 5.0,
     "max_reproj_error_track": 6.0,
     "pnp_ransac_max_error": 5.0,
@@ -43,6 +45,9 @@
     "adaptive_jump_min_history": 20,
     "adaptive_jump_history_size": 120,
     "weak_after": 2,
-    "lost_after": 2
+    "lost_after": 2,
+    "acquire_max_jump_factor": 2.0,
+    "acquire_max_yaw_diff_deg": 90.0,
+    "lost_prior_max_age_s": 3.0
   }
 }

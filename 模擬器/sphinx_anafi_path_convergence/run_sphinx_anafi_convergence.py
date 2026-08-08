@@ -569,7 +569,11 @@ def run_sphinx(args, plan, out_dir: Path, scale: ScaleContext) -> list[dict]:
         except Exception:
             pass
         try:
-            drone(Landing()).wait()
+            landing = drone(
+                Landing() >> FlyingStateChanged(state="landed", _timeout=15)
+            ).wait()
+            if hasattr(landing, "success") and not landing.success():
+                print("warning: Landing did not confirm within 15 seconds", flush=True)
         except Exception as exc:
             print(f"warning: Landing failed: {exc}", flush=True)
         drone.disconnect()

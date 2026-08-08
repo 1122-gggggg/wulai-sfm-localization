@@ -18,6 +18,20 @@ if str(TRACKER_DIR) not in sys.path:
 import production_xfeat_tracker as pxt
 
 
+def test_output_heading_uses_supplied_measured_map_frame() -> None:
+    calls = []
+    frame = SimpleNamespace(
+        heading=lambda forward: calls.append(np.asarray(forward, float)) or 0.75
+    )
+
+    yaw = pxt._map_heading_from_forward(
+        np.array([0.0, 1.0, 0.0]), frame, fallback_yaw=-1.0
+    )
+
+    assert yaw == pytest.approx(0.75)
+    assert np.allclose(calls[0], [0.0, 1.0, 0.0])
+
+
 def _candidate_tracker(monkeypatch, *, refs: int = 2, dedup_corr: bool = False):
     tracker = pxt.ProductionXFeatTracker.__new__(pxt.ProductionXFeatTracker)
     tracker.cfg = pxt.ProductionConfig(
@@ -625,13 +639,50 @@ def test_track_gate_rejects_physically_impossible_short_interval_jump(monkeypatc
         pxt, "_pose_center_yaw_from_ret",
         lambda _ret: (np.array([1.0, 0.0, 0.0], np.float32), 0.0),
     )
-    info = {"inliers": 100, "reproj_rms": 1.0}
+    info = {
+        "inliers": 100, "reproj_rms": 1.0,
+        "inlier_ratio": 0.8, "inlier_grid_cells": 12,
+    }
 
     accepted, _weak, _pose = tracker._gate(object(), info, "TRACK")
 
     assert not accepted
     assert info["jump_rejected"] is True
     assert info["jump_limit"] == pytest.approx(0.5)
+
+
+@pytest.mark.parametrize(
+    ("quality", "reason"),
+    [
+        ({"inlier_ratio": 0.05, "inlier_grid_cells": 12}, "inlier_ratio"),
+        ({"inlier_ratio": 0.8, "inlier_grid_cells": 2}, "inlier_spread"),
+    ],
+)
+def test_track_gate_rejects_weak_or_concentrated_inlier_geometry(
+    monkeypatch, quality, reason,
+) -> None:
+    tracker = pxt.ProductionXFeatTracker.__new__(pxt.ProductionXFeatTracker)
+    tracker.cfg = pxt.ProductionConfig()
+    tracker.state = pxt.RuntimeState()
+    tracker._frame_capture_stamp = 1.0
+    monkeypatch.setattr(
+        pxt,
+        "_pose_center_yaw_from_ret",
+        lambda _ret: (np.zeros(3, np.float32), 0.0),
+    )
+    info = {"inliers": 100, "reproj_rms": 1.0, **quality}
+
+    accepted, _weak, _pose = tracker._gate(object(), info, "TRACK")
+
+    assert not accepted
+    assert info["quality_rejected"] == reason
+
+
+def test_xfeat_quality_gate_configuration_is_bounded() -> None:
+    with pytest.raises(ValueError, match="min_inlier_ratio"):
+        pxt.ProductionConfig(min_inlier_ratio=0.0)
+    with pytest.raises(ValueError, match="min_inlier_grid_cells"):
+        pxt.ProductionConfig(min_inlier_grid_cells=16)
 
 
 def test_track_gate_accepts_pose_near_last_when_velocity_prediction_overshoots(
@@ -655,7 +706,10 @@ def test_track_gate_accepts_pose_near_last_when_velocity_prediction_overshoots(
         pxt, "_pose_center_yaw_from_ret",
         lambda _ret: (np.array([1.1, 0.0, 0.0], np.float32), 0.0),
     )
-    info = {"inliers": 100, "reproj_rms": 1.0}
+    info = {
+        "inliers": 100, "reproj_rms": 1.0,
+        "inlier_ratio": 0.8, "inlier_grid_cells": 12,
+    }
 
     accepted, _weak, _pose = tracker._gate(object(), info, "TRACK")
 
@@ -677,7 +731,10 @@ def test_lost_gate_rejects_far_or_reverse_reacquisition_with_prior(monkeypatch) 
         lost_since_stamp=1.0,
     )
     tracker._frame_capture_stamp = 1.1
-    info = {"inliers": 200, "reproj_rms": 1.0}
+    info = {
+        "inliers": 200, "reproj_rms": 1.0,
+        "inlier_ratio": 0.8, "inlier_grid_cells": 12,
+    }
     monkeypatch.setattr(
         pxt, "_pose_center_yaw_from_ret",
         lambda _ret: (np.array([1.2, 0.0, 0.0], np.float32), 0.0),
@@ -688,7 +745,10 @@ def test_lost_gate_rejects_far_or_reverse_reacquisition_with_prior(monkeypatch) 
     assert not accepted
     assert info["acquire_jump_rejected"] is True
 
-    info = {"inliers": 200, "reproj_rms": 1.0}
+    info = {
+        "inliers": 200, "reproj_rms": 1.0,
+        "inlier_ratio": 0.8, "inlier_grid_cells": 12,
+    }
     monkeypatch.setattr(
         pxt, "_pose_center_yaw_from_ret",
         lambda _ret: (np.array([0.1, 0.0, 0.0], np.float32), math.pi),

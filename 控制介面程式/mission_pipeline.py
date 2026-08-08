@@ -24,7 +24,12 @@ import sys
 from dataclasses import asdict
 from pathlib import Path
 
-from site_profile import SiteProfile, flight_readiness_errors, load_site_profile
+from site_profile import (
+    SiteProfile,
+    flight_readiness_errors,
+    load_hardware_approval_receipt,
+    load_site_profile,
+)
 from workspace_layout import workspace_from_file
 
 
@@ -74,6 +79,7 @@ _POLES_MUST_EXIST_MODES = {
 }
 _SITE_ASSET_ENV_VARS = (
     "SFM_MAP_PLY",
+    "SFM_MAP_ALIGN",
     "SFM_FLIGHT_PATH_JSON",
     "SFM_POLES_JSON",
     "SFM_RELOC_BUNDLE",
@@ -217,6 +223,10 @@ def validate_profile_flight_assets(profile: SiteProfile) -> None:
             profile.asset_sha256.map_reference_poses,
             "map_reference_poses",
         ),
+        # The flight gate demands this digest; without verifying it the pin was
+        # decorative and the alignment on disk could be swapped for another
+        # internally-consistent one, silently rotating every commanded body axis.
+        (profile.map_align, profile.asset_sha256.map_align, "map_align"),
     )
     if profile.localizer_profile is not None:
         checks += (
@@ -240,6 +250,85 @@ def validate_profile_flight_assets(profile: SiteProfile) -> None:
     for path, expected, label in checks:
         assert path is not None and expected is not None
         _verify_sha256(path, expected, label)
+
+
+def shadow_readiness_errors(profile: SiteProfile) -> list[str]:
+    """Return offline blockers for a map-unit shadow-algorithm session.
+
+    This checks the inputs that can be verified before travelling to the site.
+    It deliberately does *not* require flight approval or a controller contract:
+    shadow mode computes and records recommendations only, never commands an
+    aircraft.
+    """
+    errors: list[str] = []
+    flight = profile.flight
+    if flight is None or not flight.coordinate_frame_id:
+        errors.append("missing flight.coordinate_frame_id for route/map matching")
+    if profile.route_json is None:
+        errors.append("missing route_json")
+    if profile.map_reference_poses is None:
+        errors.append("missing map_reference_poses")
+    if profile.map_align is None:
+        errors.append("missing map_align")
+    if profile.query_camera is None:
+        errors.append("missing query_camera")
+    if profile.localizer != "edm" or profile.localizer_profile is None:
+        errors.append("missing EDM localizer_profile")
+    if errors:
+        return errors
+
+    try:
+        _validate_flight_route(profile)
+    except ValueError as exc:
+        errors.append(str(exc))
+
+    checks = (
+        (profile.map_ply, profile.asset_sha256.map_ply, "map_ply"),
+        (
+            profile.localization_bundle,
+            profile.asset_sha256.localization_bundle,
+            "localization_bundle",
+        ),
+        (profile.route_json, profile.asset_sha256.route_json, "route_json"),
+        (
+            profile.map_reference_poses,
+            profile.asset_sha256.map_reference_poses,
+            "map_reference_poses",
+        ),
+        (profile.map_align, profile.asset_sha256.map_align, "map_align"),
+        (
+            profile.localizer_profile,
+            profile.asset_sha256.localizer_profile,
+            "localizer_profile",
+        ),
+    )
+    for path, expected, label in checks:
+        if path is None:
+            errors.append(f"missing {label}")
+        elif expected is None:
+            errors.append(f"missing asset_sha256.{label}")
+        else:
+            try:
+                _verify_sha256(path, expected, label)
+            except ValueError as exc:
+                errors.append(str(exc))
+    return errors
+
+
+def shadow_authorization_blockers(profile: SiteProfile) -> list[str]:
+    """Report human/real-hardware work without granting any approval."""
+    blockers = list(flight_readiness_errors(profile))
+    if profile.hardware_approval is None:
+        blockers.append("missing hardware_approval receipt")
+        return blockers
+    try:
+        receipt = load_hardware_approval_receipt(profile.hardware_approval)
+    except ValueError as exc:
+        blockers.append(f"invalid hardware_approval receipt: {exc}")
+    else:
+        if not receipt.approved:
+            blockers.append("hardware_approval receipt is not approved")
+    return blockers
 
 
 def validate_profile_for_flight(profile: SiteProfile) -> None:
@@ -359,6 +448,7 @@ def env_with_mission(args, profile: SiteProfile | None = None) -> dict[str, str]
         env.pop("SFM_SITE_PROFILE", None)
     if profile is not None:
         env["SFM_LOCALIZER_BACKEND"] = profile.localizer
+        env["SFM_MAP_ALIGN"] = str(profile.map_align or "")
         env["SFM_LOCALIZER_DEPLOY_DIR"] = str(profile.localizer_deploy_dir or DEPLOY)
         env["SFM_LOCALIZER_PROFILE"] = str(profile.localizer_profile or "")
         env["SFM_BUNDLE_SHA256"] = profile.asset_sha256.localization_bundle or ""
@@ -396,6 +486,8 @@ def env_with_mission(args, profile: SiteProfile | None = None) -> dict[str, str]
             })
         else:
             env.pop("SFM_FLIGHT_CONTRACT_JSON", None)
+    else:
+        env.pop("SFM_MAP_ALIGN", None)
     return env
 
 
@@ -437,6 +529,7 @@ def main() -> None:
             "plan-path",
             "flight-selftest",
             "dry-run",
+            "shadow-readiness",
             "grab-only",
             "fly",
             "safety-auto",
@@ -492,6 +585,24 @@ def main() -> None:
             file=sys.stderr,
             flush=True,
         )
+
+    if args.mode == "shadow-readiness":
+        assert site_profile is not None
+        shadow_errors = shadow_readiness_errors(site_profile)
+        authorization_blockers = shadow_authorization_blockers(site_profile)
+        print(
+            "[shadow-readiness] package="
+            + ("READY" if not shadow_errors else "BLOCKED"),
+            flush=True,
+        )
+        for error in shadow_errors:
+            print(f"  package blocker: {error}", flush=True)
+        print("[shadow-readiness] autonomous execution remains LOCKED", flush=True)
+        for blocker in authorization_blockers:
+            print(f"  human/field blocker: {blocker}", flush=True)
+        if shadow_errors:
+            raise SystemExit(1)
+        return
 
     env = env_with_mission(args, site_profile)
 

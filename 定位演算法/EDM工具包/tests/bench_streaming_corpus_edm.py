@@ -395,9 +395,9 @@ def main() -> None:
     default_package = ROOT / "transfer" / "edm_localization_package_target_site_v1_20260718"
     parser.add_argument("--config", default=str(default_package / "config.json"))
     parser.add_argument("--bundle")
-    parser.add_argument("--base", default="/media/cihcilab/新增磁碟區/sfm_system/data/target_site/base")
-    parser.add_argument("--updates", default="/media/cihcilab/新增磁碟區/sfm_system/data/target_site/updates")
-    parser.add_argument("--corpus-manifest", default=str(ROOT.parent / "建圖/target_site/runs/target_site_v1/corpus_manifest.json"))
+    parser.add_argument("--base", required=True)
+    parser.add_argument("--updates", required=True)
+    parser.add_argument("--corpus-manifest", required=True)
     parser.add_argument("--out-dir", required=True)
     parser.add_argument("--video", action="append", default=[], help="video ID or filename substring; repeatable")
     parser.add_argument("--cohort", action="append", choices=["mapped_build", "excluded_base", "heldout_regression"])

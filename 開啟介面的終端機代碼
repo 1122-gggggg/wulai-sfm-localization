@@ -1,0 +1,2 @@
+cd /home/allen/localization
+  ./控制介面程式/真機串流/啟動.sh --site-profile /home/allen/localization/控制介面程式/site_profiles/river_site_edm.json

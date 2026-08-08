@@ -2,7 +2,11 @@
 set -euo pipefail
 
 profile="${1:-balanced}"
-output_root="${2:-/media/cihcilab/新增磁碟區/sfm_system/建圖/target_site/runs/target_site_v1/edm_streaming_benchmark_rtx5060}"
+output_root="${2:-${EDM_BENCH_OUTPUT_ROOT:-}}"
+if [[ -z "${output_root}" || -z "${EDM_BASE_ROOT:-}" || -z "${EDM_UPDATES_ROOT:-}" || -z "${EDM_CORPUS_MANIFEST:-}" ]]; then
+  echo "Set EDM_BASE_ROOT, EDM_UPDATES_ROOT, EDM_CORPUS_MANIFEST, and pass output_root (or set EDM_BENCH_OUTPUT_ROOT)." >&2
+  exit 2
+fi
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 package_root="$(cd -- "${script_dir}/.." && pwd)"
 if [[ -x "${package_root}/env/.venv_edm/bin/python" ]]; then
@@ -23,6 +27,9 @@ timestamp="$(date +%Y%m%d_%H%M%S)"
 out_dir="${output_root}/${profile}_${timestamp}"
 common=(
   "${python_bin}" "${benchmark}"
+  --base "${EDM_BASE_ROOT}"
+  --updates "${EDM_UPDATES_ROOT}"
+  --corpus-manifest "${EDM_CORPUS_MANIFEST}"
   --out-dir "${out_dir}"
   --progress-every 600
 )

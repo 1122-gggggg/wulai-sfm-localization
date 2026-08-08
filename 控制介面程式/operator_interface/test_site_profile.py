@@ -93,6 +93,48 @@ def test_site_profile_rejects_non_edm_localizer(tmp_path: Path) -> None:
         load_site_profile(profile_path)
 
 
+@pytest.mark.parametrize(
+    "display_name",
+    [
+        "River's Edge $(touch pwned)",
+        'both " and \' $(id)',
+        "back\\slash",
+        "tick `id`",
+        "two\nlines",
+    ],
+)
+def test_site_profile_rejects_shell_unsafe_display_name(
+    tmp_path: Path, display_name: str
+) -> None:
+    profile_path = _write_profile(tmp_path)
+    raw = json.loads(profile_path.read_text(encoding="utf-8"))
+    raw["display_name"] = display_name
+    profile_path.write_text(json.dumps(raw), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="display_name"):
+        load_site_profile(profile_path)
+
+
+@pytest.mark.parametrize(
+    "display_name",
+    [
+        "烏來（目標場域）EDM v1 — 2026-07-19 驗證",
+        "足球場 EDM",
+        "Your site EDM profile",
+        "Site A (north) [v2]",
+    ],
+)
+def test_site_profile_keeps_ordinary_display_names(
+    tmp_path: Path, display_name: str
+) -> None:
+    profile_path = _write_profile(tmp_path)
+    raw = json.loads(profile_path.read_text(encoding="utf-8"))
+    raw["display_name"] = display_name
+    profile_path.write_text(json.dumps(raw), encoding="utf-8")
+
+    assert load_site_profile(profile_path).display_name == display_name
+
+
 def test_site_profile_schema_version_rejects_boolean_alias(tmp_path: Path) -> None:
     profile_path = _write_profile(tmp_path)
     raw = json.loads(profile_path.read_text(encoding="utf-8"))
@@ -592,3 +634,88 @@ def test_localizer_backend_auto_detects_edm_bundle_name() -> None:
     assert app.resolve_localizer_backend("auto", Path("your_site_reloc_map_edm.pt")) == "edm"
     assert app.resolve_localizer_backend("auto", Path("current_reloc_map_updated_v3.pt")) == "xfeat"
     assert app.resolve_localizer_backend("edm", Path("anything.pt")) == "edm"
+
+
+def _approved_profile(root: Path) -> Path:
+    """A profile that passes every readiness gate, so one removal shows up alone."""
+    profile_path = _write_profile(root)
+    assets = root / "assets"
+    (assets / "refs.json").write_bytes(b"x")
+    (assets / "edm.json").write_bytes(b"x")
+    (assets / "T_align_gravity.json").write_bytes(b"x")
+    raw = json.loads(profile_path.read_text(encoding="utf-8"))
+    raw["schema_version"] = 2
+    raw["localizer"] = "edm"
+    raw["localizer_profile"] = "assets/edm.json"
+    raw["map_reference_poses"] = "assets/refs.json"
+    raw["map_align"] = "assets/T_align_gravity.json"
+    raw["asset_sha256"] = {
+        "map_ply": "a" * 64,
+        "localization_bundle": "b" * 64,
+        "route_json": "c" * 64,
+        "map_reference_poses": "d" * 64,
+        "localizer_profile": "e" * 64,
+        "map_align": "f" * 64,
+    }
+    raw["flight"] = {
+        "approved": True,
+        "coordinate_frame_id": "test-frame-v1",
+        "route_clearance_approved": True,
+        "approval_note": "test",
+        "controller": {
+            "model": "scale_free_direction_speed_guard_v1",
+            "speed_limit_mps": 0.30,
+            "pose_max_age_ms": 500,
+            "speed_max_age_ms": 500,
+            "command_ttl_ms": 150,
+            "yaw_tolerance_deg": 3.0,
+            "lookahead_map_units": 0.8,
+            "rejoin_tolerance_map_units": 0.45,
+            "arrival_tolerance_map_units": 0.15,
+            "inspect_radius_map_units": 0.75,
+            "inspect_resume_margin_map_units": 0.25,
+            "max_pose_jump_map_units": 1.5,
+            "max_route_deviation_map_units": 3.0,
+            "progress_jump_slack_map_units": 1.5,
+            "max_progress_regression_map_units": 0.2,
+            "progress_speed_factor": 2.0,
+            # Axis INDICES: this schema can only express axis-aligned frames, which
+            # is why the measured rotation lives in map_align instead.
+            "horizontal_axes": [0, 2],
+            "vertical_axis": 1,
+            "camera_to_body_yaw_deg": 0.0,
+            "body_right_sign": 1,
+            "segment_window": 2,
+            "inspect_waypoints": [],
+        },
+    }
+    profile_path.write_text(json.dumps(raw), encoding="utf-8")
+    return profile_path
+
+
+def test_autonomous_flight_requires_a_measured_map_alignment(tmp_path: Path) -> None:
+    """Without it the controller silently assumes GLOMAP -Y is up.
+
+    Every site measured so far is 1.99 to 22.51 degrees away from that guess, which
+    tilts the horizontal plane every commanded body axis is decomposed against.
+    """
+    profile_path = _approved_profile(tmp_path)
+    assert not any("map_align" in item
+                   for item in flight_readiness_errors(load_site_profile(profile_path)))
+
+    raw = json.loads(profile_path.read_text(encoding="utf-8"))
+    del raw["map_align"]
+    profile_path.write_text(json.dumps(raw), encoding="utf-8")
+
+    errors = flight_readiness_errors(load_site_profile(profile_path))
+    assert any("missing map_align" in item for item in errors), errors
+
+
+def test_autonomous_flight_requires_the_alignment_to_be_hash_pinned(tmp_path: Path) -> None:
+    profile_path = _approved_profile(tmp_path)
+    raw = json.loads(profile_path.read_text(encoding="utf-8"))
+    del raw["asset_sha256"]["map_align"]
+    profile_path.write_text(json.dumps(raw), encoding="utf-8")
+
+    errors = flight_readiness_errors(load_site_profile(profile_path))
+    assert any("asset_sha256.map_align" in item for item in errors), errors

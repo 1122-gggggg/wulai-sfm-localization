@@ -24,7 +24,9 @@ import os
 import bpy
 import numpy as np
 
-ROOT = os.environ.get("SFM_MAP_ROOT", "/media/cihcilab/新增磁碟區/sfm_glomap")
+ROOT = os.environ.get("SFM_MAP_ROOT", "").strip()
+if not ROOT:
+    raise RuntimeError("SFM_MAP_ROOT must explicitly select the authoring workspace")
 PATH_JSON = os.environ.get("SFM_FLIGHT_PATH_JSON", f"{ROOT}/safezone/flight_path.json")
 ALT_STEP = 0.25
 ALT_STEP_BIG = 1.0

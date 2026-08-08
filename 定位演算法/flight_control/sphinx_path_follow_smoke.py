@@ -66,7 +66,7 @@ class TelemetryPoseSource:
 
 
 def wait_success(expectation, label: str) -> None:
-    res = expectation.wait()
+    res = expectation.wait(_timeout=20)
     if hasattr(res, "success") and not res.success():
         raise SystemExit(f"{label} failed or timed out")
 
@@ -163,7 +163,6 @@ def main() -> int:
         save_path(path, Path(args.path_out), args.pattern)
 
         cfg = rpf.ControlConfig(
-            speed=0.7,
             lookahead=0.6,
             rejoin_tol=0.75,
             arrive=0.35,
@@ -203,7 +202,7 @@ def main() -> int:
         except Exception:
             pass
         try:
-            drone(Landing()).wait()
+            drone(Landing()).wait(_timeout=20)
         except Exception as exc:
             print(f"[sphinx-smoke] warning: Landing failed: {exc}", flush=True)
         drone.disconnect()

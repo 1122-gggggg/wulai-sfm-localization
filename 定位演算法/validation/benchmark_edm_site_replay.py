@@ -42,6 +42,51 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def camera_identity(camera) -> dict[str, object]:
+    return {
+        "model": str(camera.model),
+        "width": int(camera.width),
+        "height": int(camera.height),
+        "params": [float(value) for value in camera.params],
+    }
+
+
+def baseline_identity_failures(
+    baseline: dict,
+    *,
+    video_sha256: str,
+    site_profile_sha256: str,
+    bundle_sha256: str,
+    localizer_profile_sha256: str,
+    camera: dict[str, object],
+) -> list[str]:
+    """Fail closed unless a quality baseline names the exact replay inputs."""
+    failures: list[str] = []
+    required = {
+        "video_sha256": video_sha256,
+        "site_profile_sha256": site_profile_sha256,
+        "bundle_sha256": bundle_sha256,
+        "localizer_profile_sha256": localizer_profile_sha256,
+    }
+    for key, actual in required.items():
+        expected = baseline.get(key)
+        if not isinstance(expected, str) or len(expected) != 64:
+            failures.append(f"baseline is missing {key}")
+        elif expected != actual:
+            failures.append(f"{key} mismatch: expected={expected} actual={actual}")
+    expected_camera = baseline.get("camera")
+    if not isinstance(expected_camera, dict):
+        failures.append("baseline is missing camera identity")
+    else:
+        for key in ("model", "width", "height", "params"):
+            if expected_camera.get(key) != camera.get(key):
+                failures.append(
+                    f"camera {key} mismatch: expected={expected_camera.get(key)!r} "
+                    f"actual={camera.get(key)!r}"
+                )
+    return failures
+
+
 def percentile(values: list[float], value: float) -> float | None:
     finite = [float(item) for item in values if math.isfinite(float(item))]
     if not finite:
@@ -193,6 +238,25 @@ def main() -> int:
         site.query_camera.height,
         list(site.query_camera.params),
     )
+    site_profile_sha256 = sha256_file(site_path)
+    video_sha256 = sha256_file(video_path)
+    camera = camera_identity(site.query_camera)
+    quality_baseline = None
+    if args.quality_baseline is not None:
+        baseline_path = args.quality_baseline.expanduser().resolve()
+        quality_baseline = json.loads(baseline_path.read_text(encoding="utf-8"))
+        if not isinstance(quality_baseline, dict):
+            raise SystemExit("quality baseline must be a JSON object")
+        identity_failures = baseline_identity_failures(
+            quality_baseline,
+            video_sha256=video_sha256,
+            site_profile_sha256=site_profile_sha256,
+            bundle_sha256=str(site.asset_sha256.localization_bundle or ""),
+            localizer_profile_sha256=str(site.asset_sha256.localizer_profile or ""),
+            camera=camera,
+        )
+        if identity_failures:
+            raise SystemExit("quality baseline identity mismatch: " + "; ".join(identity_failures))
     startup_started = time.perf_counter()
     built = build_production_localizer(
         backend="edm",
@@ -372,18 +436,9 @@ def main() -> int:
         "processing_s": processing_s,
         "processing_fps": len(rows) / processing_s if processing_s > 0.0 else 0.0,
     }
-    quality_baseline = None
     quality_failures: list[str] = []
     if args.quality_baseline is not None:
-        baseline_path = args.quality_baseline.expanduser().resolve()
-        quality_baseline = json.loads(baseline_path.read_text(encoding="utf-8"))
-        expected_video_sha = str(quality_baseline.get("video_sha256") or "")
-        actual_video_sha = sha256_file(video_path)
-        if expected_video_sha and expected_video_sha != actual_video_sha:
-            raise SystemExit(
-                "quality baseline video SHA-256 mismatch: "
-                f"expected={expected_video_sha} actual={actual_video_sha}"
-            )
+        assert quality_baseline is not None
         quality_failures = evaluate_quality(summary, quality_baseline)
     if args.accept_known_incomplete and quality_baseline is None:
         raise SystemExit("--accept-known-incomplete requires --quality-baseline")
@@ -402,13 +457,14 @@ def main() -> int:
     result = {
         "schema": "edm-site-replay/v1",
         "site_profile": str(site_path),
-        "site_profile_sha256": sha256_file(site_path),
+        "site_profile_sha256": site_profile_sha256,
         "video": str(video_path),
-        "video_sha256": sha256_file(video_path),
+        "video_sha256": video_sha256,
         "bundle": str(site.localization_bundle),
         "bundle_sha256": site.asset_sha256.localization_bundle,
         "localizer_profile": str(site.localizer_profile),
         "localizer_profile_sha256": site.asset_sha256.localizer_profile,
+        "camera": camera,
         "device": built.device,
         "cuda_name": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
         "tracker_variant": built.variant,

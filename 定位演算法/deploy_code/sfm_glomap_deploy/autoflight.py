@@ -25,7 +25,6 @@ from __future__ import annotations
 
 import argparse
 import math
-import os
 import signal
 import time
 from dataclasses import dataclass, field
@@ -229,23 +228,13 @@ def run(loc: Localizer, det: PoleDetector, ctrl: AutoFlight, dry_run=False, sim=
 
     steps = 0
     try:
-        # connect + takeoff INSIDE the try so a failure still runs the finally cleanup.
+        # The retired real-flight entrypoint is permanently disabled. Dry-run
+        # remains available for controller logic checks without Olympe.
         if not dry_run:
-            if os.environ.get("SFM_ALLOW_LEGACY_FLIGHT") != "1":
-                raise SystemExit(
-                    "autoflight.py is a legacy real-flight entrypoint. "
-                    "Use sfm_system/operator_pipeline.py mission --mode fly, or set "
-                    "SFM_ALLOW_LEGACY_FLIGHT=1 only for controlled legacy testing."
-                )
-            import olympe
-            from olympe.messages.ardrone3.Piloting import TakeOff, PCMD
-            from olympe.messages.ardrone3.PilotingState import FlyingStateChanged
-            drone = olympe.Drone(DRONE_IP); drone.connect()
-            print("[auto] takeoff")
-            res = drone(TakeOff() >> FlyingStateChanged(state="hovering", _timeout=12)).wait()
-            if hasattr(res, "success") and not res.success():
-                raise SystemExit("legacy autoflight takeoff/hovering failed")
-            airborne = True
+            raise SystemExit(
+                "autoflight.py legacy TakeOff is permanently locked; "
+                "use the operator-approved flight path instead"
+            )
 
         while not stop["f"]:
             t0 = time.monotonic()
@@ -278,10 +267,11 @@ def run(loc: Localizer, det: PoleDetector, ctrl: AutoFlight, dry_run=False, sim=
                 print("[auto] landing")
                 try:
                     send(0, 0, 0, 0)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    print(f"[auto] zero PCMD before landing FAILED: {exc!r}",
+                          flush=True)
                 try:
-                    res = drone(Landing()).wait()
+                    res = drone(Landing()).wait(_timeout=20)
                     if hasattr(res, "success") and not res.success():
                         print("[auto] warning: legacy autoflight landing did not report success")
                 except (Exception, SystemExit) as exc:

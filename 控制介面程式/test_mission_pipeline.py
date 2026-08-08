@@ -14,6 +14,8 @@ CONTROL_ROOT = Path(__file__).resolve().parent
 if str(CONTROL_ROOT) not in sys.path:
     sys.path.insert(0, str(CONTROL_ROOT))
 
+from site_profile import _load_flight_controller  # noqa: E402
+
 SPEC = importlib.util.spec_from_file_location(
     "mission_pipeline_under_test", CONTROL_ROOT / "mission_pipeline.py"
 )
@@ -76,6 +78,25 @@ def _scale_free_controller() -> dict:
         "progress_speed_factor": 2.0,
         "inspect_waypoints": [],
     }
+
+
+@pytest.mark.parametrize(
+    ("field", "unsafe"),
+    [
+        ("speed_limit_mps", 2.01),
+        ("lookahead_map_units", 5.01),
+        ("max_pose_jump_map_units", 5.01),
+        ("max_route_deviation_map_units", 10.01),
+    ],
+)
+def test_site_controller_rejects_values_outside_the_safety_envelope(
+    field: str, unsafe: float, tmp_path: Path,
+) -> None:
+    controller = _scale_free_controller()
+    controller[field] = unsafe
+
+    with pytest.raises(ValueError, match=field):
+        _load_flight_controller(controller, tmp_path / "site.json")
 
 
 def test_operational_mode_requires_site_profile():
@@ -163,7 +184,8 @@ def test_scale_free_flight_contract_exports_no_map_scale_and_verifies_hashes(tmp
     bundle = tmp_path / "bundle.pt"
     reference_poses = tmp_path / "reference_poses.json"
     localizer_profile = tmp_path / "edm.json"
-    for path in (map_ply, bundle, reference_poses, localizer_profile):
+    map_align = tmp_path / "T_align_gravity.json"
+    for path in (map_ply, bundle, reference_poses, localizer_profile, map_align):
         path.write_bytes(b"x")
     route = tmp_path / "route.json"
     route.write_text(json.dumps({
@@ -188,6 +210,7 @@ def test_scale_free_flight_contract_exports_no_map_scale_and_verifies_hashes(tmp
         "localizer": "edm",
         "localizer_profile": "edm.json",
         "map_reference_poses": "reference_poses.json",
+        "map_align": "T_align_gravity.json",
         "query_camera": {
             "model": "PINHOLE",
             "width": 1280,
@@ -198,6 +221,7 @@ def test_scale_free_flight_contract_exports_no_map_scale_and_verifies_hashes(tmp
             "localization_bundle": digest(bundle),
             "route_json": digest(route),
             "map_reference_poses": digest(reference_poses),
+            "map_align": digest(map_align),
             "localizer_profile": digest(localizer_profile),
         },
         "flight": {
@@ -241,6 +265,74 @@ def test_scale_free_flight_contract_exports_no_map_scale_and_verifies_hashes(tmp
 def test_autonomous_route_flight_is_unconditionally_external_approval_locked():
     with pytest.raises(ValueError, match="LOCKED pending external approval"):
         mission_pipeline.validate_profile_for_flight(SimpleNamespace())
+
+
+def test_shadow_readiness_verifies_pinned_assets_without_granting_flight_approval(
+    tmp_path: Path,
+) -> None:
+    paths = {
+        "map_ply": tmp_path / "map.ply",
+        "localization_bundle": tmp_path / "bundle.pt",
+        "map_reference_poses": tmp_path / "reference_poses.json",
+        "map_align": tmp_path / "T_align_gravity.json",
+        "localizer_profile": tmp_path / "edm.json",
+    }
+    for path in paths.values():
+        path.write_bytes(path.name.encode("utf-8"))
+    route = tmp_path / "route.json"
+    route.write_text(json.dumps({
+        "schema": "sfm-flight-route/v1",
+        "site_id": "alpha",
+        "coordinate_frame_id": "alpha-frame-v1",
+        "frame": "glomap",
+        "units": "map",
+        "purpose": "flight",
+        "closed": False,
+        "waypoints": [[0, 0, 0], [1, 0, 0]],
+    }), encoding="utf-8")
+
+    def digest(path: Path) -> str:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+
+    profile = SimpleNamespace(
+        schema_version=2,
+        site_id="alpha",
+        localizer="edm",
+        map_ply=paths["map_ply"],
+        localization_bundle=paths["localization_bundle"],
+        route_json=route,
+        map_reference_poses=paths["map_reference_poses"],
+        map_align=paths["map_align"],
+        localizer_profile=paths["localizer_profile"],
+        query_camera=SimpleNamespace(
+            model="PINHOLE", width=1280, height=720, params=(900, 900, 640, 360),
+        ),
+        poles_json=None,
+        hardware_approval=None,
+        flight=SimpleNamespace(
+            approved=False,
+            coordinate_frame_id="alpha-frame-v1",
+            route_clearance_approved=False,
+            approval_note="shadow only",
+            controller=None,
+        ),
+        asset_sha256=SimpleNamespace(
+            map_ply=digest(paths["map_ply"]),
+            localization_bundle=digest(paths["localization_bundle"]),
+            route_json=digest(route),
+            map_reference_poses=digest(paths["map_reference_poses"]),
+            map_align=digest(paths["map_align"]),
+            localizer_profile=digest(paths["localizer_profile"]),
+            poles_json=None,
+        ),
+    )
+
+    assert mission_pipeline.shadow_readiness_errors(profile) == []
+    blockers = mission_pipeline.shadow_authorization_blockers(profile)
+    assert "flight.approved is false" in blockers
+    assert "flight.route_clearance_approved is false" in blockers
+    assert "missing flight.controller" in blockers
+    assert "missing hardware_approval receipt" in blockers
 
 
 @pytest.mark.parametrize(
@@ -297,6 +389,7 @@ def test_flight_profile_rejects_invalid_pycolmap_camera_before_launch(
         ),
         route_json=tmp_path / "route.json",
         map_reference_poses=tmp_path / "refs.json",
+        map_align=tmp_path / "T_align_gravity.json",
         localization_bundle=tmp_path / "bundle.pt",
         localizer_profile=tmp_path / "edm.json",
         poles_json=None,
@@ -304,6 +397,7 @@ def test_flight_profile_rejects_invalid_pycolmap_camera_before_launch(
             localization_bundle="a" * 64,
             route_json="b" * 64,
             map_reference_poses="c" * 64,
+            map_align="e" * 64,
             localizer_profile="d" * 64,
             poles_json=None,
         ),
@@ -331,6 +425,7 @@ def test_inspection_flight_contract_requires_hashed_poles() -> None:
         localizer="edm",
         route_json=Path("route.json"),
         map_reference_poses=Path("refs.json"),
+        map_align=Path("T_align_gravity.json"),
         query_camera=SimpleNamespace(
             model="PINHOLE",
             width=1280,
@@ -343,6 +438,7 @@ def test_inspection_flight_contract_requires_hashed_poles() -> None:
             localization_bundle="a" * 64,
             route_json="b" * 64,
             map_reference_poses="c" * 64,
+            map_align="e" * 64,
             localizer_profile="d" * 64,
             poles_json=None,
         ),
@@ -373,6 +469,7 @@ def test_approved_flight_profile_rejects_tampered_asset(tmp_path, monkeypatch):
         ),
         route_json=tmp_path / "route.json",
         map_reference_poses=tmp_path / "refs.json",
+        map_align=tmp_path / "T_align_gravity.json",
         localization_bundle=tmp_path / "bundle.pt",
         localizer_profile=tmp_path / "edm.json",
         poles_json=None,
@@ -380,6 +477,7 @@ def test_approved_flight_profile_rejects_tampered_asset(tmp_path, monkeypatch):
             localization_bundle="0" * 64,
             route_json="0" * 64,
             map_reference_poses="0" * 64,
+            map_align="0" * 64,
             localizer_profile="0" * 64,
             poles_json=None,
         ),

@@ -17,6 +17,27 @@ def test_current_manifest_excludes_imported_assets_and_runtime_caches() -> None:
     assert included(Path("控制介面程式/影片模擬串流/啟動.sh"))
 
 
+def test_manifest_excludes_editor_and_transient_release_files() -> None:
+    for path in (
+        Path(".vscode/settings.json"),
+        Path(".idea/workspace.xml"),
+        Path("notes.swp"),
+        Path("notes~"),
+        Path("report.tmp"),
+        Path(".DS_Store"),
+        Path("audit/final_validation.md"),
+        Path(".cursor/session.json"),
+        Path("env/bin/python"),
+    ):
+        assert not included(path)
+
+
+def test_release_tools_have_one_authoritative_implementation() -> None:
+    root = Path(__file__).resolve().parents[1]
+    assert not (root / "執行環境/tools/package_manifest.py").exists()
+    assert not (root / "定位演算法/sync_mirror_check.sh").exists()
+
+
 def test_manifest_round_trip(tmp_path: Path) -> None:
     (tmp_path / "a.txt").write_text("a", encoding="utf-8")
     (tmp_path / "nested").mkdir()

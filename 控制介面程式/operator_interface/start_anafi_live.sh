@@ -22,6 +22,16 @@ if [[ "$DRY_RUN" != "0" && "$DRY_RUN" != "1" ]]; then
   echo "[start] ERROR: SFM_LAUNCH_DRY_RUN must be 0 or 1" >&2
   exit 2
 fi
+if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+  cat <<'EOF'
+用法: ./start_anafi_live.sh [flight_operator_app.py 的真機選項]
+
+此入口只會啟動 real-flight Olympe 介面，禁止傳入 --video 或
+--interface simulated-stream。它可能連線 SkyController/ANAFI；離線檢查請使用：
+  控制介面程式/影片模擬串流/選擇啟動.sh
+EOF
+  exit 0
+fi
 export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
 source "$OI/resolve_display.sh"
 configure_operator_display "$DRY_RUN"
@@ -89,7 +99,17 @@ else
     exit 2
   fi
 fi
+if [[ "$DRY_RUN" != "1" ]]; then
+  UI_VENV_CFG="$(dirname "$(dirname "$UI_PYTHON")")/pyvenv.cfg"
+  if [[ -f "$UI_VENV_CFG" ]] \
+     && grep -qi '^include-system-site-packages[[:space:]]*=[[:space:]]*true' "$UI_VENV_CFG"; then
+    echo "[start] ERROR: real-flight refuses include-system-site-packages=true: $UI_VENV_CFG" >&2
+    echo "[start] Rebuild a clean CPython 3.10 venv with tools/install_runtime.sh" >&2
+    exit 2
+  fi
+fi
 export PYTHONUNBUFFERED=1
+export PYTHONNOUSERSITE=1
 
 target_reachable() {
   local target="$1"
@@ -210,6 +230,15 @@ fi
 if [[ -n "${LOC_EVERY_N:-}" ]]; then
   EXTRA+=(--loc-every-n-frames "${LOC_EVERY_N}")
 fi
+# The distance geofence is deliberately NOT passed as a flag here. --distance-geofence
+# defaults to env_bool("SFM_DISTANCE_GEOFENCE", False) in flight_operator_app, so
+# leaving it off the command line keeps the same OFF default while letting
+# SFM_DISTANCE_GEOFENCE=1 actually turn it on -- an explicit flag beat the env
+# every time, which made the switch the --help text advertises unreachable from
+# this launcher. Pass --distance-geofence after the script name to force it on.
+if [[ -n "${SFM_DISTANCE_GEOFENCE:-}" ]]; then
+  echo "[start] SFM_DISTANCE_GEOFENCE=${SFM_DISTANCE_GEOFENCE} (NoFlyOverMaxDistance)"
+fi
 CMD_PREFIX=()
 if [[ "$MAX_PERFORMANCE" == "1" ]]; then
   GAMEMODE_RUN="$(command -v gamemoderun || true)"
@@ -226,7 +255,8 @@ CMD=(
   --no-live-detect
   --max-altitude-m "${SFM_MAX_ALTITUDE_M:-50}"
   --max-distance-m "${SFM_MAX_DISTANCE_M:-100}"
-  --distance-geofence
+  --rth-min-altitude-m "${SFM_RTH_MIN_ALTITUDE_M:-5.0}"
+  --stream-loss-grace-s "${SFM_STREAM_LOSS_GRACE_S:-10.0}"
   --nudge-pct "${NUDGE_PCT:-8}"
   --nudge-pulse-s "${NUDGE_PULSE_S:-0.20}"
   "${EXTRA[@]}"

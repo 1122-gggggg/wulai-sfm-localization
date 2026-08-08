@@ -4,6 +4,7 @@ from __future__ import annotations
 import importlib.metadata
 import ipaddress
 import json
+import math
 import os
 import platform
 import shutil
@@ -29,6 +30,7 @@ RETENTION_MAX_AGE_DAYS = 30
 
 _ELIGIBLE_LOG_NAMES = {
     "localization.jsonl",
+    "telemetry.jsonl",
     "performance.jsonl",
     "video_metrics.jsonl",
 }
@@ -49,8 +51,15 @@ _INCIDENT_EVENTS = {
     "rth",
     "runtime_safety",
     "runtime_safety_latched",
+    "runtime_safety_exception",
+    "runtime_safety_rearmed",
+    "distance_guard",
+    "distance_guard_unavailable",
     "worker_exit",
     "worker_stall",
+    "backend_poll_failed",
+    "diagnostic_write_failed",
+    "legacy_takeoff_rejected",
     "logging_failed",
     "disk_critical",
     "cleanup_begin",
@@ -252,6 +261,22 @@ class _JsonlSink:
         self._handle = path.open("a", encoding="utf-8", buffering=1)
         self.healthy = True
         self.last_error = ""
+        self.durable = False
+        try:
+            # A durable property is only truthful after the kernel accepted an
+            # fsync on this exact sink.  The probe also makes a fresh session
+            # fail closed before its first safety command is issued.
+            self._handle.flush()
+            os.fsync(self._handle.fileno())
+            self.durable = True
+        except Exception as exc:
+            self.healthy = False
+            self.last_error = repr(exc)
+            print(
+                f"[session-log] durability probe failed path={self.path}: {exc!r}",
+                file=sys.stderr,
+                flush=True,
+            )
 
     def write(self, value: dict[str, Any]) -> bool:
         if not self.healthy:
@@ -259,9 +284,12 @@ class _JsonlSink:
         try:
             self._handle.write(json.dumps(value, ensure_ascii=False) + "\n")
             self._handle.flush()
+            os.fsync(self._handle.fileno())
+            self.durable = True
             return True
         except Exception as exc:
             self.healthy = False
+            self.durable = False
             self.last_error = repr(exc)
             print(
                 f"[session-log] write failed path={self.path}: {exc!r}",
@@ -275,6 +303,7 @@ class _JsonlSink:
             self._handle.close()
         except Exception as exc:
             self.healthy = False
+            self.durable = False
             self.last_error = repr(exc)
 
 
@@ -284,11 +313,14 @@ class SessionCommandLog:
     def __init__(self, session: "SessionLogs"):
         self._session = session
         self.path = session.directory / "commands.jsonl"
-        self.durable = True
 
     @property
     def healthy(self) -> bool:
         return self._session.healthy
+
+    @property
+    def durable(self) -> bool:
+        return self._session.durable
 
     def event(self, event: str, **fields: Any) -> None:
         self._session.command(event, **fields)
@@ -309,6 +341,8 @@ class SessionLogs:
         self._closed = False
         self._inventory_error: str | None = None
         self._counts = {name: 0 for name in self.REQUIRED_STREAMS}
+        self._latency_samples_ms: list[float] = []
+        self._unresolved_incidents: set[str] = set()
         self._sinks = {
             name: _JsonlSink(directory / f"{name}.jsonl")
             for name in self.REQUIRED_STREAMS
@@ -354,7 +388,10 @@ class SessionLogs:
 
     @property
     def durable(self) -> bool:
-        return True
+        return (
+            self._inventory_error is None
+            and all(sink.durable for sink in self._sinks.values())
+        )
 
     def write_inventory(self, kind: str, inventory: dict[str, Any]) -> bool:
         """Write one immutable hardware or video inventory receipt."""
@@ -390,6 +427,20 @@ class SessionLogs:
         ok = self._sinks[stream].write(_record(event, fields))
         if ok:
             self._counts[stream] += 1
+            for key in (
+                "e2e_submit_to_ui_ms",
+                "e2e_ms",
+                "wall_ms",
+                "core_wall_ms",
+            ):
+                value = fields.get(key)
+                try:
+                    value = float(value)
+                except (TypeError, ValueError):
+                    continue
+                if math.isfinite(value) and value >= 0.0:
+                    self._latency_samples_ms.append(value)
+                    break
         return ok
 
     def command(self, event: str, **fields: Any) -> bool:
@@ -402,11 +453,21 @@ class SessionLogs:
         return self._write("telemetry", event, fields)
 
     def incident(self, event: str, **fields: Any) -> bool:
+        if fields.get("resolved") is True:
+            self._unresolved_incidents.discard(str(event))
+        else:
+            self._unresolved_incidents.add(str(event))
         return self._write("incidents", event, fields)
 
     def close(self, *, reason: str, extra: dict[str, Any] | None = None) -> None:
         if self._closed:
             return
+        samples = sorted(self._latency_samples_ms)
+        p95 = None
+        maximum = None
+        if samples:
+            p95 = samples[min(len(samples) - 1, max(0, math.ceil(0.95 * len(samples)) - 1))]
+            maximum = samples[-1]
         summary = {
             "schema_version": 1,
             "session_id": self.directory.name,
@@ -415,10 +476,22 @@ class SessionLogs:
             "closed_utc": _utc_now(),
             "closed_mono_ns": time.monotonic_ns(),
             "event_counts": dict(self._counts),
+            "metrics": {
+                "p95_ms": p95,
+                "max_ms": maximum,
+                "sample_count": len(samples),
+            },
+            "p95_ms": p95,
+            "max_ms": maximum,
+            "unresolved": {
+                "count": len(self._unresolved_incidents),
+                "events": sorted(self._unresolved_incidents),
+            },
             "log_health": {
                 name: {
                     "healthy": sink.healthy,
                     "last_error": sink.last_error,
+                    "durable": sink.durable,
                 }
                 for name, sink in self._sinks.items()
             },
@@ -539,3 +612,90 @@ def install_network_guard(
     socket.getaddrinfo = guarded_getaddrinfo  # type: ignore[assignment]
     socket.create_connection = guarded_create_connection  # type: ignore[assignment]
     _NETWORK_GUARD_INSTALLED = True
+
+
+# ---------------------------------------------------------------------------
+# Manual vs autonomous authority
+#
+# Policy (operator decision, 2026-08-06): MANUAL flight does not require any
+# localization safety review -- the pilot is the control loop, and localization is
+# display-only. Switching to AUTONOMOUS makes localization the control input, so
+# every localization safety condition must hold before autonomy may be armed.
+#
+# This gate is deliberately fail-closed and takes a plain snapshot dict so it can be
+# unit-tested without a drone, a worker or a map.
+
+#: Localization states from which autonomy may be armed. BOOT_INIT / WEAK_TRACK /
+#: LOST all mean the fix is provisional or degraded.
+AUTONOMY_OK_LOC_STATES = frozenset({"TRACK"})
+
+#: Consecutive good fixes required before autonomy trusts the pose. Mirrors the
+#: flight loop's RECOVERY_GOOD_FIXES: one lucky frame is not a lock.
+AUTONOMY_MIN_CONSECUTIVE_FIXES = 2
+
+
+def autonomous_arming_blockers(snapshot: dict[str, Any]) -> list[str]:
+    """Return every reason autonomy may NOT be armed. Empty list == may arm.
+
+    Unknown/missing fields are treated as blocking: a gate that cannot see the
+    evidence must not conclude the evidence is good.
+    """
+    blockers: list[str] = []
+
+    def _num(key):
+        value = snapshot.get(key)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        return float(value) if math.isfinite(float(value)) else None
+
+    if snapshot.get("autonomous_locked", True):
+        blockers.append("autonomous route flight is locked pending external approval")
+    if not snapshot.get("localizer_ready", False):
+        blockers.append("localizer worker is not ready")
+    if not snapshot.get("profile_verified", False):
+        blockers.append(
+            "localizer profile was not verified (running on unpinned defaults)")
+    if snapshot.get("zoom_paused", False):
+        blockers.append("localization is paused by an uncalibrated camera zoom")
+
+    state = str(snapshot.get("loc_state") or "")
+    if state not in AUTONOMY_OK_LOC_STATES:
+        blockers.append(f"localization state {state or 'unknown'!s} is not TRACK")
+
+    age = _num("pose_age_s")
+    max_age = _num("max_pose_age_s")
+    if age is None or max_age is None:
+        blockers.append("pose age is unknown")
+    elif age > max_age:
+        blockers.append(f"pose is stale ({age:.2f}s > {max_age:.2f}s)")
+
+    inliers = _num("inliers")
+    min_inliers = _num("min_inliers")
+    if inliers is None or min_inliers is None:
+        blockers.append("PnP inlier count is unknown")
+    elif inliers < min_inliers:
+        blockers.append(f"PnP inliers {inliers:.0f} < {min_inliers:.0f}")
+
+    reproj = _num("reproj_rms")
+    max_reproj = _num("max_reproj_rms")
+    if reproj is None or max_reproj is None:
+        blockers.append("reprojection error is unknown")
+    elif reproj > max_reproj:
+        blockers.append(f"reprojection RMS {reproj:.2f} > {max_reproj:.2f}")
+
+    fixes = _num("consecutive_good_fixes")
+    if fixes is None or fixes < AUTONOMY_MIN_CONSECUTIVE_FIXES:
+        blockers.append(
+            f"needs {AUTONOMY_MIN_CONSECUTIVE_FIXES} consecutive good fixes "
+            f"(have {'unknown' if fixes is None else int(fixes)})"
+        )
+    return blockers
+
+
+def manual_flight_blockers(snapshot: dict[str, Any]) -> list[str]:
+    """Manual flight is NOT gated on localization — by explicit operator policy.
+
+    Present so the asymmetry is expressed in code rather than left implicit, and so a
+    regression that starts gating manual flight on localization is caught by a test.
+    """
+    return []

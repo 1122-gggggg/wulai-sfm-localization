@@ -1,6 +1,6 @@
 # 工作區完整稽核與優化清單
 
-初始稽核日期：2026-08-03；更新日期：2026-08-05。範圍：
+初始稽核日期：2026-08-03；更新日期：2026-08-07。範圍：
 `/home/allen/localization`。2026-08-05 經操作員明確授權，已永久刪除 35 組
 `__pycache__`、pytest／ruff cache、`執行環境/inductor_cache/`，以及原本位於
 `模擬器/封存/parrot_stimulate_standalone_20260803/` 的 7.5 GiB 舊獨立工作樹。
@@ -31,7 +31,7 @@
 - 沒有 broken symlink；EDM 工具包使用有效 symlink 指向唯一實作。研究候補方法
   直接由 `定位演算法/` 管理，不再建立頂層重複索引。
 - 8 組刻意保留的 runtime mirror 逐 byte 相同，並有測試阻止 drift。
-- 主測試 787 passed、1 skipped；Parrot Python 3.11 測試 86 passed，且本機固定
+- 主測試 820 passed、1 skipped；Parrot Python 3.11 測試 86 passed，且本機固定
   firmware manifest/SHA preflight 通過。
 - CUDA fail-closed、EDM checkpoint／bundle／profile SHA 與離線載入正常。
 
@@ -50,8 +50,9 @@
 
 ### P2：分階段重構
 
-1. `flight_operator_app.py` 約 6162 行，宜依「影片 source／worker client／metrics／
-   rendering」拆模組；飛行按鍵、Esc、關窗、PCMD 與起降語意必須保持不動並先補
+1. `flight_operator_app.py` 約 7058 行。場域資產面板與自製航線編輯器已拆出
+   model／controller／window；剩餘內容仍宜依「影片 source／worker client／metrics／
+   rendering」分階段拆模組。飛行按鍵、Esc、關窗、PCMD 與起降語意必須保持不動並先補
    characterization tests。
 2. `olympe_live_backend.py` 約 2768 行，宜先抽出純 read-only telemetry formatting
    與 inventory，再考慮 command dispatch；安全命令不可順手重構。
@@ -67,6 +68,9 @@
 ### P3：可維護性
 
 - 模擬影片改為工作區內可携式自動選擇：P119 固定 SHA 優先，只有一部影片時自動選用，多部時要求 `VIDEO=` 明確指定。
+- 操作 UI 已改用自製航線編輯器，但 `控制介面程式/authoring/` 的舊 Blender／獨立繪圖工具
+  仍被 `mission_pipeline.py` 與 `mission_configs/mission_defaults.json` 引用，且部分預設路徑是舊機器的
+  `/media/...`。這些是明確的 legacy 遷移項目，在 mission pipeline 移除對應指令前不可直接刪除。
 - `path_follow_flight.py` 尚有 `/home/allen/足球場` legacy fallback；自主飛行鎖定解除
   前應移除，但目前不可在缺少現場核准時順便改飛控。
 - CodeGraph、pytest、ruff cache 都是可重建資料；只在磁碟緊急且沒有程序使用時清理。
@@ -74,6 +78,8 @@
 ## 本輪整理
 
 - 新增 `tools/workspace_audit.py`，唯讀檢查目錄、入口、symlink、output 分類、容量與磁碟。
+- 場域資產 UI 已分為 panel／actions／interfaces／local provider，航線編輯器另分為
+  model／controller／window，不持有 Olympe backend 或飛行指令接口。
 - 新增根目錄 `requirements.txt`、`tools/install_runtime.sh` 與 `tools/simulator_preflight.py`，統一搬移環境、資產與影片啟動前檢查。
 - `outputs/README.md` 補上 session、validation receipt、P119 與命名／retention 規則。
 - 建立 `文件/` 作為架構、Spec 與稽核的唯一索引；驗證實作與測試收入 `tools/`。
@@ -88,3 +94,12 @@
 python tools/workspace_audit.py --strict-output-names
 ./驗證系統.sh
 ```
+
+## 2026-08-07 執行契約補充
+
+本文件上方的 2026-08-05 容量數字是當次稽核的歷史觀測，不代表目前主機容量。
+現在由 `tools/workspace_audit.py` 以唯讀方式重新計算：`audit_YYYYMMDD` 目錄歸類
+為 governance／稽核證據；workspace 總量超過 20 GiB 或檔案系統可用空間低於 15%
+時，各自輸出明確 `WARNING`，不自動刪除資料，也不把 warning 誤報成通過 release。
+低容量時應停止建立大型驗證產物並由操作員處理；請以該次 audit receipt 的
+`workspace_size_bytes`、`storage_warnings` 與可用空間觀測為準，不沿用上述歷史數字。

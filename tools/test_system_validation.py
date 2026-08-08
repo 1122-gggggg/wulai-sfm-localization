@@ -89,6 +89,9 @@ def test_portable_output_is_verified_and_bound_to_source(tmp_path: Path) -> None
         "manifest_sha256": module._sha256(module.ROOT / "MANIFEST.tsv"),
         "sha256sums_sha256": module._sha256(module.ROOT / "SHA256SUMS"),
     }
+    source_release.update(
+        {"commit": "deadbeef", "version": "release-deadbeef", "dirty": False}
+    )
     (package / "PORTABLE_PACKAGE.json").write_text(
         json.dumps({"source_release": source_release}), encoding="utf-8"
     )
@@ -149,3 +152,64 @@ def test_actual_portable_gets_clean_install_and_valid_pose_gate(tmp_path: Path) 
     gate = steps["portable_clean_install_ui_pose"]
     assert gate.argv[-1] == str(package.resolve())
     assert gate.timeout_s == 3600
+
+
+def test_system_validation_has_a_read_only_hardware_receipt_step() -> None:
+    module = _load_validation_module()
+    steps = {
+        step.name: step
+        for step in module._steps(
+            p119=False,
+            accept_p119=False,
+            p119_quality=False,
+            quality_out=None,
+        )
+    }
+    hardware = steps["hardware_snapshot"]
+    assert "monitor_hardware.py" in " ".join(hardware.argv)
+    assert "--output" in hardware.argv
+    assert hardware.argv[hardware.argv.index("--output") + 1] == "-"
+    assert "--samples" in hardware.argv
+    assert hardware.timeout_s <= 120
+
+
+def test_simulator_preflight_receipt_includes_collision_monitor_policy() -> None:
+    module = _load_validation_module()
+    steps = {
+        step.name: step
+        for step in module._steps(
+            p119=False,
+            accept_p119=False,
+            p119_quality=False,
+            quality_out=None,
+        )
+    }
+    preflight = steps["portable_simulator_preflight"]
+    assert "--json" in preflight.argv
+
+
+def test_dirty_release_is_failed_unless_development_opt_out(monkeypatch) -> None:
+    module = _load_validation_module()
+    monkeypatch.setattr(
+        module,
+        "_git_metadata",
+        lambda: {"commit": "deadbeef", "version": "release-deadbeef", "dirty": True, "changed_path_count": 1},
+    )
+    assert module._release_gate(module._git_metadata(), allow_dirty=False)["passed"] is False
+    assert module._release_gate(module._git_metadata(), allow_dirty=True)["passed"] is True
+
+
+def test_pytest_summary_records_conditional_skips_for_receipts() -> None:
+    module = _load_validation_module()
+    summary = module._pytest_summary(
+        "test_a.py::test_ok PASSED\n"
+        "================ 2 passed, 3 skipped, 1 warning in 0.4s ================\n",
+    )
+
+    assert summary is not None
+    assert summary["passed"] == 2
+    assert summary["skipped"] == 3
+    assert summary["warnings"] == 1
+
+    fallback = module._pytest_summary("SKIPPED [3] optional CUDA test\n")
+    assert fallback is not None and fallback["skipped"] == 3

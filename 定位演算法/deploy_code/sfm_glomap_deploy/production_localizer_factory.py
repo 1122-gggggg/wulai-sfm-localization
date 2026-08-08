@@ -153,11 +153,24 @@ def build_production_localizer(
     production_profile_sha256: str | None = None,
     matcher_mode: str = "",
     local_topk: int = 0,
+    allow_profile_defaults: bool = False,
+    map_frame=None,
 ) -> BuiltLocalizer:
     """Build one verified production tracker without allocating models twice."""
     selected = str(backend).strip().lower()
     if selected not in {"edm", "xfeat"}:
         raise ValueError(f"unsupported production localizer backend: {backend!r}")
+    if not production_profile and not allow_profile_defaults:
+        # Falling back to the dataclass defaults is NOT neutral: they are calibrated
+        # for the target_site map scale, so another site silently gets much looser
+        # jump/radius gates, and no profile also means no SHA-256 verification of the
+        # quality thresholds actually in force. Require an explicit opt-in instead.
+        raise ValueError(
+            "a production localizer profile is required: without it the tracker "
+            "silently uses unverified built-in thresholds calibrated for a different "
+            "map scale. Pass production_profile=..., or set "
+            "allow_profile_defaults=True for a deliberate, non-flight experiment."
+        )
     camera_spec = validate_camera_tuple(camera_tuple)
 
     if selected == "edm":
@@ -200,6 +213,7 @@ def build_production_localizer(
             cfg=config,
             matcher=matcher,
             frame_source=frame_source,
+            map_frame=map_frame,
         )
         return BuiltLocalizer(
             tracker=tracker,
@@ -254,6 +268,7 @@ def build_production_localizer(
         frame_source=frame_source,
         query_cam=camera,
         cfg=config,
+        map_frame=map_frame,
     )
     return BuiltLocalizer(
         tracker=tracker,

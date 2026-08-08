@@ -4,16 +4,27 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
 import platform
+import re
 import shutil
 import subprocess
+import sys
 import time
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from release_contract import (  # noqa: E402
+    git_identity,
+    release_verdict,
+    sha256_file,
+    source_release_identity,
+    validate_source_release,
+)
+from simulator_preflight import _collision_monitor_status  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 ROOT_PYTHON = ROOT / ".venv/bin/python"
@@ -30,6 +41,16 @@ RELEASE_FILES = (
     "requirements.txt",
     "requirements-lock.txt",
     "requirements-test.txt",
+    "requirements-test-lock.txt",
+    "pytest.ini",
+    "pyproject.toml",
+    ".github/workflows/validation.yml",
+    ".gitignore",
+    "README.md",
+    "tools/README.md",
+    "文件/ARCHITECTURE.md",
+    "文件/SYSTEM_SPEC.md",
+    "文件/WORKSPACE_AUDIT.md",
     "執行環境/requirements_runtime.txt",
     "tools/install_runtime.sh",
     "tools/test_clean_install.sh",
@@ -38,6 +59,8 @@ RELEASE_FILES = (
     "tools/simulator_preflight.py",
     "tools/export_simulator_package.py",
     "tools/package_manifest.py",
+    "tools/release_contract.py",
+    "tools/release_activation.py",
     "控制介面程式/影片模擬串流/啟動.sh",
     "控制介面程式/影片模擬串流/選擇啟動.py",
     "控制介面程式/operator_interface/flight_operator_app.py",
@@ -47,6 +70,11 @@ RELEASE_FILES = (
     "定位演算法/deploy_code/sfm_glomap_deploy/edm_matcher.py",
     "定位演算法/deploy_code/sfm_glomap_deploy/reloc_localizer_edm.py",
     "定位演算法/deploy_code/runtime/EDM/weights/edm_outdoor.ckpt",
+    "定位演算法/validation/monitor_hardware.py",
+    "定位演算法/validation/check_runtime_mirrors.py",
+    "定位演算法/validation/benchmark_edm_site_replay.py",
+    "定位演算法/validation/benchmark_production_stream.py",
+    "定位演算法/validation/baselines/p119_edm_quality.json",
     "執行環境/torch_hub_cache/gmberton_MegaLoc_main/hubconf.py",
     "執行環境/torch_hub_cache/gmberton_MegaLoc_main/megaloc_model.py",
     "執行環境/torch_hub_cache/checkpoints/megaloc/7cb9f7970d366fdf059963d04d372e503e8e9df9/model.safetensors",
@@ -61,31 +89,94 @@ class Step:
     timeout_s: int
 
 
-def _sha256(path: Path) -> str:
-    value = hashlib.sha256()
-    with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(8 * 1024 * 1024), b""):
-            value.update(chunk)
-    return value.hexdigest()
+_PYTEST_COUNT_RE = re.compile(
+    r"(?<![A-Za-z0-9_])(\d+)\s+"
+    r"(passed|failed|skipped|xfailed|xpassed|error|errors|warning|warnings)\b",
+    re.IGNORECASE,
+)
+_PYTEST_RESULT_LABELS = {
+    "passed",
+    "failed",
+    "skipped",
+    "xfailed",
+    "xpassed",
+    "error",
+    "errors",
+}
+
+
+def _pytest_summary(output: str) -> dict[str, int] | None:
+    """Extract the last pytest result line for a machine-readable receipt."""
+    keys = ("passed", "failed", "skipped", "xfailed", "xpassed", "errors", "warnings")
+    for line in reversed(output.splitlines()):
+        matches = _PYTEST_COUNT_RE.findall(line)
+        if not matches or not any(
+            label.lower() in _PYTEST_RESULT_LABELS
+            for _count, label in matches
+        ):
+            continue
+        summary = dict.fromkeys(keys, 0)
+        for count, label in matches:
+            normalized = label.lower()
+            target = {
+                "passed": "passed",
+                "failed": "failed",
+                "skipped": "skipped",
+                "xfailed": "xfailed",
+                "xpassed": "xpassed",
+                "error": "errors",
+                "errors": "errors",
+                "warning": "warnings",
+                "warnings": "warnings",
+            }[normalized]
+            if target in summary:
+                summary[target] += int(count)
+        return summary
+
+    skipped = sum(
+        int(match.group(1) or 1)
+        for line in output.splitlines()
+        if (
+            match := re.match(
+                r"\s*SKIPPED(?:\s+\[(\d+)\])?(?:\s|$)", line, re.IGNORECASE
+            )
+        )
+    )
+    if skipped:
+        return {key: (skipped if key == "skipped" else 0) for key in keys}
+    return None
+
+
+_sha256 = sha256_file
 
 
 def _git_metadata() -> dict[str, object]:
-    def run(*args: str) -> str:
-        completed = subprocess.run(
-            ["git", *args], cwd=ROOT, capture_output=True, text=True, check=False
-        )
-        return completed.stdout.strip() if completed.returncode == 0 else ""
+    identity = git_identity(ROOT)
+    branch_result = subprocess.run(
+        ["git", "branch", "--show-current"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return {**identity, "branch": branch_result.stdout.strip()}
 
-    status = run("status", "--porcelain").splitlines()
+
+def _release_gate(git: dict[str, object], *, allow_dirty: bool) -> dict[str, object]:
+    issues = release_verdict(git, allow_dirty=allow_dirty)
     return {
-        "commit": run("rev-parse", "HEAD"),
-        "branch": run("branch", "--show-current"),
-        "dirty": bool(status),
-        "changed_path_count": len(status),
+        "mode": "development" if allow_dirty else "release",
+        "allow_dirty": allow_dirty,
+        "passed": not issues,
+        "failures": issues,
     }
 
 
-def _portable_metadata(package_root: Path) -> dict[str, object]:
+def _portable_metadata(
+    package_root: Path,
+    *,
+    expected_source_release: dict[str, object] | None = None,
+) -> dict[str, object]:
     package_root = package_root.expanduser().resolve()
     files: dict[str, object] = {}
     missing: list[str] = []
@@ -98,15 +189,24 @@ def _portable_metadata(package_root: Path) -> dict[str, object]:
         files[name] = {"size_bytes": path.stat().st_size, "sha256": _sha256(path)}
 
     source_matches = False
+    binding_issues: list[str] = []
     metadata_error = ""
     metadata_path = package_root / "PORTABLE_PACKAGE.json"
     if metadata_path.is_file():
         try:
             metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-            source_matches = metadata.get("source_release", {}) == {
+            source_release = metadata.get("source_release")
+            expected = expected_source_release or {
                 "manifest_sha256": _sha256(ROOT / "MANIFEST.tsv"),
                 "sha256sums_sha256": _sha256(ROOT / "SHA256SUMS"),
+                "commit": source_release.get("commit") if isinstance(source_release, dict) else None,
+                "version": source_release.get("version") if isinstance(source_release, dict) else None,
             }
+            if not isinstance(source_release, dict):
+                binding_issues.append("PORTABLE_PACKAGE.json has no source_release object")
+            else:
+                binding_issues = validate_source_release(source_release, expected=expected)
+            source_matches = not binding_issues
         except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
             metadata_error = str(exc)
     return {
@@ -114,12 +214,17 @@ def _portable_metadata(package_root: Path) -> dict[str, object]:
         "complete": not missing and source_matches and not metadata_error,
         "missing": missing,
         "source_release_matches": source_matches,
+        "source_release_issues": binding_issues,
         "metadata_error": metadata_error,
         "files": files,
     }
 
 
-def _release_metadata(portable_package: Path | None = None) -> dict[str, object]:
+def _release_metadata(
+    portable_package: Path | None = None,
+    *,
+    expected_source_release: dict[str, object] | None = None,
+) -> dict[str, object]:
     files: dict[str, object] = {}
     missing: list[str] = []
     for relative in RELEASE_FILES:
@@ -137,7 +242,12 @@ def _release_metadata(portable_package: Path | None = None) -> dict[str, object]
         if path.is_file():
             files[name] = {"size_bytes": path.stat().st_size, "sha256": _sha256(path)}
     portable = (
-        _portable_metadata(portable_package) if portable_package is not None else None
+        _portable_metadata(
+            portable_package,
+            expected_source_release=expected_source_release,
+        )
+        if portable_package is not None
+        else None
     )
     return {
         "schema": "sfm-release-inputs/v1",
@@ -195,6 +305,21 @@ def _steps(
                 str(ROOT / "tools/workspace_audit.py"),
                 "--strict-output-names",
                 "--no-sizes",
+            ),
+            str(ROOT),
+            120,
+        ),
+        Step(
+            "hardware_snapshot",
+            (
+                str(ROOT_PYTHON),
+                str(ROOT / "定位演算法/validation/monitor_hardware.py"),
+                "--output",
+                "-",
+                "--samples",
+                "1",
+                "--interval",
+                "0.01",
             ),
             str(ROOT),
             120,
@@ -262,6 +387,7 @@ def _steps(
                 str(ROOT / "模擬器/測試影片/河濱_P1180118_first_2s.mp4"),
                 "--check-runtime",
                 "--full-runtime",
+                "--json",
             ),
             str(ROOT),
             1800,
@@ -414,6 +540,13 @@ def main() -> int:
         action="store_true",
         help="launch the simulated GUI until its localization feed is ready",
     )
+    parser.add_argument(
+        "--allow-dirty",
+        "--development",
+        dest="allow_dirty",
+        action="store_true",
+        help="development-only opt-out; a dirty tree still fails release mode",
+    )
     args = parser.parse_args()
     if args.accept_p119_known_incomplete and not args.p119_integrity:
         parser.error("--accept-p119-known-incomplete requires --p119-integrity")
@@ -439,17 +572,28 @@ def main() -> int:
         if args.portable_package is not None
         else None
     )
+    git = _git_metadata()
+    release_gate = _release_gate(git, allow_dirty=bool(args.allow_dirty))
+    source_release = source_release_identity(ROOT)
     payload: dict[str, object] = {
-        "schema_version": 1,
+        "schema_version": 2,
         "status": "running",
         "started_utc": datetime.now(timezone.utc).isoformat(),
         "root": str(ROOT),
         "host": platform.node(),
         "platform": platform.platform(),
         "system_spec_sha256": _sha256(ROOT / "文件/SYSTEM_SPEC.md"),
-        "git": _git_metadata(),
-        "release_inputs": _release_metadata(portable_package),
+        "git": git,
+        "release": release_gate,
+        "collision_monitor": _collision_monitor_status(
+            ROOT, [], production_required=False
+        ),
+        "release_inputs": _release_metadata(
+            portable_package,
+            expected_source_release=source_release,
+        ),
         "p119_waiver_requested": bool(args.accept_p119_known_incomplete),
+        "pytest": {"steps": {}, "skipped": {}},
         "steps": [],
     }
     _write_receipt(receipt_path, payload)
@@ -473,7 +617,7 @@ def main() -> int:
     )
     release_inputs = payload["release_inputs"]
     assert isinstance(release_inputs, dict)
-    failed = not bool(release_inputs.get("complete"))
+    failed = not bool(release_inputs.get("complete")) or not bool(release_gate["passed"])
     for index, step in enumerate(
         _steps(
             p119=bool(args.p119_integrity),
@@ -522,6 +666,16 @@ def main() -> int:
             print(output.rstrip(), flush=True)
         ok = exit_code == 0
         failed = failed or not ok
+        pytest_summary = _pytest_summary(output)
+        if pytest_summary is not None:
+            pytest_receipt = payload["pytest"]
+            assert isinstance(pytest_receipt, dict)
+            summaries = pytest_receipt["steps"]
+            skipped = pytest_receipt["skipped"]
+            assert isinstance(summaries, dict) and isinstance(skipped, dict)
+            summaries[step.name] = pytest_summary
+            if pytest_summary["skipped"]:
+                skipped[step.name] = pytest_summary["skipped"]
         payload["steps"].append(  # type: ignore[union-attr]
             {
                 **asdict(step),

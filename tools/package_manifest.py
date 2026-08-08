@@ -17,6 +17,7 @@ EXCLUDED_PARTS = {
     ".mypy_cache",
     ".tox",
     ".venv",
+    "env",
     "__pycache__",
     "artifacts",
     "封存",
@@ -24,7 +25,15 @@ EXCLUDED_PARTS = {
     "inductor_cache",
     "outputs",
     "package_git",
+    ".idea",
+    ".vscode",
+    ".fleet",
+    "node_modules",
+    ".cursor",
+    "audit",
 }
+EXCLUDED_NAMES = {".DS_Store", "Thumbs.db", "desktop.ini"}
+EXCLUDED_SUFFIXES = {".pyc", ".pyo", ".swp", ".swo", ".tmp", ".bak", ".orig", ".rej"}
 EXCLUDED_PREFIXES = (
     "地圖檔/",
     "模擬器/測試影片/",
@@ -45,7 +54,9 @@ def included(relative: Path) -> bool:
     return (
         value not in CONTROL_FILES
         and not any(part in EXCLUDED_PARTS for part in relative.parts)
-        and relative.suffix not in {".pyc", ".pyo"}
+        and relative.name not in EXCLUDED_NAMES
+        and not relative.name.endswith("~")
+        and relative.suffix not in EXCLUDED_SUFFIXES
         and not any(value.startswith(prefix) for prefix in EXCLUDED_PREFIXES)
     )
 

@@ -10,7 +10,8 @@ python tools/package_manifest.py verify
 ```
 
 目前發布包的 authoritative manifest 是發布包根目錄的 `MANIFEST.tsv` 與
-`SHA256SUMS`；本資料夾內的 manifest 只描述這個 legacy runtime 子資料夾。
+`SHA256SUMS`；本 legacy runtime 資料夾不再攜帶第二套 manifest 工具或 digest。
+所有 generate／verify 都必須由 package root 的 `tools/package_manifest.py` 執行。
 
 這個資料夾是要搬到另一台電腦的定位調參包。用途是調整定位 runtime 組合，例如把
 LightGlue 改成 NN、`nn_then_lg`，或調整 topK、threshold、PnP gate、temporal

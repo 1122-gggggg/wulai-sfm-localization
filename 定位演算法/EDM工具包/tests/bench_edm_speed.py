@@ -12,6 +12,7 @@ not a win.
 """
 from __future__ import annotations
 
+import argparse
 import sys
 import time
 from pathlib import Path
@@ -22,10 +23,6 @@ import torch
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "deploy"))
 from edm_matcher import EDMMatcher  # noqa: E402
-
-SITE = Path("/media/cihcilab/新增磁碟區/河濱場域/gluemap_build/runs/river_site_pi3_1fps_smoke_pinhole_fix")
-IMAGES = SITE / "images"
-
 
 def bench(matcher, q, refs, n_ref, amp: bool, iters: int = 30):
     imgs = refs[:n_ref]
@@ -44,8 +41,15 @@ def bench(matcher, q, refs, n_ref, amp: bool, iters: int = 30):
 
 
 def main():
-    names = sorted(p.name for p in (IMAGES / "P1190119").glob("*.jpg"))[:12]
-    grays = [EDMMatcher.load_gray(IMAGES / "P1190119" / n) for n in names]
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--image-root", required=True)
+    parser.add_argument("--sequence", default="P1190119")
+    args = parser.parse_args()
+    sequence_dir = Path(args.image_root).expanduser().resolve() / args.sequence
+    names = sorted(p.name for p in sequence_dir.glob("*.jpg"))[:12]
+    if len(names) < 12:
+        raise SystemExit(f"need at least 12 JPG images in {sequence_dir}, found {len(names)}")
+    grays = [EDMMatcher.load_gray(sequence_dir / n) for n in names]
     q, refs = grays[0], grays[1:]
 
     m = EDMMatcher(mconf_thr=0.2)

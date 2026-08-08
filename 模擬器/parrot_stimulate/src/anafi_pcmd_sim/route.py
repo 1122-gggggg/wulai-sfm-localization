@@ -589,9 +589,7 @@ def control_decision(
             speed_max_age_s=config.maximum_pose_age_s,
             command_ttl_s=config.pcmd_watchdog_s,
             yaw_tolerance_deg=(
-                config.yaw_tolerance_deg
-                if require_yaw_alignment and horizontal > config.minimum_yaw_alignment_distance_m
-                else 180.0
+                config.yaw_tolerance_deg if require_yaw_alignment and horizontal > 1e-12 else 180.0
             ),
             horizontal_axes=(0, 1),
             vertical_axis=2,
@@ -631,8 +629,7 @@ def control_decision(
         phase = "brake"
         command = PilotingCommand.zero()
     elif require_yaw_alignment and (
-        horizontal > config.minimum_yaw_alignment_distance_m
-        and abs(math.degrees(camera_turn_angle)) > config.yaw_tolerance_deg
+        horizontal > 1e-12 and abs(math.degrees(camera_turn_angle)) > config.yaw_tolerance_deg
     ):
         phase = "turn"
         yaw_strength = min(
@@ -1087,8 +1084,7 @@ class OlympeRouteFollower:
                         last_estimation_error = estimation_error
                         alignment_required = (
                             not aligned_for_translation
-                            and decision.horizontal_distance_m
-                            > self.config.minimum_yaw_alignment_distance_m
+                            and decision.horizontal_distance_m > 1e-12
                             and decision.phase in {"turn", "translate"}
                         )
                         if alignment_required:
@@ -1111,9 +1107,7 @@ class OlympeRouteFollower:
                                 if alignment_confirmed:
                                     aligned_for_translation = True
                         elif (
-                            not aligned_for_translation
-                            and decision.horizontal_distance_m
-                            <= self.config.minimum_yaw_alignment_distance_m
+                            not aligned_for_translation and decision.horizontal_distance_m <= 1e-12
                         ):
                             aligned_for_translation = True
                     true_distance = math.dist(

@@ -301,6 +301,22 @@ def test_run_monitor_writes_flat_csv_summary(tmp_path):
     assert json.loads(row["gpus_json"])[0]["clock_event_reasons"]["sw_power_cap"] == "Active"
 
 
+def test_run_monitor_can_write_one_read_only_sample_to_stdout(capsys):
+    monitor = load_monitor_module()
+
+    count = monitor.run_monitor(
+        output=Path("-"),
+        output_format="jsonl",
+        interval_s=1.0,
+        max_samples=1,
+        stop_event=threading.Event(),
+        collector=lambda **_kwargs: sample(),
+    )
+
+    assert count == 1
+    assert json.loads(capsys.readouterr().out)["schema_version"] == 1
+
+
 def test_thermal_warning_messages_detects_cpu_delta_and_gpu_slowdown():
     monitor = load_monitor_module()
     previous = sample()

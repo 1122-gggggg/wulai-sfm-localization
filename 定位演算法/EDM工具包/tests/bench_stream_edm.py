@@ -30,13 +30,6 @@ sys.path.insert(0, str(ROOT / "deploy"))
 from production_edm_tracker import EDMConfig, ProductionEDMTracker  # noqa: E402
 from reloc_localizer_edm import Camera, EDMRelocMap  # noqa: E402
 
-VIDEO = Path("/media/cihcilab/新增磁碟區/河濱場域/gluemap_build/raw/河濱樹24fps 2.7k/P1180118.MP4")
-SITE = Path("/media/cihcilab/新增磁碟區/河濱場域/gluemap_build/runs/river_site_pi3_1fps_smoke_pinhole_fix")
-MODEL = SITE / "gluemap" / "gluemap_aba"
-BASE_CSV = Path("/media/cihcilab/新增磁碟區/河濱場域/gluemap_build/localization/"
-                "P1180118_megaloc_xfeat_lighterglue_mnn_20260713/outputs/"
-                "P1180118_full_24fps_map_ba/frames.csv")
-BUNDLE = ROOT / "outputs" / "river_site_reloc_map_edm.pt"
 W, H = 1280, 720
 
 
@@ -61,24 +54,32 @@ def load_baseline(path: Path):
 
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("--video", required=True)
+    ap.add_argument("--model", required=True)
+    ap.add_argument("--baseline-csv", required=True)
+    ap.add_argument("--bundle", required=True)
     ap.add_argument("--max-frames", type=int, default=0)
     ap.add_argument("--local-topk", type=int, default=2)
     ap.add_argument("--out", default=str(ROOT / "outputs" / "stream_edm_result.json"))
     args = ap.parse_args()
+    video = Path(args.video).expanduser().resolve()
+    model = Path(args.model).expanduser().resolve()
+    baseline_csv = Path(args.baseline_csv).expanduser().resolve()
+    bundle = Path(args.bundle).expanduser().resolve()
 
-    base_poses, base_timing = load_baseline(BASE_CSV)
+    base_poses, base_timing = load_baseline(baseline_csv)
     print(f"baseline: {len(base_poses)} accepted poses, {len(base_timing)} frames")
 
-    rec = pycolmap.Reconstruction(str(MODEL))
+    rec = pycolmap.Reconstruction(str(model))
     c0 = list(rec.cameras.values())[0]
     cam = Camera(model=c0.model.name, width=c0.width, height=c0.height, params=list(c0.params))
 
-    rmap = EDMRelocMap.load(BUNDLE)
+    rmap = EDMRelocMap.load(bundle)
     trk = ProductionEDMTracker(rmap, cam, EDMConfig(local_topk=args.local_topk))
 
-    cap = cv2.VideoCapture(str(VIDEO))
+    cap = cv2.VideoCapture(str(video))
     if not cap.isOpened():
-        raise SystemExit(f"cannot open {VIDEO}")
+        raise SystemExit(f"cannot open {video}")
 
     states, lat, vpr, match, pnp, inl, ncorr = [], [], [], [], [], [], []
     perr, rerr = [], []
@@ -132,7 +133,9 @@ def main():
         print(f"  position (map-u): median={np.median(perr):.4f}  p90={np.percentile(perr,90):.4f}  max={perr.max():.4f}")
         print(f"  rotation (deg)  : median={np.median(rerr):.3f}  p90={np.percentile(rerr,90):.3f}  max={rerr.max():.3f}")
 
-    Path(args.out).write_text(json.dumps({
+    output_path = Path(args.out).expanduser().resolve()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(json.dumps({
         "frames": i, "localized": n_ok,
         "states": dict(Counter(states)),
         "median_ms": {"vpr": float(np.median(vpr)), "match": float(np.median(match)),
@@ -143,7 +146,7 @@ def main():
         "pose_vs_baseline": {"position_median": float(np.median(perr)) if len(perr) else None,
                              "rotation_median_deg": float(np.median(rerr)) if len(rerr) else None},
     }, indent=2))
-    print(f"\nwrote {args.out}")
+    print(f"\nwrote {output_path}")
 
 
 if __name__ == "__main__":

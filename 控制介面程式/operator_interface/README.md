@@ -31,11 +31,37 @@ Layout:
 - `operator_actions.py`：按鍵規格與操作流程；不依賴 Tk，也不直接讀寫 Olympe。
 - `site_asset_interfaces.py`：場域包、航線、巡檢目標三個 replaceable Protocol。
 - `local_site_assets.py`：目前的本機資料夾／JSON 實作與格式驗證。
+- `route_editor_model.py`：航線 schema、場域綁定與 GLOMAP ↔ Z-up 座標轉換。
+- `route_editor_controller.py`：航點、復原／重做、G 與軸向鎖定；不依賴 Tk。
+- `route_editor_window.py`：自製全螢幕點雲編輯畫面；沒有 backend 或飛行指令接口。
 - `flight_operator_app.py`：composition root，接上既有地圖、串流、飛控與安全清理；
   不在 UI view 內實作資產格式。
 
 因此日後可替換本機地圖來源或航線來源，而不需要改動飛行按鍵與 Olympe backend。
 建圖端五檔交付契約見 `../site_profiles/建圖端輸出規格.md`。
+
+### 自製航線編輯器
+
+「場域資產」的航線列提供 `匯入 JSON`、`建立新航線`、`編輯目前航線`。編輯器
+頂端只有一個 `導入地圖資料夾`。系統會遞迴偵測資料夾內的 `.ply`；只有一個時
+自動載入，多個時列出相對路徑與檔案大小供使用者選擇。選定後計算 PLY 的
+SHA-256，若唯一匹配到已匯入場域的 `asset_sha256.map_ply`，就自動綁定該場域並
+開放正式航線匯入。沒有匹配或同時匹配多個場域時，只能標注及另存 preview
+JSON，正式航線匯入按鈕會鎖住。
+
+新航線分兩階段。第一階段以俯視模式標路徑點；「標路徑點模式」預設關閉，開啟後
+左鍵單擊才會新增路徑點。左鍵拖曳旋轉、左鍵雙擊將最近點雲設為新地圖中心，雙擊不會
+同時新增路徑點；右鍵拖曳平移、滾輪縮放。Enter 後進入第二階段，標點模式會自動停用；
+選取現有路徑點後按 G，再按 X、Y 或 Z 鎖定軸向，左鍵／Enter 確認，Esc 取消。編輯器使用
+Z-up 顯示座標並輸出 `frame: aligned`；匯入端再轉回 GLOMAP 的 X/Z 水平、-Y
+向上座標。
+
+真機模式只有明確回讀為 `landed` 且沒有飛行命令處理中才可開啟；狀態改變時
+編輯器會自動關閉。儲存與匯入會更新規劃路徑 overlay，並把通過場域／座標系／
+SHA-256 驗證的路線選定為本次工作階段下一個 AUTO 候選。這不會核准、解鎖或開始
+飛行，且仍維持 `flight.approved=false` 與 `route_clearance_approved=false`。AUTO
+請求送出後，航線選擇鎖定；HOVER、MANUAL 與重新定位不會解除，只有後端拒絕該次
+請求或確認降落完成後才可選下一條航線。
 
 ## Single-Process Desktop App
 
@@ -45,6 +71,13 @@ Layout:
 and accepts only ANAFI PDRAW video. It never falls back to a video file. The old
 `--live` flag remains only as a compatibility alias. Only the human operator may
 press the takeoff button.**
+
+介面進入後會顯示一條不會遮住降落／緊急控制的「起飛前依序確認」導引。操作員必須
+依序親手確認：① 飛機羅盤校正狀態；② 目前匯入的地圖與場域；③ 顯示後逐點檢查的
+航線（包含匯入／修改結果）；④ 新鮮串流、遙測、連線、飛控警示、電量、GPS 與韌體
+限制讀回。前一步未確認時不能跳到後一步；任何已確認的狀態或資產後來改變，該步驟
+與其後步驟會失效。全部完成且狀態仍正常後，介面才顯示可以由操作員按「起飛」並啟用
+按鈕；這不會自動起飛，按下後後端仍會重新執行完整 fail-closed preflight。
 
 ```bash
 cd .../mission/operator_interface
@@ -63,14 +96,25 @@ unset. Equivalent environment variables are `SFM_MAX_ALTITUDE_M` and
 `SFM_MAX_DISTANCE_M`; do not choose flight limits by copying the simulated HUD
 numbers.
 
-`--distance-geofence` sends `NoFlyOverMaxDistance(1)` and is enabled by default.
-The firmware flag prevents outward piloting beyond the configured radius and
+`--distance-geofence` sends `NoFlyOverMaxDistance(1)` and is **off by default**
+(operator decision 2026-08-06: enabling it makes takeoff require a GPS fix, and
+this site's GPS is unreliable). Turn it on with the flag above, or with
+`SFM_DISTANCE_GEOFENCE=1`, which is the way to enable it through
+`start_anafi_live.sh` — that launcher deliberately does not pin the flag, so the
+environment variable governs. The firmware flag prevents outward piloting beyond the configured radius and
 does **not** itself start Return-To-Home. The host safety monitor separately
 requests RTH at 95% of the confirmed readback limit when Home is reachable,
 otherwise it requests in-place Landing. RTH depends on valid GPS/home state. The takeoff
-preflight also requires at least 30% battery and, while the distance geofence is
-enabled, a confirmed GPS fix. Use `--min-takeoff-battery-pct` only when the human
-safety owner has approved a different floor.
+preflight uses a 15% battery floor by default and never accepts a configured floor
+below the existing 10% critical-battery threshold. While the distance geofence is
+enabled, takeoff also requires a confirmed GPS fix.
+
+All safety-relevant CLI/environment values pass through `live_safety_config.py`
+before the UI or backend can use them. The effective normalized values and their
+SHA-256 are printed at startup. Overrides cannot exceed the measured operator
+envelope (20° tilt, 2 m/s vertical, 20°/s yaw, 10 s stream-loss grace); altitude
+and distance must be finite, positive, supplied together, and are still confirmed
+against firmware bounds and readback.
 
 The launcher keeps the UI and localization interpreters explicit:
 

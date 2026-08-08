@@ -35,10 +35,8 @@ from pathlib import Path
 from typing import Any
 
 _HERE = Path(__file__).resolve().parent
-_FC = _HERE.parent / "flight_control"
-for p in (_HERE, _FC):
-    if str(p) not in sys.path:
-        sys.path.insert(0, str(p))
+if str(_HERE) not in sys.path:
+    sys.path.insert(0, str(_HERE))
 
 LOG_DIR = _HERE.parents[1] / "outputs" / "flight_logs"
 
@@ -46,7 +44,7 @@ LOG_DIR = _HERE.parents[1] / "outputs" / "flight_logs"
 @dataclass
 class Check:
     name: str
-    ok: bool
+    ok: bool | None            # True=pass, False=fail, None=not run
     detail: str = ""
     t_mono: float = 0.0
 
@@ -67,8 +65,20 @@ class Report:
         flag = "PASS" if ok else "FAIL"
         print(f"[{flag}] {name}: {detail}", flush=True)
 
+    def skip(self, name: str, detail: str = "") -> None:
+        """Record a check that did not run. A skipped check is NOT a pass.
+
+        Recording skips as True made a --no-fly run report every air-phase check
+        as PASS, which reads as "the aircraft was verified in flight".
+        """
+        self.checks.append(
+            Check(name=name, ok=None, detail=detail, t_mono=time.monotonic()))
+        print(f"[SKIP] {name}: {detail}", flush=True)
+
     def summary(self) -> dict[str, Any]:
-        n_ok = sum(1 for c in self.checks if c.ok)
+        n_ok = sum(1 for c in self.checks if c.ok is True)
+        n_failed = sum(1 for c in self.checks if c.ok is False)
+        n_skipped = sum(1 for c in self.checks if c.ok is None)
         n = len(self.checks)
         return {
             "started_iso": self.started_iso,
@@ -77,8 +87,10 @@ class Report:
             "controller": self.controller,
             "fly": self.fly,
             "passed": n_ok,
+            "failed": n_failed,
+            "skipped": n_skipped,
             "total": n,
-            "all_ok": n_ok == n and n > 0,
+            "all_ok": n_failed == 0 and n_ok > 0,
             "checks": [asdict(c) for c in self.checks],
             "log_path": self.log_path,
             "sample_png": self.sample_png,
@@ -191,6 +203,7 @@ class LiveAcceptance:
 
     def run(self) -> int:
         from olympe_live_backend import OlympeLiveBackend
+        from backend_contract import ControlAction, ControlRequest, ControlResult
 
         # Minimal stand-ins for OperatorApp state/profile
         class _State:
@@ -276,38 +289,60 @@ class LiveAcceptance:
 
         # ---- C gimbal + zoom on ground ----
         try:
-            self.backend.set_gimbal_pitch(-45.0)
+            pitch_first_ok = bool(self.backend.set_gimbal_pitch(-45.0))
             time.sleep(0.8)
-            self.backend.set_gimbal_pitch(-10.0)
+            pitch_second_ok = bool(self.backend.set_gimbal_pitch(-10.0))
             time.sleep(0.6)
-            self.backend.reset_camera_defaults(pitch=-20.0, zoom=1.0)
+            reset_ok = bool(self.backend.reset_camera_defaults(pitch=-20.0, zoom=1.0))
             time.sleep(0.6)
+            pitch_state = self.backend.state.gimbal_pitch_deg
+            zoom_state = self.backend.state.zoom
+            gimbal_ok = (
+                isinstance(pitch_state, (int, float))
+                and abs(float(pitch_state) - (-20.0)) <= 3.0
+            )
+            zoom_ok = (
+                isinstance(zoom_state, (int, float))
+                and abs(float(zoom_state) - 1.0) <= 1e-6
+            )
+            camera_commands_ok = pitch_first_ok and pitch_second_ok and reset_ok
             self.report.add(
                 "C_gimbal_zoom",
-                True,
-                f"pitch_state={self.backend.state.gimbal_pitch_deg} zoom={self.backend.state.zoom}",
+                bool(camera_commands_ok and gimbal_ok and zoom_ok),
+                f"commands={camera_commands_ok} pitch_state={pitch_state} "
+                f"(want -20+/-3) zoom={zoom_state} (want 1.0)",
             )
         except Exception as exc:
             self.report.add("C_gimbal_zoom", False, repr(exc))
 
         if not self.fly:
-            self.report.add("D_takeoff", True, "skipped (--no-fly)")
-            self.report.add("E_nudges", True, "skipped (--no-fly)")
-            self.report.add("F_freeze_resume", True, "skipped (--no-fly)")
-            self.report.add("G_camera_air", True, "skipped (--no-fly)")
-            self.report.add("H_land", True, "skipped (--no-fly)")
+            self.report.skip("D_takeoff", "not run (--no-fly)")
+            self.report.skip("E_nudges", "not run (--no-fly)")
+            self.report.skip("F_freeze_resume", "not run (--no-fly)")
+            self.report.skip("G_camera_air", "not run (--no-fly)")
+            self.report.skip("H_land", "not run (--no-fly)")
             self.cleanup()
-            return 0 if all(c.ok for c in self.report.checks) else 1
+            return 1 if any(c.ok is False for c in self.report.checks) else 0
 
         # ---- D takeoff ----
         if fly_st not in {"landed", "Landed", "0"} and "landed" not in fly_st.lower():
             # already flying? still try hover path
             self.log("pre_takeoff_state", flying_state=fly_st)
         try:
-            self.backend.takeoff_cmd()
+            takeoff_result = self.backend.command(
+                ControlRequest.create(ControlAction.TAKEOFF, human_origin=True)
+            )
             time.sleep(1.0)
             st_after = self._flying_state()
-            ok_to = "hover" in st_after.lower() or self.backend.state.tracker_state == "HOVER"
+            accepted = (
+                bool(takeoff_result.accepted)
+                if isinstance(takeoff_result, ControlResult)
+                else bool(takeoff_result)
+            )
+            ok_to = accepted and (
+                "hover" in st_after.lower()
+                or self.backend.state.tracker_state == "HOVER"
+            )
             # also accept takeoff success log state
             if self.backend.state.tracker_state == "TAKEOFF_FAIL":
                 ok_to = False
@@ -320,8 +355,11 @@ class LiveAcceptance:
             self.report.add("D_takeoff", False, repr(exc))
             try:
                 self.backend.land_cmd("takeoff_exception")
-            except Exception:
-                pass
+            except Exception as land_exc:
+                # A failed emergency land is the single most important thing to
+                # report from this handler, not the least.
+                self.report.add("D_takeoff_land", False, repr(land_exc))
+                print(f"[acceptance] emergency land FAILED: {land_exc!r}", flush=True)
             self.cleanup()
             return 1
 
@@ -334,11 +372,16 @@ class LiveAcceptance:
         nudge_details = []
         for name in ("前", "後", "左", "右", "上", "下", "右上前"):
             try:
-                self.backend.nudge(name)
+                # nudge() discards the accept/reject result, so a run in which EVERY
+                # nudge was refused used to report PASS. Use the guarded entry point.
+                accepted = bool(self.backend.nudge_begin(name))
                 time.sleep(self.nudge_s + 0.55)
+                self.backend.nudge_end(name)
                 self.backend.hover_cmd(f"after_{name}")
                 time.sleep(0.35)
-                nudge_details.append(f"{name}=ok")
+                if not accepted:
+                    nudge_ok = False
+                nudge_details.append(f"{name}={'ok' if accepted else 'REFUSED'}")
             except Exception as exc:
                 nudge_ok = False
                 nudge_details.append(f"{name}=ERR:{exc!r}")
@@ -360,14 +403,16 @@ class LiveAcceptance:
 
         # ---- G camera in air ----
         try:
-            self.backend.set_gimbal_pitch(-30.0)
+            pitch_ok = bool(self.backend.set_gimbal_pitch(-30.0))
             time.sleep(0.7)
-            self.backend.reset_camera_defaults()
+            reset_ok = bool(self.backend.reset_camera_defaults())
             time.sleep(0.5)
             self.report.add(
                 "G_camera_air",
-                True,
-                f"pitch={self.backend.state.gimbal_pitch_deg} zoom={self.backend.state.zoom}",
+                bool(pitch_ok and reset_ok),
+                f"commands={pitch_ok and reset_ok} "
+                f"pitch={self.backend.state.gimbal_pitch_deg} "
+                f"zoom={self.backend.state.zoom}",
             )
         except Exception as exc:
             self.report.add("G_camera_air", False, repr(exc))

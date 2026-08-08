@@ -91,6 +91,10 @@ def test_edm_config_rejects_non_finite_and_relational_values() -> None:
         EDMConfig(adaptive_jump_min_history=20, adaptive_jump_history_size=10)
     with pytest.raises(ValueError, match="bootstrap"):
         EDMConfig(adaptive_jump_bootstrap=0.005, adaptive_jump_ceiling=0.008)
+    with pytest.raises(ValueError, match="min_inlier_ratio"):
+        EDMConfig(min_inlier_ratio=0.0)
+    with pytest.raises(ValueError, match="min_inlier_grid_cells"):
+        EDMConfig(corr_grid=2, min_inlier_grid_cells=5)
 
 
 def test_adaptive_jump_uses_bootstrap_before_learning_then_tightens() -> None:
@@ -482,7 +486,7 @@ def test_long_capture_gap_never_weakens_the_hard_jump_gate(monkeypatch) -> None:
 
 
 @pytest.mark.parametrize("pixel_offset", [0.0, 10.0])
-def test_boot_staging_stops_on_good_geometry_and_expands_on_bad_geometry(
+def test_boot_staging_always_evaluates_the_complete_retrieved_set(
     monkeypatch, pixel_offset: float,
 ) -> None:
     names = [f"ref{i}" for i in range(10)]
@@ -526,7 +530,7 @@ def test_boot_staging_stops_on_good_geometry_and_expands_on_bad_geometry(
     tracker = object.__new__(ProductionEDMTracker)
     tracker.cfg = EDMConfig(
         boot_global_topk=10, acquire_initial_topk=2, acquire_min_inliers=80,
-        max_corr_total=100,
+        max_corr_total=100, min_inlier_grid_cells=1,
     )
     tracker.st = RuntimeState()
     tracker.map = SimpleNamespace(
@@ -550,9 +554,9 @@ def test_boot_staging_stops_on_good_geometry_and_expands_on_bad_geometry(
     assert info["requested_reference_count"] == 10
     if pixel_offset == 0.0:
         assert info["ok"]
-        assert info["staged_early_stop"]
-        assert info["refs"] == names[:2]
-        assert calls == [names[:2]]
+        assert not info["staged_early_stop"]
+        assert info["refs"] == names
+        assert calls == [names[:2], names[2:]]
         assert tracker.temporal_gray is None
         assert tracker.temporal_xyz_by_cell is None
     else:
@@ -561,3 +565,218 @@ def test_boot_staging_stops_on_good_geometry_and_expands_on_bad_geometry(
         assert info["rejected"] == "reprojection"
         assert info["reproj_rms"] == pytest.approx(pixel_offset)
         assert calls == [names[:2], names[2:]]
+
+
+@pytest.mark.parametrize(
+    ("metrics", "reason"),
+    [
+        ({"reproj_rms": 0.0, "inlier_ratio": 0.05, "inlier_grid_cells": 16},
+         "inlier_ratio"),
+        ({"reproj_rms": 0.0, "inlier_ratio": 1.0, "inlier_grid_cells": 2},
+         "inlier_spread"),
+    ],
+)
+def test_pose_quality_rejects_weak_or_spatially_concentrated_inliers(
+    monkeypatch, metrics: dict, reason: str,
+) -> None:
+    tracker = _jump_gate_tracker(monkeypatch, [0.0])
+    monkeypatch.setattr(
+        tracker_module,
+        "reprojection_metrics",
+        lambda *_args, **_kwargs: dict(metrics),
+    )
+
+    result = tracker.localize(
+        np.zeros((720, 1280, 3), np.uint8), capture_stamp=1.0
+    )
+
+    assert not result["ok"]
+    assert result["rejected"] == reason
+
+
+# ---------------------------------------------------------------------------
+# Adapter -> flight-loop WEAK gate wiring
+
+
+def test_adapter_reports_degraded_state_fixes_as_weak_for_the_flight_gate() -> None:
+    """path_follow_flight's SFM_GATE_WEAK hover gate reads last_info["weak"].
+
+    On success the tracker always reports state_out="TRACK", so state_in is the only
+    record that a fix was won from a degraded state: WEAK_TRACK accepts at
+    weak_min_inliers (30, below the loop's LOW_CONF_INLIERS of 60) and LOST
+    re-acquisition skips the trajectory-jump gate entirely. Without this key the
+    documented WEAK gate silently never fires on the EDM backend.
+    """
+    import edm_localizer_adapter as adapter_module
+
+    cases = {
+        "TRACK": False,
+        "BOOT_INIT": False,
+        "WEAK_TRACK": True,
+        "LOST": True,
+    }
+    for state_in, expected_weak in cases.items():
+        adapter = object.__new__(adapter_module.EDMTrackerAdapter)
+        adapter.state = adapter_module.RuntimeState()
+        adapter.state.mode = state_in
+        adapter._last_info = {}
+        info = {
+            "state_in": state_in,
+            "state_out": "TRACK",
+            "ok": True,
+            "center": np.zeros(3, float),
+            "yaw": 0.0,
+            "R": np.eye(3),
+            "inliers": 120,
+        }
+        adapter.trk = SimpleNamespace(
+            st=RuntimeState(state=state_in),
+            localize=lambda _bgr, capture_stamp=None, _i=info: _i,
+        )
+        pose = adapter.localize_frame(
+            np.zeros((8, 8, 3), np.uint8), capture_stamp=1.0
+        )
+        assert pose is not None
+        assert adapter.last_info["weak"] is expected_weak, (
+            f"state_in={state_in!r} -> weak={adapter.last_info['weak']!r}, "
+            f"expected {expected_weak!r}"
+        )
+
+
+def test_edm_adapter_publishes_heading_from_measured_map_frame() -> None:
+    import edm_localizer_adapter as adapter_module
+
+    adapter = object.__new__(adapter_module.EDMTrackerAdapter)
+    adapter.state = adapter_module.RuntimeState()
+    adapter._last_info = {}
+    observed = []
+    adapter.map_frame = SimpleNamespace(
+        heading=lambda forward: observed.append(np.asarray(forward, float)) or 1.25
+    )
+    adapter.trk = SimpleNamespace(
+        st=RuntimeState(state="TRACK"),
+        localize=lambda _bgr, capture_stamp=None: {
+            "state_in": "TRACK",
+            "state_out": "TRACK",
+            "ok": True,
+            "center": np.zeros(3, float),
+            "yaw": -0.5,
+            "R": np.eye(3),
+            "inliers": 120,
+        },
+    )
+
+    pose = adapter.localize_frame(np.zeros((8, 8, 3), np.uint8), capture_stamp=1.0)
+
+    assert pose.yaw == pytest.approx(1.25)
+    assert np.allclose(observed[0], [0.0, 0.0, 1.0])
+
+
+# ---------------------------------------------------------------------------
+# LOST re-acquisition bound (was: unbounded teleport + no yaw sanity gate)
+
+
+def test_lost_reacquisition_rejects_a_teleport_beyond_the_acquire_bound(monkeypatch) -> None:
+    tracker = _jump_gate_tracker(monkeypatch, [100.0])
+    tracker.cfg.global_retrieval_policy = "boot_once"
+    tracker.st.state = "LOST"
+    tracker.st.global_retrieval_calls = 1
+    tracker.st.boot_refs = ["ref"]
+    tracker.st.last_capture_stamp = 0.95          # prior still fresh
+
+    result = tracker.localize(
+        np.zeros((720, 1280, 3), np.uint8), capture_stamp=1.0
+    )
+
+    assert not result["ok"]
+    assert result["rejected"] == "acquire_jump"
+    assert result["acquire_limit"] == pytest.approx(
+        tracker.cfg.acquire_max_jump_factor * tracker.cfg.max_jump
+    )
+
+
+def test_lost_reacquisition_within_the_bound_is_still_accepted(monkeypatch) -> None:
+    tracker = _jump_gate_tracker(monkeypatch, [1.0])
+    tracker.cfg.global_retrieval_policy = "boot_once"
+    tracker.st.state = "LOST"
+    tracker.st.global_retrieval_calls = 1
+    tracker.st.boot_refs = ["ref"]
+    tracker.st.last_capture_stamp = 0.95
+
+    result = tracker.localize(
+        np.zeros((720, 1280, 3), np.uint8), capture_stamp=1.0
+    )
+
+    assert result["ok"]
+    assert result.get("rejected") is None
+
+
+def test_lost_reacquisition_is_unbounded_once_the_prior_expires(monkeypatch) -> None:
+    """A genuinely long LOST episode must still be able to relocalize anywhere."""
+    tracker = _jump_gate_tracker(monkeypatch, [100.0])
+    tracker.cfg.global_retrieval_policy = "boot_once"
+    tracker.st.state = "LOST"
+    tracker.st.global_retrieval_calls = 1
+    tracker.st.boot_refs = ["ref"]
+    tracker.st.last_capture_stamp = 1.0 - (tracker.cfg.lost_prior_max_age_s + 1.0)
+
+    result = tracker.localize(
+        np.zeros((720, 1280, 3), np.uint8), capture_stamp=1.0
+    )
+
+    assert result["ok"]
+    assert result.get("rejected") is None
+
+
+def test_lost_reacquisition_rejects_an_impossible_heading_flip(monkeypatch) -> None:
+    tracker = _jump_gate_tracker(monkeypatch, [0.0])
+    tracker.cfg.global_retrieval_policy = "boot_once"
+    tracker.st.state = "LOST"
+    tracker.st.global_retrieval_calls = 1
+    tracker.st.boot_refs = ["ref"]
+    tracker.st.last_capture_stamp = 0.95
+    tracker.st.yaw = 0.0
+
+    # Camera centre stays put (0.1 u) but the heading flips by 180 degrees.
+    rotation = np.array([[0.0, 1.0, 0.0], [0.0, 0.0, -1.0], [-1.0, 0.0, 0.0]])
+    monkeypatch.setattr(
+        tracker_module.pycolmap,
+        "estimate_and_refine_absolute_pose",
+        lambda *_a, **_k: {
+            "cam_from_world": pycolmap.Rigid3d(
+                pycolmap.Rotation3d(rotation), np.array([0.0, 0.0, 0.1])
+            ),
+            "num_inliers": 100,
+            "inlier_mask": np.ones(100, dtype=bool),
+        },
+    )
+
+    result = tracker.localize(
+        np.zeros((720, 1280, 3), np.uint8), capture_stamp=1.0
+    )
+
+    assert not result["ok"]
+    assert result["rejected"] == "acquire_yaw"
+    assert result["acquire_yaw_delta_deg"] == pytest.approx(180.0, abs=1e-6)
+
+
+def test_limited_jump_cannot_be_confirmed_by_relocalizing_the_same_capture(
+        monkeypatch) -> None:
+    """The two-frame confirmation must need two DIFFERENT captures.
+
+    Re-running the same frame reproduces the same centre, which would score a
+    residual of ~0 against itself and promote one bad frame to an accepted relocation.
+    """
+    tracker = _jump_gate_tracker(monkeypatch, [0.05, 0.05])
+
+    first = tracker.localize(
+        np.zeros((720, 1280, 3), np.uint8), capture_stamp=1.0
+    )
+    second = tracker.localize(
+        np.zeros((720, 1280, 3), np.uint8), capture_stamp=1.0   # SAME capture
+    )
+
+    assert first["rejected"] == "limited_jump_unconfirmed"
+    assert not second["ok"]
+    assert second["rejected"] == "limited_jump_unconfirmed"
+    assert second["limited_jump"]["confirmation_independent"] is False

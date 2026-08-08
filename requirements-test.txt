@@ -2,3 +2,6 @@
 -r requirements.txt
 pytest==9.1.1
 ruff==0.16.1
+coverage[toml]==7.10.6
+pytest-cov==6.2.1
+pytest-timeout==2.4.0

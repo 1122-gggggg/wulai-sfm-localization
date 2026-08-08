@@ -39,7 +39,9 @@ import bpy
 import numpy as np
 from bpy_extras import view3d_utils  # noqa: F401  (kept for reference / fallback)
 
-ROOT = os.environ.get("SFM_MAP_ROOT", "/media/cihcilab/新增磁碟區/sfm_glomap")
+ROOT = os.environ.get("SFM_MAP_ROOT", "").strip()
+if not ROOT:
+    raise RuntimeError("SFM_MAP_ROOT must explicitly select the authoring workspace")
 OUTD = os.environ.get("SFM_SAFEZONE_DIR", f"{ROOT}/safezone")
 WIRES_JSON = f"{OUTD}/wires.json"
 WIRES_PLY = f"{OUTD}/wires.ply"

@@ -13,6 +13,7 @@ from dataclasses import dataclass
 @dataclass(frozen=True)
 class ScaleFreeConfig:
     speed_limit_mps: float = 0.30
+    landing_speed_threshold_mps: float = 0.10
     pose_max_age_s: float = 0.50
     speed_max_age_s: float = 0.50
     command_ttl_s: float = 0.15
@@ -25,6 +26,7 @@ class ScaleFreeConfig:
     def __post_init__(self) -> None:
         for name in (
             "speed_limit_mps",
+            "landing_speed_threshold_mps",
             "pose_max_age_s",
             "speed_max_age_s",
             "command_ttl_s",
@@ -33,6 +35,8 @@ class ScaleFreeConfig:
             value = float(getattr(self, name))
             if not math.isfinite(value) or value <= 0.0:
                 raise ValueError(f"{name} must be finite and > 0")
+        if self.landing_speed_threshold_mps > self.speed_limit_mps:
+            raise ValueError("landing_speed_threshold_mps must not exceed speed_limit_mps")
         axes = (*self.horizontal_axes, self.vertical_axis)
         if sorted(axes) != [0, 1, 2]:
             raise ValueError("horizontal_axes and vertical_axis must cover axes 0,1,2")
@@ -167,6 +171,14 @@ def decide_scale_free(
     if not sample.route_deviation_ok:
         return _hold("ROUTE_DEVIATION", config=cfg, now_mono_ns=now_ns, speed=speed)
     if sample.target_reached:
+        if speed > cfg.landing_speed_threshold_mps:
+            return _hold(
+                "TARGET_MOVING",
+                config=cfg,
+                now_mono_ns=now_ns,
+                speed=speed,
+                manual_handoff=False,
+            )
         decision = _hold(
             "TARGET_REACHED",
             config=cfg,

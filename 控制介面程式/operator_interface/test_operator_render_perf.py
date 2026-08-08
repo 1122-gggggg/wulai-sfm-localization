@@ -10,6 +10,10 @@ from pathlib import Path
 import sys
 
 import numpy as np
+import gc
+import inspect
+import math
+
 import pytest
 
 HERE = Path(__file__).resolve().parent
@@ -45,7 +49,11 @@ def operator():
     try:
         yield instance
     finally:
+        # Collect while the interpreter is still on the Tk main thread. Deferred
+        # Variable.__del__ calls otherwise surface as an unraisable exception in
+        # whichever unrelated test happens to trigger the collection.
         instance.destroy()
+        gc.collect()
 
 
 def test_dedup_string_var_suppresses_only_no_op_writes(operator) -> None:
@@ -156,9 +164,10 @@ def test_controls_use_tabs_without_scrollbars_and_flight_actions_stay_visible(
         operator.controls_notebook.tab(tab_id, "text")
         for tab_id in operator.controls_notebook.tabs()
     ) == (
-        "操作與定位",
-        "定位資訊",
-        "飛控與限制",
+        # One flight tab: 定位資訊 merged into it, then 飛行 · 操作 emptied out when
+        # the virtual sticks moved beside the flight readouts. Everything else is
+        # pre-flight setup and is only reached on the ground.
+        "飛行",
         "校正",
         "場域資產",
         "系統紀錄",
@@ -228,3 +237,324 @@ def test_long_route_draws_a_bounded_number_of_dots(operator, monkeypatch) -> Non
     # Route dots plus a small fixed set (pivot marker, camera dot, frustum centre).
     assert ellipses["count"] <= app.ROUTE_DOT_MAX + 8, ellipses["count"]
     assert ellipses["count"] > 0
+
+
+def test_magnetometer_axis_diagram_draws_and_clears(operator) -> None:
+    """The diagram must draw for each axis and CLEAR when no axis is requested,
+    so the operator never sees a stale rotation they should not perform."""
+    canvas = operator.magnetometer_axis_canvas
+
+    for raw in ("xAxis", "yAxis", "zAxis"):
+        operator._draw_magnetometer_axis(app.magnetometer_axis_guide(raw))
+        operator.update_idletasks()
+        items = canvas.find_all()
+        assert len(items) >= 5, f"{raw} drew too little: {len(items)} items"
+        texts = [canvas.itemcget(i, "text") for i in items
+                 if canvas.type(i) == "text"]
+        assert any("現在請轉" in t for t in texts), raw
+
+    operator._draw_magnetometer_axis(None)
+    operator.update_idletasks()
+    texts = [canvas.itemcget(i, "text") for i in canvas.find_all()
+             if canvas.type(i) == "text"]
+    assert not any("現在請轉" in t for t in texts), "stale rotation still shown"
+
+
+def test_virtual_stick_drag_clamps_to_the_circle_and_self_centres(operator) -> None:
+    """The knob is a circle: a corner drag must not exceed unit magnitude."""
+    import types
+
+    stick = operator.stick_right
+    seen: list[tuple[float, float]] = []
+    stick._on_change = lambda _s, x, y: seen.append((x, y))
+    centre = stick.SIZE / 2.0
+
+    stick._on_drag(types.SimpleNamespace(x=centre + stick._radius, y=centre))
+    assert seen[-1] == pytest.approx((1.0, 0.0))
+
+    # Far outside, diagonally: clamped onto the circle, direction preserved.
+    stick._on_drag(types.SimpleNamespace(x=stick.SIZE * 3, y=-stick.SIZE * 3))
+    x, y = seen[-1]
+    assert math.hypot(x, y) == pytest.approx(1.0)
+    assert x > 0 and y > 0
+
+    # Releasing, or the pointer leaving the widget, always reports zero.
+    stick._on_release()
+    assert seen[-1] == (0.0, 0.0)
+    assert stick.value == (0.0, 0.0)
+
+
+def test_both_virtual_sticks_are_present_and_start_centred(operator) -> None:
+    for stick in (operator.stick_left, operator.stick_right):
+        assert stick.value == (0.0, 0.0)
+        assert stick.winfo_reqwidth() == stick.SIZE
+
+
+def test_no_control_tab_is_clipped_by_the_fixed_control_pane(operator) -> None:
+    """The pane has pack_propagate(False), so a tall tab is cut off, not scrolled.
+
+    This was a hard-coded 295 px while 飛控與限制 needed 304 px: the bottom of that
+    tab was simply unreachable, with nothing on screen to say so.
+    """
+    notebook = operator.controls_notebook
+    pane = notebook.master
+    for geometry in ("1440x900", "980x640"):
+        operator.geometry(geometry)
+        operator.update_idletasks()
+        pane_bottom = pane.winfo_rooty() + pane.winfo_height()
+        for tab_id in notebook.tabs():
+            notebook.select(tab_id)
+            operator.update_idletasks()
+            stack = [operator.nametowidget(tab_id)]
+            while stack:
+                parent = stack.pop()
+                children = parent.winfo_children()
+                stack.extend(children)
+                for child in children:
+                    if not child.winfo_ismapped():
+                        continue
+                    bottom = child.winfo_rooty() + child.winfo_height()
+                    assert bottom <= pane_bottom, (
+                        f"{geometry} {notebook.tab(tab_id, 'text')}: a widget ends "
+                        f"{bottom - pane_bottom}px below the control pane"
+                    )
+
+
+def test_shrinking_the_window_takes_height_from_the_map_not_the_controls(operator) -> None:
+    """The control pane is fixed-height; the map/video pane is the elastic one."""
+    notebook = operator.controls_notebook
+    pane = notebook.master
+
+    operator.geometry("1440x900")
+    operator.update_idletasks()
+    tall_pane, tall_map = pane.winfo_height(), operator.map_label.winfo_height()
+
+    # 520, not 640: at 640 everything still fits, so pack order does not matter
+    # and the test would pass with the protection removed.
+    operator.geometry("980x520")
+    operator.update_idletasks()
+
+    assert pane.winfo_height() == tall_pane, "the control pane lost height"
+    assert operator.map_label.winfo_height() < tall_map, (
+        "sanity: the map pane should be the one that shrank"
+    )
+
+
+def test_map_view_controls_live_on_the_map(operator) -> None:
+    """They change what the map shows, so they belong on the map, bottom-left."""
+    labels = {}
+    stack = [operator.map_label]
+    while stack:
+        parent = stack.pop()
+        children = parent.winfo_children()
+        stack.extend(children)
+        for child in children:
+            try:
+                labels[str(child.cget("text"))] = child
+            except Exception:
+                continue
+
+    for text in ("重設地圖", "上下翻面", "顯示規劃路徑"):
+        assert text in labels, f"{text} is no longer a child of the map canvas"
+
+    operator.update_idletasks()
+    map_bottom = operator.map_label.winfo_rooty() + operator.map_label.winfo_height()
+    map_left = operator.map_label.winfo_rootx()
+    widget = labels["重設地圖"]
+    assert widget.winfo_rootx() - map_left < operator.map_label.winfo_width() * 0.5
+    assert map_bottom - (widget.winfo_rooty() + widget.winfo_height()) < 60
+
+
+def test_camera_and_mission_sit_in_the_always_visible_flight_bar(operator) -> None:
+    """Buried in a tab, they were unreachable unless that tab happened to be open."""
+    # The status line lives on the video now, so the bar is named rather than
+    # located through whichever widget happened to be parented to it.
+    flight_bar = operator.flight_bar
+    titles = set()
+    for child in flight_bar.winfo_children():
+        try:
+            titles.add(str(child.cget("text")))
+        except Exception:
+            continue
+
+    # 任務控制 merged INTO 飛行模式 on 2026-08-06: one block of flight actions,
+    # not two adjacent frames that read as unrelated groups.
+    assert {"飛行模式", "鏡頭"} <= titles, f"flight bar holds {sorted(titles)}"
+    assert "任務控制" not in titles, "the mission frame is back as a separate block"
+
+    labels = set()
+    stack = [flight_bar]
+    while stack:
+        parent = stack.pop()
+        for child in parent.winfo_children():
+            stack.append(child)
+            try:
+                labels.add(str(child.cget("text")))
+            except Exception:
+                continue
+    assert "起飛" in labels, "takeoff must still live in the always-visible bar"
+    assert "起飛後錄影" in labels
+
+
+def test_control_pane_follows_the_selected_tab_height(operator) -> None:
+    """Sizing to the tallest tab padded every short tab with dead space."""
+    notebook = operator.controls_notebook
+    pane = notebook.master
+    # The <<NotebookTabChanged>> binding is a virtual event, which update_idletasks
+    # does not pump; call the fitter directly and assert the binding separately.
+    assert "<<NotebookTabChanged>>" in notebook.bind(), (
+        "nothing re-fits the pane when the operator switches tabs"
+    )
+    heights = {}
+    for tab_id in notebook.tabs():
+        notebook.select(tab_id)
+        operator._fit_control_pane()
+        operator.update_idletasks()
+        heights[notebook.tab(tab_id, "text")] = pane.winfo_height()
+
+    assert len(set(heights.values())) > 1, (
+        f"every tab still gets the same height: {heights}"
+    )
+    # The shortest tab must not be forced to the tallest tab's height.
+    assert heights["系統紀錄"] < max(heights.values())
+    assert min(heights.values()) >= app.CONTROL_PANE_MIN_H
+
+
+def test_localization_readout_overlays_the_video_it_measures(operator) -> None:
+    """Reading it used to mean looking away from the picture it describes."""
+    operator.update_idletasks()
+    found = []
+    stack = [operator.video_label]
+    while stack:
+        parent = stack.pop()
+        for child in parent.winfo_children():
+            stack.append(child)
+            if child is operator.loc_health_label:
+                found.append(child)
+    assert found, "定位儀表 is no longer a child of the video canvas"
+
+    video_bottom = operator.video_label.winfo_rooty() + operator.video_label.winfo_height()
+    video_left = operator.video_label.winfo_rootx()
+    overlay = found[0].master
+    assert overlay.winfo_rootx() - video_left < operator.video_label.winfo_width() * 0.5
+    assert video_bottom - (overlay.winfo_rooty() + overlay.winfo_height()) < 200
+
+
+def test_virtual_sticks_share_the_flight_tab_with_the_readouts(operator) -> None:
+    """飛行 · 操作 held only the sticks once everything else moved out."""
+    notebook = operator.controls_notebook
+    target = [t for t in notebook.tabs() if notebook.tab(t, "text") == "飛行"]
+    assert target, "the flight tab is missing"
+    notebook.select(target[0])
+    operator.update_idletasks()
+
+    node = operator.stick_left
+    while node is not None and node is not operator:
+        if str(node) == str(target[0]):
+            break
+        node = node.master
+    else:
+        raise AssertionError("the virtual sticks are not inside the flight tab")
+
+    titles = set()
+    stack = [operator.nametowidget(target[0])]
+    while stack:
+        parent = stack.pop()
+        for child in parent.winfo_children():
+            stack.append(child)
+            try:
+                titles.add(str(child.cget("text")))
+            except Exception:
+                continue
+    assert "ANAFI / 控制權" in titles
+
+
+def test_no_control_readout_or_button_appears_twice(operator) -> None:
+    """Three copies of battery/gimbal/link, two of the handover buttons, is worse
+    than one: they refresh by different paths and disagree under load."""
+    notebook = operator.controls_notebook
+    duplicated = {"恢復電腦控制", "交回搖桿 (Esc)", "定位鎖定"}
+    seen = {label: 0 for label in duplicated}
+
+    for tab_id in list(notebook.tabs()):
+        notebook.select(tab_id)
+        operator.update_idletasks()
+    stack = [operator]
+    while stack:
+        parent = stack.pop()
+        children = parent.winfo_children()
+        stack.extend(children)
+        for child in children:
+            try:
+                label = str(child.cget("text"))
+            except Exception:
+                continue
+            if label in seen:
+                seen[label] += 1
+
+    assert seen["定位鎖定"] == 0, "定位鎖定 engages automatically after 開始定位"
+    assert seen["恢復電腦控制"] <= 1, f"恢復電腦控制 rendered {seen['恢復電腦控制']}x"
+    assert seen["交回搖桿 (Esc)"] <= 1, f"交回搖桿 rendered {seen['交回搖桿 (Esc)']}x"
+
+
+def test_anafi_panel_does_not_restate_the_hud_and_status_bar(operator) -> None:
+    """It was a third copy of battery / gimbal / zoom / backlog age / fps."""
+    operator.update_idletasks()
+    flight = operator.anafi_flight_var.get()
+    stream = operator.anafi_stream_var.get()
+
+    for token in ("battery", "gimbal", "zoom"):
+        assert token not in flight, f"{token} is already in the status bar / HUD"
+    for token in ("backlog age", "fps", "GPS", "link "):
+        assert token not in stream, f"{token} is already in the video HUD"
+
+
+def test_status_bar_states_the_mode_once(operator) -> None:
+    """It read "REAL ANAFI | mode=LIVE | LIVE | LIVE | HOVER" on screen.
+
+    video_hud_identity already ends in "mode=<X>", and display_mode is the very
+    same operator_mode_label() call, so appending it printed the value twice.
+    """
+    identity = app.video_hud_identity(True, "LIVE")
+    assert identity.endswith("mode=" + app.operator_mode_label(True, "LIVE"))
+
+    source = inspect.getsource(app.OperatorApp.tick)
+    assert "video_hud_identity" in source
+    assert "{display_mode} | {st.loc}" not in source, (
+        "display_mode restates the mode already inside video_hud_identity"
+    )
+
+
+def test_localization_overlay_stays_a_small_corner_of_the_video(operator) -> None:
+    """It overlays the picture, so every line it takes is picture lost."""
+    operator.geometry("1440x900")
+    operator.update_idletasks()
+    video = operator.video_label
+    overlay = operator.loc_health_label.master
+
+    assert overlay.winfo_rooty() >= video.winfo_rooty(), "overlay spills above the video"
+    assert overlay.winfo_height() < video.winfo_height() * 0.45, (
+        f"overlay is {overlay.winfo_height()}px of {video.winfo_height()}px"
+    )
+    # Two-up, not a single stacked column: the column count is what keeps it short.
+    # It now carries the flight readouts too, so the row budget grew with it.
+    columns, rows = overlay.grid_size()
+    assert columns >= 2, f"the readouts are stacked in {columns} column(s)"
+    assert rows <= 9, f"{rows} rows of overlay is most of the picture"
+
+
+def test_localization_facts_appear_only_in_the_video_overlay(operator) -> None:
+    """定位 / inliers / 位姿 / 影格 were in the bar AND the overlay at once."""
+    operator.update_idletasks()
+    bar_text = operator.status.cget("text")
+    assert operator.status.master is operator.loc_health_label.master, (
+        "the aircraft-state line must share the overlay, not sit in its own block"
+    )
+    for token in ("定位", "inliers", "位姿", "影格"):
+        assert token not in bar_text, f"{token} is already in the overlay: {bar_text}"
+
+    # The separate 位姿/影格 readout is gone; its colour grading moved to the
+    # overlay's health label, which is the thing it was grading.
+    assert not hasattr(operator, "loc_age_label")
+    source = inspect.getsource(app.OperatorApp._update_age_readout)
+    assert "loc_health_label" in source

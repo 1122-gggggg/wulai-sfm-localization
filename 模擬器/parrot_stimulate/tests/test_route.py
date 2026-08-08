@@ -202,6 +202,20 @@ def test_aligned_controller_decomposes_the_3d_line_into_pitch_and_gaz() -> None:
     assert decision.vertical_fraction == pytest.approx(1 / math.sqrt(3))
 
 
+def test_short_horizontal_leg_still_turns_before_translation() -> None:
+    decision = control_decision(
+        TruePosition(timestamp_s=0, x_m=0, y_m=0, z_m=1),
+        Waypoint(index=0, x_m=0, y_m=0.2, z_m=1),
+        camera_yaw_enu_rad=0.0,
+        config=RouteConfig(),
+    )
+
+    assert decision.phase == "turn"
+    assert decision.command.pitch == 0
+    assert decision.command.roll == 0
+    assert decision.command.yaw != 0
+
+
 def test_translation_recomputes_body_forward_right_and_up_components() -> None:
     decision = control_decision(
         TruePosition(timestamp_s=0, x_m=0, y_m=0, z_m=0),
@@ -497,7 +511,7 @@ def test_controller_keeps_translating_outside_half_metre_arrival_radius() -> Non
     assert decision.command.pitch > 0
 
 
-def test_short_xy_projection_does_not_block_vertical_capture() -> None:
+def test_short_nonzero_xy_projection_still_requires_yaw_alignment() -> None:
     decision = control_decision(
         TruePosition(timestamp_s=0, x_m=0, y_m=0, z_m=1),
         Waypoint(index=0, x_m=0.1, y_m=0.1, z_m=1.6),
@@ -508,5 +522,7 @@ def test_short_xy_projection_does_not_block_vertical_capture() -> None:
     assert decision.distance_m > 0.5
     assert decision.horizontal_distance_m < 0.25
     assert abs(math.degrees(decision.camera_turn_angle_enu_rad)) > 1.0
-    assert decision.phase == "translate"
-    assert decision.command.gaz > 0
+    assert decision.phase == "turn"
+    assert decision.command.yaw != 0
+    assert decision.command.pitch == 0
+    assert decision.command.gaz == 0

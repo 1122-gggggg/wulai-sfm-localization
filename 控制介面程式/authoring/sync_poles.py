@@ -16,7 +16,9 @@ import os
 import bpy
 import numpy as np
 
-ROOT = os.environ.get("SFM_MAP_ROOT", "/media/cihcilab/新增磁碟區/sfm_glomap")
+ROOT = os.environ.get("SFM_MAP_ROOT", "").strip()
+if not ROOT:
+    raise RuntimeError("SFM_MAP_ROOT must explicitly select the authoring workspace")
 OUTD = os.environ.get("SFM_SAFEZONE_DIR", f"{ROOT}/safezone")
 POLES_JSON = f"{OUTD}/poles.json"
 

@@ -23,7 +23,10 @@ FLIGHT_MODE_BUTTONS = (
 
 MISSION_MODE_BUTTONS = (
     CommandButton("起飛", "takeoff"),
-    CommandButton("定位鎖定", "boot_lock"),
+    # 定位鎖定 removed 2026-08-06: the boot lock engages automatically once 開始定位
+    # is pressed (see OperatorApp.update_boot_lock), so the button only ever
+    # re-triggered something the operator had already started. The "boot_lock"
+    # control action itself stays in the contract for the automatic path.
 )
 
 
@@ -31,6 +34,8 @@ MISSION_MODE_BUTTONS = (
 class ActionResult:
     message: str
     profile_path: Path | None = None
+    asset_path: Path | None = None
+    kind: str | None = None
 
 
 class SiteAssetActions:
@@ -59,6 +64,7 @@ class SiteAssetActions:
         return ActionResult(
             f"場域 {imported.site_id} 匯入完成{suffix}；尚未套用、未解鎖飛行",
             imported.profile_path,
+            kind="site",
         )
 
     def import_route(self, source: str | Path) -> ActionResult:
@@ -68,6 +74,8 @@ class SiteAssetActions:
         return ActionResult(
             f"航線已匯入 {imported.asset_path.name}；飛行核准已維持關閉",
             imported.profile_path,
+            imported.asset_path,
+            "route",
         )
 
     def import_targets(self, source: str | Path) -> ActionResult:
@@ -77,6 +85,8 @@ class SiteAssetActions:
         return ActionResult(
             f"巡檢目標已匯入 {imported.asset_path.name}；飛行核准已維持關閉",
             imported.profile_path,
+            imported.asset_path,
+            "targets",
         )
 
 

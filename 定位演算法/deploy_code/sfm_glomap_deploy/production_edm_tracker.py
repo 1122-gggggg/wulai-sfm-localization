@@ -61,6 +61,8 @@ class EDMConfig:
     max_yaw_diff_deg: float = 90.0
     track_min_inliers: int = 50
     weak_min_inliers: int = 30
+    min_inlier_ratio: float = 0.15
+    min_inlier_grid_cells: int = 6
     # gates
     max_reproj_error_acquire: float = 5.0
     max_reproj_error_track: float = 6.0
@@ -75,6 +77,16 @@ class EDMConfig:
     adaptive_jump_history_size: int = 120
     weak_after: int = 2
     lost_after: int = 2
+    # LOST re-acquisition bound. The continuous-trajectory gate cannot apply across a
+    # LOST episode, but accepting an unbounded teleport is exactly how a wrong-place
+    # retrieval reaches the controller looking like a normal TRACK fix. Bound the
+    # re-acquisition against the last accepted pose while that pose is still recent;
+    # once it expires, a pure global relocalization anywhere is allowed again.
+    # Expressed as a FACTOR of max_jump so it follows each site's scale-dependent
+    # calibration instead of needing its own per-site value.
+    acquire_max_jump_factor: float = 2.0
+    acquire_max_yaw_diff_deg: float = 90.0
+    lost_prior_max_age_s: float = 3.0
     # EDM emits thousands of correspondences; PnP cost is linear in them and RANSAC
     # gains nothing past a well-spread ~900. Cap spatially so the cap does not bias
     # the pose toward whichever image region happened to match densely.
@@ -107,6 +119,7 @@ class EDMConfig:
             "weak_after",
             "lost_after",
             "corr_grid",
+            "min_inlier_grid_cells",
         )
         for name in positive_ints:
             value = getattr(self, name)
@@ -136,6 +149,9 @@ class EDMConfig:
             "adaptive_jump_floor",
             "adaptive_jump_bootstrap",
             "adaptive_jump_ceiling",
+            "acquire_max_jump_factor",
+            "acquire_max_yaw_diff_deg",
+            "lost_prior_max_age_s",
         )
         for name in positive_floats:
             value = getattr(self, name)
@@ -145,6 +161,13 @@ class EDMConfig:
                 raise ValueError(f"{name} must be finite and > 0")
         if self.acquire_initial_topk > self.boot_global_topk:
             raise ValueError("acquire_initial_topk cannot exceed boot_global_topk")
+        if (isinstance(self.min_inlier_ratio, bool)
+                or not isinstance(self.min_inlier_ratio, (int, float))
+                or not math.isfinite(float(self.min_inlier_ratio))
+                or not 0.0 < float(self.min_inlier_ratio) <= 1.0):
+            raise ValueError("min_inlier_ratio must be finite and within (0, 1]")
+        if self.min_inlier_grid_cells > self.corr_grid * self.corr_grid:
+            raise ValueError("min_inlier_grid_cells cannot exceed corr_grid squared")
         if self.local_topk > self.weak_local_topk or self.local_topk > self.lost_local_topk:
             raise ValueError("weak/lost local top-k cannot be smaller than TRACK local_topk")
         if self.adaptive_jump_min_history > self.adaptive_jump_history_size:
@@ -648,12 +671,6 @@ class ProductionEDMTracker:
             cfg.max_reproj_error_acquire if acquiring else cfg.max_reproj_error_track
         )
 
-        def pose_passes_quality(candidate) -> bool:
-            if candidate is None or int(candidate[0]["num_inliers"]) < min_inl:
-                return False
-            rms = candidate[3]["reproj_rms"]
-            return rms is not None and float(rms) <= float(reproj_limit)
-
         temporal_used = (
             candidate_mode in ("edm_temporal_map", "edm_local_recovery")
             and cfg.use_temporal_reference
@@ -696,21 +713,18 @@ class ProductionEDMTracker:
                 p2, p3, confidence, per_ref = self.loc.correspondences(
                     gray, first_refs, batch_size=cfg.match_batch_size
                 )
-                first_pose = estimate_pose(p2, p3, confidence)
-                if pose_passes_quality(first_pose):
-                    ret, pose_points2d, pose_points3d, pose_metrics = first_pose
-                    refs = first_refs
-                    staged_early_stop = True
-                else:
-                    remaining_refs = refs[initial_topk:]
-                    p2_rest, p3_rest, confidence_rest, counts_rest = self.loc.correspondences(
-                        gray, remaining_refs, batch_size=cfg.match_batch_size
-                    )
-                    if len(p2_rest):
-                        p2 = np.concatenate([p2, p2_rest])
-                        p3 = np.concatenate([p3, p3_rest])
-                        confidence = np.concatenate([confidence, confidence_rest])
-                    per_ref.extend(counts_rest)
+                # Acquisition must consider the complete retrieved set.  A plausible
+                # pose from the first two visually similar references is not evidence
+                # of multi-reference agreement and used to bypass the remaining eight.
+                remaining_refs = refs[initial_topk:]
+                p2_rest, p3_rest, confidence_rest, counts_rest = self.loc.correspondences(
+                    gray, remaining_refs, batch_size=cfg.match_batch_size
+                )
+                if len(p2_rest):
+                    p2 = np.concatenate([p2, p2_rest])
+                    p3 = np.concatenate([p3, p3_rest])
+                    confidence = np.concatenate([confidence, confidence_rest])
+                per_ref.extend(counts_rest)
             else:
                 p2, p3, confidence, per_ref = self.loc.correspondences(
                     gray, refs, batch_size=cfg.match_batch_size
@@ -774,6 +788,26 @@ class ProductionEDMTracker:
             self._on_miss(info)
             return info
 
+        if float(info["inlier_ratio"]) < float(cfg.min_inlier_ratio):
+            self.st.pending_limited_center = None
+            self.st.pending_limited_stamp = None
+            self.st.pending_limited_limit = None
+            info["inliers"] = int(ret["num_inliers"])
+            info["rejected"] = "inlier_ratio"
+            info["min_inlier_ratio"] = float(cfg.min_inlier_ratio)
+            self._on_miss(info)
+            return info
+
+        if int(info["inlier_grid_cells"]) < cfg.min_inlier_grid_cells:
+            self.st.pending_limited_center = None
+            self.st.pending_limited_stamp = None
+            self.st.pending_limited_limit = None
+            info["inliers"] = int(ret["num_inliers"])
+            info["rejected"] = "inlier_spread"
+            info["min_inlier_grid_cells"] = cfg.min_inlier_grid_cells
+            self._on_miss(info)
+            return info
+
         T = ret["cam_from_world"]
         R = T.rotation.matrix()
         C = -R.T @ np.asarray(T.translation)
@@ -830,7 +864,14 @@ class ProductionEDMTracker:
                 )
                 confirmation_model = None
                 confirmation_residual = None
-                if pending is not None:
+                # The confirmation must come from a DIFFERENT capture. Re-localizing the
+                # same frame reproduces the same centre, which would score a residual of
+                # ~0 against itself and promote one bad frame to an accepted relocation.
+                independent_capture = (
+                    pending_stamp is not None and capture_stamp > pending_stamp
+                )
+                info["limited_jump"]["confirmation_independent"] = independent_capture
+                if pending is not None and independent_capture:
                     stationary_residual = float(np.linalg.norm(C - pending))
                     confirmation_model = "stationary"
                     confirmation_residual = stationary_residual
@@ -876,6 +917,39 @@ class ProductionEDMTracker:
                 self.st.pending_limited_center = None
                 self.st.pending_limited_stamp = None
                 self.st.pending_limited_limit = None
+        elif self.st.center is not None:
+            # LOST re-acquisition: bound it against the last accepted pose while that
+            # pose is still recent. Without this, any relocalization -- including one
+            # onto a repeated-texture reference on the far side of the map -- is
+            # accepted with no bound on distance or heading change and published as a
+            # normal TRACK fix.
+            prior_age = (
+                None if self.st.last_capture_stamp is None
+                else capture_stamp - self.st.last_capture_stamp
+            )
+            prior_fresh = (
+                prior_age is not None
+                and math.isfinite(prior_age)
+                and 0.0 <= prior_age <= cfg.lost_prior_max_age_s
+            )
+            info["acquire_prior_age"] = prior_age
+            if prior_fresh:
+                acquire_limit = float(cfg.acquire_max_jump_factor) * float(cfg.max_jump)
+                acquire_step = float(np.linalg.norm(C - self.st.center))
+                info["acquire_step"] = acquire_step
+                info["acquire_limit"] = acquire_limit
+                if acquire_step > acquire_limit:
+                    info["rejected"] = "acquire_jump"
+                    self._on_miss(info)
+                    return info
+                prior_yaw = self.st.yaw
+                if prior_yaw is not None and math.isfinite(float(prior_yaw)):
+                    yaw_delta = abs(_angle_diff(yaw, float(prior_yaw)))
+                    info["acquire_yaw_delta_deg"] = math.degrees(yaw_delta)
+                    if yaw_delta > math.radians(float(cfg.acquire_max_yaw_diff_deg)):
+                        info["rejected"] = "acquire_yaw"
+                        self._on_miss(info)
+                        return info
 
         previous_center = self.st.center
         previous_stamp = self.st.last_capture_stamp

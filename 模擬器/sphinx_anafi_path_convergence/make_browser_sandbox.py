@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import shutil
 from pathlib import Path
 
@@ -1195,15 +1196,20 @@ def write_html(data: dict, out_path: Path) -> None:
 def ensure_three_vendor(out_dir: Path) -> None:
     """Copy the local Three.js runtime needed by the static sandbox."""
     candidates = [
+        Path(os.environ["THREE_ROOT"]).expanduser()
+        if os.environ.get("THREE_ROOT", "").strip()
+        else None,
         Path(__file__).resolve().parent / "node_modules" / "three",
         Path.cwd() / "node_modules" / "three",
-        Path("/home/allen/.hermes/hermes-agent/node_modules/three"),
     ]
-    three_root = next((p for p in candidates if (p / "build" / "three.module.js").exists()), None)
+    three_root = next(
+        (p for p in candidates if p is not None and (p / "build" / "three.module.js").exists()),
+        None,
+    )
     if three_root is None:
         raise FileNotFoundError(
             "Three.js was not found locally. Install it under this experiment "
-            "folder with `npm install three`, then rerun make_browser_sandbox.py."
+            "folder with `npm install three` or set THREE_ROOT explicitly, then rerun."
         )
 
     vendor_dir = out_dir / "vendor" / "three"

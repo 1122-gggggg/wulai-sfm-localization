@@ -10,8 +10,12 @@ Run:  pytest -q 定位演算法/flight_control/test_flight_safety_gates.py
 from __future__ import annotations
 
 import builtins
+import ast
+import hashlib
+import importlib.util
 import inspect
 import json
+import math
 import os
 import sys
 import threading
@@ -58,6 +62,7 @@ def run_ticks(max_ticks, pose_fn, *, route=((0.0, 0.0, 0.0), (8.0, 0.0, 0.0)),
 
     extra = dict(hooks_extra or {})
     extra.setdefault("log_tick", records.append)
+    extra.setdefault("ground_speed", lambda: (0.0, st["t"]))
     hooks = pff.LoopHooks(
         get_pose=get_pose,
         olympe_yaw=lambda: None,
@@ -110,9 +115,21 @@ def test_grab_only_source_never_arms():
 def test_fly_is_the_only_arming_entrypoint():
     module_src = inspect.getsource(pff)
     fly_src = inspect.getsource(pff.fly)
-    # every arming/movement Olympe message used by the module must live in fly()
-    for token in ("TakeOff", "Emergency"):
-        assert module_src.count(f"drone({token}") == fly_src.count(f"drone({token}")
+    # Every arming/movement Olympe message constructed by the module must live in
+    # fly(). The counts must also be NON-ZERO: the previous form matched
+    # "drone(TakeOff" which never occurs (TakeOff is composed with an expectation,
+    # `TakeOff() >> FlyingStateChanged(...)`), so it asserted 0 == 0 and would have
+    # stayed green even if arming had moved somewhere else entirely.
+    for token in ("TakeOff", "Emergency", "Landing"):
+        module_uses = module_src.count(f"{token}()")
+        fly_uses = fly_src.count(f"{token}()")
+        assert fly_uses > 0, (
+            f"{token}() no longer appears in fly(); this test can no longer prove "
+            "that arming is confined to the single approved entry point"
+        )
+        assert module_uses == fly_uses, (
+            f"{token}() is constructed {module_uses - fly_uses} time(s) outside fly()"
+        )
 
 
 def test_flight_localizer_uses_site_selected_edm_factory(monkeypatch):
@@ -136,6 +153,11 @@ def test_flight_localizer_uses_site_selected_edm_factory(monkeypatch):
     monkeypatch.setattr(pff, "LOCALIZER_BACKEND", "edm")
     monkeypatch.setattr(pff, "LOCALIZER_PROFILE", "/tmp/edm-profile.json")
     monkeypatch.setattr(pff, "BUNDLE_SHA256", "a" * 64)
+    measured_frame = object()
+    monkeypatch.setattr(pff, "MAP_ALIGN", "/tmp/measured-align.json")
+    monkeypatch.setattr(rpf, "load_map_frame", lambda path: (
+        measured_frame if path == "/tmp/measured-align.json" else None
+    ))
     monkeypatch.setattr(pff, "FLIGHT_CONTRACT_JSON", json.dumps({
         "localizer_profile_sha256": "b" * 64,
     }))
@@ -151,6 +173,7 @@ def test_flight_localizer_uses_site_selected_edm_factory(monkeypatch):
     assert captured["camera_tuple"][0] == "PINHOLE"
     assert captured["bundle_sha256"] == "a" * 64
     assert captured["production_profile_sha256"] == "b" * 64
+    assert captured["map_frame"] is measured_frame
 
 
 def test_legacy_autonomous_controller_is_external_approval_locked():
@@ -513,6 +536,129 @@ def test_route_completion_lands():
     assert sent[-1] == ZERO
 
 
+def test_route_completion_holds_when_ground_speed_is_unavailable():
+    sent, reason, records = run_ticks(
+        80,
+        lambda st: fresh_pose(st, x=min(7.99, 0.5 * st["tick"])),
+        hooks_extra={"ground_speed": lambda: None},
+    )
+
+    assert reason == "tick cap"
+    assert sent[-1] == ZERO
+    assert any(
+        "ground speed unavailable" in record.get("reason", "")
+        for record in records
+    )
+
+
+def test_route_completion_waits_for_fresh_low_ground_speed():
+    speed_state = {"stamp": 0.0, "reads": 0}
+
+    def pose(st):
+        speed_state["stamp"] = st["t"]
+        return fresh_pose(st, x=min(7.99, 0.5 * st["tick"]))
+
+    def ground_speed():
+        speed_state["reads"] += 1
+        speed = 0.11 if speed_state["reads"] <= 2 else 0.09
+        return speed, speed_state["stamp"]
+
+    sent, reason, records = run_ticks(
+        80,
+        pose,
+        hooks_extra={"ground_speed": ground_speed},
+    )
+
+    assert reason == "route complete -> land"
+    assert speed_state["reads"] == 3
+    assert sent[-1] == ZERO
+    assert sum(
+        "ground speed 0.110 m/s" in record.get("reason", "")
+        for record in records
+    ) == 2
+
+
+@pytest.mark.parametrize(
+    ("sample", "allowed", "reason_fragment"),
+    [
+        (None, False, "unavailable"),
+        ((float("nan"), 10.0), False, "invalid"),
+        ((0.09, 9.49), False, "stale"),
+        ((0.09, 10.1), False, "future"),
+        ((0.11, 10.0), False, ">"),
+        ((0.09, 10.0), True, "<="),
+    ],
+)
+def test_landing_speed_gate_fails_closed(sample, allowed, reason_fragment):
+    ok, reason, _speed = pff.landing_speed_allows_land(sample, now=10.0)
+
+    assert ok is allowed
+    assert reason_fragment in reason
+
+
+def test_olympe_ground_speed_tracker_uses_event_receipt_time():
+    event = SimpleNamespace(
+        args={"speedX": 0.3, "speedY": 0.4, "speedZ": 0.0},
+        uuid="speed-1",
+        date=SimpleNamespace(timestamp=lambda: 99.8),
+    )
+    drone = SimpleNamespace(get_last_event=lambda _message: event)
+    clock = {"mono": 10.0, "wall": 100.0}
+    tracker = pff.OlympeGroundSpeedTracker(
+        drone,
+        message=object(),
+        now=lambda: clock["mono"],
+        wall_now=lambda: clock["wall"],
+    )
+
+    speed, stamp = tracker.sample()
+    assert speed == pytest.approx(0.5)
+    assert stamp == pytest.approx(9.8)
+    clock["mono"] = 10.31
+    clock["wall"] = 100.31
+    speed, stamp = tracker.sample()
+    ok, reason, _ = pff.landing_speed_allows_land((speed, stamp), now=clock["mono"])
+    assert not ok
+    assert "stale" in reason
+
+
+def test_final_waypoint_requires_continuous_unique_pose_hold():
+    wp = [np.array([0.0, 0.0, 0.0]), np.array([1.0, 0.0, 0.0])]
+    cfg = rpf.ControlConfig(
+        inspect_waypoints=(),
+        waypoint_arrive_confirm_frames=1,
+        final_arrive_confirm_frames=3,
+        final_hold_s=0.5,
+    )
+    ctrl = rpf.RouteAutoController(wp, poles=[], config=cfg)
+
+    ctrl.step(rpf.Pose(0.0, 0.0, 0.0, 0.0, stamp=0.9), now=0.9)
+    repeated = rpf.Pose(0.995, 0.0, 0.0, 0.0, stamp=1.0)
+    for now in (1.0, 1.3, 1.7):
+        cmd = ctrl.step(repeated, now=now)
+        assert not cmd.should_land, "re-reading one captured pose must not arm landing"
+
+    for stamp in (1.8, 2.05, 2.31):
+        cmd = ctrl.step(
+            rpf.Pose(0.995, 0.0, 0.0, 0.0, stamp=stamp),
+            now=stamp,
+        )
+    assert cmd.should_land
+
+
+def test_final_tolerance_never_exceeds_waypoint_arrival_sphere():
+    cfg = rpf.ControlConfig(
+        inspect_waypoints=(),
+        arrive=1.0,
+        min_arrive=0.1,
+        waypoint_arrive_radius=0.02,
+    )
+    ctrl = rpf.RouteAutoController(
+        [np.zeros(3), np.array([10.0, 0.0, 0.0])], poles=[], config=cfg
+    )
+    assert ctrl.final_arrive_tolerance() == pytest.approx(0.02)
+
+
 def test_route_completion_rejects_a_single_jump_to_the_end():
     wp = [np.array([0.0, 0.0, 0.0]), np.array([8.0, 0.0, 0.0])]
     ctrl = rpf.RouteAutoController(
@@ -595,6 +741,84 @@ def test_flight_route_contract_binds_site_frame_and_coordinate_id(tmp_path):
         )
 
 
+def _write_flight_route(path: Path, *, end_x: float = 8.0) -> str:
+    path.write_text(json.dumps({
+        "schema": "sfm-flight-route/v1",
+        "site_id": "field-a",
+        "coordinate_frame_id": "glomap-a",
+        "units": "map",
+        "purpose": "flight",
+        "closed": False,
+        "frame": "glomap",
+        "waypoints": [[0.0, 0.0, 0.0], [end_x, 0.0, 0.0]],
+    }), encoding="utf-8")
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def test_mission_route_snapshot_rejects_file_changed_before_auto(tmp_path):
+    route = tmp_path / "flight_path.json"
+    digest = _write_flight_route(route)
+    snapshot = rpf.capture_mission_route_snapshot(
+        route,
+        expected_sha256=digest,
+        expected_site_id="field-a",
+        expected_coordinate_frame_id="glomap-a",
+    )
+    lock = rpf.MissionRouteLock(snapshot)
+
+    _write_flight_route(route, end_x=9.0)
+
+    with pytest.raises(ValueError, match="changed after selection"):
+        lock.begin_auto(displayed_sha256=digest)
+    assert not lock.active
+
+
+def test_auto_route_lock_keeps_same_snapshot_until_confirmed_landed(tmp_path):
+    first_path = tmp_path / "first.json"
+    second_path = tmp_path / "second.json"
+    first = rpf.capture_mission_route_snapshot(
+        first_path,
+        expected_sha256=_write_flight_route(first_path),
+        expected_site_id="field-a",
+        expected_coordinate_frame_id="glomap-a",
+    )
+    second = rpf.capture_mission_route_snapshot(
+        second_path,
+        expected_sha256=_write_flight_route(second_path, end_x=12.0),
+        expected_site_id="field-a",
+        expected_coordinate_frame_id="glomap-a",
+    )
+    lock = rpf.MissionRouteLock(first)
+
+    assert lock.begin_auto(displayed_sha256=first.sha256) is first
+    lock.confirm_auto_started()
+    assert lock.resume_auto() is first
+    lock.cancel_rejected_auto_start()
+    assert lock.active
+    with pytest.raises(ValueError, match="cannot switch route"):
+        lock.bind(second)
+    with pytest.raises(ValueError, match="confirmed landed"):
+        lock.release_after_confirmed_landed("hovering")
+
+    lock.release_after_confirmed_landed("landed")
+    lock.bind(second)
+    assert lock.snapshot is second
+
+
+def test_route_controller_deep_copies_and_freezes_waypoints():
+    source = [np.array([0.0, 0.0, 0.0]), np.array([8.0, 0.0, 0.0])]
+    controller = rpf.RouteAutoController(
+        source,
+        config=rpf.ControlConfig(inspect_waypoints=()),
+    )
+
+    source[1][0] = 99.0
+
+    assert controller.wp[1][0] == pytest.approx(8.0)
+    with pytest.raises(ValueError, match="read-only"):
+        controller.wp[1][0] = 7.0
+
+
 @pytest.mark.parametrize("waypoints", [
     [[0.0, 0.0], [1.0, 0.0, 0.0]],
     [[0.0, 0.0, 0.0], [float("nan"), 0.0, 0.0]],
@@ -616,7 +840,7 @@ def test_direct_controller_route_validation():
 
 def test_non_finite_controller_config_rejected():
     with pytest.raises(ValueError):
-        rpf.ControlConfig(speed=float("nan"))
+        rpf.ControlConfig(lookahead=float("nan"))
     with pytest.raises(ValueError):
         rpf.ControlConfig(max_pose_age_s=0.0)
 
@@ -626,6 +850,19 @@ def test_malformed_pole_rejected(tmp_path):
     bad.write_text(json.dumps({"poles": [{"center": [0.0, float("nan"), 0.0]}]}))
     with pytest.raises(ValueError):
         rpf.load_poles(bad)
+
+
+def test_pole_geometry_uses_the_measured_horizontal_plane():
+    frame = rpf.MapFrame.from_gravity([0.0, 0.0, 1.0])
+    poles = [
+        {"id": 1, "center": np.array([0.0, 0.0, 10.0])},
+        {"id": 2, "center": np.array([1.0, 0.0, 0.0])},
+    ]
+
+    pole_id, _pole, distance = rpf.nearest_pole(poles, np.zeros(3), frame)
+
+    assert pole_id == 1
+    assert distance == pytest.approx(0.0)
 
 
 def test_boot_lock_requires_consecutive_fixes_near_route_start():
@@ -646,7 +883,8 @@ def test_inspection_requires_explicit_capture_ack():
     ctrl = rpf.RouteAutoController(
         wp, [pole], rpf.ControlConfig(inspect_waypoints=(2,), inspect_radius=0.3))
     pose = rpf.Pose(1.0, 0.0, 0.0, 0.0, stamp=2.0)
-    cmd = ctrl.step(pose, now=2.0)
+    _settle(ctrl, pose, 2.0)
+    cmd = _settle(ctrl, pose, 2.1)
     assert cmd.action == "INSPECT" and np.allclose(cmd.vel_map, 0.0)
     assert ctrl.completed_inspections == set()
     assert not ctrl.ack_inspection(cmd.look_at_pole), "orientation confirmation is mandatory"
@@ -661,7 +899,9 @@ def test_inspection_command_targets_pole_bearing_not_route_heading():
             "base": np.array([1.0, 0.0, 2.0]), "top": np.array([1.0, -1.0, 2.0])}
     ctrl = rpf.RouteAutoController(
         wp, [pole], rpf.ControlConfig(inspect_waypoints=(2,), inspect_radius=0.3))
-    cmd = ctrl.step(rpf.Pose(1.0, 0.0, 0.0, 0.0, stamp=2.0), now=2.0)
+    pose = rpf.Pose(1.0, 0.0, 0.0, 0.0, stamp=2.0)
+    _settle(ctrl, pose, 2.0)
+    cmd = _settle(ctrl, pose, 2.1)
     assert cmd.action == "INSPECT"
     assert cmd.yaw_target == pytest.approx(np.pi / 2.0)
     assert cmd.look_at_pole["target"] == [1.0, 0.0, 2.0]
@@ -673,6 +913,14 @@ def test_inspection_gimbal_pitch_is_derived_from_target_and_pose():
     pitch = pff.inspection_gimbal_pitch_deg(meta, pose)
     assert pitch == pytest.approx(-45.0)
     assert pff.inspection_gimbal_pitch_deg({"target": [np.nan, 0.0, 0.0]}, pose) is None
+
+
+def test_inspection_gimbal_pitch_uses_measured_map_frame():
+    frame = rpf.MapFrame.from_gravity([0.0, 0.0, 1.0])
+    pose = rpf.Pose(0.0, 0.0, 0.0, yaw=0.0)
+    meta = {"target": [1.0, 0.0, -1.0]}
+
+    assert pff.inspection_gimbal_pitch_deg(meta, pose, frame) == pytest.approx(45.0)
 
 
 @pytest.mark.parametrize("capture_ok", [False, True])
@@ -688,7 +936,7 @@ def test_run_loop_inspection_hook_controls_completion(capture_ok):
 
     def now():
         clock["calls"] += 1
-        if clock["calls"] > 30:
+        if clock["calls"] > 90:
             raise KeyboardInterrupt
         clock["t"] += 0.05
         return clock["t"]
@@ -723,7 +971,7 @@ def test_inspection_zero_hold_precedes_blocking_capture_hook():
 
     def now():
         clock["calls"] += 1
-        if clock["calls"] > 12:
+        if clock["calls"] > 60:
             raise KeyboardInterrupt
         clock["t"] += 0.05
         return clock["t"]
@@ -781,7 +1029,7 @@ def test_unaligned_inspection_yaws_without_capture_ack():
     assert any(cmd[2] != 0 and cmd[1] == 0 and cmd[3] == 0 for cmd in sent)
 
 
-def test_missing_body_yaw_telemetry_never_acknowledges_inspection():
+def test_visual_yaw_allows_inspection_when_olympe_yaw_is_missing():
     wp = [np.array([0.0, 0.0, 0.0]), np.array([1.0, 0.0, 0.0]),
           np.array([3.0, 0.0, 0.0])]
     pole = {"id": 1, "center": np.array([2.0, 0.0, 0.0]),
@@ -807,7 +1055,7 @@ def test_missing_body_yaw_telemetry_never_acknowledges_inspection():
     )
     with pytest.raises(KeyboardInterrupt):
         pff.run_loop(hooks, ctrl, wp, verbose=False)
-    assert clock["captures"] == 0
+    assert clock["captures"] > 0
     assert sent and all(cmd == ZERO for cmd in sent)
 
 
@@ -847,18 +1095,95 @@ def test_inspection_radius_jitter_does_not_reset_timeout(monkeypatch):
     assert reason == "inspection alignment/capture timeout -> land"
 
 
-def test_pending_inspection_at_route_end_aborts_instead_of_infinite_auto():
+def test_a_pending_inspection_waypoint_cannot_be_skipped():
+    """Direct-to-waypoint replaced the old 'abort at route end' rule.
+
+    The target holds on an un-inspected waypoint, so overshooting it commands the
+    drone BACK instead of carrying on to the end with the inspection undone.
+    """
     wp = [np.array([0.0, 0.0, 0.0]), np.array([1.0, 0.0, 0.0]),
           np.array([3.0, 0.0, 0.0])]
     pole = {"id": 1, "center": np.array([1.0, 0.0, 0.0]),
             "base": np.array([1.0, 0.0, 0.0]), "top": np.array([1.0, -1.0, 0.0])}
     ctrl = rpf.RouteAutoController(
         wp, [pole], rpf.ControlConfig(inspect_waypoints=(2,), inspect_radius=0.2))
-    ctrl.step(rpf.Pose(0.4, 0.0, 0.0, 0.0, stamp=1.0), now=1.0)
-    ctrl.step(rpf.Pose(1.4, 0.0, 0.0, 0.0, stamp=1.5), now=1.5)
-    cmd = ctrl.step(rpf.Pose(3.0, 0.0, 0.0, 0.0, stamp=2.0), now=2.0)
+
+    _settle(ctrl, rpf.Pose(0.4, 0.0, 0.0, 0.0, stamp=1.0), 1.0)
+    cmd = _settle(ctrl, rpf.Pose(1.4, 0.0, 0.0, 0.0, stamp=1.5), 1.5)
+
+    assert ctrl.target_index == 1, "target advanced past an un-inspected waypoint"
+    assert not cmd.should_land
+    # Still aimed at the waypoint it overshot, not onward to the end.
+    assert cmd.goal[0] == pytest.approx(1.0)
+    assert 1 not in ctrl.completed_inspections
+
+
+def test_parking_on_an_unreachable_inspection_waypoint_aborts():
+    """Holding forever would sit there until an unrelated failsafe fired.
+
+    Reachable whenever inspect_radius is tighter than the arrival tolerance: the
+    drone parks on the waypoint, the look-at region never opens, and the hold that
+    protects the inspection would otherwise never release.
+    """
+    wp = [np.array([0.0, 0.0, 0.0]), np.array([1.0, 0.0, 0.0]),
+          np.array([3.0, 0.0, 0.0])]
+    pole = {"id": 1, "center": np.array([1.0, 0.0, 0.4]),
+            "base": np.array([1.0, 0.0, 0.0]), "top": np.array([1.0, -1.0, 0.0])}
+    # inspect_radius tighter than the arrival sphere: the drone parks on the
+    # waypoint and the look-at region never opens.
+    ctrl = rpf.RouteAutoController(
+        wp, [pole], rpf.ControlConfig(inspect_waypoints=(2,), inspect_radius=0.005,
+                                      waypoint_arrive_radius=0.05))
+
+    _settle(ctrl, rpf.Pose(0.4, 0.0, 0.0, 0.0, stamp=1.0), 1.0)
+    cmd = _settle(ctrl, rpf.Pose(1.02, 0.0, 0.0, 0.0, stamp=1.5), 1.5)
+
     assert cmd.should_land and cmd.action == "ABORT"
-    assert "pending inspection" in cmd.status.lower()
+    assert "no reachable target" in cmd.status
+
+
+def test_waypoint_target_advances_on_overshoot_not_only_on_proximity():
+    """A 20 Hz tick at speed steps over the arrival ball; proximity alone strands it."""
+    wp = [np.array([0.0, 0.0, 0.0]), np.array([1.0, 0.0, 0.0]),
+          np.array([2.0, 0.0, 0.0])]
+    ctrl = rpf.RouteAutoController(wp, poles=[],
+                                   config=rpf.ControlConfig(inspect_waypoints=()))
+
+    # Never within translation_arrival_tolerance (0.15) of waypoint 1, but past it.
+    _settle(ctrl, rpf.Pose(0.5, 0.0, 0.0, 0.0, stamp=1.0), 1.0)
+    cmd = _settle(ctrl, rpf.Pose(1.4, 0.0, 0.0, 0.0, stamp=1.05), 1.05)
+
+    assert ctrl.target_index == 2
+    assert cmd.goal[0] == pytest.approx(2.0)
+
+
+def test_one_pose_update_can_advance_at_most_one_waypoint():
+    wp = [np.array([float(x), 0.0, 0.0]) for x in range(4)]
+    ctrl = rpf.RouteAutoController(
+        wp,
+        poles=[],
+        config=rpf.ControlConfig(
+            inspect_waypoints=(),
+            waypoint_arrive_confirm_frames=1,
+            progress_jump_slack=10.0,
+        ),
+    )
+
+    ctrl.step(rpf.Pose(3.0, 0.0, 0.0, 0.0, stamp=1.0), now=1.0)
+    assert ctrl.target_index == 1
+
+
+def test_waypoint_target_never_regresses():
+    wp = [np.array([0.0, 0.0, 0.0]), np.array([1.0, 0.0, 0.0]),
+          np.array([2.0, 0.0, 0.0])]
+    ctrl = rpf.RouteAutoController(wp, poles=[],
+                                   config=rpf.ControlConfig(inspect_waypoints=()))
+    _settle(ctrl, rpf.Pose(1.1, 0.0, 0.0, 0.0, stamp=1.0), 1.0)
+    reached = ctrl.target_index
+
+    ctrl.step(rpf.Pose(0.0, 0.0, 0.0, 0.0, stamp=1.5), now=1.5)
+
+    assert ctrl.target_index == reached, "a backward fix must not rewind the route"
 
 
 def test_heading_unavailable_is_none_before_motion():
@@ -896,11 +1221,12 @@ def test_emergency_breaks_without_pcmd():
     assert reason.startswith("EMERGENCY")
 
 
-def test_safety_switch_preserves_existing_non_auto(tmp_path):
+def test_safety_switch_rejects_stale_non_auto_commands(tmp_path):
     command = tmp_path / "safety.cmd"
     command.write_text("land\n")
+    command.chmod(0o600)
     switch = pff.SafetySwitch(command, keyboard=False)
-    assert switch.poll() == "LAND"
+    assert switch.poll() == "HOVER"
     assert command.read_text() == "land\n"
 
 
@@ -914,12 +1240,62 @@ def test_safety_switch_missing_file_defaults_to_hover(tmp_path):
 def test_fly_requires_auto_written_after_this_run_started(tmp_path):
     command = tmp_path / "safety.cmd"
     command.write_text("auto\n")
+    command.chmod(0o600)
     switch = pff.SafetySwitch(command, keyboard=False, require_fresh_auto=True)
     assert switch.poll() == "HOVER", "stale AUTO from a previous run must not arm"
     baseline = command.stat().st_mtime_ns
     command.write_text("auto\n")
     os.utime(command, ns=(baseline + 1_000_000, baseline + 1_000_000))
     assert switch.poll() == "AUTO"
+
+
+@pytest.mark.parametrize(
+    ("token", "expected", "allow_manual"),
+    [("hover", "HOVER", False), ("manual", "MANUAL", True),
+     ("land", "LAND", False), ("emergency", "EMERGENCY", False)],
+)
+def test_every_file_command_requires_fresh_write(tmp_path, token, expected, allow_manual):
+    command = tmp_path / "safety.cmd"
+    command.write_text(f"{token}\n")
+    command.chmod(0o600)
+    switch = pff.SafetySwitch(command, keyboard=False, allow_manual=allow_manual)
+    assert switch.poll() == "HOVER", f"stale {token} must fail closed"
+    baseline = command.stat().st_mtime_ns
+    command.write_text(f"{token}\n")
+    os.utime(command, ns=(baseline + 1_000_000, baseline + 1_000_000))
+    assert switch.poll() == expected
+
+
+def test_default_safety_file_is_created_in_private_runtime_dir(tmp_path, monkeypatch):
+    runtime = tmp_path / "runtime"
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(runtime))
+    path = pff._default_safety_file()
+    assert path == runtime / "sfm_drone" / "safety.cmd"
+    switch = pff.SafetySwitch(path, keyboard=False)
+    assert switch.poll() == "HOVER"
+    assert (path.parent.stat().st_mode & 0o077) == 0
+    assert (path.stat().st_mode & 0o077) == 0
+
+
+def test_safety_file_rejects_symlink_group_writable_and_non_owner(tmp_path, monkeypatch):
+    target = tmp_path / "target.cmd"
+    target.write_text("hover\n")
+    target.chmod(0o600)
+    link = tmp_path / "link.cmd"
+    link.symlink_to(target)
+    with pytest.raises(RuntimeError, match="safety command"):
+        pff.SafetySwitch(link, keyboard=False)
+
+    insecure = tmp_path / "insecure.cmd"
+    insecure.write_text("hover\n")
+    insecure.chmod(0o660)
+    with pytest.raises(RuntimeError, match="safety command"):
+        pff.SafetySwitch(insecure, keyboard=False)
+
+    real_uid = os.getuid()
+    monkeypatch.setattr(pff.os, "getuid", lambda: real_uid + 1)
+    with pytest.raises(RuntimeError, match="owner-only|owner-owned"):
+        pff.SafetySwitch(target, keyboard=False)
 
 
 def test_keyboard_read_failure_fails_closed(monkeypatch):
@@ -929,6 +1305,11 @@ def test_keyboard_read_failure_fails_closed(monkeypatch):
     monkeypatch.setattr(pff.select, "select", lambda *_args, **_kw: (_ for _ in ()).throw(
         OSError("stdin failed")))
     assert switch.poll() == "HOVER"
+
+
+def test_safety_monitor_starts_fail_closed_before_first_valid_command():
+    monitor = pff.SafetyMonitor(lambda *_cmd: None)
+    assert monitor.mode == "HOVER"
 
 
 def test_safety_monitor_poll_failure_fails_closed():
@@ -943,6 +1324,147 @@ def test_safety_monitor_poll_failure_fails_closed():
     time.sleep(0.2)
     mon.stop()
     assert mon.mode == "HOVER"
+    assert ZERO in sent
+
+
+def test_dead_pcmd_channel_is_counted_and_never_stamped_as_delivered():
+    """A failing command channel must not look like a healthy one.
+
+    last_pcmd_call_mono_ns used to be stamped BEFORE the send attempt, so every
+    failed PCMD still advanced the "last command reached the wire" marker and the
+    failures were counted nowhere. The monitor must still keep running.
+    """
+    def dead_send(*_cmd):
+        raise ConnectionError("injected dead command channel")
+
+    mon = pff.SafetyMonitor(dead_send, timeout_s=0.06)
+    assert mon.pcmd_send_failures == 0
+    assert mon.last_pcmd_call_mono_ns is None
+
+    sent, why, actual = mon.send_authorized((0, 0, 0, 0), lambda: True, lambda: False)
+
+    assert mon.pcmd_send_failures >= 1
+    assert "ConnectionError" in mon.last_pcmd_send_error
+    assert mon.last_pcmd_call_mono_ns is None, (
+        "a failed send stamped the wire-time marker, hiding a dead command channel"
+    )
+    assert mon.pcmd_timing_snapshot()["pcmd_send_failures"] >= 1
+
+
+def test_successful_pcmd_stamps_the_wire_marker():
+    sent = []
+    mon = pff.SafetyMonitor(lambda *cmd: sent.append(tuple(cmd)), timeout_s=0.06)
+    mon.mode = "AUTO"  # explicit test injection of a previously validated command
+    ok, _why, _actual = mon.send_authorized((0, 0, 0, 0), lambda: True, lambda: False)
+    assert ok
+    assert mon.pcmd_send_failures == 0
+    assert mon.last_pcmd_call_mono_ns is not None
+
+
+@pytest.mark.parametrize("pcmd", [
+    (11, 0, 0, 0),
+    (0, 11, 0, 0),
+    (0, 0, 21, 0),
+    (0, 0, 0, 11),
+    (1.5, 0, 0, 0),
+    (True, 0, 0, 0),
+    (0, 0, 0),
+])
+def test_final_command_authority_rejects_malformed_or_out_of_envelope_pcmd(pcmd):
+    sent = []
+    mon = pff.SafetyMonitor(
+        lambda *cmd: sent.append(tuple(cmd)),
+        max_translation_pcmd=10,
+        max_yaw_pcmd=20,
+    )
+    mon.mode = "AUTO"
+
+    ok, reason, actual = mon.send_authorized(pcmd, lambda: True, lambda: False)
+
+    assert not ok
+    assert "PCMD" in reason
+    assert actual == ZERO
+    assert sent[-1] == ZERO
+
+
+def test_expired_nonzero_pcmd_is_not_replayed_by_monitor_thread():
+    class _AutoSafety:
+        @staticmethod
+        def poll():
+            return "AUTO"
+
+    sent = []
+    mon = pff.SafetyMonitor(
+        lambda *cmd: sent.append((time.monotonic(), tuple(cmd))),
+        _AutoSafety(),
+        timeout_s=1.0,
+        command_ttl_s=0.05,
+    ).start()
+    try:
+        mon.beat()
+        ok, _reason, _actual = mon.send_authorized(
+            (1, 2, 3, 4), lambda: True, lambda: False
+        )
+        assert ok
+        time.sleep(0.18)
+    finally:
+        mon.stop()
+
+    nonzero_indices = [i for i, (_stamp, cmd) in enumerate(sent) if cmd != ZERO]
+    assert nonzero_indices
+    assert any(cmd == ZERO for _stamp, cmd in sent[nonzero_indices[-1] + 1:])
+
+
+def test_pose_jump_cannot_be_confirmed_by_relocalizing_the_same_capture():
+    """The confirming fix must come from a DIFFERENT capture.
+
+    Re-localizing the same frame reproduces the same centre, so it would agree with
+    itself and promote one bad frame straight to an accepted relocation.
+    """
+    jump = pff.MAX_POSE_JUMP_U * 3.0
+    frozen = {"stamp": None}
+
+    def pose(st):
+        if st["tick"] <= 2:
+            return rpf.Pose(x=0.0, y=0.0, z=0.0, yaw=0.0, stamp=st["t"])
+        if frozen["stamp"] is None:
+            frozen["stamp"] = st["t"]          # one capture, re-localized repeatedly
+        return rpf.Pose(x=jump, y=0.0, z=0.0, yaw=0.0, stamp=frozen["stamp"])
+
+    _sent, _reason, records = run_ticks(8, pose)[:3]
+    first = next(
+        (i for i, r in enumerate(records) if "jump_reject_u" in r), None)
+    assert first is not None, "the teleport was never even flagged as a jump"
+    # While the same capture keeps being re-presented it must keep being rejected.
+    # Once it ages past POSE_STALE_S the loop legitimately reports "no fresh pose".
+    accepted = [
+        r for r in records[first + 1:]
+        if "jump_reject_u" not in r
+        and "no fresh pose" not in str(r.get("reason", ""))
+    ]
+    assert not accepted, (
+        "a single teleported capture confirmed itself and was accepted: "
+        f"{[str(r.get('reason'))[:60] for r in accepted]}"
+    )
+
+
+def test_stall_watchdog_escalates_to_land_instead_of_hovering_forever():
+    """Holding zero forever leaves the aircraft airborne until the battery dies."""
+    sent = []
+    mon = pff.SafetyMonitor(lambda *cmd: sent.append(tuple(cmd)), timeout_s=0.05)
+    mon.mode = "AUTO"  # explicit test injection of a previously validated command
+    monkey_land = []
+    mon._land_cb = lambda: monkey_land.append(True)
+    mon.beat()
+    mon.start()
+    try:
+        deadline = time.monotonic() + max(3.0, pff.WATCHDOG_LAND_S + 2.0)
+        while time.monotonic() < deadline and not mon.terminated.is_set():
+            time.sleep(0.05)
+    finally:
+        mon.stop()
+    assert mon.terminated.is_set(), "stalled control loop never escalated past hover"
+    assert "stall" in (mon.reason or "").lower()
     assert ZERO in sent
 
 
@@ -1578,7 +2100,9 @@ def test_control_thread_repeats_latest_desired_pcmd_during_inference():
         lambda *cmd: calls.append((time.monotonic(), tuple(cmd))),
         None,
         timeout_s=0.4,
-    ).start()
+    )
+    mon.mode = "AUTO"  # explicit test injection of a previously validated command
+    mon.start()
     try:
         mon.beat()
         ok, _reason, actual = mon.send_authorized(
@@ -1624,11 +2148,14 @@ def test_hover_clears_desired_command_before_auto_can_resume():
 def test_no_nonzero_command_reuse_after_loss():
     # The loop may drive on last_good within the POSE_STALE_S freshness window,
     # but once it first hovers after the loss, no nonzero command may ever recur.
+    # 11 ticks, not 6: a waypoint now costs waypoint_arrive_confirm_frames to
+    # retire and yaw_alignment_confirmation_updates to unlock translation, so the
+    # loop legitimately sends zeros for the first ~6 ticks of any route.
     def pose_fn(st):
-        return fresh_pose(st) if st["tick"] <= 5 else None
+        return fresh_pose(st) if st["tick"] <= 10 else None
     sent, reason, _ = run_ticks(200, pose_fn)
-    assert any(c != ZERO for c in sent[:6]), "sanity: loop was actually driving first"
-    first_zero_after_loss = next(i for i in range(6, len(sent)) if sent[i] == ZERO)
+    assert any(c != ZERO for c in sent[:11]), "sanity: loop was actually driving first"
+    first_zero_after_loss = next(i for i in range(11, len(sent)) if sent[i] == ZERO)
     assert all(c == ZERO for c in sent[first_zero_after_loss:]), \
         "after the loss is recognized, the previous nonzero command must never be reused"
     assert reason == "localization lost -> land"
@@ -1650,6 +2177,39 @@ def test_pcmd_turns_in_place_before_translation():
 
     assert rpf.command_to_body_percent(cmd, pose) == (0, 0, 20, 0)
     assert rpf.command_to_body_percent(cmd, pose, yaw_sign=-1) == (0, 0, -20, 0)
+
+
+def test_yaw_error_uses_both_rays_projected_on_the_measured_ground_plane():
+    frame = rpf.MapFrame.from_gravity([0.0, 1.0, 1.0])
+    target_delta = frame.north + 2.0 * frame.up
+
+    assert rpf.ground_projected_yaw_error(0.0, target_delta, frame) == pytest.approx(
+        math.pi / 2.0
+    )
+    assert rpf.ground_projected_yaw_error(
+        math.pi / 2.0, target_delta, frame
+    ) == pytest.approx(0.0)
+    assert rpf.ground_projected_yaw_error(0.0, frame.up, frame) is None
+
+
+def test_pcmd_alignment_is_derived_from_the_waypoint_ray_not_stale_metadata():
+    frame = rpf.MapFrame.from_gravity([0.0, 1.0, 1.0])
+    pose = rpf.Pose(0.0, 0.0, 0.0, yaw=0.0)
+    goal = frame.north.copy()
+    cmd = rpf.Command(
+        "FOLLOW",
+        goal.copy(),
+        yaw_target=0.0,  # Deliberately stale: geometry must remain authoritative.
+        goal=goal,
+        path_error=0.0,
+        progress=0.0,
+    )
+
+    assert rpf.command_to_body_percent(
+        cmd,
+        pose,
+        config=rpf.ControlConfig(inspect_waypoints=(), map_frame=frame),
+    ) == (0, 0, 20, 0)
 
 
 @pytest.mark.parametrize("goal, expected", [
@@ -1697,6 +2257,65 @@ def test_yaw_alignment_requires_three_quiet_updates_then_translates():
 
     assert control.update(cmd, pose, 0.25, target_key=1) == ZERO
     assert control.phase == "yaw_alignment_hold"
+
+
+def test_repeated_capture_cannot_confirm_yaw_alignment():
+    cfg = rpf.ControlConfig(inspect_waypoints=())
+    control = rpf.YawAlignedPcmdController(cfg)
+    cmd = rpf.Command(
+        "FOLLOW",
+        np.array([1.0, 0.0, 0.0]),
+        yaw_target=0.0,
+        goal=np.array([1.0, 0.0, 0.0]),
+        path_error=0.0,
+        progress=0.0,
+    )
+    frozen = rpf.Pose(0.0, 0.0, 0.0, yaw=0.0, stamp=1.0)
+
+    for now in (1.0, 1.05, 1.10, 1.15, 1.20):
+        assert control.update(cmd, frozen, now, target_key=0) == ZERO
+
+    assert not control.aligned_for_translation
+    assert control.phase == "yaw_alignment_hold"
+
+
+def test_short_horizontal_leg_still_requires_nose_alignment():
+    cfg = rpf.ControlConfig(inspect_waypoints=())
+    control = rpf.YawAlignedPcmdController(cfg)
+    cmd = rpf.Command(
+        "FOLLOW",
+        np.array([0.1, 0.0, 0.0]),
+        yaw_target=0.0,
+        goal=np.array([0.0, 0.0, 0.1]),
+        path_error=0.0,
+        progress=0.0,
+    )
+    pose = rpf.Pose(0.0, 0.0, 0.0, yaw=0.0, stamp=1.0)
+
+    pcmd = control.update(cmd, pose, 1.0, target_key=1)
+
+    assert pcmd[:2] == (0, 0)
+    assert pcmd[2] != 0
+    assert control.phase == "turn"
+
+
+def test_yaw_alignment_timeout_returns_zero_and_latches_abort_reason():
+    cfg = rpf.ControlConfig(inspect_waypoints=(), yaw_alignment_timeout_s=0.2)
+    control = rpf.YawAlignedPcmdController(cfg)
+    cmd = rpf.Command(
+        "FOLLOW",
+        np.array([0.0, 0.0, 1.0]),
+        yaw_target=math.pi / 2.0,
+        goal=np.array([0.0, 0.0, 1.0]),
+        path_error=0.0,
+        progress=0.0,
+    )
+    pose = rpf.Pose(0.0, 0.0, 0.0, yaw=0.0, stamp=1.0)
+
+    assert control.update(cmd, pose, 1.0, target_key=1)[2] != 0
+    assert control.update(cmd, pose, 1.21, target_key=1) == ZERO
+    assert control.phase == "yaw_alignment_timeout"
+    assert control.abort_reason
 
 def test_pcmd_conversion_bounds():
     pose = rpf.Pose(0.0, 0.0, 0.0, yaw=0.3)
@@ -1845,3 +2464,716 @@ def test_command_log_has_final_pcmd_and_reason():
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))
+
+
+# --- map frame: which way is up is a MEASUREMENT, not an assumption ----------
+
+_URAI_ALIGN = (Path(__file__).resolve().parents[2]
+               / "地圖檔/場域/urai/maps/edm_v1/T_align_gravity.json")
+
+
+def _write_align(tmp_path, gravity, rotation=None):
+    frame = rpf.MapFrame.from_gravity(gravity)
+    R = rotation if rotation is not None else [
+        frame.east.tolist(), frame.north.tolist(), frame.up.tolist()]
+    path = tmp_path / "T_align_gravity.json"
+    path.write_text(json.dumps({
+        "schema": "sfm-align/v2", "R": R,
+        "gravity_glomap": list(gravity),
+    }), encoding="utf-8")
+    return path
+
+
+
+def _settle(ctrl, pose, now):
+    """Step through the arrival confirmation window and return the last command.
+
+    Waypoint arrival deliberately needs consecutive in-sphere frames, so a test
+    that steps once is asserting against a target that has not advanced yet.
+    """
+    cmd = None
+    for i in range(int(ctrl.cfg.waypoint_arrive_confirm_frames)):
+        sample = rpf.Pose(
+            pose.x, pose.y, pose.z, pose.yaw, stamp=float(pose.stamp) + i * 1e-3
+        )
+        cmd = ctrl.step(sample, now=now + i * 1e-3)
+    return cmd
+
+
+def test_legacy_map_frame_reproduces_the_old_hardcoded_axes():
+    """The legacy default must be bit-compatible, or this becomes a silent change."""
+    legacy = rpf.LEGACY_MAP_FRAME
+    delta = np.array([0.3, -1.2, 0.8])
+
+    assert legacy.heading(delta) == pytest.approx(math.atan2(delta[2], delta[0]))
+    assert legacy.horizontal_distance(delta) == pytest.approx(
+        math.hypot(delta[0], delta[2]))
+    assert legacy.vertical(delta) == pytest.approx(-delta[1])
+
+    yaw = 0.7
+    forward, right, up = legacy.body_components(delta, yaw)
+    assert forward == pytest.approx(delta[0] * math.cos(yaw) + delta[2] * math.sin(yaw))
+    assert right == pytest.approx(delta[0] * math.sin(yaw) - delta[2] * math.cos(yaw))
+    assert up == pytest.approx(-delta[1])
+
+    point = [1.0, 2.0, 3.0]
+    assert np.allclose(rpf.aligned_to_glomap(point, legacy),
+                       [point[0], -point[2], point[1]])
+
+
+def test_map_frame_is_orthonormal_and_right_handed():
+    for frame in (rpf.LEGACY_MAP_FRAME,
+                  rpf.MapFrame.from_gravity([0.009, 0.924, 0.383])):
+        for axis in (frame.east, frame.north, frame.up):
+            assert float(np.linalg.norm(axis)) == pytest.approx(1.0)
+        assert np.allclose(np.cross(frame.east, frame.north), frame.up, atol=1e-9)
+
+
+@pytest.mark.skipif(not _URAI_ALIGN.is_file(), reason="site alignment not present")
+def test_measured_frame_matches_the_sites_recorded_rotation():
+    frame = rpf.load_map_frame(_URAI_ALIGN)
+    R = np.asarray(json.loads(_URAI_ALIGN.read_text(encoding="utf-8"))["R"], float)
+
+    assert np.allclose(frame.east, R[0], atol=1e-6)
+    assert np.allclose(frame.north, R[1], atol=1e-6)
+    assert np.allclose(frame.up, R[2], atol=1e-6)
+    # The whole point: it is NOT the legacy guess.
+    tilt = math.degrees(math.acos(float(np.dot(frame.up, rpf.LEGACY_MAP_FRAME.up))))
+    assert tilt == pytest.approx(22.51, abs=0.05)
+
+
+def test_measured_frame_changes_the_commanded_body_axes():
+    """A 22.5 deg error leaks commanded climb into horizontal motion."""
+    frame = rpf.MapFrame.from_gravity([0.009067509372034937,
+                                       0.9237964066045453,
+                                       0.38277667042064856])
+    climb = -frame.up * 1.0          # a purely vertical move in the MEASURED frame
+
+    legacy_f, legacy_r, legacy_u = rpf.LEGACY_MAP_FRAME.body_components(climb, 0.0)
+    measured_f, measured_r, measured_u = frame.body_components(climb, 0.0)
+
+    assert measured_u == pytest.approx(-1.0)
+    assert abs(measured_f) < 1e-9 and abs(measured_r) < 1e-9
+    # Under the legacy assumption the same motion reads as partly horizontal.
+    assert math.hypot(legacy_f, legacy_r) > 0.38
+    assert abs(legacy_u) < 0.93
+
+
+def test_measured_route_round_trip_is_exact_and_legacy_inverse_is_not(tmp_path):
+    gravity = [0.009067509372034937, 0.9237964066045453, 0.38277667042064856]
+    frame = rpf.load_map_frame(_write_align(tmp_path, gravity))
+    point = np.array([0.3, -1.2, 0.8])
+    aligned = [float(np.dot(point, frame.east)),
+               float(np.dot(point, frame.north)),
+               float(np.dot(point, frame.up))]
+
+    assert np.allclose(rpf.aligned_to_glomap(aligned, frame), point, atol=1e-12)
+    # The bug this replaced: authoring with the measured basis, reading with legacy.
+    wrong = rpf.aligned_to_glomap(aligned, rpf.LEGACY_MAP_FRAME)
+    assert float(np.linalg.norm(wrong - point)) > 0.4
+
+
+def test_map_alignment_whose_R_disagrees_with_its_gravity_is_refused(tmp_path):
+    # A proper rotation (identity) whose Z row is NOT the recorded gravity's up.
+    bad = _write_align(tmp_path, [0.0, 1.0, 0.0],
+                       rotation=[[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
+    with pytest.raises(ValueError, match="disagrees with gravity_glomap"):
+        rpf.load_map_frame(bad)
+
+
+def test_map_alignment_with_a_non_rotation_matrix_is_refused(tmp_path):
+    path = tmp_path / "T_align_gravity.json"
+    path.write_text(json.dumps({
+        "schema": "sfm-align/v2",
+        "R": [[2.0, 0.0, 0.0], [0.0, 2.0, 0.0], [0.0, 0.0, 2.0]],
+        "gravity_glomap": [0.0, 1.0, 0.0],
+    }), encoding="utf-8")
+    with pytest.raises(ValueError, match="proper rotation"):
+        rpf.load_map_frame(path)
+
+
+def test_aligned_route_needs_an_align_source_when_the_site_measured_gravity(tmp_path):
+    """'aligned' does not say WHICH alignment; guessing costs 22.5 deg."""
+    frame = rpf.load_map_frame(_write_align(
+        tmp_path, [0.009067509372034937, 0.9237964066045453, 0.38277667042064856]))
+    route = tmp_path / "route.json"
+
+    def write(**extra):
+        route.write_text(json.dumps({
+            "frame": "aligned", "units": "map",
+            "waypoints": [[0.0, 0.0, 0.0], [1.0, 2.0, 3.0]],
+            **extra,
+        }), encoding="utf-8")
+
+    write()
+    with pytest.raises(ValueError, match="align_source"):
+        rpf.load_waypoints(route, map_frame=frame)
+
+    write(align_source="nonsense")
+    with pytest.raises(ValueError, match="unknown route align_source"):
+        rpf.load_waypoints(route, map_frame=frame)
+
+
+def test_align_source_selects_the_basis_that_authored_the_route(tmp_path):
+    """It says which basis PRODUCED the file, not which basis the site uses.
+
+    A route drawn before the site's gravity was measured is legacy-aligned and
+    inverts correctly with the legacy basis. Refusing it because the site has since
+    been measured made every pre-measurement route unloadable -- which is exactly
+    what happened to river_site's existing route.
+    """
+    frame = rpf.load_map_frame(_write_align(
+        tmp_path, [0.009067509372034937, 0.9237964066045453, 0.38277667042064856]))
+    route = tmp_path / "route.json"
+    aligned = [[0.0, 0.0, 0.0], [1.0, 2.0, 3.0]]
+
+    def write(source):
+        route.write_text(json.dumps({
+            "frame": "aligned", "units": "map", "align_source": source,
+            "waypoints": aligned,
+        }), encoding="utf-8")
+
+    write("legacy")
+    legacy_points = rpf.load_waypoints(route, map_frame=frame)
+    assert np.allclose(legacy_points[1], [1.0, -3.0, 2.0]), "not the legacy inverse"
+
+    write("measured")
+    measured_points = rpf.load_waypoints(route, map_frame=frame)
+    expected = frame.east * 1.0 + frame.north * 2.0 + frame.up * 3.0
+    assert np.allclose(measured_points[1], expected, atol=1e-12)
+
+    # The two really are different worlds; picking the wrong one moves the route.
+    assert float(np.linalg.norm(measured_points[1] - legacy_points[1])) > 0.4
+
+
+def test_measured_route_is_refused_when_the_site_has_no_measurement(tmp_path):
+    route = tmp_path / "route.json"
+    route.write_text(json.dumps({
+        "frame": "aligned", "units": "map", "align_source": "measured",
+        "waypoints": [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
+    }), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="no measured gravity alignment"):
+        rpf.load_waypoints(route)
+
+
+def test_a_legacy_route_loads_on_a_site_with_no_measurement(tmp_path):
+    """Sites without T_align_gravity.json must behave exactly as before."""
+    route = tmp_path / "route.json"
+    route.write_text(json.dumps({
+        "frame": "aligned", "units": "map",
+        "waypoints": [[0.0, 0.0, 0.0], [1.0, 2.0, 3.0]],
+    }), encoding="utf-8")
+
+    points = rpf.load_waypoints(route)
+
+    assert np.allclose(points[1], [1.0, -3.0, 2.0])
+
+
+def test_control_config_no_longer_exposes_a_dead_speed_knob():
+    """`speed` scaled only vel_map, which the PCMD adapter ignores."""
+    assert not hasattr(rpf.ControlConfig(), "speed")
+    with pytest.raises(TypeError):
+        rpf.ControlConfig(speed=1.2)
+
+
+_MEASURED_GRAVITY = [0.009067509372034937, 0.9237964066045453, 0.38277667042064856]
+
+
+def test_pcmd_adapter_decomposes_through_the_configured_map_frame():
+    """Without this the adapter silently keeps assuming X/Z horizontal, -Y up."""
+    frame = rpf.MapFrame.from_gravity(_MEASURED_GRAVITY)
+    pose = rpf.Pose(0.0, 0.0, 0.0, 0.0, stamp=1.0)
+    # 3.0 map units: far enough that the integer PCMD rounding cannot hide the
+    # difference between the two frames.
+    goal = frame.up * 3.0                       # straight up in the MEASURED frame
+    cmd = rpf.Command("FOLLOW", np.zeros(3), 0.0, goal, 0.0, 0.0)
+
+    roll, pitch, _yaw, gaz = rpf.command_to_body_percent(
+        cmd, pose, config=rpf.ControlConfig(map_frame=frame),
+        require_yaw_alignment=False)
+    assert (roll, pitch) == (0, 0) and gaz > 0
+
+    legacy_roll, legacy_pitch, _y, legacy_gaz = rpf.command_to_body_percent(
+        cmd, pose, config=rpf.ControlConfig(), require_yaw_alignment=False)
+    assert (legacy_roll, legacy_pitch) != (0, 0), (
+        "the legacy frame must read part of a pure climb as horizontal motion"
+    )
+    assert legacy_gaz < gaz, "the legacy frame must under-command the climb"
+
+
+def test_route_heading_target_uses_the_configured_map_frame():
+    frame = rpf.MapFrame.from_gravity(_MEASURED_GRAVITY)
+    wp = [np.array([0.0, 0.0, 0.0]), np.array([0.0, -1.0, 0.0])]
+    pose = rpf.Pose(0.0, 0.0, 0.0, 0.0, stamp=1.0)
+
+    measured = _settle(rpf.RouteAutoController(
+        wp, poles=[], config=rpf.ControlConfig(inspect_waypoints=(), map_frame=frame)
+    ), pose, 1.0)
+    legacy = _settle(rpf.RouteAutoController(
+        wp, poles=[], config=rpf.ControlConfig(inspect_waypoints=())
+    ), pose, 1.0)
+
+    assert measured.yaw_target != pytest.approx(legacy.yaw_target)
+
+
+def test_heading_estimator_anchors_to_visual_map_heading_not_route_motion():
+    frame = rpf.MapFrame.from_gravity(_MEASURED_GRAVITY)
+    estimator = pff.HeadingEstimator(frame)
+    visual_heading = math.radians(37.0)
+
+    estimator.update(visual_heading, math.radians(-80.0))
+
+    assert estimator.heading(math.radians(-80.0)) == pytest.approx(
+        visual_heading, abs=1e-9
+    )
+
+
+def test_heading_estimator_converts_clockwise_ned_yaw_before_fusion():
+    estimator = pff.HeadingEstimator()
+    estimator.update(0.0, math.pi / 2.0)  # East in clockwise-from-North NED.
+
+    assert estimator.heading(math.pi / 2.0) == pytest.approx(0.0, abs=1e-9)
+    assert estimator.heading(math.pi) == pytest.approx(-math.pi / 2.0, abs=1e-9)
+
+
+def test_heading_estimator_has_no_position_or_path_seed_api():
+    estimator = pff.HeadingEstimator()
+
+    assert not hasattr(estimator, "seed_from_path")
+    assert not hasattr(estimator, "mark_teleport")
+
+
+def test_one_stray_fix_inside_the_sphere_does_not_retire_a_waypoint():
+    """Arrival needs consecutive frames: a single bad fix must not advance."""
+    wp = [np.array([0.0, 0.0, 0.0]), np.array([4.0, 0.0, 0.0]),
+          np.array([8.0, 0.0, 0.0])]
+    cfg = rpf.ControlConfig(inspect_waypoints=(), waypoint_arrive_confirm_frames=3)
+    ctrl = rpf.RouteAutoController(wp, poles=[], config=cfg)
+    ctrl.step(rpf.Pose(0.0, 0.0, 0.0, 0.0, stamp=1.0), now=1.0)
+    ctrl.step(rpf.Pose(0.0, 0.0, 0.0, 0.0, stamp=1.05), now=1.05)
+    ctrl.step(rpf.Pose(0.0, 0.0, 0.0, 0.0, stamp=1.10), now=1.10)
+    settled = ctrl.target_index
+
+    # One fix inside waypoint 2's sphere, then back out again.
+    ctrl.step(rpf.Pose(3.5, 0.0, 0.0, 0.0, stamp=1.15), now=1.15)
+    ctrl.step(rpf.Pose(2.0, 0.0, 0.0, 0.0, stamp=1.20), now=1.20)
+
+    assert ctrl.target_index == settled, "a single in-sphere fix retired a waypoint"
+
+
+# --- audit 2026-08-06: safety threads must not stop quietly -----------------
+
+def test_safety_monitor_thread_crash_latches_a_terminal_land():
+    """It is the only safety-switch poller; a silent death disarms LAND/EMERGENCY."""
+    sent = []
+    monitor = pff.SafetyMonitor(send_pcmd=lambda *cmd: sent.append(tuple(cmd)))
+
+    boom = RuntimeError("unexpected in the safety loop")
+    monitor._run_loop = lambda: (_ for _ in ()).throw(boom)
+
+    with pytest.raises(RuntimeError):
+        monitor._run()
+
+    assert monitor.terminal_action == "LAND"
+    assert "safety monitor thread died" in (monitor.reason or "")
+    assert monitor.terminated.is_set()
+    assert "unexpected in the safety loop" in (monitor.thread_died_error or "")
+
+
+def test_safety_monitor_run_delegates_to_a_guarded_loop():
+    """Guards the wiring: the loop body must sit inside the crash handler."""
+    source = inspect.getsource(pff.SafetyMonitor._run)
+    assert "_run_loop()" in source
+    assert "_latch_terminal" in source
+
+
+def test_deadman_keeps_trying_after_a_failed_land():
+    """A dropped link during land() used to end the deadman after one attempt.
+
+    The previous version of this test used a stub whose land() returned a bool and
+    never touched safety.stop, so it passed against the REAL land() -- which
+    returned None and set safety.stop before even attempting the Landing. It
+    therefore protected nothing. This one drives the real NudgePilot.land().
+    """
+    import manual_nudge_pilot as mnp
+
+    pilot = mnp.NudgePilot.__new__(mnp.NudgePilot)
+    pilot.safety = SimpleNamespace(
+        stop=False, landed=False, airborne=True, pilot_sticks=False,
+        last_beat=0.0, last_pcmd=None,
+    )
+    events = []
+    pilot.log = SimpleNamespace(event=lambda name=None, **fields: events.append(name))
+    pilot.dry_run = False
+    pilot.drone = None
+    pilot._pulse_token = 0
+    pilot._send_lock = threading.RLock()
+    pilot._sent = []
+    pilot._set_piloting_source = lambda _source: None
+    pilot._raw_pcmd = lambda *_cmd: None
+
+    attempts = {"n": 0}
+    real_land = mnp.NudgePilot.land
+
+    def flaky_land(self, reason="land"):
+        attempts["n"] += 1
+        if attempts["n"] < 3:
+            # Touchdown not confirmed: real land() must NOT stop the world here.
+            with self._send_lock:
+                self.safety.landed = False
+                self.safety.airborne = True
+            return False
+        return real_land(self, reason)
+
+    original_sleep = mnp.time.sleep
+    mnp.time.sleep = lambda _s: None
+    try:
+        mnp.NudgePilot.land = flaky_land
+        mnp.run_deadman(pilot)
+    finally:
+        mnp.NudgePilot.land = real_land
+        mnp.time.sleep = original_sleep
+
+    assert attempts["n"] >= 3, "the deadman gave up before touchdown was confirmed"
+    assert pilot.safety.landed is True
+    assert events.count("deadman_land_retry") >= 2
+
+
+def test_land_reports_confirmed_touchdown_and_only_then_stops():
+    """run_deadman's retry guard depends on this return value being real."""
+    import manual_nudge_pilot as mnp
+
+    assert inspect.signature(mnp.NudgePilot.land).return_annotation == "bool"
+    source = inspect.getsource(mnp.NudgePilot.land)
+    assert "return landed_ok" in source
+    assert "if landed_ok:" in source, (
+        "safety.stop is set again before touchdown is confirmed"
+    )
+
+def test_no_developer_specific_site_probe_selects_flight_assets():
+    """A path probe used to swap the bundle to another site behind the operator.
+
+    The live launcher refuses to start without an explicit --site-profile because
+    field assets must never fall back to a different site's map/route/bundle; this
+    module must not reintroduce that fallback by probing the filesystem.
+    """
+    source = Path(pff.__file__).read_text(encoding="utf-8")
+    for marker in ("FOOTBALL_FIELD_ROOT", "FOOTBALL_FIELD_BUNDLE",
+                   "FOOTBALL_FIELD_MEGALOC"):
+        assert marker not in source, f"{marker} reintroduces a per-developer site probe"
+    assert not hasattr(pff, "FOOTBALL_FIELD_BUNDLE")
+    # Defaults must resolve inside the workspace, not to whatever site directory
+    # happens to exist on the machine running the flight.
+    workspace = str(pff.LOC_ROOT.parent)
+    for name in ("DEFAULT_BUNDLE", "DEFAULT_MEGALOC_CACHE"):
+        resolved = str(getattr(pff, name))
+        assert resolved.startswith(workspace), f"{name} points outside the workspace: {resolved}"
+
+
+def test_pcmd_capture_is_bounded_in_real_flight():
+    """It appends before the dry-run early return, so a long session grows it.
+
+    Also guards the constant's scope: it was briefly defined inside the module
+    docstring, which no test noticed because none of them sends 4097 commands.
+    """
+    import manual_nudge_pilot as mnp
+
+    assert isinstance(mnp._SENT_CAPTURE_MAX, int) and mnp._SENT_CAPTURE_MAX > 0
+
+    pilot = mnp.NudgePilot.__new__(mnp.NudgePilot)
+    pilot._sent = []
+    pilot.dry_run = True
+    pilot.drone = None
+    pilot.safety = SimpleNamespace(last_pcmd=None)
+
+    for index in range(mnp._SENT_CAPTURE_MAX + 50):
+        mnp.NudgePilot._raw_pcmd(pilot, index % 7, 0, 0, 0)
+
+    assert len(pilot._sent) == mnp._SENT_CAPTURE_MAX
+    # The tail is what every caller reads; it must be the most recent sends.
+    assert pilot._sent[-1] == ((mnp._SENT_CAPTURE_MAX + 49) % 7, 0, 0, 0)
+
+
+def test_heading_seed_survives_a_smaller_arrival_radius():
+    """seed_goal must use the sequencer's reached test, not a bare radius check.
+
+    With a radius smaller than the leg length, a bare check stopped skipping the
+    waypoint underfoot and the seeded heading pointed backwards along the route.
+    """
+    wp = [np.array([0.0, 0.0, 0.0]), np.array([1.0, 0.0, 0.0]),
+          np.array([3.0, 0.0, 0.0])]
+    pos = np.array([1.0, 0.0, 0.0])
+
+    for radius in (0.3, 1.0):
+        ctrl = rpf.RouteAutoController(
+            wp, poles=[],
+            config=rpf.ControlConfig(inspect_waypoints=(),
+                                     waypoint_arrive_radius=radius))
+        goal = ctrl.seed_goal(pos)
+        assert goal[0] > pos[0], (
+            f"radius={radius}: seeded toward {goal.tolist()}, which is behind the drone"
+        )
+
+
+# --- physical stick override during autonomous flight -----------------------
+
+def test_stick_override_hovers_then_suspends_autonomy():
+    """The pilot taking the aircraft back must beat anything autonomy is doing."""
+    thrown = {"n": 0}
+    manual = {"n": 0}
+
+    def sticks():
+        thrown["n"] += 1
+        return thrown["n"] >= 3          # idle for two ticks, then the pilot moves
+
+    def request_manual():
+        manual["n"] += 1
+        return True
+
+    sent, reason, records = run_ticks(
+        12,
+        lambda st: fresh_pose(st, x=min(7.99, 0.5 * st["tick"])),
+        hooks_extra={"stick_active": sticks, "request_manual": request_manual},
+    )
+
+    assert manual["n"] >= 1, "autonomy never handed control to the pilot"
+    override = [r for r in records if r.get("stick_override")]
+    assert override, "no tick recorded the override"
+    first = records.index(override[0])
+    assert override[0]["pcmd"] == list(ZERO), "the override tick must command zero"
+    # And nothing non-zero may follow it: the loop is silent once the pilot has it.
+    assert all(
+        record.get("pcmd") in (None, list(ZERO)) for record in records[first:]
+    ), "autonomy kept commanding after the pilot took over"
+
+
+def test_stick_override_without_a_manual_pilot_lands():
+    """MANUAL downgrades to HOVER with no SkyController; autonomy must not continue."""
+    sent, reason, _ = run_ticks(
+        12,
+        lambda st: fresh_pose(st, x=min(7.99, 0.5 * st["tick"])),
+        hooks_extra={"stick_active": lambda: True,
+                     "request_manual": lambda: False},
+    )
+
+    assert reason == "stick override without a manual pilot -> land"
+    assert sent[-1] == ZERO
+
+
+def test_a_stick_monitor_that_raises_is_treated_as_an_override():
+    """A monitor that cannot answer is not evidence that the pilot is idle."""
+    def broken():
+        raise RuntimeError("HID read failed")
+
+    sent, reason, records = run_ticks(
+        8,
+        lambda st: fresh_pose(st, x=0.5 * st["tick"]),
+        hooks_extra={"stick_active": broken, "request_manual": lambda: True},
+    )
+
+    assert any(record.get("stick_override") for record in records)
+    assert all(record.get("pcmd") in (None, list(ZERO)) for record in records)
+
+
+# --- the sequencer must be able to finish a route ---------------------------
+
+def _fly_route(config, waypoints, max_ticks=600):
+    """Crude closed loop: pitch percent -> forward motion. Returns the terminal."""
+    controller = rpf.RouteAutoController(waypoints, poles=[], config=config)
+    x, now = 0.0, 1.0
+    for _ in range(max_ticks):
+        pose = rpf.Pose(x, 0.0, 0.0, 0.0, stamp=now)
+        command = controller.step(pose, now=now)
+        if command.should_land:
+            return "LAND", x, controller.target_index
+        pcmd = (0, 0, 0, 0)
+        if command.action in {"FOLLOW", "REJOIN"}:
+            pcmd = rpf.command_to_body_percent(
+                command, pose, config=config, require_yaw_alignment=False)
+        x += pcmd[1] * 0.02
+        now += 0.05
+    return "STALLED", x, controller.target_index
+
+
+def test_autonomy_can_actually_finish_a_route():
+    """The PCMD dead zone must be inside the arrival sphere, or nothing arrives.
+
+    With translation_arrival_tolerance at 0.15 against a 0.02 sphere the drone
+    stopped 0.15 short of waypoint 2, was never "reached", and the route hovered
+    there for the rest of the flight.
+    """
+    waypoints = [np.array([0.0, 0.0, 0.0]), np.array([4.0, 0.0, 0.0]),
+                 np.array([8.0, 0.0, 0.0])]
+    terminal, x, index = _fly_route(rpf.ControlConfig(inspect_waypoints=()), waypoints)
+
+    assert terminal == "LAND", f"route stalled at x={x:.2f} on waypoint index {index}"
+    assert index == len(waypoints) - 1
+    assert x > 7.5, f"landed far short of the final waypoint: {x:.2f}"
+
+
+def test_config_refuses_a_dead_zone_wider_than_the_arrival_sphere():
+    with pytest.raises(ValueError, match="translation_arrival_tolerance must be smaller"):
+        rpf.ControlConfig(waypoint_arrive_radius=0.02,
+                          translation_arrival_tolerance=0.15)
+
+
+def test_config_refuses_an_end_of_route_window_inside_the_dead_zone():
+    with pytest.raises(ValueError, match="never terminate the mission"):
+        rpf.ControlConfig(waypoint_arrive_radius=0.5, arrive=0.05, min_arrive=0.05,
+                          translation_arrival_tolerance=0.2)
+
+
+# --- audit 2026-08-07: legacy paths and terminal safety callbacks -----------
+
+def test_legacy_entrypoints_stay_locked_even_when_legacy_env_is_enabled(monkeypatch):
+    """The retired takeoff paths must not become live via one environment flag."""
+    monkeypatch.setenv("SFM_ALLOW_LEGACY_FLIGHT", "1")
+    import autoflight as legacy_auto
+    import cruise_geofence as legacy_cruise
+
+    with pytest.raises(SystemExit, match="permanently locked"):
+        legacy_auto.run(None, None, None, dry_run=False)
+    with pytest.raises(SystemExit, match="permanently locked"):
+        legacy_cruise.run(None, None, dry_run=False)
+    with pytest.raises(SystemExit, match="permanently locked"):
+        ofs.run_real(object(), None, None, None)
+
+    deploy_path = (Path(__file__).resolve().parents[1]
+                   / "deploy_code" / "sfm_glomap_deploy" / "olympe_frame_source.py")
+    spec = importlib.util.spec_from_file_location("deploy_olympe_frame_source", deploy_path)
+    assert spec is not None and spec.loader is not None
+    deploy_ofs = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(deploy_ofs)
+    with pytest.raises(SystemExit, match="permanently locked"):
+        deploy_ofs.run_real(object(), None, None, None)
+
+
+def test_deploy_frame_source_shares_live_hard_lock_and_timestamp_safety():
+    deploy_path = (Path(__file__).resolve().parents[1]
+                   / "deploy_code" / "sfm_glomap_deploy" / "olympe_frame_source.py")
+    source = deploy_path.read_text(encoding="utf-8")
+    assert "SFM_ALLOW_LEGACY_FLIGHT" not in source
+    assert "TakeOff()" not in source
+    assert ".wait()" not in source
+    assert ".join()" not in source
+    assert ".wait(timeout=0.5)" in source
+    assert ".join(timeout=5.0)" in source
+    assert "require_source_timestamps" in source
+    assert "_source_timing_trusted_locked" in source
+
+
+def test_frame_source_has_no_unreferenced_coded_decoder_helpers():
+    dead_names = {
+        "_init_pyav_decoder", "_avcc_to_annexb", "_decode_h264_payload",
+        "_coded_payload_bytes", "_coded_avcc_cb", "_coded_bytestream_cb",
+    }
+    for path in (
+        Path(__file__).resolve().parent / "olympe_frame_source.py",
+        Path(__file__).resolve().parents[1]
+        / "deploy_code" / "sfm_glomap_deploy" / "olympe_frame_source.py",
+    ):
+        source = path.read_text(encoding="utf-8")
+        assert "if skipped_stale" not in source
+        tree = ast.parse(source, filename=str(path))
+        definitions = {
+            node.name for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+        calls = {
+            node.func.id for node in ast.walk(tree)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+        }
+        assert not (dead_names & definitions), f"dead helpers remain in {path}"
+        assert not (dead_names & calls), f"dead helper calls remain in {path}"
+
+
+def test_sphinx_smoke_is_simulator_only_and_uses_bounded_waits():
+    source = Path(
+        Path(__file__).resolve().parent / "sphinx_path_follow_smoke.py"
+    ).read_text(encoding="utf-8")
+    assert "require_sphinx_ip" in source
+    assert "this arming path has no real-aircraft override" in source
+    assert ".wait(_timeout=20)" in source
+
+
+def test_pole_cruise_is_controller_only_not_a_live_arming_entrypoint():
+    source = Path(Path(__file__).resolve().parent / "pole_cruise.py").read_text(
+        encoding="utf-8"
+    )
+    assert "class PoleCruise" in source
+    assert "TakeOff" not in source
+    assert "olympe" not in source
+
+
+def test_manual_takeoff_requires_a_confirmed_controller_handoff():
+    import manual_nudge_pilot as mnp
+
+    pilot = mnp.NudgePilot(
+        dry_run=False, ip="192.168.53.1", controller="skycontroller3",
+        pct=8, pulse_s=0.2, cmd_log=mnp.CommandLog(None),
+    )
+    pilot.drone = object()
+    pilot._set_piloting_source = lambda _source: False
+    pilot.approve_operator_takeoff()
+
+    assert pilot.takeoff() is False
+    assert not pilot.safety.airborne
+    assert pilot._sent == []
+
+
+def test_manual_source_wait_timeout_is_bounded():
+    import manual_nudge_pilot as mnp
+
+    class _HungExpectation:
+        def wait(self):
+            time.sleep(0.5)
+
+    t0 = time.monotonic()
+    assert not mnp._wait_result(_HungExpectation(), 0.05, "source handoff")
+    assert time.monotonic() - t0 < 0.2
+
+
+def test_blocking_land_callback_does_not_hold_safety_io_lock():
+    started = threading.Event()
+
+    class _Safety:
+        mode = "LAND"
+
+        @staticmethod
+        def poll():
+            return "LAND"
+
+    def blocking_land():
+        started.set()
+        time.sleep(0.5)
+
+    monitor = pff.SafetyMonitor(
+        lambda *_: None, _Safety(), land_cb=blocking_land, timeout_s=0.05,
+    ).start()
+    try:
+        assert started.wait(0.5)
+        t0 = time.monotonic()
+        allowed, _reason = monitor.arming_allowed(lambda: True, lambda: False)
+        elapsed = time.monotonic() - t0
+        assert not allowed
+        assert elapsed < 0.2, "LAND callback blocked the safety I/O lock"
+    finally:
+        monitor.stop()
+
+
+def test_safety_monitor_crash_attempts_bounded_land_callback():
+    attempts = []
+    monitor = pff.SafetyMonitor(
+        lambda *_: None,
+        land_cb=lambda: attempts.append(time.monotonic()),
+        timeout_s=0.05,
+    )
+    boom = RuntimeError("injected safety loop crash")
+    monitor._run_loop = lambda: (_ for _ in ()).throw(boom)
+
+    with pytest.raises(RuntimeError, match="injected safety loop crash"):
+        monitor._run()
+
+    assert attempts, "thread crash only latched LAND without trying the callback"
+    assert monitor.terminal_action == "LAND"

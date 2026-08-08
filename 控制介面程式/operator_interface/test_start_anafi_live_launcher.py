@@ -22,6 +22,7 @@ LAUNCH_ENV = {
     "OMP_NUM_THREADS",
     "OPENCV_FOR_THREADS_NUM",
     "OPENBLAS_NUM_THREADS",
+    "SFM_DISTANCE_GEOFENCE",
     "SFM_LAUNCH_DRY_RUN",
     "SFM_LOCALIZER_PYTHON",
     "SFM_MAX_ALTITUDE_M",
@@ -55,6 +56,29 @@ def run_launcher(*args: str, **overrides: str) -> subprocess.CompletedProcess[st
     )
 
 
+def test_app_help_formats_percent_literals() -> None:
+    result = subprocess.run(
+        [sys.executable, str(APP), "--help"],
+        cwd=SCRIPT.parent,
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=10,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "at 95% of the confirmed limit" in result.stdout
+
+
+def test_launcher_help_exits_before_live_setup() -> None:
+    result = run_launcher("--help")
+
+    assert result.returncode == 0, result.stderr
+    assert "只會啟動 real-flight Olympe 介面" in result.stdout
+    assert "checking target" not in result.stdout
+    assert "sustained CPU thread budget" not in result.stdout
+
+
 def write_executable(path: Path, body: str) -> None:
     path.write_text("#!/usr/bin/env bash\nset -euo pipefail\n" + body)
     path.chmod(0o755)
@@ -70,7 +94,7 @@ def test_direct_ip_derives_drone_and_preserves_benchmark_flags():
     assert result.returncode == 0, result.stderr
     assert "--ip 192.168.42.1 --controller drone" in result.stdout
     assert "--no-live-detect" in result.stdout
-    assert "--max-altitude-m 50 --max-distance-m 100 --distance-geofence" in result.stdout
+    assert "--max-altitude-m 50 --max-distance-m 100" in result.stdout
     assert "--auto-inspect --boot-lock-ms 0" in result.stdout
     assert "--loc-force-track-bench" in result.stdout
     assert "--loc-every-n-frames 2" in result.stdout
@@ -87,7 +111,31 @@ def test_firmware_limit_defaults_can_be_overridden_from_environment():
     result = run_launcher(SFM_MAX_ALTITUDE_M="18", SFM_MAX_DISTANCE_M="75")
 
     assert result.returncode == 0, result.stderr
-    assert "--max-altitude-m 18 --max-distance-m 75 --distance-geofence" in result.stdout
+    assert "--max-altitude-m 18 --max-distance-m 75" in result.stdout
+
+
+def test_launcher_leaves_the_distance_geofence_to_the_documented_env_switch():
+    """The launcher must NOT pin the flag.
+
+    It used to always pass "${SFM_DISTANCE_GEOFENCE_FLAG:---no-distance-geofence}",
+    and an explicit CLI flag beats the env-derived argparse default -- so
+    SFM_DISTANCE_GEOFENCE, the switch flight_operator_app's --help advertises,
+    could never take effect through the supported launch path. The OFF default is
+    unchanged: it now comes from env_bool("SFM_DISTANCE_GEOFENCE", False).
+    """
+    off = run_launcher()
+    assert off.returncode == 0, off.stderr
+    # "distance-geofence", not "--distance-geofence": the latter does not appear
+    # inside "--no-distance-geofence", so it would pass against the very defect
+    # this guards -- the launcher pinning the flag off.
+    assert "distance-geofence" not in off.stdout
+
+    on = run_launcher(SFM_DISTANCE_GEOFENCE="1")
+    assert on.returncode == 0, on.stderr
+    # Still not pinned on the command line; the app reads the variable itself,
+    # which it inherits from this environment.
+    assert "distance-geofence" not in on.stdout.replace("SFM_DISTANCE_GEOFENCE=1", "")
+    assert "SFM_DISTANCE_GEOFENCE=1" in on.stdout
 
 
 def test_inconsistent_ip_controller_pair_fails_before_launch():
@@ -137,6 +185,27 @@ def test_invalid_cpu_thread_budget_fails_before_launch():
     assert result.returncode == 2
     assert "SFM_CPU_THREADS must be a positive integer" in result.stderr
     assert "dry-run command" not in result.stdout
+
+
+def test_live_launcher_rejects_system_site_packages_venv(tmp_path: Path):
+    venv_dir = tmp_path / "venv"
+    bin_dir = venv_dir / "bin"
+    bin_dir.mkdir(parents=True)
+    fake_python = bin_dir / "python"
+    write_executable(fake_python, "exit 0\n")
+    (venv_dir / "pyvenv.cfg").write_text(
+        "include-system-site-packages = true\n"
+    )
+
+    result = run_launcher(
+        SFM_LAUNCH_DRY_RUN="0",
+        SFM_MAX_PERFORMANCE="0",
+        SFM_UI_PYTHON=str(fake_python),
+    )
+
+    assert result.returncode == 2
+    assert "include-system-site-packages=true" in result.stderr
+    assert "checking target" not in result.stdout
 
 
 def test_live_max_performance_is_best_effort_and_wraps_app(tmp_path: Path):
@@ -398,7 +467,8 @@ def test_live_max_performance_zero_skips_all_tuning(tmp_path: Path):
             f"python -u {APP} --interface real-flight "
             "--ip 192.168.42.1 "
             "--controller drone --no-live-detect --max-altitude-m 50 "
-            "--max-distance-m 100 --distance-geofence --nudge-pct 8 "
+            "--max-distance-m 100 "
+            "--rth-min-altitude-m 5.0 --stream-loss-grace-s 10.0 --nudge-pct 8 "
             "--nudge-pulse-s 0.20"
         )
     ]

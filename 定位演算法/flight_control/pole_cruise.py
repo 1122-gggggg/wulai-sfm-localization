@@ -36,7 +36,7 @@ import os
 
 import numpy as np
 
-ROOT = os.environ.get("SFM_MAP_ROOT", "/media/cihcilab/新增磁碟區/sfm_glomap")
+ROOT = os.environ.get("SFM_MAP_ROOT", "").strip()
 
 # --- tunables (MAP UNITS / percents; same spirit as cruise_geofence) ----------
 LOOKAHEAD = 1.5          # carrot distance along the path (map units)
@@ -78,8 +78,13 @@ class PoleCruise:
         # load_poles.py does not exist; the pole loader lives in the deployment
         # controller. (Legacy module; verify center/base/top axis convention before use.)
         from real_path_follow_controller import load_poles as load_pole_boxes
-        self.path = [np.asarray(p, float) for p in
-                     load_waypoints(path_json or f"{ROOT}/safezone/flight_path.json")]
+        if not path_json and not ROOT:
+            raise ValueError("path_json or SFM_MAP_ROOT is required")
+        if not poles_json and not ROOT:
+            raise ValueError("poles_json or SFM_MAP_ROOT is required")
+        self.path = [np.asarray(p, float) for p in load_waypoints(
+            path_json or f"{ROOT}/safezone/flight_path.json"
+        )]
         boxes = load_pole_boxes(poles_json or f"{ROOT}/safezone/poles.json")
         self.pole_xy = np.array([[b["center"][0], b["center"][1]] for b in boxes])
         self.pole_midz = np.array([0.5 * (b["base"][2] + b["top"][2]) for b in boxes])

@@ -16,6 +16,7 @@ P0710071 frames have no ground-truth pose here, so it does not claim metric erro
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -203,6 +204,60 @@ def intrinsics_check(cam) -> dict:
     return out
 
 
+def require_camera_match(cam) -> dict:
+    """Return the camera audit or raise when production and benchmark differ."""
+    result = intrinsics_check(cam)
+    if not result.get("matches_production"):
+        raise ValueError(
+            "benchmark camera does not match deployed CAM_720; refusing the run"
+        )
+    return result
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(8 * 1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def baseline_identity_failures(
+    baseline: dict,
+    *,
+    video_sha256: str | None,
+    site_profile_sha256: str | None,
+    bundle_sha256: str,
+    localizer_profile_sha256: str | None,
+    camera: dict[str, object],
+) -> list[str]:
+    """Return mismatches for the exact inputs used by a benchmark receipt."""
+    failures: list[str] = []
+    actual_values = {
+        "video_sha256": video_sha256,
+        "site_profile_sha256": site_profile_sha256,
+        "bundle_sha256": bundle_sha256,
+        "localizer_profile_sha256": localizer_profile_sha256,
+    }
+    for key, actual in actual_values.items():
+        expected = baseline.get(key)
+        if not isinstance(expected, str) or len(expected) != 64:
+            failures.append(f"baseline is missing {key}")
+        elif not isinstance(actual, str) or expected != actual:
+            failures.append(f"{key} mismatch: expected={expected} actual={actual}")
+    expected_camera = baseline.get("camera")
+    if not isinstance(expected_camera, dict):
+        failures.append("baseline is missing camera identity")
+    else:
+        for key in ("model", "width", "height", "params"):
+            if expected_camera.get(key) != camera.get(key):
+                failures.append(
+                    f"camera {key} mismatch: expected={expected_camera.get(key)!r} "
+                    f"actual={camera.get(key)!r}"
+                )
+    return failures
+
+
 def pct(vals, p):
     vals = [float(v) for v in vals if v is not None and np.isfinite(v)]
     if not vals:
@@ -318,6 +373,16 @@ def main():
     ap.add_argument("--bundle-sha256", default="",
                     help="trusted SHA-256 for a non-package bundle")
     ap.add_argument("--intrinsics", default=str(INTRINSICS))
+    ap.add_argument(
+        "--strict-camera",
+        action="store_true",
+        help="fail closed if benchmark intrinsics differ from deployed CAM_720",
+    )
+    ap.add_argument(
+        "--allow-camera-mismatch",
+        action="store_true",
+        help="development-only opt-out from camera gates (never a production claim)",
+    )
     ap.add_argument("--model", default="",
                     help="deprecated and ignored; retained for command compatibility")
     ap.add_argument("--image-root", default=str(IMAGES_FUSED))
@@ -405,6 +470,16 @@ def main():
     )
     ap.add_argument("--out", default="")
     ap.add_argument("--out-ply", default="")
+    ap.add_argument(
+        "--site-profile",
+        default="",
+        help="site profile to bind into a reproducibility receipt",
+    )
+    ap.add_argument(
+        "--quality-baseline",
+        default="",
+        help="baseline JSON whose video/site/bundle/profile identity must match",
+    )
     ap.add_argument("--lg-onnx-track-model", default="",
                     help="Experimental static ONNX matcher for TRACK query top-K")
     ap.add_argument("--lg-onnx-acquire-model", default="",
@@ -450,6 +525,56 @@ def main():
         first_rgb, orig_size, stream_size = load_rgb_resized(frames[0], args.resize_width)
         source_label = f"query_dir={qdir}"
     cam = load_query_camera(Path(args.intrinsics), orig_size, stream_size)
+    camera_audit = intrinsics_check(cam)
+    if (args.strict_camera or args.quality_baseline) and not args.allow_camera_mismatch:
+        try:
+            require_camera_match(cam)
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
+
+    site_profile_sha256 = None
+    localizer_profile_sha256 = None
+    if args.site_profile:
+        site_profile_path = Path(args.site_profile).expanduser().resolve()
+        try:
+            site_raw = json.loads(site_profile_path.read_text(encoding="utf-8"))
+            profile_value = site_raw.get("localizer_profile")
+            if not isinstance(profile_value, str) or not profile_value:
+                raise ValueError("site profile has no localizer_profile")
+            localizer_profile_path = (site_profile_path.parent / profile_value).resolve()
+            site_profile_sha256 = sha256_file(site_profile_path)
+            localizer_profile_sha256 = sha256_file(localizer_profile_path)
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            raise SystemExit(f"cannot bind site profile: {exc}") from exc
+
+    bundle_sha256 = sha256_file(Path(args.bundle).expanduser().resolve())
+    camera_identity = {
+        "model": cam.model,
+        "width": cam.width,
+        "height": cam.height,
+        "params": [float(value) for value in cam.params],
+    }
+    baseline_identity = None
+    if args.quality_baseline:
+        if video is None or not args.site_profile:
+            raise SystemExit(
+                "--quality-baseline requires --video and --site-profile"
+            )
+        baseline_path = Path(args.quality_baseline).expanduser().resolve()
+        try:
+            baseline_identity = json.loads(baseline_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise SystemExit(f"cannot read quality baseline: {exc}") from exc
+        failures = baseline_identity_failures(
+            baseline_identity,
+            video_sha256=sha256_file(video),
+            site_profile_sha256=site_profile_sha256,
+            bundle_sha256=bundle_sha256,
+            localizer_profile_sha256=localizer_profile_sha256,
+            camera=camera_identity,
+        )
+        if failures:
+            raise SystemExit("quality baseline identity mismatch: " + "; ".join(failures))
 
     print(f"device={DEVICE} cuda={torch.cuda.get_device_name(0) if torch.cuda.is_available() else None}")
     print(f"frames={frame_total} {source_label}")
@@ -814,7 +939,15 @@ def main():
         "cuda_name": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
         "bundle_meta": xmap.meta,
         "query_camera": {"model": cam.model, "width": cam.width, "height": cam.height, "params": cam.params},
-        "intrinsics_check": intrinsics_check(cam),
+        "intrinsics_check": camera_audit,
+        "input_identity": {
+            "video_sha256": None if video is None else sha256_file(video),
+            "site_profile_sha256": site_profile_sha256,
+            "bundle_sha256": bundle_sha256,
+            "localizer_profile_sha256": localizer_profile_sha256,
+            "camera": camera_identity,
+            "baseline": None if not args.quality_baseline else str(Path(args.quality_baseline).expanduser().resolve()),
+        },
         "summary": summary,
         "rows": rows,
     }

@@ -11,6 +11,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum
+from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Mapping, Protocol, runtime_checkable
 
@@ -30,6 +31,7 @@ class ControlAction(str, Enum):
     NUDGE_HEARTBEAT = "nudge_heartbeat"
     NUDGE_END = "nudge_end"
     NUDGE_CLEAR = "nudge_clear"
+    NUDGE_VECTOR = "nudge_vector"
     EMERGENCY_STOP = "emergency_stop"
     LAND_NOW = "land_now"
     APPLY_LIMITS = "apply_limits"
@@ -97,6 +99,34 @@ class NudgeHeartbeatPayload:
 
 
 @dataclass(frozen=True)
+class NudgeVectorPayload:
+    """Continuous on-screen stick deflection, one unit value per axis.
+
+    Values are fractions of the same nudge authority the discrete buttons use,
+    so a dragged stick can never command more than a button press could.
+    """
+
+    roll: float
+    pitch: float
+    yaw: float
+    gaz: float
+
+    def __post_init__(self) -> None:
+        for name in ("roll", "pitch", "yaw", "gaz"):
+            value = getattr(self, name)
+            if not isinstance(value, (int, float)) or isinstance(value, bool):
+                raise InvalidControlRequest(f"nudge vector {name} must be numeric")
+            value = float(value)
+            if not math.isfinite(value):
+                raise InvalidControlRequest(f"nudge vector {name} must be finite")
+            if not -1.0 <= value <= 1.0:
+                raise InvalidControlRequest(
+                    f"nudge vector {name} must be within [-1, 1]"
+                )
+            object.__setattr__(self, name, value)
+
+
+@dataclass(frozen=True)
 class LimitsPayload:
     max_altitude_m: float
     max_distance_m: float
@@ -117,6 +147,36 @@ class TogglePayload:
     enabled: bool
 
 
+@dataclass(frozen=True)
+class MissionRoutePayload:
+    route_path: str
+    route_sha256: str
+    site_id: str
+    coordinate_frame_id: str
+
+    def __post_init__(self) -> None:
+        path = Path(str(self.route_path or ""))
+        if not path.is_absolute():
+            raise InvalidControlRequest("start_auto route_path must be absolute")
+        digest = str(self.route_sha256 or "").strip().lower()
+        if len(digest) != 64 or any(
+            character not in "0123456789abcdef" for character in digest
+        ):
+            raise InvalidControlRequest(
+                "start_auto route_sha256 must be 64 hexadecimal characters"
+            )
+        site_id = str(self.site_id or "").strip()
+        coordinate_frame_id = str(self.coordinate_frame_id or "").strip()
+        if not site_id or not coordinate_frame_id:
+            raise InvalidControlRequest(
+                "start_auto requires site_id and coordinate_frame_id"
+            )
+        object.__setattr__(self, "route_path", str(path.resolve()))
+        object.__setattr__(self, "route_sha256", digest)
+        object.__setattr__(self, "site_id", site_id)
+        object.__setattr__(self, "coordinate_frame_id", coordinate_frame_id)
+
+
 ControlPayload = (
     EmptyPayload
     | NudgePayload
@@ -124,6 +184,7 @@ ControlPayload = (
     | LimitsPayload
     | ScalarPayload
     | TogglePayload
+    | MissionRoutePayload
 )
 
 
@@ -136,7 +197,6 @@ _NO_PAYLOAD_ACTIONS = {
     ControlAction.EMERGENCY_STOP,
     ControlAction.LAND_NOW,
     ControlAction.START_LOCALIZATION,
-    ControlAction.START_AUTO,
     ControlAction.BOOT_LOCK,
     ControlAction.CAMERA_RESET,
     ControlAction.RECORD_DISARM,
@@ -163,6 +223,7 @@ _LEGACY_ACTIONS = {
     "nudge_end": ControlAction.NUDGE_END,
     "nudge_release": ControlAction.NUDGE_END,
     "nudge_clear": ControlAction.NUDGE_CLEAR,
+    "nudge_vector": ControlAction.NUDGE_VECTOR,
     "emergency_stop": ControlAction.EMERGENCY_STOP,
     "land_now": ControlAction.LAND_NOW,
     "firmware_limits_apply": ControlAction.APPLY_LIMITS,
@@ -217,6 +278,7 @@ class ControlRequest:
             ControlAction.ZOOM: ScalarPayload,
             ControlAction.SET_AUTO_SPEED_LIMIT: ScalarPayload,
             ControlAction.RECORD_ARM: TogglePayload,
+            ControlAction.START_AUTO: MissionRoutePayload,
         }.get(self.action)
         if expected is not None and not isinstance(self.payload, expected):
             raise InvalidControlRequest(
@@ -254,6 +316,18 @@ class ControlRequest:
         parsed: ControlPayload
         if action in {ControlAction.NUDGE_BEGIN, ControlAction.NUDGE_END}:
             parsed = NudgePayload(str(payload.get("dir") or payload.get("name") or ""))
+        elif action is ControlAction.NUDGE_VECTOR:
+            try:
+                parsed = NudgeVectorPayload(
+                    float(payload.get("roll", 0.0)),
+                    float(payload.get("pitch", 0.0)),
+                    float(payload.get("yaw", 0.0)),
+                    float(payload.get("gaz", 0.0)),
+                )
+            except (TypeError, ValueError) as exc:
+                raise InvalidControlRequest(
+                    "nudge_vector requires numeric roll/pitch/yaw/gaz"
+                ) from exc
         elif action is ControlAction.NUDGE_HEARTBEAT:
             raw = payload.get("dirs", payload.get("directions", ()))
             if isinstance(raw, str):
@@ -293,6 +367,19 @@ class ControlRequest:
                 raise InvalidControlRequest(f"{action.value} requires {key}") from exc
         elif action is ControlAction.RECORD_ARM:
             parsed = TogglePayload(bool(payload.get("enabled", payload.get("value", True))))
+        elif action is ControlAction.START_AUTO:
+            try:
+                parsed = MissionRoutePayload(
+                    route_path=str(payload["route_path"]),
+                    route_sha256=str(payload["route_sha256"]),
+                    site_id=str(payload["site_id"]),
+                    coordinate_frame_id=str(payload["coordinate_frame_id"]),
+                )
+            except KeyError as exc:
+                raise InvalidControlRequest(
+                    "start_auto requires route_path, route_sha256, site_id, and "
+                    "coordinate_frame_id"
+                ) from exc
         else:
             parsed = EmptyPayload()
         return cls.create(action, payload=parsed, human_origin=human_origin)
@@ -311,6 +398,12 @@ class ControlRequest:
         elif self.action in {ControlAction.NUDGE_BEGIN, ControlAction.NUDGE_END}:
             assert isinstance(self.payload, NudgePayload)
             payload = {"dir": self.payload.direction}
+        elif self.action is ControlAction.NUDGE_VECTOR:
+            assert isinstance(self.payload, NudgeVectorPayload)
+            payload = {
+                "roll": self.payload.roll, "pitch": self.payload.pitch,
+                "yaw": self.payload.yaw, "gaz": self.payload.gaz,
+            }
         elif self.action is ControlAction.NUDGE_HEARTBEAT:
             assert isinstance(self.payload, NudgeHeartbeatPayload)
             payload = {"dirs": self.payload.directions}
@@ -327,6 +420,14 @@ class ControlRequest:
         elif self.action is ControlAction.RECORD_ARM:
             assert isinstance(self.payload, TogglePayload)
             payload = {"enabled": self.payload.enabled}
+        elif self.action is ControlAction.START_AUTO:
+            assert isinstance(self.payload, MissionRoutePayload)
+            payload = {
+                "route_path": self.payload.route_path,
+                "route_sha256": self.payload.route_sha256,
+                "site_id": self.payload.site_id,
+                "coordinate_frame_id": self.payload.coordinate_frame_id,
+            }
         return name, payload
 
 

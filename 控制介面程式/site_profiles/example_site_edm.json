@@ -1,38 +1,45 @@
 {
-  "schema_version": 2,
-  "site_id": "your_site_edm",
-  "display_name": "Your site EDM profile",
-  "localizer": "edm",
-  "localizer_deploy_dir": "../../定位演算法/deploy_code/sfm_glomap_deploy",
-  "localizer_profile": "../../定位演算法/configs/edm_production_profile.json",
-  "map_reference_poses": "../../地圖檔/場域/your_site/maps/your_site_ref_poses.json",
-  "query_camera": {
-    "model": "PINHOLE",
-    "width": 1280,
-    "height": 720,
-    "params": [1000.0, 1000.0, 640.0, 360.0]
-  },
-  "asset_sha256": {
-    "map_ply": null,
-    "localization_bundle": null,
-    "route_json": null,
-    "map_reference_poses": null,
-    "localizer_profile": null,
-    "poles_json": null
-  },
-  "flight": {
-    "approved": false,
-    "coordinate_frame_id": null,
-    "route_clearance_approved": false,
-    "approval_note": "Template only. Fill and independently verify every scale-free flight field before approval.",
-    "controller": null
-  },
-  "assets": {
-    "map_ply": "../../地圖檔/場域/your_site/maps/your_site.ply",
-    "route_json": null,
-    "poles_json": null,
-    "localization_bundle": "../../地圖檔/場域/your_site/bundles/your_site_reloc_map_edm.pt",
-    "megaloc_cache": null,
-    "track_landmarks": null
-  }
+ "schema_version": 2,
+ "site_id": "your_site_edm",
+ "display_name": "Your site EDM profile",
+ "localizer": "edm",
+ "localizer_deploy_dir": "../../定位演算法/deploy_code/sfm_glomap_deploy",
+ "localizer_profile": "../../定位演算法/configs/edm_production_profile.json",
+ "map_reference_poses": "../../地圖檔/場域/your_site/maps/your_site_ref_poses.json",
+ "query_camera": {
+  "model": "PINHOLE",
+  "width": 1280,
+  "height": 720,
+  "params": [
+   1000.0,
+   1000.0,
+   640.0,
+   360.0
+  ]
+ },
+ "asset_sha256": {
+  "map_ply": null,
+  "localization_bundle": null,
+  "route_json": null,
+  "map_reference_poses": null,
+  "localizer_profile": null,
+  "poles_json": null,
+  "map_align": null
+ },
+ "flight": {
+  "approved": false,
+  "coordinate_frame_id": null,
+  "route_clearance_approved": false,
+  "approval_note": "Template only. Fill and independently verify every scale-free flight field before approval.",
+  "controller": null
+ },
+ "assets": {
+  "map_ply": "../../地圖檔/場域/your_site/maps/your_site.ply",
+  "route_json": null,
+  "poles_json": null,
+  "localization_bundle": "../../地圖檔/場域/your_site/bundles/your_site_reloc_map_edm.pt",
+  "megaloc_cache": null,
+  "track_landmarks": null
+ },
+ "map_align": "../../地圖檔/場域/your_site/maps/T_align_gravity.json"
 }

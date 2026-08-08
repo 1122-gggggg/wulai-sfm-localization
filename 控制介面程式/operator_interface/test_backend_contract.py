@@ -12,6 +12,7 @@ from backend_contract import (
     InterfaceMode,
     InvalidControlRequest,
     LegacyFrameSourceAdapter,
+    MissionRoutePayload,
     SessionConfig,
 )
 from flight_operator_app import DroneBackend
@@ -45,6 +46,50 @@ def test_session_config_is_immutable_and_has_one_fixed_interface() -> None:
 def test_unknown_legacy_action_is_rejected_before_backend_dispatch() -> None:
     with pytest.raises(InvalidControlRequest, match="unknown control action"):
         ControlRequest.from_legacy("arbitrary-unchecked-command", human_origin=True)
+
+
+def test_start_auto_requires_complete_immutable_route_identity(tmp_path) -> None:
+    route = tmp_path / "route.json"
+    route.write_text("{}", encoding="utf-8")
+
+    with pytest.raises(InvalidControlRequest, match="start_auto requires"):
+        ControlRequest.from_legacy("start_auto", human_origin=True)
+
+    request = ControlRequest.from_legacy(
+        "start_auto",
+        human_origin=True,
+        route_path=str(route.resolve()),
+        route_sha256="a" * 64,
+        site_id="field-a",
+        coordinate_frame_id="glomap-a",
+    )
+
+    assert isinstance(request.payload, MissionRoutePayload)
+    assert request.legacy_call() == (
+        "start_auto",
+        {
+            "route_path": str(route.resolve()),
+            "route_sha256": "a" * 64,
+            "site_id": "field-a",
+            "coordinate_frame_id": "glomap-a",
+        },
+    )
+
+
+@pytest.mark.parametrize(
+    ("route_path", "route_sha256"),
+    [("relative.json", "a" * 64), ("/tmp/route.json", "not-a-sha")],
+)
+def test_start_auto_rejects_ambiguous_route_identity(
+    route_path, route_sha256
+) -> None:
+    with pytest.raises(InvalidControlRequest):
+        MissionRoutePayload(
+            route_path=route_path,
+            route_sha256=route_sha256,
+            site_id="field-a",
+            coordinate_frame_id="glomap-a",
+        )
 
 
 def test_takeoff_requires_human_origin_even_for_simulation() -> None:

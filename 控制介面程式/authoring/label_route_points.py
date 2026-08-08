@@ -14,7 +14,9 @@ import os
 import bpy
 from mathutils import Vector
 
-ROOT = os.environ.get("SFM_MAP_ROOT", "/media/cihcilab/新增磁碟區/sfm_glomap")
+ROOT = os.environ.get("SFM_MAP_ROOT", "").strip()
+if not ROOT:
+    raise RuntimeError("SFM_MAP_ROOT must explicitly select the authoring workspace")
 PATH_JSON = os.environ.get("SFM_FLIGHT_PATH_JSON", f"{ROOT}/safezone/flight_path.json")
 COLLECTION = "RoutePointLabels"
 

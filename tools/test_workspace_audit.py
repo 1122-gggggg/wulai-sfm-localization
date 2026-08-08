@@ -75,3 +75,42 @@ def test_output_classification_keeps_new_names_visible() -> None:
     assert classify_output("validation_receipts") == "validation"
     assert classify_output("flight_logs") == "operations"
     assert classify_output("misc") == "unclassified"
+
+
+def test_workspace_audit_classifies_date_stamped_audits_and_warns_on_storage(
+    tmp_path: Path, monkeypatch
+) -> None:
+    _minimal_workspace(tmp_path)
+    (tmp_path / "outputs" / "audit_20260807").mkdir()
+    monkeypatch.setattr(
+        workspace_audit.shutil,
+        "disk_usage",
+        lambda _path: workspace_audit.shutil._ntuple_diskusage(
+            total=100 * 1024**3,
+            used=86 * 1024**3,
+            free=14 * 1024**3,
+        ),
+    )
+
+    result = audit_workspace(tmp_path, include_sizes=False)
+
+    assert result["output_classes"]["governance"] == ["audit_20260807"]
+    assert any("free space is below 15%" in warning for warning in result["storage_warnings"])
+
+
+def test_workspace_audit_warns_when_workspace_exceeds_20_gib(tmp_path: Path, monkeypatch) -> None:
+    _minimal_workspace(tmp_path)
+    monkeypatch.setattr(workspace_audit, "directory_size", lambda _path: 21 * 1024**3)
+    monkeypatch.setattr(
+        workspace_audit.shutil,
+        "disk_usage",
+        lambda _path: workspace_audit.shutil._ntuple_diskusage(
+            total=100 * 1024**3,
+            used=50 * 1024**3,
+            free=50 * 1024**3,
+        ),
+    )
+
+    result = audit_workspace(tmp_path, include_sizes=True)
+
+    assert any("workspace size is above 20 GiB" in warning for warning in result["storage_warnings"])

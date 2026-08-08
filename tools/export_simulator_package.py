@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import shutil
 import sys
@@ -23,6 +22,7 @@ COPY_FILES = (
     "requirements.txt",
     "requirements-lock.txt",
     "requirements-test.txt",
+    "requirements-test-lock.txt",
     "驗證系統.sh",
 )
 EXCLUDED_NAMES = {
@@ -50,30 +50,20 @@ def _copy_tree(source: Path, destination: Path) -> None:
     shutil.copytree(source, destination, copy_function=shutil.copy2, ignore=_ignore)
 
 
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(8 * 1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def _source_release() -> dict[str, str]:
+def _source_release() -> dict[str, object]:
     sys.path.insert(0, str(ROOT))
     from tools.package_manifest import verify
+    from tools.release_contract import source_release_identity
 
     issues = verify(ROOT)
     if issues:
         raise ValueError(f"source package manifest is stale: {issues[0]}")
-    return {
-        "manifest_sha256": _sha256(ROOT / "MANIFEST.tsv"),
-        "sha256sums_sha256": _sha256(ROOT / "SHA256SUMS"),
-    }
+    return source_release_identity(ROOT)
 
 
-def _write_metadata(destination: Path, source_release: dict[str, str]) -> None:
+def _write_metadata(destination: Path, source_release: dict[str, object]) -> None:
     metadata = {
-        "schema": "sfm-portable-simulator/v1",
+        "schema": "sfm-portable-simulator/v2",
         "package_kind": "simulated-interface-runtime",
         "entrypoint": "控制介面程式/影片模擬串流/選擇啟動.sh",
         "cli_entrypoint": "控制介面程式/影片模擬串流/啟動.sh",

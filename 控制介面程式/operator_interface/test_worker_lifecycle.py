@@ -4,6 +4,7 @@ import json
 import importlib.util
 import inspect
 import io
+import os
 import queue
 import select
 import sys
@@ -19,6 +20,7 @@ from PIL import Image
 import flight_operator_app as app
 import live_localizer_protocol as localizer_protocol
 import live_localizer_worker as localizer_worker
+from localization_contract import InvalidLocalizationResult, LocalizationResult
 from site_profile import QueryCamera
 
 
@@ -200,6 +202,104 @@ def test_worker_result_backlog_keeps_only_the_newest_items(monkeypatch) -> None:
     assert [row["seq"] for row in client.poll_results()] == [2, 3]
 
 
+def test_worker_readline_preserves_second_line_from_one_read() -> None:
+    read_fd, write_fd = os.pipe()
+    writer = os.fdopen(write_fd, "wb", buffering=0)
+    writer.write(b'{"seq":1}\n{"seq":2}\n')
+    writer.close()
+    stdout = os.fdopen(read_fd, "rb", buffering=0)
+    client = app.LiveWorkerClient.__new__(app.LiveWorkerClient)
+    client.label = "tail-worker"
+    client.timeout_s = 0.2
+    client.MAX_RESPONSE_BYTES = 1024
+    client._closed = threading.Event()
+    client._stdout_buffer = bytearray()
+    proc = SimpleNamespace(stdout=stdout, poll=lambda: None)
+    try:
+        assert client._readline_with_timeout(proc) == b'{"seq":1}\n'
+        assert client._readline_with_timeout(proc) == b'{"seq":2}\n'
+    finally:
+        stdout.close()
+
+
+def test_localization_exception_payload_is_explicitly_lost() -> None:
+    payload = localizer_worker.localization_exception_payload(
+        seq=4, error=RuntimeError("tracker failed")
+    )
+
+    assert payload["success"] is False
+    assert payload["mode"] == "LOST"
+    assert payload["next_mode"] == "LOST"
+    assert payload["localization_exception"] is True
+
+
+def test_localization_result_boundary_validates_and_preserves_dict_payload() -> None:
+    payload = {
+        "localization_contract_version": 1,
+        "seq": 4,
+        "frame_id": "worker-4",
+        "capture_mono_ns": 10_000,
+        "pose_mono_ns": 20_000,
+        "validity": True,
+        "confidence": 0.75,
+        "success": True,
+        "pose": {"x": 1.0, "y": 2.0, "z": 3.0, "yaw_raw": 0.5},
+    }
+
+    result = LocalizationResult.from_payload(payload)
+
+    assert result.seq == 4
+    assert result.frame_id == "worker-4"
+    assert result.pose == (1.0, 2.0, 3.0, 0.5)
+    assert result.validity is True
+    assert result.to_payload()["pose"] == payload["pose"]
+
+    with pytest.raises(InvalidLocalizationResult, match="pose"):
+        LocalizationResult.from_payload({
+            **payload,
+            "pose": {"x": 1.0, "y": float("nan"), "z": 3.0},
+        })
+
+
+def test_worker_exception_payload_carries_localization_contract_fields() -> None:
+    payload = localizer_worker.localization_exception_payload(
+        seq=4, error=RuntimeError("tracker failed")
+    )
+
+    result = LocalizationResult.from_payload(payload)
+    assert result.validity is False
+    assert result.confidence == 0.0
+    assert result.pose is None
+
+
+def test_localization_exception_result_triggers_live_fail_safe() -> None:
+    payload = localizer_worker.localization_exception_payload(
+        seq=5, error=RuntimeError("tracker failed")
+    )
+    reasons = []
+    operator = SimpleNamespace(
+        localizer=SimpleNamespace(poll_results=lambda: [payload]),
+        _loc_benchmark_pending=None,
+        loc_benchmark_active="auto",
+        _apply_lost_hold_result=lambda _result: None,
+        update_localization_metrics=lambda _result: None,
+        _is_live_backend=lambda: True,
+        _engage_real_localization_recovery=lambda reason: reasons.append(reason),
+        _last_status_write=float("inf"),
+        _last_loc_fail_log=float("inf"),
+        _loc_ok_count=0,
+        _loc_fail_count=0,
+        loc_fps=0.0,
+        live_result=None,
+        live_result_frame_name="",
+        write_log=lambda _message: None,
+    )
+
+    app.OperatorApp.update_live_results(operator)
+
+    assert reasons == [app.FailureReason.LOCALIZATION_LOST]
+
+
 def test_heading_arrow_polygon_points_at_the_current_heading() -> None:
     arrow = app.heading_arrow_polygon(100.0, 80.0, 120.0, 80.0)
 
@@ -348,10 +448,11 @@ def test_auto_inspect_enables_feed_without_backend_command() -> None:
     assert operator.inspecting
     assert operator.backend_calls == []
 
-    # The human button path keeps its existing backend command semantics.
+    # AUTO without a validated, selected route now fails closed before dispatch.
     manual = FakeOperator()
     manual.send("start_auto")
-    assert manual.backend_calls == [("start_auto", {})]
+    assert manual.backend_calls == []
+    assert any("沒有路線鎖" in line for line in manual.logs)
 
 
 @pytest.mark.parametrize("mode", ["auto", "global", "weak", "track", "relocalize"])
@@ -480,6 +581,26 @@ def test_live_localizer_client_passes_profile_query_camera(monkeypatch) -> None:
     assert cmd[cmd.index("--query-camera-height") + 1] == "720"
     start = cmd.index("--query-camera-params") + 1
     assert [float(value) for value in cmd[start:start + 4]] == list(camera.params)
+
+
+def test_live_localizer_client_passes_measured_map_alignment(monkeypatch) -> None:
+    captured = {}
+
+    def fake_worker_init(_self, cmd, *_args, **_kwargs) -> None:
+        captured["cmd"] = cmd
+
+    monkeypatch.setattr(app.LiveWorkerClient, "__init__", fake_worker_init)
+    app.LiveLocalizerClient(
+        Path("worker.py"),
+        sys.executable,
+        1280,
+        720,
+        Path("bundle.pt"),
+        map_align=Path("T_align_gravity.json"),
+    )
+
+    index = captured["cmd"].index("--map-align")
+    assert captured["cmd"][index + 1] == "T_align_gravity.json"
 
 
 def test_shipped_edm_production_profile_pins_validated_parameters() -> None:
@@ -981,6 +1102,70 @@ def test_valid_route_is_finite_and_converted(tmp_path: Path) -> None:
     assert points[0].tolist() == [1.0, -3.0, 2.0]
 
 
+def test_raw_glomap_route_is_not_axis_converted(tmp_path: Path) -> None:
+    route = tmp_path / "route.json"
+    route.write_text(
+        json.dumps({"frame": "glomap", "waypoints": [[1.0, 2.0, 3.0]]}),
+        encoding="utf-8",
+    )
+
+    points = app.load_route_glomap(str(route))
+
+    assert points[0].tolist() == [1.0, 2.0, 3.0]
+
+
+def test_preview_and_flight_loader_agree_on_every_route(tmp_path: Path) -> None:
+    """The pink overlay and the path autonomy flies must come from one rule.
+
+    load_route_glomap (preview) and real_path_follow_controller.load_waypoints
+    (flight) each decide which basis to invert an "aligned" route with. If those
+    two rules ever drift, the operator validates a route on the map that is NOT
+    the one the flight loader produces -- rotated by the angle the two bases
+    differ by, 22.5 deg on target_site_v1. This pins them together.
+    """
+    import numpy as np
+    import real_path_follow_controller as rpf
+
+    measured = rpf.MapFrame.from_gravity([0.009067509372034937, 0.924, 0.383])
+    waypoints = [[1.0, 2.0, 3.0], [4.0, -5.0, 6.0]]
+
+    cases = []
+    for frame in ("aligned", "glomap"):
+        for align_source in (None, "legacy", "measured", "bogus"):
+            for site in (None, measured):
+                body = {"frame": frame, "units": "map", "waypoints": waypoints}
+                if align_source is not None:
+                    body["align_source"] = align_source
+                cases.append((body, site))
+
+    for index, (body, site) in enumerate(cases):
+        route = tmp_path / f"route_{index}.json"
+        route.write_text(json.dumps(body), encoding="utf-8")
+
+        preview_error = flight_error = None
+        try:
+            preview = app.load_route_glomap(str(route), map_frame=site)
+        except Exception as exc:            # noqa: BLE001 - comparing the decision
+            preview, preview_error = None, type(exc)
+        try:
+            flown = rpf.load_waypoints(
+                route,
+                map_frame=site if site is not None else rpf.LEGACY_MAP_FRAME,
+            )
+        except Exception as exc:            # noqa: BLE001 - comparing the decision
+            flown, flight_error = None, type(exc)
+
+        assert (preview_error is None) == (flight_error is None), (
+            f"{body} at site measured={site is not None}: preview "
+            f"{'rejected' if preview_error else 'accepted'} but flight loader "
+            f"{'rejected' if flight_error else 'accepted'}"
+        )
+        if preview_error is None:
+            assert np.allclose(np.asarray(preview), np.asarray(flown)), (
+                f"{body}: preview and flight loader produced different points"
+            )
+
+
 @pytest.mark.parametrize(
     "pose",
     [
@@ -1413,3 +1598,65 @@ def test_attached_frame_shm_survives_worker_death(tmp_path):
     finally:
         shm.close()
         shm.unlink()
+
+
+def test_stale_response_after_a_refused_restart_is_never_published_as_a_new_fix(
+        tmp_path: Path) -> None:
+    """A worker response must never be attributed to a frame it did not answer.
+
+    Two timeouts inside the 30 s restart cooldown used to leave the stalled worker
+    attached: the client then read request N's answer while writing request N+1 and
+    stamped the OLD pose with the NEW frame's identity and timing. The worker numbers
+    every payload, so the mismatch is detectable — and must force a restart even
+    though the cooldown would normally refuse one.
+    """
+    worker = (
+        "import sys,time,json\n"
+        "seq=0\n"
+        "while True:\n"
+        "    b=sys.stdin.buffer.read(3)\n"
+        "    if not b: break\n"
+        "    if seq==0: time.sleep(0.8)\n"          # first frame stalls past the timeout
+        "    sys.stdout.write(json.dumps({'seq':seq,'success':True,"
+        "'x':float(seq)})+'\\n'); sys.stdout.flush()\n"
+        "    seq+=1\n"
+    )
+    client = app.LiveWorkerClient(
+        [sys.executable, "-c", worker],
+        1, 1,
+        str(tmp_path / "desync.log"),
+        "desync-worker",
+        "desync",
+        timeout_s=0.2,
+    )
+    client.restart_warmup_s = 0.0
+    try:
+        # Burn the restart budget so the stall's _restart() is refused by the cooldown.
+        client._last_restart = time.monotonic()
+        old_pid = client.proc.pid
+
+        assert client.submit(1, "frame_a", Image.new("RGB", (1, 1))) is True
+        assert _wait_for(lambda: bool(client.poll_results()), timeout=3.0)
+
+        # Let the stalled worker finish frame_a, so its late answer is sitting in the
+        # pipe when frame_b's response is read.
+        time.sleep(1.2)
+        assert _wait_for(
+            lambda: client.submit(2, "frame_b", Image.new("RGB", (1, 1))), timeout=3.0)
+        published: list[dict] = []
+        assert _wait_for(
+            lambda: bool(published.extend(client.poll_results()) or published),
+            timeout=5.0,
+        )
+        frame_b = [p for p in published if p.get("frame_name") == "frame_b"]
+        assert frame_b, "frame_b produced no result at all"
+        for payload in frame_b:
+            assert not payload.get("success"), (
+                f"frame_a's pose was published as frame_b's fix: {payload}"
+            )
+            assert "desync" in str(payload.get("error", "")).lower()
+        # Desync must force a respawn despite the cooldown.
+        assert _wait_for(lambda: client.proc.pid != old_pid, timeout=5.0)
+    finally:
+        client.close()
+    assert not client.thread.is_alive()

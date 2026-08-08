@@ -15,8 +15,12 @@ import sys
 
 import bpy
 
-ROOT = os.environ.get("SFM_MAP_ROOT", "/media/cihcilab/新增磁碟區/sfm_glomap")
-TOOLS = os.environ.get("SFM_TOOLS_ROOT", "/media/cihcilab/新增磁碟區/tools")
+ROOT = os.environ.get("SFM_MAP_ROOT", "").strip()
+TOOLS = os.environ.get("SFM_TOOLS_ROOT", "").strip()
+if not ROOT or not TOOLS:
+    raise RuntimeError(
+        "SFM_MAP_ROOT and SFM_TOOLS_ROOT must explicitly select authoring inputs"
+    )
 SETUP = os.environ.get("SFM_BLENDER_SETUP", f"{ROOT}/scripts/blender_safezone.py")
 
 # 1) build the safezone scene

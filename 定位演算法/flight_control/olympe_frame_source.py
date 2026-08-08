@@ -82,12 +82,6 @@ def connect(ip: str = DRONE_IP_REAL, controller: str = "auto"):
     return drone
 
 
-def _wait_success(expectation, label: str):
-    res = expectation.wait()
-    if hasattr(res, "success") and not res.success():
-        raise SystemExit(f"{label} failed or timed out")
-
-
 # ----------------------------- grabber -------------------------------------
 class OlympePdrawGrabber:
     """Latest-frame PDRAW grabber (never a multi-frame queue).
@@ -251,7 +245,6 @@ class OlympePdrawGrabber:
             pass
 
         # Raw YUV path only (no coded/PyAV): less CPU, lower latency.
-        self._av_codec = None
         try:
             import olympe_deps as od
             from olympe.features.video.pdraw import (
@@ -312,104 +305,6 @@ class OlympePdrawGrabber:
         if ok is False:
             raise RuntimeError(f"streaming.play returned False (media_name={name!r})")
 
-    def _init_pyav_decoder(self) -> None:
-        self._av_codec = None
-        try:
-            import av
-            self._av_codec = av.CodecContext.create("h264", "r")
-            print("[olympe_frame_source] PyAV H264 decoder ready (bytestream backup)", flush=True)
-        except Exception as exc:
-            print(f"[olympe_frame_source] PyAV unavailable ({exc!r}); raw-only", flush=True)
-
-    @staticmethod
-    def _avcc_to_annexb(data: bytes) -> bytes:
-        out = bytearray()
-        i = 0
-        n = len(data)
-        while i + 4 <= n:
-            nal_len = int.from_bytes(data[i:i + 4], "big")
-            i += 4
-            if nal_len <= 0 or i + nal_len > n:
-                break
-            out += b"\x00\x00\x00\x01"
-            out += data[i:i + nal_len]
-            i += nal_len
-        return bytes(out)
-
-    def _decode_h264_payload(self, payload: bytes, receipt_stamp: float,
-                             source_frame, *, annexb: bool, tag: str) -> None:
-        if self._av_codec is None or not payload:
-            return
-        try:
-            data = payload if annexb else self._avcc_to_annexb(payload)
-            if not data:
-                return
-            for packet in self._av_codec.parse(data):
-                for frame in self._av_codec.decode(packet):
-                    rgb = frame.to_ndarray(format="rgb24")
-                    if self.resize is not None and (rgb.shape[1], rgb.shape[0]) != self.resize:
-                        import cv2
-                        rgb = cv2.resize(rgb, self.resize)
-                    capture_stamp, stamp_source, source_ntp_us = self._capture_stamp(
-                        source_frame, receipt_stamp)
-                    if capture_stamp is None:
-                        if self.require_source_timestamps:
-                            continue
-                        capture_stamp, stamp_source, source_ntp_us = (
-                            receipt_stamp, "callback-receipt", None)
-                    self._store(
-                        rgb, stamp=capture_stamp,
-                        stamp_source=stamp_source or tag,
-                        source_ntp_us=source_ntp_us, receipt_stamp=receipt_stamp)
-        except Exception as exc:
-            if not self._decode_warned:
-                self._decode_warned = True
-                print(f"[olympe_frame_source] {tag} decode failed ({exc!r}); "
-                      "disabling PyAV backup (raw YUV path remains)", flush=True)
-            # Stop burning CPU on every coded packet after the first failure.
-            self._av_codec = None
-
-    def _coded_payload_bytes(self, h264_frame) -> bytes | None:
-        """Copy coded payload immediately (mbuf views can die after unref)."""
-        try:
-            arr = h264_frame.as_ndarray()
-            if arr is not None and getattr(arr, "size", 0) > 0:
-                return bytes(arr)
-        except Exception:
-            pass
-        try:
-            ptr, size = h264_frame.as_ctypes_pointer()
-            if ptr and size and size > 0:
-                import ctypes
-                return bytes(ctypes.string_at(ptr, int(size)))
-        except Exception:
-            pass
-        return None
-
-    def _coded_avcc_cb(self, h264_frame):
-        receipt = time.monotonic()
-        h264_frame.ref()
-        try:
-            payload = self._coded_payload_bytes(h264_frame)
-            if not payload:
-                return
-            self._decode_h264_payload(payload, receipt, h264_frame,
-                                      annexb=False, tag="pyav-avcc")
-        finally:
-            h264_frame.unref()
-
-    def _coded_bytestream_cb(self, h264_frame):
-        receipt = time.monotonic()
-        h264_frame.ref()
-        try:
-            payload = self._coded_payload_bytes(h264_frame)
-            if not payload:
-                return
-            self._decode_h264_payload(payload, receipt, h264_frame,
-                                      annexb=True, tag="pyav-bytestream")
-        finally:
-            h264_frame.unref()
-
     def _start_frame_worker(self):
         with self._frame_cv:
             worker = self._frame_worker
@@ -445,9 +340,12 @@ class OlympePdrawGrabber:
             worker = self._frame_worker
             self._frame_cv.notify_all()
         if worker is not None and worker is not threading.current_thread():
-            worker.join()
+            worker.join(timeout=5.0)
+            if worker.is_alive():
+                print("[olympe_frame_source] frame worker did not stop before timeout",
+                      flush=True)
         with self._frame_cv:
-            if self._frame_worker is worker:
+            if worker is not None and self._frame_worker is worker and not worker.is_alive():
                 self._frame_worker = None
 
     def stop(self):
@@ -557,7 +455,7 @@ class OlympePdrawGrabber:
         while True:
             with self._frame_cv:
                 while self._pending_yuv is None and not self._frame_worker_stop:
-                    self._frame_cv.wait()
+                    self._frame_cv.wait(timeout=0.5)
                 if self._frame_worker_stop:
                     return
                 pending = self._pending_yuv
@@ -567,7 +465,6 @@ class OlympePdrawGrabber:
             started = time.perf_counter()
             converted = False
             failed = False
-            skipped_stale = False
             try:
                 yuv_frame, receipt_mono_ns = pending
                 receipt_stamp = int(receipt_mono_ns) * 1e-9
@@ -593,7 +490,6 @@ class OlympePdrawGrabber:
                     with self._frame_cv:
                         newer_pending = self._pending_yuv is not None
                     if newer_pending:
-                        skipped_stale = True
                         self._queue_drops += 1
                     else:
                         converted = self._convert_yuv_frame(
@@ -623,8 +519,6 @@ class OlympePdrawGrabber:
                             self._frames_converted += 1
                         if failed:
                             self._decode_failures += 1
-                        if skipped_stale:
-                            pass
                         self._convert_inflight -= 1
                         self._frame_cv.notify_all()
 
@@ -641,7 +535,7 @@ class OlympePdrawGrabber:
             pending[0].unref()
         with self._frame_cv:
             while self._convert_inflight:
-                self._frame_cv.wait()
+                self._frame_cv.wait(timeout=0.5)
             self._flush_depth -= 1
             self._frame_cv.notify_all()
         return True
@@ -945,66 +839,10 @@ def run_real(drone, loc, det, ctrl):
     SAFETY: see module header. Validate in sim first; PROPS-OFF bench; open area
     with manual override; verify PCMD signs. Ctrl-C lands.
     """
-    import math
-    import os
-    import signal
-    import autoflight as af
-    from olympe.messages.ardrone3.Piloting import TakeOff, PCMD, Landing
-    from olympe.messages.ardrone3.PilotingState import FlyingStateChanged
-
-    if os.environ.get("SFM_ALLOW_LEGACY_FLIGHT") != "1":
-        raise SystemExit(
-            "olympe_frame_source.run_real is a legacy arming path with no safety "
-            "switch and no localization lock before takeoff. Use "
-            "path_follow_flight.py fly, or set SFM_ALLOW_LEGACY_FLIGHT=1 only "
-            "for controlled legacy testing."
-        )
-
-    print("[real] takeoff")
-    _wait_success(drone(TakeOff() >> FlyingStateChanged(state="hovering", _timeout=12)), "takeoff/hovering")
-
-    stop = {"f": False}
-    signal.signal(signal.SIGINT, lambda *_: stop.__setitem__("f", True))
-    period = 1.0 / af.CTRL_HZ
-    last_good = lost_since = None
-    steps = 0
-    try:
-        while not stop["f"]:
-            t0 = time.monotonic()
-            p = loc.get_pose(); now = time.monotonic()
-            fresh = p is not None and (now - p.stamp) <= af.POSE_STALE_S
-            if fresh:
-                last_good, lost_since = p, None
-            elif last_good and (now - last_good.stamp) <= af.POSE_STALE_S:
-                p, fresh = last_good, True
-
-            if not fresh:
-                drone(PCMD(1, 0, 0, 0, 0, 0)); lost_since = lost_since or now
-                if now - lost_since >= af.LOST_LAND_S:
-                    print("[real] localization lost -> land"); break
-            else:
-                roll, pitch, yaw, gaz, info = ctrl.step(p, det.detect(), now)
-                drone(PCMD(1, roll, pitch, yaw, gaz, 0))
-                if steps % 10 == 0:
-                    print(f"[{info:28s}] pos=({p.x:5.1f},{p.y:5.1f},{p.z:4.1f}) "
-                          f"yaw={math.degrees(p.yaw):6.1f} PCMD(p={pitch:+d},y={yaw:+d},g={gaz:+d})")
-                if ctrl.state == "DONE":
-                    print("[real] all targets done -> land"); break
-            steps += 1
-            dt = time.monotonic() - t0
-            if dt < period:
-                time.sleep(period - dt)
-    finally:
-        print("[real] landing")
-        try:
-            drone(PCMD(1, 0, 0, 0, 0, 0))
-            _wait_success(drone(Landing()), "landing")   # raises SystemExit on timeout
-        except (Exception, SystemExit) as exc:
-            print(f"[real] warning: landing raised: {exc}")
-        try:
-            drone.disconnect()
-        except Exception:
-            pass
+    raise SystemExit(
+        "olympe_frame_source.run_real legacy TakeOff is permanently locked; "
+        "use the operator-approved flight path instead"
+    )
 
 
 # ----------------------------- self-test / smoke ---------------------------

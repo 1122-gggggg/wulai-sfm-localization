@@ -19,11 +19,15 @@ import os
 
 import numpy as np
 
-ROOT = os.environ.get("SFM_MAP_ROOT", "/media/cihcilab/新增磁碟區/sfm_glomap")
-PATH_JSON = os.environ.get("SFM_FLIGHT_PATH_JSON", f"{ROOT}/safezone/flight_path.json")
+PATH_JSON = os.environ.get("SFM_FLIGHT_PATH_JSON", "").strip()
 
 
-def load_waypoints(path_json: str = PATH_JSON, close: bool | None = None):
+def load_waypoints(path_json: str | None = None, close: bool | None = None):
+    path_json = str(path_json or PATH_JSON).strip()
+    if not path_json:
+        raise ValueError(
+            "flight path must be explicit: pass path_json or set SFM_FLIGHT_PATH_JSON"
+        )
     if not os.path.exists(path_json):
         raise FileNotFoundError(f"no drawn path at {path_json} -- run scripts/draw_path.py first")
     d = json.load(open(path_json))

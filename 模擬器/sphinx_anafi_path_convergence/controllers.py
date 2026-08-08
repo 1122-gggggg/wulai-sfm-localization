@@ -964,12 +964,12 @@ def _cap_int_vector_norm(roll: int, pitch: int, gaz: int, max_norm: float) -> tu
 class TranslationalWaypointController:
     """Waypoint-to-waypoint, body-frame translation, yaw ONLY at waypoints.
 
-    Per segment the target is the NEXT waypoint (Pi+1). The vector to it is
-    decomposed on the drone's (fixed) body axes into forward/right/up velocity
-    components -> PCMD (pitch, roll, gaz) with yaw = 0. On arrival: hover, then
-    yaw so the body/camera heading (XY projection) aligns with the Pi+1->Pi+2
-    segment (XY projection); the reported yaw angle is exactly that in-plane
-    angle. Repeat to the last waypoint, then hover for landing.
+    Before the first segment, and after every arrival, hover and yaw so the
+    body/camera heading projected onto the ground plane aligns with the next
+    waypoint vector projected onto the same plane.  Only after alignment is the
+    vector decomposed on the drone's fixed body axes into forward/right/up PCMD
+    components (pitch, roll, gaz), with yaw held at zero during translation.
+    Repeat to the last waypoint, then hover for landing.
     """
 
     name = "translational_waypoint"
@@ -984,7 +984,12 @@ class TranslationalWaypointController:
         if name:
             self.name = name
         self.k = 1                       # target = SECOND waypoint (spec: connect start->P1)
-        self.mode = SEGMENT_FOLLOW
+        # The first leg obeys the same hover/align/translate contract as every
+        # later leg.  Starting directly in SEGMENT_FOLLOW let a misaligned drone
+        # translate immediately after take-off.
+        self.mode = SEGMENT_ALIGN
+        self._initial_alignment_pending = True
+        self._initial_turn_commanded = False
         self._seg_entered_t = None
         self._mode_entered_t = None
         self._hover_until = None
@@ -1045,7 +1050,10 @@ class TranslationalWaypointController:
         if self.mode in (ABORT_OR_MANUAL, COMPLETED):
             return TickCommand(0, 0, 0, 0, self.mode, {"abort_reason": self.abort_reason})
         if self.mode == LOST_OR_UNCERTAIN:
-            self._adv_mode(SEGMENT_FOLLOW, now)
+            self._adv_mode(
+                SEGMENT_ALIGN if self._initial_alignment_pending else SEGMENT_FOLLOW,
+                now,
+            )
 
         pos = pose.xyz
         if p.use_smoothed_target:                       # optional control-pose low-pass
@@ -1114,29 +1122,61 @@ class TranslationalWaypointController:
                                    {**info, "final_landing_pending": True})
             self._adv_mode(SEGMENT_ALIGN, now)
 
-        # ---- SEGMENT_ALIGN: yaw ONLY, to face wp[k] -> wp[k+1] (XY projection) ----
+        # ---- SEGMENT_ALIGN: yaw ONLY, using both rays' ground-plane projection ----
         if self.mode == SEGMENT_ALIGN:
-            nxt = self.route.wp[self.k + 1]
+            initial_alignment = self._initial_alignment_pending
+            segment_start = 0 if initial_alignment else self.k
+            next_index = 1 if initial_alignment else self.k + 1
+            nxt = self.route.wp[next_index]
             yaw_targets = getattr(self.route, "yaw_targets", {})
-            seg_head = yaw_targets.get(self.k, heading_of(nxt - self.route.wp[self.k]))
+            seg_head = yaw_targets.get(
+                segment_start,
+                heading_of(nxt - self.route.wp[segment_start]),
+            )
             body_target = wrap_angle(seg_head - _camera_yaw_offset(p))
             camera_heading = wrap_angle(heading + _camera_yaw_offset(p))
             yaw_err = wrap_angle(seg_head - camera_heading)        # camera XY vs segment XY
             info.update({"heading_target": body_target, "camera_heading_target": seg_head,
                          "camera_yaw_offset_deg": p.camera_yaw_offset_deg,
-                         "yaw_err": yaw_err, "align_to_wp": self.k + 1,
+                         "yaw_err": yaw_err, "align_to_wp": next_index,
                          "pitch_suppressed": "align"})
-            if abs(yaw_err) <= math.radians(p.segment_align_yaw_tolerance_deg) or \
-                    (now - self._mode_entered_t) > p.segment_align_timeout_s:
-                self.k += 1                              # advance to next segment
+            aligned = abs(yaw_err) <= math.radians(p.segment_align_yaw_tolerance_deg)
+            timed_out = (now - self._mode_entered_t) > p.segment_align_timeout_s
+            if aligned:
+                if initial_alignment:
+                    self._initial_alignment_pending = False
+                else:
+                    self.k += 1                          # advance to next segment
                 self._seg_entered_t = now
                 self._adv_mode(SEGMENT_FOLLOW, now)
-                return TickCommand(0, 0, 0, 0, NEXT_SEGMENT, {**info, "next_segment": self.k})
-            gaz = _vertical_gaz(vert_err, p)             # hold altitude while yawing
-            yaw_cmd = max(-1.0, min(1.0, p.k_yaw * yaw_err)) * p.max_yaw
-            r_, pi_, y_, g_ = clamp_pcmd(0, 0, yaw_cmd, gaz)
-            r_, pi_, y_, g_ = _rate_limit_pcmd(self, r_, pi_, y_, g_, now, p)
-            return TickCommand(r_, pi_, y_, g_, SEGMENT_ALIGN, info)
+                # At take-off, an already aligned aircraft may enter the first
+                # translation in this tick. Later waypoints still emit one full
+                # zero-PCMD transition tick after their hover/alignment phase.
+                if not initial_alignment or self._initial_turn_commanded:
+                    self._initial_turn_commanded = False
+                    self._last_pcmd = (0, 0, 0, 0)
+                    self._last_pcmd_t = now
+                    return TickCommand(
+                        0, 0, 0, 0, NEXT_SEGMENT,
+                        {**info, "next_segment": self.k},
+                    )
+            elif timed_out:
+                # Never convert a failed turn into translation. The two projected
+                # rays must actually overlap within tolerance before a leg starts.
+                self.abort_reason = "segment_alignment_timeout"
+                self._adv_mode(ABORT_OR_MANUAL, now)
+                return TickCommand(
+                    0, 0, 0, 0, self.mode,
+                    {**info, "abort_reason": self.abort_reason},
+                )
+            else:
+                gaz = _vertical_gaz(vert_err, p)         # hold altitude while yawing
+                yaw_cmd = max(-1.0, min(1.0, p.k_yaw * yaw_err)) * p.max_yaw
+                r_, pi_, y_, g_ = clamp_pcmd(0, 0, yaw_cmd, gaz)
+                r_, pi_, y_, g_ = _rate_limit_pcmd(self, r_, pi_, y_, g_, now, p)
+                if initial_alignment:
+                    self._initial_turn_commanded = True
+                return TickCommand(r_, pi_, y_, g_, SEGMENT_ALIGN, info)
 
         # ---- SEGMENT_FOLLOW: body translation, NO yaw ----
         arrival_radius = p.final_landing_radius if self.k >= len(self.route.wp) - 1 else p.arrival_radius

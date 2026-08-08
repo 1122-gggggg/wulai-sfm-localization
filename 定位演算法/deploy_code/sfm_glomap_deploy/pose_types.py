@@ -10,6 +10,18 @@ from dataclasses import dataclass
 
 @dataclass
 class Pose:
+    """Visual-localizer pose crossing the localization/flight-control boundary.
+
+    x/y/z are RAW GLOMAP coordinates. They carry no axis convention: which way is
+    up is a per-site measurement held in T_align_gravity.json, applied by
+    real_path_follow_controller.MapFrame. ``yaw`` is the heading in that measured
+    horizontal plane; ``stamp`` is a time.monotonic() reading, never wall clock.
+
+    Deliberately field-compatible with real_path_follow_controller.Pose, which
+    adds an .xyz helper. The two are exchanged by duck typing, so the field names
+    and their meaning must stay identical.
+    """
+
     x: float; y: float; z: float; yaw: float; stamp: float
 
 

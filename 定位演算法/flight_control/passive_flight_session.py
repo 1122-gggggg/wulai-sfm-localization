@@ -79,9 +79,21 @@ def run_session(*, ip: str, controller: str, secs: float, hz: float,
             loc = pff.build_localizer(grabber)
             loc.ensure_models()
             try:
-                waypoints = rpf.load_waypoints(pff.PATH_JSON)
-                poles = rpf.load_poles(pff.POLES_JSON)
-                ctrl = rpf.RouteAutoController(waypoints, poles)
+                map_frame = (
+                    rpf.load_map_frame(pff.MAP_ALIGN)
+                    if pff.MAP_ALIGN else rpf.LEGACY_MAP_FRAME
+                )
+                waypoints = rpf.load_waypoints(
+                    pff.PATH_JSON, map_frame=map_frame
+                )
+                poles = rpf.load_poles(pff.POLES_JSON, map_frame)
+                ctrl = rpf.RouteAutoController(
+                    waypoints,
+                    poles,
+                    rpf.config_for_route(
+                        pff.PATH_JSON, rpf.ControlConfig(map_frame=map_frame)
+                    ),
+                )
                 cum = ctrl.cum
                 path_len = float(ctrl.path_len)
                 print(f"[session] route loaded: {len(waypoints)} wp, "

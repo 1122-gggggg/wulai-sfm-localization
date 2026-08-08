@@ -10,7 +10,8 @@ cleanup() {
 }
 trap cleanup EXIT
 VENV_DIR="$TEMP_ROOT/venv"
-SFM_VENV_DIR="$VENV_DIR" bash "$ROOT/tools/install_runtime.sh"
+SFM_VENV_DIR="$VENV_DIR" SFM_INSTALL_TEST_DEPS=1 \
+  bash "$ROOT/tools/install_runtime.sh" --test-deps
 SFM_UI_PYTHON="$VENV_DIR/bin/python" \
 SFM_LOCALIZER_PYTHON="$VENV_DIR/bin/python" \
 SFM_WORKSPACE_ROOT="$ROOT" \
@@ -20,4 +21,8 @@ SFM_TORCH_HUB_CACHE="$ROOT/執行環境/torch_hub_cache" \
     --site-profile "$ROOT/控制介面程式/site_profiles/river_site_edm.json" \
     --video "$ROOT/模擬器/測試影片/河濱_P1180118_first_2s.mp4" \
     --check-runtime \
-    --full-runtime
+    --full-runtime \
+    --json
+"$VENV_DIR/bin/python" -m pytest -q --timeout=300 --cov \
+  --cov-config="$ROOT/pyproject.toml" --cov-report=term-missing \
+  --cov-fail-under=0 "$ROOT/tools" "$ROOT/定位演算法/validation/tests"

@@ -102,7 +102,7 @@
 | 項目 | 原始 → 現在 |
 |---|---|
 | **pose_types 解耦** | localizer `from autoflight import Pose,Localizer` → 連帶載入 plan_path(SDF 規劃) → 新增 `pose_types.py`,localizer 改 import 它;autoflight re-export 保相容。**驗證:import localizer 不再載入 plan_path/autoflight** |
-| **鏡像補完 + 同步檢查** | `reloc_localizer_xfeat.py` 只在 deploy_code、flight_control 沒有(真飛靠 PYTHONPATH 混用兩份) → 複製補完 + `sync_mirror_check.sh`(8 檔 diff,drift 即報錯) |
+| **鏡像補完 + 同步檢查** | `reloc_localizer_xfeat.py` 只在 deploy_code、flight_control 沒有(真飛靠 PYTHONPATH 混用兩份) → 複製補完 + authoritative `validation/check_runtime_mirrors.py`(8 檔 diff, drift 即報錯) |
 | **`find_system_root`** | 5 份複製、硬編 `/media/cihcilab/新增磁碟區/...` fallback(換機靜默解析到外機路徑) → 改吃 `SFM_SYSTEM_ROOT`,否則明確報錯 |
 | **env 變數統一** | UI `SFM_LOC_LOW_INLIERS` vs 飛控 `SFM_LOW_CONF_INLIERS` 兩名 → 統一 `SFM_LOW_CONF_INLIERS` |
 | **依賴補齊** | `requirements_runtime.txt` 漏 `huggingface_hub`/`safetensors`/`kornia`(MegaLoc/LighterGlue 需要) → 補 pin |
@@ -128,7 +128,7 @@
 
 ## 七、新增檔案
 - `sfm_system/定位/deploy_code/sfm_glomap_deploy/pose_types.py`(+ flight_control 鏡像):中性 `Pose`/`Localizer` 型別。
-- `sfm_system/定位/sync_mirror_check.sh`:兩份鏡像 drift 檢查。
+- `sfm_system/定位/validation/check_runtime_mirrors.py`:兩份鏡像 drift 檢查。
 - `.gitignore`:排除大檔(*.pt/*.bin/*.ply/torch_hub_cache/影片/__pycache__)。
 - `OPTIMIZATION_CHANGES_LOG.md`(本檔)。
 - `sfm_system/定位/validation/compare_benchmarks.py`(2026-07-07):兩份 benchmark JSON 差異 + speed/accuracy 接受準則判定(容忍度可調,`--json-out` 存判定)。
@@ -187,7 +187,7 @@
 | mutual-NN 快路 | **移除**（`matcher_mode` 預設由 `nn_then_lg` 改為 `lighterglue`） |
 | temporal anchor cache | **實質失效**：cache 只在 NN 快路分支被查詢（`production_xfeat_tracker.py` 的 `matcher_mode == "nn_then_lg"` 區塊），移除 NN 後 cache-used/accept 恆為 0。設定值保留只為讓舊 benchmark 可重現。 |
 
-**改動檔案**（兩份鏡像已同步，`sync_mirror_check.sh` 通過）
+**改動檔案**（兩份鏡像已同步，`check_runtime_mirrors.py` 通過）
 
 - `production_xfeat_tracker.py`：`ProductionConfig.matcher_mode` 預設 `nn_then_lg` → `lighterglue`
 - `path_follow_flight.py`：`production_config()` 同上

@@ -415,7 +415,7 @@ def test_mission_pipeline_defaults_to_current_validated_interpreter(monkeypatch)
 
 
 def test_manifest_detects_content_and_file_set_changes(tmp_path):
-    manifest_path = PACKAGE_ROOT / "執行環境" / "tools" / "package_manifest.py"
+    manifest_path = PACKAGE_ROOT / "tools" / "package_manifest.py"
     manifest = load_module("package_manifest", manifest_path)
     (tmp_path / "nested").mkdir()
     (tmp_path / "a.txt").write_text("a", encoding="utf-8")
@@ -653,3 +653,38 @@ def test_bundle_schema_rejects_nonfinite_features_bad_dtype_and_covis(tmp_path, 
             assert message in str(exc).lower()
         else:
             raise AssertionError(f"malicious bundle {index} was accepted")
+
+
+def test_localizer_factory_refuses_unverified_default_thresholds() -> None:
+    """No profile means no SHA verification AND target_site-scaled defaults.
+
+    The EDMConfig dataclass defaults (radius 0.8 / max_jump 2.0 / ...) are the
+    target_site scale, so another site silently inherits gates several times too
+    loose. Falling back to them must be an explicit, deliberate opt-in.
+    """
+    deploy = PACKAGE_ROOT / "定位演算法" / "deploy_code" / "sfm_glomap_deploy"
+    if str(deploy) not in sys.path:
+        sys.path.insert(0, str(deploy))
+    import production_localizer_factory as factory
+
+    with pytest.raises(ValueError, match="production localizer profile is required"):
+        factory.build_production_localizer(
+            backend="edm",
+            bundle="/nonexistent/bundle.pt",
+            frame_source=lambda: None,
+            camera_tuple=("PINHOLE", 1280, 720, [900.0, 900.0, 640.0, 360.0]),
+            production_profile=None,
+        )
+
+    # The opt-in still exists for deliberate non-flight experiments: it must get
+    # past the profile gate (and fail later, on the missing bundle).
+    with pytest.raises(Exception) as excinfo:
+        factory.build_production_localizer(
+            backend="edm",
+            bundle="/nonexistent/bundle.pt",
+            frame_source=lambda: None,
+            camera_tuple=("PINHOLE", 1280, 720, [900.0, 900.0, 640.0, 360.0]),
+            production_profile=None,
+            allow_profile_defaults=True,
+        )
+    assert "production localizer profile is required" not in str(excinfo.value)

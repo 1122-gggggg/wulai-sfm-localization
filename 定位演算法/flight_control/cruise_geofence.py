@@ -28,7 +28,6 @@ from __future__ import annotations
 
 import argparse
 import math
-import os
 import signal
 import time
 from dataclasses import dataclass
@@ -221,21 +220,10 @@ def run(localizer: Localizer, zone: SafeZone2p5D, dry_run: bool = False):
 
     drone = None
     if not dry_run:
-        if os.environ.get("SFM_ALLOW_LEGACY_FLIGHT") != "1":
-            raise SystemExit(
-                "cruise_geofence.py is a legacy real-flight entrypoint. "
-                "Use sfm_system/operator_pipeline.py mission --mode fly, or set "
-                "SFM_ALLOW_LEGACY_FLIGHT=1 only for controlled legacy testing."
-            )
-        import olympe
-        from olympe.messages.ardrone3.Piloting import TakeOff, Landing, PCMD
-        from olympe.messages.ardrone3.PilotingState import FlyingStateChanged
-        drone = olympe.Drone(DRONE_IP)
-        drone.connect()
-        print("[cruise] taking off ...")
-        res = drone(TakeOff() >> FlyingStateChanged(state="hovering", _timeout=12)).wait()
-        if hasattr(res, "success") and not res.success():
-            raise SystemExit("legacy cruise_geofence takeoff/hovering failed")
+        raise SystemExit(
+            "cruise_geofence.py legacy TakeOff is permanently locked; "
+            "use the operator-approved flight path instead"
+        )
 
     stop = {"flag": False}
     signal.signal(signal.SIGINT, lambda *_: stop.__setitem__("flag", True))
@@ -277,7 +265,7 @@ def run(localizer: Localizer, zone: SafeZone2p5D, dry_run: bool = False):
             print("[cruise] landing ...")
             try:
                 send(0, 0, 0, 0)                 # zero PCMD before landing
-                res = drone(Landing()).wait()
+                res = drone(Landing()).wait(_timeout=20)
                 if hasattr(res, "success") and not res.success():
                     print("[cruise] warning: legacy cruise_geofence landing did not report success")
             except (Exception, SystemExit) as exc:

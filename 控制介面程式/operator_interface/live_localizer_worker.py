@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import json
+import math
 from multiprocessing import resource_tracker, shared_memory
 import os
 import sys
@@ -266,6 +267,32 @@ def apply_runtime_benchmark_mode(tracker, mode: str, previous_mode: str,
     return False
 
 
+def localization_exception_payload(
+    *,
+    seq: int,
+    error: BaseException | str,
+    frame_id: str | None = None,
+    capture_mono_ns: int | None = None,
+    pose_mono_ns: int | None = None,
+) -> dict:
+    """Build the explicit LOST result used for tracker-side exceptions."""
+    now_ns = time.monotonic_ns()
+    return {
+        "seq": int(seq),
+        "frame_id": str(frame_id or f"worker-{int(seq)}"),
+        "capture_mono_ns": int(capture_mono_ns or now_ns),
+        "pose_mono_ns": int(pose_mono_ns or now_ns),
+        "localization_contract_version": 1,
+        "validity": False,
+        "confidence": 0.0,
+        "success": False,
+        "mode": "LOST",
+        "next_mode": "LOST",
+        "localization_exception": True,
+        "error": error if isinstance(error, str) else repr(error),
+    }
+
+
 @contextlib.contextmanager
 def redirect_native_stdout_to_stderr():
     """Route native fd-1 logs away from the JSON stdout pipe."""
@@ -289,6 +316,11 @@ def main() -> None:
     ap.add_argument("--query-camera-height", type=int, default=0)
     ap.add_argument("--query-camera-params", type=float, nargs="+", default=None)
     ap.add_argument("--bundle", default=str(DEFAULT_BUNDLE))
+    ap.add_argument(
+        "--map-align",
+        default="",
+        help="Measured sfm-align/v2 T_align_gravity.json for public pose yaw.",
+    )
     ap.add_argument(
         "--bundle-sha256",
         default="",
@@ -435,6 +467,10 @@ def main() -> None:
         sys.path.insert(1, str(DEPLOY_DIR))
     if backend == "xfeat" and (args.neuflow_track or args.projection_track):
         sys.path.insert(0, str(VALIDATION_DIR))
+    map_frame = None
+    if args.map_align:
+        from real_path_follow_controller import load_map_frame
+        map_frame = load_map_frame(args.map_align)
 
     with redirect_native_stdout_to_stderr(), contextlib.redirect_stdout(sys.stderr):
         import torch
@@ -461,6 +497,7 @@ def main() -> None:
                     args.production_profile_sha256 or None
                 ),
                 local_topk=int(args.local_topk),
+                map_frame=map_frame,
             )
             tracker = built.tracker
             xmap = built.reloc_map
@@ -567,7 +604,12 @@ def main() -> None:
                 tracker_variant = "projection_guided_r15_25_40_s060_ratio095"
             else:
                 tracker = ProductionXFeatTracker(
-                    xmap, megaloc, frame_source=lambda: None, query_cam=cam, cfg=cfg)
+                    xmap, megaloc, frame_source=lambda: None, query_cam=cam,
+                    cfg=cfg, map_frame=map_frame)
+
+        # Experimental XFeat wrappers inherit the production pose gate but have
+        # older constructor signatures. Apply the same verified frame uniformly.
+        tracker.map_frame = map_frame
 
         if args.force_track_bench:
             # Hard lock: never MegaLoc / never leave TRACK for the whole session.
@@ -808,8 +850,27 @@ def main() -> None:
             # (invalid JSON) and could steer the UI trajectory -> report it as no fix.
             pose_ok = pose is not None and bool(
                 np.isfinite([pose.x, pose.y, pose.z, pose.yaw]).all())
+            raw_confidence = info.get("confidence", info.get("inlier_ratio"))
+            try:
+                confidence = float(raw_confidence)
+            except (TypeError, ValueError, OverflowError):
+                confidence = 1.0 if pose_ok else 0.0
+            if not math.isfinite(confidence):
+                confidence = 1.0 if pose_ok else 0.0
+            confidence = min(1.0, max(0.0, confidence))
+            capture_mono_ns = (
+                int(round(float(capture_stamp) * 1_000_000_000.0))
+                if capture_stamp is not None
+                else worker_read_done_mono_ns
+            )
             payload = {
                 "seq": seq,
+                "frame_id": f"worker-{seq}",
+                "capture_mono_ns": capture_mono_ns,
+                "pose_mono_ns": worker_core_done_mono_ns,
+                "localization_contract_version": 1,
+                "validity": bool(pose_ok),
+                "confidence": confidence,
                 "success": pose_ok,
                 "wall_ms": wall_ms,
                 "core_wall_ms": core_wall_ms,
@@ -890,9 +951,18 @@ def main() -> None:
             core_wall_ms = (
                 (time.perf_counter() - core_t0) * 1000.0 if core_t0 is not None else None)
             wall_ms = (time.perf_counter() - wall_t0) * 1000.0
-            payload = {
-                "seq": seq,
-                "success": False,
+            payload = localization_exception_payload(
+                seq=seq,
+                error=exc,
+                frame_id=f"worker-{seq}",
+                capture_mono_ns=(
+                    int(round(float(capture_stamp) * 1_000_000_000.0))
+                    if capture_stamp is not None
+                    else worker_read_done_mono_ns
+                ),
+                pose_mono_ns=worker_core_done_mono_ns or worker_read_done_mono_ns,
+            )
+            payload.update({
                 "wall_ms": wall_ms,
                 "core_wall_ms": core_wall_ms,
                 "worker_read_done_mono": worker_read_done_mono,
@@ -920,8 +990,7 @@ def main() -> None:
                     if benchmark_mode_active in {"weak", "track"} else None),
                 "benchmark_setup_ms": benchmark_setup_ms,
                 "benchmark_seeded": benchmark_seeded,
-                "error": repr(exc),
-            }
+            })
             print(f"[live_worker] localization error: {exc!r}", file=sys.stderr, flush=True)
         json_out.write(json.dumps(payload, ensure_ascii=False) + "\n")
         json_out.flush()

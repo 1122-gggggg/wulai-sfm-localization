@@ -25,6 +25,7 @@ EDM_CHECKPOINT_SHA256 = (
 )
 SCALE_FREE_CORE = "模擬器/parrot_stimulate/src/anafi_pcmd_sim/scale_free_control.py"
 REQUIRED_GPU_SUBSTRING = "rtx 5060"
+SCIPY_LOCK_PACKAGE = "scipy"
 
 
 def _workspace_root() -> Path:
@@ -96,6 +97,20 @@ def _resolved_env_path(name: str, *, resolve_symlinks: bool = True) -> Path | No
 def _check_environment_contract(
     root: Path, profile_path: Path, failures: list[str], runtime: dict[str, object]
 ) -> None:
+    venv_config = Path(sys.prefix) / "pyvenv.cfg"
+    system_site_packages = False
+    if venv_config.is_file():
+        for line in venv_config.read_text(encoding="utf-8").splitlines():
+            key, separator, value = line.partition("=")
+            if separator and key.strip().lower() == "include-system-site-packages":
+                system_site_packages = value.strip().lower() == "true"
+                break
+    runtime["system_site_packages"] = system_site_packages
+    if system_site_packages:
+        failures.append(
+            f"runtime venv has include-system-site-packages=true: {venv_config}"
+        )
+
     expected_paths = {
         "SFM_WORKSPACE_ROOT": root.resolve(),
         "SFM_TORCH_HUB_CACHE": (root / "執行環境/torch_hub_cache").resolve(),
@@ -190,6 +205,86 @@ def _check_runtime(
     ) as exc:
         failures.append(f"EDM runtime import failed: {exc}")
     return runtime
+
+
+def _collision_monitor_status(
+    root: Path,
+    failures: list[str],
+    *,
+    production_required: bool,
+) -> dict[str, object]:
+    """Report the effective sparse-cloud monitor policy.
+
+    The controller has a guarded SciPy import, so importing SciPy from an
+    operator's ambient environment is not enough to make this capability
+    reproducible.  A clean runtime can only rely on packages present in the
+    hash-locked runtime requirements.  The monitor is currently a warning-only
+    research aid, not an approved production collision-protection layer.
+    """
+    lock_path = root / "requirements-lock.txt"
+    hash_locked = False
+    lock_error = ""
+    if lock_path.is_file():
+        try:
+            hash_locked = any(
+                line.lstrip().startswith(f"{SCIPY_LOCK_PACKAGE}==")
+                for line in lock_path.read_text(encoding="utf-8").splitlines()
+            )
+        except OSError as exc:
+            lock_error = f"cannot read requirements-lock.txt: {exc}"
+
+    runtime_import = False
+    import_error = ""
+    try:
+        scipy_spatial = importlib.import_module("scipy.spatial")
+        runtime_import = getattr(scipy_spatial, "cKDTree", None) is not None
+        if not runtime_import:
+            import_error = "scipy.spatial.cKDTree is unavailable"
+    except Exception as exc:  # noqa: BLE001 - report optional monitor as unavailable
+        import_error = str(exc)
+
+    reasons: list[str] = []
+    if not hash_locked:
+        reasons.append(
+            "scipy is not present in requirements-lock.txt; clean lock-only installs "
+            "must treat SparseCloudCollisionMonitor as unavailable"
+        )
+    if lock_error:
+        reasons.append(lock_error)
+    if not runtime_import:
+        reasons.append(import_error or "scipy.spatial.cKDTree import failed")
+    reasons.append(
+        "SparseCloudCollisionMonitor is not an approved production safety layer; "
+        "collision_protection_claim=false"
+    )
+
+    effective_available = hash_locked and runtime_import
+    if production_required:
+        if not hash_locked:
+            failures.append(
+                "production collision monitor required but scipy is absent from "
+                "requirements-lock.txt; preflight is fail-closed"
+            )
+        if not runtime_import:
+            failures.append(
+                "production collision monitor required but scipy.spatial.cKDTree "
+                "is unavailable; preflight is fail-closed"
+            )
+        failures.append(
+            "SparseCloudCollisionMonitor is not an approved production safety layer; "
+            "production preflight is fail-closed"
+        )
+
+    return {
+        "available": effective_available,
+        "status": "available_non_production" if effective_available else "unavailable",
+        "runtime_import": runtime_import,
+        "hash_locked": hash_locked,
+        "required_for_production": production_required,
+        "production_safety": False,
+        "collision_protection_claim": False,
+        "reason": " ".join(reasons),
+    }
 
 
 def _check_ply(path: Path, failures: list[str]) -> None:
@@ -315,6 +410,7 @@ def run_preflight(
     video_path: Path,
     check_runtime: bool,
     full_runtime: bool = False,
+    require_collision_monitor: bool = False,
 ) -> dict[str, object]:
     failures: list[str] = []
     profile = None
@@ -343,6 +439,11 @@ def run_preflight(
     runtime_report = (
         _check_runtime(root, profile_path, failures) if check_runtime else {}
     )
+    runtime_report["collision_monitor"] = _collision_monitor_status(
+        root,
+        failures,
+        production_required=require_collision_monitor,
+    )
     if full_runtime:
         if not check_runtime:
             failures.append("full runtime check requires --check-runtime")
@@ -365,6 +466,11 @@ def main() -> None:
     parser.add_argument("--video", required=True)
     parser.add_argument("--check-runtime", action="store_true")
     parser.add_argument(
+        "--require-collision-monitor",
+        action="store_true",
+        help="require a hash-locked, approved collision monitor; otherwise fail closed",
+    )
+    parser.add_argument(
         "--full-runtime",
         action="store_true",
         help="load the selected bundle, EDM CUDA model, MegaLoc model, GUI and worker",
@@ -377,6 +483,7 @@ def main() -> None:
         video_path=Path(args.video).expanduser().resolve(),
         check_runtime=bool(args.check_runtime or args.full_runtime),
         full_runtime=bool(args.full_runtime),
+        require_collision_monitor=bool(args.require_collision_monitor),
     )
     if args.json:
         print(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))
@@ -385,6 +492,13 @@ def main() -> None:
         if report["profile"]:
             print(f"[simulator-preflight] site={report['profile']['site_id']}")
         print(f"[simulator-preflight] video={report['video']['path']}")
+        collision_monitor = report["runtime"].get("collision_monitor")
+        if isinstance(collision_monitor, dict):
+            print(
+                "[simulator-preflight] collision-monitor="
+                f"{collision_monitor['status']} "
+                "production_safety=false collision_protection_claim=false"
+            )
         for failure in report["failures"]:
             print(f"[simulator-preflight] ERROR: {failure}", file=sys.stderr)
     raise SystemExit(0 if report["ok"] else 1)

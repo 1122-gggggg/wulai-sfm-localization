@@ -128,6 +128,20 @@ python 控制介面程式/mission_pipeline.py \
 - WEAK、LOST、stale pose、stale stream 或 watchdog timeout 必須導向零 PCMD、懸停、人工接管或降落，不得繼續沿用舊命令。
 - 場域資產不完整、路徑不存在或 profile 與 per-asset override 混用時，入口必須 fail closed。
 
+### 稀疏點雲 monitor 與 reproducibility
+
+`SparseCloudCollisionMonitor` 的 SciPy import 是 optional，且目前沒有接入
+autonomous route 或其他 production safety path。`requirements-lock.txt` 未 pin
+scipy，因此即使開發 venv 恰好能 import `scipy`，clean lock-only runtime 仍必須把
+此能力記為 `unavailable`。`tools/simulator_preflight.py --json` 與 system validation
+receipt 會記錄 `runtime.collision_monitor`、`production_safety=false` 及
+`collision_protection_claim=false`，不把它當作碰撞保護。
+
+若將來 production 明確需要這個 monitor，先完成 safety wiring 審查，並以官方 lock
+產生流程加入受審查的 scipy pin 與平台 wheel hashes，再使用
+`--require-collision-monitor`；缺少任一項時 preflight 必須 fail closed。離線維護時
+不得猜測或手寫 scipy wheel hash。
+
 ## 後續收斂順序
 
 1. 以 mirror check 維持現有部署包一致性。

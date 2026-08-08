@@ -23,8 +23,15 @@ SHA256_KEYS = (
     "map_reference_poses",
     "localizer_profile",
     "poles_json",
+    "map_align",
 )
 SITE_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
+#: display_name stays free-form text -- CJK, spaces, dashes and brackets are all
+#: legitimate -- but it comes from a site package authored on another machine and
+#: is interpolated into launcher shell commands and window titles. Control
+#: characters and the shell quoting/expansion characters have no business in a
+#: field whose only job is to be read by a human.
+DISPLAY_NAME_REJECT_RE = re.compile("[\x00-\x1f\x7f-\x9f$`\"'\\\\]")
 
 
 def _reject_json_constant(value: str):
@@ -59,6 +66,7 @@ class AssetDigests:
     map_reference_poses: str | None = None
     localizer_profile: str | None = None
     poles_json: str | None = None
+    map_align: str | None = None
 
 
 @dataclass(frozen=True)
@@ -129,6 +137,10 @@ class SiteProfile:
     localizer_deploy_dir: Path | None = None
     localizer_profile: Path | None = None
     map_reference_poses: Path | None = None
+    #: Measured gravity alignment (T_align_gravity.json). Without it the runtime
+    #: falls back to assuming GLOMAP -Y is up, which is wrong on every site
+    #: measured so far (1.99 to 22.51 degrees).
+    map_align: Path | None = None
     megaloc_cache: Path | None = None
     track_landmarks: Path | None = None
     poles_json: Path | None = None
@@ -358,6 +370,20 @@ def _load_flight_controller(raw, source: Path) -> FlightControlProfile | None:
         key: _finite_number(raw, key, source, positive=True)
         for key in positive_keys
     }
+    # These are safety-envelope ceilings, not tuning defaults.  Site profiles are
+    # hand-authored deployment inputs; accepting an extra zero here can otherwise
+    # turn a 0.30 m/s or 1.5-map-unit guard into a effectively disabled one.
+    ceilings = {
+        "speed_limit_mps": 2.0,
+        "lookahead_map_units": 5.0,
+        "max_pose_jump_map_units": 5.0,
+        "max_route_deviation_map_units": 10.0,
+    }
+    for key, maximum in ceilings.items():
+        if values[key] > maximum:
+            raise ValueError(
+                f"site profile flight.controller.{key} must be <= {maximum:g}: {source}"
+            )
     if values["pose_max_age_ms"] > 500.0:
         raise ValueError(
             f"site profile flight.controller.pose_max_age_ms must be <= 500: {source}"
@@ -575,11 +601,16 @@ def flight_readiness_errors(profile: SiteProfile) -> list[str]:
         errors.append("missing route_json")
     if profile.map_reference_poses is None:
         errors.append("missing map_reference_poses")
+    if profile.map_align is None:
+        # Fail closed: without a measured alignment the controller would silently
+        # assume GLOMAP -Y is up, which tilts every commanded body axis.
+        errors.append("missing map_align (measured T_align_gravity.json)")
     if profile.query_camera is None:
         errors.append("missing query_camera")
     if profile.localizer == "edm" and profile.localizer_profile is None:
         errors.append("missing EDM localizer_profile")
-    for key in ("localization_bundle", "route_json", "map_reference_poses"):
+    for key in ("localization_bundle", "route_json", "map_reference_poses",
+                "map_align"):
         if getattr(profile.asset_sha256, key) is None:
             errors.append(f"missing asset_sha256.{key}")
     if profile.localizer_profile is not None and profile.asset_sha256.localizer_profile is None:
@@ -621,6 +652,7 @@ def load_site_profile(path: str | Path, *, validate_files: bool = True) -> SiteP
         "localizer_deploy_dir",
         "localizer_profile",
         "map_reference_poses",
+        "map_align",
         "query_camera",
         "coordinate_frame",
         "asset_sha256",
@@ -650,6 +682,11 @@ def load_site_profile(path: str | Path, *, validate_files: bool = True) -> SiteP
     display_name = raw.get("display_name", site_id)
     if not isinstance(display_name, str) or not display_name.strip():
         raise ValueError(f"site profile display_name must be a non-empty string: {source}")
+    if DISPLAY_NAME_REJECT_RE.search(display_name):
+        raise ValueError(
+            "site profile display_name must not contain control characters or any "
+            f"of $ ` \" ' \\ : {source}"
+        )
     localizer = raw.get("localizer", PRODUCTION_LOCALIZER_BACKEND)
     if (
         not isinstance(localizer, str)
@@ -711,6 +748,9 @@ def load_site_profile(path: str | Path, *, validate_files: bool = True) -> SiteP
             "map_reference_poses",
             required=False,
         ),
+        map_align=_resolve_asset(
+            base, raw.get("map_align"), "map_align", required=False
+        ),
         megaloc_cache=_resolve_asset(
             base, assets.get("megaloc_cache"), "megaloc_cache", required=False
         ),
@@ -751,6 +791,7 @@ def load_site_profile(path: str | Path, *, validate_files: bool = True) -> SiteP
                 ("track_landmarks", profile.track_landmarks),
                 ("poles_json", profile.poles_json),
                 ("map_reference_poses", profile.map_reference_poses),
+                ("map_align", profile.map_align),
                 ("localizer_profile", profile.localizer_profile),
                 (
                     "hardware_approval.receipt",

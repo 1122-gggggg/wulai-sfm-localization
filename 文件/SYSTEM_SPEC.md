@@ -785,8 +785,8 @@ stateDiagram-v2
 - command/safety/incident/session manifest/summary：不自動刪除。
 - 手動 archive/export 產生 manifest、SHA-256 與檔案清單。
 - 自動清理前後都寫 retention audit，不可刪除當前 session。
-- 磁碟 free space <20 GB 或 <15% 時警告並清理可刪 log；<5 GB 或 <5% 時禁止新的真機起飛。門檻採較早觸發者。
-- 目前只有約 14 GB free，實作完成前必須先清理／擴充空間或調整經操作員核准的部署容量；不可藉由刪除永久 safety log 解決。
+- `tools/workspace_audit.py` 在 workspace 總量超過 20 GiB 或 filesystem free space 低於 15% 時發出明確 warning；它不自動清理，也不把 warning 誤報成 release 通過。這個 20 GiB workspace 警告與上方 derived-log 的 20 GB retention 配額是不同門檻。
+- 真機部署若另有經核准的低磁碟 safety gate（例如 <5 GiB 或 <5%），必須由該部署 gate 實作並寫入 receipt；不得把本 audit 的 warning 當成已完成該 gate，也不可藉由刪除永久 safety log 解決容量問題。
 
 ### 14.3 本機監控
 
@@ -807,6 +807,11 @@ stateDiagram-v2
 - REAL process 只允許 loopback 與已解析的 `192.168.53.1`／`192.168.42.1` 等核准 ANAFI 私有 endpoint；不得查 DNS 或連 Internet。
 - 設定 `HF_HUB_OFFLINE=1`、`TRANSFORMERS_OFFLINE=1`、固定 package-local cache；任何 cache 缺失都 fail closed。
 - model/checkpoint/bundle/profile/route/reference poses/map manifest 在載入前驗 SHA-256。
+- `SparseCloudCollisionMonitor` 目前不是 production safety：runtime lock 沒有 scipy，
+  preflight／validation receipt 必須把 clean lock-only effective status 記為
+  `unavailable`，並固定 `collision_protection_claim=false`。若產品需求改為依賴此
+  monitor，必須先完成 safety wiring 審查、加入受審查的 scipy version 與所有平台
+  wheel hashes，再以 `--require-collision-monitor` fail closed；離線時不得猜 hash。
 - PyTorch artifact 優先使用 `weights_only=True`、受限 safe globals 及 schema validation。任何仍使用 unrestricted pickle 的維護工具必須先驗 SHA，且不得進 production startup path。
 - command log 不記錄 secret；工作區不可要求 Internet token 才能飛行。
 - 操作員核准 artifact 更新時，receipt 必須包含舊／新 SHA、變更理由、測試結果、人工視覺判定與日期。

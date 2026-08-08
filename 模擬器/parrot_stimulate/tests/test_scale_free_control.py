@@ -74,6 +74,22 @@ def test_controller_turns_before_allowing_translation() -> None:
     assert translate.body_forward == pytest.approx(1.0)
 
 
+def test_target_reached_requires_landing_speed_not_only_cruise_speed() -> None:
+    moving = decide_scale_free(
+        sample(target_reached=True, airframe_horizontal_speed_mps=0.11),
+        now_mono_ns=NOW_NS,
+    )
+    settled = decide_scale_free(
+        sample(target_reached=True, airframe_horizontal_speed_mps=0.09),
+        now_mono_ns=NOW_NS,
+    )
+
+    assert moving.phase == "HOLD"
+    assert moving.reason == "TARGET_MOVING"
+    assert moving.zero_motion and not moving.manual_handoff
+    assert settled.phase == "ARRIVED"
+
+
 def test_real_approval_lock_and_command_ttl_are_fail_closed() -> None:
     locked = decide_scale_free(sample(approval_locked=True), now_mono_ns=NOW_NS)
     active = decide_scale_free(sample(), now_mono_ns=NOW_NS)

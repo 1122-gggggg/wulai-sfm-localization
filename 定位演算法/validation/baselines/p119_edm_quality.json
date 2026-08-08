@@ -2,6 +2,21 @@
   "schema": "edm-site-replay-quality-baseline/v1",
   "video": "/home/allen/下載/P1190119.MP4",
   "video_sha256": "600bbf70227311cab079d77fcb896f97e6d3e55f6bc40b5bef01d74b65f7826c",
+  "site_profile": "控制介面程式/site_profiles/river_site_edm.json",
+  "site_profile_sha256": "207296ac3f645e1a4ca5242ce7c5fe687f46d72af10dbabb5362905fe8cbad06",
+  "bundle_sha256": "39a817936c0ba314a739701411f974672a94f126830f9f5b9a7a4efdfee08117",
+  "localizer_profile_sha256": "208a32f1284672c55581e0570e2f05fa3f19bbb20e5227a4261949e0d5ed8ea0",
+  "camera": {
+    "model": "PINHOLE",
+    "width": 1280,
+    "height": 720,
+    "params": [
+      1000.8124857902368,
+      1007.5681084778566,
+      670.8167724609375,
+      358.71917724609375
+    ]
+  },
   "evidence": "outputs/validation/edm_p119_pnp_ab_20260802/pnp_cap_900_full.json",
   "thresholds": {
     "frames": 2934,

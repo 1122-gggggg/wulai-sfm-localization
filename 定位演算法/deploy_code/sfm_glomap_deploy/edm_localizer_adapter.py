@@ -79,7 +79,7 @@ class InertTemporalCache:
 class EDMTrackerAdapter(Localizer):
     def __init__(self, reloc_map: EDMRelocMap, camera: Camera,
                  cfg: EDMConfig | None = None, megaloc=None, matcher=None,
-                 frame_source=lambda: None):
+                 frame_source=lambda: None, map_frame=None):
         # matcher: EDMMatcher (torch FP16) or EDMOnnxMatcher (ORT CUDA/TensorRT).
         # None -> ProductionEDMTracker builds the default torch EDMMatcher.
         self.trk = ProductionEDMTracker(
@@ -91,6 +91,7 @@ class EDMTrackerAdapter(Localizer):
         self.map = reloc_map
         self.cfg = self.trk.cfg
         self.frame_source = frame_source
+        self.map_frame = map_frame
         self.state = RuntimeState()
         self.temporal_cache = InertTemporalCache()
         self._last_info: dict = {}
@@ -169,8 +170,14 @@ class EDMTrackerAdapter(Localizer):
         pose = None
         if info.get("ok"):
             c = info["center"]
+            pose_yaw = float(info["yaw"])
+            R = np.asarray(info.get("R"), dtype=float)
+            map_frame = getattr(self, "map_frame", None)
+            if (map_frame is not None and R.shape == (3, 3)
+                    and np.isfinite(R).all()):
+                pose_yaw = float(map_frame.heading(R[2]))
             pose = Pose(x=float(c[0]), y=float(c[1]), z=float(c[2]),
-                        yaw=float(info["yaw"]),
+                        yaw=pose_yaw,
                         stamp=time.monotonic() if capture_stamp is None
                         else float(capture_stamp))
             self.state.last_pose = pose
@@ -187,6 +194,12 @@ class EDMTrackerAdapter(Localizer):
         self._last_info = {
             "mode": info["state_in"],
             "next_mode": info["state_out"],
+            # The flight loop's WEAK gate (SFM_GATE_WEAK -> LoopHooks.pose_is_weak)
+            # reads this key. On success the tracker always reports state_out="TRACK",
+            # so the only record that a fix was won from a degraded state is state_in:
+            # WEAK_TRACK accepts at weak_min_inliers, and LOST re-acquisition skips the
+            # trajectory-jump gate. Without this key the gate silently never fires.
+            "weak": info["state_in"] in ("WEAK_TRACK", "LOST"),
             "inliers": int(info.get("inliers", 0) or 0),
             "reproj_rms": info.get("reproj_rms"),
             "inlier_ratio": info.get("inlier_ratio"),

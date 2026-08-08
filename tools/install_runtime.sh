@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+install_test_deps=0
+if [[ "${1:-}" == "--test-deps" ]]; then
+  install_test_deps=1
+  shift
+fi
 if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
   cat <<'EOF'
 用法: bash tools/install_runtime.sh
@@ -8,6 +13,10 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
 環境變數:
   SFM_PYTHON=python3.10       CPython 3.10 executable
   SFM_VENV_DIR=/tmp/sfm-venv  alternate venv directory for clean-install checks
+  SFM_INSTALL_TEST_DEPS=1     additionally install requirements-test-lock.txt
+
+選項:
+  --test-deps                  同上，安裝 hash-locked pytest/ruff/coverage tools
 EOF
   exit 0
 fi
@@ -17,6 +26,10 @@ python_bin="${SFM_PYTHON:-python3.10}"
 venv_dir="${SFM_VENV_DIR:-$root_dir/.venv}"
 venv_python="$venv_dir/bin/python"
 requirements_lock="$root_dir/requirements-lock.txt"
+requirements_test_lock="$root_dir/requirements-test-lock.txt"
+if [[ "${SFM_INSTALL_TEST_DEPS:-0}" == "1" ]]; then
+  install_test_deps=1
+fi
 
 if ! command -v "$python_bin" >/dev/null 2>&1; then
   echo "[runtime] 找不到 $python_bin；需要 CPython 3.10" >&2
@@ -52,5 +65,12 @@ if [[ ! -f "$requirements_lock" ]]; then
   exit 1
 fi
 "$venv_python" -m pip install --require-hashes --requirement "$requirements_lock"
+if [[ "$install_test_deps" == "1" ]]; then
+  if [[ ! -f "$requirements_test_lock" ]]; then
+    echo "[runtime] 缺少固定測試相依鎖檔: $requirements_test_lock" >&2
+    exit 1
+  fi
+  "$venv_python" -m pip install --require-hashes --requirement "$requirements_test_lock"
+fi
 echo "[runtime] 安裝完成：$venv_python"
 echo "[runtime] 系統層仍需 ffmpeg、python3-tk、X11/XWayland、可用 NVIDIA CUDA driver"

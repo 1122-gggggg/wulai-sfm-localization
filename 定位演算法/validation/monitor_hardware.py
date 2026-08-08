@@ -4,6 +4,7 @@
 Examples:
   python3 monitor_hardware.py --output outputs/hardware.jsonl
   python3 monitor_hardware.py --output outputs/hardware.csv --interval 0.5
+  python3 monitor_hardware.py --output - --samples 1  # receipt/stdout mode
 
 The monitor is read-only. It emits rate-limited stderr warnings when Linux CPU
 thermal-throttle counters increase or NVIDIA reports thermal slowdown.
@@ -548,14 +549,17 @@ def run_monitor(
     collector: Callable[..., dict[str, Any]] = collect_sample,
     warning_sink: Callable[[str], None] | None = None,
 ) -> int:
-    output.parent.mkdir(parents=True, exist_ok=True)
+    stdout_mode = output == Path("-")
+    if not stdout_mode:
+        output.parent.mkdir(parents=True, exist_ok=True)
     started = time.monotonic()
     sample_count = 0
     previous_sample: dict[str, Any] | None = None
     warning_times: dict[str, float] = {}
     if warning_sink is None:
         warning_sink = lambda message: print(message, file=sys.stderr)
-    with output.open("w", encoding="utf-8", newline="") as handle:
+    handle = sys.stdout if stdout_mode else output.open("w", encoding="utf-8", newline="")
+    try:
         writer = SampleWriter(handle, output_format)
         try:
             while not stop_event.is_set():
@@ -587,6 +591,9 @@ def run_monitor(
                     break
         except KeyboardInterrupt:
             stop_event.set()
+    finally:
+        if not stdout_mode:
+            handle.close()
     return sample_count
 
 
@@ -598,7 +605,12 @@ def _output_format(path: Path, requested: str | None) -> str:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--output",
+        type=Path,
+        required=True,
+        help="output JSONL/CSV path, or '-' for receipt/stdout mode",
+    )
     parser.add_argument("--format", choices=("jsonl", "csv"), default=None)
     parser.add_argument("--interval", type=float, default=1.0, help="seconds between samples")
     parser.add_argument(

@@ -118,7 +118,7 @@ def test_correspondence_confidence_stays_aligned_after_3d_filtering() -> None:
 
 
 @pytest.mark.parametrize("pixel_offset", [0.0, 10.0])
-def test_boot_staging_stops_on_good_geometry_and_expands_on_bad_geometry(
+def test_boot_staging_evaluates_the_complete_retrieved_set(
     monkeypatch, pixel_offset: float,
 ) -> None:
     names = [f"ref{i}" for i in range(10)]
@@ -162,7 +162,7 @@ def test_boot_staging_stops_on_good_geometry_and_expands_on_bad_geometry(
     tracker = object.__new__(ProductionEDMTracker)
     tracker.cfg = EDMConfig(
         boot_global_topk=10, acquire_initial_topk=2, acquire_min_inliers=80,
-        max_corr_total=100,
+        max_corr_total=100, min_inlier_grid_cells=1,
     )
     tracker.st = RuntimeState()
     tracker.map = SimpleNamespace(
@@ -186,9 +186,11 @@ def test_boot_staging_stops_on_good_geometry_and_expands_on_bad_geometry(
     assert info["requested_reference_count"] == 10
     if pixel_offset == 0.0:
         assert info["ok"]
-        assert info["staged_early_stop"]
-        assert info["refs"] == names[:2]
-        assert calls == [names[:2]]
+        assert not info["staged_early_stop"]
+        assert info["refs"] == names
+        assert calls == [names[:2], names[2:]]
+        assert tracker.temporal_gray is None
+        assert tracker.temporal_xyz_by_cell is None
     else:
         assert not info["ok"]
         assert not info["staged_early_stop"]

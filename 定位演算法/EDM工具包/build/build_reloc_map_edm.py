@@ -60,12 +60,6 @@ KEYPOINT_IDENTITY = (
     "refined partner observations kept separate"
 )
 
-SITE = Path("/media/cihcilab/新增磁碟區/河濱場域/gluemap_build/runs/river_site_pi3_1fps_smoke_pinhole_fix")
-DEF_MODEL = SITE / "gluemap" / "gluemap_aba"
-DEF_IMAGES = SITE / "images"
-DEF_IN_BUNDLE = Path("/media/cihcilab/新增磁碟區/河濱場域/gluemap_build/localization/"
-                     "P1180118_megaloc_xfeat_lighterglue_mnn_20260713/package/bundles/"
-                     "river_site_reloc_map_xfeat_tri.pt")
 DEF_WORK = Path(__file__).resolve().parent.parent / "outputs" / "river_edm_work"
 DEF_OUT = Path(__file__).resolve().parent.parent / "outputs" / "river_site_reloc_map_edm.pt"
 
@@ -472,11 +466,11 @@ def pack_bundle(
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--model", default=str(DEF_MODEL))
-    ap.add_argument("--image-root", default=str(DEF_IMAGES))
+    ap.add_argument("--model", required=True)
+    ap.add_argument("--image-root", required=True)
     ap.add_argument(
         "--in-bundle",
-        default=str(DEF_IN_BUNDLE),
+        required=True,
         help="seed bundle: MegaLoc + covis + tracking metadata are inherited from it",
     )
     ap.add_argument("--work-dir", default=str(DEF_WORK))

@@ -10,6 +10,7 @@ Not a "did it run" test. It checks the two things the whole design rests on:
 """
 from __future__ import annotations
 
+import argparse
 import sys
 from pathlib import Path
 
@@ -18,11 +19,6 @@ import pycolmap
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "deploy"))
 from edm_matcher import EDM_H, EDM_W, EDMMatcher  # noqa: E402
-
-SITE = Path("/media/cihcilab/新增磁碟區/河濱場域/gluemap_build/runs/river_site_pi3_1fps_smoke_pinhole_fix")
-MODEL = SITE / "gluemap" / "gluemap_aba"
-IMAGES = SITE / "images"
-
 
 def cam_K(cam) -> np.ndarray:
     fx, fy, cx, cy = cam.params
@@ -47,7 +43,14 @@ def symmetric_epipolar(k0, k1, K, T0, T1):
 
 
 def main():
-    rec = pycolmap.Reconstruction(str(MODEL))
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model", required=True)
+    parser.add_argument("--image-root", required=True)
+    args = parser.parse_args()
+    model = Path(args.model).expanduser().resolve()
+    image_root = Path(args.image_root).expanduser().resolve()
+
+    rec = pycolmap.Reconstruction(str(model))
     cam = list(rec.cameras.values())[0]
     K = cam_K(cam)
     scale = cam.width / EDM_W  # EDM-res -> full-res (1280/1024 = 1.25)
@@ -66,7 +69,7 @@ def main():
     ok = True
     for n0, n1 in pairs:
         covis = len(pts_of[n0] & pts_of[n1])
-        r = m.match(IMAGES / n0, IMAGES / n1)
+        r = m.match(image_root / n0, image_root / n1)
         k0, k1, mc = r["mkpts0"], r["mkpts1"], r["mconf"]
         if len(k0) < 10:
             print(f"{n0} <-> {n1}: only {len(k0)} matches  FAIL")

@@ -35,6 +35,8 @@ EDM_REQUIRED_TRACKER_KEYS = {
     "max_yaw_diff_deg",
     "track_min_inliers",
     "weak_min_inliers",
+    "min_inlier_ratio",
+    "min_inlier_grid_cells",
     "max_reproj_error_acquire",
     "max_reproj_error_track",
     "pnp_ransac_max_error",
@@ -48,6 +50,11 @@ EDM_REQUIRED_TRACKER_KEYS = {
     "adaptive_jump_history_size",
     "weak_after",
     "lost_after",
+    # LOST re-acquisition bound. Scale-FREE (a factor of max_jump, degrees, seconds),
+    # so unlike radius/max_jump these carry the same value at every site.
+    "acquire_max_jump_factor",
+    "acquire_max_yaw_diff_deg",
+    "lost_prior_max_age_s",
     "max_corr_total",
     "corr_grid",
 }

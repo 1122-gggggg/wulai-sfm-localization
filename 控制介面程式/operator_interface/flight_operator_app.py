@@ -62,9 +62,23 @@ from backend_contract import (
     StartResult,
 )
 from local_site_assets import (
+    discover_ply_files,
     LocalRouteProvider,
     LocalSitePackageProvider,
     LocalTargetProvider,
+    match_managed_site_profile_for_map,
+    site_pack_root_for_profile,
+)
+from localization_contract import (
+    InvalidLocalizationResult,
+    LocalizationResult,
+)
+from live_safety_config import (
+    DEFAULT_MAX_ROTATION_SPEED_DEGS,
+    DEFAULT_MAX_TILT_DEG,
+    DEFAULT_MAX_VERTICAL_SPEED_MS,
+    DEFAULT_RTH_MIN_ALTITUDE_M,
+    LiveSafetyConfig,
 )
 from operator_actions import (
     FLIGHT_MODE_BUTTONS,
@@ -74,6 +88,7 @@ from operator_actions import (
     replace_site_profile_argument,
 )
 from site_assets_panel import SiteAssetsPanel
+from route_editor_window import RouteEditorWindow
 from live_localizer_protocol import encode_mode, encode_request
 from runtime_safety import (
     SessionLogs,
@@ -101,6 +116,12 @@ _MISSION_ROOT = _CTRL_ROOT  # site_profiles + site_profile live here now
 _FLIGHT_CONTROL = _WS.flight_control
 if str(_FLIGHT_CONTROL) not in sys.path:
     sys.path.insert(0, str(_FLIGHT_CONTROL))
+from real_path_follow_controller import (  # type: ignore
+    LEGACY_MAP_FRAME,
+    MissionRouteLock,
+    MissionRouteSnapshot,
+    capture_mission_route_snapshot,
+)
 try:
     from gravity_calibration import (  # type: ignore
         PHASE_LABELS,
@@ -397,10 +418,25 @@ POSE_JUMP_U = _positive_env_float("SFM_MAX_POSE_JUMP_U", 1.5)
 LOC_LOW_INLIERS = _positive_env_int("SFM_LOW_CONF_INLIERS", 60)
 LOC_HIGH_REPROJ = _positive_env_float("SFM_LOC_HIGH_REPROJ", 4.0)
 CONFIDENCE_HOLD_ENGAGE_EVENTS = frozenset({"ENGAGE_FAIL", "ENGAGE_LOW_CONF"})
-HEALTH_COLOR = {"OK": "#3fbf7f", "LOW": "#e0a92e", "FAIL": "#e2483d"}
+#: Every value self.loc_health can take must appear here AND in HEALTH_TEXT:
+#: both are indexed inside Tk callbacks, where a KeyError kills the callback.
+HEALTH_COLOR = {
+    "OK": "#3fbf7f", "LOW": "#e0a92e", "FAIL": "#e2483d",
+    # Not a localization failure: localization is deliberately not running.
+    "PAUSED_ZOOM": "#b26a00",
+}
 NO_LOC_DEDUP_U = _positive_env_float("SFM_NO_LOC_DEDUP_U", 1.0)
 NO_LOC_MAX_MARKERS = _positive_env_int("SFM_NO_LOC_MAX_MARKERS", 1000)
 UI_LOG_MAX_LINES = _positive_env_int("SFM_UI_LOG_MAX_LINES", 2000)
+# Typed requests are submitted immediately before the backend boundary.  Keep
+# the same upper bound as the flight-control command TTL: a queued ordinary
+# request must never become a delayed movement command.  Explicit safety actions
+# below are exempt so an old emergency/landing request remains actionable.
+CONTROL_REQUEST_MAX_AGE_NS = 250_000_000
+FLIGHT_RESULT_QUEUE_MAX = 32
+_SAFETY_FLIGHT_RESULT_COMMANDS = frozenset({
+    "land", "land_now", "emergency_stop",
+})
 # Map base rebuild is a depth argsort plus a scatter over the whole cloud:
 # ~16 ms at 250k points on the operator laptop. Full detail once the view is
 # still, decimated while the operator is dragging or zooming.
@@ -518,6 +554,7 @@ def camera_frustum_world_points(
 
 _SITE_ASSET_ENV_VARS = (
     "SFM_MAP_PLY",
+    "SFM_MAP_ALIGN",
     "SFM_FLIGHT_PATH_JSON",
     "SFM_RELOC_BUNDLE",
     "SFM_MEGALOC_CACHE",
@@ -582,6 +619,9 @@ def resolve_operator_site_assets(args, parser: argparse.ArgumentParser) -> SiteP
                 profile.asset_sha256.map_reference_poses,
                 "map_reference_poses",
             ),
+            # Verified here too: this file decides which way is up for every
+            # commanded body axis, so a swapped one must not start the interface.
+            (profile.map_align, profile.asset_sha256.map_align, "map_align"),
         ):
             if asset is not None and expected is not None:
                 actual = file_sha256(asset)
@@ -657,11 +697,41 @@ def optional_env_float(name: str) -> float | None:
     return None if not raw else float(raw)
 
 
+_ENV_TRUE = {"1", "true", "yes", "on"}
+_ENV_FALSE = {"0", "false", "no", "off"}
+
+
+#: Signals that must be armed for "close the terminal -> land in place" to hold.
+#: SIGHUP is the terminal actually closing; SIGINT is Ctrl-C; SIGTERM is kill.
+EXIT_SAFETY_SIGNALS = frozenset({"SIGINT", "SIGTERM", "SIGHUP"})
+
+
 def env_bool(name: str, default: bool) -> bool:
+    """Parse a boolean env switch, FAILING CLOSED on anything unrecognised.
+
+    These switches gate safety preconditions (e.g. SFM_REQUIRE_GPS_FOR_GEOFENCE).
+    Treating an unrecognised value as False silently disabled the precondition, so a
+    typo such as "ture" or "True " turned a guard off with no diagnostic at all.
+
+    An EMPTY value means the same as unset: `SFM_X= ./start...` and a systemd
+    `Environment=SFM_X=` line are the conventional ways to neutralise a variable,
+    and killing the interface over one is a denial of service, not a guard.
+    """
     raw = os.environ.get(name)
     if raw is None:
         return bool(default)
-    return raw.strip().lower() in {"1", "true", "yes", "on"}
+    token = raw.strip().lower()
+    if not token:
+        return bool(default)
+    if token in _ENV_TRUE:
+        return True
+    if token in _ENV_FALSE:
+        return False
+    raise SystemExit(
+        f"{name}={raw!r} is not a recognised boolean; use one of "
+        f"{sorted(_ENV_TRUE)} / {sorted(_ENV_FALSE)}. Refusing to guess, because "
+        "this switch gates a safety precondition."
+    )
 
 
 def file_sha256(path: Path) -> str:
@@ -691,6 +761,36 @@ def normalize_live_localization_result(result: object) -> tuple[dict, np.ndarray
         normalized["error"] = f"invalid localization pose: {exc}"
         return normalized, None
     return normalized, xyz
+
+
+def validate_live_localization_result(result: object) -> dict:
+    """Validate new worker payloads once while retaining dict compatibility."""
+    if not isinstance(result, dict):
+        return {
+            "success": False,
+            "validity": False,
+            "mode": "LOST",
+            "next_mode": "LOST",
+            "localization_exception": True,
+            "error": "invalid localization result: expected object",
+        }
+    if result.get("localization_contract_version") != 1:
+        # Older test doubles/plugins remain readable until they opt into the
+        # explicit boundary fields. Production worker payloads always carry v1.
+        return dict(result)
+    try:
+        return LocalizationResult.from_payload(result).to_payload()
+    except InvalidLocalizationResult as exc:
+        invalid = dict(result)
+        invalid.update({
+            "success": False,
+            "validity": False,
+            "mode": "LOST",
+            "next_mode": "LOST",
+            "localization_exception": True,
+            "error": f"invalid localization result: {exc}",
+        })
+        return invalid
 
 
 class TemporalPoseStabilizer:
@@ -922,27 +1022,112 @@ class LostHoldPolicy:
             self.attempts += 1
 
 
-def load_route_glomap(path_json: str) -> list:
-    """Load a Blender-drawn flight path (aligned frame) and convert each waypoint to the
-    GLOMAP map frame used by the point cloud / localizer: aligned(x,y,z) -> (x, -z, y)."""
+def resolve_site_map_frame(profile) -> object | None:
+    """The site's measured MapFrame, or None for the legacy [x, -z, y] guess.
+
+    Same resolution real_path_follow_controller applies when it loads the route
+    for flight; the preview overlay must ask this question the same way or it
+    draws a path autonomy will not fly.
+    """
+    align = getattr(profile, "map_align", None) if profile is not None else None
+    if align is None:
+        return None
+    # A site that DECLARES an alignment but whose alignment cannot be read must
+    # not quietly fall back to the legacy guess: that is the 22.5 deg silent
+    # rotation this whole align_source mechanism exists to prevent. Fail loudly;
+    # the callers turn this into "no preview + a log line" or a startup error.
+    try:
+        from real_path_follow_controller import load_map_frame  # type: ignore
+    except ImportError as exc:
+        raise ValueError(
+            f"site declares a gravity alignment ({align}) but the flight-control "
+            f"module that reads it is unavailable: {exc}"
+        ) from exc
+    return load_map_frame(align)
+
+
+def load_route_glomap(path_json: str, map_frame=None) -> list:
+    """Load an aligned or raw-GLOMAP route into the map/localizer frame.
+
+    ``map_frame`` is the site's measured MapFrame (None = the legacy assumption).
+
+    The align_source rules below MIRROR real_path_follow_controller.load_waypoints
+    exactly, and must keep mirroring it: align_source names the basis that PRODUCED
+    these aligned coordinates, so that is the basis to invert with -- it is not a
+    claim about the site. Reading a route back through the other basis rotates it
+    by the angle the two differ by (22.5 deg on target_site_v1), so any divergence
+    here means the pink preview shows a different path from the one autonomy flies.
+    test_preview_and_flight_loader_agree_on_every_route pins the equivalence.
+    """
     data = json.loads(Path(path_json).read_text(encoding="utf-8"))
     if not isinstance(data, dict):
         raise ValueError("route root must be a JSON object")
     waypoints = data.get("waypoints")
     if not isinstance(waypoints, list) or not waypoints:
         raise ValueError("route must contain a non-empty waypoints list")
+    frame = data.get("frame", "aligned")
+    if frame not in {"aligned", "glomap"}:
+        raise ValueError("route frame must be 'aligned' or 'glomap'")
+    if data.get("units", "map") != "map":
+        raise ValueError("route units must be 'map'")
+    site_is_measured = (
+        map_frame is not None
+        and getattr(map_frame, "source", "legacy_assumption") != "legacy_assumption"
+    )
+    #: None means the legacy [x, -z, y] basis; otherwise the site's measured one.
+    authoring_frame = None
+    if frame == "aligned":
+        declared = data.get("align_source")
+        if declared is None:
+            if site_is_measured:
+                raise ValueError(
+                    "route uses frame='aligned' but declares no align_source, and "
+                    "this site has a measured gravity alignment; add "
+                    "align_source='legacy' or 'measured' (or export frame='glomap')"
+                )
+            declared = "legacy"
+        if declared == "legacy":
+            authoring_frame = None
+        elif declared == "measured":
+            if not site_is_measured:
+                raise ValueError(
+                    "route declares align_source='measured' but this site has no "
+                    "measured gravity alignment to invert it with"
+                )
+            authoring_frame = map_frame
+        else:
+            raise ValueError(f"unknown route align_source: {declared!r}")
     converted = []
     for index, point in enumerate(waypoints):
         if not isinstance(point, list) or len(point) != 3:
             raise ValueError(f"route waypoint {index} must contain exactly 3 coordinates")
         try:
-            aligned = np.asarray(point, dtype=float)
+            route_point = np.asarray(point, dtype=float)
         except (TypeError, ValueError) as exc:
             raise ValueError(f"route waypoint {index} is not numeric") from exc
-        if aligned.shape != (3,) or not np.isfinite(aligned).all():
+        if route_point.shape != (3,) or not np.isfinite(route_point).all():
             raise ValueError(f"route waypoint {index} contains a non-finite coordinate")
-        converted.append(np.array([aligned[0], -aligned[2], aligned[1]], dtype=float))
+        if frame != "aligned":
+            converted.append(route_point.copy())
+        elif authoring_frame is not None:
+            # Same recombination as rpf.aligned_to_glomap: aligned coordinates are
+            # the (east, north, up) components of the authoring basis.
+            converted.append(
+                route_point[0] * np.asarray(authoring_frame.east, dtype=float)
+                + route_point[1] * np.asarray(authoring_frame.north, dtype=float)
+                + route_point[2] * np.asarray(authoring_frame.up, dtype=float)
+            )
+        else:
+            # The legacy basis reduces to exactly this swap.
+            converted.append(
+                np.array([route_point[0], -route_point[2], route_point[1]], dtype=float)
+            )
     return converted
+#: Floor for the fixed-height control pane, and the notebook tab strip + border
+#: allowance added on top of the tallest tab's requested height.
+CONTROL_PANE_MIN_H = 220
+CONTROL_PANE_CHROME_H = 40
+
 DEFAULT_MAP_YAW = 0.0
 DEFAULT_MAP_PITCH = (math.radians(78.0) + math.pi) % (2.0 * math.pi)
 DEFAULT_MAP_ROLL = 0.0
@@ -973,6 +1158,60 @@ class AnafiProfile:
 
 
 ANAFI = AnafiProfile()
+
+
+PREFLIGHT_GUIDE_STEPS = ("compass", "map", "route", "system")
+PREFLIGHT_GUIDE_LABELS = {
+    "compass": "羅盤校正狀態",
+    "map": "地圖匯入",
+    "route": "路線匯入／修改",
+    "system": "串流與系統資訊",
+}
+
+
+class SequentialPreflightGuide:
+    """Human confirmations that must be completed in one fixed order."""
+
+    def __init__(self) -> None:
+        self._evidence: dict[str, object] = {}
+
+    @property
+    def current_step(self) -> str | None:
+        return next(
+            (step for step in PREFLIGHT_GUIDE_STEPS if step not in self._evidence),
+            None,
+        )
+
+    @property
+    def complete(self) -> bool:
+        return self.current_step is None
+
+    @property
+    def confirmed_steps(self) -> tuple[str, ...]:
+        return tuple(
+            step for step in PREFLIGHT_GUIDE_STEPS if step in self._evidence
+        )
+
+    def confirm_current(self, evidence: object) -> str:
+        step = self.current_step
+        if step is None:
+            raise ValueError("preflight guide is already complete")
+        if evidence is None:
+            raise ValueError(f"preflight step {step} has no valid evidence")
+        self._evidence[step] = evidence
+        return step
+
+    def sync(self, current_evidence: dict[str, object | None]) -> str | None:
+        """Drop one changed step and everything confirmed after it."""
+        for index, step in enumerate(PREFLIGHT_GUIDE_STEPS):
+            if step not in self._evidence:
+                break
+            if current_evidence.get(step) == self._evidence[step]:
+                continue
+            for invalid in PREFLIGHT_GUIDE_STEPS[index:]:
+                self._evidence.pop(invalid, None)
+            return step
+        return None
 
 
 @dataclass
@@ -1025,8 +1264,18 @@ class DroneState:
     home_reachable: bool | None = None
     rth_policy_valid: bool | None = None
     rth_policy_configured: bool = False
+    #: Firmware return_home_min_altitude. RTH climbs to this before flying home, so
+    #: it must be compared against the flight's own altitude ceiling.
+    rth_min_altitude_m: float | None = None
+    #: Whether the SkyController could report its own compass state. Informational:
+    #: it must never block takeoff (operator policy 2026-08-06).
+    skycontroller_magnetometer_readable: bool = True
     stick_monitor_ok: bool = False
     distance_from_home_m: float | None = None
+    # False when the distance geofence is requested but cannot actually be evaluated
+    # (no GPS position / no Home Point). The operator must not read "geofence on" as
+    # "distance containment active" in that state.
+    distance_guard_active: bool | None = None
     # Olympe flight-controller cache readback. Attitude/altitude/speed are
     # firmware estimates, not raw IMU/barometer samples.
     flight_state: str = "UNKNOWN"
@@ -1187,6 +1436,28 @@ def format_olympe_telemetry(
     }
 
 
+#: Which rotation the operator must perform for each firmware-requested axis.
+#: ``view`` selects the drawing: "top" = seen from above, "side" = seen from the
+#: left, "front" = seen from behind. ``spin`` is the arrow direction drawn on it.
+MAGNETOMETER_AXIS_GUIDE = {
+    "x": ("X/roll", "top", "沿機頭—機尾軸滾轉（像轉烤肉串）"),
+    "y": ("Y/pitch", "side", "沿左右翼尖軸翻轉（機頭往上翻過頂）"),
+    "z": ("Z/yaw", "front", "機身保持水平、原地自轉（像轉盤）"),
+}
+
+
+def magnetometer_axis_guide(axis_raw: object) -> tuple[str, str, str] | None:
+    """Map a firmware axis readback to (label, view, instruction).
+
+    Returns None when no axis is being requested, so the caller can hide the
+    diagram rather than show a stale rotation the operator should not perform.
+    """
+    key = str(axis_raw or "unknown").rsplit(".", 1)[-1].replace("_", "").lower()
+    if key.endswith("axis"):
+        key = key[:-4]
+    return MAGNETOMETER_AXIS_GUIDE.get(key)
+
+
 def format_magnetometer_calibration(state: DroneState) -> dict[str, str]:
     """Format aircraft/controller firmware calibration without guessing state."""
     required = getattr(state, "drone_magnetometer_required", None)
@@ -1281,6 +1552,20 @@ class DroneBackend:
         }
         if request.action in calibration_starts and not request.human_origin:
             return ControlResult.rejected("HUMAN_ORIGIN_REQUIRED", self.state)
+        if request.action not in {
+            ControlAction.LAND_NOW,
+            ControlAction.EMERGENCY_STOP,
+        }:
+            age_ns = time.monotonic_ns() - int(request.submitted_mono_ns)
+            if age_ns > CONTROL_REQUEST_MAX_AGE_NS:
+                if self.session_logs is not None:
+                    self.session_logs.incident(
+                        "control_request_stale",
+                        request_id=request.request_id,
+                        action=request.action.value,
+                        age_ms=age_ns / 1_000_000.0,
+                    )
+                return ControlResult.rejected("STALE_CONTROL_REQUEST", self.state)
         if request.action in calibration_actions:
             return ControlResult.rejected("LIVE_HARDWARE_REQUIRED", self.state)
         if request.action is ControlAction.EMERGENCY_STOP:
@@ -1288,6 +1573,12 @@ class DroneBackend:
         if request.action is ControlAction.LAND_NOW:
             raw = self.command("land")
             return ControlResult.completed(self.state, raw_result=raw)
+        if request.action is ControlAction.TAKEOFF:
+            self.state.tracker_state = "TAKEOFF"
+            self.target_altitude_m = ANAFI.takeoff_hover_m
+            if self.flight_start is None:
+                self.flight_start = time.monotonic()
+            return ControlResult.completed(self.state, raw_result=self.state)
         if request.action is ControlAction.START_LOCALIZATION:
             self.state.loc = "STARTING"
             self.state.last_command = request.action.value
@@ -1312,6 +1603,16 @@ class DroneBackend:
                     reason_code=result.reason_code,
                 )
             return result
+        if name == "takeoff":
+            # Legacy strings remain compatible for non-flight actions, but a
+            # takeoff must carry the typed human-origin proof all the way to the
+            # backend boundary.
+            if self.session_logs is not None:
+                self.session_logs.incident(
+                    "legacy_takeoff_rejected",
+                    reason="typed_request_required",
+                )
+            return ControlResult.rejected("TYPED_TAKEOFF_REQUIRED", self.state)
         self.state.last_command = name
         if name in {"manual", "hover", "land"}:
             self.state.mode = "MANUAL"
@@ -1326,11 +1627,6 @@ class DroneBackend:
         elif name == "land":
             self.state.tracker_state = "LAND"
             self.target_altitude_m = 0.0
-        elif name == "takeoff":
-            self.state.tracker_state = "TAKEOFF"
-            self.target_altitude_m = ANAFI.takeoff_hover_m
-            if self.flight_start is None:
-                self.flight_start = time.monotonic()
         elif name == "boot_lock":
             self.state.tracker_state = "BOOT_INIT"
         elif name == "gimbal_pitch":
@@ -1377,6 +1673,8 @@ class DroneBackend:
             d = str(payload.get("dir") or payload.get("name") or "")
             if d:
                 self._apply_nudge(d, payload)
+        elif name == "nudge_vector":
+            self._apply_nudge_vector(payload)
         elif name in {"nudge_end", "nudge_release", "nudge_clear"}:
             self.state.tracker_state = "HOVER"
             self.state.last_command = "hover"
@@ -1428,6 +1726,21 @@ class DroneBackend:
         self.state.mode = "CLOSED"
         self.state.last_command = f"close:{reason}"
         return CloseResult(True, "OK")
+
+    def _apply_nudge_vector(self, payload: dict) -> None:
+        """Continuous stick input, reusing the discrete nudge geometry."""
+        step = float(payload.get("step_m", 0.25))
+        roll = float(payload.get("roll", 0.0))
+        pitch = float(payload.get("pitch", 0.0))
+        gaz = float(payload.get("gaz", 0.0))
+        c, s = math.cos(self.sim_yaw), math.sin(self.sim_yaw)
+        self.sim_xyz[0] += (pitch * c - roll * s) * step
+        self.sim_xyz[2] += (pitch * s + roll * c) * step
+        self.sim_xyz[1] -= gaz * step
+        self.sim_yaw += float(payload.get("yaw", 0.0)) * 0.1
+        self.target_altitude_m = max(0.0, -float(self.sim_xyz[1]))
+        self.state.tracker_state = "NUDGE"
+        self.state.last_command = "nudge:vector"
 
     def _apply_nudge(self, name: str, payload: dict) -> None:
         """Map named diagonal/cardinal nudges onto sim_xyz (GLOMAP-like: -Y up)."""
@@ -1816,6 +2129,10 @@ class FFmpegFrameStream:
         return Image.frombytes("RGB", (self.width, self.height), raw)
 
 
+class _WorkerResponseDesync(RuntimeError):
+    """A worker response could not be paired with the request that produced it."""
+
+
 class LiveWorkerClient:
     """Shared queue/subprocess plumbing for the worker clients.
 
@@ -1840,6 +2157,16 @@ class LiveWorkerClient:
         self.restart_warmup_s = float(os.environ.get("SFM_WORKER_WARMUP_S", "20"))
         self._last_restart = 0.0
         self._spawned_at = 0.0
+        # The client/worker protocol is strictly synchronous and carries no request
+        # id, so a response can only be paired with a request by position. The worker
+        # numbers its responses from 0, so the response to the k-th request written
+        # since the worker started must carry seq == k-1. Any other value means the
+        # stream has slipped and the payload belongs to an older frame.
+        self._worker_requests_written = 0
+        # os.read may return multiple newline-delimited worker responses. Keep
+        # bytes after the first line for the next request instead of discarding
+        # them and desynchronizing the frame/response protocol.
+        self._stdout_buffer = bytearray()
         self._expect_ready_event = bool(expect_ready_event)
         self._ready_event = threading.Event()
         self._startup_info: dict = {}
@@ -1933,6 +2260,7 @@ class LiveWorkerClient:
                 break
 
     def _spawn(self, mode: str) -> subprocess.Popen:
+        self._stdout_buffer.clear()
         log = open(self.log_path, mode, encoding="utf-8")
         try:
             proc = subprocess.Popen(
@@ -2012,12 +2340,13 @@ class LiveWorkerClient:
         os.set_blocking(fd, False)
         timeout = self.timeout_s if timeout_s is None else float(timeout_s)
         deadline = time.monotonic() + timeout
-        response = bytearray()
         while True:
-            newline = response.find(b"\n")
+            newline = self._stdout_buffer.find(b"\n")
             if newline >= 0:
-                return bytes(response[:newline + 1])
-            if len(response) > self.MAX_RESPONSE_BYTES:
+                line = bytes(self._stdout_buffer[:newline + 1])
+                del self._stdout_buffer[:newline + 1]
+                return line
+            if len(self._stdout_buffer) > self.MAX_RESPONSE_BYTES:
                 raise RuntimeError(
                     f"{self.label} worker response exceeds {self.MAX_RESPONSE_BYTES} bytes")
             if self._closed.is_set():
@@ -2036,18 +2365,23 @@ class LiveWorkerClient:
                 continue
             if not chunk:
                 raise RuntimeError(f"{self.label} worker exited with an incomplete response")
-            response.extend(chunk)
+            self._stdout_buffer.extend(chunk)
 
-    def _restart(self) -> bool:
+    def _restart(self, *, force: bool = False) -> bool:
         """Respawn a hung/exited worker so localization can recover. Cooldown-guarded so a
-        freshly-restarted worker (which needs ~15s to reload models) is not thrashed."""
+        freshly-restarted worker (which needs ~15s to reload models) is not thrashed.
+
+        `force` bypasses the cooldown. It is for the response-desync case only: once
+        request/response pairing has slipped, every later response is attributed to the
+        wrong frame, so leaving the stalled worker attached is worse than thrashing.
+        """
         if self._closed.is_set():
             return False
         with self._proc_lock:
             if self._closed.is_set():
                 return False
             now = time.monotonic()
-            if now - self._last_restart < 30.0:
+            if not force and now - self._last_restart < 30.0:
                 return False
             self._last_restart = now
             try:
@@ -2058,6 +2392,7 @@ class LiveWorkerClient:
                     self._ready_event.set()
                 self._startup_info = {}
                 self._startup_error = None
+                self._worker_requests_written = 0
                 self.proc = self._spawn("a")
                 print(f"[operator] {self.label} worker restarted after stall/exit", flush=True)
                 return True
@@ -2066,9 +2401,16 @@ class LiveWorkerClient:
                 return False
 
     def _error_result(self, seq: int, frame_name: str, error: str) -> dict:
+        now_ns = time.monotonic_ns()
         payload = {
             "display_seq": seq,
             "frame_name": frame_name,
+            "frame_id": frame_name,
+            "capture_mono_ns": now_ns,
+            "pose_mono_ns": now_ns,
+            "localization_contract_version": 1,
+            "validity": False,
+            "confidence": 0.0,
             "success": False,
         }
         payload.update(self.error_defaults)
@@ -2187,14 +2529,43 @@ class LiveWorkerClient:
                     self._write_all(proc, prefix)
                 self._write_all(
                     proc, bytes((int(raw),)) if self._frame_shm is not None else raw)
+                self._worker_requests_written += 1
+                expected_worker_seq = self._worker_requests_written - 1
                 self._mark_mono(timing, "client_write_done_mono")
                 line = self._readline_with_timeout(proc)
                 self._mark_mono(timing, "client_response_mono")
                 payload = json.loads(line.decode("utf-8"))
+                worker_seq = payload.get("seq")
+                # Both production workers (live_localizer_worker, object_detector_worker)
+                # number every payload, so this check is active in the real system. Some
+                # lightweight test stubs omit "seq"; there is nothing to verify against
+                # then, so the pairing is only checked when the worker supplies it.
+                if isinstance(worker_seq, int) and not isinstance(worker_seq, bool) \
+                        and worker_seq != expected_worker_seq:
+                    # Pairing has slipped: this payload answers an OLDER frame. Stamping
+                    # it with this frame's identity would publish a stale pose as the
+                    # newest fix, and the parent's shared-memory slot bookkeeping is now
+                    # one behind the worker, so it could overwrite the slot being read.
+                    # Never publish it; drop the worker even if the cooldown says wait.
+                    raise _WorkerResponseDesync(
+                        f"{self.label} worker response desync: "
+                        f"got seq={worker_seq!r}, expected {expected_worker_seq}"
+                    )
                 payload["display_seq"] = seq
                 payload["frame_name"] = frame_name
+                # The worker sequence identifies its own response; the client
+                # knows the actual camera frame id paired with this request.
+                payload["frame_id"] = frame_name
                 self._attach_client_timing(payload, timing)
                 self._publish_result(payload)
+            except _WorkerResponseDesync as exc:
+                if not self._closed.is_set():
+                    print(f"[operator] {exc}", flush=True)
+                    self._mark_mono(timing, "client_response_mono")
+                    payload = self._error_result(seq, frame_name, repr(exc))
+                    self._attach_client_timing(payload, timing)
+                    self._publish_result(payload)
+                    self._restart(force=True)   # correctness emergency: ignore cooldown
             except (TimeoutError, RuntimeError, BrokenPipeError, OSError,
                     json.JSONDecodeError) as exc:
                 if not self._closed.is_set():
@@ -2209,6 +2580,11 @@ class LiveWorkerClient:
                     payload = self._error_result(seq, frame_name, repr(exc))
                     self._attach_client_timing(payload, timing)
                     self._publish_result(payload)
+                    # Unexpected protocol/client failures can leave pairing or
+                    # worker state unknown. Apply the same cooldown-bounded
+                    # restart as timeout/exit failures; tracker-side localization
+                    # exceptions are normal LOST payloads and never reach here.
+                    self._restart()
             finally:
                 with self._lock:
                     # Promote coalesced newest frame into the capacity-1 queue.
@@ -2379,7 +2755,8 @@ class LiveLocalizerClient(LiveWorkerClient):
                  bundle_sha256: str = "",
                  localizer_profile_sha256: str = "",
                  local_topk: int = 0,
-                 query_camera=None):
+                 query_camera=None,
+                 map_align: str | Path = ""):
         self._runtime_benchmark_control = not bool(force_track_bench)
         self._benchmark_mode_lock = threading.Lock()
         self._benchmark_mode = "track" if force_track_bench else "auto"
@@ -2420,6 +2797,8 @@ class LiveLocalizerClient(LiveWorkerClient):
                 "--query-camera-params",
                 *(str(float(value)) for value in query_camera.params),
             ])
+        if map_align:
+            cmd.extend(["--map-align", str(map_align)])
         # Pass an explicit empty value too: otherwise a stale inherited
         # SFM_MEGALOC_CACHE would silently override profile bundle descriptors.
         cmd.extend(["--megaloc-cache", str(megaloc_cache)])
@@ -2440,6 +2819,11 @@ class LiveLocalizerClient(LiveWorkerClient):
         super().__init__(cmd, width, height,
                          "/tmp/sfm_live_localizer_worker.log",
                          "live-localizer-client", "localizer",
+                         error_defaults={
+                             "mode": "LOST",
+                             "next_mode": "LOST",
+                             "localization_exception": True,
+                         },
                          use_shared_frames=os.environ.get(
                              "SFM_SHARED_FRAMES", "1").strip() not in {"0", "false", "no"},
                          expect_ready_event=True)
@@ -2581,6 +2965,81 @@ def read_map_points(path: Path, max_points: int) -> np.ndarray:
     return read_ply_points(path, max_points)
 
 
+class VirtualStick(tk.Canvas):
+    """A round, drag-to-command stick, sized and centred like a real gimbal.
+
+    Deliberately a *self-centring* control: releasing, dragging out of the
+    widget, or losing the pointer all snap back to zero and report it, so a
+    lost event can only ever decay to hover -- never leave the aircraft with a
+    latched deflection.
+    """
+
+    SIZE = 118
+    KNOB = 15
+
+    def __init__(self, master, *, title: str, x_label: str, y_label: str,
+                 on_change) -> None:
+        super().__init__(master, width=self.SIZE, height=self.SIZE,
+                         highlightthickness=0, takefocus=0)
+        self._on_change = on_change
+        self.title = title
+        self._x = 0.0
+        self._y = 0.0
+        pad = self.KNOB + 1
+        self._radius = self.SIZE / 2.0 - pad
+        c = self.SIZE / 2.0
+        self.create_oval(c - self._radius - self.KNOB, c - self._radius - self.KNOB,
+                         c + self._radius + self.KNOB, c + self._radius + self.KNOB,
+                         outline="#8a8a8a", width=2, fill="#ededed")
+        self.create_line(c - self._radius, c, c + self._radius, c, fill="#c0c0c0")
+        self.create_line(c, c - self._radius, c, c + self._radius, fill="#c0c0c0")
+        self.create_text(c, 7, text=y_label, font=("Sans", 7), fill="#666")
+        self.create_text(c, self.SIZE - 7, text=y_label.split("/")[-1] if "/" in y_label else "",
+                         font=("Sans", 7), fill="#666")
+        self.create_text(self.SIZE - 12, c, text=x_label, font=("Sans", 7), fill="#666")
+        self._knob = self.create_oval(c - self.KNOB, c - self.KNOB,
+                                      c + self.KNOB, c + self.KNOB,
+                                      fill="#4a76c8", outline="#26467d", width=2)
+        for sequence in ("<ButtonPress-1>", "<B1-Motion>"):
+            self.bind(sequence, self._on_drag)
+        for sequence in ("<ButtonRelease-1>", "<Leave>"):
+            self.bind(sequence, self._on_release)
+
+    @property
+    def value(self) -> tuple[float, float]:
+        return (self._x, self._y)
+
+    def _on_drag(self, event) -> None:
+        c = self.SIZE / 2.0
+        dx = (event.x - c) / self._radius
+        dy = (c - event.y) / self._radius
+        magnitude = math.hypot(dx, dy)
+        if magnitude > 1.0:
+            dx /= magnitude
+            dy /= magnitude
+        self._set(dx, dy)
+
+    def _on_release(self, _event=None) -> None:
+        self._set(0.0, 0.0)
+
+    def recenter(self) -> None:
+        """Snap to zero WITHOUT reporting -- for callers already sending zero."""
+        self._x = self._y = 0.0
+        self._draw()
+
+    def _set(self, x: float, y: float) -> None:
+        self._x, self._y = x, y
+        self._draw()
+        self._on_change(self, x, y)
+
+    def _draw(self) -> None:
+        c = self.SIZE / 2.0
+        cx = c + self._x * self._radius
+        cy = c - self._y * self._radius
+        self.coords(self._knob, cx - self.KNOB, cy - self.KNOB,
+                    cx + self.KNOB, cy + self.KNOB)
+
+
 class OperatorApp(tk.Tk):
     def __init__(self, backend: DroneBackend, map_points: np.ndarray,
                  video_stream: FFmpegFrameStream | None = None,
@@ -2595,7 +3054,8 @@ class OperatorApp(tk.Tk):
                  pose_stabilize: bool = False,
                  session_logs: SessionLogs | None = None,
                  site_id: str = "",
-                 site_profile_path: str | Path | None = None):
+                 site_profile_path: str | Path | None = None,
+                 mission_route_snapshot: MissionRouteSnapshot | None = None):
         super().__init__()
         self.backend = backend
         self.session_logs = session_logs
@@ -2614,9 +3074,29 @@ class OperatorApp(tk.Tk):
         )
         # Slow Olympe expectations must never block Tk. Land is intentionally
         # allowed to run while a takeoff expectation is pending.
-        self._flight_results: queue.Queue[tuple[str, object | None, str | None]] = queue.Queue()
+        self._flight_results: queue.Queue[tuple[str, object | None, str | None]] = queue.Queue(
+            maxsize=FLIGHT_RESULT_QUEUE_MAX
+        )
+        # Safety completions have their own drain path.  A frozen Tk loop or a
+        # burst of ordinary expectation completions must not evict LAND/EMERGENCY
+        # results from the bounded normal-result queue.
+        self._flight_safety_results: queue.Queue[
+            tuple[str, object | None, str | None]
+        ] = queue.Queue()
+        self._flight_result_publish_lock = threading.Lock()
         self._flight_inflight: set[str] = set()
         self._flight_inflight_lock = threading.Lock()
+        self._route_editor_window: RouteEditorWindow | None = None
+        self._route_editor_loading = False
+        self._route_editor_load_queue: queue.Queue[
+            tuple[
+                SiteProfile | None,
+                np.ndarray | None,
+                Path | None,
+                Path | None,
+                Exception | None,
+            ]
+        ] = queue.Queue(maxsize=1)
         self.map_points = map_points
         self.video_stream = video_stream
         self.localizer = localizer
@@ -2656,6 +3136,8 @@ class OperatorApp(tk.Tk):
         self._loc_benchmark_pending: str | None = None
         self._last_status_write = 0.0          # throttle debug status files to ~5Hz
         self._last_det_write = 0.0
+        self._diagnostic_failures_reported: set[str] = set()
+        self._last_localization_exception_seq: object | None = None
         self._last_loc_fail_log = 0.0          # throttle FAIL log spam off-field
         self._loc_fail_count = 0
         self._loc_ok_count = 0
@@ -2684,11 +3166,16 @@ class OperatorApp(tk.Tk):
         self._last_busy_skip_index = -1
         self._submit_ok = 0
         self._zoom_localization_paused = False
+        #: loc_health as it stood when the zoom pause began, restored on resume.
+        self._zoom_paused_health: str | None = None
         self.live_last_xyz: np.ndarray | None = None
         self.pose_stabilizer = TemporalPoseStabilizer() if pose_stabilize else None
         self._live_pending: np.ndarray | None = None   # continuity gate: jump awaiting a confirming fix
         self.live_heading: float | None = None
         self.camera_axes_world: np.ndarray | None = None
+        #: (east, north, up, measured) for the map axis gizmo. Resolved once: it is
+        #: read every redraw, and resolving it reloads the site profile from disk.
+        self._map_axis_basis_cache: tuple | None = None
         self.camera_forward_world: np.ndarray | None = None
         self.live_pose = np.array([0.0, 0.0, 0.0, np.nan], dtype=float)
         self.live_locked = False
@@ -2728,6 +3215,14 @@ class OperatorApp(tk.Tk):
         self.history: list[np.ndarray] = []
         self.route_pts: list = []          # planned drawn route (GLOMAP frame), overlay
         self.route_visible = False         # presentation only; route contract stays loaded
+        self.mission_route_lock = MissionRouteLock(mission_route_snapshot)
+        self._displayed_route_sha256 = (
+            mission_route_snapshot.sha256
+            if mission_route_snapshot is not None
+            else None
+        )
+        self._pending_auto_route_activation = False
+        self.preflight_guide = SequentialPreflightGuide()
         self.current_state = self.backend.state
         self.base_map_image = None
         self.map_photo = None
@@ -2746,6 +3241,11 @@ class OperatorApp(tk.Tk):
         # change at <=17 Hz, so only push text that actually differs.
         self._hud_text_cache: dict[str, str] = {}
         self._age_readout_next = 0.0
+        self._age_readout_colour: str | None = None
+        # Latest intent of each loc_health_label writer; _set_loc_health_display
+        # composes them so neither can silently erase the other.
+        self._loc_health_text: str | None = None
+        self._loc_health_colour: str | None = None
         self._incident_banner_state: tuple | None = ("__unset__", None)
         self.default_map_center, self.map_radius = self._map_view_bounds(map_points)
         if len(map_points):
@@ -2799,7 +3299,7 @@ class OperatorApp(tk.Tk):
         # Space=全方向懸停 | Esc=交回搖桿凍結 PC | 關窗→_on_close 強制降落
         # 下方 _nudge_key_map = 微移方向；按住=PCMD、放開=懸停。見 SAFETY.md。
         # ------------------------------------------------------------------
-        self.bind("<space>", lambda _e: self._hover_all_nudges())
+        self.bind("<space>", self._on_space_hover)
         self.bind("<Escape>", lambda _e: self.send("manual"))
         self.bind("<FocusOut>", self._on_input_focus_lost)
         self.bind("<Unmap>", self._on_input_focus_lost)
@@ -2817,6 +3317,7 @@ class OperatorApp(tk.Tk):
         # DO NOT change press/release semantics without pilot review.
         self._nudge_keys_held: set[str] = set()
         self._nudge_buttons_held: set[str] = set()
+        self._stick_vector_active = False
         self._nudge_key_map = {
             "u": "左上前", "i": "前", "o": "右上前",
             "j": "左", "l": "右",
@@ -2825,6 +3326,9 @@ class OperatorApp(tk.Tk):
             "1": "左下後", "2": "下", "3": "右下後",
             "w": "前", "s": "後", "a": "左", "d": "右",
             "r": "上", "f": "下",
+            # Yaw. NUDGE_DIRS always had 左旋/右旋 but nothing was ever bound to
+            # them, so the operator had no way to turn the nose at all.
+            "q": "左旋", "e": "右旋",
         }
         for key, cmd in self._nudge_key_map.items():
             self.bind(f"<KeyPress-{key}>",
@@ -2833,6 +3337,10 @@ class OperatorApp(tk.Tk):
                       lambda e, c=cmd, k=key: self._on_nudge_key_release(k, c, e))
         self.after(100, self.tick)
         self.after(105, self.poll_localization_results)
+        # After a site switch the interface restarts into the new profile, so the
+        # "does this field have a route yet?" question has to be asked again here
+        # -- the panel that asked it at import time is gone with the old process.
+        self.after(1200, self._check_active_site_route)
 
     def poll_localization_results(self) -> None:
         """Drain completed poses independently of the heavier render cadence."""
@@ -3034,6 +3542,30 @@ class OperatorApp(tk.Tk):
                 headings[i] = first_heading
         return headings
 
+    def _fit_control_pane(self) -> None:
+        """Size the fixed control pane to the tallest tab.
+
+        It used to be a hard-coded 295 px with pack_propagate(False), so any tab
+        that grew past it was silently cut off -- the operator simply could not see
+        or click the bottom of 飛控與限制. A measured height cannot drift out of
+        date the way that constant did.
+        """
+        notebook = getattr(self, "controls_notebook", None)
+        pane = getattr(self, "_controls_pane", None)
+        if notebook is None or pane is None:
+            return
+        self.update_idletasks()
+        selected = notebook.select()
+        if not selected:
+            return
+        # Only the visible tab's height matters. Sizing to the tallest one left the
+        # short tabs (系統紀錄 needs 83 px) padded with dead space on every screen.
+        needed = self.nametowidget(selected).winfo_reqheight()
+        height = max(CONTROL_PANE_MIN_H, needed + CONTROL_PANE_CHROME_H)
+        if pane.winfo_reqheight() != height:
+            pane.configure(height=height)
+            self.update_idletasks()
+
     def _build_ui(self) -> None:
         style = ttk.Style()
         style.theme_use("clam")
@@ -3048,7 +3580,7 @@ class OperatorApp(tk.Tk):
         # 2026-08-03, operator decision: the permanent top identity strip and the
         # fixed pipeline-summary bar were removed as duplicates of the video-panel
         # HUD and the定位儀表 panel. SYSTEM_SPEC 8.1/8.2 updated to match.
-        # SIM/REAL identity now lives only in the video HUD (video_hud_identity),
+        # SIM/REAL identity is composed into the status bar in tick(), so it stays
         # so it is absent whenever there is no frame to draw.
         self.incident_banner = tk.Label(
             self,
@@ -3069,8 +3601,11 @@ class OperatorApp(tk.Tk):
         mid.columnconfigure(1, weight=1)
         mid.rowconfigure(0, weight=1)
 
+        # 140: the map/video pane expands into whatever height is spare, so this
+        # REQUESTED size only decides who loses on a short window -- and it must
+        # not be the controls below. Lowered 240 -> 180 -> 140 by operator request.
         self.map_label = tk.Canvas(mid, bg="#15181c", highlightthickness=0, bd=0,
-                                   width=440, height=240)
+                                   width=440, height=140)
         self.map_label.grid(row=0, column=0, sticky="nsew", padx=(0, 5))
         self.map_label.bind("<ButtonPress-1>", self.on_map_press)
         self.map_label.bind("<B1-Motion>", self.on_map_drag)
@@ -3086,65 +3621,77 @@ class OperatorApp(tk.Tk):
         self.map_label.bind("<Button-4>", self.on_map_wheel)
         self.map_label.bind("<Button-5>", self.on_map_wheel)
         self.video_label = tk.Canvas(mid, bg="#08090b", highlightthickness=0, bd=0,
-                                     width=440, height=240)
+                                     width=440, height=140)
         self.video_label.grid(row=0, column=1, sticky="nsew", padx=(5, 0))
 
         # Flight actions and the two ages an operator reacts to live stay outside
         # the tabbed control pane, so 原地降落 / 緊急停止 are always visible.
         flight_bar = ttk.Frame(self, style="Panel.TFrame")
         flight_bar.pack(fill="x", padx=10, pady=(0, 4))
+        #: The always-visible action row. Named so callers and tests do not have to
+        #: locate it by walking the widget tree.
+        self.flight_bar = flight_bar
+        preflight_bar = ttk.LabelFrame(self, text="起飛前依序確認（只提示，不會自行起飛）")
+        preflight_bar.pack(fill="x", padx=10, pady=(0, 4))
+        self.preflight_guide_var = DedupStringVar(
+            value="① 羅盤校正狀態：等待飛機狀態讀回"
+        )
+        ttk.Label(
+            preflight_bar,
+            textvariable=self.preflight_guide_var,
+            font=("Sans", 9, "bold"),
+        ).pack(side="left", fill="x", expand=True, padx=8, pady=5)
+        self.preflight_confirm_button = ttk.Button(
+            preflight_bar,
+            text="確認本步驟",
+            command=self.confirm_current_preflight_step,
+            state="disabled",
+        )
+        self.preflight_confirm_button.pack(side="right", padx=8, pady=4)
+        # 位姿 / 影格 are NOT a separate readout any more: both ages are already in
+        # the localization overlay (pose_age / stream_age). The variable stays so the
+        # age computation and its colour grading keep one owner.
         self.loc_age_var = DedupStringVar(value="位姿 - | 影格 -")
-        self.loc_age_label = tk.Label(
-            flight_bar,
-            textvariable=self.loc_age_var,
-            font=("Sans", 12, "bold"),
-            bg="#1a1d21",
-            fg="#a7b0b8",
-            padx=10,
-        )
-        self.loc_age_label.pack(side="right", padx=(8, 6))
-        # Rehomed from the removed top strip so mode/health/battery/inliers stay
-        # visible without scrolling.
-        self.status = tk.Label(
-            flight_bar,
-            text="MANUAL | WAIT | HOVER",
-            bg="#1a1d21",
-            fg="#f0f3f5",
-            font=("Sans", 11, "bold"),
-            padx=10,
-            wraplength=520,
-            justify="left",
-        )
-        self.status.pack(side="right", padx=(8, 0))
+        # The aircraft-state line is NOT built here any more: it joins the single
+        # overlay on the video, so identity / mode / flight state / battery and the
+        # localization readouts are one block instead of two.
 
-        controls = ttk.Frame(self, style="Panel.TFrame", width=920, height=295)
+        controls = ttk.Frame(self, style="Panel.TFrame", width=920,
+                             height=CONTROL_PANE_MIN_H)
         controls.pack(fill="x", padx=10, pady=(4, 6))
         controls.pack_propagate(False)
+        self._controls_pane = controls
         control_notebook = ttk.Notebook(controls)
         control_notebook.pack(fill="both", expand=True)
-        operation_tab = ttk.Frame(control_notebook, style="Panel.TFrame")
-        localization_tab = ttk.Frame(control_notebook, style="Panel.TFrame")
         aircraft_tab = ttk.Frame(control_notebook, style="Panel.TFrame")
+        # 定位資訊 was a separate tab reporting the same flight health from another
+        # angle; reading it meant switching tabs mid-flight. Its readouts now
+        # overlay the video they measure, so the tab is gone, not hidden.
         calibration_tab = ttk.Frame(control_notebook, style="Panel.TFrame")
         site_tab = ttk.Frame(control_notebook, style="Panel.TFrame")
         log_tab = ttk.Frame(control_notebook, style="Panel.TFrame")
+        # Ordered and prefixed so the tabs an operator needs IN FLIGHT come first
+        # and read as one group; everything else is pre-flight setup.
         for tab, label in (
-            (operation_tab, "操作與定位"),
-            (localization_tab, "定位資訊"),
-            (aircraft_tab, "飛控與限制"),
+            # 飛行 · 操作 is gone: its only remaining panel (the virtual sticks)
+            # moved beside the flight readouts, so the tab held nothing.
+            (aircraft_tab, "飛行"),
             (calibration_tab, "校正"),
             (site_tab, "場域資產"),
             (log_tab, "系統紀錄"),
         ):
             control_notebook.add(tab, text=label)
         self.controls_notebook = control_notebook
+        self._preflight_tabs = {
+            "compass": calibration_tab,
+            "map": site_tab,
+            "route": site_tab,
+            "system": aircraft_tab,
+        }
+        control_notebook.select(calibration_tab)
 
-        operation_tab.columnconfigure(0, weight=1)
-        operation_tab.columnconfigure(1, minsize=300)
-        operation_tab.rowconfigure(1, weight=1)
-        localization_tab.columnconfigure(0, weight=1)
-        localization_tab.rowconfigure(0, weight=1)
         aircraft_tab.columnconfigure(0, weight=1)
+        aircraft_tab.columnconfigure(1, minsize=300)
         aircraft_tab.rowconfigure(1, weight=1)
         calibration_tab.columnconfigure(0, weight=1)
         calibration_tab.columnconfigure(1, weight=1)
@@ -3157,12 +3704,18 @@ class OperatorApp(tk.Tk):
         # Button labels, command strings and lambdas below are unchanged.
         flight = ttk.LabelFrame(flight_bar, text="飛行模式")
         flight.pack(side="left", fill="x", expand=True)
-        mission = ttk.LabelFrame(operation_tab, text="任務控制")
-        mission.grid(row=0, column=0, sticky="ew", padx=6, pady=(4, 3))
-        camera = ttk.LabelFrame(operation_tab, text="鏡頭")
-        camera.grid(row=1, column=0, sticky="new", padx=6, pady=3)
-        telemetry = ttk.LabelFrame(localization_tab, text="定位儀表")
-        telemetry.grid(row=0, column=0, sticky="nsew", padx=6, pady=(4, 5))
+        # Operator decision 2026-08-06: mission and camera belong beside 飛行模式,
+        # in the always-visible bar, not buried in a tab the operator has to be on.
+        # Merged into 飛行模式 (operator decision 2026-08-06): takeoff and recording
+        # are flight-mode actions, and splitting them across two adjacent frames
+        # made one row of buttons look like two unrelated groups.
+        mission = flight
+        camera = ttk.LabelFrame(flight_bar, text="鏡頭")
+        camera.pack(side="left", fill="x", padx=(6, 0))
+        # Localization health belongs ON the video it is measured from: reading it
+        # used to mean looking away from the picture the numbers describe.
+        telemetry = ttk.Frame(self.video_label, style="Panel.TFrame")
+        telemetry.place(relx=0.0, rely=1.0, x=8, y=-8, anchor="sw")
         anafi_panel = ttk.LabelFrame(aircraft_tab, text="ANAFI / 控制權")
         anafi_panel.grid(row=0, column=0, sticky="ew", padx=6, pady=(4, 3))
 
@@ -3172,12 +3725,14 @@ class OperatorApp(tk.Tk):
             ttk.Button(
                 flight,
                 text=button.label,
-                command=lambda c=button.command: self.send(c),
+                command=lambda c=button.command: self._send_flight_button(c),
+                takefocus=0,
             ).pack(side="left", padx=4, pady=8)
         tk.Button(
             flight,
             text="緊急停止電腦動作",
-            command=lambda: self.send("emergency_stop"),
+            command=lambda: self._send_flight_button("emergency_stop"),
+            takefocus=0,
             bg="#b42318",
             fg="#ffffff",
             activebackground="#8a1c13",
@@ -3190,7 +3745,9 @@ class OperatorApp(tk.Tk):
             widget = ttk.Button(
                 mission,
                 text=button.label,
-                command=lambda c=button.command: self.send(c),
+                command=lambda c=button.command: self._send_flight_button(c),
+                takefocus=0,
+                state="disabled" if button.command == "takeoff" else "normal",
             )
             widget.pack(side="left", padx=4, pady=8)
             if button.command == "takeoff":
@@ -3217,64 +3774,79 @@ class OperatorApp(tk.Tk):
         ttk.Label(mission, textvariable=self.record_status_var,
                   font=("Sans", 10, "bold")).pack(side="left", padx=4, pady=8)
 
-        nudge_title = ("微移（按住移動／放開懸停）" if live
-                       else "微移方向（模擬）")
-        nudge = ttk.LabelFrame(operation_tab, text=nudge_title)
+        nudge_title = ("虛擬搖桿（拖曳給指令／放開懸停）" if live
+                       else "虛擬搖桿（模擬）")
+        nudge = ttk.LabelFrame(aircraft_tab, text=nudge_title)
         nudge.grid(row=0, column=1, rowspan=2, sticky="nsew", padx=6, pady=(4, 5))
-        for text, r, c in (
-            ("左上後", 0, 0), ("上", 0, 1), ("右上後", 0, 2),
-            ("左上前", 1, 0), ("前", 1, 1), ("右上前", 1, 2),
-            ("左", 2, 0), ("懸停", 2, 1), ("右", 2, 2),
-            ("左下前", 3, 0), ("後", 3, 1), ("右下前", 3, 2),
-            ("左下後", 4, 0), ("下", 4, 1), ("右下後", 4, 2),
-        ):
-            if text == "懸停":
-                ttk.Button(nudge, text=text, width=8,
-                           command=self._hover_all_nudges).grid(
-                    row=r, column=c, padx=2, pady=2)
-            else:
-                # tk.Button: reliable ButtonPress/Release (hold-to-move).
-                btn = tk.Button(nudge, text=text, width=8, takefocus=0)
-                btn.grid(row=r, column=c, padx=2, pady=2)
-                btn.bind("<ButtonPress-1>",
-                         lambda e, d=text: self._on_nudge_btn_press(d, e))
-                btn.bind("<ButtonRelease-1>",
-                         lambda e, d=text: self._on_nudge_btn_release(d, e))
-                # If pointer leaves while pressed, still stop (hover).
-                btn.bind("<Leave>",
-                         lambda e, d=text: self._on_nudge_btn_leave(d, e))
-        # The same directions are bound to keys (_nudge_key_map); the panel only
-        # showed buttons, so the shortcuts were invisible to the operator.
+        sticks = ttk.Frame(nudge)
+        sticks.pack(padx=4, pady=(6, 2))
+        self.stick_left = VirtualStick(
+            sticks, title="左", x_label="旋", y_label="上/下",
+            on_change=self._on_virtual_stick)
+        self.stick_left.grid(row=0, column=0, padx=(2, 6))
+        self.stick_right = VirtualStick(
+            sticks, title="右", x_label="右", y_label="前/後",
+            on_change=self._on_virtual_stick)
+        self.stick_right.grid(row=0, column=1, padx=(6, 2))
+        ttk.Label(sticks, text="左：Q/E 左右旋 · R/F 上下",
+                  font=("Sans", 8)).grid(row=1, column=0, pady=(1, 0))
+        ttk.Label(sticks, text="右：A/D 左右 · W/S 前後",
+                  font=("Sans", 8)).grid(row=1, column=1, pady=(1, 0))
+        ttk.Button(nudge, text="懸停（全部歸零）",
+                   command=self._hover_all_nudges).pack(pady=(2, 2))
+        # The same axes are bound to keys (_nudge_key_map); without this the
+        # shortcuts were invisible to the operator.
         ttk.Label(
             nudge,
-            text="鍵盤：W 前 / S 後 / A 左 / D 右 / R 上 / F 下　空白鍵=全部懸停　Esc=交回搖桿",
+            text="拖曳圓鈕給指令，放開自動歸中懸停　空白鍵=全部懸停　Esc=交回搖桿",
             font=("Sans", 8),
             wraplength=270,
-        ).grid(row=5, column=0, columnspan=3, sticky="w", padx=2, pady=(4, 2))
+        ).pack(padx=2, pady=(0, 3))
 
         self.pitch = tk.DoubleVar(value=-20)
         self.zoom = tk.DoubleVar(value=1)
         ttk.Label(camera, text="俯仰").pack(side="left", padx=(6, 2))
         ttk.Scale(camera, from_=ANAFI.gimbal_pitch_min_deg, to=ANAFI.gimbal_pitch_max_deg, variable=self.pitch,
-                  command=lambda _v: self.send("gimbal_pitch", pitch=self.pitch.get())).pack(side="left", fill="x", expand=True, padx=4)
+                  length=110,
+                  command=lambda _v: self.send("gimbal_pitch", pitch=self.pitch.get())).pack(side="left", padx=4)
         ttk.Label(camera, text="縮放").pack(side="left", padx=(8, 2))
         ttk.Scale(camera, from_=1, to=ANAFI.digital_zoom_max, variable=self.zoom,
-                  command=lambda _v: self.send("zoom", zoom=self.zoom.get())).pack(side="left", fill="x", expand=True, padx=4)
+                  length=90,
+                  command=lambda _v: self.send("zoom", zoom=self.zoom.get())).pack(side="left", padx=4)
         ttk.Button(camera, text="鏡頭預設", command=self.reset_camera_defaults).pack(side="left", padx=4, pady=8)
-        ttk.Button(camera, text="重設地圖", command=self.reset_map_view).pack(side="left", padx=4, pady=8)
-        ttk.Button(camera, text="上下翻面", command=self.flip_map_vertical).pack(side="left", padx=4, pady=8)
+        # Map-view controls sit ON the map, bottom-left: they act on what is under
+        # them, so putting them in a camera panel made the operator look elsewhere
+        # to change what the map shows.
+        map_tools = ttk.Frame(self.map_label, style="Panel.TFrame")
+        map_tools.place(relx=0.0, rely=1.0, x=8, y=-8, anchor="sw")
+        ttk.Button(map_tools, text="重設地圖", command=self.reset_map_view).pack(
+            side="left", padx=(4, 2), pady=3)
+        ttk.Button(map_tools, text="上下翻面", command=self.flip_map_vertical).pack(
+            side="left", padx=2, pady=3)
         self.show_route_var = tk.BooleanVar(value=self.route_visible)
         ttk.Checkbutton(
-            camera,
+            map_tools,
             text="顯示規劃路徑",
             variable=self.show_route_var,
             command=self.set_route_visibility,
-        ).pack(side="left", padx=4, pady=8)
+        ).pack(side="left", padx=(2, 6), pady=3)
 
         self.loc_health_label = ttk.Label(
             telemetry, text="定位 待命", font=("Sans", 14, "bold")
         )
-        self.loc_health_label.pack(anchor="w", padx=8, pady=(6, 2))
+        self.status = tk.Label(
+            telemetry,
+            text="MANUAL | WAIT | HOVER",
+            bg="#1a1d21",
+            fg="#f0f3f5",
+            font=("Sans", 9, "bold"),
+            justify="left",
+            wraplength=420,
+        )
+        self.status.grid(row=0, column=0, columnspan=2, sticky="w",
+                         padx=8, pady=(4, 0))
+        self.loc_health_label.grid(row=1, column=0, columnspan=2, sticky="w",
+                                   padx=8, pady=(1, 1))
         self.overall_fps_var = DedupStringVar(value="串流 FPS - (待命，按開始定位)")
         self.loc_fps_var = DedupStringVar(value="定位 FPS -")
         self.loc_latency_var = DedupStringVar(value="核心延遲 -")
@@ -3284,23 +3856,45 @@ class OperatorApp(tk.Tk):
         self.det_fps_var = DedupStringVar(value="偵測 關 (YOLO 未導入)")
         self.det_latency_var = DedupStringVar(value="")
         self.det_count_var = DedupStringVar(value="")
-        ttk.Label(telemetry, textvariable=self.overall_fps_var, font=("Sans", 11, "bold")).pack(anchor="w", padx=8, pady=(5, 0))
-        ttk.Label(telemetry, textvariable=self.loc_fps_var, font=("Sans", 10, "bold")).pack(anchor="w", padx=8, pady=(5, 0))
-        ttk.Label(telemetry, textvariable=self.loc_latency_var, font=("Sans", 10, "bold")).pack(anchor="w", padx=8)
-        ttk.Label(telemetry, textvariable=self.loc_quality_var).pack(anchor="w", padx=8)
-        ttk.Label(telemetry, textvariable=self.loc_recovery_var).pack(anchor="w", padx=8)
-        ttk.Label(telemetry, textvariable=self.loc_map_coverage_var).pack(anchor="w", padx=8)
-        # YOLO not in pipeline — hide dense detector readouts unless explicitly enabled.
+        # Two-up and small: it overlays the video, so every extra line is picture
+        # the operator cannot see. Seven stacked lines covered a third of the frame.
+        for index, variable in enumerate((
+            self.overall_fps_var, self.loc_fps_var,
+            self.loc_latency_var, self.loc_quality_var,
+            self.loc_recovery_var, self.loc_map_coverage_var,
+        )):
+            ttk.Label(
+                telemetry, textvariable=variable, font=("Sans", 8),
+            ).grid(row=2 + index // 2, column=index % 2, sticky="w",
+                   padx=(8, 10))
+        #: Next free overlay row, so later blocks append without colliding.
+        self._overlay_next_row = 2 + (6 + 1) // 2
+        # YOLO is not in the flight pipeline. When it is off there is nothing to
+        # report, so the panel says nothing rather than announcing an absence.
         if self.detector is not None:
-            ttk.Label(telemetry, textvariable=self.det_fps_var, font=("Sans", 10, "bold")).pack(anchor="w", padx=8, pady=(4, 0))
-            ttk.Label(telemetry, textvariable=self.det_latency_var, font=("Sans", 10, "bold")).pack(anchor="w", padx=8)
-            ttk.Label(telemetry, textvariable=self.det_count_var).pack(anchor="w", padx=8, pady=(0, 5))
-        else:
-            ttk.Label(telemetry, text="YOLO 未啟用", font=("Sans", 9)).pack(anchor="w", padx=8, pady=(4, 5))
+            # grid, not pack: every other child of `telemetry` is gridded, and Tk
+            # raises TclError when one container gets both geometry managers.
+            for variable, font, pady in (
+                (self.det_fps_var, ("Sans", 10, "bold"), (4, 0)),
+                (self.det_latency_var, ("Sans", 10, "bold"), (0, 0)),
+                (self.det_count_var, None, (0, 5)),
+            ):
+                label = (
+                    ttk.Label(telemetry, textvariable=variable)
+                    if font is None
+                    else ttk.Label(telemetry, textvariable=variable, font=font)
+                )
+                label.grid(row=self._overlay_next_row, column=0, columnspan=2,
+                           sticky="w", padx=8, pady=pady)
+                self._overlay_next_row += 1
 
-        self.anafi_flight_var = DedupStringVar(value="battery 100% | alt 0.0m | gimbal -20° | zoom 1.0x")
+        # Initial values must match what the setters produce, or the panel shows
+        # the removed duplicates until the first telemetry tick arrives.
+        # Rendered in the ANAFI panel below; without a widget this was a variable
+        # refreshed at telemetry rate that nobody could ever see.
+        self.anafi_flight_var = DedupStringVar(value="map Y 0.0u")
         self.anafi_stream_var = DedupStringVar(
-            value="720p30 | backlog age - | fps - | GPS - | link -"
+            value="ground speed - | PCMD→telemetry poll -"
         )
         self.anafi_limit_var = DedupStringVar(
             value="firmware limits: waiting for readback | preflight NOT READY")
@@ -3332,17 +3926,19 @@ class OperatorApp(tk.Tk):
         ).pack(fill="x", padx=8, pady=(4, 0))
         ttk.Label(anafi_status, textvariable=self.control_owner_var,
                   font=("Sans", 11, "bold")).pack(side="left", padx=(8, 14), pady=5)
-        ttk.Label(anafi_status, textvariable=self.anafi_flight_var,
-                  font=("Sans", 10, "bold")).pack(side="left", padx=(0, 14), pady=5)
+        # battery / gimbal / zoom / backlog age / fps / GPS / link are NOT repeated
+        # here: the status bar carries battery and the video HUD carries the rest.
+        # This panel keeps only what neither of them shows.
+        ttk.Label(anafi_status, textvariable=self.anafi_flight_var).pack(
+            side="left", padx=(0, 10), pady=5)
         ttk.Label(anafi_status, textvariable=self.anafi_stream_var).pack(
             side="left", padx=(0, 14), pady=5)
+
         if self._is_live_backend():
-            ttk.Button(anafi_status, text="恢復電腦控制",
-                       command=lambda: self.send("pc_control")).pack(
-                           side="right", padx=8, pady=4)
-            ttk.Button(anafi_status, text="交回搖桿 (Esc)",
-                       command=lambda: self.send("manual")).pack(
-                           side="right", padx=4, pady=4)
+            # 恢復電腦控制 / 交回搖桿 are NOT repeated here: they are in the always
+            # visible 飛行模式 row (FLIGHT_MODE_BUTTONS). Two copies of a control
+            # ownership button meant two places to look when handing the aircraft
+            # over, and only one of them was reachable from every tab.
 
             desired_altitude = getattr(self.backend, "desired_max_altitude_m", None)
             desired_distance = getattr(self.backend, "desired_max_distance_m", None)
@@ -3414,27 +4010,30 @@ class OperatorApp(tk.Tk):
         # ---- Firmware magnetometer calibration (human-guided, motors stay off) ----
         magnetometer = ttk.LabelFrame(
             calibration_tab,
-            text="韌體羅盤校正（只允許 landed；使用者手持旋轉）",
+            text="飛機羅盤校正（只允許 landed；使用者手持旋轉）",
         )
         magnetometer.grid(
             row=0, column=0, sticky="nsew", padx=6, pady=(4, 5)
         )
         if self._is_live_backend():
             drone_mag_initial = "飛機羅盤：等待 Olympe 韌體狀態讀回"
-            controller_mag_initial = "SkyController 羅盤：等待狀態讀回"
         else:
             drone_mag_initial = "飛機羅盤：SIM 不提供韌體校正"
-            controller_mag_initial = "SkyController 羅盤：SIM 不提供韌體校正"
         self.drone_magnetometer_var = DedupStringVar(value=drone_mag_initial)
-        self.skycontroller_magnetometer_var = DedupStringVar(
-            value=controller_mag_initial
-        )
         ttk.Label(
             magnetometer,
             textvariable=self.drone_magnetometer_var,
             wraplength=620,
             font=("Sans", 9, "bold"),
         ).pack(anchor="w", padx=6, pady=(4, 2))
+        # Which way to physically rotate the airframe for the axis the firmware is
+        # currently asking for. Text alone ("目前 Y/pitch") does not tell an operator
+        # holding the aircraft which way to turn it.
+        self.magnetometer_axis_canvas = tk.Canvas(
+            magnetometer, width=430, height=52, highlightthickness=0,
+            bg="#111316",   # matches style.configure("TLabel", background=...)
+        )
+        self.magnetometer_axis_canvas.pack(anchor="w", padx=6, pady=(1, 1))
         drone_mag_buttons = ttk.Frame(magnetometer)
         drone_mag_buttons.pack(fill="x", padx=4)
         self.drone_magnetometer_start_button = ttk.Button(
@@ -3451,33 +4050,15 @@ class OperatorApp(tk.Tk):
             state="disabled",
         )
         self.drone_magnetometer_cancel_button.pack(side="left", padx=2)
-        ttk.Label(
-            magnetometer,
-            textvariable=self.skycontroller_magnetometer_var,
-            wraplength=620,
-            font=("Sans", 9, "bold"),
-        ).pack(anchor="w", padx=6, pady=(5, 2))
-        controller_mag_buttons = ttk.Frame(magnetometer)
-        controller_mag_buttons.pack(fill="x", padx=4)
-        self.skycontroller_magnetometer_start_button = ttk.Button(
-            controller_mag_buttons,
-            text="開始 SkyController 校正",
-            command=lambda: self.send("skycontroller_magnetometer_start"),
-            state="disabled",
-        )
-        self.skycontroller_magnetometer_start_button.pack(side="left", padx=2)
-        self.skycontroller_magnetometer_cancel_button = ttk.Button(
-            controller_mag_buttons,
-            text="取消控制器校正",
-            command=lambda: self.send("skycontroller_magnetometer_cancel"),
-            state="disabled",
-        )
-        self.skycontroller_magnetometer_cancel_button.pack(side="left", padx=2)
+        # The SkyController compass panel was removed (operator decision 2026-08-06):
+        # it only feeds pilot-referenced features this system never uses, and it no
+        # longer gates takeoff. The backend command still exists for FreeFlight-style
+        # recovery, it is simply not exposed here.
         ttk.Label(
             magnetometer,
             text=(
                 "程式只啟動／取消韌體流程並顯示 X/Y/Z；不會轉動機身、"
-                "不會啟動馬達。遠離鋼筋、車輛與磁性物品。"
+                "不會啟動馬達。每一軸請轉滿三圈，遠離鋼筋、車輛與磁性物品。"
             ),
             wraplength=620,
             font=("Sans", 8),
@@ -3493,10 +4074,15 @@ class OperatorApp(tk.Tk):
             value="待命：依序旋轉機身，僅記錄姿態並分析重力一致性")
         self.gravity_att_var = DedupStringVar(value="att roll/pitch/yaw = -")
         self.gravity_g_var = DedupStringVar(value="g_body = -")
-        ttk.Label(grav, textvariable=self.gravity_status_var, wraplength=280,
-                  font=("Sans", 9, "bold")).pack(anchor="w", padx=6, pady=(4, 2))
-        ttk.Label(grav, textvariable=self.gravity_att_var).pack(anchor="w", padx=6)
-        ttk.Label(grav, textvariable=self.gravity_g_var).pack(anchor="w", padx=6)
+        # Keep detailed calibration status for the workflow and logs, but present
+        # only the live attitude / gravity-vector row in this compact panel.
+        # One row, not two: the panel was 23 px taller than the minimum window
+        # and its buttons were being clipped.
+        attitude_row = ttk.Frame(grav)
+        attitude_row.pack(anchor="w", fill="x", padx=6)
+        ttk.Label(attitude_row, textvariable=self.gravity_att_var).pack(side="left")
+        ttk.Label(attitude_row, text=" | ").pack(side="left")
+        ttk.Label(attitude_row, textvariable=self.gravity_g_var).pack(side="left")
         row = ttk.Frame(grav)
         row.pack(fill="x", padx=4, pady=4)
         ttk.Button(row, text="開始檢查", command=self.gravity_start).pack(side="left", padx=2)
@@ -3509,51 +4095,46 @@ class OperatorApp(tk.Tk):
                 "LIVE：手持拆槳旋轉，僅採樣姿態；這不是 FreeFlight 羅盤校正。"
                 "SIM：自動產生本階段姿態。"
             ),
-            wraplength=280, font=("Sans", 8),
+            wraplength=430, font=("Sans", 8),
         ).pack(anchor="w", padx=6, pady=(0, 4))
 
-        olympe_telemetry = ttk.LabelFrame(
-            aircraft_tab, text="飛控遙測（Olympe 讀回）"
-        )
-        olympe_telemetry.grid(
-            row=1, column=0, sticky="nsew", padx=6, pady=(3, 5)
-        )
+        # The flight readouts joined the single video overlay (operator decision
+        # 2026-08-06), so this panel's grid cell now holds the firmware limits --
+        # they were being clipped where they sat inside the ANAFI block.
         self.olympe_state_var = DedupStringVar(value="飛行 ? | 警示 ? | 航向 ? | RTH ?/?")
-        self.olympe_attitude_var = DedupStringVar(value="飛控融合姿態 -")
-        self.olympe_speed_var = DedupStringVar(value="NED 地速 -")
-        self.olympe_altitude_var = DedupStringVar(value="飛控高度 - | AGL - | GPS -")
-        self.olympe_gps_var = DedupStringVar(value="GPS -")
-        self.olympe_environment_var = DedupStringVar(value="風 - | 震動 - | 懸停警告 -")
-        self.olympe_sensors_var = DedupStringVar(value="感測器健康 -")
-        for variable, bold in (
-            (self.olympe_state_var, True),
-            (self.olympe_attitude_var, False),
-            (self.olympe_speed_var, False),
-            (self.olympe_altitude_var, False),
-            (self.olympe_gps_var, False),
-            (self.olympe_environment_var, False),
-            (self.olympe_sensors_var, False),
+        self.olympe_attitude_var = DedupStringVar(value="姿態 - | 地速 -")
+        self.olympe_altitude_var = DedupStringVar(value="高度 - | 環境 - | 感測器 -")
+        for variable in (
+            self.olympe_state_var, self.olympe_attitude_var, self.olympe_altitude_var,
         ):
             ttk.Label(
-                olympe_telemetry,
-                textvariable=variable,
-                font=("Sans", 9, "bold") if bold else ("Sans", 9),
-                wraplength=1300,
-            ).pack(anchor="w", padx=8, pady=(3, 0) if bold else 0)
+                telemetry, textvariable=variable, font=("Sans", 8), wraplength=420,
+            ).grid(row=self._overlay_next_row, column=0, columnspan=2, sticky="w",
+                   padx=8)
+            self._overlay_next_row += 1
+        # Kept from the removed panel: these are flight-controller FUSED estimates.
+        # This model exposes no raw IMU／raw 氣壓數值, and saying so is the honest
+        # part -- an operator reading "高度" must know what produced it.
         ttk.Label(
-            olympe_telemetry,
-            text=(
-                "姿態與高度是飛控融合估計；公開 Olympe 事件可讀取 "
-                "IMU／barometer 等感測器健康，但本機型不提供 raw IMU／raw 氣壓數值。"
-            ),
-            font=("Sans", 8),
-            wraplength=1300,
-        ).pack(anchor="w", padx=8, pady=(3, 5))
+            telemetry, text="姿態／高度為飛控融合估計（無 raw IMU／raw 氣壓數值）",
+            font=("Sans", 7), wraplength=420,
+        ).grid(row=self._overlay_next_row, column=0, columnspan=2, sticky="w", padx=8)
+        self._overlay_next_row += 1
 
         self.site_assets_panel = SiteAssetsPanel(
             site_tab,
             actions=self.site_asset_actions,
             request_apply=self.request_site_profile_restart,
+            request_route_editor=self.request_route_editor,
+            request_route_preview=self.preview_site_route,
+            route_imported=self.apply_route_import_preview,
+            site_packages_root=SYSTEM_ROOT / "地圖檔" / "場域",
+            site_pack_root=site_pack_root_for_profile(
+                self.site_profile_path, _WS.site_packages
+            ),
+            # Same gate the route editor and the site restart use: nothing that
+            # grabs input or rebinds a route may run over an airborne aircraft.
+            flight_state_check=self.route_editor_safety_check,
         )
         self.site_assets_panel.grid(
             row=0, column=0, sticky="nsew", padx=6, pady=(4, 5)
@@ -3567,14 +4148,23 @@ class OperatorApp(tk.Tk):
             insertbackground="#f0f3f5",
         )
         self.log.grid(row=0, column=0, sticky="nsew", padx=6, pady=(4, 5))
+        self.controls_notebook.bind(
+            "<<NotebookTabChanged>>", lambda _event: self._fit_control_pane()
+        )
+        self._fit_control_pane()
         self.write_log("ready")
         if GravityCalibrator is None:
             self.gravity_status_var.set("姿態／重力檢查模組載入失敗（gravity_calibration.py）")
         else:
             self._load_gravity_cal_into_ui()
+        self._update_preflight_guide(self.backend.state)
 
     def _on_nudge_key_press(self, key: str, direction: str, _event=None) -> None:
         """Hold-to-move: first KeyPress only (ignore OS auto-repeat)."""
+        widget = getattr(_event, "widget", None)
+        widget_class = getattr(widget, "winfo_class", lambda: "")()
+        if widget_class in {"Entry", "TEntry", "Text"}:
+            return
         if key in self._nudge_keys_held:
             return
         self._nudge_keys_held.add(key)
@@ -3608,10 +4198,65 @@ class OperatorApp(tk.Tk):
         self._nudge_buttons_held.discard(direction)
         self._backend_command("nudge_end", {"dir": direction})
 
+    def _on_virtual_stick(self, stick, x: float, y: float) -> None:
+        """Left stick = yaw/altitude, right stick = roll/pitch (Mode 2 layout)."""
+        left = self.stick_left.value if stick is not self.stick_left else (x, y)
+        right = self.stick_right.value if stick is not self.stick_right else (x, y)
+        self._send_stick_vector(left, right)
+
+    def _send_stick_vector(self, left, right) -> None:
+        yaw, gaz = left
+        roll, pitch = right
+        if max(abs(yaw), abs(gaz), abs(roll), abs(pitch)) <= 1e-3:
+            if self._stick_vector_active:
+                self._stick_vector_active = False
+                try:
+                    # nudge_vector with all-zero axes clears ONLY the stick's own
+                    # hold. nudge_clear wipes the whole set, which silently dropped
+                    # a keyboard direction the operator was still physically holding.
+                    self._backend_command(
+                        "nudge_vector",
+                        {"roll": 0.0, "pitch": 0.0, "yaw": 0.0, "gaz": 0.0},
+                    )
+                except Exception as exc:
+                    self.write_log(f"虛擬搖桿歸零失敗: {exc!r}")
+            return
+        try:
+            sent = self._backend_command(
+                "nudge_vector",
+                {"roll": roll, "pitch": pitch, "yaw": yaw, "gaz": gaz},
+            )
+        except Exception as exc:
+            self._reset_virtual_sticks()
+            self.write_log(f"虛擬搖桿指令失敗，已歸零: {exc!r}")
+            return
+        # A refused vector must not leave the knob deflected: the operator would
+        # otherwise see a commanded stick that the aircraft is not following.
+        if sent is False:
+            self._reset_virtual_sticks()
+            return
+        self._stick_vector_active = True
+
+    def _reset_virtual_sticks(self) -> None:
+        """Snap both knobs home. Callers are responsible for the zero command."""
+        for name in ("stick_left", "stick_right"):
+            # __dict__, not getattr: Tk's Misc.__getattr__ recurses forever on a
+            # widget whose __init__ has not run yet (test doubles, early aborts).
+            stick = self.__dict__.get(name)
+            if stick is not None:
+                stick.recenter()
+        self._stick_vector_active = False
+
     def _hover_all_nudges(self, _event=None) -> None:
         self._nudge_keys_held.clear()
         self._nudge_buttons_held.clear()
+        self._reset_virtual_sticks()
         self.send("hover")
+
+    def _on_space_hover(self, _event=None):
+        """Hover and consume Space so a focused button cannot invoke twice."""
+        self._hover_all_nudges()
+        return "break"
 
     def _active_nudge_directions(self) -> list[str]:
         key_dirs = {
@@ -3622,9 +4267,11 @@ class OperatorApp(tk.Tk):
 
     def _on_input_focus_lost(self, _event=None) -> None:
         """A missing release event must decay to zero, never stale motion."""
-        had_input = bool(self._nudge_keys_held or self._nudge_buttons_held)
+        had_input = bool(self._nudge_keys_held or self._nudge_buttons_held
+                         or self._stick_vector_active)
         self._nudge_keys_held.clear()
         self._nudge_buttons_held.clear()
+        self._reset_virtual_sticks()
         try:
             self._backend_command("nudge_clear", {"reason": "ui_focus_lost"})
         except Exception as exc:
@@ -3789,6 +4436,358 @@ class OperatorApp(tk.Tk):
         )
         return True
 
+    def _send_flight_button(self, command: str) -> None:
+        """Run a flight button and return focus to the root window."""
+        try:
+            if command == "takeoff" and not self.preflight_guide.complete:
+                step = self.preflight_guide.current_step
+                label = PREFLIGHT_GUIDE_LABELS.get(str(step), str(step))
+                self.write_log(
+                    f"起飛前確認尚未完成：請先完成「{label}」；未送出起飛指令"
+                )
+                self._select_preflight_tab(step)
+                return
+            self.send(command)
+        finally:
+            # A clicked ttk.Button may keep keyboard focus on some Tk themes.
+            # Move focus away even if the command itself reports an error so the
+            # next Space is hover-only.
+            try:
+                self.focus_set()
+            except (AttributeError, tk.TclError):
+                pass
+
+    def _select_preflight_tab(self, step: str | None) -> None:
+        notebook = self.__dict__.get("controls_notebook")
+        tab = self.__dict__.get("_preflight_tabs", {}).get(step)
+        if notebook is None or tab is None:
+            return
+        try:
+            notebook.select(tab)
+        except tk.TclError:
+            pass
+
+    def _preflight_step_evidence(
+        self,
+        step: str,
+        st: DroneState,
+        *,
+        now: float | None = None,
+        verify_route_hash: bool = False,
+    ) -> tuple[object | None, str]:
+        """Return read-only evidence for one human preflight confirmation."""
+        now_value = time.monotonic() if now is None else float(now)
+        live = self._is_live_backend()
+        if step == "compass":
+            if not live:
+                return ("compass", "simulated"), "SIM 模式不提供韌體羅盤校正"
+            flight_state = str(getattr(st, "flight_state", "") or "")
+            if flight_state.rsplit(".", 1)[-1].lower() != "landed":
+                return None, "必須先確認飛機為 landed"
+            required = getattr(st, "drone_magnetometer_required", None)
+            if required is None:
+                return None, "等待飛機羅盤狀態讀回"
+            if getattr(st, "drone_magnetometer_failed", None) is True:
+                return None, "飛機羅盤校正失敗，請重新校正"
+            if getattr(st, "drone_magnetometer_started", None) is True:
+                return None, "飛機羅盤校正仍在進行"
+            if required == 1:
+                return None, "飛機要求完成羅盤校正"
+            if required not in {0, 2}:
+                return None, f"未知的飛機羅盤狀態：{required!r}"
+            controller_raw = str(
+                getattr(st, "skycontroller_magnetometer_state", "unknown")
+                or "unknown"
+            )
+            controller_key = (
+                controller_raw.rsplit(".", 1)[-1].replace("_", "").lower()
+            )
+            if controller_key.startswith("calibrating"):
+                return None, "SkyController 羅盤校正仍在進行"
+            note = "校正有效" if required == 0 else "韌體建議校正，請人工確認現場條件"
+            return ("compass", int(required)), note
+
+        if step == "map":
+            points = getattr(self, "map_points", None)
+            try:
+                point_count = len(points)
+            except TypeError:
+                point_count = 0
+            if point_count <= 0:
+                return None, "尚未載入可用地圖點雲"
+            profile_path = getattr(self, "site_profile_path", None)
+            if live and profile_path is None:
+                return None, "真機模式尚未綁定場域設定"
+            if profile_path is not None and not Path(profile_path).is_file():
+                return None, "場域設定檔已不存在"
+            identity = (
+                str(Path(profile_path).resolve())
+                if profile_path is not None
+                else "simulated-map"
+            )
+            return (
+                "map",
+                identity,
+                id(points),
+                point_count,
+            ), f"已載入 {point_count} 個地圖點，請確認場域正確"
+
+        if step == "route":
+            route_lock = getattr(self, "mission_route_lock", None)
+            snapshot = None if route_lock is None else route_lock.snapshot
+            if snapshot is None:
+                return None, "尚未選定通過驗證的飛行路線"
+            if getattr(self, "_displayed_route_sha256", None) != snapshot.sha256:
+                return None, "畫面路線與任務路線不一致"
+            if not bool(getattr(self, "route_visible", False)):
+                return None, "請先顯示規劃路徑並逐點檢查"
+            route_points = getattr(self, "route_pts", ())
+            if len(route_points) != len(snapshot.waypoints):
+                return None, "畫面航點數與任務路線不一致"
+            try:
+                stat = snapshot.path.stat()
+                if verify_route_hash:
+                    snapshot.verify_file_unchanged()
+            except (OSError, ValueError) as exc:
+                return None, f"路線檔驗證失敗：{exc}"
+            return (
+                "route",
+                str(snapshot.path),
+                snapshot.sha256,
+                snapshot.site_id,
+                snapshot.coordinate_frame_id,
+                stat.st_dev,
+                stat.st_ino,
+                stat.st_size,
+                stat.st_mtime_ns,
+            ), f"{len(snapshot.waypoints)} 個航點，請確認順序、高度與轉向位置"
+
+        if step != "system":
+            return None, f"未知的起飛前步驟：{step}"
+        if not live:
+            if getattr(self, "video_frame", None) is None:
+                return None, "等待模擬串流畫面"
+            return ("system", "simulated"), "模擬串流已顯示"
+        flight_state = str(getattr(st, "flight_state", "") or "")
+        if flight_state.rsplit(".", 1)[-1].lower() != "landed":
+            return None, "飛機狀態必須為 landed"
+        if not bool(getattr(st, "link_ok", False)):
+            return None, "Olympe 控制連線異常"
+        if str(getattr(st, "active_incident", "") or ""):
+            return None, f"仍有安全事件：{st.active_incident}"
+        alert = str(getattr(st, "alert_state", "") or "")
+        alert_key = alert.rsplit(".", 1)[-1].replace("_", "").lower()
+        if alert_key not in {"none", "noalert"}:
+            return None, f"飛控警示尚未清除：{alert or 'unknown'}"
+        telemetry_ns = getattr(st, "telemetry_read_mono_ns", None)
+        if telemetry_ns is None:
+            return None, "等待即時遙測讀回"
+        telemetry_age_s = now_value - int(telemetry_ns) / 1_000_000_000.0
+        if telemetry_age_s < 0.0 or telemetry_age_s > 2.0:
+            return None, f"遙測已過期（{max(0.0, telemetry_age_s):.1f}s）"
+        stream_stamp = getattr(getattr(self, "video_stream", None), "last_stamp", None)
+        if stream_stamp in (None, 0):
+            stream_stamp = getattr(self, "_video_frame_stamp", None)
+        try:
+            stream_age_s = now_value - float(stream_stamp)
+        except (TypeError, ValueError):
+            return None, "等待即時串流影格"
+        if (
+            getattr(self, "video_frame", None) is None
+            or stream_age_s < 0.0
+            or stream_age_s > 1.0
+        ):
+            return None, f"串流影格不新鮮（{max(0.0, stream_age_s):.1f}s）"
+        if str(getattr(st, "stream", "")).upper() not in {"PREVIEW", "OK"}:
+            return None, f"串流狀態尚未就緒：{getattr(st, 'stream', '?')}"
+        try:
+            battery = float(getattr(st, "battery_pct", -1.0))
+            battery_floor = float(
+                getattr(self.backend, "min_takeoff_battery_pct", 15.0)
+            )
+        except (TypeError, ValueError):
+            return None, "電量讀回或起飛門檻格式無效"
+        if not math.isfinite(battery) or battery < battery_floor:
+            return None, f"電量低於起飛門檻 {battery_floor:.0f}%"
+        for field_name, label in (
+            ("max_altitude_m", "最大高度"),
+            ("max_distance_m", "最大距離"),
+            ("distance_geofence_enabled", "距離圍欄"),
+        ):
+            if getattr(st, field_name, None) is None:
+                return None, f"等待{label}讀回"
+        desired_geofence = bool(
+            getattr(self.backend, "desired_distance_geofence", True)
+        )
+        if bool(st.distance_geofence_enabled) != desired_geofence:
+            return None, "距離圍欄讀回與設定不一致"
+        if (
+            desired_geofence
+            and bool(getattr(self.backend, "require_gps_for_geofence", True))
+            and getattr(st, "gps_fixed", None) is not True
+        ):
+            return None, "距離圍欄需要 GPS FIX"
+        via_controller = bool(
+            callable(getattr(self.backend, "via_skycontroller", None))
+            and self.backend.via_skycontroller()
+        )
+        if via_controller and not bool(getattr(st, "stick_monitor_ok", False)):
+            return None, "SkyController 搖桿監看尚未就緒"
+        safety_log = getattr(self.backend, "log", None)
+        if safety_log is not None and (
+            not bool(getattr(safety_log, "durable", False))
+            or not bool(getattr(safety_log, "healthy", False))
+        ):
+            return None, "安全紀錄尚未確認可寫入"
+        if getattr(self.backend, "_inventory_takeoff_ready", None) is False:
+            reason = str(
+                getattr(self.backend, "_inventory_block_reason", "硬體清單未通過")
+            )
+            return None, f"硬體／版本／失聯策略尚未通過：{reason}"
+        if getattr(self.backend, "_firmware_config_ok", None) is False:
+            reason = str(
+                getattr(self.backend, "_firmware_config_reason", "韌體限制未確認")
+            )
+            return None, f"韌體限制尚未確認：{reason}"
+        return ("system", "live"), "串流、遙測、連線、電量與限制讀回正常"
+
+    def confirm_current_preflight_step(self) -> bool:
+        step = self.preflight_guide.current_step
+        if step is None:
+            self.write_log("起飛前人工確認已全部完成")
+            return True
+        state = getattr(self, "current_state", self.backend.state)
+        evidence, reason = self._preflight_step_evidence(
+            step,
+            state,
+            verify_route_hash=(step == "route"),
+        )
+        if evidence is None:
+            self.write_log(
+                f"起飛前步驟「{PREFLIGHT_GUIDE_LABELS[step]}」不能確認：{reason}"
+            )
+            self._update_preflight_guide(state)
+            return False
+        confirmed = self.preflight_guide.confirm_current(evidence)
+        self.write_log(
+            f"起飛前步驟已由使用者確認：{PREFLIGHT_GUIDE_LABELS[confirmed]}（{reason}）"
+        )
+        self._update_preflight_guide(state)
+        self._select_preflight_tab(self.preflight_guide.current_step)
+        return True
+
+    def _update_preflight_guide(self, st: DroneState) -> None:
+        guide = getattr(self, "preflight_guide", None)
+        if guide is None:
+            return
+        live = self._is_live_backend()
+        flight_state = str(getattr(st, "flight_state", "") or "")
+        landed = flight_state.rsplit(".", 1)[-1].lower() == "landed"
+        if guide.complete and live and not landed:
+            self.preflight_guide_var.set("飛行中：起飛按鈕維持關閉；安全控制仍可使用")
+            self._set_widget_enabled(self.preflight_confirm_button, False)
+            self._set_widget_enabled(getattr(self, "takeoff_button", None), False)
+            return
+        evidence_by_step = {}
+        reasons = {}
+        for confirmed in guide.confirmed_steps:
+            evidence, reason = self._preflight_step_evidence(confirmed, st)
+            evidence_by_step[confirmed] = evidence
+            reasons[confirmed] = reason
+        invalidated = guide.sync(evidence_by_step)
+        if invalidated is not None:
+            self.write_log(
+                f"起飛前確認已失效，請從「{PREFLIGHT_GUIDE_LABELS[invalidated]}」重新確認："
+                f"{reasons.get(invalidated, '狀態已改變')}"
+            )
+        step = guide.current_step
+        if step is None:
+            self.preflight_guide_var.set(
+                "✓ 人工依序確認完成，當前串流／遙測正常；可以由使用者按「起飛」"
+                "（按下後仍會執行飛控最終硬檢查）"
+            )
+            self._set_widget_enabled(self.preflight_confirm_button, False)
+            self._set_widget_enabled(getattr(self, "takeoff_button", None), True)
+            return
+        evidence, reason = self._preflight_step_evidence(step, st)
+        index = PREFLIGHT_GUIDE_STEPS.index(step) + 1
+        self.preflight_guide_var.set(
+            f"{index}/4 {PREFLIGHT_GUIDE_LABELS[step]}：{reason}"
+        )
+        self._set_widget_enabled(
+            self.preflight_confirm_button,
+            evidence is not None,
+        )
+        self._set_widget_enabled(getattr(self, "takeoff_button", None), False)
+
+    def _publish_flight_result(
+            self, item: tuple[str, object | None, str | None]) -> None:
+        """Publish one async result without allowing normal work to crowd safety."""
+        command = str(item[0])
+        safety_queue = self.__dict__.get("_flight_safety_results")
+        if safety_queue is None:
+            safety_queue = queue.Queue()
+            self.__dict__["_flight_safety_results"] = safety_queue
+        if command in _SAFETY_FLIGHT_RESULT_COMMANDS:
+            safety_queue.put(item)
+            return
+
+        result_queue = self._flight_results
+        publish_lock = self.__dict__.get("_flight_result_publish_lock")
+        if publish_lock is None:
+            publish_lock = threading.Lock()
+            self.__dict__["_flight_result_publish_lock"] = publish_lock
+        dropped_command = None
+        with publish_lock:
+            try:
+                result_queue.put_nowait(item)
+                return
+            except queue.Full:
+                pass
+            try:
+                dropped = result_queue.get_nowait()
+                dropped_command = str(dropped[0])
+                task_done = getattr(result_queue, "task_done", None)
+                if callable(task_done):
+                    task_done()
+                if dropped_command in _SAFETY_FLIGHT_RESULT_COMMANDS:
+                    # Defensive migration for a queue populated by an older
+                    # caller: never discard a safety completion even there.
+                    safety_queue.put(dropped)
+                    dropped_command = None
+            except queue.Empty:
+                # A concurrent drain may have made room.  Treat a second Full as
+                # a dropped new normal result rather than blocking the worker.
+                dropped_command = command
+            try:
+                result_queue.put_nowait(item)
+            except queue.Full:
+                dropped_command = command
+
+        try:
+            self.write_log(
+                f"{command}: 完成佇列已滿，丟棄舊的一般結果"
+                f" ({dropped_command or command})"
+            )
+        except Exception:
+            # Diagnostics must not turn a bounded-result policy into a producer
+            # thread crash, especially while Tk is already overloaded.
+            pass
+        session_logs = self.__dict__.get("session_logs")
+        incident = getattr(session_logs, "incident", None)
+        if callable(incident):
+            try:
+                incident(
+                    "flight_result_dropped",
+                    command=command,
+                    dropped_command=dropped_command or command,
+                    safety=False,
+                    resolved=False,
+                )
+            except Exception:
+                # The result producer must not crash because diagnostics are down.
+                pass
+
     def _dispatch_live_command(self, command: str, payload: dict) -> bool:
         """Run a potentially blocking Olympe expectation off the Tk thread."""
         with self._flight_inflight_lock:
@@ -3807,7 +4806,7 @@ class OperatorApp(tk.Tk):
             finally:
                 with self._flight_inflight_lock:
                     self._flight_inflight.discard(command)
-                self._flight_results.put((command, result, error))
+                self._publish_flight_result((command, result, error))
 
         threading.Thread(
             target=run,
@@ -3846,8 +4845,17 @@ class OperatorApp(tk.Tk):
     def _finish_backend_command(
             self, command: str, result: object | None, error: str | None) -> None:
         if error is not None:
+            if command in {"auto", "start_auto"}:
+                self._cancel_pending_auto_route_activation()
             self.write_log(f"{command}: 失敗 {error}")
             return
+        if command in {"auto", "start_auto"}:
+            if result is False:
+                self._cancel_pending_auto_route_activation()
+            else:
+                if getattr(self, "_pending_auto_route_activation", False):
+                    self.mission_route_lock.confirm_auto_started()
+                self._pending_auto_route_activation = False
         pilot_sticks = bool(getattr(self.backend, "pilot_sticks", False))
         if command == "manual":
             if pilot_sticks:
@@ -3873,6 +4881,21 @@ class OperatorApp(tk.Tk):
         elif command == "land":
             state = str(getattr(self.backend.state, "tracker_state", ""))
             self.write_log(f"降落 expectation 完成：{state}")
+            state_reader = getattr(self.backend, "_flight_state_name", None)
+            flight_state = (
+                state_reader()
+                if callable(state_reader)
+                else str(getattr(self.backend.state, "flight_state", ""))
+            )
+            route_lock = getattr(self, "mission_route_lock", None)
+            if (
+                result is not False
+                and route_lock is not None
+                and route_lock.active
+                and str(flight_state).strip().lower() == "landed"
+            ):
+                route_lock.release_after_confirmed_landed(flight_state)
+                self.write_log("已確認 landed；AUTO 航線鎖已解除，可選擇下一段航線")
         elif command == "firmware_limits_apply":
             state = self.backend.state
             if result is True:
@@ -3926,18 +4949,51 @@ class OperatorApp(tk.Tk):
             )
 
     def _drain_flight_command_results(self) -> None:
-        while True:
-            try:
-                command, result, error = self._flight_results.get_nowait()
-            except queue.Empty:
-                return
-            self._finish_backend_command(command, result, error)
+        for result_queue in (
+            self.__dict__.get("_flight_safety_results"),
+            self._flight_results,
+        ):
+            if result_queue is None:
+                continue
+            while True:
+                try:
+                    command, result, error = result_queue.get_nowait()
+                except queue.Empty:
+                    break
+                self._finish_backend_command(command, result, error)
 
     def send(self, command: str, **payload) -> None:
+        activated_now = False
+        if command in {"auto", "start_auto"}:
+            route_lock = getattr(self, "mission_route_lock", None)
+            if route_lock is None:
+                self.write_log("AUTO 已拒絕：本次工作階段沒有路線鎖")
+                return
+            was_active = route_lock.active
+            try:
+                snapshot = route_lock.begin_auto(
+                    displayed_sha256=getattr(
+                        self, "_displayed_route_sha256", None
+                    )
+                )
+            except ValueError as exc:
+                self.write_log(f"AUTO 已拒絕：{exc}")
+                return
+            activated_now = not was_active
+            if activated_now:
+                self._pending_auto_route_activation = True
+            payload = {
+                **payload,
+                "route_path": str(snapshot.path),
+                "route_sha256": snapshot.sha256,
+                "site_id": snapshot.site_id,
+                "coordinate_frame_id": snapshot.coordinate_frame_id,
+            }
         if command in {"manual", "hover", "land", "pc_control", "resume_pc"}:
             self._nudge_keys_held.clear()
             if hasattr(self, "_nudge_buttons_held"):
                 self._nudge_buttons_held.clear()
+            self._reset_virtual_sticks()
             self.stream_lost_since = None
             if command == "manual":
                 self.backend.state.stream = "STICKS"
@@ -3957,13 +5013,24 @@ class OperatorApp(tk.Tk):
         if (bool(getattr(self.backend, "is_live", False))
                 and hasattr(self, "_flight_results")
                 and command in async_commands):
-            self._dispatch_live_command(command, payload)
+            if (
+                not self._dispatch_live_command(command, payload)
+                and activated_now
+            ):
+                self._cancel_pending_auto_route_activation()
             return
         dispatch = getattr(self, "_backend_command", None)
         if callable(dispatch):
-            dispatch(command, payload)
+            result = dispatch(command, payload)
         else:
-            self.backend.command(command, **payload)
+            result = self.backend.command(command, **payload)
+        if command in {"auto", "start_auto"}:
+            if result is False:
+                self._cancel_pending_auto_route_activation()
+            else:
+                if getattr(self, "_pending_auto_route_activation", False):
+                    self.mission_route_lock.confirm_auto_started()
+                self._pending_auto_route_activation = False
         if command == "manual":
             self.write_log("已交回搖桿 (Esc/手動)。要再由電腦控 → 按「恢復電腦控制」")
             if hasattr(self, "control_owner_var"):
@@ -3976,10 +5043,19 @@ class OperatorApp(tk.Tk):
                 self.control_owner_var.set(
                     "控制權: 電腦 (LIVE) — 動搖桿立即交回"
                 )
-        elif command in {"nudge_begin", "nudge_end", "nudge_press", "nudge_release"}:
+        elif command in {"nudge_begin", "nudge_end", "nudge_press", "nudge_release",
+                         "nudge_vector", "nudge_clear"}:
             pass  # high-rate; skip log spam
         else:
             self.write_log(command)
+
+    def _cancel_pending_auto_route_activation(self) -> None:
+        if not getattr(self, "_pending_auto_route_activation", False):
+            return
+        route_lock = getattr(self, "mission_route_lock", None)
+        if route_lock is not None:
+            route_lock.cancel_rejected_auto_start()
+        self._pending_auto_route_activation = False
 
     def write_log(self, text: str) -> None:
         self.log.insert("1.0", f"{time.strftime('%H:%M:%S')} {text}\n")
@@ -4121,8 +5197,32 @@ class OperatorApp(tk.Tk):
         self.write_log(f"gravity_cal: loaded {path}")
         return True
 
+    def _check_active_site_route(self) -> None:
+        """On startup, send the operator to draw a route when this site has none."""
+        panel = getattr(self, "site_assets_panel", None)
+        profile_path = getattr(self, "site_profile_path", None)
+        if panel is None or profile_path is None:
+            return
+        try:
+            profile = load_site_profile(profile_path)
+        except Exception as exc:
+            self.write_log(f"航線自動偵測略過（場域設定讀取失敗）: {exc!r}")
+            return
+        if profile.route_json is not None:
+            return
+        folder = Path(profile_path).parent
+        if not folder.is_dir():
+            return
+        try:
+            panel.follow_up_route_for_site(folder)
+        except Exception as exc:
+            self.write_log(f"航線自動偵測失敗: {exc!r}")
+
     def request_site_profile_restart(self, profile_path: Path) -> None:
         """Stage a restart only when the real aircraft is confirmed landed."""
+        if getattr(self, "mission_route_lock", None) is not None:
+            if self.mission_route_lock.active:
+                raise ValueError("AUTO 任務進行中，禁止切換場域或航線")
         profile = load_site_profile(profile_path)
         if self._is_live_backend():
             state_reader = getattr(self.backend, "_flight_state_name", None)
@@ -4140,6 +5240,281 @@ class OperatorApp(tk.Tk):
             f"場域 {profile.site_id} 已驗證；關閉現有連線後安全重啟（不送出起飛）"
         )
         self._on_close()
+
+    def route_editor_safety_check(self) -> tuple[bool, str]:
+        """Read-only gate: route authoring is never allowed over an airborne live UI."""
+        if getattr(self, "mission_route_lock", None) is not None:
+            if self.mission_route_lock.active:
+                return False, "AUTO 任務進行中，禁止編輯或切換航線"
+        if not self._is_live_backend():
+            return True, ""
+        state_reader = getattr(self.backend, "_flight_state_name", None)
+        if not callable(state_reader):
+            return False, "無法回讀飛行狀態，已拒絕航線編輯"
+        with self._flight_inflight_lock:
+            commands_inflight = bool(self._flight_inflight)
+        try:
+            require_safe_site_switch(
+                is_live=True,
+                flight_state=state_reader(),
+                commands_inflight=commands_inflight,
+            )
+        except ValueError as exc:
+            return False, str(exc)
+        return True, ""
+
+    def request_route_editor(self, edit_current: bool) -> None:
+        """Load editor assets off the Tk thread, then open the isolated full-screen view."""
+        if self._route_editor_window is not None:
+            self._route_editor_window.lift()
+            self._route_editor_window.focus_force()
+            return
+        if self._route_editor_loading:
+            raise ValueError("航線編輯器正在載入")
+        allowed, reason = self.route_editor_safety_check()
+        if not allowed:
+            raise ValueError(reason)
+        profile_path = self.site_asset_actions.current_profile
+        profile = load_site_profile(profile_path) if profile_path is not None else None
+        bound_profile = (
+            profile
+            if profile is not None and profile.coordinate_frame is not None
+            else None
+        )
+        route_path = bound_profile.route_json if edit_current and bound_profile else None
+        if edit_current and route_path is None:
+            raise ValueError(
+                "目前沒有已綁定場域的航線；請選擇「建立新航線」後導入 PLY"
+            )
+        map_source = profile.map_ply if profile is not None else None
+        self._route_editor_loading = True
+        self.site_assets_panel.set_status(
+            "正在開啟航線編輯器；可直接導入 PLY，飛控與安全監視仍持續運作…"
+        )
+
+        def load_editor_assets() -> None:
+            try:
+                if (
+                    profile is not None
+                    and self.site_profile_path == profile.source
+                    and len(self.map_points)
+                ):
+                    points = self.map_points
+                elif profile is not None:
+                    points = read_map_points(profile.map_ply, MAP_STATIC_POINTS)
+                elif len(self.map_points):
+                    points = self.map_points
+                else:
+                    points = np.empty((0, 6), dtype=np.float32)
+                self._route_editor_load_queue.put(
+                    (bound_profile, points, map_source, route_path, None)
+                )
+            except Exception as exc:
+                self._route_editor_load_queue.put((None, None, None, None, exc))
+
+        threading.Thread(
+            target=load_editor_assets,
+            name="route-editor-map-load",
+            daemon=True,
+        ).start()
+        self.after(50, self._poll_route_editor_load)
+
+    def _poll_route_editor_load(self) -> None:
+        try:
+            profile, points, map_source, route_path, error = (
+                self._route_editor_load_queue.get_nowait()
+            )
+        except queue.Empty:
+            self.after(50, self._poll_route_editor_load)
+            return
+        self._route_editor_loading = False
+        if error is not None:
+            self.site_assets_panel.set_status(f"航線編輯器載入失敗：{error}")
+            return
+        assert points is not None
+        allowed, reason = self.route_editor_safety_check()
+        if not allowed:
+            self.site_assets_panel.set_status(f"航線編輯器未開啟：{reason}")
+            return
+        try:
+            self._route_editor_window = RouteEditorWindow(
+                self,
+                profile=profile,
+                map_points=points,
+                map_source=map_source,
+                route_path=route_path,
+                import_route=self.site_assets_panel.import_authored_route,
+                discover_map_ply=discover_ply_files,
+                load_map_ply=self.load_route_editor_ply,
+                safety_check=self.route_editor_safety_check,
+                map_loaded=self.site_assets_panel.set_status,
+                on_close=self._route_editor_closed,
+                on_guard_failure=self._route_editor_guard_failed,
+            )
+        except Exception as exc:
+            self._route_editor_window = None
+            self.site_assets_panel.set_status(f"航線編輯器開啟失敗：{exc}")
+            return
+        self.site_assets_panel.set_status(
+            "航線編輯器已開啟；只編輯草稿／預覽，不會下達飛行指令"
+        )
+
+    def _route_editor_closed(self) -> None:
+        self._route_editor_window = None
+        try:
+            self.focus_force()
+        except tk.TclError:
+            pass
+
+    def _route_editor_guard_failed(self, reason: str) -> None:
+        self._route_editor_window = None
+        self.site_assets_panel.set_status(f"航線編輯器已因安全狀態關閉：{reason}")
+        self.write_log(f"route editor safety close: {reason}")
+
+    def load_route_editor_ply(
+        self, source: Path
+    ) -> tuple[SiteProfile | None, np.ndarray, str]:
+        """Load any PLY, binding it only when one managed site digest matches."""
+        profile = match_managed_site_profile_for_map(source, _WS.site_packages)
+        points = read_map_points(source, MAP_STATIC_POINTS)
+        if profile is None:
+            return (
+                None,
+                points,
+                "PLY 已載入；尚未匹配已匯入場域，只能儲存預覽草稿",
+            )
+        self.site_asset_actions.current_profile = profile.source
+        return (
+            profile,
+            points,
+            f"PLY 已匹配場域 {profile.display_name}；可儲存並匯入正式航線",
+        )
+
+    def _active_site_map_frame(self):
+        """Measured MapFrame of the site currently loaded, or None (legacy).
+
+        Raises when the site declares an alignment that cannot be read -- see
+        resolve_site_map_frame. Only a MISSING profile means legacy.
+        """
+        profile_path = getattr(self, "site_profile_path", None)
+        if profile_path is None:
+            return None
+        profile = load_site_profile(profile_path)
+        return resolve_site_map_frame(profile)
+
+    def _map_axis_basis(self) -> tuple:
+        """(east, north, up, measured) for the axis gizmo, in raw GLOMAP coords.
+
+        The gizmo used to hard-code +X / -Y / +Z and label -Y "UP". That is the
+        legacy assumption, not a measurement: it points 5.22 deg off true up on
+        river_site and 22.51 deg off on urai, while the route editor draws the same
+        cloud through the MEASURED basis. Cached because this runs every redraw.
+        """
+        if self._map_axis_basis_cache is None:
+            frame = None
+            try:
+                frame = self._active_site_map_frame()
+            except Exception as exc:
+                # An unreadable alignment must not kill the redraw loop; falling
+                # back is what the old code always did, only now it is labelled.
+                self.write_log(f"map axes fell back to the legacy assumption: {exc}")
+            if frame is None:
+                basis = (
+                    np.array([1.0, 0.0, 0.0]),
+                    np.array([0.0, 0.0, 1.0]),
+                    np.array([0.0, -1.0, 0.0]),
+                    False,
+                )
+            else:
+                basis = (
+                    np.asarray(frame.east, dtype=float),
+                    np.asarray(frame.north, dtype=float),
+                    np.asarray(frame.up, dtype=float),
+                    getattr(frame, "source", "legacy_assumption") != "legacy_assumption",
+                )
+            self._map_axis_basis_cache = basis
+        return self._map_axis_basis_cache
+
+    def apply_route_import_preview(self, result) -> None:
+        """Select and draw the imported route; never approve, arm, or execute it."""
+        route_path = getattr(result, "asset_path", None)
+        if route_path is None:
+            return
+        result_profile = getattr(result, "profile_path", None)
+        if (
+            result_profile is None
+            or self.site_profile_path is None
+            or Path(result_profile).resolve() != self.site_profile_path.resolve()
+        ):
+            self.write_log(
+                "route imported for an inactive site; preview waits for a landed site restart"
+            )
+            return
+        try:
+            self._show_route_overlay(route_path)
+        except Exception as exc:
+            # A basis mismatch here means the overlay would be rotated against the
+            # map. Showing nothing is honest; showing the wrong path is not. Broad
+            # on purpose: this runs in a Tk callback, and an unreadable site
+            # profile or alignment must degrade to "no preview", not kill the UI.
+            self.write_log(f"route preview rejected: {exc}")
+
+    def _show_route_overlay(self, route_path) -> int:
+        """Validate, bind, and draw the route selected for the next AUTO mission."""
+        route_lock = getattr(self, "mission_route_lock", None)
+        if route_lock is None:
+            route_lock = MissionRouteLock()
+            self.mission_route_lock = route_lock
+        if route_lock.active:
+            raise ValueError("AUTO mission is active; route switching is locked")
+        profile_path = getattr(self, "site_profile_path", None)
+        if profile_path is None:
+            raise ValueError("a site profile is required to bind an AUTO route")
+        profile = load_site_profile(profile_path)
+        flight = profile.flight
+        coordinate_frame_id = (
+            flight.coordinate_frame_id if flight is not None else None
+        )
+        if not coordinate_frame_id:
+            raise ValueError("site profile has no flight coordinate_frame_id")
+        snapshot = capture_mission_route_snapshot(
+            route_path,
+            expected_sha256=file_sha256(Path(route_path)),
+            expected_site_id=profile.site_id,
+            expected_coordinate_frame_id=coordinate_frame_id,
+            map_frame=self._active_site_map_frame() or LEGACY_MAP_FRAME,
+        )
+        route_lock.bind(snapshot)
+        points = snapshot.controller_waypoints()
+        self.route_pts = points
+        self._displayed_route_sha256 = snapshot.sha256
+        self.route_visible = True
+        if hasattr(self, "show_route_var"):
+            self.show_route_var.set(True)
+        self._map_dirty_key = None
+        self.redraw_map_only()
+        return len(points)
+
+    def preview_site_route(self, route_path) -> str:
+        """Select one route for the next AUTO request and show it on the map.
+
+        Selection creates an immutable in-memory snapshot but does not persist a
+        different site profile or bypass flight approval. Once AUTO is requested,
+        the snapshot is locked until the backend rejects it or landing is confirmed.
+        """
+        name = Path(route_path).name
+        try:
+            count = self._show_route_overlay(route_path)
+        except Exception as exc:
+            self.write_log(f"route preview rejected: {exc}")
+            return f"航線顯示失敗（{name}）：{exc}"
+        self.write_log(
+            f"route selected: {count} waypoints; existing autonomy approval gates remain"
+        )
+        return (
+            f"已選定並顯示 {name}（{count} 點）；AUTO 開始後將鎖定此航線，"
+            "仍須通過既有飛行核准閘門"
+        )
 
     def _on_close(self) -> None:
         """Window X: always run backend cleanup (live → force in-place land).
@@ -4196,6 +5571,40 @@ class OperatorApp(tk.Tk):
                 return
         self.no_loc_markers.append(np.asarray(p, dtype=float).copy())
 
+    def _record_diagnostic_failure(self, path: object, exc: BaseException) -> None:
+        """Publish a diagnostic sink failure as a durable session incident."""
+        key = str(path)
+        reported = self.__dict__.get("_diagnostic_failures_reported")
+        if not isinstance(reported, set):
+            reported = set()
+            self.__dict__["_diagnostic_failures_reported"] = reported
+        if key in reported:
+            return
+        reported.add(key)
+        incident = getattr(self.__dict__.get("session_logs"), "incident", None)
+        if callable(incident):
+            try:
+                incident(
+                    "diagnostic_write_failed",
+                    path=key,
+                    error=repr(exc),
+                    resolved=False,
+                )
+            except Exception:
+                pass
+        log_event = getattr(
+            getattr(self.__dict__.get("backend"), "log", None), "event", None
+        )
+        if callable(log_event):
+            try:
+                log_event("diagnostic_write_failed", path=key, error=repr(exc))
+            except Exception:
+                pass
+        try:
+            self.write_log(f"DIAGNOSTIC_WRITE_FAILED path={key} error={exc!r}")
+        except Exception:
+            pass
+
     def _ensure_loc_metrics_log(self) -> None:
         if self.session_logs is not None:
             self._loc_metrics_path = (
@@ -4214,6 +5623,9 @@ class OperatorApp(tk.Tk):
             self.write_log(f"loc metrics -> {path}")
         except Exception as exc:
             self._loc_metrics_f = False  # type: ignore[assignment]
+            self._record_diagnostic_failure(
+                getattr(self, "_loc_metrics_path", "localization.jsonl"), exc
+            )
             try:
                 self.write_log(f"loc metrics log open failed: {exc!r}")
             except Exception:
@@ -4350,11 +5762,14 @@ class OperatorApp(tk.Tk):
             }
             session_logs = getattr(self, "session_logs", None)
             if session_logs is not None:
-                session_logs.localization("pose_result", **rec)
+                if not session_logs.localization("pose_result", **rec):
+                    raise OSError("session localization sink rejected record")
             else:
                 self._loc_metrics_f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-        except Exception:
-            pass
+        except Exception as exc:
+            self._record_diagnostic_failure(
+                getattr(self, "_loc_metrics_path", "localization.jsonl"), exc
+            )
 
     def pipeline_metrics_summary(self, now: float | None = None) -> str:
         """Current UI-boundary rates and latency, with a five-second E2E p95."""
@@ -4518,10 +5933,16 @@ class OperatorApp(tk.Tk):
             p50 = s[len(s) // 2]
             p95 = s[max(0, int(len(s) * 0.95) - 1)]
         if hasattr(self, "loc_health_label"):
-            txt = {"OK": "定位正常", "LOW": f"定位信心低 inliers={inliers}", "FAIL": "定位失敗"}[self.loc_health]
+            txt = {
+                "OK": "定位正常",
+                "LOW": f"定位信心低 inliers={inliers}",
+                "FAIL": "定位失敗",
+                "PAUSED_ZOOM": "定位暫停：相機縮放未校正",
+            }[self.loc_health]
             if self._loc_fail_count or self._loc_ok_count:
                 txt += f" | ok={self._loc_ok_count} fail={self._loc_fail_count}"
-            self.loc_health_label.configure(text=txt, foreground=HEALTH_COLOR[self.loc_health])
+            self._set_loc_health_display(
+                text=txt, colour=HEALTH_COLOR.get(self.loc_health, "#e0a92e"))
         if hasattr(self, "loc_fps_var"):
             self.loc_fps_var.set(
                 f"定位 FPS {self.loc_fps:.1f} (5s) | 能力 {self.loc_core_fps:.1f} "
@@ -4580,6 +6001,65 @@ class OperatorApp(tk.Tk):
         if widget is not None:
             widget.state(["!disabled"] if enabled else ["disabled"])
 
+    def _draw_magnetometer_axis(self, guide: tuple[str, str, str] | None) -> None:
+        """Draw the rotation the firmware is currently asking for.
+
+        ``guide`` is magnetometer_axis_guide()'s result, or None when no axis is
+        being requested -- in which case the canvas is cleared rather than left
+        showing a stale rotation the operator should not perform. Kept deliberately
+        short (52 px) so the calibration buttons below it stay reachable at the
+        minimum supported window size.
+        """
+        canvas = getattr(self, "magnetometer_axis_canvas", None)
+        if canvas is None:
+            return
+        canvas.delete("all")
+        if guide is None:
+            canvas.create_text(8, 26, anchor="w", text="（目前沒有要求校正軸）",
+                               fill="#7a828a", font=("Sans", 9))
+            return
+        label, view, instruction = guide
+        body, accent, arrow = "#39424b", "#f0f3f5", "#4ea1ff"
+        cx, cy = 30, 26
+
+        if view == "top":            # X/roll: seen from above, roll about nose-tail
+            canvas.create_oval(cx - 20, cy - 7, cx + 20, cy + 7,
+                               fill=body, outline=accent)
+            canvas.create_polygon(cx + 20, cy, cx + 28, cy - 4, cx + 28, cy + 4,
+                                  fill=accent, outline=accent)
+            canvas.create_line(cx - 27, cy, cx + 30, cy, fill=arrow, dash=(3, 2))
+            canvas.create_arc(cx - 12, cy - 20, cx + 12, cy + 20,
+                              start=20, extent=300, style="arc",
+                              outline=arrow, width=2)
+            canvas.create_polygon(cx + 11, cy - 16, cx + 17, cy - 7,
+                                  cx + 5, cy - 8, fill=arrow, outline=arrow)
+        elif view == "side":         # Y/pitch: seen from the left, nose over the top
+            canvas.create_oval(cx - 21, cy - 6, cx + 21, cy + 6,
+                               fill=body, outline=accent)
+            canvas.create_polygon(cx + 21, cy, cx + 29, cy - 4, cx + 29, cy + 4,
+                                  fill=accent, outline=accent)
+            canvas.create_line(cx, cy - 22, cx, cy + 22, fill=arrow, dash=(3, 2))
+            canvas.create_arc(cx - 24, cy - 19, cx + 24, cy + 19,
+                              start=200, extent=140, style="arc",
+                              outline=arrow, width=2)
+            canvas.create_polygon(cx + 20, cy - 9, cx + 27, cy - 1,
+                                  cx + 15, cy - 1, fill=arrow, outline=arrow)
+        else:                        # Z/yaw: seen from above, spin flat
+            canvas.create_oval(cx - 14, cy - 14, cx + 14, cy + 14,
+                               fill=body, outline=accent)
+            canvas.create_polygon(cx, cy - 14, cx - 5, cy - 22, cx + 5, cy - 22,
+                                  fill=accent, outline=accent)
+            canvas.create_arc(cx - 22, cy - 22, cx + 22, cy + 22,
+                              start=45, extent=250, style="arc",
+                              outline=arrow, width=2)
+            canvas.create_polygon(cx + 14, cy - 13, cx + 22, cy - 7,
+                                  cx + 12, cy - 4, fill=arrow, outline=arrow)
+
+        canvas.create_text(66, 13, anchor="w", text=f"現在請轉：{label}",
+                           fill=arrow, font=("Sans", 11, "bold"))
+        canvas.create_text(66, 34, anchor="w", text=f"{instruction}　轉滿三圈",
+                           fill="#c3cad1", font=("Sans", 9))
+
     def update_magnetometer_metrics(self, st: DroneState) -> None:
         if not hasattr(self, "drone_magnetometer_var"):
             return
@@ -4587,17 +6067,17 @@ class OperatorApp(tk.Tk):
             self.drone_magnetometer_var.set(
                 "飛機羅盤：SIM 不提供韌體校正"
             )
-            self.skycontroller_magnetometer_var.set(
-                "SkyController 羅盤：SIM 不提供韌體校正"
-            )
-            self._set_widget_enabled(
-                getattr(self, "takeoff_button", None), True
-            )
+            self._draw_magnetometer_axis(None)
+            self._magnetometer_takeoff_ready = True
             return
 
         formatted = format_magnetometer_calibration(st)
         self.drone_magnetometer_var.set(formatted["drone"])
-        self.skycontroller_magnetometer_var.set(formatted["controller"])
+        active = getattr(st, "drone_magnetometer_started", None) is True
+        self._draw_magnetometer_axis(
+            magnetometer_axis_guide(getattr(st, "drone_magnetometer_axis", None))
+            if active else None
+        )
 
         flight_state = str(getattr(st, "flight_state", "") or "")
         landed = flight_state.rsplit(".", 1)[-1].lower() == "landed"
@@ -4622,14 +6102,6 @@ class OperatorApp(tk.Tk):
             getattr(self, "drone_magnetometer_cancel_button", None),
             link_ok and drone_active,
         )
-        self._set_widget_enabled(
-            getattr(self, "skycontroller_magnetometer_start_button", None),
-            landed and link_ok and via_controller and not any_active,
-        )
-        self._set_widget_enabled(
-            getattr(self, "skycontroller_magnetometer_cancel_button", None),
-            link_ok and via_controller and controller_active,
-        )
 
         required = getattr(st, "drone_magnetometer_required", None)
         drone_ready = (
@@ -4637,80 +6109,73 @@ class OperatorApp(tk.Tk):
             and not drone_active
             and getattr(st, "drone_magnetometer_failed", None) is not True
         )
-        controller_ready = (
-            not via_controller or controller_key == "calibrated"
-        )
-        self._set_widget_enabled(
-            getattr(self, "takeoff_button", None),
-            drone_ready and controller_ready,
-        )
+        # Must mirror olympe_live_backend._magnetometer_control_error(): an
+        # UNCALIBRATED controller compass no longer blocks takeoff (it only feeds
+        # pilot-referenced features this system never uses). A calibration actively
+        # RUNNING still does -- the controller is being rotated by hand.
+        controller_ready = not (via_controller and controller_active)
+        self._magnetometer_takeoff_ready = drone_ready and controller_ready
 
     def update_anafi_metrics(self, st: DroneState) -> None:
         if not hasattr(self, "anafi_flight_var"):
             return
-        drone_alt = getattr(st, "drone_altitude_m", None)
-        drone_alt_txt = "-" if drone_alt is None else f"{float(drone_alt):.1f}m"
-        # Keep the scale-free localization coordinate visibly separate from
-        # the firmware/barometer altitude used by flight limits.
-        self.anafi_flight_var.set(
-            f"battery {st.battery_pct:.0f}% | drone alt {drone_alt_txt} | "
-            f"map Y {-float(st.pose[1]):.1f}u | "
-            f"gimbal {st.gimbal_pitch_deg:.0f}° | zoom {st.zoom:.1f}x"
-        )
+        # Map coordinate only. Battery lives in the status bar; gimbal and zoom
+        # live in the video HUD. Repeating them here meant the same number
+        # appeared three times, refreshed by three different paths.
+        # Unclamped: st.altitude_m is max(0, -pose[1]), so a negative map Y (below
+        # the reconstruction origin) survived only as 0.0 and looked like the ground.
+        self.anafi_flight_var.set(f"map Y {-float(st.pose[1]):+.2f}u")
         # Mapped stream backlog age / fps / GPS / link (not absolute camera latency).
         age = getattr(st, "frame_age_ms", None)
         if age is None and getattr(st, "link_latency_ms", None) is not None:
             # Live backend writes measured age into link_latency_ms.
             if self._is_live_backend():
                 age = float(st.link_latency_ms)
-        if age is None:
-            age_txt = "-"
-        else:
-            age_txt = f"{float(age):.0f} ms"
-        fps = float(getattr(st, "stream_fps", 0.0) or 0.0)
-        fps_txt = f"{fps:.1f}" if fps > 0.05 else "-"
-        gps = getattr(st, "gps_fixed", None)
-        if gps is None:
-            gps_txt = "-" if not self._is_live_backend() else "?"
-        else:
-            gps_txt = "FIX" if gps else "NO"
+        # backlog age and stream fps are drawn by the video HUD; only the values
+        # nothing else reports are formatted here.
+        # Still needed by the incident banner below, even though the readout that
+        # used to format it moved into the video HUD.
         link_ok = bool(getattr(st, "link_ok", True))
-        link_st = str(getattr(st, "link_status", "OK") or "OK")
-        if not self._is_live_backend():
-            link_txt = "sim"
-        else:
-            link_txt = "OK" if link_ok else "LOST"
-            if link_st and link_st not in {"OK", "LOST"}:
-                link_txt = link_st
         ctl_poll = getattr(st, "pcmd_to_telemetry_poll_ms", None)
         ctl_poll_txt = "-" if ctl_poll is None else f"{float(ctl_poll):.0f} ms"
         speed = getattr(st, "ground_speed_mps", None)
         if speed is None:
             speed = getattr(st, "airspeed_mps", None)
         speed_txt = "?" if speed is None else f"{float(speed):.2f}m/s"
+        # backlog age / fps / GPS / link are in the video HUD; only the two
+        # figures nothing else reports stay here.
         self.anafi_stream_var.set(
-            f"{ANAFI.stream_width}x{ANAFI.stream_height} | "
-            f"backlog age {age_txt} | fps {fps_txt} | GPS {gps_txt} | "
-            f"link {link_txt} | ground speed {speed_txt} | "
-            f"PCMD→telemetry poll {ctl_poll_txt}"
+            f"ground speed {speed_txt} | PCMD→telemetry poll {ctl_poll_txt}"
         )
         telemetry = format_olympe_telemetry(st)
         if hasattr(self, "olympe_state_var"):
-            self.olympe_state_var.set(telemetry["state"])
-            self.olympe_attitude_var.set(telemetry["attitude"])
-            self.olympe_speed_var.set(telemetry["speed"])
-            self.olympe_altitude_var.set(telemetry["altitude"])
-            self.olympe_gps_var.set(telemetry["gps"])
-            self.olympe_environment_var.set(telemetry["environment"])
-            self.olympe_sensors_var.set(telemetry["sensors"])
+            self.olympe_state_var.set(
+                telemetry["state"] + " | " + telemetry["gps"])
+            self.olympe_attitude_var.set(
+                telemetry["attitude"] + " | " + telemetry["speed"])
+            self.olympe_altitude_var.set(
+                telemetry["altitude"] + " | " + telemetry["environment"]
+                + " | " + telemetry["sensors"])
         self.update_magnetometer_metrics(st)
+        self._update_preflight_guide(st)
         def val(value, suffix: str, digits: int = 1) -> str:
             if value is None:
                 return "?"
             return f"{float(value):.{digits}f}{suffix}"
 
         geofence = getattr(st, "distance_geofence_enabled", None)
-        geofence_txt = "?" if geofence is None else ("ON" if geofence else "OFF")
+        # The firmware switch is only half the story: with it ON but no GPS position
+        # or Home Point, nothing is actually contained. Say which of the two is true
+        # rather than letting "ON" imply containment that is not being evaluated.
+        guard_active = getattr(st, "distance_guard_active", None)
+        if geofence is None:
+            geofence_txt = "?"
+        elif not geofence:
+            geofence_txt = "圍籬關閉"
+        elif guard_active is False:
+            geofence_txt = "圍籬 ON 但未生效（無 GPS/Home）"
+        else:
+            geofence_txt = "圍籬 ON"
         preflight = getattr(st, "preflight_ok", None)
         preflight_txt = "NOT CHECKED" if preflight is None else ("READY" if preflight else "BLOCKED")
         self.anafi_limit_var.set(
@@ -4945,9 +6410,6 @@ class OperatorApp(tk.Tk):
         the value moves every tick, so an unthrottled label would put the 100 Hz
         churn straight back.
         """
-        label = getattr(self, "loc_age_label", None)
-        if label is None:
-            return
         now = time.monotonic()
         if now < self._age_readout_next:
             return
@@ -4973,7 +6435,52 @@ class OperatorApp(tk.Tk):
             f"位姿 {'-' if pose_ms is None else f'{pose_ms:.0f}ms'} | "
             f"影格 {'-' if stream_ms is None else f'{stream_ms:.0f}ms'}"
         )
-        self._set_widget_text("loc_age", label, fg=colour)
+        # The ages themselves are in the overlay (pose_age / stream_age); what this
+        # readout uniquely carried was the colour, so that is what moves -- but it
+        # shares loc_health_label with two other writers, so it records its intent
+        # and lets _set_loc_health_display compose rather than painting directly.
+        if colour == self._age_readout_colour:
+            return
+        self._age_readout_colour = colour
+        self._set_loc_health_display()
+
+    #: Severity rank used to compose loc_health_label's foreground. The label has
+    #: three writers (the per-result health line, the warm-up/ready line, and the
+    #: 10 Hz staleness grading); whichever ran last used to win, so a 900 ms-stale
+    #: pose was repainted green by the next result and the dedup cache then made
+    #: that loss permanent. Higher rank wins instead.
+    _LOC_HEALTH_COLOUR_RANK = {
+        "#a7b0b8": 0,                            # idle grey
+        "#3fbf7f": 1, "#24733f": 1,              # healthy green
+        "#e0a92e": 2, "#b26a00": 2,              # warning amber
+        "#e2483d": 3,                            # failure red
+    }
+
+    def _set_loc_health_display(self, text: str | None = None,
+                                colour: str | None = None) -> None:
+        """The single writer for loc_health_label's text and foreground.
+
+        Each caller states its own intent; this composes the most severe colour of
+        the health state and the pose/frame staleness grading, so neither can
+        silently erase the other regardless of the order they run in within a tick.
+        """
+        if text is not None:
+            self._loc_health_text = text
+        if colour is not None:
+            self._loc_health_colour = colour
+        label = getattr(self, "loc_health_label", None)
+        if label is None or self._loc_health_text is None:
+            return
+        rank = self._LOC_HEALTH_COLOUR_RANK
+        shown = self._loc_health_colour or "#a7b0b8"
+        stale = self._age_readout_colour
+        if stale is not None and rank.get(stale, 0) > rank.get(shown, 0):
+            shown = stale
+        try:
+            self._set_widget_text(
+                "loc_health", label, text=self._loc_health_text, foreground=shown)
+        except tk.TclError:
+            pass
 
     def _note_map_interaction(self) -> None:
         self._map_interact_until = time.monotonic() + 0.35
@@ -5030,10 +6537,14 @@ class OperatorApp(tk.Tk):
         axis_len = self.map_radius * 0.18
         origin = self.map_center
         ox, oy = self.project_world(origin, width, height)
+        east, north, up, measured = self._map_axis_basis()
+        # Legacy keeps the raw GLOMAP letters, because that is literally what the
+        # arrows are then; * marks that "up" is an assumption rather than measured.
+        labels = ("東", "上", "北") if measured else ("X", "UP*", "Z")
         axes = [
-            (origin + np.array([axis_len, 0, 0]), "#ff6b5f", "X"),
-            (origin + np.array([0, -axis_len, 0]), "#3fbf7f", "UP"),
-            (origin + np.array([0, 0, axis_len]), "#5aa7e8", "Z"),
+            (origin + east * axis_len, "#ff6b5f", labels[0]),
+            (origin + up * axis_len, "#3fbf7f", labels[1]),
+            (origin + north * axis_len, "#5aa7e8", labels[2]),
         ]
         for end, color, label in axes:
             ex, ey = self.project_world(end, width, height)
@@ -5135,51 +6646,34 @@ class OperatorApp(tk.Tk):
             )
             draw.ellipse((sx - 3, sy - 3, sx + 3, sy + 3), fill="#00d4ff")
             arrow = None
-            heading_text = "青色四角錐 = 相機視錐；前方正方形 = 影像面"
             arrow_color = "#00d4ff"
         elif camera_forward is not None:
             hx, hy = self.project_world(
                 camera_center + camera_forward, width, height)
             arrow = heading_arrow_polygon(sx, sy, hx, hy)
-            heading_text = "亮藍箭頭 = 相機光軸（PnP）"
             arrow_color = "#00d4ff"
         elif np.isfinite(float(yaw)):
             heading = np.array([math.cos(float(yaw)), 0.0, math.sin(float(yaw))], dtype=float)
             center = np.array([x, y, z], dtype=float)
             hx, hy = self.project_world(center + heading, width, height)
             arrow = heading_arrow_polygon(sx, sy, hx, hy)
-            heading_text = "綠箭頭 = 移動方向（尚無相機光軸）"
             arrow_color = "#3fbf7f"
         else:
             draw.ellipse((sx - 7, sy - 7, sx + 7, sy + 7), outline="#3fbf7f", width=3)
             arrow = None
-            heading_text = "圓圈 = 尚無移動/相機朝向"
             arrow_color = "#3fbf7f"
         if arrow is not None:
             draw.polygon(arrow, fill=arrow_color)
             draw.line(arrow + [arrow[0]], fill="#ffffff", width=2)
-        # The overlay sits directly on the point cloud, so over a bright cluster
-        # the readouts were unreadable. One flat backdrop behind the whole block
-        # costs ~0.05 ms and makes them legible regardless of what is underneath.
-        overlay_rows = 5 if self.no_loc_markers else 4
-        draw.rectangle(
-            (4, 4, min(width - 4, 620), 14 + 20 * overlay_rows), fill="#0b0c0e")
-        draw.text(
-            (10, 10),
-            "左鍵360旋轉 | 左鍵雙擊設旋轉中心 | 中鍵滾轉 | 右鍵平移 | 滾輪縮放",
-            fill="#f0f3f5",
-            font=overlay_font,
-        )
-        draw.text((10, 30), f"x={x:.2f} y={y:.2f} z={z:.2f} | inliers={st.inliers} "
-                  f"reproj={'-' if st.reproj is None else f'{st.reproj:.2f}'}",
-                  fill="#a7b0b8", font=overlay_font)
-        draw.text((10, 50), f"zoom={self.map_zoom:.2f} yaw={math.degrees(self.map_yaw)%360:.0f} "
-                  f"pitch={math.degrees(self.map_pitch)%360:.0f} roll={math.degrees(self.map_roll)%360:.0f}",
-                  fill="#a7b0b8", font=overlay_font)
-        draw.text((10, 70), heading_text, fill=arrow_color, font=overlay_font)
+        # The permanent top-left block is gone (operator decision 2026-08-06): the
+        # mouse legend was an introduction the operator had already read, the view
+        # angles were noise, and inliers/reproj were a THIRD copy of what the video
+        # overlay already shows. Only the red-dot legend remains, and only while
+        # there are red dots on screen to explain.
         if self.no_loc_markers:
+            draw.rectangle((4, 4, min(width - 4, 420), 26), fill="#0b0c0e")
             draw.text(
-                (10, 90),
+                (10, 8),
                 f"紅點 = 最近無法定位位置（最多 {NO_LOC_MAX_MARKERS} 處）",
                 fill="#ff6a6a",
                 font=overlay_font,
@@ -5292,15 +6786,11 @@ class OperatorApp(tk.Tk):
                     fill="#a7b0b8", font=overlay_font,
                 )
         draw.rectangle((18, 18, width - 18, height - 18), outline="#363c44", width=2)
-        hud_h = 100
+        hud_h = 78
         draw.rectangle((18, height - hud_h, width - 18, height - 18), fill="#08090b", outline="#363c44")
-        identity = video_hud_identity(self._is_live_backend(), st.mode)
-        draw.text(
-            (28, height - hud_h + 10),
-            f"{identity} | {st.tracker_state} | {st.loc} | stream={st.stream}",
-            fill="#e6b94f",
-            font=overlay_font,
-        )
+        # Identity / tracker_state / loc / stream are NOT drawn here: they live in
+        # the status bar below, which stays readable when the video does not.
+        # Only what that bar lacks is overlaid on the image.
         age = getattr(st, "frame_age_ms", None)
         if age is None and self._is_live_backend():
             age = getattr(st, "link_latency_ms", None)
@@ -5314,18 +6804,18 @@ class OperatorApp(tk.Tk):
         gps_txt = ("FIX" if gps else "NO") if gps is not None else ("-" if not self._is_live_backend() else "?")
         link_ok = bool(getattr(st, "link_ok", True))
         link_txt = "sim" if not self._is_live_backend() else ("OK" if link_ok else "LOST")
-        draw.text((28, height - hud_h + 32),
+        draw.text((28, height - hud_h + 10),
                   f"backlog age {age_txt} | stream fps {fps_txt} | GPS {gps_txt} | link {link_txt} | "
                   f"HFOV {ANAFI.video_hfov_deg:.0f}°",
                   fill="#f0f3f5", font=overlay_font)
-        draw.text((28, height - hud_h + 54), f"battery={st.battery_pct:.0f}% alt={st.altitude_m:.1f}u(map) "
+        # battery and inliers are in the status bar; only the fields it lacks here.
+        draw.text((28, height - hud_h + 32), f"alt={st.altitude_m:.1f}u(map) "
                   f"gimbal={st.gimbal_pitch_deg:.0f}° zoom={st.zoom:.1f}x | "
-                  f"inliers={st.inliers} reproj={'-' if st.reproj is None else f'{st.reproj:.2f}'}",
+                  f"reproj={'-' if st.reproj is None else f'{st.reproj:.2f}'}",
                   fill="#f0f3f5", font=overlay_font)
-        draw.text((28, height - hud_h + 76), f"video={self.video_display_frame_name or '-'} "
+        draw.text((28, height - hud_h + 54), f"video={self.video_display_frame_name or '-'} "
                   f"loc={self.live_result_frame_name or self.live_pending_frame_name or '-'} "
-                  f"det={self.detection_result_frame_name or self.detection_pending_frame_name or '-'} "
-                  f"obj={self.det_count}",
+                  f"det={self.detection_result_frame_name or self.detection_pending_frame_name or '-'}",
                   fill="#a7b0b8", font=overlay_font)
         # LINK LOST banner (highest priority) — display only, no auto takeoff/land here.
         if self._is_live_backend() and not link_ok:
@@ -5351,10 +6841,14 @@ class OperatorApp(tk.Tk):
             # localization alert banner: operator sees WHEN localization fails / is low-confidence
             health = getattr(self, "loc_health", "OK")
             if self.inspecting and health != "OK":
-                col = HEALTH_COLOR[health]
-                msg = ("LOCALIZATION LOST" if health == "FAIL"
-                       else f"LOW CONFIDENCE  inliers={self.loc_health_inliers}"
-                            f" reproj={'-' if self.loc_health_reproj is None else f'{self.loc_health_reproj:.1f}'}")
+                col = HEALTH_COLOR.get(health, HEALTH_COLOR["LOW"])
+                if health == "FAIL":
+                    msg = "LOCALIZATION LOST"
+                elif health == "PAUSED_ZOOM":
+                    msg = "LOCALIZATION PAUSED — 相機縮放未校正，回到 1.0x 恢復"
+                else:
+                    msg = (f"LOW CONFIDENCE  inliers={self.loc_health_inliers}"
+                           f" reproj={'-' if self.loc_health_reproj is None else f'{self.loc_health_reproj:.1f}'}")
                 draw.rectangle((18, 20, width - 18, 60), fill=col)
                 draw.text(
                     (width // 2, 40), msg, fill="#0b0c0e", anchor="mm",
@@ -5448,14 +6942,38 @@ class OperatorApp(tk.Tk):
         zoom = getattr(
             getattr(getattr(self, "backend", None), "state", None), "zoom", 1.0)
         if not localization_zoom_is_calibrated(zoom):
+            # A one-off log line scrolls away; the persistent health indicator must
+            # also say localization is not running, otherwise the HUD keeps showing
+            # the last fix and reads as a healthy system.
             if not getattr(self, "_zoom_localization_paused", False):
+                # Snapshot BEFORE overwriting: this runs on every tick while the
+                # zoom is uncalibrated, so without a snapshot taken at entry the
+                # real health is destroyed on the first tick and resume invents
+                # an "OK" that no successful fix ever produced.
+                self._zoom_paused_health = getattr(self, "loc_health", "OK")
                 self._zoom_localization_paused = True
                 if hasattr(self, "write_log"):
                     self.write_log(
                         f"定位暫停：相機縮放 {zoom!s}x 未校正；回到 1.0x 自動恢復")
+            self.loc_health = "PAUSED_ZOOM"
+            # No results arrive while paused, so update_localization_metrics -- the
+            # only other writer of this label -- never runs; without this the panel
+            # keeps showing "定位正常" for the whole pause.
+            paint = getattr(self, "_set_loc_health_display", None)
+            if paint is not None:
+                paint(text="定位暫停：相機縮放未校正",
+                      colour=HEALTH_COLOR["PAUSED_ZOOM"])
             return
         if getattr(self, "_zoom_localization_paused", False):
             self._zoom_localization_paused = False
+            if self.loc_health == "PAUSED_ZOOM":
+                # Restore what was true when the pause began. Forcing "OK" cleared
+                # a LOCALIZATION LOST that no successful fix had replaced: the
+                # banner vanished and the panel read healthy with nothing behind it.
+                self.loc_health = getattr(self, "_zoom_paused_health", "OK") or "OK"
+                if self.loc_health == "PAUSED_ZOOM":
+                    self.loc_health = "OK"
+            self._zoom_paused_health = None
             if hasattr(self, "write_log"):
                 self.write_log("定位恢復：相機縮放已回到校正值 1.0x")
         # Held-frame retries (file/video flight pipeline):
@@ -5554,8 +7072,22 @@ class OperatorApp(tk.Tk):
         if self.localizer is None:
             return
         for raw_result in self.localizer.poll_results():
-            result, xyz = normalize_live_localization_result(raw_result)
+            validated = validate_live_localization_result(raw_result)
+            result, xyz = normalize_live_localization_result(validated)
             annotate_ui_arrival_timing(result)
+            if (
+                bool(result.get("localization_exception"))
+                and str(result.get("next_mode") or result.get("mode") or "").upper()
+                == "LOST"
+            ):
+                marker = result.get("seq", result.get("display_seq"))
+                if marker is None:
+                    marker = result.get("error", "localization_exception")
+                if marker != getattr(self, "_last_localization_exception_seq", None):
+                    self._last_localization_exception_seq = marker
+                    self._engage_real_localization_recovery(
+                        FailureReason.LOCALIZATION_LOST
+                    )
             active_mode = str(result.get("benchmark_mode_active") or "auto")
             if self._loc_benchmark_pending == active_mode:
                 self._reset_localization_benchmark_metrics()
@@ -5594,8 +7126,8 @@ class OperatorApp(tk.Tk):
                 self._last_status_write = _tw
                 try:
                     LIVE_STATUS_PATH.write_text(json.dumps(result, ensure_ascii=False), encoding="utf-8")
-                except Exception:
-                    pass
+                except Exception as exc:
+                    self._record_diagnostic_failure(LIVE_STATUS_PATH, exc)
             if not result.get("success") or not result.get("pose"):
                 if invalid_success_pose:
                     self.loc_health = "FAIL"
@@ -5667,8 +7199,8 @@ class OperatorApp(tk.Tk):
                 self._last_det_write = _tw
                 try:
                     LIVE_DETECTION_STATUS_PATH.write_text(json.dumps(result, ensure_ascii=False), encoding="utf-8")
-                except Exception:
-                    pass
+                except Exception as exc:
+                    self._record_diagnostic_failure(LIVE_DETECTION_STATUS_PATH, exc)
             if not result.get("success"):
                 self.write_log(f"LIVE_DETECT_FAIL {self.detection_result_frame_name}: {result.get('error', 'no boxes')}")
 
@@ -5725,7 +7257,47 @@ class OperatorApp(tk.Tk):
                 self._nudge_keys_held.clear()
                 self._nudge_buttons_held.clear()
                 self.write_log(f"微移 heartbeat 失敗，已清除輸入: {exc!r}")
-        st = self.backend.poll()
+        if self._stick_vector_active and self._is_live_backend():
+            # Same contract as the button heartbeat: a frozen UI stops refreshing
+            # the backend TTL, so a held stick decays to zero PCMD on its own.
+            self._send_stick_vector(self.stick_left.value, self.stick_right.value)
+        try:
+            st = self.backend.poll()
+        except Exception as exc:
+            incident = getattr(getattr(self, "session_logs", None), "incident", None)
+            if callable(incident):
+                try:
+                    incident(
+                        "backend_poll_failed",
+                        error=repr(exc),
+                        resolved=False,
+                    )
+                except Exception:
+                    pass
+            try:
+                self.write_log(f"BACKEND_POLL_FAILED: {exc!r}")
+            except Exception:
+                pass
+            try:
+                self.backend.fail_safe(FailureReason.INVALID_TELEMETRY)
+            except Exception as safe_exc:
+                if callable(incident):
+                    try:
+                        incident(
+                            "backend_poll_fail_safe_failed",
+                            error=repr(safe_exc),
+                            resolved=False,
+                        )
+                    except Exception:
+                        pass
+            now = time.monotonic()
+            self._next_tick_deadline, delay_ms = next_tick_deadline(
+                getattr(self, "_next_tick_deadline", 0.0),
+                now,
+                getattr(self, "_tick_period_s", 0.1),
+            )
+            self.after(delay_ms, self.tick)
+            return
         # Stick override can reclaim authority outside the UI button path.
         if self._is_live_backend() and hasattr(self, "control_owner_var"):
             sticks_now = bool(getattr(self.backend, "pilot_sticks", False))
@@ -5882,11 +7454,16 @@ class OperatorApp(tk.Tk):
             # A result may have arrived on the independent 5 ms poll callback.
             # Consume its one-shot history notification only after this render tick.
             self.live_new_pose = False
-        display_mode = operator_mode_label(self._is_live_backend(), st.mode)
         self._set_widget_text(
             "status", self.status,
-            text=f"{display_mode} | {st.loc} | {st.tracker_state} | stream {st.stream} | "
-                 f"battery {st.battery_pct:.0f}% | inliers {st.inliers} | objects {self.det_count}",
+            # video_hud_identity already ends in "mode=<X>"; appending display_mode
+            # printed the same value twice ("REAL ANAFI | mode=LIVE | LIVE | ...").
+            # Aircraft state only. Localization health, inliers, pose age and frame
+            # age all live in the single overlay on the video they are measured
+            # from -- repeating any of them here is the same fact in two places.
+            text=f"{video_hud_identity(self._is_live_backend(), st.mode)} | "
+                 f"{st.tracker_state} | 串流 {st.stream} | "
+                 f"電量 {st.battery_pct:.0f}%",
         )
         self._update_age_readout(st)
         if hasattr(self, "overall_fps_var"):
@@ -5900,9 +7477,7 @@ class OperatorApp(tk.Tk):
                     "定位 worker 暖機重試中"
                     if startup_error else "定位模型暖機中"
                 )
-                self._set_widget_text(
-                    "loc_health", self.loc_health_label,
-                    text=text, foreground="#b26a00")
+                self._set_loc_health_display(text=text, colour="#b26a00")
             elif (
                 self.localizer is not None
                 and not self.live_result_frame_name
@@ -5914,8 +7489,7 @@ class OperatorApp(tk.Tk):
                 if device:
                     text += f" ({str(device).upper()})"
                 color = "#24733f" if device in (None, "cuda") else "#b26a00"
-                self._set_widget_text(
-                    "loc_health", self.loc_health_label, text=text, foreground=color)
+                self._set_loc_health_display(text=text, colour=color)
             if not self.inspecting:
                 self.overall_fps_var.set("串流 FPS - (待命，按開始定位)")
                 if hasattr(self, "loc_fps_var"):
@@ -6248,16 +7822,57 @@ def main() -> None:
     )
     ap.add_argument(
         "--distance-geofence", action=argparse.BooleanOptionalAction,
-        default=env_bool("SFM_DISTANCE_GEOFENCE", True),
+        # Operator decision 2026-08-06: OFF by default. Enabling it makes takeoff
+        # require a GPS fix, and this site's GPS is unreliable; containment for
+        # manual flight comes from MaxAltitude plus the operator. Link loss is
+        # handled by the onboard policy (RTH when Home is usable, else land).
+        default=env_bool("SFM_DISTANCE_GEOFENCE", False),
         help=(
             "enable NoFlyOverMaxDistance; host monitor also triggers RTH/Landing "
-            "at 95% of the confirmed limit"
+            "at 95%% of the confirmed limit"
         ),
     )
     ap.add_argument(
+        "--max-tilt-deg", type=float,
+        default=float(os.environ.get("SFM_MAX_TILT_DEG",
+                                     DEFAULT_MAX_TILT_DEG)),
+        help="firmware MaxTilt pinned at connect; scales every stick command",
+    )
+    ap.add_argument(
+        "--max-vertical-speed-ms", type=float,
+        default=float(os.environ.get("SFM_MAX_VERTICAL_SPEED_MS",
+                                     DEFAULT_MAX_VERTICAL_SPEED_MS)),
+        help="firmware MaxVerticalSpeed pinned at connect",
+    )
+    ap.add_argument(
+        "--max-rotation-speed-degs", type=float,
+        default=float(os.environ.get("SFM_MAX_ROTATION_SPEED_DEGS",
+                                     DEFAULT_MAX_ROTATION_SPEED_DEGS)),
+        help="firmware MaxRotationSpeed pinned at connect",
+    )
+    ap.add_argument(
+        "--stream-loss-grace-s", type=float,
+        default=float(os.environ.get("SFM_STREAM_LOSS_GRACE_S", 10.0)),
+        help=("how long the video stream must be CONTINUOUSLY stale before control "
+              "is handed back to the sticks; brief latency spikes recover inside it"),
+    )
+    ap.add_argument(
+        "--auto-pc-control", action=argparse.BooleanOptionalAction,
+        default=env_bool("SFM_AUTO_PC_CONTROL", True),
+        help=("take PC control automatically on connect (landed + sticks idle "
+              "only); stick movement always hands control back"),
+    )
+    ap.add_argument(
+        "--rth-min-altitude-m", type=float,
+        default=float(os.environ.get("SFM_RTH_MIN_ALTITUDE_M",
+                                     DEFAULT_RTH_MIN_ALTITUDE_M)),
+        help=("RTH climb altitude pinned at connect; keep at or below "
+              "--max-altitude-m or the recovery breaks your own ceiling"),
+    )
+    ap.add_argument(
         "--min-takeoff-battery-pct", type=float,
-        default=float(os.environ.get("SFM_MIN_TAKEOFF_BATTERY_PCT", "30")),
-        help="fail-closed takeoff battery floor (default 30%%)",
+        default=float(os.environ.get("SFM_MIN_TAKEOFF_BATTERY_PCT", "15")),
+        help="fail-closed takeoff battery floor (default 15%%)",
     )
     ap.add_argument(
         "--require-gps-for-geofence", action=argparse.BooleanOptionalAction,
@@ -6285,6 +7900,17 @@ def main() -> None:
             "simulated-stream requires a video file; use the dedicated launcher "
             "for the approved P119 default"
         )
+    if args.live and args.replay_json and not args.live_localize:
+        # Real-flight interface. state_from_replay() feeds the operator's pose, map
+        # track, heading and localization-quality HUD; sourcing that from a recording
+        # while a live, commandable ANAFI is connected would show a plausible
+        # trajectory that has nothing to do with where the aircraft actually is.
+        # Refuse before anything connects.
+        raise SystemExit(
+            "--replay-json cannot be combined with the real-flight interface: the "
+            "operator HUD must never be driven from a recording while a live aircraft "
+            "is connected. Use --live-localize, or drop --live."
+        )
     site_profile = resolve_operator_site_assets(args, ap)
     if args.live and site_profile is None:
         raise SystemExit(
@@ -6303,13 +7929,32 @@ def main() -> None:
         ap.error("--neuflow-track and --projection-track are separate alternatives")
     if args.projection_track and not args.track_landmarks:
         ap.error("--projection-track requires --track-landmarks or a profile sidecar")
-    if args.max_altitude_m is not None and args.max_altitude_m <= 0:
-        ap.error("--max-altitude-m must be > 0")
-    if args.max_distance_m is not None and args.max_distance_m <= 0:
-        ap.error("--max-distance-m must be > 0")
-    if not 0 <= args.min_takeoff_battery_pct <= 100:
-        ap.error("--min-takeoff-battery-pct must be in [0, 100]")
+    try:
+        live_safety_config = LiveSafetyConfig.resolve(
+            nudge_pct=args.nudge_pct,
+            nudge_pulse_s=args.nudge_pulse_s,
+            max_altitude_m=args.max_altitude_m,
+            max_distance_m=args.max_distance_m,
+            max_tilt_deg=args.max_tilt_deg,
+            max_vertical_speed_ms=args.max_vertical_speed_ms,
+            max_rotation_speed_degs=args.max_rotation_speed_degs,
+            rth_min_altitude_m=args.rth_min_altitude_m,
+            stream_loss_grace_s=args.stream_loss_grace_s,
+            min_takeoff_battery_pct=args.min_takeoff_battery_pct,
+            distance_geofence=args.distance_geofence,
+            require_gps_for_geofence=args.require_gps_for_geofence,
+        )
+    except ValueError as exc:
+        ap.error(str(exc))
+    args.nudge_pulse_s = live_safety_config.nudge_pulse_s
+    print(
+        "[operator] effective_live_safety="
+        f"{json.dumps(live_safety_config.as_log_fields(), sort_keys=True)} "
+        f"sha256={live_safety_config.checksum()}",
+        flush=True,
+    )
     route_path = Path(args.route_json) if args.route_json else None
+    mission_route_snapshot = None
     if route_path is None:
         route_hash = None
         route_points = []
@@ -6318,9 +7963,30 @@ def main() -> None:
             raise SystemExit(f"route JSON not found: {route_path}")
         route_hash = file_sha256(route_path)
         try:
-            route_points = load_route_glomap(str(route_path))
-        except (OSError, ValueError) as exc:
-            raise SystemExit(f"invalid route JSON {route_path}: {exc}") from exc
+            route_map_frame = resolve_site_map_frame(site_profile)
+            flight = site_profile.flight if site_profile is not None else None
+            coordinate_frame_id = (
+                flight.coordinate_frame_id if flight is not None else None
+            )
+            if site_profile is not None and coordinate_frame_id:
+                mission_route_snapshot = capture_mission_route_snapshot(
+                    route_path,
+                    expected_sha256=route_hash,
+                    expected_site_id=site_profile.site_id,
+                    expected_coordinate_frame_id=coordinate_frame_id,
+                    map_frame=route_map_frame or LEGACY_MAP_FRAME,
+                )
+                route_points = mission_route_snapshot.controller_waypoints()
+            else:
+                route_points = load_route_glomap(
+                    str(route_path), map_frame=route_map_frame
+                )
+        except Exception as exc:
+            # Broad on purpose: this also covers resolving the site's gravity
+            # alignment, which raises TypeError on a malformed R. Every failure
+            # here must be an operator-readable startup refusal, not a traceback.
+            raise SystemExit(
+                f"cannot load route {route_path} for this site: {exc}") from exc
     if args.live_detect and not Path(args.detector_model).is_file():
         raise SystemExit(
             f"--live-detect set but model missing: {args.detector_model}; "
@@ -6612,6 +8278,12 @@ def main() -> None:
             max_distance_m=args.max_distance_m,
             distance_geofence=bool(args.distance_geofence),
             min_takeoff_battery_pct=float(args.min_takeoff_battery_pct),
+            max_tilt_deg=float(args.max_tilt_deg),
+            max_vertical_speed_ms=float(args.max_vertical_speed_ms),
+            max_rotation_speed_degs=float(args.max_rotation_speed_degs),
+            rth_min_altitude_m=float(args.rth_min_altitude_m),
+            auto_pc_control=bool(args.auto_pc_control),
+            stream_loss_grace_s=float(args.stream_loss_grace_s),
             require_gps_for_geofence=bool(args.require_gps_for_geofence),
             approved_aircraft_firmware=(
                 hardware_approval.aircraft_firmware_versions
@@ -6692,6 +8364,7 @@ def main() -> None:
             ),
             local_topk=int(getattr(args, "local_topk", 0) or 0),
             query_camera=(site_profile.query_camera if site_profile is not None else None),
+            map_align=(site_profile.map_align if site_profile is not None else ""),
         )
         if args.localizer_backend == "edm":
             edm_m = str(getattr(args, "edm_matcher", "torch") or "torch")
@@ -6778,7 +8451,8 @@ def main() -> None:
                       site_id=(site_profile.site_id if site_profile is not None else ""),
                       site_profile_path=(
                           site_profile.source if site_profile is not None else None
-                      ))
+                      ),
+                      mission_route_snapshot=mission_route_snapshot)
     app.route_pts = route_points
     if app.route_pts:
         print(
@@ -6813,7 +8487,17 @@ def main() -> None:
     if live_backend is not None:
         atexit.register(lambda: _emergency_cleanup("atexit"))
 
+        exit_in_progress = threading.Event()
+
         def _sig_handler(signum, _frame):
+            # Repeated Ctrl-C must not re-enter the landing sequence: the first one
+            # is still issuing Landing and tearing down Olympe, and re-entering it
+            # produced an interpreter-shutdown traceback.
+            if exit_in_progress.is_set():
+                print("[operator] exit already in progress; ignoring extra signal",
+                      flush=True)
+                return
+            exit_in_progress.set()
             _emergency_cleanup(f"signal_{signum}")
             # Destroy UI if still up, then exit.
             try:
@@ -6823,11 +8507,35 @@ def main() -> None:
             # Hard exit after a short grace so Landing can be issued.
             raise SystemExit(0)
 
+        # Arm the exit-safety signals and SAY SO. A silent registration failure
+        # here means "close the terminal and it lands" is simply not true, with
+        # nothing on screen or in the log to reveal it.
+        armed, failed = [], []
         for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
             try:
                 signal.signal(sig, _sig_handler)
-            except Exception:
-                pass
+                armed.append(sig.name)
+            except Exception as exc:
+                failed.append(f"{sig.name}:{exc!r}")
+        exit_safety_armed = EXIT_SAFETY_SIGNALS.issubset(set(armed))
+        print(
+            f"[operator] exit safety armed: {'+'.join(armed) or 'NONE'}"
+            + (f"  FAILED: {'; '.join(failed)}" if failed else ""),
+            flush=True,
+        )
+        if not exit_safety_armed:
+            print(
+                "[operator] WARNING: closing the terminal / Ctrl-C may NOT land "
+                "the aircraft. Land manually before exiting.",
+                flush=True,
+            )
+        try:
+            live_backend.log.event(
+                "exit_safety", ok=exit_safety_armed,
+                armed=armed, failed=failed,
+            )
+        except Exception:
+            pass
 
     try:
         app.mainloop()
@@ -6856,6 +8564,17 @@ def main() -> None:
             f"{app.requested_site_profile} (no takeoff command)",
             flush=True,
         )
+        # execv INHERITS open descriptors. Olympe's pomp loop routinely fails to
+        # tear down ("Error while destroying pomp loop: -16", "fd=... still in
+        # loop"), so the replacement image started holding the SkyController
+        # socket the old backend never released and could not connect. Close
+        # everything above stdio first; the new image needs nothing else.
+        sys.stdout.flush()
+        sys.stderr.flush()
+        try:
+            os.closerange(3, 4096)
+        except OSError as exc:
+            print(f"[operator] closerange before restart failed: {exc!r}", flush=True)
         os.execv(sys.executable, [sys.executable, *restart_argv])
 
 

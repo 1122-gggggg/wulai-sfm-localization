@@ -9,6 +9,7 @@ import os
 import shutil
 from collections.abc import Iterable
 from pathlib import Path
+import re
 from typing import Any
 
 REQUIRED_DIRECTORIES = (
@@ -28,6 +29,9 @@ REQUIRED_FILES = (
     "requirements.txt",
     "requirements-lock.txt",
     "requirements-test.txt",
+    "requirements-test-lock.txt",
+    "pytest.ini",
+    "pyproject.toml",
     "文件/README.md",
     "文件/ARCHITECTURE.md",
     "文件/SYSTEM_SPEC.md",
@@ -40,6 +44,8 @@ REQUIRED_FILES = (
     "tools/package_manifest.py",
     "tools/simulator_preflight.py",
     "tools/system_validation.py",
+    "tools/release_contract.py",
+    "tools/release_activation.py",
     "驗證系統.sh",
     "模擬器/parrot_stimulate/pyproject.toml",
     "模擬器/parrot_stimulate/firmware/manifest.json",
@@ -82,6 +88,9 @@ OUTPUT_EVIDENCE_PREFIXES = (
     "reverse_topk_",
     "video720_",
 )
+WORKSPACE_SIZE_WARNING_BYTES = 20 * 1024**3
+FREE_SPACE_WARNING_PERCENT = 15.0
+AUDIT_OUTPUT_RE = re.compile(r"audit_\d{8}$")
 
 
 def _walk_without_following_links(root: Path) -> Iterable[tuple[Path, os.stat_result]]:
@@ -115,6 +124,8 @@ def classify_output(name: str) -> str:
         return "operations"
     if name in {"validation", "validation_receipts", "production_stream_bench"}:
         return "validation"
+    if AUDIT_OUTPUT_RE.fullmatch(name):
+        return "governance"
     if name.startswith(OUTPUT_EVIDENCE_PREFIXES):
         return "experiment_evidence"
     return "unclassified"
@@ -165,6 +176,17 @@ def audit_workspace(root: str | Path, *, include_sizes: bool = True) -> dict[str
 
     usage_target = workspace if workspace.exists() else workspace.parent
     usage = shutil.disk_usage(usage_target)
+    workspace_size_bytes = sum(top_level_sizes.values()) if include_sizes else None
+    storage_warnings: list[str] = []
+    if workspace_size_bytes is not None and workspace_size_bytes > WORKSPACE_SIZE_WARNING_BYTES:
+        storage_warnings.append(
+            "workspace size is above 20 GiB; review generated data before release"
+        )
+    free_percent = usage.free / usage.total * 100.0 if usage.total else 0.0
+    if free_percent < FREE_SPACE_WARNING_PERCENT:
+        storage_warnings.append(
+            "free space is below 15%; stop before creating large validation artifacts"
+        )
     structural_failures = [
         *(f"missing directory: {name}" for name in missing_directories),
         *(f"missing file: {name}" for name in missing_files),
@@ -180,6 +202,8 @@ def audit_workspace(root: str | Path, *, include_sizes: bool = True) -> dict[str
         "symlinks": symlinks,
         "top_level_bytes": top_level_sizes,
         "output_classes": output_classes,
+        "workspace_size_bytes": workspace_size_bytes,
+        "storage_warnings": storage_warnings,
         "generated_top_level": sorted(
             name for name in GENERATED_TOP_LEVEL if (workspace / name).exists()
         ),
@@ -206,6 +230,8 @@ def format_human(report: dict[str, Any]) -> str:
             f"({report['disk']['free_percent']:.1f}%)"
         ),
     ]
+    for warning in report.get("storage_warnings", []):
+        lines.append(f"WARNING: {warning}")
     sizes = report.get("top_level_bytes", {})
     if sizes:
         lines.append("largest top-level entries:")

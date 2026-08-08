@@ -1,0 +1,31 @@
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+exclude = [
+  ".git",
+  ".venv",
+  ".codegraph",
+  ".pytest_cache",
+  ".ruff_cache",
+  "outputs",
+  "地圖檔",
+  "執行環境/package_git",
+]
+
+[tool.ruff.lint]
+# The repository-wide baseline is intentionally narrow. CI runs these rules on
+# every Python file until the legacy code has a separately reviewed strict baseline.
+select = ["E9", "F63", "F7", "F82"]
+
+[tool.coverage.run]
+branch = true
+source = ["tools", "定位演算法/validation"]
+omit = [
+  "*/tests/*",
+  "*/test_*.py",
+]
+
+[tool.coverage.report]
+# Coverage is collected for trend data; no unrealistic release threshold is set.
+fail_under = 0
+show_missing = true

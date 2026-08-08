@@ -116,6 +116,22 @@ def _pose_center_yaw_from_ret(ret) -> tuple[np.ndarray, float]:
     return C.astype(np.float32), yaw
 
 
+def _map_heading_from_forward(fwd: np.ndarray, map_frame,
+                              fallback_yaw: float) -> float:
+    """Public pose heading; internal reference-yaw convention stays untouched."""
+    if map_frame is None:
+        return float(fallback_yaw)
+    return float(map_frame.heading(np.asarray(fwd, dtype=float)))
+
+
+def _pose_map_yaw_from_ret(ret, map_frame, fallback_yaw: float) -> float:
+    if map_frame is None:
+        return float(fallback_yaw)
+    R = ret["cam_from_world"].rotation.matrix()
+    fwd = R.T @ np.array([0.0, 0.0, 1.0])
+    return _map_heading_from_forward(fwd, map_frame, fallback_yaw)
+
+
 def _ret_inlier_mask(ret, n_corr: int) -> np.ndarray | None:
     if ret is None:
         return None
@@ -125,6 +141,22 @@ def _ret_inlier_mask(ret, n_corr: int) -> np.ndarray | None:
             if mask.shape[0] == int(n_corr):
                 return mask
     return None
+
+
+def _inlier_distribution(
+    ret, pts2d: np.ndarray, width: int, height: int,
+) -> tuple[float, int]:
+    """Return inlier ratio and occupied cells in the production 5x3 image grid."""
+    points = np.asarray(pts2d, dtype=float)
+    mask = _ret_inlier_mask(ret, len(points))
+    if mask is None or not np.any(mask):
+        return 0.0, 0
+    inliers = points[mask]
+    gx = np.clip((inliers[:, 0] * 5.0 / max(int(width), 1)).astype(int), 0, 4)
+    gy = np.clip((inliers[:, 1] * 3.0 / max(int(height), 1)).astype(int), 0, 2)
+    return float(np.count_nonzero(mask) / max(len(points), 1)), int(
+        len(np.unique(gy * 5 + gx))
+    )
 
 
 def scaled_simple_radial_camera(width0: int, height0: int, params0: list[float],
@@ -234,6 +266,8 @@ class ProductionConfig:
     track_min_inliers: int = 50
     weak_min_inliers: int = 30
     good_inliers: int = 80
+    min_inlier_ratio: float = 0.15
+    min_inlier_grid_cells: int = 6
     max_reproj_error_acquire: float = 5.0
     max_reproj_error_track: float = 5.0
     pnp_ransac_max_error: float = 5.0
@@ -277,6 +311,16 @@ class ProductionConfig:
     flow_mnn_max_yaw_deg: float = 3.0
     flow_mnn_min_unique_inliers: int = 80
     flow_mnn_max_reproj: float = 3.5
+
+    def __post_init__(self) -> None:
+        if not math.isfinite(float(self.min_inlier_ratio)) or not (
+            0.0 < float(self.min_inlier_ratio) <= 1.0
+        ):
+            raise ValueError("min_inlier_ratio must be finite and within (0, 1]")
+        if isinstance(self.min_inlier_grid_cells, bool) or not (
+            1 <= int(self.min_inlier_grid_cells) <= 15
+        ):
+            raise ValueError("min_inlier_grid_cells must be within [1, 15]")
 
 
 @dataclass
@@ -579,7 +623,8 @@ class MegaLocLayer:
 class ProductionXFeatTracker(Localizer):
     def __init__(self, reloc_map: XFeatRelocMap, megaloc: MegaLocLayer,
                  frame_source, query_cam: Camera,
-                 cfg: ProductionConfig | None = None):   # avoid shared mutable default
+                 cfg: ProductionConfig | None = None,
+                 map_frame=None):   # avoid shared mutable default
         n_refs = len(reloc_map.ref_names)
         if reloc_map.ref_centers is None or len(reloc_map.ref_centers) != n_refs:
             got = 0 if reloc_map.ref_centers is None else len(reloc_map.ref_centers)
@@ -600,6 +645,7 @@ class ProductionXFeatTracker(Localizer):
         self.frame_source = frame_source
         self.cam = query_cam
         self.cfg = cfg if cfg is not None else ProductionConfig()
+        self.map_frame = map_frame
         # Cache each ref's XFeat features on the GPU so they are uploaded once, not every frame.
         self._ref_dev_cache: OrderedDict[int, dict] = OrderedDict()
         self.state = RuntimeState()
@@ -1229,6 +1275,12 @@ class ProductionXFeatTracker(Localizer):
         info["pnp_failed"] = ret is None
         info["inliers"] = 0 if ret is None else int(ret.get("num_inliers", 0))
         info["reproj_rms"] = None if ret is None else self._estimate_reproj_rms(ret, pts2d_arr, pts3d_arr)
+        ratio, cells = _inlier_distribution(
+            ret, pts2d_arr, self.cam.width, self.cam.height
+        )
+        info["inlier_ratio"] = ratio
+        info["inlier_grid_cells"] = cells
+        info["inlier_coverage"] = float(cells / 15.0)
         # additive hook: expose the accepted inlier 2D<->3D so an optical-flow tracker can
         # seed on refresh (does NOT affect pose/gate/behavior; just stores the arrays)
         _m = _ret_inlier_mask(ret, len(pts3d_arr))
@@ -1253,11 +1305,6 @@ class ProductionXFeatTracker(Localizer):
             self._last_inl_2d = self._last_inl_3d = None
         info["unique_query_inliers"] = (
             0 if inlier_2d is None else int(len(np.unique(inlier_2d, axis=0))))
-        # diagnostics only: fraction of occupied 5x3 grid cells among inlier keypoints
-        if self._last_inl_2d is not None and len(self._last_inl_2d):
-            gx = np.clip((self._last_inl_2d[:, 0] * 5.0 / max(self.cam.width, 1)).astype(int), 0, 4)
-            gy = np.clip((self._last_inl_2d[:, 1] * 3.0 / max(self.cam.height, 1)).astype(int), 0, 2)
-            info["inlier_coverage"] = float(len(np.unique(gy * 5 + gx)) / 15.0)
         if (
             self.cfg.temporal_cache_enabled
             and ret is not None
@@ -1348,6 +1395,12 @@ class ProductionXFeatTracker(Localizer):
         info["pnp_ms"] = _timing_ms(t0)
         info["inliers"] = 0 if ret is None else int(ret.get("num_inliers", 0))
         info["reproj_rms"] = None if ret is None else self._estimate_reproj_rms(ret, pts2d_arr, pts3d_arr)
+        ratio, cells = _inlier_distribution(
+            ret, pts2d_arr, self.cam.width, self.cam.height
+        )
+        info["inlier_ratio"] = ratio
+        info["inlier_grid_cells"] = cells
+        info["inlier_coverage"] = float(cells / 15.0)
         if ret is not None:
             payload = self._cache_payload_from_temporal_inliers(ret, cache_idx, "temporal_nn")
             if payload:
@@ -1359,10 +1412,25 @@ class ProductionXFeatTracker(Localizer):
         if ret is None:
             return False, False, None
         center, yaw = _pose_center_yaw_from_ret(ret)
-        pose = Pose(x=float(center[0]), y=float(center[1]), z=float(center[2]), yaw=yaw,
+        pose_yaw = _pose_map_yaw_from_ret(
+            ret, getattr(self, "map_frame", None), yaw
+        )
+        info["_tracker_yaw"] = float(yaw)
+        pose = Pose(x=float(center[0]), y=float(center[1]), z=float(center[2]), yaw=pose_yaw,
                     stamp=float(self._frame_capture_stamp))
         ninl = int(info.get("inliers", 0))
         reproj = info.get("reproj_rms")
+        ratio = info.get("inlier_ratio")
+        cells = info.get("inlier_grid_cells")
+        if ratio is None or not math.isfinite(float(ratio)):
+            info["quality_rejected"] = "missing_inlier_ratio"
+            return False, False, pose
+        if float(ratio) < float(self.cfg.min_inlier_ratio):
+            info["quality_rejected"] = "inlier_ratio"
+            return False, False, pose
+        if cells is None or int(cells) < int(self.cfg.min_inlier_grid_cells):
+            info["quality_rejected"] = "inlier_spread"
+            return False, False, pose
         is_acquire = mode in ("BOOT_INIT", "LOST", "GLOBAL_RETRY")
         if is_acquire:
             if ninl < self.cfg.acquire_min_inliers:
@@ -1397,7 +1465,7 @@ class ProductionXFeatTracker(Localizer):
                         return False, False, pose
             if has_prior and self.state.last_yaw is not None \
                     and self.cfg.acquire_max_yaw_diff_deg > 0:
-                yaw_delta = abs(_angle_diff(float(pose.yaw), float(self.state.last_yaw)))
+                yaw_delta = abs(_angle_diff(float(yaw), float(self.state.last_yaw)))
                 info["acquire_yaw_delta_deg"] = math.degrees(yaw_delta)
                 if yaw_delta > math.radians(float(self.cfg.acquire_max_yaw_diff_deg)):
                     info["acquire_yaw_rejected"] = True
@@ -1441,7 +1509,7 @@ class ProductionXFeatTracker(Localizer):
         self.state.prev_yaw = self.state.last_yaw
         self.state.last_pose = pose
         self.state.last_center = np.array([pose.x, pose.y, pose.z], np.float32)
-        self.state.last_yaw = float(pose.yaw)
+        self.state.last_yaw = float(info.get("_tracker_yaw", pose.yaw))
         self.state.last_refs = list(info.get("used_refs") or info.get("candidates", [])[:3])
         self.state.fail_count = 0
         if getattr(self, "lock_track_only", False):
@@ -1653,6 +1721,9 @@ class ProductionXFeatTracker(Localizer):
             return self._flow_fallback_deep(
                 frame, "track_lowconf", inliers=inl, reproj_rms=reproj, tracked=int(len(n3d)))
         center, yaw = _pose_center_yaw_from_ret(ret)
+        pose_yaw = _pose_map_yaw_from_ret(
+            ret, getattr(self, "map_frame", None), yaw
+        )
         # max_jump gate (same intent as the deep _gate): a KLT/PnP flip can look inlier/reproj
         # consistent yet jump far. Tracked motion is always small, so a big jump from the last
         # published center is not published (hover + deep refresh next frame).
@@ -1676,7 +1747,7 @@ class ProductionXFeatTracker(Localizer):
                     **crosscheck,
                 )
         pose = Pose(x=float(center[0]), y=float(center[1]), z=float(center[2]),
-                    yaw=float(yaw), stamp=float(self._frame_capture_stamp))
+                    yaw=float(pose_yaw), stamp=float(self._frame_capture_stamp))
         self._flow_2d, self._flow_3d, self._flow_gray = n2d, n3d, gray
         self._flow_age += 1
         # keep the deep matcher's motion prior current for the next refresh

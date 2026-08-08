@@ -7,7 +7,7 @@ Git 版控不包含實際場域點雲、localization bundle、影片、飛行紀
 本機 workspace 會在被忽略的資料目錄保存它們。系統架構、目錄所有權與相容鏡像
 規則見 [`文件/ARCHITECTURE.md`](文件/ARCHITECTURE.md)。
 
-最後整理：2026-08-03。歷史設計決策與安全需求見 [`文件/SYSTEM_SPEC.md`](文件/SYSTEM_SPEC.md)；
+最後整理：2026-08-07。歷史設計決策與安全需求見 [`文件/SYSTEM_SPEC.md`](文件/SYSTEM_SPEC.md)；
 目前可執行的場域與發布契約以本 README、site profile schema 與 preflight 為準。最近一次
 結構／容量與優化稽核見 [`文件/WORKSPACE_AUDIT.md`](文件/WORKSPACE_AUDIT.md)。
 
@@ -90,6 +90,9 @@ cd /path/to/source/localization
 # 在新電腦建立乾淨 CPython 3.10 虛擬環境並安裝固定套件
 bash tools/install_runtime.sh
 
+# 驗證／測試所需套件也從 hash lock 安裝（不使用 system site packages）
+bash tools/install_runtime.sh --test-deps
+
 # 匯入完整地圖場域包到地圖檔/場域/<site>/，再由選擇介面挑選地圖與影片
 ./控制介面程式/影片模擬串流/選擇啟動.sh
 ```
@@ -113,6 +116,16 @@ CPython 3.10 的 `venv/ensurepip`（Ubuntu/Debian 通常是 `python3.10-venv`）
 `ffmpeg`、`python3-tk`、X11/XWayland 與 NVIDIA CUDA driver。
 首次執行安裝器需要網路連線，並需預留數 GB 空間下載 PyTorch/CUDA 與其他固定
 Python wheels；安裝完成後，模擬介面可在模型與場域資產都已備妥時離線執行。
+
+`scipy` 目前刻意不在 runtime hash lock。`SparseCloudCollisionMonitor` 的 guarded
+import 只提供非 production 的稀疏點雲警告，且沒有接入 autonomous safety；因此
+`tools/simulator_preflight.py --json` 會在
+`runtime.collision_monitor` 明確記錄 `status=unavailable`（即使某個開發環境碰巧
+能 import scipy）、`production_safety=false` 與
+`collision_protection_claim=false`。需要此 monitor 作為 production safety 時，必須
+先完成 production safety wiring 的審查，以及 scipy 版本／平台 wheel hash lock，
+再以 `--require-collision-monitor` 執行 fail-closed preflight；沒有這些證據不得
+宣稱具備 collision protection。
 
 ## 現有場域
 
@@ -262,6 +275,10 @@ worker 自己的錯誤在 `/tmp/sfm_live_localizer_worker.log`，操作介面的
 入口使用主 Python 3.10 與獨立 Python 3.11 `parrot_stimulate` 環境，執行
 pytest、ruff、mirror、flight selftest、dependency、profile/SHA、CUDA 與離線模型檢查，
 並寫入 `outputs/validation_receipts/`。任一必要項失敗時整體 exit code 非零。
+CI 與 `tools/test_clean_install.sh` 由 `requirements-test-lock.txt` 提供固定的
+pytest-timeout、coverage 與 pytest-cov；測試使用每測試 300 秒上限並收集 coverage，
+但不設不切實際的 coverage release threshold。validation receipt 會彙整 pytest
+各 step 的 conditional skip，未執行的測試不會被當成通過。
 
 `parrot_stimulate` 明確要求 Python 3.11，因此使用自己的 `.venv` 驗證，
 不由根目錄的 Python 3.10 pytest 跨版本收集。實際通過數以當次輸出為準。

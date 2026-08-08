@@ -1,0 +1,21 @@
+name: validation
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  root:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - name: Install hash-locked test dependencies
+        run: python -m pip install --require-hashes -r requirements-test-lock.txt
+      - name: Root lint baseline
+        run: ruff check .
+      - name: Root tests with bounded runtime
+        run: python -m pytest -q --timeout=300 --cov --cov-config="$GITHUB_WORKSPACE/pyproject.toml" --cov-report=term-missing --cov-fail-under=0

@@ -38,7 +38,7 @@ fi
 
 # 從 site profile 取出這個場域的點雲與航線輸出目錄，避免手動指定而配錯場域。
 eval "$("$PY" - "$SITE_PROFILE" <<'PY'
-import json, sys
+import json, shlex, sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 src = Path(sys.argv[1]).resolve()
@@ -64,11 +64,17 @@ else:
     while pack.name and pack.name != "maps":
         pack = pack.parent
     out_dir = str(pack.parent / "routes" / "authored")
-print(f"SITE_ID={raw.get('site_id','')!r}")
-print(f"SITE_NAME={raw.get('display_name','')!r}")
-print(f"MAP_PLY={map_ply!r}")
-print(f"REF_POSES={resolve(raw.get('map_reference_poses'))!r}")
-print(f"OUT_DIR={out_dir!r}")
+def emit(name, value):
+    # 用 shlex.quote 而非 repr：repr 遇到撇號會改用雙引號，bash 會在雙引號內
+    # 展開 $(...)，讓 site profile 的字串（例如 display_name）能注入指令。
+    print(f"{name}={shlex.quote(str(value))}")
+
+
+emit("SITE_ID", raw.get("site_id", ""))
+emit("SITE_NAME", raw.get("display_name", ""))
+emit("MAP_PLY", map_ply)
+emit("REF_POSES", resolve(raw.get("map_reference_poses")))
+emit("OUT_DIR", out_dir)
 PY
 )"
 
