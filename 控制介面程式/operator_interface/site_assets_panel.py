@@ -1,6 +1,7 @@
 """Tk layout for the three explicit site-asset import interfaces."""
 from __future__ import annotations
 
+import hashlib
 import threading
 import queue
 from pathlib import Path
@@ -65,6 +66,7 @@ class SiteAssetsPanel(ttk.LabelFrame):
         #: refused while the aircraft is not confirmed landed.
         self.flight_state_check = flight_state_check or (lambda: (True, ""))
         self.status_var = tk.StringVar(value="① 請先匯入建圖端輸出資料夾")
+        self._busy = False
         self._buttons: list[ttk.Button] = []
         #: Buttons that must stay disabled regardless of the busy state.
         self._permanently_disabled: set[ttk.Button] = set()
@@ -111,9 +113,8 @@ class SiteAssetsPanel(ttk.LabelFrame):
                 available = list_site_packages(self.site_packages_root)
             except Exception as exc:
                 self.status_var.set(f"場域清單讀取失敗，請用「其他資料夾…」：{exc}")
-        # Switching to the site already loaded re-imports it and re-execs the whole
-        # app to arrive back where it started. Drop that button rather than leave a
-        # control whose only effect is a restart.
+        # Drop the active site from the shortcuts: selecting it would only rebuild
+        # the same localization/control runtime.
         active = self._active_site_label(available)
         available = [item for item in available if not self._is_active_site(item)]
         heading = f"切換場域（目前：{active}）" if active else "切換場域"
@@ -162,13 +163,15 @@ class SiteAssetsPanel(ttk.LabelFrame):
     def _build_route_choices(self, row: int) -> int:
         """One button per route this site already has. Returns the next free row.
 
-        Applying a site re-execs the process, so the active site cannot change
-        under this list -- it is built once and stays correct for the session.
+        The panel is rebuilt after an in-process site switch, so these choices
+        always belong to the active site's package.
         """
         if self.site_pack_root is None:
             return row
         try:
-            routes = describe_site_routes(self.site_pack_root)
+            routes = self._dedupe_route_choices(
+                describe_site_routes(self.site_pack_root)
+            )
         except Exception as exc:
             self.status_var.set(f"航線清單讀取失敗，請用「匯入航線 JSON」：{exc}")
             return row
@@ -176,7 +179,7 @@ class SiteAssetsPanel(ttk.LabelFrame):
             return row
         ttk.Label(
             self,
-            text="可用航線（選定下一次 AUTO）",
+            text="可選航線（點擊後切換顯示）",
             font=("Sans", 9, "bold"),
         ).grid(
             row=row, column=0, sticky="w", padx=(8, 5), pady=(2, 2)
@@ -195,6 +198,27 @@ class SiteAssetsPanel(ttk.LabelFrame):
             button.pack(side="left", padx=(0, 6))
             self._buttons.append(button)
         return row + 1
+
+    @staticmethod
+    def _dedupe_route_choices(routes):
+        """Keep one deterministic, operator-meaningful entry per route payload."""
+        unique = {}
+        for item in routes:
+            digest = hashlib.sha256(item.path.read_bytes()).hexdigest()
+            current = unique.get(digest)
+            if current is None or (
+                SiteAssetsPanel._route_choice_key(item)
+                < SiteAssetsPanel._route_choice_key(current)
+            ):
+                unique[digest] = item
+        return sorted(unique.values(), key=SiteAssetsPanel._route_choice_key)
+
+    @staticmethod
+    def _route_choice_key(item):
+        """Prefer canonical route names, then use path spelling as a stable tie-break."""
+        name = item.path.name.casefold()
+        canonical = name in {"flight_route.json", "flight_path.json"}
+        return (not canonical, name, item.path.as_posix().casefold())
 
     def _preview_existing_route(self, path: Path) -> None:
         """Validate and select one route for this session's next AUTO request.
@@ -244,6 +268,10 @@ class SiteAssetsPanel(ttk.LabelFrame):
             button.configure(state=state)
 
     def _run(self, label: str, action: Callable[[], ActionResult]) -> None:
+        if getattr(self, "_busy", False):
+            self.status_var.set(f"{label}：前一個資產作業尚未完成")
+            return
+        self._busy = True
         self._set_busy(True)
         self.status_var.set(f"{label}：驗證中…")
 
@@ -271,10 +299,12 @@ class SiteAssetsPanel(ttk.LabelFrame):
             self._finish_ok(result)
 
     def _finish_error(self, label: str, exc: Exception) -> None:
+        self._busy = False
         self._set_busy(False)
         self.status_var.set(f"{label}失敗：{exc}")
 
     def _finish_ok(self, result: ActionResult) -> None:
+        self._busy = False
         self._set_busy(False)
         self.status_var.set(result.message)
         if result.kind == "route" and self.route_imported is not None:
@@ -284,8 +314,8 @@ class SiteAssetsPanel(ttk.LabelFrame):
             outcome = "declined"
             if folder is not None:
                 outcome = self.follow_up_route_for_site(folder)
-            # Applying restarts the interface. Never do that out from under an
-            # editor the operator was just sent into to draw a route.
+            # Never switch the runtime out from under an editor that was just
+            # opened to draw the route.
             if outcome != "drawing":
                 self.offer_apply_after_import()
 
@@ -433,6 +463,12 @@ class SiteAssetsPanel(ttk.LabelFrame):
             self._import_site_folder(folder)
 
     def _choose_route(self) -> None:
+        flight_state_check = getattr(self, "flight_state_check", None)
+        if callable(flight_state_check):
+            safe, reason = flight_state_check()
+            if not safe:
+                self.status_var.set(f"航線匯入已拒絕：{reason}")
+                return
         # Open where this field's routes and drafts actually are, so picking among
         # several is one click rather than a hunt through the filesystem.
         initial = ""
@@ -454,7 +490,16 @@ class SiteAssetsPanel(ttk.LabelFrame):
             filetypes=(("JSON", "*.json"),),
         )
         if source:
-            self._run("航線匯入", lambda: self.actions.import_route(source))
+            def import_route() -> ActionResult:
+                # Re-check on the worker immediately before the write: the
+                # aircraft can become airborne while the file picker is open.
+                if callable(flight_state_check):
+                    safe, reason = flight_state_check()
+                    if not safe:
+                        raise ValueError(f"航線匯入已拒絕：{reason}")
+                return self.actions.import_route(source)
+
+            self._run("航線匯入", import_route)
 
     def _open_route_editor(self, edit_current: bool) -> None:
         if self.request_route_editor is None:
@@ -482,12 +527,13 @@ class SiteAssetsPanel(ttk.LabelFrame):
             self._run("巡檢目標匯入", lambda: self.actions.import_targets(source))
 
     def offer_apply_after_import(self) -> bool:
-        """Ask whether to restart into the site just imported. True if applying."""
+        """Ask whether to activate the imported site. True if applying."""
         if self.actions.current_profile is None:
             return False
         if not self.ask_yes_no(
             "切換到這個場域",
-            "匯入完成。要立即重啟介面套用這個場域嗎？（僅限已落地）",
+            "匯入完成。要立即重建定位／飛控連線並套用這個場域嗎？"
+            "（介面保持開啟，僅限已落地）",
         ):
             self.status_var.set(
                 f"{self.status_var.get()}；尚未套用，之後再切換場域即可"
@@ -505,3 +551,23 @@ class SiteAssetsPanel(ttk.LabelFrame):
             self.request_apply(profile)
         except Exception as exc:
             self.status_var.set(f"套用失敗：{exc}")
+
+    def activate_site(
+        self,
+        profile_path: str | Path,
+        site_pack_root: str | Path | None,
+    ) -> None:
+        """Rebuild shortcuts and routes after an in-process runtime swap."""
+        self.actions.current_profile = Path(profile_path).expanduser().resolve()
+        self.site_pack_root = (
+            None
+            if site_pack_root is None
+            else Path(site_pack_root).expanduser().resolve()
+        )
+        for child in self.winfo_children():
+            child.destroy()
+        self._buttons.clear()
+        self._permanently_disabled.clear()
+        self._pending_site_folder = None
+        self._result_queue = queue.Queue(maxsize=1)
+        self._build()

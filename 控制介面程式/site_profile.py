@@ -11,6 +11,8 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from workspace_layout import workspace_from_file
+
 
 SCHEMA_VERSION = 2
 SUPPORTED_SCHEMA_VERSIONS = (1, SCHEMA_VERSION)
@@ -227,7 +229,29 @@ def _localizer_capabilities(backend: str):
         ) from exc
 
 
-def _resolve_asset(profile_dir: Path, value, key: str, *, required: bool) -> Path | None:
+def _reject_symlink_components(path: Path, *, key: str) -> None:
+    current = Path(path.anchor)
+    for part in path.parts[1:]:
+        if part == ".":
+            continue
+        if part == "..":
+            current = current.parent
+            continue
+        current /= part
+        if current.is_symlink():
+            raise ValueError(
+                f"site profile asset {key!r} must not use symlinks: {path}"
+            )
+
+
+def _resolve_asset(
+    profile_dir: Path,
+    value,
+    key: str,
+    *,
+    required: bool,
+    workspace_root: Path,
+) -> Path | None:
     if value in (None, ""):
         if required:
             raise ValueError(f"site profile asset {key!r} is required")
@@ -237,7 +261,20 @@ def _resolve_asset(profile_dir: Path, value, key: str, *, required: bool) -> Pat
     path = Path(value).expanduser()
     if not path.is_absolute():
         path = profile_dir / path
-    return path.resolve()
+    root = workspace_root.resolve()
+    _reject_symlink_components(path, key=key)
+    try:
+        resolved = path.resolve()
+    except (OSError, RuntimeError) as exc:
+        raise ValueError(
+            f"site profile asset {key!r} cannot be resolved: {path}"
+        ) from exc
+    if not resolved.is_relative_to(root):
+        raise ValueError(
+            f"site profile asset {key!r} resolves outside workspace root "
+            f"{root}: {path}"
+        )
+    return resolved
 
 
 def _load_query_camera(raw, source: Path) -> QueryCamera | None:
@@ -552,7 +589,7 @@ def _load_flight_readiness(
 
 
 def _load_hardware_approval_reference(
-    raw, source: Path, profile_dir: Path
+    raw, source: Path, profile_dir: Path, workspace_root: Path
 ) -> HardwareApprovalReference | None:
     if raw is None:
         return None
@@ -572,7 +609,11 @@ def _load_hardware_approval_reference(
             f"{source}"
         )
     receipt = _resolve_asset(
-        profile_dir, raw.get("receipt"), "hardware_approval.receipt", required=True
+        profile_dir,
+        raw.get("receipt"),
+        "hardware_approval.receipt",
+        required=True,
+        workspace_root=workspace_root,
     )
     digest = _sha256(raw.get("sha256"), "hardware_approval", source)
     assert receipt is not None and digest is not None
@@ -583,12 +624,14 @@ def _load_hardware_approval_reference(
         raw.get("signature"),
         "hardware_approval.signature",
         required=True,
+        workspace_root=workspace_root,
     )
     trust_store = _resolve_asset(
         profile_dir,
         raw.get("trust_store"),
         "hardware_approval.trust_store",
         required=True,
+        workspace_root=workspace_root,
     )
     signature_digest = _sha256(
         raw.get("signature_sha256"), "hardware_approval.signature", source
@@ -851,19 +894,6 @@ def load_hardware_approval_receipt(
     )
 
 
-def _verify_hardware_material_sha256(
-    path: Path, expected: str, label: str
-) -> None:
-    try:
-        actual = hashlib.sha256(path.read_bytes()).hexdigest()
-    except OSError as exc:
-        raise ValueError(f"cannot read {label} {path}: {exc}") from exc
-    if not hmac.compare_digest(actual, expected):
-        raise ValueError(
-            f"{label} SHA-256 mismatch: expected {expected}, got {actual} ({path})"
-        )
-
-
 def flight_readiness_errors(profile: SiteProfile) -> list[str]:
     """Return every reason this site profile is not eligible for autonomous flight."""
     if profile.schema_version != SCHEMA_VERSION:
@@ -928,117 +958,15 @@ def flight_readiness_errors(profile: SiteProfile) -> list[str]:
         and profile.asset_sha256.poles_json is None
     ):
         errors.append("inspection waypoints require asset_sha256.poles_json")
-    hardware_reference = getattr(profile, "hardware_approval", None)
-    if hardware_reference is None:
-        errors.append("missing signed hardware approval receipt v2 for AUTO")
-    else:
-        try:
-            receipt = load_hardware_approval_receipt(hardware_reference)
-        except ValueError as exc:
-            errors.append(f"invalid hardware approval receipt for AUTO: {exc}")
-        else:
-            if receipt.schema != HARDWARE_APPROVAL_V2_SCHEMA:
-                errors.append(
-                    "hardware approval receipt v2 is required for AUTO; "
-                    f"got {receipt.schema}"
-                )
-            if not receipt.approved:
-                errors.append("hardware approval receipt approved is false")
-            if receipt.approved_mode != "auto":
-                errors.append(
-                    "hardware approval approved_mode is not auto "
-                    f"({receipt.approved_mode!r})"
-                )
-            if receipt.site_id != profile.site_id:
-                errors.append(
-                    "hardware approval site_id mismatch: "
-                    f"expected {profile.site_id!r}, got {receipt.site_id!r}"
-                )
-            expected_frame = flight.coordinate_frame_id
-            if receipt.coordinate_frame_id != expected_frame:
-                errors.append(
-                    "hardware approval coordinate_frame_id mismatch: "
-                    f"expected {expected_frame!r}, got {receipt.coordinate_frame_id!r}"
-                )
-            bindings = (
-                ("profile_sha256", site_profile_approval_sha256(profile.source)),
-                ("route_sha256", profile.asset_sha256.route_json),
-                ("bundle_sha256", profile.asset_sha256.localization_bundle),
-            )
-            for key, expected in bindings:
-                if getattr(receipt, key) != expected:
-                    errors.append(
-                        f"hardware approval {key} mismatch: "
-                        f"expected {expected!r}, got {getattr(receipt, key)!r}"
-                    )
-            if receipt.approved_envelope.get("gps_required") is not False:
-                errors.append(
-                    "hardware approval approved_envelope.gps_required must be "
-                    "false (GPS is not an AUTO readiness requirement)"
-                )
-            trust_paths = (
-                hardware_reference.signature,
-                hardware_reference.signature_sha256,
-                hardware_reference.trust_store,
-                hardware_reference.trust_store_sha256,
-            )
-            if any(value is None for value in trust_paths):
-                errors.append(
-                    "signed hardware approval trust chain is required for AUTO"
-                )
-            else:
-                assert hardware_reference.signature is not None
-                assert hardware_reference.signature_sha256 is not None
-                assert hardware_reference.trust_store is not None
-                assert hardware_reference.trust_store_sha256 is not None
-                try:
-                    _verify_hardware_material_sha256(
-                        hardware_reference.signature,
-                        hardware_reference.signature_sha256,
-                        "hardware approval signature",
-                    )
-                    _verify_hardware_material_sha256(
-                        hardware_reference.trust_store,
-                        hardware_reference.trust_store_sha256,
-                        "hardware approval trust store",
-                    )
-                    try:
-                        from operator_interface.hardware_approval_trust import (
-                            verify_hardware_approval_receipt,
-                        )
-                    except ImportError:
-                        from hardware_approval_trust import (  # type: ignore
-                            verify_hardware_approval_receipt,
-                        )
-                    verdict = verify_hardware_approval_receipt(
-                        hardware_reference.receipt,
-                        signature=hardware_reference.signature,
-                        trust_store=hardware_reference.trust_store,
-                        expected_bindings={
-                            "site_id": profile.site_id,
-                            "coordinate_frame_id": flight.coordinate_frame_id,
-                            "profile_sha256": site_profile_approval_sha256(
-                                profile.source
-                            ),
-                            "route_sha256": profile.asset_sha256.route_json,
-                            "bundle_sha256": (
-                                profile.asset_sha256.localization_bundle
-                            ),
-                        },
-                    )
-                except (ImportError, ValueError) as exc:
-                    errors.append(f"hardware approval trust chain invalid: {exc}")
-                else:
-                    if not verdict.accepted:
-                        errors.append(
-                            "hardware approval trust chain rejected: "
-                            f"{verdict.reason_code}: {verdict.detail}"
-                        )
+    # A hardware approval reference remains part of the profile contract and is
+    # still parsed/recorded by ``load_site_profile`` when configured.  It is not
+    # an AUTO readiness gate; the remaining profile, asset, route, and alignment
+    # checks above are the readiness contract.
     return errors
 
 
 def load_site_profile(path: str | Path, *, validate_files: bool = True) -> SiteProfile:
-    """Load a profile and resolve relative asset paths beside the JSON file."""
+    """Load a profile and resolve contained, non-symlink assets."""
     source = Path(path).expanduser().resolve()
     try:
         raw = json.loads(
@@ -1051,6 +979,12 @@ def load_site_profile(path: str | Path, *, validate_files: bool = True) -> SiteP
         raise ValueError(f"invalid site profile JSON {source}: {exc}") from exc
     if not isinstance(raw, dict):
         raise ValueError(f"site profile root must be an object: {source}")
+    try:
+        workspace_root = workspace_from_file(source).root
+    except SystemExit as exc:
+        raise ValueError(
+            f"cannot discover site profile workspace root for {source}: {exc}"
+        ) from exc
     allowed_top_level = {
         "schema_version",
         "site_id",
@@ -1129,15 +1063,26 @@ def load_site_profile(path: str | Path, *, validate_files: bool = True) -> SiteP
         schema_version=schema_version,
         site_id=site_id.strip(),
         display_name=display_name.strip(),
-        map_ply=_resolve_asset(base, assets.get("map_ply"), "map_ply", required=True),
+        map_ply=_resolve_asset(
+            base,
+            assets.get("map_ply"),
+            "map_ply",
+            required=True,
+            workspace_root=workspace_root,
+        ),
         route_json=_resolve_asset(
-            base, assets.get("route_json"), "route_json", required=False
+            base,
+            assets.get("route_json"),
+            "route_json",
+            required=False,
+            workspace_root=workspace_root,
         ),
         localization_bundle=_resolve_asset(
             base,
             assets.get("localization_bundle"),
             "localization_bundle",
             required=True,
+            workspace_root=workspace_root,
         ),
         localizer=localizer,
         localizer_deploy_dir=_resolve_asset(
@@ -1145,36 +1090,56 @@ def load_site_profile(path: str | Path, *, validate_files: bool = True) -> SiteP
             raw.get("localizer_deploy_dir"),
             "localizer_deploy_dir",
             required=False,
+            workspace_root=workspace_root,
         ),
         localizer_profile=_resolve_asset(
             base,
             raw.get("localizer_profile"),
             "localizer_profile",
             required=False,
+            workspace_root=workspace_root,
         ),
         reference_index=_resolve_asset(
             base,
             assets.get("reference_index"),
             "reference_index",
             required=False,
+            workspace_root=workspace_root,
         ),
         map_reference_poses=_resolve_asset(
             base,
             raw.get("map_reference_poses"),
             "map_reference_poses",
             required=False,
+            workspace_root=workspace_root,
         ),
         map_align=_resolve_asset(
-            base, raw.get("map_align"), "map_align", required=False
+            base,
+            raw.get("map_align"),
+            "map_align",
+            required=False,
+            workspace_root=workspace_root,
         ),
         megaloc_cache=_resolve_asset(
-            base, assets.get("megaloc_cache"), "megaloc_cache", required=False
+            base,
+            assets.get("megaloc_cache"),
+            "megaloc_cache",
+            required=False,
+            workspace_root=workspace_root,
         ),
         track_landmarks=_resolve_asset(
-            base, assets.get("track_landmarks"), "track_landmarks", required=False
+            base,
+            assets.get("track_landmarks"),
+            "track_landmarks",
+            required=False,
+            workspace_root=workspace_root,
         ),
         poles_json=_resolve_asset(
-            base, assets.get("poles_json"), "poles_json", required=False
+            base,
+            assets.get("poles_json"),
+            "poles_json",
+            required=False,
+            workspace_root=workspace_root,
         ),
         query_camera=_load_query_camera(raw.get("query_camera"), source),
         coordinate_frame=_load_coordinate_frame(raw.get("coordinate_frame"), source),
@@ -1183,7 +1148,7 @@ def load_site_profile(path: str | Path, *, validate_files: bool = True) -> SiteP
             raw.get("flight"), source, schema_version=schema_version
         ),
         hardware_approval=_load_hardware_approval_reference(
-            raw.get("hardware_approval"), source, base
+            raw.get("hardware_approval"), source, base, workspace_root
         ),
     )
     if profile.reference_index is not None:

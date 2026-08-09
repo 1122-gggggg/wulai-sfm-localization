@@ -21,11 +21,20 @@ def _load_validation_module():
 def test_release_receipt_tracks_operator_runtime_seams() -> None:
     module = _load_validation_module()
     required = {
+        "PORTABLE_README.md",
         "outputs/README.md",
+        "一鍵啟動.sh",
+        "控制介面程式/operator_interface/localization_contract.py",
+        "控制介面程式/operator_interface/olympe_live_backend.py",
         "控制介面程式/operator_interface/operator_autonomy.py",
         "控制介面程式/operator_interface/operator_preflight.py",
         "控制介面程式/operator_interface/operator_rendering.py",
+        "控制介面程式/operator_interface/operator_shutdown.py",
+        "控制介面程式/operator_interface/operator_site_runtime.py",
         "控制介面程式/operator_interface/operator_tick.py",
+        "控制介面程式/operator_interface/site_assets_panel.py",
+        "控制介面程式/site_profiles/river_site_edm.json",
+        "定位演算法/flight_control/real_path_follow_controller.py",
     }
 
     assert required <= set(module.RELEASE_FILES)

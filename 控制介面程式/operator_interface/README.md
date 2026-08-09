@@ -63,7 +63,7 @@ Z-up 顯示座標並輸出 `frame: aligned`；匯入端再轉回 GLOMAP 的 X/Z 
 真機模式只有明確回讀為 `landed` 且沒有飛行命令處理中才可開啟；狀態改變時
 編輯器會自動關閉。儲存與匯入會更新規劃路徑 overlay，並把通過場域／座標系／
 SHA-256 驗證的路線選定為本次工作階段下一個 AUTO 候選。這不會核准、解鎖或開始
-飛行，且仍維持 `flight.approved=false` 與 `route_clearance_approved=false`。AUTO
+飛行，不會自行改寫 profile 的 `flight.approved` 與 `route_clearance_approved`。AUTO
 請求送出後，航線選擇鎖定；HOVER、MANUAL 與重新定位不會解除，只有後端拒絕該次
 請求或確認降落完成後才可選下一條航線。
 
@@ -137,15 +137,17 @@ aircraft readback separately; applying limits while airborne is rejected.
 Crossing either firmware limit prevents continued flight outward; it does not
 automatically invoke RTH. The separate future-autonomy speed guard starts at
 0.30 m/s and may also be changed only while confirmed landed. Any speed change
-invalidates the prior approval receipt, while autonomous flight remains locked.
+invalidates the current session's AUTO approval, so the four preflight steps
+must be confirmed again.
 
 On connection the backend records the actual ANAFI model/serial/firmware,
 SkyController 3 model/serial/software, Olympe version, transport, Home Point,
 lost-link/RTH policy, and firmware limit readbacks. Ground diagnostics remain
-available when these are incomplete, but takeoff is blocked unless a hash-pinned
-`anafi-hardware-approval/v1` receipt in the site profile approves the observed
-aircraft firmware, controller firmware, and Olympe version. No shipped profile
-currently carries such a receipt.
+available when these are incomplete. Firmware/Olympe versions and an optional
+signed hardware receipt are diagnostic/audit records; they are not takeoff or
+AUTO readiness gates. The selected profile, immutable route snapshot, asset
+digests, four preflight steps, and post-takeoff localization gates remain
+enforced.
 
 UI Python resolution is `SFM_UI_PYTHON` > legacy `VENV` executable > the
 nearest package/workspace `.venv/bin/python` (up to two parent levels) >
@@ -286,10 +288,10 @@ frames to the localizer, so per-tick waste there is not free.
   The rolling pipeline summary and the age readout are additionally throttled to
   10 Hz.
 
-Safety pilot must hold the sticks. Autonomous route flight is unconditionally
-`LOCKED`; the retired metric entrypoint exits before connecting, and the UI only
-runs localization until external approval, two-person confirmation, and field
-receipts exist.
+Safety pilot must hold the sticks. After the four preflight steps, AUTO takes off
+and hovers while the post-takeoff localization gates converge; route translation
+starts only after those gates pass. Manual takeover cancels AUTO without automatic
+resume, and UI/terminal shutdown stops AUTO before requesting landing.
 
 Self-test without opening a GUI:
 

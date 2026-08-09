@@ -5,9 +5,14 @@ install_test_deps=0
 install_quality_deps=0
 offline_install=0
 offline_lock_dir=""
+portable_identity=""
+portable_marker_tmp=""
 cleanup() {
   if [[ -n "$offline_lock_dir" ]] && [[ -d "$offline_lock_dir" ]]; then
     rm -r -- "$offline_lock_dir"
+  fi
+  if [[ -n "$portable_marker_tmp" ]] && [[ -f "$portable_marker_tmp" ]]; then
+    rm -f -- "$portable_marker_tmp"
   fi
 }
 trap cleanup EXIT
@@ -67,6 +72,8 @@ install_requirements_quality_lock="$requirements_quality_lock"
 offline_wheelhouse="$root_dir/執行環境/offline_wheelhouse"
 offline_wheelhouse_manifest="$offline_wheelhouse/WHEELHOUSE.json"
 offline_wheelhouse_tool="$root_dir/tools/offline_wheelhouse.py"
+package_manifest_tool="$root_dir/tools/package_manifest.py"
+portable_metadata="$root_dir/PORTABLE_PACKAGE.json"
 if [[ "${SFM_INSTALL_TEST_DEPS:-0}" == "1" ]]; then
   install_test_deps=1
 fi
@@ -82,6 +89,42 @@ if ! command -v "$python_bin" >/dev/null 2>&1; then
   exit 1
 fi
 
+if [[ -f "$portable_metadata" ]]; then
+  if [[ ! -f "$package_manifest_tool" ]]; then
+    echo "[runtime] portable package 缺少 manifest 驗證工具" >&2
+    exit 1
+  fi
+  "$python_bin" "$package_manifest_tool" verify --root "$root_dir"
+  portable_identity="$("$python_bin" - "$root_dir" <<'PY'
+import hashlib
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+digest = hashlib.sha256()
+for name in ("PORTABLE_PACKAGE.json", "MANIFEST.tsv"):
+    digest.update(name.encode("utf-8") + b"\0")
+    digest.update((root / name).read_bytes())
+print(digest.hexdigest())
+PY
+)"
+  if [[ -L "$venv_dir" ]]; then
+    echo "[runtime] 拒絕 symlink venv: $venv_dir" >&2
+    exit 1
+  fi
+  if [[ -e "$venv_dir" ]]; then
+    portable_marker="$venv_dir/.sfm-portable-runtime"
+    if [[ ! -f "$portable_marker" ]] \
+       || [[ "$(<"$portable_marker")" != "$portable_identity" ]]; then
+      echo "[runtime] 拒絕未由目前 portable package 建立的既有 venv: $venv_dir" >&2
+      exit 1
+    fi
+  fi
+elif [[ ! -d "$root_dir/.git" ]]; then
+  echo "[runtime] 非 Git 原始碼目錄必須包含 PORTABLE_PACKAGE.json" >&2
+  exit 1
+fi
+
 if [[ "$offline_install" == "1" ]]; then
   if [[ ! -f "$offline_wheelhouse_manifest" ]]; then
     echo "[runtime] 離線 wheelhouse 缺少固定索引: $offline_wheelhouse_manifest" >&2
@@ -91,21 +134,29 @@ if [[ "$offline_install" == "1" ]]; then
     echo "[runtime] 缺少離線 wheelhouse 驗證工具: $offline_wheelhouse_tool" >&2
     exit 1
   fi
-  for lock_path in "$requirements_lock" "$requirements_test_lock" "$requirements_quality_lock"; do
+  offline_requirement_locks=("$requirements_lock")
+  for optional_lock in "$requirements_test_lock" "$requirements_quality_lock"; do
+    if [[ -f "$optional_lock" ]]; then
+      offline_requirement_locks+=("$optional_lock")
+    fi
+  done
+  for lock_path in "${offline_requirement_locks[@]}"; do
     if [[ ! -f "$lock_path" ]]; then
       echo "[runtime] 缺少固定相依鎖檔: $lock_path" >&2
       exit 1
     fi
   done
+  offline_verify_args=()
+  for lock_path in "${offline_requirement_locks[@]}"; do
+    offline_verify_args+=(--requirements "$lock_path")
+  done
   "$python_bin" "$offline_wheelhouse_tool" verify \
     --wheelhouse "$offline_wheelhouse" \
-    --requirements "$requirements_lock" \
-    --requirements "$requirements_test_lock" \
-    --requirements "$requirements_quality_lock" >/dev/null
-  echo "[runtime] 離線 wheelhouse 與三份 lockfile 驗證完成"
+    "${offline_verify_args[@]}" >/dev/null
+  echo "[runtime] 離線 wheelhouse 與包內 lockfile 驗證完成"
 
   offline_lock_dir="$(mktemp -d -t sfm-offline-locks-XXXXXX)"
-  for lock_path in "$requirements_lock" "$requirements_test_lock" "$requirements_quality_lock"; do
+  for lock_path in "${offline_requirement_locks[@]}"; do
     "$python_bin" "$offline_wheelhouse_tool" prepare-lock \
       --source "$lock_path" \
       --output "$offline_lock_dir/$(basename -- "$lock_path")" >/dev/null
@@ -166,6 +217,13 @@ if [[ "$install_quality_deps" == "1" ]]; then
   fi
   "$venv_python" -m pip "${pip_global_args[@]}" install \
     "${pip_install_args[@]}" --requirement "$install_requirements_quality_lock"
+fi
+if [[ -n "$portable_identity" ]]; then
+  portable_marker_tmp="$(mktemp "$venv_dir/.sfm-portable-runtime.XXXXXX")"
+  printf '%s\n' "$portable_identity" >"$portable_marker_tmp"
+  chmod 0600 "$portable_marker_tmp"
+  mv -f -- "$portable_marker_tmp" "$venv_dir/.sfm-portable-runtime"
+  portable_marker_tmp=""
 fi
 echo "[runtime] 安裝完成：$venv_python"
 echo "[runtime] 系統層仍需 ffmpeg、python3-tk、X11/XWayland、可用 NVIDIA CUDA driver"

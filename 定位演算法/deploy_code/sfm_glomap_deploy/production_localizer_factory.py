@@ -106,6 +106,28 @@ def validate_camera_tuple(camera_tuple) -> tuple[str, int, int, list[float]]:
     return parsed
 
 
+def _validate_xfeat_vpr_metadata(meta: object) -> str:
+    """Require every declared XFeat bundle VPR identity to be MegaLoc."""
+    if not isinstance(meta, dict):
+        raise ValueError("XFeat production bundle metadata must be a dictionary")
+    declared = []
+    for key in ("bundle_vpr", "vpr"):
+        if key not in meta:
+            continue
+        value = meta[key]
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"XFeat production {key} metadata must declare MegaLoc")
+        normalized = value.strip().lower()
+        if not normalized.startswith("megaloc"):
+            raise ValueError(
+                f"XFeat production requires MegaLoc VPR metadata; {key}={value!r}"
+            )
+        declared.append(normalized)
+    if not declared:
+        raise ValueError("XFeat production bundle must declare MegaLoc VPR metadata")
+    return "megaloc"
+
+
 def production_xfeat_config():
     """Pinned production XFeat/LighterGlue configuration."""
     from production_xfeat_tracker import ProductionConfig
@@ -264,6 +286,7 @@ def _build_xfeat_localizer(
     from reloc_localizer_xfeat import Camera, DEVICE, XFeatRelocMap
 
     reloc_map = XFeatRelocMap.load(str(bundle), bundle_sha256 or None)
+    _validate_xfeat_vpr_metadata(reloc_map.meta)
     if reloc_map.ref_centers is None or len(reloc_map.ref_centers) != len(reloc_map.ref_names):
         raise ValueError(
             "bundle tracking metadata mismatch: "

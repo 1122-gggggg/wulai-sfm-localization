@@ -22,6 +22,34 @@ if [[ "$DRY_RUN" != "0" && "$DRY_RUN" != "1" ]]; then
   echo "[start] ERROR: SFM_LAUNCH_DRY_RUN must be 0 or 1" >&2
   exit 2
 fi
+
+verify_portable_package() {
+  if [[ ! -f "$PACKAGE_ROOT/PORTABLE_PACKAGE.json" ]]; then
+    if [[ ! -d "$PACKAGE_ROOT/.git" ]]; then
+      echo "[start] ERROR: non-Git runtime is missing PORTABLE_PACKAGE.json" >&2
+      exit 2
+    fi
+    return 0
+  fi
+  local verifier
+  verifier="$(command -v python3.10 || command -v python3 || true)"
+  if [[ -z "$verifier" ]]; then
+    echo "[start] ERROR: no Python interpreter available for portable manifest verification" >&2
+    exit 2
+  fi
+  if [[ ! -f "$PACKAGE_ROOT/tools/package_manifest.py" ]]; then
+    echo "[start] ERROR: portable package is missing tools/package_manifest.py" >&2
+    exit 2
+  fi
+  echo "[start] verifying portable package manifest ..."
+  if ! "$verifier" "$PACKAGE_ROOT/tools/package_manifest.py" verify --root "$PACKAGE_ROOT"; then
+    echo "[start] ERROR: portable package manifest verification failed" >&2
+    exit 1
+  fi
+}
+
+verify_portable_package
+
 if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
   cat <<'EOF'
 用法: ./start_anafi_live.sh [flight_operator_app.py 的真機選項]
@@ -98,6 +126,36 @@ else
     echo "[start] ERROR: Python command not found" >&2
     exit 2
   fi
+fi
+if [[ -f "$PACKAGE_ROOT/PORTABLE_PACKAGE.json" ]]; then
+  if [[ -L "$PACKAGE_ROOT/.venv" ]]; then
+    echo "[start] ERROR: portable package-local .venv must not be a symlink" >&2
+    exit 2
+  fi
+  case "$UI_PYTHON" in
+    "$PACKAGE_ROOT/.venv/"*)
+      PORTABLE_MARKER="$PACKAGE_ROOT/.venv/.sfm-portable-runtime"
+      IDENTITY_PYTHON="$(command -v python3.10 || command -v python3 || true)"
+      PORTABLE_IDENTITY="$("$IDENTITY_PYTHON" - "$PACKAGE_ROOT" <<'PY'
+import hashlib
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+digest = hashlib.sha256()
+for name in ("PORTABLE_PACKAGE.json", "MANIFEST.tsv"):
+    digest.update(name.encode("utf-8") + b"\0")
+    digest.update((root / name).read_bytes())
+print(digest.hexdigest())
+PY
+)"
+      if [[ ! -f "$PORTABLE_MARKER" ]] \
+         || [[ "$(<"$PORTABLE_MARKER")" != "$PORTABLE_IDENTITY" ]]; then
+        echo "[start] ERROR: package-local .venv is not bound to this portable manifest" >&2
+        exit 2
+      fi
+      ;;
+  esac
 fi
 if [[ "$DRY_RUN" != "1" ]]; then
   UI_VENV_CFG="$(dirname "$(dirname "$UI_PYTHON")")/pyvenv.cfg"

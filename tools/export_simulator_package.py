@@ -8,6 +8,7 @@ import json
 import os
 import shutil
 import sys
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable
@@ -44,6 +45,26 @@ COPY_FILES = (
     "pyproject.toml",
     "pytest.ini",
     "驗證系統.sh",
+)
+LIVE_MINIMAL_COPY_DIRS = (
+    "控制介面程式",
+    "定位演算法/configs",
+    "定位演算法/deploy_code/sfm_glomap_deploy",
+    "定位演算法/deploy_code/runtime/EDM/configs",
+    "定位演算法/deploy_code/runtime/EDM/src",
+    "定位演算法/flight_control",
+)
+LIVE_MINIMAL_COPY_FILES = (
+    "README.md",
+    "PORTABLE_README.md",
+    "outputs/README.md",
+    ARTIFACT_MANIFEST,
+    "requirements-lock.txt",
+    "tools/install_runtime.sh",
+    "tools/offline_wheelhouse.py",
+    "tools/package_manifest.py",
+    "tools/simulated_ui_smoke.sh",
+    "一鍵啟動.sh",
 )
 EXCLUDED_NAMES = {
     ".git",
@@ -114,6 +135,8 @@ _PROFILE_ASSET_KEYS = (
     "reference_index",
     "poles_json",
     "map_align",
+    "megaloc_cache",
+    "track_landmarks",
 )
 _SIGNED_HARDWARE_KEYS = (
     "signature",
@@ -153,6 +176,25 @@ def _safe_repo_file(root: Path, candidate: Path, *, label: str) -> Path:
     if not candidate.is_file():
         raise ArtifactResolutionError(f"{label} is missing or not a regular file: {candidate}")
     return resolved
+
+
+def _absolute_path(path: str | Path) -> Path:
+    """Make a path absolute without resolving symlinks."""
+    return Path(os.path.abspath(os.fspath(Path(path).expanduser())))
+
+
+def _reject_symlink_components(path: Path, *, label: str) -> None:
+    """Reject a path whose leaf or any existing ancestor is a symlink."""
+    current = _absolute_path(path)
+    while True:
+        try:
+            if current.is_symlink():
+                raise ArtifactResolutionError(f"{label} must not use symlinks: {path}")
+        except OSError as exc:
+            raise ArtifactResolutionError(f"{label} cannot be inspected: {path}") from exc
+        if current == current.parent:
+            return
+        current = current.parent
 
 
 def _profile_asset_path(root: Path, profile: Path, value: object, *, label: str) -> Path:
@@ -266,6 +308,7 @@ def _collect_profile_assets(
             root, profile_path, value, label=f"{profile_label} {key}"
         )
         expected = digests.get(key)
+        _validate_sha256(expected, label=f"{profile_label} {key} SHA-256")
         if key == "reference_index":
             for index_path, role in _load_reference_index_files(
                 root,
@@ -431,23 +474,27 @@ def _write_site_bundle_manifest(destination: Path, bundle: SiteBundle) -> None:
     )
 
 
-def _safe_destination_path(destination: Path, relative: str) -> Path:
+def _safe_destination_path(
+    destination: Path, relative: str, *, label: str = "destination"
+) -> Path:
+    relative_path = Path(relative)
+    if relative_path.is_absolute() or ".." in relative_path.parts:
+        raise ArtifactResolutionError(
+            f"{label} path is unsafe: {relative}"
+        )
     target = destination / relative
     try:
         resolved = target.resolve(strict=False)
     except (OSError, RuntimeError) as exc:
         raise ArtifactResolutionError(
-            f"site bundle destination cannot be resolved: {relative}"
+            f"{label} cannot be resolved: {relative}"
         ) from exc
     if not resolved.is_relative_to(destination):
-        raise ArtifactResolutionError(f"site bundle destination escapes root: {relative}")
-    current = target
-    while current != destination:
-        if current.is_symlink():
-            raise ArtifactResolutionError(f"site bundle destination contains symlink: {relative}")
-        if current == current.parent:
-            break
-        current = current.parent
+        raise ArtifactResolutionError(f"{label} escapes root: {relative}")
+    _reject_symlink_components(
+        target,
+        label=f"{label} {relative}",
+    )
     return target
 
 
@@ -465,7 +512,13 @@ def _copy_site_bundle_files(
             if _sha256(target) != item.sha256:
                 raise ArtifactResolutionError(f"site bundle target conflicts: {item.path}")
         else:
-            shutil.copy2(source, target)
+            _copy_verified_file(
+                source,
+                target,
+                expected_size=item.size_bytes,
+                expected_sha256=item.sha256,
+                label=f"site bundle {item.path}",
+            )
         copied.append(item.path)
     _write_site_bundle_manifest(destination, bundle)
     return copied
@@ -499,8 +552,26 @@ def _ignore(directory: str, names: list[str]) -> set[str]:
     return ignored
 
 
-def _copy_tree(source: Path, destination: Path) -> None:
-    shutil.copytree(source, destination, copy_function=shutil.copy2, ignore=_ignore)
+def _minimal_live_ignore(directory: str, names: list[str]) -> set[str]:
+    ignored = _ignore(directory, names)
+    ignored.update(
+        name
+        for name in names
+        if name.startswith("test_")
+        or name.endswith("_test.py")
+        or name in {"tests", "validation", "authoring", "site_profiles"}
+    )
+    return ignored
+
+
+def _copy_tree(source: Path, destination: Path, *, live_minimal: bool = False) -> None:
+    shutil.copytree(
+        source,
+        destination,
+        copy_function=shutil.copy2,
+        symlinks=True,
+        ignore=_minimal_live_ignore if live_minimal else _ignore,
+    )
 
 
 def _source_release() -> dict[str, object]:
@@ -542,11 +613,12 @@ def _offline_wheelhouse_root(
 def _verify_offline_wheelhouse(
     root: Path,
     wheelhouse_root: str | Path,
+    requirement_names: tuple[str, ...] = OFFLINE_REQUIREMENT_LOCKS,
 ) -> VerifiedOfflineWheelhouse:
     from tools.offline_wheelhouse import MANIFEST_NAME, verify_wheelhouse
 
     wheelhouse = Path(os.path.abspath(os.fspath(Path(wheelhouse_root).expanduser())))
-    requirement_locks = tuple(root / relative for relative in OFFLINE_REQUIREMENT_LOCKS)
+    requirement_locks = tuple(root / relative for relative in requirement_names)
     verified = verify_wheelhouse(wheelhouse, requirement_locks)
     wheels = verified["wheels"]
     assert isinstance(wheels, list)
@@ -564,17 +636,34 @@ def _verify_offline_wheelhouse(
 def _copy_offline_wheelhouse(
     destination: Path,
     verified: VerifiedOfflineWheelhouse,
-) -> None:
-    from tools.offline_wheelhouse import verify_wheelhouse
+    *,
+    live_minimal: bool = False,
+) -> VerifiedOfflineWheelhouse:
+    from tools.offline_wheelhouse import subset_wheelhouse, verify_wheelhouse
 
     target_root = destination / OFFLINE_WHEELHOUSE_RELATIVE
-    target_root.mkdir(parents=True, exist_ok=True)
-    for name in (verified.manifest_name, *verified.wheel_paths):
-        shutil.copy2(verified.root / name, target_root / name)
-    verify_wheelhouse(
-        target_root,
-        tuple(destination / relative for relative in OFFLINE_REQUIREMENT_LOCKS),
-    )
+    if live_minimal:
+        target_root.parent.mkdir(parents=True, exist_ok=True)
+        subset_wheelhouse(
+            verified.root,
+            target_root,
+            source_requirement_locks=tuple(
+                ROOT / relative for relative in OFFLINE_REQUIREMENT_LOCKS
+            ),
+            requirement_locks=(destination / "requirements-lock.txt",),
+            python_executable=sys.executable,
+        )
+        requirement_names = ("requirements-lock.txt",)
+    else:
+        target_root.mkdir(parents=True, exist_ok=True)
+        for name in (verified.manifest_name, *verified.wheel_paths):
+            shutil.copy2(verified.root / name, target_root / name)
+        verify_wheelhouse(
+            target_root,
+            tuple(destination / relative for relative in OFFLINE_REQUIREMENT_LOCKS),
+        )
+        requirement_names = OFFLINE_REQUIREMENT_LOCKS
+    return _verify_offline_wheelhouse(destination, target_root, requirement_names)
 
 
 def _offline_install_metadata(
@@ -673,8 +762,30 @@ def _artifact_root(root: Path, artifact_root: str | Path | None) -> Path | None:
         configured = os.environ.get(ARTIFACT_ROOT_ENV, "").strip() or None
     if configured is None:
         return None
-    resolved = Path(configured).expanduser().resolve()
+    configured_path = _absolute_path(configured)
+    _reject_symlink_components(configured_path, label="runtime artifact seed root")
+    resolved = configured_path.resolve(strict=False)
     return None if resolved == root else resolved
+
+
+def _safe_runtime_artifact_candidate(
+    anchor: Path, relative: str, *, label: str
+) -> Path:
+    """Resolve an artifact under an anchor without following symlink components."""
+    anchor = _absolute_path(anchor)
+    candidate = anchor / relative
+    try:
+        candidate.relative_to(anchor)
+        resolved_anchor = anchor.resolve(strict=False)
+        resolved_candidate = candidate.resolve(strict=False)
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise ArtifactResolutionError(
+            f"{label} cannot be resolved safely: {candidate}"
+        ) from exc
+    if not resolved_candidate.is_relative_to(resolved_anchor):
+        raise ArtifactResolutionError(f"{label} escapes its root: {candidate}")
+    _reject_symlink_components(candidate, label=label)
+    return candidate
 
 
 def resolve_runtime_artifacts(
@@ -689,15 +800,23 @@ def resolve_runtime_artifacts(
     resolved: list[ResolvedRuntimeArtifact] = []
     failures: list[str] = []
     for spec in specs:
-        candidates = [root / spec.path]
+        candidates = [
+            _safe_runtime_artifact_candidate(
+                root, spec.path, label=f"{spec.name} runtime artifact"
+            )
+        ]
         if seed_root is not None:
-            candidates.append(seed_root / spec.path)
+            candidates.append(
+                _safe_runtime_artifact_candidate(
+                    seed_root, spec.path, label=f"{spec.name} runtime artifact"
+                )
+            )
         found = False
         for candidate in candidates:
             if not candidate.exists() and not candidate.is_symlink():
                 continue
             found = True
-            if candidate.is_symlink() or not candidate.is_file():
+            if not candidate.is_file():
                 failures.append(f"{spec.name}: not a regular file: {candidate}")
                 break
             actual_size = candidate.stat().st_size
@@ -739,13 +858,53 @@ def resolve_runtime_artifacts(
 def _copy_resolved_runtime_artifacts(
     resolved: tuple[ResolvedRuntimeArtifact, ...], destination: Path
 ) -> list[str]:
+    destination = _absolute_path(destination)
+    _reject_symlink_components(destination, label="runtime artifact copy destination")
+    destination.mkdir(parents=True, exist_ok=True)
     copied: list[str] = []
     for artifact in resolved:
-        target = destination / artifact.spec.path
+        target = _safe_destination_path(
+            destination,
+            artifact.spec.path,
+            label="runtime artifact copy destination",
+        )
         target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(artifact.source, target)
+        _copy_verified_file(
+            artifact.source,
+            target,
+            expected_size=artifact.spec.size_bytes,
+            expected_sha256=artifact.spec.sha256,
+            label=artifact.spec.name,
+        )
         copied.append(artifact.spec.path)
     return copied
+
+
+def _copy_verified_file(
+    source: Path,
+    target: Path,
+    *,
+    expected_size: int,
+    expected_sha256: str,
+    label: str,
+) -> None:
+    """Atomically publish bytes only after verifying the copied snapshot."""
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{target.name}.", dir=str(target.parent)
+    )
+    os.close(descriptor)
+    temporary = Path(temporary_name)
+    try:
+        shutil.copy2(source, temporary)
+        actual_size = temporary.stat().st_size
+        actual_sha256 = _sha256(temporary)
+        if actual_size != expected_size or actual_sha256 != expected_sha256:
+            raise ArtifactResolutionError(
+                f"{label}: copied artifact changed after validation: {source}"
+            )
+        os.replace(temporary, target)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def copy_runtime_artifacts(
@@ -756,7 +915,7 @@ def copy_runtime_artifacts(
 ) -> list[str]:
     """Copy only verified allowlisted artifacts into a portable package."""
     resolved = resolve_runtime_artifacts(root, artifact_root=artifact_root)
-    return _copy_resolved_runtime_artifacts(resolved, Path(destination).expanduser().resolve())
+    return _copy_resolved_runtime_artifacts(resolved, Path(destination).expanduser())
 
 
 def _write_metadata(
@@ -764,18 +923,32 @@ def _write_metadata(
     source_release: dict[str, object],
     artifacts: tuple[RuntimeArtifact, ...],
     offline_wheelhouse: VerifiedOfflineWheelhouse | None = None,
+    *,
+    live_minimal: bool = False,
 ) -> None:
     artifact_manifest_sha256 = _sha256(destination / ARTIFACT_MANIFEST)
-    metadata = {
-        "schema": "sfm-portable-simulator/v2",
-        "package_kind": "simulated-interface-runtime",
-        "entrypoint": "控制介面程式/影片模擬串流/選擇啟動.sh",
-        "cli_entrypoint": "控制介面程式/影片模擬串流/啟動.sh",
-        "install": "bash tools/install_runtime.sh",
-        "fixed_assets": [
+    if live_minimal:
+        schema = "sfm-portable-live-runtime/v1"
+        package_kind = "live-operator-runtime"
+        entrypoint = "一鍵啟動.sh"
+        cli_entrypoint = "控制介面程式/真機串流/啟動.sh"
+        fixed_assets = [artifact.path for artifact in artifacts]
+    else:
+        schema = "sfm-portable-simulator/v2"
+        package_kind = "simulated-interface-runtime"
+        entrypoint = "控制介面程式/影片模擬串流/選擇啟動.sh"
+        cli_entrypoint = "控制介面程式/影片模擬串流/啟動.sh"
+        fixed_assets = [
             *(artifact.path for artifact in artifacts),
             "模擬器/parrot_stimulate/src/anafi_pcmd_sim/scale_free_control.py",
-        ],
+        ]
+    metadata = {
+        "schema": schema,
+        "package_kind": package_kind,
+        "entrypoint": entrypoint,
+        "cli_entrypoint": cli_entrypoint,
+        "install": "bash tools/install_runtime.sh",
+        "fixed_assets": fixed_assets,
         "source_manifest": {
             "scope": "git-source",
             "manifest": "MANIFEST.tsv",
@@ -796,6 +969,12 @@ def _write_metadata(
         },
         "excluded_from_package": sorted(EXCLUDED_NAMES),
         "source_release": source_release,
+        "supported_target": {
+            "os": "Linux",
+            "architecture": "x86_64",
+            "python": "CPython 3.10",
+            "gpu_runtime": "NVIDIA driver compatible with CUDA 12.8 wheels",
+        },
         "supported_gpu": "NVIDIA RTX 5060 + CUDA 12.8 runtime (validated target)",
     }
     (destination / "PORTABLE_PACKAGE.json").write_text(
@@ -804,37 +983,71 @@ def _write_metadata(
     )
 
 
-def _prepare_export_destination(destination: Path) -> None:
-    if destination.exists() and any(destination.iterdir()):
-        raise ValueError(f"destination must be empty: {destination}")
-    destination.mkdir(parents=True, exist_ok=True)
+def _reject_package_symlinks(root: Path) -> None:
+    """Fail closed before manifest generation if any copied link survived."""
+    for current, directories, files in os.walk(root, followlinks=False):
+        for name in (*directories, *files):
+            candidate = Path(current) / name
+            if candidate.is_symlink():
+                raise ArtifactResolutionError(
+                    "portable package does not permit symlinks: "
+                    f"{candidate.relative_to(root)}"
+                )
+
+
+def _prepare_export_destination(destination: Path) -> Path:
+    """Validate the requested destination and prepare its staging parent."""
+    destination = _absolute_path(destination)
+    _reject_symlink_components(destination, label="export destination")
+    if destination.exists():
+        if not destination.is_dir():
+            raise ValueError(f"destination must be a directory: {destination}")
+        if any(destination.iterdir()):
+            raise ValueError(f"destination must be empty: {destination}")
+    else:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+    return destination
 
 
 def _copy_export_payload(
     destination: Path,
     resolved_artifacts: tuple[ResolvedRuntimeArtifact, ...],
     offline_wheelhouse: VerifiedOfflineWheelhouse | None = None,
-) -> None:
-    for relative in COPY_FILES:
+    *,
+    live_minimal: bool = False,
+) -> VerifiedOfflineWheelhouse | None:
+    copy_files = LIVE_MINIMAL_COPY_FILES if live_minimal else COPY_FILES
+    copy_dirs = LIVE_MINIMAL_COPY_DIRS if live_minimal else COPY_DIRS
+    for relative in copy_files:
         source = ROOT / relative
         if not source.is_file():
             raise FileNotFoundError(source)
         target = destination / relative
         target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(source, target)
-    for relative in COPY_DIRS:
+        shutil.copy2(source, target, follow_symlinks=False)
+    for relative in copy_dirs:
         source = ROOT / relative
         if not source.is_dir():
             raise FileNotFoundError(source)
-        _copy_tree(source, destination / relative)
-    runtime_source = ROOT / "執行環境"
-    runtime_target = destination / "執行環境"
-    runtime_target.mkdir(parents=True, exist_ok=True)
-    for relative in ("requirements_runtime.txt", "requirements_test.txt", "README.md"):
-        shutil.copy2(runtime_source / relative, runtime_target / relative)
+        _copy_tree(source, destination / relative, live_minimal=live_minimal)
+    if not live_minimal:
+        runtime_source = ROOT / "執行環境"
+        runtime_target = destination / "執行環境"
+        runtime_target.mkdir(parents=True, exist_ok=True)
+        for relative in ("requirements_runtime.txt", "requirements_test.txt", "README.md"):
+            shutil.copy2(
+                runtime_source / relative,
+                runtime_target / relative,
+                follow_symlinks=False,
+            )
     _copy_resolved_runtime_artifacts(resolved_artifacts, destination)
     if offline_wheelhouse is not None:
-        _copy_offline_wheelhouse(destination, offline_wheelhouse)
+        return _copy_offline_wheelhouse(
+            destination,
+            offline_wheelhouse,
+            live_minimal=live_minimal,
+        )
+    return None
 
 
 def export(
@@ -843,22 +1056,24 @@ def export(
     artifact_root: str | Path | None = None,
     wheelhouse_root: str | Path | None = None,
     site_profiles: Iterable[str | Path] | None = None,
+    live_minimal: bool = False,
 ) -> list[str]:
-    destination = destination.expanduser().resolve()
+    destination = _absolute_path(destination)
+    resolved_destination = destination.resolve(strict=False)
+    source_root = ROOT.expanduser().resolve()
     if (
-        destination == ROOT
-        or ROOT.is_relative_to(destination)
-        or destination.is_relative_to(ROOT)
+        resolved_destination == source_root
+        or source_root.is_relative_to(resolved_destination)
+        or resolved_destination.is_relative_to(source_root)
     ):
         raise ValueError("destination and source workspace must not contain each other")
-    source_release = _source_release()
+    source_release = dict(_source_release())
     configured_wheelhouse = _offline_wheelhouse_root(wheelhouse_root)
     verified_wheelhouse = (
         _verify_offline_wheelhouse(ROOT, configured_wheelhouse)
         if configured_wheelhouse is not None
         else None
     )
-    _prepare_export_destination(destination)
     resolved_artifacts = resolve_runtime_artifacts(ROOT, artifact_root=artifact_root)
     artifact_specs = tuple(artifact.spec for artifact in resolved_artifacts)
     site_bundle = (
@@ -866,16 +1081,46 @@ def export(
         if site_profiles is not None
         else None
     )
-    _copy_export_payload(destination, resolved_artifacts, verified_wheelhouse)
-    if site_bundle is not None:
-        _copy_site_bundle_files(ROOT, destination, site_bundle)
-    _write_metadata(destination, source_release, artifact_specs, verified_wheelhouse)
+    destination = _prepare_export_destination(destination)
+    temporary: Path | None = Path(
+        tempfile.mkdtemp(prefix=f".{destination.name}.", dir=str(destination.parent))
+    )
+    try:
+        assert temporary is not None
+        exported_wheelhouse = _copy_export_payload(
+            temporary,
+            resolved_artifacts,
+            verified_wheelhouse,
+            live_minimal=live_minimal,
+        )
+        if site_bundle is not None:
+            _copy_site_bundle_files(ROOT, temporary, site_bundle)
+        _reject_package_symlinks(temporary)
 
-    sys.path.insert(0, str(ROOT))
-    from tools.package_manifest import generate
+        source_release_after_copy = dict(_source_release())
+        if source_release_after_copy != source_release:
+            raise ValueError(
+                "source release changed during export; package was not published"
+            )
 
-    entries = generate(destination, include_site_assets=site_bundle is not None)
-    return [entry.path for entry in entries]
+        _write_metadata(
+            temporary,
+            source_release,
+            artifact_specs,
+            exported_wheelhouse,
+            live_minimal=live_minimal,
+        )
+
+        sys.path.insert(0, str(ROOT))
+        from tools.package_manifest import generate
+
+        entries = generate(temporary, include_site_assets=site_bundle is not None)
+        os.replace(temporary, destination)
+        temporary = None
+        return [entry.path for entry in entries]
+    finally:
+        if temporary is not None and temporary.exists():
+            shutil.rmtree(temporary, ignore_errors=True)
 
 
 def main() -> int:
@@ -908,6 +1153,11 @@ def main() -> int:
             "portable site bundle; repeat for multiple profiles"
         ),
     )
+    parser.add_argument(
+        "--live-minimal",
+        action="store_true",
+        help="export only the live operator UI, localization runtime, and launch support",
+    )
     args = parser.parse_args()
     try:
         files = export(
@@ -915,6 +1165,7 @@ def main() -> int:
             artifact_root=args.artifact_root,
             wheelhouse_root=args.wheelhouse_root,
             site_profiles=args.site_profile or None,
+            live_minimal=args.live_minimal,
         )
     except (FileNotFoundError, OSError, ValueError) as exc:
         parser.error(str(exc))

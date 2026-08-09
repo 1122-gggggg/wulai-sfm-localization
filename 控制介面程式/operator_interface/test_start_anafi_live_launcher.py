@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -11,6 +12,7 @@ import pytest
 
 SCRIPT = Path(__file__).with_name("start_anafi_live.sh")
 APP = SCRIPT.with_name("flight_operator_app.py")
+PACKAGE_MANIFEST_TOOL = SCRIPT.parents[2] / "tools" / "package_manifest.py"
 LAUNCH_ENV = {
     "CTRL",
     "DISPLAY",
@@ -82,6 +84,181 @@ def test_launcher_help_exits_before_live_setup() -> None:
 def write_executable(path: Path, body: str) -> None:
     path.write_text("#!/usr/bin/env bash\nset -euo pipefail\n" + body)
     path.chmod(0o755)
+
+
+def make_fake_portable_package(tmp_path: Path) -> Path:
+    package = tmp_path / "portable"
+    for relative in (
+        Path("控制介面程式/operator_interface/start_anafi_live.sh"),
+        Path("控制介面程式/真機串流/啟動.sh"),
+    ):
+        destination = package / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(SCRIPT.parents[2] / relative, destination)
+    display = package / "控制介面程式/operator_interface/resolve_display.sh"
+    display.parent.mkdir(parents=True, exist_ok=True)
+    display.write_text(
+        "configure_operator_display() { export DISPLAY=:0; }\n",
+        encoding="utf-8",
+    )
+    manifest_tool = package / "tools/package_manifest.py"
+    manifest_tool.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(PACKAGE_MANIFEST_TOOL, manifest_tool)
+    (package / "PORTABLE_PACKAGE.json").write_text(
+        '{"schema":"sfm-portable-live-runtime/v1",'
+        '"package_kind":"live-operator-runtime",'
+        '"entrypoint":"一鍵啟動.sh"}\n',
+        encoding="utf-8",
+    )
+    subprocess.run(
+        [sys.executable, str(manifest_tool), "generate", "--root", str(package)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return package
+
+
+def run_portable_launcher(
+    launcher: Path, *, dry_run: str, package: Path, **overrides: str
+) -> subprocess.CompletedProcess[str]:
+    env = os.environ.copy()
+    for name in LAUNCH_ENV | {
+        "SFM_PYTHON",
+        "SFM_VENV_DIR",
+        "SFM_WORKSPACE_ROOT",
+        "SFM_PORTABLE_ALLOW_EXTERNAL_PYTHON",
+    }:
+        env.pop(name, None)
+    env.update(
+        {
+            "SFM_LAUNCH_DRY_RUN": dry_run,
+            "SFM_MAX_PERFORMANCE": "0",
+            "SFM_UI_PYTHON": sys.executable,
+            "SFM_SITE_PROFILE": str(package / "profile.json"),
+            **overrides,
+        }
+    )
+    return subprocess.run(
+        [str(launcher)],
+        cwd=launcher.parent,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=10,
+    )
+
+
+@pytest.mark.parametrize(
+    "relative_launcher",
+    (
+        Path("控制介面程式/operator_interface/start_anafi_live.sh"),
+        Path("控制介面程式/真機串流/啟動.sh"),
+    ),
+)
+def test_tampered_portable_manifest_fails_before_reachability(
+    tmp_path: Path, relative_launcher: Path
+) -> None:
+    package = make_fake_portable_package(tmp_path)
+    manifest = package / "MANIFEST.tsv"
+    rows = manifest.read_text(encoding="utf-8").splitlines()
+    size, _digest, relative = rows[1].split("\t", 2)
+    rows[1] = f"{size}\t{'0' * 64}\t{relative}"
+    manifest.write_text("\n".join(rows) + "\n", encoding="utf-8")
+    call_log = tmp_path / "calls.log"
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    write_executable(bin_dir / "ping", 'printf \'ping\\n\' >> "$CALL_LOG"\nexit 0\n')
+
+    result = run_portable_launcher(
+        package / relative_launcher,
+        dry_run="0",
+        package=package,
+        CALL_LOG=str(call_log),
+        PATH=f"{bin_dir}:{os.environ['PATH']}",
+        IP="192.168.42.1",
+        CTRL="drone",
+    )
+
+    assert result.returncode == 1, (result.stdout, result.stderr)
+    assert "SHA-256 mismatch" in result.stdout
+    assert not call_log.exists(), "manifest verification must precede reachability"
+    assert "dry-run command" not in result.stdout
+
+
+@pytest.mark.parametrize(
+    "relative_launcher",
+    (
+        Path("控制介面程式/operator_interface/start_anafi_live.sh"),
+        Path("控制介面程式/真機串流/啟動.sh"),
+    ),
+)
+def test_valid_portable_manifest_reaches_dry_run_without_connecting(
+    tmp_path: Path, relative_launcher: Path
+) -> None:
+    package = make_fake_portable_package(tmp_path)
+    result = run_portable_launcher(
+        package / relative_launcher,
+        dry_run="1",
+        package=package,
+    )
+
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    assert "portable package manifest OK" in result.stdout
+    assert "dry-run command" in result.stdout
+    assert "checking target" not in result.stdout
+
+
+@pytest.mark.parametrize(
+    "relative_launcher",
+    (
+        Path("控制介面程式/operator_interface/start_anafi_live.sh"),
+        Path("控制介面程式/真機串流/啟動.sh"),
+    ),
+)
+def test_non_git_runtime_rejects_missing_portable_metadata(
+    tmp_path: Path, relative_launcher: Path
+) -> None:
+    package = make_fake_portable_package(tmp_path)
+    (package / "PORTABLE_PACKAGE.json").unlink()
+
+    result = run_portable_launcher(
+        package / relative_launcher,
+        dry_run="1",
+        package=package,
+    )
+
+    assert result.returncode == 2
+    assert "missing PORTABLE_PACKAGE.json" in result.stderr
+    assert "dry-run command" not in result.stdout
+
+
+@pytest.mark.parametrize(
+    "relative_launcher",
+    (
+        Path("控制介面程式/operator_interface/start_anafi_live.sh"),
+        Path("控制介面程式/真機串流/啟動.sh"),
+    ),
+)
+def test_portable_launcher_rejects_unbound_package_local_venv(
+    tmp_path: Path, relative_launcher: Path
+) -> None:
+    package = make_fake_portable_package(tmp_path)
+    fake_python = package / ".venv/bin/python"
+    fake_python.parent.mkdir(parents=True)
+    write_executable(fake_python, "exit 99\n")
+
+    result = run_portable_launcher(
+        package / relative_launcher,
+        dry_run="1",
+        package=package,
+        SFM_UI_PYTHON=str(fake_python),
+    )
+
+    assert result.returncode == 2
+    assert "not bound to this portable manifest" in result.stderr
+    assert "dry-run command" not in result.stdout
 
 
 def test_direct_ip_derives_drone_and_preserves_benchmark_flags():

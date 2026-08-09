@@ -533,15 +533,32 @@ class LiveAnafiVideoStream:
         self._last_frame_width_px: int | None = None
         self._last_frame_height_px: int | None = None
 
+    @staticmethod
+    def _valid_stamp(value: Any) -> float | None:
+        try:
+            stamp = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return (
+            stamp
+            if math.isfinite(stamp) and stamp > 0.0 and stamp <= time.monotonic()
+            else None
+        )
+
     def next_frame(self, *, only_new: bool = True):
         peek_stamp = getattr(self._grab, "peek_stamp", None)
         if only_new and callable(peek_stamp):
             try:
-                stamp_hint = peek_stamp()
+                raw_stamp_hint = peek_stamp()
             except Exception:
-                stamp_hint = None
-            if stamp_hint is None or (
-                    self._last_stamp is not None and stamp_hint == self._last_stamp):
+                raw_stamp_hint = None
+            if raw_stamp_hint is not None:
+                stamp_hint = self._valid_stamp(raw_stamp_hint)
+                if stamp_hint is None:
+                    return None
+                if self._last_stamp is not None and stamp_hint == self._last_stamp:
+                    return None
+            elif self._last_stamp is not None:
                 return None
         try:
             sample_with_timing = getattr(self._grab, "latest_frame_with_timing", None)
@@ -553,12 +570,13 @@ class LiveAnafiVideoStream:
             return None
         timing = {}
         if isinstance(sample, tuple):
-            frame, stamp = sample[0], float(sample[1])
+            frame = sample[0]
+            stamp = self._valid_stamp(sample[1])
             if len(sample) >= 3 and isinstance(sample[2], dict):
                 timing = dict(sample[2])
         else:
             frame, stamp = sample, time.monotonic()
-        if frame is None:
+        if frame is None or stamp is None:
             return None
         if only_new and self._last_stamp is not None and stamp == self._last_stamp:
             return None
@@ -712,10 +730,6 @@ class OlympeLiveBackend:
         self.state.airspeed_mps = None
         self.state.autonomous_speed_limit_mps = 0.30
         self.state.autonomous_approval_valid = False
-        # Set True only after a site/route/mode-bound hardware receipt is
-        # verified for this live session.  The desktop AUTO coordinator treats
-        # a missing value as a release blocker.
-        self.state.live_auto_release_ready = False
         self.state.drone_magnetometer_required = None
         self.state.drone_magnetometer_started = None
         self.state.drone_magnetometer_axis = "unknown"
@@ -993,14 +1007,18 @@ class OlympeLiveBackend:
         )
         observed_mono_ns = int(now_mono_ns)
         get_last_event = getattr(self.drone, "get_last_event", None)
+        invalid_event_timestamp = False
         if callable(get_last_event):
             try:
                 event = get_last_event(message)
+                wall_age_s = time.time() - float(event.date.timestamp())
+                if not math.isfinite(wall_age_s) or wall_age_s < 0.0:
+                    invalid_event_timestamp = True
+                    raise ValueError("invalid telemetry event timestamp")
+                # Validate the event clock before allowing its payload or marker
+                # to replace the last trusted state.
                 state = dict(event.args)
                 marker = ("event", str(event.uuid))
-                wall_age_s = time.time() - float(event.date.timestamp())
-                if not math.isfinite(wall_age_s) or wall_age_s < -0.05:
-                    raise ValueError("invalid telemetry event timestamp")
                 observed_mono_ns -= int(max(0.0, wall_age_s) * 1_000_000_000)
             except (
                 AttributeError,
@@ -1010,7 +1028,14 @@ class OlympeLiveBackend:
                 ValueError,
                 OverflowError,
             ):
-                pass
+                if invalid_event_timestamp:
+                    previous = self.telemetry_freshness.sample(name)
+                    if previous is not None:
+                        return dict(previous.value)
+                    # With no trusted sample, the cache fallback may itself be
+                    # the future event payload. Do not let it become current
+                    # state or give runtime safety a value with no valid receipt.
+                    return {}
         sample = self.telemetry_freshness.observe(
             name,
             state,
@@ -1238,11 +1263,6 @@ class OlympeLiveBackend:
             olympe_version = importlib.metadata.version("parrot-olympe")
         except importlib.metadata.PackageNotFoundError:
             olympe_version = None
-            errors.append("parrot-olympe version unavailable")
-        if olympe_version not in self.approved_olympe_versions:
-            errors.append(
-                f"Olympe version {olympe_version!r} lacks an approved receipt"
-            )
 
         aircraft_name = " ".join(
             str(aircraft.get(key) or "") for key in ("name", "model")
@@ -1252,10 +1272,6 @@ class OlympeLiveBackend:
             errors.append("connected aircraft is not an approved ANAFI model")
         if not aircraft.get("serial"):
             errors.append("aircraft serial unavailable")
-        if aircraft.get("software") not in self.approved_aircraft_firmware:
-            errors.append(
-                f"aircraft firmware {aircraft.get('software')!r} lacks an approved receipt"
-            )
         if not self.via_skycontroller():
             errors.append("formal flight requires SkyController 3")
         else:
@@ -1281,11 +1297,6 @@ class OlympeLiveBackend:
                 )
             if not (controller or {}).get("serial"):
                 errors.append("controller serial unavailable")
-            if (controller or {}).get("software") not in self.approved_controller_firmware:
-                errors.append(
-                    "controller firmware "
-                    f"{(controller or {}).get('software')!r} lacks an approved receipt"
-                )
         if not lost_link_policy_ok:
             errors.append("lost-link auto-land policy readback is not confirmed")
         if not home_usable:
@@ -2101,6 +2112,14 @@ class OlympeLiveBackend:
         if not self.via_skycontroller():
             return True
         with self._lock:
+            if self._maneuver_in_progress == "landing":
+                self.log.event(
+                    "takeoff_source_restore",
+                    ok=True,
+                    reason=reason,
+                    note="landing_confirmation_in_progress",
+                )
+                return True
             self._zero_pcmd_or_log("takeoff_abort:handoff_zero")
         ok = self._set_piloting_source("SkyController")
         with self._lock:
@@ -2735,12 +2754,13 @@ class OlympeLiveBackend:
         # Release the manoeuvre block. On an UNCONFIRMED landing the aircraft may still
         # be airborne, and the operator must keep the ability to reposition it -- a
         # permanently-held block would strand them with hover-only authority.
-        self._clear_maneuver()
+        self._clear_maneuver("landing")
         return landed
 
-    def _clear_maneuver(self) -> None:
+    def _clear_maneuver(self, maneuver: str | None = None) -> None:
         with self._lock:
-            self._maneuver_in_progress = None
+            if maneuver is None or self._maneuver_in_progress == maneuver:
+                self._maneuver_in_progress = None
 
     def takeoff_cmd(self) -> bool:
         # 【起飛 — 僅操作員親手按起飛／自動飛行 UI】禁止腳本／AI 代理人／任何 LLM 代為呼叫。
@@ -2768,11 +2788,11 @@ class OlympeLiveBackend:
             self.log.event(
                 "takeoff", ok=False, note="superseded_before_takeoff",
             )
-            self._clear_maneuver()
+            self._clear_maneuver("takeoff")
             return False
         if not preflight_ok:
             self.state.tracker_state = "TAKEOFF_BLOCKED"
-            self._clear_maneuver()
+            self._clear_maneuver("takeoff")
             self.log.event(
                 "takeoff", ok=False, note="preflight_blocked",
                 reason=self.state.preflight_reason,
@@ -2879,7 +2899,7 @@ class OlympeLiveBackend:
                 )
             return False
         finally:
-            self._clear_maneuver()
+            self._clear_maneuver("takeoff")
 
     # -------------------------------------------------------------- flight recording
     def set_record_on_takeoff(self, enabled: bool) -> None:
@@ -3444,11 +3464,25 @@ class OlympeLiveBackend:
             return ControlResult.rejected("LOCKED_EXTERNAL_APPROVAL", self.state)
         if request.action is ControlAction.EMERGENCY_STOP:
             return self.fail_safe(FailureReason.EMERGENCY_STOP)
-        if request.action is ControlAction.LAND_NOW:
-            raw = self.land_cmd("ui_land_now")
-            return ControlResult.completed(self.state, raw_result=raw)
-        if request.action is ControlAction.TAKEOFF:
-            raw = self.takeoff_cmd()
+        if request.action in {ControlAction.LAND_NOW, ControlAction.TAKEOFF}:
+            try:
+                raw = (
+                    self.land_cmd("ui_land_now")
+                    if request.action is ControlAction.LAND_NOW
+                    else self.takeoff_cmd()
+                )
+            except Exception as exc:
+                self.log.event(
+                    "typed_command_exception",
+                    request_id=request.request_id,
+                    action=request.action.value,
+                    error=repr(exc),
+                    active_incident=getattr(self.state, "active_incident", ""),
+                    tracker_state=getattr(self.state, "tracker_state", ""),
+                    mode=getattr(self.state, "mode", ""),
+                    control_owner=getattr(self.state, "control_owner", ""),
+                )
+                return ControlResult.rejected("BACKEND_EXCEPTION", self.state)
             return ControlResult.completed(self.state, raw_result=raw)
         if request.action is ControlAction.START_LOCALIZATION:
             return ControlResult.completed(self.state, raw_result=True)

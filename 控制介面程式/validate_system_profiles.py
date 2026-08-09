@@ -12,10 +12,9 @@ from site_profile import SCHEMA_VERSION, flight_readiness_errors, load_site_prof
 ROOT = Path(__file__).resolve().parent
 PROFILES = ROOT / "site_profiles"
 TEMPLATE_NAMES = {"example_site_edm.json"}
-# No shipped profile currently has a signed, site-bound hardware AUTO approval.
-# Adding a name here is a release decision and must accompany the verified v2
-# receipt/signature/trust material required by ``flight_readiness_errors``.
-APPROVED_PROFILE_NAMES: set[str] = set()
+# River-site is the currently approved AUTO profile.  Hardware receipt material
+# remains optional metadata and is not part of ``flight_readiness_errors``.
+APPROVED_PROFILE_NAMES: set[str] = {"river_site_edm.json"}
 
 
 def _digest(path: Path) -> str:

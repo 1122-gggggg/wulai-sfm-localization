@@ -5,12 +5,43 @@ set -euo pipefail
 CTRL_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 ROOT="$(cd "$CTRL_DIR/.." && pwd)"
 OI="$CTRL_DIR/operator_interface"
+PACKAGE_ROOT="$ROOT"
 
 export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
-export SFM_UI_PYTHON="${SFM_UI_PYTHON:-$ROOT/.venv/bin/python}"
+if [[ -z "${SFM_UI_PYTHON:-}" && -x "$ROOT/.venv/bin/python" ]]; then
+  export SFM_UI_PYTHON="$ROOT/.venv/bin/python"
+fi
 export LOCAL_TOPK="${LOCAL_TOPK:-0}"
 export IP="${IP:-192.168.53.1}"
 export CTRL="${CTRL:-skycontroller3}"
+
+verify_portable_package() {
+  if [[ ! -f "$PACKAGE_ROOT/PORTABLE_PACKAGE.json" ]]; then
+    if [[ ! -d "$PACKAGE_ROOT/.git" ]]; then
+      echo "[真機串流] ERROR: non-Git runtime is missing PORTABLE_PACKAGE.json" >&2
+      exit 2
+    fi
+    return 0
+  fi
+  local verifier
+  verifier="$(command -v python3.10 || command -v python3 || true)"
+  if [[ -z "$verifier" ]]; then
+    echo "[真機串流] ERROR: no Python interpreter available for portable manifest verification" >&2
+    exit 2
+  fi
+  if [[ ! -f "$PACKAGE_ROOT/tools/package_manifest.py" ]]; then
+    echo "[真機串流] ERROR: portable package is missing tools/package_manifest.py" >&2
+    exit 2
+  fi
+  echo "[真機串流] verifying portable package manifest ..."
+  if ! "$verifier" "$PACKAGE_ROOT/tools/package_manifest.py" verify --root "$PACKAGE_ROOT"; then
+    echo "[真機串流] ERROR: portable package manifest verification failed" >&2
+    exit 1
+  fi
+}
+
+verify_portable_package
+
 source "$OI/resolve_display.sh"
 configure_operator_display "${SFM_LAUNCH_DRY_RUN:-0}"
 

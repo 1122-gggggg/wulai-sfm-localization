@@ -754,13 +754,21 @@ def test_video_inventory_is_logged_once_after_first_observed_frame(make_backend)
     assert backend.connection_inventory["video"]["ui_frame_width_px"] == 1280
 
 
-def test_preflight_blocks_firmware_not_in_approved_receipt(make_backend):
+def test_preflight_does_not_gate_on_runtime_or_firmware_receipt_lists(make_backend):
     backend = make_backend(max_altitude_m=30.0, max_distance_m=100.0)
     backend.drone.flight_state = "landed"
     backend.approved_aircraft_firmware = frozenset({"different-version"})
+    backend.approved_controller_firmware = frozenset({"different-version"})
+    backend.approved_olympe_versions = frozenset({"different-version"})
 
-    assert not backend._takeoff_preflight()
-    assert "aircraft firmware" in backend.state.preflight_reason
+    assert backend._takeoff_preflight(), backend.state.preflight_reason
+    assert backend.connection_inventory["aircraft"]["software"] == "1.8.2"
+    assert backend.connection_inventory["controller"]["software"] == "1.8.2"
+    assert backend.connection_inventory["runtime"]["olympe_version"] == "8.4.0"
+    assert not any(
+        "approved receipt" in reason
+        for reason in backend.connection_inventory["block_reasons"]
+    )
     assert "TakeOff" not in backend.drone.events
 
 
@@ -1213,6 +1221,62 @@ def test_poll_does_not_refresh_speed_age_without_a_new_olympe_event(
     assert backend.state.ground_speed_mono_ns > first_stamp
 
 
+def test_future_telemetry_event_does_not_replace_last_valid_state(make_backend):
+    backend = make_backend()
+    old_state = {"speedX": 0.18, "speedY": 0.24, "speedZ": -0.04}
+    backend.telemetry_freshness.observe(
+        "ground_speed", old_state, marker="valid-event", observed_mono_ns=100
+    )
+    future_event = SimpleNamespace(
+        uuid="future-event",
+        args={"speedX": 99.0, "speedY": 99.0, "speedZ": 99.0},
+        date=SimpleNamespace(timestamp=lambda: time.time() + 10.0),
+    )
+    backend.drone.get_last_event = lambda _message: future_event
+
+    observed = backend._observe_telemetry(
+        "ground_speed",
+        object(),
+        old_state,
+        now_mono_ns=200,
+    )
+
+    assert observed == old_state
+    sample = backend.telemetry_freshness.sample("ground_speed")
+    assert sample is not None
+    assert sample.value == old_state
+    assert sample.marker == "valid-event"
+
+
+@pytest.mark.parametrize(
+    ("name", "key", "future_value"),
+    [
+        ("battery", "percent", 2.0),
+        ("altitude", "altitude", 99.0),
+    ],
+)
+def test_first_future_critical_telemetry_is_rejected(
+        make_backend, name, key, future_value):
+    backend = make_backend()
+    future_state = {key: future_value}
+    future_event = SimpleNamespace(
+        uuid=f"future-{name}",
+        args=future_state,
+        date=SimpleNamespace(timestamp=lambda: time.time() + 10.0),
+    )
+    backend.drone.get_last_event = lambda _message: future_event
+
+    observed = backend._observe_telemetry(
+        name,
+        object(),
+        future_state,
+        now_mono_ns=time.monotonic_ns(),
+    )
+
+    assert observed == {}
+    assert backend.telemetry_freshness.sample(name) is None
+
+
 def test_stale_critical_telemetry_fails_safe_without_requiring_gps(
     make_backend,
 ) -> None:
@@ -1336,6 +1400,59 @@ def test_typed_live_control_request_rejects_stale_normal_action_but_not_safety(
     ))
     assert stale_emergency.accepted
     assert stale_emergency.executed
+
+
+@pytest.mark.parametrize(
+    ("action", "method_name", "stale"),
+    [
+        (ControlAction.TAKEOFF, "takeoff_cmd", False),
+        (ControlAction.LAND_NOW, "land_cmd", True),
+    ],
+)
+def test_typed_live_command_exception_is_rejected_with_context(
+        make_backend, monkeypatch, action, method_name, stale):
+    backend = make_backend()
+    backend.state.active_incident = "existing_incident"
+    backend.state.tracker_state = "TEST_CONTEXT"
+    submitted_mono_ns = time.monotonic_ns()
+    if stale:
+        submitted_mono_ns -= backend_module.CONTROL_REQUEST_MAX_AGE_NS + 1
+    request = ControlRequest(
+        action=action,
+        submitted_mono_ns=submitted_mono_ns,
+        human_origin=True,
+    )
+
+    def raise_backend_error(*_args, **_kwargs):
+        raise RuntimeError("synthetic backend failure")
+
+    monkeypatch.setattr(backend, method_name, raise_backend_error)
+
+    result = backend.command(request)
+
+    assert isinstance(result, ControlResult)
+    assert not result.accepted
+    assert not result.executed
+    assert result.reason_code == "BACKEND_EXCEPTION"
+    assert result.resulting_state is backend.state
+    assert backend.state.active_incident == "existing_incident"
+    exception_records = [
+        fields
+        for event, fields in backend.log.records
+        if event == "typed_command_exception"
+    ]
+    assert exception_records
+    assert exception_records[-1]["request_id"] == request.request_id
+    assert exception_records[-1]["action"] == action.value
+    assert exception_records[-1]["active_incident"] == "existing_incident"
+    assert exception_records[-1]["error"] == "RuntimeError('synthetic backend failure')"
+    result_records = [
+        fields
+        for event, fields in backend.log.records
+        if event == "control_result"
+    ]
+    assert result_records[-1]["accepted"] is False
+    assert result_records[-1]["executed"] is False
 
 
 def test_typed_land_reports_unconfirmed_touchdown_as_rejected(make_backend) -> None:
@@ -2609,6 +2726,83 @@ def test_land_during_takeoff_wait_wins_epoch_and_prevents_recording(make_backend
     assert backend._landed
     assert backend.state.tracker_state == "LAND"
     assert recording_starts == []
+
+
+def test_superseded_takeoff_does_not_restore_source_during_blocked_landing(
+        make_backend):
+    class BlockedManeuverDrone(_FakeDrone):
+        def __init__(self):
+            super().__init__()
+            self.takeoff_wait_entered = threading.Event()
+            self.release_takeoff_wait = threading.Event()
+            self.landing_wait_entered = threading.Event()
+            self.release_landing_wait = threading.Event()
+
+        @staticmethod
+        def _blocked_wait(expectation, entered, release):
+            class BlockedExpectation:
+                def wait(self, _timeout=None):
+                    entered.set()
+                    assert release.wait(timeout=1.0)
+                    return expectation.wait(_timeout=_timeout)
+
+            return BlockedExpectation()
+
+        def __call__(self, message):
+            expectation = super().__call__(message)
+            first = self._first(message)
+            if first.name == "TakeOff":
+                return self._blocked_wait(
+                    expectation,
+                    self.takeoff_wait_entered,
+                    self.release_takeoff_wait,
+                )
+            if first.name == "Landing":
+                return self._blocked_wait(
+                    expectation,
+                    self.landing_wait_entered,
+                    self.release_landing_wait,
+                )
+            return expectation
+
+    backend = make_backend(max_altitude_m=10.0, max_distance_m=50.0)
+    backend.drone = BlockedManeuverDrone()
+    backend.drone.flight_state = "landed"
+    backend._firmware_config_ok = True
+    takeoff_results: list[bool] = []
+    takeoff_thread = threading.Thread(
+        target=lambda: takeoff_results.append(backend.takeoff_cmd())
+    )
+    takeoff_thread.start()
+    assert backend.drone.takeoff_wait_entered.wait(timeout=1.0)
+
+    backend.drone.flight_state = "flying"
+    landing_results: list[bool] = []
+    landing_thread = threading.Thread(
+        target=lambda: landing_results.append(backend.land_cmd("blocked_landing"))
+    )
+    landing_thread.start()
+    assert backend.drone.landing_wait_entered.wait(timeout=1.0)
+    assert backend._maneuver_in_progress == "landing"
+    source_requests_before_takeoff_release = list(backend.drone.source_requests)
+
+    backend.drone.release_takeoff_wait.set()
+    takeoff_thread.join(timeout=1.0)
+
+    assert not takeoff_thread.is_alive()
+    assert takeoff_results == [False]
+    assert backend._maneuver_in_progress == "landing"
+    assert backend.drone.source_requests == source_requests_before_takeoff_release
+    assert backend.drone.source_state == "Controller"
+    assert backend.pilot_sticks is False
+
+    backend.drone.release_landing_wait.set()
+    landing_thread.join(timeout=1.0)
+
+    assert not landing_thread.is_alive()
+    assert landing_results == [True]
+    assert backend.drone.source_requests[-1] == "SkyController"
+    assert backend._landed
 
 
 def test_hover_invalidates_a_pending_takeoff_epoch(make_backend):

@@ -3,6 +3,8 @@ from __future__ import annotations
 import queue
 import threading
 
+import pytest
+
 from backend_contract import ControlRequest, ControlResult, InterfaceMode
 from operator_command_coordinator import OperatorCommandCoordinator
 from operator_shutdown import OperatorShutdownCoordinator
@@ -100,6 +102,25 @@ def test_suspended_coordinator_rejects_new_commands_and_can_resume() -> None:
     coordinator.resume()
     assert coordinator.dispatch("manual", {}) is True
     assert normal.get(timeout=1.0) == ("manual", True, None)
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [RuntimeError("backend failed"), TimeoutError("backend timed out")],
+    ids=["exception", "timeout"],
+)
+def test_async_backend_failure_is_published_and_clears_inflight(failure) -> None:
+    class Backend:
+        def command(self, name: str, **payload):
+            raise failure
+
+    coordinator, normal, _safety, inflight, _logs, _drops = _coordinator(
+        Backend()
+    )
+
+    assert coordinator.dispatch("manual", {}) is True
+    assert normal.get(timeout=1.0) == ("manual", None, repr(failure))
+    assert inflight == set()
 
 
 def test_failed_shutdown_resumes_commands_but_success_keeps_them_suspended() -> None:

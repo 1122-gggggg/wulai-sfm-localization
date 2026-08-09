@@ -25,13 +25,18 @@ class OperatorShutdownCoordinator:
         write_log: Callable[[str], None] | None,
         destroy: Callable[[], None] | None,
         command_coordinator: Any | None = None,
+        autonomy: Any | None = None,
+        get_autonomy: Callable[[], Any | None] | None = None,
     ) -> None:
         self.backend = backend
         self.session_logs = session_logs
         self.write_log = write_log
         self.destroy = destroy
         self.command_coordinator = command_coordinator
+        self.autonomy = autonomy
+        self.get_autonomy = get_autonomy
         self._closed = False
+        self._autonomy_cancel_latched = False
 
     def _log(self, message: str) -> None:
         if self.write_log is None:
@@ -59,6 +64,8 @@ class OperatorShutdownCoordinator:
         return True
 
     def _resume_commands(self) -> None:
+        if self._autonomy_cancel_latched:
+            return
         resume = getattr(self.command_coordinator, "resume", None)
         if resume is None:
             return
@@ -66,6 +73,56 @@ class OperatorShutdownCoordinator:
             resume()
         except Exception as exc:
             self._log(f"控制指令恢復失敗（{exc!r}）；請保持手動控制並重試關窗。")
+
+    def _current_autonomy(self) -> Any | None:
+        if self.get_autonomy is not None:
+            return self.get_autonomy()
+        return self.autonomy
+
+    def _stop_autonomy(self) -> bool:
+        """Latch AUTO cancellation and join its worker before backend cleanup."""
+        try:
+            autonomy = self._current_autonomy()
+        except Exception as exc:
+            self._log(f"關窗已暫停：無法讀取 AUTO 狀態（{exc!r}）；請重試。")
+            return False
+        if autonomy is None or not bool(getattr(autonomy, "active", False)):
+            return True
+
+        cancel = getattr(autonomy, "cancel", None)
+        if not callable(cancel):
+            self._log(
+                "關窗已暫停：AUTO 執行緒沒有可用的取消介面；"
+                "請保持手動控制並重試。"
+            )
+            return False
+        self._autonomy_cancel_latched = True
+        try:
+            # DesktopRouteAutonomy.cancel() is the safety latch: it clears the
+            # route vector and sends a zero PCMD before starting its asynchronous
+            # SkyController handoff.  Do not wait for that handoff here.
+            cancel("ui_window_close")
+        except Exception as exc:
+            self._log(f"關窗已暫停：AUTO 取消失敗（{exc!r}）；請重試。")
+            return False
+
+        join = getattr(autonomy, "join", None)
+        if callable(join):
+            try:
+                joined = join(timeout=1.0)
+            except Exception as exc:
+                self._log(f"關窗已暫停：AUTO 執行緒停止失敗（{exc!r}）；請重試。")
+                return False
+            if joined is False:
+                self._log("關窗已暫停：AUTO 執行緒尚未停止；請重試。")
+                return False
+        if bool(getattr(autonomy, "active", False)):
+            self._log("關窗已暫停：AUTO 執行緒尚未停止；請重試。")
+            return False
+        # AUTO is now stopped, so a failed touchdown confirmation must leave
+        # the operator able to issue a manual safety command before retrying.
+        self._autonomy_cancel_latched = False
+        return True
 
     def _reject_cleanup(self, message: str) -> bool:
         self._log(message)
@@ -129,6 +186,8 @@ class OperatorShutdownCoordinator:
         if self._closed:
             return True
         if not self._suspend_commands():
+            return False
+        if not self._stop_autonomy():
             return False
 
         is_live = bool(getattr(self.backend, "is_live", False))

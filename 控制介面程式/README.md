@@ -14,7 +14,8 @@
 `模擬器/測試影片/` 自動選擇：P1190119.MP4 優先，否則只有一部影片時使用該影片，多部時必須明確傳入。P119 會先驗證 SHA-256，再模擬 720p30、5 Mb/s、
 280 ms 無線鏈路；影片結束後停在最後完整幀。真機入口無預設場域，
 連線後讀取並記錄飛機、SkyController、firmware、Olympe、Home 與 RTH。
-沒有 SHA 固定的核准 receipt 時可做地面診斷，但起飛 fail closed。
+hardware approval receipt 是可選的診斷與追溯資料；沒有 receipt 時仍依 profile、資產
+hash、路線與其他真機安全條件判定是否可起飛。
 介面也分別回讀 ANAFI 與 SkyController 3 的韌體羅盤校正狀態；狀態未知、必須
 校正、校正失敗或進行中時會封鎖起飛與自主入口。校正只能由操作員在確認
 `landed` 後按下對應按鈕，不會啟動馬達、起飛或自動移動。

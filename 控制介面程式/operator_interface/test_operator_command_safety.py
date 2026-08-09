@@ -91,7 +91,6 @@ def _complete_preflight(operator) -> None:
 
 def _make_autonomy_runtime_ready(operator) -> None:
     operator._autonomy_profile_verified = True
-    operator.backend.state.live_auto_release_ready = True
     operator.localizer = SimpleNamespace(
         ready=True, request_relocalize=lambda: None
     )
@@ -284,6 +283,107 @@ def test_preflight_route_step_requires_visible_hash_verified_route(tmp_path) -> 
     evidence, reason = operator._preflight_step_evidence("route", DroneState())
     assert evidence is None
     assert "顯示規劃路徑" in reason
+
+
+def test_display_only_import_can_be_confirmed_without_becoming_auto_candidate(
+    tmp_path, monkeypatch
+) -> None:
+    route = tmp_path / "route.json"
+    route.write_text("{}", encoding="utf-8")
+    snapshot = SimpleNamespace(
+        path=route.resolve(),
+        sha256="a" * 64,
+        site_id="river_site_edm",
+        coordinate_frame_id="river_site_glomap",
+        waypoints=((0.0, 0.0, 0.0), (1.0, 0.0, 0.0)),
+        controller_waypoints=lambda: [
+            np.array([0.0, 0.0, 0.0]),
+            np.array([1.0, 0.0, 0.0]),
+        ],
+        verify_file_unchanged=lambda: None,
+    )
+    operator = OperatorApp.__new__(OperatorApp)
+    operator.backend = SimpleNamespace(is_live=False)
+    operator.mission_route_lock = SimpleNamespace(active=False, snapshot=None)
+    operator.site_profile_path = tmp_path / "profile.json"
+    operator._active_site_map_frame = lambda: None
+    operator.show_route_var = SimpleNamespace(set=lambda _value: None)
+    operator.redraw_map_only = lambda: None
+    monkeypatch.setattr(
+        app,
+        "load_site_profile",
+        lambda _path: SimpleNamespace(
+            site_id="river_site_edm",
+            flight=SimpleNamespace(coordinate_frame_id="river_site_glomap"),
+        ),
+    )
+    monkeypatch.setattr(app, "flight_readiness_errors", lambda _profile: ["not approved"])
+    monkeypatch.setattr(app, "file_sha256", lambda _path: snapshot.sha256)
+    monkeypatch.setattr(
+        app, "capture_mission_route_snapshot", lambda *_args, **_kwargs: snapshot
+    )
+
+    operator._show_route_overlay(route, bind_for_auto=False)
+    evidence, reason = operator._preflight_step_evidence(
+        "route", DroneState(), verify_route_hash=True
+    )
+
+    assert evidence is not None, reason
+    assert operator.mission_route_lock.snapshot is None
+
+
+def test_confirming_route_step_binds_the_displayed_snapshot_for_auto() -> None:
+    old_snapshot = SimpleNamespace(
+        path=Path("/tmp/old-route.json"),
+        sha256="a" * 64,
+    )
+    selected_snapshot = SimpleNamespace(
+        path=Path("/tmp/selected-route.json"),
+        sha256="b" * 64,
+        site_id="river_site_edm",
+        coordinate_frame_id="river_site_glomap",
+        waypoints=((0.0, 0.0, 0.0), (1.0, 0.0, 0.0)),
+    )
+    events = []
+
+    class RouteLock:
+        active = False
+        snapshot = old_snapshot
+
+        def bind(self, snapshot):
+            events.append(("bind", snapshot))
+            self.snapshot = snapshot
+
+    class SessionLogs:
+        def command(self, event, **fields):
+            events.append((event, fields))
+            return True
+
+    operator = OperatorApp.__new__(OperatorApp)
+    operator.backend = SimpleNamespace(state=DroneState())
+    operator.current_state = operator.backend.state
+    operator.preflight_guide = SequentialPreflightGuide()
+    operator.preflight_guide.confirm_current(("compass", "confirmed"))
+    operator.preflight_guide.confirm_current(("map", "confirmed"))
+    operator.mission_route_lock = RouteLock()
+    operator._displayed_route_snapshot = selected_snapshot
+    operator._displayed_route_sha256 = selected_snapshot.sha256
+    operator.session_logs = SessionLogs()
+    operator._preflight_step_evidence = lambda *_args, **_kwargs: (
+        ("route", selected_snapshot.sha256),
+        "route verified",
+    )
+    operator._update_preflight_guide = lambda _state: None
+    operator._select_preflight_tab = lambda _step: None
+    operator.write_log = lambda _message: None
+
+    assert operator.confirm_current_preflight_step() is True
+
+    assert operator.mission_route_lock.snapshot is selected_snapshot
+    assert events[0][0] == "route_selected"
+    assert events[0][1]["route_sha256"] == selected_snapshot.sha256
+    assert events[1] == ("bind", selected_snapshot)
+    assert operator.preflight_guide.current_step == "system"
 
 
 def test_route_selection_is_logged_before_the_snapshot_is_bound(
@@ -546,6 +646,42 @@ def test_unapproved_profile_or_route_is_not_bound_as_auto_candidate(
     assert operator.mission_route_lock.snapshot is None
 
 
+def test_unapproved_route_choice_switches_display_without_binding_auto(
+    tmp_path, monkeypatch
+) -> None:
+    route = tmp_path / "alternate-route.json"
+    route.write_text("{}", encoding="utf-8")
+    snapshot = SimpleNamespace(
+        path=route,
+        sha256="b" * 64,
+        waypoints=((0.0, 0.0, 0.0), (1.0, 0.0, 0.0)),
+    )
+    calls = []
+    operator = OperatorApp.__new__(OperatorApp)
+    operator.site_profile_path = tmp_path / "profile.json"
+    operator.mission_route_lock = SimpleNamespace(snapshot=None)
+    operator.write_log = lambda _message: None
+
+    def show(path, *, bind_for_auto=True):
+        calls.append((Path(path), bind_for_auto))
+        operator._displayed_route_snapshot = snapshot
+        return len(snapshot.waypoints)
+
+    operator._show_route_overlay = show
+    monkeypatch.setattr(app, "load_site_profile", lambda _path: object())
+    monkeypatch.setattr(
+        app,
+        "flight_readiness_errors",
+        lambda _profile: ["AUTO approval is incomplete"],
+    )
+
+    message = operator.preview_site_route(route)
+
+    assert calls == [(route, False)]
+    assert operator.mission_route_lock.snapshot is None
+    assert "僅切換顯示" in message
+
+
 def test_start_auto_does_not_dispatch_when_four_step_preflight_is_incomplete() -> None:
     operator = _bare_app()
     operator.inspecting = True
@@ -626,7 +762,7 @@ def test_integrated_auto_does_not_create_coordinator_when_runtime_approval_is_in
     assert operator.backend.calls == []
 
 
-def test_integrated_auto_is_fail_closed_without_live_release_approval(
+def test_integrated_auto_starts_without_a_separate_live_release_flag(
     tmp_path, monkeypatch
 ) -> None:
     created = []
@@ -654,11 +790,9 @@ def test_integrated_auto_is_fail_closed_without_live_release_approval(
     operator.backend.state = SimpleNamespace(
         autonomous_locked=False,
         autonomous_approval_valid=True,
-        live_auto_release_ready=False,
     )
     operator.inspecting = True
     _make_autonomy_runtime_ready(operator)
-    operator.backend.state.live_auto_release_ready = False
     _complete_preflight(operator)
     operator.mission_route_lock = _RouteLock()
     operator._displayed_route_sha256 = "a" * 64
@@ -675,17 +809,39 @@ def test_integrated_auto_is_fail_closed_without_live_release_approval(
 
     operator.send("start_auto")
 
-    assert created == []
-    assert operator.__dict__.get("_integrated_autonomy") is None
-    assert not operator.mission_route_lock.active
-    assert any("發布阻擋" in message for message in operator.logs)
+    assert len(created) == 1
+    assert operator.__dict__.get("_integrated_autonomy") is created[0]
+    assert operator.mission_route_lock.active
+    assert not any("發布阻擋" in message for message in operator.logs)
 
 
-def test_profile_verification_cannot_clear_temporary_live_release_block() -> None:
+def test_integrated_auto_takeoff_event_requires_literal_true() -> None:
+    operator = OperatorApp.__new__(OperatorApp)
+    operator._pending_auto_route_activation = True
+    operator.cancelled_activation = False
+    operator.confirmed_activation = False
+    operator._cancel_pending_auto_route_activation = (
+        lambda: setattr(operator, "cancelled_activation", True)
+    )
+    operator.mission_route_lock = SimpleNamespace(
+        confirm_auto_started=lambda: setattr(operator, "confirmed_activation", True)
+    )
+    operator._finish_backend_command = lambda *_args: None
+
+    OperatorApp._finish_integrated_auto_command_event(
+        operator,
+        SimpleNamespace(command="takeoff", result=None, error=None),
+    )
+
+    assert not operator.confirmed_activation
+    assert operator.cancelled_activation
+
+
+def test_profile_verification_sets_only_the_runtime_approval_state() -> None:
     operator = _bare_app()
     operator.backend.is_live = True
     operator.backend.session_config = SimpleNamespace(autonomous_locked=False)
-    operator.backend.state = SimpleNamespace(live_auto_release_ready=True)
+    operator.backend.state = SimpleNamespace()
     operator._active_site_autonomy_errors = lambda: ()
 
     operator._sync_autonomy_profile_approval()
@@ -693,14 +849,14 @@ def test_profile_verification_cannot_clear_temporary_live_release_block() -> Non
     assert operator._autonomy_profile_verified is True
     assert operator.backend.state.autonomous_locked is False
     assert operator.backend.state.autonomous_approval_valid is True
-    assert operator.backend.state.live_auto_release_ready is False
+    assert not hasattr(operator.backend.state, "live_auto_release_ready")
 
 
 def test_runtime_unlock_cannot_bypass_site_profile_readiness() -> None:
     operator = _bare_app()
     operator.backend.is_live = True
     operator.backend.session_config = SimpleNamespace(autonomous_locked=False)
-    operator.backend.state = SimpleNamespace(live_auto_release_ready=True)
+    operator.backend.state = SimpleNamespace()
     operator._active_site_autonomy_errors = lambda: ("signed receipt missing",)
 
     operator._sync_autonomy_profile_approval()
@@ -708,14 +864,14 @@ def test_runtime_unlock_cannot_bypass_site_profile_readiness() -> None:
     assert operator._autonomy_profile_verified is False
     assert operator.backend.state.autonomous_locked is True
     assert operator.backend.state.autonomous_approval_valid is False
-    assert operator.backend.state.live_auto_release_ready is False
+    assert not hasattr(operator.backend.state, "live_auto_release_ready")
 
 
 def test_runtime_lock_remains_an_additional_site_profile_blocker() -> None:
     operator = _bare_app()
     operator.backend.is_live = True
     operator.backend.session_config = SimpleNamespace(autonomous_locked=True)
-    operator.backend.state = SimpleNamespace(live_auto_release_ready=True)
+    operator.backend.state = SimpleNamespace()
     operator._active_site_autonomy_errors = lambda: ()
 
     operator._sync_autonomy_profile_approval()
@@ -724,7 +880,7 @@ def test_runtime_lock_remains_an_additional_site_profile_blocker() -> None:
     assert operator.backend.state.autonomous_locked is True
     assert operator.backend.state.autonomous_approval_valid is False
     assert "runtime configuration" in operator._autonomy_profile_errors[0]
-    assert operator.backend.state.live_auto_release_ready is False
+    assert not hasattr(operator.backend.state, "live_auto_release_ready")
 
 
 @pytest.mark.parametrize("gps_fixed", [False, None], ids=["no-fix", "unknown"])
@@ -1087,8 +1243,15 @@ def test_focus_loss_clears_all_holds_and_backend_nudges():
     assert app.backend.calls == [("nudge_clear", {"reason": "ui_focus_lost"})]
 
 
-@pytest.mark.parametrize("widget_class", ["Entry", "TEntry", "Text"])
-def test_text_input_keypress_does_not_start_nudge(widget_class):
+@pytest.mark.parametrize(
+    "widget_class",
+    [
+        "Entry", "TEntry", "Text", "Button", "TButton", "Scale", "TScale",
+        "TNotebook", "TCombobox", "Spinbox", "TSpinbox", "Listbox",
+        "Checkbutton", "TCheckbutton", "Radiobutton", "TRadiobutton",
+    ],
+)
+def test_interactive_widget_keypress_does_not_start_nudge(widget_class):
     app = _bare_app()
     event = SimpleNamespace(
         widget=SimpleNamespace(winfo_class=lambda: widget_class)
@@ -1132,6 +1295,29 @@ def test_slow_backend_command_is_dispatched_without_blocking_caller():
     release.set()
     command, result, error = app._flight_results.get(timeout=1.0)
     assert (command, result, error) == ("takeoff", "takeoff", None)
+
+
+def test_live_emergency_stop_is_dispatched_without_blocking_caller():
+    entered = threading.Event()
+    release = threading.Event()
+
+    class SlowSafetyBackend(_Backend):
+        is_live = True
+
+        def command(self, name, **payload):
+            entered.set()
+            assert release.wait(1.0)
+            return super().command(name, **payload)
+
+    operator = _bare_app(SlowSafetyBackend())
+    started = time.monotonic()
+    operator.send("emergency_stop")
+
+    assert time.monotonic() - started < 0.1
+    assert entered.wait(0.5)
+    release.set()
+    command, result, error = operator._flight_safety_results.get(timeout=1.0)
+    assert (command, result, error) == ("emergency_stop", "emergency_stop", None)
 
 
 def test_flight_result_queue_drops_old_normal_results_but_preserves_safety():
@@ -1460,9 +1646,32 @@ def test_emergency_cleanup_lands_and_survives_a_failing_backend():
     source = inspect.getsource(app.main)
     start = source.index("def _emergency_cleanup")
     body = source[start:start + 700]
-    assert "live_backend.cleanup()" in body, "exit path does not land"
+    assert "current_backend.cleanup()" in body, "exit path does not land"
+    assert 'app.__dict__.get("backend")' in body, "exit path can use a stale backend"
     assert "except Exception" in body, "a broken backend would abort the exit path"
-    assert "session_logs.close" in body, "exit path does not close the session log"
+    assert "current_logs.close" in body, "exit path does not close the session log"
+
+
+@pytest.mark.parametrize(
+    ("command", "false_success"),
+    (("takeoff", "起飛 expectation 完成"), ("land", "降落 expectation 完成")),
+)
+def test_false_takeoff_or_land_completion_is_not_reported_as_success(
+    command: str,
+    false_success: str,
+) -> None:
+    operator = OperatorApp.__new__(OperatorApp)
+    operator.backend = SimpleNamespace(
+        pilot_sticks=False,
+        state=SimpleNamespace(tracker_state="HOVER", flight_state="hovering"),
+    )
+    messages = []
+    operator.write_log = messages.append
+
+    OperatorApp._finish_backend_command(operator, command, False, None)
+
+    assert not any(false_success in message for message in messages)
+    assert any("未確認" in message for message in messages)
 
 
 class _ShutdownSessionLog:
@@ -1681,22 +1890,16 @@ def test_tick_drives_the_held_virtual_stick_heartbeat():
     assert "_send_stick_vector(app.stick_left.value, app.stick_right.value)" in source
 
 
-def test_restart_closes_inherited_descriptors_before_exec() -> None:
-    """execv inherits open fds, and Olympe routinely fails to release its pomp loop.
-
-    The replacement image then held the SkyController socket the dying backend
-    never closed, and could not connect -- observed as "Error while destroying
-    pomp loop: -16" followed by a restart that died immediately.
-    """
-    source = inspect.getsource(app.main)
-    exec_index = source.index("os.execv(")
-    assert "os.closerange(3" in source[:exec_index], (
-        "descriptors are still inherited by the restarted interface"
-    )
+def test_site_switch_keeps_the_tk_process_and_rebuilds_runtime_off_thread() -> None:
+    source = inspect.getsource(app.OperatorApp.request_site_profile_restart)
+    assert "_on_close" not in source
+    assert "threading.Thread" in source
+    assert "replace_active_site_runtime" in source
+    assert "os.execv(" not in inspect.getsource(app.main)
 
 
 def test_startup_asks_about_a_missing_route_for_the_active_site() -> None:
-    """After a site switch the interface restarts, so the question must be re-asked."""
+    """Direct startup still asks when the profile has no route."""
     source = inspect.getsource(app.OperatorApp._check_active_site_route)
     assert "follow_up_route_for_site" in source
     assert "route_json" in source

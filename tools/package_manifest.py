@@ -13,11 +13,12 @@ from pathlib import Path
 CONTROL_FILES = {"MANIFEST.tsv", "SHA256SUMS"}
 SITE_ASSET_MANIFEST = "PORTABLE_SITE_ASSETS.json"
 OFFLINE_WHEELHOUSE_RELATIVE = "執行環境/offline_wheelhouse"
-OFFLINE_REQUIREMENT_LOCKS = (
-    "requirements-lock.txt",
-    "requirements-test-lock.txt",
-    "requirements-quality-lock.txt",
+_SITE_PROFILE_TOP_LEVEL_ASSET_KEYS = (
+    "localizer_profile",
+    "map_reference_poses",
+    "map_align",
 )
+_SITE_PROFILE_HARDWARE_PATH_KEYS = ("receipt", "signature", "trust_store")
 EXCLUDED_PARTS = {
     ".git",
     ".codegraph",
@@ -59,6 +60,26 @@ class Entry:
     size: int
     sha256: str
     path: str
+
+
+def _contains_symlink(path: Path) -> bool:
+    try:
+        absolute = path.absolute()
+        current = Path(absolute.anchor)
+        for part in absolute.parts[1:]:
+            current /= part
+            if current.is_symlink():
+                return True
+    except (OSError, RuntimeError):
+        return True
+    return False
+
+
+def _control_file_issue(root: Path) -> str | None:
+    for name in sorted(CONTROL_FILES):
+        if _contains_symlink(root / name):
+            return f"{name} or its parent path contains a symlink"
+    return None
 
 
 def included(
@@ -136,7 +157,10 @@ def generate(
     source_only: bool = False,
     include_site_assets: bool | None = None,
 ) -> list[Entry]:
-    root = Path(root).resolve()
+    root_path = Path(root)
+    if issue := _control_file_issue(root_path):
+        raise ValueError(issue)
+    root = root_path.resolve()
     if include_site_assets is None:
         include_site_assets = not source_only and (root / SITE_ASSET_MANIFEST).is_file()
     result = entries(
@@ -265,6 +289,22 @@ def _offline_install_metadata_issues(
     )
 
 
+def _offline_lock_names(value: object) -> tuple[str, ...]:
+    if not isinstance(value, dict) or not value:
+        raise ValueError("PORTABLE_PACKAGE.json offline_install.lock_digests is invalid")
+    names = tuple(sorted(value))
+    for name in names:
+        if (
+            not isinstance(name, str)
+            or not name
+            or Path(name).name != name
+            or "/" in name
+            or "\\" in name
+        ):
+            raise ValueError("PORTABLE_PACKAGE.json offline install lock name is invalid")
+    return names
+
+
 def _offline_wheelhouse_issues(root: Path) -> list[str]:
     package_metadata = root / "PORTABLE_PACKAGE.json"
     if not package_metadata.is_file():
@@ -287,11 +327,16 @@ def _offline_wheelhouse_issues(root: Path) -> list[str]:
         return ["PORTABLE_PACKAGE.json offline_install.complete must be a boolean"]
 
     try:
+        lock_names = _offline_lock_names(offline_install.get("lock_digests"))
+    except ValueError as exc:
+        return [str(exc)]
+
+    try:
         from offline_wheelhouse import WheelhouseError, verify_wheelhouse
 
         metadata = verify_wheelhouse(
             root / OFFLINE_WHEELHOUSE_RELATIVE,
-            tuple(root / relative for relative in OFFLINE_REQUIREMENT_LOCKS),
+            tuple(root / relative for relative in lock_names),
         )
         return _offline_install_metadata_issues(root, offline_install, metadata)
     except (OSError, WheelhouseError) as exc:
@@ -303,15 +348,19 @@ def _site_asset_path_issue(
 ) -> tuple[str | None, Path | None]:
     if not isinstance(relative, str) or not relative.strip():
         return f"{SITE_ASSET_MANIFEST} {label} path is invalid: {relative!r}", None
+    if "\\" in relative:
+        return f"{SITE_ASSET_MANIFEST} {label} path is unsafe: {relative}", None
     relative_path = Path(relative)
     if relative_path.is_absolute() or ".." in relative_path.parts:
         return f"{SITE_ASSET_MANIFEST} {label} path is not relative: {relative}", None
     path = root / relative_path
+    if _contains_symlink(path):
+        return f"{SITE_ASSET_MANIFEST} {label} path contains a symlink: {relative}", None
     try:
         resolved = path.resolve(strict=False)
-    except OSError as exc:
+    except (OSError, RuntimeError) as exc:
         return f"{SITE_ASSET_MANIFEST} {label} path cannot be resolved: {relative}: {exc}", None
-    if path.is_symlink() or not resolved.is_relative_to(root):
+    if not resolved.is_relative_to(root):
         return f"{SITE_ASSET_MANIFEST} {label} path escapes package root: {relative}", None
     return None, path
 
@@ -365,7 +414,7 @@ def _reference_index_issues(
 ) -> list[str]:
     try:
         index = json.loads((root / relative).read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         return [f"reference index manifest cannot be read: {relative}: {exc}"]
     if not isinstance(index, dict) or index.get("schema") != "localization-reference-index-sha256":
         return [f"reference index manifest has unsupported schema: {relative}"]
@@ -403,13 +452,252 @@ def _reference_index_issues(
     return issues
 
 
+def _site_profile_asset_path(
+    root: Path,
+    profile_path: Path,
+    relative: object,
+    *,
+    label: str,
+) -> tuple[str | None, str | None, Path | None]:
+    if not isinstance(relative, str) or not relative.strip():
+        return (
+            f"{SITE_ASSET_MANIFEST} {label} path is invalid: {relative!r}",
+            None,
+            None,
+        )
+    if "\\" in relative:
+        return (
+            f"{SITE_ASSET_MANIFEST} {label} path is unsafe: {relative}",
+            None,
+            None,
+        )
+    try:
+        candidate = Path(relative).expanduser()
+        if not candidate.is_absolute():
+            candidate = profile_path.parent / candidate
+        if _contains_symlink(candidate):
+            return (
+                f"{SITE_ASSET_MANIFEST} {label} path contains a symlink: {relative}",
+                None,
+                None,
+            )
+        resolved = candidate.resolve(strict=False)
+    except (OSError, RuntimeError, ValueError) as exc:
+        return (
+            f"{SITE_ASSET_MANIFEST} {label} path cannot be resolved: {relative}: {exc}",
+            None,
+            None,
+        )
+    if not resolved.is_relative_to(root):
+        return (
+            f"{SITE_ASSET_MANIFEST} {label} path escapes package root: {relative}",
+            None,
+            None,
+        )
+    return None, resolved.relative_to(root).as_posix(), resolved
+
+
+def _site_profile_files_issues(
+    root: Path,
+    profile_relative: str,
+    raw_profile: dict[str, object],
+    entries_by_path: dict[str, dict[str, object]],
+) -> tuple[list[str], set[str]]:
+    issues: list[str] = []
+    listed_files = raw_profile.get("files")
+    listed_paths: set[str] = set()
+    if not isinstance(listed_files, list) or not listed_files:
+        issues.append(f"{SITE_ASSET_MANIFEST} profile has no files list: {profile_relative}")
+    else:
+        for listed in listed_files:
+            listed_issue, listed_path = _site_asset_path_issue(
+                root, listed, label="profile file"
+            )
+            if listed_issue is not None or listed_path is None:
+                issues.append(listed_issue or f"{SITE_ASSET_MANIFEST} profile file is invalid")
+                continue
+            assert isinstance(listed, str)
+            listed_paths.add(listed)
+            if listed not in entries_by_path:
+                issues.append(f"{SITE_ASSET_MANIFEST} profile file is not bundled: {listed}")
+            elif not listed_path.is_file():
+                issues.append(f"{SITE_ASSET_MANIFEST} profile file missing: {listed}")
+    if profile_relative not in listed_paths:
+        issues.append(f"{SITE_ASSET_MANIFEST} profile does not list itself: {profile_relative}")
+    return issues, listed_paths
+
+
+def _read_site_profile(
+    profile_path: Path, profile_relative: str
+) -> tuple[list[str], dict[str, object] | None]:
+    try:
+        profile_data = json.loads(profile_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        return [f"{SITE_ASSET_MANIFEST} profile cannot be read: {profile_relative}: {exc}"], None
+    if not isinstance(profile_data, dict):
+        return [f"{SITE_ASSET_MANIFEST} profile must contain an object: {profile_relative}"], None
+    return [], profile_data
+
+
+def _site_profile_declared_assets(
+    profile_data: dict[str, object], profile_relative: str
+) -> tuple[list[str], dict[str, object]]:
+    issues: list[str] = []
+    declared_assets: dict[str, object] = {}
+    profile_assets = profile_data.get("assets", {})
+    if not isinstance(profile_assets, dict):
+        issues.append(
+            f"{SITE_ASSET_MANIFEST} profile assets must be an object: {profile_relative}"
+        )
+    else:
+        declared_assets.update(profile_assets)
+    for key in _SITE_PROFILE_TOP_LEVEL_ASSET_KEYS:
+        if key in profile_data:
+            declared_assets[key] = profile_data[key]
+
+    hardware = profile_data.get("hardware_approval")
+    if hardware is not None:
+        if not isinstance(hardware, dict):
+            issues.append(
+                f"{SITE_ASSET_MANIFEST} profile hardware_approval must be an object: "
+                f"{profile_relative}"
+            )
+        else:
+            for key in _SITE_PROFILE_HARDWARE_PATH_KEYS:
+                if key in hardware:
+                    declared_assets[f"hardware_approval.{key}"] = hardware[key]
+    return issues, declared_assets
+
+
+def _site_profile_asset_issues(
+    root: Path,
+    profile_path: Path,
+    profile_relative: str,
+    declared_assets: dict[str, object],
+    listed_paths: set[str],
+    entries_by_path: dict[str, dict[str, object]],
+    checked_reference_indexes: set[str],
+) -> list[str]:
+    issues: list[str] = []
+    for label, value in declared_assets.items():
+        if value in (None, ""):
+            continue
+        asset_issue, asset_relative, asset_path = _site_profile_asset_path(
+            root,
+            profile_path,
+            value,
+            label=f"profile {profile_relative} {label}",
+        )
+        if asset_issue is not None or asset_relative is None or asset_path is None:
+            issues.append(asset_issue or f"{SITE_ASSET_MANIFEST} profile asset path is invalid")
+            continue
+        if asset_relative not in entries_by_path:
+            issues.append(
+                f"{SITE_ASSET_MANIFEST} profile {profile_relative} asset {label} "
+                f"is not bundled: {asset_relative}"
+            )
+        elif not asset_path.is_file():
+            issues.append(
+                f"{SITE_ASSET_MANIFEST} profile {profile_relative} asset {label} "
+                f"is missing: {asset_relative}"
+            )
+        if asset_relative not in listed_paths:
+            issues.append(
+                f"{SITE_ASSET_MANIFEST} profile {profile_relative} asset {label} "
+                f"is not listed in profile files: {asset_relative}"
+            )
+        if label == "reference_index" and asset_relative not in checked_reference_indexes:
+            issues.extend(_reference_index_issues(root, asset_relative, entries_by_path))
+            checked_reference_indexes.add(asset_relative)
+    return issues
+
+
+def _site_profile_entry_issues(
+    root: Path,
+    raw_profile: object,
+    seen_profiles: set[str],
+    entries_by_path: dict[str, dict[str, object]],
+    checked_reference_indexes: set[str],
+) -> list[str]:
+    if not isinstance(raw_profile, dict):
+        return [f"{SITE_ASSET_MANIFEST} contains a non-object profile"]
+    profile_relative = raw_profile.get("path")
+    issue, profile_path = _site_asset_path_issue(root, profile_relative, label="profile")
+    if issue is not None or profile_path is None:
+        return [issue or f"{SITE_ASSET_MANIFEST} profile path is invalid"]
+    assert isinstance(profile_relative, str)
+    if profile_relative in seen_profiles:
+        return [f"{SITE_ASSET_MANIFEST} contains duplicate profile: {profile_relative}"]
+    seen_profiles.add(profile_relative)
+    issues: list[str] = []
+    profile_entry = entries_by_path.get(profile_relative)
+    if profile_entry is None:
+        issues.append(f"{SITE_ASSET_MANIFEST} profile is not bundled: {profile_relative}")
+    elif profile_entry.get("role") != "site_profile":
+        issues.append(
+            f"{SITE_ASSET_MANIFEST} profile has an invalid file role: {profile_relative}"
+        )
+    if not profile_path.is_file():
+        issues.append(f"{SITE_ASSET_MANIFEST} profile missing: {profile_relative}")
+        return issues
+
+    file_issues, listed_paths = _site_profile_files_issues(
+        root, profile_relative, raw_profile, entries_by_path
+    )
+    issues.extend(file_issues)
+    profile_issues, profile_data = _read_site_profile(profile_path, profile_relative)
+    issues.extend(profile_issues)
+    if profile_data is None:
+        return issues
+    declaration_issues, declared_assets = _site_profile_declared_assets(
+        profile_data, profile_relative
+    )
+    issues.extend(declaration_issues)
+    issues.extend(
+        _site_profile_asset_issues(
+            root,
+            profile_path,
+            profile_relative,
+            declared_assets,
+            listed_paths,
+            entries_by_path,
+            checked_reference_indexes,
+        )
+    )
+    return issues
+
+
+def _site_profile_issues(
+    root: Path,
+    data: dict[str, object],
+    entries_by_path: dict[str, dict[str, object]],
+    checked_reference_indexes: set[str],
+) -> list[str]:
+    profiles = data.get("profiles")
+    if not isinstance(profiles, list) or not profiles:
+        return [f"{SITE_ASSET_MANIFEST} has no profiles list"]
+    issues: list[str] = []
+    seen_profiles: set[str] = set()
+    for raw_profile in profiles:
+        issues.extend(
+            _site_profile_entry_issues(
+                root,
+                raw_profile,
+                seen_profiles,
+                entries_by_path,
+                checked_reference_indexes,
+            )
+        )
+    return issues
+
+
 def _site_asset_issues(root: Path) -> list[str]:
     manifest_path = root / SITE_ASSET_MANIFEST
     if not manifest_path.is_file():
         return []
     try:
         data = json.loads(manifest_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         return [f"{SITE_ASSET_MANIFEST} cannot be read: {exc}"]
     if not isinstance(data, dict) or data.get("schema") != "sfm-portable-site-assets/v1":
         return [f"{SITE_ASSET_MANIFEST} has an unsupported schema"]
@@ -420,9 +708,14 @@ def _site_asset_issues(root: Path) -> list[str]:
     entries_by_path: dict[str, dict[str, object]] = {}
     for raw in files:
         issues.extend(_site_asset_entry_issues(root, raw, entries_by_path))
+    checked_reference_indexes: set[str] = set()
     for relative, raw in entries_by_path.items():
         if raw.get("role") == "reference_index_manifest":
             issues.extend(_reference_index_issues(root, relative, entries_by_path))
+            checked_reference_indexes.add(relative)
+    issues.extend(
+        _site_profile_issues(root, data, entries_by_path, checked_reference_indexes)
+    )
     return issues
 
 
@@ -482,7 +775,10 @@ def verify(
     source_only: bool = False,
     include_site_assets: bool | None = None,
 ) -> list[str]:
-    root = Path(root).resolve()
+    root_path = Path(root)
+    if issue := _control_file_issue(root_path):
+        return [issue]
+    root = root_path.resolve()
     if include_site_assets is None:
         include_site_assets = not source_only and (root / SITE_ASSET_MANIFEST).is_file()
     try:

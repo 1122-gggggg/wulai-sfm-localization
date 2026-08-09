@@ -102,12 +102,12 @@ OperatorApp
           └─ TelemetryFreshnessStore：逐欄位 freshness 與速度限制語意
 ```
 
-真機 AUTO 另有獨立的 release latch。程式啟動與 profile 同步都會把 latch 設為
-關閉；即使一般起飛按鈕可用，也不能建立 live AUTO coordinator。未來解除阻擋前，
-必須同時通過四步 preflight、site/route 核准、資產雜湊、runtime lock，以及簽章的
-hardware approval receipt v2。GPS 不可用不會阻擋起飛，但只會停用依賴 GPS 的距離
-柵欄，不能繞過其他安全 gate。目前隨附的所有 site profile 都不具備 live AUTO
-核准。
+真機 AUTO 沒有額外的 release latch。操作員必須完成四步 preflight，且選定的
+site/route 核准、座標框架、資產雜湊與 runtime lock 必須一致。AUTO 起飛後先懸停，
+只有 TRACK、pose freshness、inliers、reprojection 與連續定位樣本達標後才會開始
+沿路線平移。hardware approval receipt v2 可作為外部稽核證據記錄，但不是 runtime
+readiness gate。GPS 不可用不會阻擋起飛，並停用依賴 GPS 的距離柵欄；其他定位與
+命令安全 gate 不受影響。隨附的河濱 profile 已核准其 SHA 綁定航線。
 
 ## 路線與定位替換邊界
 

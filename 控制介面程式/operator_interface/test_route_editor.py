@@ -588,6 +588,34 @@ def test_choose_route_opens_the_site_folder_of_the_current_profile(tmp_path, mon
     assert opened["initialdir"] == str(route.parent)
 
 
+def test_choose_route_never_imports_while_airborne(monkeypatch):
+    import site_assets_panel as sap
+
+    statuses = []
+    opened = []
+    imported = []
+    monkeypatch.setattr(
+        sap.filedialog,
+        "askopenfilename",
+        lambda **_kwargs: opened.append(True) or "/tmp/route.json",
+    )
+
+    panel = SimpleNamespace(
+        flight_state_check=lambda: (False, "飛機尚未確認 landed"),
+        status_var=SimpleNamespace(set=statuses.append),
+        actions=SimpleNamespace(
+            current_profile=None,
+            import_route=lambda source: imported.append(source),
+        ),
+    )
+
+    sap.SiteAssetsPanel._choose_route(panel)
+
+    assert opened == []
+    assert imported == []
+    assert statuses == ["航線匯入已拒絕：飛機尚未確認 landed"]
+
+
 def _write_route(path: Path, **overrides) -> Path:
     payload = {
         "schema": "sfm-flight-route/v1",
@@ -639,6 +667,27 @@ def test_describe_site_routes_marks_display_only_and_legacy_routes(tmp_path):
     assert "2 點" in by_name["flight.json"].label
 
 
+def test_route_choice_candidates_dedupe_content_and_keep_canonical_name(tmp_path):
+    import site_assets_panel as sap
+
+    canonical = _write_route(tmp_path / "routes" / "flight_route.json")
+    duplicate = _write_route(
+        tmp_path / "routes" / "authored" / "route_20260807_013944.json"
+    )
+    other = _write_route(
+        tmp_path / "routes" / "authored" / "route_20260807_013811.json",
+        waypoints=[[0.0, 0.0, 0.0], [2.0, 0.0, 0.0]],
+    )
+
+    choices = sap.SiteAssetsPanel._dedupe_route_choices(
+        list(reversed(lsa.describe_site_routes(tmp_path)))
+    )
+
+    assert duplicate.read_bytes() == canonical.read_bytes()
+    assert [item.path for item in choices] == [canonical, other]
+    assert choices[0].label.startswith("flight_route.json")
+
+
 def test_existing_route_selection_is_refused_until_landed(tmp_path):
     import site_assets_panel as sap
 
@@ -663,6 +712,27 @@ def test_existing_route_selection_is_refused_until_landed(tmp_path):
     assert statuses[-1] == "selected"
 
 
+def test_asset_panel_drops_a_second_import_while_the_first_is_running():
+    import site_assets_panel as sap
+
+    statuses = []
+    actions = []
+    panel = SimpleNamespace(
+        _busy=True,
+        status_var=SimpleNamespace(set=statuses.append),
+        _set_busy=lambda _busy: None,
+    )
+
+    sap.SiteAssetsPanel._run(
+        panel,
+        "航線匯入",
+        lambda: actions.append("ran"),
+    )
+
+    assert actions == []
+    assert statuses == ["航線匯入：前一個資產作業尚未完成"]
+
+
 def test_site_pack_root_comes_from_the_map_not_the_profile_location(tmp_path):
     """A system profile's parent is site_profiles/, not the site it describes.
 
@@ -679,10 +749,15 @@ def test_site_pack_root_comes_from_the_map_not_the_profile_location(tmp_path):
     elsewhere.mkdir()
     profile_path = elsewhere / "river_site_edm.json"
 
-    class _Profile:
-        map_ply = ply
-
     import local_site_assets as mod
+
+    class _Profile:
+        source = profile_path
+        site_id = "river-site"
+        map_ply = ply
+        coordinate_frame = SimpleNamespace(id="river-frame")
+        asset_sha256 = SimpleNamespace(map_ply=mod._sha256(ply))
+
     original = mod.load_site_profile
     mod.load_site_profile = lambda _path: _Profile()
     try:

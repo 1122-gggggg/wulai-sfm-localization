@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import time
+
 import numpy as np
+import pytest
 
 from olympe_live_backend import LiveAnafiVideoStream
 
@@ -94,3 +97,43 @@ def test_live_stream_reports_observed_frame_and_pdraw_metadata():
     assert metadata["observed_fps"] == 29.5
     assert metadata["frames_delivered"] == 1
     assert metadata["source_timestamp_capable"] is True
+
+
+@pytest.mark.parametrize("stamp", [float("nan"), float("inf"), -float("inf")])
+def test_live_stream_rejects_non_finite_frame_timestamps(stamp):
+    frame = np.zeros((2, 3, 3), dtype=np.uint8)
+
+    class Grabber:
+        @staticmethod
+        def peek_stamp():
+            return stamp
+
+        @staticmethod
+        def latest_frame_with_timing():
+            return frame, stamp, {}
+
+    stream = LiveAnafiVideoStream(Grabber())
+
+    assert stream.next_frame() is None
+    assert stream.last_stamp == 0.0
+    assert stream.output_index == 0
+
+
+def test_live_stream_rejects_a_future_frame_timestamp():
+    frame = np.zeros((2, 3, 3), dtype=np.uint8)
+    stamp = time.monotonic() + 1.0
+
+    class Grabber:
+        @staticmethod
+        def peek_stamp():
+            return stamp
+
+        @staticmethod
+        def latest_frame_with_timing():
+            return frame, stamp, {}
+
+    stream = LiveAnafiVideoStream(Grabber())
+
+    assert stream.next_frame() is None
+    assert stream.last_stamp == 0.0
+    assert stream.output_index == 0

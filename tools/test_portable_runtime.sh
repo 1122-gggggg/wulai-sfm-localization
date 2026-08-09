@@ -32,14 +32,29 @@ if [[ "$portable_root" == "$source_root" ]]; then
   echo "[portable-runtime] package must differ from the source workspace" >&2
   exit 2
 fi
+for path in "$staged_output_root" "$portable_root/模擬器"; do
+  if [[ -L "$path" ]]; then
+    echo "[portable-runtime] refusing symlinked package path: $path" >&2
+    exit 2
+  fi
+done
+if [[ ! -d "$staged_output_root" ]]; then
+  echo "[portable-runtime] package outputs directory is missing: $staged_output_root" >&2
+  exit 2
+fi
+if [[ -e "$portable_root/模擬器" ]] && [[ ! -d "$portable_root/模擬器" ]]; then
+  echo "[portable-runtime] package simulator path is not a directory" >&2
+  exit 2
+fi
 for path in "$staged_video_root" "$portable_root/.venv"; do
-  if [[ -e "$path" ]]; then
+  if [[ -e "$path" || -L "$path" ]]; then
     echo "[portable-runtime] refusing to overwrite existing path: $path" >&2
     exit 2
   fi
 done
 for path in \
   "$portable_root/PORTABLE_PACKAGE.json" \
+  "$portable_root/一鍵啟動.sh" \
   "$portable_root/tools/install_runtime.sh" \
   "$portable_root/tools/simulated_ui_smoke.sh" \
   "$portable_root/PORTABLE_SITE_ASSETS.json" \
@@ -118,5 +133,11 @@ SFM_UI_PYTHON="$portable_venv/bin/python" \
 SFM_LOCALIZER_PYTHON="$portable_venv/bin/python" \
 SFM_PORTABLE_ALLOW_EXTERNAL_PYTHON=1 \
   bash "$portable_root/tools/simulated_ui_smoke.sh"
+SFM_UI_PYTHON="$portable_venv/bin/python" \
+SFM_LOCALIZER_PYTHON="$portable_venv/bin/python" \
+SFM_PORTABLE_ALLOW_EXTERNAL_PYTHON=1 \
+SFM_LAUNCH_DRY_RUN=1 \
+SFM_MAX_PERFORMANCE=0 \
+  bash "$portable_root/一鍵啟動.sh"
 
-echo "[portable-runtime] PASS: actual portable clean install and valid pose"
+echo "[portable-runtime] PASS: clean install, valid pose, and live launcher dry-run"

@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import math
+from collections.abc import Mapping
+from numbers import Real
 from typing import Any
 
 
@@ -116,6 +119,16 @@ RESULT_FIELDS = (
 )
 
 
+def _json_safe(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {key: _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, Real) and not isinstance(value, bool):
+        return value if math.isfinite(float(value)) else None
+    return value
+
+
 def build_localization_metric_record(
     result: dict[str, Any],
     *,
@@ -143,4 +156,4 @@ def build_localization_metric_record(
             "submit_busy_attempts": submit_busy_attempts,
         }
     )
-    return record
+    return _json_safe(record)

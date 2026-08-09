@@ -60,3 +60,14 @@ def test_telemetry_store_does_not_refresh_an_unchanged_event_marker() -> None:
     assert store.fresh(
         "ground_speed", max_age_s=0.5, now_mono_ns=2_100_000_000
     ) == 0.3
+
+
+def test_telemetry_store_does_not_treat_a_future_sample_as_fresh() -> None:
+    store = TelemetryFreshnessStore()
+    store.observe(
+        "ground_speed", 0.2, marker="future", observed_mono_ns=2_000_000_000
+    )
+
+    assert store.fresh(
+        "ground_speed", max_age_s=0.5, now_mono_ns=1_900_000_000
+    ) is None

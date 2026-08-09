@@ -405,6 +405,45 @@ def test_magnetometer_axis_diagram_draws_and_clears(operator) -> None:
     assert not any("現在請轉" in t for t in texts), "stale rotation still shown"
 
 
+def test_gravity_phase_diagram_uses_the_active_motion_and_clears(operator) -> None:
+    """The passive attitude check must show the requested axis motion, not stale art."""
+    canvas = operator.gravity_phase_canvas
+
+    operator._draw_gravity_phase(None)
+    assert canvas.find_withtag("gravity-phase-ready")
+
+    for phase in app.PHASES:
+        operator._draw_gravity_phase(phase)
+        operator.update_idletasks()
+        assert canvas.find_withtag(f"gravity-phase-{phase}"), phase
+        assert canvas.find_withtag(f"motion-{phase}"), phase
+        assert "arc" in {canvas.type(item) for item in canvas.find_all()}
+
+    operator._draw_gravity_phase(None)
+    assert canvas.find_withtag("gravity-phase-ready")
+    assert not canvas.find_withtag("motion-yaw")
+    assert not canvas.find_withtag("motion-pitch")
+    assert not canvas.find_withtag("motion-roll")
+
+
+def test_gravity_uses_one_progress_bar_and_relabels_it_for_the_active_phase(
+    operator,
+) -> None:
+    bars = [
+        child
+        for child in operator.gravity_progress_panel.winfo_children()
+        if isinstance(child, ttk.Progressbar)
+    ]
+    assert bars == [operator.gravity_progress_bar]
+
+    operator.gravity_start()
+    assert operator.gravity_progress_phase_var.get().startswith("1/3 水平旋轉")
+
+    operator.gravity_cal.begin_phase("pitch")
+    operator._refresh_gravity_controls()
+    assert operator.gravity_progress_phase_var.get().startswith("2/3 前後俯仰")
+
+
 def test_virtual_stick_drag_clamps_to_the_circle_and_self_centres(operator) -> None:
     """The knob is a circle: a corner drag must not exceed unit magnitude."""
     import types
@@ -516,6 +555,7 @@ def test_gravity_workflow_preserves_samples_and_gates_phase_advance(
 ) -> None:
     operator.gravity_start()
     assert operator.gravity_cal.phase == "yaw"
+    assert operator.gravity_phase_canvas.find_withtag("gravity-phase-yaw")
     assert operator.gravity_next_button.instate(["disabled"])
 
     operator.gravity_next()
@@ -535,6 +575,7 @@ def test_gravity_workflow_preserves_samples_and_gates_phase_advance(
     assert operator.gravity_next_button.instate(["!disabled"])
     operator.gravity_next()
     assert operator.gravity_cal.phase == "pitch"
+    assert operator.gravity_phase_canvas.find_withtag("gravity-phase-pitch")
 
     count_before = len(operator.gravity_cal.samples)
     monkeypatch.setattr(app.messagebox, "askyesno", lambda *_args, **_kwargs: False)
@@ -803,8 +844,9 @@ def test_video_has_no_widget_overlay_and_one_engineering_hud(operator) -> None:
     assert not operator.video_label.winfo_children()
     source = inspect.getsource(app.OperatorApp.render_video)
     assert "_video_diagnostic_lines" in source
-    assert "hud_h = 146" in source
-    assert "hud_font = pil_ui_font(11)" in source
+    assert "hud_h = 160" in source
+    assert "hud_font = pil_ui_font(13, bold=True)" in source
+    assert "main_hud_font = pil_ui_font(15, bold=True)" in source
     assert "video=" not in source and "loc=" not in source and "det=" not in source
 
 

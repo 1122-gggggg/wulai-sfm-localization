@@ -78,6 +78,55 @@ def test_build_and_verify_happy_path(tmp_path: Path, monkeypatch: pytest.MonkeyP
     ]
 
 
+def test_subset_wheelhouse_is_network_free_and_binds_only_selected_locks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source, runtime_lock, _, _ = _build_fixture(
+        tmp_path,
+        monkeypatch,
+        {
+            "runtime-1.0-py3-none-any.whl": b"runtime",
+            "quality-1.0-py3-none-any.whl": b"quality",
+        },
+    )
+    quality_lock = tmp_path / "requirements-quality-lock.txt"
+    quality_lock.write_text("quality==1.0 lock\n", encoding="utf-8")
+    manifest = _read_manifest(source)
+    manifest["requirements"] = sorted(
+        [
+            *manifest["requirements"],
+            {"name": quality_lock.name, "sha256": _digest(quality_lock)},
+        ],
+        key=lambda entry: entry["name"],
+    )
+    _write_manifest(source, manifest)
+    calls: list[list[str]] = []
+
+    def fake_run(command: list[str], *, check: bool) -> None:
+        assert check is True
+        calls.append(command)
+        destination = Path(command[command.index("--dest") + 1])
+        (destination / "runtime-1.0-py3-none-any.whl").write_bytes(b"runtime")
+
+    monkeypatch.setattr(offline_wheelhouse.subprocess, "run", fake_run)
+    output = tmp_path / "runtime-only"
+
+    metadata = offline_wheelhouse.subset_wheelhouse(
+        source,
+        output,
+        source_requirement_locks=(runtime_lock, quality_lock),
+        requirement_locks=(runtime_lock,),
+        python_executable=sys.executable,
+    )
+
+    assert metadata == offline_wheelhouse.verify_wheelhouse(output, (runtime_lock,))
+    assert [entry["name"] for entry in metadata["requirements"]] == [runtime_lock.name]
+    assert [entry["name"] for entry in metadata["wheels"]] == ["runtime-1.0-py3-none-any.whl"]
+    command = calls[0]
+    assert "--no-index" in command
+    assert command[command.index("--find-links") + 1] == str(source.resolve())
+
+
 def test_lock_digest_mismatch_is_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     wheelhouse, lock, _, _ = _build_fixture(
         tmp_path, monkeypatch, {"demo-1.0-py3-none-any.whl": b"payload"}

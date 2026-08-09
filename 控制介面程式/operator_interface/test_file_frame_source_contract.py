@@ -56,6 +56,23 @@ def test_anafi_link_latency_is_applied_before_frames_reach_localization() -> Non
     assert stream.output_index == 1
 
 
+def test_file_stream_drains_delayed_tail_once_at_eof() -> None:
+    frames = (
+        b"\x01\x02\x03"
+        + b"\x04\x05\x06"
+        + b"\x07\x08\x09"
+    )
+    stream = _stream_with_bytes(frames)
+    stream.delay_frames = 2
+
+    assert [stream.next_frame() for _ in range(2)] == [None, None]
+    assert stream.next_frame().getpixel((0, 0)) == (1, 2, 3)
+    assert stream.next_frame().getpixel((0, 0)) == (4, 5, 6)
+    assert stream.next_frame().getpixel((0, 0)) == (7, 8, 9)
+    assert stream.next_frame() is None
+    assert stream.output_index == 3
+
+
 def test_file_stream_preserves_native_rate_instead_of_duplicating_frames(
     tmp_path, monkeypatch
 ) -> None:

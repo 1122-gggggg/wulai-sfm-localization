@@ -243,8 +243,10 @@ STREAM_LOST_LAND_S = _env_float(
     "SFM_STREAM_LOST_LAND_S", 15.0, minimum=0.5, maximum=600.0)
 # A WEAK (low-confidence) fix in repetitive line-corridor geometry can be plausible
 # but wrong and still pass the jump/deviation gates; treat it as "uncertain" -> hover.
-# SFM_GATE_WEAK=0 restores the old behavior of flying on weak fixes (tuning only).
+# SFM_GATE_WEAK is retained for explicit offline benchmark/simulation callers only.
+# The real-flight runner always enables this gate below, regardless of the env.
 GATE_WEAK = os.environ.get("SFM_GATE_WEAK", "1") != "0"
+REAL_FLIGHT_WEAK_POSE_GATE = True
 WEAK_HOVER_LAND_S = _env_float(
     "SFM_WEAK_HOVER_LAND_S", 8.0, minimum=0.5, maximum=600.0)
 # Reject a fresh fix that jumps farther than this from the last accepted fix
@@ -1610,11 +1612,14 @@ def stop_skycontroller_stick_override(stick_monitor) -> None:
         print(f"[fly] warning: could not stop stick monitor: {exc}", flush=True)
 
 
-def run_loop(hooks: LoopHooks, ctrl, waypoints, yaw_sign: int = 1, verbose: bool = True):
+def run_loop(hooks: LoopHooks, ctrl, waypoints, yaw_sign: int = 1, verbose: bool = True,
+             *, enforce_weak_pose_gate: bool = True):
     """Localize -> fuse heading -> RouteAutoController -> PCMD, at CTRL_HZ.
 
     Returns the terminal reason string. `ctrl` is a RouteAutoController; `waypoints`
     are raw-GLOMAP np arrays (its own list). Import here so --selftest needs no deps.
+    Real flight calls this with the weak-pose gate forced on; only offline runners
+    may explicitly disable it for a benchmark.
     """
     import real_path_follow_controller as rpf
 
@@ -1902,7 +1907,8 @@ def run_loop(hooks: LoopHooks, ctrl, waypoints, yaw_sign: int = 1, verbose: bool
         # LOST_LAND_S; fresh-but-weak fixes use WEAK_HOVER_LAND_S.
         # The drone is never driven on a low-confidence fix.
         low_conf = bool(fresh and (
-            (GATE_WEAK and hooks.pose_is_weak is not None and hooks.pose_is_weak())
+            (enforce_weak_pose_gate and hooks.pose_is_weak is not None
+             and hooks.pose_is_weak())
             or (hooks.pose_confidence is not None and hooks.pose_confidence() < LOW_CONF_INLIERS)))
         if low_conf or not fresh:
             reset_pcmd_controller()
@@ -2554,7 +2560,13 @@ def _run_until(hooks, ctrl, wp, yaw_sign, stop):
         return orig_now()
     hooks.now = guarded_now
     try:
-        return run_loop(hooks, ctrl, wp, yaw_sign=yaw_sign)
+        return run_loop(
+            hooks,
+            ctrl,
+            wp,
+            yaw_sign=yaw_sign,
+            enforce_weak_pose_gate=REAL_FLIGHT_WEAK_POSE_GATE,
+        )
     except KeyboardInterrupt:
         return "operator Ctrl-C -> land"
 
@@ -2680,7 +2692,14 @@ def _run_capped(hooks, ctrl, wp, yaw_sign, max_steps):
         return orig_now()
     hooks.now = counting_now
     try:
-        return run_loop(hooks, ctrl, wp, yaw_sign=yaw_sign, verbose=False)
+        return run_loop(
+            hooks,
+            ctrl,
+            wp,
+            yaw_sign=yaw_sign,
+            verbose=False,
+            enforce_weak_pose_gate=GATE_WEAK,
+        )
     except KeyboardInterrupt:
         return "step cap"
 

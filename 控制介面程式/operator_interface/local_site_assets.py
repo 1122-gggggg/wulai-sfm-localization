@@ -5,12 +5,14 @@ import hashlib
 import json
 import math
 import os
+import fcntl
 import shutil
 import subprocess
 import sys
 import tempfile
-from pathlib import Path
+from contextlib import contextmanager
 from collections.abc import Callable, Iterable
+from pathlib import Path
 
 from site_asset_interfaces import (
     AssetCheck,
@@ -132,6 +134,40 @@ SITE_ASSET_PATTERNS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
 #: PLY files the route editor itself writes. They live beside the map but are
 #: previews of a route, never the map, so proposing one would be a trap.
 _ROUTE_PREVIEW_PLY = ("flight_path.ply", "route.ply", "poles.ply", "wires.ply")
+
+
+@contextmanager
+def _site_asset_lock(path: Path):
+    """Serialize commits for one site across threads and processes."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+b") as stream:
+        fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+
+def _site_asset_lock_path(root: Path, site_id: str) -> Path:
+    return root / f".{site_id}.asset.lock"
+
+
+def _new_temp_path(parent: Path, prefix: str, suffix: str = ".tmp") -> Path:
+    descriptor, name = tempfile.mkstemp(prefix=prefix, suffix=suffix, dir=parent)
+    os.close(descriptor)
+    return Path(name)
+
+
+def _remove_file(path: Path | None) -> None:
+    if path is None:
+        return
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError:
+        # Cleanup must not hide the transaction's original failure.
+        pass
 
 
 class DiscoveredAsset:
@@ -434,9 +470,20 @@ def site_pack_root_for_profile(
     try:
         profile = load_site_profile(profile_path)
         relative = profile.map_ply.resolve().relative_to(root)
-    except (OSError, ValueError):
+        site_root = root / relative.parts[0]
+        managed_path = (site_root / "site_profile.json").resolve()
+        if Path(profile.source).resolve() == managed_path:
+            return site_root
+        managed = load_site_profile(managed_path)
+        if (
+            profile.site_id != managed.site_id
+            or profile.coordinate_frame != managed.coordinate_frame
+            or profile.asset_sha256.map_ply != managed.asset_sha256.map_ply
+        ):
+            return None
+    except (IndexError, OSError, ValueError):
         return None
-    return root / relative.parts[0]
+    return site_root
 
 
 def _camera_dict(camera: QueryCamera) -> dict:
@@ -768,6 +815,14 @@ class LocalSitePackageProvider:
     def import_folder(self, folder: str | Path) -> ImportedSite:
         report = self.validate_folder(folder)
         source_profile = load_site_profile(report.folder / "site_profile.json")
+        self.managed_root.mkdir(parents=True, exist_ok=True)
+        lock_path = _site_asset_lock_path(self.managed_root, report.site_id)
+        with _site_asset_lock(lock_path):
+            return self._import_folder_locked(report, source_profile)
+
+    def _import_folder_locked(
+        self, report: ValidatedSitePackage, source_profile: SiteProfile
+    ) -> ImportedSite:
         destination = self.managed_root / report.site_id
         existing = destination / "site_profile.json"
         if existing.is_file():
@@ -786,7 +841,6 @@ class LocalSitePackageProvider:
                     f"managed site {report.site_id!r} already exists with different assets"
                 )
             return ImportedSite(existing, report.site_id, already_present=True)
-        self.managed_root.mkdir(parents=True, exist_ok=True)
         staging = Path(
             tempfile.mkdtemp(prefix=f".{report.site_id}-", dir=self.managed_root)
         )
@@ -887,9 +941,20 @@ class _LocalSupplementProvider:
     def _load_managed_profile(self, profile_path: str | Path) -> tuple[Path, SiteProfile, dict]:
         path = Path(profile_path).expanduser().resolve()
         if not _is_inside(path, self.managed_root):
-            raise ValueError("import a site package before adding route or target files")
+            site_root = site_pack_root_for_profile(path, self.managed_root)
+            managed_profile = (
+                None if site_root is None else (site_root / "site_profile.json").resolve()
+            )
+            if managed_profile is None or not managed_profile.is_file():
+                raise ValueError(
+                    "目前場域尚未對應到已匯入的場域資料夾；請先匯入場域資料"
+                )
+            path = managed_profile
         profile = load_site_profile(path)
-        if path != self.managed_root / profile.site_id / "site_profile.json":
+        if (
+            path.name != "site_profile.json"
+            or path.parent.parent != self.managed_root
+        ):
             raise ValueError("route and target imports require a managed site profile")
         return path, profile, _json(path)
 
@@ -898,21 +963,63 @@ class _LocalSupplementProvider:
     ) -> ImportedAsset:
         target = profile_path.parent / self.relative_path
         target.parent.mkdir(parents=True, exist_ok=True)
-        temp_asset = target.with_name(f".{target.name}.tmp")
-        shutil.copy2(source, temp_asset)
-        os.replace(temp_asset, target)
-        raw["assets"][self.profile_key] = self.relative_path.as_posix()
-        raw.setdefault("asset_sha256", {})[self.digest_key] = _sha256(target)
-        flight = raw.setdefault("flight", {})
-        flight["approved"] = False
-        flight["route_clearance_approved"] = False
-        flight["approval_note"] = "Imported asset changed; flight re-approval required."
-        temp_profile = profile_path.with_name(".site_profile.json.tmp")
-        temp_profile.write_text(
-            json.dumps(raw, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-        )
-        load_site_profile(temp_profile)
-        os.replace(temp_profile, profile_path)
+        temp_asset = _new_temp_path(target.parent, f".{target.name}.")
+        try:
+            shutil.copy2(source, temp_asset)
+        except Exception:
+            _remove_file(temp_asset)
+            raise
+
+        lock_path = _site_asset_lock_path(self.managed_root, profile.site_id)
+        backup_asset = None
+        temp_profile = None
+        target_replaced = False
+        try:
+            with _site_asset_lock(lock_path):
+                current_raw = _json(profile_path)
+                if target.exists() and not target.is_file():
+                    raise ValueError(f"managed asset target is not a file: {target}")
+                if target.is_file():
+                    backup_asset = _new_temp_path(target.parent, f".{target.name}.", ".bak")
+                    shutil.copy2(target, backup_asset)
+
+                os.replace(temp_asset, target)
+                temp_asset = None
+                target_replaced = True
+
+                current_raw["assets"][self.profile_key] = self.relative_path.as_posix()
+                current_raw.setdefault("asset_sha256", {})[self.digest_key] = _sha256(target)
+                flight = current_raw.setdefault("flight", {})
+                flight["approved"] = False
+                flight["route_clearance_approved"] = False
+                flight["approval_note"] = (
+                    "Imported asset changed; flight re-approval required."
+                )
+                temp_profile = _new_temp_path(profile_path.parent, ".site_profile.json.")
+                temp_profile.write_text(
+                    json.dumps(current_raw, ensure_ascii=False, indent=2) + "\n",
+                    encoding="utf-8",
+                )
+                load_site_profile(temp_profile)
+                os.replace(temp_profile, profile_path)
+                temp_profile = None
+        except Exception:
+            if target_replaced:
+                try:
+                    if backup_asset is None:
+                        target.unlink()
+                    else:
+                        os.replace(backup_asset, target)
+                        backup_asset = None
+                except Exception as rollback_error:
+                    raise RuntimeError(
+                        f"asset transaction rollback failed for {target}"
+                    ) from rollback_error
+            raise
+        finally:
+            _remove_file(temp_asset)
+            _remove_file(temp_profile)
+            _remove_file(backup_asset)
         return ImportedAsset(profile_path, target)
 
 

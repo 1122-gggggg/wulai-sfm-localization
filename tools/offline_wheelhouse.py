@@ -339,6 +339,33 @@ def _download(lock: Path, stage: Path, python_executable: str | os.PathLike[str]
         raise WheelhouseError(f"pip download failed for {lock}: {exc}") from exc
 
 
+def _download_from_wheelhouse(
+    lock: Path,
+    stage: Path,
+    python_executable: str | os.PathLike[str],
+    source: Path,
+) -> None:
+    command = [
+        str(python_executable),
+        "-m",
+        "pip",
+        "download",
+        "--require-hashes",
+        "--only-binary=:all:",
+        "--no-index",
+        "--find-links",
+        str(source),
+        "--dest",
+        str(stage),
+        "--requirement",
+        str(lock),
+    ]
+    try:
+        subprocess.run(command, check=True)
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise WheelhouseError(f"offline pip download failed for {lock}: {exc}") from exc
+
+
 def build_wheelhouse(
     output: str | os.PathLike[str],
     requirement_locks: Iterable[str | os.PathLike[str]],
@@ -391,6 +418,60 @@ def build_wheelhouse(
         except OSError as exc:
             raise WheelhouseError(f"cannot publish wheelhouse: {exc}") from exc
         stage = None
+    finally:
+        if stage is not None:
+            shutil.rmtree(stage, ignore_errors=True)
+    return manifest
+
+
+def subset_wheelhouse(
+    source: str | os.PathLike[str],
+    output: str | os.PathLike[str],
+    *,
+    source_requirement_locks: Iterable[str | os.PathLike[str]],
+    requirement_locks: Iterable[str | os.PathLike[str]],
+    python_executable: str | os.PathLike[str],
+) -> WheelhouseManifest:
+    """Publish the wheels selected by fewer locks from a verified wheelhouse."""
+    source_root = Path(source).expanduser().resolve()
+    verify_wheelhouse(source_root, source_requirement_locks)
+    destination = Path(output)
+    if destination.exists() or destination.is_symlink():
+        raise WheelhouseError(f"wheelhouse output already exists: {destination}")
+    parent = destination.parent
+    if parent.is_symlink() or not parent.is_dir():
+        raise WheelhouseError(f"wheelhouse output parent is not a directory: {parent}")
+    resolved_destination = destination.resolve(strict=False)
+    if resolved_destination == source_root or resolved_destination.is_relative_to(source_root):
+        raise WheelhouseError("wheelhouse subset output must be outside the source")
+
+    _check_build_host()
+    locks = _lock_paths(requirement_locks)
+    _check_python_executable(python_executable)
+    requirements = _requirement_records(locks)
+    stage: Path | None = None
+    try:
+        stage = Path(tempfile.mkdtemp(prefix=f".{destination.name}.", dir=str(parent)))
+        for lock in locks:
+            _download_from_wheelhouse(lock, stage, python_executable, source_root)
+        wheels = _wheel_entries(stage)
+        manifest: WheelhouseManifest = {
+            "schema": SCHEMA,
+            "target": dict(TARGET),
+            "requirements": requirements,
+            "wheels": wheels,
+        }
+        (stage / MANIFEST_NAME).write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        verify_wheelhouse(stage, locks)
+        if destination.exists() or destination.is_symlink():
+            raise WheelhouseError(f"wheelhouse output appeared during build: {destination}")
+        os.replace(stage, destination)
+        stage = None
+    except OSError as exc:
+        raise WheelhouseError(f"cannot publish wheelhouse subset: {exc}") from exc
     finally:
         if stage is not None:
             shutil.rmtree(stage, ignore_errors=True)

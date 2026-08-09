@@ -87,6 +87,45 @@ def test_manifest_round_trip(tmp_path: Path) -> None:
     )
 
 
+@pytest.mark.parametrize("control_name", ("MANIFEST.tsv", "SHA256SUMS"))
+def test_manifest_rejects_symlinked_control_files(
+    tmp_path: Path, control_name: str
+) -> None:
+    root = tmp_path / "package"
+    root.mkdir()
+    (root / "payload.txt").write_text("payload\n", encoding="utf-8")
+    generate(root)
+
+    control = root / control_name
+    outside = tmp_path / f"outside-{control_name}"
+    outside.write_bytes(b"outside sentinel\n")
+    control.unlink()
+    control.symlink_to(outside)
+
+    with pytest.raises(ValueError, match="symlink"):
+        generate(root)
+    assert outside.read_bytes() == b"outside sentinel\n"
+    assert any("symlink" in issue.lower() for issue in verify(root))
+
+
+def test_manifest_rejects_symlinked_control_parent(tmp_path: Path) -> None:
+    real_parent = tmp_path / "real-parent"
+    root = real_parent / "package"
+    root.mkdir(parents=True)
+    (root / "payload.txt").write_text("payload\n", encoding="utf-8")
+    generate(root)
+    before = (root / "MANIFEST.tsv").read_bytes()
+
+    symlink_parent = tmp_path / "symlink-parent"
+    symlink_parent.symlink_to(real_parent, target_is_directory=True)
+    aliased_root = symlink_parent / "package"
+
+    with pytest.raises(ValueError, match="symlink"):
+        generate(aliased_root)
+    assert (root / "MANIFEST.tsv").read_bytes() == before
+    assert any("symlink" in issue.lower() for issue in verify(aliased_root))
+
+
 def _write_runtime_registry(root: Path, *artifacts: dict[str, object]) -> None:
     (root / "RUNTIME_ARTIFACTS.json").write_text(
         json.dumps(
@@ -259,6 +298,35 @@ def test_portable_manifest_rechecks_registry_digest(tmp_path: Path) -> None:
     assert any("runtime artifact SHA-256 mismatch" in issue for issue in issues)
 
 
+def test_runtime_artifact_copy_rechecks_bytes_after_copy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "trusted.bin"
+    source.write_bytes(b"trusted")
+    destination = tmp_path / "portable"
+    spec = export_simulator_package.RuntimeArtifact(
+        name="fixture",
+        path="models/trusted.bin",
+        size_bytes=len(b"trusted"),
+        sha256=hashlib.sha256(b"trusted").hexdigest(),
+    )
+    resolved = export_simulator_package.ResolvedRuntimeArtifact(spec, source)
+    original_copy = export_simulator_package.shutil.copy2
+
+    def tampering_copy(copy_source: Path, copy_target: Path) -> None:
+        source.write_bytes(b"changed")
+        original_copy(copy_source, copy_target)
+
+    monkeypatch.setattr(export_simulator_package.shutil, "copy2", tampering_copy)
+
+    with pytest.raises(export_simulator_package.ArtifactResolutionError, match="changed"):
+        export_simulator_package._copy_resolved_runtime_artifacts(
+            (resolved,), destination
+        )
+
+    assert not (destination / spec.path).exists()
+
+
 def test_export_rejects_a_destination_inside_the_source(tmp_path: Path, monkeypatch) -> None:
     source = tmp_path / "source"
     source.mkdir()
@@ -378,6 +446,45 @@ def test_portable_export_copies_verified_wheelhouse_and_records_metadata(
         "wheelhouse": export_simulator_package.OFFLINE_WHEELHOUSE_RELATIVE,
     }
     assert verify(destination) == []
+
+
+def test_portable_manifest_accepts_a_runtime_only_offline_wheelhouse(
+    tmp_path: Path,
+) -> None:
+    lock_name = "requirements-lock.txt"
+    (tmp_path / lock_name).write_text("runtime\n", encoding="utf-8")
+    wheelhouse = _write_offline_wheelhouse(tmp_path, (lock_name,))
+    wheel_manifest = json.loads(
+        (wheelhouse / offline_wheelhouse.MANIFEST_NAME).read_text(encoding="utf-8")
+    )
+    target = tmp_path / export_simulator_package.OFFLINE_WHEELHOUSE_RELATIVE
+    target.parent.mkdir(parents=True)
+    wheelhouse.rename(target)
+    manifest_relative = (
+        f"{export_simulator_package.OFFLINE_WHEELHOUSE_RELATIVE}/"
+        f"{offline_wheelhouse.MANIFEST_NAME}"
+    )
+    (tmp_path / "PORTABLE_PACKAGE.json").write_text(
+        json.dumps(
+            {
+                "offline_install": {
+                    "complete": True,
+                    "lock_digests": {
+                        lock_name: _sha256(tmp_path / lock_name),
+                    },
+                    "manifest": manifest_relative,
+                    "manifest_sha256": _sha256(tmp_path / manifest_relative),
+                    "mode": "no-index",
+                    "wheel_count": len(wheel_manifest["wheels"]),
+                    "wheelhouse": export_simulator_package.OFFLINE_WHEELHOUSE_RELATIVE,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    generate(tmp_path)
+
+    assert verify(tmp_path) == []
 
 
 def test_portable_export_rejects_tampered_wheel_before_destination_copy(
@@ -532,6 +639,87 @@ def test_site_bundle_copies_and_verifies_all_reference_index_siblings(
     )
     assert marker["schema"] == "sfm-portable-site-assets/v1"
     assert {item["path"] for item in marker["files"]} == set(copied)
+
+
+def test_portable_manifest_rejects_profile_asset_missing_from_marker(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "source"
+    destination = tmp_path / "bundle"
+    index_manifest = _write_reference_index(root)
+    profile = _write_site_profile(root)
+    raw = json.loads(profile.read_text(encoding="utf-8"))
+    raw["asset_sha256"]["reference_index"] = _sha256(index_manifest)
+    profile.write_text(json.dumps(raw), encoding="utf-8")
+    export_simulator_package.copy_site_bundle(root, destination, [profile])
+
+    marker_path = destination / "PORTABLE_SITE_ASSETS.json"
+    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    omitted = "maps/index/SHA256SUMS.json"
+    marker["files"] = [item for item in marker["files"] if item["path"] != omitted]
+    marker["profiles"][0]["files"] = [
+        path for path in marker["profiles"][0]["files"] if path != omitted
+    ]
+    marker_path.write_text(json.dumps(marker), encoding="utf-8")
+    generate(destination, include_site_assets=True)
+
+    issues = verify(destination)
+    assert any(
+        "reference_index" in issue and "bundled" in issue for issue in issues
+    )
+
+
+@pytest.mark.parametrize(
+    ("profile_path", "marker"),
+    (("../outside.json", "not relative"), ("missing/profile.json", "not bundled")),
+)
+def test_portable_manifest_rejects_unsafe_or_unlisted_profiles(
+    tmp_path: Path, profile_path: str, marker: str
+) -> None:
+    root = tmp_path / "source"
+    destination = tmp_path / "bundle"
+    index_manifest = _write_reference_index(root)
+    profile = _write_site_profile(root)
+    raw = json.loads(profile.read_text(encoding="utf-8"))
+    raw["asset_sha256"]["reference_index"] = _sha256(index_manifest)
+    profile.write_text(json.dumps(raw), encoding="utf-8")
+    export_simulator_package.copy_site_bundle(root, destination, [profile])
+
+    marker_path = destination / "PORTABLE_SITE_ASSETS.json"
+    marker_data = json.loads(marker_path.read_text(encoding="utf-8"))
+    marker_data["profiles"][0]["path"] = profile_path
+    marker_path.write_text(json.dumps(marker_data), encoding="utf-8")
+    generate(destination, include_site_assets=True)
+
+    assert any(marker in issue for issue in verify(destination))
+
+
+def test_portable_manifest_checks_reference_index_siblings_from_profile(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "source"
+    destination = tmp_path / "bundle"
+    index_manifest = _write_reference_index(root)
+    profile = _write_site_profile(root)
+    raw = json.loads(profile.read_text(encoding="utf-8"))
+    raw["asset_sha256"]["reference_index"] = _sha256(index_manifest)
+    profile.write_text(json.dumps(raw), encoding="utf-8")
+    export_simulator_package.copy_site_bundle(root, destination, [profile])
+
+    marker_path = destination / "PORTABLE_SITE_ASSETS.json"
+    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    omitted = "maps/index/names.json"
+    marker["files"] = [item for item in marker["files"] if item["path"] != omitted]
+    for item in marker["files"]:
+        if item["path"] == "maps/index/SHA256SUMS.json":
+            item["role"] = "site_asset"
+    marker["profiles"][0]["files"] = [
+        path for path in marker["profiles"][0]["files"] if path != omitted
+    ]
+    marker_path.write_text(json.dumps(marker), encoding="utf-8")
+    generate(destination, include_site_assets=True)
+
+    assert any("reference index sibling is not bundled" in issue for issue in verify(destination))
 
 
 def test_site_bundle_rejects_reference_index_path_traversal(tmp_path: Path) -> None:

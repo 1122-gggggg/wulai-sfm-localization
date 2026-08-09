@@ -30,7 +30,7 @@ import numpy as np
 import torch
 
 from artifact_integrity import verify_sha256
-from edm_matcher import EDM_W, EDMMatcher
+from edm_matcher import EDM_H, EDM_W, EDMMatcher
 from reference_index import ReferenceIndex
 
 MEGALOC_INPUT = 322
@@ -45,6 +45,74 @@ MEGALOC_HUBCONF_SHA256 = (
 MEGALOC_MODEL_SOURCE_SHA256 = (
     "3cbf1d20515b1da423998a8edab787031eaa7bb273c5a86a5c41c4f6d84e2a6d"
 )
+
+# The river bundle currently has 454 references.  Keep a fixed load-time budget
+# safely above that map while rejecting 100k-reference retrieval, which this
+# embedded-image plus per-reference-XYZ architecture does not support.
+EDM_MAX_REFERENCE_COUNT = 4096
+EDM_MAX_BUNDLE_FILE_BYTES = 2 * 1024 * 1024 * 1024
+EDM_MAX_IMAGE_ENCODED_BYTES = 4 * 1024 * 1024
+EDM_MAX_TOTAL_ENCODED_IMAGE_BYTES = 512 * 1024 * 1024
+EDM_MAX_TOTAL_DECODED_IMAGE_BYTES = 1024 * 1024 * 1024
+EDM_MAX_XYZ_BYTES = 512 * 1024 * 1024
+EDM_GLOBAL_DESCRIPTOR_DIM = 8448
+EDM_MAX_GLOBAL_DESCRIPTOR_BYTES = 256 * 1024 * 1024
+EDM_MAX_COVIS_EDGES = EDM_MAX_REFERENCE_COUNT * 128
+
+_JPEG_SOF_MARKERS = frozenset({
+    0xC0, 0xC1, 0xC2, 0xC3,
+    0xC5, 0xC6, 0xC7,
+    0xC9, 0xCA, 0xCB,
+    0xCD, 0xCE, 0xCF,
+})
+
+
+def _next_jpeg_marker(raw: bytes, offset: int) -> tuple[int, int]:
+    if offset >= len(raw) or raw[offset] != 0xFF:
+        raise ValueError("embedded EDM reference JPEG has an invalid marker")
+    while offset < len(raw) and raw[offset] == 0xFF:
+        offset += 1
+    if offset >= len(raw):
+        raise ValueError("embedded EDM reference JPEG has a truncated marker")
+    return raw[offset], offset + 1
+
+
+def _jpeg_segment_length(raw: bytes, offset: int) -> int:
+    if offset + 2 > len(raw):
+        raise ValueError("embedded EDM reference JPEG has a truncated segment")
+    length = int.from_bytes(raw[offset:offset + 2], "big")
+    if length < 2 or offset + length > len(raw):
+        raise ValueError("embedded EDM reference JPEG has an invalid segment length")
+    return length
+
+
+def _jpeg_sof_dimensions(raw: bytes, offset: int, length: int) -> tuple[int, int]:
+    if length < 7:
+        raise ValueError("embedded EDM reference JPEG has a truncated SOF")
+    height = int.from_bytes(raw[offset + 3:offset + 5], "big")
+    width = int.from_bytes(raw[offset + 5:offset + 7], "big")
+    if width <= 0 or height <= 0:
+        raise ValueError("embedded EDM reference JPEG has invalid dimensions")
+    return width, height
+
+
+def _jpeg_dimensions(encoded: np.ndarray) -> tuple[int, int]:
+    """Read JPEG SOF dimensions without allocating its decoded pixel buffer."""
+    raw = encoded.tobytes()
+    if len(raw) < 4 or raw[:2] != b"\xff\xd8":
+        raise ValueError("embedded EDM reference image is not a JPEG")
+    offset = 2
+    while offset < len(raw):
+        marker, offset = _next_jpeg_marker(raw, offset)
+        if marker in {0xD9, 0xDA}:
+            break
+        if marker == 0x01 or 0xD0 <= marker <= 0xD7:
+            continue
+        length = _jpeg_segment_length(raw, offset)
+        if marker in _JPEG_SOF_MARKERS:
+            return _jpeg_sof_dimensions(raw, offset, length)
+        offset += length
+    raise ValueError("embedded EDM reference JPEG has no supported SOF marker")
 
 
 def _torch_hub_cache() -> Path:
@@ -86,6 +154,14 @@ class EDMRelocMap:
         expected_sha256: str | None = None,
     ) -> "EDMRelocMap":
         artifact = Path(path)
+        if artifact.is_symlink() or not artifact.is_file():
+            raise ValueError(f"EDM relocation bundle must be a regular non-symlink file: {artifact}")
+        artifact_size = artifact.stat().st_size
+        if artifact_size <= 0 or artifact_size > EDM_MAX_BUNDLE_FILE_BYTES:
+            raise ValueError(
+                f"EDM relocation bundle size {artifact_size} exceeds the load budget "
+                f"{EDM_MAX_BUNDLE_FILE_BYTES}"
+            )
         verify_sha256(artifact, expected_sha256)
         dtypes = (
             np.float16,
@@ -149,12 +225,19 @@ def _validate_edm_bundle_schema(bundle: object) -> dict:
         raise ValueError(f"not an EDM bundle: feature={feature!r}")
     names = bundle["ref_names"]
     refs = bundle["refs"]
-    if (not isinstance(names, list) or not names
-            or not all(isinstance(name, str) and name for name in names)
+    if not isinstance(names, list) or not names:
+        raise ValueError("EDM bundle ref_names must be unique non-empty strings")
+    if len(names) > EDM_MAX_REFERENCE_COUNT:
+        raise ValueError(
+            f"EDM bundle reference count {len(names)} exceeds supported bound "
+            f"{EDM_MAX_REFERENCE_COUNT}; 100k-reference retrieval is not supported "
+            "by this architecture"
+        )
+    if (not all(isinstance(name, str) and name for name in names)
             or len(names) != len(set(names))):
         raise ValueError("EDM bundle ref_names must be unique non-empty strings")
-    if not isinstance(refs, dict) or set(refs) != set(names):
-        raise ValueError("EDM bundle refs do not exactly match ref_names")
+    if not isinstance(refs, dict):
+        raise ValueError("EDM bundle refs must be a dictionary")
     dimensions = (
         meta.get("edm_grid_w"),
         meta.get("edm_grid_h"),
@@ -166,14 +249,28 @@ def _validate_edm_bundle_schema(bundle: object) -> dict:
             or dimensions != (128, 72, 1024, 576)):
         raise ValueError("EDM bundle grid/input dimensions are incompatible with this runtime")
     grid_w, grid_h, input_w, input_h = dimensions
+    projected_decoded_bytes = len(names) * input_w * input_h
+    if projected_decoded_bytes > EDM_MAX_TOTAL_DECODED_IMAGE_BYTES:
+        raise ValueError(
+            "EDM bundle projected decoded image bytes "
+            f"{projected_decoded_bytes} exceed the load budget "
+            f"{EDM_MAX_TOTAL_DECODED_IMAGE_BYTES}"
+        )
+    if set(refs) != set(names):
+        raise ValueError("EDM bundle refs do not exactly match ref_names")
     ref_global = bundle["ref_global"]
     if (not isinstance(ref_global, np.ndarray) or ref_global.ndim != 2
-            or ref_global.shape[0] != len(names) or ref_global.shape[1] == 0
+            or ref_global.shape != (len(names), EDM_GLOBAL_DESCRIPTOR_DIM)
             or not np.issubdtype(ref_global.dtype, np.floating)
+            or ref_global.nbytes > EDM_MAX_GLOBAL_DESCRIPTOR_BYTES
             or not np.isfinite(ref_global).all()
             or np.any(np.linalg.norm(ref_global, axis=1) <= 1e-12)):
-        raise ValueError("EDM bundle ref_global has an invalid shape, dtype, or value")
+        raise ValueError(
+            "EDM bundle ref_global has an invalid shape, dtype, size, or value"
+        )
     cell_count = grid_w * grid_h
+    total_xyz_bytes = 0
+    total_encoded_image_bytes = 0
     for name in names:
         entry = refs[name]
         if not isinstance(entry, dict) or set(entry) != {"xyz_by_cell", "image_jpg"}:
@@ -183,12 +280,34 @@ def _validate_edm_bundle_schema(bundle: object) -> dict:
         if (not isinstance(xyz, np.ndarray) or xyz.shape != (cell_count, 3)
                 or xyz.dtype != np.float32):
             raise ValueError(f"invalid EDM xyz_by_cell: {name}")
-        valid_xyz_rows = np.isfinite(xyz).all(axis=1) | np.isnan(xyz).all(axis=1)
-        if np.isinf(xyz).any() or not valid_xyz_rows.all():
-            raise ValueError(f"invalid non-finite EDM anchors: {name}")
         if (not isinstance(image_jpg, np.ndarray) or image_jpg.ndim != 1
                 or image_jpg.dtype != np.uint8 or image_jpg.size == 0):
             raise ValueError(f"invalid embedded EDM reference image: {name}")
+        total_xyz_bytes += int(xyz.nbytes)
+        if total_xyz_bytes > EDM_MAX_XYZ_BYTES:
+            raise ValueError(
+                "EDM bundle XYZ memory "
+                f"{total_xyz_bytes} exceeds the load budget {EDM_MAX_XYZ_BYTES}"
+            )
+        if image_jpg.nbytes > EDM_MAX_IMAGE_ENCODED_BYTES:
+            raise ValueError(
+                f"EDM reference encoded image is too large at {name}: "
+                f"{image_jpg.nbytes} > {EDM_MAX_IMAGE_ENCODED_BYTES} bytes"
+            )
+        total_encoded_image_bytes += int(image_jpg.nbytes)
+        if total_encoded_image_bytes > EDM_MAX_TOTAL_ENCODED_IMAGE_BYTES:
+            raise ValueError(
+                "EDM bundle encoded image bytes "
+                f"{total_encoded_image_bytes} exceed the load budget "
+                f"{EDM_MAX_TOTAL_ENCODED_IMAGE_BYTES}"
+            )
+        if _jpeg_dimensions(image_jpg) != (input_w, input_h):
+            raise ValueError(
+                f"EDM reference JPEG dimensions are incompatible at {name}"
+            )
+        valid_xyz_rows = np.isfinite(xyz).all(axis=1) | np.isnan(xyz).all(axis=1)
+        if np.isinf(xyz).any() or not valid_xyz_rows.all():
+            raise ValueError(f"invalid non-finite EDM anchors: {name}")
     for key, shape in (("ref_centers", (len(names), 3)), ("ref_yaws", (len(names),))):
         value = bundle.get(key)
         if value is not None and (
@@ -202,6 +321,7 @@ def _validate_edm_bundle_schema(bundle: object) -> dict:
     if covis is not None:
         if not isinstance(covis, dict) or set(covis) != set(names):
             raise ValueError("invalid EDM bundle covis keys")
+        total_covis_edges = 0
         for index, name in enumerate(names):
             neighbors = covis[name]
             if (not isinstance(neighbors, list)
@@ -209,6 +329,11 @@ def _validate_edm_bundle_schema(bundle: object) -> dict:
                            for value in neighbors)
                     or index in neighbors or len(neighbors) != len(set(neighbors))):
                 raise ValueError(f"invalid EDM bundle covis neighbors: {name}")
+            total_covis_edges += len(neighbors)
+            if total_covis_edges > EDM_MAX_COVIS_EDGES:
+                raise ValueError(
+                    f"EDM bundle covis edge count exceeds {EDM_MAX_COVIS_EDGES}"
+                )
     return bundle
 
 
@@ -265,7 +390,11 @@ class EDMLocalizer:
         self.topk = topk
         self.min_inliers = min_inliers
         self.pnp_max_error = pnp_max_error
-        self.scale = camera.width / EDM_W        # EDM px -> camera px (1280/1024 = 1.25)
+        self.scale_x = camera.width / EDM_W
+        self.scale_y = camera.height / EDM_H
+        # Keep the historical ``scale`` seam for the temporal EDM LUT.  Numpy
+        # broadcasting makes it an x/y pair instead of assuming a 16:9 camera.
+        self.scale = np.asarray((self.scale_x, self.scale_y), dtype=np.float32)
         self.reference_index = reference_index
         if reference_index is not None:
             names = tuple(reloc_map.ref_names)

@@ -24,7 +24,9 @@ def test_installer_documents_and_constructs_offline_pip_mode() -> None:
     assert 'offline_wheelhouse_manifest="$offline_wheelhouse/WHEELHOUSE.json"' in script
     assert 'offline_wheelhouse_tool="$root_dir/tools/offline_wheelhouse.py"' in script
     assert '"$python_bin" "$offline_wheelhouse_tool" verify' in script
-    assert script.count('--requirements "$requirements_') == 3
+    assert 'offline_requirement_locks=("$requirements_lock")' in script
+    assert 'offline_verify_args+=(--requirements "$lock_path")' in script
+    assert '"${offline_verify_args[@]}"' in script
     assert '"$offline_wheelhouse_tool" prepare-lock' in script
     assert script.count("install_requirements_") >= 6
     assert "pip_install_args=(--require-hashes)" in script
@@ -36,6 +38,15 @@ def test_installer_documents_and_constructs_offline_pip_mode() -> None:
     )
     assert script.count('"${pip_install_args[@]}"') == 3
     assert script.index("prepare-lock") < script.index("pip_install_args=")
+
+
+def test_portable_installer_verifies_package_and_marks_its_venv() -> None:
+    script = INSTALLER.read_text(encoding="utf-8")
+
+    assert '"$python_bin" "$package_manifest_tool" verify --root "$root_dir"' in script
+    assert ".sfm-portable-runtime" in script
+    assert "拒絕未由目前 portable package 建立的既有 venv" in script
+    assert "非 Git 原始碼目錄必須包含 PORTABLE_PACKAGE.json" in script
 
 
 def test_portable_runtime_requires_literal_offline_marker_and_payload() -> None:
@@ -54,6 +65,8 @@ def test_portable_runtime_forces_pip_offline_and_runs_offline_installer() -> Non
     assert "PIP_INDEX_URL=http://127.0.0.1:9/invalid" in script
     assert "PIP_EXTRA_INDEX_URL= " in script
     assert 'bash "$portable_root/tools/install_runtime.sh" --offline' in script
+    assert 'bash "$portable_root/一鍵啟動.sh"' in script
+    assert "SFM_LAUNCH_DRY_RUN=1" in script
     assert "looking in indexes:" in script
     assert "https?://" in script
 

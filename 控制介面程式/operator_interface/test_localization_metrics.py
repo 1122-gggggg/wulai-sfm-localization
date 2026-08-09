@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import json
+import math
+
 from localization_metrics import RESULT_FIELDS, build_localization_metric_record
 
 
@@ -45,3 +48,26 @@ def test_metric_record_does_not_mutate_the_worker_result() -> None:
     )
 
     assert source == before
+
+
+def test_metric_record_replaces_non_finite_values_before_json_output() -> None:
+    record = build_localization_metric_record(
+        {
+            "success": True,
+            "wall_ms": float("nan"),
+            "pose": {"x": float("inf"), "y": -float("inf")},
+        },
+        metric_mono_ns=2_000_000_000,
+        loc_fps=float("nan"),
+        submit_ok=0,
+        submit_skip_busy=0,
+        submit_busy_attempts=0,
+    )
+
+    json.dumps(record, allow_nan=False)
+    assert record["wall_ms"] is None
+    assert record["pose"] == {"x": None, "y": None}
+    assert record["loc_fps"] is None
+    assert not any(
+        isinstance(value, float) and not math.isfinite(value) for value in record.values()
+    )

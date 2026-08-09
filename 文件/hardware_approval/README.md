@@ -1,4 +1,4 @@
-# Hardware approval trust chain
+# Optional hardware approval trust chain
 
 `hardware_approval_trust.py` verifies an existing
 `anafi-hardware-approval/v2` receipt for AUTO with an Ed25519 detached
@@ -7,7 +7,8 @@ signature.  The signed envelope binds the exact receipt, purpose, signer
 that key ID to a public key, role, validity window, revocation state, and the
 `hardware_approval:auto` permission.
 
-The readiness integration point is:
+The verifier remains available when a deployment wants an independently signed
+hardware audit record:
 
 ```python
 verdict = verify_hardware_approval_receipt(
@@ -23,14 +24,17 @@ verdict = verify_hardware_approval_receipt(
     },
 )
 if not verdict.accepted:
-    errors.append(f"hardware approval trust chain: {verdict.reason_code}: {verdict.detail}")
+    audit_warnings.append(
+        f"hardware approval trust chain: {verdict.reason_code}: {verdict.detail}"
+    )
 ```
 
-An absent, pending, unsigned, unknown, revoked, expired, not-yet-valid, wrong-
-purpose, wrong-binding, or invalid-signature material must remain a readiness
-error.  GPS is intentionally represented by `approved_envelope.gps_required`;
-the AUTO receipt policy requires it to be `false`, but that does not bypass any
-other safety gate.
+An invalid optional receipt must never be reported as valid, but an absent receipt
+is not a runtime readiness error. GPS is intentionally represented by
+`approved_envelope.gps_required`; the current river deployment does not require
+GPS for takeoff or AUTO, and disables the GPS-dependent distance fence when no fix
+exists. This policy does not bypass route/profile hashes, four-step preflight, or
+post-takeoff localization gates.
 
 The CLI only verifies or prepares unsigned material:
 

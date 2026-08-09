@@ -293,9 +293,9 @@ flowchart LR
 4. 每筆 autonomous desired PCMD 的有效期不得超過 0.25 s；沒有更新即歸零。
 5. 缺少、過期或不可信的飛機速度遙測時，不允許 autonomous translation。
 6. waypoint arrival、route deviation、pose jump 等幾何門檻以場域 profile 的 map unit 欄位保存，不能跨場域複製。
-7. 速度上限變更只允許落地時操作；變更後 profile/receipt digest 改變，`flight.approved` 自動視為 false。
+7. 速度上限變更只允許落地時操作；變更後目前 session 的 AUTO 核准失效，必須重新完成四步 preflight；不會暗中改寫 site profile。
 
-真機 PCMD 不是直接的 m/s 命令，因此「0.30 m/s」是必須由速度回授保護的上限，不得只以固定 PCMD 百分比推算。真機 response receipt 尚未產生時，自主功能保持鎖定。
+真機 PCMD 不是直接的 m/s 命令，因此「0.30 m/s」是必須由速度回授保護的上限，不得只以固定 PCMD 百分比推算。硬體 receipt 可選擇性留作稽核證據，不是 AUTO readiness gate。
 
 ### 5.3 建圖與換圖流程
 

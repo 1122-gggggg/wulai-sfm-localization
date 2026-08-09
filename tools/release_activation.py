@@ -171,7 +171,14 @@ def stage(
         raise ValueError(f"release version already exists: {destination}")
     temporary = Path(tempfile.mkdtemp(prefix=f".{version}.", dir=releases))
     try:
-        shutil.copytree(source_path, temporary, dirs_exist_ok=True)
+        # Preserve links as links so an excluded path cannot make copytree follow
+        # package-external data into a release before validation sees it.
+        shutil.copytree(source_path, temporary, dirs_exist_ok=True, symlinks=True)
+        for current, directories, files in os.walk(temporary, followlinks=False):
+            for name in (*directories, *files):
+                candidate = Path(current) / name
+                if candidate.is_symlink():
+                    raise ValueError(f"release contains a symlink: {candidate.relative_to(temporary)}")
         validate_release(
             temporary,
             allow_dirty=allow_dirty,

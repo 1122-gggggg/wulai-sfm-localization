@@ -101,6 +101,30 @@ def test_route_domain_rejects_json_nan_and_infinity_tokens(tmp_path):
         RouteDocument.from_path(path)
 
 
+@pytest.mark.parametrize(
+    "radius",
+    [True, False, 0, -0.1, float("nan"), float("inf"), float("-inf"), "0.5"],
+)
+def test_route_domain_rejects_invalid_arrival_radius(radius):
+    with pytest.raises(ValueError, match="arrive_radius_map_units"):
+        RouteDocument.from_data(_route(arrive_radius_map_units=radius))
+
+
+def test_route_arrival_radius_is_preserved_by_controller_conversion(tmp_path):
+    path = tmp_path / "route.json"
+    path.write_text(
+        json.dumps(_route(arrive_radius_map_units=0.42)),
+        encoding="utf-8",
+    )
+
+    route = RouteDocument.from_path(path)
+    config = rpf.config_for_route(path)
+
+    assert route.arrive_radius_map_units == pytest.approx(0.42)
+    assert config.waypoint_arrive_radius == pytest.approx(0.42)
+    assert config.progress_jump_slack >= 0.42
+
+
 def test_aligned_conversion_uses_the_declared_legacy_or_measured_authoring_frame():
     frame = rpf.MapFrame.from_gravity(MEASURED_GRAVITY)
     aligned = [[0.0, 0.0, 0.0], [1.0, 2.0, 3.0]]

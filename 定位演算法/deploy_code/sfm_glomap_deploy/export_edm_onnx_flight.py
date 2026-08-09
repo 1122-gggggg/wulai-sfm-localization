@@ -7,6 +7,7 @@ The upstream deploy export is 640x480 indoor. River-site flight matching uses
 from __future__ import annotations
 
 import argparse
+from collections.abc import Mapping
 import sys
 from pathlib import Path
 
@@ -23,6 +24,33 @@ SAMPLE1 = EDM_REPO / "deploy" / "edm_onnx_cpp" / "scene0707_00_45.jpg"
 
 # Flight resolution used by edm_matcher.py
 W, H = 1024, 576
+EDM_MAX_CHECKPOINT_BYTES = 2 * 1024 * 1024 * 1024
+
+
+def _load_checkpoint_state_dict(path: Path) -> Mapping[str, torch.Tensor]:
+    """Load the expected weights-only checkpoint shape for export."""
+    if path.is_symlink() or not path.is_file():
+        raise ValueError("EDM checkpoint must be a regular non-symlink file")
+    size_bytes = path.stat().st_size
+    if size_bytes <= 0 or size_bytes > EDM_MAX_CHECKPOINT_BYTES:
+        raise ValueError(
+            f"EDM checkpoint size {size_bytes} exceeds {EDM_MAX_CHECKPOINT_BYTES} bytes"
+        )
+    checkpoint = torch.load(
+        str(path),
+        map_location="cpu",
+        weights_only=True,
+    )
+    if not isinstance(checkpoint, Mapping):
+        raise ValueError("EDM checkpoint must be a mapping containing state_dict")
+    state = checkpoint.get("state_dict")
+    if not isinstance(state, Mapping) or not state:
+        raise ValueError("EDM checkpoint state_dict must be a non-empty mapping")
+    if any(not isinstance(key, str) for key in state):
+        raise ValueError("EDM checkpoint state_dict keys must be strings")
+    if any(not torch.is_tensor(value) for value in state.values()):
+        raise ValueError("EDM checkpoint state_dict values must be tensors")
+    return state
 
 
 def main() -> None:
@@ -60,7 +88,7 @@ def main() -> None:
     cfg.EDM.NECK.NPE = [cfg.EDM.TRAIN_RES_H, cfg.EDM.TRAIN_RES_W, h, w]
 
     model = EDM(config=lower_config(cfg)["edm"])
-    state = torch.load(str(args.ckpt), map_location="cpu", weights_only=False)["state_dict"]
+    state = _load_checkpoint_state_dict(args.ckpt)
     model.load_state_dict(state)
     model = model.eval().cpu()
 

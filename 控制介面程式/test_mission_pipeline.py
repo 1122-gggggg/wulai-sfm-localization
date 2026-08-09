@@ -223,6 +223,8 @@ def test_flight_mode_rejects_files_without_an_approved_contract(monkeypatch, tmp
 
 
 def test_scale_free_flight_contract_exports_no_map_scale_and_verifies_hashes(tmp_path):
+    for name in ("控制介面程式", "定位演算法", "地圖檔"):
+        (tmp_path / name).mkdir()
     map_ply = tmp_path / "map.ply"
     bundle = tmp_path / "bundle.pt"
     reference_poses = tmp_path / "reference_poses.json"

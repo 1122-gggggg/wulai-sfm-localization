@@ -64,7 +64,10 @@ class TelemetryFreshnessStore:
         sample = self.sample(name)
         if sample is None:
             return None
-        age_ns = max(0, int(now_mono_ns) - sample.observed_mono_ns)
+        now_ns = int(now_mono_ns)
+        if now_ns < sample.observed_mono_ns:
+            return None
+        age_ns = now_ns - sample.observed_mono_ns
         if age_ns > int(age_limit * 1_000_000_000):
             return None
         return sample.value

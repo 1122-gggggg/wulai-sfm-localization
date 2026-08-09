@@ -36,7 +36,7 @@ ZERO = (0, 0, 0, 0)
 
 
 def run_ticks(max_ticks, pose_fn, *, route=((0.0, 0.0, 0.0), (8.0, 0.0, 0.0)),
-              hooks_extra=None):
+              hooks_extra=None, enforce_weak_pose_gate=None):
     """Run the real run_loop against mock hooks on a virtual clock.
 
     pose_fn(st) -> rpf.Pose | None; st has "t" (virtual now) and "tick".
@@ -69,8 +69,11 @@ def run_ticks(max_ticks, pose_fn, *, route=((0.0, 0.0, 0.0), (8.0, 0.0, 0.0)),
         now=now,
         **extra,
     )
+    run_kwargs = {}
+    if enforce_weak_pose_gate is not None:
+        run_kwargs["enforce_weak_pose_gate"] = enforce_weak_pose_gate
     try:
-        reason = pff.run_loop(hooks, ctrl, wp, verbose=False)
+        reason = pff.run_loop(hooks, ctrl, wp, verbose=False, **run_kwargs)
     except KeyboardInterrupt:
         reason = "tick cap"
     return sent, reason, records
@@ -517,6 +520,26 @@ def test_weak_pose_hovers():
         600, fresh_pose, hooks_extra={"pose_is_weak": lambda: True})
     assert sent and all(c == ZERO for c in sent)
     assert reason == "low confidence -> land"
+
+
+def test_real_route_weak_gate_cannot_be_disabled_by_environment(monkeypatch):
+    monkeypatch.setenv("SFM_GATE_WEAK", "0")
+    monkeypatch.setattr(pff, "GATE_WEAK", os.environ["SFM_GATE_WEAK"] != "0")
+    sent, reason, _ = run_ticks(
+        600, fresh_pose, hooks_extra={"pose_is_weak": lambda: True})
+    assert sent and all(c == ZERO for c in sent)
+    assert reason == "low confidence -> land"
+
+
+def test_offline_runner_can_explicitly_disable_weak_pose_gate(monkeypatch):
+    monkeypatch.setattr(pff, "GATE_WEAK", False)
+    sent, _reason, _ = run_ticks(
+        8,
+        fresh_pose,
+        hooks_extra={"pose_is_weak": lambda: True},
+        enforce_weak_pose_gate=False,
+    )
+    assert any(c != ZERO for c in sent)
 
 
 def test_low_inliers_hovers():

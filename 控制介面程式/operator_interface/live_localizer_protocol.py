@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import math
 import struct
+import time
 
 
 MAGIC = b"SFM1"
@@ -20,6 +21,14 @@ MODE_TO_CODE = {
     "relocalize": 4,
 }
 CODE_TO_MODE = {code: mode for mode, code in MODE_TO_CODE.items()}
+
+
+def _validate_capture_stamp(stamp: float) -> float:
+    if not math.isfinite(stamp) or stamp <= 0:
+        raise ValueError(f"invalid live-localizer capture stamp: {stamp!r}")
+    if stamp > time.monotonic():
+        raise ValueError(f"future live-localizer capture stamp: {stamp!r}")
+    return stamp
 
 
 def encode_mode(mode: str) -> bytes:
@@ -44,9 +53,13 @@ def encode_request(mode: str, capture_stamp: float | None) -> bytes:
     """Encode a timed request while retaining the legacy SFM1 mode header."""
     if capture_stamp is None:
         return encode_mode(mode)
-    stamp = float(capture_stamp)
-    if not math.isfinite(stamp) or stamp <= 0:
-        raise ValueError(f"invalid live-localizer capture stamp: {capture_stamp!r}")
+    try:
+        stamp = float(capture_stamp)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(
+            f"invalid live-localizer capture stamp: {capture_stamp!r}"
+        ) from exc
+    stamp = _validate_capture_stamp(stamp)
     try:
         code = MODE_TO_CODE[str(mode)]
     except KeyError as exc:
@@ -67,6 +80,5 @@ def decode_request(header: bytes | bytearray | memoryview) -> tuple[str, float |
         mode = CODE_TO_MODE[code]
     except KeyError as exc:
         raise ValueError(f"invalid live-localizer mode code: {code}") from exc
-    if not math.isfinite(stamp) or stamp <= 0:
-        raise ValueError(f"invalid live-localizer capture stamp: {stamp!r}")
+    stamp = _validate_capture_stamp(stamp)
     return mode, stamp

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import math
+import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
@@ -55,6 +56,20 @@ def _mono_ns(
     raise InvalidLocalizationResult(f"missing {canonical}")
 
 
+def _validate_timestamps(
+    capture_mono_ns: int,
+    pose_mono_ns: int,
+    now_mono_ns: int | None,
+) -> None:
+    current_mono_ns = time.monotonic_ns() if now_mono_ns is None else int(now_mono_ns)
+    if pose_mono_ns < capture_mono_ns:
+        raise InvalidLocalizationResult("pose_mono_ns cannot precede capture_mono_ns")
+    if capture_mono_ns > current_mono_ns:
+        raise InvalidLocalizationResult("capture_mono_ns cannot be in the future")
+    if pose_mono_ns > current_mono_ns:
+        raise InvalidLocalizationResult("pose_mono_ns cannot be in the future")
+
+
 def _pose_tuple(value: object) -> tuple[float, float, float, float] | None:
     if value is None:
         return None
@@ -94,7 +109,12 @@ class LocalizationResult:
     _payload: Mapping[str, Any] = field(repr=False, compare=False)
 
     @classmethod
-    def from_payload(cls, payload: Mapping[str, Any]) -> "LocalizationResult":
+    def from_payload(
+        cls,
+        payload: Mapping[str, Any],
+        *,
+        now_mono_ns: int | None = None,
+    ) -> "LocalizationResult":
         if not isinstance(payload, Mapping):
             raise InvalidLocalizationResult("payload must be an object")
 
@@ -118,6 +138,7 @@ class LocalizationResult:
             "worker_core_done_mono_ns",
             "client_response_mono_ns",
         )
+        _validate_timestamps(capture_mono_ns, pose_mono_ns, now_mono_ns)
 
         validity = payload.get("validity", payload.get("success"))
         if not isinstance(validity, bool):
@@ -150,12 +171,17 @@ class LocalizationResult:
         )
 
     @classmethod
-    def from_json(cls, raw: str | bytes | bytearray) -> "LocalizationResult":
+    def from_json(
+        cls,
+        raw: str | bytes | bytearray,
+        *,
+        now_mono_ns: int | None = None,
+    ) -> "LocalizationResult":
         try:
             payload = json.loads(raw)
         except (TypeError, UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise InvalidLocalizationResult("payload is not valid JSON") from exc
-        return cls.from_payload(payload)
+        return cls.from_payload(payload, now_mono_ns=now_mono_ns)
 
     def to_payload(self) -> dict[str, Any]:
         """Return a dict-compatible copy with canonical safety fields present."""

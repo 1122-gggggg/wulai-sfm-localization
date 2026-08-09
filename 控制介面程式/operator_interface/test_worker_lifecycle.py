@@ -118,6 +118,57 @@ def test_localization_metrics_prunes_e2e_samples_without_crashing(monkeypatch) -
     assert operator.loc_e2e_ms == 90.0
 
 
+def test_delayed_success_keeps_source_pose_age_instead_of_ui_arrival(monkeypatch) -> None:
+    monkeypatch.setattr(app.time, "monotonic", lambda: 100.0)
+    operator = SimpleNamespace(
+        live_result_times=[],
+        loc_fps=0.0,
+        loc_latency_ms=None,
+        loc_wall_ms=None,
+        loc_e2e_ms=None,
+        _loc_e2e_ms_samples=[],
+        loc_core_fps=0.0,
+        loc_stage="-",
+        _loc_wall_ms_samples=[],
+        loc_health="OK",
+        _loc_fail_count=0,
+        _loc_ok_count=0,
+        loc_pose_updated_mono=None,
+        loc_health_inliers=0,
+        loc_health_reproj=None,
+        loc_hold_engage_count=0,
+        loc_recovery_fix_count=0,
+        loc_recovery_text="",
+        _append_loc_metrics=lambda _result: None,
+    )
+
+    app.OperatorApp.update_localization_metrics(
+        operator,
+        {
+            "success": True,
+            "inliers": app.LOC_LOW_INLIERS,
+            "reproj_rms": 0.1,
+            "source_frame_stamp_mono": 99.0,
+            "capture_mono_ns": 99_000_000_000,
+            "pose_mono_ns": 99_500_000_000,
+        },
+    )
+
+    assert operator.loc_pose_updated_mono == 99.0
+
+
+def test_autonomy_pose_rejects_source_pose_older_than_half_second(monkeypatch) -> None:
+    monkeypatch.setattr(app.time, "monotonic", lambda: 100.0)
+    operator = SimpleNamespace(
+        live_locked=True,
+        loc_health="OK",
+        loc_pose_updated_mono=99.0,
+        live_pose=np.array([1.0, 2.0, 3.0, 0.0], dtype=float),
+    )
+
+    assert app.OperatorApp._autonomy_pose(operator) is None
+
+
 def test_low_confidence_hold_is_an_engagement_event() -> None:
     assert "ENGAGE_LOW_CONF" in app.CONFIDENCE_HOLD_ENGAGE_EVENTS
     assert "ENGAGE_LOW" not in app.CONFIDENCE_HOLD_ENGAGE_EVENTS
@@ -261,6 +312,22 @@ def test_localization_result_boundary_validates_and_preserves_dict_payload() -> 
         })
 
 
+def test_localization_result_boundary_rejects_future_timestamps() -> None:
+    payload = {
+        "localization_contract_version": 1,
+        "seq": 4,
+        "frame_id": "worker-4",
+        "capture_mono_ns": 1_001,
+        "pose_mono_ns": 1_002,
+        "validity": False,
+        "confidence": 0.0,
+        "success": False,
+    }
+
+    with pytest.raises(InvalidLocalizationResult, match="future"):
+        LocalizationResult.from_payload(payload, now_mono_ns=1_000)
+
+
 def test_worker_exception_payload_carries_localization_contract_fields() -> None:
     payload = localizer_worker.localization_exception_payload(
         seq=4, error=RuntimeError("tracker failed")
@@ -270,6 +337,43 @@ def test_worker_exception_payload_carries_localization_contract_fields() -> None
     assert result.validity is False
     assert result.confidence == 0.0
     assert result.pose is None
+
+
+def test_edm_cuda_oom_is_structured_fatal_and_cleans_cache() -> None:
+    class FakeCudaOOM(RuntimeError):
+        pass
+
+    cleanup_calls = []
+    fake_torch = SimpleNamespace(
+        OutOfMemoryError=FakeCudaOOM,
+        cuda=SimpleNamespace(
+            OutOfMemoryError=FakeCudaOOM,
+            empty_cache=lambda: cleanup_calls.append("empty_cache"),
+            ipc_collect=lambda: cleanup_calls.append("ipc_collect"),
+        ),
+    )
+    error = FakeCudaOOM("CUDA out of memory")
+
+    assert localizer_worker.edm_cuda_oom_requires_restart(
+        "edm", error, fake_torch)
+    assert not localizer_worker.edm_cuda_oom_requires_restart(
+        "xfeat", error, fake_torch)
+
+    payload = localizer_worker.localization_exception_payload(seq=4, error=error)
+    payload.update(localizer_worker.cuda_oom_failure_fields(error))
+    payload["cuda_cache_cleanup"] = localizer_worker.cleanup_cuda_cache(fake_torch)
+
+    assert payload["success"] is False
+    assert payload["validity"] is False
+    assert payload["error"] == "cuda_oom"
+    assert payload["failure_kind"] == "cuda_oom"
+    assert payload["worker_fatal"] is True
+    assert payload["restart_required"] is True
+    assert payload["cuda_cache_cleanup"] == {
+        "empty_cache": "ok",
+        "ipc_collect": "ok",
+    }
+    assert cleanup_calls == ["empty_cache", "ipc_collect"]
 
 
 def test_localization_exception_result_triggers_live_fail_safe() -> None:
@@ -296,8 +400,193 @@ def test_localization_exception_result_triggers_live_fail_safe() -> None:
     )
 
     app.OperatorApp.update_live_results(operator)
-
     assert reasons == [app.FailureReason.LOCALIZATION_LOST]
+
+
+def test_live_results_drop_publication_inversions_before_autonomy() -> None:
+    metrics = []
+    recovery_calls = []
+    rows = [
+        {
+            "seq": 2,
+            "display_seq": 20,
+            "frame_id": "frame-20",
+            "frame_name": "frame-20",
+            "success": False,
+            "mode": "LOST",
+            "next_mode": "LOST",
+            "localization_exception": True,
+            "error": "worker restarting",
+        },
+        {
+            "seq": 1,
+            "display_seq": 10,
+            "frame_id": "frame-10",
+            "frame_name": "frame-10",
+            "success": True,
+            "pose": {"x": 1.0, "y": 2.0, "z": 3.0, "yaw_raw": 0.1},
+            "inliers": app.LOC_LOW_INLIERS,
+            "mode": "TRACK",
+            "next_mode": "TRACK",
+        },
+        {
+            "seq": 3,
+            "display_seq": 30,
+            "frame_id": "frame-30",
+            "frame_name": "frame-30",
+            "success": True,
+            "pose": {"x": 4.0, "y": 5.0, "z": 6.0, "yaw_raw": 0.2},
+            "inliers": app.LOC_LOW_INLIERS,
+            "mode": "TRACK",
+            "next_mode": "TRACK",
+        },
+    ]
+    operator = SimpleNamespace(
+        localizer=SimpleNamespace(poll_results=lambda: rows),
+        _loc_benchmark_pending=None,
+        loc_benchmark_active="auto",
+        _last_localization_exception_seq=None,
+        _last_applied_live_result_display_seq=None,
+        _apply_lost_hold_result=lambda _result: None,
+        update_localization_metrics=lambda result: metrics.append(result),
+        _is_live_backend=lambda: True,
+        _engage_real_localization_recovery=lambda reason: recovery_calls.append(reason),
+        _last_status_write=float("inf"),
+        _last_loc_fail_log=float("inf"),
+        _loc_ok_count=0,
+        _loc_fail_count=0,
+        loc_fps=0.0,
+        live_result=None,
+        live_result_frame_name="",
+        live_last_xyz=None,
+        _live_pending=None,
+        camera_forward_world=None,
+        camera_axes_world=None,
+        _integrated_auto_map_frame=None,
+        live_heading=None,
+        live_pose=np.zeros(4, dtype=float),
+        live_locked=False,
+        live_new_pose=False,
+        boot_holding=lambda: False,
+        pose_stabilizer=None,
+        write_log=lambda _message: None,
+    )
+
+    app.OperatorApp.update_live_results(operator)
+
+    assert [result["display_seq"] for result in metrics] == [20, 30]
+    assert operator.live_result["display_seq"] == 30
+    assert operator.live_result_frame_name == "frame-30"
+    assert np.allclose(operator.live_pose[:3], [4.0, 5.0, 6.0])
+    assert recovery_calls == [app.FailureReason.LOCALIZATION_LOST]
+    assert operator._last_applied_live_result_display_seq == 30
+
+
+def test_install_site_runtime_allows_localization_exception_seq_zero(monkeypatch) -> None:
+    profile = SimpleNamespace(
+        site_id="new-site",
+        source=Path("/tmp/new-site.yaml"),
+        display_name="New site",
+    )
+    localizer = SimpleNamespace(benchmark_mode="auto")
+    prepared = app.PreparedSiteRuntime(
+        args=SimpleNamespace(),
+        interface_mode="sim",
+        profile=profile,
+        hardware_approval=None,
+        map_points=np.empty((0, 3), dtype=float),
+        route_points=[],
+        mission_route_snapshot=None,
+        replay_rows=[],
+    )
+    runtime = app.ActiveSiteRuntime(
+        prepared=prepared,
+        session_logs=SimpleNamespace(),
+        backend=SimpleNamespace(state=SimpleNamespace(), is_live=False),
+        video_stream=SimpleNamespace(output_fps=30.0),
+        live_backend=None,
+        localizer=localizer,
+        detector=None,
+        lost_hold=None,
+    )
+    operator = app.OperatorApp.__new__(app.OperatorApp)
+    operator._loc_metrics_f = None
+    operator.site_asset_actions = SimpleNamespace(current_profile=None)
+    operator.history = []
+    operator.history_health = []
+    operator.no_loc_markers = []
+    operator.write_log = lambda _message: None
+    operator.destroy = lambda: None
+    operator.boot_lock_s = 0.0
+    operator._last_localization_exception_seq = 0
+    operator._last_applied_live_result_display_seq = 99
+    operator._make_command_coordinator = lambda: object()
+    operator._map_view_bounds = lambda _points: (np.zeros(2), 1.0)
+    operator._set_preflight_visible = lambda _visible: None
+    operator._reset_localization_benchmark_metrics = lambda: None
+    operator._derive_motion_headings = lambda _rows: []
+    operator._sync_autonomy_profile_approval = lambda: None
+    operator.title = lambda _title: None
+    operator._attach_localizer_file_handler = lambda: None
+    operator._sync_record_status_label = lambda: None
+    operator.site_assets_panel = SimpleNamespace(activate_site=lambda *_args: None)
+    monkeypatch.setattr(
+        app,
+        "OperatorShutdownCoordinator",
+        lambda **_kwargs: object(),
+    )
+    monkeypatch.setattr(
+        app,
+        "site_pack_root_for_profile",
+        lambda *_args: Path("/tmp/site-pack"),
+    )
+
+    app.OperatorApp._install_site_runtime(operator, runtime)
+
+    recovery_calls = []
+    operator.localizer.poll_results = lambda: [{
+        "seq": 0,
+        "display_seq": 0,
+        "frame_id": "frame-0",
+        "frame_name": "frame-0",
+        "success": False,
+        "mode": "LOST",
+        "next_mode": "LOST",
+        "localization_exception": True,
+        "error": "new worker failure",
+    }]
+    operator._loc_benchmark_pending = None
+    operator.loc_benchmark_active = "auto"
+    operator.loc_benchmark_mode_var = SimpleNamespace(set=lambda _value: None)
+    operator._apply_lost_hold_result = lambda _result: None
+    operator.update_localization_metrics = lambda _result: None
+    operator._is_live_backend = lambda: True
+    operator._engage_real_localization_recovery = (
+        lambda reason: recovery_calls.append(reason)
+    )
+    operator._last_status_write = float("inf")
+    operator._last_loc_fail_log = float("inf")
+    operator._loc_ok_count = 0
+    operator._loc_fail_count = 0
+    operator.loc_fps = 0.0
+    operator.live_result = None
+    operator.live_result_frame_name = ""
+    operator.live_last_xyz = None
+    operator._live_pending = None
+    operator.camera_forward_world = None
+    operator.camera_axes_world = None
+    operator._integrated_auto_map_frame = None
+    operator.live_heading = None
+    operator.live_pose = np.zeros(4, dtype=float)
+    operator.live_locked = False
+    operator.live_new_pose = False
+    operator.boot_holding = lambda: False
+    operator.pose_stabilizer = None
+
+    assert operator._last_localization_exception_seq is None
+    app.OperatorApp.update_live_results(operator)
+    assert recovery_calls == [app.FailureReason.LOCALIZATION_LOST]
+    assert operator._last_localization_exception_seq == 0
 
 
 def test_heading_arrow_polygon_points_at_the_current_heading() -> None:
@@ -495,6 +784,11 @@ def test_timed_localizer_header_round_trip() -> None:
 
     assert mode == "auto"
     assert capture_stamp == pytest.approx(123.456)
+
+
+def test_timed_localizer_header_rejects_future_capture_timestamp() -> None:
+    with pytest.raises(ValueError, match="future"):
+        localizer_protocol.encode_request("auto", time.monotonic() + 1.0)
 
 
 def test_live_localizer_client_snapshots_only_localizer_mode_prefix() -> None:
@@ -1413,6 +1707,129 @@ def test_submit_restarts_an_idle_exited_worker(tmp_path: Path) -> None:
     finally:
         client.close()
     assert not client.thread.is_alive()
+
+
+def test_fatal_worker_result_forces_immediate_restart(tmp_path: Path) -> None:
+    worker = (
+        "import json,sys; sys.stdin.buffer.read(3); "
+        "print(json.dumps({'seq':0,'success':False,'restart_required':True}),flush=True)"
+    )
+    client = app.LiveWorkerClient(
+        [sys.executable, "-c", worker],
+        1,
+        1,
+        str(tmp_path / "fatal.log"),
+        "fatal-worker",
+        "fatal",
+        timeout_s=1.0,
+    )
+    client.restart_warmup_s = 0.0
+    old_pid = client.proc.pid
+    try:
+        assert client.submit(1, "frame", Image.new("RGB", (1, 1))) is True
+        assert _wait_for(lambda: not client.results.empty())
+        result = client.poll_results()[0]
+        assert result["restart_required"] is True
+        assert _wait_for(lambda: client.proc.pid != old_pid)
+    finally:
+        client.close()
+
+
+def test_fatal_worker_restarts_are_bounded_and_publish_unavailable(tmp_path: Path) -> None:
+    worker = (
+        "import json,sys\n"
+        "i=0\n"
+        "while True:\n"
+        "  raw=sys.stdin.buffer.read(3)\n"
+        "  if not raw: break\n"
+        "  print(json.dumps({'seq':i,'success':False,'restart_required':True}),flush=True)\n"
+        "  i+=1"
+    )
+    client = app.LiveWorkerClient(
+        [sys.executable, "-c", worker], 1, 1,
+        str(tmp_path / "fatal-bounded.log"), "fatal-bounded-worker", "fatal",
+        timeout_s=1.0,
+    )
+    client.restart_warmup_s = 0.0
+    client.max_fatal_restart_attempts = 2
+    client.fatal_restart_backoff_s = 0.0
+    client.fatal_restart_backoff_max_s = 0.0
+    frame = Image.new("RGB", (1, 1))
+    try:
+        for seq in (1, 2, 3):
+            old_pid = client.proc.pid
+            assert client.submit(seq, f"frame-{seq}", frame) is True
+            assert _wait_for(lambda: not client.results.empty())
+            result = client.poll_results()[0]
+            assert result["restart_required"] is True
+            if seq < 3:
+                assert _wait_for(lambda: client.proc.pid != old_pid)
+            else:
+                assert _wait_for(lambda: client.unavailable)
+                assert client.proc.pid == old_pid
+
+        assert client.ready is False
+        assert client._fatal_restart_attempts == 2
+        assert "unavailable" in (client.startup_error or "")
+        assert client.submit(4, "frame-4", frame) is False
+        assert _wait_for(lambda: not client.results.empty())
+        unavailable = client.poll_results()[0]
+        assert unavailable["success"] is False
+        assert unavailable["validity"] is False
+        assert unavailable["worker_unavailable"] is True
+        assert unavailable["failure_kind"] == "worker_unavailable"
+        assert unavailable["restart_required"] is False
+    finally:
+        client.close()
+
+
+def test_healthy_worker_response_resets_fatal_restart_budget(tmp_path: Path) -> None:
+    worker = (
+        "import json,sys\n"
+        "i=0\n"
+        "while True:\n"
+        "  raw=sys.stdin.buffer.read(3)\n"
+        "  if not raw: break\n"
+        "  print(json.dumps({'seq':i,'success':False}),flush=True)\n"
+        "  i+=1"
+    )
+    client = app.LiveWorkerClient(
+        [sys.executable, "-c", worker], 1, 1,
+        str(tmp_path / "fatal-reset.log"), "fatal-reset-worker", "fatal",
+        timeout_s=1.0,
+    )
+    client.restart_warmup_s = 0.0
+    client._fatal_restart_attempts = 2
+    client._startup_error = "previous fatal failure"
+    try:
+        assert client.submit(1, "frame", Image.new("RGB", (1, 1))) is True
+        assert _wait_for(lambda: not client.results.empty())
+        result = client.poll_results()[0]
+        assert result["success"] is False
+        assert client._fatal_restart_attempts == 0
+        assert client.startup_error is None
+    finally:
+        client.close()
+
+
+def test_startup_failure_restarts_are_bounded(tmp_path: Path) -> None:
+    client = app.LiveWorkerClient(
+        [sys.executable, "-c", "raise SystemExit(3)"], 1, 1,
+        str(tmp_path / "startup-fatal.log"), "startup-fatal-worker", "fatal",
+        timeout_s=0.05,
+        expect_ready_event=True,
+    )
+    client.restart_warmup_s = 0.05
+    client.max_fatal_restart_attempts = 2
+    client.fatal_restart_backoff_s = 0.0
+    client.fatal_restart_backoff_max_s = 0.0
+    try:
+        assert _wait_for(lambda: client.unavailable, timeout=2.0)
+        assert client.ready is False
+        assert client._fatal_restart_attempts == 2
+        assert "unavailable" in (client.startup_error or "")
+    finally:
+        client.close()
 
 
 def test_worker_client_reports_submit_pipe_worker_and_response_timing(tmp_path: Path) -> None:

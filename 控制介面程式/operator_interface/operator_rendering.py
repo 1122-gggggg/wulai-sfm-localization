@@ -325,11 +325,6 @@ def draw_video_hud(
         width=2,
     )
     hud_top = max(18, height - hud_height)
-    draw.rectangle(
-        (18, hud_top, width - 18, height - 18),
-        fill="#08090b",
-        outline="#363c44",
-    )
     age = getattr(state, "frame_age_ms", None)
     if age is None and live_backend:
         age = getattr(state, "link_latency_ms", None)
@@ -357,8 +352,10 @@ def draw_video_hud(
         draw.text(
             (28, hud_top + 5 + index * line_spacing),
             line,
-            fill="#f0f3f5" if index == 0 else "#c6cdd4",
+            fill="#000000",
             font=main_hud_font if index == 0 else hud_font,
+            stroke_width=1,
+            stroke_fill="#f4f4f4",
         )
     return link_ok
 
@@ -437,3 +434,78 @@ def draw_video_banner(
             anchor="mm",
             font=banner_font,
         )
+
+
+def draw_gravity_phase_icon(canvas: Any, phase: str | None) -> None:
+    """Draw the yaw, pitch, or roll calibration cue on a Tk-like canvas."""
+    phase = phase if phase in {"yaw", "pitch", "roll"} else None
+    if getattr(canvas, "_gravity_phase_icon", object()) == phase and canvas.find_all():
+        return
+    canvas.delete("all")
+    canvas._gravity_phase_icon = phase
+    cx, cy = 36, 32
+    body, accent, arrow = "#39424b", "#f0f3f5", "#4ea1ff"
+    tag = f"gravity-phase-{phase}" if phase else "gravity-phase-ready"
+    if phase is None:
+        canvas.create_text(
+            cx, cy, text="準備", fill="#7a828a", font=("Sans", 9), tags=(tag,)
+        )
+        return
+
+    if phase == "yaw":
+        canvas.create_oval(
+            cx - 9, cy - 18, cx + 9, cy + 18,
+            fill=body, outline=accent, tags=(tag, "airframe"),
+        )
+        canvas.create_polygon(
+            cx, cy - 23, cx - 5, cy - 14, cx + 5, cy - 14,
+            fill=accent, outline=accent, tags=(tag, "airframe"),
+        )
+        canvas.create_arc(
+            cx - 27, cy - 27, cx + 27, cy + 27,
+            start=35, extent=285, style="arc", outline=arrow, width=2,
+            tags=(tag, "motion-yaw"),
+        )
+        canvas.create_polygon(
+            cx + 21, cy - 18, cx + 28, cy - 10, cx + 16, cy - 11,
+            fill=arrow, outline=arrow, tags=(tag, "motion-yaw"),
+        )
+        return
+
+    if phase == "pitch":
+        canvas.create_oval(
+            cx - 22, cy - 7, cx + 17, cy + 7,
+            fill=body, outline=accent, tags=(tag, "airframe"),
+        )
+        canvas.create_polygon(
+            cx + 16, cy, cx + 25, cy - 5, cx + 25, cy + 5,
+            fill=accent, outline=accent, tags=(tag, "airframe"),
+        )
+        canvas.create_line(
+            cx, cy - 26, cx, cy + 26,
+            fill=arrow, width=2, arrow="both", tags=(tag, "motion-pitch"),
+        )
+        canvas.create_arc(
+            cx - 27, cy - 22, cx + 27, cy + 22,
+            start=205, extent=130, style="arc", outline=arrow, width=2,
+            tags=(tag, "motion-pitch"),
+        )
+        return
+
+    canvas.create_oval(
+        cx - 7, cy - 18, cx + 7, cy + 18,
+        fill=body, outline=accent, tags=(tag, "airframe"),
+    )
+    canvas.create_line(
+        cx - 24, cy, cx + 24, cy,
+        fill=accent, width=3, tags=(tag, "airframe"),
+    )
+    canvas.create_line(
+        cx - 27, cy, cx + 27, cy,
+        fill=arrow, width=2, arrow="both", tags=(tag, "motion-roll"),
+    )
+    canvas.create_arc(
+        cx - 27, cy - 27, cx + 27, cy + 27,
+        start=140, extent=80, style="arc", outline=arrow, width=2,
+        tags=(tag, "motion-roll"),
+    )

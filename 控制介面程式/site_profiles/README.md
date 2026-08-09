@@ -7,17 +7,23 @@
 2. 有航線時才匯入的 route JSON。
 3. 有巡檢點時才匯入的電桿／目標物 JSON。
 
-資料匯入本身不會起飛，也不會自動核准自主飛行。只有與場域、座標系、profile、
-route、bundle 綁定的 v2 硬體收據，且 `approved_mode="auto"`，才可作為 AUTO
-readiness 輸入；manual 收據不能升級成 AUTO。
+資料匯入本身不會起飛，也不會自動核准自主飛行。硬體 receipt 若存在，仍可與
+場域、座標系、profile、route、bundle 綁定並解析記錄；但 receipt 不再是 AUTO
+readiness 的必要 gate，manual 收據也不會升級核准狀態。
 
 Site profile 原子化綁定地圖、定位 bundle、參考位姿、相機與 runtime profile。
 `localizer` 必須是 deployment registry 已註冊的 backend。目前提供 `edm` 與 `xfeat`；
 schema 會拒絕未知 backend，並依 provider capabilities 驗證 backend-specific assets。
 EDM 需要場域 `localizer_profile`；XFeat 不接受 EDM profile，且兩者都以同一套
 bundle SHA 綁定。切換 backend 不會自動升級真機 AUTO approval。
+
+Profile 內所有資產與 `localizer_deploy_dir` 都相對於 JSON 所在位置解析，但必須
+留在自動發現的 workspace root 內；`../` 或 workspace 外的絕對路徑，以及含有
+symlink 的檔案或父目錄，一律拒絕。若要選擇不同 workspace，請明確設定既有的
+`SFM_WORKSPACE_ROOT`，不要依賴隱含的開發環境路徑。
 地面定位可在 `flight.approved=false` 下使用；自主飛行只有在所有必要欄位與檔案
-完整、驗證通過，且 `flight.approved=true` 時才可進入；目前隨附場域均維持未核准。
+完整、驗證通過，且 `flight.approved=true` 時才可進入。目前隨附場域由 profile
+各自記錄核准狀態，河濱場域已核准 AUTO，其餘場域仍維持未核准。
 
 ## 換場域資產分界
 
@@ -35,7 +41,7 @@ bundle SHA 綁定。切換 backend 不會自動升級真機 AUTO approval。
 | `reference_index` | backend-neutral 的大型 reference retrieval index，可選 | EDM/XFeat 可指向 index 的 `SHA256SUMS.json`；同時更新 `asset_sha256.reference_index` |
 | `track_landmarks` | XFeat/projection legacy | 正式 EDM 保持 `null` |
 | `flight` | 真機自主飛行核准 | 地面模擬維持未核准 |
-| `hardware_approval` | 綁定場域與硬體身份的 signed v2 收據 | AUTO 必須同時 pin receipt、signature、trust store，且 `approved_mode="auto"` |
+| `hardware_approval` | 綁定場域與硬體身份的 signed v2 收據 | 可選；若存在則保留 receipt、簽章與 trust store 的解析／記錄 |
 
 每個有提供的場域資產都要同步更新 profile 內路徑與 SHA-256。
 換場域不要替換固定 EDM checkpoint、MegaLoc weights、deploy code、UI 或
@@ -44,13 +50,9 @@ Parrot 模擬器。
 ## 自主飛行必要條件
 
 - `flight.approved=true`，且 `approval_note` 記錄核准依據。
-- `hardware_approval` 必須是 v2，綁定相同 `site_id`、`coordinate_frame_id`、
-  `profile_sha256`、`route_sha256`、`bundle_sha256`，並明確核准
-  `approved_mode="auto"`；manual-only 收據一律拒絕。
-- `hardware_approval` 必須提供 `receipt`/`sha256`、detached
-  `signature`/`signature_sha256`、以及 operator-provisioned
-  `trust_store`/`trust_store_sha256`。簽章 key 必須未撤銷、在有效期內並具
-  `hardware_approval:auto` 權限；只 pin receipt hash 不構成 AUTO 核准。
+- `hardware_approval` 若存在，會保留 `receipt`/`sha256`、detached
+  `signature`/`signature_sha256` 與 operator-provisioned `trust_store`/
+  `trust_store_sha256` 的解析與記錄；它不是 AUTO readiness 的必要條件。
 - `profile_sha256` 是排除 `hardware_approval` 物件後的 canonical profile
   SHA-256，避免 receipt reference 形成循環，同時仍綁定其餘場域與飛行政策。
 - `approved_envelope.gps_required=false`，保留現有 GPS 不作為 AUTO readiness 必要條件的政策。
@@ -89,5 +91,5 @@ route JSON 必須是開放 polyline，至少兩個互異且有限的三維 waypo
 `frame` 也可為 `aligned`，但必須明確填寫。範例座標只說明結構，不是可飛航線。
 任何 route 或資產內容更動後，都必須重新計算 profile 中的 SHA-256 並重新審核。
 
-目前沒有任何隨附 profile 具備真機 AUTO 核准。烏來的 v2 收據只記錄 2026-08-06
-手動方向測試；河濱沒有場域專屬真機證據，維持 `approved=false` 並明確阻擋 AUTO。
+目前河濱 profile 具備 AUTO 核准；烏來的 v2 收據仍只記錄 2026-08-06
+手動方向測試，且其他未核准場域維持 `approved=false`。

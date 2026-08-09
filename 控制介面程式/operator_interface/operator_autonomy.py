@@ -25,6 +25,9 @@ import path_follow_flight as pff
 import real_path_follow_controller as rpf
 
 
+LAND_ATTEMPTS = 2
+
+
 @dataclass(frozen=True)
 class AutonomyEvent:
     kind: str
@@ -72,7 +75,7 @@ class DesktopRouteAutonomy:
             max_translation_pcmd=min(10, nudge_pct),
             max_yaw_pcmd=min(20, nudge_pct),
         )
-        config = rpf.config_for_route(snapshot.path, base_config)
+        config = rpf.config_for_route(snapshot, base_config)
 
         self.backend = backend
         self.snapshot = snapshot
@@ -98,12 +101,21 @@ class DesktopRouteAutonomy:
         self._cancel_reason = ""
         self._manual_handoff_attempted = False
         self._thread: threading.Thread | None = None
+        self._landing_confirmed: bool | None = None
         self.phase = "IDLE"
 
     @property
     def active(self) -> bool:
         thread = self._thread
         return bool(thread is not None and thread.is_alive())
+
+    def join(self, timeout: float | None = None) -> bool:
+        """Wait for the route worker only; SkyController handoff stays async."""
+        thread = self._thread
+        if thread is None or thread is threading.current_thread():
+            return True
+        thread.join(timeout=timeout)
+        return not thread.is_alive()
 
     def start(self) -> bool:
         if self.active:
@@ -112,6 +124,7 @@ class DesktopRouteAutonomy:
         self._paused.clear()
         self._cancel_reason = ""
         self._manual_handoff_attempted = False
+        self._landing_confirmed = None
         self._thread = threading.Thread(
             target=self._run,
             name="desktop-route-autonomy",
@@ -125,6 +138,20 @@ class DesktopRouteAutonomy:
         self._cancel.set()
         self._paused.clear()
         self._clear_motion()
+        handoff_reason = f"auto_cancel:{self._cancel_reason}"
+        self._send_zero(handoff_reason)
+        if not self._manual_handoff_attempted:
+            self._manual_handoff_attempted = True
+            # give_to_pilot() serializes the piloting-source transition and may
+            # wait up to ten seconds.  Cancellation is the safety latch and zero
+            # command above; keep the UI caller free while the authority handoff
+            # completes on its own daemon thread.
+            threading.Thread(
+                target=self._request_manual,
+                kwargs={"reason": handoff_reason},
+                name="desktop-route-manual-handoff",
+                daemon=True,
+            ).start()
 
     @property
     def paused(self) -> bool:
@@ -321,12 +348,12 @@ class DesktopRouteAutonomy:
             return None
         return speed, stamp
 
-    def _request_manual(self) -> bool:
+    def _request_manual(self, reason: str = "auto_stick_override") -> bool:
         give = getattr(self.backend, "give_to_pilot", None)
         if not callable(give):
             return False
         try:
-            return bool(give(reason="auto_stick_override"))
+            return bool(give(reason=reason))
         except Exception:
             return False
 
@@ -354,20 +381,39 @@ class DesktopRouteAutonomy:
 
     def _land_after_failure(self, detail: str) -> None:
         self.phase = "LANDING"
+        self._landing_confirmed = False
         self._clear_motion()
         self._send_zero("auto_pre_land")
-        result = None
-        error = None
-        try:
-            result = self.land()
-        except Exception as exc:
-            error = repr(exc)
+        last_result = None
+        last_error = None
+        for attempt in range(1, LAND_ATTEMPTS + 1):
+            result = None
+            error = None
+            try:
+                result = self.land()
+            except Exception as exc:
+                error = repr(exc)
+            last_result, last_error = result, error
+            self._emit(
+                "command_result",
+                detail,
+                command="land",
+                result=result,
+                error=error,
+            )
+            if result is True:
+                self._landing_confirmed = True
+                return
+            if attempt < LAND_ATTEMPTS:
+                self._clear_motion()
+                self._send_zero("auto_pre_land_retry")
+        self.phase = "LANDING_UNRESOLVED"
         self._emit(
-            "command_result",
+            "landing_unresolved",
             detail,
             command="land",
-            result=result,
-            error=error,
+            result=last_result,
+            error=last_error,
         )
 
     def _run(self) -> None:
@@ -388,7 +434,7 @@ class DesktopRouteAutonomy:
                 result=takeoff_result,
                 error=takeoff_error,
             )
-            if takeoff_error is not None or takeoff_result is False:
+            if takeoff_error is not None or takeoff_result is not True:
                 terminal_detail = "AUTO takeoff failed"
                 return
             airborne = True
@@ -469,5 +515,8 @@ class DesktopRouteAutonomy:
         finally:
             self._clear_motion()
             self._paused.clear()
-            self.phase = "DONE"
-            self._emit("finished", terminal_detail)
+            if self._landing_confirmed is False:
+                self.phase = "LANDING_UNRESOLVED"
+            else:
+                self.phase = "DONE"
+                self._emit("finished", terminal_detail)

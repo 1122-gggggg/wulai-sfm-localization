@@ -296,6 +296,58 @@ def localization_exception_payload(
     }
 
 
+def is_cuda_oom_error(error: BaseException, torch_module) -> bool:
+    """Identify PyTorch CUDA OOMs without importing torch at module load time."""
+    cuda = getattr(torch_module, "cuda", None)
+    oom_types = tuple(
+        candidate
+        for candidate in (
+            getattr(cuda, "OutOfMemoryError", None),
+            getattr(torch_module, "OutOfMemoryError", None),
+        )
+        if isinstance(candidate, type)
+    )
+    return bool(oom_types) and isinstance(error, oom_types)
+
+
+def edm_cuda_oom_requires_restart(
+    backend: str,
+    error: BaseException,
+    torch_module,
+) -> bool:
+    """Only EDM OOMs are fatal; XFeat keeps its existing missed-fix behavior."""
+    return str(backend).lower() == "edm" and is_cuda_oom_error(error, torch_module)
+
+
+def cuda_oom_failure_fields(error: BaseException) -> dict[str, object]:
+    """Return stable protocol fields for a fatal EDM CUDA OOM."""
+    return {
+        "error": "cuda_oom",
+        "error_type": type(error).__name__,
+        "failure_kind": "cuda_oom",
+        "worker_fatal": True,
+        "restart_required": True,
+    }
+
+
+def cleanup_cuda_cache(torch_module) -> dict[str, str]:
+    """Best-effort CUDA cache cleanup after a fatal OOM."""
+    cuda = getattr(torch_module, "cuda", None)
+    status: dict[str, str] = {}
+    for name in ("empty_cache", "ipc_collect"):
+        cleanup = getattr(cuda, name, None)
+        if not callable(cleanup):
+            status[name] = "unavailable"
+            continue
+        try:
+            cleanup()
+        except Exception:
+            status[name] = "error"
+        else:
+            status[name] = "ok"
+    return status
+
+
 @contextlib.contextmanager
 def redirect_native_stdout_to_stderr():
     """Route native fd-1 logs away from the JSON stdout pipe."""
@@ -799,6 +851,7 @@ def main() -> None:
         benchmark_setup_ms = 0.0
         benchmark_seeded = False
         benchmark_mode_active = "track" if args.force_track_bench else previous_runtime_mode
+        worker_fatal = False
         try:
             if args.force_track_bench:
                 seed_t0 = time.perf_counter()
@@ -950,9 +1003,10 @@ def main() -> None:
             core_wall_ms = (
                 (time.perf_counter() - core_t0) * 1000.0 if core_t0 is not None else None)
             wall_ms = (time.perf_counter() - wall_t0) * 1000.0
+            worker_fatal = edm_cuda_oom_requires_restart(backend, exc, torch)
             payload = localization_exception_payload(
                 seq=seq,
-                error=exc,
+                error="cuda_oom" if worker_fatal else exc,
                 frame_id=f"worker-{seq}",
                 capture_mono_ns=(
                     int(round(float(capture_stamp) * 1_000_000_000.0))
@@ -990,10 +1044,21 @@ def main() -> None:
                 "benchmark_setup_ms": benchmark_setup_ms,
                 "benchmark_seeded": benchmark_seeded,
             })
+            if worker_fatal:
+                payload.update(cuda_oom_failure_fields(exc))
             print(f"[live_worker] localization error: {exc!r}", file=sys.stderr, flush=True)
+        if worker_fatal:
+            payload["cuda_cache_cleanup"] = cleanup_cuda_cache(torch)
+            print(
+                "[live_worker] fatal EDM CUDA OOM: cache cleanup complete; exiting for restart",
+                file=sys.stderr,
+                flush=True,
+            )
         json_out.write(json.dumps(payload, ensure_ascii=False) + "\n")
         json_out.flush()
         seq += 1
+        if worker_fatal:
+            break
         if args.max_frames and seq >= args.max_frames:
             break
     if frame_shm is not None:

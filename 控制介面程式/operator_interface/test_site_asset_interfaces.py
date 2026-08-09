@@ -5,6 +5,8 @@ import json
 import shutil
 import subprocess
 import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -60,6 +62,10 @@ def _sha(path: Path) -> str:
 
 
 def _write_site_package(root: Path) -> Path:
+    # Site packages are loaded from a workspace, not an arbitrary filesystem
+    # folder; mirror the production marker directories in this fixture.
+    for name in ("控制介面程式", "定位演算法", "地圖檔"):
+        (root / name).mkdir(parents=True, exist_ok=True)
     package = root / "builder-output"
     package.mkdir()
     (package / "map.ply").write_text(
@@ -138,6 +144,25 @@ def _profile_loader(path: Path) -> dict:
     raw = json.loads(path.read_text(encoding="utf-8"))
     assert raw["schema"] == "edm-deployment-profile/v1"
     return raw
+
+
+def _write_valid_route(path: Path) -> Path:
+    path.write_text(
+        json.dumps(
+            {
+                "schema": "sfm-flight-route/v1",
+                "site_id": "test-yard",
+                "coordinate_frame_id": "test-yard-reconstruction-v1",
+                "frame": "glomap",
+                "units": "map",
+                "purpose": "flight",
+                "closed": False,
+                "waypoints": [[0, 0, 0], [1, 0, 0]],
+            }
+        ),
+        encoding="utf-8",
+    )
+    return path
 
 
 def test_site_package_is_validated_and_imported_atomically(tmp_path: Path) -> None:
@@ -357,6 +382,167 @@ def test_route_and_target_are_independent_profile_ports(tmp_path: Path) -> None:
     assert profile.asset_sha256.route_json == _sha(profile.route_json)
     assert profile.asset_sha256.poles_json == _sha(profile.poles_json)
     assert profile.flight is not None and profile.flight.approved is False
+
+
+def test_route_commit_rolls_back_asset_when_profile_replace_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    package = _write_site_package(tmp_path)
+    managed = tmp_path / "managed"
+    site_provider = LocalSitePackageProvider(
+        managed,
+        bundle_inspector=lambda _path: ("ref-a.jpg",),
+        edm_profile_loader=_profile_loader,
+    )
+    profile_path = site_provider.import_folder(package).profile_path
+    profile_before = profile_path.read_bytes()
+    route = _write_valid_route(tmp_path / "route.json")
+    real_replace = local_assets.os.replace
+
+    def fail_profile_replace(source: str | Path, destination: str | Path) -> None:
+        if Path(destination) == profile_path:
+            raise OSError("forced profile replace failure")
+        real_replace(source, destination)
+
+    monkeypatch.setattr(local_assets.os, "replace", fail_profile_replace)
+
+    with pytest.raises(OSError, match="forced profile replace failure"):
+        LocalRouteProvider(managed).import_file(route, profile_path)
+
+    route_target = managed / "test-yard" / "routes" / "flight_route.json"
+    assert not route_target.exists()
+    assert profile_path.read_bytes() == profile_before
+    assert not [path for path in managed.rglob("*") if ".tmp" in path.name]
+
+
+def test_concurrent_route_imports_commit_without_temp_collision(tmp_path: Path,
+                                                                monkeypatch: pytest.MonkeyPatch) -> None:
+    package = _write_site_package(tmp_path)
+    managed = tmp_path / "managed"
+    site_provider = LocalSitePackageProvider(
+        managed,
+        bundle_inspector=lambda _path: ("ref-a.jpg",),
+        edm_profile_loader=_profile_loader,
+    )
+    profile_path = site_provider.import_folder(package).profile_path
+    route = _write_valid_route(tmp_path / "route.json")
+    copied = threading.Barrier(2)
+    real_copy2 = local_assets.shutil.copy2
+
+    def synchronized_copy2(source: str | Path, destination: str | Path, *args, **kwargs):
+        result = real_copy2(source, destination, *args, **kwargs)
+        if Path(destination).name.endswith(".tmp"):
+            copied.wait(timeout=5)
+        return result
+
+    monkeypatch.setattr(local_assets.shutil, "copy2", synchronized_copy2)
+
+    def import_route() -> object:
+        return LocalRouteProvider(managed).import_file(route, profile_path)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(lambda _index: import_route(), range(2)))
+
+    target = managed / "test-yard" / "routes" / "flight_route.json"
+    profile = load_site_profile(profile_path)
+    assert all(result.asset_path == target for result in results)
+    assert target.read_bytes() == route.read_bytes()
+    assert profile.route_json == target
+    assert profile.asset_sha256.route_json == _sha(target)
+    assert not [path for path in managed.rglob("*") if ".tmp" in path.name]
+
+
+def test_concurrent_site_package_imports_have_one_winner(tmp_path: Path,
+                                                        monkeypatch: pytest.MonkeyPatch) -> None:
+    package = _write_site_package(tmp_path)
+    managed = tmp_path / "managed"
+    provider = LocalSitePackageProvider(
+        managed,
+        bundle_inspector=lambda _path: ("ref-a.jpg",),
+        edm_profile_loader=_profile_loader,
+    )
+    validated = threading.Barrier(2)
+    real_validate = provider.validate_folder
+
+    def synchronized_validate(folder: str | Path):
+        report = real_validate(folder)
+        validated.wait(timeout=5)
+        return report
+
+    monkeypatch.setattr(provider, "validate_folder", synchronized_validate)
+
+    def import_package() -> object:
+        return provider.import_folder(package)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(lambda _index: import_package(), range(2)))
+
+    assert sorted(result.already_present for result in results) == [False, True]
+    profile_path = managed / "test-yard" / "site_profile.json"
+    assert profile_path.is_file()
+    assert not [path for path in managed.rglob("*") if ".tmp" in path.name]
+
+
+def test_route_import_resolves_system_profile_to_its_managed_site(
+    tmp_path: Path,
+) -> None:
+    """The operator commonly starts from control/site_profiles, not the pack."""
+    package = _write_site_package(tmp_path)
+    managed = tmp_path / "managed"
+    site_provider = LocalSitePackageProvider(
+        managed,
+        bundle_inspector=lambda _path: ("ref-a.jpg",),
+        edm_profile_loader=_profile_loader,
+    )
+    imported_profile_path = site_provider.import_folder(package).profile_path
+    site_folder = managed / "operator-folder"
+    imported_profile_path.parent.rename(site_folder)
+    managed_profile_path = site_folder / "site_profile.json"
+    managed_profile = load_site_profile(managed_profile_path)
+
+    raw = json.loads(managed_profile_path.read_text(encoding="utf-8"))
+    raw["localizer_profile"] = str(managed_profile.localizer_profile)
+    raw["map_reference_poses"] = str(managed_profile.map_reference_poses)
+    raw["map_align"] = str(managed_profile.map_align)
+    raw["assets"]["map_ply"] = str(managed_profile.map_ply)
+    raw["assets"]["localization_bundle"] = str(
+        managed_profile.localization_bundle
+    )
+    system_profiles = tmp_path / "control" / "site_profiles"
+    system_profiles.mkdir(parents=True)
+    system_profile_path = system_profiles / "test_yard_edm.json"
+    system_profile_path.write_text(json.dumps(raw), encoding="utf-8")
+
+    route = tmp_path / "route.json"
+    route.write_text(
+        json.dumps(
+            {
+                "schema": "sfm-flight-route/v1",
+                "site_id": "test-yard",
+                "coordinate_frame_id": "test-yard-reconstruction-v1",
+                "frame": "glomap",
+                "units": "map",
+                "purpose": "flight",
+                "closed": False,
+                "waypoints": [[0, 0, 0], [1, 0, 0]],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    imported = LocalRouteProvider(managed).import_file(route, system_profile_path)
+
+    assert imported.profile_path == managed_profile_path
+    assert imported.asset_path == site_folder / "routes" / "flight_route.json"
+    updated = load_site_profile(managed_profile_path)
+    assert updated.route_json == imported.asset_path
+    assert updated.asset_sha256.route_json == _sha(imported.asset_path)
+
+    mismatched = json.loads(system_profile_path.read_text(encoding="utf-8"))
+    mismatched["site_id"] = "wrong-site"
+    system_profile_path.write_text(json.dumps(mismatched), encoding="utf-8")
+    with pytest.raises(ValueError, match="尚未對應"):
+        LocalRouteProvider(managed).import_file(route, system_profile_path)
 
 
 def test_restart_argument_replaces_only_site_profile() -> None:

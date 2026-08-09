@@ -165,6 +165,49 @@ def test_activation_is_atomic_and_rollback_is_verifiable(tmp_path: Path) -> None
     assert (activation_root / "current" / "payload.txt").read_text() == "one"
 
 
+def test_stage_rejects_symlinks_even_under_manifest_excluded_paths(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "package"
+    source.mkdir()
+    (source / "PORTABLE_PACKAGE.json").write_text(
+        json.dumps(
+            {
+                "schema": "sfm-portable-simulator/v2",
+                "source_release": {
+                    "commit": "deadbeef",
+                    "version": "release-one",
+                    "manifest_sha256": "a" * 64,
+                    "sha256sums_sha256": "b" * 64,
+                    "dirty": False,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    _add_offline_bundle(source)
+    (source / "payload.txt").write_text("one", encoding="utf-8")
+    generate(source)
+    expected = json.loads(
+        (source / "PORTABLE_PACKAGE.json").read_text(encoding="utf-8")
+    )["source_release"]
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.txt").write_text("secret", encoding="utf-8")
+    (source / "outputs").mkdir()
+    (source / "outputs/leak").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="symlink"):
+        stage(
+            source,
+            tmp_path / "activation",
+            version="release-one",
+            expected_source_release=expected,
+        )
+
+    assert not (tmp_path / "activation/releases/release-one").exists()
+
+
 def test_activation_rejects_missing_release_metadata(tmp_path: Path) -> None:
     source = tmp_path / "package"
     source.mkdir()

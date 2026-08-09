@@ -290,6 +290,28 @@ def test_store_still_enforces_stale_and_frozen_contract(module):
     assert not grabber.is_healthy()
 
 
+@pytest.mark.parametrize("stamp", [float("nan"), float("inf"), -float("inf")])
+@pytest.mark.parametrize("module", MODULES, ids=("canonical",))
+def test_store_rejects_non_finite_timestamps(module, stamp):
+    grabber = _grabber(module)
+    frame = np.zeros((8, 8, 3), dtype=np.uint8)
+
+    grabber._store(frame, stamp=stamp)
+
+    assert grabber._latest is None
+
+
+@pytest.mark.parametrize("module", MODULES, ids=("canonical",))
+def test_store_rejects_even_a_small_future_timestamp(module, monkeypatch):
+    grabber = _grabber(module)
+    frame = np.zeros((8, 8, 3), dtype=np.uint8)
+    monkeypatch.setattr(module.time, "monotonic", lambda: 100.0)
+
+    grabber._store(frame, stamp=100.01)
+
+    assert grabber._latest is None
+
+
 @pytest.mark.parametrize("module", MODULES, ids=("canonical",))
 def test_live_ui_sample_reuses_owned_rgb_and_carries_monotonic_nodes(module):
     grabber = _grabber(module)

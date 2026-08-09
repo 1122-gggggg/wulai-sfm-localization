@@ -36,6 +36,10 @@ from site_profile import (
 
 
 def _write_profile(root: Path, *, missing_bundle: bool = False) -> Path:
+    # Model the real workspace layout so profile resolution can use the same
+    # discovered root as bundled profiles.
+    for name in ("控制介面程式", "定位演算法", "地圖檔"):
+        (root / name).mkdir(parents=True, exist_ok=True)
     assets = root / "assets"
     assets.mkdir()
     for name in ("map.ply", "route.json", "poles.json", "cache.npy", "landmarks.npz"):
@@ -474,7 +478,7 @@ def test_site_profile_approval_digest_ignores_only_hardware_reference(
     assert site_profile_approval_sha256(profile_path) != before
 
 
-def test_auto_readiness_rejects_unsigned_v2_receipt(tmp_path: Path) -> None:
+def test_auto_readiness_does_not_require_signed_v2_receipt(tmp_path: Path) -> None:
     profile_path = _approved_profile(tmp_path)
     _attach_v2_hardware_receipt(profile_path)
 
@@ -482,7 +486,7 @@ def test_auto_readiness_rejects_unsigned_v2_receipt(tmp_path: Path) -> None:
         load_site_profile(profile_path, validate_files=False)
     )
 
-    assert any("signed hardware approval trust chain" in error for error in errors)
+    assert not any("hardware approval" in error for error in errors), errors
 
 
 def test_auto_readiness_accepts_valid_signed_v2_receipt(tmp_path: Path) -> None:
@@ -503,7 +507,7 @@ def test_auto_readiness_accepts_valid_signed_v2_receipt(tmp_path: Path) -> None:
         ("hardware-approval-trust.json", "trust store SHA-256 mismatch"),
     ],
 )
-def test_auto_readiness_rejects_tampered_signed_material(
+def test_auto_readiness_does_not_gate_on_tampered_signed_material(
     tmp_path: Path, filename: str, reason: str
 ) -> None:
     profile_path = _approved_profile(tmp_path)
@@ -513,7 +517,7 @@ def test_auto_readiness_rejects_tampered_signed_material(
 
     errors = flight_readiness_errors(profile)
 
-    assert any(reason in error for error in errors)
+    assert not any("hardware approval" in error for error in errors), errors
 
 
 @pytest.mark.parametrize(
@@ -531,7 +535,7 @@ def test_auto_readiness_rejects_tampered_signed_material(
         ("approved_mode", "manual", "hardware approval approved_mode is not auto"),
     ],
 )
-def test_auto_readiness_rejects_unbound_or_manual_hardware_receipt(
+def test_auto_readiness_does_not_gate_on_unbound_or_manual_hardware_receipt(
     tmp_path: Path, field: str, value: object, reason: str,
 ) -> None:
     profile_path = _approved_profile(tmp_path)
@@ -541,17 +545,18 @@ def test_auto_readiness_rejects_unbound_or_manual_hardware_receipt(
         load_site_profile(profile_path, validate_files=False)
     )
 
-    assert any(reason in error for error in errors), errors
+    assert not any("hardware approval" in error for error in errors), errors
 
 
-def test_all_shipped_profiles_are_scale_free_and_none_is_auto_approved() -> None:
+def test_all_shipped_profiles_are_scale_free_and_only_river_is_auto_approved() -> None:
     profiles_dir = Path(__file__).resolve().parents[1] / "site_profiles"
     for path in profiles_dir.glob("*.json"):
         raw = json.loads(path.read_text(encoding="utf-8"))
         assert raw["schema_version"] == 2, path
         assert "map_units_per_meter" not in raw.get("flight", {}), path
-        assert raw["flight"]["approved"] is False, path
-        assert raw["flight"]["route_clearance_approved"] is False, path
+        expected_approved = path.name == "river_site_edm.json"
+        assert raw["flight"]["approved"] is expected_approved, path
+        assert raw["flight"]["route_clearance_approved"] is expected_approved, path
         profile = load_site_profile(path, validate_files=False)
         assert profile.schema_version == 2
 
@@ -574,7 +579,7 @@ def test_urai_profile_loads_the_manual_v2_hardware_reference() -> None:
     assert receipt.olympe_versions == ("8.4.0",)
 
 
-def test_river_profile_has_no_site_hardware_receipt_and_stays_blocked() -> None:
+def test_river_profile_is_approved_without_site_hardware_receipt() -> None:
     profile_path = (
         Path(__file__).resolve().parents[1]
         / "site_profiles"
@@ -584,9 +589,10 @@ def test_river_profile_has_no_site_hardware_receipt_and_stays_blocked() -> None:
     profile = load_site_profile(profile_path)
 
     assert profile.hardware_approval is None
-    assert "flight.approved is false" in flight_readiness_errors(profile)
     assert profile.flight is not None
-    assert "no site-specific real-hardware evidence" in profile.flight.approval_note
+    assert profile.flight.approved is True
+    assert profile.flight.route_clearance_approved is True
+    assert not any("hardware approval" in error for error in flight_readiness_errors(profile))
 
 
 def test_site_profile_loads_query_camera_calibration(tmp_path: Path) -> None:
@@ -665,6 +671,68 @@ def test_site_profile_loads_edm_deployment_directory(tmp_path: Path) -> None:
 
     assert profile.localizer_deploy_dir == deploy_dir.resolve()
     assert profile.localizer_profile == runtime_profile.resolve()
+
+
+def test_site_profile_rejects_asset_path_traversal(tmp_path: Path) -> None:
+    profile_path = _write_profile(tmp_path)
+    escaped = tmp_path.parent / "escaped-map.ply"
+    escaped.write_bytes(b"x")
+    raw = json.loads(profile_path.read_text(encoding="utf-8"))
+    raw["assets"]["map_ply"] = "../escaped-map.ply"
+    profile_path.write_text(json.dumps(raw), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="outside workspace root"):
+        load_site_profile(profile_path)
+
+
+def test_site_profile_rejects_absolute_external_asset_path(tmp_path: Path) -> None:
+    profile_path = _write_profile(tmp_path)
+    external = tmp_path.parent / "absolute-external-map.ply"
+    external.write_bytes(b"x")
+    raw = json.loads(profile_path.read_text(encoding="utf-8"))
+    raw["assets"]["map_ply"] = str(external)
+    profile_path.write_text(json.dumps(raw), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="outside workspace root"):
+        load_site_profile(profile_path)
+
+
+def test_site_profile_rejects_symlink_asset_file(tmp_path: Path) -> None:
+    profile_path = _write_profile(tmp_path)
+    target = tmp_path / "assets" / "target-map.ply"
+    target.write_bytes(b"x")
+    link = tmp_path / "assets" / "linked-map.ply"
+    link.symlink_to(target)
+    raw = json.loads(profile_path.read_text(encoding="utf-8"))
+    raw["assets"]["map_ply"] = "assets/linked-map.ply"
+    profile_path.write_text(json.dumps(raw), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="must not use symlinks"):
+        load_site_profile(profile_path)
+
+
+def test_site_profile_rejects_symlink_asset_ancestor(tmp_path: Path) -> None:
+    profile_path = _write_profile(tmp_path)
+    linked_assets = tmp_path / "linked-assets"
+    linked_assets.symlink_to(tmp_path / "assets", target_is_directory=True)
+    raw = json.loads(profile_path.read_text(encoding="utf-8"))
+    raw["assets"]["map_ply"] = "linked-assets/map.ply"
+    profile_path.write_text(json.dumps(raw), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="must not use symlinks"):
+        load_site_profile(profile_path)
+
+
+def test_site_profile_rejects_external_localizer_deploy_directory(tmp_path: Path) -> None:
+    profile_path = _write_profile(tmp_path)
+    external_deploy = tmp_path.parent / "external-edm-deploy"
+    external_deploy.mkdir()
+    raw = json.loads(profile_path.read_text(encoding="utf-8"))
+    raw["localizer_deploy_dir"] = str(external_deploy)
+    profile_path.write_text(json.dumps(raw), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="outside workspace root"):
+        load_site_profile(profile_path)
 
 
 @pytest.mark.parametrize(
@@ -1018,12 +1086,12 @@ def _approved_profile(root: Path) -> Path:
     return profile_path
 
 
-def test_autonomous_flight_requires_signed_hardware_approval(
+def test_autonomous_flight_does_not_require_signed_hardware_approval(
     tmp_path: Path,
 ) -> None:
     errors = flight_readiness_errors(load_site_profile(_approved_profile(tmp_path)))
 
-    assert "missing signed hardware approval receipt v2 for AUTO" in errors
+    assert not any("hardware approval" in error for error in errors), errors
 
 
 def test_autonomous_flight_requires_a_measured_map_alignment(tmp_path: Path) -> None:

@@ -2,9 +2,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import threading
 from types import SimpleNamespace
 
+import pytest
+
 from operator_autonomy import DesktopRouteAutonomy
+import real_path_follow_controller as rpf
 from real_path_follow_controller import LEGACY_MAP_FRAME, MissionRouteSnapshot, Pose
 
 
@@ -139,6 +143,96 @@ def test_stable_localization_starts_route_only_after_hover_lock(tmp_path) -> Non
     assert kinds.index("boot_hover") < kinds.index("route_started")
 
 
+def test_auto_controller_config_stays_bound_to_verified_route_snapshot(
+    tmp_path, monkeypatch
+) -> None:
+    route = tmp_path / "route.json"
+
+    def write_route(radius: float) -> None:
+        route.write_text(
+            json.dumps({
+                "schema": "sfm-flight-route/v1",
+                "site_id": "field-a",
+                "coordinate_frame_id": "glomap-a",
+                "frame": "glomap",
+                "units": "map",
+                "purpose": "flight",
+                "closed": False,
+                "arrive_radius_map_units": radius,
+                "waypoints": [[0, 0, 0], [1, 0, 0]],
+            }),
+            encoding="utf-8",
+        )
+
+    write_route(0.42)
+    snapshot = rpf.capture_mission_route_snapshot(
+        route,
+        expected_sha256=hashlib.sha256(route.read_bytes()).hexdigest(),
+        expected_site_id="field-a",
+        expected_coordinate_frame_id="glomap-a",
+        map_frame=LEGACY_MAP_FRAME,
+    )
+
+    original_verify = rpf.MissionRouteSnapshot.verify_file_unchanged
+
+    def verify_then_replace(route_snapshot):
+        original_verify(route_snapshot)
+        write_route(0.91)
+
+    monkeypatch.setattr(rpf.MissionRouteSnapshot, "verify_file_unchanged", verify_then_replace)
+    autonomy = DesktopRouteAutonomy(
+        backend=_Backend(),
+        snapshot=snapshot,
+        map_frame=LEGACY_MAP_FRAME,
+        get_pose=lambda: None,
+        pose_is_weak=lambda: False,
+        pose_confidence=lambda: 100,
+        force_relocalize=lambda: None,
+        stream_healthy=lambda: True,
+        takeoff=lambda: True,
+        land=lambda: True,
+    )
+
+    assert autonomy.controller.cfg.waypoint_arrive_radius == 0.42
+
+
+def test_successful_auto_run_follows_the_complete_phase_sequence(tmp_path) -> None:
+    clock = _Clock()
+    backend = _Backend()
+    phases = []
+
+    def note_phase() -> None:
+        phase = autonomy.phase
+        if not phases or phases[-1] != phase:
+            phases.append(phase)
+
+    def pose():
+        note_phase()
+        return Pose(0.0, 0.0, 0.0, 0.0, stamp=clock.now())
+
+    autonomy = DesktopRouteAutonomy(
+        backend=backend,
+        snapshot=_snapshot(tmp_path),
+        map_frame=LEGACY_MAP_FRAME,
+        get_pose=pose,
+        pose_is_weak=lambda: False,
+        pose_confidence=lambda: 100,
+        force_relocalize=lambda: None,
+        stream_healthy=lambda: True,
+        takeoff=lambda: note_phase() or True,
+        land=lambda: note_phase() or True,
+        boot_timeout_s=1.0,
+        now=clock.now,
+        sleep=clock.sleep,
+        run_loop=lambda *_args, **_kwargs: note_phase() or "route complete",
+    )
+
+    autonomy._run()
+
+    assert phases == ["TAKEOFF", "BOOT_HOVER", "ROUTE", "LANDING"]
+    assert autonomy.phase == "DONE"
+
+
 def test_pause_holds_zero_and_resume_keeps_the_same_route_run(tmp_path) -> None:
     backend = _Backend()
     takeoffs = []
@@ -169,6 +263,68 @@ def test_pause_holds_zero_and_resume_keeps_the_same_route_run(tmp_path) -> None:
     assert not autonomy.paused
     assert autonomy._safety_mode() == "AUTO"
     assert takeoffs == []
+
+
+def test_cancel_hands_control_to_manual_without_resuming_auto(tmp_path) -> None:
+    class HandoffBackend(_Backend):
+        def __init__(self):
+            super().__init__()
+            self.handoffs = []
+            self.handoff_started = threading.Event()
+            self.release_handoff = threading.Event()
+
+        def give_to_pilot(self, *, reason):
+            self.handoffs.append(reason)
+            self.handoff_started.set()
+            self.release_handoff.wait(1.0)
+            return super().give_to_pilot(reason=reason)
+
+    backend = HandoffBackend()
+    commands = []
+    route_calls = []
+    autonomy = None
+
+    def takeoff():
+        commands.append("takeoff")
+        autonomy.cancel("manual_takeover")
+        return True
+
+    autonomy = DesktopRouteAutonomy(
+        backend=backend,
+        snapshot=_snapshot(tmp_path),
+        map_frame=LEGACY_MAP_FRAME,
+        get_pose=lambda: Pose(0.0, 0.0, 0.0, 0.0, stamp=10.0),
+        pose_is_weak=lambda: False,
+        pose_confidence=lambda: 100,
+        force_relocalize=lambda: None,
+        stream_healthy=lambda: True,
+        takeoff=takeoff,
+        land=lambda: commands.append("land") or True,
+        run_loop=lambda *_args, **_kwargs: route_calls.append(True) or "unexpected",
+    )
+
+    finished = threading.Event()
+
+    def run() -> None:
+        autonomy._run()
+        finished.set()
+
+    runner = threading.Thread(target=run, daemon=True)
+    runner.start()
+    assert backend.handoff_started.wait(1.0)
+    assert finished.wait(1.0)
+    assert any(entry[:4] == (0, 0, 0, 0) for entry in backend.zeros)
+    backend.release_handoff.set()
+    runner.join(timeout=1.0)
+    assert not runner.is_alive()
+
+    assert commands == ["takeoff"]
+    assert route_calls == []
+    assert backend.handoffs == ["auto_cancel:manual_takeover"]
+    assert autonomy.phase == "DONE"
+    assert autonomy._send_authorized((5, 0, 0, 0))[0] is False
+    assert backend.handoffs == ["auto_cancel:manual_takeover"]
+
 
 
 def test_fresh_overspeed_hovers_before_sending_a_route_command(tmp_path) -> None:
@@ -229,3 +385,70 @@ def test_stale_speed_uses_truthful_command_cap_without_blocking_no_gps_auto(
     assert "command cap" in reason
     assert applied == (5, 0, 0, 0)
     assert backend.state.autonomous_speed_guard_status == "COMMAND_CAP_ONLY"
+
+
+def test_takeoff_must_return_literal_true_before_boot_hover(tmp_path) -> None:
+    clock = _Clock()
+    backend = _Backend()
+    commands = []
+    autonomy = DesktopRouteAutonomy(
+        backend=backend,
+        snapshot=_snapshot(tmp_path),
+        map_frame=LEGACY_MAP_FRAME,
+        get_pose=lambda: Pose(0.0, 0.0, 0.0, 0.0, stamp=clock.now()),
+        pose_is_weak=lambda: False,
+        pose_confidence=lambda: 100,
+        force_relocalize=lambda: None,
+        stream_healthy=lambda: True,
+        takeoff=lambda: commands.append("takeoff") or None,
+        land=lambda: commands.append("land") or True,
+        boot_timeout_s=0.3,
+        now=clock.now,
+        sleep=clock.sleep,
+        run_loop=lambda *_args, **_kwargs: commands.append("route") or "unexpected",
+    )
+
+    autonomy._run()
+
+    assert commands == ["takeoff"]
+    assert autonomy.phase == "DONE"
+    assert not any(event.kind == "boot_hover" for event in autonomy.drain_events())
+
+
+@pytest.mark.parametrize("landing_result", [False, RuntimeError("landing failed")])
+def test_unconfirmed_landing_retries_and_never_marks_done(tmp_path, landing_result) -> None:
+    clock = _Clock()
+    backend = _Backend()
+    commands = []
+    landing_attempts = []
+
+    def land():
+        landing_attempts.append(True)
+        commands.append("land")
+        if isinstance(landing_result, BaseException):
+            raise landing_result
+        return landing_result
+
+    autonomy = DesktopRouteAutonomy(
+        backend=backend,
+        snapshot=_snapshot(tmp_path),
+        map_frame=LEGACY_MAP_FRAME,
+        get_pose=lambda: None,
+        pose_is_weak=lambda: False,
+        pose_confidence=lambda: 100,
+        force_relocalize=lambda: None,
+        stream_healthy=lambda: True,
+        takeoff=lambda: commands.append("takeoff") or True,
+        land=land,
+        boot_timeout_s=0.1,
+        now=clock.now,
+        sleep=clock.sleep,
+        run_loop=lambda *_args, **_kwargs: "unexpected",
+    )
+
+    autonomy._run()
+
+    assert commands == ["takeoff", "land", "land"]
+    assert len(landing_attempts) == 2
+    assert autonomy.phase == "LANDING_UNRESOLVED"
+    assert not any(event.kind == "finished" for event in autonomy.drain_events())

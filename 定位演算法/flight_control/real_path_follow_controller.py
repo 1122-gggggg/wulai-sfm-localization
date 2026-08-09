@@ -568,11 +568,14 @@ def load_route_arrive_radius(path_json: str | Path) -> float | None:
 
 
 def config_for_route(
-    path_json: str | Path, base: "ControlConfig | None" = None
+    path_json: str | Path | MissionRouteSnapshot, base: "ControlConfig | None" = None
 ) -> "ControlConfig":
-    """`base` with the route file's own arrival radius applied when it has one."""
+    """Apply a route's arrival radius without rereading a validated snapshot."""
     cfg = ControlConfig() if base is None else base
-    radius = load_route_arrive_radius(path_json)
+    if isinstance(path_json, MissionRouteSnapshot):
+        radius = path_json.arrive_radius_map_units
+    else:
+        radius = load_route_arrive_radius(path_json)
     if radius is None:
         return cfg
     # progress_jump_slack must stay >= the arrival sphere (__post_init__ enforces

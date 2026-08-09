@@ -320,6 +320,7 @@ class MissionRouteSnapshot:
     site_id: str
     coordinate_frame_id: str
     waypoints: tuple[tuple[float, float, float], ...]
+    arrive_radius_map_units: float | None = None
 
     def controller_waypoints(self) -> list[np.ndarray]:
         return [np.array(point, dtype=float, copy=True) for point in self.waypoints]
@@ -375,6 +376,7 @@ def capture_mission_route_snapshot(
         site_id=site_id,
         coordinate_frame_id=coordinate_frame_id,
         waypoints=tuple(tuple(point) for point in route.controller_points),
+        arrive_radius_map_units=route.arrive_radius_map_units,
     )
 
 

@@ -594,9 +594,10 @@ class OlympePdrawGrabber:
                timing: dict | None = None):
         stamp = time.monotonic() if stamp is None else float(stamp)
         receipt = time.monotonic() if receipt_stamp is None else float(receipt_stamp)
-        if not np.isfinite(stamp) or stamp > time.monotonic() + 0.05:
+        now_mono = time.monotonic()
+        if not np.isfinite(stamp) or stamp > now_mono:
             return
-        if not np.isfinite(receipt):
+        if not np.isfinite(receipt) or receipt > now_mono:
             return
         try:
             source_us = None if source_ntp_us is None else int(source_ntp_us)
