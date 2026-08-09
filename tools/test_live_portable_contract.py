@@ -18,6 +18,15 @@ LAUNCHER = ROOT / "一鍵啟動.sh"
 def test_live_minimal_export_contract_excludes_development_payload() -> None:
     assert "一鍵啟動.sh" in exporter.LIVE_MINIMAL_COPY_FILES
     assert "requirements-lock.txt" in exporter.LIVE_MINIMAL_COPY_FILES
+    assert "tools/simulator_preflight.py" in exporter.LIVE_MINIMAL_COPY_FILES
+    assert (
+        "模擬器/parrot_stimulate/src/anafi_pcmd_sim/scale_free_control.py"
+        in exporter.LIVE_MINIMAL_COPY_FILES
+    )
+    assert (
+        "模擬器/測試影片/河濱_P1180118_first_2s.mp4",
+        "執行環境/smoke/river_site_first_2s.mp4",
+    ) in exporter.LIVE_MINIMAL_COPY_MAPPINGS
     assert "控制介面程式" in exporter.LIVE_MINIMAL_COPY_DIRS
     assert "定位演算法/flight_control" in exporter.LIVE_MINIMAL_COPY_DIRS
     assert "模擬器/parrot_stimulate" not in exporter.LIVE_MINIMAL_COPY_DIRS
@@ -58,6 +67,7 @@ def test_live_minimal_export_uses_live_entrypoint_and_filters_tests(
     monkeypatch.setattr(
         exporter, "LIVE_MINIMAL_COPY_FILES", ("RUNTIME_ARTIFACTS.json",)
     )
+    monkeypatch.setattr(exporter, "LIVE_MINIMAL_COPY_MAPPINGS", ())
     monkeypatch.setattr(exporter, "_source_release", lambda: {})
 
     exporter.export(destination, live_minimal=True)
@@ -83,6 +93,9 @@ def test_one_click_launcher_installs_offline_and_selects_river_profile() -> None
     assert ".sfm-portable-runtime" in script
     assert "非 Git 原始碼目錄必須包含 PORTABLE_PACKAGE.json" in script
     assert "exec" in script
+
+    smoke_script = (ROOT / "tools/simulated_ui_smoke.sh").read_text(encoding="utf-8")
+    assert "執行環境/smoke/river_site_first_2s.mp4" in smoke_script
 
 
 def test_export_cli_forwards_live_minimal_mode(

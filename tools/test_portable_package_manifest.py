@@ -448,6 +448,57 @@ def test_portable_export_copies_verified_wheelhouse_and_records_metadata(
     assert verify(destination) == []
 
 
+def test_live_minimal_export_reuses_runtime_only_wheelhouse(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source, _ = _minimal_export_source(tmp_path / "source", monkeypatch)
+    runtime_locks = ("requirements-lock.txt",)
+    wheelhouse = _write_offline_wheelhouse(source, runtime_locks)
+    destination = tmp_path / "portable"
+    monkeypatch.setattr(export_simulator_package, "LIVE_MINIMAL_COPY_DIRS", ("code",))
+    monkeypatch.setattr(
+        export_simulator_package,
+        "LIVE_MINIMAL_COPY_FILES",
+        ("RUNTIME_ARTIFACTS.json", "requirements-lock.txt"),
+    )
+    monkeypatch.setattr(export_simulator_package, "LIVE_MINIMAL_COPY_MAPPINGS", ())
+    source_lock_names: tuple[str, ...] = ()
+
+    def fake_subset(
+        source_root: Path,
+        output: Path,
+        *,
+        source_requirement_locks,
+        requirement_locks,
+        python_executable,
+    ) -> dict[str, object]:
+        nonlocal source_lock_names
+        del python_executable
+        source_lock_names = tuple(Path(path).name for path in source_requirement_locks)
+        assert tuple(Path(path).name for path in requirement_locks) == runtime_locks
+        output.mkdir(parents=True)
+        for path in Path(source_root).iterdir():
+            (output / path.name).write_bytes(path.read_bytes())
+        return json.loads(
+            (output / offline_wheelhouse.MANIFEST_NAME).read_text(encoding="utf-8")
+        )
+
+    monkeypatch.setattr(offline_wheelhouse, "subset_wheelhouse", fake_subset)
+
+    export_simulator_package.export(
+        destination,
+        wheelhouse_root=wheelhouse,
+        live_minimal=True,
+    )
+
+    assert source_lock_names == runtime_locks
+    metadata = json.loads(
+        (destination / "PORTABLE_PACKAGE.json").read_text(encoding="utf-8")
+    )
+    assert set(metadata["offline_install"]["lock_digests"]) == set(runtime_locks)
+    assert verify(destination) == []
+
+
 def test_portable_manifest_accepts_a_runtime_only_offline_wheelhouse(
     tmp_path: Path,
 ) -> None:

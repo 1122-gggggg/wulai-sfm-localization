@@ -5,6 +5,10 @@ set -euo pipefail
 root_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 log_file="$(mktemp -t sfm-ui-smoke-XXXXXX.log)"
 process_id=""
+video_path="$root_dir/執行環境/smoke/river_site_first_2s.mp4"
+if [[ ! -f "$video_path" ]]; then
+  video_path="$root_dir/模擬器/測試影片/河濱_P1180118_first_2s.mp4"
+fi
 
 cleanup() {
   if [[ -n "$process_id" ]] && kill -0 "$process_id" 2>/dev/null; then
@@ -30,7 +34,7 @@ trap cleanup EXIT
 
 setsid "$root_dir/控制介面程式/影片模擬串流/選擇啟動.sh" \
   --map "$root_dir/地圖檔/場域/river_site/maps/river_site_realrgb_dense_trimmed.ply" \
-  --video "$root_dir/模擬器/測試影片/河濱_P1180118_first_2s.mp4" \
+  --video "$video_path" \
   >"$log_file" 2>&1 &
 process_id=$!
 

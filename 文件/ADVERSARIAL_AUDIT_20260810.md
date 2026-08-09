@@ -36,7 +36,7 @@ Ruff、format、bounded mypy、maintainability budget、第一方 security rules
 audit/SBOM、runtime ownership、workspace audit、profile asset validation、CUDA/model smoke、
 來源 manifest、portable manifest、clean offline install 與 simulated UI pose smoke。
 
-本次整合修正後的開發階段結果：root `1650 passed, 1 skipped`，Parrot simulator
+本次整合修正後的開發階段結果：root `1651 passed, 1 skipped`，Parrot simulator
 `88 passed`；Ruff、format、bounded mypy、maintainability、security/SBOM、module ownership、
 workspace、profile assets、flight selftest、dependency check、CUDA production smoke、EDM/MegaLoc
 offline inference 與 simulated UI valid-pose smoke 均通過。正式 release receipt 必須在 clean
@@ -79,6 +79,7 @@ commit 與最終 portable package 建立後重跑，避免把 dirty-tree 結果�
 | post-takeoff fallback | takeoff 後初始化失敗不一定進入 landing | takeoff 成功後任何 gate/factory 失敗都走 landing supervisor |
 | typed command / cleanup | truthy object 或缺例外型別可產生 false-success | command 回傳與例外合約明確化；cleanup failure 保留失敗狀態 |
 | portable wheelhouse | runtime package 強制攜帶 test/quality locks | live-minimal 只解析 runtime lock；仍保留 exact hashes |
+| portable rebuild/smoke | runtime-only wheelhouse 無法再匯出，且最小包漏掉 UI smoke 的 preflight/core/video | 接受經完整驗證的 runtime-only wheelhouse 作為重建來源；將 preflight、控制核心與 manifest 內的短片 fixture 納入最小包契約 |
 | portable scope | 舊 package 含 authoring、測試與多餘場域 | live-minimal 僅含 operator、所選 river bundle、必要定位／飛控與安裝工具 |
 | portable smoke cleanup | 被 manifest 排除的 `outputs` symlink 可能讓 cleanup 指向包外 | 任何寫入／清理前拒絕 symlinked outputs/simulator/venv path，加入 victim-survival regression |
 | portable site marker | marker 可漏 profile 宣告 asset 或 reference-index sibling 仍自洽 | 交叉驗證 profiles、files、實際 profile JSON 與 index siblings |

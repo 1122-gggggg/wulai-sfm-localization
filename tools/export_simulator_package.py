@@ -64,7 +64,15 @@ LIVE_MINIMAL_COPY_FILES = (
     "tools/offline_wheelhouse.py",
     "tools/package_manifest.py",
     "tools/simulated_ui_smoke.sh",
+    "tools/simulator_preflight.py",
+    "模擬器/parrot_stimulate/src/anafi_pcmd_sim/scale_free_control.py",
     "一鍵啟動.sh",
+)
+LIVE_MINIMAL_COPY_MAPPINGS = (
+    (
+        "模擬器/測試影片/河濱_P1180118_first_2s.mp4",
+        "執行環境/smoke/river_site_first_2s.mp4",
+    ),
 )
 EXCLUDED_NAMES = {
     ".git",
@@ -610,6 +618,38 @@ def _offline_wheelhouse_root(
     return Path(os.path.abspath(os.fspath(Path(configured).expanduser())))
 
 
+def _live_minimal_wheelhouse_requirement_names(
+    wheelhouse_root: str | Path,
+) -> tuple[str, ...]:
+    """Select only an explicitly declared, supported wheelhouse lock set."""
+    from tools.offline_wheelhouse import MANIFEST_NAME, WheelhouseError
+
+    root = Path(os.path.abspath(os.fspath(Path(wheelhouse_root).expanduser())))
+    manifest_path = root / MANIFEST_NAME
+    if manifest_path.is_symlink() or not manifest_path.is_file():
+        raise WheelhouseError(f"wheelhouse is missing a regular {MANIFEST_NAME}")
+    try:
+        data = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise WheelhouseError(f"cannot read {MANIFEST_NAME}: {exc}") from exc
+    requirements = data.get("requirements") if isinstance(data, dict) else None
+    if not isinstance(requirements, list) or not all(
+        isinstance(entry, dict) and isinstance(entry.get("name"), str)
+        for entry in requirements
+    ):
+        raise WheelhouseError(f"{MANIFEST_NAME} contains invalid requirement entries")
+    names = tuple(sorted(str(entry["name"]) for entry in requirements))
+    runtime_only = ("requirements-lock.txt",)
+    full = tuple(sorted(OFFLINE_REQUIREMENT_LOCKS))
+    if names == runtime_only:
+        return runtime_only
+    if names == full:
+        return OFFLINE_REQUIREMENT_LOCKS
+    raise WheelhouseError(
+        f"{MANIFEST_NAME} must declare either the runtime lock or all release locks"
+    )
+
+
 def _verify_offline_wheelhouse(
     root: Path,
     wheelhouse_root: str | Path,
@@ -644,11 +684,16 @@ def _copy_offline_wheelhouse(
     target_root = destination / OFFLINE_WHEELHOUSE_RELATIVE
     if live_minimal:
         target_root.parent.mkdir(parents=True, exist_ok=True)
+        requirements = verified.metadata["requirements"]
+        assert isinstance(requirements, list)
+        source_requirement_names = tuple(
+            str(entry["name"]) for entry in requirements
+        )
         subset_wheelhouse(
             verified.root,
             target_root,
             source_requirement_locks=tuple(
-                ROOT / relative for relative in OFFLINE_REQUIREMENT_LOCKS
+                ROOT / relative for relative in source_requirement_names
             ),
             requirement_locks=(destination / "requirements-lock.txt",),
             python_executable=sys.executable,
@@ -1009,6 +1054,16 @@ def _prepare_export_destination(destination: Path) -> Path:
     return destination
 
 
+def _copy_live_minimal_mappings(destination: Path) -> None:
+    for source_relative, target_relative in LIVE_MINIMAL_COPY_MAPPINGS:
+        source = ROOT / source_relative
+        if not source.is_file():
+            raise FileNotFoundError(source)
+        target = destination / target_relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, target, follow_symlinks=False)
+
+
 def _copy_export_payload(
     destination: Path,
     resolved_artifacts: tuple[ResolvedRuntimeArtifact, ...],
@@ -1025,6 +1080,8 @@ def _copy_export_payload(
         target = destination / relative
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source, target, follow_symlinks=False)
+    if live_minimal:
+        _copy_live_minimal_mappings(destination)
     for relative in copy_dirs:
         source = ROOT / relative
         if not source.is_dir():
@@ -1070,7 +1127,13 @@ def export(
     source_release = dict(_source_release())
     configured_wheelhouse = _offline_wheelhouse_root(wheelhouse_root)
     verified_wheelhouse = (
-        _verify_offline_wheelhouse(ROOT, configured_wheelhouse)
+        _verify_offline_wheelhouse(
+            ROOT,
+            configured_wheelhouse,
+            _live_minimal_wheelhouse_requirement_names(configured_wheelhouse)
+            if live_minimal
+            else OFFLINE_REQUIREMENT_LOCKS,
+        )
         if configured_wheelhouse is not None
         else None
     )
