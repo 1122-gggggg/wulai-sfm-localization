@@ -81,6 +81,7 @@ from live_safety_config import (  # noqa: E402
     DEFAULT_RTH_MIN_ALTITUDE_M,
     DEFAULT_STREAM_LOSS_GRACE_S,
     LiveSafetyConfig,
+    MIN_TAKEOFF_BATTERY_PCT,
     NUDGE_TTL_MAX_S,
 )
 
@@ -627,7 +628,7 @@ class OlympeLiveBackend:
         auto_pc_control: bool = True,
         stream_loss_grace_s: float = DEFAULT_STREAM_LOSS_GRACE_S,
         distance_geofence: bool = True,
-        min_takeoff_battery_pct: float = 15.0,
+        min_takeoff_battery_pct: float = 30.0,
         require_gps_for_geofence: bool = True,
         approved_aircraft_firmware: tuple[str, ...] = (),
         approved_controller_firmware: tuple[str, ...] = (),
@@ -829,6 +830,11 @@ class OlympeLiveBackend:
             self.drone = None
             raise RuntimeError(f"failed to confirm {initial_source} piloting source")
         self.pilot_sticks = self.via_skycontroller()
+        # SkyController 3 firmware 1.8.1 does not publish ProductVariantChanged.
+        # Start HID monitoring before inventory so its product name can confirm
+        # the controller model on the first read instead of leaving step 4 stale.
+        if self.via_skycontroller():
+            self._start_stick_monitor()
         self._configure_lost_link_policy_if_safe()
         self.read_connection_inventory()
         self._read_magnetometer_calibration_state()
@@ -841,9 +847,6 @@ class OlympeLiveBackend:
         self.state.link_ok = True
         self.state.link_status = "OK"
         self.log.event("connect_ok")
-        # Stick override only applies on SC USB (HID joystick present).
-        if self.via_skycontroller():
-            self._start_stick_monitor()
         # AFTER the monitor exists: one of the safety conditions for taking PC
         # authority is that something can take it back, so this must not run first.
         self._auto_take_pc_control_if_safe()
@@ -2056,9 +2059,20 @@ class OlympeLiveBackend:
             self._set_preflight_status(False, reason)
             return False
 
-        error = self._desired_limits_error()
-        if error is not None:
-            return fail(error)
+        battery_floor = self._finite_float(self.min_takeoff_battery_pct)
+        if (
+            battery_floor is None
+            or not MIN_TAKEOFF_BATTERY_PCT <= battery_floor <= 100.0
+        ):
+            return fail(
+                "takeoff battery floor must be finite and within "
+                f"[{MIN_TAKEOFF_BATTERY_PCT:g}, 100]"
+            )
+        advisories: list[str] = []
+        firmware_advisories: list[str] = []
+        limit_config_error = self._desired_limits_error()
+        if limit_config_error is not None:
+            firmware_advisories.append(limit_config_error)
         if self._flight_state_name() != "landed":
             return fail("takeoff requires confirmed landed state")
         if self.via_skycontroller() and not self._stick_monitor_ready():
@@ -2118,17 +2132,18 @@ class OlympeLiveBackend:
         if battery is None or not 0.0 <= battery <= 100.0:
             return fail("battery state unavailable or invalid")
         self.state.battery_pct = battery
-        if battery < self.min_takeoff_battery_pct:
+        if battery < battery_floor:
             return fail(
                 f"battery {battery:.0f}% is below the "
-                f"{self.min_takeoff_battery_pct:.0f}% takeoff floor"
+                f"{battery_floor:.0f}% takeoff floor"
             )
 
-        if self.desired_distance_geofence and self.require_gps_for_geofence:
-            try:
-                from olympe.messages.ardrone3.GPSSettingsState import GPSFixStateChanged
-            except Exception:
-                return fail("GPS state API unavailable")
+        try:
+            from olympe.messages.ardrone3.GPSSettingsState import GPSFixStateChanged
+        except Exception:
+            self.state.gps_fixed = None
+            advisories.append("GPS state API unavailable")
+        else:
             gps_state = self._state_dict(GPSFixStateChanged)
             gps_fixed = gps_state.get("fixed") if gps_state is not None else None
             try:
@@ -2137,41 +2152,50 @@ class OlympeLiveBackend:
                 fixed = False
             self.state.gps_fixed = fixed
             if not fixed:
-                return fail("enabled distance geofence requires a confirmed GPS fix")
+                advisories.append("GPS fix unavailable; takeoff remains allowed")
 
-        altitude = float(self.desired_max_altitude_m)
-        distance = float(self.desired_max_distance_m)
-        if not self._firmware_config_ok:
-            if expected_epoch is not None:
-                with self._lock:
-                    if expected_epoch != self._pulse_token or self._cleanup_done:
-                        return fail("takeoff preflight was superseded")
-            if not self._configure_firmware_limits_if_safe():
-                return fail(
-                    "firmware limit configuration retry failed: "
-                    f"{self._firmware_config_reason}"
+        if limit_config_error is None:
+            altitude = float(self.desired_max_altitude_m)
+            distance = float(self.desired_max_distance_m)
+            if not self._firmware_config_ok:
+                if expected_epoch is not None:
+                    with self._lock:
+                        if expected_epoch != self._pulse_token or self._cleanup_done:
+                            return fail("takeoff preflight was superseded")
+                if not self._configure_firmware_limits_if_safe():
+                    firmware_advisories.append(
+                        "firmware limit configuration retry failed: "
+                        f"{self._firmware_config_reason}"
+                    )
+
+            states = self._read_firmware_safety_state()
+            for limit_error in (
+                self._limit_bounds_error(states.get("altitude"), altitude, "MaxAltitude"),
+                self._limit_bounds_error(states.get("distance"), distance, "MaxDistance"),
+                self._limit_readback_error(states.get("altitude"), altitude, "MaxAltitude"),
+                self._limit_readback_error(states.get("distance"), distance, "MaxDistance"),
+            ):
+                if limit_error is not None:
+                    firmware_advisories.append(limit_error)
+
+            geofence = states.get("geofence")
+            actual = geofence.get("shouldNotFlyOver") if geofence is not None else None
+            try:
+                geofence_matches = int(actual) == int(self.desired_distance_geofence)
+            except (TypeError, ValueError, OverflowError):
+                geofence_matches = False
+            if not geofence_matches:
+                firmware_advisories.append(
+                    "NoFlyOverMaxDistance readback mismatch: "
+                    f"requested={int(self.desired_distance_geofence)} actual={actual!r}"
                 )
 
-        states = self._read_firmware_safety_state()
-        for limit_error in (
-            self._limit_bounds_error(states.get("altitude"), altitude, "MaxAltitude"),
-            self._limit_bounds_error(states.get("distance"), distance, "MaxDistance"),
-            self._limit_readback_error(states.get("altitude"), altitude, "MaxAltitude"),
-            self._limit_readback_error(states.get("distance"), distance, "MaxDistance"),
-        ):
-            if limit_error is not None:
-                return fail(limit_error)
-
-        geofence = states.get("geofence")
-        actual = geofence.get("shouldNotFlyOver") if geofence is not None else None
-        try:
-            geofence_matches = int(actual) == int(self.desired_distance_geofence)
-        except (TypeError, ValueError, OverflowError):
-            geofence_matches = False
-        if not geofence_matches:
-            return fail(
-                "NoFlyOverMaxDistance readback mismatch: "
-                f"requested={int(self.desired_distance_geofence)} actual={actual!r}"
+        advisories.extend(firmware_advisories)
+        if advisories:
+            self.log.event(
+                "takeoff_advisory",
+                warnings=tuple(dict.fromkeys(advisories)),
+                note="GPS and firmware height/distance limits do not block takeoff",
             )
 
         if expected_epoch is not None:
@@ -2189,9 +2213,11 @@ class OlympeLiveBackend:
             )
             return fail("Controller piloting source readback is unconfirmed")
 
-        self._firmware_config_ok = True
-        self._firmware_config_reason = "firmware limits confirmed"
-        self._set_preflight_status(True, "ready")
+        if not firmware_advisories:
+            self._firmware_config_ok = True
+            self._firmware_config_reason = "firmware limits confirmed"
+        status = "ready" if not advisories else "ready with advisory warnings"
+        self._set_preflight_status(True, status)
         return True
 
     # ------------------------------------------------------------------ wire
@@ -2495,6 +2521,12 @@ class OlympeLiveBackend:
         if self.pilot_sticks:
             self.log.event("hover_blocked_manual", reason=reason)
             return False
+        with self._lock:
+            if self._maneuver_in_progress == "takeoff":
+                # Hover is an explicit operator cancellation of an AUTO launch.
+                # Invalidate the takeoff epoch before sending zero so a blocking
+                # preflight/source handoff cannot schedule TakeOff afterwards.
+                self._pulse_token += 1
         self.nudge_clear(reason=reason)
         if not self.send_pcmd(0, 0, 0, 0, reason=reason):
             self.log.event("hover", reason=reason, ok=False)
@@ -2610,7 +2642,7 @@ class OlympeLiveBackend:
             self._maneuver_in_progress = None
 
     def takeoff_cmd(self) -> bool:
-        # 【起飛 — 僅操作員親手按 UI】禁止腳本／AI 代理人／任何 LLM 代為呼叫。
+        # 【起飛 — 僅操作員親手按起飛／自動飛行 UI】禁止腳本／AI 代理人／任何 LLM 代為呼叫。
         if self.drone is None or self._cleanup_done:
             return False
         self.nudge_clear(reason="takeoff")
@@ -3867,14 +3899,10 @@ class OlympeLiveBackend:
             )
         self._distance_guard_active = guard_active
         self.state.distance_guard_active = guard_active if distance_requested else None
-        if distance_requested and not guard_active:
-            # An enabled geofence with missing GPS/Home data is invalid telemetry,
-            # not a harmless inactive display state.  While airborne, hand the
-            # aircraft to the existing bounded safety action; it will prefer an
-            # in-place landing for this reason rather than silently continuing.
-            return self._schedule_runtime_safety_action(
-                FailureReason.INVALID_TELEMETRY.value
-            )
+        # No GPS/Home is a normal operating condition at some approved sites.
+        # The distance fence is then unavailable and is shown as such, but it does
+        # not block takeoff or force a landing. Altitude, battery, stream, link,
+        # pose and operator-takeover guards remain active independently.
         if (
             guard_active
             and distance >= distance_limit * _DISTANCE_LIMIT_FRACTION

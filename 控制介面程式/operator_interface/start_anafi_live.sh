@@ -255,7 +255,7 @@ CMD=(
   --no-live-detect
   --max-altitude-m "${SFM_MAX_ALTITUDE_M:-50}"
   --max-distance-m "${SFM_MAX_DISTANCE_M:-100}"
-  --rth-min-altitude-m "${SFM_RTH_MIN_ALTITUDE_M:-5.0}"
+  --rth-min-altitude-m "${SFM_RTH_MIN_ALTITUDE_M:-20.0}"
   --stream-loss-grace-s "${SFM_STREAM_LOSS_GRACE_S:-10.0}"
   --nudge-pct "${NUDGE_PCT:-8}"
   --nudge-pulse-s "${NUDGE_PULSE_S:-0.20}"

@@ -74,7 +74,8 @@ per-asset 參數只能在明確加上 `--allow-legacy-assets` 的遷移作業中
 ## 轉到另一台電腦
 
 先在來源電腦建立固定程式/runtime 發布包。它會包含 UI、EDM 程式、固定模型與
-authoritative controller，但排除 `.venv`、outputs、地圖與影片：
+authoritative controller，但排除 `.venv`、執行輸出、地圖與影片；僅保留
+`outputs/README.md` 作為輸出治理契約：
 
 ```bash
 python tools/export_simulator_package.py /path/to/portable_localization

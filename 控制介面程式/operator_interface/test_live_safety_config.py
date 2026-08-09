@@ -14,9 +14,9 @@ def _resolve(**overrides) -> LiveSafetyConfig:
         "max_tilt_deg": 20.0,
         "max_vertical_speed_ms": 2.0,
         "max_rotation_speed_degs": 20.0,
-        "rth_min_altitude_m": 5.0,
+        "rth_min_altitude_m": 20.0,
         "stream_loss_grace_s": 10.0,
-        "min_takeoff_battery_pct": 15.0,
+        "min_takeoff_battery_pct": 30.0,
         "distance_geofence": False,
         "require_gps_for_geofence": True,
     }
@@ -40,7 +40,7 @@ def test_effective_safety_config_is_normalized_and_hash_stable() -> None:
         ("max_vertical_speed_ms", 2.1),
         ("max_rotation_speed_degs", 20.1),
         ("stream_loss_grace_s", 10.1),
-        ("min_takeoff_battery_pct", 9.9),
+        ("min_takeoff_battery_pct", 29.9),
     ],
 )
 def test_unsafe_safety_override_is_rejected(field: str, value: float) -> None:

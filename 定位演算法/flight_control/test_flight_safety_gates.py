@@ -1710,7 +1710,7 @@ def test_firmware_preflight_sets_waits_and_reads_back_limits(monkeypatch):
     assert tokens["gps"] in drone.reads
 
 
-def test_firmware_preflight_rejects_low_battery_before_commands(monkeypatch):
+def test_firmware_preflight_reports_low_battery_as_advisory(monkeypatch):
     drone, _ = _fake_firmware_preflight(monkeypatch, battery=29, gps_fixed=1)
     with pytest.raises(RuntimeError, match="below the 30%"):
         pff.configure_flight_preflight(drone, 20.0, 80.0, True)
@@ -1733,12 +1733,39 @@ def test_firmware_distance_geofence_requires_gps_fix(monkeypatch):
     assert drone.calls == []
 
 
-def test_disabled_distance_geofence_does_not_require_gps(monkeypatch):
+def test_default_preflight_does_not_require_gps(monkeypatch):
     drone, tokens = _fake_firmware_preflight(monkeypatch, battery=80, gps_fixed=0)
-    result = pff.configure_flight_preflight(drone, 20.0, 80.0, False)
+    result = pff.configure_flight_preflight(drone, 20.0, 80.0)
     assert result["distance_geofence"] is False
     assert tokens["gps"] not in drone.reads
     assert drone.calls[-1][1] == {"shouldNotFlyOver": 0}
+
+
+def test_missing_firmware_limits_are_advisory(monkeypatch):
+    drone, _ = _fake_firmware_preflight(monkeypatch, battery=80, gps_fixed=0)
+    with pytest.raises(RuntimeError, match="were not provided"):
+        pff.configure_flight_preflight(drone, None, None)
+    assert drone.calls == []
+
+
+def test_firmware_limit_failure_is_advisory(monkeypatch):
+    drone, tokens = _fake_firmware_preflight(monkeypatch, battery=80, gps_fixed=0)
+    drone.states[tokens["max_altitude"]]["max"] = 10.0
+    with pytest.raises(RuntimeError, match="outside firmware range"):
+        pff.configure_flight_preflight(drone, 20.0, 80.0)
+    assert drone.calls == []
+
+
+def test_fly_cli_defaults_to_no_gps_or_firmware_limits(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(pff, "fly", lambda *args, **kwargs: captured.update(kwargs))
+    monkeypatch.setattr(sys, "argv", ["path_follow_flight.py", "--fly"])
+
+    pff.main()
+
+    assert captured["max_altitude_m"] is None
+    assert captured["max_distance_m"] is None
+    assert captured["distance_geofence"] is False
 
 
 def test_manual_handoff_and_auto_reacquire_are_atomic_with_pcmd():
@@ -1786,7 +1813,10 @@ def test_fly_confirms_controller_before_pcmd_takeoff_and_waits_for_landed():
     )
     restore_i = src.rindex('set_piloting_source(drone, "SkyController")')
     assert restore_i < src.rindex("drone.disconnect()")
-    assert "--fly requires explicit --max-altitude-m and --max-distance-m" in src
+    assert src.index("require_landed_for_firmware_config") < src.index(
+        "except Exception as exc")
+    assert "continuing without confirmed firmware limits" in src
+    assert "--fly requires explicit --max-altitude-m and --max-distance-m" not in src
     assert src.count('state="landed"') >= 2
 
 

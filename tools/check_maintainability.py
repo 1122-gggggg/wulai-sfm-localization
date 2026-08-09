@@ -24,7 +24,7 @@ SCAN_PATHS = (
     "控制介面程式",
 )
 
-# Measured with Ruff 0.16.1 on 2026-08-08 after the maintenance refactor.
+# Measured with Ruff 0.16.1 on 2026-08-09 after the operator UI seam refactor.
 # Values are ceilings, not targets. Reductions do not require this table to be
 # updated immediately; any increase fails CI.
 BUDGETS = {
@@ -32,7 +32,7 @@ BUDGETS = {
     "deploy": {"violations": 13, "max_complexity": 49},
     "flight": {"violations": 21, "max_complexity": 86},
     "validation": {"violations": 13, "max_complexity": 39},
-    "control": {"violations": 60, "max_complexity": 72},
+    "control": {"violations": 56, "max_complexity": 60},
 }
 
 

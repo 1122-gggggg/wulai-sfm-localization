@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import flight_operator_app as app
 import inspect
+import operator_tick
 import queue
 import threading
 import time
@@ -17,12 +18,13 @@ from flight_operator_app import (
     OperatorApp,
     PREFLIGHT_GUIDE_STEPS,
     SequentialPreflightGuide,
-    UI_LOG_MAX_LINES,
     _positive_env_float,
     _positive_env_int,
     format_magnetometer_calibration,
     format_olympe_telemetry,
+    gps_operator_message,
     gravity_phase_guidance,
+    inventory_ui_status,
     next_tick_deadline,
     video_hud_identity,
 )
@@ -40,6 +42,9 @@ class _Backend:
 def _bare_app(backend=None):
     app = OperatorApp.__new__(OperatorApp)
     app.backend = backend or _Backend()
+    app.preflight_guide = SequentialPreflightGuide()
+    for step in PREFLIGHT_GUIDE_STEPS:
+        app.preflight_guide.confirm_current((step, "test fixture"))
     app._nudge_keys_held = set()
     app._nudge_buttons_held = set()
     app._nudge_key_map = {"w": "前"}
@@ -72,6 +77,30 @@ class _RouteLock:
 
     def confirm_auto_started(self):
         self.active = True
+
+    def cancel_rejected_auto_start(self):
+        self.active = False
+
+
+def _complete_preflight(operator) -> None:
+    operator.preflight_guide = SequentialPreflightGuide()
+    for step in PREFLIGHT_GUIDE_STEPS:
+        operator.preflight_guide.confirm_current((step, "confirmed"))
+
+
+def _make_autonomy_runtime_ready(operator) -> None:
+    operator._autonomy_profile_verified = True
+    operator.localizer = SimpleNamespace(
+        ready=True, request_relocalize=lambda: None
+    )
+    operator.loc_health = "OK"
+    operator.loc_health_inliers = 100
+    operator.loc_health_reproj = 0.1
+    operator._loc_consecutive_good_fixes = 2
+    operator._zoom_localization_paused = False
+    operator.live_locked = True
+    operator.live_pose = np.zeros(4, dtype=float)
+    operator.loc_pose_updated_mono = time.monotonic()
 
 
 def test_preflight_guide_is_sequential_and_invalidates_downstream() -> None:
@@ -111,6 +140,9 @@ def test_takeoff_button_path_refuses_until_human_preflight_is_complete() -> None
 
     for step in PREFLIGHT_GUIDE_STEPS:
         operator.preflight_guide.confirm_current((step, "confirmed"))
+    operator.inspecting = False
+    operator.live_locked = False
+    operator.loc_health = "FAIL"
     operator._send_flight_button("takeoff")
 
     assert operator.sent == ["takeoff"]
@@ -149,12 +181,75 @@ def test_preflight_system_step_requires_fresh_stream_and_telemetry() -> None:
     )
     assert evidence is not None, reason
 
+    state.gps_fixed = False
+    state.max_altitude_m = None
+    state.max_distance_m = None
+    state.distance_geofence_enabled = None
+    operator.backend._firmware_config_ok = False
+    evidence, reason = operator._preflight_step_evidence(
+        "system", state, now=now
+    )
+    assert evidence is not None, reason
+    assert "不阻擋起飛" in reason
+
     state.telemetry_read_mono_ns = int((now - 3.0) * 1_000_000_000)
     evidence, reason = operator._preflight_step_evidence(
         "system", state, now=now
     )
     assert evidence is None
     assert "遙測" in reason
+
+
+@pytest.mark.parametrize("gps_fixed", [False, None], ids=["no-fix", "unknown"])
+def test_missing_gps_with_disabled_geofence_is_not_a_preflight_blocker(gps_fixed) -> None:
+    now = time.monotonic()
+    operator = OperatorApp.__new__(OperatorApp)
+    operator.backend = SimpleNamespace(
+        is_live=True,
+        min_takeoff_battery_pct=15.0,
+        desired_distance_geofence=False,
+        require_gps_for_geofence=True,
+        via_skycontroller=lambda: False,
+        log=SimpleNamespace(durable=True, healthy=True),
+    )
+    operator.video_frame = object()
+    operator.video_stream = SimpleNamespace(last_stamp=now)
+    state = DroneState(
+        stream="PREVIEW",
+        link_ok=True,
+        flight_state="landed",
+        alert_state="none",
+        battery_pct=80.0,
+        gps_fixed=gps_fixed,
+        distance_geofence_enabled=False,
+        telemetry_read_mono_ns=int(now * 1_000_000_000),
+    )
+
+    evidence, reason = operator._preflight_step_evidence(
+        "system", state, now=now
+    )
+
+    assert evidence is not None, reason
+    assert "不阻擋起飛" in reason
+
+
+@pytest.mark.parametrize("gps_fixed", [False, None], ids=["no-fix", "unknown"])
+def test_manual_takeoff_does_not_require_gps_fix(gps_fixed) -> None:
+    operator = OperatorApp.__new__(OperatorApp)
+    _complete_preflight(operator)
+    operator.backend = SimpleNamespace(
+        state=DroneState(gps_fixed=gps_fixed, distance_geofence_enabled=False),
+        desired_distance_geofence=False,
+        require_gps_for_geofence=True,
+    )
+    operator.sent = []
+    operator.send = operator.sent.append
+    operator.write_log = lambda _message: None
+    operator.focus_set = lambda: None
+
+    operator._send_flight_button("takeoff")
+
+    assert operator.sent == ["takeoff"]
 
 
 def test_preflight_route_step_requires_visible_hash_verified_route(tmp_path) -> None:
@@ -235,6 +330,7 @@ def test_route_selection_is_logged_before_the_snapshot_is_bound(
             flight=SimpleNamespace(coordinate_frame_id="river_site_glomap"),
         ),
     )
+    monkeypatch.setattr(app, "flight_readiness_errors", lambda _profile: [])
     monkeypatch.setattr(app, "file_sha256", lambda _path: snapshot.sha256)
     monkeypatch.setattr(
         app, "capture_mission_route_snapshot", lambda *_args, **_kwargs: snapshot
@@ -284,6 +380,7 @@ def test_route_selection_is_not_bound_when_the_audit_log_fails(
             flight=SimpleNamespace(coordinate_frame_id="river_site_glomap"),
         ),
     )
+    monkeypatch.setattr(app, "flight_readiness_errors", lambda _profile: [])
     monkeypatch.setattr(app, "file_sha256", lambda _path: snapshot.sha256)
     monkeypatch.setattr(
         app, "capture_mission_route_snapshot", lambda *_args, **_kwargs: snapshot
@@ -313,6 +410,60 @@ def test_start_auto_dispatches_the_selected_route_identity_and_locks_it() -> Non
     })]
 
 
+def test_live_start_auto_uses_integrated_takeoff_sequence_not_legacy_backend() -> None:
+    operator = _bare_app()
+    operator.backend.is_live = True
+    operator.inspecting = False
+    operator.mission_route_lock = _RouteLock()
+    operator._displayed_route_sha256 = "a" * 64
+    operator._begin_inspection_feed = lambda: setattr(operator, "inspecting", True)
+    started = []
+    operator._start_integrated_auto = lambda snapshot: started.append(snapshot) or True
+
+    operator.send("start_auto")
+
+    assert operator.inspecting
+    assert started == [operator.mission_route_lock.snapshot]
+    assert operator.backend.calls == []
+
+
+def test_hover_pauses_integrated_auto_and_auto_button_resumes_without_takeoff() -> None:
+    class Coordinator:
+        phase = "ROUTE"
+        paused = False
+
+        def __init__(self):
+            self.pause_calls = []
+            self.resume_calls = 0
+
+        def pause(self, reason):
+            self.pause_calls.append(reason)
+            self.paused = True
+            return True
+
+        def resume(self):
+            self.resume_calls += 1
+            self.paused = False
+            return True
+
+    coordinator = Coordinator()
+    operator = _bare_app()
+    operator._integrated_autonomy = coordinator
+    operator._reset_virtual_sticks = lambda: None
+
+    operator.send("hover")
+
+    assert coordinator.pause_calls == ["operator_hover"]
+    assert operator._auto_paused
+    assert operator.backend.calls == [("hover", {})]
+
+    operator.send("start_auto")
+
+    assert coordinator.resume_calls == 1
+    assert not operator._auto_paused
+    assert operator.backend.calls == [("hover", {})]
+
+
 def test_start_auto_does_not_dispatch_when_route_identity_mismatches() -> None:
     operator = _bare_app()
     operator.inspecting = True
@@ -322,6 +473,211 @@ def test_start_auto_does_not_dispatch_when_route_identity_mismatches() -> None:
 
     operator.send("start_auto")
 
+    assert operator.backend.calls == []
+
+
+@pytest.mark.parametrize(
+    ("profile_approved", "route_clearance_approved"),
+    [(False, True), (True, False)],
+    ids=["profile-not-approved", "route-not-cleared"],
+)
+def test_unapproved_profile_or_route_is_not_bound_as_auto_candidate(
+    tmp_path, monkeypatch, profile_approved, route_clearance_approved
+) -> None:
+    route = tmp_path / "route.json"
+    route.write_text("{}", encoding="utf-8")
+    snapshot = SimpleNamespace(
+        path=route.resolve(),
+        sha256="a" * 64,
+        site_id="field-a",
+        coordinate_frame_id="glomap-a",
+        waypoints=((0.0, 0.0, 0.0), (1.0, 0.0, 0.0)),
+        controller_waypoints=lambda: [
+            np.array([0.0, 0.0, 0.0]),
+            np.array([1.0, 0.0, 0.0]),
+        ],
+    )
+    bound = []
+
+    class RouteLock:
+        active = False
+        snapshot = None
+
+        def bind(self, value):
+            bound.append(value)
+            self.snapshot = value
+
+    profile = SimpleNamespace(
+        site_id="field-a",
+        flight=SimpleNamespace(
+            approved=profile_approved,
+            route_clearance_approved=route_clearance_approved,
+            coordinate_frame_id="glomap-a",
+        ),
+    )
+    operator = OperatorApp.__new__(OperatorApp)
+    operator.mission_route_lock = RouteLock()
+    operator.site_profile_path = tmp_path / "profile.json"
+    operator._active_site_map_frame = lambda: None
+    operator.redraw_map_only = lambda: None
+    operator.write_log = lambda _message: None
+    monkeypatch.setattr(app, "load_site_profile", lambda _path: profile)
+    monkeypatch.setattr(app, "file_sha256", lambda _path: snapshot.sha256)
+    monkeypatch.setattr(
+        app, "capture_mission_route_snapshot", lambda *_args, **_kwargs: snapshot
+    )
+    monkeypatch.setattr(
+        app,
+        "flight_readiness_errors",
+        lambda selected: (
+            []
+            if selected.flight.approved and selected.flight.route_clearance_approved
+            else ["AUTO approval is incomplete"]
+        ),
+        raising=False,
+    )
+
+    with pytest.raises(ValueError):
+        operator._show_route_overlay(route)
+
+    assert bound == []
+    assert operator.mission_route_lock.snapshot is None
+
+
+def test_start_auto_does_not_dispatch_when_four_step_preflight_is_incomplete() -> None:
+    operator = _bare_app()
+    operator.inspecting = True
+    operator.preflight_guide = SequentialPreflightGuide()
+    for step in PREFLIGHT_GUIDE_STEPS[:-1]:
+        operator.preflight_guide.confirm_current((step, "confirmed"))
+    operator.mission_route_lock = _RouteLock()
+    operator._displayed_route_sha256 = "a" * 64
+    operator._reset_virtual_sticks = lambda: None
+    operator._pending_auto_route_activation = False
+    operator.logs = []
+    operator.write_log = operator.logs.append
+
+    operator.send("start_auto")
+
+    assert operator.backend.calls == []
+    assert not operator.mission_route_lock.active
+    assert not getattr(operator, "_pending_auto_route_activation", False)
+    assert operator.preflight_guide.current_step == PREFLIGHT_GUIDE_STEPS[-1]
+
+
+@pytest.mark.parametrize(
+    ("autonomous_locked", "autonomous_approval_valid"),
+    [(True, True), (False, False)],
+    ids=["runtime-lock", "invalid-approval"],
+)
+def test_integrated_auto_does_not_create_coordinator_when_runtime_approval_is_invalid(
+    tmp_path,
+    monkeypatch,
+    autonomous_locked,
+    autonomous_approval_valid,
+) -> None:
+    created = []
+
+    class Coordinator:
+        phase = "IDLE"
+        boot_timeout_s = 1.0
+
+        def __init__(self, **_kwargs):
+            created.append(self)
+
+        def start(self):
+            return True
+
+    profile = SimpleNamespace(
+        site_id="field-a",
+        flight=SimpleNamespace(
+            approved=True,
+            route_clearance_approved=True,
+            coordinate_frame_id="glomap-a",
+        ),
+    )
+    operator = _bare_app()
+    operator.backend.is_live = True
+    operator.backend.state = SimpleNamespace(
+        autonomous_locked=autonomous_locked,
+        autonomous_approval_valid=autonomous_approval_valid,
+    )
+    operator.inspecting = True
+    _make_autonomy_runtime_ready(operator)
+    _complete_preflight(operator)
+    operator.mission_route_lock = _RouteLock()
+    operator._displayed_route_sha256 = "a" * 64
+    operator.site_profile_path = tmp_path / "profile.json"
+    operator._active_site_map_frame = lambda: object()
+    operator._reset_virtual_sticks = lambda: None
+    monkeypatch.setattr(app, "DesktopRouteAutonomy", Coordinator)
+    monkeypatch.setattr(app, "load_site_profile", lambda _path: profile)
+    monkeypatch.setattr(
+        app, "flight_readiness_errors", lambda _profile: [], raising=False
+    )
+
+    operator.send("start_auto")
+
+    assert created == []
+    assert operator.__dict__.get("_integrated_autonomy") is None
+    assert not operator.mission_route_lock.active
+    assert operator.backend.calls == []
+
+
+@pytest.mark.parametrize("gps_fixed", [False, None], ids=["no-fix", "unknown"])
+def test_integrated_auto_takeoff_allows_missing_gps_when_geofence_is_off(
+    tmp_path, monkeypatch, gps_fixed
+) -> None:
+    created = []
+
+    class Coordinator:
+        phase = "IDLE"
+        boot_timeout_s = 1.0
+
+        def __init__(self, **_kwargs):
+            created.append(self)
+
+        def start(self):
+            return True
+
+    profile = SimpleNamespace(
+        site_id="field-a",
+        flight=SimpleNamespace(
+            approved=True,
+            route_clearance_approved=True,
+            coordinate_frame_id="glomap-a",
+        ),
+    )
+    operator = _bare_app()
+    operator.backend.is_live = True
+    operator.backend.desired_distance_geofence = False
+    operator.backend.require_gps_for_geofence = True
+    operator.backend.state = SimpleNamespace(
+        autonomous_locked=False,
+        autonomous_approval_valid=True,
+        gps_fixed=gps_fixed,
+        distance_geofence_enabled=False,
+        flight_state="landed",
+        link_ok=True,
+    )
+    operator.inspecting = True
+    _make_autonomy_runtime_ready(operator)
+    _complete_preflight(operator)
+    operator.mission_route_lock = _RouteLock()
+    operator._displayed_route_sha256 = "a" * 64
+    operator.site_profile_path = tmp_path / "profile.json"
+    operator._active_site_map_frame = lambda: object()
+    operator._reset_virtual_sticks = lambda: None
+    monkeypatch.setattr(app, "DesktopRouteAutonomy", Coordinator)
+    monkeypatch.setattr(app, "load_site_profile", lambda _path: profile)
+    monkeypatch.setattr(
+        app, "flight_readiness_errors", lambda _profile: [], raising=False
+    )
+
+    operator.send("start_auto")
+
+    assert len(created) == 1
+    assert operator.__dict__.get("_integrated_autonomy") is created[0]
     assert operator.backend.calls == []
 
 
@@ -375,33 +731,24 @@ def test_no_localization_markers_are_bounded() -> None:
     assert np.allclose(app.no_loc_markers[0], [4.0, 0.0, 0.0])
 
 
-def test_ui_log_is_trimmed_to_a_bounded_number_of_lines() -> None:
-    class FakeLog:
-        def __init__(self):
-            self.insert_calls = []
-            self.delete_calls = []
+def test_write_log_remains_available_without_a_ui_log_widget(capsys) -> None:
+    operator = OperatorApp.__new__(OperatorApp)
 
-        def insert(self, *args):
-            self.insert_calls.append(args)
+    operator.write_log("terminal-only")
 
-        def delete(self, *args):
-            self.delete_calls.append(args)
-
-    app = OperatorApp.__new__(OperatorApp)
-    app.log = FakeLog()
-
-    app.write_log("bounded")
-
-    assert app.log.insert_calls
-    assert app.log.delete_calls == [(f"{UI_LOG_MAX_LINES + 1}.0", "end")]
+    assert "terminal-only" in capsys.readouterr().out
+    assert "log" not in operator.__dict__
 
 
-def test_ui_starts_localization_without_exposing_fake_autonomy() -> None:
+def test_ui_exposes_integrated_autonomy_and_separate_localization() -> None:
     source = inspect.getsource(OperatorApp._build_ui)
     assert 'text="開始定位"' in source
     assert "command=self.begin_auto_inspect" in source
-    assert '"start_auto"' not in source
-    assert 'text="自主巡檢未接入此介面"' in source
+    assert any(
+        button.command == "start_auto" and button.label == "自動飛行"
+        for button in app.MISSION_MODE_BUTTONS
+    )
+    assert 'text="自主巡檢未接入此介面"' not in source
 
 
 def test_operator_ui_cannot_force_megaloc_outside_boot_or_lost() -> None:
@@ -412,7 +759,7 @@ def test_operator_ui_cannot_force_megaloc_outside_boot_or_lost() -> None:
     assert "定位測速：" not in source
 
 
-def test_ui_has_textual_sim_real_identity_and_emergency_stop() -> None:
+def test_ui_has_textual_sim_real_identity_without_separate_auto_stop() -> None:
     """SIM/REAL must always be distinguishable by TEXT, not colour alone.
 
     2026-08-06, operator decision: the video HUD and the status bar below it were
@@ -421,13 +768,11 @@ def test_ui_has_textual_sim_real_identity_and_emergency_stop() -> None:
     change had accepted as lost: it stays readable when there is no video frame.
     """
     build_source = inspect.getsource(OperatorApp._build_ui)
-    assert "緊急停止電腦動作" in build_source
+    assert "停止自動並懸停" not in build_source
 
-    # Identity belongs to the always-visible status bar, not the overlay.
-    status_source = inspect.getsource(OperatorApp.tick)
-    assert "video_hud_identity" in status_source, (
-        "SIM/REAL identity must be composed into the status bar"
-    )
+    # Identity belongs to the always-visible status header, not the video.
+    status_source = inspect.getsource(OperatorApp._update_flight_header)
+    assert "REAL ANAFI" in status_source and "SIMULATED" in status_source
     render_source = inspect.getsource(OperatorApp.render_video)
     assert "video_hud_identity" not in render_source, (
         "identity on the video would vanish exactly when the stream is lost"
@@ -439,13 +784,56 @@ def test_ui_has_textual_sim_real_identity_and_emergency_stop() -> None:
     assert simulated != real
 
 
+def test_gps_header_is_advisory_and_invalid_values_are_hidden() -> None:
+    state = DroneState(
+        gps_fixed=False,
+        gps_altitude_m=500.0,
+        gps_latitude_deg=500.0,
+        gps_longitude_deg=500.0,
+    )
+    message, severity = gps_operator_message(state, live=True)
+    assert severity == "warning"
+    assert "手動可起飛" in message
+    assert "自動先懸停" in message
+
+    telemetry = format_olympe_telemetry(state)
+    assert "GPS — m" in telemetry["altitude"]
+    assert "lat —, lon —" in telemetry["gps"]
+    assert "500" not in telemetry["altitude"] + telemetry["gps"]
+
+
+def test_inventory_status_separates_hardware_version_and_lost_link() -> None:
+    backend = SimpleNamespace(
+        is_live=True,
+        connection_inventory={
+            "aircraft": {"name": "ANAFI", "software": "1.8.2"},
+            "controller": {"variant": None, "software": "1.8.1"},
+            "runtime": {"olympe_version": "8.4.0"},
+            "lost_link": {
+                "fallback": "land_in_place",
+                "policy_confirmed": True,
+            },
+            "block_reasons": [
+                "connected controller is not confirmed SkyController 3 "
+                "(variant='unavailable', hid='unavailable')",
+                "controller firmware '1.8.1' lacks an approved receipt",
+            ],
+        },
+    )
+    statuses = inventory_ui_status(backend)
+    assert statuses["hardware"][0] == "blocked"
+    assert "SkyController 3" in statuses["hardware"][1]
+    assert statuses["version"][0] == "blocked"
+    assert "控制器韌體" in statuses["version"][1]
+    assert statuses["lost_link"] == ("good", "已確認：無 Home 時原地降落")
+
+
 def test_ui_exposes_read_only_olympe_flight_telemetry() -> None:
     source = inspect.getsource(OperatorApp._build_ui)
     # The panel became rows of the single video overlay on 2026-08-06; what must
     # still hold is that the readouts exist and are composed read-only.
     assert "olympe_state_var" in source
     assert "olympe_altitude_var" in source
-    assert "raw IMU／raw 氣壓數值" in source  # the fused-estimate disclosure
 
     state = DroneState(
         flight_state="hovering",
@@ -484,10 +872,14 @@ def test_ui_exposes_read_only_olympe_flight_telemetry() -> None:
     )
 
     assert "飛行 hovering" in telemetry["state"]
+    assert telemetry["rth"] == "RTH available/enabled"
     assert "飛控融合姿態" in telemetry["attitude"]
     assert "N 0.18" in telemetry["speed"] and "水平 0.30" in telemetry["speed"]
+    assert "三軸速度" in telemetry["velocity"] and "水平" not in telemetry["velocity"]
     assert "相對起飛點" in telemetry["altitude"] and "AGL 1.80" in telemetry["altitude"]
+    assert "GPS" not in telemetry["altitude_agl"]
     assert "GPS FIX" in telemetry["gps"] and "衛星 14" in telemetry["gps"]
+    assert telemetry["link_quality"] == "連接品質 4/5 (外部干擾)"
     assert "外部干擾" in telemetry["environment"]
     assert "GPS:FAULT" in telemetry["sensors"]
     assert "cache age 25 ms" in telemetry["sensors"]
@@ -685,7 +1077,7 @@ def test_typed_sim_control_request_rejects_stale_normal_action_but_not_safety():
     assert stale_emergency.executed
 
 
-def test_space_hover_handler_consumes_event_and_flight_buttons_drop_focus():
+def test_space_hover_handler_consumes_event_and_flight_buttons_are_focusable():
     operator = _bare_app()
     calls = []
     operator._hover_all_nudges = lambda: calls.append("hover")
@@ -694,7 +1086,14 @@ def test_space_hover_handler_consumes_event_and_flight_buttons_drop_focus():
     assert calls == ["hover"]
 
     source = inspect.getsource(OperatorApp._build_ui)
-    assert "takefocus=0" in source
+    assert "takefocus=True" in source
+    assert 'widget.bind("<space>", self._on_space_hover)' in source
+    assert 'widget.bind("<Return>", self._on_flight_button_return)' in source
+
+    invoked = []
+    event = SimpleNamespace(widget=SimpleNamespace(invoke=lambda: invoked.append(True)))
+    assert operator._on_flight_button_return(event) == "break"
+    assert invoked == [True]
 
 
 def test_tick_poll_failure_fails_safe_and_schedules_next_tick():
@@ -1074,9 +1473,9 @@ def test_a_held_virtual_stick_keeps_refreshing_the_backend_ttl():
 
 def test_tick_drives_the_held_virtual_stick_heartbeat():
     """Without this wiring the knob would look held while PCMD decayed to zero."""
-    source = inspect.getsource(OperatorApp.tick)
+    source = inspect.getsource(operator_tick._refresh_held_controls)
     assert "_stick_vector_active" in source
-    assert "_send_stick_vector(self.stick_left.value, self.stick_right.value)" in source
+    assert "_send_stick_vector(app.stick_left.value, app.stick_right.value)" in source
 
 
 def test_restart_closes_inherited_descriptors_before_exec() -> None:

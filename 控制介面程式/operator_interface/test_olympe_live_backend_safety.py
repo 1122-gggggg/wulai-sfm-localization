@@ -793,19 +793,18 @@ def test_critical_disk_pressure_blocks_new_takeoff_but_is_only_logged_in_flight(
     ), "takeoff was blocked without a durable incident"
 
 
-def test_takeoff_battery_floor_is_fifteen_percent(make_backend):
-    """Operator decision 2026-08-06, lowered from 30%."""
+def test_takeoff_battery_floor_is_thirty_percent(make_backend):
     default = inspect.signature(
         backend_module.OlympeLiveBackend.__init__
     ).parameters["min_takeoff_battery_pct"].default
-    assert default == pytest.approx(15.0), "the constructor default was not lowered"
+    assert default == pytest.approx(30.0)
 
     backend = make_backend(max_altitude_m=30.0, max_distance_m=100.0)
-    backend.min_takeoff_battery_pct = 15.0
+    backend.min_takeoff_battery_pct = 30.0
     backend.drone.flight_state = "landed"
-    backend.drone.battery_pct = 14.0
+    backend.drone.battery_pct = 29.0
     assert not backend._takeoff_preflight()
-    assert "15% takeoff floor" in (backend.state.preflight_reason or "")
+    assert "30% takeoff floor" in (backend.state.preflight_reason or "")
     assert "TakeOff" not in backend.drone.events
 
 
@@ -893,6 +892,10 @@ def test_connect_keeps_skycontroller_sticks_until_explicit_pc_request(
     monkeypatch.setattr(backend_module, "_DEFAULT_RECORD_DIR", tmp_path)
     monkeypatch.setattr(backend_module, "quiet_olympe_logs", lambda: None)
     drone = _FakeDrone()
+    if skycontroller:
+        # Firmware 1.8.1 leaves the Olympe variant state unavailable; inventory
+        # must therefore see the HID monitor that _connect starts.
+        drone.controller_variant = None
     frame_source = ModuleType("olympe_frame_source")
     frame_source.connect = lambda _ip, _controller: drone
     monkeypatch.setitem(sys.modules, "olympe_frame_source", frame_source)
@@ -910,12 +913,16 @@ def test_connect_keeps_skycontroller_sticks_until_explicit_pc_request(
         profile,
         ip="192.168.53.1" if skycontroller else "192.168.42.1",
         controller="skycontroller3" if skycontroller else "drone",
+        approved_aircraft_firmware=("1.8.2",),
+        approved_controller_firmware=("1.8.2",),
+        approved_olympe_versions=("8.4.0",),
         with_video=False,
     )
 
     if skycontroller:
         assert drone.source_state == "SkyController"
         assert "setPilotingSource" in drone.events
+        assert backend._inventory_takeoff_ready
     else:
         assert "setPilotingSource" not in drone.events
     assert backend.pilot_sticks is pilot_sticks
@@ -937,17 +944,23 @@ def test_piloting_source_requires_expectation_and_matching_readback(make_backend
     assert backend._set_piloting_source("Controller")
 
 
-def test_unset_limits_keep_ground_backend_available_but_block_takeoff(make_backend):
+def test_unset_limits_are_advisory_and_do_not_block_takeoff(make_backend):
     backend = make_backend()
     backend.drone.flight_state = "landed"
 
     assert not backend._configure_firmware_limits_if_safe()
-    assert not backend.takeoff_cmd()
+    assert backend.takeoff_cmd()
 
     assert backend.drone is not None
-    assert "ground UI only" in backend.state.preflight_reason
-    assert "TakeOff" not in backend.drone.events
+    assert backend.state.preflight_ok
+    assert "TakeOff" in backend.drone.events
     assert not any(event.startswith("Max") for event in backend.drone.events)
+    assert any(
+        event == "takeoff_advisory"
+        and any("max altitude and max distance are unset" in warning
+                for warning in fields["warnings"])
+        for event, fields in backend.log.records
+    )
 
 
 def test_firmware_limits_write_only_when_landed_and_confirm_readback(make_backend):
@@ -1345,18 +1358,22 @@ def test_takeoff_preflight_success_checks_video_battery_gps_source_and_limits(
     assert backend.drone.source_state == "Controller"
 
 
-def test_limit_mismatch_never_hands_off_skycontroller(make_backend):
+def test_limit_mismatch_is_advisory_and_takeoff_remains_available(make_backend):
     backend = make_backend(max_altitude_m=10.0, max_distance_m=50.0)
     backend.drone.flight_state = "landed"
     backend.pilot_sticks = True
     backend._firmware_config_ok = True
     backend.drone.setting_states["MaxAltitudeChanged"]["current"] = 11.0
 
-    assert not backend._takeoff_preflight()
+    assert backend._takeoff_preflight()
 
-    assert backend.drone.source_state == "SkyController"
-    assert backend.drone.source_requests == []
-    assert backend.pilot_sticks
+    assert backend.drone.source_state == "Controller"
+    assert any(
+        event == "takeoff_advisory" and any(
+            "MaxAltitude" in warning for warning in fields["warnings"]
+        )
+        for event, fields in backend.log.records
+    )
 
 
 @pytest.mark.parametrize(
@@ -1366,9 +1383,7 @@ def test_limit_mismatch_never_hands_off_skycontroller(make_backend):
         ("link", "healthy Olympe link"),
         ("video", "live video frame"),
         ("battery", "takeoff floor"),
-        ("gps", "GPS fix"),
         ("source", "source command"),
-        ("limit", "readback mismatch"),
     ],
 )
 def test_takeoff_preflight_fail_closed_on_each_gate(make_backend, case, reason):
@@ -1384,19 +1399,28 @@ def test_takeoff_preflight_fail_closed_on_each_gate(make_backend, case, reason):
         backend.drone.connected = False
     elif case == "battery":
         backend.drone.battery_pct = 29.0
-    elif case == "gps":
-        backend.drone.gps_fixed = 0
     elif case == "source":
         backend.drone.source_ack = False
-    elif case == "limit":
-        backend._firmware_config_ok = True
-        backend.drone.setting_states["MaxAltitudeChanged"]["current"] = 11.0
 
     assert not backend._takeoff_preflight()
 
     assert backend.state.preflight_ok is False
     assert reason in backend.state.preflight_reason
     assert "TakeOff" not in backend.drone.events
+
+
+def test_gps_fix_is_advisory_and_does_not_block_takeoff(make_backend):
+    backend = make_backend(max_altitude_m=10.0, max_distance_m=50.0)
+    backend.drone.flight_state = "landed"
+    backend.drone.gps_fixed = 0
+
+    assert backend._takeoff_preflight()
+    assert backend.state.gps_fixed is False
+    assert any(
+        event == "takeoff_advisory"
+        and "GPS fix unavailable; takeoff remains allowed" in fields["warnings"]
+        for event, fields in backend.log.records
+    )
 
 
 def test_disabled_distance_geofence_does_not_require_gps(make_backend):
@@ -1572,7 +1596,7 @@ def test_distance_geofence_reports_itself_inactive_without_gps(make_backend):
     """With no GPS position/Home the distance check evaluates nothing.
 
     The operator must not read "geofence enabled" as "distance containment active",
-    especially now that a usable Home Point is no longer a takeoff precondition.
+    and missing GPS must neither block takeoff nor force a landing.
     """
     backend = make_backend(max_altitude_m=50.0, max_distance_m=100.0)
     backend.drone.flight_state = "flying"
@@ -1588,9 +1612,9 @@ def test_distance_geofence_reports_itself_inactive_without_gps(make_backend):
 
     backend._schedule_runtime_safety_action = schedule
 
-    assert backend._evaluate_runtime_safety()
+    assert not backend._evaluate_runtime_safety()
     assert backend.state.distance_guard_active is False
-    assert scheduled == [FailureReason.INVALID_TELEMETRY.value]
+    assert scheduled == []
     assert any(
         event == "distance_guard" and fields["active"] is False
         for event, fields in backend.log.records
@@ -2394,6 +2418,18 @@ def test_land_during_takeoff_wait_wins_epoch_and_prevents_recording(make_backend
     assert backend._landed
     assert backend.state.tracker_state == "LAND"
     assert recording_starts == []
+
+
+def test_hover_invalidates_a_pending_takeoff_epoch(make_backend):
+    backend = make_backend(max_altitude_m=10.0, max_distance_m=50.0)
+    backend.drone.flight_state = "hovering"
+    backend._maneuver_in_progress = "takeoff"
+    before = backend._pulse_token
+
+    assert backend.hover_cmd("operator_auto_cancel")
+
+    assert backend._pulse_token == before + 1
+    assert backend.drone.pcmds[-1][1:5] == (0, 0, 0, 0)
 
 
 def test_land_before_takeoff_schedule_prevents_takeoff_command(

@@ -40,7 +40,26 @@ def test_manifest_excludes_editor_and_transient_release_files() -> None:
 def test_release_tools_have_one_authoritative_implementation() -> None:
     root = Path(__file__).resolve().parents[1]
     assert not (root / "執行環境/tools/package_manifest.py").exists()
+    assert not (root / "執行環境/MANIFEST.tsv").exists()
+    assert not (root / "執行環境/SHA256SUMS").exists()
     assert not (root / "定位演算法/sync_mirror_check.sh").exists()
+
+
+def test_portable_export_keeps_output_governance_readme() -> None:
+    import export_simulator_package as exporter
+
+    assert "outputs/README.md" in exporter.COPY_FILES
+
+    runtime_script = (Path(__file__).parent / "test_portable_runtime.sh").read_text(
+        encoding="utf-8"
+    )
+    assert '"$portable_root/outputs/README.md"' in runtime_script
+    assert 'rm -r -- "$staged_output_root/flight_logs"' in runtime_script
+    assert 'rm -r -- "$staged_output_root"' not in runtime_script
+    assert "routes/authored/route_20260807_013811.json" in runtime_script
+    assert "maps/T_align_gravity.json" in runtime_script
+    assert "reports/hardware_approval_20260806.json" in runtime_script
+    assert "river_site_safezone/flight_path.json" not in runtime_script
 
 
 def test_manifest_round_trip(tmp_path: Path) -> None:

@@ -36,6 +36,7 @@ REQUIRED_FILES = (
     "文件/ARCHITECTURE.md",
     "文件/SYSTEM_SPEC.md",
     "文件/WORKSPACE_AUDIT.md",
+    "outputs/README.md",
     "tools/README.md",
     "tools/install_runtime.sh",
     "tools/test_clean_install.sh",

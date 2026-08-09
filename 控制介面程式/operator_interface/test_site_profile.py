@@ -266,6 +266,20 @@ def test_all_shipped_profiles_are_scale_free_and_only_river_is_approved() -> Non
         assert profile.schema_version == 2
 
 
+def test_river_profile_loads_the_approved_reference_hardware_versions() -> None:
+    profile_path = (
+        Path(__file__).resolve().parents[1] / "site_profiles" / "river_site_edm.json"
+    )
+
+    profile = load_site_profile(profile_path)
+    receipt = load_hardware_approval_receipt(profile.hardware_approval)
+
+    assert receipt.approved
+    assert receipt.aircraft_firmware_versions == ("1.8.2",)
+    assert receipt.controller_firmware_versions == ("1.8.1",)
+    assert receipt.olympe_versions == ("8.4.0",)
+
+
 def test_site_profile_loads_query_camera_calibration(tmp_path: Path) -> None:
     profile_path = _write_profile(tmp_path)
     raw = json.loads(profile_path.read_text(encoding="utf-8"))

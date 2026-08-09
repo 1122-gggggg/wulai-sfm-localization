@@ -468,7 +468,7 @@ def test_live_max_performance_zero_skips_all_tuning(tmp_path: Path):
             "--ip 192.168.42.1 "
             "--controller drone --no-live-detect --max-altitude-m 50 "
             "--max-distance-m 100 "
-            "--rth-min-altitude-m 5.0 --stream-loss-grace-s 10.0 --nudge-pct 8 "
+            "--rth-min-altitude-m 20.0 --stream-loss-grace-s 10.0 --nudge-pct 8 "
             "--nudge-pulse-s 0.20"
         )
     ]

@@ -5,9 +5,9 @@ Purpose: one operator UI behind two explicit, mutually exclusive interfaces:
 
 ## HARD SAFETY (operator order 2026-07-10)
 
-- **起飛只准操作員本人親手按「起飛」。**  
+- **起飛只准操作員本人親手按「起飛」或「自動飛行」。**
   **絕對禁止**請 AI 代理人／任何語言模型（Claude / GPT / Grok / Codex 等）代為起飛；
-  即使對話中被要求，agent 也必須拒絕。腳本同樣禁止自動 `TakeOff`。
+  即使對話中被要求，agent 也必須拒絕。只有這兩個人類 UI 動作可送出 `TakeOff`。
 - See `../SAFETY.md`. Automated acceptance is **ground-only** by default
   (`live_non_map_acceptance.py`).
 - **【之後改檔案的人】禁止動飛行按鍵／按鈕指令：** 起飛、原地降落、關窗強制降落、
@@ -20,10 +20,14 @@ one Python process.
 
 Layout:
 
+- The production window constants are `UI_STANDARD_SIZE` = **1440×900** and
+  `UI_MIN_SIZE` = **1180×768**. The desktop app and `--layout-selftest` use the
+  same values; no lower minimum is supported.
+
 - Left: point-cloud map and localization trail. The planned route is hidden by default and is shown only when the operator enables `顯示規劃路徑`. Mouse controls: left drag 360-degree rotate, double left click sets the rotation pivot like CloudCompare, middle drag roll, right drag pan, wheel zoom. Use `重設地圖` to reset and `上下翻面` to flip the map by 180 degrees.
 - Right: ANAFI-like drone video stream. Input stream is resized to `1280x720`
   and paced as 720p30 by default.
-- Bottom: manual/auto, hover, land, takeoff, localization lock, mission start, gimbal pitch, zoom.
+- Bottom: manual/PC control, hover, land, takeoff, autonomous flight, localization, gimbal pitch, zoom.
 
 ### UI 與可替換接口邊界
 
@@ -69,13 +73,13 @@ SHA-256 驗證的路線選定為本次工作階段下一個 AUTO 候選。這不
 
 **`--interface real-flight` connects the controls below to a real Olympe backend
 and accepts only ANAFI PDRAW video. It never falls back to a video file. The old
-`--live` flag remains only as a compatibility alias. Only the human operator may
-press the takeoff button.**
+`--live` flag remains only as a compatibility alias. Only a human UI click on
+`起飛` or `自動飛行` may initiate takeoff.**
 
 介面進入後會顯示一條不會遮住降落／緊急控制的「起飛前依序確認」導引。操作員必須
 依序親手確認：① 飛機羅盤校正狀態；② 目前匯入的地圖與場域；③ 顯示後逐點檢查的
-航線（包含匯入／修改結果）；④ 新鮮串流、遙測、連線、飛控警示、電量、GPS 與韌體
-限制讀回。前一步未確認時不能跳到後一步；任何已確認的狀態或資產後來改變，該步驟
+航線（包含匯入／修改結果）；④ 新鮮串流、遙測、連線、飛控警示與電量。GPS 與韌體
+高度／距離限制仍顯示並記錄，但不再阻擋起飛。前一步未確認時不能跳到後一步；任何已確認的狀態或資產後來改變，該步驟
 與其後步驟會失效。全部完成且狀態仍正常後，介面才顯示可以由操作員按「起飛」並啟用
 按鈕；這不會自動起飛，按下後後端仍會重新執行完整 fail-closed preflight。
 
@@ -89,25 +93,24 @@ python3 flight_operator_app.py --interface real-flight \
   --no-live-detect
 ```
 
-`MaxAltitude` and `MaxDistance` are adjustable firmware settings. Live takeoff
-fails closed unless both desired values are supplied, acknowledged, and read
-back from the aircraft. The ground-only stream/UI may still run while they are
-unset. Equivalent environment variables are `SFM_MAX_ALTITUDE_M` and
+`MaxAltitude` and `MaxDistance` are adjustable firmware settings. The backend
+still attempts to configure and read them back, but missing values, rejected
+writes, and readback mismatches are advisory and do not block takeoff. Equivalent environment variables are `SFM_MAX_ALTITUDE_M` and
 `SFM_MAX_DISTANCE_M`; do not choose flight limits by copying the simulated HUD
 numbers.
 
-`--distance-geofence` sends `NoFlyOverMaxDistance(1)` and is **off by default**
-(operator decision 2026-08-06: enabling it makes takeoff require a GPS fix, and
-this site's GPS is unreliable). Turn it on with the flag above, or with
+`--distance-geofence` sends `NoFlyOverMaxDistance(1)` and is **off by default**.
+It does not make GPS fix a takeoff requirement. Turn it on with the flag above, or with
 `SFM_DISTANCE_GEOFENCE=1`, which is the way to enable it through
 `start_anafi_live.sh` — that launcher deliberately does not pin the flag, so the
 environment variable governs. The firmware flag prevents outward piloting beyond the configured radius and
 does **not** itself start Return-To-Home. The host safety monitor separately
 requests RTH at 95% of the confirmed readback limit when Home is reachable,
 otherwise it requests in-place Landing. RTH depends on valid GPS/home state. The takeoff
-preflight uses a 15% battery floor by default and never accepts a configured floor
-below the existing 10% critical-battery threshold. While the distance geofence is
-enabled, takeoff also requires a confirmed GPS fix.
+preflight uses a 30% battery floor and rejects any configured floor below 30%.
+When GPS is unavailable, distance geofence may be disabled or kept advisory-only
+according to the backend/firmware policy; that state is shown and logged. Missing
+GPS is an advisory and does not block manual or autonomous takeoff.
 
 All safety-relevant CLI/environment values pass through `live_safety_config.py`
 before the UI or backend can use them. The effective normalized values and their
@@ -125,7 +128,9 @@ IP=192.168.53.1 CTRL=skycontroller3 ./start_anafi_live.sh
 ```
 
 The standard launcher starts with `MaxAltitude=50 m`, `MaxDistance=100 m`, and
-the distance geofence enabled. Override these conservative startup values with
+the distance geofence enabled when GPS/home support is available. If GPS is not
+available, the backend may disable the distance geofence or keep it advisory-only,
+with the state shown and logged. Override these conservative startup values with
 `SFM_MAX_ALTITUDE_M` and `SFM_MAX_DISTANCE_M`, or edit and apply them from the
 ANAFI panel while the aircraft is confirmed landed. The panel always shows the
 aircraft readback separately; applying limits while airborne is rejected.
@@ -176,13 +181,13 @@ This wires the UI buttons to real Olympe:
 
 | UI | Real action |
 |---|---|
-| 起飛 | TakeOff → hover；若已勾「起飛後錄影」則開始機載錄影 |
+| 起飛 | TakeOff → hover；不檢查定位；起飛成功後固定開始機載錄影 |
+| 自動飛行 | TakeOff → 原地零 PCMD 懸停 → 連續可靠定位後執行已鎖定路線；25 秒仍無定位則原地降落；暫停後按「繼續自動飛行」沿原路線恢復 |
 | 原地降落 | 停止錄影並盡力下載 → Landing + restore sticks |
 | 關窗 / Ctrl+C | **強制原地降落**（即使曾 Esc；已落地則跳過） |
-| 起飛後錄影 | 勾選=武裝；下次起飛成功後自動錄，降落時存檔 |
-| 懸停 / Space | zero PCMD |
+| 錄影 | 介面啟動時固定武裝；起飛成功後自動錄，降落時存檔；介面只顯示狀態 |
+| 懸停 / Space | zero PCMD；AUTO 執行中改為暫停 AUTO 並保留原路線狀態 |
 | 手動 / Esc | zero PCMD + `setPilotingSource(SkyController)` |
-| 緊急停止電腦動作 | zero PCMD + 取消 nudge/AUTO + 交回人工；不是空中斷馬達 |
 | 動搖桿（SC USB） | HID 偵測偏轉 → 強制交回搖桿（即使當下是 PC 控機） |
 | 微移 8 方向 | hold-to-move PCMD; release returns to hover |
 | 俯仰滑桿 | gimbal set_target |
@@ -251,12 +256,13 @@ required event synchronization, so its FPS is not a production FPS result.
 Everything below runs on the Tk main thread, which is also the thread that hands
 frames to the localizer, so per-tick waste there is not free.
 
-- Flight actions (手動/搖桿, 恢復電腦控制, 懸停, 原地降落, 緊急停止電腦動作) and the
-  pose/frame age readout sit in a fixed bar **above** the control tabs. The fixed
-  295 px pane has six tabs and no horizontal or vertical scrollbar: 操作與定位、
-  定位資訊、飛控與限制、校正、場域資產、系統紀錄. Command strings and bindings are
-  unchanged. `test_operator_render_perf.py` verifies every tab fits the minimum
-  980×640 client area and every abort action remains outside the selectable tabs.
+- The always-visible header separates REAL/SIM, link, control owner, flight state,
+  battery, localization and GPS into textual status chips. GPS NO FIX explicitly
+  says that manual takeoff remains available and AUTO will hover first.
+- Flight actions (手動/搖桿, 恢復電腦控制, 懸停, 原地降落) stay **above** the
+  selectable tabs. The control pane has three tabs: 飛行、校正、場域資產. The map/video
+  sash defaults to 35/65 and remains operator-adjustable. Tests verify every tab
+  fits the minimum 1180×768 client area and abort actions remain always visible.
 - Localization alerts (LOCALIZATION LOST, LOW CONFIDENCE, LOST hold) live only in
   the video panel (`render_video`) and in `loc_health_label`. **2026-08-03 operator
   decision:** the top-level banner was removed as duplicated by the middle of the
@@ -369,9 +375,12 @@ Localization and detection worker input/output are time-bounded; an exited,
 non-reading, or partial-response worker is reaped and restarted without blocking
 the UI shutdown path. A `success` response is accepted only with finite XYZ.
 
-The right video panel overlays the latest detection boxes and the bottom
-telemetry panel shows detection FPS, detector latency, object count, and the
-frame name used by the detector. The latest detection JSON is also written to:
+The right video panel overlays the latest detection boxes. Its bottom-left HUD
+combines image FPS with the selected engineering telemetry: speed limit,
+localization FPS/wall/core/e2e/inliers, RTH/GPS, flight-controller altitude/AGL,
+link quality, fused attitude and three-axis velocity. There is no UI log tab;
+persistent session/audit logs remain on disk. The latest detection JSON is also
+written to:
 
 ```text
 /tmp/sfm_flight_operator_detection_status.json
@@ -406,7 +415,10 @@ backend is created.
 
 Keyboard safety shortcuts:
 
-- `Space`: hover
+- `起飛` and `自動飛行` remain keyboard-focusable; `Return` invokes the focused
+  button just like a local click.
+- `Space`: full-direction hover only, even when an action button has focus; it
+  never invokes the focused button.
 - `Esc`: manual
 
 ### Firmware magnetometer calibration

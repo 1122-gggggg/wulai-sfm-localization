@@ -7,7 +7,7 @@
 | `check_maintainability.py` | 以分區 C901 預算阻止複雜度熱點數量或最壞值回升 |
 | `simulator_preflight.py` | 模擬介面啟動前檢查 Python、CUDA、模型、場域資產與影片 |
 | `install_runtime.sh` | 用 `requirements-lock.txt` 的 transitive pins/hashes 建立乾淨 CPython 3.10 venv |
-| `export_simulator_package.py` | 匯出固定程式/runtime，排除 venv、outputs、地圖與影片並產生 manifest |
+| `export_simulator_package.py` | 匯出固定程式/runtime，排除 venv、執行輸出、地圖與影片，僅保留 outputs 治理 README，並產生 manifest |
 | `package_manifest.py` | 驗證目前可攜式發布包的 MANIFEST.tsv / SHA256SUMS |
 | `release_activation.py` | 驗證 commit/version-bound package，原子 stage/activate/rollback |
 | `test_clean_install.sh` | 在暫存目錄重建 CPython 3.10 venv 並執行 runtime preflight |
@@ -34,8 +34,9 @@ passed/failed/skipped/xfailed/xpassed/errors/warnings，並在 `pytest.skipped` 
 狀態；JSONL 只進該 step 的 receipt log，不建立額外的永久硬體輸出檔。
 
 Portable manifest 的 scope 由 `tools/package_manifest.py` 唯一決定；editor files、
-cache、workspace outputs、audit review artifacts 與其他 `.gitignore` 對應的非發布
-資料不會因為偶然存在於 workspace 就進入 MANIFEST.tsv。
+cache、workspace 執行輸出、audit review artifacts 與其他 `.gitignore` 對應的非發布
+資料不會因為偶然存在於 workspace 就進入 MANIFEST.tsv。唯一例外是受版控的
+`outputs/README.md`，用來把輸出分類與保留規則帶到新電腦。
 
 發布收據與 `PORTABLE_PACKAGE.json` 必須同時帶 manifest/SHA256SUMS、commit、version
 與 dirty 狀態。`release_activation.py` 先驗證完整 package，再以 temporary directory

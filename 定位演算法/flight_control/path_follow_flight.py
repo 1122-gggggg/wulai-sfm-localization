@@ -576,25 +576,9 @@ def set_piloting_source(drone, source: str) -> bool:
     return True
 
 
-def configure_flight_preflight(drone, max_altitude_m: float, max_distance_m: float,
-                               distance_geofence: bool = True) -> dict:
-    """Fail closed on battery/GPS and confirm firmware distance/height limits."""
-    from olympe.messages.ardrone3.PilotingSettings import (
-        MaxAltitude, MaxDistance, NoFlyOverMaxDistance,
-    )
-    from olympe.messages.ardrone3.PilotingSettingsState import (
-        MaxAltitudeChanged, MaxDistanceChanged, NoFlyOverMaxDistanceChanged,
-    )
+def require_landed_for_firmware_config(drone) -> None:
+    """Keep the aircraft-state gate separate from advisory firmware setup."""
     from olympe.messages.ardrone3.PilotingState import FlyingStateChanged
-    from olympe.messages.ardrone3.GPSSettingsState import GPSFixStateChanged
-    from olympe.messages.common.CommonState import BatteryStateChanged
-
-    altitude = float(max_altitude_m)
-    distance = float(max_distance_m)
-    if not math.isfinite(altitude) or altitude <= 0.0:
-        raise RuntimeError("max altitude must be finite and > 0 m")
-    if not math.isfinite(distance) or distance <= 0.0:
-        raise RuntimeError("max distance must be finite and > 0 m")
 
     flying_state = drone.get_state(FlyingStateChanged)
     state = flying_state.get("state") if isinstance(flying_state, dict) else None
@@ -603,14 +587,39 @@ def configure_flight_preflight(drone, max_altitude_m: float, max_distance_m: flo
         raise RuntimeError(
             f"firmware limits may only be changed while landed; current state={state_name}")
 
+
+def configure_flight_preflight(drone, max_altitude_m: float, max_distance_m: float,
+                               distance_geofence: bool = False, *,
+                               check_landed: bool = True) -> dict:
+    """Check battery and try to apply optional firmware flight limits."""
+    if check_landed:
+        require_landed_for_firmware_config(drone)
+    from olympe.messages.ardrone3.PilotingSettings import (
+        MaxAltitude, MaxDistance, NoFlyOverMaxDistance,
+    )
+    from olympe.messages.ardrone3.PilotingSettingsState import (
+        MaxAltitudeChanged, MaxDistanceChanged, NoFlyOverMaxDistanceChanged,
+    )
+    from olympe.messages.common.CommonState import BatteryStateChanged
+
+    if max_altitude_m is None or max_distance_m is None:
+        raise RuntimeError("firmware altitude/distance limits were not provided")
+    altitude = float(max_altitude_m)
+    distance = float(max_distance_m)
+    if not math.isfinite(altitude) or altitude <= 0.0:
+        raise RuntimeError("max altitude must be finite and > 0 m")
+    if not math.isfinite(distance) or distance <= 0.0:
+        raise RuntimeError("max distance must be finite and > 0 m")
+
     battery_state = drone.get_state(BatteryStateChanged)
     battery = battery_state.get("percent") if isinstance(battery_state, dict) else None
     if not isinstance(battery, (int, float)) or not 0 <= float(battery) <= 100:
         raise RuntimeError(f"battery state unavailable/invalid: {battery!r}")
     if float(battery) < 30.0:
-        raise RuntimeError(f"battery {float(battery):.0f}% is below the 30% takeoff floor")
+        raise RuntimeError(f"battery {float(battery):.0f}% is below the 30% advisory floor")
 
     if distance_geofence:
+        from olympe.messages.ardrone3.GPSSettingsState import GPSFixStateChanged
         gps_state = drone.get_state(GPSFixStateChanged)
         gps_fixed = gps_state.get("fixed") if isinstance(gps_state, dict) else None
         if int(gps_fixed or 0) != 1:
@@ -2206,19 +2215,7 @@ def build_controller(*, require_approved: bool = True):
 
 def fly(ip: str, yaw_sign: int, gimbal_pitch: float, controller: str, safety_file: str,
         cmd_log_path: str = "", max_altitude_m: float | None = None,
-        max_distance_m: float | None = None, distance_geofence: bool = True):
-    if max_altitude_m is None or max_distance_m is None:
-        raise SystemExit(
-            "--fly requires explicit --max-altitude-m and --max-distance-m")
-    try:
-        max_altitude_m = float(max_altitude_m)
-        max_distance_m = float(max_distance_m)
-    except (TypeError, ValueError) as exc:
-        raise SystemExit("flight limits must be finite numbers") from exc
-    if (not math.isfinite(max_altitude_m) or max_altitude_m <= 0.0
-            or not math.isfinite(max_distance_m) or max_distance_m <= 0.0):
-        raise SystemExit("flight limits must be finite and > 0 m")
-
+        max_distance_m: float | None = None, distance_geofence: bool = False):
     stop = {"f": False}
     for sig_name in ("SIGINT", "SIGTERM", "SIGHUP"):
         sig = getattr(signal, sig_name, None)
@@ -2271,17 +2268,31 @@ def fly(ip: str, yaw_sign: int, gimbal_pitch: float, controller: str, safety_fil
         if via_skycontroller:
             # Keep the physical pilot authoritative throughout ground setup.
             set_piloting_source(drone, "SkyController")
-        preflight = configure_flight_preflight(
-            drone, max_altitude_m, max_distance_m, distance_geofence)
-        clog.event(event="firmware_preflight", **preflight)
-        print(
-            "[fly] firmware preflight confirmed: "
-            f"battery={preflight['battery_percent']}% "
-            f"max_altitude={preflight['max_altitude_m']:.1f}m "
-            f"max_distance={preflight['max_distance_m']:.1f}m "
-            f"distance_geofence={preflight['distance_geofence']}",
-            flush=True,
-        )
+        require_landed_for_firmware_config(drone)
+        try:
+            preflight = configure_flight_preflight(
+                drone, max_altitude_m, max_distance_m, distance_geofence,
+                check_landed=False)
+        except Exception as exc:
+            clog.event(
+                event="firmware_preflight", confirmed=False, warning=str(exc),
+                max_altitude_m=max_altitude_m, max_distance_m=max_distance_m,
+                distance_geofence=bool(distance_geofence),
+            )
+            print(
+                f"[fly] WARNING: {exc}; continuing without confirmed firmware limits",
+                flush=True,
+            )
+        else:
+            clog.event(event="firmware_preflight", confirmed=True, **preflight)
+            print(
+                "[fly] firmware preflight confirmed: "
+                f"battery={preflight['battery_percent']}% "
+                f"max_altitude={preflight['max_altitude_m']:.1f}m "
+                f"max_distance={preflight['max_distance_m']:.1f}m "
+                f"distance_geofence={preflight['distance_geofence']}",
+                flush=True,
+            )
         # True flight rejects callback-receipt timestamps: without source NTP,
         # upstream queue latency cannot be distinguished from a fresh frame.
         grab = ofs.OlympePdrawGrabber(
@@ -2842,11 +2853,11 @@ def main():
     ap.add_argument("--gimbal-pitch", type=float, default=GIMBAL_PITCH_DEG,
                     help="camera tilt vs horizon (deg, negative=down)")
     ap.add_argument("--max-altitude-m", type=float,
-                    help="required with --fly; firmware maximum altitude in metres")
+                    help="optional advisory firmware maximum altitude in metres")
     ap.add_argument("--max-distance-m", type=float,
-                    help="required with --fly; firmware maximum distance from takeoff in metres")
-    ap.add_argument("--distance-geofence", action=argparse.BooleanOptionalAction, default=True,
-                    help="enable firmware NoFlyOverMaxDistance (default: enabled)")
+                    help="optional advisory firmware maximum distance from takeoff in metres")
+    ap.add_argument("--distance-geofence", action=argparse.BooleanOptionalAction, default=False,
+                    help="enable GPS-dependent firmware NoFlyOverMaxDistance (default: disabled)")
     ap.add_argument("--controller", default=os.environ.get("SFM_OLYMPE_CONTROLLER", "auto"),
                     help="auto / drone / anafi / skycontroller3")
     ap.add_argument("--safety-file", default=SAFETY_FILE,

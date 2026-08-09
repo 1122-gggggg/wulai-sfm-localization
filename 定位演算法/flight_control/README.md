@@ -8,18 +8,18 @@
 ```bash
 .venv/bin/python 控制介面程式/mission_pipeline.py \
   --site-profile 控制介面程式/site_profiles/river_site_edm.json \
-  --mode fly --controller skycontroller3 \
-  --max-altitude-m <METERS> --max-distance-m <METERS>
+  --mode fly --controller skycontroller3
 ```
 
 此命令只能由現場操作員執行；agent 不得執行 `--fly` 或代為授權 AUTO。
 
 ## Firmware 高度／距離上限
 
-`--fly` 必須明確提供 `--max-altitude-m` 與 `--max-distance-m`；兩者會先和
-firmware 公布的 min/max 比對，再逐項送出並回讀確認。距離圍欄預設以
-`--distance-geofence` 開啟；起飛前另外要求電池至少 30% 且 GPS 已 fix。
-任一狀態缺失或不一致都拒絕起飛。
+`--max-altitude-m` 與 `--max-distance-m` 現在是選用的盡力設定；未提供、數值不符、
+firmware 設定／回讀失敗，或電量低於 30%，程式都只記錄警告並繼續，不會以此
+阻擋飛行。距離圍欄預設關閉，因此沒有 GPS 或尚未 fix 也可以繼續。操作員若明確
+加上 `--distance-geofence`，程式會嘗試設定 GPS 距離圍欄，但失敗同樣只會警告。
+飛機 firmware 本身若拒絕起飛，程式不會繞過該機載決定。
 
 距離圍欄只阻止飛越上限，不會自動返航。`NavigateHome` 是獨立的 RTH
 操作；本程式不會因碰到 geofence 而自行呼叫它。

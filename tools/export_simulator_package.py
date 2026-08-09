@@ -19,6 +19,7 @@ COPY_DIRS = (
 )
 COPY_FILES = (
     "README.md",
+    "outputs/README.md",
     "requirements.txt",
     "requirements-lock.txt",
     "requirements-test.txt",

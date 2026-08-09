@@ -419,7 +419,16 @@ def test_auto_inspect_enables_feed_without_backend_command() -> None:
     class FakeOperator:
         _begin_inspection_feed = app.OperatorApp._begin_inspection_feed
         begin_auto_inspect = app.OperatorApp.begin_auto_inspect
+        _preflight_blocks_flight_command = (
+            app.OperatorApp._preflight_blocks_flight_command
+        )
         send = app.OperatorApp.send
+
+        def _resume_integrated_auto(self):
+            return False
+
+        def _select_preflight_tab(self, _step):
+            return None
 
         def __init__(self):
             self.inspecting = False
@@ -433,6 +442,7 @@ def test_auto_inspect_enables_feed_without_backend_command() -> None:
             self._loc_e2e_ms_samples = []
             self.logs = []
             self.backend_calls = []
+            self.preflight_guide = SimpleNamespace(complete=True, current_step=None)
             self.backend = SimpleNamespace(
                 is_live=True,
                 command=lambda name, **payload: self.backend_calls.append((name, payload)),

@@ -22,7 +22,7 @@
 4. 接口模式與場域 profile 在程序生命週期內不可變。禁止模擬／真機熱切換，也禁止飛行中或執行中熱換地圖；必須完全關閉後重啟。
 5. 模擬接口本階段只保證影片檔。啟動器優先選用工作區內的 P1190119.MP4，否則只有一部匯入影片時自動選用，播放完停在最後一個可解碼畫面，不循環。
 6. 模擬介面的起飛、降落、懸停與微移只更新模擬狀態，永不載入 Olympe、連接真機或送出真機命令。
-7. 真機接口涵蓋連線與影像、即時定位、人工起飛／降落、人工微移、懸停、手動接管及緊急停止。真機自主路徑飛行保持鎖定，直到外部核准條件全部完成。
+7. 真機接口涵蓋連線與影像、即時定位、人工起飛／降落、人工微移、懸停、手動接管、緊急停止及人類按鈕啟動的自主路徑飛行。自主按鈕先起飛懸停，可靠定位後才移動；定位逾時則原地降落。
 8. 地圖及路徑不建立公尺尺度，也不要求 `map_units_per_meter`。地圖座標只作定位、方向、相對路徑進度與畫面顯示。
 9. 未來自主路徑的初始實際水平速度上限為 **0.30 m/s**。它是飛機端速度限制，不是 map unit 尺度；必須由真機速度遙測及實機 PCMD 響應測試驗證。速度日後可修改，但只能在確認落地時修改，且每次修改都使原自主飛行核准失效，必須重新測試與核准。
 10. 路徑由操作員避開已知障礙物。系統不宣稱具備動態避障或可靠碰撞偵測；稀疏點雲碰撞監控不是正式安全層。每條真機路徑仍須做人工現場淨空審查。
@@ -36,7 +36,7 @@
 18. 高度／距離預設為 30 m／100 m，操作員可在 UI 修改，但只允許在飛機確認落地、連線健康且 firmware readback 可用時套用。
 19. 影像、定位或 worker 故障但控制鏈仍在時：立即送零 PCMD、原地懸停、取消自動／電腦連續動作，切換成手動操作。SkyController 搖桿優先；若無 SkyController 但 PC 控制鏈仍健康，保留電腦手動控制。
 20. 完全失去飛機控制連線時使用機載安全策略：先懸停／重連；逾時後，GPS 與 Home Point 有效則 RTH，否則依經現場確認的 firmware 策略受控降落。主機端不可假裝斷線後仍能控制飛機。
-21. UI 採繁體中文，標準尺寸 1440×900、最低 980×640；SIM 使用藍色識別，REAL 使用紅橘色永久警告。
+21. UI 採繁體中文，標準尺寸 1440×900、最低 1180×768；SIM 使用藍色識別，REAL 使用紅橘色永久警告。
 22. 定位／效能 log 保留 30 天或總量 20 GB，先到者為準；command／safety／incident log 不自動刪除，只能手動封存或匯出。
 23. map、bundle、model、runtime profile 與 SHA manifest 的更新由操作員明確核准。
 24. 無 ground truth 時不得宣稱公尺級位置誤差或絕對姿態誤差；以固定影格、全部 LOST 恢復事件及完整軌跡的影像人工判讀作為品質驗收。
@@ -50,7 +50,7 @@
 - 讓單一操作員可安全使用模擬影片或真機 ANAFI，而不可能誤用另一個接口。
 - 真機故障時先停止電腦動作，再交回人工，不沿用過期姿態或過期 PCMD。
 - 以可重現的資產 SHA、測試、紀錄與監控，證明修改沒有讓目前定位品質或速度退步。
-- 未來自主飛行採慢速、短有效期、每次依新 pose 重算的控制，初始速度上限 0.30 m/s。
+- 自主飛行採慢速、短有效期、每次依新 pose 重算的控制，初始速度上限 0.30 m/s。
 
 ### 2.2 非目標
 
@@ -182,14 +182,14 @@ Pose + TRACK / WEAK_TRACK / LOST
 
 已存在的保護包括：
 
-- 只有人類可在桌面 UI 按下起飛；agent 與自動化禁止起飛。
+- 只有人類可在桌面 UI 按下「起飛」或「自動飛行」；agent 與自動化禁止起飛。
 - SkyController 搖桿偏轉會強制取回控制權。
 - Space 懸停、Esc 手動接管、微移按住才送 PCMD、放開或 heartbeat 過期歸零。
 - 關窗、Ctrl+C 或 signal 會嘗試零 PCMD、原地降落，再交還 SkyController。
-- 高度／距離預設 30 m／100 m，只有落地時可寫，並要求 firmware ack/readback；距離 geofence 預設開啟。
-- 起飛前要求至少 30% 電量；距離 geofence 開啟時要求 GPS fix。
+- 高度／距離只有落地時可寫並嘗試 firmware ack/readback；失敗會顯示及記錄警示，但不阻擋起飛。
+- 起飛前要求至少 30% 電量；GPS fix 僅作狀態提示，不阻擋手動或自主起飛。
 - legacy autonomous runner 有獨立 20 Hz SafetyMonitor、pose freshness、WEAK/LOST、jump、route deviation 與終止安全 gate。
-- 目前 UI 真機 backend 的 `start_auto` 只會切成 localization-only PC control，不執行 route。
+- UI 的「自動飛行」由同一個 Olympe backend 起飛並持續零 PCMD 懸停；連續可靠定位後才交給 production route loop，25 秒仍無定位則原地降落。
 
 尚未符合本規格之處：
 
@@ -201,7 +201,7 @@ Pose + TRACK / WEAK_TRACK / LOST
 
 ### 3.8 UI、紀錄、部署與測試現況
 
-- UI 已是 1440×900、最小 980×640；route 預設隱藏且有「顯示規劃路徑」checkbox。
+- UI 已是 1440×900、最小 1180×768；route 預設隱藏且有「顯示規劃路徑」checkbox。
 - 軌跡、相機視錐及 XYZ 軸已顯示。
 - SIM 與 REAL 標題不同，但尚未建立完整藍／紅橘視覺身份與永久 REAL 警告區。
 - `loc_metrics_*.jsonl`、`live_ui_cmdlog_*.jsonl`、飛行 telemetry 與硬體監控均已存在。
@@ -440,7 +440,7 @@ class FrameSource(Protocol):
 | `LAND_NOW` | 模擬降落 | 明確且獨立的緊急降落命令 |
 | `APPLY_LIMITS` | 更新模擬 HUD | 只在確認落地時寫 firmware，ack/readback 不一致即失敗 |
 | `START_LOCALIZATION` | 啟動 worker feed | 啟動 worker feed，不取回 PC 控制、不起飛 |
-| `START_AUTO` | 可進入純模擬 route test | 預設回 `LOCKED_EXTERNAL_APPROVAL`；不得只靠按鈕解鎖 |
+| `START_AUTO` | 可進入純模擬 route test | 原始 backend typed request 仍回 `LOCKED_EXTERNAL_APPROVAL`；桌面人類 UI 由已驗證路線鎖與整合協調器執行起飛、定位懸停及 route loop |
 
 未知 action、缺 payload、錯誤狀態或 backend 不支援時，必須回傳明確拒絕理由，不可只寫 log 後假裝成功。
 
@@ -449,21 +449,20 @@ class FrameSource(Protocol):
 ### 8.1 版面與身份
 
 - 語言：繁體中文。
-- 標準視窗：1440×900；最小：980×640。
+- 標準視窗：1440×900；最小：1180×768。
+- 兩個尺寸只由 production `UI_STANDARD_SIZE`／`UI_MIN_SIZE` 定義，桌面 app 與
+  `--layout-selftest` 必須共用，不得另寫視窗尺寸。
 - SIM／REAL 身份以文字區分，不可只靠顏色，避免色覺辨識問題。
-- **2026-08-03 操作員決定**：移除最上方的常駐身份列。身份改由影像面板 HUD
-  的 `video_hud_identity()` 提供（`SIMULATED ANAFI` / `REAL ANAFI`）。
-  **已知代價**：沒有影格可畫時（開機、串流中斷、EOF 之前的空窗）畫面上不會
-  出現任何 SIM／REAL 標示。此決定以節省版面為由做出，非疏漏；要恢復常駐標示
-  就把身份列加回 `_build_ui`。
+- **2026-08-08 介面整理**：恢復常駐頂部狀態列，以獨立文字卡顯示
+  REAL／SIM、連線、控制權、飛行狀態、電量、定位與 GPS。身份不再依賴影像幀，
+  串流中斷時仍可讀取。每張狀態卡同時使用文字與顏色。
 - REAL 仍須顯示 aircraft/controller identity、site ID、control owner 及自主鎖定狀態
   （`控制介面程式/operator_interface` 的 ANAFI／控制權面板）。
 - LINK LOST、STREAM LOST、WORKER DOWN、LOGGING FAILED 使用最高優先全寬警告
   （`incident_banner`），且只在事件發生時佔用版面；`安全狀態：正常` 這類閒置列不常駐。
-- **2026-08-03 操作員決定**：LOCALIZATION LOST／LOW CONFIDENCE／LOST hold 不再有
-  全寬警告列，只保留影像面板內的 banner（`render_video`）與「定位儀表」面板的
-  `loc_health_label`。**已知代價**：該 banner 被裁切在影像面板內、受 video dirty key
-  節流，不具全寬最高優先性質。此決定以避免與介面中段資訊重複為由做出，非疏漏。
+- LOCALIZATION LOST／LOW CONFIDENCE／LOST hold 保留影像內的緊急 banner，
+  並同步更新頂部「定位」文字卡。詳細 inliers、reprojection、latency 與影格名稱
+  只出現在「診斷／紀錄」，不覆蓋實時影像。
 
 ### 8.2 地圖與影像
 
@@ -471,7 +470,8 @@ class FrameSource(Protocol):
 - 規劃 route 預設隱藏；「顯示規劃路徑」只控制 overlay。
 - 實際軌跡與規劃 route 必須使用不同顏色與圖例。
 - 不可因 LOST 把最後姿態當成新 pose 繼續畫線；LOST 區段以斷線或不同健康標記呈現。
-- 右側顯示目前 source、frame sequence、source age、stream FPS、localization FPS、p95 latency、inliers、reprojection、TRACK/WEAK/LOST。
+- 右側影像只常駐顯示一行影像 FPS、影格新鮮度、鏡頭俯仰與縮放；
+  其餘 source、latency、inliers、reprojection、TRACK/WEAK/LOST 詳細資料放在「診斷／紀錄」。
 - **2026-08-03 操作員決定**：移除地圖上方的固定管線摘要列（與「定位儀表」面板重複）。
   定位結果抵達 UI 的 5 秒滾動 FPS、串流 5 秒滾動 FPS、submit-to-UI 端到端延遲與其
   5 秒 p95 現在只存在於控制區的「定位資訊」分頁。分頁不使用上下或左右捲軸；切換到
@@ -504,6 +504,8 @@ EMERGENCY_STOP / lost-link firmware policy
 
 - Space 永遠為 HOVER。
 - Esc 永遠為 MANUAL／交回搖桿。
+- 飛行與 AUTO action button 可進入鍵盤焦點；Return invoke 目前焦點按鈕。
+- Space 即使 action button 取得焦點也只執行全方向 HOVER，不 invoke 該按鈕。
 - 微移必須 hold-to-move，release／focus loss／heartbeat timeout 都歸零。
 - 「開始定位」不能取回 PC control、起飛或啟動 route。
 - 「恢復電腦控制」只能進入 PC manual，不能自動恢復 autonomous。
@@ -511,7 +513,8 @@ EMERGENCY_STOP / lost-link firmware policy
 
 ### 8.4 高度與距離
 
-- 預設 desired limit：高度 30 m、距離 100 m、distance geofence ON。
+- 預設 desired limit：高度 30 m、距離 100 m；GPS／Home 可用時 distance geofence ON。
+- 無 GPS 時 distance geofence 可關閉或降級為僅提示（狀態須顯示並記錄），不得因此阻擋人工起飛。
 - UI 永遠同時顯示 desired value 與 aircraft readback，不得混為一個值。
 - 只在 `LANDED + LINK_OK + bounds_known` 時允許套用；值必須為正、在 firmware bounds 內、寫入後 readback 一致。
 - 接近 80% 顯示黃色；接近 95% 或到達限制顯示紅色。
@@ -583,9 +586,9 @@ WEAK、LOST、stale pose 或 worker error 都不可沿用上一筆非零 autonom
   recommended 時顯示警告但不封鎖人工起飛。
 - SkyController 搖桿接管已實測；正式飛行不可只相信設定值。
 - battery 至少 30%。
-- GPS fix、Home Point 與 firmware lost-link/RTH policy 符合 B1。
+- Home Point 與 firmware lost-link/RTH policy 符合 B1；GPS fix 不是起飛門檻，無可用 Home 時失聯策略必須原地降落。
 - 高度 30 m／距離 100 m 或操作員當次設定值已 ack/readback。
-- distance geofence 已確認開啟。
+- distance geofence 狀態已明確確認：GPS／Home 可用時應開啟；無 GPS 時可關閉或僅提示，且不得把這個狀態當成人工起飛門檻。
 - 影像串流、定位 worker、CUDA、logging、磁碟空間健康。
 - 真機起飛只能由操作員在本機 UI 實際按下；不得有 CLI、環境變數或自動化旁路。
 
@@ -626,7 +629,8 @@ WEAK、LOST、stale pose 或 worker error 都不可沿用上一筆非零 autonom
 | UI freeze／focus loss | nudge heartbeat/desired PCMD TTL 到期歸零 | 手動或 hover | 否 |
 | SkyController stick movement | 立即停止 PC PCMD並交回 sticks | SkyController manual | 否 |
 | PC 與 SkyController/aircraft 完全斷線 | 主機停止假設可控；機載懸停／重連 | GPS+Home 有效逾時 RTH；否則經驗證的受控降落 | 否 |
-| battery/GPS/Home/limit readback 不合格 | 起飛前拒絕；空中依 firmware 與操作員處置 | 手動／安全降落 | 否 |
+| battery 低於 30% 或核心安全讀回不合格 | 起飛前拒絕；空中依 firmware 與操作員處置 | 手動／安全降落 | 否 |
+| GPS／Home／distance geofence／高度或距離限制未就緒 | 文字提示；無 GPS 時 distance geofence 可關閉或僅提示，不阻擋手動起飛；AUTO 先懸停等待定位，逾時原地降落 | 手動可飛／AUTO 等待 | 否 |
 | logging 或磁碟無法保證 safety log | 起飛前拒絕；空中發出 incident 並交人工 | 手動 | 否 |
 | 關窗／Ctrl+C／SIGTERM | 零 PCMD、停止錄影、原地 Landing、交還 sticks | CLOSED | 不適用 |
 
@@ -753,7 +757,7 @@ stateDiagram-v2
 |---|---|---|---|
 | profile／asset 不存在 | 拒絕啟動 | 拒絕啟動 | 列出缺少路徑與 site ID |
 | SHA mismatch | 拒絕啟動 | 拒絕啟動 | expected/actual，不載入 artifact |
-| CUDA 不可用／GPU 不符 | 拒絕 production localization | 拒絕真機定位與起飛 | 顯示 driver/GPU 診斷，不降級 CPU |
+| CUDA 不可用／GPU 不符 | 拒絕 production localization | 不阻擋手動起飛；自主起飛後只懸停並在定位逾時時原地降落 | 顯示 driver/GPU 診斷，不降級 CPU |
 | 影片目錄沒影片／多部未指定 | 拒絕啟動 | 不適用 | 提示匯入影片或明確指定 `VIDEO` |
 | P119 2,934/2,935 | 播放、標示已知不完整、EOF hold | 不適用 | integrity verdict 非正常完整 |
 | 一般影片 decode error | 保留最後完整 frame，進 `DECODE_ERROR_HOLD` | 不適用 | frame index、ffmpeg status |

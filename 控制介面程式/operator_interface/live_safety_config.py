@@ -11,9 +11,10 @@ from dataclasses import asdict, dataclass
 DEFAULT_MAX_TILT_DEG = 20.0
 DEFAULT_MAX_VERTICAL_SPEED_MS = 2.0
 DEFAULT_MAX_ROTATION_SPEED_DEGS = 20.0
-DEFAULT_RTH_MIN_ALTITUDE_M = 5.0
+DEFAULT_RTH_MIN_ALTITUDE_M = 20.0
 DEFAULT_STREAM_LOSS_GRACE_S = 10.0
 CRITICAL_BATTERY_PCT = 10.0
+MIN_TAKEOFF_BATTERY_PCT = 30.0
 NUDGE_PCT_MAX = 25
 NUDGE_TTL_MIN_S = 0.1
 NUDGE_TTL_MAX_S = 2.0
@@ -105,9 +106,10 @@ class LiveSafetyConfig:
             raise ValueError(
                 f"stream_loss_grace_s must be within [0, {DEFAULT_STREAM_LOSS_GRACE_S:g}]"
             )
-        if not CRITICAL_BATTERY_PCT <= battery <= 100.0:
+        if not MIN_TAKEOFF_BATTERY_PCT <= battery <= 100.0:
             raise ValueError(
-                f"min_takeoff_battery_pct must be within [{CRITICAL_BATTERY_PCT:g}, 100]"
+                "min_takeoff_battery_pct must be within "
+                f"[{MIN_TAKEOFF_BATTERY_PCT:g}, 100]"
             )
         return cls(
             nudge_pct=pct,

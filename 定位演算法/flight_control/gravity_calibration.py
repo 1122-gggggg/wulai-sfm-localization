@@ -43,7 +43,7 @@ PHASE_LABELS = {
 }
 
 # Pass thresholds (tune after a few real benches)
-MAX_LEVEL_TILT_DEG = 5.0          # mean |tilt| during yaw phase
+MAX_LEVEL_TILT_DEG = 6.0          # allow the stable ~5° ANAFI attitude offset
 MIN_YAW_SPAN_DEG = 90.0           # must cover enough yaw
 MIN_PITCH_SPAN_DEG = 25.0
 MIN_ROLL_SPAN_DEG = 25.0

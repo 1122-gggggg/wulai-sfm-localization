@@ -43,8 +43,8 @@ images、完整 source/update workspace，以及重建腳本。
 
 ```text
 requirements_runtime.txt        # 已驗證 Python 3.10 / CUDA 12.8 釘選
-MANIFEST.tsv / SHA256SUMS       # 可重現的封裝大小與 SHA-256
-tools/package_manifest.py       # generate / verify 封裝工具
+# MANIFEST.tsv / SHA256SUMS      # 僅在發布包根目錄；不在此 legacy 資料夾
+# tools/package_manifest.py      # 僅在發布包根目錄；由該處執行 generate / verify
 torch_hub_cache/                # package-local 離線模型 repo 與權重
   checkpoints/megaloc/7cb9f.../model.safetensors
 sfm_system/

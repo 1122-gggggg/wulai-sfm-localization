@@ -23,6 +23,7 @@ FLIGHT_MODE_BUTTONS = (
 
 MISSION_MODE_BUTTONS = (
     CommandButton("起飛", "takeoff"),
+    CommandButton("自動飛行", "start_auto"),
     # 定位鎖定 removed 2026-08-06: the boot lock engages automatically once 開始定位
     # is pressed (see OperatorApp.update_boot_lock), so the button only ever
     # re-triggered something the operator had already started. The "boot_lock"

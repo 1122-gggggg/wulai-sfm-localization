@@ -4,6 +4,10 @@
  "display_name": "河濱場域 EDM",
  "localizer": "edm",
  "localizer_deploy_dir": "../../定位演算法/deploy_code/sfm_glomap_deploy",
+ "hardware_approval": {
+  "receipt": "../../地圖檔/場域/urai/reports/hardware_approval_20260806.json",
+  "sha256": "7bd0cc5fe465044ea2e65f6ea6e8b751531275cfc6fedb4bdba59def2576dcdd"
+ },
  "localizer_profile": "../../定位演算法/configs/edm_profiles/river_site.json",
  "map_reference_poses": "../../地圖檔/場域/river_site/maps/river_site_ref_poses.json",
  "query_camera": {
