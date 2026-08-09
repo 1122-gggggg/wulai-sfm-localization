@@ -10,6 +10,8 @@ import pytest
 
 from tools import offline_wheelhouse
 
+ROOT = Path(__file__).resolve().parents[1]
+
 
 def _digest(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
@@ -210,6 +212,83 @@ def test_build_rejects_a_different_python_executable(tmp_path: Path) -> None:
         offline_wheelhouse.build_wheelhouse(
             tmp_path / "wheelhouse", [lock], "/not/the/current/python"
         )
+
+
+def test_prepare_lock_removes_only_index_declarations(tmp_path: Path) -> None:
+    source = tmp_path / "requirements-lock.txt"
+    source.write_text(
+        "# locked\n"
+        "--index-url https://example.invalid/simple\n"
+        "--extra-index-url=https://extra.invalid/simple\n"
+        "demo==1.0 \\\n"
+        "    --hash=sha256:" + "a" * 64 + "\n",
+        encoding="utf-8",
+    )
+    output = tmp_path / "offline.txt"
+
+    assert offline_wheelhouse.write_offline_requirements(source, output) == output
+    assert output.read_text(encoding="utf-8") == (
+        "# locked\ndemo==1.0 \\\n    --hash=sha256:" + "a" * 64 + "\n"
+    )
+
+
+@pytest.mark.parametrize(
+    "unsafe_line",
+    (
+        "--find-links https://example.invalid/wheels\n",
+        "-r nested-lock.txt\n",
+        "demo @ https://example.invalid/demo.whl\n",
+    ),
+)
+def test_prepare_lock_rejects_network_and_nested_inputs(tmp_path: Path, unsafe_line: str) -> None:
+    source = tmp_path / "requirements-lock.txt"
+    source.write_text(unsafe_line, encoding="utf-8")
+
+    with pytest.raises(offline_wheelhouse.WheelhouseError):
+        offline_wheelhouse.write_offline_requirements(source, tmp_path / "offline.txt")
+
+
+def test_cli_prepare_lock_refuses_to_overwrite(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    source = tmp_path / "requirements-lock.txt"
+    source.write_text("demo==1.0\n", encoding="utf-8")
+    output = tmp_path / "offline.txt"
+    output.write_text("existing\n", encoding="utf-8")
+
+    assert (
+        offline_wheelhouse.main(
+            [
+                "prepare-lock",
+                "--source",
+                str(source),
+                "--output",
+                str(output),
+            ]
+        )
+        == 1
+    )
+    assert "already exists" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "name",
+    (
+        "requirements-lock.txt",
+        "requirements-test-lock.txt",
+        "requirements-quality-lock.txt",
+    ),
+)
+def test_project_locks_have_a_network_free_install_derivative(tmp_path: Path, name: str) -> None:
+    output = tmp_path / name
+
+    offline_wheelhouse.write_offline_requirements(ROOT / name, output)
+
+    contents = output.read_text(encoding="utf-8")
+    assert "://" not in contents
+    assert "--index-url" not in contents
+    assert "--extra-index-url" not in contents
+    assert "--hash=sha256:" in contents
 
 
 def test_cli_verify_success_and_failure(

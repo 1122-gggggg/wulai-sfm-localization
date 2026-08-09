@@ -234,6 +234,52 @@ def verify_wheelhouse(
     return manifest
 
 
+def _offline_requirement_line(source: Path, line_number: int, line: str) -> str | None:
+    stripped = line.strip()
+    if not stripped or stripped.startswith("#"):
+        return line
+    option = stripped.split(maxsplit=1)[0].split("=", 1)[0]
+    if option in {"--index-url", "--extra-index-url"}:
+        return None
+    if stripped.startswith("-") and not stripped.startswith("--hash=sha256:"):
+        raise WheelhouseError(f"unsupported offline requirement option at {source}:{line_number}")
+    if "://" in stripped:
+        raise WheelhouseError(f"direct URL is not permitted at {source}:{line_number}")
+    return line
+
+
+def write_offline_requirements(
+    source: str | os.PathLike[str],
+    output: str | os.PathLike[str],
+) -> Path:
+    """Write a network-free derivative after the original lock was verified."""
+    source_path = Path(source)
+    output_path = Path(output)
+    if source_path.is_symlink() or not source_path.is_file():
+        raise WheelhouseError(f"requirement lock is not a regular file: {source_path}")
+    if output_path.exists() or output_path.is_symlink():
+        raise WheelhouseError(f"offline requirement output already exists: {output_path}")
+    if output_path.parent.is_symlink() or not output_path.parent.is_dir():
+        raise WheelhouseError(
+            f"offline requirement output parent is not a directory: {output_path.parent}"
+        )
+    try:
+        lines = source_path.read_text(encoding="utf-8").splitlines(keepends=True)
+    except (OSError, UnicodeError) as exc:
+        raise WheelhouseError(f"cannot read requirement lock {source_path}: {exc}") from exc
+
+    result = [
+        prepared
+        for line_number, line in enumerate(lines, start=1)
+        if (prepared := _offline_requirement_line(source_path, line_number, line)) is not None
+    ]
+    try:
+        output_path.write_text("".join(result), encoding="utf-8")
+    except OSError as exc:
+        raise WheelhouseError(f"cannot write offline requirement file: {exc}") from exc
+    return output_path
+
+
 def _check_build_host() -> None:
     version = sys.version_info
     if (
@@ -362,6 +408,12 @@ def _parser() -> argparse.ArgumentParser:
     verify = commands.add_parser("verify", help="verify an existing wheelhouse")
     verify.add_argument("--wheelhouse", required=True, type=Path)
     verify.add_argument("--requirements", action="append", default=[], type=Path)
+
+    prepare = commands.add_parser(
+        "prepare-lock", help="remove only package-index declarations from a verified lock"
+    )
+    prepare.add_argument("--source", required=True, type=Path)
+    prepare.add_argument("--output", required=True, type=Path)
     return parser
 
 
@@ -370,8 +422,12 @@ def main(argv: Iterable[str] | None = None) -> int:
     try:
         if args.command == "build":
             metadata = build_wheelhouse(args.output, args.requirements, sys.executable)
-        else:
+        elif args.command == "verify":
             metadata = verify_wheelhouse(args.wheelhouse, args.requirements)
+        else:
+            output = write_offline_requirements(args.source, args.output)
+            print(output)
+            return 0
     except WheelhouseError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1

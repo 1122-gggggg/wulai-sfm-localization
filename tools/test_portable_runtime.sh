@@ -101,11 +101,19 @@ install -m 0644 \
   "$staged_video_root/河濱_P1180118_first_2s.mp4"
 
 portable_venv="$temporary_root/venv"
-PIP_NO_INDEX=1 \
-PIP_INDEX_URL=http://127.0.0.1:9/invalid \
-PIP_EXTRA_INDEX_URL= \
-SFM_VENV_DIR="$portable_venv" \
-  bash "$portable_root/tools/install_runtime.sh" --offline
+install_log="$temporary_root/offline-install.log"
+if ! PIP_NO_INDEX=1 \
+  PIP_INDEX_URL=http://127.0.0.1:9/invalid \
+  PIP_EXTRA_INDEX_URL= \
+  SFM_VENV_DIR="$portable_venv" \
+  bash "$portable_root/tools/install_runtime.sh" --offline 2>&1 | tee "$install_log"; then
+  echo "[portable-runtime] offline installer failed" >&2
+  exit 1
+fi
+if grep -Eiq 'https?://|looking in indexes:' "$install_log"; then
+  echo "[portable-runtime] offline installer attempted a package index or URL" >&2
+  exit 1
+fi
 SFM_UI_PYTHON="$portable_venv/bin/python" \
 SFM_LOCALIZER_PYTHON="$portable_venv/bin/python" \
 SFM_PORTABLE_ALLOW_EXTERNAL_PYTHON=1 \

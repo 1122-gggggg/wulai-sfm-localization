@@ -4,6 +4,14 @@ set -euo pipefail
 install_test_deps=0
 install_quality_deps=0
 offline_install=0
+offline_lock_dir=""
+cleanup() {
+  if [[ -n "$offline_lock_dir" ]] && [[ -d "$offline_lock_dir" ]]; then
+    rm -r -- "$offline_lock_dir"
+  fi
+}
+trap cleanup EXIT
+
 while [[ "$#" -gt 0 ]]; do
   case "$1" in
     --test-deps)
@@ -53,6 +61,9 @@ venv_python="$venv_dir/bin/python"
 requirements_lock="$root_dir/requirements-lock.txt"
 requirements_test_lock="$root_dir/requirements-test-lock.txt"
 requirements_quality_lock="$root_dir/requirements-quality-lock.txt"
+install_requirements_lock="$requirements_lock"
+install_requirements_test_lock="$requirements_test_lock"
+install_requirements_quality_lock="$requirements_quality_lock"
 offline_wheelhouse="$root_dir/執行環境/offline_wheelhouse"
 offline_wheelhouse_manifest="$offline_wheelhouse/WHEELHOUSE.json"
 offline_wheelhouse_tool="$root_dir/tools/offline_wheelhouse.py"
@@ -92,6 +103,16 @@ if [[ "$offline_install" == "1" ]]; then
     --requirements "$requirements_test_lock" \
     --requirements "$requirements_quality_lock" >/dev/null
   echo "[runtime] 離線 wheelhouse 與三份 lockfile 驗證完成"
+
+  offline_lock_dir="$(mktemp -d -t sfm-offline-locks-XXXXXX)"
+  for lock_path in "$requirements_lock" "$requirements_test_lock" "$requirements_quality_lock"; do
+    "$python_bin" "$offline_wheelhouse_tool" prepare-lock \
+      --source "$lock_path" \
+      --output "$offline_lock_dir/$(basename -- "$lock_path")" >/dev/null
+  done
+  install_requirements_lock="$offline_lock_dir/$(basename -- "$requirements_lock")"
+  install_requirements_test_lock="$offline_lock_dir/$(basename -- "$requirements_test_lock")"
+  install_requirements_quality_lock="$offline_lock_dir/$(basename -- "$requirements_quality_lock")"
 fi
 
 if [[ ! -x "$venv_python" ]]; then
@@ -123,23 +144,28 @@ if [[ ! -f "$requirements_lock" ]]; then
   exit 1
 fi
 pip_install_args=(--require-hashes)
+pip_global_args=(--disable-pip-version-check)
 if [[ "$offline_install" == "1" ]]; then
   pip_install_args+=(--no-index --only-binary=:all: --find-links "$offline_wheelhouse")
+  pip_global_args+=(--isolated)
 fi
-"$venv_python" -m pip install "${pip_install_args[@]}" --requirement "$requirements_lock"
+"$venv_python" -m pip "${pip_global_args[@]}" install \
+  "${pip_install_args[@]}" --requirement "$install_requirements_lock"
 if [[ "$install_test_deps" == "1" ]]; then
   if [[ ! -f "$requirements_test_lock" ]]; then
     echo "[runtime] 缺少固定測試相依鎖檔: $requirements_test_lock" >&2
     exit 1
   fi
-  "$venv_python" -m pip install "${pip_install_args[@]}" --requirement "$requirements_test_lock"
+  "$venv_python" -m pip "${pip_global_args[@]}" install \
+    "${pip_install_args[@]}" --requirement "$install_requirements_test_lock"
 fi
 if [[ "$install_quality_deps" == "1" ]]; then
   if [[ ! -f "$requirements_quality_lock" ]]; then
     echo "[runtime] 缺少固定品質相依鎖檔: $requirements_quality_lock" >&2
     exit 1
   fi
-  "$venv_python" -m pip install "${pip_install_args[@]}" --requirement "$requirements_quality_lock"
+  "$venv_python" -m pip "${pip_global_args[@]}" install \
+    "${pip_install_args[@]}" --requirement "$install_requirements_quality_lock"
 fi
 echo "[runtime] 安裝完成：$venv_python"
 echo "[runtime] 系統層仍需 ffmpeg、python3-tk、X11/XWayland、可用 NVIDIA CUDA driver"
