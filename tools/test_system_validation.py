@@ -91,6 +91,38 @@ def test_parrot_simulator_validation_stays_in_its_python311_environment() -> Non
     assert steps["parrot_preflight"].argv[-1] == "preflight"
 
 
+def test_tests_and_portable_smoke_do_not_inherit_source_workspace_binding(
+    tmp_path: Path,
+) -> None:
+    module = _load_validation_module()
+    steps = {
+        step.name: step
+        for step in module._steps(
+            p119=False,
+            accept_p119=False,
+            p119_quality=False,
+            quality_out=None,
+            portable_package=tmp_path / "portable",
+            clean_install=True,
+            ui_smoke=True,
+        )
+    }
+    base = {
+        "PATH": "/usr/bin",
+        **{key: "source-bound" for key in module.WORKSPACE_BINDING_ENV_KEYS},
+    }
+
+    for name in ("root_pytest", "portable_clean_install_ui_pose"):
+        step = steps[name]
+        assert step.isolate_workspace is True
+        environment = module._environment_for_step(base, step)
+        assert environment["PATH"] == "/usr/bin"
+        assert not (set(environment) & set(module.WORKSPACE_BINDING_ENV_KEYS))
+
+    inherited = module._environment_for_step(base, steps["simulated_ui_smoke"])
+    assert inherited["SFM_WORKSPACE_ROOT"] == "source-bound"
+
+
 def test_p119_quality_validation_runs_the_pinned_replay_gate(tmp_path) -> None:
     module = _load_validation_module()
 

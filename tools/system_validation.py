@@ -30,6 +30,13 @@ ROOT = Path(__file__).resolve().parents[1]
 ROOT_PYTHON = ROOT / ".venv/bin/python"
 PARROT_ROOT = ROOT / "模擬器/parrot_stimulate"
 PARROT_PYTHON = PARROT_ROOT / ".venv/bin/python"
+WORKSPACE_BINDING_ENV_KEYS = (
+    "SFM_WORKSPACE_ROOT",
+    "SFM_TORCH_HUB_CACHE",
+    "SFM_UI_PYTHON",
+    "SFM_LOCALIZER_PYTHON",
+    "SFM_SITE_PROFILE",
+)
 P119_VIDEO = Path(
     os.environ.get(
         "SFM_P119_VIDEO",
@@ -142,6 +149,15 @@ class Step:
     argv: tuple[str, ...]
     cwd: str
     timeout_s: int
+    isolate_workspace: bool = False
+
+
+def _environment_for_step(base: dict[str, str], step: Step) -> dict[str, str]:
+    environment = dict(base)
+    if step.isolate_workspace:
+        for key in WORKSPACE_BINDING_ENV_KEYS:
+            environment.pop(key, None)
+    return environment
 
 
 _PYTEST_COUNT_RE = re.compile(
@@ -434,6 +450,7 @@ def _steps(
             ),
             str(ROOT),
             2400,
+            isolate_workspace=True,
         ),
         Step(
             "parrot_pytest",
@@ -623,6 +640,7 @@ def _steps(
                 ),
                 str(ROOT),
                 3600,
+                isolate_workspace=True,
             )
         )
     if p119:
@@ -801,7 +819,7 @@ def main() -> int:
             completed = subprocess.run(
                 step.argv,
                 cwd=step.cwd,
-                env=environment,
+                env=_environment_for_step(environment, step),
                 capture_output=True,
                 text=True,
                 timeout=step.timeout_s,

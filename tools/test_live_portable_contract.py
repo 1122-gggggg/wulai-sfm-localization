@@ -96,6 +96,7 @@ def test_one_click_launcher_installs_offline_and_selects_river_profile() -> None
 
     smoke_script = (ROOT / "tools/simulated_ui_smoke.sh").read_text(encoding="utf-8")
     assert "執行環境/smoke/river_site_first_2s.mp4" in smoke_script
+    assert 'SFM_WORKSPACE_ROOT="$root_dir" setsid' in smoke_script
 
 
 def test_export_cli_forwards_live_minimal_mode(

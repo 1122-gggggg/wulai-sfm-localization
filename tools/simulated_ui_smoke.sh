@@ -32,7 +32,8 @@ cleanup() {
 }
 trap cleanup EXIT
 
-setsid "$root_dir/控制介面程式/影片模擬串流/選擇啟動.sh" \
+SFM_WORKSPACE_ROOT="$root_dir" setsid \
+  "$root_dir/控制介面程式/影片模擬串流/選擇啟動.sh" \
   --map "$root_dir/地圖檔/場域/river_site/maps/river_site_realrgb_dense_trimmed.ply" \
   --video "$video_path" \
   >"$log_file" 2>&1 &
