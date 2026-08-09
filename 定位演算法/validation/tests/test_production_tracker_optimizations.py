@@ -15,7 +15,7 @@ TRACKER_DIR = Path(__file__).resolve().parents[2] / "deploy_code" / "sfm_glomap_
 if str(TRACKER_DIR) not in sys.path:
     sys.path.insert(0, str(TRACKER_DIR))
 
-import production_xfeat_tracker as pxt
+import production_xfeat_tracker as pxt  # noqa: E402
 
 
 def test_output_heading_uses_supplied_measured_map_frame() -> None:
@@ -101,7 +101,10 @@ def test_flow_experiment_gates_are_read_from_environment(monkeypatch):
     reloc_map = SimpleNamespace(
         ref_names=[], ref_centers=np.empty((0, 3)), ref_yaws=None,
     )
-    megaloc = SimpleNamespace(ref_desc=np.empty((0, 4), np.float32))
+    megaloc = SimpleNamespace(
+        ref_desc=np.empty((0, 4), np.float32),
+        reference_count=0,
+    )
 
     tracker = pxt.ProductionXFeatTracker(
         reloc_map, megaloc, None, None, pxt.ProductionConfig(flow_enabled=True),

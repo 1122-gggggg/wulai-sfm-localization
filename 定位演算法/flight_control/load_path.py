@@ -14,10 +14,12 @@ in the JSON, the start waypoint is appended so the loop closes.
 """
 from __future__ import annotations
 
-import json
 import os
+from pathlib import Path
 
 import numpy as np
+
+from route_domain import RouteDocument
 
 PATH_JSON = os.environ.get("SFM_FLIGHT_PATH_JSON", "").strip()
 
@@ -30,14 +32,9 @@ def load_waypoints(path_json: str | None = None, close: bool | None = None):
         )
     if not os.path.exists(path_json):
         raise FileNotFoundError(f"no drawn path at {path_json} -- run scripts/draw_path.py first")
-    d = json.load(open(path_json))
-    wp = [np.asarray(p, float) for p in d.get("waypoints", [])]
-    if len(wp) < 2:
-        raise ValueError(f"path has {len(wp)} waypoints, need >= 2")
-    closed = d.get("closed", False) if close is None else close
-    if closed and not np.allclose(wp[0], wp[-1]):
-        wp.append(wp[0].copy())
-    return wp
+    route = RouteDocument.from_path(Path(path_json))
+    return [np.array(point, dtype=float, copy=True)
+            for point in route.source_waypoints(close=close)]
 
 
 def _pt_seg_dist(p, a, b):

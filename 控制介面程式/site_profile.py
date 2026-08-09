@@ -7,7 +7,8 @@ import hmac
 import json
 import math
 import re
-from dataclasses import dataclass
+import sys
+from dataclasses import dataclass, field
 from pathlib import Path
 
 
@@ -22,6 +23,7 @@ SHA256_KEYS = (
     "route_json",
     "map_reference_poses",
     "localizer_profile",
+    "reference_index",
     "poles_json",
     "map_align",
 )
@@ -36,6 +38,33 @@ DISPLAY_NAME_REJECT_RE = re.compile("[\x00-\x1f\x7f-\x9f$`\"'\\\\]")
 
 def _reject_json_constant(value: str):
     raise ValueError(f"non-finite JSON number is not allowed: {value}")
+
+
+def site_profile_approval_sha256(path: str | Path) -> str:
+    """Hash the canonical site contract without its circular receipt references."""
+    source = Path(path).expanduser().resolve()
+    try:
+        raw = json.loads(
+            source.read_text(encoding="utf-8"),
+            parse_constant=_reject_json_constant,
+        )
+    except (OSError, json.JSONDecodeError, ValueError) as exc:
+        raise ValueError(f"cannot compute site profile approval SHA-256: {exc}") from exc
+    if not isinstance(raw, dict):
+        raise ValueError("site profile approval subject must be an object")
+    subject = dict(raw)
+    subject.pop("hardware_approval", None)
+    try:
+        canonical = json.dumps(
+            subject,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    except (TypeError, ValueError, UnicodeEncodeError) as exc:
+        raise ValueError(f"invalid site profile approval subject: {exc}") from exc
+    return hashlib.sha256(canonical).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -65,6 +94,7 @@ class AssetDigests:
     route_json: str | None = None
     map_reference_poses: str | None = None
     localizer_profile: str | None = None
+    reference_index: str | None = None
     poles_json: str | None = None
     map_align: str | None = None
 
@@ -108,6 +138,10 @@ class FlightReadiness:
 class HardwareApprovalReference:
     receipt: Path
     sha256: str
+    signature: Path | None = None
+    signature_sha256: str | None = None
+    trust_store: Path | None = None
+    trust_store_sha256: str | None = None
 
 
 @dataclass(frozen=True)
@@ -121,6 +155,16 @@ class HardwareApprovalReceipt:
     controller_firmware_versions: tuple[str, ...]
     olympe_versions: tuple[str, ...]
     approval_note: str
+    schema: str = "anafi-hardware-approval/v1"
+    site_id: str | None = None
+    coordinate_frame_id: str | None = None
+    profile_sha256: str | None = None
+    route_sha256: str | None = None
+    bundle_sha256: str | None = None
+    approved_mode: str | None = None
+    aircraft_serial: str | None = None
+    controller_serial: str | None = None
+    approved_envelope: dict[str, object] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -132,10 +176,11 @@ class SiteProfile:
     map_ply: Path
     route_json: Path | None
     localization_bundle: Path
-    # Production site profiles always use the EDM tracker adapter.
+    # The backend name must resolve through the deployment localizer registry.
     localizer: str = PRODUCTION_LOCALIZER_BACKEND
     localizer_deploy_dir: Path | None = None
     localizer_profile: Path | None = None
+    reference_index: Path | None = None
     map_reference_poses: Path | None = None
     #: Measured gravity alignment (T_align_gravity.json). Without it the runtime
     #: falls back to assuming GLOMAP -Y is up, which is wrong on every site
@@ -149,6 +194,37 @@ class SiteProfile:
     asset_sha256: AssetDigests = AssetDigests()
     flight: FlightReadiness | None = None
     hardware_approval: HardwareApprovalReference | None = None
+
+
+def _localizer_capabilities(backend: str):
+    """Load static provider metadata without importing model/CUDA modules."""
+    try:
+        from localizer_registry import get_localizer_capabilities
+    except ModuleNotFoundError:
+        deploy_dir = (
+            Path(__file__).resolve().parents[1]
+            / "定位演算法"
+            / "deploy_code"
+            / "sfm_glomap_deploy"
+        )
+        if not deploy_dir.is_dir():
+            raise ValueError(
+                "localizer registry is unavailable; cannot validate backend safely"
+            )
+        if str(deploy_dir) not in sys.path:
+            sys.path.insert(0, str(deploy_dir))
+        try:
+            from localizer_registry import get_localizer_capabilities
+        except ModuleNotFoundError as exc:
+            raise ValueError(
+                "localizer registry is unavailable; cannot validate backend safely"
+            ) from exc
+    try:
+        return get_localizer_capabilities(backend)
+    except ValueError as exc:
+        raise ValueError(
+            f"site profile localizer must name a registered localizer backend: {exc}"
+        ) from exc
 
 
 def _resolve_asset(profile_dir: Path, value, key: str, *, required: bool) -> Path | None:
@@ -480,9 +556,19 @@ def _load_hardware_approval_reference(
 ) -> HardwareApprovalReference | None:
     if raw is None:
         return None
-    if not isinstance(raw, dict) or set(raw) != {"receipt", "sha256"}:
+    basic_keys = {"receipt", "sha256"}
+    signed_keys = basic_keys | {
+        "signature",
+        "signature_sha256",
+        "trust_store",
+        "trust_store_sha256",
+    }
+    actual_keys = set(raw) if isinstance(raw, dict) else set()
+    if not isinstance(raw, dict) or actual_keys not in (basic_keys, signed_keys):
         raise ValueError(
-            "site profile hardware_approval must contain exactly receipt and sha256: "
+            "site profile hardware_approval must contain receipt/sha256 and either "
+            "all or none of signature/signature_sha256/trust_store/"
+            "trust_store_sha256: "
             f"{source}"
         )
     receipt = _resolve_asset(
@@ -490,7 +576,36 @@ def _load_hardware_approval_reference(
     )
     digest = _sha256(raw.get("sha256"), "hardware_approval", source)
     assert receipt is not None and digest is not None
-    return HardwareApprovalReference(receipt=receipt, sha256=digest)
+    if actual_keys == basic_keys:
+        return HardwareApprovalReference(receipt=receipt, sha256=digest)
+    signature = _resolve_asset(
+        profile_dir,
+        raw.get("signature"),
+        "hardware_approval.signature",
+        required=True,
+    )
+    trust_store = _resolve_asset(
+        profile_dir,
+        raw.get("trust_store"),
+        "hardware_approval.trust_store",
+        required=True,
+    )
+    signature_digest = _sha256(
+        raw.get("signature_sha256"), "hardware_approval.signature", source
+    )
+    trust_store_digest = _sha256(
+        raw.get("trust_store_sha256"), "hardware_approval.trust_store", source
+    )
+    assert signature is not None and trust_store is not None
+    assert signature_digest is not None and trust_store_digest is not None
+    return HardwareApprovalReference(
+        receipt=receipt,
+        sha256=digest,
+        signature=signature,
+        signature_sha256=signature_digest,
+        trust_store=trust_store,
+        trust_store_sha256=trust_store_digest,
+    )
 
 
 def _string_tuple(value, key: str, source: Path) -> tuple[str, ...]:
@@ -506,6 +621,88 @@ def _string_tuple(value, key: str, source: Path) -> tuple[str, ...]:
     if len(parsed) != len(set(parsed)):
         raise ValueError(f"hardware approval {key} must not contain duplicates: {source}")
     return parsed
+
+
+HARDWARE_APPROVAL_V1_SCHEMA = "anafi-hardware-approval/v1"
+HARDWARE_APPROVAL_V2_SCHEMA = "anafi-hardware-approval/v2"
+HARDWARE_APPROVED_MODES = {"auto", "manual", "manual_only", "manual-only"}
+HARDWARE_ENVELOPE_KEYS = {
+    "max_altitude_m",
+    "max_distance_m",
+    "max_tilt_deg",
+    "max_vertical_speed_ms",
+    "max_rotation_speed_degs",
+    "gps_required",
+}
+
+
+def _hardware_digest(
+    value, key: str, source: Path, *, required: bool,
+) -> str | None:
+    if value is None:
+        if required:
+            raise ValueError(f"hardware approval {key} must be a SHA-256: {source}")
+        return None
+    if not isinstance(value, str):
+        raise ValueError(f"hardware approval {key} must be a SHA-256: {source}")
+    digest = value.strip().lower()
+    if len(digest) != 64 or any(ch not in "0123456789abcdef" for ch in digest):
+        raise ValueError(f"hardware approval {key} must be a SHA-256: {source}")
+    return digest
+
+
+def _hardware_identity(
+    raw, key: str, source: Path,
+) -> tuple[str, str | None, tuple[str, ...]]:
+    expected = {"product", "serial", "firmware_versions"}
+    if not isinstance(raw, dict) or set(raw) != expected:
+        actual = set(raw) if isinstance(raw, dict) else set()
+        raise ValueError(
+            f"hardware approval {key} fields mismatch: "
+            f"unknown={sorted(actual - expected)} missing={sorted(expected - actual)}"
+        )
+    product = raw["product"]
+    if not isinstance(product, str) or not product.strip():
+        raise ValueError(f"hardware approval {key}.product must be non-empty")
+    serial = raw["serial"]
+    if serial is not None and (not isinstance(serial, str) or not serial.strip()):
+        raise ValueError(f"hardware approval {key}.serial must be a string or null")
+    return (
+        product.strip(),
+        None if serial is None else serial.strip(),
+        _string_tuple(raw["firmware_versions"], f"{key}.firmware_versions", source),
+    )
+
+
+def _hardware_envelope(raw, source: Path, *, approved_mode: str) -> dict[str, object]:
+    if not isinstance(raw, dict):
+        raise ValueError(f"hardware approval approved_envelope must be an object: {source}")
+    if set(raw) != HARDWARE_ENVELOPE_KEYS:
+        raise ValueError(
+            "hardware approval approved_envelope fields mismatch: "
+            f"unknown={sorted(set(raw) - HARDWARE_ENVELOPE_KEYS)} "
+            f"missing={sorted(HARDWARE_ENVELOPE_KEYS - set(raw))}"
+        )
+    gps_required = raw["gps_required"]
+    if not isinstance(gps_required, bool):
+        raise ValueError("hardware approval approved_envelope.gps_required must be boolean")
+    envelope = {"gps_required": gps_required}
+    for key in sorted(HARDWARE_ENVELOPE_KEYS - {"gps_required"}):
+        value = raw[key]
+        if value is None and approved_mode != "auto":
+            envelope[key] = None
+            continue
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(
+                f"hardware approval approved_envelope.{key} must be numeric"
+            )
+        parsed = float(value)
+        if not math.isfinite(parsed) or parsed <= 0.0:
+            raise ValueError(
+                f"hardware approval approved_envelope.{key} must be finite and > 0"
+            )
+        envelope[key] = parsed
+    return envelope
 
 
 def load_hardware_approval_receipt(
@@ -530,50 +727,141 @@ def load_hardware_approval_receipt(
         raw = json.loads(content, parse_constant=_reject_json_constant)
     except (json.JSONDecodeError, ValueError) as exc:
         raise ValueError(f"invalid hardware approval receipt {reference.receipt}: {exc}") from exc
+    if not isinstance(raw, dict):
+        raise ValueError("hardware approval receipt root must be an object")
+    schema = raw.get("schema")
+    if schema == HARDWARE_APPROVAL_V1_SCHEMA:
+        keys = {
+            "schema",
+            "approved",
+            "aircraft_product",
+            "controller_product",
+            "aircraft_firmware_versions",
+            "controller_firmware_versions",
+            "olympe_versions",
+            "approval_note",
+        }
+        if set(raw) != keys:
+            raise ValueError(
+                "hardware approval receipt fields mismatch: "
+                f"unknown={sorted(set(raw) - keys)} missing={sorted(keys - set(raw))}"
+            )
+        if not isinstance(raw["approved"], bool):
+            raise ValueError("hardware approval approved must be boolean")
+        for key in ("aircraft_product", "controller_product", "approval_note"):
+            if not isinstance(raw[key], str) or not raw[key].strip():
+                raise ValueError(f"hardware approval {key} must be non-empty")
+        return HardwareApprovalReceipt(
+            source=reference.receipt,
+            sha256=actual,
+            approved=raw["approved"],
+            aircraft_product=raw["aircraft_product"].strip(),
+            controller_product=raw["controller_product"].strip(),
+            aircraft_firmware_versions=_string_tuple(
+                raw["aircraft_firmware_versions"],
+                "aircraft_firmware_versions",
+                reference.receipt,
+            ),
+            controller_firmware_versions=_string_tuple(
+                raw["controller_firmware_versions"],
+                "controller_firmware_versions",
+                reference.receipt,
+            ),
+            olympe_versions=_string_tuple(
+                raw["olympe_versions"], "olympe_versions", reference.receipt
+            ),
+            approval_note=raw["approval_note"].strip(),
+            schema=HARDWARE_APPROVAL_V1_SCHEMA,
+            approved_mode="manual",
+        )
+    if schema != HARDWARE_APPROVAL_V2_SCHEMA:
+        raise ValueError("unsupported hardware approval receipt schema")
+
     keys = {
         "schema",
         "approved",
-        "aircraft_product",
-        "controller_product",
-        "aircraft_firmware_versions",
-        "controller_firmware_versions",
+        "site_id",
+        "coordinate_frame_id",
+        "profile_sha256",
+        "route_sha256",
+        "bundle_sha256",
+        "approved_mode",
+        "aircraft",
+        "controller",
         "olympe_versions",
+        "approved_envelope",
         "approval_note",
     }
-    if not isinstance(raw, dict) or set(raw) != keys:
-        actual_keys = set(raw) if isinstance(raw, dict) else set()
+    if set(raw) != keys:
         raise ValueError(
-            "hardware approval receipt fields mismatch: "
-            f"unknown={sorted(actual_keys - keys)} missing={sorted(keys - actual_keys)}"
+            "hardware approval receipt v2 fields mismatch: "
+            f"unknown={sorted(set(raw) - keys)} missing={sorted(keys - set(raw))}"
         )
-    if raw["schema"] != "anafi-hardware-approval/v1":
-        raise ValueError("unsupported hardware approval receipt schema")
     if not isinstance(raw["approved"], bool):
         raise ValueError("hardware approval approved must be boolean")
-    for key in ("aircraft_product", "controller_product", "approval_note"):
+    text_values = ("site_id", "coordinate_frame_id", "approved_mode", "approval_note")
+    for key in text_values:
         if not isinstance(raw[key], str) or not raw[key].strip():
             raise ValueError(f"hardware approval {key} must be non-empty")
+    approved_mode = raw["approved_mode"].strip().lower()
+    if approved_mode not in HARDWARE_APPROVED_MODES:
+        raise ValueError(
+            "hardware approval approved_mode must be one of "
+            f"{sorted(HARDWARE_APPROVED_MODES)}"
+        )
+    profile_sha256 = _hardware_digest(
+        raw["profile_sha256"], "profile_sha256", reference.receipt, required=True
+    )
+    bundle_sha256 = _hardware_digest(
+        raw["bundle_sha256"], "bundle_sha256", reference.receipt, required=True
+    )
+    route_sha256 = _hardware_digest(
+        raw["route_sha256"], "route_sha256", reference.receipt, required=False
+    )
+    aircraft_product, aircraft_serial, aircraft_firmware = _hardware_identity(
+        raw["aircraft"], "aircraft", reference.receipt
+    )
+    controller_product, controller_serial, controller_firmware = _hardware_identity(
+        raw["controller"], "controller", reference.receipt
+    )
     return HardwareApprovalReceipt(
         source=reference.receipt,
         sha256=actual,
         approved=raw["approved"],
-        aircraft_product=raw["aircraft_product"].strip(),
-        controller_product=raw["controller_product"].strip(),
-        aircraft_firmware_versions=_string_tuple(
-            raw["aircraft_firmware_versions"],
-            "aircraft_firmware_versions",
-            reference.receipt,
-        ),
-        controller_firmware_versions=_string_tuple(
-            raw["controller_firmware_versions"],
-            "controller_firmware_versions",
-            reference.receipt,
-        ),
+        aircraft_product=aircraft_product,
+        controller_product=controller_product,
+        aircraft_firmware_versions=aircraft_firmware,
+        controller_firmware_versions=controller_firmware,
         olympe_versions=_string_tuple(
             raw["olympe_versions"], "olympe_versions", reference.receipt
         ),
         approval_note=raw["approval_note"].strip(),
+        schema=HARDWARE_APPROVAL_V2_SCHEMA,
+        site_id=raw["site_id"].strip(),
+        coordinate_frame_id=raw["coordinate_frame_id"].strip(),
+        profile_sha256=profile_sha256,
+        route_sha256=route_sha256,
+        bundle_sha256=bundle_sha256,
+        approved_mode=approved_mode,
+        aircraft_serial=aircraft_serial,
+        controller_serial=controller_serial,
+        approved_envelope=_hardware_envelope(
+            raw["approved_envelope"], reference.receipt, approved_mode=approved_mode
+        ),
     )
+
+
+def _verify_hardware_material_sha256(
+    path: Path, expected: str, label: str
+) -> None:
+    try:
+        actual = hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError as exc:
+        raise ValueError(f"cannot read {label} {path}: {exc}") from exc
+    if not hmac.compare_digest(actual, expected):
+        raise ValueError(
+            f"{label} SHA-256 mismatch: expected {expected}, got {actual} ({path})"
+        )
 
 
 def flight_readiness_errors(profile: SiteProfile) -> list[str]:
@@ -605,14 +893,29 @@ def flight_readiness_errors(profile: SiteProfile) -> list[str]:
         errors.append("missing map_align (measured T_align_gravity.json)")
     if profile.query_camera is None:
         errors.append("missing query_camera")
-    if profile.localizer == "edm" and profile.localizer_profile is None:
-        errors.append("missing EDM localizer_profile")
+    try:
+        capabilities = _localizer_capabilities(profile.localizer)
+    except ValueError as exc:
+        errors.append(str(exc))
+        capabilities = None
+    if capabilities is not None:
+        for key in capabilities.required_assets:
+            if getattr(profile, key, None) is None:
+                if key == "localizer_profile" and profile.localizer == "edm":
+                    errors.append("missing EDM localizer_profile")
+                else:
+                    errors.append(f"missing {profile.localizer} {key}")
     for key in ("localization_bundle", "route_json", "map_reference_poses",
                 "map_align"):
         if getattr(profile.asset_sha256, key) is None:
             errors.append(f"missing asset_sha256.{key}")
     if profile.localizer_profile is not None and profile.asset_sha256.localizer_profile is None:
         errors.append("missing asset_sha256.localizer_profile")
+    if (
+        getattr(profile, "reference_index", None) is not None
+        and getattr(profile.asset_sha256, "reference_index", None) is None
+    ):
+        errors.append("missing asset_sha256.reference_index")
     if (
         flight.controller is not None
         and flight.controller.inspect_waypoints
@@ -625,6 +928,112 @@ def flight_readiness_errors(profile: SiteProfile) -> list[str]:
         and profile.asset_sha256.poles_json is None
     ):
         errors.append("inspection waypoints require asset_sha256.poles_json")
+    hardware_reference = getattr(profile, "hardware_approval", None)
+    if hardware_reference is None:
+        errors.append("missing signed hardware approval receipt v2 for AUTO")
+    else:
+        try:
+            receipt = load_hardware_approval_receipt(hardware_reference)
+        except ValueError as exc:
+            errors.append(f"invalid hardware approval receipt for AUTO: {exc}")
+        else:
+            if receipt.schema != HARDWARE_APPROVAL_V2_SCHEMA:
+                errors.append(
+                    "hardware approval receipt v2 is required for AUTO; "
+                    f"got {receipt.schema}"
+                )
+            if not receipt.approved:
+                errors.append("hardware approval receipt approved is false")
+            if receipt.approved_mode != "auto":
+                errors.append(
+                    "hardware approval approved_mode is not auto "
+                    f"({receipt.approved_mode!r})"
+                )
+            if receipt.site_id != profile.site_id:
+                errors.append(
+                    "hardware approval site_id mismatch: "
+                    f"expected {profile.site_id!r}, got {receipt.site_id!r}"
+                )
+            expected_frame = flight.coordinate_frame_id
+            if receipt.coordinate_frame_id != expected_frame:
+                errors.append(
+                    "hardware approval coordinate_frame_id mismatch: "
+                    f"expected {expected_frame!r}, got {receipt.coordinate_frame_id!r}"
+                )
+            bindings = (
+                ("profile_sha256", site_profile_approval_sha256(profile.source)),
+                ("route_sha256", profile.asset_sha256.route_json),
+                ("bundle_sha256", profile.asset_sha256.localization_bundle),
+            )
+            for key, expected in bindings:
+                if getattr(receipt, key) != expected:
+                    errors.append(
+                        f"hardware approval {key} mismatch: "
+                        f"expected {expected!r}, got {getattr(receipt, key)!r}"
+                    )
+            if receipt.approved_envelope.get("gps_required") is not False:
+                errors.append(
+                    "hardware approval approved_envelope.gps_required must be "
+                    "false (GPS is not an AUTO readiness requirement)"
+                )
+            trust_paths = (
+                hardware_reference.signature,
+                hardware_reference.signature_sha256,
+                hardware_reference.trust_store,
+                hardware_reference.trust_store_sha256,
+            )
+            if any(value is None for value in trust_paths):
+                errors.append(
+                    "signed hardware approval trust chain is required for AUTO"
+                )
+            else:
+                assert hardware_reference.signature is not None
+                assert hardware_reference.signature_sha256 is not None
+                assert hardware_reference.trust_store is not None
+                assert hardware_reference.trust_store_sha256 is not None
+                try:
+                    _verify_hardware_material_sha256(
+                        hardware_reference.signature,
+                        hardware_reference.signature_sha256,
+                        "hardware approval signature",
+                    )
+                    _verify_hardware_material_sha256(
+                        hardware_reference.trust_store,
+                        hardware_reference.trust_store_sha256,
+                        "hardware approval trust store",
+                    )
+                    try:
+                        from operator_interface.hardware_approval_trust import (
+                            verify_hardware_approval_receipt,
+                        )
+                    except ImportError:
+                        from hardware_approval_trust import (  # type: ignore
+                            verify_hardware_approval_receipt,
+                        )
+                    verdict = verify_hardware_approval_receipt(
+                        hardware_reference.receipt,
+                        signature=hardware_reference.signature,
+                        trust_store=hardware_reference.trust_store,
+                        expected_bindings={
+                            "site_id": profile.site_id,
+                            "coordinate_frame_id": flight.coordinate_frame_id,
+                            "profile_sha256": site_profile_approval_sha256(
+                                profile.source
+                            ),
+                            "route_sha256": profile.asset_sha256.route_json,
+                            "bundle_sha256": (
+                                profile.asset_sha256.localization_bundle
+                            ),
+                        },
+                    )
+                except (ImportError, ValueError) as exc:
+                    errors.append(f"hardware approval trust chain invalid: {exc}")
+                else:
+                    if not verdict.accepted:
+                        errors.append(
+                            "hardware approval trust chain rejected: "
+                            f"{verdict.reason_code}: {verdict.detail}"
+                        )
     return errors
 
 
@@ -686,14 +1095,16 @@ def load_site_profile(path: str | Path, *, validate_files: bool = True) -> SiteP
             f"of $ ` \" ' \\ : {source}"
         )
     localizer = raw.get("localizer", PRODUCTION_LOCALIZER_BACKEND)
-    if (
-        not isinstance(localizer, str)
-        or localizer.strip().lower() != PRODUCTION_LOCALIZER_BACKEND
-    ):
-        raise ValueError(
-            f"site profile localizer must be 'edm': {source}"
-        )
+    if not isinstance(localizer, str) or not localizer.strip():
+        raise ValueError(f"site profile localizer must be a non-empty string: {source}")
     localizer = localizer.strip().lower()
+    capabilities = _localizer_capabilities(localizer)
+    for key in capabilities.unsupported_assets:
+        value = raw.get(key)
+        if value not in (None, ""):
+            raise ValueError(
+                f"site profile localizer {localizer!r} does not support {key}: {source}"
+            )
     assets = raw.get("assets")
     if not isinstance(assets, dict):
         raise ValueError(f"site profile assets must be an object: {source}")
@@ -703,6 +1114,7 @@ def load_site_profile(path: str | Path, *, validate_files: bool = True) -> SiteP
         "localization_bundle",
         "megaloc_cache",
         "track_landmarks",
+        "reference_index",
         "poles_json",
     }
     unknown_assets = sorted(set(assets) - asset_keys)
@@ -740,6 +1152,12 @@ def load_site_profile(path: str | Path, *, validate_files: bool = True) -> SiteP
             "localizer_profile",
             required=False,
         ),
+        reference_index=_resolve_asset(
+            base,
+            assets.get("reference_index"),
+            "reference_index",
+            required=False,
+        ),
         map_reference_poses=_resolve_asset(
             base,
             raw.get("map_reference_poses"),
@@ -768,6 +1186,17 @@ def load_site_profile(path: str | Path, *, validate_files: bool = True) -> SiteP
             raw.get("hardware_approval"), source, base
         ),
     )
+    if profile.reference_index is not None:
+        if profile.reference_index.name != "SHA256SUMS.json":
+            raise ValueError(
+                "site profile assets.reference_index must point to the index "
+                f"SHA256SUMS.json manifest: {source}"
+            )
+        if profile.megaloc_cache is not None:
+            raise ValueError(
+                "site profile must choose either assets.reference_index or "
+                f"assets.megaloc_cache, not both: {source}"
+            )
     if (
         profile.coordinate_frame is not None
         and profile.flight is not None
@@ -791,11 +1220,24 @@ def load_site_profile(path: str | Path, *, validate_files: bool = True) -> SiteP
                 ("map_reference_poses", profile.map_reference_poses),
                 ("map_align", profile.map_align),
                 ("localizer_profile", profile.localizer_profile),
+                ("reference_index", profile.reference_index),
                 (
                     "hardware_approval.receipt",
                     None
                     if profile.hardware_approval is None
                     else profile.hardware_approval.receipt,
+                ),
+                (
+                    "hardware_approval.signature",
+                    None
+                    if profile.hardware_approval is None
+                    else profile.hardware_approval.signature,
+                ),
+                (
+                    "hardware_approval.trust_store",
+                    None
+                    if profile.hardware_approval is None
+                    else profile.hardware_approval.trust_store,
                 ),
             )
             if asset is not None and not asset.is_file()

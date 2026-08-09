@@ -222,6 +222,63 @@ class DesktopRouteAutonomy:
             self._send_zero("auto_stream_unhealthy")
             return False, "AUTO stream unhealthy", (0, 0, 0, 0)
 
+        speed_guard_active, rejection = self._apply_speed_guard(pcmd)
+        if rejection is not None:
+            return rejection
+        return self._dispatch_route_pcmd(pcmd, speed_guard_active=speed_guard_active)
+
+    def _apply_speed_guard(self, pcmd: tuple[int, int, int, int]):
+        """Hover on fresh measured overspeed; stale speed only disables this guard."""
+
+        speed_sample = self._ground_speed()
+        try:
+            speed_limit = float(self.backend.state.autonomous_speed_limit_mps)
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            speed_limit = float("nan")
+        speed_guard_active = False
+        if speed_sample is not None and math.isfinite(speed_limit) and speed_limit > 0.0:
+            speed_mps, speed_stamp = speed_sample
+            speed_guard_active = (
+                0.0 <= self.now() - speed_stamp <= pff.GROUND_SPEED_MAX_AGE_S
+            )
+            if (
+                speed_guard_active
+                and (int(pcmd[0]) != 0 or int(pcmd[1]) != 0)
+                and speed_mps > speed_limit
+            ):
+                self.backend.state.autonomous_speed_guard_status = "OVERSPEED_HOVER"
+                self._clear_motion()
+                self._send_zero("auto_overspeed_hover")
+                return (
+                    speed_guard_active,
+                    (
+                        False,
+                        f"AUTO speed limit {speed_limit:g} m/s exceeded "
+                        f"({speed_mps:g} m/s) -> HOVER",
+                        (0, 0, 0, 0),
+                    ),
+                )
+        self.backend.state.autonomous_speed_guard_status = (
+            "FRESH_SPEED_GUARD" if speed_guard_active else "COMMAND_CAP_ONLY"
+        )
+        return speed_guard_active, None
+
+    @staticmethod
+    def _route_pcmd_reason(accepted: bool, speed_guard_active: bool) -> str:
+        if not accepted:
+            return "AUTO PCMD rejected"
+        if speed_guard_active:
+            return "desktop AUTO fresh-speed guard + command cap"
+        return "desktop AUTO command cap only (fresh speed unavailable)"
+
+    def _dispatch_route_pcmd(
+        self,
+        pcmd: tuple[int, int, int, int],
+        *,
+        speed_guard_active: bool,
+    ):
+        """Send through the backend's normalized vector seam or direct PCMD."""
+
         pct = max(1, int(getattr(self.backend, "nudge_pct", 10) or 10))
         vector = tuple(max(-1.0, min(1.0, float(value) / pct)) for value in pcmd)
         setter = getattr(self.backend, "set_nudge_vector", None)
@@ -232,7 +289,7 @@ class DesktopRouteAutonomy:
                 return False, f"AUTO PCMD failed: {exc!r}", None
             return (
                 accepted,
-                "desktop AUTO deadman refreshed" if accepted else "AUTO PCMD rejected",
+                self._route_pcmd_reason(accepted, speed_guard_active),
                 tuple(int(value) for value in pcmd) if accepted else None,
             )
 
@@ -241,7 +298,8 @@ class DesktopRouteAutonomy:
             accepted = bool(send(*pcmd, reason="desktop_auto_route"))
         except Exception as exc:
             return False, f"AUTO PCMD failed: {exc!r}", None
-        return accepted, "desktop AUTO PCMD" if accepted else "AUTO PCMD rejected", (
+        reason = self._route_pcmd_reason(accepted, speed_guard_active)
+        return accepted, reason, (
             tuple(int(value) for value in pcmd) if accepted else None
         )
 
@@ -256,7 +314,7 @@ class DesktopRouteAutonomy:
         state = self.backend.state
         try:
             speed = float(state.ground_speed_mps)
-            stamp = int(state.telemetry_read_mono_ns) / 1_000_000_000.0
+            stamp = int(state.ground_speed_mono_ns) / 1_000_000_000.0
         except (AttributeError, TypeError, ValueError, OverflowError):
             return None
         if not math.isfinite(speed) or not math.isfinite(stamp):

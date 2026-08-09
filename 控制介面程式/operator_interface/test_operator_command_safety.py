@@ -28,6 +28,7 @@ from flight_operator_app import (
     next_tick_deadline,
     video_hud_identity,
 )
+from operator_shutdown import OperatorShutdownCoordinator
 
 
 class _Backend:
@@ -90,6 +91,7 @@ def _complete_preflight(operator) -> None:
 
 def _make_autonomy_runtime_ready(operator) -> None:
     operator._autonomy_profile_verified = True
+    operator.backend.state.live_auto_release_ready = True
     operator.localizer = SimpleNamespace(
         ready=True, request_relocalize=lambda: None
     )
@@ -624,6 +626,107 @@ def test_integrated_auto_does_not_create_coordinator_when_runtime_approval_is_in
     assert operator.backend.calls == []
 
 
+def test_integrated_auto_is_fail_closed_without_live_release_approval(
+    tmp_path, monkeypatch
+) -> None:
+    created = []
+
+    class Coordinator:
+        phase = "IDLE"
+        boot_timeout_s = 1.0
+
+        def __init__(self, **_kwargs):
+            created.append(self)
+
+        def start(self):
+            return True
+
+    profile = SimpleNamespace(
+        site_id="field-a",
+        flight=SimpleNamespace(
+            approved=True,
+            route_clearance_approved=True,
+            coordinate_frame_id="glomap-a",
+        ),
+    )
+    operator = _bare_app()
+    operator.backend.is_live = True
+    operator.backend.state = SimpleNamespace(
+        autonomous_locked=False,
+        autonomous_approval_valid=True,
+        live_auto_release_ready=False,
+    )
+    operator.inspecting = True
+    _make_autonomy_runtime_ready(operator)
+    operator.backend.state.live_auto_release_ready = False
+    _complete_preflight(operator)
+    operator.mission_route_lock = _RouteLock()
+    operator._displayed_route_sha256 = "a" * 64
+    operator.site_profile_path = tmp_path / "profile.json"
+    operator._active_site_map_frame = lambda: object()
+    operator._reset_virtual_sticks = lambda: None
+    operator.logs = []
+    operator.write_log = operator.logs.append
+    monkeypatch.setattr(app, "DesktopRouteAutonomy", Coordinator)
+    monkeypatch.setattr(app, "load_site_profile", lambda _path: profile)
+    monkeypatch.setattr(
+        app, "flight_readiness_errors", lambda _profile: [], raising=False
+    )
+
+    operator.send("start_auto")
+
+    assert created == []
+    assert operator.__dict__.get("_integrated_autonomy") is None
+    assert not operator.mission_route_lock.active
+    assert any("發布阻擋" in message for message in operator.logs)
+
+
+def test_profile_verification_cannot_clear_temporary_live_release_block() -> None:
+    operator = _bare_app()
+    operator.backend.is_live = True
+    operator.backend.session_config = SimpleNamespace(autonomous_locked=False)
+    operator.backend.state = SimpleNamespace(live_auto_release_ready=True)
+    operator._active_site_autonomy_errors = lambda: ()
+
+    operator._sync_autonomy_profile_approval()
+
+    assert operator._autonomy_profile_verified is True
+    assert operator.backend.state.autonomous_locked is False
+    assert operator.backend.state.autonomous_approval_valid is True
+    assert operator.backend.state.live_auto_release_ready is False
+
+
+def test_runtime_unlock_cannot_bypass_site_profile_readiness() -> None:
+    operator = _bare_app()
+    operator.backend.is_live = True
+    operator.backend.session_config = SimpleNamespace(autonomous_locked=False)
+    operator.backend.state = SimpleNamespace(live_auto_release_ready=True)
+    operator._active_site_autonomy_errors = lambda: ("signed receipt missing",)
+
+    operator._sync_autonomy_profile_approval()
+
+    assert operator._autonomy_profile_verified is False
+    assert operator.backend.state.autonomous_locked is True
+    assert operator.backend.state.autonomous_approval_valid is False
+    assert operator.backend.state.live_auto_release_ready is False
+
+
+def test_runtime_lock_remains_an_additional_site_profile_blocker() -> None:
+    operator = _bare_app()
+    operator.backend.is_live = True
+    operator.backend.session_config = SimpleNamespace(autonomous_locked=True)
+    operator.backend.state = SimpleNamespace(live_auto_release_ready=True)
+    operator._active_site_autonomy_errors = lambda: ()
+
+    operator._sync_autonomy_profile_approval()
+
+    assert operator._autonomy_profile_verified is False
+    assert operator.backend.state.autonomous_locked is True
+    assert operator.backend.state.autonomous_approval_valid is False
+    assert "runtime configuration" in operator._autonomy_profile_errors[0]
+    assert operator.backend.state.live_auto_release_ready is False
+
+
 @pytest.mark.parametrize("gps_fixed", [False, None], ids=["no-fix", "unknown"])
 def test_integrated_auto_takeoff_allows_missing_gps_when_geofence_is_off(
     tmp_path, monkeypatch, gps_fixed
@@ -749,6 +852,13 @@ def test_ui_exposes_integrated_autonomy_and_separate_localization() -> None:
         for button in app.MISSION_MODE_BUTTONS
     )
     assert 'text="自主巡檢未接入此介面"' not in source
+
+
+def test_ui_does_not_claim_an_unconditional_physical_speed_limit() -> None:
+    source = inspect.getsource(OperatorApp._build_ui)
+
+    assert "新鮮速度時強制" in source
+    assert "無速度讀回僅套用 PCMD command cap" in source
 
 
 def test_operator_ui_cannot_force_megaloc_outside_boot_or_lost() -> None:
@@ -1353,6 +1463,99 @@ def test_emergency_cleanup_lands_and_survives_a_failing_backend():
     assert "live_backend.cleanup()" in body, "exit path does not land"
     assert "except Exception" in body, "a broken backend would abort the exit path"
     assert "session_logs.close" in body, "exit path does not close the session log"
+
+
+class _ShutdownSessionLog:
+    def __init__(self):
+        self.reasons = []
+
+    def close(self, *, reason):
+        self.reasons.append(reason)
+
+
+class _ShutdownBackend:
+    is_live = True
+
+    def __init__(self, result=True, error=None):
+        self.result = result
+        self.error = error
+        self.calls = 0
+
+    def cleanup(self):
+        self.calls += 1
+        if self.error is not None:
+            raise self.error
+        return self.result
+
+
+def test_shutdown_coordinator_keeps_live_session_open_when_cleanup_rejected():
+    backend = _ShutdownBackend(result=False)
+    session_logs = _ShutdownSessionLog()
+    destroyed = []
+    messages = []
+    coordinator = OperatorShutdownCoordinator(
+        backend=backend,
+        session_logs=session_logs,
+        write_log=messages.append,
+        destroy=lambda: destroyed.append(True),
+    )
+
+    assert coordinator.shutdown() is False
+    assert backend.calls == 1
+    assert session_logs.reasons == []
+    assert destroyed == []
+    assert any("重試" in message for message in messages)
+
+
+def test_shutdown_coordinator_keeps_live_session_open_when_cleanup_raises():
+    backend = _ShutdownBackend(error=RuntimeError("landing unavailable"))
+    session_logs = _ShutdownSessionLog()
+    destroyed = []
+    messages = []
+    coordinator = OperatorShutdownCoordinator(
+        backend=backend,
+        session_logs=session_logs,
+        write_log=messages.append,
+        destroy=lambda: destroyed.append(True),
+    )
+
+    assert coordinator.shutdown() is False
+    assert session_logs.reasons == []
+    assert destroyed == []
+    assert any("例外" in message for message in messages)
+
+
+def test_shutdown_coordinator_allows_legacy_non_live_cleanup_none():
+    backend = _ShutdownBackend(result=None)
+    backend.is_live = False
+    session_logs = _ShutdownSessionLog()
+    destroyed = []
+    coordinator = OperatorShutdownCoordinator(
+        backend=backend,
+        session_logs=session_logs,
+        write_log=lambda _message: None,
+        destroy=lambda: destroyed.append(True),
+    )
+
+    assert coordinator.shutdown(reason="sim_close") is True
+    assert session_logs.reasons == ["sim_close"]
+    assert destroyed == [True]
+
+
+def test_operator_on_close_keeps_window_when_live_cleanup_fails():
+    operator = OperatorApp.__new__(OperatorApp)
+    operator.backend = _ShutdownBackend(result=False)
+    operator.session_logs = _ShutdownSessionLog()
+    operator.logs = []
+    operator.write_log = operator.logs.append
+    destroyed = []
+    operator.destroy = lambda: destroyed.append(True)
+
+    operator._on_close()
+
+    assert operator.session_logs.reasons == []
+    assert destroyed == []
+    assert any("重試" in message for message in operator.logs)
 
 
 class _FakeStick:

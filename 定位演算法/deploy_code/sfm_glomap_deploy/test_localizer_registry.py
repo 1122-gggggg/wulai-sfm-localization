@@ -1,0 +1,35 @@
+from __future__ import annotations
+
+import pytest
+
+from localizer_registry import (
+    get_localizer_capabilities,
+    get_localizer_provider,
+    registered_localizer_names,
+)
+
+
+def test_named_providers_expose_backend_capabilities() -> None:
+    assert registered_localizer_names() == ("edm", "xfeat")
+
+    edm = get_localizer_provider("edm")
+    assert edm.name == "edm"
+    assert edm.capabilities.required_assets == ("localizer_profile",)
+    assert edm.capabilities.supports_production_profile is True
+
+    xfeat = get_localizer_capabilities("xfeat")
+    assert xfeat.name == "xfeat"
+    assert xfeat.required_assets == ()
+    assert xfeat.supports_production_profile is False
+
+
+def test_unknown_backend_fails_closed() -> None:
+    with pytest.raises(ValueError, match="unsupported localizer backend"):
+        get_localizer_provider("unknown")
+
+
+def test_factory_attaches_named_provider_builders() -> None:
+    import production_localizer_factory  # noqa: F401
+
+    assert get_localizer_provider("edm").builder is not None
+    assert get_localizer_provider("xfeat").builder is not None

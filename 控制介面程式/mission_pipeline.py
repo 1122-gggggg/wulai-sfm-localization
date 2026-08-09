@@ -85,6 +85,8 @@ _SITE_ASSET_ENV_VARS = (
     "SFM_POLES_JSON",
     "SFM_RELOC_BUNDLE",
     "SFM_MEGALOC_CACHE",
+    "SFM_REFERENCE_INDEX",
+    "SFM_REFERENCE_INDEX_SHA256",
     "SFM_TRACK_LANDMARKS",
     "SFM_LOCALIZER_BACKEND",
     "SFM_LOCALIZER_DEPLOY_DIR",
@@ -339,6 +341,11 @@ def resolve_mission_site_assets(
             ("--map-ply", getattr(args, "map_ply", None)),
             ("--bundle", getattr(args, "bundle", None)),
             ("--megaloc-cache", getattr(args, "megaloc_cache", None)),
+            ("--reference-index", getattr(args, "reference_index", None)),
+            (
+                "--reference-index-sha256",
+                getattr(args, "reference_index_sha256", None),
+            ),
             ("--track-landmarks", getattr(args, "track_landmarks", None)),
             ("--path-json", getattr(args, "path_json", None)),
             ("--poles-json", getattr(args, "poles_json", None)),
@@ -380,6 +387,11 @@ def resolve_mission_site_assets(
         args.map_ply = str(profile.map_ply)
         args.bundle = str(profile.localization_bundle)
         args.megaloc_cache = str(profile.megaloc_cache or "")
+        args.reference_index = str(getattr(profile, "reference_index", None) or "")
+        args.reference_index_sha256 = str(
+            getattr(getattr(profile, "asset_sha256", None), "reference_index", None)
+            or ""
+        )
         args.track_landmarks = str(profile.track_landmarks or "")
         args.path_json = str(route)
         args.poles_json = str(poles)
@@ -396,6 +408,10 @@ def resolve_mission_site_assets(
     args.bundle = str(DEFAULT_FLIGHT_BUNDLE if args.bundle is None else args.bundle)
     args.megaloc_cache = str(
         DEFAULT_MEGALOC_CACHE if args.megaloc_cache is None else args.megaloc_cache
+    )
+    args.reference_index = str(getattr(args, "reference_index", None) or "")
+    args.reference_index_sha256 = str(
+        getattr(args, "reference_index_sha256", None) or ""
     )
     args.track_landmarks = str(
         os.environ.get("SFM_TRACK_LANDMARKS", "")
@@ -418,6 +434,8 @@ def env_with_mission(args, profile: SiteProfile | None = None) -> dict[str, str]
     env["SFM_WORKSPACE_ROOT"] = str(SYSTEM_ROOT)
     env["SFM_RELOC_BUNDLE"] = args.bundle
     env["SFM_MEGALOC_CACHE"] = args.megaloc_cache
+    env["SFM_REFERENCE_INDEX"] = args.reference_index
+    env["SFM_REFERENCE_INDEX_SHA256"] = args.reference_index_sha256
     env["SFM_TRACK_LANDMARKS"] = args.track_landmarks
     env["SFM_MAP_PLY"] = args.map_ply
     env["SFM_FLIGHT_PATH_JSON"] = args.path_json
@@ -466,6 +484,14 @@ def env_with_mission(args, profile: SiteProfile | None = None) -> dict[str, str]
                 ),
                 "map_reference_poses_sha256": profile.asset_sha256.map_reference_poses,
                 "localizer_profile_sha256": profile.asset_sha256.localizer_profile,
+                "reference_index": (
+                    None
+                    if getattr(profile, "reference_index", None) is None
+                    else str(profile.reference_index)
+                ),
+                "reference_index_sha256": getattr(
+                    profile.asset_sha256, "reference_index", None
+                ),
                 "poles_sha256": profile.asset_sha256.poles_json,
             })
         else:
@@ -526,6 +552,8 @@ def main() -> None:
     parser.add_argument("--map-ply", default=None)
     parser.add_argument("--bundle", default=None)
     parser.add_argument("--megaloc-cache", default=None)
+    parser.add_argument("--reference-index", default=None)
+    parser.add_argument("--reference-index-sha256", default=None)
     parser.add_argument("--track-landmarks", default=None)
     parser.add_argument("--path-json", default=None)
     parser.add_argument("--poles-json", default=None)

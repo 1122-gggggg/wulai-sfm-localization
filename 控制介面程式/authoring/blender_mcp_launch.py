@@ -25,7 +25,7 @@ SETUP = os.environ.get("SFM_BLENDER_SETUP", f"{ROOT}/scripts/blender_safezone.py
 
 # 1) build the safezone scene
 with open(SETUP) as f:
-    exec(compile(f.read(), SETUP, "exec"), {"__name__": "__setup__"})
+    exec(compile(f.read(), SETUP, "exec"), {"__name__": "__setup__"})  # noqa: S102 - Blender must load the operator-selected setup script in-process.
 
 # 2) register the official blender-mcp addon
 sys.path.insert(0, TOOLS)

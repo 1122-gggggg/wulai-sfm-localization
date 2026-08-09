@@ -4,10 +4,13 @@ import argparse
 import hashlib
 import json
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from Cryptodome.PublicKey import ECC
+from Cryptodome.Signature import eddsa
 
 import flight_operator_app as app
 import mission_pipeline
@@ -18,10 +21,17 @@ from live_localizer_worker import (
 )
 from edm_localizer_adapter import production_edm_config
 from production_localizer_factory import validate_camera_tuple
+from hardware_approval_trust import (
+    TRUST_STORE_SCHEMA,
+    attach_detached_signature,
+    canonical_json_bytes,
+    create_unsigned_signing_payload,
+)
 from site_profile import (
     flight_readiness_errors,
     load_hardware_approval_receipt,
     load_site_profile,
+    site_profile_approval_sha256,
 )
 
 
@@ -83,13 +93,85 @@ def test_site_profile_resolves_all_paths_relative_to_profile(tmp_path: Path) -> 
     assert profile.poles_json == (tmp_path / "assets/poles.json").resolve()
 
 
-def test_site_profile_rejects_non_edm_localizer(tmp_path: Path) -> None:
+def test_site_profile_accepts_registered_xfeat_localizer(tmp_path: Path) -> None:
     profile_path = _write_profile(tmp_path)
     raw = json.loads(profile_path.read_text(encoding="utf-8"))
     raw["localizer"] = "xfeat"
     profile_path.write_text(json.dumps(raw), encoding="utf-8")
 
-    with pytest.raises(ValueError, match="must be 'edm'"):
+    profile = load_site_profile(profile_path)
+    assert profile.localizer == "xfeat"
+    assert all("localizer_profile" not in error for error in flight_readiness_errors(profile))
+
+
+def test_site_profile_rejects_cache_and_reference_index_together(
+    tmp_path: Path,
+) -> None:
+    profile_path = _write_profile(tmp_path)
+    index_dir = tmp_path / "assets" / "index"
+    index_dir.mkdir()
+    (index_dir / "SHA256SUMS.json").write_text("{}", encoding="utf-8")
+    raw = json.loads(profile_path.read_text(encoding="utf-8"))
+    raw["localizer"] = "xfeat"
+    raw["assets"]["reference_index"] = "assets/index/SHA256SUMS.json"
+    profile_path.write_text(json.dumps(raw), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="either assets.reference_index"):
+        load_site_profile(profile_path)
+
+
+def test_site_profile_reference_index_must_name_its_manifest(
+    tmp_path: Path,
+) -> None:
+    profile_path = _write_profile(tmp_path)
+    raw = json.loads(profile_path.read_text(encoding="utf-8"))
+    raw["localizer"] = "xfeat"
+    raw["assets"].pop("megaloc_cache")
+    raw["assets"]["reference_index"] = "assets/index.json"
+    profile_path.write_text(json.dumps(raw), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="SHA256SUMS.json manifest"):
+        load_site_profile(profile_path, validate_files=False)
+
+
+def test_site_profile_requires_backend_specific_edm_profile(tmp_path: Path) -> None:
+    profile_path = _write_profile(tmp_path)
+    raw = json.loads(profile_path.read_text(encoding="utf-8"))
+    raw["schema_version"] = 2
+    raw["localizer"] = "edm"
+    raw["flight"] = {
+        "approved": False,
+        "coordinate_frame_id": "test-frame-v1",
+        "route_clearance_approved": False,
+        "approval_note": "ground only",
+        "controller": None,
+    }
+    profile_path.write_text(json.dumps(raw), encoding="utf-8")
+
+    profile = load_site_profile(profile_path)
+    assert "missing EDM localizer_profile" in flight_readiness_errors(profile)
+
+
+def test_xfeat_profile_rejects_edm_only_profile_asset(tmp_path: Path) -> None:
+    profile_path = _write_profile(tmp_path)
+    runtime_profile = tmp_path / "edm.json"
+    runtime_profile.write_text("{}", encoding="utf-8")
+    raw = json.loads(profile_path.read_text(encoding="utf-8"))
+    raw["localizer"] = "xfeat"
+    raw["localizer_profile"] = runtime_profile.name
+    profile_path.write_text(json.dumps(raw), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="does not support localizer_profile"):
+        load_site_profile(profile_path)
+
+
+def test_site_profile_rejects_unknown_localizer(tmp_path: Path) -> None:
+    profile_path = _write_profile(tmp_path)
+    raw = json.loads(profile_path.read_text(encoding="utf-8"))
+    raw["localizer"] = "unknown"
+    profile_path.write_text(json.dumps(raw), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="registered localizer backend"):
         load_site_profile(profile_path)
 
 
@@ -253,31 +335,258 @@ def test_hardware_approval_receipt_is_hash_verified(tmp_path: Path) -> None:
         load_hardware_approval_receipt(profile.hardware_approval)
 
 
-def test_all_shipped_profiles_are_scale_free_and_only_river_is_approved() -> None:
+def _attach_v2_hardware_receipt(profile_path: Path, **overrides: object) -> Path:
+    raw = json.loads(profile_path.read_text(encoding="utf-8"))
+    raw["query_camera"] = {
+        "model": "PINHOLE",
+        "width": 1280,
+        "height": 720,
+        "params": [931.2, 931.2, 640.0, 360.0],
+    }
+    raw.pop("hardware_approval", None)
+    profile_path.write_text(json.dumps(raw), encoding="utf-8")
+    receipt = {
+        "schema": "anafi-hardware-approval/v2",
+        "approved": True,
+        "site_id": "test_site",
+        "coordinate_frame_id": "test-frame-v1",
+        "profile_sha256": site_profile_approval_sha256(profile_path),
+        "route_sha256": "c" * 64,
+        "bundle_sha256": "b" * 64,
+        "approved_mode": "auto",
+        "aircraft": {
+            "product": "ANAFI",
+            "serial": "ANAFI-L105488",
+            "firmware_versions": ["1.8.2"],
+        },
+        "controller": {
+            "product": "SkyController 3",
+            "serial": "SC3-001",
+            "firmware_versions": ["1.8.1"],
+        },
+        "olympe_versions": ["8.4.0"],
+        "approved_envelope": {
+            "max_altitude_m": 20.0,
+            "max_distance_m": 50.0,
+            "max_tilt_deg": 15.0,
+            "max_vertical_speed_ms": 2.0,
+            "max_rotation_speed_degs": 20.0,
+            "gps_required": False,
+        },
+        "approval_note": "Props-off and ground checks recorded; AUTO not implied.",
+    }
+    receipt.update(overrides)
+    receipt_path = profile_path.parent / "hardware-approval-v2.json"
+    receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+    raw["hardware_approval"] = {
+        "receipt": receipt_path.name,
+        "sha256": hashlib.sha256(receipt_path.read_bytes()).hexdigest(),
+    }
+    profile_path.write_text(json.dumps(raw), encoding="utf-8")
+    return receipt_path
+
+
+def _attach_signed_v2_hardware_receipt(profile_path: Path) -> None:
+    receipt_path = _attach_v2_hardware_receipt(profile_path)
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    now = datetime.now(timezone.utc)
+
+    def timestamp(value: datetime) -> str:
+        return value.isoformat(timespec="seconds").replace("+00:00", "Z")
+
+    key = ECC.generate(curve="ed25519")
+    unsigned = create_unsigned_signing_payload(
+        receipt,
+        key_id="test-field-authority",
+        issued_at=timestamp(now - timedelta(minutes=1)),
+        expires_at=timestamp(now + timedelta(hours=1)),
+    )
+    signature = eddsa.new(key, "rfc8032").sign(canonical_json_bytes(unsigned))
+    signature_path = profile_path.parent / "hardware-approval-v2.signature.json"
+    signature_path.write_text(
+        json.dumps(attach_detached_signature(unsigned, signature)),
+        encoding="utf-8",
+    )
+    trust_path = profile_path.parent / "hardware-approval-trust.json"
+    trust_path.write_text(
+        json.dumps({
+            "schema": TRUST_STORE_SCHEMA,
+            "keys": [{
+                "key_id": "test-field-authority",
+                "public_key": key.public_key().export_key(format="raw").hex(),
+                "role": "field_hardware_authority",
+                "permissions": ["hardware_approval:auto"],
+                "not_before": timestamp(now - timedelta(days=1)),
+                "not_after": timestamp(now + timedelta(days=1)),
+                "revoked": False,
+            }],
+        }),
+        encoding="utf-8",
+    )
+    raw = json.loads(profile_path.read_text(encoding="utf-8"))
+    raw["hardware_approval"].update({
+        "signature": signature_path.name,
+        "signature_sha256": hashlib.sha256(
+            signature_path.read_bytes()
+        ).hexdigest(),
+        "trust_store": trust_path.name,
+        "trust_store_sha256": hashlib.sha256(trust_path.read_bytes()).hexdigest(),
+    })
+    profile_path.write_text(json.dumps(raw), encoding="utf-8")
+
+
+def test_hardware_approval_receipt_v2_loads_bound_identity_and_envelope(
+    tmp_path: Path,
+) -> None:
+    profile_path = _approved_profile(tmp_path)
+    _attach_v2_hardware_receipt(profile_path)
+
+    profile = load_site_profile(profile_path, validate_files=False)
+    receipt = load_hardware_approval_receipt(profile.hardware_approval)
+
+    assert receipt.site_id == "test_site"
+    assert receipt.coordinate_frame_id == "test-frame-v1"
+    assert receipt.profile_sha256 == site_profile_approval_sha256(profile_path)
+    assert receipt.route_sha256 == "c" * 64
+    assert receipt.bundle_sha256 == "b" * 64
+    assert receipt.approved_mode == "auto"
+    assert receipt.aircraft_serial == "ANAFI-L105488"
+    assert receipt.controller_serial == "SC3-001"
+    assert receipt.approved_envelope["gps_required"] is False
+
+
+def test_site_profile_approval_digest_ignores_only_hardware_reference(
+    tmp_path: Path,
+) -> None:
+    profile_path = _approved_profile(tmp_path)
+    before = site_profile_approval_sha256(profile_path)
+    raw = json.loads(profile_path.read_text(encoding="utf-8"))
+    raw["hardware_approval"] = {
+        "receipt": "receipt.json",
+        "sha256": "a" * 64,
+    }
+    profile_path.write_text(json.dumps(raw), encoding="utf-8")
+
+    assert site_profile_approval_sha256(profile_path) == before
+
+    raw["flight"]["approval_note"] = "changed safety decision"
+    profile_path.write_text(json.dumps(raw), encoding="utf-8")
+    assert site_profile_approval_sha256(profile_path) != before
+
+
+def test_auto_readiness_rejects_unsigned_v2_receipt(tmp_path: Path) -> None:
+    profile_path = _approved_profile(tmp_path)
+    _attach_v2_hardware_receipt(profile_path)
+
+    errors = flight_readiness_errors(
+        load_site_profile(profile_path, validate_files=False)
+    )
+
+    assert any("signed hardware approval trust chain" in error for error in errors)
+
+
+def test_auto_readiness_accepts_valid_signed_v2_receipt(tmp_path: Path) -> None:
+    profile_path = _approved_profile(tmp_path)
+    _attach_signed_v2_hardware_receipt(profile_path)
+
+    errors = flight_readiness_errors(
+        load_site_profile(profile_path, validate_files=False)
+    )
+
+    assert errors == []
+
+
+@pytest.mark.parametrize(
+    ("filename", "reason"),
+    [
+        ("hardware-approval-v2.signature.json", "signature SHA-256 mismatch"),
+        ("hardware-approval-trust.json", "trust store SHA-256 mismatch"),
+    ],
+)
+def test_auto_readiness_rejects_tampered_signed_material(
+    tmp_path: Path, filename: str, reason: str
+) -> None:
+    profile_path = _approved_profile(tmp_path)
+    _attach_signed_v2_hardware_receipt(profile_path)
+    profile = load_site_profile(profile_path, validate_files=False)
+    (tmp_path / filename).write_text("{}", encoding="utf-8")
+
+    errors = flight_readiness_errors(profile)
+
+    assert any(reason in error for error in errors)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "reason"),
+    [
+        ("site_id", "other_site", "hardware approval site_id mismatch"),
+        (
+            "coordinate_frame_id",
+            "other-frame",
+            "hardware approval coordinate_frame_id mismatch",
+        ),
+        ("profile_sha256", "f" * 64, "hardware approval profile_sha256 mismatch"),
+        ("route_sha256", "d" * 64, "hardware approval route_sha256 mismatch"),
+        ("bundle_sha256", "a" * 64, "hardware approval bundle_sha256 mismatch"),
+        ("approved_mode", "manual", "hardware approval approved_mode is not auto"),
+    ],
+)
+def test_auto_readiness_rejects_unbound_or_manual_hardware_receipt(
+    tmp_path: Path, field: str, value: object, reason: str,
+) -> None:
+    profile_path = _approved_profile(tmp_path)
+    _attach_v2_hardware_receipt(profile_path, **{field: value})
+
+    errors = flight_readiness_errors(
+        load_site_profile(profile_path, validate_files=False)
+    )
+
+    assert any(reason in error for error in errors), errors
+
+
+def test_all_shipped_profiles_are_scale_free_and_none_is_auto_approved() -> None:
     profiles_dir = Path(__file__).resolve().parents[1] / "site_profiles"
     for path in profiles_dir.glob("*.json"):
         raw = json.loads(path.read_text(encoding="utf-8"))
         assert raw["schema_version"] == 2, path
         assert "map_units_per_meter" not in raw.get("flight", {}), path
-        approved = path.name == "river_site_edm.json"
-        assert raw["flight"]["approved"] is approved, path
-        assert raw["flight"]["route_clearance_approved"] is approved, path
+        assert raw["flight"]["approved"] is False, path
+        assert raw["flight"]["route_clearance_approved"] is False, path
         profile = load_site_profile(path, validate_files=False)
         assert profile.schema_version == 2
 
 
-def test_river_profile_loads_the_approved_reference_hardware_versions() -> None:
+def test_urai_profile_loads_the_manual_v2_hardware_reference() -> None:
     profile_path = (
-        Path(__file__).resolve().parents[1] / "site_profiles" / "river_site_edm.json"
+        Path(__file__).resolve().parents[1] / "site_profiles" / "urai_edm.json"
     )
 
     profile = load_site_profile(profile_path)
     receipt = load_hardware_approval_receipt(profile.hardware_approval)
 
     assert receipt.approved
+    assert receipt.schema == "anafi-hardware-approval/v2"
+    assert receipt.site_id == "urai_edm_v1"
+    assert receipt.coordinate_frame_id == "target_site_v1_glomap"
+    assert receipt.approved_mode == "manual"
     assert receipt.aircraft_firmware_versions == ("1.8.2",)
     assert receipt.controller_firmware_versions == ("1.8.1",)
     assert receipt.olympe_versions == ("8.4.0",)
+
+
+def test_river_profile_has_no_site_hardware_receipt_and_stays_blocked() -> None:
+    profile_path = (
+        Path(__file__).resolve().parents[1]
+        / "site_profiles"
+        / "river_site_edm.json"
+    )
+
+    profile = load_site_profile(profile_path)
+
+    assert profile.hardware_approval is None
+    assert "flight.approved is false" in flight_readiness_errors(profile)
+    assert profile.flight is not None
+    assert "no site-specific real-hardware evidence" in profile.flight.approval_note
 
 
 def test_site_profile_loads_query_camera_calibration(tmp_path: Path) -> None:
@@ -653,7 +962,7 @@ def test_localizer_backend_auto_detects_edm_bundle_name() -> None:
 
 
 def _approved_profile(root: Path) -> Path:
-    """A profile that passes every readiness gate, so one removal shows up alone."""
+    """A complete flight contract; receipt helpers add the hardware trust gate."""
     profile_path = _write_profile(root)
     assets = root / "assets"
     (assets / "refs.json").write_bytes(b"x")
@@ -707,6 +1016,14 @@ def _approved_profile(root: Path) -> Path:
     }
     profile_path.write_text(json.dumps(raw), encoding="utf-8")
     return profile_path
+
+
+def test_autonomous_flight_requires_signed_hardware_approval(
+    tmp_path: Path,
+) -> None:
+    errors = flight_readiness_errors(load_site_profile(_approved_profile(tmp_path)))
+
+    assert "missing signed hardware approval receipt v2 for AUTO" in errors
 
 
 def test_autonomous_flight_requires_a_measured_map_alignment(tmp_path: Path) -> None:

@@ -5,8 +5,8 @@
  "localizer": "edm",
  "localizer_deploy_dir": "../../定位演算法/deploy_code/sfm_glomap_deploy",
  "hardware_approval": {
-  "receipt": "../../地圖檔/場域/urai/reports/hardware_approval_20260806.json",
-  "sha256": "7bd0cc5fe465044ea2e65f6ea6e8b751531275cfc6fedb4bdba59def2576dcdd"
+  "receipt": "../../地圖檔/場域/urai/reports/hardware_approval_20260806_v2.json",
+  "sha256": "941a4210dfe1bcf0d3f91418793a02f372e78ce065e1af12d90bb67f4586b449"
  },
  "localizer_profile": "../../定位演算法/configs/edm_production_profile.json",
  "map_reference_poses": "../../地圖檔/場域/urai/maps/edm_v1/target_site_ref_poses.json",
@@ -34,7 +34,7 @@
   "approved": false,
   "coordinate_frame_id": "target_site_v1_glomap",
   "route_clearance_approved": false,
-  "approval_note": "Blocked until a scale-free flight route, route-clearance review, coordinate ID, and props-off yaw-sign test exist.",
+  "approval_note": "AUTO blocked: the v2 hardware receipt records manual-only ground evidence; a scale-free flight route, route-clearance review, coordinate ID, and props-off yaw-sign test are still required.",
   "controller": null
  },
  "assets": {

@@ -123,7 +123,12 @@ def classify_output(name: str) -> str:
         return "governance"
     if name == "flight_logs":
         return "operations"
-    if name in {"validation", "validation_receipts", "production_stream_bench"}:
+    if name in {
+        "validation",
+        "validation_receipts",
+        "production_stream_bench",
+        "security",
+    }:
         return "validation"
     if AUDIT_OUTPUT_RE.fullmatch(name):
         return "governance"

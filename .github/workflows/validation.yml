@@ -22,6 +22,8 @@ jobs:
           python-version: "3.10"
       - name: Install hash-locked test dependencies
         run: python -m pip install --require-hashes -r requirements-test-lock.txt
+      - name: Install hash-locked quality dependencies
+        run: python -m pip install --require-hashes -r requirements-quality-lock.txt
       - name: First-party code quality gates
         run: |
           ruff check .
@@ -36,6 +38,30 @@ jobs:
             控制介面程式/operator_interface/localization_metrics.py \
             控制介面程式/operator_interface/test_localization_metrics.py
           python tools/check_maintainability.py
+          python -m mypy
+      - name: High-signal Ruff security gate
+        run: |
+          # Tests are assertion-heavy by design.  This bounded rule set targets
+          # dynamic execution, credentials, shell injection, and unsafe SQL/
+          # deserialization without claiming a whole-repository Bandit cleanup.
+          ruff check . \
+            --select S102,S105,S106,S107,S602,S604,S605,S608 \
+            --exclude '**/test*.py' \
+            --exclude '**/tests/**' \
+            --exclude '定位演算法/deploy_code/runtime/**'
+      - name: Dependency vulnerability audit and CycloneDX SBOM
+        run: |
+          python tools/security_dependency_gate.py \
+            --config pyproject.toml \
+            --audit-json outputs/security/pip-audit.json \
+            --sbom outputs/security/sbom.cyclonedx.json
+      - name: Upload dependency audit receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dependency-security-receipts
+          path: outputs/security/
+          if-no-files-found: ignore
       - name: Release metadata and workspace contracts
         run: |
           missing=()

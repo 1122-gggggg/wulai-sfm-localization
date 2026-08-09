@@ -77,8 +77,8 @@ symlink、容量與未分類 output。
 
 | owner 目錄 | 權威模組 |
 |---|---|
-| `deploy_code/sfm_glomap_deploy/` | `artifact_integrity.py`、`megaloc_cache.py`、`pose_types.py`、`production_xfeat_tracker.py`、`reloc_localizer_xfeat.py` |
-| `flight_control/` | `autoflight.py`、`manual_nudge_pilot.py`、`olympe_frame_source.py`、`path_follow_flight.py`、`plan_path.py`、`real_path_follow_controller.py` |
+| `deploy_code/sfm_glomap_deploy/` | `artifact_integrity.py`、`localizer_registry.py`、`megaloc_cache.py`、`pose_types.py`、`reference_index.py`、`production_xfeat_tracker.py`、`reloc_localizer_xfeat.py` |
+| `flight_control/` | `autoflight.py`、`manual_nudge_pilot.py`、`olympe_frame_source.py`、`path_follow_flight.py`、`plan_path.py`、`real_path_follow_controller.py`、`route_domain.py` |
 
 呼叫端直接從 owner 匯入，另一個目錄不得再放相容副本。CI 由下列命令驗證 owner
 存在、舊副本沒有回流，且沒有未分類的同名 runtime 檔案：
@@ -88,6 +88,49 @@ python 定位演算法/validation/check_runtime_mirrors.py
 ```
 
 兩個目錄都保有各自的 `README.md`，內容描述不同責任，這是唯一允許的同名檔案。
+
+## 飛行權限與安全資料流
+
+```text
+OperatorApp
+  │
+  ├─ OperatorCommandCoordinator：命令序列化、優先佇列與 shutdown suspend
+  └─ typed backend command
+          │
+          ├─ AuthorityController：MANUAL / PC_CONTROL 單一 owner
+          ├─ TakeoffLandingSupervisor：起飛後失敗的降落 fallback
+          └─ TelemetryFreshnessStore：逐欄位 freshness 與速度限制語意
+```
+
+真機 AUTO 另有獨立的 release latch。程式啟動與 profile 同步都會把 latch 設為
+關閉；即使一般起飛按鈕可用，也不能建立 live AUTO coordinator。未來解除阻擋前，
+必須同時通過四步 preflight、site/route 核准、資產雜湊、runtime lock，以及簽章的
+hardware approval receipt v2。GPS 不可用不會阻擋起飛，但只會停用依賴 GPS 的距離
+柵欄，不能繞過其他安全 gate。目前隨附的所有 site profile 都不具備 live AUTO
+核准。
+
+## 路線與定位替換邊界
+
+`flight_control/route_domain.py` 是 route JSON 的唯一解析、驗證與 controller
+conversion 邊界。profile 的 `site_id`、`coordinate_frame_id` 與 route 必須完全
+一致。localizer 由 `localizer_registry.py` 依 profile 建立，EDM 與 XFeat 都實作相同
+pose provider contract；呼叫端不得直接綁定某個 tracker。
+
+大量 reference 透過 `reference_index.py` 的磁碟式、可驗證 IVF index 讀取，descriptor
+與 posting array 使用 memory map，避免把 100k reference 全部載入 RAM。index
+metadata、陣列與模型 identity 都由 `SHA256SUMS.json` 固定。
+
+## Portable artifact 與信任邊界
+
+- `MANIFEST.tsv` / `SHA256SUMS`：Git source release 的完整性。
+- `RUNTIME_ARTIFACTS.json`：runtime 大型資產的來源、目標與 digest，不允許網路下載。
+- `PORTABLE_SITE_ASSETS.json`：匯出時選定 site profile 的離線資產清單。
+- hardware receipt、detached signature 與 trust store：分別固定內容、簽章及信任根，
+  三者都必須由 profile 以 SHA-256 綁定。
+
+portable exporter 只從 source repository 或明確指定的 offline artifact root 取得資產，
+拒絕 traversal、symlink 逸出與 digest 不符。portable 套件因此可在無 Git、無原始場域
+目錄的另一台電腦驗證與安裝；它不會因為攜帶 pending request 而取得 AUTO 權限。
 
 ## 支援的入口
 

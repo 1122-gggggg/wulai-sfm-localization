@@ -329,6 +329,12 @@ def build_argument_parser() -> argparse.ArgumentParser:
         help="trusted SHA-256 for the selected localization bundle",
     )
     ap.add_argument("--megaloc-cache", default=DEFAULT_MEGALOC)
+    ap.add_argument(
+        "--reference-index",
+        default="",
+        help="IVF index SHA256SUMS.json selected by the site profile",
+    )
+    ap.add_argument("--reference-index-sha256", default="")
     ap.add_argument("--deploy-dir", default=str(DEPLOY_DIR))
     ap.add_argument("--max-frames", type=int, default=0)
     ap.add_argument("--frame-shm-name", default="")
@@ -499,6 +505,8 @@ def main() -> None:
                 backend="edm",
                 bundle=args.bundle,
                 bundle_sha256=args.bundle_sha256 or None,
+                reference_index=args.reference_index or None,
+                reference_index_sha256=args.reference_index_sha256 or None,
                 frame_source=lambda: None,
                 camera_tuple=query_camera_override or CAM_720_EDM,
                 production_profile=args.production_profile or None,
@@ -533,43 +541,29 @@ def main() -> None:
                 file=sys.stderr, flush=True,
             )
         else:
-            from path_follow_flight import CAM_720, production_config
-            from production_xfeat_tracker import MegaLocLayer, ProductionXFeatTracker
-            from reloc_localizer_xfeat import Camera, DEVICE, XFeatRelocMap
+            from path_follow_flight import CAM_720
+            from production_localizer_factory import build_production_localizer
 
-            xmap = XFeatRelocMap.load(args.bundle)
-            cache = Path(args.megaloc_cache) if args.megaloc_cache else None
-            if cache is None:
-                print(
-                    "[live_worker] using bundle ref_global MegaLoc descriptors",
-                    file=sys.stderr, flush=True,
-                )
-                megaloc = MegaLocLayer(xmap.ref_global, input_size=322, device=DEVICE)
-            elif cache.exists():
-                try:
-                    megaloc = MegaLocLayer.load_cache(
-                        cache, xmap.ref_names, input_size=322, device=DEVICE)
-                except Exception as exc:
-                    print(
-                        f"[live_worker] MegaLoc cache incompatible ({exc}); "
-                        "using bundle ref_global",
-                        file=sys.stderr, flush=True,
-                    )
-                    megaloc = MegaLocLayer(xmap.ref_global, input_size=322, device=DEVICE)
-            else:
-                print(
-                    f"[live_worker] MegaLoc cache missing: {cache}; using bundle ref_global",
-                    file=sys.stderr, flush=True,
-                )
-                megaloc = MegaLocLayer(xmap.ref_global, input_size=322, device=DEVICE)
-
-            cam = Camera(*(query_camera_override or CAM_720))
-            cfg = production_config()
-            apply_xfeat_runtime_overrides(
-                cfg,
+            built = build_production_localizer(
+                backend="xfeat",
+                bundle=args.bundle,
+                bundle_sha256=args.bundle_sha256 or None,
+                frame_source=lambda: None,
+                camera_tuple=query_camera_override or CAM_720,
+                megaloc_cache=args.megaloc_cache or None,
+                reference_index=args.reference_index or None,
+                reference_index_sha256=args.reference_index_sha256 or None,
                 matcher_mode=str(args.matcher_mode),
                 local_topk=int(args.local_topk),
+                map_frame=map_frame,
             )
+            tracker = built.tracker
+            xmap = built.reloc_map
+            cam = built.camera
+            cfg = built.config
+            tracker_variant = built.variant
+            DEVICE = built.device
+            megaloc = tracker.meg
             tracker_variant = (
                 f"matcher_{cfg.matcher_mode}_topk{cfg.local_topk}"
                 f"_adapt{cfg.adaptive_first_topk}"
@@ -611,10 +605,6 @@ def main() -> None:
                     min_score=0.60, ratio=0.95,
                 )
                 tracker_variant = "projection_guided_r15_25_40_s060_ratio095"
-            else:
-                tracker = ProductionXFeatTracker(
-                    xmap, megaloc, frame_source=lambda: None, query_cam=cam,
-                    cfg=cfg, map_frame=map_frame)
 
         # Experimental XFeat wrappers inherit the production pose gate but have
         # older constructor signatures. Apply the same verified frame uniformly.

@@ -613,6 +613,30 @@ def test_live_localizer_client_passes_measured_map_alignment(monkeypatch) -> Non
     assert captured["cmd"][index + 1] == "T_align_gravity.json"
 
 
+def test_live_localizer_client_passes_reference_index_manifest(monkeypatch) -> None:
+    captured = {}
+
+    def fake_worker_init(_self, cmd, *_args, **_kwargs) -> None:
+        captured["cmd"] = cmd
+
+    monkeypatch.setattr(app.LiveWorkerClient, "__init__", fake_worker_init)
+    app.LiveLocalizerClient(
+        Path("worker.py"),
+        sys.executable,
+        1280,
+        720,
+        Path("bundle.pt"),
+        reference_index=Path("reference-index/SHA256SUMS.json"),
+        reference_index_sha256="a" * 64,
+    )
+
+    cmd = captured["cmd"]
+    assert cmd[cmd.index("--reference-index") + 1] == (
+        "reference-index/SHA256SUMS.json"
+    )
+    assert cmd[cmd.index("--reference-index-sha256") + 1] == "a" * 64
+
+
 def test_shipped_edm_production_profile_pins_validated_parameters() -> None:
     profile_path = (
         Path(__file__).resolve().parents[2]
@@ -1119,22 +1143,32 @@ def test_invalid_route_fails_closed(tmp_path: Path, payload: dict) -> None:
 
 def test_valid_route_is_finite_and_converted(tmp_path: Path) -> None:
     route = tmp_path / "route.json"
-    route.write_text(json.dumps({"waypoints": [[1.0, 2.0, 3.0]]}), encoding="utf-8")
+    route.write_text(
+        json.dumps({"waypoints": [[1.0, 2.0, 3.0], [2.0, 2.0, 3.0]]}),
+        encoding="utf-8",
+    )
     points = app.load_route_glomap(str(route))
-    assert len(points) == 1
+    assert len(points) == 2
     assert points[0].tolist() == [1.0, -3.0, 2.0]
+    assert points[1].tolist() == [2.0, -3.0, 2.0]
 
 
 def test_raw_glomap_route_is_not_axis_converted(tmp_path: Path) -> None:
     route = tmp_path / "route.json"
     route.write_text(
-        json.dumps({"frame": "glomap", "waypoints": [[1.0, 2.0, 3.0]]}),
+        json.dumps(
+            {
+                "frame": "glomap",
+                "waypoints": [[1.0, 2.0, 3.0], [2.0, 2.0, 3.0]],
+            }
+        ),
         encoding="utf-8",
     )
 
     points = app.load_route_glomap(str(route))
 
     assert points[0].tolist() == [1.0, 2.0, 3.0]
+    assert points[1].tolist() == [2.0, 2.0, 3.0]
 
 
 def test_preview_and_flight_loader_agree_on_every_route(tmp_path: Path) -> None:

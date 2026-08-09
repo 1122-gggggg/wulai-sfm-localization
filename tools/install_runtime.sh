@@ -2,10 +2,26 @@
 set -euo pipefail
 
 install_test_deps=0
-if [[ "${1:-}" == "--test-deps" ]]; then
-  install_test_deps=1
-  shift
-fi
+install_quality_deps=0
+while [[ "$#" -gt 0 ]]; do
+  case "$1" in
+    --test-deps)
+      install_test_deps=1
+      shift
+      ;;
+    --quality-deps)
+      install_quality_deps=1
+      shift
+      ;;
+    --help|-h)
+      break
+      ;;
+    *)
+      echo "[runtime] 未知選項: $1" >&2
+      exit 2
+      ;;
+  esac
+done
 if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
   cat <<'EOF'
 用法: bash tools/install_runtime.sh
@@ -14,9 +30,11 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
   SFM_PYTHON=python3.10       CPython 3.10 executable
   SFM_VENV_DIR=/tmp/sfm-venv  alternate venv directory for clean-install checks
   SFM_INSTALL_TEST_DEPS=1     additionally install requirements-test-lock.txt
+  SFM_INSTALL_QUALITY_DEPS=1  additionally install requirements-quality-lock.txt
 
 選項:
   --test-deps                  同上，安裝 hash-locked pytest/ruff/coverage tools
+  --quality-deps               安裝 hash-locked mypy/pip-audit/SBOM tools
 EOF
   exit 0
 fi
@@ -27,8 +45,12 @@ venv_dir="${SFM_VENV_DIR:-$root_dir/.venv}"
 venv_python="$venv_dir/bin/python"
 requirements_lock="$root_dir/requirements-lock.txt"
 requirements_test_lock="$root_dir/requirements-test-lock.txt"
+requirements_quality_lock="$root_dir/requirements-quality-lock.txt"
 if [[ "${SFM_INSTALL_TEST_DEPS:-0}" == "1" ]]; then
   install_test_deps=1
+fi
+if [[ "${SFM_INSTALL_QUALITY_DEPS:-0}" == "1" ]]; then
+  install_quality_deps=1
 fi
 
 if ! command -v "$python_bin" >/dev/null 2>&1; then
@@ -71,6 +93,13 @@ if [[ "$install_test_deps" == "1" ]]; then
     exit 1
   fi
   "$venv_python" -m pip install --require-hashes --requirement "$requirements_test_lock"
+fi
+if [[ "$install_quality_deps" == "1" ]]; then
+  if [[ ! -f "$requirements_quality_lock" ]]; then
+    echo "[runtime] 缺少固定品質相依鎖檔: $requirements_quality_lock" >&2
+    exit 1
+  fi
+  "$venv_python" -m pip install --require-hashes --requirement "$requirements_quality_lock"
 fi
 echo "[runtime] 安裝完成：$venv_python"
 echo "[runtime] 系統層仍需 ffmpeg、python3-tk、X11/XWayland、可用 NVIDIA CUDA driver"

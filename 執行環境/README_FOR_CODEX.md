@@ -4,10 +4,22 @@
 目前可攜式模擬介面請從工作區根目錄執行：
 
 ```bash
-python tools/export_simulator_package.py /path/to/portable_localization
+python tools/export_simulator_package.py /path/to/portable_localization \
+  --artifact-root /path/to/approved-runtime-artifact-seed \
+  --site-profile 控制介面程式/site_profiles/river_site_edm.json
 cd /path/to/portable_localization
 python tools/package_manifest.py verify
 ```
+
+工作區根目錄的 `RUNTIME_ARTIFACTS.json` 是 Git source 內的 runtime artifact
+allowlist，固定每個外部檔案的相對路徑、大小與 SHA-256。clean checkout 沒有這些
+檔案時，請從受核准的離線 bundle 依 registry 路徑建立 seed root，再傳入
+`--artifact-root`（或 `SFM_RUNTIME_ARTIFACT_ROOT`）；exporter 不會嘗試網路下載，也不會
+無條件複製整個 `torch_hub_cache/`。來源 `MANIFEST.tsv` / `SHA256SUMS` 只涵蓋 Git
+source，portable 輸出包的 manifest 才會包含已解析的 runtime artifacts。
+`--site-profile` 會把該 profile 的 hash-pinned 場域資產收進
+`PORTABLE_SITE_ASSETS.json`；reference index 的所有 sibling 與 signed hardware
+sidecar 會逐檔驗證，影片仍由使用者另外提供。
 
 目前發布包的 authoritative manifest 是發布包根目錄的 `MANIFEST.tsv` 與
 `SHA256SUMS`；本 legacy runtime 資料夾不再攜帶第二套 manifest 工具或 digest。
@@ -43,9 +55,9 @@ images、完整 source/update workspace，以及重建腳本。
 
 ```text
 requirements_runtime.txt        # 已驗證 Python 3.10 / CUDA 12.8 釘選
-# MANIFEST.tsv / SHA256SUMS      # 僅在發布包根目錄；不在此 legacy 資料夾
+# MANIFEST.tsv / SHA256SUMS      # 只在發布包根目錄；不在此 legacy 資料夾
 # tools/package_manifest.py      # 僅在發布包根目錄；由該處執行 generate / verify
-torch_hub_cache/                # package-local 離線模型 repo 與權重
+torch_hub_cache/                # 由 RUNTIME_ARTIFACTS.json allowlist seed 的外部檔案
   checkpoints/megaloc/7cb9f.../model.safetensors
 sfm_system/
   定位/

@@ -432,13 +432,20 @@ def reprojection_rank(value) -> float:
 
 class ProductionEDMTracker:
     def __init__(self, reloc_map: EDMRelocMap, camera: Camera, cfg: EDMConfig | None = None,
-                 matcher: EDMMatcher | None = None, megaloc=None):
+                 matcher: EDMMatcher | None = None, megaloc=None,
+                 reference_index=None):
         self.cfg = cfg or EDMConfig()
         self.cfg.validate()
         self.map = reloc_map
         self.cam = camera
-        self.loc = EDMLocalizer(reloc_map, camera, matcher=matcher, megaloc=megaloc,
-                                pnp_max_error=self.cfg.pnp_ransac_max_error)
+        self.loc = EDMLocalizer(
+            reloc_map,
+            camera,
+            matcher=matcher,
+            megaloc=megaloc,
+            pnp_max_error=self.cfg.pnp_ransac_max_error,
+            reference_index=reference_index,
+        )
         self.st = RuntimeState(
             accepted_step_norms=deque(maxlen=self.cfg.adaptive_jump_history_size),
             observed_capture_dts=deque(maxlen=self.cfg.adaptive_jump_history_size),

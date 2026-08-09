@@ -1,0 +1,36 @@
+{
+  "schema": "anafi-hardware-approval/v2",
+  "approved": true,
+  "site_id": "urai_edm_v1",
+  "coordinate_frame_id": "target_site_v1_glomap",
+  "profile_sha256": "a3a4f96226b9ba8af477c871457254d62a875edbbfb167cf5302f43a085c0716",
+  "route_sha256": null,
+  "bundle_sha256": "b32866d6595ca30b89e7cf6cef6dacbb4692f3c4992b759d833488c31b489d05",
+  "approved_mode": "manual",
+  "aircraft": {
+    "product": "ANAFI",
+    "serial": "ANAFI-L105488",
+    "firmware_versions": [
+      "1.8.2"
+    ]
+  },
+  "controller": {
+    "product": "SkyController 3",
+    "serial": null,
+    "firmware_versions": [
+      "1.8.1"
+    ]
+  },
+  "olympe_versions": [
+    "8.4.0"
+  ],
+  "approved_envelope": {
+    "max_altitude_m": null,
+    "max_distance_m": null,
+    "max_tilt_deg": null,
+    "max_vertical_speed_ms": null,
+    "max_rotation_speed_degs": null,
+    "gps_required": false
+  },
+  "approval_note": "2026-08-06 操作員核准：ANAFI-L105488 韌體 1.8.2 + SkyController 3 韌體 1.8.1 + Olympe 8.4.0，用於烏來場域低空手動方向測試。核准依據為當日地面驗證：退出保護三信號 armed、搖桿 override 實測、飛行封套設定並回讀確認、失聯政策 RTH 20m/原地降落確認。此收據僅核准 manual，不代表 AUTO。"
+}

@@ -208,7 +208,7 @@ def main() -> None:
     if TOOLS_SCRIPT and os.path.isfile(TOOLS_SCRIPT):
         # Register the click/height operators in this same Blender session.
         with open(TOOLS_SCRIPT, encoding="utf-8") as fh:
-            exec(compile(fh.read(), TOOLS_SCRIPT, "exec"), {"__name__": "__route_tools__"})
+            exec(compile(fh.read(), TOOLS_SCRIPT, "exec"), {"__name__": "__route_tools__"})  # noqa: S102 - Blender must load the selected authoring operators in-process.
     print(f"[route] cloud={MAP_PLY}", flush=True)
     print(f"[route] output dir={OUT_DIR}", flush=True)
 

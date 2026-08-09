@@ -42,6 +42,7 @@ import torch.nn.functional as F
 
 from pose_types import Localizer, Pose
 from megaloc_cache import load_megaloc_cache, write_megaloc_cache
+from reference_index import ReferenceIndex, open_reference_index
 from reloc_localizer_xfeat import (
     Camera,
     XFeatRelocMap,
@@ -533,12 +534,46 @@ def spatially_cap_correspondence_indices(
 class MegaLocLayer:
     """MegaLoc retrieval layer with cached reference descriptors."""
 
-    def __init__(self, ref_desc: np.ndarray, input_size: int = 322, device: str = DEVICE):
-        self.ref_desc = np.asarray(ref_desc, np.float32)
+    def __init__(
+        self,
+        ref_desc: np.ndarray | None,
+        input_size: int = 322,
+        device: str = DEVICE,
+        *,
+        reference_index: ReferenceIndex | None = None,
+        ref_names: Iterable[str] | None = None,
+    ):
+        if (ref_desc is None) == (reference_index is None):
+            raise ValueError("provide exactly one of ref_desc or reference_index")
+        self.ref_desc = None if ref_desc is None else np.asarray(ref_desc, np.float32)
+        self._reference_index = reference_index
+        self._reference_name_to_bundle_index: dict[str, int] | None = None
+        if reference_index is not None:
+            bundle_names = tuple(ref_names or ())
+            if len(bundle_names) != reference_index.count:
+                raise ValueError(
+                    "reference index count does not match relocation bundle names"
+                )
+            if len(set(bundle_names)) != len(bundle_names):
+                raise ValueError("relocation bundle reference names must be unique")
+            if set(bundle_names) != set(reference_index.names):
+                raise ValueError(
+                    "reference index names do not match relocation bundle names"
+                )
+            self._reference_name_to_bundle_index = {
+                name: index for index, name in enumerate(bundle_names)
+            }
         self.input_size = int(input_size)
         self.device = device
         self.fp16 = device.startswith("cuda") and os.environ.get("SFM_MEGALOC_FP16", "0") == "1"
         self._model = None
+
+    @property
+    def reference_count(self) -> int:
+        if self._reference_index is not None:
+            return self._reference_index.count
+        assert self.ref_desc is not None
+        return int(self.ref_desc.shape[0])
 
     def model(self):
         if self._model is None:
@@ -569,8 +604,22 @@ class MegaLocLayer:
         """Return (ref_index, cosine_similarity) pairs sorted by score descending."""
         t0 = _timing_begin()
         q = self.extract_one(rgb)
+        if isinstance(k, bool) or not isinstance(k, (int, np.integer)) or k <= 0:
+            raise ValueError("k must be a positive integer")
+        top_k = min(int(k), self.reference_count)
+        if top_k == 0:
+            return [], _timing_ms(t0)
+        if self._reference_index is not None:
+            matches = self._reference_index.query(q, top_k=top_k)
+            assert self._reference_name_to_bundle_index is not None
+            scored = [
+                (self._reference_name_to_bundle_index[match.name], match.score)
+                for match in matches
+            ]
+            return scored, _timing_ms(t0)
+        assert self.ref_desc is not None
         sims = self.ref_desc @ q
-        order = np.argsort(-sims)[: int(k)]
+        order = np.argsort(-sims)[:top_k]
         scored = [(int(i), float(sims[int(i)])) for i in order]
         return scored, _timing_ms(t0)
 
@@ -579,6 +628,27 @@ class MegaLocLayer:
                    device: str = DEVICE, meta_path: Path | None = None) -> "MegaLocLayer":
         desc = load_megaloc_cache(cache_path, ref_names, meta_path)
         return MegaLocLayer(desc, input_size=input_size, device=device)
+
+    @staticmethod
+    def load_index(
+        index_path: Path,
+        ref_names: list[str],
+        *,
+        expected_model_identity: str,
+        input_size: int = 322,
+        device: str = DEVICE,
+    ) -> "MegaLocLayer":
+        index = open_reference_index(
+            index_path,
+            expected_model_identity=expected_model_identity,
+        )
+        return MegaLocLayer(
+            None,
+            input_size=input_size,
+            device=device,
+            reference_index=index,
+            ref_names=ref_names,
+        )
 
     @staticmethod
     @torch.inference_mode()
@@ -640,9 +710,10 @@ class ProductionXFeatTracker(Localizer):
             raise ValueError(
                 f"reloc bundle ref_yaws mismatch: refs={n_refs} ref_yaws={len(reloc_map.ref_yaws)}"
             )
-        if megaloc.ref_desc.shape[0] != n_refs:
+        if megaloc.reference_count != n_refs:
             raise ValueError(
-                f"MegaLoc descriptor mismatch: refs={n_refs} descriptors={megaloc.ref_desc.shape[0]}"
+                f"MegaLoc descriptor mismatch: refs={n_refs} "
+                f"descriptors={megaloc.reference_count}"
             )
         self.map = reloc_map
         self.meg = megaloc

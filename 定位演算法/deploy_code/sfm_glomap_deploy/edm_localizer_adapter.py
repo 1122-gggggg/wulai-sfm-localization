@@ -79,7 +79,8 @@ class InertTemporalCache:
 class EDMTrackerAdapter(Localizer):
     def __init__(self, reloc_map: EDMRelocMap, camera: Camera,
                  cfg: EDMConfig | None = None, megaloc=None, matcher=None,
-                 frame_source=lambda: None, map_frame=None):
+                 frame_source=lambda: None, map_frame=None,
+                 reference_index=None):
         # matcher: EDMMatcher (torch FP16) or EDMOnnxMatcher (ORT CUDA/TensorRT).
         # None -> ProductionEDMTracker builds the default torch EDMMatcher.
         self.trk = ProductionEDMTracker(
@@ -87,6 +88,7 @@ class EDMTrackerAdapter(Localizer):
             cfg=cfg or production_edm_config(),
             matcher=matcher,
             megaloc=megaloc,
+            reference_index=reference_index,
         )
         self.map = reloc_map
         self.cfg = self.trk.cfg

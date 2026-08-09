@@ -31,6 +31,7 @@ import torch
 
 from artifact_integrity import verify_sha256
 from edm_matcher import EDM_W, EDMMatcher
+from reference_index import ReferenceIndex
 
 MEGALOC_INPUT = 322
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -255,7 +256,8 @@ class Camera:
 class EDMLocalizer:
     def __init__(self, reloc_map: EDMRelocMap, camera: Camera, matcher: EDMMatcher | None = None,
                  megaloc: MegaLocQuery | None = None, topk: int = 5, min_conf: float = 0.2,
-                 pnp_max_error: float = 5.0, min_inliers: int = 50):
+                 pnp_max_error: float = 5.0, min_inliers: int = 50,
+                 reference_index: ReferenceIndex | None = None):
         self.map = reloc_map
         self.cam = camera
         self.matcher = matcher or EDMMatcher(mconf_thr=min_conf)
@@ -264,6 +266,13 @@ class EDMLocalizer:
         self.min_inliers = min_inliers
         self.pnp_max_error = pnp_max_error
         self.scale = camera.width / EDM_W        # EDM px -> camera px (1280/1024 = 1.25)
+        self.reference_index = reference_index
+        if reference_index is not None:
+            names = tuple(reloc_map.ref_names)
+            if reference_index.count != len(names) or set(reference_index.names) != set(names):
+                raise ValueError(
+                    "reference index names do not match EDM relocation bundle"
+                )
 
     @property
     def megaloc(self) -> MegaLocQuery:
@@ -273,6 +282,21 @@ class EDMLocalizer:
 
     def retrieve(self, frame_rgb: np.ndarray, k: int, exclude: set[str] | None = None) -> list[str]:
         d = self.megaloc.extract_one(frame_rgb)
+        if self.reference_index is not None:
+            requested = max(0, int(k))
+            if requested == 0:
+                return []
+            candidate_count = min(
+                self.reference_index.count,
+                requested + len(exclude or ()),
+            )
+            matches = self.reference_index.query(d, top_k=candidate_count)
+            out = [
+                match.name
+                for match in matches
+                if not exclude or match.name not in exclude
+            ]
+            return out[:requested]
         sim = self.map.ref_global @ d
         order = np.argsort(-sim)
         out = []

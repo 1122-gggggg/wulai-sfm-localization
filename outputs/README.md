@@ -14,8 +14,9 @@ python tools/workspace_audit.py --strict-output-names
 
 - `flight_logs/`：操作與飛控 session 紀錄。這些資料屬安全證據，不得由驗證腳本
   自動刪除或覆寫。
-- `validation/`、`validation_receipts/`、`production_stream_bench/`：系統驗證、
-  portable 驗證與效能收據；保留收據 JSON 及其對應的 log 目錄。
+- `validation/`、`validation_receipts/`、`production_stream_bench/`、`security/`：
+  系統驗證、portable 驗證、效能收據、dependency audit 與 SBOM；保留收據 JSON
+  及其對應的 log 目錄。
 - `edm_`、`exact_latency_`、`localization_fps_`、`onnx_flow_`、`optimization_`、
   `regression_`、`reverse_topk_`、`video720_` 開頭的項目：實驗證據。
 - `audit_YYYYMMDD` 與已登記的治理文件名稱：稽核或決策鏈證據。

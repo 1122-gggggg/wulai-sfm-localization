@@ -127,6 +127,7 @@ from real_path_follow_controller import (  # type: ignore
     Pose,
     capture_mission_route_snapshot,
 )
+from route_domain import RouteDocument  # type: ignore
 from operator_autonomy import DesktopRouteAutonomy
 from operator_preflight import (
     PREFLIGHT_GUIDE_LABELS,
@@ -144,6 +145,8 @@ from operator_rendering import (
     prepare_video_frame,
 )
 from operator_tick import run_tick
+from operator_command_coordinator import OperatorCommandCoordinator
+from operator_shutdown import OperatorShutdownCoordinator
 try:
     from gravity_calibration import (  # type: ignore
         MIN_PITCH_SPAN_DEG,
@@ -587,6 +590,8 @@ _SITE_ASSET_ENV_VARS = (
     "SFM_FLIGHT_PATH_JSON",
     "SFM_RELOC_BUNDLE",
     "SFM_MEGALOC_CACHE",
+    "SFM_REFERENCE_INDEX",
+    "SFM_REFERENCE_INDEX_SHA256",
     "SFM_TRACK_LANDMARKS",
     "SFM_LOCALIZER_BACKEND",
     "SFM_LOCALIZER_DEPLOY_DIR",
@@ -616,6 +621,11 @@ def resolve_operator_site_assets(args, parser: argparse.ArgumentParser) -> SiteP
             ("--route-json", getattr(args, "route_json", None)),
             ("--bundle", getattr(args, "bundle", None)),
             ("--megaloc-cache", getattr(args, "megaloc_cache", None)),
+            ("--reference-index", getattr(args, "reference_index", None)),
+            (
+                "--reference-index-sha256",
+                getattr(args, "reference_index_sha256", None),
+            ),
             ("--track-landmarks", getattr(args, "track_landmarks", None)),
             ("--localizer-backend", getattr(args, "localizer_backend", None)),
             ("--localizer-deploy-dir", getattr(args, "localizer_deploy_dir", None)),
@@ -651,6 +661,11 @@ def resolve_operator_site_assets(args, parser: argparse.ArgumentParser) -> SiteP
             # Verified here too: this file decides which way is up for every
             # commanded body axis, so a swapped one must not start the interface.
             (profile.map_align, profile.asset_sha256.map_align, "map_align"),
+            (
+                profile.reference_index,
+                profile.asset_sha256.reference_index,
+                "reference_index",
+            ),
         ):
             if asset is not None and expected is not None:
                 actual = file_sha256(asset)
@@ -664,6 +679,10 @@ def resolve_operator_site_assets(args, parser: argparse.ArgumentParser) -> SiteP
         args.route_json = str(profile.route_json or "")
         args.bundle = str(profile.localization_bundle)
         args.megaloc_cache = str(profile.megaloc_cache or "")
+        args.reference_index = str(profile.reference_index or "")
+        args.reference_index_sha256 = str(
+            profile.asset_sha256.reference_index or ""
+        )
         args.track_landmarks = str(profile.track_landmarks or "")
         args.localizer_backend = str(profile.localizer)
         args.localizer_deploy_dir = str(profile.localizer_deploy_dir or "")
@@ -679,6 +698,10 @@ def resolve_operator_site_assets(args, parser: argparse.ArgumentParser) -> SiteP
     args.route_json = str(DEFAULT_ROUTE if args.route_json is None else args.route_json)
     args.bundle = str(DEFAULT_BUNDLE if args.bundle is None else args.bundle)
     args.megaloc_cache = str(DEFAULT_MEGALOC if args.megaloc_cache is None else args.megaloc_cache)
+    args.reference_index = str(getattr(args, "reference_index", None) or "")
+    args.reference_index_sha256 = str(
+        getattr(args, "reference_index_sha256", None) or ""
+    )
     args.track_landmarks = str(
         DEFAULT_TRACK_LANDMARKS if args.track_landmarks is None else args.track_landmarks)
     backend_arg = getattr(args, "localizer_backend", None)
@@ -1076,82 +1099,12 @@ def resolve_site_map_frame(profile) -> object | None:
 
 
 def load_route_glomap(path_json: str, map_frame=None) -> list:
-    """Load an aligned or raw-GLOMAP route into the map/localizer frame.
-
-    ``map_frame`` is the site's measured MapFrame (None = the legacy assumption).
-
-    The align_source rules below MIRROR real_path_follow_controller.load_waypoints
-    exactly, and must keep mirroring it: align_source names the basis that PRODUCED
-    these aligned coordinates, so that is the basis to invert with -- it is not a
-    claim about the site. Reading a route back through the other basis rotates it
-    by the angle the two differ by (22.5 deg on target_site_v1), so any divergence
-    here means the pink preview shows a different path from the one autonomy flies.
-    test_preview_and_flight_loader_agree_on_every_route pins the equivalence.
-    """
-    data = json.loads(Path(path_json).read_text(encoding="utf-8"))
-    if not isinstance(data, dict):
-        raise ValueError("route root must be a JSON object")
-    waypoints = data.get("waypoints")
-    if not isinstance(waypoints, list) or not waypoints:
-        raise ValueError("route must contain a non-empty waypoints list")
-    frame = data.get("frame", "aligned")
-    if frame not in {"aligned", "glomap"}:
-        raise ValueError("route frame must be 'aligned' or 'glomap'")
-    if data.get("units", "map") != "map":
-        raise ValueError("route units must be 'map'")
-    site_is_measured = (
-        map_frame is not None
-        and getattr(map_frame, "source", "legacy_assumption") != "legacy_assumption"
-    )
-    #: None means the legacy [x, -z, y] basis; otherwise the site's measured one.
-    authoring_frame = None
-    if frame == "aligned":
-        declared = data.get("align_source")
-        if declared is None:
-            if site_is_measured:
-                raise ValueError(
-                    "route uses frame='aligned' but declares no align_source, and "
-                    "this site has a measured gravity alignment; add "
-                    "align_source='legacy' or 'measured' (or export frame='glomap')"
-                )
-            declared = "legacy"
-        if declared == "legacy":
-            authoring_frame = None
-        elif declared == "measured":
-            if not site_is_measured:
-                raise ValueError(
-                    "route declares align_source='measured' but this site has no "
-                    "measured gravity alignment to invert it with"
-                )
-            authoring_frame = map_frame
-        else:
-            raise ValueError(f"unknown route align_source: {declared!r}")
-    converted = []
-    for index, point in enumerate(waypoints):
-        if not isinstance(point, list) or len(point) != 3:
-            raise ValueError(f"route waypoint {index} must contain exactly 3 coordinates")
-        try:
-            route_point = np.asarray(point, dtype=float)
-        except (TypeError, ValueError) as exc:
-            raise ValueError(f"route waypoint {index} is not numeric") from exc
-        if route_point.shape != (3,) or not np.isfinite(route_point).all():
-            raise ValueError(f"route waypoint {index} contains a non-finite coordinate")
-        if frame != "aligned":
-            converted.append(route_point.copy())
-        elif authoring_frame is not None:
-            # Same recombination as rpf.aligned_to_glomap: aligned coordinates are
-            # the (east, north, up) components of the authoring basis.
-            converted.append(
-                route_point[0] * np.asarray(authoring_frame.east, dtype=float)
-                + route_point[1] * np.asarray(authoring_frame.north, dtype=float)
-                + route_point[2] * np.asarray(authoring_frame.up, dtype=float)
-            )
-        else:
-            # The legacy basis reduces to exactly this swap.
-            converted.append(
-                np.array([route_point[0], -route_point[2], route_point[1]], dtype=float)
-            )
-    return converted
+    """Load preview points through the same route domain used by the controller."""
+    return RouteDocument.from_path(
+        path_json,
+        require_map_units=True,
+        map_frame=map_frame or LEGACY_MAP_FRAME,
+    ).controller_waypoints()
 #: Floor for the fixed-height control pane, and the notebook tab strip + border
 #: allowance added on top of the tallest tab's requested height.
 CONTROL_PANE_MIN_H = 220
@@ -1770,21 +1723,27 @@ class DroneBackend:
         if request.action is ControlAction.EMERGENCY_STOP:
             return self.fail_safe(FailureReason.EMERGENCY_STOP)
         if request.action is ControlAction.LAND_NOW:
-            raw = self.command("land")
-            return ControlResult.completed(self.state, raw_result=raw)
+            self.command("land")
+            return ControlResult.completed(self.state, raw_result=True)
         if request.action is ControlAction.TAKEOFF:
             self.state.tracker_state = "TAKEOFF"
             self.target_altitude_m = ANAFI.takeoff_hover_m
             if self.flight_start is None:
                 self.flight_start = time.monotonic()
-            return ControlResult.completed(self.state, raw_result=self.state)
+            return ControlResult.completed(self.state, raw_result=True)
         if request.action is ControlAction.START_LOCALIZATION:
             self.state.loc = "STARTING"
             self.state.last_command = request.action.value
-            return ControlResult.completed(self.state, raw_result=self.state)
+            return ControlResult.completed(self.state, raw_result=True)
         name, payload = request.legacy_call()
         raw = self.command(name, **payload)
-        return ControlResult.completed(self.state, raw_result=raw)
+        if isinstance(raw, ControlResult):
+            explicit = raw.accepted and raw.executed
+        elif isinstance(raw, bool):
+            explicit = raw
+        else:
+            explicit = raw is self.state
+        return ControlResult.completed(self.state, raw_result=explicit)
 
     def command(
         self, name: str | ControlRequest, **payload,
@@ -2942,6 +2901,8 @@ class LiveWorkerClient:
 class LiveLocalizerClient(LiveWorkerClient):
     def __init__(self, worker_py: Path, python_bin: str, width: int, height: int,
                  bundle: Path, megaloc_cache: str | Path = "",
+                 reference_index: str | Path = "",
+                 reference_index_sha256: str = "",
                  force_track_bench: bool = False,
                  force_track_ref: int = -1,
                  neuflow_track: bool = False,
@@ -3001,6 +2962,13 @@ class LiveLocalizerClient(LiveWorkerClient):
         # Pass an explicit empty value too: otherwise a stale inherited
         # SFM_MEGALOC_CACHE would silently override profile bundle descriptors.
         cmd.extend(["--megaloc-cache", str(megaloc_cache)])
+        if reference_index:
+            cmd.extend(["--reference-index", str(reference_index)])
+        if reference_index_sha256:
+            cmd.extend([
+                "--reference-index-sha256",
+                str(reference_index_sha256),
+            ])
         if neuflow_track:
             cmd.append("--neuflow-track")
         if projection_track:
@@ -3285,6 +3253,7 @@ class OperatorApp(tk.Tk):
         self._flight_result_publish_lock = threading.Lock()
         self._flight_inflight: set[str] = set()
         self._flight_inflight_lock = threading.Lock()
+        self._command_coordinator = self._make_command_coordinator()
         self._route_editor_window: RouteEditorWindow | None = None
         self._route_editor_loading = False
         self._route_editor_load_queue: queue.Queue[
@@ -3488,6 +3457,13 @@ class OperatorApp(tk.Tk):
         self.minsize(*UI_MIN_SIZE)
         self.configure(bg="#111316")
         self._build_ui()
+        self._shutdown_coordinator = OperatorShutdownCoordinator(
+            backend=self.backend,
+            session_logs=self.session_logs,
+            write_log=self.write_log,
+            destroy=self.destroy,
+            command_coordinator=self._command_coordinator,
+        )
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self._loc_file_handler_registered = False
         if localizer is not None and hasattr(self, "createfilehandler"):
@@ -4516,7 +4492,10 @@ class OperatorApp(tk.Tk):
             self.backend.state, "autonomous_speed_limit_mps", 0.30
         )
         self.current_auto_speed_var = DedupStringVar(
-            value=f"目前速度上限 {float(current_auto_speed):g} m/s"
+            value=(
+                f"自主速度警戒 {float(current_auto_speed):g} m/s "
+                "（新鮮速度時強制）"
+            )
         )
         self.autonomous_speed_limit_input_var = DedupStringVar(
             value=f"{float(current_auto_speed):g}"
@@ -4530,7 +4509,10 @@ class OperatorApp(tk.Tk):
         ).pack(side="left", padx=(0, 14))
         ttk.Label(
             autonomous_limit,
-            text="速度上限（landed 才可套用）",
+            text=(
+                "無速度讀回僅套用 PCMD command cap；"
+                "landed 才可改警戒值"
+            ),
         ).pack(side="left")
         ttk.Entry(
             autonomous_limit,
@@ -4540,7 +4522,7 @@ class OperatorApp(tk.Tk):
         ttk.Label(autonomous_limit, text="m/s").pack(side="left")
         ttk.Button(
             autonomous_limit,
-            text="套用速度上限",
+            text="套用速度警戒",
             command=self.apply_autonomous_speed_limit_from_ui,
         ).pack(side="left", padx=6)
 
@@ -4970,19 +4952,21 @@ class OperatorApp(tk.Tk):
         """Initialize the runtime approval lock from the verified site profile."""
         session_config = getattr(self.backend, "session_config", None)
         config_locked = getattr(session_config, "autonomous_locked", None)
-        errors = (
-            ()
-            if config_locked is False
-            else self._active_site_autonomy_errors()
-        )
+        errors = self._active_site_autonomy_errors()
+        if config_locked is True:
+            errors = (*errors, "runtime configuration keeps autonomous_locked enabled")
         self._autonomy_profile_errors = errors
-        verified = not errors and config_locked is not True
+        verified = not errors
         self._autonomy_profile_verified = verified
         if not bool(getattr(self.backend, "is_live", False)):
             return
         state = self.backend.state
         state.autonomous_locked = not verified
         state.autonomous_approval_valid = verified
+        # Profile/route approval is necessary but not sufficient to publish the
+        # live coordinator. Keep the explicit release containment latched until
+        # a separately reviewed activation path is implemented and validated.
+        state.live_auto_release_ready = False
 
     def _autonomy_gate_snapshot(self) -> dict[str, object]:
         """Build the existing fail-closed runtime arming gate's input."""
@@ -5095,6 +5079,16 @@ class OperatorApp(tk.Tk):
     def _start_integrated_auto(self, snapshot: MissionRouteSnapshot) -> bool:
         if self._integrated_auto_active():
             self.write_log("AUTO 已在執行中；略過重複啟動")
+            return False
+        if (
+            bool(getattr(self.backend, "is_live", False))
+            and getattr(self.backend.state, "live_auto_release_ready", False)
+            is not True
+        ):
+            self.write_log(
+                "AUTO 已拒絕：live AUTO 發布阻擋仍生效；"
+                "必須先通過真機場域 receipt 與安全修正驗證"
+            )
             return False
         approval_blockers = autonomous_approval_blockers(
             self._autonomy_gate_snapshot()
@@ -5427,127 +5421,77 @@ class OperatorApp(tk.Tk):
         self._update_preflight_cards(st)
         self._update_flight_action_guidance(st)
 
-    def _publish_flight_result(
-            self, item: tuple[str, object | None, str | None]) -> None:
-        """Publish one async result without allowing normal work to crowd safety."""
-        command = str(item[0])
-        safety_queue = self.__dict__.get("_flight_safety_results")
-        if safety_queue is None:
-            safety_queue = queue.Queue()
-            self.__dict__["_flight_safety_results"] = safety_queue
-        if command in _SAFETY_FLIGHT_RESULT_COMMANDS:
-            safety_queue.put(item)
-            return
-
-        result_queue = self._flight_results
+    def _make_command_coordinator(self) -> OperatorCommandCoordinator:
+        normal_results = self.__dict__.get("_flight_results")
+        if normal_results is None:
+            normal_results = queue.Queue(maxsize=FLIGHT_RESULT_QUEUE_MAX)
+            self._flight_results = normal_results
+        safety_results = self.__dict__.get("_flight_safety_results")
+        if safety_results is None:
+            safety_results = queue.Queue()
+            self._flight_safety_results = safety_results
+        inflight = self.__dict__.get("_flight_inflight")
+        if inflight is None:
+            inflight = set()
+            self._flight_inflight = inflight
+        inflight_lock = self.__dict__.get("_flight_inflight_lock")
+        if inflight_lock is None:
+            inflight_lock = threading.Lock()
+            self._flight_inflight_lock = inflight_lock
         publish_lock = self.__dict__.get("_flight_result_publish_lock")
         if publish_lock is None:
             publish_lock = threading.Lock()
-            self.__dict__["_flight_result_publish_lock"] = publish_lock
-        dropped_command = None
-        with publish_lock:
-            try:
-                result_queue.put_nowait(item)
-                return
-            except queue.Full:
-                pass
-            try:
-                dropped = result_queue.get_nowait()
-                dropped_command = str(dropped[0])
-                task_done = getattr(result_queue, "task_done", None)
-                if callable(task_done):
-                    task_done()
-                if dropped_command in _SAFETY_FLIGHT_RESULT_COMMANDS:
-                    # Defensive migration for a queue populated by an older
-                    # caller: never discard a safety completion even there.
-                    safety_queue.put(dropped)
-                    dropped_command = None
-            except queue.Empty:
-                # A concurrent drain may have made room.  Treat a second Full as
-                # a dropped new normal result rather than blocking the worker.
-                dropped_command = command
-            try:
-                result_queue.put_nowait(item)
-            except queue.Full:
-                dropped_command = command
+            self._flight_result_publish_lock = publish_lock
+        return OperatorCommandCoordinator(
+            backend=self.backend,
+            normal_results=normal_results,
+            safety_results=safety_results,
+            inflight=inflight,
+            inflight_lock=inflight_lock,
+            publish_lock=publish_lock,
+            write_log=self.__dict__.get("write_log", self.write_log),
+            record_drop=self._record_flight_result_drop,
+            safety_commands=_SAFETY_FLIGHT_RESULT_COMMANDS,
+        )
 
-        try:
-            self.write_log(
-                f"{command}: 完成佇列已滿，丟棄舊的一般結果"
-                f" ({dropped_command or command})"
-            )
-        except Exception:
-            # Diagnostics must not turn a bounded-result policy into a producer
-            # thread crash, especially while Tk is already overloaded.
-            pass
+    def _get_command_coordinator(self) -> OperatorCommandCoordinator:
+        coordinator = self.__dict__.get("_command_coordinator")
+        if (
+            coordinator is None
+            or coordinator.backend is not self.backend
+            or coordinator.normal_results is not self.__dict__.get("_flight_results")
+            or coordinator.safety_results
+            is not self.__dict__.get("_flight_safety_results")
+        ):
+            coordinator = self._make_command_coordinator()
+            self._command_coordinator = coordinator
+        return coordinator
+
+    def _record_flight_result_drop(
+        self, command: str, dropped_command: str
+    ) -> None:
         session_logs = self.__dict__.get("session_logs")
         incident = getattr(session_logs, "incident", None)
         if callable(incident):
-            try:
-                incident(
-                    "flight_result_dropped",
-                    command=command,
-                    dropped_command=dropped_command or command,
-                    safety=False,
-                    resolved=False,
-                )
-            except Exception:
-                # The result producer must not crash because diagnostics are down.
-                pass
+            incident(
+                "flight_result_dropped",
+                command=command,
+                dropped_command=dropped_command,
+                safety=False,
+                resolved=False,
+            )
+
+    def _publish_flight_result(
+            self, item: tuple[str, object | None, str | None]) -> None:
+        self._get_command_coordinator().publish(item)
 
     def _dispatch_live_command(self, command: str, payload: dict) -> bool:
         """Run a potentially blocking Olympe expectation off the Tk thread."""
-        with self._flight_inflight_lock:
-            if command in self._flight_inflight:
-                self.write_log(f"{command}: 指令仍在等待確認，略過重複送出")
-                return False
-            self._flight_inflight.add(command)
-
-        def run() -> None:
-            result = None
-            error = None
-            try:
-                result = self._backend_command(command, payload)
-            except Exception as exc:  # surfaced on Tk thread by the result queue
-                error = repr(exc)
-            finally:
-                with self._flight_inflight_lock:
-                    self._flight_inflight.discard(command)
-                self._publish_flight_result((command, result, error))
-
-        threading.Thread(
-            target=run,
-            name=f"olympe-ui-{command}",
-            daemon=True,
-        ).start()
-        self.write_log(f"{command}: 已送至背景飛控執行緒，介面保持可操作")
-        return True
+        return self._get_command_coordinator().dispatch(command, payload)
 
     def _backend_command(self, command: str, payload: dict | None = None):
         """Dispatch UI-origin controls through the typed contract when supported."""
-        values = dict(payload or {})
-        mode = getattr(self.backend, "mode", None)
-        if isinstance(mode, InterfaceMode):
-            try:
-                request = ControlRequest.from_legacy(
-                    command,
-                    human_origin=True,
-                    **values,
-                )
-            except ValueError as exc:
-                self.write_log(f"指令已拒絕: {exc}")
-                return False
-            result = self.backend.command(request)
-            if isinstance(result, ControlResult):
-                if not result.accepted:
-                    self.write_log(
-                        f"{command}: 已拒絕 ({result.reason_code})"
-                    )
-                    return False
-                return result.raw_result if result.raw_result is not None else True
-            return result
-        # Compatibility for narrow test doubles and pre-contract plugins.
-        return self.backend.command(command, **values)
+        return self._get_command_coordinator().execute(command, payload)
 
     def _finish_backend_command(
             self, command: str, result: object | None, error: str | None) -> None:
@@ -5656,18 +5600,7 @@ class OperatorApp(tk.Tk):
             )
 
     def _drain_flight_command_results(self) -> None:
-        for result_queue in (
-            self.__dict__.get("_flight_safety_results"),
-            self._flight_results,
-        ):
-            if result_queue is None:
-                continue
-            while True:
-                try:
-                    command, result, error = result_queue.get_nowait()
-                except queue.Empty:
-                    break
-                self._finish_backend_command(command, result, error)
+        self._get_command_coordinator().drain(self._finish_backend_command)
 
     def send(self, command: str, **payload) -> None:
         activated_now = False
@@ -6497,20 +6430,19 @@ class OperatorApp(tk.Tk):
             self.write_log("關窗 → 強制原地降落並斷線…")
         except Exception:
             pass
-        try:
-            if hasattr(self.backend, "cleanup"):
-                self.backend.cleanup()
-        except Exception as exc:
-            try:
-                self.write_log(f"backend cleanup error: {exc!r}")
-            except Exception:
-                print(f"[operator] backend cleanup error: {exc!r}", flush=True)
-        if self.session_logs is not None:
-            self.session_logs.close(reason="ui_window_close")
-        try:
-            self.destroy()
-        except Exception:
-            pass
+        # ``Tk.__getattr__`` attempts to resolve unknown names through Tcl;
+        # use the instance dictionary so a bare/test instance remains safe.
+        coordinator = self.__dict__.get("_shutdown_coordinator")
+        if coordinator is None:
+            coordinator = OperatorShutdownCoordinator(
+                backend=self.backend,
+                session_logs=self.__dict__.get("session_logs"),
+                write_log=self.__dict__.get("write_log"),
+                destroy=self.destroy,
+                command_coordinator=self._get_command_coordinator(),
+            )
+            self._shutdown_coordinator = coordinator
+        coordinator.shutdown(reason="ui_window_close")
 
     def _gravity_tick(self, st: DroneState) -> None:
         """Feed current attitude into the calibrator and refresh HUD lines."""
@@ -8049,6 +7981,12 @@ def build_argument_parser() -> argparse.ArgumentParser:
         ),
     )
     ap.add_argument("--megaloc-cache", default=None)
+    ap.add_argument(
+        "--reference-index",
+        default=None,
+        help="Profile-pinned IVF index SHA256SUMS.json for large reference maps",
+    )
+    ap.add_argument("--reference-index-sha256", default=None)
     ap.add_argument("--track-landmarks", default=None,
                     help="XFeat TRACK landmark sidecar selected directly or by site profile")
     ap.add_argument(
@@ -8896,6 +8834,10 @@ def _build_operator_localizer(
         STREAM_HEIGHT,
         Path(args.bundle),
         args.megaloc_cache,
+        reference_index=str(getattr(args, "reference_index", "") or ""),
+        reference_index_sha256=str(
+            getattr(args, "reference_index_sha256", "") or ""
+        ),
         force_track_bench=bool(args.loc_force_track_bench),
         force_track_ref=int(args.loc_force_track_ref),
         neuflow_track=bool(args.neuflow_track),

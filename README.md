@@ -74,11 +74,14 @@ per-asset 參數只能在明確加上 `--allow-legacy-assets` 的遷移作業中
 ## 轉到另一台電腦
 
 先在來源電腦建立固定程式/runtime 發布包。它會包含 UI、EDM 程式、固定模型與
-authoritative controller，但排除 `.venv`、執行輸出、地圖與影片；僅保留
-`outputs/README.md` 作為輸出治理契約：
+authoritative controller，排除 `.venv`、執行輸出與影片。指定 `--site-profile`
+時，exporter 會另外收錄該 profile 的所有 digest-bound 地圖、route、bundle、
+reference index 與核准 sidecar，並產生 `PORTABLE_SITE_ASSETS.json`：
 
 ```bash
-python tools/export_simulator_package.py /path/to/portable_localization
+python tools/export_simulator_package.py /path/to/portable_localization \
+  --artifact-root /path/to/approved-runtime-artifact-seed \
+  --site-profile 控制介面程式/site_profiles/river_site_edm.json
 cd /path/to/portable_localization
 python tools/package_manifest.py verify
 
@@ -96,9 +99,18 @@ bash tools/install_runtime.sh
 # 驗證／測試所需套件也從 hash lock 安裝（不使用 system site packages）
 bash tools/install_runtime.sh --test-deps
 
+# 完整 system validation 另安裝 bounded mypy、dependency audit 與 SBOM 工具
+bash tools/install_runtime.sh --test-deps --quality-deps
+
 # 匯入完整地圖場域包到地圖檔/場域/<site>/，再由選擇介面挑選地圖與影片
 ./控制介面程式/影片模擬串流/選擇啟動.sh
 ```
+
+`RUNTIME_ARTIFACTS.json` 是 Git source 內的固定 runtime artifact allowlist；exporter
+只會複製其中已驗證大小與 SHA-256 的檔案，不會無條件搬整個 model cache。clean
+checkout 若沒有外部 runtime artifacts，請從受核准的離線 bundle 依相對路徑 seed
+後再指定 `--artifact-root`（或 `SFM_RUNTIME_ARTIFACT_ROOT`）；exporter 只提供缺檔／
+digest 與 seed 指引，不會假造下載 URL 或自行連網。
 
 正式驗證會將固定場域與短影片暫時匯入 actual portable，使用該包的
 lock 檔建立乾淨環境，從其 selector/UI 產生有效 pose 後自動清理；

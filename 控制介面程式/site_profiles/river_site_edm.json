@@ -4,10 +4,6 @@
  "display_name": "河濱場域 EDM",
  "localizer": "edm",
  "localizer_deploy_dir": "../../定位演算法/deploy_code/sfm_glomap_deploy",
- "hardware_approval": {
-  "receipt": "../../地圖檔/場域/urai/reports/hardware_approval_20260806.json",
-  "sha256": "7bd0cc5fe465044ea2e65f6ea6e8b751531275cfc6fedb4bdba59def2576dcdd"
- },
  "localizer_profile": "../../定位演算法/configs/edm_profiles/river_site.json",
  "map_reference_poses": "../../地圖檔/場域/river_site/maps/river_site_ref_poses.json",
  "query_camera": {
@@ -31,10 +27,10 @@
   "map_align": "7c9e407c1937412faf19d0493ccda3b87612e22ec3b2a9db193d6db7cddce4fc"
  },
  "flight": {
-  "approved": true,
+  "approved": false,
   "coordinate_frame_id": "river_site_glomap",
-  "route_clearance_approved": true,
-  "approval_note": "Operator approved the current river-site route for autonomous flight on 2026-08-08.",
+  "route_clearance_approved": false,
+  "approval_note": "AUTO blocked: no site-specific real-hardware evidence or v2 receipt exists for river_site_edm; the route remains ground/replay validation only.",
   "controller": null
  },
  "assets": {

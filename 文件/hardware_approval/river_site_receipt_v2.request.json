@@ -1,0 +1,32 @@
+{
+  "schema": "anafi-hardware-approval-request/v2",
+  "status": "pending",
+  "purpose": "hardware_approval:auto",
+  "approved": false,
+  "approved_mode": "auto",
+  "site_id": "river_site_edm",
+  "coordinate_frame_id": "river_site_glomap",
+  "profile_sha256": "ab1eee43c76773e92073a8250099a5143199a0f5f9da7cde9d546b5dafe6ee1e",
+  "route_sha256": "70c14189432bea35c40db103a8587d91294d6f5fbdcedd995fa887496c7b1b35",
+  "bundle_sha256": "39a817936c0ba314a739701411f974672a94f126830f9f5b9a7a4efdfee08117",
+  "aircraft": {
+    "product": null,
+    "serial": null,
+    "firmware_versions": []
+  },
+  "controller": {
+    "product": null,
+    "serial": null,
+    "firmware_versions": []
+  },
+  "olympe_versions": [],
+  "approved_envelope": {
+    "max_altitude_m": null,
+    "max_distance_m": null,
+    "max_tilt_deg": null,
+    "max_vertical_speed_ms": null,
+    "max_rotation_speed_degs": null,
+    "gps_required": false
+  },
+  "approval_note": "REQUEST ONLY: pending field hardware identity, firmware, safety envelope, operator evidence, and detached Ed25519 approval. Never use this file as approval."
+}

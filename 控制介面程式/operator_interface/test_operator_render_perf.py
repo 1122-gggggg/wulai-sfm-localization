@@ -830,7 +830,7 @@ def test_video_hud_contains_only_requested_engineering_metrics(operator) -> None
     }
     joined = "\n".join(operator._video_diagnostic_lines())
     for token in (
-        "速度上限", "wall_ms", "core", "e2e", "RTH", "GPS",
+        "自主速度警戒", "wall_ms", "core", "e2e", "RTH", "GPS",
         "飛控高度", "AGL", "連接品質", "定位 FPS", "inliers",
         "飛控融合姿態", "三軸速度",
     ):
@@ -877,10 +877,10 @@ def test_flight_tab_only_shows_limit_settings_and_has_no_duplicate_hover(
             except Exception:
                 continue
     joined = "\n".join(settings_texts)
-    for token in ("目前設定", "高度", "距離", "圍欄", "速度上限"):
+    for token in ("目前設定", "高度", "距離", "圍欄", "自主速度警戒"):
         assert token in joined
     for removed in (
         "硬體", "版本", "失聯策略", "起飛資料", "控制器",
-        "ground speed", "PCMD", "map Y",
+        "ground speed", "map Y",
     ):
         assert removed not in joined

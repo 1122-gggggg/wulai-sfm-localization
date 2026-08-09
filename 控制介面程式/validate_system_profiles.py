@@ -6,13 +6,16 @@ import hashlib
 import json
 from pathlib import Path
 
-from site_profile import SCHEMA_VERSION, load_site_profile
+from site_profile import SCHEMA_VERSION, flight_readiness_errors, load_site_profile
 
 
 ROOT = Path(__file__).resolve().parent
 PROFILES = ROOT / "site_profiles"
 TEMPLATE_NAMES = {"example_site_edm.json"}
-APPROVED_PROFILE_NAMES = {"river_site_edm.json"}
+# No shipped profile currently has a signed, site-bound hardware AUTO approval.
+# Adding a name here is a release decision and must accompany the verified v2
+# receipt/signature/trust material required by ``flight_readiness_errors``.
+APPROVED_PROFILE_NAMES: set[str] = set()
 
 
 def _digest(path: Path) -> str:
@@ -23,62 +26,121 @@ def _digest(path: Path) -> str:
     return value.hexdigest()
 
 
+def _validate_profile_fields(source: Path, raw: dict, profile: object) -> list[str]:
+    failures: list[str] = []
+    if profile.schema_version != SCHEMA_VERSION:
+        failures.append(
+            f"{source.name}: schema v{profile.schema_version} is not v{SCHEMA_VERSION}"
+        )
+    if "map_units_per_meter" in raw.get("flight", {}):
+        failures.append(f"{source.name}: metric map scale is prohibited")
+    approved = bool(profile.flight and profile.flight.approved)
+    expected_approved = source.name in APPROVED_PROFILE_NAMES
+    if approved is not expected_approved:
+        failures.append(f"{source.name}: flight.approved must be {expected_approved}")
+    if expected_approved:
+        failures.extend(
+            f"{source.name}: AUTO readiness: {error}"
+            for error in flight_readiness_errors(profile)
+        )
+    return failures
+
+
+def _validate_asset_digests(source: Path, profile: object) -> tuple[list[str], int]:
+    failures: list[str] = []
+    checked = 0
+    for key, path in (
+        ("map_ply", profile.map_ply),
+        ("localization_bundle", profile.localization_bundle),
+        ("route_json", profile.route_json),
+        ("map_reference_poses", profile.map_reference_poses),
+        ("localizer_profile", profile.localizer_profile),
+        ("reference_index", profile.reference_index),
+        ("poles_json", profile.poles_json),
+        ("map_align", profile.map_align),
+    ):
+        expected = getattr(profile.asset_sha256, key)
+        if expected is None:
+            continue
+        if path is None or not path.is_file():
+            failures.append(f"{source.name}: hashed asset {key} is missing")
+            continue
+        actual = _digest(path)
+        checked += 1
+        if actual != expected:
+            failures.append(
+                f"{source.name}: {key} SHA-256 mismatch "
+                f"expected={expected} actual={actual}"
+            )
+    return failures, checked
+
+
+def _validate_hardware_digests(source: Path, profile: object) -> tuple[list[str], int]:
+    hardware = profile.hardware_approval
+    if hardware is None:
+        return [], 0
+    failures: list[str] = []
+    checked = 0
+    for key, path, expected in (
+        ("hardware_approval.receipt", hardware.receipt, hardware.sha256),
+        (
+            "hardware_approval.signature",
+            hardware.signature,
+            hardware.signature_sha256,
+        ),
+        (
+            "hardware_approval.trust_store",
+            hardware.trust_store,
+            hardware.trust_store_sha256,
+        ),
+    ):
+        if path is None and expected is None:
+            continue
+        if path is None or expected is None or not path.is_file():
+            failures.append(f"{source.name}: hashed asset {key} is missing")
+            continue
+        actual = _digest(path)
+        checked += 1
+        if actual != expected:
+            failures.append(
+                f"{source.name}: {key} SHA-256 mismatch "
+                f"expected={expected} actual={actual}"
+            )
+    return failures, checked
+
+
+def _validate_one(source: Path) -> tuple[dict[str, object] | None, list[str]]:
+    try:
+        raw = json.loads(source.read_text(encoding="utf-8"))
+        profile = load_site_profile(
+            source, validate_files=source.name not in TEMPLATE_NAMES
+        )
+    except Exception as exc:
+        return None, [f"{source.name}: {exc}"]
+
+    failures = _validate_profile_fields(source, raw, profile)
+    asset_failures, asset_count = _validate_asset_digests(source, profile)
+    hardware_failures, hardware_count = _validate_hardware_digests(source, profile)
+    failures.extend(asset_failures)
+    failures.extend(hardware_failures)
+    return {
+        "profile": source.name,
+        "site_id": profile.site_id,
+        "schema_version": profile.schema_version,
+        "flight_approved": bool(profile.flight and profile.flight.approved),
+        "digests_checked": asset_count + hardware_count,
+        "template": source.name in TEMPLATE_NAMES,
+    }, failures
+
+
 def validate() -> tuple[list[dict[str, object]], list[str]]:
     rows: list[dict[str, object]] = []
     failures: list[str] = []
     for source in sorted(PROFILES.glob("*.json")):
-        try:
-            raw = json.loads(source.read_text(encoding="utf-8"))
-            profile = load_site_profile(
-                source, validate_files=source.name not in TEMPLATE_NAMES
-            )
-        except Exception as exc:
-            failures.append(f"{source.name}: {exc}")
-            continue
-        if profile.schema_version != SCHEMA_VERSION:
-            failures.append(
-                f"{source.name}: schema v{profile.schema_version} is not v{SCHEMA_VERSION}"
-            )
-        if "map_units_per_meter" in raw.get("flight", {}):
-            failures.append(f"{source.name}: metric map scale is prohibited")
-        approved = bool(profile.flight and profile.flight.approved)
-        expected_approved = source.name in APPROVED_PROFILE_NAMES
-        if approved is not expected_approved:
-            failures.append(
-                f"{source.name}: flight.approved must be {expected_approved}"
-            )
-
-        checked = 0
-        for key, path in (
-            ("map_ply", profile.map_ply),
-            ("localization_bundle", profile.localization_bundle),
-            ("route_json", profile.route_json),
-            ("map_reference_poses", profile.map_reference_poses),
-            ("localizer_profile", profile.localizer_profile),
-            ("poles_json", profile.poles_json),
-        ):
-            expected = getattr(profile.asset_sha256, key)
-            if expected is None:
-                continue
-            if path is None or not path.is_file():
-                failures.append(f"{source.name}: hashed asset {key} is missing")
-                continue
-            actual = _digest(path)
-            checked += 1
-            if actual != expected:
-                failures.append(
-                    f"{source.name}: {key} SHA-256 mismatch expected={expected} actual={actual}"
-                )
-        rows.append(
-            {
-                "profile": source.name,
-                "site_id": profile.site_id,
-                "schema_version": profile.schema_version,
-                "flight_approved": bool(profile.flight and profile.flight.approved),
-                "digests_checked": checked,
-                "template": source.name in TEMPLATE_NAMES,
-            }
-        )
+        row, profile_failures = _validate_one(source)
+        failures.extend(profile_failures)
+        if row is not None:
+            rows.append(row)
     return rows, failures
 
 

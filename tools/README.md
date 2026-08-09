@@ -7,7 +7,7 @@
 | `check_maintainability.py` | 以分區 C901 預算阻止複雜度熱點數量或最壞值回升 |
 | `simulator_preflight.py` | 模擬介面啟動前檢查 Python、CUDA、模型、場域資產與影片 |
 | `install_runtime.sh` | 用 `requirements-lock.txt` 的 transitive pins/hashes 建立乾淨 CPython 3.10 venv |
-| `export_simulator_package.py` | 匯出固定程式/runtime，排除 venv、執行輸出、地圖與影片，僅保留 outputs 治理 README，並產生 manifest |
+| `export_simulator_package.py` | 依 runtime allowlist 匯出固定程式；可用 `--site-profile` 收錄完整 hash-bound 場域資產，排除 venv、執行輸出與影片 |
 | `package_manifest.py` | 驗證目前可攜式發布包的 MANIFEST.tsv / SHA256SUMS |
 | `release_activation.py` | 驗證 commit/version-bound package，原子 stage/activate/rollback |
 | `test_clean_install.sh` | 在暫存目錄重建 CPython 3.10 venv 並執行 runtime preflight |
@@ -15,10 +15,12 @@
 | `test_portable_runtime.sh` | 在 actual portable 暫時匯入固定場域，乾淨安裝並要求 UI 產生有效 pose，後恢復發布邊界 |
 | `test_system_validation.py` | 驗證編排步驟和 Python 環境隔離 |
 | `test_workspace_audit.py` | 驗證工作區結構契約 |
+| `security_dependency_gate.py` | 執行 pip-audit、驗證到期中的安全例外，並輸出 CycloneDX SBOM |
 
 `requirements-lock.txt` 是 runtime 的唯一 hash lock；`requirements-test-lock.txt`
-另外固定 pytest、ruff、coverage 與 timeout plugin。乾淨驗證可用
-`bash tools/install_runtime.sh --test-deps`，安裝器會拒絕
+另外固定 pytest、ruff、coverage 與 timeout plugin。乾淨測試可用
+`bash tools/install_runtime.sh --test-deps`；完整 system validation 使用
+`bash tools/install_runtime.sh --test-deps --quality-deps`。安裝器會拒絕
 `include-system-site-packages=true` 的既有 venv。`simulator_preflight.py --json` 的
 receipt 會記錄稀疏點雲 collision monitor 是否能在 clean lock-only 環境取得；
 scipy 已固定於 runtime lock，正常狀態為 `available_non_production`。它不是
@@ -55,3 +57,55 @@ cache、workspace 執行輸出、audit review artifacts 與其他 `.gitignore` �
 ```bash
 python tools/workspace_audit.py --strict-output-names
 ```
+
+## 外部 runtime artifacts
+
+`RUNTIME_ARTIFACTS.json` 是 Git source 內的 runtime artifact registry，不是下載器。
+它只列出 portable runtime 真正需要的相對路徑、大小與 SHA-256；模型 cache 的其他
+repo、checkpoint 與暫存檔不會被 exporter 掃描或複製。來源工作區的
+`MANIFEST.tsv` / `SHA256SUMS` 是 source-only manifest，外部 artifact 則由 registry
+獨立綁定；portable 輸出包的 manifest 會同時包含已解析的 allowlist 檔案。
+來源 checkout 可用 `python tools/package_manifest.py verify --source-only` 檢查；
+portable package 則在其根目錄執行一般的 `verify`。
+
+乾淨 checkout 沒有外部 artifact 時，exporter 會 fail closed，列出缺少的相對路徑與
+digest，不會嘗試網路下載。請從受核准的離線 artifact bundle 建立與 registry 相同的
+目錄樹，再指定 seed root：
+
+```bash
+python tools/export_simulator_package.py /path/to/portable_localization \
+  --artifact-root /path/to/seed-root \
+  --site-profile 控制介面程式/site_profiles/river_site_edm.json
+# 或：SFM_RUNTIME_ARTIFACT_ROOT=/path/to/seed-root python tools/export_simulator_package.py ...
+```
+
+`--artifact-root` 下的檔案必須以 repository-relative path 放置；resolver 會先驗證
+大小，再驗證 SHA-256。沒有 registry 或 digest 不符時不會產生部分可信的 runtime 包。
+有 `--site-profile` 時，`PORTABLE_SITE_ASSETS.json` 另外綁定 profile 與每個場域檔案；
+reference index 不能只帶 manifest，signed hardware approval 也不能缺 receipt、
+signature 或 trust store sidecar。
+
+## 工程品質 gates
+
+`requirements-quality.txt` / `requirements-quality-lock.txt` 是獨立的品質工具
+清單，不會改寫 runtime 或 test lock。CPython 3.10 可由安裝器加入現有驗證環境：
+
+```bash
+bash tools/install_runtime.sh --quality-deps
+python -m mypy
+ruff check . --select S102,S105,S106,S107,S602,S604,S605,S608 \
+  --exclude '**/test*.py' --exclude '**/tests/**' \
+  --exclude '定位演算法/deploy_code/runtime/**'
+python tools/security_dependency_gate.py
+```
+
+`mypy` 只對 `pyproject.toml` 的明確 typed boundary 清單設 fail gate，並不宣稱
+整個 Tk/Olympe/Torch 應用程式已完成型別化。安全 gate 的 vulnerability exception 在
+`pyproject.toml` 以 package、advisory ID、理由和 ISO 到期日保存；到期或未列出的
+漏洞都會 fail。pip-audit 的 `skip_reason` 不能以一般 vulnerability exception
+略過，必須在 `[[tool.security_dependency_gate.skip_exceptions]]` 以精確的 package、
+version、`skip_reason`、理由和到期日列出。版本、原因改變或例外過期都會 fail，避免
+把新的未稽核套件默認視為安全。`security_dependency_gate.py` 會在
+`outputs/security/` 產生 `pip-audit.json` 和 `sbom.cyclonedx.json`；非 PyPI 的
+CUDA wheel 即使被 pip-audit skip，也會以 `audited=false` 與原始 `skip_reason`
+保留在 CycloneDX JSON SBOM 中。

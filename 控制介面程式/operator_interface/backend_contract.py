@@ -75,6 +75,15 @@ class InvalidControlRequest(ValueError):
     pass
 
 
+def _finite_control_float(value: object, label: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise InvalidControlRequest(f"{label} must be numeric")
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise InvalidControlRequest(f"{label} must be finite")
+    return parsed
+
+
 @dataclass(frozen=True)
 class EmptyPayload:
     pass
@@ -133,18 +142,51 @@ class LimitsPayload:
     distance_geofence: bool = True
 
     def __post_init__(self) -> None:
-        if self.max_altitude_m <= 0.0 or self.max_distance_m <= 0.0:
+        altitude = _finite_control_float(
+            self.max_altitude_m, "max_altitude_m"
+        )
+        distance = _finite_control_float(
+            self.max_distance_m, "max_distance_m"
+        )
+        if altitude <= 0.0 or distance <= 0.0:
             raise InvalidControlRequest("firmware limits must be positive")
+        if not isinstance(self.distance_geofence, bool):
+            raise InvalidControlRequest("distance_geofence must be boolean")
+        object.__setattr__(self, "max_altitude_m", altitude)
+        object.__setattr__(self, "max_distance_m", distance)
 
 
 @dataclass(frozen=True)
 class ScalarPayload:
     value: float
 
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "value", _finite_control_float(self.value, "scalar value")
+        )
+
 
 @dataclass(frozen=True)
 class TogglePayload:
     enabled: bool
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.enabled, bool):
+            raise InvalidControlRequest("toggle enabled must be boolean")
+
+
+@dataclass(frozen=True)
+class CameraResetPayload:
+    pitch: float
+    zoom: float
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "pitch", _finite_control_float(self.pitch, "camera pitch")
+        )
+        object.__setattr__(
+            self, "zoom", _finite_control_float(self.zoom, "camera zoom")
+        )
 
 
 @dataclass(frozen=True)
@@ -181,9 +223,11 @@ ControlPayload = (
     EmptyPayload
     | NudgePayload
     | NudgeHeartbeatPayload
+    | NudgeVectorPayload
     | LimitsPayload
     | ScalarPayload
     | TogglePayload
+    | CameraResetPayload
     | MissionRoutePayload
 )
 
@@ -198,7 +242,6 @@ _NO_PAYLOAD_ACTIONS = {
     ControlAction.LAND_NOW,
     ControlAction.START_LOCALIZATION,
     ControlAction.BOOT_LOCK,
-    ControlAction.CAMERA_RESET,
     ControlAction.RECORD_DISARM,
     ControlAction.RECORD_START,
     ControlAction.RECORD_STOP,
@@ -261,10 +304,18 @@ class ControlRequest:
     def __post_init__(self) -> None:
         if not isinstance(self.action, ControlAction):
             raise InvalidControlRequest("action must be a ControlAction")
-        if not self.request_id.strip():
+        if not isinstance(self.request_id, str) or not self.request_id.strip():
             raise InvalidControlRequest("request_id is required")
-        if self.submitted_mono_ns <= 0:
+        if (
+            isinstance(self.submitted_mono_ns, bool)
+            or not isinstance(self.submitted_mono_ns, int)
+            or self.submitted_mono_ns <= 0
+        ):
             raise InvalidControlRequest("submitted_mono_ns must be positive")
+        if self.submitted_mono_ns > time.monotonic_ns() + 1_000_000_000:
+            raise InvalidControlRequest("submitted_mono_ns cannot be in the future")
+        if not isinstance(self.human_origin, bool):
+            raise InvalidControlRequest("human_origin must be boolean")
         if self.action in _NO_PAYLOAD_ACTIONS and not isinstance(
             self.payload, EmptyPayload
         ):
@@ -278,6 +329,7 @@ class ControlRequest:
             ControlAction.ZOOM: ScalarPayload,
             ControlAction.SET_AUTO_SPEED_LIMIT: ScalarPayload,
             ControlAction.RECORD_ARM: TogglePayload,
+            ControlAction.CAMERA_RESET: CameraResetPayload,
             ControlAction.START_AUTO: MissionRoutePayload,
         }.get(self.action)
         if expected is not None and not isinstance(self.payload, expected):
@@ -296,7 +348,7 @@ class ControlRequest:
         return cls(
             action=action,
             payload=payload if payload is not None else EmptyPayload(),
-            human_origin=bool(human_origin),
+            human_origin=human_origin,
         )
 
     @classmethod
@@ -319,10 +371,10 @@ class ControlRequest:
         elif action is ControlAction.NUDGE_VECTOR:
             try:
                 parsed = NudgeVectorPayload(
-                    float(payload.get("roll", 0.0)),
-                    float(payload.get("pitch", 0.0)),
-                    float(payload.get("yaw", 0.0)),
-                    float(payload.get("gaz", 0.0)),
+                    payload.get("roll", 0.0),
+                    payload.get("pitch", 0.0),
+                    payload.get("yaw", 0.0),
+                    payload.get("gaz", 0.0),
                 )
             except (TypeError, ValueError) as exc:
                 raise InvalidControlRequest(
@@ -330,6 +382,7 @@ class ControlRequest:
                 ) from exc
         elif action is ControlAction.NUDGE_HEARTBEAT:
             raw = payload.get("dirs", payload.get("directions", ()))
+            values: tuple[str, ...]
             if isinstance(raw, str):
                 values = (raw,)
             else:
@@ -343,9 +396,9 @@ class ControlRequest:
         elif action is ControlAction.APPLY_LIMITS:
             try:
                 parsed = LimitsPayload(
-                    float(payload["max_altitude_m"]),
-                    float(payload["max_distance_m"]),
-                    bool(payload.get("distance_geofence", True)),
+                    payload["max_altitude_m"],
+                    payload["max_distance_m"],
+                    payload.get("distance_geofence", True),
                 )
             except (KeyError, TypeError, ValueError) as exc:
                 raise InvalidControlRequest(
@@ -362,11 +415,18 @@ class ControlRequest:
                 ControlAction.SET_AUTO_SPEED_LIMIT: "speed_limit_mps",
             }[action]
             try:
-                parsed = ScalarPayload(float(payload[key]))
+                parsed = ScalarPayload(payload[key])
             except (KeyError, TypeError, ValueError) as exc:
                 raise InvalidControlRequest(f"{action.value} requires {key}") from exc
         elif action is ControlAction.RECORD_ARM:
-            parsed = TogglePayload(bool(payload.get("enabled", payload.get("value", True))))
+            parsed = TogglePayload(
+                payload.get("enabled", payload.get("value", True))
+            )
+        elif action is ControlAction.CAMERA_RESET:
+            parsed = CameraResetPayload(
+                payload.get("pitch", -20.0),
+                payload.get("zoom", 1.0),
+            )
         elif action is ControlAction.START_AUTO:
             try:
                 parsed = MissionRoutePayload(
@@ -407,19 +467,30 @@ class ControlRequest:
         elif self.action is ControlAction.NUDGE_HEARTBEAT:
             assert isinstance(self.payload, NudgeHeartbeatPayload)
             payload = {"dirs": self.payload.directions}
-        elif self.action is ControlAction.GIMBAL_PITCH:
+        elif self.action in {
+            ControlAction.GIMBAL_PITCH,
+            ControlAction.ZOOM,
+            ControlAction.SET_AUTO_SPEED_LIMIT,
+        }:
             assert isinstance(self.payload, ScalarPayload)
-            payload = {"pitch": self.payload.value}
-        elif self.action is ControlAction.ZOOM:
-            assert isinstance(self.payload, ScalarPayload)
-            payload = {"zoom": self.payload.value}
-        elif self.action is ControlAction.SET_AUTO_SPEED_LIMIT:
-            assert isinstance(self.payload, ScalarPayload)
-            name = "auto_speed_limit_apply"
-            payload = {"speed_limit_mps": self.payload.value}
+            name, key = {
+                ControlAction.GIMBAL_PITCH: (name, "pitch"),
+                ControlAction.ZOOM: (name, "zoom"),
+                ControlAction.SET_AUTO_SPEED_LIMIT: (
+                    "auto_speed_limit_apply",
+                    "speed_limit_mps",
+                ),
+            }[self.action]
+            payload = {key: self.payload.value}
         elif self.action is ControlAction.RECORD_ARM:
             assert isinstance(self.payload, TogglePayload)
             payload = {"enabled": self.payload.enabled}
+        elif self.action is ControlAction.CAMERA_RESET:
+            assert isinstance(self.payload, CameraResetPayload)
+            payload = {
+                "pitch": self.payload.pitch,
+                "zoom": self.payload.zoom,
+            }
         elif self.action is ControlAction.START_AUTO:
             assert isinstance(self.payload, MissionRoutePayload)
             payload = {
@@ -454,11 +525,16 @@ class ControlResult:
     def completed(
         cls, state: Any, *, raw_result: Any = None, reason_code: str = "OK"
     ) -> "ControlResult":
-        accepted = raw_result is not False
+        accepted = raw_result is True
+        rejected_reason = (
+            "BACKEND_REJECTED"
+            if raw_result is False
+            else "BACKEND_RESULT_NOT_EXPLICIT"
+        )
         return cls(
             accepted,
             accepted,
-            reason_code if accepted else "BACKEND_REJECTED",
+            reason_code if accepted else rejected_reason,
             {"accepted": accepted},
             {},
             state,
@@ -535,7 +611,7 @@ class LegacyFrameSourceAdapter:
         else:
             self._last_rgb = frame
 
-        stamp = getattr(self.source, "last_stamp", None)
+        stamp: Any = getattr(self.source, "last_stamp", None)
         try:
             source_ns = int(round(float(stamp) * 1_000_000_000))
         except (TypeError, ValueError, OverflowError):

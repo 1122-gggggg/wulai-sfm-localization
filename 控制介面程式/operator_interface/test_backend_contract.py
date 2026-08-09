@@ -5,6 +5,7 @@ from dataclasses import FrozenInstanceError
 import pytest
 
 from backend_contract import (
+    CameraResetPayload,
     ControlAction,
     ControlRequest,
     ControlResult,
@@ -12,8 +13,12 @@ from backend_contract import (
     InterfaceMode,
     InvalidControlRequest,
     LegacyFrameSourceAdapter,
+    LimitsPayload,
     MissionRoutePayload,
+    NudgeVectorPayload,
+    ScalarPayload,
     SessionConfig,
+    TogglePayload,
 )
 from flight_operator_app import DroneBackend
 
@@ -41,6 +46,68 @@ def test_session_config_is_immutable_and_has_one_fixed_interface() -> None:
     assert backend.start(config).started
     with pytest.raises(FrozenInstanceError):
         config.interface_mode = InterfaceMode.REAL_FLIGHT  # type: ignore[misc]
+
+
+def test_control_result_requires_explicit_boolean_backend_success() -> None:
+    state = object()
+
+    ambiguous = ControlResult.completed(state, raw_result=state)
+    confirmed = ControlResult.completed(state, raw_result=True)
+
+    assert not ambiguous.accepted
+    assert not ambiguous.executed
+    assert ambiguous.reason_code == "BACKEND_RESULT_NOT_EXPLICIT"
+    assert confirmed.accepted and confirmed.executed
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), -float("inf"), True])
+def test_numeric_control_payloads_reject_non_finite_and_boolean_values(value) -> None:
+    with pytest.raises(InvalidControlRequest):
+        ScalarPayload(value)
+    with pytest.raises(InvalidControlRequest):
+        LimitsPayload(value, 10.0, True)
+    with pytest.raises(InvalidControlRequest):
+        NudgeVectorPayload(value, 0.0, 0.0, 0.0)
+
+
+def test_boolean_control_payloads_reject_truthy_strings() -> None:
+    with pytest.raises(InvalidControlRequest):
+        TogglePayload("false")
+    with pytest.raises(InvalidControlRequest):
+        LimitsPayload(10.0, 20.0, "false")
+    with pytest.raises(InvalidControlRequest):
+        ControlRequest.from_legacy(
+            "record_arm", human_origin=True, enabled="false"
+        )
+
+
+def test_control_request_rejects_non_boolean_origin_and_future_timestamp() -> None:
+    with pytest.raises(InvalidControlRequest, match="human_origin"):
+        ControlRequest(
+            action=ControlAction.HOVER,
+            human_origin=1,
+        )
+
+
+def test_camera_reset_preserves_typed_pitch_and_zoom() -> None:
+    request = ControlRequest.from_legacy(
+        "camera_reset",
+        human_origin=True,
+        pitch=-35.0,
+        zoom=1.5,
+    )
+
+    assert isinstance(request.payload, CameraResetPayload)
+    assert request.legacy_call() == (
+        "camera_reset",
+        {"pitch": -35.0, "zoom": 1.5},
+    )
+    with pytest.raises(InvalidControlRequest, match="future"):
+        ControlRequest(
+            action=ControlAction.HOVER,
+            human_origin=True,
+            submitted_mono_ns=10**30,
+        )
 
 
 def test_unknown_legacy_action_is_rejected_before_backend_dispatch() -> None:

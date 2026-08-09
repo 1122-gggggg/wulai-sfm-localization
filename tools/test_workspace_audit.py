@@ -83,6 +83,7 @@ def test_workspace_audit_requires_embedded_parrot_control_core(tmp_path: Path) -
 def test_output_classification_keeps_new_names_visible() -> None:
     assert classify_output("edm_speed_20260803") == "experiment_evidence"
     assert classify_output("validation_receipts") == "validation"
+    assert classify_output("security") == "validation"
     assert classify_output("flight_logs") == "operations"
     assert classify_output("misc") == "unclassified"
 

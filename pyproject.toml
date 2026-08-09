@@ -20,6 +20,69 @@ exclude = [
 # correctness issues in first-party code. Syntax errors remain an explicit gate.
 select = ["E9", "F"]
 
+[tool.mypy]
+# This is an intentionally bounded boundary gate, not a claim that the whole
+# robotics application is typed.  Dynamic vendor/UI/ML modules remain outside
+# this list until they have stable interfaces and stubs.
+python_version = "3.10"
+files = [
+  "tools/release_contract.py",
+  "tools/package_manifest.py",
+  "定位演算法/flight_control/safety_command.py",
+  "控制介面程式/operator_interface/backend_contract.py",
+]
+check_untyped_defs = true
+disallow_untyped_defs = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_return_any = true
+warn_unused_ignores = true
+ignore_missing_imports = true
+follow_imports = "skip"
+
+[tool.security_dependency_gate]
+# Avoid noisy style-adjacent rules in the security gate.  These rules catch
+# dynamic code execution, credential literals, shell injection, and unsafe
+# deserialization without turning existing test assertions into findings.
+
+[[tool.security_dependency_gate.exceptions]]
+package = "protobuf"
+advisory_id = "PYSEC-2026-899"
+reason = "parrot-olympe==8.4.0 pins this protobuf wire schema; upgrading it changes the flight SDK protocol. The deployed runtime is isolated and offline; revisit this exception with the next Olympe upgrade."
+expires = "2027-08-09"
+
+[[tool.security_dependency_gate.exceptions]]
+package = "protobuf"
+advisory_id = "PYSEC-2026-1806"
+reason = "parrot-olympe==8.4.0 pins this protobuf wire schema; upgrading it changes the flight SDK protocol. The deployed runtime is isolated and offline; revisit this exception with the next Olympe upgrade."
+expires = "2027-08-09"
+
+[[tool.security_dependency_gate.exceptions]]
+package = "protobuf"
+advisory_id = "PYSEC-2026-1805"
+reason = "parrot-olympe==8.4.0 pins this protobuf wire schema; upgrading it changes the flight SDK protocol. The deployed runtime is isolated and offline; revisit this exception with the next Olympe upgrade."
+expires = "2027-08-09"
+
+[[tool.security_dependency_gate.exceptions]]
+package = "setuptools"
+advisory_id = "PYSEC-2026-3447"
+reason = "torch==2.11.0+cu128 pins setuptools<82. This advisory is limited to macOS sdist Unicode MANIFEST exclusion behavior; this Linux runtime does not build or publish sdists. Revisit when the pinned torch/runtime contract changes."
+expires = "2027-02-09"
+
+[[tool.security_dependency_gate.skip_exceptions]]
+package = "torch"
+version = "2.11.0+cu128"
+skip_reason = "Dependency not found on PyPI and could not be audited: torch (2.11.0+cu128)"
+reason = "The official PyTorch cu128 extra index (https://download.pytorch.org/whl/cu128) provides this CUDA wheel. The runtime and test locks pin its exact version and hashes, installation is offline after seeding the approved artifact bundle, and the gate records this skipped component in the CycloneDX SBOM. Revisit before expiry."
+expires = "2027-02-09"
+
+[[tool.security_dependency_gate.skip_exceptions]]
+package = "torchvision"
+version = "0.26.0+cu128"
+skip_reason = "Dependency not found on PyPI and could not be audited: torchvision (0.26.0+cu128)"
+reason = "The official PyTorch cu128 extra index (https://download.pytorch.org/whl/cu128) provides this CUDA wheel. The runtime and test locks pin its exact version and hashes, installation is offline after seeding the approved artifact bundle, and the gate records this skipped component in the CycloneDX SBOM. Revisit before expiry."
+expires = "2027-02-09"
+
 [tool.coverage.run]
 branch = true
 source = [

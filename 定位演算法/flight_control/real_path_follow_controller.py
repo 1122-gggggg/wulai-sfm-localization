@@ -48,15 +48,26 @@ Olympe.  It outputs a Command.  A real-flight runner must:
 from __future__ import annotations
 
 import json
-import hashlib
-import hmac
 import math
 import time
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Optional
 
 import numpy as np
+
+from route_domain import (
+    MissionRouteLock as _MissionRouteLock,
+    MissionRouteSnapshot,
+    RouteDocument,
+    _validated_waypoints as _validated_route_waypoints,
+    aligned_to_glomap as _domain_aligned_to_glomap,
+    capture_mission_route_snapshot as _capture_mission_route_snapshot,
+)
+
+# Preserve the historical public import path while keeping the implementation
+# in the shared route domain module.
+MissionRouteLock = _MissionRouteLock
 
 try:
     from scipy.spatial import cKDTree
@@ -401,30 +412,14 @@ def _finite_vec3(value, label: str) -> np.ndarray:
 
 
 def _validated_waypoints(waypoints) -> list[np.ndarray]:
-    if not isinstance(waypoints, (list, tuple)) or len(waypoints) < 2:
-        raise ValueError(f"need >=2 waypoints, got {0 if waypoints is None else len(waypoints)}")
-    out = [_finite_vec3(p, f"waypoint[{i}]") for i, p in enumerate(waypoints)]
-    for i, (a, b) in enumerate(zip(out[:-1], out[1:])):
-        if float(np.linalg.norm(b - a)) <= 1e-9:
-            raise ValueError(f"route segment {i}->{i + 1} has zero length")
-    return out
+    """Compatibility adapter to the shared route-domain validator."""
+    return [np.array(point, dtype=float, copy=True)
+            for point in _validated_route_waypoints(waypoints)]
 
 
-def aligned_to_glomap(p: Iterable[float],
-                      frame: MapFrame = LEGACY_MAP_FRAME) -> np.ndarray:
-    """Blender aligned Z-up -> raw GLOMAP, through the SAME basis Blender used.
-
-    Aligned coordinates are (east, north, up) components of that basis, so the
-    inverse is just the basis recombination. With the legacy basis this reduces
-    exactly to the old [x, -z, y] swap; with a measured basis it undoes what the
-    authoring tool actually applied. Using the legacy inverse on a route authored
-    against T_align_gravity.json rotates every waypoint by the 22.5 deg the two
-    bases differ by -- the route silently no longer matches the map.
-    """
-    p = _finite_vec3(p, "aligned coordinate")
-    return (float(p[0]) * frame.east
-            + float(p[1]) * frame.north
-            + float(p[2]) * frame.up)
+def aligned_to_glomap(p, frame: MapFrame = LEGACY_MAP_FRAME) -> np.ndarray:
+    """Compatibility adapter to the shared route-domain conversion."""
+    return _domain_aligned_to_glomap(p, frame)
 
 
 def wrap_angle(a: float) -> float:
@@ -516,67 +511,14 @@ def _waypoints_from_route_data(
     require_flight_contract: bool = False,
     map_frame: MapFrame = LEGACY_MAP_FRAME,
 ) -> list[np.ndarray]:
-    if not isinstance(data, dict) or not isinstance(data.get("waypoints"), list):
-        raise ValueError("route JSON must contain a waypoints list")
-    if require_flight_contract:
-        expected = {
-            "schema": "sfm-flight-route/v1",
-            "site_id": expected_site_id,
-            "coordinate_frame_id": expected_coordinate_frame_id,
-            "units": "map",
-            "purpose": "flight",
-        }
-        for key, value in expected.items():
-            if data.get(key) != value:
-                raise ValueError(
-                    f"flight route {key} must be {value!r}, got {data.get(key)!r}"
-                )
-        if data.get("closed") is not False:
-            raise ValueError(
-                f"flight route closed must be False, got {data.get('closed')!r}"
-            )
-    frame = data.get("frame", "aligned")
-    if frame not in {"aligned", "glomap"}:
-        raise ValueError("route frame must be 'aligned' or 'glomap'")
-    if data.get("units", "map") != "map":
-        raise ValueError("route units must be 'map'")
-    if frame == "aligned":
-        # An "aligned" route does not say WHICH alignment produced it. When the
-        # site has a measured one, a route that declares nothing was either
-        # authored against it (fine) or against the legacy guess (22.5 deg wrong)
-        # and we cannot tell which -- so require the file to say so.
-        # align_source says which basis PRODUCED these aligned coordinates, so that
-        # is the basis to invert with -- it is not a claim about the site. A route
-        # authored before the site's gravity was measured is legacy-aligned and
-        # inverts correctly with the legacy basis; demanding it match the site was
-        # a category error that made every pre-measurement route unloadable.
-        declared = data.get("align_source")
-        site_is_measured = map_frame.source != "legacy_assumption"
-        if declared is None:
-            if site_is_measured:
-                # Genuinely ambiguous: with a measured basis available, "aligned"
-                # alone could mean either, and the two differ by degrees.
-                raise ValueError(
-                    "route uses frame='aligned' but declares no align_source, and "
-                    "this site has a measured gravity alignment; add "
-                    "align_source='legacy' or 'measured' (or export frame='glomap')"
-                )
-            declared = "legacy"
-        if declared == "legacy":
-            authoring_frame = LEGACY_MAP_FRAME
-        elif declared == "measured":
-            if not site_is_measured:
-                raise ValueError(
-                    "route declares align_source='measured' but this site has no "
-                    "measured gravity alignment to invert it with"
-                )
-            authoring_frame = map_frame
-        else:
-            raise ValueError(f"unknown route align_source: {declared!r}")
-        points = [aligned_to_glomap(point, authoring_frame) for point in data["waypoints"]]
-    else:
-        points = data["waypoints"]
-    return _validated_waypoints(points)
+    return RouteDocument.from_data(
+        data,
+        expected_site_id=expected_site_id,
+        expected_coordinate_frame_id=expected_coordinate_frame_id,
+        require_flight_contract=require_flight_contract,
+        require_map_units=True,
+        map_frame=map_frame,
+    ).controller_waypoints()
 
 
 def load_waypoints(
@@ -587,44 +529,14 @@ def load_waypoints(
     require_flight_contract: bool = False,
     map_frame: MapFrame = LEGACY_MAP_FRAME,
 ) -> list[np.ndarray]:
-    data = json.loads(
-        Path(path_json).read_text(encoding="utf-8"),
-        parse_constant=_reject_json_constant,
-    )
-    return _waypoints_from_route_data(
-        data,
+    return RouteDocument.from_path(
+        path_json,
         expected_site_id=expected_site_id,
         expected_coordinate_frame_id=expected_coordinate_frame_id,
         require_flight_contract=require_flight_contract,
+        require_map_units=True,
         map_frame=map_frame,
-    )
-
-
-@dataclass(frozen=True)
-class MissionRouteSnapshot:
-    """Immutable identity and controller coordinates for one AUTO mission."""
-
-    path: Path
-    sha256: str
-    site_id: str
-    coordinate_frame_id: str
-    waypoints: tuple[tuple[float, float, float], ...]
-
-    def controller_waypoints(self) -> list[np.ndarray]:
-        return [np.array(point, dtype=float, copy=True) for point in self.waypoints]
-
-    def verify_file_unchanged(self) -> None:
-        try:
-            current = hashlib.sha256(self.path.read_bytes()).hexdigest()
-        except OSError as exc:
-            raise ValueError(
-                f"selected route is no longer readable: {self.path}"
-            ) from exc
-        if not hmac.compare_digest(current, self.sha256):
-            raise ValueError(
-                "selected route changed after selection; re-open and validate it "
-                "before starting AUTO"
-            )
+    ).controller_waypoints()
 
 
 def capture_mission_route_snapshot(
@@ -635,101 +547,14 @@ def capture_mission_route_snapshot(
     expected_coordinate_frame_id: str,
     map_frame: MapFrame = LEGACY_MAP_FRAME,
 ) -> MissionRouteSnapshot:
-    """Read, hash, validate, and convert one route from the same byte snapshot."""
-    path = Path(path_json).expanduser().resolve()
-    expected_digest = str(expected_sha256 or "").strip().lower()
-    if len(expected_digest) != 64 or any(
-        character not in "0123456789abcdef" for character in expected_digest
-    ):
-        raise ValueError("expected route SHA-256 must be 64 lowercase hex characters")
-    site_id = str(expected_site_id or "").strip()
-    coordinate_frame_id = str(expected_coordinate_frame_id or "").strip()
-    if not site_id or not coordinate_frame_id:
-        raise ValueError("route snapshot requires site_id and coordinate_frame_id")
-    try:
-        payload = path.read_bytes()
-    except OSError as exc:
-        raise ValueError(f"cannot read selected route: {path}") from exc
-    digest = hashlib.sha256(payload).hexdigest()
-    if not hmac.compare_digest(digest, expected_digest):
-        raise ValueError(
-            f"selected route SHA-256 mismatch: expected {expected_digest}, got {digest}"
-        )
-    try:
-        data = json.loads(
-            payload.decode("utf-8"),
-            parse_constant=_reject_json_constant,
-        )
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise ValueError(f"selected route is not valid UTF-8 JSON: {path}") from exc
-    points = _waypoints_from_route_data(
-        data,
-        expected_site_id=site_id,
-        expected_coordinate_frame_id=coordinate_frame_id,
-        require_flight_contract=True,
+    """Compatibility adapter to the shared route-domain snapshot."""
+    return _capture_mission_route_snapshot(
+        path_json,
+        expected_sha256=expected_sha256,
+        expected_site_id=expected_site_id,
+        expected_coordinate_frame_id=expected_coordinate_frame_id,
         map_frame=map_frame,
     )
-    return MissionRouteSnapshot(
-        path=path,
-        sha256=digest,
-        site_id=site_id,
-        coordinate_frame_id=coordinate_frame_id,
-        waypoints=tuple(tuple(float(value) for value in point) for point in points),
-    )
-
-
-class MissionRouteLock:
-    """Keeps one selected route bound across AUTO/HOVER/MANUAL/resume states."""
-
-    def __init__(self, snapshot: MissionRouteSnapshot | None = None):
-        self._snapshot = snapshot
-        self._state = "idle"
-
-    @property
-    def snapshot(self) -> MissionRouteSnapshot | None:
-        return self._snapshot
-
-    @property
-    def active(self) -> bool:
-        return self._state != "idle"
-
-    def bind(self, snapshot: MissionRouteSnapshot) -> None:
-        if self.active:
-            raise ValueError("cannot switch route while an AUTO mission is active")
-        self._snapshot = snapshot
-
-    def begin_auto(self, *, displayed_sha256: str | None) -> MissionRouteSnapshot:
-        snapshot = self._snapshot
-        if snapshot is None:
-            raise ValueError("no validated route is selected for AUTO")
-        displayed = str(displayed_sha256 or "").strip().lower()
-        if not hmac.compare_digest(displayed, snapshot.sha256):
-            raise ValueError(
-                "displayed route does not match the selected AUTO route"
-            )
-        snapshot.verify_file_unchanged()
-        if self._state == "idle":
-            self._state = "pending"
-        return snapshot
-
-    def confirm_auto_started(self) -> None:
-        if self._state != "pending":
-            raise ValueError("no pending AUTO route start to confirm")
-        self._state = "active"
-
-    def resume_auto(self) -> MissionRouteSnapshot:
-        if self._state != "active" or self._snapshot is None:
-            raise ValueError("no active AUTO mission route to resume")
-        return self._snapshot
-
-    def cancel_rejected_auto_start(self) -> None:
-        if self._state == "pending":
-            self._state = "idle"
-
-    def release_after_confirmed_landed(self, flight_state: str) -> None:
-        if str(flight_state or "").strip().lower() != "landed":
-            raise ValueError("route lock releases only after confirmed landed")
-        self._state = "idle"
 
 
 def load_route_arrive_radius(path_json: str | Path) -> float | None:
@@ -739,21 +564,7 @@ def load_route_arrive_radius(path_json: str | Path) -> float | None:
     it here, or the operator sets a radius on a slider and the drone flies the
     ControlConfig default instead -- the two silently disagree.
     """
-    data = json.loads(
-        Path(path_json).read_text(),
-        parse_constant=_reject_json_constant,
-    )
-    if not isinstance(data, dict):
-        raise ValueError("route JSON root must be an object")
-    raw = data.get("arrive_radius_map_units")
-    if raw is None:
-        return None
-    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
-        raise ValueError("route arrive_radius_map_units must be a number")
-    value = float(raw)
-    if not math.isfinite(value) or value <= 0.0:
-        raise ValueError("route arrive_radius_map_units must be finite and > 0")
-    return value
+    return RouteDocument.from_path(path_json, require_map_units=True).arrive_radius_map_units
 
 
 def config_for_route(

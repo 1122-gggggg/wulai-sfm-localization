@@ -28,7 +28,9 @@ class _Backend:
         self.state = SimpleNamespace(
             att_yaw=0.0,
             ground_speed_mps=0.0,
+            ground_speed_mono_ns=10_000_000_000,
             telemetry_read_mono_ns=10_000_000_000,
+            autonomous_speed_limit_mps=0.30,
             stream="OK",
         )
 
@@ -167,3 +169,63 @@ def test_pause_holds_zero_and_resume_keeps_the_same_route_run(tmp_path) -> None:
     assert not autonomy.paused
     assert autonomy._safety_mode() == "AUTO"
     assert takeoffs == []
+
+
+def test_fresh_overspeed_hovers_before_sending_a_route_command(tmp_path) -> None:
+    clock = _Clock()
+    backend = _Backend()
+    backend.state.ground_speed_mps = 0.31
+    backend.state.ground_speed_mono_ns = 10_000_000_000
+    autonomy = DesktopRouteAutonomy(
+        backend=backend,
+        snapshot=_snapshot(tmp_path),
+        map_frame=LEGACY_MAP_FRAME,
+        get_pose=lambda: None,
+        pose_is_weak=lambda: False,
+        pose_confidence=lambda: 100,
+        force_relocalize=lambda: None,
+        stream_healthy=lambda: True,
+        takeoff=lambda: True,
+        land=lambda: True,
+        now=clock.now,
+        sleep=clock.sleep,
+    )
+
+    accepted, reason, applied = autonomy._send_authorized((5, 0, 0, 0))
+
+    assert not accepted
+    assert "speed limit" in reason
+    assert applied == (0, 0, 0, 0)
+    assert backend.vectors == [(0.0, 0.0, 0.0, 0.0)]
+    assert backend.zeros[-1][:4] == (0, 0, 0, 0)
+    assert backend.state.autonomous_speed_guard_status == "OVERSPEED_HOVER"
+
+
+def test_stale_speed_uses_truthful_command_cap_without_blocking_no_gps_auto(
+    tmp_path,
+) -> None:
+    clock = _Clock()
+    backend = _Backend()
+    backend.state.ground_speed_mps = 5.0
+    backend.state.ground_speed_mono_ns = 1_000_000_000
+    autonomy = DesktopRouteAutonomy(
+        backend=backend,
+        snapshot=_snapshot(tmp_path),
+        map_frame=LEGACY_MAP_FRAME,
+        get_pose=lambda: None,
+        pose_is_weak=lambda: False,
+        pose_confidence=lambda: 100,
+        force_relocalize=lambda: None,
+        stream_healthy=lambda: True,
+        takeoff=lambda: True,
+        land=lambda: True,
+        now=clock.now,
+        sleep=clock.sleep,
+    )
+
+    accepted, reason, applied = autonomy._send_authorized((5, 0, 0, 0))
+
+    assert accepted
+    assert "command cap" in reason
+    assert applied == (5, 0, 0, 0)
+    assert backend.state.autonomous_speed_guard_status == "COMMAND_CAP_ONLY"

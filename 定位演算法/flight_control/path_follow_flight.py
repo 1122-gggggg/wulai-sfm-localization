@@ -117,6 +117,10 @@ DEFAULT_POLES_JSON = (
 # artifact paths (same ones sim_dashboard_real.py loads)
 XBUN = os.environ.get("SFM_RELOC_BUNDLE", str(DEFAULT_BUNDLE))
 MEG = os.environ.get("SFM_MEGALOC_CACHE", str(DEFAULT_MEGALOC_CACHE))
+REFERENCE_INDEX = os.environ.get("SFM_REFERENCE_INDEX", "").strip()
+REFERENCE_INDEX_SHA256 = os.environ.get(
+    "SFM_REFERENCE_INDEX_SHA256", ""
+).strip()
 PATH_JSON = os.environ.get("SFM_FLIGHT_PATH_JSON", str(DEFAULT_PATH_JSON))
 POLES_JSON = os.environ.get("SFM_POLES_JSON", str(DEFAULT_POLES_JSON))
 MAP_ALIGN = os.environ.get("SFM_MAP_ALIGN", "").strip()
@@ -2151,6 +2155,12 @@ def build_localizer(frame_source, cam_tuple=None):
             contract_camera.get("params"),
         )
     bundle_sha256 = contract.get("localization_bundle_sha256") or BUNDLE_SHA256
+    reference_index = contract.get("reference_index") or REFERENCE_INDEX or None
+    reference_index_sha256 = (
+        contract.get("reference_index_sha256")
+        or REFERENCE_INDEX_SHA256
+        or None
+    )
     if (
         contract.get("approved") is True
         and BUNDLE_SHA256
@@ -2166,6 +2176,8 @@ def build_localizer(frame_source, cam_tuple=None):
         camera_tuple=cam_tuple or query_camera_from_environment(),
         bundle_sha256=bundle_sha256 or None,
         megaloc_cache=MEG or None,
+        reference_index=reference_index,
+        reference_index_sha256=reference_index_sha256,
         production_profile=LOCALIZER_PROFILE or None,
         production_profile_sha256=contract.get("localizer_profile_sha256"),
         map_frame=(rpf.load_map_frame(MAP_ALIGN) if MAP_ALIGN else None),

@@ -5,16 +5,28 @@ import hashlib
 import importlib.util
 import json
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from Cryptodome.PublicKey import ECC
+from Cryptodome.Signature import eddsa
 
 CONTROL_ROOT = Path(__file__).resolve().parent
 if str(CONTROL_ROOT) not in sys.path:
     sys.path.insert(0, str(CONTROL_ROOT))
 
-from site_profile import _load_flight_controller  # noqa: E402
+from operator_interface.hardware_approval_trust import (  # noqa: E402
+    TRUST_STORE_SCHEMA,
+    attach_detached_signature,
+    canonical_json_bytes,
+    create_unsigned_signing_payload,
+)
+from site_profile import (  # noqa: E402
+    _load_flight_controller,
+    site_profile_approval_sha256,
+)
 
 SPEC = importlib.util.spec_from_file_location(
     "mission_pipeline_under_test", CONTROL_ROOT / "mission_pipeline.py"
@@ -271,6 +283,84 @@ def test_scale_free_flight_contract_exports_no_map_scale_and_verifies_hashes(tmp
             "track_landmarks": None,
         },
     }), encoding="utf-8")
+
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+
+    def timestamp(value: datetime) -> str:
+        return value.isoformat().replace("+00:00", "Z")
+
+    receipt = {
+        "schema": "anafi-hardware-approval/v2",
+        "approved": True,
+        "site_id": "alpha",
+        "coordinate_frame_id": "alpha-reconstruction-v1",
+        "profile_sha256": site_profile_approval_sha256(profile_path),
+        "route_sha256": digest(route),
+        "bundle_sha256": digest(bundle),
+        "approved_mode": "auto",
+        "aircraft": {
+            "product": "ANAFI",
+            "serial": "fixture-aircraft",
+            "firmware_versions": ["fixture"],
+        },
+        "controller": {
+            "product": "SkyController 3",
+            "serial": "fixture-controller",
+            "firmware_versions": ["fixture"],
+        },
+        "olympe_versions": ["fixture"],
+        "approved_envelope": {
+            "max_altitude_m": 20.0,
+            "max_distance_m": 50.0,
+            "max_tilt_deg": 15.0,
+            "max_vertical_speed_ms": 2.0,
+            "max_rotation_speed_degs": 20.0,
+            "gps_required": False,
+        },
+        "approval_note": "test-only signed AUTO readiness fixture",
+    }
+    receipt_path = tmp_path / "hardware-approval-v2.json"
+    receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+
+    key = ECC.generate(curve="ed25519")
+    unsigned_envelope = create_unsigned_signing_payload(
+        receipt,
+        key_id="test-field-authority",
+        issued_at=timestamp(now - timedelta(minutes=1)),
+        expires_at=timestamp(now + timedelta(hours=1)),
+    )
+    signature = eddsa.new(key, "rfc8032").sign(
+        canonical_json_bytes(unsigned_envelope)
+    )
+    signature_path = tmp_path / "hardware-approval-v2.signature.json"
+    signature_path.write_text(
+        json.dumps(attach_detached_signature(unsigned_envelope, signature)),
+        encoding="utf-8",
+    )
+    trust_path = tmp_path / "hardware-approval-trust.json"
+    trust_path.write_text(json.dumps({
+        "schema": TRUST_STORE_SCHEMA,
+        "keys": [{
+            "key_id": "test-field-authority",
+            "public_key": key.public_key().export_key(format="raw").hex(),
+            "role": "field_hardware_authority",
+            "permissions": ["hardware_approval:auto"],
+            "not_before": timestamp(now - timedelta(days=1)),
+            "not_after": timestamp(now + timedelta(days=1)),
+            "revoked": False,
+        }],
+    }), encoding="utf-8")
+
+    raw = json.loads(profile_path.read_text(encoding="utf-8"))
+    raw["hardware_approval"] = {
+        "receipt": receipt_path.name,
+        "sha256": digest(receipt_path),
+        "signature": signature_path.name,
+        "signature_sha256": digest(signature_path),
+        "trust_store": trust_path.name,
+        "trust_store_sha256": digest(trust_path),
+    }
+    profile_path.write_text(json.dumps(raw), encoding="utf-8")
 
     args = _args(site_profile=str(profile_path))
     profile = mission_pipeline.resolve_mission_site_assets(

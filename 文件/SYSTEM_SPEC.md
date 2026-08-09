@@ -464,32 +464,6 @@ class FrameSource(Protocol):
   並同步更新頂部「定位」文字卡。詳細 inliers、reprojection、latency 與影格名稱
   只出現在「診斷／紀錄」，不覆蓋實時影像。
 
-### 8.2 地圖與影像
-
-- 左側顯示點雲、即時定位軌跡、相機中心／視錐、XYZ／UP 軸。
-- 規劃 route 預設隱藏；「顯示規劃路徑」只控制 overlay。
-- 實際軌跡與規劃 route 必須使用不同顏色與圖例。
-- 不可因 LOST 把最後姿態當成新 pose 繼續畫線；LOST 區段以斷線或不同健康標記呈現。
-- 右側影像只常駐顯示一行影像 FPS、影格新鮮度、鏡頭俯仰與縮放；
-  其餘 source、latency、inliers、reprojection、TRACK/WEAK/LOST 詳細資料放在「診斷／紀錄」。
-- **2026-08-03 操作員決定**：移除地圖上方的固定管線摘要列（與「定位儀表」面板重複）。
-  定位結果抵達 UI 的 5 秒滾動 FPS、串流 5 秒滾動 FPS、submit-to-UI 端到端延遲與其
-  5 秒 p95 現在只存在於控制區的「定位資訊」分頁。分頁不使用上下或左右捲軸；切換到
-  其他分頁時該儀表不顯示。計數語意不變 —— SIM 標示「實機鏈路模擬」，計數點位於
-  720p30／H.264 Main／5 Mb/s／280 ms backlog／選用丟包模擬之後，且須等 EDM 結果抵達
-  UI 才計數；REAL 由 PDRAW 影格經 EDM 到 UI 的實際結果計數；無可信樣本顯示 `N/A`，
-  不得以核心理論吞吐量替代端到端 FPS。`format_pipeline_metrics_summary()` 與
-  `OperatorApp.pipeline_metrics_summary()` 保留（目前只有測試使用），要恢復摘要列
-  直接接回 `_build_ui` 即可。
-- 影格年齡與位姿年齡改由飛行列右側的固定讀數提供，隨門檻變色（350／750 ms）。
-- SIM 到 EOF 時畫面保持最後一幀並明確顯示 `EOF_HOLD`，不再增加 frame sequence。
-- 「飛控與限制」分頁必須有獨立「飛控遙測（Olympe 讀回）」面板，顯示飛控融合
-  roll/pitch/yaw、相對起飛點高度、AGL、NED 地速、GPS 位置／精度／衛星、
-  heading/RTH、風／震動／懸停警告、RSSI／鏈路品質與 IMU／barometer／GPS 等感測器
-  健康。這些值只從 Olympe event cache 讀取，不得被當成定位結果或 PCMD 回應。
-  Original ANAFI 公開事件沒有 raw IMU 與 raw 氣壓數值，介面必須明確標示為
-  飛控融合估計／感測器健康，不可偽裝成 raw telemetry。
-
 ### 8.3 控制與優先權
 
 控制優先順序固定為：
@@ -510,16 +484,6 @@ EMERGENCY_STOP / lost-link firmware policy
 - 「開始定位」不能取回 PC control、起飛或啟動 route。
 - 「恢復電腦控制」只能進入 PC manual，不能自動恢復 autonomous。
 - 發生安全故障後，即使定位恢復也不自動重新進入 autonomous；需要新的人工核准流程。
-
-### 8.4 高度與距離
-
-- 預設 desired limit：高度 30 m、距離 100 m；GPS／Home 可用時 distance geofence ON。
-- 無 GPS 時 distance geofence 可關閉或降級為僅提示（狀態須顯示並記錄），不得因此阻擋人工起飛。
-- UI 永遠同時顯示 desired value 與 aircraft readback，不得混為一個值。
-- 只在 `LANDED + LINK_OK + bounds_known` 時允許套用；值必須為正、在 firmware bounds 內、寫入後 readback 一致。
-- 接近 80% 顯示黃色；接近 95% 或到達限制顯示紅色。
-- PC route/manual controller 在 firmware 前先消除繼續向上／向外的命令；firmware geofence 是最後保護層。
-- 到達高度／距離限制時阻止繼續上升／向外，不因碰到 geofence 自動 RTH。RTH 只用於獨立的 lost-link／返航流程。
 
 ## 9. 定位系統規格
 

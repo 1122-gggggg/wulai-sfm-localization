@@ -1,0 +1,37 @@
+{
+  "artifacts": [
+    {
+      "fetch_hint": "Seed the approved EDM runtime checkpoint at this repository-relative path.",
+      "name": "edm-outdoor-checkpoint",
+      "path": "定位演算法/deploy_code/runtime/EDM/weights/edm_outdoor.ckpt",
+      "sha256": "f686bebdd9705bf6918621a1a83695f83d698cbd8c3eed932847fe3678d13a97",
+      "size_bytes": 41417503
+    },
+    {
+      "fetch_hint": "Seed the approved MegaLoc torch.hub source at this repository-relative path.",
+      "name": "megaloc-hubconf",
+      "path": "執行環境/torch_hub_cache/gmberton_MegaLoc_main/hubconf.py",
+      "sha256": "0ebf9fc9c455ca38b9e52c69bcfee4b136a0f8872fdfc4307d00469013228b98",
+      "size_bytes": 1718
+    },
+    {
+      "fetch_hint": "Seed the approved MegaLoc torch.hub source at this repository-relative path.",
+      "name": "megaloc-model-source",
+      "path": "執行環境/torch_hub_cache/gmberton_MegaLoc_main/megaloc_model.py",
+      "sha256": "3cbf1d20515b1da423998a8edab787031eaa7bb273c5a86a5c41c4f6d84e2a6d",
+      "size_bytes": 15258
+    },
+    {
+      "fetch_hint": "Seed the approved MegaLoc weights at this repository-relative path.",
+      "name": "megaloc-weights",
+      "path": "執行環境/torch_hub_cache/checkpoints/megaloc/7cb9f7970d366fdf059963d04d372e503e8e9df9/model.safetensors",
+      "sha256": "d4f9f2bcb60018f91eb6a8e061ed054fd55654e10c2569cf13841ea986ffb4f8",
+      "size_bytes": 914577436
+    }
+  ],
+  "schema": "sfm-runtime-artifacts/v1",
+  "seed": {
+    "hint": "No network fetch is performed by the exporter. Obtain an approved offline artifact bundle, mirror these repository-relative paths under a seed root, and pass --artifact-root PATH or SFM_RUNTIME_ARTIFACT_ROOT=PATH.",
+    "layout": "repository-relative"
+  }
+}

@@ -72,6 +72,11 @@ from backend_contract import (  # noqa: E402
     StartResult,
 )
 from runtime_safety import assess_disk_space  # noqa: E402
+from operator_flight_safety import (  # noqa: E402
+    AuthorityController,
+    TakeoffLandingSupervisor,
+    TelemetryFreshnessStore,
+)
 from scale_free_control_adapter import validate_speed_limit_change  # noqa: E402
 from live_safety_config import (  # noqa: E402
     CRITICAL_BATTERY_PCT,
@@ -93,6 +98,7 @@ _MEDIA_DOWNLOAD_TIMEOUT_S = 15.0
 # A queued ordinary request is rejected once it is older than this; explicit
 # LAND_NOW and EMERGENCY_STOP requests remain executable regardless of age.
 CONTROL_REQUEST_MAX_AGE_NS = 250_000_000
+CRITICAL_TELEMETRY_MAX_AGE_S = 1.0
 
 
 def _clamp_pct(v: int) -> int:
@@ -706,6 +712,10 @@ class OlympeLiveBackend:
         self.state.airspeed_mps = None
         self.state.autonomous_speed_limit_mps = 0.30
         self.state.autonomous_approval_valid = False
+        # Set True only after a site/route/mode-bound hardware receipt is
+        # verified for this live session.  The desktop AUTO coordinator treats
+        # a missing value as a release blocker.
+        self.state.live_auto_release_ready = False
         self.state.drone_magnetometer_required = None
         self.state.drone_magnetometer_started = None
         self.state.drone_magnetometer_axis = "unknown"
@@ -745,6 +755,8 @@ class OlympeLiveBackend:
         self.session_config: SessionConfig | None = None
         self.with_video = bool(with_video)
         self._lock = threading.RLock()
+        self.authority_controller = AuthorityController()
+        self._cleanup_lock = threading.Lock()
         self._firmware_limits_lock = threading.Lock()
         self._calibration_lock = threading.Lock()
         self._pulse_token = 0
@@ -766,6 +778,7 @@ class OlympeLiveBackend:
         # held nudge would fight it. Zero PCMD stays allowed (it only reinforces hover).
         self._maneuver_in_progress: str | None = None
         self._distance_guard_active: bool | None = None
+        self.state.distance_guard_active = None
         self._nudge_vector: tuple[float, float, float, float] | None = None
         self.zero_pcmd_failures = 0
         self.last_zero_pcmd_error: str | None = None
@@ -775,6 +788,8 @@ class OlympeLiveBackend:
         self._runtime_safety_action_latched = False
         self._runtime_safety_action_reason = ""
         self._runtime_safety_action_thread: threading.Thread | None = None
+        self.telemetry_freshness = TelemetryFreshnessStore()
+        self.takeoff_landing_supervisor = TakeoffLandingSupervisor()
         self._home_latitude_deg: float | None = None
         self._home_longitude_deg: float | None = None
         # Hold-to-move: keys/buttons held → continuous PCMD; all released → hover.
@@ -961,6 +976,49 @@ class OlympeLiveBackend:
         except (TypeError, ValueError, OverflowError):
             return None
         return number if math.isfinite(number) else None
+
+    def _observe_telemetry(
+        self,
+        name: str,
+        message: Any,
+        fallback_state: dict[str, Any],
+        *,
+        now_mono_ns: int,
+    ) -> dict[str, Any]:
+        """Record one SDK event without refreshing an unchanged cache entry."""
+        state = dict(fallback_state)
+        marker: object = (
+            "cache",
+            json.dumps(state, sort_keys=True, default=str),
+        )
+        observed_mono_ns = int(now_mono_ns)
+        get_last_event = getattr(self.drone, "get_last_event", None)
+        if callable(get_last_event):
+            try:
+                event = get_last_event(message)
+                state = dict(event.args)
+                marker = ("event", str(event.uuid))
+                wall_age_s = time.time() - float(event.date.timestamp())
+                if not math.isfinite(wall_age_s) or wall_age_s < -0.05:
+                    raise ValueError("invalid telemetry event timestamp")
+                observed_mono_ns -= int(max(0.0, wall_age_s) * 1_000_000_000)
+            except (
+                AttributeError,
+                KeyError,
+                RuntimeError,
+                TypeError,
+                ValueError,
+                OverflowError,
+            ):
+                pass
+        sample = self.telemetry_freshness.observe(
+            name,
+            state,
+            marker=marker,
+            observed_mono_ns=max(0, observed_mono_ns),
+        )
+        setattr(self.state, f"{name}_mono_ns", sample.observed_mono_ns)
+        return dict(sample.value)
 
     @staticmethod
     def _state_value(raw: dict | None, key: str) -> Any:
@@ -2290,11 +2348,23 @@ class OlympeLiveBackend:
             return True
 
     def give_to_pilot(self, *, reason: str = "manual") -> bool:
-        self.nudge_clear(reason=reason if reason != "manual" else "manual")
+        # Manual/safety intent must pre-empt PCMD immediately, even when a
+        # blocking Controller handoff currently owns the serialized transition.
+        # The source change itself remains serialized below.
         with self._lock:
-            # Block all later PCMD before attempting the source handoff.
             self.pilot_sticks = True
             self._pulse_token += 1
+            self._zero_pcmd_or_log(f"{reason}:manual_intent_zero")
+        with self.authority_controller.transition():
+            return self._give_to_pilot(reason=reason)
+
+    def _give_to_pilot(self, *, reason: str = "manual") -> bool:
+        self.nudge_clear(reason=reason if reason != "manual" else "manual")
+        with self._lock:
+            # The public entry point already latched manual ownership before it
+            # waited for the serialized source transition. Internal restoration
+            # calls also reinforce that latch here.
+            self.pilot_sticks = True
             self._zero_pcmd_or_log(f"{reason}:manual_handoff_zero")
         if self.via_skycontroller():
             ok = self._set_piloting_source("SkyController")
@@ -2446,6 +2516,10 @@ class OlympeLiveBackend:
         return ok
 
     def take_pc_control(self) -> bool:
+        with self.authority_controller.transition():
+            return self._take_pc_control()
+
+    def _take_pc_control(self) -> bool:
         """Explicitly request PC authority; remain PCMD-blocked unless confirmed."""
         if self.via_skycontroller() and not self._stick_monitor_ready():
             with self._lock:
@@ -2503,12 +2577,22 @@ class OlympeLiveBackend:
                 self.log.event(
                     "pc_control", ok=False, note="safety_latched_during_handoff",
                 )
-                return False
-            self.pilot_sticks = False
+                superseded = True
+            else:
+                superseded = False
+            if not superseded:
+                self.pilot_sticks = False
+        if superseded:
+            # A safety/manual epoch may have changed while the blocking source
+            # request was in flight. Restore the physical/manual owner before
+            # returning; leaving firmware on Controller makes the False result
+            # lie about who actually owns the aircraft.
+            self._give_to_pilot(reason="pc_control_superseded")
+            self.state.tracker_state = "SOURCE_FAIL"
+            return False
         if not self._landed and not self.send_pcmd(
                 0, 0, 0, 0, reason="pc_control_resumed"):
-            with self._lock:
-                self.pilot_sticks = True
+            self._give_to_pilot(reason="pc_control_zero_failed")
             self.state.tracker_state = "SOURCE_FAIL"
             self.log.event("pc_control", ok=False, note="zero_pcmd_failed")
             return False
@@ -2578,6 +2662,23 @@ class OlympeLiveBackend:
             note="touchdown_confirmed" if ok else "touchdown_unconfirmed",
         )
         return ok
+
+    def _recover_after_scheduled_takeoff_failure(self, reason: str) -> bool:
+        """A scheduled TakeOff failure is airborne-unknown until Landing confirms."""
+        outcome = self.takeoff_landing_supervisor.ensure_landed(
+            reason=f"takeoff_failure:{reason}",
+            is_landed=self._is_already_landed,
+            land_and_confirm=self._land_and_confirm,
+            force_command=True,
+        )
+        self._restore_skycontroller_after_takeoff_abort(reason)
+        self.log.event(
+            "takeoff_recovery",
+            reason=reason,
+            landed=outcome.confirmed,
+            reason_code=outcome.reason_code,
+        )
+        return outcome.confirmed
 
     def land_cmd(self, reason: str = "land") -> bool:
         # 【原地降落 — 禁止隨意改】UI「原地降落」；語意改壞可能不降或誤降。
@@ -2677,6 +2778,7 @@ class OlympeLiveBackend:
                 reason=self.state.preflight_reason,
             )
             return False
+        takeoff_scheduled = False
         try:
             from olympe.messages.ardrone3.Piloting import TakeOff
             from olympe.messages.ardrone3.PilotingState import FlyingStateChanged
@@ -2696,6 +2798,7 @@ class OlympeLiveBackend:
                     self.pilot_sticks = False
                     self._landed = False
                     takeoff_expectation = self.drone(takeoff_request)
+                    takeoff_scheduled = True
                 else:
                     takeoff_expectation = None
             if takeoff_expectation is None:
@@ -2731,11 +2834,12 @@ class OlympeLiveBackend:
                 )
                 return False
             if not ok:
-                self._restore_skycontroller_after_takeoff_abort(
-                    "hover_unconfirmed",
+                self._recover_after_scheduled_takeoff_failure(
+                    "hover_unconfirmed"
                 )
                 self.log.event("takeoff", ok=False, note="hover_unconfirmed")
-                self.state.tracker_state = "TAKEOFF_FAIL"
+                if not self._landed:
+                    self.state.tracker_state = "TAKEOFF_FAIL"
                 return False
 
             self.log.event("takeoff", ok=True)
@@ -2754,7 +2858,6 @@ class OlympeLiveBackend:
                 self.start_flight_recording(reason="post_takeoff")
             return True
         except Exception as exc:
-            self._restore_skycontroller_after_takeoff_abort("takeoff_exception")
             self.log.event("takeoff", ok=False, error=repr(exc))
             with self._lock:
                 current = (
@@ -2762,8 +2865,18 @@ class OlympeLiveBackend:
                     and not self._cleanup_done
                     and not self._landed
                 )
-            if current:
-                self.state.tracker_state = "TAKEOFF_FAIL"
+            if current and takeoff_scheduled:
+                self._recover_after_scheduled_takeoff_failure(
+                    "takeoff_exception"
+                )
+                if not self._landed:
+                    self.state.tracker_state = "TAKEOFF_FAIL"
+            else:
+                self._restore_skycontroller_after_takeoff_abort(
+                    "takeoff_exception_superseded"
+                    if takeoff_scheduled
+                    else "takeoff_exception_before_schedule"
+                )
             return False
         finally:
             self._clear_maneuver()
@@ -3370,14 +3483,16 @@ class OlympeLiveBackend:
             return ControlResult.rejected("TYPED_TAKEOFF_REQUIRED", self.state)
         self.state.last_command = name
         if name == "manual":
-            self.give_to_pilot()
+            return self.give_to_pilot()
         elif name in {"pc_control", "resume_pc", "恢復電腦控制"}:
-            if self.take_pc_control():
+            accepted = self.take_pc_control()
+            if accepted:
                 self.state.last_command = "pc_control"
+            return accepted
         elif name == "hover":
-            self.hover_cmd("ui_hover")
+            return self.hover_cmd("ui_hover")
         elif name == "land":
-            self.land_cmd("ui_land")
+            return self.land_cmd("ui_land")
         elif name == "emergency_stop":
             self.fail_safe(FailureReason.EMERGENCY_STOP)
             return True
@@ -3412,7 +3527,8 @@ class OlympeLiveBackend:
                     reason=calibration_error,
                 )
                 return False
-            if self.take_pc_control():
+            accepted = self.take_pc_control()
+            if accepted:
                 self.state.mode = "PC_CONTROL"
                 self.state.tracker_state = "LOCALIZATION_ONLY"
                 self.log.event(
@@ -3426,17 +3542,22 @@ class OlympeLiveBackend:
                     ok=False,
                     note="source_unconfirmed",
                 )
+            return accepted
         elif name == "boot_lock":
             self.state.tracker_state = "BOOT_INIT"
+            return True
         elif name in {"pause", "resume"}:
-            self.hover_cmd(f"ui_{name}")
+            accepted = self.hover_cmd(f"ui_{name}")
             self.log.event(name)
+            return accepted
         elif name == "gimbal_pitch":
-            self.set_gimbal_pitch(float(payload.get("pitch", self.state.gimbal_pitch_deg)))
+            return self.set_gimbal_pitch(
+                float(payload.get("pitch", self.state.gimbal_pitch_deg))
+            )
         elif name == "zoom":
-            self.set_zoom(float(payload.get("zoom", self.state.zoom)))
+            return self.set_zoom(float(payload.get("zoom", self.state.zoom)))
         elif name in {"camera_reset", "reset_camera", "鏡頭預設", "回復預設"}:
-            self.reset_camera_defaults(
+            return self.reset_camera_defaults(
                 pitch=float(payload.get("pitch", -20.0)),
                 zoom=float(payload.get("zoom", 1.0)),
             )
@@ -3445,21 +3566,23 @@ class OlympeLiveBackend:
             if isinstance(en, str):
                 en = en.lower() in {"1", "true", "yes", "on"}
             self.set_record_on_takeoff(bool(en))
+            return True
         elif name in {"record_disarm"}:
             self.set_record_on_takeoff(False)
+            return True
         elif name in {"record_start"}:
-            self.start_flight_recording(reason="ui_manual")
+            return self.start_flight_recording(reason="ui_manual")
         elif name in {"record_stop"}:
-            self.stop_flight_recording(reason="ui_manual")
+            return self.stop_flight_recording(reason="ui_manual")
         elif name in {"nudge_begin", "nudge_press"}:
             d = str(payload.get("dir") or payload.get("name") or "")
-            self.nudge_begin(d)
+            return self.nudge_begin(d)
         elif name in {"nudge_end", "nudge_release"}:
             d = str(payload.get("dir") or payload.get("name") or "")
-            self.nudge_end(d)
+            return self.nudge_end(d)
         elif name == "nudge_heartbeat":
             dirs = payload.get("dirs", payload.get("directions"))
-            self.nudge_heartbeat(dirs)
+            return self.nudge_heartbeat(dirs)
         elif name == "nudge_vector":
             return self.set_nudge_vector(
                 float(payload.get("roll", 0.0)), float(payload.get("pitch", 0.0)),
@@ -3467,14 +3590,14 @@ class OlympeLiveBackend:
             )
         elif name in {"nudge_clear"}:
             self.nudge_clear(reason="ui")
-            self.hover_cmd("nudge_clear")
+            return self.hover_cmd("nudge_clear")
         elif name.startswith("nudge_") or name in NUDGE_DIRS:
             # Legacy one-shot name: treat as begin (UI should send begin/end).
             n = name[6:] if name.startswith("nudge_") else name
-            self.nudge_begin(n)
+            return self.nudge_begin(n)
         else:
             self.log.event("unhandled_command", name=name, payload=payload)
-        return self.state
+            return False
 
     def apply_autonomous_speed_limit(self, value: Any) -> bool:
         parsed = self._finite_float(value)
@@ -3845,7 +3968,7 @@ class OlympeLiveBackend:
         self.log.event("runtime_safety_latched", reason=reason)
         return True
 
-    def _evaluate_runtime_safety(self) -> bool:
+    def _evaluate_runtime_safety(self, now_mono_ns: int | None = None) -> bool:
         if (
             self._runtime_safety_action_latched
             or self._cleanup_done
@@ -3854,14 +3977,51 @@ class OlympeLiveBackend:
             or not self._is_airborne()
         ):
             return False
-        battery = self._finite_float(getattr(self.state, "battery_pct", None))
+        safety_now_ns = (
+            time.monotonic_ns() if now_mono_ns is None else int(now_mono_ns)
+        )
+        battery_sample = self.telemetry_freshness.sample("battery")
+        if battery_sample is None:
+            battery = self._finite_float(
+                getattr(self.state, "battery_pct", None)
+            )
+        else:
+            fresh_battery = self.telemetry_freshness.fresh(
+                "battery",
+                max_age_s=CRITICAL_TELEMETRY_MAX_AGE_S,
+                now_mono_ns=safety_now_ns,
+            )
+            battery = self._finite_float(
+                None if fresh_battery is None else fresh_battery.get("percent")
+            )
+            if battery is None:
+                return self._schedule_runtime_safety_action(
+                    FailureReason.INVALID_TELEMETRY.value
+                )
         if battery is not None and battery <= _CRITICAL_BATTERY_PCT:
             return self._schedule_runtime_safety_action(
                 FailureReason.BATTERY_CRITICAL.value
             )
-        altitude = self._finite_float(
-            getattr(self.state, "drone_altitude_m", None)
-        )
+        altitude_sample = self.telemetry_freshness.sample("altitude")
+        if altitude_sample is None:
+            altitude = self._finite_float(
+                getattr(self.state, "drone_altitude_m", None)
+            )
+        else:
+            fresh_altitude = self.telemetry_freshness.fresh(
+                "altitude",
+                max_age_s=CRITICAL_TELEMETRY_MAX_AGE_S,
+                now_mono_ns=safety_now_ns,
+            )
+            altitude = self._finite_float(
+                None
+                if fresh_altitude is None
+                else fresh_altitude.get("altitude")
+            )
+            if altitude is None:
+                return self._schedule_runtime_safety_action(
+                    FailureReason.INVALID_TELEMETRY.value
+                )
         altitude_limit = self._finite_float(
             getattr(self.state, "max_altitude_m", None)
         )
@@ -3874,9 +4034,22 @@ class OlympeLiveBackend:
             return self._schedule_runtime_safety_action(
                 FailureReason.ALTITUDE_LIMIT.value
             )
-        distance = self._finite_float(
-            getattr(self.state, "distance_from_home_m", None)
-        )
+        distance_sample = self.telemetry_freshness.sample("distance")
+        if distance_sample is None:
+            distance = self._finite_float(
+                getattr(self.state, "distance_from_home_m", None)
+            )
+        else:
+            fresh_distance = self.telemetry_freshness.fresh(
+                "distance",
+                max_age_s=CRITICAL_TELEMETRY_MAX_AGE_S,
+                now_mono_ns=safety_now_ns,
+            )
+            distance = self._finite_float(
+                None
+                if fresh_distance is None
+                else fresh_distance.get("distance")
+            )
         distance_limit = self._finite_float(
             getattr(self.state, "max_distance_m", None)
         )
@@ -3985,10 +4158,13 @@ class OlympeLiveBackend:
         return state == "connected"
 
     def poll(self, now_mono_ns: int | None = None) -> Any:
+        poll_mono_ns = (
+            time.monotonic_ns() if now_mono_ns is None else int(now_mono_ns)
+        )
         now = (
             time.monotonic()
             if now_mono_ns is None
-            else float(now_mono_ns) * 1e-9
+            else float(poll_mono_ns) * 1e-9
         )
         self.last_poll = now
         self._check_runtime_storage_health(now)
@@ -4070,10 +4246,22 @@ class OlympeLiveBackend:
                 self.sim_yaw = self.state.att_yaw
             alt = gs(AltitudeChanged)
             if alt and alt.get("altitude") is not None:
+                alt = self._observe_telemetry(
+                    "altitude",
+                    AltitudeChanged,
+                    alt,
+                    now_mono_ns=poll_mono_ns,
+                )
                 self.state.altitude_m = float(alt["altitude"])
                 self.state.drone_altitude_m = float(alt["altitude"])
             speed = gs(SpeedChanged)
             if speed:
+                speed = self._observe_telemetry(
+                    "ground_speed",
+                    SpeedChanged,
+                    speed,
+                    now_mono_ns=poll_mono_ns,
+                )
                 sx = self._finite_float(speed.get("speedX"))
                 sy = self._finite_float(speed.get("speedY"))
                 sz = self._finite_float(speed.get("speedZ"))
@@ -4088,6 +4276,12 @@ class OlympeLiveBackend:
                 self.state.airspeed_mps = self.state.ground_speed_mps
             bat = gs(BatteryStateChanged)
             if bat and bat.get("percent") is not None:
+                bat = self._observe_telemetry(
+                    "battery",
+                    BatteryStateChanged,
+                    bat,
+                    now_mono_ns=poll_mono_ns,
+                )
                 self.state.battery_pct = float(bat["percent"])
             fly = gs(FlyingStateChanged)
             if fly and fly.get("state") is not None:
@@ -4119,6 +4313,12 @@ class OlympeLiveBackend:
                     self.state.agl_altitude_m = self._finite_float(agl.get("altitude"))
                 location = gs(GpsLocationChanged)
                 if location:
+                    location = self._observe_telemetry(
+                        "gps_location",
+                        GpsLocationChanged,
+                        location,
+                        now_mono_ns=poll_mono_ns,
+                    )
                     latitude = self._finite_float(location.get("latitude"))
                     longitude = self._finite_float(location.get("longitude"))
                     self.state.gps_latitude_deg = (
@@ -4134,6 +4334,23 @@ class OlympeLiveBackend:
                         self.state.gps_latitude_deg,
                         self.state.gps_longitude_deg,
                     )
+                    location_sample = self.telemetry_freshness.sample(
+                        "gps_location"
+                    )
+                    if location_sample is not None:
+                        self.telemetry_freshness.observe(
+                            "distance",
+                            {
+                                "distance": getattr(
+                                    self.state, "distance_from_home_m", None
+                                )
+                            },
+                            marker=location_sample.marker,
+                            observed_mono_ns=location_sample.observed_mono_ns,
+                        )
+                        self.state.distance_mono_ns = (
+                            location_sample.observed_mono_ns
+                        )
                     self.state.gps_altitude_m = self._finite_float(
                         location.get("altitude")
                     )
@@ -4290,7 +4507,7 @@ class OlympeLiveBackend:
                 self.state.frame_age_ms = None
             self._maybe_log_video_inventory()
             self._evaluate_video_health(now)
-        self._evaluate_runtime_safety()
+        self._evaluate_runtime_safety(poll_mono_ns)
         # Do not clobber UI stream labels (PREVIEW/OK/HOLD) every poll.
         return self.state
 
@@ -4371,42 +4588,35 @@ class OlympeLiveBackend:
             pass
         return False
 
-    def cleanup(self) -> None:
-        """Idempotent: zero PCMD + FORCE Landing + media cleanup + disconnect.
+    def cleanup(self) -> bool:
+        """Confirm touchdown before finalizing media or disconnecting.
 
         Called on: UI window close, Ctrl-C / SIGTERM / SIGHUP, process atexit.
 
         【強制降落 — 禁止刪除或弱化】關窗／Ctrl+C 時：只要未落地就必須原地 Landing，
         即使曾按 Esc 交回搖桿。弱化此邏輯可能導致空中失控。見 mission/SAFETY.md。
         """
-        with self._lock:
-            if self._cleanup_done:
-                return
-            self._cleanup_done = True
-            self._pulse_token += 1
+        with self._cleanup_lock:
+            with self._lock:
+                if self._cleanup_done:
+                    return True
+                self._pulse_token += 1
 
-        def _cleanup_log(event: str, **fields: Any) -> None:
-            # Cleanup logging is diagnostic only. A broken sink must never
-            # prevent the bounded Landing attempt below (or final disconnect).
-            try:
-                self.log.event(event, **fields)
-            except Exception:
-                pass
+            def _cleanup_log(event: str, **fields: Any) -> None:
+                # Cleanup logging is diagnostic only. A broken sink must never
+                # prevent the bounded Landing attempt below.
+                try:
+                    self.log.event(event, **fields)
+                except Exception:
+                    pass
 
-        try:
-            try:
-                self._stop_stick_monitor()
-            except Exception as exc:
-                _cleanup_log("cleanup_stick_monitor_error", error=repr(exc))
             _cleanup_log("cleanup_begin", reason="exit_or_signal")
             try:
                 self.nudge_clear(reason="cleanup")
             except Exception as exc:
-                # Nudge bookkeeping is best effort; it must never prevent the
-                # bounded Landing attempt below.
                 _cleanup_log("cleanup_pre_action_error", action="nudge_clear",
                              error=repr(exc))
-            landed = False
+            landed = self.drone is None
             if self.drone is not None:
                 # Zero immediately, even before a potentially blocking source
                 # acknowledgement. A second zero follows a confirmed handoff.
@@ -4437,26 +4647,25 @@ class OlympeLiveBackend:
                     )
 
                 try:
-                    already_landed = self._is_already_landed()
+                    outcome = self.takeoff_landing_supervisor.ensure_landed(
+                        reason="cleanup_force_land",
+                        is_landed=self._is_already_landed,
+                        land_and_confirm=self._land_and_confirm,
+                    )
+                    landed = outcome.confirmed
                 except Exception as exc:
-                    already_landed = False
-                    _cleanup_log("cleanup_pre_action_error",
-                                 action="landed_probe", error=repr(exc))
-                if already_landed:
-                    landed = True
+                    landed = False
+                    outcome = None
+                    _cleanup_log(
+                        "land_cmd", reason="cleanup_force_land", ok=False,
+                        error=repr(exc), note="landing_attempt_failed",
+                    )
+                if landed and outcome is not None and outcome.reason_code == "ALREADY_LANDED":
                     self.state.tracker_state = "LAND"
                     _cleanup_log(
                         "land_cmd", reason="cleanup_exit", ok=True,
                         note="already_landed",
                     )
-                else:
-                    try:
-                        landed = self._land_and_confirm("cleanup_force_land")
-                    except Exception as exc:
-                        landed = False
-                        _cleanup_log("land_cmd", reason="cleanup_force_land",
-                                     ok=False, error=repr(exc),
-                                     note="landing_attempt_failed")
 
                 if landed and self.via_skycontroller():
                     handed_off = self._set_piloting_source("SkyController")
@@ -4479,7 +4688,19 @@ class OlympeLiveBackend:
                     "record_stop_deferred", reason="cleanup",
                     note="touchdown_unconfirmed",
                 )
-        finally:
+
+            if not landed:
+                _cleanup_log(
+                    "cleanup_incomplete",
+                    reason_code="LAND_UNCONFIRMED",
+                    action="connection_preserved_for_retry",
+                )
+                return False
+
+            try:
+                self._stop_stick_monitor()
+            except Exception as exc:
+                _cleanup_log("cleanup_stick_monitor_error", error=repr(exc))
             if self.grabber is not None:
                 try:
                     self.grabber.stop()
@@ -4492,13 +4713,16 @@ class OlympeLiveBackend:
                 except Exception as exc:
                     _cleanup_log("disconnect_error", error=repr(exc))
                 self.drone = None
-            _cleanup_log("cleanup_done")
+            with self._lock:
+                self._cleanup_done = True
+            _cleanup_log("cleanup_done", touchdown_confirmed=True)
             try:
                 self.log.close()
             except Exception:
                 pass
+            return True
 
     def close(self, reason: str) -> CloseResult:
         self.log.event("close_requested", reason=reason)
-        self.cleanup()
-        return CloseResult(True, "OK")
+        closed = self.cleanup()
+        return CloseResult(closed, "OK" if closed else "LAND_UNCONFIRMED")
