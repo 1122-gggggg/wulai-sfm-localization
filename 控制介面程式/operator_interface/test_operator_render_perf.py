@@ -92,11 +92,28 @@ def operator():
     try:
         yield instance
     finally:
+        # Tk keeps ``after`` callbacks in the Tcl event queue even when a test
+        # destroys its root.  A later test can then dispatch the stale callback
+        # after its Python command has gone away, making otherwise unrelated
+        # focus assertions depend on test order.
+        for callback_id in instance.tk.call("after", "info"):
+            try:
+                instance.after_cancel(callback_id)
+            except tk.TclError:
+                pass
         # Collect while the interpreter is still on the Tk main thread. Deferred
         # Variable.__del__ calls otherwise surface as an unraisable exception in
         # whichever unrelated test happens to trigger the collection.
         instance.destroy()
         gc.collect()
+
+
+def _force_widget_focus(operator, widget) -> None:
+    """Give a widget deterministic keyboard focus without a window-manager race."""
+    operator.update_idletasks()
+    widget.focus_force()
+    operator.update()
+    assert operator.focus_get() is widget
 
 
 def test_window_sizes_come_from_production_constants_and_selftest_has_no_old_minimum(
@@ -262,9 +279,7 @@ def test_flight_actions_are_keyboard_focusable_and_return_invokes_auto(
     invoked: list[str] = []
     auto_button.configure(command=lambda: invoked.append("start_auto"))
     auto_button.configure(state="normal")
-    auto_button.focus_set()
-    operator.update()
-    assert operator.focus_get() is auto_button
+    _force_widget_focus(operator, auto_button)
 
     auto_button.event_generate("<KeyPress-Return>")
     operator.update()
@@ -279,8 +294,7 @@ def test_space_on_a_focused_action_only_hovers_all_directions(operator, monkeypa
     operator._stick_vector_active = True
 
     auto_button = operator.flight_buttons["start_auto"]
-    auto_button.focus_set()
-    operator.update()
+    _force_widget_focus(operator, auto_button)
     auto_button.event_generate("<KeyPress-space>")
     operator.update()
 
