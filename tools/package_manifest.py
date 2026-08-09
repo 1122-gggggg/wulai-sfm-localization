@@ -6,11 +6,18 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
 CONTROL_FILES = {"MANIFEST.tsv", "SHA256SUMS"}
 SITE_ASSET_MANIFEST = "PORTABLE_SITE_ASSETS.json"
+OFFLINE_WHEELHOUSE_RELATIVE = "執行環境/offline_wheelhouse"
+OFFLINE_REQUIREMENT_LOCKS = (
+    "requirements-lock.txt",
+    "requirements-test-lock.txt",
+    "requirements-quality-lock.txt",
+)
 EXCLUDED_PARTS = {
     ".git",
     ".codegraph",
@@ -43,7 +50,7 @@ EXCLUDED_PREFIXES = (
     "定位演算法/validation/report_",
     "定位演算法/validation/source_videos/",
 )
-SOURCE_EXTERNAL_PARTS = {"torch_hub_cache"}
+SOURCE_EXTERNAL_PARTS = {"offline_wheelhouse", "torch_hub_cache"}
 SOURCE_EXTERNAL_PREFIXES = ("定位演算法/deploy_code/runtime/EDM/weights/",)
 
 
@@ -223,10 +230,77 @@ def _runtime_artifact_issues(root: Path) -> list[str]:
 
 
 def _portable_runtime_issues(root: Path, source_only: bool) -> list[str]:
-    return [] if source_only else _runtime_artifact_issues(root)
+    if source_only:
+        return []
+    return [*_runtime_artifact_issues(root), *_offline_wheelhouse_issues(root)]
 
 
-def _site_asset_path_issue(root: Path, relative: object, *, label: str) -> tuple[str | None, Path | None]:
+def _offline_install_metadata_issues(
+    root: Path,
+    offline_install: dict[str, object],
+    wheelhouse_metadata: Mapping[str, object],
+) -> list[str]:
+    from offline_wheelhouse import MANIFEST_NAME
+
+    requirements = wheelhouse_metadata["requirements"]
+    wheels = wheelhouse_metadata["wheels"]
+    assert isinstance(requirements, list)
+    assert isinstance(wheels, list)
+    expected = {
+        "complete": True,
+        "mode": "no-index",
+        "wheelhouse": OFFLINE_WHEELHOUSE_RELATIVE,
+        "manifest": f"{OFFLINE_WHEELHOUSE_RELATIVE}/{MANIFEST_NAME}",
+        "manifest_sha256": digest(root / OFFLINE_WHEELHOUSE_RELATIVE / MANIFEST_NAME),
+        "lock_digests": {
+            str(entry["name"]): str(entry["sha256"])
+            for entry in requirements
+        },
+        "wheel_count": len(wheels),
+    }
+    return (
+        []
+        if offline_install == expected
+        else ["PORTABLE_PACKAGE.json offline_install does not match WHEELHOUSE.json"]
+    )
+
+
+def _offline_wheelhouse_issues(root: Path) -> list[str]:
+    package_metadata = root / "PORTABLE_PACKAGE.json"
+    if not package_metadata.is_file():
+        return []
+    try:
+        data = json.loads(package_metadata.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        return [f"PORTABLE_PACKAGE.json cannot be read: {exc}"]
+    if not isinstance(data, dict):
+        return ["PORTABLE_PACKAGE.json must contain an object"]
+    offline_install = data.get("offline_install")
+    if offline_install is None:
+        return []
+    if not isinstance(offline_install, dict):
+        return ["PORTABLE_PACKAGE.json offline_install must be an object"]
+    complete = offline_install.get("complete")
+    if complete is False:
+        return []
+    if complete is not True:
+        return ["PORTABLE_PACKAGE.json offline_install.complete must be a boolean"]
+
+    try:
+        from offline_wheelhouse import WheelhouseError, verify_wheelhouse
+
+        metadata = verify_wheelhouse(
+            root / OFFLINE_WHEELHOUSE_RELATIVE,
+            tuple(root / relative for relative in OFFLINE_REQUIREMENT_LOCKS),
+        )
+        return _offline_install_metadata_issues(root, offline_install, metadata)
+    except (OSError, WheelhouseError) as exc:
+        return [f"offline wheelhouse is invalid: {exc}"]
+
+
+def _site_asset_path_issue(
+    root: Path, relative: object, *, label: str
+) -> tuple[str | None, Path | None]:
     if not isinstance(relative, str) or not relative.strip():
         return f"{SITE_ASSET_MANIFEST} {label} path is invalid: {relative!r}", None
     relative_path = Path(relative)
@@ -372,7 +446,10 @@ def _manifest_entries_issues(
     except ValueError as exc:
         return [str(exc)]
     issues = [f"missing: {name}" for name in sorted(set(expected_by_path) - set(actual_paths))]
-    issues.extend(f"unexpected: {name}" for name in sorted(set(actual_paths) - set(expected_by_path)))
+    issues.extend(
+        f"unexpected: {name}"
+        for name in sorted(set(actual_paths) - set(expected_by_path))
+    )
     for name in sorted(set(expected_by_path) & set(actual_paths)):
         expected_entry = expected_by_path[name]
         path = actual_paths[name]

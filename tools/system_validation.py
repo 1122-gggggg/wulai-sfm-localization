@@ -41,6 +41,9 @@ ROOT_FORMAT_SCOPE = (
     "tools/check_maintainability.py",
     "tools/test_check_maintainability.py",
     "tools/test_documentation_contract.py",
+    "tools/offline_wheelhouse.py",
+    "tools/test_offline_wheelhouse.py",
+    "tools/test_install_runtime_contract.py",
     "定位演算法/flight_control/safety_command.py",
     "定位演算法/validation/check_runtime_mirrors.py",
     "定位演算法/validation/tests/test_runtime_mirrors.py",
@@ -71,6 +74,7 @@ RELEASE_FILES = (
     "文件/hardware_approval/river_site_receipt_v2.request.json",
     "執行環境/requirements_runtime.txt",
     "tools/install_runtime.sh",
+    "tools/offline_wheelhouse.py",
     "tools/test_clean_install.sh",
     "tools/test_portable_runtime.sh",
     "tools/simulated_ui_smoke.sh",
@@ -224,18 +228,40 @@ def _portable_metadata(
         files[name] = {"size_bytes": path.stat().st_size, "sha256": _sha256(path)}
 
     source_matches = False
+    offline_install_complete = False
+    offline_install_issues: list[str] = []
     binding_issues: list[str] = []
     metadata_error = ""
     metadata_path = package_root / "PORTABLE_PACKAGE.json"
     if metadata_path.is_file():
         try:
             metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            if not isinstance(metadata, dict):
+                raise ValueError("PORTABLE_PACKAGE.json must contain an object")
             source_release = metadata.get("source_release")
+            offline_install = metadata.get("offline_install")
+            if (
+                not isinstance(offline_install, dict)
+                or offline_install.get("complete") is not True
+            ):
+                offline_install_issues.append(
+                    "PORTABLE_PACKAGE.json has no complete offline install bundle"
+                )
+            else:
+                offline_install_complete = True
             expected = expected_source_release or {
                 "manifest_sha256": _sha256(ROOT / "MANIFEST.tsv"),
                 "sha256sums_sha256": _sha256(ROOT / "SHA256SUMS"),
-                "commit": source_release.get("commit") if isinstance(source_release, dict) else None,
-                "version": source_release.get("version") if isinstance(source_release, dict) else None,
+                "commit": (
+                    source_release.get("commit")
+                    if isinstance(source_release, dict)
+                    else None
+                ),
+                "version": (
+                    source_release.get("version")
+                    if isinstance(source_release, dict)
+                    else None
+                ),
             }
             if not isinstance(source_release, dict):
                 binding_issues.append("PORTABLE_PACKAGE.json has no source_release object")
@@ -246,10 +272,17 @@ def _portable_metadata(
             metadata_error = str(exc)
     return {
         "path": str(package_root),
-        "complete": not missing and source_matches and not metadata_error,
+        "complete": (
+            not missing
+            and source_matches
+            and offline_install_complete
+            and not metadata_error
+        ),
         "missing": missing,
         "source_release_matches": source_matches,
         "source_release_issues": binding_issues,
+        "offline_install_complete": offline_install_complete,
+        "offline_install_issues": offline_install_issues,
         "metadata_error": metadata_error,
         "files": files,
     }

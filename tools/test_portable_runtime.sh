@@ -39,9 +39,11 @@ for path in "$staged_video_root" "$portable_root/.venv"; do
   fi
 done
 for path in \
+  "$portable_root/PORTABLE_PACKAGE.json" \
   "$portable_root/tools/install_runtime.sh" \
   "$portable_root/tools/simulated_ui_smoke.sh" \
   "$portable_root/PORTABLE_SITE_ASSETS.json" \
+  "$portable_root/執行環境/offline_wheelhouse/WHEELHOUSE.json" \
   "$portable_root/outputs/README.md" \
   "$portable_root/控制介面程式/site_profiles/river_site_edm.json" \
   "$portable_root/地圖檔/場域/river_site/maps/river_site_realrgb_dense_trimmed.ply" \
@@ -54,6 +56,27 @@ for path in \
     exit 1
   fi
 done
+
+"$source_root/.venv/bin/python" - "$portable_root/PORTABLE_PACKAGE.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+metadata = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+offline_install = metadata.get("offline_install")
+if not isinstance(offline_install, dict) or offline_install.get("complete") is not True:
+    raise SystemExit(
+        "[portable-runtime] PORTABLE_PACKAGE.json must set "
+        "offline_install.complete to literal true"
+    )
+PY
+
+offline_wheelhouse="$portable_root/執行環境/offline_wheelhouse"
+wheelhouse_payload="$(find "$offline_wheelhouse" -type f ! -name WHEELHOUSE.json -print -quit)"
+if [[ -z "$wheelhouse_payload" ]]; then
+  echo "[portable-runtime] offline wheelhouse has no package files: $offline_wheelhouse" >&2
+  exit 1
+fi
 unexpected_outputs=()
 while IFS= read -r -d '' path; do
   unexpected_outputs+=("$path")
@@ -78,8 +101,11 @@ install -m 0644 \
   "$staged_video_root/河濱_P1180118_first_2s.mp4"
 
 portable_venv="$temporary_root/venv"
+PIP_NO_INDEX=1 \
+PIP_INDEX_URL=http://127.0.0.1:9/invalid \
+PIP_EXTRA_INDEX_URL= \
 SFM_VENV_DIR="$portable_venv" \
-  bash "$portable_root/tools/install_runtime.sh"
+  bash "$portable_root/tools/install_runtime.sh" --offline
 SFM_UI_PYTHON="$portable_venv/bin/python" \
 SFM_LOCALIZER_PYTHON="$portable_venv/bin/python" \
 SFM_PORTABLE_ALLOW_EXTERNAL_PYTHON=1 \

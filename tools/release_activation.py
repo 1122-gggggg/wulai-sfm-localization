@@ -126,6 +126,12 @@ def validate_release(
     issues = verify(release)
     if issues:
         raise ValueError(f"release manifest is invalid: {issues[0]}")
+    offline_install = metadata.get("offline_install")
+    if (
+        not isinstance(offline_install, dict)
+        or offline_install.get("complete") is not True
+    ):
+        raise ValueError("release has no complete offline install bundle")
     source = metadata["source_release"]
     expected = _expected_source_release(expected_source_release, release=release)
     binding_issues = validate_source_release(source, expected=expected)

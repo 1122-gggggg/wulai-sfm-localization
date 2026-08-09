@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sys
 from pathlib import Path
 
 import export_simulator_package
 import pytest
+from tools import offline_wheelhouse
 from package_manifest import generate, included, verify
 
 
@@ -114,6 +116,9 @@ def test_source_manifest_separates_external_runtime_artifacts() -> None:
         Path("定位演算法/deploy_code/runtime/EDM/weights/.gitignore"),
         source_only=True,
     )
+    wheel = Path("執行環境/offline_wheelhouse/demo.whl")
+    assert not included(wheel, source_only=True)
+    assert included(wheel, source_only=False)
 
 
 def test_runtime_artifact_resolver_reports_seed_guidance_for_clean_checkout(
@@ -265,6 +270,197 @@ def test_export_rejects_a_destination_inside_the_source(tmp_path: Path, monkeypa
 
 def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _write_offline_wheelhouse(
+    root: Path,
+    locks: tuple[str, ...],
+    *,
+    tamper_wheel: bool = False,
+) -> Path:
+    wheelhouse = root / "wheelhouse"
+    wheelhouse.mkdir()
+    wheel = wheelhouse / "demo-1.0-py3-none-any.whl"
+    wheel.write_bytes(b"wheel-payload")
+    lock_records = [
+        {"name": name, "sha256": _sha256(root / name)} for name in sorted(locks)
+    ]
+    wheel_record = {
+        "name": wheel.name,
+        "size_bytes": wheel.stat().st_size,
+        "sha256": _sha256(wheel),
+    }
+    (wheelhouse / offline_wheelhouse.MANIFEST_NAME).write_text(
+        json.dumps(
+            {
+                "schema": offline_wheelhouse.SCHEMA,
+                "target": offline_wheelhouse.TARGET,
+                "requirements": lock_records,
+                "wheels": [wheel_record],
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    if tamper_wheel:
+        wheel.write_bytes(b"tampered-wheel")
+    return wheelhouse
+
+
+def _minimal_export_source(
+    root: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[Path, tuple[str, ...]]:
+    root.mkdir()
+    (root / "code").mkdir()
+    (root / "code/main.py").write_text("main\n", encoding="utf-8")
+    runtime = root / "執行環境"
+    runtime.mkdir()
+    for name in (
+        "requirements_runtime.txt",
+        "requirements_test.txt",
+        "README.md",
+    ):
+        (runtime / name).write_text(f"{name}\n", encoding="utf-8")
+    lock_names = export_simulator_package.OFFLINE_REQUIREMENT_LOCKS
+    for name in lock_names:
+        (root / name).write_text(f"{name}\n", encoding="utf-8")
+    artifact = root / "artifact.bin"
+    artifact.write_bytes(b"abc")
+    _write_runtime_registry(
+        root,
+        {
+            "name": "demo-model",
+            "path": "artifact.bin",
+            "size_bytes": 3,
+            "sha256": _sha256(artifact),
+        },
+    )
+    monkeypatch.setattr(export_simulator_package, "ROOT", root)
+    monkeypatch.setattr(export_simulator_package, "COPY_DIRS", ("code",))
+    monkeypatch.setattr(
+        export_simulator_package,
+        "COPY_FILES",
+        ("RUNTIME_ARTIFACTS.json", *lock_names),
+    )
+    monkeypatch.setattr(export_simulator_package, "_source_release", lambda: {})
+    return root, lock_names
+
+
+def test_portable_export_copies_verified_wheelhouse_and_records_metadata(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source, lock_names = _minimal_export_source(tmp_path / "source", monkeypatch)
+    wheelhouse = _write_offline_wheelhouse(source, lock_names)
+    destination = tmp_path / "portable"
+
+    export_simulator_package.export(destination, wheelhouse_root=wheelhouse)
+
+    wheel_relative = "demo-1.0-py3-none-any.whl"
+    manifest_relative = (
+        f"{export_simulator_package.OFFLINE_WHEELHOUSE_RELATIVE}/"
+        f"{offline_wheelhouse.MANIFEST_NAME}"
+    )
+    assert (destination / manifest_relative).is_file()
+    assert (
+        destination / export_simulator_package.OFFLINE_WHEELHOUSE_RELATIVE / wheel_relative
+    ).is_file()
+    metadata = json.loads((destination / "PORTABLE_PACKAGE.json").read_text(encoding="utf-8"))
+    offline = metadata["offline_install"]
+    assert offline == {
+        "complete": True,
+        "lock_digests": {name: _sha256(source / name) for name in lock_names},
+        "manifest": manifest_relative,
+        "manifest_sha256": _sha256(wheelhouse / offline_wheelhouse.MANIFEST_NAME),
+        "mode": "no-index",
+        "wheel_count": 1,
+        "wheelhouse": export_simulator_package.OFFLINE_WHEELHOUSE_RELATIVE,
+    }
+    assert verify(destination) == []
+
+
+def test_portable_export_rejects_tampered_wheel_before_destination_copy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source, lock_names = _minimal_export_source(tmp_path / "source", monkeypatch)
+    wheelhouse = _write_offline_wheelhouse(source, lock_names, tamper_wheel=True)
+    destination = tmp_path / "portable"
+    destination.mkdir()
+
+    with pytest.raises(offline_wheelhouse.WheelhouseError, match="mismatch"):
+        export_simulator_package.export(destination, wheelhouse_root=wheelhouse)
+
+    assert list(destination.iterdir()) == []
+
+
+def test_portable_manifest_rejects_false_offline_completion_claim(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source, lock_names = _minimal_export_source(tmp_path / "source", monkeypatch)
+    wheelhouse = _write_offline_wheelhouse(source, lock_names)
+    destination = tmp_path / "portable"
+    export_simulator_package.export(destination, wheelhouse_root=wheelhouse)
+
+    wheel = (
+        destination
+        / export_simulator_package.OFFLINE_WHEELHOUSE_RELATIVE
+        / "demo-1.0-py3-none-any.whl"
+    )
+    wheel.write_bytes(b"tampered-after-export")
+    generate(destination)
+
+    assert any("offline wheelhouse is invalid" in issue for issue in verify(destination))
+
+
+def test_portable_manifest_requires_a_literal_offline_completion_boolean(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "PORTABLE_PACKAGE.json").write_text(
+        json.dumps({"offline_install": {"complete": 1}}),
+        encoding="utf-8",
+    )
+    generate(tmp_path)
+
+    assert any("must be a boolean" in issue for issue in verify(tmp_path))
+
+
+def test_wheelhouse_root_prefers_cli_value_and_supports_environment_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    environment_root = tmp_path / "from-env"
+    cli_root = tmp_path / "from-cli"
+    monkeypatch.setenv(export_simulator_package.OFFLINE_WHEELHOUSE_ENV, str(environment_root))
+
+    assert export_simulator_package._offline_wheelhouse_root(None) == environment_root.resolve()
+    assert export_simulator_package._offline_wheelhouse_root(cli_root) == cli_root.resolve()
+
+
+def test_export_cli_passes_wheelhouse_root(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    destination = tmp_path / "portable"
+    wheelhouse = tmp_path / "wheelhouse"
+    calls: dict[str, object] = {}
+
+    def fake_export(path: Path, **kwargs: object) -> list[str]:
+        calls["destination"] = path
+        calls.update(kwargs)
+        return []
+
+    monkeypatch.setattr(export_simulator_package, "export", fake_export)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "export_simulator_package.py",
+            str(destination),
+            "--wheelhouse-root",
+            str(wheelhouse),
+        ],
+    )
+
+    assert export_simulator_package.main() == 0
+    assert calls["destination"] == destination
+    assert calls["wheelhouse_root"] == wheelhouse
 
 
 def _write_site_profile(root: Path, *, hardware: dict[str, object] | None = None) -> Path:

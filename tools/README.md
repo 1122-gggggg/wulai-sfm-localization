@@ -6,7 +6,8 @@
 | `workspace_audit.py` | 唯讀檢查目錄、必要檔案、symlink、output 命名與容量 |
 | `check_maintainability.py` | 以分區 C901 預算阻止複雜度熱點數量或最壞值回升 |
 | `simulator_preflight.py` | 模擬介面啟動前檢查 Python、CUDA、模型、場域資產與影片 |
-| `install_runtime.sh` | 用 `requirements-lock.txt` 的 transitive pins/hashes 建立乾淨 CPython 3.10 venv |
+| `offline_wheelhouse.py` | 建立／驗證與三份 lockfile 及每個 wheel SHA-256 綁定的離線安裝庫 |
+| `install_runtime.sh` | 用 hash lock 建立乾淨 CPython 3.10 venv；`--offline` 強制 `--no-index` |
 | `export_simulator_package.py` | 依 runtime allowlist 匯出固定程式；可用 `--site-profile` 收錄完整 hash-bound 場域資產，排除 venv、執行輸出與影片 |
 | `package_manifest.py` | 驗證目前可攜式發布包的 MANIFEST.tsv / SHA256SUMS |
 | `release_activation.py` | 驗證 commit/version-bound package，原子 stage/activate/rollback |
@@ -18,9 +19,21 @@
 | `security_dependency_gate.py` | 執行 pip-audit、驗證到期中的安全例外，並輸出 CycloneDX SBOM |
 
 `requirements-lock.txt` 是 runtime 的唯一 hash lock；`requirements-test-lock.txt`
-另外固定 pytest、ruff、coverage 與 timeout plugin。乾淨測試可用
-`bash tools/install_runtime.sh --test-deps`；完整 system validation 使用
-`bash tools/install_runtime.sh --test-deps --quality-deps`。安裝器會拒絕
+另外固定 pytest、ruff、coverage 與 timeout plugin。正式 portable 先在來源機建立
+wheelhouse：
+
+```bash
+.venv/bin/python tools/offline_wheelhouse.py build \
+  --output /path/to/approved-wheelhouse \
+  --requirements requirements-lock.txt \
+  --requirements requirements-test-lock.txt \
+  --requirements requirements-quality-lock.txt
+```
+
+乾淨測試可用 `bash tools/install_runtime.sh --offline --test-deps`；完整 system
+validation 使用 `bash tools/install_runtime.sh --offline --test-deps --quality-deps`。
+offline 模式會先核對 `WHEELHOUSE.json`、三份 lockfile 與所有 wheel，再以
+`--no-index --find-links` 安裝。安裝器會拒絕
 `include-system-site-packages=true` 的既有 venv。`simulator_preflight.py --json` 的
 receipt 會記錄稀疏點雲 collision monitor 是否能在 clean lock-only 環境取得；
 scipy 已固定於 runtime lock，正常狀態為 `available_non_production`。它不是
@@ -44,7 +57,8 @@ cache、workspace 執行輸出、audit review artifacts 與其他 `.gitignore` �
 與 dirty 狀態。`release_activation.py` 先驗證完整 package，再以 temporary directory
 與 atomic symlink replacement 建立 `current`／`previous`；dirty source 預設拒絕，只有
 明確傳入 `--allow-dirty`（development）才可 stage 或 activate，rollback 也會重新驗證
-目標 package。
+目標 package。即使 manifest 正確，`offline_install.complete` 不是字面 `true` 或
+wheelhouse 與 lock/digest 不符也不得 activation。
 
 正常使用仍從根目錄執行 `./驗證系統.sh`；不需要直接呼叫
 `system_validation.py`。正式轉移時以
@@ -75,12 +89,16 @@ digest，不會嘗試網路下載。請從受核准的離線 artifact bundle 建
 ```bash
 python tools/export_simulator_package.py /path/to/portable_localization \
   --artifact-root /path/to/seed-root \
+  --wheelhouse-root /path/to/approved-wheelhouse \
   --site-profile 控制介面程式/site_profiles/river_site_edm.json
 # 或：SFM_RUNTIME_ARTIFACT_ROOT=/path/to/seed-root python tools/export_simulator_package.py ...
 ```
 
 `--artifact-root` 下的檔案必須以 repository-relative path 放置；resolver 會先驗證
 大小，再驗證 SHA-256。沒有 registry 或 digest 不符時不會產生部分可信的 runtime 包。
+沒有 `--wheelhouse-root` 的一般匯出不會假裝成離線包；其
+`PORTABLE_PACKAGE.json` 會明確標示 `offline_install.complete=false`，不得當作正式
+activation 輸入。
 有 `--site-profile` 時，`PORTABLE_SITE_ASSETS.json` 另外綁定 profile 與每個場域檔案；
 reference index 不能只帶 manifest，signed hardware approval 也不能缺 receipt、
 signature 或 trust store sidecar。

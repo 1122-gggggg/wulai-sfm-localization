@@ -3,6 +3,7 @@ set -euo pipefail
 
 install_test_deps=0
 install_quality_deps=0
+offline_install=0
 while [[ "$#" -gt 0 ]]; do
   case "$1" in
     --test-deps)
@@ -11,6 +12,10 @@ while [[ "$#" -gt 0 ]]; do
       ;;
     --quality-deps)
       install_quality_deps=1
+      shift
+      ;;
+    --offline)
+      offline_install=1
       shift
       ;;
     --help|-h)
@@ -31,10 +36,12 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
   SFM_VENV_DIR=/tmp/sfm-venv  alternate venv directory for clean-install checks
   SFM_INSTALL_TEST_DEPS=1     additionally install requirements-test-lock.txt
   SFM_INSTALL_QUALITY_DEPS=1  additionally install requirements-quality-lock.txt
+  SFM_INSTALL_OFFLINE=1       install only from 執行環境/offline_wheelhouse
 
 選項:
   --test-deps                  同上，安裝 hash-locked pytest/ruff/coverage tools
   --quality-deps               安裝 hash-locked mypy/pip-audit/SBOM tools
+  --offline                    僅使用已驗證的離線 wheelhouse 安裝
 EOF
   exit 0
 fi
@@ -46,16 +53,45 @@ venv_python="$venv_dir/bin/python"
 requirements_lock="$root_dir/requirements-lock.txt"
 requirements_test_lock="$root_dir/requirements-test-lock.txt"
 requirements_quality_lock="$root_dir/requirements-quality-lock.txt"
+offline_wheelhouse="$root_dir/執行環境/offline_wheelhouse"
+offline_wheelhouse_manifest="$offline_wheelhouse/WHEELHOUSE.json"
+offline_wheelhouse_tool="$root_dir/tools/offline_wheelhouse.py"
 if [[ "${SFM_INSTALL_TEST_DEPS:-0}" == "1" ]]; then
   install_test_deps=1
 fi
 if [[ "${SFM_INSTALL_QUALITY_DEPS:-0}" == "1" ]]; then
   install_quality_deps=1
 fi
+if [[ "${SFM_INSTALL_OFFLINE:-0}" == "1" ]]; then
+  offline_install=1
+fi
 
 if ! command -v "$python_bin" >/dev/null 2>&1; then
   echo "[runtime] 找不到 $python_bin；需要 CPython 3.10" >&2
   exit 1
+fi
+
+if [[ "$offline_install" == "1" ]]; then
+  if [[ ! -f "$offline_wheelhouse_manifest" ]]; then
+    echo "[runtime] 離線 wheelhouse 缺少固定索引: $offline_wheelhouse_manifest" >&2
+    exit 1
+  fi
+  if [[ ! -f "$offline_wheelhouse_tool" ]]; then
+    echo "[runtime] 缺少離線 wheelhouse 驗證工具: $offline_wheelhouse_tool" >&2
+    exit 1
+  fi
+  for lock_path in "$requirements_lock" "$requirements_test_lock" "$requirements_quality_lock"; do
+    if [[ ! -f "$lock_path" ]]; then
+      echo "[runtime] 缺少固定相依鎖檔: $lock_path" >&2
+      exit 1
+    fi
+  done
+  "$python_bin" "$offline_wheelhouse_tool" verify \
+    --wheelhouse "$offline_wheelhouse" \
+    --requirements "$requirements_lock" \
+    --requirements "$requirements_test_lock" \
+    --requirements "$requirements_quality_lock" >/dev/null
+  echo "[runtime] 離線 wheelhouse 與三份 lockfile 驗證完成"
 fi
 
 if [[ ! -x "$venv_python" ]]; then
@@ -86,20 +122,24 @@ if [[ ! -f "$requirements_lock" ]]; then
   echo "[runtime] 缺少固定相依鎖檔: $requirements_lock" >&2
   exit 1
 fi
-"$venv_python" -m pip install --require-hashes --requirement "$requirements_lock"
+pip_install_args=(--require-hashes)
+if [[ "$offline_install" == "1" ]]; then
+  pip_install_args+=(--no-index --only-binary=:all: --find-links "$offline_wheelhouse")
+fi
+"$venv_python" -m pip install "${pip_install_args[@]}" --requirement "$requirements_lock"
 if [[ "$install_test_deps" == "1" ]]; then
   if [[ ! -f "$requirements_test_lock" ]]; then
     echo "[runtime] 缺少固定測試相依鎖檔: $requirements_test_lock" >&2
     exit 1
   fi
-  "$venv_python" -m pip install --require-hashes --requirement "$requirements_test_lock"
+  "$venv_python" -m pip install "${pip_install_args[@]}" --requirement "$requirements_test_lock"
 fi
 if [[ "$install_quality_deps" == "1" ]]; then
   if [[ ! -f "$requirements_quality_lock" ]]; then
     echo "[runtime] 缺少固定品質相依鎖檔: $requirements_quality_lock" >&2
     exit 1
   fi
-  "$venv_python" -m pip install --require-hashes --requirement "$requirements_quality_lock"
+  "$venv_python" -m pip install "${pip_install_args[@]}" --requirement "$requirements_quality_lock"
 fi
 echo "[runtime] 安裝完成：$venv_python"
 echo "[runtime] 系統層仍需 ffmpeg、python3-tk、X11/XWayland、可用 NVIDIA CUDA driver"

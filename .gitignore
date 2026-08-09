@@ -7,6 +7,7 @@ outputs/*
 **/torch_hub_cache/
 # Compiled EDM coarse-tail kernels. Regenerable (~5 s cold) and machine-specific.
 執行環境/inductor_cache/
+執行環境/offline_wheelhouse/
 地圖檔/maps/*
 !地圖檔/maps/.gitkeep
 地圖檔/bundles/*

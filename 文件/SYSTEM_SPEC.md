@@ -777,11 +777,13 @@ stateDiagram-v2
 - REAL process 只允許 loopback 與已解析的 `192.168.53.1`／`192.168.42.1` 等核准 ANAFI 私有 endpoint；不得查 DNS 或連 Internet。
 - 設定 `HF_HUB_OFFLINE=1`、`TRANSFORMERS_OFFLINE=1`、固定 package-local cache；任何 cache 缺失都 fail closed。
 - model/checkpoint/bundle/profile/route/reference poses/map manifest 在載入前驗 SHA-256。
-- `SparseCloudCollisionMonitor` 目前不是 production safety：runtime lock 沒有 scipy，
-  preflight／validation receipt 必須把 clean lock-only effective status 記為
-  `unavailable`，並固定 `collision_protection_claim=false`。若產品需求改為依賴此
-  monitor，必須先完成 safety wiring 審查、加入受審查的 scipy version 與所有平台
-  wheel hashes，再以 `--require-collision-monitor` fail closed；離線時不得猜 hash。
+- Python 安裝資產由 `WHEELHOUSE.json` 綁定 runtime/test/quality 三份 lockfile
+  與每個 wheel 的 size/SHA-256；正式 portable 安裝強制 `--no-index`。
+- `SparseCloudCollisionMonitor` 目前不是 production safety。scipy 已在 runtime hash
+  lock 中，preflight／validation receipt 的正常狀態為
+  `available_non_production`，且固定 `collision_protection_claim=false`。若產品需求
+  改為依賴此 monitor，必須先完成 safety wiring 審查，再以
+  `--require-collision-monitor` fail closed。
 - PyTorch artifact 優先使用 `weights_only=True`、受限 safe globals 及 schema validation。任何仍使用 unrestricted pickle 的維護工具必須先驗 SHA，且不得進 production startup path。
 - command log 不記錄 secret；工作區不可要求 Internet token 才能飛行。
 - 操作員核准 artifact 更新時，receipt 必須包含舊／新 SHA、變更理由、測試結果、人工視覺判定與日期。
@@ -796,6 +798,9 @@ stateDiagram-v2
 - 主 Python 3.10 environment 維持 UI、EDM、pycolmap、Olympe 相容依賴。
 - `parrot_stimulate` Python 3.11 environment 維持獨立，不被 root pytest 跨版本收集。
 - 所有依賴、torch hub repo、模型、權重與 firmware test asset 在部署前本地備妥並驗 manifest。
+- portable 必須帶有 `offline_install.complete=true` 的已驗證 wheelhouse；目標機
+  仍需由離線 OS 供應流程預裝 CPython 3.10/venv、ffmpeg、Tk/X11 與 NVIDIA
+  driver。
 - 不建立 system boot/login service；由操作員手動執行 SIM 或 REAL launcher。
 
 ### 16.2 DISPLAY 自動偵測

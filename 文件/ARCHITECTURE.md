@@ -124,13 +124,19 @@ metadata、陣列與模型 identity 都由 `SHA256SUMS.json` 固定。
 
 - `MANIFEST.tsv` / `SHA256SUMS`：Git source release 的完整性。
 - `RUNTIME_ARTIFACTS.json`：runtime 大型資產的來源、目標與 digest，不允許網路下載。
+- `WHEELHOUSE.json`：綁定 runtime/test/quality lockfile 與每個 Python wheel 的
+  size/SHA-256，目標安裝強制 `--no-index`。
 - `PORTABLE_SITE_ASSETS.json`：匯出時選定 site profile 的離線資產清單。
 - hardware receipt、detached signature 與 trust store：分別固定內容、簽章及信任根，
   三者都必須由 profile 以 SHA-256 綁定。
 
 portable exporter 只從 source repository 或明確指定的 offline artifact root 取得資產，
 拒絕 traversal、symlink 逸出與 digest 不符。portable 套件因此可在無 Git、無原始場域
-目錄的另一台電腦驗證與安裝；它不會因為攜帶 pending request 而取得 AUTO 權限。
+目錄的另一台電腦驗證與安裝。只有經 `--wheelhouse-root` 逐檔驗證的包才會
+標示 `offline_install.complete=true`；一般開發匯出不能作為正式 activation 輸入。
+OS 層的 CPython/venv、ffmpeg、Tk/X11 與 NVIDIA driver 仍由目標機的離線
+供應流程預先安裝，不會被 Python wheelhouse 假裝覆蓋。portable 也不會因為攜帶
+pending request 而取得 AUTO 權限。
 
 ## 支援的入口
 

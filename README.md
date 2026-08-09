@@ -79,8 +79,16 @@ authoritative controller，排除 `.venv`、執行輸出與影片。指定 `--si
 reference index 與核准 sidecar，並產生 `PORTABLE_SITE_ASSETS.json`：
 
 ```bash
+# 來源電腦一次性建立與三份 hash lock 完全綁定的 Python wheelhouse
+.venv/bin/python tools/offline_wheelhouse.py build \
+  --output /path/to/approved-wheelhouse \
+  --requirements requirements-lock.txt \
+  --requirements requirements-test-lock.txt \
+  --requirements requirements-quality-lock.txt
+
 python tools/export_simulator_package.py /path/to/portable_localization \
   --artifact-root /path/to/approved-runtime-artifact-seed \
+  --wheelhouse-root /path/to/approved-wheelhouse \
   --site-profile 控制介面程式/site_profiles/river_site_edm.json
 cd /path/to/portable_localization
 python tools/package_manifest.py verify
@@ -93,14 +101,14 @@ cd /path/to/source/localization
 ./驗證系統.sh --portable-package /path/to/portable_localization \
   --clean-install --ui-smoke
 
-# 在新電腦建立乾淨 CPython 3.10 虛擬環境並安裝固定套件
-bash tools/install_runtime.sh
+# 在新電腦建立乾淨 CPython 3.10 虛擬環境；強制不查詢任何 package index
+bash tools/install_runtime.sh --offline
 
 # 驗證／測試所需套件也從 hash lock 安裝（不使用 system site packages）
-bash tools/install_runtime.sh --test-deps
+bash tools/install_runtime.sh --offline --test-deps
 
 # 完整 system validation 另安裝 bounded mypy、dependency audit 與 SBOM 工具
-bash tools/install_runtime.sh --test-deps --quality-deps
+bash tools/install_runtime.sh --offline --test-deps --quality-deps
 
 # 匯入完整地圖場域包到地圖檔/場域/<site>/，再由選擇介面挑選地圖與影片
 ./控制介面程式/影片模擬串流/選擇啟動.sh
@@ -111,6 +119,12 @@ bash tools/install_runtime.sh --test-deps --quality-deps
 checkout 若沒有外部 runtime artifacts，請從受核准的離線 bundle 依相對路徑 seed
 後再指定 `--artifact-root`（或 `SFM_RUNTIME_ARTIFACT_ROOT`）；exporter 只提供缺檔／
 digest 與 seed 指引，不會假造下載 URL 或自行連網。
+
+`WHEELHOUSE.json` 是 Python 套件的第二個 artifact registry：它同時綁定
+runtime、test、quality 三份 lockfile 與每個 wheel 的大小／SHA-256。exporter 只在
+`--wheelhouse-root` 驗證完整後才寫入 `offline_install.complete=true`；正式
+clean-install 強制 `--no-index`，缺檔、多檔、symlink、lock 變動或 digest 不符都
+fail closed。
 
 正式驗證會將固定場域與短影片暫時匯入 actual portable，使用該包的
 lock 檔建立乾淨環境，從其 selector/UI 產生有效 pose 後自動清理；
@@ -128,9 +142,10 @@ overlay／任務選配。完整格式見
 地圖 bundle、EDM CUDA model、MegaLoc、GUI 與 worker。正式發布目前只支援已驗證的
 NVIDIA RTX 5060 + CUDA 12.8；其他 GPU 必須重新做 CUDA、模型與效能驗證。系統層仍需
 CPython 3.10 的 `venv/ensurepip`（Ubuntu/Debian 通常是 `python3.10-venv`）、
-`ffmpeg`、`python3-tk`、X11/XWayland 與 NVIDIA CUDA driver。
-首次執行安裝器需要網路連線，並需預留數 GB 空間下載 PyTorch/CUDA 與其他固定
-Python wheels；安裝完成後，模擬介面可在模型與場域資產都已備妥時離線執行。
+`ffmpeg`、`python3-tk`、X11/XWayland 與 NVIDIA CUDA driver。這些 OS/driver 先決條件不在
+Python wheelhouse 內，必須由目標電腦的離線 OS 安裝媒體預先供應。正式 portable
+內已收錄 PyTorch/CUDA 及所有固定 Python wheels；目標電腦的
+`install_runtime.sh --offline` 不需要 Internet。
 
 `scipy` 已固定在 runtime hash lock，讓 `SparseCloudCollisionMonitor` 可提供
 非 production 的稀疏點雲警告；它仍未接入 autonomous safety。
@@ -147,14 +162,15 @@ Python wheels；安裝完成後，模擬介面可在模型與場域資產都已�
 | site profile | 資產包 | runtime profile | 航線 | 狀態 |
 |---|---|---|---|---|
 | `urai_edm.json` | `地圖檔/場域/urai/` | 共用 | **無** | 地面定位可用；自主飛行未核准 |
-| `river_site_edm.json` | `地圖檔/場域/river_site/` | `edm_profiles/river_site.json` | 已核准 route | 自主飛行已由操作員核准 |
+| `river_site_edm.json` | `地圖檔/場域/river_site/` | `edm_profiles/river_site.json` | route 僅供顯示 | 地面定位可用；自主飛行未核准 |
 | `football_field_edm.json` | `地圖檔/場域/football_field/` | `edm_profiles/football_field.json` | **無** | 待 replay；自主飛行未核准 |
 | `example_site_edm.json` | — | — | — | 新場域範本 |
 
 全部使用 EDM。XFeat / LighterGlue 的地圖、bundle 與設定已於 2026-07-26 移除
 （程式碼保留）。`urai`（烏來）就是交付包代號 `target_site` 的實體場域。
-目前只有河濱場域的 `flight.approved` 與 `route_clearance_approved` 為 `true`；
-其他場域仍維持 fail-closed。河濱自主控制只使用 map-space 方向，不建立或使用
+目前所有場域（包含河濱）的 `flight.approved` 與
+`route_clearance_approved` 都為 `false`，全部維持 fail-closed。河濱自主控制只使用
+map-space 方向，不建立或使用
 `map_units_per_meter`，並以全域保守控制設定執行。
 
 ## 新增場域

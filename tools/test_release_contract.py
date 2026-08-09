@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import shutil
 from pathlib import Path
 
 import pytest
@@ -8,6 +10,69 @@ import pytest
 from package_manifest import generate
 from release_activation import activate, main, rollback, stage
 from release_contract import release_verdict, validate_source_release
+
+
+_OFFLINE_LOCKS = (
+    "requirements-lock.txt",
+    "requirements-test-lock.txt",
+    "requirements-quality-lock.txt",
+)
+
+
+def _sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _add_offline_bundle(package: Path) -> None:
+    for name in _OFFLINE_LOCKS:
+        (package / name).write_text(f"{name}\n", encoding="utf-8")
+    wheelhouse = package / "執行環境/offline_wheelhouse"
+    wheelhouse.mkdir(parents=True)
+    wheel = wheelhouse / "demo-1.0-py3-none-any.whl"
+    wheel.write_bytes(b"wheel")
+    manifest = wheelhouse / "WHEELHOUSE.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "requirements": [
+                    {"name": name, "sha256": _sha256(package / name)}
+                    for name in sorted(_OFFLINE_LOCKS)
+                ],
+                "schema": "sfm-offline-wheelhouse/v1",
+                "target": {
+                    "implementation": "CPython",
+                    "machine": "x86_64",
+                    "platform": "linux",
+                    "python": "3.10",
+                },
+                "wheels": [
+                    {
+                        "name": wheel.name,
+                        "sha256": _sha256(wheel),
+                        "size_bytes": wheel.stat().st_size,
+                    }
+                ],
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    metadata_path = package / "PORTABLE_PACKAGE.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["offline_install"] = {
+        "complete": True,
+        "lock_digests": {
+            name: _sha256(package / name) for name in sorted(_OFFLINE_LOCKS)
+        },
+        "manifest": "執行環境/offline_wheelhouse/WHEELHOUSE.json",
+        "manifest_sha256": _sha256(manifest),
+        "mode": "no-index",
+        "wheel_count": 1,
+        "wheelhouse": "執行環境/offline_wheelhouse",
+    }
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
 
 
 def test_dirty_release_requires_an_explicit_development_opt_out() -> None:
@@ -51,6 +116,7 @@ def test_activation_is_atomic_and_rollback_is_verifiable(tmp_path: Path) -> None
         ),
         encoding="utf-8",
     )
+    _add_offline_bundle(source)
     (source / "payload.txt").write_text("one", encoding="utf-8")
     generate(source)
 
@@ -71,7 +137,11 @@ def test_activation_is_atomic_and_rollback_is_verifiable(tmp_path: Path) -> None
     second_source = tmp_path / "package-two"
     second_source.mkdir()
     for path in source.iterdir():
-        (second_source / path.name).write_bytes(path.read_bytes())
+        target = second_source / path.name
+        if path.is_dir():
+            shutil.copytree(path, target)
+        else:
+            shutil.copy2(path, target)
     (second_source / "payload.txt").write_text("two", encoding="utf-8")
     metadata = json.loads(
         (second_source / "PORTABLE_PACKAGE.json").read_text(encoding="utf-8")
@@ -103,6 +173,36 @@ def test_activation_rejects_missing_release_metadata(tmp_path: Path) -> None:
         stage(source, tmp_path / "activation", version="bad")
 
 
+def test_activation_rejects_incomplete_offline_bundle(tmp_path: Path) -> None:
+    source = tmp_path / "package"
+    source.mkdir()
+    source_release = {
+        "commit": "deadbeef",
+        "version": "release-no-wheels",
+        "manifest_sha256": "a" * 64,
+        "sha256sums_sha256": "b" * 64,
+        "dirty": False,
+    }
+    (source / "PORTABLE_PACKAGE.json").write_text(
+        json.dumps(
+            {
+                "source_release": source_release,
+                "offline_install": {"complete": False},
+            }
+        ),
+        encoding="utf-8",
+    )
+    generate(source)
+
+    with pytest.raises(ValueError, match="offline install bundle"):
+        stage(
+            source,
+            tmp_path / "activation",
+            version="release-no-wheels",
+            expected_source_release=source_release,
+        )
+
+
 def test_activation_rejects_dirty_release_without_development_opt_out(tmp_path: Path) -> None:
     source = tmp_path / "package"
     source.mkdir()
@@ -120,6 +220,7 @@ def test_activation_rejects_dirty_release_without_development_opt_out(tmp_path: 
         ),
         encoding="utf-8",
     )
+    _add_offline_bundle(source)
     (source / "payload.txt").write_text("dirty", encoding="utf-8")
     generate(source)
 
@@ -164,6 +265,7 @@ def test_activation_rejects_self_bound_metadata_without_trusted_expected(tmp_pat
         ),
         encoding="utf-8",
     )
+    _add_offline_bundle(source)
     (source / "payload.txt").write_text("untrusted", encoding="utf-8")
     generate(source)
 
@@ -197,6 +299,7 @@ def test_activation_rejects_releases_symlink_outside_root(tmp_path: Path) -> Non
         ),
         encoding="utf-8",
     )
+    _add_offline_bundle(source)
     (source / "payload.txt").write_text("one", encoding="utf-8")
     generate(source)
     expected = json.loads((source / "PORTABLE_PACKAGE.json").read_text(encoding="utf-8"))[
@@ -235,6 +338,7 @@ def test_activation_rejects_current_symlink_outside_root(tmp_path: Path) -> None
         ),
         encoding="utf-8",
     )
+    _add_offline_bundle(source)
     (source / "payload.txt").write_text("one", encoding="utf-8")
     generate(source)
     expected = json.loads((source / "PORTABLE_PACKAGE.json").read_text(encoding="utf-8"))[
@@ -269,6 +373,7 @@ def test_cli_accepts_a_trusted_expected_receipt(tmp_path: Path, capsys) -> None:
     (source / "PORTABLE_PACKAGE.json").write_text(
         json.dumps({"source_release": expected}), encoding="utf-8"
     )
+    _add_offline_bundle(source)
     (source / "payload.txt").write_text("one", encoding="utf-8")
     generate(source)
     receipt = tmp_path / "trusted-receipt.json"

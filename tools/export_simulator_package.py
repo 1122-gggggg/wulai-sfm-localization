@@ -15,6 +15,13 @@ from typing import Callable, Iterable
 ROOT = Path(__file__).resolve().parents[1]
 ARTIFACT_MANIFEST = "RUNTIME_ARTIFACTS.json"
 ARTIFACT_ROOT_ENV = "SFM_RUNTIME_ARTIFACT_ROOT"
+OFFLINE_WHEELHOUSE_ENV = "SFM_OFFLINE_WHEELHOUSE"
+OFFLINE_WHEELHOUSE_RELATIVE = "執行環境/offline_wheelhouse"
+OFFLINE_REQUIREMENT_LOCKS = (
+    "requirements-lock.txt",
+    "requirements-test-lock.txt",
+    "requirements-quality-lock.txt",
+)
 SITE_ASSET_MANIFEST = "PORTABLE_SITE_ASSETS.json"
 REFERENCE_INDEX_SCHEMA = "localization-reference-index-sha256"
 COPY_DIRS = (
@@ -87,6 +94,15 @@ class SiteBundle:
 
 class ArtifactResolutionError(ValueError):
     """Raised when an external runtime artifact is absent or not trusted."""
+
+
+@dataclass(frozen=True)
+class VerifiedOfflineWheelhouse:
+    root: Path
+    manifest_name: str
+    wheel_paths: tuple[str, ...]
+    manifest_sha256: str
+    metadata: dict[str, object]
 
 
 _PROFILE_ASSET_KEYS = (
@@ -420,7 +436,9 @@ def _safe_destination_path(destination: Path, relative: str) -> Path:
     try:
         resolved = target.resolve(strict=False)
     except (OSError, RuntimeError) as exc:
-        raise ArtifactResolutionError(f"site bundle destination cannot be resolved: {relative}") from exc
+        raise ArtifactResolutionError(
+            f"site bundle destination cannot be resolved: {relative}"
+        ) from exc
     if not resolved.is_relative_to(destination):
         raise ArtifactResolutionError(f"site bundle destination escapes root: {relative}")
     current = target
@@ -506,6 +524,79 @@ def _sha256(path: Path) -> str:
     from tools.package_manifest import digest
 
     return digest(path)
+
+
+def _offline_wheelhouse_root(
+    wheelhouse_root: str | Path | None,
+) -> Path | None:
+    configured = wheelhouse_root
+    if configured is None:
+        configured = os.environ.get(OFFLINE_WHEELHOUSE_ENV, "").strip() or None
+    if configured is None:
+        return None
+    if isinstance(configured, str) and not configured.strip():
+        return None
+    return Path(os.path.abspath(os.fspath(Path(configured).expanduser())))
+
+
+def _verify_offline_wheelhouse(
+    root: Path,
+    wheelhouse_root: str | Path,
+) -> VerifiedOfflineWheelhouse:
+    from tools.offline_wheelhouse import MANIFEST_NAME, verify_wheelhouse
+
+    wheelhouse = Path(os.path.abspath(os.fspath(Path(wheelhouse_root).expanduser())))
+    requirement_locks = tuple(root / relative for relative in OFFLINE_REQUIREMENT_LOCKS)
+    verified = verify_wheelhouse(wheelhouse, requirement_locks)
+    wheels = verified["wheels"]
+    assert isinstance(wheels, list)
+    wheel_paths = tuple(str(wheel["name"]) for wheel in wheels)
+    manifest_sha256 = _sha256(wheelhouse / MANIFEST_NAME)
+    return VerifiedOfflineWheelhouse(
+        wheelhouse,
+        MANIFEST_NAME,
+        wheel_paths,
+        manifest_sha256,
+        verified,
+    )
+
+
+def _copy_offline_wheelhouse(
+    destination: Path,
+    verified: VerifiedOfflineWheelhouse,
+) -> None:
+    from tools.offline_wheelhouse import verify_wheelhouse
+
+    target_root = destination / OFFLINE_WHEELHOUSE_RELATIVE
+    target_root.mkdir(parents=True, exist_ok=True)
+    for name in (verified.manifest_name, *verified.wheel_paths):
+        shutil.copy2(verified.root / name, target_root / name)
+    verify_wheelhouse(
+        target_root,
+        tuple(destination / relative for relative in OFFLINE_REQUIREMENT_LOCKS),
+    )
+
+
+def _offline_install_metadata(
+    verified: VerifiedOfflineWheelhouse | None,
+) -> dict[str, object]:
+    if verified is None:
+        return {"complete": False}
+    requirements = verified.metadata["requirements"]
+    assert isinstance(requirements, list)
+    lock_digests = {
+        str(entry["name"]): str(entry["sha256"])
+        for entry in requirements
+    }
+    return {
+        "complete": True,
+        "mode": "no-index",
+        "wheelhouse": OFFLINE_WHEELHOUSE_RELATIVE,
+        "manifest": f"{OFFLINE_WHEELHOUSE_RELATIVE}/{verified.manifest_name}",
+        "manifest_sha256": verified.manifest_sha256,
+        "lock_digests": lock_digests,
+        "wheel_count": len(verified.wheel_paths),
+    }
 
 
 def _load_runtime_artifact_data(root: Path) -> dict[str, object]:
@@ -672,6 +763,7 @@ def _write_metadata(
     destination: Path,
     source_release: dict[str, object],
     artifacts: tuple[RuntimeArtifact, ...],
+    offline_wheelhouse: VerifiedOfflineWheelhouse | None = None,
 ) -> None:
     artifact_manifest_sha256 = _sha256(destination / ARTIFACT_MANIFEST)
     metadata = {
@@ -695,6 +787,7 @@ def _write_metadata(
             "manifest_sha256": artifact_manifest_sha256,
             "artifact_count": len(artifacts),
         },
+        "offline_install": _offline_install_metadata(offline_wheelhouse),
         "site_import": {
             "maps_root": "地圖檔/場域/<site>/",
             "videos_root": "模擬器/測試影片/",
@@ -720,6 +813,7 @@ def _prepare_export_destination(destination: Path) -> None:
 def _copy_export_payload(
     destination: Path,
     resolved_artifacts: tuple[ResolvedRuntimeArtifact, ...],
+    offline_wheelhouse: VerifiedOfflineWheelhouse | None = None,
 ) -> None:
     for relative in COPY_FILES:
         source = ROOT / relative
@@ -739,12 +833,15 @@ def _copy_export_payload(
     for relative in ("requirements_runtime.txt", "requirements_test.txt", "README.md"):
         shutil.copy2(runtime_source / relative, runtime_target / relative)
     _copy_resolved_runtime_artifacts(resolved_artifacts, destination)
+    if offline_wheelhouse is not None:
+        _copy_offline_wheelhouse(destination, offline_wheelhouse)
 
 
 def export(
     destination: Path,
     *,
     artifact_root: str | Path | None = None,
+    wheelhouse_root: str | Path | None = None,
     site_profiles: Iterable[str | Path] | None = None,
 ) -> list[str]:
     destination = destination.expanduser().resolve()
@@ -755,6 +852,12 @@ def export(
     ):
         raise ValueError("destination and source workspace must not contain each other")
     source_release = _source_release()
+    configured_wheelhouse = _offline_wheelhouse_root(wheelhouse_root)
+    verified_wheelhouse = (
+        _verify_offline_wheelhouse(ROOT, configured_wheelhouse)
+        if configured_wheelhouse is not None
+        else None
+    )
     _prepare_export_destination(destination)
     resolved_artifacts = resolve_runtime_artifacts(ROOT, artifact_root=artifact_root)
     artifact_specs = tuple(artifact.spec for artifact in resolved_artifacts)
@@ -763,10 +866,10 @@ def export(
         if site_profiles is not None
         else None
     )
-    _copy_export_payload(destination, resolved_artifacts)
+    _copy_export_payload(destination, resolved_artifacts, verified_wheelhouse)
     if site_bundle is not None:
         _copy_site_bundle_files(ROOT, destination, site_bundle)
-    _write_metadata(destination, source_release, artifact_specs)
+    _write_metadata(destination, source_release, artifact_specs, verified_wheelhouse)
 
     sys.path.insert(0, str(ROOT))
     from tools.package_manifest import generate
@@ -788,6 +891,15 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--wheelhouse-root",
+        type=Path,
+        default=None,
+        help=(
+            "prebuilt offline wheelhouse directory (or set "
+            f"{OFFLINE_WHEELHOUSE_ENV})"
+        ),
+    )
+    parser.add_argument(
         "--site-profile",
         action="append",
         default=[],
@@ -801,6 +913,7 @@ def main() -> int:
         files = export(
             args.destination,
             artifact_root=args.artifact_root,
+            wheelhouse_root=args.wheelhouse_root,
             site_profiles=args.site_profile or None,
         )
     except (FileNotFoundError, OSError, ValueError) as exc:

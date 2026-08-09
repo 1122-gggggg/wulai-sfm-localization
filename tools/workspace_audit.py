@@ -39,6 +39,7 @@ REQUIRED_FILES = (
     "outputs/README.md",
     "tools/README.md",
     "tools/install_runtime.sh",
+    "tools/offline_wheelhouse.py",
     "tools/test_clean_install.sh",
     "tools/simulated_ui_smoke.sh",
     "tools/export_simulator_package.py",

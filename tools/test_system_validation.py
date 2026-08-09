@@ -114,7 +114,13 @@ def test_portable_output_is_verified_and_bound_to_source(tmp_path: Path) -> None
         {"commit": "deadbeef", "version": "release-deadbeef", "dirty": False}
     )
     (package / "PORTABLE_PACKAGE.json").write_text(
-        json.dumps({"source_release": source_release}), encoding="utf-8"
+        json.dumps(
+            {
+                "source_release": source_release,
+                "offline_install": {"complete": True},
+            }
+        ),
+        encoding="utf-8",
     )
     (package / "MANIFEST.tsv").write_text("manifest", encoding="utf-8")
     (package / "SHA256SUMS").write_text("sums", encoding="utf-8")
@@ -133,7 +139,40 @@ def test_portable_output_is_verified_and_bound_to_source(tmp_path: Path) -> None
 
     assert metadata["complete"]
     assert metadata["source_release_matches"]
+    assert metadata["offline_install_complete"]
     assert steps["portable_output_manifest"].cwd == str(package.resolve())
+
+
+def test_portable_release_metadata_rejects_incomplete_offline_bundle(
+    tmp_path: Path,
+) -> None:
+    module = _load_validation_module()
+    package = tmp_path / "portable"
+    package.mkdir()
+    source_release = {
+        "manifest_sha256": module._sha256(module.ROOT / "MANIFEST.tsv"),
+        "sha256sums_sha256": module._sha256(module.ROOT / "SHA256SUMS"),
+        "commit": "deadbeef",
+        "version": "release-deadbeef",
+        "dirty": False,
+    }
+    (package / "PORTABLE_PACKAGE.json").write_text(
+        json.dumps(
+            {
+                "source_release": source_release,
+                "offline_install": {"complete": False},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (package / "MANIFEST.tsv").write_text("manifest", encoding="utf-8")
+    (package / "SHA256SUMS").write_text("sums", encoding="utf-8")
+
+    metadata = module._portable_metadata(package)
+
+    assert not metadata["complete"]
+    assert not metadata["offline_install_complete"]
+    assert metadata["offline_install_issues"]
 
 
 def test_optional_release_gates_are_explicit_steps() -> None:
@@ -214,7 +253,12 @@ def test_dirty_release_is_failed_unless_development_opt_out(monkeypatch) -> None
     monkeypatch.setattr(
         module,
         "_git_metadata",
-        lambda: {"commit": "deadbeef", "version": "release-deadbeef", "dirty": True, "changed_path_count": 1},
+        lambda: {
+            "commit": "deadbeef",
+            "version": "release-deadbeef",
+            "dirty": True,
+            "changed_path_count": 1,
+        },
     )
     assert module._release_gate(module._git_metadata(), allow_dirty=False)["passed"] is False
     assert module._release_gate(module._git_metadata(), allow_dirty=True)["passed"] is True

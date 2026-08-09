@@ -4,11 +4,18 @@
 目前可攜式模擬介面請從工作區根目錄執行：
 
 ```bash
+.venv/bin/python tools/offline_wheelhouse.py build \
+  --output /path/to/approved-wheelhouse \
+  --requirements requirements-lock.txt \
+  --requirements requirements-test-lock.txt \
+  --requirements requirements-quality-lock.txt
 python tools/export_simulator_package.py /path/to/portable_localization \
   --artifact-root /path/to/approved-runtime-artifact-seed \
+  --wheelhouse-root /path/to/approved-wheelhouse \
   --site-profile 控制介面程式/site_profiles/river_site_edm.json
 cd /path/to/portable_localization
 python tools/package_manifest.py verify
+bash tools/install_runtime.sh --offline
 ```
 
 工作區根目錄的 `RUNTIME_ARTIFACTS.json` 是 Git source 內的 runtime artifact
@@ -17,6 +24,8 @@ allowlist，固定每個外部檔案的相對路徑、大小與 SHA-256。clean 
 `--artifact-root`（或 `SFM_RUNTIME_ARTIFACT_ROOT`）；exporter 不會嘗試網路下載，也不會
 無條件複製整個 `torch_hub_cache/`。來源 `MANIFEST.tsv` / `SHA256SUMS` 只涵蓋 Git
 source，portable 輸出包的 manifest 才會包含已解析的 runtime artifacts。
+Python 套件由 `WHEELHOUSE.json` 另外綁定三份 lockfile 與每個 wheel。正式
+portable 必須匯入驗證過的 wheelhouse；目標機安裝強制 `--no-index`。
 `--site-profile` 會把該 profile 的 hash-pinned 場域資產收進
 `PORTABLE_SITE_ASSETS.json`；reference index 的所有 sibling 與 signed hardware
 sidecar 會逐檔驗證，影片仍由使用者另外提供。
