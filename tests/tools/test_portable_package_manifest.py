@@ -689,6 +689,85 @@ def test_site_bundle_copies_and_verifies_all_reference_index_siblings(
     assert {item["path"] for item in marker["files"]} == set(copied)
 
 
+def test_site_bundle_keeps_bound_route_and_distinct_valid_route_siblings(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "source"
+    site_root = root / "地圖檔/場域/river_site"
+    routes_root = site_root / "routes"
+    bound = routes_root / "authored/route_20260807_013811.json"
+    duplicate = routes_root / "flight_route.json"
+    distinct = routes_root / "authored/route_20260807_013944.json"
+    valid_route = {
+        "schema": "sfm-flight-route/v1",
+        "site_id": "river_site_edm",
+        "coordinate_frame_id": "river_site_glomap",
+        "frame": "aligned",
+        "align_source": "measured",
+        "units": "map",
+        "purpose": "flight",
+        "closed": False,
+        "waypoints": [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
+    }
+    bound.parent.mkdir(parents=True)
+    bound.write_text(json.dumps(valid_route), encoding="utf-8")
+    duplicate.write_bytes(bound.read_bytes())
+    distinct_route = dict(valid_route)
+    distinct_route["waypoints"] = [[0.0, 0.0, 0.0], [2.0, 0.0, 0.0]]
+    distinct.write_text(json.dumps(distinct_route), encoding="utf-8")
+
+    invalid = dict(valid_route)
+    invalid["waypoints"] = [[0.0, 0.0, 0.0]]
+    (routes_root / "invalid.json").write_text(json.dumps(invalid), encoding="utf-8")
+    preview = dict(valid_route)
+    preview.update(schema="sfm-route-preview/v1", purpose="preview_only")
+    (routes_root / "preview.json").write_text(json.dumps(preview), encoding="utf-8")
+    wrong_site = dict(valid_route, site_id="other_site")
+    (routes_root / "wrong_site.json").write_text(json.dumps(wrong_site), encoding="utf-8")
+    wrong_frame = dict(valid_route, coordinate_frame_id="other_frame")
+    (routes_root / "wrong_frame.json").write_text(json.dumps(wrong_frame), encoding="utf-8")
+    drafts = routes_root / "route_drafts/draft.json"
+    drafts.parent.mkdir(parents=True)
+    drafts.write_text(json.dumps(valid_route), encoding="utf-8")
+
+    profile = root / "控制介面程式/site_profiles/river_site_edm.json"
+    profile.parent.mkdir(parents=True)
+    profile.write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "site_id": "river_site_edm",
+                "coordinate_frame": {"id": "river_site_glomap"},
+                "assets": {
+                    "route_json": "../../地圖檔/場域/river_site/"
+                    "routes/authored/route_20260807_013811.json"
+                },
+                "asset_sha256": {"route_json": _sha256(bound)},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    destination = tmp_path / "bundle"
+    export_simulator_package.copy_site_bundle(root, destination, [profile])
+    marker = json.loads(
+        (destination / "PORTABLE_SITE_ASSETS.json").read_text(encoding="utf-8")
+    )
+    route_entries = {
+        (item["role"], item["path"])
+        for item in marker["files"]
+        if item["role"].startswith("route")
+    }
+    assert route_entries == {
+        ("route_json", "地圖檔/場域/river_site/routes/authored/route_20260807_013811.json"),
+        ("route_sibling", "地圖檔/場域/river_site/routes/authored/route_20260807_013944.json"),
+    }
+    bundled_paths = {item["path"] for item in marker["files"]}
+    assert "地圖檔/場域/river_site/routes/flight_route.json" not in bundled_paths
+    assert "地圖檔/場域/river_site/routes/route_drafts/draft.json" not in bundled_paths
+    assert verify(destination) == []
+
+
 def test_portable_manifest_rejects_profile_asset_missing_from_marker(
     tmp_path: Path,
 ) -> None:

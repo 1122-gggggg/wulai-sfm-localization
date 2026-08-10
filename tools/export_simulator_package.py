@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import shutil
 import sys
@@ -141,6 +142,8 @@ _PROFILE_ASSET_KEYS = (
     "megaloc_cache",
     "track_landmarks",
 )
+_ROUTE_SCHEMA = "sfm-flight-route/v1"
+_ROUTE_DRAFT_PARTS = {"route_drafts", "drafts"}
 _SIGNED_HARDWARE_KEYS = (
     "signature",
     "signature_sha256",
@@ -274,6 +277,112 @@ def _load_reference_index_files(
     return tuple(result)
 
 
+def _route_tree_root(route_path: Path) -> Path | None:
+    for parent in route_path.parents:
+        if parent.name.casefold() == "routes":
+            return parent
+    return None
+
+
+def _route_candidate_path(path: Path, routes_root: Path) -> bool:
+    relative = path.relative_to(routes_root)
+    parts = {part.casefold() for part in relative.parts}
+    return not (parts & _ROUTE_DRAFT_PARTS or "draft" in path.stem.casefold())
+
+
+def _is_valid_site_route(
+    path: Path,
+    *,
+    expected_site_id: object,
+    expected_coordinate_frame_id: object,
+) -> bool:
+    if not isinstance(expected_site_id, str) or not expected_site_id:
+        return False
+    if not isinstance(expected_coordinate_frame_id, str) or not expected_coordinate_frame_id:
+        return False
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return False
+    if not isinstance(data, dict) or any(
+        data.get(key) != value
+        for key, value in (
+            ("schema", _ROUTE_SCHEMA),
+            ("site_id", expected_site_id),
+            ("coordinate_frame_id", expected_coordinate_frame_id),
+            ("units", "map"),
+            ("purpose", "flight"),
+            ("align_source", "measured"),
+        )
+    ):
+        return False
+    if data.get("frame") not in {"aligned", "glomap"} or data.get("closed") is not False:
+        return False
+    waypoints = data.get("waypoints")
+    if not isinstance(waypoints, list) or len(waypoints) < 2:
+        return False
+    checked: list[tuple[float, float, float]] = []
+    for waypoint in waypoints:
+        if (
+            not isinstance(waypoint, list)
+            or len(waypoint) != 3
+            or any(
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+                for value in waypoint
+            )
+        ):
+            return False
+        checked.append(
+            (float(waypoint[0]), float(waypoint[1]), float(waypoint[2]))
+        )
+    return all(start != end for start, end in zip(checked, checked[1:]))
+
+
+def _collect_route_siblings(
+    bound_route: Path,
+    *,
+    expected_site_id: object,
+    expected_coordinate_frame_id: object,
+    profile_label: str,
+    root: Path,
+    add_file: Callable[..., str],
+) -> list[str]:
+    routes_root = _route_tree_root(bound_route)
+    if routes_root is None or not routes_root.is_dir():
+        return []
+    seen_digests = {_sha256(bound_route)}
+    siblings: list[str] = []
+    for candidate in sorted(routes_root.rglob("*.json"), key=lambda item: item.as_posix()):
+        if candidate == bound_route:
+            continue
+        try:
+            candidate = _safe_repo_file(root, candidate, label="route sibling")
+        except ArtifactResolutionError:
+            continue
+        if not _route_candidate_path(candidate, routes_root):
+            continue
+        if not _is_valid_site_route(
+            candidate,
+            expected_site_id=expected_site_id,
+            expected_coordinate_frame_id=expected_coordinate_frame_id,
+        ):
+            continue
+        digest = _sha256(candidate)
+        if digest in seen_digests:
+            continue
+        siblings.append(
+            add_file(
+                candidate,
+                role="route_sibling",
+                profile_label=profile_label,
+            )
+        )
+        seen_digests.add(digest)
+    return siblings
+
+
 def _read_site_profile(root: Path, raw_profile: str | Path) -> tuple[Path, dict[str, object]]:
     candidate = Path(raw_profile).expanduser()
     if not candidate.is_absolute():
@@ -301,6 +410,10 @@ def _collect_profile_assets(
         raise ArtifactResolutionError(
             f"site profile assets/digests must be objects: {profile_path}"
         )
+    coordinate_frame = raw.get("coordinate_frame")
+    coordinate_frame_id = (
+        coordinate_frame.get("id") if isinstance(coordinate_frame, dict) else None
+    )
     profile_files: list[str] = []
     top_level = {"localizer_profile", "map_reference_poses", "map_align"}
     for key in _PROFILE_ASSET_KEYS:
@@ -336,6 +449,17 @@ def _collect_profile_assets(
                     expected=expected,
                 )
             )
+            if key == "route_json":
+                profile_files.extend(
+                    _collect_route_siblings(
+                        asset_path,
+                        expected_site_id=raw.get("site_id"),
+                        expected_coordinate_frame_id=coordinate_frame_id,
+                        profile_label=profile_label,
+                        root=root,
+                        add_file=add_file,
+                    )
+                )
     return profile_files
 
 
