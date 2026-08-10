@@ -35,6 +35,50 @@ if str(_FLIGHT_CONTROL) not in sys.path:
     sys.path.insert(0, str(_FLIGHT_CONTROL))
 
 
+def _load_rows(path: str, limit: int) -> list[dict]:
+    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    rows = payload.get("rows", [])
+    if limit and limit > 0:
+        rows = rows[:limit]
+    if not rows:
+        raise SystemExit(f"no rows in {path}")
+    return rows
+
+
+def _print_replay_summary(
+    reason: str,
+    rows: list[dict],
+    records: list[dict],
+    sent: list[tuple],
+    state: dict,
+    out: Path,
+) -> None:
+    driven = [r for r in records if not r.get("blocked")]
+    blocked = [r for r in records if r.get("blocked")]
+    reasons: dict[str, int] = {}
+    for record in blocked:
+        key = str(record.get("reason", "?")).split(" (")[0]
+        reasons[key] = reasons.get(key, 0) + 1
+    errs = [r["path_error_u"] for r in records if r.get("path_error_u") is not None]
+    nonzero = [command for command in sent if tuple(command) != (0, 0, 0, 0)]
+
+    print("\n=== replay-to-command summary ===")
+    print(f"terminal reason      : {reason}")
+    print(f"frames consumed      : {state['i']}/{len(rows)}")
+    print(f"ticks logged         : {len(records)}  (driven={len(driven)}, blocked={len(blocked)})")
+    print(f"PCMD sent            : {len(sent)}  (nonzero={len(nonzero)}, zero/hover={len(sent) - len(nonzero)})")
+    print(f"relocalize requests  : {state['reloc']}")
+    if errs:
+        errs_sorted = sorted(errs)
+        print(f"path error (u)       : max={errs_sorted[-1]:.3f}  "
+              f"p90={errs_sorted[int(0.9 * (len(errs_sorted) - 1))]:.3f}")
+    if reasons:
+        print("block reasons:")
+        for key, value in sorted(reasons.items(), key=lambda item: -item[1]):
+            print(f"  {value:5d}  {key}")
+    print(f"command log          : {out}")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -56,12 +100,7 @@ def main() -> int:
 
     print("[mode] REPLAY-VALIDATE: mock command sink only -- no drone, no Olympe", flush=True)
 
-    payload = json.loads(Path(args.bench_json).read_text(encoding="utf-8"))
-    rows = payload.get("rows", [])
-    if args.limit and args.limit > 0:
-        rows = rows[:args.limit]
-    if not rows:
-        raise SystemExit(f"no rows in {args.bench_json}")
+    rows = _load_rows(args.bench_json, args.limit)
 
     wp = rpf.load_waypoints(pff.PATH_JSON)
     ctrl = rpf.RouteAutoController(wp, poles=[],
@@ -118,30 +157,7 @@ def main() -> int:
     clog.event(event="terminal", reason=reason, frames_consumed=S["i"], frames_total=len(rows))
     clog.close()
 
-    driven = [r for r in records if not r.get("blocked")]
-    blocked = [r for r in records if r.get("blocked")]
-    reasons: dict[str, int] = {}
-    for r in blocked:
-        key = str(r.get("reason", "?")).split(" (")[0]
-        reasons[key] = reasons.get(key, 0) + 1
-    errs = [r["path_error_u"] for r in records if r.get("path_error_u") is not None]
-    nonzero = [c for c in sent if tuple(c) != (0, 0, 0, 0)]
-
-    print("\n=== replay-to-command summary ===")
-    print(f"terminal reason      : {reason}")
-    print(f"frames consumed      : {S['i']}/{len(rows)}")
-    print(f"ticks logged         : {len(records)}  (driven={len(driven)}, blocked={len(blocked)})")
-    print(f"PCMD sent            : {len(sent)}  (nonzero={len(nonzero)}, zero/hover={len(sent) - len(nonzero)})")
-    print(f"relocalize requests  : {S['reloc']}")
-    if errs:
-        errs_sorted = sorted(errs)
-        print(f"path error (u)       : max={errs_sorted[-1]:.3f}  "
-              f"p90={errs_sorted[int(0.9 * (len(errs_sorted) - 1))]:.3f}")
-    if reasons:
-        print("block reasons:")
-        for k, v in sorted(reasons.items(), key=lambda kv: -kv[1]):
-            print(f"  {v:5d}  {k}")
-    print(f"command log          : {out}")
+    _print_replay_summary(reason, rows, records, sent, S, out)
     return 0
 
 

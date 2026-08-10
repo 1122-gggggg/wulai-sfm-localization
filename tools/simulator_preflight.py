@@ -14,15 +14,9 @@ from pathlib import Path
 
 MEGALOC_REVISION = "7cb9f7970d366fdf059963d04d372e503e8e9df9"
 MEGALOC_SHA256 = "d4f9f2bcb60018f91eb6a8e061ed054fd55654e10c2569cf13841ea986ffb4f8"
-MEGALOC_HUBCONF_SHA256 = (
-    "0ebf9fc9c455ca38b9e52c69bcfee4b136a0f8872fdfc4307d00469013228b98"
-)
-MEGALOC_MODEL_SOURCE_SHA256 = (
-    "3cbf1d20515b1da423998a8edab787031eaa7bb273c5a86a5c41c4f6d84e2a6d"
-)
-EDM_CHECKPOINT_SHA256 = (
-    "f686bebdd9705bf6918621a1a83695f83d698cbd8c3eed932847fe3678d13a97"
-)
+MEGALOC_HUBCONF_SHA256 = "0ebf9fc9c455ca38b9e52c69bcfee4b136a0f8872fdfc4307d00469013228b98"
+MEGALOC_MODEL_SOURCE_SHA256 = "3cbf1d20515b1da423998a8edab787031eaa7bb273c5a86a5c41c4f6d84e2a6d"
+EDM_CHECKPOINT_SHA256 = "f686bebdd9705bf6918621a1a83695f83d698cbd8c3eed932847fe3678d13a97"
 SCALE_FREE_CORE = "模擬器/parrot_stimulate/src/anafi_pcmd_sim/scale_free_control.py"
 REQUIRED_GPU_SUBSTRING = "rtx 5060"
 SCIPY_LOCK_PACKAGE = "scipy"
@@ -75,9 +69,7 @@ def _check_video(video: Path, failures: list[str]) -> dict[str, str]:
         check=False,
     )
     if completed.returncode != 0 or not completed.stdout.strip():
-        failures.append(
-            f"ffprobe cannot read video: {video}: {completed.stderr.strip()}"
-        )
+        failures.append(f"ffprobe cannot read video: {video}: {completed.stderr.strip()}")
         return {}
     return {"duration_s": completed.stdout.strip()}
 
@@ -107,9 +99,7 @@ def _check_environment_contract(
                 break
     runtime["system_site_packages"] = system_site_packages
     if system_site_packages:
-        failures.append(
-            f"runtime venv has include-system-site-packages=true: {venv_config}"
-        )
+        failures.append(f"runtime venv has include-system-site-packages=true: {venv_config}")
 
     expected_paths = {
         "SFM_WORKSPACE_ROOT": root.resolve(),
@@ -124,21 +114,11 @@ def _check_environment_contract(
             resolve_symlinks=name not in {"SFM_UI_PYTHON", "SFM_LOCALIZER_PYTHON"},
         )
         if actual is not None and actual != expected:
-            failures.append(
-                f"{name} does not match selected runtime: {actual} != {expected}"
-            )
+            failures.append(f"{name} does not match selected runtime: {actual} != {expected}")
         runtime[f"{name.lower()}_resolved"] = str(actual or expected)
 
 
-def _check_runtime(
-    root: Path, profile_path: Path, failures: list[str]
-) -> dict[str, object]:
-    runtime: dict[str, object] = {"python": sys.version.split()[0]}
-    _check_environment_contract(root, profile_path, failures, runtime)
-    if sys.version_info[:2] != (3, 10):
-        failures.append(f"Python 3.10 required; got {sys.version.split()[0]}")
-    if shutil.which("ffmpeg") is None:
-        failures.append("missing system command: ffmpeg")
+def _check_required_python_modules(runtime: dict[str, object], failures: list[str]) -> None:
     for module_name in ("numpy", "cv2", "PIL", "torch", "pycolmap", "tkinter"):
         try:
             module = importlib.import_module(module_name)
@@ -153,13 +133,11 @@ def _check_runtime(
                 device = module.cuda.get_device_name(0)
                 runtime["cuda_device"] = device
                 if REQUIRED_GPU_SUBSTRING not in device.lower():
-                    failures.append(
-                        f"production runtime requires an NVIDIA RTX 5060; got {device}"
-                    )
+                    failures.append(f"production runtime requires an NVIDIA RTX 5060; got {device}")
 
-    edm_checkpoint = (
-        root / "定位演算法/deploy_code/runtime/EDM/weights/edm_outdoor.ckpt"
-    )
+
+def _check_runtime_artifacts(root: Path, failures: list[str]) -> None:
+    edm_checkpoint = root / "定位演算法/deploy_code/runtime/EDM/weights/edm_outdoor.ckpt"
     _check_sha(edm_checkpoint, EDM_CHECKPOINT_SHA256, "EDM checkpoint", failures)
     megaloc_root = root / "執行環境/torch_hub_cache/gmberton_MegaLoc_main"
     _check_sha(
@@ -181,11 +159,12 @@ def _check_runtime(
         / "model.safetensors"
     )
     _check_sha(megaloc_weights, MEGALOC_SHA256, "MegaLoc weights", failures)
-    edm_config = (
-        root / "定位演算法/deploy_code/runtime/EDM/configs/edm/outdoor/edm_base.py"
-    )
+    edm_config = root / "定位演算法/deploy_code/runtime/EDM/configs/edm/outdoor/edm_base.py"
     if not edm_config.is_file():
         failures.append(f"missing EDM config: {edm_config}")
+
+
+def _check_edm_runtime_import(root: Path, runtime: dict[str, object], failures: list[str]) -> None:
     deploy_dir = root / "定位演算法/deploy_code/sfm_glomap_deploy"
     edm_repo = root / "定位演算法/deploy_code/runtime/EDM"
     for path in (deploy_dir, edm_repo):
@@ -204,45 +183,56 @@ def _check_runtime(
         ValueError,
     ) as exc:
         failures.append(f"EDM runtime import failed: {exc}")
+
+
+def _check_runtime(root: Path, profile_path: Path, failures: list[str]) -> dict[str, object]:
+    runtime: dict[str, object] = {"python": sys.version.split()[0]}
+    _check_environment_contract(root, profile_path, failures, runtime)
+    if sys.version_info[:2] != (3, 10):
+        failures.append(f"Python 3.10 required; got {sys.version.split()[0]}")
+    if shutil.which("ffmpeg") is None:
+        failures.append("missing system command: ffmpeg")
+    _check_required_python_modules(runtime, failures)
+    _check_runtime_artifacts(root, failures)
+    _check_edm_runtime_import(root, runtime, failures)
     return runtime
 
 
-def _collision_monitor_status(
-    root: Path,
-    failures: list[str],
-    *,
-    production_required: bool,
-) -> dict[str, object]:
-    """Report the effective sparse-cloud monitor policy.
-
-    The controller has a guarded SciPy import, so importing SciPy from an
-    operator's ambient environment is not enough to make this capability
-    reproducible.  A clean runtime can only rely on packages present in the
-    hash-locked runtime requirements.  The monitor is currently a warning-only
-    research aid, not an approved production collision-protection layer.
-    """
+def _scipy_lock_status(root: Path) -> tuple[bool, str]:
     lock_path = root / "requirements/runtime-lock.txt"
-    hash_locked = False
-    lock_error = ""
-    if lock_path.is_file():
-        try:
-            hash_locked = any(
+    if not lock_path.is_file():
+        return False, ""
+    try:
+        return (
+            any(
                 line.lstrip().startswith(f"{SCIPY_LOCK_PACKAGE}==")
                 for line in lock_path.read_text(encoding="utf-8").splitlines()
-            )
-        except OSError as exc:
-            lock_error = f"cannot read requirements/runtime-lock.txt: {exc}"
+            ),
+            "",
+        )
+    except OSError as exc:
+        return False, f"cannot read requirements/runtime-lock.txt: {exc}"
 
-    runtime_import = False
-    import_error = ""
+
+def _scipy_runtime_status() -> tuple[bool, str]:
     try:
         scipy_spatial = importlib.import_module("scipy.spatial")
         runtime_import = getattr(scipy_spatial, "cKDTree", None) is not None
-        if not runtime_import:
-            import_error = "scipy.spatial.cKDTree is unavailable"
+        return (
+            runtime_import,
+            "" if runtime_import else "scipy.spatial.cKDTree is unavailable",
+        )
     except Exception as exc:  # noqa: BLE001 - report optional monitor as unavailable
-        import_error = str(exc)
+        return False, str(exc)
 
+
+def _collision_monitor_reasons(
+    *,
+    hash_locked: bool,
+    lock_error: str,
+    runtime_import: bool,
+    import_error: str,
+) -> list[str]:
     reasons: list[str] = []
     if not hash_locked:
         reasons.append(
@@ -257,24 +247,51 @@ def _collision_monitor_status(
         "SparseCloudCollisionMonitor is not an approved production safety layer; "
         "collision_protection_claim=false"
     )
+    return reasons
 
-    effective_available = hash_locked and runtime_import
-    if production_required:
-        if not hash_locked:
-            failures.append(
-                "production collision monitor required but scipy is absent from "
-                "requirements/runtime-lock.txt; preflight is fail-closed"
-            )
-        if not runtime_import:
-            failures.append(
-                "production collision monitor required but scipy.spatial.cKDTree "
-                "is unavailable; preflight is fail-closed"
-            )
+
+def _record_collision_monitor_requirement_failures(
+    failures: list[str], *, hash_locked: bool, runtime_import: bool
+) -> None:
+    if not hash_locked:
         failures.append(
-            "SparseCloudCollisionMonitor is not an approved production safety layer; "
-            "production preflight is fail-closed"
+            "production collision monitor required but scipy is absent from "
+            "requirements/runtime-lock.txt; preflight is fail-closed"
+        )
+    if not runtime_import:
+        failures.append(
+            "production collision monitor required but scipy.spatial.cKDTree "
+            "is unavailable; preflight is fail-closed"
+        )
+    failures.append(
+        "SparseCloudCollisionMonitor is not an approved production safety layer; "
+        "production preflight is fail-closed"
+    )
+
+
+def _collision_monitor_status(
+    root: Path,
+    failures: list[str],
+    *,
+    production_required: bool,
+) -> dict[str, object]:
+    """Report the effective sparse-cloud monitor policy."""
+    hash_locked, lock_error = _scipy_lock_status(root)
+    runtime_import, import_error = _scipy_runtime_status()
+    reasons = _collision_monitor_reasons(
+        hash_locked=hash_locked,
+        lock_error=lock_error,
+        runtime_import=runtime_import,
+        import_error=import_error,
+    )
+    if production_required:
+        _record_collision_monitor_requirement_failures(
+            failures,
+            hash_locked=hash_locked,
+            runtime_import=runtime_import,
         )
 
+    effective_available = hash_locked and runtime_import
     return {
         "available": effective_available,
         "status": "available_non_production" if effective_available else "unavailable",
@@ -301,15 +318,7 @@ def _check_ply(path: Path, failures: list[str]) -> None:
         failures.append(f"map PLY header is invalid: {path}")
 
 
-def _check_full_runtime(
-    root: Path,
-    profile,
-    failures: list[str],
-    runtime: dict[str, object],
-) -> None:
-    if profile is None:
-        failures.append("full runtime check requires a valid site profile")
-        return
+def _check_profile_runtime_assets(profile, failures: list[str]) -> None:
     for path, label in (
         (profile.map_ply, "map PLY"),
         (profile.localization_bundle, "localization bundle"),
@@ -323,9 +332,9 @@ def _check_full_runtime(
     if profile.query_camera is None:
         failures.append("site profile has no query camera")
 
-    deploy_dir = profile.localizer_deploy_dir or (
-        root / "定位演算法/deploy_code/sfm_glomap_deploy"
-    )
+
+def _check_profile_runtime_containment(root: Path, profile, failures: list[str]) -> Path:
+    deploy_dir = profile.localizer_deploy_dir or (root / "定位演算法/deploy_code/sfm_glomap_deploy")
     expected_deploy_dir = (root / "定位演算法/deploy_code/sfm_glomap_deploy").resolve()
     if deploy_dir.resolve() != expected_deploy_dir:
         failures.append(
@@ -339,37 +348,41 @@ def _check_full_runtime(
                 "site profile localizer_profile is outside the fixed package: "
                 f"{profile.localizer_profile}"
             )
-    edm_repo = root / "定位演算法/deploy_code/runtime/EDM"
-    for path in (deploy_dir, edm_repo):
+    return deploy_dir
+
+
+def _prepend_import_paths(*paths: Path) -> None:
+    for path in paths:
         if str(path) not in sys.path:
             sys.path.insert(0, str(path))
 
+
+def _check_camera_runtime(profile, failures: list[str], runtime: dict[str, object]) -> None:
     try:
         from production_localizer_factory import validate_camera_tuple
 
         camera = profile.query_camera
         if camera is not None:
-            validate_camera_tuple(
-                (camera.model, camera.width, camera.height, list(camera.params))
-            )
+            validate_camera_tuple((camera.model, camera.width, camera.height, list(camera.params)))
             runtime["camera"] = f"{camera.model} {camera.width}x{camera.height}"
     except Exception as exc:  # noqa: BLE001 - report clean-install failures
         failures.append(f"camera/deploy validation failed: {exc}")
 
+
+def _check_edm_bundle_runtime(profile, failures: list[str], runtime: dict[str, object]) -> None:
     try:
         from reloc_localizer_edm import EDMRelocMap
 
         expected = profile.asset_sha256.localization_bundle
-        reloc_map = EDMRelocMap.load(
-            profile.localization_bundle, expected_sha256=expected
-        )
+        reloc_map = EDMRelocMap.load(profile.localization_bundle, expected_sha256=expected)
         runtime["bundle_refs"] = len(reloc_map.ref_names)
         del reloc_map
     except Exception as exc:  # noqa: BLE001 - report corrupt bundle failures
         failures.append(f"EDM bundle load failed: {exc}")
 
+
+def _check_edm_cuda_runtime(failures: list[str], runtime: dict[str, object]) -> None:
     try:
-        import numpy as np
         from edm_matcher import EDMMatcher
 
         matcher = EDMMatcher(device="cuda", fp16=True)
@@ -378,7 +391,10 @@ def _check_full_runtime(
     except Exception as exc:  # noqa: BLE001 - report model/runtime failures
         failures.append(f"EDM CUDA matcher load failed: {exc}")
 
+
+def _check_megaloc_runtime(failures: list[str], runtime: dict[str, object]) -> None:
     try:
+        import numpy as np
         from reloc_localizer_edm import MegaLocQuery
 
         extractor = MegaLocQuery(device="cuda")
@@ -390,17 +406,37 @@ def _check_full_runtime(
     except Exception as exc:  # noqa: BLE001 - report model/runtime failures
         failures.append(f"MegaLoc CUDA load/inference failed: {exc}")
 
+
+def _check_operator_imports(root: Path, failures: list[str], runtime: dict[str, object]) -> None:
     operator_dir = root / "控制介面程式/operator_interface"
     control_dir = root / "控制介面程式"
-    for path in (control_dir, operator_dir):
-        if str(path) not in sys.path:
-            sys.path.insert(0, str(path))
+    _prepend_import_paths(control_dir, operator_dir)
     for module_name in ("flight_operator_app", "live_localizer_worker"):
         try:
             importlib.import_module(module_name)
             runtime[f"import_{module_name}"] = "ok"
         except Exception as exc:  # noqa: BLE001 - report UI/worker import failures
             failures.append(f"{module_name} import failed: {exc}")
+
+
+def _check_full_runtime(
+    root: Path,
+    profile,
+    failures: list[str],
+    runtime: dict[str, object],
+) -> None:
+    if profile is None:
+        failures.append("full runtime check requires a valid site profile")
+        return
+    _check_profile_runtime_assets(profile, failures)
+    deploy_dir = _check_profile_runtime_containment(root, profile, failures)
+    edm_repo = root / "定位演算法/deploy_code/runtime/EDM"
+    _prepend_import_paths(deploy_dir, edm_repo)
+    _check_camera_runtime(profile, failures, runtime)
+    _check_edm_bundle_runtime(profile, failures, runtime)
+    _check_edm_cuda_runtime(failures, runtime)
+    _check_megaloc_runtime(failures, runtime)
+    _check_operator_imports(root, failures, runtime)
 
 
 def run_preflight(
@@ -417,9 +453,7 @@ def run_preflight(
     control_dir = root / "控制介面程式"
     scale_free_core = root / SCALE_FREE_CORE
     if not scale_free_core.is_file():
-        failures.append(
-            f"missing authoritative scale-free control core: {scale_free_core}"
-        )
+        failures.append(f"missing authoritative scale-free control core: {scale_free_core}")
     if str(control_dir) not in sys.path:
         sys.path.insert(0, str(control_dir))
     try:
@@ -436,9 +470,7 @@ def run_preflight(
         failures.append(f"site profile invalid: {exc}")
         profile_report = {}
     video_report = _check_video(video_path, failures)
-    runtime_report = (
-        _check_runtime(root, profile_path, failures) if check_runtime else {}
-    )
+    runtime_report = _check_runtime(root, profile_path, failures) if check_runtime else {}
     runtime_report["collision_monitor"] = _collision_monitor_status(
         root,
         failures,

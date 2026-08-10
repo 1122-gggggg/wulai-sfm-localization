@@ -81,7 +81,6 @@ RELEASE_FILES = (
     "文件/ADVERSARIAL_AUDIT_20260810.md",
     "文件/REFERENCE_INDEX.md",
     "文件/SYSTEM_SPEC.md",
-    "文件/WORKSPACE_AUDIT.md",
     "文件/hardware_approval/README.md",
     "文件/hardware_approval/river_site_receipt_v2.request.json",
     "tools/install_runtime.sh",

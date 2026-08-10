@@ -118,21 +118,21 @@ def test_grab_only_source_never_arms():
 
 def test_fly_is_the_only_arming_entrypoint():
     module_src = inspect.getsource(pff)
-    fly_src = inspect.getsource(pff.fly)
-    # Every arming/movement Olympe message constructed by the module must live in
-    # fly(). The counts must also be NON-ZERO: the previous form matched
-    # "drone(TakeOff" which never occurs (TakeOff is composed with an expectation,
-    # `TakeOff() >> FlyingStateChanged(...)`), so it asserted 0 == 0 and would have
-    # stayed green even if arming had moved somewhere else entirely.
+    fly_lines, fly_start = inspect.getsourcelines(pff.fly)
+    fly_end = fly_start + len(fly_lines) - 1
+    tree = ast.parse(module_src)
+    # Count actual constructors, not matching text in comments/error messages.
     for token in ("TakeOff", "Emergency", "Landing"):
-        module_uses = module_src.count(f"{token}()")
-        fly_uses = fly_src.count(f"{token}()")
-        assert fly_uses > 0, (
-            f"{token}() no longer appears in fly(); this test can no longer prove "
-            "that arming is confined to the single approved entry point"
-        )
-        assert module_uses == fly_uses, (
-            f"{token}() is constructed {module_uses - fly_uses} time(s) outside fly()"
+        calls = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == token
+        ]
+        assert calls, f"{token}() is no longer constructed by the approved entry point"
+        assert all(fly_start <= node.lineno <= fly_end for node in calls), (
+            f"{token}() is constructed outside fly()"
         )
 
 
@@ -1824,6 +1824,8 @@ def test_manual_handoff_and_auto_reacquire_are_atomic_with_pcmd():
 
 def test_fly_confirms_controller_before_pcmd_takeoff_and_waits_for_landed():
     src = inspect.getsource(pff.fly)
+    firmware_src = inspect.getsource(pff._configure_flight_preflight_for_live)
+    cleanup_src = inspect.getsource(pff._close_live_flight_resources)
     initial_sticks_i = src.index('set_piloting_source(drone, "SkyController")')
     preflight_i = src.index("configure_flight_preflight")
     models_i = src.index("loc.ensure_models()")
@@ -1836,13 +1838,14 @@ def test_fly_confirms_controller_before_pcmd_takeoff_and_waits_for_landed():
     assert helper.index("stick_monitor.start()") < helper.index(
         'set_piloting_source(drone, "Controller")'
     )
-    restore_i = src.rindex('set_piloting_source(drone, "SkyController")')
-    assert restore_i < src.rindex("drone.disconnect()")
+    restore_i = cleanup_src.index('set_piloting_source(drone, "SkyController")')
+    assert restore_i < cleanup_src.index("drone.disconnect()")
     assert src.index("require_landed_for_firmware_config") < src.index(
-        "except Exception as exc")
-    assert "continuing without confirmed firmware limits" in src
+        "_configure_flight_preflight_for_live")
+    assert "except Exception as exc" in firmware_src
+    assert "continuing without confirmed firmware limits" in firmware_src
     assert "--fly requires explicit --max-altitude-m and --max-distance-m" not in src
-    assert src.count('state="landed"') >= 2
+    assert 'state="landed"' in src
 
 
 def test_dry_run_does_not_apply_yaw_sign_twice():
@@ -2180,27 +2183,40 @@ def test_non_finite_safety_environment_value_rejected(monkeypatch):
 
 def test_takeoff_has_final_arming_gate_cleanup_and_termination_signals():
     src = inspect.getsource(pff.fly)
+    boot_src = inspect.getsource(pff._wait_for_boot_lock)
+    route_src = inspect.getsource(pff._run_live_route_after_takeoff)
+    authorize_src = inspect.getsource(pff._authorize_cleanup_zero)
+    terminal_src = inspect.getsource(pff._perform_terminal_flight_action)
+    inspection_src = inspect.getsource(pff._capture_inspection_frame)
+    signal_src = inspect.getsource(pff._install_flight_stop_handlers)
     assert src.index("must_land = True") < src.index("TakeOff() >>")
     assert "schedule_authorized_takeoff" in src
-    assert "arming_allowed" in src
+    assert "arming_allowed" in boot_src and "arming_allowed" in route_src
     assert "require_fresh_auto=True" in src
-    assert src.rindex("monitor.stop()") < src.rindex("reason = monitor.reason")
-    assert src.rindex("reason = monitor.reason") < src.rindex("if must_land")
-    assert src.rindex("monitor.send_authorized") > src.index("finally:")
-    assert "emergency_issued" in src
+    assert authorize_src.index("monitor.stop()") < authorize_src.index(
+        "reason = monitor.reason")
+    assert authorize_src.index("reason = monitor.reason") < authorize_src.index(
+        "if not must_land")
+    assert "monitor.send_authorized" in authorize_src
+    assert src.index("finally:") < src.index("_authorize_cleanup_zero")
+    assert "emergency_issued" in terminal_src
     assert "require_source_timestamps=True" in src
-    assert src.index("require_confirmation=True") < src.index("baseline_source_us =")
-    assert "inspection_sample_after" in src and "INSPECTION_PIPELINE_DRAIN_S" in src
+    assert inspection_src.index("require_confirmation=True") < inspection_src.index(
+        "baseline_source_us =")
+    assert "inspection_sample_after" in inspection_src
+    assert "INSPECTION_PIPELINE_DRAIN_S" in inspection_src
     for sig in ("SIGINT", "SIGTERM", "SIGHUP"):
-        assert sig in src
+        assert sig in signal_src
 
 
 def test_fly_arms_and_cleans_up_physical_stick_override_before_takeoff():
     src = inspect.getsource(pff.fly)
+    hooks_src = inspect.getsource(pff._make_live_loop_hooks)
     assert src.index("start_skycontroller_stick_override") < src.index("monitor.start()")
     assert src.index("monitor.start()") < src.index("schedule_authorized_takeoff")
-    assert 'stick_active=getattr(stick_monitor, "is_active", None)' in src
-    assert src.index("stop_skycontroller_stick_override") < src.index("monitor.stop()")
+    assert 'stick_active=getattr(stick_monitor, "is_active", None)' in hooks_src
+    assert src.index("stop_skycontroller_stick_override") < src.index(
+        "_authorize_cleanup_zero")
 
     helper = inspect.getsource(pff.start_skycontroller_stick_override)
     assert "if not stick_monitor.start()" in helper

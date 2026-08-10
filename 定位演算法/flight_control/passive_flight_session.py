@@ -23,6 +23,7 @@ import signal
 import sys
 import time
 import traceback
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -44,246 +45,383 @@ def _finite_pose(p) -> bool:
     return all(math.isfinite(float(v)) for v in (p.x, p.y, p.z))
 
 
-def run_session(*, ip: str, controller: str, secs: float, hz: float,
-                out: Path, with_localize: bool) -> Path:
-    out.parent.mkdir(parents=True, exist_ok=True)
-    messages = tel._build_message_table()
+@dataclass
+class _SessionResources:
+    grabber: Any = None
+    localizer: Any = None
+    waypoints: Any = None
+    cumulative_path: Any = None
+    path_length: float | None = None
 
-    stop = {"f": False}
 
-    def _sig(*_a):
+@dataclass
+class _SessionStats:
+    samples: int = 0
+    video_ok: int = 0
+    video_none: int = 0
+    loc_ok: int = 0
+    loc_fail: int = 0
+    loc_skip: int = 0
+    jump_rejects: int = 0
+    last_good_xyz: tuple[float, float, float] | None = None
+
+
+def _install_signal_handlers(stop: dict[str, bool]) -> None:
+    def request_stop(*_args) -> None:
         stop["f"] = True
         print("[session] stop requested (signal)", flush=True)
 
-    signal.signal(signal.SIGINT, _sig)
-    signal.signal(signal.SIGTERM, _sig)
+    signal.signal(signal.SIGINT, request_stop)
+    signal.signal(signal.SIGTERM, request_stop)
 
-    print(f"[session] connecting ip={ip} controller={controller}", flush=True)
-    print("[session] PASSIVE ONLY — no TakeOff/PCMD/Landing/Emergency/gimbal cmd", flush=True)
-    drone = ofs.connect(ip, controller=controller)
 
-    grabber = None
-    loc = None
-    waypoints = None
-    cum = None
-    path_len = None
-
+def _load_route(resources: _SessionResources) -> None:
     try:
-        grabber = ofs.OlympePdrawGrabber(
-            drone, resize=(1280, 720), stale_s=0.8).start()
-        print("[session] video grabber started", flush=True)
+        map_frame = (
+            rpf.load_map_frame(pff.MAP_ALIGN)
+            if pff.MAP_ALIGN
+            else rpf.LEGACY_MAP_FRAME
+        )
+        resources.waypoints = rpf.load_waypoints(pff.PATH_JSON, map_frame=map_frame)
+        poles = rpf.load_poles(pff.POLES_JSON, map_frame)
+        controller = rpf.RouteAutoController(
+            resources.waypoints,
+            poles,
+            rpf.config_for_route(
+                pff.PATH_JSON,
+                rpf.ControlConfig(map_frame=map_frame),
+            ),
+        )
+        resources.cumulative_path = controller.cum
+        resources.path_length = float(controller.path_len)
+        print(
+            f"[session] route loaded: {len(resources.waypoints)} wp, "
+            f"len={resources.path_length:.2f}u  poles={len(poles)}",
+            flush=True,
+        )
+    except Exception as exc:
+        print(f"[session] route load failed (loc continues): {exc}", flush=True)
 
+
+def _start_resources(drone, *, with_localize: bool) -> _SessionResources:
+    resources = _SessionResources()
+    try:
+        resources.grabber = ofs.OlympePdrawGrabber(
+            drone,
+            resize=(1280, 720),
+            stale_s=0.8,
+        ).start()
+        print("[session] video grabber started", flush=True)
         if with_localize:
-            print("[session] loading localizer models (stay on ground until ready)...",
-                  flush=True)
-            loc = pff.build_localizer(grabber)
-            loc.ensure_models()
-            try:
-                map_frame = (
-                    rpf.load_map_frame(pff.MAP_ALIGN)
-                    if pff.MAP_ALIGN else rpf.LEGACY_MAP_FRAME
-                )
-                waypoints = rpf.load_waypoints(
-                    pff.PATH_JSON, map_frame=map_frame
-                )
-                poles = rpf.load_poles(pff.POLES_JSON, map_frame)
-                ctrl = rpf.RouteAutoController(
-                    waypoints,
-                    poles,
-                    rpf.config_for_route(
-                        pff.PATH_JSON, rpf.ControlConfig(map_frame=map_frame)
-                    ),
-                )
-                cum = ctrl.cum
-                path_len = float(ctrl.path_len)
-                print(f"[session] route loaded: {len(waypoints)} wp, "
-                      f"len={path_len:.2f}u  poles={len(poles)}", flush=True)
-            except Exception as exc:
-                print(f"[session] route load failed (loc continues): {exc}", flush=True)
+            print(
+                "[session] loading localizer models (stay on ground until ready)...",
+                flush=True,
+            )
+            resources.localizer = pff.build_localizer(resources.grabber)
+            resources.localizer.ensure_models()
+            _load_route(resources)
             print("[session] localizer ready — pilot may take off with sticks", flush=True)
     except Exception as exc:
         print(f"[session] video/localizer setup failed: {exc}", flush=True)
         traceback.print_exc()
-        # telemetry-only fallback
-        if grabber is not None:
+        if resources.grabber is not None:
             try:
-                grabber.stop()
+                resources.grabber.stop()
             except Exception:
                 pass
-            grabber = None
-        loc = None
+            resources.grabber = None
+        resources.localizer = None
+    return resources
 
-    period = 1.0 / max(1e-3, hz)
-    t_end = time.monotonic() + max(0.1, secs)
-    n = 0
-    video_ok = video_none = 0
-    loc_ok = loc_fail = loc_skip = 0
-    jump_rejects = 0
-    last_good_xyz = None
-    max_jump_u = float(getattr(pff, "MAX_POSE_JUMP_U", 1.5)
-                       if hasattr(pff, "MAX_POSE_JUMP_U") else
-                       __import__("os").environ.get("SFM_MAX_POSE_JUMP_U", "1.5"))
 
-    # use same threshold as flight if available
+def _max_pose_jump() -> float:
     try:
-        max_jump_u = pff._env_float("SFM_MAX_POSE_JUMP_U", 1.5, minimum=0.1, maximum=50.0)
+        return pff._env_float(
+            "SFM_MAX_POSE_JUMP_U",
+            1.5,
+            minimum=0.1,
+            maximum=50.0,
+        )
     except Exception:
-        max_jump_u = 1.5
+        return 1.5
 
+
+def _add_video_sample(
+    row: dict[str, Any],
+    resources: _SessionResources,
+    stats: _SessionStats,
+) -> None:
+    grabber = resources.grabber
+    if grabber is None:
+        row["video.frame"] = None
+        return
     try:
-        with out.open("w", encoding="utf-8") as f:
-            meta = {
-                "event": "start",
-                "ip": ip,
-                "controller": controller,
-                "secs": secs,
-                "hz": hz,
-                "with_localize": bool(with_localize and loc is not None),
-                "bundle": str(pff.XBUN),
-                "path_json": str(pff.PATH_JSON),
-                "channel_labels": [lab for lab, _ in messages],
-                "safety": "passive_no_arm",
-                "max_pose_jump_u": max_jump_u,
-                "t_iso": datetime.now(timezone.utc).isoformat(),
-            }
-            f.write(json.dumps(meta, ensure_ascii=False) + "\n")
-            f.flush()
+        result = grabber()
+    except Exception:
+        result = None
+    if result is None:
+        stats.video_none += 1
+        row["video.frame"] = None
+        row["video.healthy"] = bool(grabber.is_healthy())
+        return
+    stats.video_ok += 1
+    frame, stamp = result if isinstance(result, tuple) else (result, None)
+    height, width = frame.shape[:2] if frame is not None else (None, None)
+    row["video.frame"] = {
+        "w": width,
+        "h": height,
+        "stamp_mono": stamp,
+        "age_s": (time.monotonic() - stamp) if stamp else None,
+    }
+    row["video.healthy"] = bool(grabber.is_healthy())
+    row["video.fps"] = float(getattr(grabber, "fps", 0.0) or 0.0)
 
-            while (not stop["f"]) and time.monotonic() < t_end:
-                t0 = time.monotonic()
-                row = tel.sample_once(drone, messages)
 
-                # video
-                frame = None
-                stamp = None
-                if grabber is not None:
-                    try:
-                        fr = grabber()
-                    except Exception:
-                        fr = None
-                    if fr is None:
-                        video_none += 1
-                        row["video.frame"] = None
-                        row["video.healthy"] = bool(grabber.is_healthy())
-                    else:
-                        video_ok += 1
-                        frame, stamp = fr if isinstance(fr, tuple) else (fr, None)
-                        h, w = (frame.shape[:2] if frame is not None else (None, None))
-                        row["video.frame"] = {
-                            "w": w, "h": h,
-                            "stamp_mono": stamp,
-                            "age_s": (time.monotonic() - stamp) if stamp else None,
-                        }
-                        row["video.healthy"] = bool(grabber.is_healthy())
-                        row["video.fps"] = float(getattr(grabber, "fps", 0.0) or 0.0)
-                else:
-                    row["video.frame"] = None
+def _pose_path_metrics(pose, resources: _SessionResources) -> tuple[float | None, float | None]:
+    if resources.waypoints is None or resources.cumulative_path is None:
+        return None, None
+    try:
+        distance, _segments, _segment, progress = rpf.project_to_path(
+            [pose.x, pose.y, pose.z],
+            resources.waypoints,
+            resources.cumulative_path,
+        )
+        fraction = progress / resources.path_length if resources.path_length else None
+        return float(distance), float(fraction) if fraction is not None else None
+    except Exception:
+        return None, None
 
-                # localization (uses grabber as frame_source; get_pose pulls frame)
-                if loc is not None:
-                    try:
-                        pose = loc.get_pose()
-                        info = dict(getattr(loc, "last_info", {}) or {})
-                        finite = _finite_pose(pose)
-                        jump = False
-                        if finite and last_good_xyz is not None:
-                            dx = pose.x - last_good_xyz[0]
-                            dy = pose.y - last_good_xyz[1]
-                            dz = pose.z - last_good_xyz[2]
-                            dist = math.sqrt(dx * dx + dy * dy + dz * dz)
-                            if dist > max_jump_u:
-                                jump = True
-                                jump_rejects += 1
-                        if finite and not jump:
-                            last_good_xyz = (float(pose.x), float(pose.y), float(pose.z))
-                            loc_ok += 1
-                        else:
-                            loc_fail += 1
 
-                        path_err = None
-                        progress = None
-                        if finite and waypoints is not None and cum is not None:
-                            try:
-                                d, _nseg, _seg, s = rpf.project_to_path(
-                                    [pose.x, pose.y, pose.z], waypoints, cum)
-                                path_err = float(d)
-                                progress = float(s / path_len) if path_len else None
-                            except Exception:
-                                pass
+def _pose_is_jump(pose, stats: _SessionStats, max_jump_u: float) -> bool:
+    if stats.last_good_xyz is None:
+        return False
+    dx = pose.x - stats.last_good_xyz[0]
+    dy = pose.y - stats.last_good_xyz[1]
+    dz = pose.z - stats.last_good_xyz[2]
+    return math.sqrt(dx * dx + dy * dy + dz * dz) > max_jump_u
 
-                        row["loc"] = {
-                            "ok": bool(finite and not jump),
-                            "finite": finite,
-                            "jump_reject": jump,
-                            "x": float(pose.x) if finite else None,
-                            "y": float(pose.y) if finite else None,
-                            "z": float(pose.z) if finite else None,
-                            "yaw": float(getattr(pose, "yaw", float("nan")))
-                                   if finite else None,
-                            "stamp": float(getattr(pose, "stamp", 0.0) or 0.0)
-                                     if finite else None,
-                            "mode": info.get("mode") or info.get("next_mode"),
-                            "inliers": int(info.get("inliers", 0) or 0),
-                            "weak": bool(info.get("weak", False)),
-                            "reproj": info.get("reproj") or info.get("reproj_rms"),
-                            "path_error_u": path_err,
-                            "progress": progress,
-                        }
-                    except Exception as exc:
-                        loc_fail += 1
-                        row["loc"] = {"ok": False, "error": repr(exc)}
-                else:
-                    loc_skip += 1
-                    row["loc"] = None
 
-                f.write(json.dumps(row, ensure_ascii=False) + "\n")
-                n += 1
-                if n % max(1, int(hz)) == 0:
-                    f.flush()
-                    alt = row.get("piloting.altitude")
-                    fly = row.get("piloting.flying_state")
-                    bat = row.get("common.battery") or row.get("battery.capacity")
-                    loc_s = row.get("loc") or {}
-                    print(
-                        f"[session] n={n} fly={fly} alt={alt} bat={bat} "
-                        f"vid_ok={video_ok} loc_ok={loc_ok}/{loc_ok + loc_fail} "
-                        f"mode={loc_s.get('mode')} inl={loc_s.get('inliers')} "
-                        f"pos=({loc_s.get('x')},{loc_s.get('y')},{loc_s.get('z')}) "
-                        f"path_err={loc_s.get('path_error_u')}",
-                        flush=True,
-                    )
+def _record_pose_quality(pose, stats: _SessionStats, max_jump_u: float) -> tuple[bool, bool]:
+    finite = _finite_pose(pose)
+    jump = finite and _pose_is_jump(pose, stats, max_jump_u)
+    if jump:
+        stats.jump_rejects += 1
+    if finite and not jump:
+        stats.last_good_xyz = (float(pose.x), float(pose.y), float(pose.z))
+        stats.loc_ok += 1
+    else:
+        stats.loc_fail += 1
+    return finite, jump
 
-                dt = time.monotonic() - t0
-                time.sleep(max(0.0, period - dt))
 
-            footer = {
-                "event": "end",
-                "samples": n,
-                "video_frames_ok": video_ok,
-                "video_frames_none": video_none,
-                "loc_ok": loc_ok,
-                "loc_fail": loc_fail,
-                "loc_skip": loc_skip,
-                "jump_rejects": jump_rejects,
-                "stopped": stop["f"],
-                "t_iso": datetime.now(timezone.utc).isoformat(),
-            }
-            f.write(json.dumps(footer, ensure_ascii=False) + "\n")
-    finally:
-        if grabber is not None:
-            try:
-                grabber.stop()
-            except Exception:
-                pass
+def _localization_record(
+    pose,
+    info: dict[str, Any],
+    *,
+    finite: bool,
+    jump: bool,
+    resources: _SessionResources,
+) -> dict[str, Any]:
+    path_error, progress = (
+        _pose_path_metrics(pose, resources) if finite else (None, None)
+    )
+    return {
+        "ok": bool(finite and not jump),
+        "finite": finite,
+        "jump_reject": jump,
+        "x": float(pose.x) if finite else None,
+        "y": float(pose.y) if finite else None,
+        "z": float(pose.z) if finite else None,
+        "yaw": float(getattr(pose, "yaw", float("nan"))) if finite else None,
+        "stamp": float(getattr(pose, "stamp", 0.0) or 0.0) if finite else None,
+        "mode": info.get("mode") or info.get("next_mode"),
+        "inliers": int(info.get("inliers", 0) or 0),
+        "weak": bool(info.get("weak", False)),
+        "reproj": info.get("reproj") or info.get("reproj_rms"),
+        "path_error_u": path_error,
+        "progress": progress,
+    }
+
+
+def _add_localization_sample(
+    row: dict[str, Any],
+    resources: _SessionResources,
+    stats: _SessionStats,
+    *,
+    max_jump_u: float,
+) -> None:
+    localizer = resources.localizer
+    if localizer is None:
+        stats.loc_skip += 1
+        row["loc"] = None
+        return
+    try:
+        pose = localizer.get_pose()
+        info = dict(getattr(localizer, "last_info", {}) or {})
+        finite, jump = _record_pose_quality(pose, stats, max_jump_u)
+        row["loc"] = _localization_record(
+            pose,
+            info,
+            finite=finite,
+            jump=jump,
+            resources=resources,
+        )
+    except Exception as exc:
+        stats.loc_fail += 1
+        row["loc"] = {"ok": False, "error": repr(exc)}
+
+
+def _report_progress(stats: _SessionStats, row: dict[str, Any]) -> None:
+    altitude = row.get("piloting.altitude")
+    flying = row.get("piloting.flying_state")
+    battery = row.get("common.battery") or row.get("battery.capacity")
+    localization = row.get("loc") or {}
+    print(
+        f"[session] n={stats.samples} fly={flying} alt={altitude} bat={battery} "
+        f"vid_ok={stats.video_ok} loc_ok={stats.loc_ok}/{stats.loc_ok + stats.loc_fail} "
+        f"mode={localization.get('mode')} inl={localization.get('inliers')} "
+        f"pos=({localization.get('x')},{localization.get('y')},{localization.get('z')}) "
+        f"path_err={localization.get('path_error_u')}",
+        flush=True,
+    )
+
+
+def _write_start_record(
+    stream,
+    *,
+    ip: str,
+    controller: str,
+    secs: float,
+    hz: float,
+    with_localize: bool,
+    resources: _SessionResources,
+    messages,
+    max_jump_u: float,
+) -> None:
+    record = {
+        "event": "start",
+        "ip": ip,
+        "controller": controller,
+        "secs": secs,
+        "hz": hz,
+        "with_localize": bool(with_localize and resources.localizer is not None),
+        "bundle": str(pff.XBUN),
+        "path_json": str(pff.PATH_JSON),
+        "channel_labels": [label for label, _ in messages],
+        "safety": "passive_no_arm",
+        "max_pose_jump_u": max_jump_u,
+        "t_iso": datetime.now(timezone.utc).isoformat(),
+    }
+    stream.write(json.dumps(record, ensure_ascii=False) + "\n")
+    stream.flush()
+
+
+def _write_samples(
+    stream,
+    *,
+    drone,
+    messages,
+    resources: _SessionResources,
+    stop: dict[str, bool],
+    secs: float,
+    hz: float,
+    max_jump_u: float,
+) -> _SessionStats:
+    stats = _SessionStats()
+    period = 1.0 / max(1e-3, hz)
+    end_time = time.monotonic() + max(0.1, secs)
+    while not stop["f"] and time.monotonic() < end_time:
+        started_at = time.monotonic()
+        row = tel.sample_once(drone, messages)
+        _add_video_sample(row, resources, stats)
+        _add_localization_sample(
+            row,
+            resources,
+            stats,
+            max_jump_u=max_jump_u,
+        )
+        stream.write(json.dumps(row, ensure_ascii=False) + "\n")
+        stats.samples += 1
+        if stats.samples % max(1, int(hz)) == 0:
+            stream.flush()
+            _report_progress(stats, row)
+        elapsed = time.monotonic() - started_at
+        time.sleep(max(0.0, period - elapsed))
+    return stats
+
+
+def _write_end_record(stream, stats: _SessionStats, *, stopped: bool) -> None:
+    record = {
+        "event": "end",
+        "samples": stats.samples,
+        "video_frames_ok": stats.video_ok,
+        "video_frames_none": stats.video_none,
+        "loc_ok": stats.loc_ok,
+        "loc_fail": stats.loc_fail,
+        "loc_skip": stats.loc_skip,
+        "jump_rejects": stats.jump_rejects,
+        "stopped": stopped,
+        "t_iso": datetime.now(timezone.utc).isoformat(),
+    }
+    stream.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def _cleanup_resources(drone, resources: _SessionResources) -> None:
+    if resources.grabber is not None:
         try:
-            drone.disconnect()
+            resources.grabber.stop()
         except Exception:
             pass
+    try:
+        drone.disconnect()
+    except Exception:
+        pass
 
-    print(f"[session] wrote {n} samples -> {out}", flush=True)
+
+def run_session(*, ip: str, controller: str, secs: float, hz: float,
+                out: Path, with_localize: bool) -> Path:
+    out.parent.mkdir(parents=True, exist_ok=True)
+    messages = tel._build_message_table()
+    stop = {"f": False}
+    _install_signal_handlers(stop)
+    print(f"[session] connecting ip={ip} controller={controller}", flush=True)
+    print("[session] PASSIVE ONLY — no TakeOff/PCMD/Landing/Emergency/gimbal cmd", flush=True)
+    drone = ofs.connect(ip, controller=controller)
+    resources = _start_resources(drone, with_localize=with_localize)
+    max_jump_u = _max_pose_jump()
+    stats = _SessionStats()
+    try:
+        with out.open("w", encoding="utf-8") as stream:
+            _write_start_record(
+                stream,
+                ip=ip,
+                controller=controller,
+                secs=secs,
+                hz=hz,
+                with_localize=with_localize,
+                resources=resources,
+                messages=messages,
+                max_jump_u=max_jump_u,
+            )
+            stats = _write_samples(
+                stream,
+                drone=drone,
+                messages=messages,
+                resources=resources,
+                stop=stop,
+                secs=secs,
+                hz=hz,
+                max_jump_u=max_jump_u,
+            )
+            _write_end_record(stream, stats, stopped=stop["f"])
+    finally:
+        _cleanup_resources(drone, resources)
+
+    print(f"[session] wrote {stats.samples} samples -> {out}", flush=True)
     print(
-        f"[session] summary video_ok={video_ok} video_none={video_none} "
-        f"loc_ok={loc_ok} loc_fail={loc_fail} jump_rejects={jump_rejects}",
+        f"[session] summary video_ok={stats.video_ok} video_none={stats.video_none} "
+        f"loc_ok={stats.loc_ok} loc_fail={stats.loc_fail} "
+        f"jump_rejects={stats.jump_rejects}",
         flush=True,
     )
     return out

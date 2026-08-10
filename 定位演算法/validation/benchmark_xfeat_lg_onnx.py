@@ -361,6 +361,40 @@ def percentile(values: list[float], q: float) -> float:
     return float(np.percentile(np.asarray(values, np.float64), q))
 
 
+def _select_covisible_pairs(
+    reloc_map,
+    query_topk: int,
+    reference_topk: int,
+    limit: int,
+) -> list[tuple[int, int]]:
+    pairs: list[tuple[int, int]] = []
+    for query_index, name in enumerate(reloc_map.ref_names):
+        for reference_index in (reloc_map.covis or {}).get(name, []):
+            query = reloc_map.refs[name].feats
+            reference = reloc_map.refs[reloc_map.ref_names[reference_index]].feats
+            if len(query["keypoints"]) >= query_topk and len(reference["keypoints"]) >= reference_topk:
+                pairs.append((query_index, reference_index))
+                break
+        if len(pairs) >= limit:
+            break
+    return pairs
+
+
+def _run_engine(
+    context,
+    stream: int,
+    feed: dict[str, torch.Tensor],
+    matches_output: torch.Tensor,
+    scores_output: torch.Tensor,
+) -> tuple[np.ndarray, np.ndarray]:
+    for name, tensor in feed.items():
+        context.set_tensor_address(name, tensor.data_ptr())
+    if not context.execute_async_v3(stream_handle=stream):
+        raise RuntimeError("TensorRT execute_async_v3 failed")
+    torch.cuda.synchronize()
+    return matches_output.cpu().numpy().copy(), scores_output.cpu().numpy().copy()
+
+
 def quantize_model(args: argparse.Namespace) -> None:
     import modelopt.onnx.quantization as moq
     from reloc_localizer_xfeat import XFeatRelocMap
@@ -444,16 +478,9 @@ def benchmark_onnx(args: argparse.Namespace) -> None:
     }
     reloc_map = XFeatRelocMap.load(str(args.bundle), expected_sha256=args.bundle_sha256)
 
-    pair_indices: list[tuple[int, int]] = []
-    for query_index, name in enumerate(reloc_map.ref_names):
-        for reference_index in (reloc_map.covis or {}).get(name, []):
-            query = reloc_map.refs[name].feats
-            reference = reloc_map.refs[reloc_map.ref_names[reference_index]].feats
-            if len(query["keypoints"]) >= args.query_topk and len(reference["keypoints"]) >= args.reference_topk:
-                pair_indices.append((query_index, reference_index))
-                break
-        if len(pair_indices) >= args.pairs:
-            break
+    pair_indices = _select_covisible_pairs(
+        reloc_map, args.query_topk, args.reference_topk, args.pairs
+    )
     if len(pair_indices) < args.pairs:
         raise RuntimeError(f"only found {len(pair_indices)} usable covisible pairs")
 
@@ -542,16 +569,9 @@ def benchmark_engine(args: argparse.Namespace) -> None:
     context = engine.create_execution_context()
     reloc_map = XFeatRelocMap.load(str(args.bundle), expected_sha256=args.bundle_sha256)
 
-    pairs = []
-    for query_index, name in enumerate(reloc_map.ref_names):
-        for reference_index in (reloc_map.covis or {}).get(name, []):
-            query = reloc_map.refs[name].feats
-            reference = reloc_map.refs[reloc_map.ref_names[reference_index]].feats
-            if len(query["keypoints"]) >= args.query_topk and len(reference["keypoints"]) >= args.reference_topk:
-                pairs.append((query_index, reference_index))
-                break
-        if len(pairs) >= args.pairs:
-            break
+    pairs = _select_covisible_pairs(
+        reloc_map, args.query_topk, args.reference_topk, args.pairs
+    )
     if len(pairs) < args.pairs:
         raise RuntimeError(f"only found {len(pairs)} usable covisible pairs")
 
@@ -575,22 +595,16 @@ def benchmark_engine(args: argparse.Namespace) -> None:
     context.set_tensor_address("scores0", scores_output.data_ptr())
     stream = torch.cuda.current_stream().cuda_stream
 
-    def run(feed: dict[str, torch.Tensor]) -> tuple[np.ndarray, np.ndarray]:
-        for name, tensor in feed.items():
-            context.set_tensor_address(name, tensor.data_ptr())
-        if not context.execute_async_v3(stream_handle=stream):
-            raise RuntimeError("TensorRT execute_async_v3 failed")
-        torch.cuda.synchronize()
-        return matches_output.cpu().numpy().copy(), scores_output.cpu().numpy().copy()
-
     for _ in range(args.warmup):
-        run(prepared[0])
+        _run_engine(context, stream, prepared[0], matches_output, scores_output)
     baseline = load_model(args.weights, "max").to(device)
     latencies, jaccards, score_diffs, valid_matches = [], [], [], []
     with torch.inference_mode():
         for feed in prepared:
             start = time.perf_counter()
-            actual_matches, actual_scores = run(feed)
+            actual_matches, actual_scores = _run_engine(
+                context, stream, feed, matches_output, scores_output
+            )
             latencies.append((time.perf_counter() - start) * 1000)
             expected_matches, expected_scores = baseline(
                 feed["keypoints0"], feed["descriptors0"], feed["image_size0"],

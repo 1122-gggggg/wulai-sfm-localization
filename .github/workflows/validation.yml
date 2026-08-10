@@ -29,14 +29,17 @@ jobs:
           ruff check .
           ruff format --check \
             tools/check_maintainability.py \
-            tools/test_check_maintainability.py \
-            tools/test_documentation_contract.py \
+            tests/tools/test_check_maintainability.py \
+            tests/tools/test_documentation_contract.py \
+            tools/offline_wheelhouse.py \
+            tests/tools/test_offline_wheelhouse.py \
+            tests/tools/test_install_runtime_contract.py \
             定位演算法/flight_control/safety_command.py \
             定位演算法/validation/check_runtime_mirrors.py \
             定位演算法/validation/tests/test_runtime_mirrors.py \
             定位演算法/validation/tests/test_edm_cpp_resource_safety.py \
             控制介面程式/operator_interface/localization_metrics.py \
-            控制介面程式/operator_interface/test_localization_metrics.py
+            tests/control_interface/operator_interface/test_localization_metrics.py
           python tools/check_maintainability.py
           python -m mypy
       - name: High-signal Ruff security gate

@@ -2,7 +2,7 @@
 
 > **2026-07-14 更新：本文的 production 選擇已被推翻。** 操作者依準度決定**移除 mutual-NN 快路**，
 > TRACK/WEAK 改為每幀跑 XFeat + LighterGlue adaptive 3→5（即本文的「LG reference」路徑本身）。
-> temporal cache 只在 NN 分支被查詢，故現已失效。詳見 `OPTIMIZATION_CHANGES_LOG.md` §十一。
+> temporal cache 只在 NN 分支被查詢，故現已失效。詳見現行 production 設定與驗證紀錄。
 > 本文以下的 `deep_nn_then_lg_3_5` 相關結論僅作為歷史量測保留。
 
 

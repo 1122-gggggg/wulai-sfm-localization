@@ -208,8 +208,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def main() -> int:
-    args = parse_args()
+def _validate_run_inputs(args) -> tuple[Path, Path]:
     if args.stride <= 0 or args.max_frames < 0 or args.max_corr_total < 0:
         raise SystemExit("stride must be > 0; frame/correspondence limits must be >= 0")
     site_path = args.site_profile.expanduser().resolve()
@@ -221,7 +220,10 @@ def main() -> int:
             "CUDA is required but unavailable. Check nvidia-smi and confirm the loaded "
             "kernel driver matches libcuda before running this smoke test."
         )
+    return site_path, video_path
 
+
+def _load_replay_profile(args, site_path: Path, video_path: Path):
     os.environ.setdefault("HF_HUB_OFFLINE", "1")
     os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
     os.environ.setdefault(
@@ -257,6 +259,17 @@ def main() -> int:
         )
         if identity_failures:
             raise SystemExit("quality baseline identity mismatch: " + "; ".join(identity_failures))
+    return (
+        site,
+        camera_tuple,
+        site_profile_sha256,
+        video_sha256,
+        camera,
+        quality_baseline,
+    )
+
+
+def _build_replay_runtime(args, site, camera_tuple):
     startup_started = time.perf_counter()
     built = build_production_localizer(
         backend="edm",
@@ -276,7 +289,10 @@ def main() -> int:
     startup_ms = (time.perf_counter() - startup_started) * 1000.0
     if args.require_cuda and built.device != "cuda":
         raise SystemExit(f"production localizer selected {built.device!r}, expected 'cuda'")
+    return built, startup_ms
 
+
+def _open_replay_stream(args, video_path: Path):
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
         raise SystemExit(f"cannot decode video: {video_path}")
@@ -301,6 +317,100 @@ def main() -> int:
         capture_opened=True,
         reported_raw_frames=reported_raw_frames,
     )
+    return cap, source_fps, all_frames_requested, audit
+
+
+def _process_replay_frame(
+    bgr,
+    current_index: int,
+    decode_ms: float,
+    source_fps: float,
+    site,
+    built,
+    previous_center: np.ndarray | None,
+):
+    if bgr.shape[1] != site.query_camera.width or bgr.shape[0] != site.query_camera.height:
+        bgr = cv2.resize(
+            bgr,
+            (site.query_camera.width, site.query_camera.height),
+            interpolation=cv2.INTER_AREA,
+        )
+    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+    capture_stamp = float(current_index) / source_fps
+    started = time.perf_counter()
+    pose = built.tracker.localize_frame(rgb, capture_stamp=capture_stamp)
+    wall_ms = (time.perf_counter() - started) * 1000.0
+    info = dict(built.tracker.last_info)
+    center = None if pose is None else np.asarray([pose.x, pose.y, pose.z], float)
+    step = None
+    if center is not None and previous_center is not None:
+        step = float(np.linalg.norm(center - previous_center))
+    next_center = center if center is not None else previous_center
+    row = {
+        "source_index": current_index,
+        "capture_stamp": capture_stamp,
+        "success": pose is not None,
+        "mode": info.get("mode"),
+        "next_mode": info.get("next_mode"),
+        "rejected": info.get("rejected"),
+        "limited_jump": info.get("limited_jump"),
+        "limited_jump_confirmed": bool(info.get("limited_jump_confirmed")),
+        "inliers": int(info.get("inliers", 0) or 0),
+        "reproj_rms": info.get("reproj_rms"),
+        "n_corr": info.get("n_corr"),
+        "reference_count": info.get("reference_count"),
+        "refs": list(info.get("refs") or []),
+        "wall_ms": wall_ms,
+        "decode_ms": decode_ms,
+        "vpr_ms": info.get("vpr_ms"),
+        "match_ms": info.get("match_ms"),
+        "pnp_ms": info.get("pnp_ms"),
+        "step": step,
+    }
+    return row, next_center, step
+
+
+def _update_replay_cache_stats(row, read_cache_stats, previous_cache_stats):
+    if previous_cache_stats is None:
+        return None
+    stats = read_cache_stats()
+    row["ref_feature_cache"] = {
+        key: stats[key] - previous_cache_stats[key]
+        for key in ("hits", "misses", "evictions")
+    }
+    return stats
+
+
+def _append_replay_metrics(
+    row,
+    wall_values: list[float],
+    pnp_values: list[float],
+    match_values: list[float],
+    inlier_values: list[float],
+    reproj_values: list[float],
+) -> None:
+    wall_values.append(row["wall_ms"])
+    for key, target in (
+        ("pnp_ms", pnp_values),
+        ("match_ms", match_values),
+        ("inliers", inlier_values),
+        ("reproj_rms", reproj_values),
+    ):
+        value = row.get(key)
+        if value is not None and math.isfinite(float(value)):
+            target.append(float(value))
+
+
+def _print_replay_progress(selected_count: int, row) -> None:
+    if selected_count == 1 or selected_count % 100 == 0:
+        print(
+            f"frames={selected_count} state={row['next_mode']} "
+            f"ok={row['success']} inliers={row['inliers']} wall={row['wall_ms']:.1f}ms",
+            flush=True,
+        )
+
+
+def _run_replay(args, cap, source_fps: float, site, built, audit):
     rows = []
     wall_values: list[float] = []
     pnp_values: list[float] = []
@@ -336,81 +446,67 @@ def main() -> int:
             audit.decoded_raw_frames += 1
             if current_index % args.stride:
                 continue
-            if bgr.shape[1] != site.query_camera.width or bgr.shape[0] != site.query_camera.height:
-                bgr = cv2.resize(
-                    bgr,
-                    (site.query_camera.width, site.query_camera.height),
-                    interpolation=cv2.INTER_AREA,
-                )
-            rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-            capture_stamp = float(current_index) / source_fps
-            started = time.perf_counter()
-            pose = built.tracker.localize_frame(rgb, capture_stamp=capture_stamp)
-            wall_ms = (time.perf_counter() - started) * 1000.0
-            info = dict(built.tracker.last_info)
-            center = None if pose is None else np.asarray([pose.x, pose.y, pose.z], float)
-            step = None
-            if center is not None and previous_center is not None:
-                step = float(np.linalg.norm(center - previous_center))
-                steps.append(step)
-            if center is not None:
-                previous_center = center
-            row = {
-                "source_index": current_index,
-                "capture_stamp": capture_stamp,
-                "success": pose is not None,
-                "mode": info.get("mode"),
-                "next_mode": info.get("next_mode"),
-                "rejected": info.get("rejected"),
-                "limited_jump": info.get("limited_jump"),
-                "limited_jump_confirmed": bool(info.get("limited_jump_confirmed")),
-                "inliers": int(info.get("inliers", 0) or 0),
-                "reproj_rms": info.get("reproj_rms"),
-                "n_corr": info.get("n_corr"),
-                "reference_count": info.get("reference_count"),
-                "refs": list(info.get("refs") or []),
-                "wall_ms": wall_ms,
-                "decode_ms": decode_ms,
-                "vpr_ms": info.get("vpr_ms"),
-                "match_ms": info.get("match_ms"),
-                "pnp_ms": info.get("pnp_ms"),
-                "step": step,
-            }
-            if previous_cache_stats is not None:
-                stats = read_cache_stats()
-                row["ref_feature_cache"] = {
-                    key: stats[key] - previous_cache_stats[key]
-                    for key in ("hits", "misses", "evictions")
-                }
-                previous_cache_stats = stats
+            row, previous_center, step = _process_replay_frame(
+                bgr,
+                current_index,
+                decode_ms,
+                source_fps,
+                site,
+                built,
+                previous_center,
+            )
+            previous_cache_stats = _update_replay_cache_stats(
+                row, read_cache_stats, previous_cache_stats)
             rows.append(row)
             selected_count += 1
             audit.sampled_frames += 1
-            wall_values.append(wall_ms)
-            for key, target in (
-                ("pnp_ms", pnp_values),
-                ("match_ms", match_values),
-                ("inliers", inlier_values),
-                ("reproj_rms", reproj_values),
-            ):
-                value = row.get(key)
-                if value is not None and math.isfinite(float(value)):
-                    target.append(float(value))
-            if selected_count == 1 or selected_count % 100 == 0:
-                print(
-                    f"frames={selected_count} state={row['next_mode']} "
-                    f"ok={row['success']} inliers={row['inliers']} wall={wall_ms:.1f}ms",
-                    flush=True,
-                )
+            if step is not None:
+                steps.append(step)
+            _append_replay_metrics(
+                row,
+                wall_values,
+                pnp_values,
+                match_values,
+                inlier_values,
+                reproj_values,
+            )
+            _print_replay_progress(selected_count, row)
     finally:
         cap.release()
+    return (
+        rows,
+        wall_values,
+        pnp_values,
+        match_values,
+        inlier_values,
+        reproj_values,
+        steps,
+        previous_cache_stats,
+        selected_count,
+        processing_started,
+    )
+
+
+def _finish_replay_stream(args, audit, all_frames_requested, selected_count):
     requested_frames_complete = not args.max_frames or selected_count >= args.max_frames
     if all_frames_requested:
         audit.finish()
-    processing_s = time.perf_counter() - processing_started
+    return requested_frames_complete
 
+
+def _summarize_replay(
+    rows,
+    wall_values,
+    pnp_values,
+    match_values,
+    inlier_values,
+    reproj_values,
+    steps,
+    previous_cache_stats,
+    processing_s,
+):
     successes = sum(bool(row["success"]) for row in rows)
-    summary = {
+    return {
         "frames": len(rows),
         "successes": successes,
         "success_rate": successes / len(rows) if rows else 0.0,
@@ -436,6 +532,15 @@ def main() -> int:
         "processing_s": processing_s,
         "processing_fps": len(rows) / processing_s if processing_s > 0.0 else 0.0,
     }
+
+
+def _evaluate_replay_quality(
+    args,
+    summary,
+    quality_baseline,
+    audit,
+    all_frames_requested,
+):
     quality_failures: list[str] = []
     if args.quality_baseline is not None:
         assert quality_baseline is not None
@@ -454,7 +559,30 @@ def main() -> int:
         and audit.sampled_frames == expected_decoded
         and audit.decode_errors == 1
     )
-    result = {
+    return quality_failures, known_incomplete_accepted
+
+
+def _build_replay_result(
+    args,
+    site_path,
+    video_path,
+    site,
+    built,
+    source_fps,
+    site_profile_sha256,
+    video_sha256,
+    camera,
+    startup_ms,
+    audit,
+    all_frames_requested,
+    requested_frames_complete,
+    known_incomplete_accepted,
+    quality_baseline,
+    summary,
+    quality_failures,
+    rows,
+):
+    return {
         "schema": "edm-site-replay/v1",
         "site_profile": str(site_path),
         "site_profile_sha256": site_profile_sha256,
@@ -493,23 +621,22 @@ def main() -> int:
         },
         "rows": rows,
     }
+
+
+def _write_replay_report(args, result, summary):
     out = args.out.expanduser().resolve()
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
     print(
-        f"localized={successes}/{len(rows)} ({summary['success_rate']:.1%}) "
+        f"localized={summary['successes']}/{summary['frames']} ({summary['success_rate']:.1%}) "
         f"p50/p95={summary['wall_ms']['p50']}/{summary['wall_ms']['p95']}ms "
         f"out={out}",
         flush=True,
     )
-    exit_code = _result_exit_code(
-        len(rows),
-        audit,
-        all_frames_requested=all_frames_requested,
-        requested_frames_complete=requested_frames_complete,
-        quality_failures=quality_failures,
-        decode_accepted=known_incomplete_accepted,
-    )
+    return out
+
+
+def _report_replay_exit(exit_code, audit, quality_failures):
     if exit_code == 3:
         print(
             "incomplete replay decode: "
@@ -524,6 +651,86 @@ def main() -> int:
         for failure in quality_failures:
             print(f"localization quality regression: {failure}", file=sys.stderr)
     return exit_code
+
+
+def main() -> int:
+    args = parse_args()
+    site_path, video_path = _validate_run_inputs(args)
+    (
+        site,
+        camera_tuple,
+        site_profile_sha256,
+        video_sha256,
+        camera,
+        quality_baseline,
+    ) = _load_replay_profile(args, site_path, video_path)
+    built, startup_ms = _build_replay_runtime(args, site, camera_tuple)
+    cap, source_fps, all_frames_requested, audit = _open_replay_stream(
+        args, video_path)
+    (
+        rows,
+        wall_values,
+        pnp_values,
+        match_values,
+        inlier_values,
+        reproj_values,
+        steps,
+        previous_cache_stats,
+        selected_count,
+        processing_started,
+    ) = _run_replay(args, cap, source_fps, site, built, audit)
+    requested_frames_complete = _finish_replay_stream(
+        args, audit, all_frames_requested, selected_count)
+    processing_s = time.perf_counter() - processing_started
+
+    summary = _summarize_replay(
+        rows,
+        wall_values,
+        pnp_values,
+        match_values,
+        inlier_values,
+        reproj_values,
+        steps,
+        previous_cache_stats,
+        processing_s,
+    )
+    quality_failures, known_incomplete_accepted = _evaluate_replay_quality(
+        args,
+        summary,
+        quality_baseline,
+        audit,
+        all_frames_requested,
+    )
+    result = _build_replay_result(
+        args,
+        site_path,
+        video_path,
+        site,
+        built,
+        source_fps,
+        site_profile_sha256,
+        video_sha256,
+        camera,
+        startup_ms,
+        audit,
+        all_frames_requested,
+        requested_frames_complete,
+        known_incomplete_accepted,
+        quality_baseline,
+        summary,
+        quality_failures,
+        rows,
+    )
+    _write_replay_report(args, result, summary)
+    exit_code = _result_exit_code(
+        len(rows),
+        audit,
+        all_frames_requested=all_frames_requested,
+        requested_frames_complete=requested_frames_complete,
+        quality_failures=quality_failures,
+        decode_accepted=known_incomplete_accepted,
+    )
+    return _report_replay_exit(exit_code, audit, quality_failures)
 
 
 if __name__ == "__main__":

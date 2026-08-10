@@ -293,6 +293,110 @@ _LEGACY_ACTIONS = {
 }
 
 
+def _parse_legacy_nudge(payload: dict[str, Any]) -> NudgePayload:
+    return NudgePayload(str(payload.get("dir") or payload.get("name") or ""))
+
+
+def _parse_legacy_nudge_vector(payload: dict[str, Any]) -> NudgeVectorPayload:
+    try:
+        return NudgeVectorPayload(
+            payload.get("roll", 0.0),
+            payload.get("pitch", 0.0),
+            payload.get("yaw", 0.0),
+            payload.get("gaz", 0.0),
+        )
+    except (TypeError, ValueError) as exc:
+        raise InvalidControlRequest(
+            "nudge_vector requires numeric roll/pitch/yaw/gaz"
+        ) from exc
+
+
+def _parse_legacy_nudge_heartbeat(payload: dict[str, Any]) -> NudgeHeartbeatPayload:
+    raw = payload.get("dirs", payload.get("directions", ()))
+    values: tuple[str, ...]
+    if isinstance(raw, str):
+        values = (raw,)
+    else:
+        try:
+            values = tuple(str(item) for item in raw)
+        except TypeError as exc:
+            raise InvalidControlRequest(
+                "nudge heartbeat directions must be iterable"
+            ) from exc
+    return NudgeHeartbeatPayload(values)
+
+
+def _parse_legacy_limits(payload: dict[str, Any]) -> LimitsPayload:
+    try:
+        return LimitsPayload(
+            payload["max_altitude_m"],
+            payload["max_distance_m"],
+            payload.get("distance_geofence", True),
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise InvalidControlRequest(
+            "apply_limits requires numeric max_altitude_m and max_distance_m"
+        ) from exc
+
+
+def _parse_legacy_scalar(
+    action: ControlAction, payload: dict[str, Any]
+) -> ScalarPayload:
+    key = {
+        ControlAction.GIMBAL_PITCH: "pitch",
+        ControlAction.ZOOM: "zoom",
+        ControlAction.SET_AUTO_SPEED_LIMIT: "speed_limit_mps",
+    }[action]
+    try:
+        return ScalarPayload(payload[key])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise InvalidControlRequest(f"{action.value} requires {key}") from exc
+
+
+def _parse_legacy_start_auto(payload: dict[str, Any]) -> MissionRoutePayload:
+    try:
+        return MissionRoutePayload(
+            route_path=str(payload["route_path"]),
+            route_sha256=str(payload["route_sha256"]),
+            site_id=str(payload["site_id"]),
+            coordinate_frame_id=str(payload["coordinate_frame_id"]),
+        )
+    except KeyError as exc:
+        raise InvalidControlRequest(
+            "start_auto requires route_path, route_sha256, site_id, and "
+            "coordinate_frame_id"
+        ) from exc
+
+
+def _parse_legacy_payload(
+    action: ControlAction, payload: dict[str, Any]
+) -> ControlPayload:
+    if action in {ControlAction.NUDGE_BEGIN, ControlAction.NUDGE_END}:
+        return _parse_legacy_nudge(payload)
+    if action is ControlAction.NUDGE_VECTOR:
+        return _parse_legacy_nudge_vector(payload)
+    if action is ControlAction.NUDGE_HEARTBEAT:
+        return _parse_legacy_nudge_heartbeat(payload)
+    if action is ControlAction.APPLY_LIMITS:
+        return _parse_legacy_limits(payload)
+    if action in {
+        ControlAction.GIMBAL_PITCH,
+        ControlAction.ZOOM,
+        ControlAction.SET_AUTO_SPEED_LIMIT,
+    }:
+        return _parse_legacy_scalar(action, payload)
+    if action is ControlAction.RECORD_ARM:
+        return TogglePayload(payload.get("enabled", payload.get("value", True)))
+    if action is ControlAction.CAMERA_RESET:
+        return CameraResetPayload(
+            payload.get("pitch", -20.0),
+            payload.get("zoom", 1.0),
+        )
+    if action is ControlAction.START_AUTO:
+        return _parse_legacy_start_auto(payload)
+    return EmptyPayload()
+
+
 @dataclass(frozen=True)
 class ControlRequest:
     action: ControlAction
@@ -364,85 +468,11 @@ class ControlRequest:
                 payload = {"dir": suffix, **payload}
         if action is None:
             raise InvalidControlRequest(f"unknown control action: {name!r}")
-
-        parsed: ControlPayload
-        if action in {ControlAction.NUDGE_BEGIN, ControlAction.NUDGE_END}:
-            parsed = NudgePayload(str(payload.get("dir") or payload.get("name") or ""))
-        elif action is ControlAction.NUDGE_VECTOR:
-            try:
-                parsed = NudgeVectorPayload(
-                    payload.get("roll", 0.0),
-                    payload.get("pitch", 0.0),
-                    payload.get("yaw", 0.0),
-                    payload.get("gaz", 0.0),
-                )
-            except (TypeError, ValueError) as exc:
-                raise InvalidControlRequest(
-                    "nudge_vector requires numeric roll/pitch/yaw/gaz"
-                ) from exc
-        elif action is ControlAction.NUDGE_HEARTBEAT:
-            raw = payload.get("dirs", payload.get("directions", ()))
-            values: tuple[str, ...]
-            if isinstance(raw, str):
-                values = (raw,)
-            else:
-                try:
-                    values = tuple(str(item) for item in raw)
-                except TypeError as exc:
-                    raise InvalidControlRequest(
-                        "nudge heartbeat directions must be iterable"
-                    ) from exc
-            parsed = NudgeHeartbeatPayload(values)
-        elif action is ControlAction.APPLY_LIMITS:
-            try:
-                parsed = LimitsPayload(
-                    payload["max_altitude_m"],
-                    payload["max_distance_m"],
-                    payload.get("distance_geofence", True),
-                )
-            except (KeyError, TypeError, ValueError) as exc:
-                raise InvalidControlRequest(
-                    "apply_limits requires numeric max_altitude_m and max_distance_m"
-                ) from exc
-        elif action in {
-            ControlAction.GIMBAL_PITCH,
-            ControlAction.ZOOM,
-            ControlAction.SET_AUTO_SPEED_LIMIT,
-        }:
-            key = {
-                ControlAction.GIMBAL_PITCH: "pitch",
-                ControlAction.ZOOM: "zoom",
-                ControlAction.SET_AUTO_SPEED_LIMIT: "speed_limit_mps",
-            }[action]
-            try:
-                parsed = ScalarPayload(payload[key])
-            except (KeyError, TypeError, ValueError) as exc:
-                raise InvalidControlRequest(f"{action.value} requires {key}") from exc
-        elif action is ControlAction.RECORD_ARM:
-            parsed = TogglePayload(
-                payload.get("enabled", payload.get("value", True))
-            )
-        elif action is ControlAction.CAMERA_RESET:
-            parsed = CameraResetPayload(
-                payload.get("pitch", -20.0),
-                payload.get("zoom", 1.0),
-            )
-        elif action is ControlAction.START_AUTO:
-            try:
-                parsed = MissionRoutePayload(
-                    route_path=str(payload["route_path"]),
-                    route_sha256=str(payload["route_sha256"]),
-                    site_id=str(payload["site_id"]),
-                    coordinate_frame_id=str(payload["coordinate_frame_id"]),
-                )
-            except KeyError as exc:
-                raise InvalidControlRequest(
-                    "start_auto requires route_path, route_sha256, site_id, and "
-                    "coordinate_frame_id"
-                ) from exc
-        else:
-            parsed = EmptyPayload()
-        return cls.create(action, payload=parsed, human_origin=human_origin)
+        return cls.create(
+            action,
+            payload=_parse_legacy_payload(action, payload),
+            human_origin=human_origin,
+        )
 
     def legacy_call(self) -> tuple[str, dict[str, Any]]:
         name = self.action.value

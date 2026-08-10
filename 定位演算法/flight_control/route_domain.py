@@ -7,6 +7,7 @@ JSON decoding, finite waypoint validation, route metadata, and conversion from
 the authoring frame to controller GLOMAP coordinates.  It intentionally has no
 flight or UI dependencies.
 """
+
 from __future__ import annotations
 
 import hashlib
@@ -42,15 +43,11 @@ def _validated_waypoints(waypoints: object) -> tuple[tuple[float, float, float],
     if not isinstance(waypoints, (list, tuple)) or len(waypoints) < 2:
         count = len(waypoints) if isinstance(waypoints, (list, tuple)) else 0
         raise ValueError(f"need >=2 waypoints, got {count}")
-    checked = [finite_vec3(point, f"waypoint[{index}]")
-               for index, point in enumerate(waypoints)]
+    checked = [finite_vec3(point, f"waypoint[{index}]") for index, point in enumerate(waypoints)]
     for index, (start, end) in enumerate(zip(checked[:-1], checked[1:])):
         if float(np.linalg.norm(end - start)) <= 1e-9:
             raise ValueError(f"route segment {index}->{index + 1} has zero length")
-    return tuple(
-        (float(point[0]), float(point[1]), float(point[2]))
-        for point in checked
-    )
+    return tuple((float(point[0]), float(point[1]), float(point[2])) for point in checked)
 
 
 class MapFrameLike(Protocol):
@@ -128,6 +125,100 @@ def _optional_text(data: dict[str, Any], key: str) -> str | None:
     return value
 
 
+def _route_core_fields(
+    data: dict[str, Any],
+    *,
+    require_map_units: bool,
+) -> tuple[tuple[tuple[float, float, float], ...], str, str, bool]:
+    source_points = _validated_waypoints(data["waypoints"])
+    frame = data.get("frame", "aligned")
+    if not isinstance(frame, str) or frame not in {"aligned", "glomap"}:
+        raise ValueError("route frame must be 'aligned' or 'glomap'")
+    units = data.get("units", "map")
+    if not isinstance(units, str) or not units:
+        raise ValueError("route units must be a non-empty string")
+    if require_map_units and units != "map":
+        raise ValueError("route units must be 'map'")
+    return source_points, frame, units, _strict_bool(data.get("closed"), "closed")
+
+
+def _validate_flight_contract(
+    data: dict[str, Any],
+    *,
+    expected_site_id: str | None,
+    expected_coordinate_frame_id: str | None,
+    frame: str,
+    closed: bool,
+) -> None:
+    if "frame" not in data:
+        raise ValueError("flight route frame must be declared")
+    if "closed" not in data:
+        raise ValueError("flight route closed must be declared False")
+    expected = {
+        "schema": ROUTE_SCHEMA,
+        "site_id": expected_site_id,
+        "coordinate_frame_id": expected_coordinate_frame_id,
+        "units": "map",
+        "purpose": "flight",
+    }
+    for key, value in expected.items():
+        if data.get(key) != value:
+            raise ValueError(f"flight route {key} must be {value!r}, got {data.get(key)!r}")
+    if frame not in {"aligned", "glomap"}:
+        raise ValueError("flight route frame must be 'aligned' or 'glomap'")
+    if closed is not False:
+        raise ValueError(f"flight route closed must be False, got {data.get('closed')!r}")
+
+
+def _controller_coordinates(
+    source_points: tuple[tuple[float, float, float], ...],
+    *,
+    frame: str,
+    align_source: str | None,
+    map_frame: MapFrameLike,
+) -> tuple[tuple[tuple[float, float, float], ...], str | None]:
+    if frame != "aligned":
+        return source_points, align_source
+
+    site_is_measured = getattr(map_frame, "source", "") != "legacy_assumption"
+    if align_source is None:
+        if site_is_measured:
+            raise ValueError(
+                "route uses frame='aligned' but declares no align_source, and "
+                "this site has a measured gravity alignment; add "
+                "align_source='legacy' or 'measured' (or export frame='glomap')"
+            )
+        align_source = "legacy"
+    if align_source == "legacy":
+        authoring_frame: MapFrameLike = LEGACY_MAP_FRAME
+    elif align_source == "measured":
+        if not site_is_measured:
+            raise ValueError(
+                "route declares align_source='measured' but this site has no "
+                "measured gravity alignment to invert it with"
+            )
+        authoring_frame = map_frame
+    else:
+        raise ValueError(f"unknown route align_source: {align_source!r}")
+    controller_points = tuple(
+        (float(value[0]), float(value[1]), float(value[2]))
+        for value in (aligned_to_glomap(point, authoring_frame) for point in source_points)
+    )
+    return controller_points, align_source
+
+
+def _arrival_radius(data: dict[str, Any]) -> float | None:
+    raw_radius = data.get("arrive_radius_map_units")
+    if raw_radius is None:
+        return None
+    if isinstance(raw_radius, bool) or not isinstance(raw_radius, (int, float)):
+        raise ValueError("route arrive_radius_map_units must be a number")
+    arrive_radius = float(raw_radius)
+    if not math.isfinite(arrive_radius) or arrive_radius <= 0.0:
+        raise ValueError("route arrive_radius_map_units must be finite and > 0")
+    return arrive_radius
+
+
 @dataclass(frozen=True)
 class RouteDocument:
     """One validated route and its canonical controller coordinates.
@@ -164,16 +255,10 @@ class RouteDocument:
         if not isinstance(data, dict) or not isinstance(data.get("waypoints"), list):
             raise ValueError("route JSON must contain a waypoints list")
 
-        source_points = _validated_waypoints(data["waypoints"])
-        frame = data.get("frame", "aligned")
-        if not isinstance(frame, str) or frame not in {"aligned", "glomap"}:
-            raise ValueError("route frame must be 'aligned' or 'glomap'")
-        units = data.get("units", "map")
-        if not isinstance(units, str) or not units:
-            raise ValueError("route units must be a non-empty string")
-        if require_map_units and units != "map":
-            raise ValueError("route units must be 'map'")
-        closed = _strict_bool(data.get("closed"), "closed")
+        source_points, frame, units, closed = _route_core_fields(
+            data,
+            require_map_units=require_map_units,
+        )
 
         schema = _optional_text(data, "schema")
         site_id = _optional_text(data, "site_id")
@@ -182,72 +267,20 @@ class RouteDocument:
         align_source = _optional_text(data, "align_source")
 
         if require_flight_contract:
-            if "frame" not in data:
-                raise ValueError("flight route frame must be declared")
-            if "closed" not in data:
-                raise ValueError("flight route closed must be declared False")
-            expected = {
-                "schema": ROUTE_SCHEMA,
-                "site_id": expected_site_id,
-                "coordinate_frame_id": expected_coordinate_frame_id,
-                "units": "map",
-                "purpose": "flight",
-            }
-            for key, value in expected.items():
-                if data.get(key) != value:
-                    raise ValueError(
-                        f"flight route {key} must be {value!r}, got {data.get(key)!r}"
-                    )
-            if frame not in {"aligned", "glomap"}:
-                raise ValueError("flight route frame must be 'aligned' or 'glomap'")
-            if closed is not False:
-                raise ValueError(f"flight route closed must be False, got {data.get('closed')!r}")
-
-        if frame == "aligned":
-            site_is_measured = getattr(map_frame, "source", "") != "legacy_assumption"
-            if align_source is None:
-                if site_is_measured:
-                    raise ValueError(
-                        "route uses frame='aligned' but declares no align_source, and "
-                        "this site has a measured gravity alignment; add "
-                        "align_source='legacy' or 'measured' (or export frame='glomap')"
-                    )
-                align_source = "legacy"
-            authoring_frame: MapFrameLike
-            if align_source == "legacy":
-                authoring_frame = LEGACY_MAP_FRAME
-            elif align_source == "measured":
-                if not site_is_measured:
-                    raise ValueError(
-                        "route declares align_source='measured' but this site has no "
-                        "measured gravity alignment to invert it with"
-                    )
-                authoring_frame = map_frame
-            else:
-                raise ValueError(f"unknown route align_source: {align_source!r}")
-            controller_points: tuple[tuple[float, float, float], ...] = tuple(
-                (
-                    float(value[0]),
-                    float(value[1]),
-                    float(value[2]),
-                )
-                for value in (
-                    aligned_to_glomap(point, authoring_frame)
-                    for point in source_points
-                )
+            _validate_flight_contract(
+                data,
+                expected_site_id=expected_site_id,
+                expected_coordinate_frame_id=expected_coordinate_frame_id,
+                frame=frame,
+                closed=closed,
             )
-        else:
-            controller_points = source_points
-
-        raw_radius = data.get("arrive_radius_map_units")
-        if raw_radius is None:
-            arrive_radius = None
-        elif isinstance(raw_radius, bool) or not isinstance(raw_radius, (int, float)):
-            raise ValueError("route arrive_radius_map_units must be a number")
-        else:
-            arrive_radius = float(raw_radius)
-            if not math.isfinite(arrive_radius) or arrive_radius <= 0.0:
-                raise ValueError("route arrive_radius_map_units must be finite and > 0")
+        controller_points, align_source = _controller_coordinates(
+            source_points,
+            frame=frame,
+            align_source=align_source,
+            map_frame=map_frame,
+        )
+        arrive_radius = _arrival_radius(data)
 
         return cls(
             waypoints=source_points,
@@ -280,7 +313,9 @@ class RouteDocument:
             raise
         return cls.from_data(data, **kwargs)
 
-    def source_waypoints(self, *, close: bool | None = None) -> tuple[tuple[float, float, float], ...]:
+    def source_waypoints(
+        self, *, close: bool | None = None
+    ) -> tuple[tuple[float, float, float], ...]:
         should_close = self.closed if close is None else bool(close)
         if should_close and self.waypoints[-1] != self.waypoints[0]:
             return self.waypoints + (self.waypoints[0],)
@@ -380,7 +415,9 @@ def capture_mission_route_snapshot(
         raise ValueError(f"cannot read selected route: {path}") from exc
     digest = hashlib.sha256(payload).hexdigest()
     if not hmac.compare_digest(digest, expected_digest):
-        raise ValueError(f"selected route SHA-256 mismatch: expected {expected_digest}, got {digest}")
+        raise ValueError(
+            f"selected route SHA-256 mismatch: expected {expected_digest}, got {digest}"
+        )
     route = RouteDocument.from_bytes(
         payload,
         expected_site_id=site_id,
@@ -394,10 +431,7 @@ def capture_mission_route_snapshot(
         sha256=digest,
         site_id=site_id,
         coordinate_frame_id=coordinate_frame_id,
-        waypoints=tuple(
-            (point[0], point[1], point[2])
-            for point in route.controller_points
-        ),
+        waypoints=tuple((point[0], point[1], point[2]) for point in route.controller_points),
         arrive_radius_map_units=route.arrive_radius_map_units,
     )
 

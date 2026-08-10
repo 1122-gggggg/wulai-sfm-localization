@@ -6,6 +6,7 @@ successful cleanup may close the session log and destroy the window.
 """
 from __future__ import annotations
 
+import threading
 from typing import Any, Callable
 
 
@@ -37,6 +38,7 @@ class OperatorShutdownCoordinator:
         self.get_autonomy = get_autonomy
         self._closed = False
         self._autonomy_cancel_latched = False
+        self._shutdown_lock = threading.Lock()
 
     def _log(self, message: str) -> None:
         if self.write_log is None:
@@ -183,6 +185,10 @@ class OperatorShutdownCoordinator:
 
     def shutdown(self, *, reason: str = "ui_window_close") -> bool:
         """Return whether the UI may close; failed cleanup remains retryable."""
+        with self._shutdown_lock:
+            return self._shutdown_once(reason=reason)
+
+    def _shutdown_once(self, *, reason: str) -> bool:
         if self._closed:
             return True
         if not self._suspend_commands():

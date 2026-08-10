@@ -840,7 +840,7 @@ tools/package_manifest.py:24:    "inductor_cache",      ← 只有 root 版排�
 ```
 
 26 項中 25 項是 `inductor_cache/`（torch inductor 編譯快取）的必然變動，
-1 項為真實漂移（`OPTIMIZATION_CHANGES_LOG.md` size 18067→21650）。
+1 項為真實漂移（當時的優化記錄檔 size 18067→21650）。
 因為該分支未排除編譯快取，**任何一次編譯後它都會再度失敗**——結構上不可能通過。
 且 `system_validation.py` 不呼叫它，故此失敗對 `驗證系統.sh` 不可見。
 
@@ -1178,8 +1178,8 @@ _FC = _HERE.parent / "flight_control"      # → 控制介面程式/flight_contr
 
 - **嚴重度**：P3
 
-兩者涵蓋**完全相同的 8 對檔案**。前者無任何程式呼叫（僅
-`執行環境/OPTIMIZATION_CHANGES_LOG.md:105,131` 提及），後者才被
+兩者涵蓋**完全相同的 8 對檔案**。前者無任何程式呼叫（僅在歷史優化記錄中被
+提及），後者才被
 `tools/system_validation.py:184-190` 使用。
 
 更重要的是：舊版 `sync_mirror_check.sh:8-11` 的標頭宣告了

@@ -4,6 +4,7 @@ import json
 import importlib.util
 import inspect
 import io
+import math
 import os
 import queue
 import select
@@ -271,6 +272,22 @@ def test_worker_readline_preserves_second_line_from_one_read() -> None:
         assert client._readline_with_timeout(proc) == b'{"seq":2}\n'
     finally:
         stdout.close()
+
+
+@pytest.mark.parametrize("payload", [{}, {"seq": True}, {"seq": 1.0}, {"seq": "1"}, {"seq": 2}])
+def test_worker_sequence_rejects_missing_or_non_exact_sequence(payload) -> None:
+    client = app.LiveWorkerClient.__new__(app.LiveWorkerClient)
+    client.label = "sequence-worker"
+
+    with pytest.raises(app._WorkerResponseDesync, match="desync"):
+        client._validate_worker_sequence(payload, 1)
+
+
+def test_worker_sequence_accepts_only_matching_builtin_int() -> None:
+    client = app.LiveWorkerClient.__new__(app.LiveWorkerClient)
+    client.label = "sequence-worker"
+
+    client._validate_worker_sequence({"seq": 1}, 1)
 
 
 def test_localization_exception_payload_is_explicitly_lost() -> None:
@@ -981,8 +998,8 @@ def test_xfeat_topk_override_keeps_validated_three_then_four_retry() -> None:
 def test_live_localizer_switches_mode_without_restarting_worker(tmp_path: Path) -> None:
     worker = (
         "import json,sys; "
-        "[(lambda h,r: print(json.dumps({'success':False,'header':h.hex()}),flush=True))"
-        "(sys.stdin.buffer.read(5),sys.stdin.buffer.read(3)) for _ in range(2)]"
+        "[(lambda h,r,seq: print(json.dumps({'seq':seq,'success':False,'header':h.hex()}),flush=True))"
+        "(sys.stdin.buffer.read(5),sys.stdin.buffer.read(3),seq) for seq in range(2)]"
     )
     client = object.__new__(app.LiveLocalizerClient)
     client._runtime_benchmark_control = True
@@ -1022,7 +1039,7 @@ def test_ready_handshake_blocks_submit_until_model_is_loaded(tmp_path: Path) -> 
         "time.sleep(0.15); "
         "print(json.dumps({'event':'ready','startup_ms':150.0}),flush=True); "
         "raw=sys.stdin.buffer.read(3); "
-        "print(json.dumps({'success':bool(raw)}),flush=True)"
+        "print(json.dumps({'seq':0,'success':bool(raw)}),flush=True)"
     )
     client = app.LiveWorkerClient(
         [sys.executable, "-c", worker],
@@ -1600,6 +1617,56 @@ def test_worker_can_refill_the_same_fixed_frame_buffer() -> None:
     assert frame.tobytes() == second
 
 
+def test_worker_loop_emits_one_json_result_for_one_mock_frame(monkeypatch) -> None:
+    calls = []
+
+    class FakeTracker:
+        last_info = {"mode": "TRACK", "next_mode": "TRACK", "confidence": 0.8}
+
+        def localize_frame(self, frame, *, capture_stamp=None):
+            calls.append((frame.shape, capture_stamp))
+            return SimpleNamespace(x=1.0, y=2.0, z=3.0, yaw=0.4)
+
+    args = SimpleNamespace(
+        width=1,
+        height=1,
+        frame_shm_name="",
+        frame_shm_slots=0,
+        runtime_benchmark_control=False,
+        force_track_bench=False,
+        force_track_ref=-1,
+        max_frames=1,
+    )
+    fake_torch = SimpleNamespace(
+        cuda=SimpleNamespace(is_available=lambda: False),
+    )
+    monkeypatch.setattr(
+        localizer_worker.sys,
+        "stdin",
+        SimpleNamespace(buffer=io.BytesIO(b"\x01\x02\x03")),
+    )
+    output = io.StringIO()
+
+    localizer_worker._run_worker_loop(
+        args,
+        output,
+        "xfeat",
+        fake_torch,
+        FakeTracker(),
+        "mock-tracker",
+        None,
+        None,
+        None,
+    )
+
+    payload = json.loads(output.getvalue())
+    assert payload["seq"] == 0
+    assert payload["success"] is True
+    assert payload["frame_id"] == "worker-0"
+    assert payload["tracker_variant"] == "mock-tracker"
+    assert calls == [((1, 1, 3), None)]
+
+
 def test_live_rgb_worker_input_is_a_zero_copy_memoryview() -> None:
     frame = app.np.zeros((app.STREAM_HEIGHT, app.STREAM_WIDTH, 3), dtype=app.np.uint8)
     raw = app.OperatorApp._frame_rgb_bytes_for_worker(SimpleNamespace(), frame)
@@ -1646,7 +1713,7 @@ try:
         if index == 0:
             time.sleep(0.1)
         start = slot[0] * 6
-        print(json.dumps({'success': False, 'pixel_sum': sum(shm.buf[start:start + 6])}), flush=True)
+        print(json.dumps({'seq': index, 'success': False, 'pixel_sum': sum(shm.buf[start:start + 6])}), flush=True)
 finally:
     shm.close()
 """
@@ -1838,7 +1905,7 @@ def test_worker_client_reports_submit_pipe_worker_and_response_timing(tmp_path: 
         "sys.stdin.buffer.read(3); "
         "rn=time.monotonic_ns(); sn=time.monotonic_ns(); dn=time.monotonic_ns(); "
         "r=rn*1e-9; s=sn*1e-9; d=dn*1e-9; "
-        "print(json.dumps({'success':False,'wall_ms':1.0,'core_wall_ms':1.0,"
+        "print(json.dumps({'seq':0,'success':False,'wall_ms':1.0,'core_wall_ms':1.0,"
         "'worker_read_done_mono':r,'worker_core_start_mono':s,"
         "'worker_core_done_mono':d,'worker_read_done_mono_ns':rn,"
         "'worker_core_start_mono_ns':sn,'worker_core_done_mono_ns':dn}),flush=True)"
@@ -1966,6 +2033,75 @@ def test_ply_reader_uses_rgb_after_normals(tmp_path: Path) -> None:
     )
 
     assert app.read_ply_points(ply, max_points=1).tolist() == [[1, 2, 3, 4, 5, 6]]
+
+
+def test_binary_ply_reader_preserves_xyz_and_rgb(tmp_path: Path) -> None:
+    ply = tmp_path / "binary.ply"
+    header = (
+        b"ply\nformat binary_little_endian 1.0\nelement vertex 2\n"
+        b"property float x\nproperty float y\nproperty float z\n"
+        b"property uchar red\nproperty uchar green\nproperty uchar blue\nend_header\n"
+    )
+    ply.write_bytes(
+        header
+        + app.struct.pack("<fffBBB", 1.0, 2.0, 3.0, 4, 5, 6)
+        + app.struct.pack("<fffBBB", 7.0, 8.0, 9.0, 10, 11, 12)
+    )
+
+    assert app.read_ply_points(ply, max_points=2).tolist() == [
+        [1, 2, 3, 4, 5, 6],
+        [7, 8, 9, 10, 11, 12],
+    ]
+
+
+@pytest.mark.parametrize(
+    ("loss_pct", "expected"),
+    [
+        (0.0, b"\x00\x00\x01\x01a\x00\x00\x01\x05b\x00\x00\x01\x07c"),
+        (100.0, b"\x00\x00\x01\x05b\x00\x00\x01\x07c"),
+    ],
+)
+def test_annex_b_pump_only_drops_non_idr_slices(loss_pct: float,
+                                                 expected: bytes) -> None:
+    class RecordingSink(io.BytesIO):
+        def __init__(self) -> None:
+            super().__init__()
+            self.closed_by_pump = False
+
+        def close(self) -> None:
+            self.closed_by_pump = True
+
+    source = io.BytesIO(
+        b"\x00\x00\x01\x01a\x00\x00\x01\x05b\x00\x00\x01\x07c"
+    )
+    destination = RecordingSink()
+
+    app.FFmpegFrameStream._pump_nals(source, destination, loss_pct, seed=5)
+
+    assert destination.getvalue() == expected
+    assert destination.closed_by_pump is True
+
+
+def test_motion_headings_bridge_missing_poses_and_backfill_start() -> None:
+    rows = [
+        {},
+        {"pose": {"x": 0.0, "z": 0.0}},
+        {},
+        {"pose": {"x": 1.0, "z": 1.0}},
+    ]
+
+    headings = app.OperatorApp._derive_motion_headings(rows)
+
+    assert headings == pytest.approx([math.pi / 4.0] * 4)
+
+
+def test_motion_headings_ignore_subthreshold_motion() -> None:
+    rows = [
+        {"pose": {"x": 0.0, "z": 0.0}},
+        {"pose": {"x": 0.05, "z": 0.05}},
+    ]
+
+    assert app.OperatorApp._derive_motion_headings(rows) == [None, None]
 
 
 def test_partial_worker_response_times_out_and_recovers(tmp_path: Path) -> None:

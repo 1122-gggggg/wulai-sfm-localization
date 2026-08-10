@@ -10,6 +10,7 @@ import re
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any, Literal, NoReturn, overload
 
 from workspace_layout import workspace_from_file
 
@@ -38,7 +39,7 @@ SITE_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 DISPLAY_NAME_REJECT_RE = re.compile("[\x00-\x1f\x7f-\x9f$`\"'\\\\]")
 
 
-def _reject_json_constant(value: str):
+def _reject_json_constant(value: str) -> NoReturn:
     raise ValueError(f"non-finite JSON number is not allowed: {value}")
 
 
@@ -198,7 +199,7 @@ class SiteProfile:
     hardware_approval: HardwareApprovalReference | None = None
 
 
-def _localizer_capabilities(backend: str):
+def _localizer_capabilities(backend: str) -> Any:
     """Load static provider metadata without importing model/CUDA modules."""
     try:
         from localizer_registry import get_localizer_capabilities
@@ -244,9 +245,31 @@ def _reject_symlink_components(path: Path, *, key: str) -> None:
             )
 
 
+@overload
 def _resolve_asset(
     profile_dir: Path,
-    value,
+    value: object,
+    key: str,
+    *,
+    required: Literal[True],
+    workspace_root: Path,
+) -> Path: ...
+
+
+@overload
+def _resolve_asset(
+    profile_dir: Path,
+    value: object,
+    key: str,
+    *,
+    required: Literal[False],
+    workspace_root: Path,
+) -> Path | None: ...
+
+
+def _resolve_asset(
+    profile_dir: Path,
+    value: object,
     key: str,
     *,
     required: bool,
@@ -277,7 +300,7 @@ def _resolve_asset(
     return resolved
 
 
-def _load_query_camera(raw, source: Path) -> QueryCamera | None:
+def _load_query_camera(raw: object, source: Path) -> QueryCamera | None:
     if raw is None:
         return None
     if not isinstance(raw, dict):
@@ -318,7 +341,7 @@ def _load_query_camera(raw, source: Path) -> QueryCamera | None:
     )
 
 
-def _load_coordinate_frame(raw, source: Path) -> CoordinateFrame | None:
+def _load_coordinate_frame(raw: object, source: Path) -> CoordinateFrame | None:
     if raw is None:
         return None
     if not isinstance(raw, dict):
@@ -362,7 +385,7 @@ def _load_coordinate_frame(raw, source: Path) -> CoordinateFrame | None:
     )
 
 
-def _sha256(value, key: str, source: Path) -> str | None:
+def _sha256(value: object, key: str, source: Path) -> str | None:
     if value in (None, ""):
         return None
     if not isinstance(value, str):
@@ -375,7 +398,7 @@ def _sha256(value, key: str, source: Path) -> str | None:
     return digest
 
 
-def _load_asset_digests(raw, source: Path) -> AssetDigests:
+def _load_asset_digests(raw: object, source: Path) -> AssetDigests:
     if raw is None:
         return AssetDigests()
     if not isinstance(raw, dict):
@@ -388,7 +411,9 @@ def _load_asset_digests(raw, source: Path) -> AssetDigests:
     )
 
 
-def _finite_number(raw: dict, key: str, source: Path, *, positive: bool) -> float:
+def _finite_number(
+    raw: dict[str, Any], key: str, source: Path, *, positive: bool
+) -> float:
     value = raw.get(key)
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ValueError(f"site profile flight.controller.{key} must be numeric: {source}")
@@ -401,7 +426,90 @@ def _finite_number(raw: dict, key: str, source: Path, *, positive: bool) -> floa
     return parsed
 
 
-def _load_flight_controller(raw, source: Path) -> FlightControlProfile | None:
+def _load_flight_controller_axes(
+    raw: dict[str, Any], source: Path
+) -> tuple[tuple[int, int], int, int, int, tuple[int, ...]]:
+    horizontal_axes = raw["horizontal_axes"]
+    vertical_axis = raw["vertical_axis"]
+    if (
+        not isinstance(horizontal_axes, list)
+        or len(horizontal_axes) != 2
+        or any(type(value) is not int for value in horizontal_axes)
+        or type(vertical_axis) is not int
+        or sorted([*horizontal_axes, vertical_axis]) != [0, 1, 2]
+    ):
+        raise ValueError(
+            "site profile flight.controller axes must cover 0, 1, and 2 exactly: "
+            f"{source}"
+        )
+    body_right_sign = raw["body_right_sign"]
+    if type(body_right_sign) not in {int, float} or float(body_right_sign) not in {-1.0, 1.0}:
+        raise ValueError(
+            "site profile flight.controller.body_right_sign must be -1 or 1: "
+            f"{source}"
+        )
+    segment_window = raw["segment_window"]
+    if (isinstance(segment_window, bool) or not isinstance(segment_window, int)
+            or not 0 <= segment_window <= 20):
+        raise ValueError(
+            f"site profile flight.controller.segment_window must be an integer in [0,20]: "
+            f"{source}"
+        )
+    inspect_waypoints = raw["inspect_waypoints"]
+    if (not isinstance(inspect_waypoints, list)
+            or any(isinstance(value, bool) or not isinstance(value, int) or value <= 0
+                   for value in inspect_waypoints)
+            or len(inspect_waypoints) != len(set(inspect_waypoints))):
+        raise ValueError(
+            "site profile flight.controller.inspect_waypoints must be a unique list "
+            f"of positive 1-based integers: {source}"
+        )
+    return (
+        (horizontal_axes[0], horizontal_axes[1]),
+        vertical_axis,
+        int(body_right_sign),
+        segment_window,
+        tuple(inspect_waypoints),
+    )
+
+
+def _load_flight_controller_values(
+    raw: dict[str, Any], source: Path, positive_keys: tuple[str, ...]
+) -> dict[str, float]:
+    values = {
+        key: _finite_number(raw, key, source, positive=True)
+        for key in positive_keys
+    }
+    # These are safety-envelope ceilings, not tuning defaults.  Site profiles are
+    # hand-authored deployment inputs; accepting an extra zero here can otherwise
+    # turn a 0.30 m/s or 1.5-map-unit guard into a effectively disabled one.
+    ceilings = {
+        "speed_limit_mps": 2.0,
+        "lookahead_map_units": 5.0,
+        "max_pose_jump_map_units": 5.0,
+        "max_route_deviation_map_units": 10.0,
+    }
+    for key, maximum in ceilings.items():
+        if values[key] > maximum:
+            raise ValueError(
+                f"site profile flight.controller.{key} must be <= {maximum:g}: {source}"
+            )
+    if values["pose_max_age_ms"] > 500.0:
+        raise ValueError(
+            f"site profile flight.controller.pose_max_age_ms must be <= 500: {source}"
+        )
+    if values["speed_max_age_ms"] > 500.0:
+        raise ValueError(
+            f"site profile flight.controller.speed_max_age_ms must be <= 500: {source}"
+        )
+    if values["command_ttl_ms"] > 250.0:
+        raise ValueError(
+            f"site profile flight.controller.command_ttl_ms must be <= 250: {source}"
+        )
+    return values
+
+
+def _load_flight_controller(raw: object, source: Path) -> FlightControlProfile | None:
     if raw is None:
         return None
     if not isinstance(raw, dict):
@@ -444,87 +552,51 @@ def _load_flight_controller(raw, source: Path) -> FlightControlProfile | None:
             "site profile flight.controller.model must be "
             f"'scale_free_direction_speed_guard_v1': {source}"
         )
-    horizontal_axes = raw["horizontal_axes"]
-    vertical_axis = raw["vertical_axis"]
-    if (
-        not isinstance(horizontal_axes, list)
-        or len(horizontal_axes) != 2
-        or any(type(value) is not int for value in horizontal_axes)
-        or type(vertical_axis) is not int
-        or sorted([*horizontal_axes, vertical_axis]) != [0, 1, 2]
-    ):
-        raise ValueError(
-            "site profile flight.controller axes must cover 0, 1, and 2 exactly: "
-            f"{source}"
-        )
-    body_right_sign = raw["body_right_sign"]
-    if type(body_right_sign) not in {int, float} or float(body_right_sign) not in {-1.0, 1.0}:
-        raise ValueError(
-            "site profile flight.controller.body_right_sign must be -1 or 1: "
-            f"{source}"
-        )
-    segment_window = raw["segment_window"]
-    if (isinstance(segment_window, bool) or not isinstance(segment_window, int)
-            or not 0 <= segment_window <= 20):
-        raise ValueError(
-            f"site profile flight.controller.segment_window must be an integer in [0,20]: "
-            f"{source}"
-        )
-    inspect_waypoints = raw["inspect_waypoints"]
-    if (not isinstance(inspect_waypoints, list)
-            or any(isinstance(value, bool) or not isinstance(value, int) or value <= 0
-                   for value in inspect_waypoints)
-            or len(inspect_waypoints) != len(set(inspect_waypoints))):
-        raise ValueError(
-            "site profile flight.controller.inspect_waypoints must be a unique list "
-            f"of positive 1-based integers: {source}"
-        )
-    values = {
-        key: _finite_number(raw, key, source, positive=True)
-        for key in positive_keys
-    }
-    # These are safety-envelope ceilings, not tuning defaults.  Site profiles are
-    # hand-authored deployment inputs; accepting an extra zero here can otherwise
-    # turn a 0.30 m/s or 1.5-map-unit guard into a effectively disabled one.
-    ceilings = {
-        "speed_limit_mps": 2.0,
-        "lookahead_map_units": 5.0,
-        "max_pose_jump_map_units": 5.0,
-        "max_route_deviation_map_units": 10.0,
-    }
-    for key, maximum in ceilings.items():
-        if values[key] > maximum:
-            raise ValueError(
-                f"site profile flight.controller.{key} must be <= {maximum:g}: {source}"
-            )
-    if values["pose_max_age_ms"] > 500.0:
-        raise ValueError(
-            f"site profile flight.controller.pose_max_age_ms must be <= 500: {source}"
-        )
-    if values["speed_max_age_ms"] > 500.0:
-        raise ValueError(
-            f"site profile flight.controller.speed_max_age_ms must be <= 500: {source}"
-        )
-    if values["command_ttl_ms"] > 250.0:
-        raise ValueError(
-            f"site profile flight.controller.command_ttl_ms must be <= 250: {source}"
-        )
+    (
+        horizontal_axes,
+        vertical_axis,
+        body_right_sign,
+        segment_window,
+        inspect_waypoints,
+    ) = _load_flight_controller_axes(raw, source)
+    values = _load_flight_controller_values(raw, source, positive_keys)
     return FlightControlProfile(
         model=model,
-        horizontal_axes=tuple(horizontal_axes),
+        horizontal_axes=horizontal_axes,
         vertical_axis=vertical_axis,
         camera_to_body_yaw_deg=_finite_number(
             raw, "camera_to_body_yaw_deg", source, positive=False
         ),
-        body_right_sign=int(body_right_sign),
+        body_right_sign=body_right_sign,
         segment_window=segment_window,
-        inspect_waypoints=tuple(inspect_waypoints),
+        inspect_waypoints=inspect_waypoints,
         **values,
     )
 
 
+def _validate_legacy_flight_fields(
+    raw: dict[str, Any], source: Path, schema_version: int
+) -> None:
+    legacy_scale = raw.get("map_units_per_meter")
+    if schema_version == 1 and legacy_scale is not None:
+        if isinstance(legacy_scale, bool) or not isinstance(legacy_scale, (int, float)):
+            raise ValueError(
+                f"site profile flight.map_units_per_meter must be numeric or null: {source}"
+            )
+        legacy_scale = float(legacy_scale)
+        if not math.isfinite(legacy_scale) or legacy_scale <= 0.0:
+            raise ValueError(
+                f"site profile flight.map_units_per_meter must be finite and > 0: {source}"
+            )
+    if schema_version == 1 and raw.get("controller") is not None:
+        raise ValueError(
+            "site profile schema v1 flight controllers are retired; migrate to "
+            f"schema v2 scale-free controller: {source}"
+        )
+
+
 def _load_flight_readiness(
-    raw, source: Path, *, schema_version: int
+    raw: object, source: Path, *, schema_version: int
 ) -> FlightReadiness | None:
     if raw is None:
         return None
@@ -556,22 +628,7 @@ def _load_flight_readiness(
             f"site profile flight.coordinate_frame_id must be a non-empty string or null: "
             f"{source}"
         )
-    legacy_scale = raw.get("map_units_per_meter")
-    if schema_version == 1 and legacy_scale is not None:
-        if isinstance(legacy_scale, bool) or not isinstance(legacy_scale, (int, float)):
-            raise ValueError(
-                f"site profile flight.map_units_per_meter must be numeric or null: {source}"
-            )
-        legacy_scale = float(legacy_scale)
-        if not math.isfinite(legacy_scale) or legacy_scale <= 0.0:
-            raise ValueError(
-                f"site profile flight.map_units_per_meter must be finite and > 0: {source}"
-            )
-    if schema_version == 1 and raw.get("controller") is not None:
-        raise ValueError(
-            "site profile schema v1 flight controllers are retired; migrate to "
-            f"schema v2 scale-free controller: {source}"
-        )
+    _validate_legacy_flight_fields(raw, source, schema_version)
     note = raw.get("approval_note", "")
     if not isinstance(note, str):
         raise ValueError(f"site profile flight.approval_note must be a string: {source}")
@@ -589,7 +646,7 @@ def _load_flight_readiness(
 
 
 def _load_hardware_approval_reference(
-    raw, source: Path, profile_dir: Path, workspace_root: Path
+    raw: object, source: Path, profile_dir: Path, workspace_root: Path
 ) -> HardwareApprovalReference | None:
     if raw is None:
         return None
@@ -651,7 +708,7 @@ def _load_hardware_approval_reference(
     )
 
 
-def _string_tuple(value, key: str, source: Path) -> tuple[str, ...]:
+def _string_tuple(value: object, key: str, source: Path) -> tuple[str, ...]:
     if (
         not isinstance(value, list)
         or not value
@@ -680,7 +737,7 @@ HARDWARE_ENVELOPE_KEYS = {
 
 
 def _hardware_digest(
-    value, key: str, source: Path, *, required: bool,
+    value: object, key: str, source: Path, *, required: bool,
 ) -> str | None:
     if value is None:
         if required:
@@ -695,7 +752,7 @@ def _hardware_digest(
 
 
 def _hardware_identity(
-    raw, key: str, source: Path,
+    raw: object, key: str, source: Path,
 ) -> tuple[str, str | None, tuple[str, ...]]:
     expected = {"product", "serial", "firmware_versions"}
     if not isinstance(raw, dict) or set(raw) != expected:
@@ -717,7 +774,9 @@ def _hardware_identity(
     )
 
 
-def _hardware_envelope(raw, source: Path, *, approved_mode: str) -> dict[str, object]:
+def _hardware_envelope(
+    raw: object, source: Path, *, approved_mode: str
+) -> dict[str, object]:
     if not isinstance(raw, dict):
         raise ValueError(f"hardware approval approved_envelope must be an object: {source}")
     if set(raw) != HARDWARE_ENVELOPE_KEYS:
@@ -729,7 +788,7 @@ def _hardware_envelope(raw, source: Path, *, approved_mode: str) -> dict[str, ob
     gps_required = raw["gps_required"]
     if not isinstance(gps_required, bool):
         raise ValueError("hardware approval approved_envelope.gps_required must be boolean")
-    envelope = {"gps_required": gps_required}
+    envelope: dict[str, object] = {"gps_required": gps_required}
     for key in sorted(HARDWARE_ENVELOPE_KEYS - {"gps_required"}):
         value = raw[key]
         if value is None and approved_mode != "auto":
@@ -748,78 +807,57 @@ def _hardware_envelope(raw, source: Path, *, approved_mode: str) -> dict[str, ob
     return envelope
 
 
-def load_hardware_approval_receipt(
-    reference: HardwareApprovalReference | None,
+def _load_hardware_approval_v1(
+    raw: dict[str, Any], reference: HardwareApprovalReference, actual: str
 ) -> HardwareApprovalReceipt:
-    """Load a hash-pinned real-hardware approval; absence never implies approval."""
-    if reference is None:
-        raise ValueError("hardware approval receipt is not configured")
-    try:
-        content = reference.receipt.read_bytes()
-    except OSError as exc:
+    keys = {
+        "schema",
+        "approved",
+        "aircraft_product",
+        "controller_product",
+        "aircraft_firmware_versions",
+        "controller_firmware_versions",
+        "olympe_versions",
+        "approval_note",
+    }
+    if set(raw) != keys:
         raise ValueError(
-            f"cannot read hardware approval receipt {reference.receipt}: {exc}"
-        ) from exc
-    actual = hashlib.sha256(content).hexdigest()
-    if not hmac.compare_digest(actual, reference.sha256):
-        raise ValueError(
-            "hardware approval receipt SHA-256 mismatch: "
-            f"expected {reference.sha256}, got {actual} ({reference.receipt})"
+            "hardware approval receipt fields mismatch: "
+            f"unknown={sorted(set(raw) - keys)} missing={sorted(keys - set(raw))}"
         )
-    try:
-        raw = json.loads(content, parse_constant=_reject_json_constant)
-    except (json.JSONDecodeError, ValueError) as exc:
-        raise ValueError(f"invalid hardware approval receipt {reference.receipt}: {exc}") from exc
-    if not isinstance(raw, dict):
-        raise ValueError("hardware approval receipt root must be an object")
-    schema = raw.get("schema")
-    if schema == HARDWARE_APPROVAL_V1_SCHEMA:
-        keys = {
-            "schema",
-            "approved",
-            "aircraft_product",
-            "controller_product",
+    if not isinstance(raw["approved"], bool):
+        raise ValueError("hardware approval approved must be boolean")
+    for key in ("aircraft_product", "controller_product", "approval_note"):
+        if not isinstance(raw[key], str) or not raw[key].strip():
+            raise ValueError(f"hardware approval {key} must be non-empty")
+    return HardwareApprovalReceipt(
+        source=reference.receipt,
+        sha256=actual,
+        approved=raw["approved"],
+        aircraft_product=raw["aircraft_product"].strip(),
+        controller_product=raw["controller_product"].strip(),
+        aircraft_firmware_versions=_string_tuple(
+            raw["aircraft_firmware_versions"],
             "aircraft_firmware_versions",
+            reference.receipt,
+        ),
+        controller_firmware_versions=_string_tuple(
+            raw["controller_firmware_versions"],
             "controller_firmware_versions",
-            "olympe_versions",
-            "approval_note",
-        }
-        if set(raw) != keys:
-            raise ValueError(
-                "hardware approval receipt fields mismatch: "
-                f"unknown={sorted(set(raw) - keys)} missing={sorted(keys - set(raw))}"
-            )
-        if not isinstance(raw["approved"], bool):
-            raise ValueError("hardware approval approved must be boolean")
-        for key in ("aircraft_product", "controller_product", "approval_note"):
-            if not isinstance(raw[key], str) or not raw[key].strip():
-                raise ValueError(f"hardware approval {key} must be non-empty")
-        return HardwareApprovalReceipt(
-            source=reference.receipt,
-            sha256=actual,
-            approved=raw["approved"],
-            aircraft_product=raw["aircraft_product"].strip(),
-            controller_product=raw["controller_product"].strip(),
-            aircraft_firmware_versions=_string_tuple(
-                raw["aircraft_firmware_versions"],
-                "aircraft_firmware_versions",
-                reference.receipt,
-            ),
-            controller_firmware_versions=_string_tuple(
-                raw["controller_firmware_versions"],
-                "controller_firmware_versions",
-                reference.receipt,
-            ),
-            olympe_versions=_string_tuple(
-                raw["olympe_versions"], "olympe_versions", reference.receipt
-            ),
-            approval_note=raw["approval_note"].strip(),
-            schema=HARDWARE_APPROVAL_V1_SCHEMA,
-            approved_mode="manual",
-        )
-    if schema != HARDWARE_APPROVAL_V2_SCHEMA:
-        raise ValueError("unsupported hardware approval receipt schema")
+            reference.receipt,
+        ),
+        olympe_versions=_string_tuple(
+            raw["olympe_versions"], "olympe_versions", reference.receipt
+        ),
+        approval_note=raw["approval_note"].strip(),
+        schema=HARDWARE_APPROVAL_V1_SCHEMA,
+        approved_mode="manual",
+    )
 
+
+def _load_hardware_approval_v2(
+    raw: dict[str, Any], reference: HardwareApprovalReference, actual: str
+) -> HardwareApprovalReceipt:
     keys = {
         "schema",
         "approved",
@@ -894,16 +932,39 @@ def load_hardware_approval_receipt(
     )
 
 
-def flight_readiness_errors(profile: SiteProfile) -> list[str]:
-    """Return every reason this site profile is not eligible for autonomous flight."""
-    if profile.schema_version != SCHEMA_VERSION:
-        return [
-            f"schema v{profile.schema_version} is localization-only; migrate to "
-            f"scale-free schema v{SCHEMA_VERSION}"
-        ]
-    flight = profile.flight
-    if flight is None:
-        return ["missing flight contract"]
+def load_hardware_approval_receipt(
+    reference: HardwareApprovalReference | None,
+) -> HardwareApprovalReceipt:
+    """Load a hash-pinned real-hardware approval; absence never implies approval."""
+    if reference is None:
+        raise ValueError("hardware approval receipt is not configured")
+    try:
+        content = reference.receipt.read_bytes()
+    except OSError as exc:
+        raise ValueError(
+            f"cannot read hardware approval receipt {reference.receipt}: {exc}"
+        ) from exc
+    actual = hashlib.sha256(content).hexdigest()
+    if not hmac.compare_digest(actual, reference.sha256):
+        raise ValueError(
+            "hardware approval receipt SHA-256 mismatch: "
+            f"expected {reference.sha256}, got {actual} ({reference.receipt})"
+        )
+    try:
+        raw = json.loads(content, parse_constant=_reject_json_constant)
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise ValueError(f"invalid hardware approval receipt {reference.receipt}: {exc}") from exc
+    if not isinstance(raw, dict):
+        raise ValueError("hardware approval receipt root must be an object")
+    schema = raw.get("schema")
+    if schema == HARDWARE_APPROVAL_V1_SCHEMA:
+        return _load_hardware_approval_v1(raw, reference, actual)
+    if schema != HARDWARE_APPROVAL_V2_SCHEMA:
+        raise ValueError("unsupported hardware approval receipt schema")
+    return _load_hardware_approval_v2(raw, reference, actual)
+
+
+def _flight_contract_errors(flight: FlightReadiness) -> list[str]:
     errors = []
     if not flight.approved:
         errors.append("flight.approved is false")
@@ -913,16 +974,11 @@ def flight_readiness_errors(profile: SiteProfile) -> list[str]:
         errors.append("missing flight.coordinate_frame_id")
     if not flight.route_clearance_approved:
         errors.append("flight.route_clearance_approved is false")
-    if profile.route_json is None:
-        errors.append("missing route_json")
-    if profile.map_reference_poses is None:
-        errors.append("missing map_reference_poses")
-    if profile.map_align is None:
-        # Fail closed: without a measured alignment the controller would silently
-        # assume GLOMAP -Y is up, which tilts every commanded body axis.
-        errors.append("missing map_align (measured T_align_gravity.json)")
-    if profile.query_camera is None:
-        errors.append("missing query_camera")
+    return errors
+
+
+def _localizer_asset_errors(profile: SiteProfile) -> list[str]:
+    errors = []
     try:
         capabilities = _localizer_capabilities(profile.localizer)
     except ValueError as exc:
@@ -935,6 +991,29 @@ def flight_readiness_errors(profile: SiteProfile) -> list[str]:
                     errors.append("missing EDM localizer_profile")
                 else:
                     errors.append(f"missing {profile.localizer} {key}")
+    return errors
+
+
+def _profile_asset_presence_errors(profile: SiteProfile) -> list[str]:
+    errors = []
+    if profile.route_json is None:
+        errors.append("missing route_json")
+    if profile.map_reference_poses is None:
+        errors.append("missing map_reference_poses")
+    if profile.map_align is None:
+        # Fail closed: without a measured alignment the controller would silently
+        # assume GLOMAP -Y is up, which tilts every commanded body axis.
+        errors.append("missing map_align (measured T_align_gravity.json)")
+    if profile.query_camera is None:
+        errors.append("missing query_camera")
+    errors.extend(_localizer_asset_errors(profile))
+    return errors
+
+
+def _profile_asset_digest_errors(
+    profile: SiteProfile, flight: FlightReadiness
+) -> list[str]:
+    errors = []
     for key in ("localization_bundle", "route_json", "map_reference_poses",
                 "map_align"):
         if getattr(profile.asset_sha256, key) is None:
@@ -958,6 +1037,22 @@ def flight_readiness_errors(profile: SiteProfile) -> list[str]:
         and profile.asset_sha256.poles_json is None
     ):
         errors.append("inspection waypoints require asset_sha256.poles_json")
+    return errors
+
+
+def flight_readiness_errors(profile: SiteProfile) -> list[str]:
+    """Return every reason this site profile is not eligible for autonomous flight."""
+    if profile.schema_version != SCHEMA_VERSION:
+        return [
+            f"schema v{profile.schema_version} is localization-only; migrate to "
+            f"scale-free schema v{SCHEMA_VERSION}"
+        ]
+    flight = profile.flight
+    if flight is None:
+        return ["missing flight contract"]
+    errors = _flight_contract_errors(flight)
+    errors.extend(_profile_asset_presence_errors(profile))
+    errors.extend(_profile_asset_digest_errors(profile, flight))
     # A hardware approval reference remains part of the profile contract and is
     # still parsed/recorded by ``load_site_profile`` when configured.  It is not
     # an AUTO readiness gate; the remaining profile, asset, route, and alignment
@@ -965,9 +1060,7 @@ def flight_readiness_errors(profile: SiteProfile) -> list[str]:
     return errors
 
 
-def load_site_profile(path: str | Path, *, validate_files: bool = True) -> SiteProfile:
-    """Load a profile and resolve contained, non-symlink assets."""
-    source = Path(path).expanduser().resolve()
+def _read_site_profile_json(source: Path) -> dict[str, Any]:
     try:
         raw = json.loads(
             source.read_text(encoding="utf-8"),
@@ -979,12 +1072,12 @@ def load_site_profile(path: str | Path, *, validate_files: bool = True) -> SiteP
         raise ValueError(f"invalid site profile JSON {source}: {exc}") from exc
     if not isinstance(raw, dict):
         raise ValueError(f"site profile root must be an object: {source}")
-    try:
-        workspace_root = workspace_from_file(source).root
-    except SystemExit as exc:
-        raise ValueError(
-            f"cannot discover site profile workspace root for {source}: {exc}"
-        ) from exc
+    return raw
+
+
+def _load_profile_metadata(
+    raw: dict[str, Any], source: Path
+) -> tuple[int, str, str]:
     allowed_top_level = {
         "schema_version",
         "site_id",
@@ -1028,6 +1121,10 @@ def load_site_profile(path: str | Path, *, validate_files: bool = True) -> SiteP
             "site profile display_name must not contain control characters or any "
             f"of $ ` \" ' \\ : {source}"
         )
+    return schema_version, site_id.strip(), display_name.strip()
+
+
+def _load_profile_localizer(raw: dict[str, Any], source: Path) -> str:
     localizer = raw.get("localizer", PRODUCTION_LOCALIZER_BACKEND)
     if not isinstance(localizer, str) or not localizer.strip():
         raise ValueError(f"site profile localizer must be a non-empty string: {source}")
@@ -1039,6 +1136,12 @@ def load_site_profile(path: str | Path, *, validate_files: bool = True) -> SiteP
             raise ValueError(
                 f"site profile localizer {localizer!r} does not support {key}: {source}"
             )
+    return localizer
+
+
+def _load_profile_assets(
+    raw: dict[str, Any], source: Path
+) -> dict[str, Any]:
     assets = raw.get("assets")
     if not isinstance(assets, dict):
         raise ValueError(f"site profile assets must be an object: {source}")
@@ -1056,13 +1159,25 @@ def load_site_profile(path: str | Path, *, validate_files: bool = True) -> SiteP
         raise ValueError(
             f"unknown site profile assets keys {unknown_assets}: {source}"
         )
+    return assets
 
-    base = source.parent
-    profile = SiteProfile(
+
+def _build_site_profile(
+    raw: dict[str, Any],
+    source: Path,
+    base: Path,
+    workspace_root: Path,
+    schema_version: int,
+    site_id: str,
+    display_name: str,
+    localizer: str,
+    assets: dict[str, Any],
+) -> SiteProfile:
+    return SiteProfile(
         source=source,
         schema_version=schema_version,
-        site_id=site_id.strip(),
-        display_name=display_name.strip(),
+        site_id=site_id,
+        display_name=display_name,
         map_ply=_resolve_asset(
             base,
             assets.get("map_ply"),
@@ -1151,6 +1266,9 @@ def load_site_profile(path: str | Path, *, validate_files: bool = True) -> SiteP
             raw.get("hardware_approval"), source, base, workspace_root
         ),
     )
+
+
+def _validate_profile_contract(profile: SiteProfile, source: Path) -> None:
     if profile.reference_index is not None:
         if profile.reference_index.name != "SHA256SUMS.json":
             raise ValueError(
@@ -1172,49 +1290,82 @@ def load_site_profile(path: str | Path, *, validate_files: bool = True) -> SiteP
             "site profile flight.coordinate_frame_id must match coordinate_frame.id: "
             f"{source}"
         )
+
+
+def _validate_profile_files(profile: SiteProfile) -> None:
+    missing = [
+        f"{name}={asset}"
+        for name, asset in (
+            ("map_ply", profile.map_ply),
+            ("route_json", profile.route_json),
+            ("localization_bundle", profile.localization_bundle),
+            ("megaloc_cache", profile.megaloc_cache),
+            ("track_landmarks", profile.track_landmarks),
+            ("poles_json", profile.poles_json),
+            ("map_reference_poses", profile.map_reference_poses),
+            ("map_align", profile.map_align),
+            ("localizer_profile", profile.localizer_profile),
+            ("reference_index", profile.reference_index),
+            (
+                "hardware_approval.receipt",
+                None
+                if profile.hardware_approval is None
+                else profile.hardware_approval.receipt,
+            ),
+            (
+                "hardware_approval.signature",
+                None
+                if profile.hardware_approval is None
+                else profile.hardware_approval.signature,
+            ),
+            (
+                "hardware_approval.trust_store",
+                None
+                if profile.hardware_approval is None
+                else profile.hardware_approval.trust_store,
+            ),
+        )
+        if asset is not None and not asset.is_file()
+    ]
+    if profile.localizer_deploy_dir is not None and not profile.localizer_deploy_dir.is_dir():
+        missing.append(
+            "localizer_deploy_dir=" + str(profile.localizer_deploy_dir)
+        )
+    if missing:
+        raise ValueError(
+            f"site profile {profile.source} has missing asset(s): " + "; ".join(missing)
+        )
+    if profile.hardware_approval is not None:
+        load_hardware_approval_receipt(profile.hardware_approval)
+
+
+def load_site_profile(path: str | Path, *, validate_files: bool = True) -> SiteProfile:
+    """Load a profile and resolve contained, non-symlink assets."""
+    source = Path(path).expanduser().resolve()
+    raw = _read_site_profile_json(source)
+    try:
+        workspace_root = workspace_from_file(source).root
+    except SystemExit as exc:
+        raise ValueError(
+            f"cannot discover site profile workspace root for {source}: {exc}"
+        ) from exc
+    schema_version, site_id, display_name = _load_profile_metadata(raw, source)
+    localizer = _load_profile_localizer(raw, source)
+    assets = _load_profile_assets(raw, source)
+
+    base = source.parent
+    profile = _build_site_profile(
+        raw,
+        source,
+        base,
+        workspace_root,
+        schema_version,
+        site_id,
+        display_name,
+        localizer,
+        assets,
+    )
+    _validate_profile_contract(profile, source)
     if validate_files:
-        missing = [
-            f"{name}={asset}"
-            for name, asset in (
-                ("map_ply", profile.map_ply),
-                ("route_json", profile.route_json),
-                ("localization_bundle", profile.localization_bundle),
-                ("megaloc_cache", profile.megaloc_cache),
-                ("track_landmarks", profile.track_landmarks),
-                ("poles_json", profile.poles_json),
-                ("map_reference_poses", profile.map_reference_poses),
-                ("map_align", profile.map_align),
-                ("localizer_profile", profile.localizer_profile),
-                ("reference_index", profile.reference_index),
-                (
-                    "hardware_approval.receipt",
-                    None
-                    if profile.hardware_approval is None
-                    else profile.hardware_approval.receipt,
-                ),
-                (
-                    "hardware_approval.signature",
-                    None
-                    if profile.hardware_approval is None
-                    else profile.hardware_approval.signature,
-                ),
-                (
-                    "hardware_approval.trust_store",
-                    None
-                    if profile.hardware_approval is None
-                    else profile.hardware_approval.trust_store,
-                ),
-            )
-            if asset is not None and not asset.is_file()
-        ]
-        if profile.localizer_deploy_dir is not None and not profile.localizer_deploy_dir.is_dir():
-            missing.append(
-                "localizer_deploy_dir=" + str(profile.localizer_deploy_dir)
-            )
-        if missing:
-            raise ValueError(
-                f"site profile {source} has missing asset(s): " + "; ".join(missing)
-            )
-        if profile.hardware_approval is not None:
-            load_hardware_approval_receipt(profile.hardware_approval)
+        _validate_profile_files(profile)
     return profile

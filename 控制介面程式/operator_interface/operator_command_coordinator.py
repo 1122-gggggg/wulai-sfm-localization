@@ -3,12 +3,23 @@ from __future__ import annotations
 
 import queue
 import threading
-from typing import Callable, Iterable
+from typing import Callable, Iterable, Protocol
 
 from backend_contract import ControlRequest, ControlResult, InterfaceMode
 
 
 CommandCompletion = tuple[str, object | None, str | None]
+
+
+class CommandBackend(Protocol):
+    @property
+    def mode(self) -> object: ...
+
+    def command(
+        self,
+        request: ControlRequest | str,
+        **payload: object,
+    ) -> object: ...
 
 
 class OperatorCommandCoordinator:
@@ -17,7 +28,7 @@ class OperatorCommandCoordinator:
     def __init__(
         self,
         *,
-        backend: object,
+        backend: CommandBackend,
         normal_results: queue.Queue[CommandCompletion],
         safety_results: queue.Queue[CommandCompletion],
         inflight: set[str],

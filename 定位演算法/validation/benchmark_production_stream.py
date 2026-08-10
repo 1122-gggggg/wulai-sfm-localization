@@ -365,6 +365,432 @@ def write_camera_positions_ply(rows: list[dict], out_ply: Path) -> int:
     return len(pose_rows)
 
 
+def _configure_args(args, parser) -> None:
+    np.random.seed(args.random_seed)
+    torch.manual_seed(args.random_seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.random_seed)
+
+    if args.stride <= 0:
+        parser.error("--stride must be positive")
+    if sum(bool(value) for value in (
+        args.flow_track, args.neuflow_track, args.projection_track,
+    )) > 1:
+        parser.error("--flow-track, --neuflow-track, and --projection-track are alternatives")
+    if args.projection_track and not args.track_landmarks:
+        parser.error("--projection-track requires --track-landmarks")
+
+
+def _prepare_input(args) -> dict:
+    qdir = Path(args.query_dir)
+    video = Path(args.video) if args.video else None
+    frames = None
+    if video is not None:
+        frame_total = video_frame_count(video, args.stride, args.limit)
+        source_fps = video_frame_rate(video)
+        first = next(iter_video_frames(video, args.resize_width, args.stride, 1), None)
+        if first is None:
+            raise SystemExit(f"no decodable video frames found in {video}")
+        _first_rgb, orig_size, stream_size = first[1], first[2], first[3]
+        source_label = f"video={video} source_fps={source_fps:.6f}"
+    else:
+        source_fps = None
+        frames = sorted(qdir.glob("*.jpg"))
+        if args.stride > 1:
+            frames = frames[::args.stride]
+        if args.limit and args.limit > 0:
+            frames = frames[:args.limit]
+        if not frames:
+            raise SystemExit(f"no jpg frames found under {qdir}")
+        frame_total = len(frames)
+        _first_rgb, orig_size, stream_size = load_rgb_resized(frames[0], args.resize_width)
+        source_label = f"query_dir={qdir}"
+    return {
+        "video": video,
+        "frames": frames,
+        "frame_total": frame_total,
+        "source_fps": source_fps,
+        "orig_size": orig_size,
+        "stream_size": stream_size,
+        "source_label": source_label,
+    }
+
+
+def _load_site_profile(args) -> tuple[str | None, str | None]:
+    site_profile_sha256 = None
+    localizer_profile_sha256 = None
+    if args.site_profile:
+        site_profile_path = Path(args.site_profile).expanduser().resolve()
+        try:
+            site_raw = json.loads(site_profile_path.read_text(encoding="utf-8"))
+            profile_value = site_raw.get("localizer_profile")
+            if not isinstance(profile_value, str) or not profile_value:
+                raise ValueError("site profile has no localizer_profile")
+            localizer_profile_path = (site_profile_path.parent / profile_value).resolve()
+            site_profile_sha256 = sha256_file(site_profile_path)
+            localizer_profile_sha256 = sha256_file(localizer_profile_path)
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            raise SystemExit(f"cannot bind site profile: {exc}") from exc
+    return site_profile_sha256, localizer_profile_sha256
+
+
+def _validate_quality_baseline(
+    args,
+    video: Path | None,
+    site_profile_sha256: str | None,
+    localizer_profile_sha256: str | None,
+    bundle_sha256: str,
+    camera_identity: dict[str, object],
+) -> None:
+    if not args.quality_baseline:
+        return
+    if video is None or not args.site_profile:
+        raise SystemExit("--quality-baseline requires --video and --site-profile")
+    baseline_path = Path(args.quality_baseline).expanduser().resolve()
+    try:
+        baseline_identity = json.loads(baseline_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SystemExit(f"cannot read quality baseline: {exc}") from exc
+    failures = baseline_identity_failures(
+        baseline_identity,
+        video_sha256=sha256_file(video),
+        site_profile_sha256=site_profile_sha256,
+        bundle_sha256=bundle_sha256,
+        localizer_profile_sha256=localizer_profile_sha256,
+        camera=camera_identity,
+    )
+    if failures:
+        raise SystemExit("quality baseline identity mismatch: " + "; ".join(failures))
+
+
+def _prepare_projection(args, parser):
+    if not args.projection_track:
+        return None
+    from projection_guided_tracker import ProjectionGuidedTracker, TrackLandmarkSidecar
+
+    landmark_path = Path(args.track_landmarks)
+    if not landmark_path.is_file():
+        raise SystemExit(f"TRACK landmark sidecar not found: {landmark_path}")
+    sidecar_bundle_sha256, _sidecar_names_sha256 = TrackLandmarkSidecar.read_binding(
+        landmark_path)
+    if args.bundle_sha256 and args.bundle_sha256 != sidecar_bundle_sha256:
+        parser.error("--bundle-sha256 does not match --track-landmarks binding")
+    return ProjectionGuidedTracker, TrackLandmarkSidecar, landmark_path, sidecar_bundle_sha256
+
+
+def _load_megaloc(args, xmap):
+    cache = Path(args.megaloc_cache)
+    meta = Path(args.megaloc_meta) if args.megaloc_meta else cache.with_suffix(".json")
+    if cache.exists():
+        print(f"loading MegaLoc cache {cache}", flush=True)
+        try:
+            return MegaLocLayer.load_cache(
+                cache, xmap.ref_names, input_size=322, device=DEVICE,
+                meta_path=meta if args.megaloc_meta else None,
+            )
+        except ValueError as exc:
+            print(
+                f"MegaLoc cache incompatible ({exc}); using bundle ref_global descriptors",
+                flush=True,
+            )
+            return MegaLocLayer(xmap.ref_global, input_size=322, device=DEVICE)
+    if Path(args.image_root).exists():
+        print(f"building MegaLoc cache {cache} from {args.image_root}", flush=True)
+        return MegaLocLayer.build_cache(
+            xmap.ref_names, Path(args.image_root), cache, meta,
+            input_size=322, batch=16, device=DEVICE)
+    print(
+        "MegaLoc cache and reference images missing; using bundle ref_global descriptors",
+        flush=True,
+    )
+    return MegaLocLayer(xmap.ref_global, input_size=322, device=DEVICE)
+
+
+def _build_tracker_variant(args, xmap, megaloc, cam, cfg, projection_types):
+    neuflow_metadata = None
+    projection_metadata = None
+    tracker_variant = f"deep_{args.matcher_mode}_{args.adaptive_first_topk}_{args.local_topk}"
+    if args.neuflow_track:
+        from neuflow_refresh_experiment import NeuFlowRefreshTracker, NeuFlowV2Backend
+
+        print(
+            f"loading NeuFlow-v2 {args.neuflow_width}x{args.neuflow_height} "
+            f"refresh={args.neuflow_refresh_interval}",
+            flush=True,
+        )
+        neuflow_backend = NeuFlowV2Backend(
+            repo=Path(args.neuflow_repo),
+            weights=Path(args.neuflow_weights),
+            width=args.neuflow_width,
+            height=args.neuflow_height,
+        )
+        neuflow_metadata = neuflow_backend.metadata()
+        tracker = NeuFlowRefreshTracker(
+            xmap,
+            megaloc,
+            frame_source=lambda: None,
+            query_cam=cam,
+            cfg=cfg,
+            neuflow_backend=neuflow_backend,
+            refresh_interval=args.neuflow_refresh_interval,
+            min_seed=args.neuflow_min_seed,
+            min_track=args.neuflow_min_track,
+            min_inliers=args.neuflow_min_inliers,
+            min_inlier_ratio=args.neuflow_min_inlier_ratio,
+            max_reproj=args.neuflow_max_reproj,
+        )
+        tracker_variant = (
+            f"neuflow_v2_r{args.neuflow_refresh_interval}"
+            f"_s{args.neuflow_min_seed}_t{args.neuflow_min_track}")
+    elif args.projection_track:
+        ProjectionGuidedTracker, TrackLandmarkSidecar, landmark_path, bundle_sha256 = (
+            projection_types)
+        landmark_sidecar = TrackLandmarkSidecar.load(
+            landmark_path,
+            xmap.ref_names,
+            verified_bundle_sha256=bundle_sha256,
+        )
+        tracker = ProjectionGuidedTracker(
+            xmap,
+            megaloc,
+            frame_source=lambda: None,
+            query_cam=cam,
+            cfg=cfg,
+            landmark_sidecar=landmark_sidecar,
+            search_radii=(15.0, 25.0, 40.0),
+            min_score=0.60,
+            ratio=0.95,
+        )
+        projection_metadata = {
+            "landmarks": str(landmark_path),
+            "bundle_sha256": bundle_sha256,
+            "search_radii_px": [15.0, 25.0, 40.0],
+            "min_score": 0.60,
+            "ratio": 0.95,
+        }
+        tracker_variant = "projection_guided_r15_25_40_s060_ratio095"
+    else:
+        tracker = ProductionXFeatTracker(
+            xmap, megaloc, frame_source=lambda: None, query_cam=cam, cfg=cfg)
+    return tracker, neuflow_metadata, projection_metadata, tracker_variant
+
+
+def _attach_onnx_matcher(args, tracker) -> None:
+    if not (args.lg_onnx_track_model or args.lg_onnx_acquire_model):
+        return
+    from benchmark_xfeat_lg_onnx import OnnxXFeatMatcher
+
+    xfeat = tracker.ensure_xfeat()
+    models = {}
+    if args.lg_onnx_track_model:
+        models[args.track_xfeat_topk] = Path(args.lg_onnx_track_model)
+    if args.lg_onnx_acquire_model:
+        models[args.acquire_xfeat_topk] = Path(args.lg_onnx_acquire_model)
+    backend = OnnxXFeatMatcher(
+        models,
+        provider=args.lg_onnx_provider,
+        reference_topk=args.lg_onnx_ref_topk,
+    )
+    backend.fallback = xfeat.match_lighterglue_indices
+    xfeat.match_lighterglue_indices = backend
+    print(
+        f"experimental ONNX matcher provider={args.lg_onnx_provider} "
+        f"query_shapes={sorted(models)} "
+        f"ref_topk={args.lg_onnx_ref_topk}",
+        flush=True,
+    )
+
+
+def _run_frames(args, video, frames, frame_total, tracker) -> tuple[list[dict], float]:
+    rows = []
+    t_all0 = time.perf_counter()
+    if video is not None:
+        frame_iter = iter_video_frames(
+            video, args.resize_width, args.stride, args.limit)
+    else:
+        def image_frames():
+            for path in frames:
+                t_load0 = time.perf_counter()
+                frame, frame_orig, frame_stream = load_rgb_resized(path, args.resize_width)
+                yield (
+                    path.name,
+                    frame,
+                    frame_orig,
+                    frame_stream,
+                    (time.perf_counter() - t_load0) * 1000.0,
+                    time.monotonic(),
+                )
+        frame_iter = image_frames()
+    for i, (frame_name, frame, _orig, _stream, load_ms, capture_stamp) in enumerate(frame_iter, 1):
+        sync(); t0 = time.perf_counter()
+        pose = tracker.localize_frame(frame, capture_stamp=capture_stamp)
+        sync(); wall_ms = (time.perf_counter() - t0) * 1000.0
+        info = dict(tracker.last_info)
+        row = {
+            "idx": i - 1,
+            "frame": frame_name,
+            "success": pose is not None,
+            "wall_ms": wall_ms,
+            "load_ms": load_ms,
+            "capture_stamp": capture_stamp,
+            "pose": None if pose is None else {"x": pose.x, "y": pose.y, "z": pose.z, "yaw": pose.yaw},
+            **info,
+        }
+        rows.append(row)
+        if i <= 5 or i % 25 == 0 or i == frame_total:
+            print(
+                f"{i:4d}/{frame_total} {frame_name} mode={row.get('mode')} -> {row.get('next_mode')} "
+                f"ok={row['success']} inl={row.get('inliers')} corr={row.get('corr3d')} "
+                f"ms={wall_ms:.1f} vpr={row.get('vpr_ms',0):.1f} "
+                f"feat={row.get('feature_ms',0):.1f} match={row.get('match_ms',0):.1f}",
+                flush=True,
+            )
+    sync(); t_all = time.perf_counter() - t_all0
+    return rows, t_all
+
+
+def _summarize_rows(rows: list[dict], t_all: float) -> dict:
+    n = len(rows)
+    ok = [r for r in rows if r["success"]]
+    by_mode = {}
+    for r in rows:
+        by_mode[r.get("mode", "?")] = by_mode.get(r.get("mode", "?"), 0) + 1
+    by_stage = count_by(rows, "composite_stage")
+    steady = rows[min(5, len(rows)):]
+    flow_rows = [r for r in rows if r.get("mode") == "FLOW_TRACK"]
+    flow_fallback_rows = [r for r in rows if r.get("flow_fallback")]
+    flow_mnn_rows = [
+        r for r in rows
+        if r.get("flow_mnn_inliers") is not None
+        or r.get("flow_stage") == "mnn_crosscheck"
+        or r.get("flow_mnn_reason") is not None
+    ]
+    flow_mnn_failure_reasons = {}
+    for row in flow_fallback_rows:
+        reason = row.get("flow_mnn_reason")
+        if reason:
+            flow_mnn_failure_reasons[reason] = (
+                flow_mnn_failure_reasons.get(reason, 0) + 1)
+    neuflow_rows = [r for r in rows if r.get("mode") == "NEUFLOW_TRACK"]
+    neuflow_fallback_rows = [r for r in rows if r.get("neuflow_fallback")]
+    neuflow_fallback_reasons = count_by(neuflow_fallback_rows, "neuflow_stage")
+    projection_rows = [
+        r for r in rows
+        if r.get("composite_stage") == "projection_guided"
+        and not r.get("projection_fallback")
+    ]
+    projection_fallback_rows = [r for r in rows if r.get("projection_fallback")]
+    projection_fallback_reasons = count_by(
+        projection_fallback_rows, "projection_reason")
+    return {
+        "n": n,
+        "success": len(ok),
+        "success_rate": len(ok) / max(n, 1),
+        "actual_wall_s": float(t_all),
+        "actual_fps_including_io": float(n / max(t_all, 1e-9)),
+        "mode_counts": by_mode,
+        "composite_stage_counts": by_stage,
+        # The tracker folds temporal-cache anchors into the NN pass (there is no
+        # separate "temporal_nn_cache_accept" stage), so count frames where the
+        # cache actually contributed correspondences.
+        "temporal_cache_accept": int(by_stage.get("temporal_nn_cache_accept", 0)),
+        "temporal_cache_used_frames": sum(
+            1 for r in rows if (r.get("temporal_cache_corr3d") or 0) > 0),
+        "temporal_cache_attempted_frames": sum(
+            1 for r in rows if r.get("temporal_cache_attempted")),
+        "nn_fast_accept": int(by_stage.get("nn_fast_accept", 0)),
+        "lg_fallback": int(sum(by_stage.get(stage, 0) for stage in (
+            "lg_adaptive_after_nn", "lg_full_after_nn",
+            "lg_adaptive_forced", "lg_full_forced", "lg_forced",
+        ))),
+        "pnp_failures": sum(1 for r in rows if r.get("pnp_failed")),
+        "jump_rejections": sum(1 for r in rows if r.get("jump_rejected")),
+        "xfeat_extracts_total": sum(int(r.get("xfeat_extract_count") or 0) for r in rows),
+        "lg_calls_total": sum(int(r.get("lg_call_count") or 0) for r in rows),
+        "lg_reuse_total": sum(int(r.get("lg_reuse_count") or 0) for r in rows),
+        "nn_calls_total": sum(int(r.get("nn_call_count") or 0) for r in rows),
+        "megaloc_calls_total": sum(int(r.get("megaloc_call_count") or 0) for r in rows),
+        "xfeat_extracts_per_frame": sum(int(r.get("xfeat_extract_count") or 0) for r in rows) / max(n, 1),
+        "lg_calls_per_frame": sum(int(r.get("lg_call_count") or 0) for r in rows) / max(n, 1),
+        "megaloc_calls_per_frame": sum(int(r.get("megaloc_call_count") or 0) for r in rows) / max(n, 1),
+        "flow_accept_frames": len(flow_rows),
+        "flow_fallback_frames": len(flow_fallback_rows),
+        "flow_mnn_attempted_frames": len(flow_mnn_rows),
+        "flow_mnn_failure_reasons": flow_mnn_failure_reasons,
+        "flow_accept_wall_ms": stat([r.get("wall_ms") for r in flow_rows]),
+        "flow_fallback_wall_ms": stat([r.get("wall_ms") for r in flow_fallback_rows]),
+        "flow_mnn_translation_delta": stat([
+            r.get("flow_mnn_translation_delta") for r in flow_rows]),
+        "flow_mnn_yaw_delta_deg": stat([
+            r.get("flow_mnn_yaw_delta_deg") for r in flow_rows]),
+        "neuflow_accept_frames": len(neuflow_rows),
+        "neuflow_fallback_frames": len(neuflow_fallback_rows),
+        "neuflow_fallback_reasons": neuflow_fallback_reasons,
+        "neuflow_accept_wall_ms": stat([
+            r.get("wall_ms") for r in neuflow_rows]),
+        "neuflow_flow_ms": stat([
+            r.get("neuflow_flow_ms") for r in neuflow_rows]),
+        "neuflow_gpu_ms": stat([
+            r.get("neuflow_gpu_ms") for r in neuflow_rows]),
+        "neuflow_pnp_ms": stat([
+            r.get("pnp_ms") for r in neuflow_rows]),
+        "projection_accept_frames": len(projection_rows),
+        "projection_fallback_frames": len(projection_fallback_rows),
+        "projection_fallback_reasons": projection_fallback_reasons,
+        "projection_accept_wall_ms": stat([
+            r.get("wall_ms") for r in projection_rows]),
+        "projection_match_ms": stat([
+            r.get("match_ms") for r in projection_rows]),
+        "projection_pnp_ms": stat([
+            r.get("pnp_ms") for r in projection_rows]),
+        "corr3d_pre_dedup": stat([r.get("corr3d_pre_dedup") for r in rows]),
+        "inlier_coverage": stat([r.get("inlier_coverage") for r in rows]),
+        "quality_score": stat([r.get("quality_score") for r in rows]),
+        "load_ms": stat([r.get("load_ms") for r in rows]),
+        "wall_ms": stat([r.get("wall_ms") for r in rows]),
+        "wall_ms_steady_excluding_first5": stat([r.get("wall_ms") for r in steady]),
+        "fps_from_median_wall": None if pct([r.get("wall_ms") for r in rows], 50) is None else 1000.0 / pct([r.get("wall_ms") for r in rows], 50),
+        "fps_from_steady_median_wall": None if pct([r.get("wall_ms") for r in steady], 50) is None else 1000.0 / pct([r.get("wall_ms") for r in steady], 50),
+        "inliers": stat([r.get("inliers") for r in rows]),
+        "corr3d": stat([r.get("corr3d") for r in rows]),
+        "raw_matches": stat([r.get("raw_matches") for r in rows]),
+        "vpr_ms": stat([r.get("vpr_ms") for r in rows]),
+        "feature_ms": stat([r.get("feature_ms") for r in rows]),
+        "match_ms": stat([r.get("match_ms") for r in rows]),
+        "pnp_ms": stat([r.get("pnp_ms") for r in rows]),
+        "reproj_rms": stat([r.get("reproj_rms") for r in rows]),
+    }
+
+
+def _write_report(args, payload: dict, rows: list[dict]):
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    out = Path(args.out) if args.out else OUT_DIR / "current_production_default_nn_then_lg_720p_stream.json"
+    out_ply = Path(args.out_ply) if args.out_ply else out.with_name(out.stem + "_camera_positions.ply")
+    ply_vertices = write_camera_positions_ply(rows, out_ply)
+    payload["camera_positions_ply"] = str(out_ply)
+    payload["camera_positions_ply_vertices"] = int(ply_vertices)
+    out.write_text(json.dumps(payload, ensure_ascii=False, indent=2))
+    return out, out_ply, ply_vertices
+
+
+def _print_report(summary: dict, out: Path, out_ply: Path, ply_vertices: int) -> None:
+    print("\n=== production stream summary ===")
+    print(f"localized {summary['success']}/{summary['n']} = {100*summary['success_rate']:.1f}%")
+    print(f"mode_counts {summary['mode_counts']}")
+    print(f"stage_counts {summary['composite_stage_counts']}")
+    print(f"actual FPS incl I/O {summary['actual_fps_including_io']:.2f}")
+
+    def fmt(x, nd=2):
+        return "NA" if x is None else f"{x:.{nd}f}"
+
+    print(f"median wall FPS {fmt(summary['fps_from_median_wall'])}  steady(excl first5) {fmt(summary['fps_from_steady_median_wall'])}")
+    print(f"wall_ms median/p90 {fmt(summary['wall_ms']['median'],1)}/{fmt(summary['wall_ms']['p90'],1)}")
+    print(f"inliers median/p90 {fmt(summary['inliers']['median'],0)}/{fmt(summary['inliers']['p90'],0)}")
+    print(f"match_ms median/p90 {fmt(summary['match_ms']['median'],1)}/{fmt(summary['match_ms']['p90'],1)}")
+    print(f"saved {out}")
+    print(f"saved camera positions {out_ply} ({ply_vertices} vertices)")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--query-dir", default=str(QUERY_DIR))
@@ -489,41 +915,15 @@ def main():
     )
     ap.add_argument("--lg-onnx-ref-topk", type=int, default=2048)
     args = ap.parse_args()
-    np.random.seed(args.random_seed)
-    torch.manual_seed(args.random_seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(args.random_seed)
-
-    if args.stride <= 0:
-        ap.error("--stride must be positive")
-    if sum(bool(value) for value in (
-        args.flow_track, args.neuflow_track, args.projection_track,
-    )) > 1:
-        ap.error("--flow-track, --neuflow-track, and --projection-track are alternatives")
-    if args.projection_track and not args.track_landmarks:
-        ap.error("--projection-track requires --track-landmarks")
-    qdir = Path(args.query_dir)
-    video = Path(args.video) if args.video else None
-    if video is not None:
-        frame_total = video_frame_count(video, args.stride, args.limit)
-        source_fps = video_frame_rate(video)
-        first = next(iter_video_frames(video, args.resize_width, args.stride, 1), None)
-        if first is None:
-            raise SystemExit(f"no decodable video frames found in {video}")
-        first_rgb, orig_size, stream_size = first[1], first[2], first[3]
-        source_label = f"video={video} source_fps={source_fps:.6f}"
-    else:
-        source_fps = None
-        frames = sorted(qdir.glob("*.jpg"))
-        if args.stride > 1:
-            frames = frames[::args.stride]
-        if args.limit and args.limit > 0:
-            frames = frames[:args.limit]
-        if not frames:
-            raise SystemExit(f"no jpg frames found under {qdir}")
-        frame_total = len(frames)
-        first_rgb, orig_size, stream_size = load_rgb_resized(frames[0], args.resize_width)
-        source_label = f"query_dir={qdir}"
+    _configure_args(args, ap)
+    input_data = _prepare_input(args)
+    video = input_data["video"]
+    frames = input_data["frames"]
+    frame_total = input_data["frame_total"]
+    source_fps = input_data["source_fps"]
+    orig_size = input_data["orig_size"]
+    stream_size = input_data["stream_size"]
+    source_label = input_data["source_label"]
     cam = load_query_camera(Path(args.intrinsics), orig_size, stream_size)
     camera_audit = intrinsics_check(cam)
     if (args.strict_camera or args.quality_baseline) and not args.allow_camera_mismatch:
@@ -532,20 +932,7 @@ def main():
         except ValueError as exc:
             raise SystemExit(str(exc)) from exc
 
-    site_profile_sha256 = None
-    localizer_profile_sha256 = None
-    if args.site_profile:
-        site_profile_path = Path(args.site_profile).expanduser().resolve()
-        try:
-            site_raw = json.loads(site_profile_path.read_text(encoding="utf-8"))
-            profile_value = site_raw.get("localizer_profile")
-            if not isinstance(profile_value, str) or not profile_value:
-                raise ValueError("site profile has no localizer_profile")
-            localizer_profile_path = (site_profile_path.parent / profile_value).resolve()
-            site_profile_sha256 = sha256_file(site_profile_path)
-            localizer_profile_sha256 = sha256_file(localizer_profile_path)
-        except (OSError, ValueError, json.JSONDecodeError) as exc:
-            raise SystemExit(f"cannot bind site profile: {exc}") from exc
+    site_profile_sha256, localizer_profile_sha256 = _load_site_profile(args)
 
     bundle_sha256 = sha256_file(Path(args.bundle).expanduser().resolve())
     camera_identity = {
@@ -554,50 +941,21 @@ def main():
         "height": cam.height,
         "params": [float(value) for value in cam.params],
     }
-    baseline_identity = None
-    if args.quality_baseline:
-        if video is None or not args.site_profile:
-            raise SystemExit(
-                "--quality-baseline requires --video and --site-profile"
-            )
-        baseline_path = Path(args.quality_baseline).expanduser().resolve()
-        try:
-            baseline_identity = json.loads(baseline_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
-            raise SystemExit(f"cannot read quality baseline: {exc}") from exc
-        failures = baseline_identity_failures(
-            baseline_identity,
-            video_sha256=sha256_file(video),
-            site_profile_sha256=site_profile_sha256,
-            bundle_sha256=bundle_sha256,
-            localizer_profile_sha256=localizer_profile_sha256,
-            camera=camera_identity,
-        )
-        if failures:
-            raise SystemExit("quality baseline identity mismatch: " + "; ".join(failures))
+    _validate_quality_baseline(
+        args,
+        video,
+        site_profile_sha256,
+        localizer_profile_sha256,
+        bundle_sha256,
+        camera_identity,
+    )
 
     print(f"device={DEVICE} cuda={torch.cuda.get_device_name(0) if torch.cuda.is_available() else None}")
     print(f"frames={frame_total} {source_label}")
     print(f"resize {orig_size[0]}x{orig_size[1]} -> {stream_size[0]}x{stream_size[1]}")
     print(f"query camera {cam.model} {cam.width}x{cam.height} params={cam.params}")
 
-    projection_types = None
-    if args.projection_track:
-        from projection_guided_tracker import ProjectionGuidedTracker, TrackLandmarkSidecar
-
-        landmark_path = Path(args.track_landmarks)
-        if not landmark_path.is_file():
-            raise SystemExit(f"TRACK landmark sidecar not found: {landmark_path}")
-        sidecar_bundle_sha256, _sidecar_names_sha256 = (
-            TrackLandmarkSidecar.read_binding(landmark_path))
-        if args.bundle_sha256 and args.bundle_sha256 != sidecar_bundle_sha256:
-            ap.error("--bundle-sha256 does not match --track-landmarks binding")
-        projection_types = (
-            ProjectionGuidedTracker,
-            TrackLandmarkSidecar,
-            landmark_path,
-            sidecar_bundle_sha256,
-        )
+    projection_types = _prepare_projection(args, ap)
 
     print(f"loading bundle {args.bundle}", flush=True)
     expected_bundle_sha256 = (
@@ -607,26 +965,7 @@ def main():
     xmap = XFeatRelocMap.load(args.bundle, expected_bundle_sha256)
     print("bundle meta", xmap.meta, flush=True)
 
-    cache = Path(args.megaloc_cache)
-    meta = Path(args.megaloc_meta) if args.megaloc_meta else cache.with_suffix(".json")
-    if cache.exists():
-        print(f"loading MegaLoc cache {cache}", flush=True)
-        try:
-            megaloc = MegaLocLayer.load_cache(
-                cache, xmap.ref_names, input_size=322, device=DEVICE,
-                meta_path=meta if args.megaloc_meta else None,
-            )
-        except ValueError as exc:
-            print(f"MegaLoc cache incompatible ({exc}); using bundle ref_global descriptors", flush=True)
-            megaloc = MegaLocLayer(xmap.ref_global, input_size=322, device=DEVICE)
-    elif Path(args.image_root).exists():
-        print(f"building MegaLoc cache {cache} from {args.image_root}", flush=True)
-        megaloc = MegaLocLayer.build_cache(
-            xmap.ref_names, Path(args.image_root), cache, meta,
-            input_size=322, batch=16, device=DEVICE)
-    else:
-        print("MegaLoc cache and reference images missing; using bundle ref_global descriptors", flush=True)
-        megaloc = MegaLocLayer(xmap.ref_global, input_size=322, device=DEVICE)
+    megaloc = _load_megaloc(args, xmap)
 
     cfg = ProductionConfig(
         boot_global_topk=args.boot_topk,
@@ -672,252 +1011,16 @@ def main():
     )
     os.environ["SFM_FLOW_REFRESH"] = str(args.flow_refresh)
     os.environ["SFM_FLOW_FB_PX"] = str(args.flow_fb_px)
-    neuflow_metadata = None
-    projection_metadata = None
-    tracker_variant = (
-        f"deep_{args.matcher_mode}_{args.adaptive_first_topk}_{args.local_topk}")
-    if args.neuflow_track:
-        from neuflow_refresh_experiment import NeuFlowRefreshTracker, NeuFlowV2Backend
-
-        print(
-            f"loading NeuFlow-v2 {args.neuflow_width}x{args.neuflow_height} "
-            f"refresh={args.neuflow_refresh_interval}",
-            flush=True,
-        )
-        neuflow_backend = NeuFlowV2Backend(
-            repo=Path(args.neuflow_repo),
-            weights=Path(args.neuflow_weights),
-            width=args.neuflow_width,
-            height=args.neuflow_height,
-        )
-        neuflow_metadata = neuflow_backend.metadata()
-        tracker = NeuFlowRefreshTracker(
-            xmap,
-            megaloc,
-            frame_source=lambda: None,
-            query_cam=cam,
-            cfg=cfg,
-            neuflow_backend=neuflow_backend,
-            refresh_interval=args.neuflow_refresh_interval,
-            min_seed=args.neuflow_min_seed,
-            min_track=args.neuflow_min_track,
-            min_inliers=args.neuflow_min_inliers,
-            min_inlier_ratio=args.neuflow_min_inlier_ratio,
-            max_reproj=args.neuflow_max_reproj,
-        )
-        tracker_variant = (
-            f"neuflow_v2_r{args.neuflow_refresh_interval}"
-            f"_s{args.neuflow_min_seed}_t{args.neuflow_min_track}")
-    elif args.projection_track:
-        ProjectionGuidedTracker, TrackLandmarkSidecar, landmark_path, bundle_sha256 = (
-            projection_types)
-        landmark_sidecar = TrackLandmarkSidecar.load(
-            landmark_path,
-            xmap.ref_names,
-            verified_bundle_sha256=bundle_sha256,
-        )
-        tracker = ProjectionGuidedTracker(
-            xmap,
-            megaloc,
-            frame_source=lambda: None,
-            query_cam=cam,
-            cfg=cfg,
-            landmark_sidecar=landmark_sidecar,
-            search_radii=(15.0, 25.0, 40.0),
-            min_score=0.60,
-            ratio=0.95,
-        )
-        projection_metadata = {
-            "landmarks": str(landmark_path),
-            "bundle_sha256": bundle_sha256,
-            "search_radii_px": [15.0, 25.0, 40.0],
-            "min_score": 0.60,
-            "ratio": 0.95,
-        }
-        tracker_variant = "projection_guided_r15_25_40_s060_ratio095"
-    else:
-        tracker = ProductionXFeatTracker(
-            xmap, megaloc, frame_source=lambda: None, query_cam=cam, cfg=cfg)
+    tracker, neuflow_metadata, projection_metadata, tracker_variant = _build_tracker_variant(
+        args, xmap, megaloc, cam, cfg, projection_types)
     print("loading models ...", flush=True)
     tracker.ensure_models()
-    if args.lg_onnx_track_model or args.lg_onnx_acquire_model:
-        from benchmark_xfeat_lg_onnx import OnnxXFeatMatcher
-        xfeat = tracker.ensure_xfeat()
-        models = {}
-        if args.lg_onnx_track_model:
-            models[args.track_xfeat_topk] = Path(args.lg_onnx_track_model)
-        if args.lg_onnx_acquire_model:
-            models[args.acquire_xfeat_topk] = Path(args.lg_onnx_acquire_model)
-        backend = OnnxXFeatMatcher(
-            models,
-            provider=args.lg_onnx_provider,
-            reference_topk=args.lg_onnx_ref_topk,
-        )
-        backend.fallback = xfeat.match_lighterglue_indices
-        xfeat.match_lighterglue_indices = backend
-        print(
-            f"experimental ONNX matcher provider={args.lg_onnx_provider} "
-            f"query_shapes={sorted(models)} "
-            f"ref_topk={args.lg_onnx_ref_topk}",
-            flush=True,
-        )
+    _attach_onnx_matcher(args, tracker)
     sync()
 
-    rows = []
-    t_all0 = time.perf_counter()
-    if video is not None:
-        frame_iter = iter_video_frames(
-            video, args.resize_width, args.stride, args.limit)
-    else:
-        def image_frames():
-            for path in frames:
-                t_load0 = time.perf_counter()
-                frame, frame_orig, frame_stream = load_rgb_resized(path, args.resize_width)
-                yield (
-                    path.name,
-                    frame,
-                    frame_orig,
-                    frame_stream,
-                    (time.perf_counter() - t_load0) * 1000.0,
-                    time.monotonic(),
-                )
-        frame_iter = image_frames()
-    for i, (frame_name, frame, _orig, _stream, load_ms, capture_stamp) in enumerate(frame_iter, 1):
-        sync(); t0 = time.perf_counter()
-        pose = tracker.localize_frame(frame, capture_stamp=capture_stamp)
-        sync(); wall_ms = (time.perf_counter() - t0) * 1000.0
-        info = dict(tracker.last_info)
-        row = {
-            "idx": i - 1,
-            "frame": frame_name,
-            "success": pose is not None,
-            "wall_ms": wall_ms,
-            "load_ms": load_ms,
-            "capture_stamp": capture_stamp,
-            "pose": None if pose is None else {"x": pose.x, "y": pose.y, "z": pose.z, "yaw": pose.yaw},
-            **info,
-        }
-        rows.append(row)
-        if i <= 5 or i % 25 == 0 or i == frame_total:
-            print(
-                f"{i:4d}/{frame_total} {frame_name} mode={row.get('mode')} -> {row.get('next_mode')} "
-                f"ok={row['success']} inl={row.get('inliers')} corr={row.get('corr3d')} "
-                f"ms={wall_ms:.1f} vpr={row.get('vpr_ms',0):.1f} "
-                f"feat={row.get('feature_ms',0):.1f} match={row.get('match_ms',0):.1f}",
-                flush=True,
-            )
-    sync(); t_all = time.perf_counter() - t_all0
+    rows, t_all = _run_frames(args, video, frames, frame_total, tracker)
 
-    n = len(rows)
-    ok = [r for r in rows if r["success"]]
-    by_mode = {}
-    for r in rows:
-        by_mode[r.get("mode", "?")] = by_mode.get(r.get("mode", "?"), 0) + 1
-    by_stage = count_by(rows, "composite_stage")
-    steady = rows[min(5, len(rows)):]
-    flow_rows = [r for r in rows if r.get("mode") == "FLOW_TRACK"]
-    flow_fallback_rows = [r for r in rows if r.get("flow_fallback")]
-    flow_mnn_rows = [
-        r for r in rows
-        if r.get("flow_mnn_inliers") is not None
-        or r.get("flow_stage") == "mnn_crosscheck"
-        or r.get("flow_mnn_reason") is not None
-    ]
-    flow_mnn_failure_reasons = {}
-    for row in flow_fallback_rows:
-        reason = row.get("flow_mnn_reason")
-        if reason:
-            flow_mnn_failure_reasons[reason] = (
-                flow_mnn_failure_reasons.get(reason, 0) + 1)
-    neuflow_rows = [r for r in rows if r.get("mode") == "NEUFLOW_TRACK"]
-    neuflow_fallback_rows = [r for r in rows if r.get("neuflow_fallback")]
-    neuflow_fallback_reasons = count_by(neuflow_fallback_rows, "neuflow_stage")
-    projection_rows = [
-        r for r in rows
-        if r.get("composite_stage") == "projection_guided"
-        and not r.get("projection_fallback")
-    ]
-    projection_fallback_rows = [r for r in rows if r.get("projection_fallback")]
-    projection_fallback_reasons = count_by(
-        projection_fallback_rows, "projection_reason")
-    summary = {
-        "n": n,
-        "success": len(ok),
-        "success_rate": len(ok) / max(n, 1),
-        "actual_wall_s": float(t_all),
-        "actual_fps_including_io": float(n / max(t_all, 1e-9)),
-        "mode_counts": by_mode,
-        "composite_stage_counts": by_stage,
-        # The tracker folds temporal-cache anchors into the NN pass (there is no
-        # separate "temporal_nn_cache_accept" stage), so count frames where the
-        # cache actually contributed correspondences.
-        "temporal_cache_accept": int(by_stage.get("temporal_nn_cache_accept", 0)),
-        "temporal_cache_used_frames": sum(
-            1 for r in rows if (r.get("temporal_cache_corr3d") or 0) > 0),
-        "temporal_cache_attempted_frames": sum(
-            1 for r in rows if r.get("temporal_cache_attempted")),
-        "nn_fast_accept": int(by_stage.get("nn_fast_accept", 0)),
-        "lg_fallback": int(sum(by_stage.get(stage, 0) for stage in (
-            "lg_adaptive_after_nn", "lg_full_after_nn",
-            "lg_adaptive_forced", "lg_full_forced", "lg_forced",
-        ))),
-        "pnp_failures": sum(1 for r in rows if r.get("pnp_failed")),
-        "jump_rejections": sum(1 for r in rows if r.get("jump_rejected")),
-        "xfeat_extracts_total": sum(int(r.get("xfeat_extract_count") or 0) for r in rows),
-        "lg_calls_total": sum(int(r.get("lg_call_count") or 0) for r in rows),
-        "lg_reuse_total": sum(int(r.get("lg_reuse_count") or 0) for r in rows),
-        "nn_calls_total": sum(int(r.get("nn_call_count") or 0) for r in rows),
-        "megaloc_calls_total": sum(int(r.get("megaloc_call_count") or 0) for r in rows),
-        "xfeat_extracts_per_frame": sum(int(r.get("xfeat_extract_count") or 0) for r in rows) / max(n, 1),
-        "lg_calls_per_frame": sum(int(r.get("lg_call_count") or 0) for r in rows) / max(n, 1),
-        "megaloc_calls_per_frame": sum(int(r.get("megaloc_call_count") or 0) for r in rows) / max(n, 1),
-        "flow_accept_frames": len(flow_rows),
-        "flow_fallback_frames": len(flow_fallback_rows),
-        "flow_mnn_attempted_frames": len(flow_mnn_rows),
-        "flow_mnn_failure_reasons": flow_mnn_failure_reasons,
-        "flow_accept_wall_ms": stat([r.get("wall_ms") for r in flow_rows]),
-        "flow_fallback_wall_ms": stat([r.get("wall_ms") for r in flow_fallback_rows]),
-        "flow_mnn_translation_delta": stat([
-            r.get("flow_mnn_translation_delta") for r in flow_rows]),
-        "flow_mnn_yaw_delta_deg": stat([
-            r.get("flow_mnn_yaw_delta_deg") for r in flow_rows]),
-        "neuflow_accept_frames": len(neuflow_rows),
-        "neuflow_fallback_frames": len(neuflow_fallback_rows),
-        "neuflow_fallback_reasons": neuflow_fallback_reasons,
-        "neuflow_accept_wall_ms": stat([
-            r.get("wall_ms") for r in neuflow_rows]),
-        "neuflow_flow_ms": stat([
-            r.get("neuflow_flow_ms") for r in neuflow_rows]),
-        "neuflow_gpu_ms": stat([
-            r.get("neuflow_gpu_ms") for r in neuflow_rows]),
-        "neuflow_pnp_ms": stat([
-            r.get("pnp_ms") for r in neuflow_rows]),
-        "projection_accept_frames": len(projection_rows),
-        "projection_fallback_frames": len(projection_fallback_rows),
-        "projection_fallback_reasons": projection_fallback_reasons,
-        "projection_accept_wall_ms": stat([
-            r.get("wall_ms") for r in projection_rows]),
-        "projection_match_ms": stat([
-            r.get("match_ms") for r in projection_rows]),
-        "projection_pnp_ms": stat([
-            r.get("pnp_ms") for r in projection_rows]),
-        "corr3d_pre_dedup": stat([r.get("corr3d_pre_dedup") for r in rows]),
-        "inlier_coverage": stat([r.get("inlier_coverage") for r in rows]),
-        "quality_score": stat([r.get("quality_score") for r in rows]),
-        "load_ms": stat([r.get("load_ms") for r in rows]),
-        "wall_ms": stat([r.get("wall_ms") for r in rows]),
-        "wall_ms_steady_excluding_first5": stat([r.get("wall_ms") for r in steady]),
-        "fps_from_median_wall": None if pct([r.get("wall_ms") for r in rows], 50) is None else 1000.0 / pct([r.get("wall_ms") for r in rows], 50),
-        "fps_from_steady_median_wall": None if pct([r.get("wall_ms") for r in steady], 50) is None else 1000.0 / pct([r.get("wall_ms") for r in steady], 50),
-        "inliers": stat([r.get("inliers") for r in rows]),
-        "corr3d": stat([r.get("corr3d") for r in rows]),
-        "raw_matches": stat([r.get("raw_matches") for r in rows]),
-        "vpr_ms": stat([r.get("vpr_ms") for r in rows]),
-        "feature_ms": stat([r.get("feature_ms") for r in rows]),
-        "match_ms": stat([r.get("match_ms") for r in rows]),
-        "pnp_ms": stat([r.get("pnp_ms") for r in rows]),
-        "reproj_rms": stat([r.get("reproj_rms") for r in rows]),
-    }
+    summary = _summarize_rows(rows, t_all)
     payload = {
         "args": vars(args),
         "runtime_env": {
@@ -951,27 +1054,8 @@ def main():
         "summary": summary,
         "rows": rows,
     }
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
-    out = Path(args.out) if args.out else OUT_DIR / "current_production_default_nn_then_lg_720p_stream.json"
-    out_ply = Path(args.out_ply) if args.out_ply else out.with_name(out.stem + "_camera_positions.ply")
-    ply_vertices = write_camera_positions_ply(rows, out_ply)
-    payload["camera_positions_ply"] = str(out_ply)
-    payload["camera_positions_ply_vertices"] = int(ply_vertices)
-    out.write_text(json.dumps(payload, ensure_ascii=False, indent=2))
-
-    print("\n=== production stream summary ===")
-    print(f"localized {summary['success']}/{summary['n']} = {100*summary['success_rate']:.1f}%")
-    print(f"mode_counts {summary['mode_counts']}")
-    print(f"stage_counts {summary['composite_stage_counts']}")
-    print(f"actual FPS incl I/O {summary['actual_fps_including_io']:.2f}")
-    def fmt(x, nd=2):
-        return "NA" if x is None else f"{x:.{nd}f}"
-    print(f"median wall FPS {fmt(summary['fps_from_median_wall'])}  steady(excl first5) {fmt(summary['fps_from_steady_median_wall'])}")
-    print(f"wall_ms median/p90 {fmt(summary['wall_ms']['median'],1)}/{fmt(summary['wall_ms']['p90'],1)}")
-    print(f"inliers median/p90 {fmt(summary['inliers']['median'],0)}/{fmt(summary['inliers']['p90'],0)}")
-    print(f"match_ms median/p90 {fmt(summary['match_ms']['median'],1)}/{fmt(summary['match_ms']['p90'],1)}")
-    print(f"saved {out}")
-    print(f"saved camera positions {out_ply} ({ply_vertices} vertices)")
+    out, out_ply, ply_vertices = _write_report(args, payload, rows)
+    _print_report(summary, out, out_ply, ply_vertices)
 
 
 if __name__ == "__main__":

@@ -97,6 +97,40 @@ class Report:
         }
 
 
+class _AcceptanceState:
+    def __init__(self):
+        import numpy as np
+
+        self.mode = "MANUAL"
+        self.tracker_state = "BOOT"
+        self.loc = "LIVE"
+        self.stream = "WAIT"
+        self.pose = np.zeros(4, dtype=float)
+        self.inliers = 0
+        self.reproj = None
+        self.battery_pct = 0.0
+        self.altitude_m = 0.0
+        self.gimbal_pitch_deg = -20.0
+        self.zoom = 1.0
+        self.link_latency_ms = 280.0
+        self.stream_fps = 0.0
+        self.stream_mbps = 5.0
+        self.last_command = "ready"
+        self.att_roll = 0.0
+        self.att_pitch = 0.0
+        self.att_yaw = 0.0
+
+
+class _AcceptanceAnafi:
+    gimbal_pitch_min_deg = -90.0
+    gimbal_pitch_max_deg = 90.0
+    digital_zoom_max = 3.0
+    stream_latency_ms = 280.0
+    stream_fps = 30.0
+    stream_mbps = 5.0
+    takeoff_hover_m = 1.0
+
+
 class LiveAcceptance:
     def __init__(self, ip: str, controller: str, *, fly: bool, nudge_pct: int, nudge_s: float,
                  out_dir: Path):
@@ -201,207 +235,205 @@ class LiveAcceptance:
             time.sleep(0.05)
         return n, last
 
-    def run(self) -> int:
-        from olympe_live_backend import OlympeLiveBackend
-        from backend_contract import ControlAction, ControlRequest, ControlResult
-
-        # Minimal stand-ins for OperatorApp state/profile
-        class _State:
-            def __init__(self):
-                self.mode = "MANUAL"
-                self.tracker_state = "BOOT"
-                self.loc = "LIVE"
-                self.stream = "WAIT"
-                self.pose = __import__("numpy").zeros(4, dtype=float)
-                self.inliers = 0
-                self.reproj = None
-                self.battery_pct = 0.0
-                self.altitude_m = 0.0
-                self.gimbal_pitch_deg = -20.0
-                self.zoom = 1.0
-                self.link_latency_ms = 280.0
-                self.stream_fps = 0.0
-                self.stream_mbps = 5.0
-                self.last_command = "ready"
-                self.att_roll = 0.0
-                self.att_pitch = 0.0
-                self.att_yaw = 0.0
-
-        class _Anafi:
-            gimbal_pitch_min_deg = -90.0
-            gimbal_pitch_max_deg = 90.0
-            digital_zoom_max = 3.0
-            stream_latency_ms = 280.0
-            stream_fps = 30.0
-            stream_mbps = 5.0
-            takeoff_hover_m = 1.0
-
-        self.log("begin", ip=self.ip, controller=self.controller, fly=self.fly)
-
-        # ---- A connect ----
+    def _connect_backend(self, backend_type) -> bool:
         try:
-            self.backend = OlympeLiveBackend(
-                _State, _Anafi(),
-                ip=self.ip, controller=self.controller,
-                nudge_pct=self.nudge_pct, nudge_pulse_s=self.nudge_s,
+            self.backend = backend_type(
+                _AcceptanceState,
+                _AcceptanceAnafi(),
+                ip=self.ip,
+                controller=self.controller,
+                nudge_pct=self.nudge_pct,
+                nudge_pulse_s=self.nudge_s,
                 cmd_log=self.log_path.with_suffix(".backend.jsonl"),
                 with_video=True,
             )
-            self.report.add("A_connect", True, f"drone={self.backend.drone is not None}")
+            self.report.add(
+                "A_connect",
+                True,
+                f"drone={self.backend.drone is not None}",
+            )
+            return True
         except Exception as exc:
             self.report.add("A_connect", False, repr(exc))
             self.cleanup()
-            return 2
+            return False
 
-        # ---- A2 telemetry ----
-        bat = self._battery()
-        fly_st = self._flying_state()
-        self.log("telemetry", battery=bat, flying_state=fly_st)
+    def _check_telemetry(self) -> str:
+        battery = self._battery()
+        flying_state = self._flying_state()
+        self.log("telemetry", battery=battery, flying_state=flying_state)
         self.report.add(
             "A_telemetry",
-            bat is not None and bat > 0,
-            f"battery={bat}% flying_state={fly_st}",
+            battery is not None and battery > 0,
+            f"battery={battery}% flying_state={flying_state}",
         )
-        if bat is not None and bat < 20:
-            self.report.add("A_battery_floor", False, f"battery {bat}% < 20 — abort fly")
+        if battery is not None and battery < 20:
+            self.report.add(
+                "A_battery_floor",
+                False,
+                f"battery {battery}% < 20 — abort fly",
+            )
             self.fly = False
+        return flying_state
 
-        # ---- B video ----
-        n, last = self._wait_frames(5.0)
-        ok_v = n >= 5 and last is not None
-        detail = f"frames={n}"
-        if last is not None:
-            try:
-                import cv2
-                import numpy as np
-                arr = np.asarray(last)
-                if arr.ndim == 3 and arr.shape[2] == 3:
-                    bgr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
-                else:
-                    bgr = arr
-                cv2.imwrite(str(self.sample_png), bgr)
-                detail += f" shape={getattr(last, 'size', arr.shape)} saved={self.sample_png.name}"
-            except Exception as exc:
-                detail += f" save_err={exc!r}"
-        grab_fps = float(getattr(self.backend.grabber, "fps", 0.0) or 0.0) if self.backend.grabber else 0.0
-        detail += f" grabber_fps~{grab_fps:.1f}"
-        self.report.add("B_video_frames", ok_v, detail)
+    def _save_video_sample(self, frame) -> str:
+        if frame is None:
+            return ""
+        try:
+            import cv2
+            import numpy as np
 
-        # ---- C gimbal + zoom on ground ----
+            array = np.asarray(frame)
+            image = (
+                cv2.cvtColor(array, cv2.COLOR_RGB2BGR)
+                if array.ndim == 3 and array.shape[2] == 3
+                else array
+            )
+            cv2.imwrite(str(self.sample_png), image)
+            shape = getattr(frame, "size", array.shape)
+            return f" shape={shape} saved={self.sample_png.name}"
+        except Exception as exc:
+            return f" save_err={exc!r}"
+
+    def _check_video(self) -> None:
+        frame_count, last_frame = self._wait_frames(5.0)
+        detail = f"frames={frame_count}" + self._save_video_sample(last_frame)
+        grabber = self.backend.grabber
+        grabber_fps = float(getattr(grabber, "fps", 0.0) or 0.0) if grabber else 0.0
+        detail += f" grabber_fps~{grabber_fps:.1f}"
+        self.report.add(
+            "B_video_frames",
+            frame_count >= 5 and last_frame is not None,
+            detail,
+        )
+
+    def _check_ground_camera(self) -> None:
         try:
             pitch_first_ok = bool(self.backend.set_gimbal_pitch(-45.0))
             time.sleep(0.8)
             pitch_second_ok = bool(self.backend.set_gimbal_pitch(-10.0))
             time.sleep(0.6)
-            reset_ok = bool(self.backend.reset_camera_defaults(pitch=-20.0, zoom=1.0))
+            reset_ok = bool(
+                self.backend.reset_camera_defaults(pitch=-20.0, zoom=1.0)
+            )
             time.sleep(0.6)
             pitch_state = self.backend.state.gimbal_pitch_deg
             zoom_state = self.backend.state.zoom
-            gimbal_ok = (
-                isinstance(pitch_state, (int, float))
-                and abs(float(pitch_state) - (-20.0)) <= 3.0
-            )
-            zoom_ok = (
-                isinstance(zoom_state, (int, float))
-                and abs(float(zoom_state) - 1.0) <= 1e-6
-            )
-            camera_commands_ok = pitch_first_ok and pitch_second_ok and reset_ok
+            gimbal_ok = isinstance(pitch_state, (int, float)) and abs(
+                float(pitch_state) + 20.0
+            ) <= 3.0
+            zoom_ok = isinstance(zoom_state, (int, float)) and abs(
+                float(zoom_state) - 1.0
+            ) <= 1e-6
+            commands_ok = pitch_first_ok and pitch_second_ok and reset_ok
             self.report.add(
                 "C_gimbal_zoom",
-                bool(camera_commands_ok and gimbal_ok and zoom_ok),
-                f"commands={camera_commands_ok} pitch_state={pitch_state} "
+                bool(commands_ok and gimbal_ok and zoom_ok),
+                f"commands={commands_ok} pitch_state={pitch_state} "
                 f"(want -20+/-3) zoom={zoom_state} (want 1.0)",
             )
         except Exception as exc:
             self.report.add("C_gimbal_zoom", False, repr(exc))
 
-        if not self.fly:
-            self.report.skip("D_takeoff", "not run (--no-fly)")
-            self.report.skip("E_nudges", "not run (--no-fly)")
-            self.report.skip("F_freeze_resume", "not run (--no-fly)")
-            self.report.skip("G_camera_air", "not run (--no-fly)")
-            self.report.skip("H_land", "not run (--no-fly)")
-            self.cleanup()
-            return 1 if any(c.ok is False for c in self.report.checks) else 0
+    def _finish_ground_only(self) -> int:
+        for name in (
+            "D_takeoff",
+            "E_nudges",
+            "F_freeze_resume",
+            "G_camera_air",
+            "H_land",
+        ):
+            self.report.skip(name, "not run (--no-fly)")
+        self.cleanup()
+        return 1 if any(check.ok is False for check in self.report.checks) else 0
 
-        # ---- D takeoff ----
-        if fly_st not in {"landed", "Landed", "0"} and "landed" not in fly_st.lower():
-            # already flying? still try hover path
-            self.log("pre_takeoff_state", flying_state=fly_st)
+    def _takeoff(self, control_action, control_request, control_result, flying_state: str) -> bool:
+        if flying_state not in {"landed", "Landed", "0"} and "landed" not in flying_state.lower():
+            self.log("pre_takeoff_state", flying_state=flying_state)
         try:
-            takeoff_result = self.backend.command(
-                ControlRequest.create(ControlAction.TAKEOFF, human_origin=True)
+            result = self.backend.command(
+                control_request.create(control_action.TAKEOFF, human_origin=True)
             )
             time.sleep(1.0)
-            st_after = self._flying_state()
+            state_after = self._flying_state()
             accepted = (
-                bool(takeoff_result.accepted)
-                if isinstance(takeoff_result, ControlResult)
-                else bool(takeoff_result)
+                bool(result.accepted)
+                if isinstance(result, control_result)
+                else bool(result)
             )
-            ok_to = accepted and (
-                "hover" in st_after.lower()
+            succeeded = accepted and (
+                "hover" in state_after.lower()
                 or self.backend.state.tracker_state == "HOVER"
             )
-            # also accept takeoff success log state
             if self.backend.state.tracker_state == "TAKEOFF_FAIL":
-                ok_to = False
-            self.report.add("D_takeoff", ok_to, f"flying_state={st_after} tracker={self.backend.state.tracker_state}")
-            if not ok_to:
+                succeeded = False
+            self.report.add(
+                "D_takeoff",
+                succeeded,
+                f"flying_state={state_after} tracker={self.backend.state.tracker_state}",
+            )
+            if not succeeded:
                 self.backend.land_cmd("takeoff_failed")
                 self.cleanup()
-                return 1
+            return succeeded
         except Exception as exc:
             self.report.add("D_takeoff", False, repr(exc))
-            try:
-                self.backend.land_cmd("takeoff_exception")
-            except Exception as land_exc:
-                # A failed emergency land is the single most important thing to
-                # report from this handler, not the least.
-                self.report.add("D_takeoff_land", False, repr(land_exc))
-                print(f"[acceptance] emergency land FAILED: {land_exc!r}", flush=True)
+            self._land_after_takeoff_exception()
             self.cleanup()
-            return 1
+            return False
 
-        # hover settle
-        self.backend.hover_cmd("post_takeoff_settle")
-        time.sleep(2.0)
+    def _land_after_takeoff_exception(self) -> None:
+        try:
+            self.backend.land_cmd("takeoff_exception")
+        except Exception as exc:
+            self.report.add("D_takeoff_land", False, repr(exc))
+            print(f"[acceptance] emergency land FAILED: {exc!r}", flush=True)
 
-        # ---- E nudges ----
-        nudge_ok = True
-        nudge_details = []
+    def _check_nudges(self) -> None:
+        succeeded = True
+        details = []
         for name in ("前", "後", "左", "右", "上", "下", "右上前"):
             try:
-                # nudge() discards the accept/reject result, so a run in which EVERY
-                # nudge was refused used to report PASS. Use the guarded entry point.
                 accepted = bool(self.backend.nudge_begin(name))
                 time.sleep(self.nudge_s + 0.55)
                 self.backend.nudge_end(name)
                 self.backend.hover_cmd(f"after_{name}")
                 time.sleep(0.35)
-                if not accepted:
-                    nudge_ok = False
-                nudge_details.append(f"{name}={'ok' if accepted else 'REFUSED'}")
+                succeeded = succeeded and accepted
+                details.append(f"{name}={'ok' if accepted else 'REFUSED'}")
             except Exception as exc:
-                nudge_ok = False
-                nudge_details.append(f"{name}=ERR:{exc!r}")
-        self.report.add("E_nudges", nudge_ok, "; ".join(nudge_details))
+                succeeded = False
+                details.append(f"{name}=ERR:{exc!r}")
+        self.report.add("E_nudges", succeeded, "; ".join(details))
 
-        # ---- F freeze / resume (direct: freeze PC PCMD) ----
+    def _check_freeze_resume(self) -> None:
         try:
             self.backend.give_to_pilot()
-            blocked = not self.backend.send_pcmd(0, 10, 0, 0, reason="should_block")
+            blocked = not self.backend.send_pcmd(
+                0,
+                10,
+                0,
+                0,
+                reason="should_block",
+            )
             self.backend.take_pc_control()
-            resumed = self.backend.send_pcmd(0, 0, 0, 0, reason="after_resume")
+            resumed = self.backend.send_pcmd(
+                0,
+                0,
+                0,
+                0,
+                reason="after_resume",
+            )
             self.report.add(
                 "F_freeze_resume",
                 blocked and resumed,
-                f"blocked={blocked} resumed={resumed} tracker={self.backend.state.tracker_state}",
+                f"blocked={blocked} resumed={resumed} "
+                f"tracker={self.backend.state.tracker_state}",
             )
         except Exception as exc:
             self.report.add("F_freeze_resume", False, repr(exc))
 
-        # ---- G camera in air ----
+    def _check_air_camera(self) -> None:
         try:
             pitch_ok = bool(self.backend.set_gimbal_pitch(-30.0))
             time.sleep(0.7)
@@ -417,32 +449,63 @@ class LiveAcceptance:
         except Exception as exc:
             self.report.add("G_camera_air", False, repr(exc))
 
-        # more video while airborne
-        n2, _ = self._wait_frames(2.5)
-        self.report.add("B2_video_in_air", n2 >= 3, f"frames={n2}")
+    def _check_air_video(self) -> None:
+        frame_count, _frame = self._wait_frames(2.5)
+        self.report.add("B2_video_in_air", frame_count >= 3, f"frames={frame_count}")
 
-        # ---- H land ----
+    def _check_landing(self) -> None:
         try:
             self.backend.land_cmd("acceptance_end")
-            # wait for landed
-            t0 = time.monotonic()
+            started_at = time.monotonic()
             landed = False
-            while time.monotonic() - t0 < 20.0:
-                st = self._flying_state()
-                if "land" in st.lower():
+            while time.monotonic() - started_at < 20.0:
+                if "land" in self._flying_state().lower():
                     landed = True
                     break
                 time.sleep(0.4)
-            self.report.add("H_land", landed, f"flying_state={self._flying_state()}")
+            self.report.add(
+                "H_land",
+                landed,
+                f"flying_state={self._flying_state()}",
+            )
         except Exception as exc:
             self.report.add("H_land", False, repr(exc))
 
+    def _finish_report(self) -> int:
         self.cleanup()
         summary = self.report.summary()
         print("\n==== ACCEPTANCE SUMMARY ====", flush=True)
         print(json.dumps(summary, ensure_ascii=False, indent=2), flush=True)
         print(f"summary file: {self.summary_path}", flush=True)
         return 0 if summary["all_ok"] else 1
+
+    def run(self) -> int:
+        from backend_contract import ControlAction, ControlRequest, ControlResult
+        from olympe_live_backend import OlympeLiveBackend
+
+        self.log("begin", ip=self.ip, controller=self.controller, fly=self.fly)
+        if not self._connect_backend(OlympeLiveBackend):
+            return 2
+        flying_state = self._check_telemetry()
+        self._check_video()
+        self._check_ground_camera()
+        if not self.fly:
+            return self._finish_ground_only()
+        if not self._takeoff(
+            ControlAction,
+            ControlRequest,
+            ControlResult,
+            flying_state,
+        ):
+            return 1
+        self.backend.hover_cmd("post_takeoff_settle")
+        time.sleep(2.0)
+        self._check_nudges()
+        self._check_freeze_resume()
+        self._check_air_camera()
+        self._check_air_video()
+        self._check_landing()
+        return self._finish_report()
 
 
 def main() -> int:

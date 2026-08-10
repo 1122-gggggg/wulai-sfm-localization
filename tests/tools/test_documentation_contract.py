@@ -10,7 +10,6 @@ LIVING_DOCUMENTS = (
     ROOT / "README.md",
     ROOT / "文件" / "ARCHITECTURE.md",
     ROOT / "文件" / "SYSTEM_SPEC.md",
-    ROOT / "定位演算法" / "README.md",
     ROOT / "定位演算法" / "flight_control" / "README.md",
     ROOT / "定位演算法" / "deploy_code" / "sfm_glomap_deploy" / "README.md",
     ROOT / "控制介面程式" / "README.md",

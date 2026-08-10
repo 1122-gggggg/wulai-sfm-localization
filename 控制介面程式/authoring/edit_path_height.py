@@ -101,6 +101,60 @@ def _draw(wp, closed, sel):
         col.objects.link(m)
 
 
+def _height_edit_event(operator, context, event):
+    e = event.type
+    if e == "LEFTMOUSE" and event.value == "PRESS":
+        operator._sel = operator._pick(context, event)
+        _draw(operator._wp, operator._closed, operator._sel)
+        operator._status(context)
+        return {"RUNNING_MODAL"}
+
+    if e in {"WHEELUPMOUSE", "WHEELDOWNMOUSE"} and event.value == "PRESS":
+        operator._wp[operator._sel][2] += ALT_STEP if e == "WHEELUPMOUSE" else -ALT_STEP
+        _draw(operator._wp, operator._closed, operator._sel)
+        operator._status(context)
+        return {"RUNNING_MODAL"}
+
+    if e in {"PAGE_UP", "PAGE_DOWN"} and event.value == "PRESS":
+        operator._wp[operator._sel][2] += ALT_STEP_BIG if e == "PAGE_UP" else -ALT_STEP_BIG
+        _draw(operator._wp, operator._closed, operator._sel)
+        operator._status(context)
+        return {"RUNNING_MODAL"}
+
+    if e in {"LEFT_BRACKET", "RIGHT_BRACKET"} and event.value == "PRESS":
+        operator._sel = (operator._sel + (1 if e == "RIGHT_BRACKET" else -1)) % len(operator._wp)
+        _draw(operator._wp, operator._closed, operator._sel)
+        operator._status(context)
+        return {"RUNNING_MODAL"}
+
+    if e == "L" and event.value == "PRESS" and len(operator._wp) >= 2:
+        z0, z1 = operator._wp[0][2], operator._wp[-1][2]
+        for i in range(len(operator._wp)):
+            operator._wp[i][2] = z0 + (z1 - z0) * i / (len(operator._wp) - 1)
+        _draw(operator._wp, operator._closed, operator._sel)
+        operator._status(context)
+        return {"RUNNING_MODAL"}
+    return None
+
+
+def _height_finish_event(operator, context, event):
+    e = event.type
+    if e == "S" and event.value == "PRESS":
+        _save(operator._wp, operator._closed)
+        operator.report({"INFO"}, "saved heights")
+        return {"RUNNING_MODAL"}
+
+    if e in {"RET", "NUMPAD_ENTER", "ESC"} and event.value == "PRESS":
+        _save(operator._wp, operator._closed)
+        context.area.header_text_set(None)
+        operator.report({"INFO"}, f"done, {len(operator._wp)} waypoints saved")
+        return {"FINISHED"}
+
+    if e in {"MIDDLEMOUSE", "TRACKPADPAN", "TRACKPADZOOM"} or e.startswith("NUMPAD_"):
+        return {"PASS_THROUGH"}
+    return None
+
+
 class PATH_OT_edit_height(bpy.types.Operator):
     bl_idname = "view3d.edit_path_height"
     bl_label = "Edit Path Height"
@@ -149,35 +203,14 @@ class PATH_OT_edit_height(bpy.types.Operator):
             return {"PASS_THROUGH"}
         if event.alt:
             return {"PASS_THROUGH"}
-        e = event.type
-        if e == "LEFTMOUSE" and event.shift:             # Shift+LMB = pan (global keymap)
+        if event.type == "LEFTMOUSE" and event.shift:   # Shift+LMB = pan (global keymap)
             return {"PASS_THROUGH"}
-        if e == "LEFTMOUSE" and event.value == "PRESS":
-            self._sel = self._pick(context, event)
-            _draw(self._wp, self._closed, self._sel); self._status(context); return {"RUNNING_MODAL"}
-        if e in {"WHEELUPMOUSE", "WHEELDOWNMOUSE"} and event.value == "PRESS":
-            self._wp[self._sel][2] += ALT_STEP if e == "WHEELUPMOUSE" else -ALT_STEP
-            _draw(self._wp, self._closed, self._sel); self._status(context); return {"RUNNING_MODAL"}
-        if e in {"PAGE_UP", "PAGE_DOWN"} and event.value == "PRESS":
-            self._wp[self._sel][2] += ALT_STEP_BIG if e == "PAGE_UP" else -ALT_STEP_BIG
-            _draw(self._wp, self._closed, self._sel); self._status(context); return {"RUNNING_MODAL"}
-        if e in {"LEFT_BRACKET", "RIGHT_BRACKET"} and event.value == "PRESS":
-            self._sel = (self._sel + (1 if e == "RIGHT_BRACKET" else -1)) % len(self._wp)
-            _draw(self._wp, self._closed, self._sel); self._status(context); return {"RUNNING_MODAL"}
-        if e == "L" and event.value == "PRESS" and len(self._wp) >= 2:
-            z0, z1 = self._wp[0][2], self._wp[-1][2]
-            for i in range(len(self._wp)):
-                self._wp[i][2] = z0 + (z1 - z0) * i / (len(self._wp) - 1)
-            _draw(self._wp, self._closed, self._sel); self._status(context); return {"RUNNING_MODAL"}
-        if e == "S" and event.value == "PRESS":
-            _save(self._wp, self._closed); self.report({"INFO"}, "saved heights")
-            return {"RUNNING_MODAL"}
-        if e in {"RET", "NUMPAD_ENTER", "ESC"} and event.value == "PRESS":
-            _save(self._wp, self._closed); context.area.header_text_set(None)
-            self.report({"INFO"}, f"done, {len(self._wp)} waypoints saved")
-            return {"FINISHED"}
-        if e in {"MIDDLEMOUSE", "TRACKPADPAN", "TRACKPADZOOM"} or e.startswith("NUMPAD_"):
-            return {"PASS_THROUGH"}
+        result = _height_edit_event(self, context, event)
+        if result is not None:
+            return result
+        result = _height_finish_event(self, context, event)
+        if result is not None:
+            return result
         return {"RUNNING_MODAL"}
 
 

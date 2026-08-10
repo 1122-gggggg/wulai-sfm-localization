@@ -150,18 +150,7 @@ def _verify_sha256(path: Path, expected: str, label: str) -> None:
         )
 
 
-def _validate_flight_route(profile: SiteProfile) -> None:
-    assert profile.flight is not None
-    assert profile.route_json is not None
-    try:
-        route = json.loads(
-            profile.route_json.read_text(encoding="utf-8"),
-            parse_constant=_reject_json_constant,
-        )
-    except OSError as exc:
-        raise ValueError(f"cannot read flight route {profile.route_json}: {exc}") from exc
-    except (json.JSONDecodeError, ValueError) as exc:
-        raise ValueError(f"invalid flight route JSON {profile.route_json}: {exc}") from exc
+def _validate_flight_route_metadata(profile: SiteProfile, route) -> None:
     expected = {
         "schema": "sfm-flight-route/v1",
         "site_id": profile.site_id,
@@ -182,6 +171,9 @@ def _validate_flight_route(profile: SiteProfile) -> None:
         )
     if route.get("frame") not in {"aligned", "glomap"}:
         raise ValueError("flight route frame must be 'aligned' or 'glomap'")
+
+
+def _validate_flight_route_geometry(route) -> None:
     waypoints = route.get("waypoints")
     if not isinstance(waypoints, list) or len(waypoints) < 2:
         raise ValueError("flight route must contain at least two waypoints")
@@ -207,6 +199,22 @@ def _validate_flight_route(profile: SiteProfile) -> None:
         length_sq = sum((b - a) ** 2 for a, b in zip(start, end))
         if length_sq <= 1e-18:
             raise ValueError(f"flight route segment {index}->{index + 1} has zero length")
+
+
+def _validate_flight_route(profile: SiteProfile) -> None:
+    assert profile.flight is not None
+    assert profile.route_json is not None
+    try:
+        route = json.loads(
+            profile.route_json.read_text(encoding="utf-8"),
+            parse_constant=_reject_json_constant,
+        )
+    except OSError as exc:
+        raise ValueError(f"cannot read flight route {profile.route_json}: {exc}") from exc
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise ValueError(f"invalid flight route JSON {profile.route_json}: {exc}") from exc
+    _validate_flight_route_metadata(profile, route)
+    _validate_flight_route_geometry(route)
 
 
 def validate_profile_flight_assets(profile: SiteProfile) -> None:
@@ -270,14 +278,7 @@ def validate_profile_flight_assets(profile: SiteProfile) -> None:
         _verify_sha256(path, expected, label)
 
 
-def shadow_readiness_errors(profile: SiteProfile) -> list[str]:
-    """Return offline blockers for a map-unit shadow-algorithm session.
-
-    This checks the inputs that can be verified before travelling to the site.
-    It deliberately does *not* require flight approval or a controller contract:
-    shadow mode computes and records recommendations only, never commands an
-    aircraft.
-    """
+def _shadow_required_errors(profile: SiteProfile) -> list[str]:
     errors: list[str] = []
     flight = profile.flight
     if flight is None or not flight.coordinate_frame_id:
@@ -292,14 +293,11 @@ def shadow_readiness_errors(profile: SiteProfile) -> list[str]:
         errors.append("missing query_camera")
     if profile.localizer != "edm" or profile.localizer_profile is None:
         errors.append("missing EDM localizer_profile")
-    if errors:
-        return errors
+    return errors
 
-    try:
-        _validate_flight_route(profile)
-    except ValueError as exc:
-        errors.append(str(exc))
 
+def _shadow_pinned_asset_errors(profile: SiteProfile) -> list[str]:
+    errors: list[str] = []
     checks = (
         (profile.map_ply, profile.asset_sha256.map_ply, "map_ply"),
         (
@@ -330,6 +328,26 @@ def shadow_readiness_errors(profile: SiteProfile) -> list[str]:
                 _verify_sha256(path, expected, label)
             except ValueError as exc:
                 errors.append(str(exc))
+    return errors
+
+
+def shadow_readiness_errors(profile: SiteProfile) -> list[str]:
+    """Return offline blockers for a map-unit shadow-algorithm session.
+
+    This checks the inputs that can be verified before travelling to the site.
+    It deliberately does *not* require flight approval or a controller contract:
+    shadow mode computes and records recommendations only, never commands an
+    aircraft.
+    """
+    errors = _shadow_required_errors(profile)
+    if errors:
+        return errors
+
+    try:
+        _validate_flight_route(profile)
+    except ValueError as exc:
+        errors.append(str(exc))
+    errors.extend(_shadow_pinned_asset_errors(profile))
     return errors
 
 
@@ -525,77 +543,16 @@ def run(cmd: list[str], env: dict[str, str] | None = None) -> None:
 DEFAULT_PYTHON = os.environ.get("SFM_LOCALIZER_PYTHON") or sys.executable
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Unified mission authoring / flight pipeline.")
-    parser.add_argument(
-        "--site-profile",
-        default=os.environ.get("SFM_SITE_PROFILE", ""),
-        help="JSON profile that atomically selects this site's map and mission assets",
-    )
-    parser.add_argument(
-        "--allow-legacy-assets",
-        action="store_true",
-        help=(
-            "migration escape hatch: allow per-asset/default paths without a site profile; "
-            "never use for an unreviewed real-flight run"
-        ),
-    )
-    parser.add_argument("--python", default=DEFAULT_PYTHON)
-    parser.add_argument(
-        "--mode",
-        choices=[
-            "launch-blender",
-            "draw-path",
-            "draw-poles",
-            "draw-wires",
-            "label-route",
-            "edit-height",
-            "sync-path",
-            "sync-poles",
-            "plan-path",
-            "flight-selftest",
-            "dry-run",
-            "shadow-readiness",
-            "grab-only",
-            "fly",
-            "safety-auto",
-            "safety-hover",
-            "safety-manual",
-            "safety-land",
-        ],
-        required=True,
-    )
-    parser.add_argument("--map-ply", default=None)
-    parser.add_argument("--bundle", default=None)
-    parser.add_argument("--megaloc-cache", default=None)
-    parser.add_argument("--reference-index", default=None)
-    parser.add_argument("--reference-index-sha256", default=None)
-    parser.add_argument("--track-landmarks", default=None)
-    parser.add_argument("--path-json", default=None)
-    parser.add_argument("--poles-json", default=None)
-    parser.add_argument("--safezone-dir", default=None)
-    parser.add_argument("--ip", default="192.168.42.1")
-    parser.add_argument("--controller", default=os.environ.get("SFM_OLYMPE_CONTROLLER", "auto"))
-    parser.add_argument("--safety-file", default=str(DEFAULT_SAFETY_FILE))
-    parser.add_argument("--secs", type=float, default=20.0)
-    parser.add_argument("--yaw-sign", type=int, choices=(-1, 1), default=1)
-    args, passthrough = parser.parse_known_args()
-
-    # Emergency safety commands must remain available even when map/profile
-    # assets are missing or misconfigured.
+def _handle_safety_mode(args) -> bool:
     if args.mode.startswith("safety-"):
         cmd = args.mode.removeprefix("safety-")
         write_safety_command(args.safety_file, cmd)
         print(f"[mission_pipeline] safety command -> {cmd} ({args.safety_file})", flush=True)
-        return
+        return True
+    return False
 
-    site_profile = resolve_mission_site_assets(args, parser, mode=args.mode)
 
-    if args.safezone_dir:
-        safezone = Path(args.safezone_dir)
-        args.path_json = str(safezone / "flight_path.json")
-        args.poles_json = str(safezone / "poles.json")
-
+def _print_site_selection(args, site_profile: SiteProfile | None) -> None:
     if site_profile is not None:
         print(
             f"[mission_pipeline] site={site_profile.site_id!r} "
@@ -610,30 +567,29 @@ def main() -> None:
             flush=True,
         )
 
-    if args.mode == "shadow-readiness":
-        assert site_profile is not None
-        shadow_errors = shadow_readiness_errors(site_profile)
-        authorization_blockers = shadow_authorization_blockers(site_profile)
-        print(
-            "[shadow-readiness] package="
-            + ("READY" if not shadow_errors else "BLOCKED"),
-            flush=True,
-        )
-        for error in shadow_errors:
-            print(f"  package blocker: {error}", flush=True)
-        print(
-            "[shadow-readiness] autonomous execution="
-            + ("APPROVED" if not authorization_blockers else "BLOCKED"),
-            flush=True,
-        )
-        for blocker in authorization_blockers:
-            print(f"  human/field blocker: {blocker}", flush=True)
-        if shadow_errors:
-            raise SystemExit(1)
-        return
 
-    env = env_with_mission(args, site_profile)
+def _run_shadow_readiness(profile: SiteProfile) -> None:
+    shadow_errors = shadow_readiness_errors(profile)
+    authorization_blockers = shadow_authorization_blockers(profile)
+    print(
+        "[shadow-readiness] package="
+        + ("READY" if not shadow_errors else "BLOCKED"),
+        flush=True,
+    )
+    for error in shadow_errors:
+        print(f"  package blocker: {error}", flush=True)
+    print(
+        "[shadow-readiness] autonomous execution="
+        + ("APPROVED" if not authorization_blockers else "BLOCKED"),
+        flush=True,
+    )
+    for blocker in authorization_blockers:
+        print(f"  human/field blocker: {blocker}", flush=True)
+    if shadow_errors:
+        raise SystemExit(1)
 
+
+def _run_mission_mode(args, passthrough, env) -> None:
     if args.mode == "launch-blender":
         run([args.python, str(AUTHOR / "blender_mcp_launch.py"), *passthrough], env)
         return
@@ -697,6 +653,85 @@ def main() -> None:
             ],
             env,
         )
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Unified mission authoring / flight pipeline.")
+    parser.add_argument(
+        "--site-profile",
+        default=os.environ.get("SFM_SITE_PROFILE", ""),
+        help="JSON profile that atomically selects this site's map and mission assets",
+    )
+    parser.add_argument(
+        "--allow-legacy-assets",
+        action="store_true",
+        help=(
+            "migration escape hatch: allow per-asset/default paths without a site profile; "
+            "never use for an unreviewed real-flight run"
+        ),
+    )
+    parser.add_argument("--python", default=DEFAULT_PYTHON)
+    parser.add_argument(
+        "--mode",
+        choices=[
+            "launch-blender",
+            "draw-path",
+            "draw-poles",
+            "draw-wires",
+            "label-route",
+            "edit-height",
+            "sync-path",
+            "sync-poles",
+            "plan-path",
+            "flight-selftest",
+            "dry-run",
+            "shadow-readiness",
+            "grab-only",
+            "fly",
+            "safety-auto",
+            "safety-hover",
+            "safety-manual",
+            "safety-land",
+        ],
+        required=True,
+    )
+    parser.add_argument("--map-ply", default=None)
+    parser.add_argument("--bundle", default=None)
+    parser.add_argument("--megaloc-cache", default=None)
+    parser.add_argument("--reference-index", default=None)
+    parser.add_argument("--reference-index-sha256", default=None)
+    parser.add_argument("--track-landmarks", default=None)
+    parser.add_argument("--path-json", default=None)
+    parser.add_argument("--poles-json", default=None)
+    parser.add_argument("--safezone-dir", default=None)
+    parser.add_argument("--ip", default="192.168.42.1")
+    parser.add_argument("--controller", default=os.environ.get("SFM_OLYMPE_CONTROLLER", "auto"))
+    parser.add_argument("--safety-file", default=str(DEFAULT_SAFETY_FILE))
+    parser.add_argument("--secs", type=float, default=20.0)
+    parser.add_argument("--yaw-sign", type=int, choices=(-1, 1), default=1)
+    args, passthrough = parser.parse_known_args()
+
+    # Emergency safety commands must remain available even when map/profile
+    # assets are missing or misconfigured.
+    if _handle_safety_mode(args):
+        return
+
+    site_profile = resolve_mission_site_assets(args, parser, mode=args.mode)
+
+    if args.safezone_dir:
+        safezone = Path(args.safezone_dir)
+        args.path_json = str(safezone / "flight_path.json")
+        args.poles_json = str(safezone / "poles.json")
+
+    _print_site_selection(args, site_profile)
+
+    if args.mode == "shadow-readiness":
+        assert site_profile is not None
+        _run_shadow_readiness(site_profile)
+        return
+
+    env = env_with_mission(args, site_profile)
+    _run_mission_mode(args, passthrough, env)
 
 
 if __name__ == "__main__":

@@ -30,7 +30,7 @@ def test_summary_groups_production_findings_and_ignores_tests() -> None:
     assert summary["control"]["max_complexity"] == 72
 
 
-def test_budget_rejects_new_violation_and_higher_worst_case() -> None:
+def test_zero_budget_rejects_any_violation() -> None:
     summary = {
         group: {
             "violations": budget["violations"],
@@ -39,10 +39,10 @@ def test_budget_rejects_new_violation_and_higher_worst_case() -> None:
         }
         for group, budget in BUDGETS.items()
     }
-    summary["tools"]["violations"] = 5
-    summary["flight"]["max_complexity"] = 87
+    summary["tools"]["violations"] = 1
+    summary["flight"]["max_complexity"] = 11
 
     assert budget_failures(summary) == [
-        "tools violations increased: 5 > 4",
-        "flight max_complexity increased: 87 > 86",
+        "tools violations increased: 1 > 0",
+        "flight max_complexity increased: 11 > 0",
     ]

@@ -29,6 +29,7 @@ grabber with PROPS OFF (--selftest-live just grabs video, never arms motors).
 Only fly run_real() in open space, with a human holding the manual-override
 controller, after verifying PCMD signs on YOUR airframe. Speeds are tiny. !!!
 """
+
 from __future__ import annotations
 
 import argparse
@@ -46,7 +47,7 @@ DRONE_IP_SIM = "10.202.0.1"
 # check (fresh timestamps, frozen picture): localization returns a constant pose
 # while the drone physically drifts. Real decoded video has sensor noise, so
 # byte-identical consecutive frames only happen on a pipeline freeze/duplication.
-FROZEN_DUP_FRAMES = 15          # consecutive identical frames -> stream unhealthy (~0.5s @30fps)
+FROZEN_DUP_FRAMES = 15  # consecutive identical frames -> stream unhealthy (~0.5s @30fps)
 
 
 # ----------------------------- connection ----------------------------------
@@ -60,6 +61,7 @@ def connect(ip: str = DRONE_IP_REAL, controller: str = "auto"):
     Reuse this one controller object for BOTH video streaming and PCMD control.
     """
     import olympe
+
     ctrl = str(controller or "auto").lower()
     if ctrl == "auto":
         ctrl = "skycontroller3" if str(ip) == DRONE_IP_SKYCTRL else "drone"
@@ -68,7 +70,9 @@ def connect(ip: str = DRONE_IP_REAL, controller: str = "auto"):
     elif ctrl in {"drone", "anafi", "direct"}:
         klass = getattr(olympe, "Anafi", None) or getattr(olympe, "Drone")
     else:
-        raise SystemExit(f"unsupported Olympe controller={controller}; use auto, drone, anafi, skycontroller3")
+        raise SystemExit(
+            f"unsupported Olympe controller={controller}; use auto, drone, anafi, skycontroller3"
+        )
     drone = klass(ip)
     # retry=3 matches official examples; SC needs a moment after USB discovery.
     try:
@@ -101,9 +105,14 @@ class OlympePdrawGrabber:
     look fresh to the flight controller.
     """
 
-    def __init__(self, drone, resize: tuple | None = (1280, 720), stale_s: float = 0.5,
-                 media_name: str = "Front camera",
-                 require_source_timestamps: bool = False):
+    def __init__(
+        self,
+        drone,
+        resize: tuple | None = (1280, 720),
+        stale_s: float = 0.5,
+        media_name: str = "Front camera",
+        require_source_timestamps: bool = False,
+    ):
         self.drone = drone
         self.resize = resize
         self.stale_s = stale_s
@@ -114,15 +123,15 @@ class OlympePdrawGrabber:
         self.require_source_timestamps = bool(require_source_timestamps)
         self._lock = threading.Lock()
         self._frame_cv = threading.Condition(self._lock)
-        self._latest = None          # RGB uint8 HxWx3
-        self._latest_timing = {}     # host monotonic_ns pipeline markers
+        self._latest = None  # RGB uint8 HxWx3
+        self._latest_timing = {}  # host monotonic_ns pipeline markers
         self._stamp = 0.0
-        self._n = 0                  # frames received (for fps)
-        self._digest = None          # sparse pixel sample of the last stored frame
-        self._dup_n = 0              # consecutive identical frames (freeze detector)
+        self._n = 0  # frames received (for fps)
+        self._digest = None  # sparse pixel sample of the last stored frame
+        self._dup_n = 0  # consecutive identical frames (freeze detector)
         self._frozen_warned = False
         self._t0 = None
-        self._cvt = None             # lazy: {olympe format -> cv2 code}
+        self._cvt = None  # lazy: {olympe format -> cv2 code}
         self._default_code = None
         self._decode_warned = False
         self._stream_mode = None
@@ -162,8 +171,7 @@ class OlympePdrawGrabber:
         # advertised media name is often "DefaultVideo" rather than "Front camera".
         # Try SC name first so a failed "Front camera" open does not poison pdraw.
         if not hasattr(self.drone.streaming, "play"):
-            raise RuntimeError(
-                "Olympe streaming has no play(); this SDK is too old for live grab")
+            raise RuntimeError("Olympe streaming has no play(); this SDK is too old for live grab")
         self._start_frame_worker()
         last_exc = None
         names = []
@@ -181,13 +189,11 @@ class OlympePdrawGrabber:
                 self.media_name = name
                 self._stream_mode = "play"
                 self._t0 = time.monotonic()
-                print(f"[olympe_frame_source] streaming.play ok media_name={name!r}",
-                      flush=True)
+                print(f"[olympe_frame_source] streaming.play ok media_name={name!r}", flush=True)
                 return self
             except Exception as exc:
                 last_exc = exc
-                print(f"[olympe_frame_source] play failed media_name={name!r}: {exc}",
-                      flush=True)
+                print(f"[olympe_frame_source] play failed media_name={name!r}: {exc}", flush=True)
         self._stop_frame_worker()
         raise RuntimeError(f"streaming.play failed for all media names {names}: {last_exc}")
 
@@ -285,7 +291,8 @@ class OlympePdrawGrabber:
             )
             if ok is False:
                 raise RuntimeError(
-                    f"streaming.play_multiple_stream returned False (media_name={name!r})")
+                    f"streaming.play_multiple_stream returned False (media_name={name!r})"
+                )
             return
 
         # Fallback: classic play() with bytestream raw_cb and no renderer window.
@@ -298,6 +305,7 @@ class OlympePdrawGrabber:
         )
         try:
             from olympe.features.video.pdraw import h264_coded_data_format
+
             play_kw["data_formats"] = [h264_coded_data_format.bytestream]
         except Exception:
             pass
@@ -342,8 +350,7 @@ class OlympePdrawGrabber:
         if worker is not None and worker is not threading.current_thread():
             worker.join(timeout=5.0)
             if worker.is_alive():
-                print("[olympe_frame_source] frame worker did not stop before timeout",
-                      flush=True)
+                print("[olympe_frame_source] frame worker did not stop before timeout", flush=True)
         with self._frame_cv:
             if worker is not None and self._frame_worker is worker and not worker.is_alive():
                 self._frame_worker = None
@@ -367,11 +374,14 @@ class OlympePdrawGrabber:
     def _formats(self):
         if self._cvt is None:
             import cv2, olympe
+
             # VERIFY against your olympe version: I420 / NV12 are the usual yuv
             # raw formats for the ANAFI live stream.
             cvt = {}
-            for nm, code in (("VDEF_I420", cv2.COLOR_YUV2RGB_I420),
-                             ("VDEF_NV12", cv2.COLOR_YUV2RGB_NV12)):
+            for nm, code in (
+                ("VDEF_I420", cv2.COLOR_YUV2RGB_I420),
+                ("VDEF_NV12", cv2.COLOR_YUV2RGB_NV12),
+            ):
                 if hasattr(olympe, nm):
                     cvt[getattr(olympe, nm)] = code
             # publish fully-built maps under the lock (callback may run on another thread)
@@ -413,18 +423,24 @@ class OlympePdrawGrabber:
             if not keep_ref:
                 yuv_frame.unref()
 
-    def _convert_yuv_frame(self, yuv_frame, receipt_stamp: float,
-                           capture_stamp: float, stamp_source: str,
-                           source_ntp_us: int | None,
-                           callback_mono_ns: int | None = None) -> bool:
+    def _convert_yuv_frame(
+        self,
+        yuv_frame,
+        receipt_stamp: float,
+        capture_stamp: float,
+        stamp_source: str,
+        source_ntp_us: int | None,
+        callback_mono_ns: int | None = None,
+    ) -> bool:
         import cv2
+
         preprocess_start_mono_ns = time.monotonic_ns()
-        arr = yuv_frame.as_ndarray()              # full YUV plane (H*3/2, W)
+        arr = yuv_frame.as_ndarray()  # full YUV plane (H*3/2, W)
         yuv_ready_mono_ns = time.monotonic_ns()
         if arr is None:
             return False
         code = self._formats().get(yuv_frame.format(), self._default_code)
-        rgb = cv2.cvtColor(arr, code)             # -> RGB HxWx3 uint8
+        rgb = cv2.cvtColor(arr, code)  # -> RGB HxWx3 uint8
         try:
             decoded_pixel_format = str(yuv_frame.format())
         except Exception:
@@ -437,8 +453,11 @@ class OlympePdrawGrabber:
             rgb = cv2.resize(rgb, self.resize)
         preprocess_done_mono_ns = time.monotonic_ns()
         self._store(
-            rgb, stamp=capture_stamp, stamp_source=stamp_source,
-            source_ntp_us=source_ntp_us, receipt_stamp=receipt_stamp,
+            rgb,
+            stamp=capture_stamp,
+            stamp_source=stamp_source,
+            source_ntp_us=source_ntp_us,
+            receipt_stamp=receipt_stamp,
             timing={
                 "frame_callback_enter_mono_ns": int(
                     callback_mono_ns
@@ -448,79 +467,112 @@ class OlympePdrawGrabber:
                 "frame_preprocess_start_mono_ns": preprocess_start_mono_ns,
                 "frame_yuv_ready_mono_ns": yuv_ready_mono_ns,
                 "frame_preprocess_done_mono_ns": preprocess_done_mono_ns,
-            })
+            },
+        )
         return True
+
+    def _next_pending_yuv(self):
+        with self._frame_cv:
+            while self._pending_yuv is None and not self._frame_worker_stop:
+                self._frame_cv.wait(timeout=0.5)
+            if self._frame_worker_stop:
+                return None
+            pending = self._pending_yuv
+            self._pending_yuv = None
+            self._convert_inflight += 1
+            return pending
+
+    def _convert_pending_yuv(self, pending) -> tuple[bool, bool]:
+        yuv_frame, receipt_mono_ns = pending
+        receipt_stamp = int(receipt_mono_ns) * 1e-9
+        # VideoFrame.info() can be non-trivial. Read it here, never on Pdraw's
+        # callback thread.
+        capture_stamp, stamp_source, source_ntp_us = self._capture_stamp(yuv_frame, receipt_stamp)
+        if capture_stamp is None and self.require_source_timestamps:
+            with self._lock:
+                self._timestamp_drops += 1
+        if capture_stamp is None:
+            if self.require_source_timestamps:
+                return False, False
+            capture_stamp, stamp_source, source_ntp_us = (
+                receipt_stamp,
+                "callback-receipt",
+                None,
+            )
+
+        # If a newer YUV is already waiting, the latest frame wins and this
+        # conversion is discarded before publication.
+        with self._frame_cv:
+            newer_pending = self._pending_yuv is not None
+        if newer_pending:
+            self._queue_drops += 1
+            return False, False
+        converted = self._convert_yuv_frame(
+            yuv_frame,
+            receipt_stamp,
+            capture_stamp,
+            stamp_source,
+            source_ntp_us,
+            receipt_mono_ns,
+        )
+        return converted, not converted
+
+    def _warn_decode_failure(self, exc: Exception) -> None:
+        if self._decode_warned:
+            return
+        self._decode_warned = True
+        print(
+            f"[olympe_frame_source] frame decode failed ({exc!r}); "
+            "dropping frame(s), stream stays alive "
+            "(controller hovers on staleness)",
+            flush=True,
+        )
+
+    def _finish_pending_yuv(
+        self,
+        pending,
+        elapsed: float,
+        *,
+        converted: bool,
+        failed: bool,
+    ) -> None:
+        try:
+            pending[0].unref()
+        finally:
+            with self._frame_cv:
+                self._convert_attempts += 1
+                self._convert_total_s += elapsed
+                self._convert_last_s = elapsed
+                self._convert_max_s = max(self._convert_max_s, elapsed)
+                if converted:
+                    self._frames_converted += 1
+                if failed:
+                    self._decode_failures += 1
+                self._convert_inflight -= 1
+                self._frame_cv.notify_all()
 
     def _frame_worker_loop(self):
         while True:
-            with self._frame_cv:
-                while self._pending_yuv is None and not self._frame_worker_stop:
-                    self._frame_cv.wait(timeout=0.5)
-                if self._frame_worker_stop:
-                    return
-                pending = self._pending_yuv
-                self._pending_yuv = None
-                self._convert_inflight += 1
-
+            pending = self._next_pending_yuv()
+            if pending is None:
+                return
             started = time.perf_counter()
             converted = False
             failed = False
             try:
-                yuv_frame, receipt_mono_ns = pending
-                receipt_stamp = int(receipt_mono_ns) * 1e-9
-                # If a newer YUV already replaced the slot during a previous
-                # wait, we still convert this one only if it is not already
-                # obsolete vs the published RGB (checked after convert).
-                # VideoFrame.info() can be non-trivial. Read it here, never on
-                # Pdraw's callback thread.
-                capture_stamp, stamp_source, source_ntp_us = self._capture_stamp(
-                    yuv_frame, receipt_stamp)
-                if capture_stamp is None and self.require_source_timestamps:
-                    with self._lock:
-                        self._timestamp_drops += 1
-                if capture_stamp is None:
-                    if self.require_source_timestamps:
-                        converted = False
-                    else:
-                        capture_stamp, stamp_source, source_ntp_us = (
-                            receipt_stamp, "callback-receipt", None)
-                if capture_stamp is not None:
-                    # Mid-convert: if a newer YUV is already waiting, drop this
-                    # conversion work's result without publishing (latest wins).
-                    with self._frame_cv:
-                        newer_pending = self._pending_yuv is not None
-                    if newer_pending:
-                        self._queue_drops += 1
-                    else:
-                        converted = self._convert_yuv_frame(
-                            yuv_frame, receipt_stamp, capture_stamp,
-                            stamp_source, source_ntp_us, receipt_mono_ns)
-                        failed = not converted
+                converted, failed = self._convert_pending_yuv(pending)
             except Exception as exc:
                 failed = True
-                # A single bad frame must NOT kill the worker. Sustained failure
-                # makes the stored frame stale, so the controller HOVERs.
-                if not self._decode_warned:
-                    self._decode_warned = True
-                    print(f"[olympe_frame_source] frame decode failed ({exc!r}); "
-                          "dropping frame(s), stream stays alive "
-                          "(controller hovers on staleness)", flush=True)
+                # A bad frame cannot kill the worker. Sustained failure makes the
+                # published frame stale, so the controller hovers.
+                self._warn_decode_failure(exc)
             finally:
-                elapsed = time.perf_counter() - started
-                try:
-                    pending[0].unref()
-                finally:
-                    with self._frame_cv:
-                        self._convert_attempts += 1
-                        self._convert_total_s += elapsed
-                        self._convert_last_s = elapsed
-                        self._convert_max_s = max(self._convert_max_s, elapsed)
-                        if converted:
-                            self._frames_converted += 1
-                        if failed:
-                            self._decode_failures += 1
-                        self._convert_inflight -= 1
-                        self._frame_cv.notify_all()
+                self._finish_pending_yuv(
+                    pending,
+                    time.perf_counter() - started,
+                    converted=converted,
+                    failed=failed,
+                )
 
     def _flush_cb(self, *_):
         pending = None
@@ -587,11 +639,15 @@ class OlympePdrawGrabber:
         mapped = min(receipt, source_us * 1e-6 + self._source_to_monotonic)
         return mapped, "ntp-mapped", source_us
 
-    def _store(self, rgb: np.ndarray, stamp: float | None = None,
-               stamp_source: str = "callback-receipt",
-               source_ntp_us: int | None = None,
-               receipt_stamp: float | None = None,
-               timing: dict | None = None):
+    def _store(
+        self,
+        rgb: np.ndarray,
+        stamp: float | None = None,
+        stamp_source: str = "callback-receipt",
+        source_ntp_us: int | None = None,
+        receipt_stamp: float | None = None,
+        timing: dict | None = None,
+    ):
         stamp = time.monotonic() if stamp is None else float(stamp)
         receipt = time.monotonic() if receipt_stamp is None else float(receipt_stamp)
         now_mono = time.monotonic()
@@ -605,7 +661,7 @@ class OlympePdrawGrabber:
             source_us = None
         if source_us is not None and source_us <= 0:
             source_us = None
-        digest = rgb[::64, ::64].tobytes()   # ~720B sample; identical only if the frame repeats
+        digest = rgb[::64, ::64].tobytes()  # ~720B sample; identical only if the frame repeats
         stored_timing = dict(timing or {})
         stored_timing["frame_store_mono_ns"] = time.monotonic_ns()
         output_height_px = int(rgb.shape[0])
@@ -623,7 +679,7 @@ class OlympePdrawGrabber:
             else:
                 self._digest = digest
                 self._dup_n = 0
-                self._frozen_warned = False   # recovered; warn again on the next freeze
+                self._frozen_warned = False  # recovered; warn again on the next freeze
                 warn = False
             self._latest = rgb
             self._stamp = stamp
@@ -635,20 +691,25 @@ class OlympePdrawGrabber:
             self._output_width_px = output_width_px
             self._n += 1
         if warn:
-            print(f"[olympe_frame_source] stream FROZEN: {FROZEN_DUP_FRAMES} identical "
-                  "consecutive frames; treating as unhealthy (controller hovers)", flush=True)
+            print(
+                f"[olympe_frame_source] stream FROZEN: {FROZEN_DUP_FRAMES} identical "
+                "consecutive frames; treating as unhealthy (controller hovers)",
+                flush=True,
+            )
 
     def __call__(self):
         with self._lock:
             if self._latest is None:
                 return None
             if time.monotonic() - self._stamp > self.stale_s:
-                return None                            # stale -> controller HOVERs
+                return None  # stale -> controller HOVERs
             if self._dup_n >= FROZEN_DUP_FRAMES:
-                return None                            # frozen -> controller HOVERs
-            if (getattr(self, "require_source_timestamps", False)
-                    and not self._source_timing_trusted_locked()):
-                return None                            # degraded timing -> true-flight HOVER
+                return None  # frozen -> controller HOVERs
+            if (
+                getattr(self, "require_source_timestamps", False)
+                and not self._source_timing_trusted_locked()
+            ):
+                return None  # degraded timing -> true-flight HOVER
             return self._latest.copy(), float(self._stamp)
 
     def latest_frame_with_timing(self):
@@ -665,11 +726,12 @@ class OlympePdrawGrabber:
                 return None
             if self._dup_n >= FROZEN_DUP_FRAMES:
                 return None
-            if (getattr(self, "require_source_timestamps", False)
-                    and not self._source_timing_trusted_locked()):
+            if (
+                getattr(self, "require_source_timestamps", False)
+                and not self._source_timing_trusted_locked()
+            ):
                 return None
-            return self._latest, float(self._stamp), dict(
-                getattr(self, "_latest_timing", {}))
+            return self._latest, float(self._stamp), dict(getattr(self, "_latest_timing", {}))
 
     def peek_stamp(self) -> float | None:
         """Return the available frame stamp without copying the image."""
@@ -680,15 +742,19 @@ class OlympePdrawGrabber:
                 return None
             if self._dup_n >= FROZEN_DUP_FRAMES:
                 return None
-            if (getattr(self, "require_source_timestamps", False)
-                    and not self._source_timing_trusted_locked()):
+            if (
+                getattr(self, "require_source_timestamps", False)
+                and not self._source_timing_trusted_locked()
+            ):
                 return None
             return float(self._stamp)
 
     def _source_timing_trusted_locked(self) -> bool:
-        return (getattr(self, "_stamp_source", "none") == "ntp-mapped"
-                and isinstance(getattr(self, "_stored_source_ntp_us", None), int)
-                and self._stored_source_ntp_us > 0)
+        return (
+            getattr(self, "_stamp_source", "none") == "ntp-mapped"
+            and isinstance(getattr(self, "_stored_source_ntp_us", None), int)
+            and self._stored_source_ntp_us > 0
+        )
 
     def last_frame_age(self) -> float | None:
         with self._lock:
@@ -699,9 +765,11 @@ class OlympePdrawGrabber:
     def is_healthy(self) -> bool:
         with self._lock:
             if self._dup_n >= FROZEN_DUP_FRAMES:
-                return False                           # frozen picture with fresh stamps
-            if (getattr(self, "require_source_timestamps", False)
-                    and not self._source_timing_trusted_locked()):
+                return False  # frozen picture with fresh stamps
+            if (
+                getattr(self, "require_source_timestamps", False)
+                and not self._source_timing_trusted_locked()
+            ):
                 return False
             if self._latest is None:
                 return False
@@ -718,9 +786,9 @@ class OlympePdrawGrabber:
                 return None
             return int(self._stored_source_ntp_us)
 
-    def inspection_sample_after(self, baseline_source_ntp_us: int,
-                                min_source_advance_s: float,
-                                receipt_after: float):
+    def inspection_sample_after(
+        self, baseline_source_ntp_us: int, min_source_advance_s: float, receipt_after: float
+    ):
         """Return a frame only after both source-clock and host-receipt drains.
 
         Raw NTP is treated as a sequence clock, not as host-synchronized time.
@@ -736,11 +804,14 @@ class OlympePdrawGrabber:
         if baseline <= 0 or advance_us <= 0 or not np.isfinite(receipt_min):
             return None
         with self._lock:
-            if (self._latest is None or self._dup_n >= FROZEN_DUP_FRAMES
-                    or not self._source_timing_trusted_locked()
-                    or time.monotonic() - self._stamp > self.stale_s
-                    or self._stored_source_ntp_us < baseline + advance_us
-                    or getattr(self, "_receipt_stamp", 0.0) < receipt_min):
+            if (
+                self._latest is None
+                or self._dup_n >= FROZEN_DUP_FRAMES
+                or not self._source_timing_trusted_locked()
+                or time.monotonic() - self._stamp > self.stale_s
+                or self._stored_source_ntp_us < baseline + advance_us
+                or getattr(self, "_receipt_stamp", 0.0) < receipt_min
+            ):
                 return None
             return self._latest.copy(), float(self._stamp)
 
@@ -776,9 +847,7 @@ class OlympePdrawGrabber:
                 "output_width_px": self._output_width_px,
                 "output_height_px": self._output_height_px,
                 "observed_fps": float(self.fps),
-                "source_timestamp_capable": (
-                    isinstance(source_ntp_us, int) and source_ntp_us > 0
-                ),
+                "source_timestamp_capable": (isinstance(source_ntp_us, int) and source_ntp_us > 0),
                 "source_timestamp_trusted": self._source_timing_trusted_locked(),
                 "stamp_source": self._stamp_source,
             }
@@ -810,23 +879,26 @@ class OlympePdrawGrabber:
                 "frozen": self._dup_n >= FROZEN_DUP_FRAMES,
                 "stamp_source": self._stamp_source,
                 "latest_age_ms": (
-                    (time.monotonic() - self._stamp) * 1000.0
-                    if self._latest is not None else None),
+                    (time.monotonic() - self._stamp) * 1000.0 if self._latest is not None else None
+                ),
                 "convert_attempts": attempts,
                 "pending": int(self._pending_yuv is not None),
                 "inflight": self._convert_inflight,
                 "convert_ms_last": self._convert_last_s * 1000.0,
-                "convert_ms_mean": (
-                    self._convert_total_s * 1000.0 / attempts if attempts else 0.0),
+                "convert_ms_mean": (self._convert_total_s * 1000.0 / attempts if attempts else 0.0),
                 "convert_ms_max": self._convert_max_s * 1000.0,
                 "callback_to_preprocess_ms": timing_ms(
-                    "frame_callback_enter_mono_ns", "frame_preprocess_start_mono_ns"),
+                    "frame_callback_enter_mono_ns", "frame_preprocess_start_mono_ns"
+                ),
                 "yuv_view_ms": timing_ms(
-                    "frame_preprocess_start_mono_ns", "frame_yuv_ready_mono_ns"),
+                    "frame_preprocess_start_mono_ns", "frame_yuv_ready_mono_ns"
+                ),
                 "preprocess_ms": timing_ms(
-                    "frame_preprocess_start_mono_ns", "frame_preprocess_done_mono_ns"),
+                    "frame_preprocess_start_mono_ns", "frame_preprocess_done_mono_ns"
+                ),
                 "callback_to_store_ms": timing_ms(
-                    "frame_callback_enter_mono_ns", "frame_store_mono_ns"),
+                    "frame_callback_enter_mono_ns", "frame_store_mono_ns"
+                ),
             }
 
 
@@ -850,8 +922,13 @@ def run_real(drone, loc, det, ctrl):
 def _selftest():
     """Pure-python: the frame_source freshness/None contract (no olympe/cv2)."""
     g = OlympePdrawGrabber.__new__(OlympePdrawGrabber)
-    g._lock = threading.Lock(); g._latest = None; g._stamp = 0.0; g._n = 0
-    g._digest = None; g._dup_n = 0; g._frozen_warned = False
+    g._lock = threading.Lock()
+    g._latest = None
+    g._stamp = 0.0
+    g._n = 0
+    g._digest = None
+    g._dup_n = 0
+    g._frozen_warned = False
     g.stale_s = 0.1
     assert g() is None, "no frame yet -> None"
     frame = (np.arange(720 * 1280 * 3, dtype=np.uint8) % 255).reshape(720, 1280, 3)
@@ -863,7 +940,7 @@ def _selftest():
     assert out is not g._latest, "must return a COPY, not the live buffer"
     assert np.array_equal(out, frame)
     assert capture_stamp == g._stamp, "capture stamp must travel atomically with the frame"
-    g._stamp = time.monotonic() - 1.0                 # force stale
+    g._stamp = time.monotonic() - 1.0  # force stale
     assert g() is None, "stale frame -> None (controller HOVERs)"
     assert not g.is_healthy(), "stale stream should be unhealthy"
     # frozen stream: the SAME frame re-delivered with fresh stamps must go unhealthy
@@ -871,18 +948,22 @@ def _selftest():
         g._store(frame)
     assert g() is None, "frozen (duplicated) frames -> None (controller HOVERs)"
     assert not g.is_healthy(), "frozen stream should be unhealthy despite fresh stamps"
-    g._store(frame.copy() + 1)                        # a genuinely new frame recovers
+    g._store(frame.copy() + 1)  # a genuinely new frame recovers
     assert g() is not None and g.is_healthy(), "new distinct frame -> healthy again"
-    print("olympe_frame_source self-test: OK (None-before-frame, fresh copy, stale->None, "
-          "stale->unhealthy, frozen->unhealthy, distinct-frame recovery)")
+    print(
+        "olympe_frame_source self-test: OK (None-before-frame, fresh copy, stale->None, "
+        "stale->unhealthy, frozen->unhealthy, distinct-frame recovery)"
+    )
 
 
 def _smoke_live(ip: str, secs: float, controller: str):
     """Connect, grab video for `secs`, report fps, save one sample. NO arming."""
     import cv2
+
     drone = connect(ip, controller)
     with OlympePdrawGrabber(drone) as g:
-        t0 = time.monotonic(); last = None
+        t0 = time.monotonic()
+        last = None
         while time.monotonic() - t0 < secs:
             sample = g()
             if sample is not None:
@@ -898,8 +979,11 @@ def _smoke_live(ip: str, secs: float, controller: str):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("mode", choices=["selftest", "smoke"],
-                    help="selftest=no deps; smoke=live video grab (props off, no arming)")
+    ap.add_argument(
+        "mode",
+        choices=["selftest", "smoke"],
+        help="selftest=no deps; smoke=live video grab (props off, no arming)",
+    )
     ap.add_argument("--ip", default=DRONE_IP_REAL, help="192.168.42.1 real / 10.202.0.1 sim")
     ap.add_argument("--controller", default="auto", help="auto / drone / anafi / skycontroller3")
     ap.add_argument("--secs", type=float, default=5.0)

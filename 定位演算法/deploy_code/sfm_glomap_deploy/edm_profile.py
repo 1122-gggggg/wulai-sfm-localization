@@ -64,18 +64,7 @@ def _reject_json_constant(value: str):
     raise ValueError(f"non-finite JSON number is not allowed: {value}")
 
 
-def load_edm_production_profile(path: str | Path) -> dict:
-    """Load the EDM runtime contract before allocating any model."""
-    source = Path(path).expanduser().resolve()
-    try:
-        raw = json.loads(
-            source.read_text(encoding="utf-8"),
-            parse_constant=_reject_json_constant,
-        )
-    except OSError as exc:
-        raise ValueError(f"cannot read EDM production profile {source}: {exc}") from exc
-    except (json.JSONDecodeError, ValueError) as exc:
-        raise ValueError(f"invalid EDM production profile JSON {source}: {exc}") from exc
+def _validate_edm_profile_sections(raw: object, source: Path) -> tuple[dict, dict]:
     if not isinstance(raw, dict) or raw.get("schema") != EDM_PROFILE_SCHEMA:
         raise ValueError(
             f"EDM production profile schema must be {EDM_PROFILE_SCHEMA}: {source}"
@@ -84,6 +73,10 @@ def load_edm_production_profile(path: str | Path) -> dict:
     tracker = raw.get("tracker")
     if not isinstance(matcher, dict) or not isinstance(tracker, dict):
         raise ValueError(f"EDM production profile needs matcher and tracker objects: {source}")
+    return matcher, tracker
+
+
+def _validate_edm_profile_keys(matcher: dict, tracker: dict, source: Path) -> None:
     missing_matcher = sorted(EDM_REQUIRED_MATCHER_KEYS - matcher.keys())
     unknown_matcher = sorted(set(matcher) - EDM_REQUIRED_MATCHER_KEYS)
     missing_tracker = sorted(EDM_REQUIRED_TRACKER_KEYS - tracker.keys())
@@ -94,6 +87,9 @@ def load_edm_production_profile(path: str | Path) -> dict:
             f"matcher_missing={missing_matcher}, matcher_unknown={unknown_matcher}, "
             f"tracker_missing={missing_tracker}, tracker_unknown={unknown_tracker}"
         )
+
+
+def _validate_edm_matcher_profile(matcher: dict, source: Path) -> None:
     coarse_topk = matcher["coarse_topk"]
     mconf_thr = matcher["mconf_thr"]
     if isinstance(coarse_topk, bool) or not isinstance(coarse_topk, int) or coarse_topk <= 0:
@@ -110,11 +106,32 @@ def load_edm_production_profile(path: str | Path) -> dict:
     cache_size = matcher["reference_cache_size"]
     if isinstance(cache_size, bool) or not isinstance(cache_size, int) or cache_size < 0:
         raise ValueError(f"EDM matcher reference_cache_size must be non-negative: {source}")
+
+
+def _validate_edm_tracker_profile(tracker: dict, source: Path) -> None:
     for name, value in tracker.items():
         if isinstance(value, float) and not math.isfinite(value):
             raise ValueError(f"EDM tracker {name} must be finite: {source}")
         if not isinstance(value, (bool, int, float, str)):
             raise ValueError(f"EDM tracker {name} has an unsupported value type: {source}")
+
+
+def load_edm_production_profile(path: str | Path) -> dict:
+    """Load the EDM runtime contract before allocating any model."""
+    source = Path(path).expanduser().resolve()
+    try:
+        raw = json.loads(
+            source.read_text(encoding="utf-8"),
+            parse_constant=_reject_json_constant,
+        )
+    except OSError as exc:
+        raise ValueError(f"cannot read EDM production profile {source}: {exc}") from exc
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise ValueError(f"invalid EDM production profile JSON {source}: {exc}") from exc
+    matcher, tracker = _validate_edm_profile_sections(raw, source)
+    _validate_edm_profile_keys(matcher, tracker, source)
+    _validate_edm_matcher_profile(matcher, source)
+    _validate_edm_tracker_profile(tracker, source)
     return raw
 
 

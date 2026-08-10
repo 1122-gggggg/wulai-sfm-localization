@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 
 PREFLIGHT_GUIDE_STEPS = ("compass", "map", "route", "system")
@@ -171,6 +171,11 @@ def _fresh_stream_stamp(context: PreflightContext) -> object | None:
     return context.video_frame_stamp
 
 
+def _evidence_float(value: object) -> float:
+    """Convert a validated-at-runtime evidence value without leaking Any."""
+    return float(cast(Any, value))
+
+
 def _live_state_problem(state: object) -> str | None:
     flight_state = str(getattr(state, "flight_state", "") or "")
     if flight_state.rsplit(".", 1)[-1].lower() != "landed":
@@ -203,7 +208,7 @@ def _stream_problem(
     now: float,
 ) -> str | None:
     try:
-        stream_age_s = now - float(_fresh_stream_stamp(context))
+        stream_age_s = now - _evidence_float(_fresh_stream_stamp(context))
     except (TypeError, ValueError):
         return "等待即時串流影格"
     if (
@@ -223,8 +228,8 @@ def _system_readiness_problem(
     context: PreflightContext,
 ) -> str | None:
     try:
-        battery = float(getattr(state, "battery_pct", -1.0))
-        battery_floor = float(context.min_takeoff_battery_pct)
+        battery = _evidence_float(getattr(state, "battery_pct", -1.0))
+        battery_floor = _evidence_float(context.min_takeoff_battery_pct)
     except (TypeError, ValueError):
         return "電量讀回或起飛門檻格式無效"
     if not math.isfinite(battery) or battery < battery_floor:

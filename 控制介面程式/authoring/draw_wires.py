@@ -174,6 +174,62 @@ def _save(wires):
     print(f"[wires] saved {len(wires)} wires -> {WIRES_JSON} ; {len(allp)} pts -> {WIRES_PLY}")
 
 
+def _wires_edit_event(operator, context, event):
+    if event.type == "LEFTMOUSE" and event.value == "PRESS":
+        p = operator._snap(context, event)
+        if p is None:
+            operator.report({"WARNING"}, "no cloud vertex under cursor (zoom in / aim at a point)")
+            return {"RUNNING_MODAL"}
+        if operator._pending is None:
+            operator._pending = p
+        else:
+            a, b = operator._pending, p
+            span = float(np.linalg.norm(np.array(b[:2]) - np.array(a[:2])))
+            sag = max(span * DEFAULT_SAG_FRAC, 1e-3)
+            operator._wires.append({"a": a, "b": b, "sag": sag})
+            _make_curve(len(operator._wires) - 1, catenary_points(a, b, sag), span)
+            operator._pending = None
+        operator._status(context)
+        return {"RUNNING_MODAL"}
+
+    if event.type in {"WHEELUPMOUSE", "WHEELDOWNMOUSE"} and event.value == "PRESS" \
+            and operator._wires:
+        w = operator._wires[-1]
+        w["sag"] *= SAG_STEP if event.type == "WHEELUPMOUSE" else (1.0 / SAG_STEP)
+        span = float(np.linalg.norm(np.array(w["b"][:2]) - np.array(w["a"][:2])))
+        _make_curve(len(operator._wires) - 1, catenary_points(w["a"], w["b"], w["sag"]), span)
+        operator._status(context)
+        return {"RUNNING_MODAL"}
+
+    if event.type == "Z" and event.value == "PRESS" and operator._wires:
+        operator._wires.pop()
+        obj = bpy.data.objects.get(f"wire_{len(operator._wires):03d}")
+        if obj:
+            bpy.data.objects.remove(obj, do_unlink=True)
+        operator._status(context)
+        return {"RUNNING_MODAL"}
+    return None
+
+
+def _wires_finish_event(operator, context, event):
+    if event.type == "S" and event.value == "PRESS":
+        _save(operator._wires)
+        operator.report({"INFO"}, f"saved {len(operator._wires)} wires")
+        return {"RUNNING_MODAL"}
+
+    if event.type in {"RET", "NUMPAD_ENTER", "ESC"} and event.value == "PRESS":
+        _save(operator._wires)
+        context.area.header_text_set(None)
+        operator.report({"INFO"}, f"done, {len(operator._wires)} wires saved")
+        return {"FINISHED"}
+
+    if event.type in {"MIDDLEMOUSE", "TRACKPADPAN", "TRACKPADZOOM",
+                      "NUMPAD_1", "NUMPAD_2", "NUMPAD_3", "NUMPAD_4", "NUMPAD_5",
+                      "NUMPAD_6", "NUMPAD_7", "NUMPAD_8", "NUMPAD_9"}:
+        return {"PASS_THROUGH"}
+    return None
+
+
 # ---------------------------------------------------------------- modal operator
 class WIRE_OT_draw(bpy.types.Operator):
     bl_idname = "view3d.draw_catenary_wires"
@@ -247,55 +303,12 @@ class WIRE_OT_draw(bpy.types.Operator):
         if event.alt:
             return {"PASS_THROUGH"}
 
-        if event.type == "LEFTMOUSE" and event.value == "PRESS":
-            p = self._snap(context, event)
-            if p is None:
-                self.report({"WARNING"}, "no cloud vertex under cursor (zoom in / aim at a point)")
-                return {"RUNNING_MODAL"}
-            if self._pending is None:
-                self._pending = p
-            else:
-                a, b = self._pending, p
-                span = float(np.linalg.norm(np.array(b[:2]) - np.array(a[:2])))
-                sag = max(span * DEFAULT_SAG_FRAC, 1e-3)
-                self._wires.append({"a": a, "b": b, "sag": sag})
-                _make_curve(len(self._wires) - 1, catenary_points(a, b, sag), span)
-                self._pending = None
-            self._status(context)
-            return {"RUNNING_MODAL"}
-
-        if event.type in {"WHEELUPMOUSE", "WHEELDOWNMOUSE"} and event.value == "PRESS" and self._wires:
-            w = self._wires[-1]
-            w["sag"] *= SAG_STEP if event.type == "WHEELUPMOUSE" else (1.0 / SAG_STEP)
-            span = float(np.linalg.norm(np.array(w["b"][:2]) - np.array(w["a"][:2])))
-            _make_curve(len(self._wires) - 1, catenary_points(w["a"], w["b"], w["sag"]), span)
-            self._status(context)
-            return {"RUNNING_MODAL"}
-
-        if event.type == "Z" and event.value == "PRESS" and self._wires:
-            self._wires.pop()
-            obj = bpy.data.objects.get(f"wire_{len(self._wires):03d}")
-            if obj:
-                bpy.data.objects.remove(obj, do_unlink=True)
-            self._status(context)
-            return {"RUNNING_MODAL"}
-
-        if event.type == "S" and event.value == "PRESS":
-            _save(self._wires)
-            self.report({"INFO"}, f"saved {len(self._wires)} wires")
-            return {"RUNNING_MODAL"}
-
-        if event.type in {"RET", "NUMPAD_ENTER", "ESC"} and event.value == "PRESS":
-            _save(self._wires)
-            context.area.header_text_set(None)
-            self.report({"INFO"}, f"done, {len(self._wires)} wires saved")
-            return {"FINISHED"}
-
-        # let the user orbit/zoom the view
-        if event.type in {"MIDDLEMOUSE", "TRACKPADPAN", "TRACKPADZOOM",
-                          "NUMPAD_1", "NUMPAD_2", "NUMPAD_3", "NUMPAD_4", "NUMPAD_5",
-                          "NUMPAD_6", "NUMPAD_7", "NUMPAD_8", "NUMPAD_9"}:
-            return {"PASS_THROUGH"}
+        result = _wires_edit_event(self, context, event)
+        if result is not None:
+            return result
+        result = _wires_finish_event(self, context, event)
+        if result is not None:
+            return result
         return {"RUNNING_MODAL"}
 
 

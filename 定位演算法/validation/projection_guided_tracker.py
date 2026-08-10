@@ -1,4 +1,5 @@
 """Opt-in projection-guided TRACK fast path with unchanged deep fallback."""
+
 from __future__ import annotations
 
 import hashlib
@@ -118,13 +119,14 @@ def _opencv_camera(cam) -> tuple[np.ndarray, np.ndarray]:
         dist = np.asarray(params[4:12], dtype=np.float64)
     else:
         raise ValueError(f"unsupported projection camera model: {cam.model}")
-    camera_matrix = np.array(
-        [[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]], dtype=np.float64)
+    camera_matrix = np.array([[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]], dtype=np.float64)
     return camera_matrix, dist
 
 
 def project_visible_landmarks(
-    xyz: np.ndarray, tcw: np.ndarray, cam,
+    xyz: np.ndarray,
+    tcw: np.ndarray,
+    cam,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Project positive-depth landmarks and retain only finite image points."""
     xyz = np.asarray(xyz, dtype=np.float32).reshape(-1, 3)
@@ -138,7 +140,8 @@ def project_visible_landmarks(
     translation = tcw[:3, 3]
     camera_xyz = (rotation @ xyz.astype(np.float64).T).T + translation
     positive_indices = np.flatnonzero(
-        np.isfinite(camera_xyz).all(axis=1) & (camera_xyz[:, 2] > 1e-6))
+        np.isfinite(camera_xyz).all(axis=1) & (camera_xyz[:, 2] > 1e-6)
+    )
     if not len(positive_indices):
         return positive_indices, np.zeros((0, 2), dtype=np.float32)
     rvec = cv2.Rodrigues(rotation)[0]
@@ -167,10 +170,21 @@ class TrackLandmarkSidecar:
     """Validated unique XFeat landmark descriptors and per-reference visibility."""
 
     REQUIRED_KEYS = {
-        "point3D_id", "xyz", "descriptor", "obs_offsets", "obs_ref_idx",
-        "obs_kp_idx", "ref_kp_offsets", "ref_kp_landmark_idx", "schema_name",
-        "schema_version", "ref_bundle_sha256", "ref_names_sha256",
-        "source_features_sha256", "source_images_sha256", "source_points3D_sha256",
+        "point3D_id",
+        "xyz",
+        "descriptor",
+        "obs_offsets",
+        "obs_ref_idx",
+        "obs_kp_idx",
+        "ref_kp_offsets",
+        "ref_kp_landmark_idx",
+        "schema_name",
+        "schema_version",
+        "ref_bundle_sha256",
+        "ref_names_sha256",
+        "source_features_sha256",
+        "source_images_sha256",
+        "source_points3D_sha256",
     }
 
     def __init__(
@@ -208,6 +222,21 @@ class TrackLandmarkSidecar:
         verified_bundle_sha256: str,
     ) -> "TrackLandmarkSidecar":
         path = Path(path)
+        arrays = cls._read_track_landmark_arrays(
+            path,
+            ref_names,
+            verified_bundle_sha256,
+        )
+        cls._validate_track_landmark_arrays(*arrays, ref_count=len(ref_names))
+        return cls(*arrays)
+
+    @classmethod
+    def _read_track_landmark_arrays(
+        cls,
+        path: Path,
+        ref_names: list[str],
+        verified_bundle_sha256: str,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         with np.load(path, allow_pickle=False) as archive:
             missing = cls.REQUIRED_KEYS - set(archive.files)
             if missing:
@@ -217,12 +246,24 @@ class TrackLandmarkSidecar:
                 raise ValueError("TRACK landmark sidecar bundle SHA-256 mismatch")
             if names_hash != ordered_names_sha256(ref_names):
                 raise ValueError("TRACK landmark sidecar ordered reference names mismatch")
-            point3d_id = np.ascontiguousarray(archive["point3D_id"], dtype=np.int64)
-            xyz = np.ascontiguousarray(archive["xyz"], dtype=np.float32)
-            descriptor = np.ascontiguousarray(archive["descriptor"], dtype=np.float16)
-            ref_kp_offsets = np.ascontiguousarray(archive["ref_kp_offsets"], dtype=np.int64)
-            ref_kp_landmark_idx = np.ascontiguousarray(
-                archive["ref_kp_landmark_idx"], dtype=np.int32)
+            return (
+                np.ascontiguousarray(archive["point3D_id"], dtype=np.int64),
+                np.ascontiguousarray(archive["xyz"], dtype=np.float32),
+                np.ascontiguousarray(archive["descriptor"], dtype=np.float16),
+                np.ascontiguousarray(archive["ref_kp_offsets"], dtype=np.int64),
+                np.ascontiguousarray(archive["ref_kp_landmark_idx"], dtype=np.int32),
+            )
+
+    @staticmethod
+    def _validate_track_landmark_arrays(
+        point3d_id: np.ndarray,
+        xyz: np.ndarray,
+        descriptor: np.ndarray,
+        ref_kp_offsets: np.ndarray,
+        ref_kp_landmark_idx: np.ndarray,
+        *,
+        ref_count: int,
+    ) -> None:
         count = len(point3d_id)
         if xyz.shape != (count, 3) or descriptor.shape != (count, 64):
             raise ValueError("TRACK landmark xyz/descriptor shapes are inconsistent")
@@ -230,17 +271,19 @@ class TrackLandmarkSidecar:
             raise ValueError("TRACK landmark sidecar contains non-finite values")
         if len(np.unique(point3d_id)) != count:
             raise ValueError("TRACK landmark point3D_id values are not unique")
-        if ref_kp_offsets.shape != (len(ref_names) + 1,):
+        if ref_kp_offsets.shape != (ref_count + 1,):
             raise ValueError("TRACK landmark reference offsets do not match the bundle")
-        if (ref_kp_offsets[0] != 0 or ref_kp_offsets[-1] != len(ref_kp_landmark_idx)
-                or np.any(np.diff(ref_kp_offsets) < 0)):
+        if (
+            ref_kp_offsets[0] != 0
+            or ref_kp_offsets[-1] != len(ref_kp_landmark_idx)
+            or np.any(np.diff(ref_kp_offsets) < 0)
+        ):
             raise ValueError("TRACK landmark reference offsets are invalid")
         if np.any((ref_kp_landmark_idx < -1) | (ref_kp_landmark_idx >= count)):
             raise ValueError("TRACK landmark reverse lookup contains invalid indices")
         norms = np.linalg.norm(descriptor.astype(np.float32), axis=1)
         if np.any(np.abs(norms - 1.0) > 0.02):
             raise ValueError("TRACK landmark representative descriptors are not normalized")
-        return cls(point3d_id, xyz, descriptor, ref_kp_offsets, ref_kp_landmark_idx)
 
     def landmarks_for_refs(self, ref_ids: Iterable[int]) -> np.ndarray:
         chunks = []
@@ -248,8 +291,8 @@ class TrackLandmarkSidecar:
         for ref_id in dict.fromkeys(int(value) for value in ref_ids):
             if not 0 <= ref_id < n_refs:
                 continue
-            start, end = self.ref_kp_offsets[ref_id:ref_id + 2]
-            values = self.ref_kp_landmark_idx[int(start):int(end)]
+            start, end = self.ref_kp_offsets[ref_id : ref_id + 2]
+            values = self.ref_kp_landmark_idx[int(start) : int(end)]
             chunks.append(values[values >= 0])
         if not chunks:
             return np.zeros(0, dtype=np.int64)
@@ -321,13 +364,13 @@ def match_projected_landmarks(
     if not radii or any(radius <= 0 for radius in radii):
         raise ValueError("projection search radii must be positive")
     pair_landmark, pair_query, pair_distance = _spatial_candidate_pairs(
-        projected_xy, query_xy, max(radii))
+        projected_xy, query_xy, max(radii)
+    )
     results = {}
     if not len(pair_landmark):
         empty_i = np.zeros(0, dtype=np.int64)
         empty_s = np.zeros(0, dtype=np.float32)
-        return {float(radius): (empty_i.copy(), empty_i.copy(), empty_s.copy())
-                for radius in radii}
+        return {float(radius): (empty_i.copy(), empty_i.copy(), empty_s.copy()) for radius in radii}
     query_descriptor = query_descriptor.float()
     landmark_descriptor = landmark_descriptor.float()
     score_chunks = []
@@ -339,10 +382,13 @@ def match_projected_landmarks(
             dtype=torch.long,
         )
         query_ids = torch.as_tensor(
-            pair_query[start:end], device=query_descriptor.device, dtype=torch.long)
-        score_chunks.append(torch.sum(
-            landmark_descriptor[landmark_ids] * query_descriptor[query_ids], dim=1
-        ).detach().cpu())
+            pair_query[start:end], device=query_descriptor.device, dtype=torch.long
+        )
+        score_chunks.append(
+            torch.sum(landmark_descriptor[landmark_ids] * query_descriptor[query_ids], dim=1)
+            .detach()
+            .cpu()
+        )
     scores = torch.cat(score_chunks).numpy().astype(np.float32, copy=False)
 
     for radius in radii:
@@ -371,9 +417,9 @@ def match_projected_landmarks(
             best_distance = 1.0 - best_scores
             second_distance = np.maximum(1.0 - second_scores, 1e-8)
             ratio_ok = ~np.isfinite(second_scores) | (
-                best_distance <= float(ratio) * second_distance)
-            accepted_rows = np.flatnonzero(
-                present & (best_scores >= float(min_score)) & ratio_ok)
+                best_distance <= float(ratio) * second_distance
+            )
+            accepted_rows = np.flatnonzero(present & (best_scores >= float(min_score)) & ratio_ok)
             accepted_pairs = best_pairs[accepted_rows]
             candidate_scores = best_scores[accepted_rows]
             candidate_landmarks = projected_landmark_idx[accepted_rows]
@@ -446,8 +492,7 @@ class ProjectionGuidedTracker(ProductionXFeatTracker):
             self._projection_pending = self._sample_from_ret(ret, self._frame_capture_stamp)
         return ok, weak, pose
 
-    def _publish_success(self, pose: Pose, info: dict, weak: bool,
-                         source_mode: str | None = None):
+    def _publish_success(self, pose: Pose, info: dict, weak: bool, source_mode: str | None = None):
         sample = self._projection_pending
         super()._publish_success(pose, info, weak, source_mode=source_mode)
         if sample is not None:
@@ -502,14 +547,17 @@ class ProjectionGuidedTracker(ProductionXFeatTracker):
 
         projection_t0 = time.perf_counter()
         visible_rows, projected_xy = project_visible_landmarks(
-            self.landmark_sidecar.xyz[anchor_indices], predicted_tcw, self.cam)
+            self.landmark_sidecar.xyz[anchor_indices], predicted_tcw, self.cam
+        )
         visible_landmarks = anchor_indices[visible_rows]
         projection_ms = (time.perf_counter() - projection_t0) * 1000.0
-        fallback.update({
-            "projection_prediction_scale": prediction_scale,
-            "projection_visible_count": int(len(visible_landmarks)),
-            "projection_project_ms": projection_ms,
-        })
+        fallback.update(
+            {
+                "projection_prediction_scale": prediction_scale,
+                "projection_visible_count": int(len(visible_landmarks)),
+                "projection_project_ms": projection_ms,
+            }
+        )
         if len(visible_landmarks) < self.cfg.weak_min_inliers:
             pose = self._localize_frame_deep(frame, prior_counters=self._frame_counters)
             self._last_info.update(fallback, projection_reason="too_few_visible_anchors")
@@ -603,30 +651,33 @@ class ProjectionGuidedTracker(ProductionXFeatTracker):
                 self._last_inl_3d = points3d[mask].astype(np.float32)
             self._publish_success(pose, info, weak=False, source_mode="TRACK")
             self._age_temporal_cache()
-            info.update({
-                "accepted": True,
-                "weak": False,
-                "projection_fallback": False,
-                "projection_attempts": attempts,
-                "next_mode": self.state.mode,
-                "temporal_cache_updated": False,
-                "temporal_cache_size_after": int(len(self.temporal_cache)),
-                "total_ms": (time.perf_counter() - start) * 1000.0,
-                **self._frame_counters,
-            })
+            info.update(
+                {
+                    "accepted": True,
+                    "weak": False,
+                    "projection_fallback": False,
+                    "projection_attempts": attempts,
+                    "next_mode": self.state.mode,
+                    "temporal_cache_updated": False,
+                    "temporal_cache_size_after": int(len(self.temporal_cache)),
+                    "total_ms": (time.perf_counter() - start) * 1000.0,
+                    **self._frame_counters,
+                }
+            )
             self._last_info = info
             return pose
 
-        fallback.update({
-            "projection_reason": "strong_gate_not_met",
-            "projection_attempts": attempts,
-            "projection_best_inliers": int(best_inliers),
-            "projection_best_reproj_rms": best_reproj,
-            "projection_feature_ms": feature_ms,
-            "projection_match_ms": match_ms,
-        })
+        fallback.update(
+            {
+                "projection_reason": "strong_gate_not_met",
+                "projection_attempts": attempts,
+                "projection_best_inliers": int(best_inliers),
+                "projection_best_reproj_rms": best_reproj,
+                "projection_feature_ms": feature_ms,
+                "projection_match_ms": match_ms,
+            }
+        )
         counters = dict(self._frame_counters)
-        pose = self._localize_frame_deep(
-            frame, q_cache=query_cache, prior_counters=counters)
+        pose = self._localize_frame_deep(frame, q_cache=query_cache, prior_counters=counters)
         self._last_info.update(fallback)
         return pose

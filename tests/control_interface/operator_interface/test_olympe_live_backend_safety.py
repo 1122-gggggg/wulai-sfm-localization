@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import inspect
+import struct
 import sys
 import threading
 import time
 from datetime import datetime, timezone
 from types import ModuleType, SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
@@ -1124,6 +1126,27 @@ def test_firmware_expectation_failure_stops_remaining_writes(make_backend):
     assert "MaxDistance" not in backend.drone.events
 
 
+def test_firmware_command_exception_stops_remaining_writes(
+        make_backend, monkeypatch):
+    backend = make_backend(max_altitude_m=20.0, max_distance_m=80.0)
+    backend.drone.flight_state = "landed"
+    original_call = type(backend.drone).__call__
+
+    def explode_on_altitude(self, message):
+        first = self._first(message)
+        if first.name == "MaxAltitude":
+            raise RuntimeError("synthetic firmware write failure")
+        return original_call(self, message)
+
+    monkeypatch.setattr(type(backend.drone), "__call__", explode_on_altitude)
+
+    assert not backend._configure_firmware_limits_if_safe()
+
+    assert "MaxAltitude command failed" in backend.state.preflight_reason
+    assert "MaxDistance" not in backend.drone.events
+    assert not backend._firmware_config_ok
+
+
 def test_firmware_readback_mismatch_is_fail_closed(make_backend):
     backend = make_backend(max_altitude_m=20.0, max_distance_m=80.0)
     backend.drone.flight_state = "landed"
@@ -1455,6 +1478,60 @@ def test_typed_live_command_exception_is_rejected_with_context(
     assert result_records[-1]["executed"] is False
 
 
+def test_typed_live_command_mock_logs_request_and_result(make_backend) -> None:
+    backend = make_backend()
+    backend.log.event = Mock()
+
+    result = backend.command(
+        ControlRequest.create(ControlAction.START_LOCALIZATION, human_origin=True)
+    )
+
+    assert result.accepted and result.executed
+    events = [call.args[0] for call in backend.log.event.call_args_list]
+    assert events == ["control_request", "control_result"]
+
+
+def test_legacy_nudge_command_mock_preserves_release_return(make_backend) -> None:
+    backend = make_backend()
+    backend.nudge_begin = Mock(return_value=True)
+    backend.nudge_end = Mock(return_value=None)
+
+    assert backend.command("nudge_begin", dir="前") is True
+    assert backend.command("nudge_end", dir="前") is None
+    backend.nudge_begin.assert_called_once_with("前")
+    backend.nudge_end.assert_called_once_with("前")
+
+
+def test_nudge_loop_mock_failure_releases_hold_and_sends_zero(make_backend) -> None:
+    backend = make_backend(skycontroller=False, pulse_s=5.0)
+    backend._combined_nudge_pcmd = Mock(return_value=(backend.nudge_pct, 0, 0, 0))
+    entered = threading.Event()
+    release = threading.Event()
+
+    def fail_after_observed(*_args, **_kwargs):
+        entered.set()
+        release.wait(timeout=2.0)
+        raise ConnectionError("mock hold failure")
+
+    backend.send_pcmd = Mock(side_effect=fail_after_observed)
+    backend._raw_pcmd = Mock()
+    with backend._lock:
+        backend._nudge_held.add("前")
+        backend._nudge_deadline = time.monotonic() + 5.0
+
+    backend._ensure_nudge_loop()
+    thread = backend._nudge_loop_thread
+    assert thread is not None
+    assert entered.wait(timeout=1.0)
+    release.set()
+    thread.join(timeout=2.0)
+
+    assert not thread.is_alive()
+    assert backend._nudge_held == set()
+    backend._raw_pcmd.assert_called_once_with(0, 0, 0, 0)
+    assert backend.state.last_command == "nudge_loop_error_hover"
+
+
 def test_typed_land_reports_unconfirmed_touchdown_as_rejected(make_backend) -> None:
     backend = make_backend()
     backend.drone.flight_state = "flying"
@@ -1582,6 +1659,63 @@ def test_takeoff_preflight_success_checks_video_battery_gps_source_and_limits(
     assert backend.state.preflight_ok is True
     assert backend.state.preflight_reason == "ready"
     assert backend.drone.source_state == "Controller"
+
+
+def test_mock_takeoff_success_records_only_after_hover_confirmation(
+        make_backend, monkeypatch):
+    backend = make_backend(max_altitude_m=10.0, max_distance_m=50.0)
+    backend.drone.flight_state = "landed"
+    backend.record_on_takeoff = True
+    recording_starts: list[str] = []
+    monkeypatch.setattr(
+        backend,
+        "start_flight_recording",
+        lambda reason: recording_starts.append(reason) or True,
+    )
+
+    assert backend.takeoff_cmd()
+
+    assert backend.drone.events.index("TakeOff") < backend.drone.events.index("PCMD")
+    assert recording_starts == ["post_takeoff"]
+    assert backend.state.tracker_state == "HOVER"
+    assert backend._maneuver_in_progress is None
+
+
+def test_mock_takeoff_preflight_failure_never_schedules_takeoff(make_backend):
+    backend = make_backend(max_altitude_m=10.0, max_distance_m=50.0)
+    backend.drone.flight_state = "landed"
+    backend.drone.connected = False
+
+    assert not backend.takeoff_cmd()
+
+    assert "TakeOff" not in backend.drone.events
+    assert backend.state.tracker_state == "TAKEOFF_BLOCKED"
+    assert backend._maneuver_in_progress is None
+
+
+def test_mock_takeoff_exception_after_schedule_uses_landing_fallback(
+        make_backend, monkeypatch):
+    backend = make_backend(max_altitude_m=10.0, max_distance_m=50.0)
+    backend.drone.flight_state = "landed"
+
+    def explode_after_hover(*_args, **_kwargs):
+        raise RuntimeError("synthetic post-takeoff failure")
+
+    monkeypatch.setattr(backend, "send_pcmd", explode_after_hover)
+
+    assert not backend.takeoff_cmd()
+
+    assert backend.drone.events.index("TakeOff") < backend.drone.events.index(
+        "Landing"
+    )
+    assert backend._landed
+    assert backend.drone.source_requests[-1] == "SkyController"
+    assert backend._maneuver_in_progress is None
+    assert any(
+        event == "takeoff" and fields.get("error") ==
+        "RuntimeError('synthetic post-takeoff failure')"
+        for event, fields in backend.log.records
+    )
 
 
 def test_limit_mismatch_is_advisory_and_takeoff_remains_available(make_backend):
@@ -2252,6 +2386,15 @@ def test_skycontroller_drone_wifi_loss_uses_the_same_three_poll_debounce(
     assert backend.drone.events == before
 
 
+def test_link_probe_falls_back_to_cached_state_without_issuing_commands(make_backend):
+    backend = make_backend()
+    backend.drone.connection_state = lambda: SimpleNamespace(name="Unknown")
+    before = list(backend.drone.events)
+
+    assert backend._probe_link_ok()
+    assert backend.drone.events == before
+
+
 def test_lost_link_policy_is_written_only_while_landed_and_read_back(make_backend):
     backend = make_backend()
     backend.drone.flight_state = "landed"
@@ -2510,6 +2653,28 @@ def test_cleanup_still_attempts_bounded_landing_after_pre_action_failure(make_ba
     backend.cleanup()
 
     assert attempts == ["cleanup_force_land"]
+
+
+def test_cleanup_completes_when_resource_close_reports_fault(make_backend):
+    backend = make_backend()
+    backend.drone.flight_state = "landed"
+
+    class BrokenGrabber:
+        def stop(self):
+            raise RuntimeError("pdraw close failed")
+
+    backend.grabber = BrokenGrabber()
+    backend._stop_stick_monitor = lambda: (_ for _ in ()).throw(
+        RuntimeError("stick monitor close failed")
+    )
+
+    assert backend.cleanup()
+    assert backend._cleanup_done
+    assert backend.grabber is None
+    assert backend.drone is None
+    assert any(
+        event == "cleanup_stick_monitor_error" for event, _ in backend.log.records
+    )
 
 
 def test_cleanup_finalizes_recording_without_synchronous_download(make_backend):
@@ -2916,6 +3081,23 @@ def test_axes_active_deadzone():
     assert not backend_module.axes_active({0: 2000})  # equal to default deadzone
     assert backend_module.axes_active({0: 2001})
     assert backend_module.axes_active({3: -5000, 0: 0})
+
+
+def test_stick_monitor_processes_axis_data_and_notifies_override():
+    observed = []
+    monitor = backend_module.SkyControllerStickMonitor(observed.append)
+
+    event = struct.pack(
+        backend_module._JS_EVENT_FMT,
+        0,
+        2501,
+        backend_module._JS_EVENT_AXIS,
+        0,
+    )
+    monitor._process_stick_data(event)
+
+    assert observed == [{0: 2501}]
+    assert monitor.snapshot_axes() == {0: 2501}
 
 
 def test_stick_monitor_reports_an_unexpected_device_disconnect(monkeypatch):
@@ -3645,7 +3827,12 @@ def test_stick_override_callback_failure_is_logged_and_latches_unhealthy():
 
 def test_stick_monitor_loop_reports_callback_failures(monkeypatch):
     """Guards the real _loop wiring, not just the pattern above."""
-    source = inspect.getsource(backend_module.SkyControllerStickMonitor._loop)
+    source = "\n".join(
+        (
+            inspect.getsource(backend_module.SkyControllerStickMonitor._loop),
+            inspect.getsource(backend_module.SkyControllerStickMonitor._notify_stick_activity),
+        )
+    )
     assert "stick_override_callback_failed" in source
     assert "_STICK_CALLBACK_FAIL_LIMIT" in source
     assert "except Exception:\n                        pass" not in source

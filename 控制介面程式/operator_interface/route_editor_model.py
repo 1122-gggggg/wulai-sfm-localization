@@ -73,6 +73,37 @@ def _arrive_radius(raw: object) -> float | None:
     return value
 
 
+def _editor_points_from_route(
+    raw: dict,
+    *,
+    map_frame,
+    align_source: str,
+) -> np.ndarray:
+    points = _waypoints(raw.get("waypoints"), "route")
+    frame = raw.get("frame", "aligned")
+    if frame == "glomap":
+        return glomap_to_editor(points, map_frame)
+    if frame != "aligned":
+        raise ValueError("route frame must be 'aligned' or 'glomap'")
+
+    declared = raw.get("align_source")
+    if declared is None:
+        declared = "legacy"
+    if declared not in ("legacy", "measured"):
+        raise ValueError(f"unsupported route align_source: {declared!r}")
+    if declared == align_source:
+        return np.asarray(points, dtype=float).reshape(-1, 3)
+    if declared == "legacy":
+        # Legacy-authored route opened at a measured site: round-trip
+        # through raw GLOMAP so the points land in the basis on screen.
+        return glomap_to_editor(editor_to_glomap(points), map_frame)
+    raise ValueError(
+        "route declares align_source='measured' but this site has no "
+        "measured gravity alignment, so the basis it was authored in "
+        "cannot be reconstructed"
+    )
+
+
 @dataclass
 class RouteDocument:
     """An open waypoint polyline stored internally in editor Z-up coordinates."""
@@ -131,32 +162,11 @@ class RouteDocument:
             raise ValueError(
                 "route coordinate_frame_id does not match the selected site"
             )
-        points = _waypoints(raw.get("waypoints"), "route")
-        frame = raw.get("frame", "aligned")
-        if frame == "glomap":
-            editor_points = glomap_to_editor(points, map_frame)
-        elif frame == "aligned":
-            declared = raw.get("align_source")
-            if declared is None:
-                declared = "legacy"
-            if declared not in ("legacy", "measured"):
-                raise ValueError(f"unsupported route align_source: {declared!r}")
-            if declared == align_source:
-                editor_points = np.asarray(points, dtype=float).reshape(-1, 3)
-            elif declared == "legacy":
-                # Legacy-authored route opened at a measured site: round-trip
-                # through raw GLOMAP so the points land in the basis on screen.
-                editor_points = glomap_to_editor(
-                    editor_to_glomap(points), map_frame
-                )
-            else:
-                raise ValueError(
-                    "route declares align_source='measured' but this site has no "
-                    "measured gravity alignment, so the basis it was authored in "
-                    "cannot be reconstructed"
-                )
-        else:
-            raise ValueError("route frame must be 'aligned' or 'glomap'")
+        editor_points = _editor_points_from_route(
+            raw,
+            map_frame=map_frame,
+            align_source=align_source,
+        )
         return cls(
             site_id=site_id,
             coordinate_frame_id=coordinate_frame_id,

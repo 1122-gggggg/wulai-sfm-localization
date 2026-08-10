@@ -477,9 +477,24 @@ def build_argument_parser() -> argparse.ArgumentParser:
     return ap
 
 
-def main() -> None:
-    configure_offline_environment()
-    install_network_guard(InterfaceMode.SIMULATED_STREAM)
+def _validate_backend_options(ap, args, backend: str) -> None:
+    if backend == "edm":
+        for enabled, flag in (
+            (args.neuflow_track, "--neuflow-track"),
+            (args.projection_track, "--projection-track"),
+            (args.matcher_mode, "--matcher-mode"),
+        ):
+            if enabled:
+                ap.error(f"{flag} is XFeat-only; use --localizer-backend xfeat")
+        if args.production_profile_sha256 and not args.production_profile:
+            ap.error("--production-profile-sha256 requires --production-profile")
+    elif args.production_profile:
+        ap.error("--production-profile is EDM-only")
+    elif args.production_profile_sha256:
+        ap.error("--production-profile-sha256 is EDM-only")
+
+
+def _parse_worker_args():
     ap = build_argument_parser()
     args = ap.parse_args()
     if bool(args.frame_shm_name) != (args.frame_shm_slots > 0):
@@ -505,21 +520,11 @@ def main() -> None:
         backend = resolve_localizer_backend(args.localizer_backend, Path(args.bundle))
     except ValueError as exc:
         ap.error(str(exc))
-    if backend == "edm":
-        for enabled, flag in (
-            (args.neuflow_track, "--neuflow-track"),
-            (args.projection_track, "--projection-track"),
-            (args.matcher_mode, "--matcher-mode"),
-        ):
-            if enabled:
-                ap.error(f"{flag} is XFeat-only; use --localizer-backend xfeat")
-        if args.production_profile_sha256 and not args.production_profile:
-            ap.error("--production-profile-sha256 requires --production-profile")
-    elif args.production_profile:
-        ap.error("--production-profile is EDM-only")
-    elif args.production_profile_sha256:
-        ap.error("--production-profile-sha256 is EDM-only")
+    _validate_backend_options(ap, args, backend)
+    return args, query_camera_override, backend
 
+
+def _prepare_worker_runtime(args, backend: str):
     startup_started = time.perf_counter()
     json_fd = os.dup(sys.stdout.fileno())
     json_out = os.fdopen(json_fd, "w", encoding="utf-8", buffering=1)
@@ -537,8 +542,80 @@ def main() -> None:
     map_frame = None
     if args.map_align:
         from real_path_follow_controller import load_map_frame
-        map_frame = load_map_frame(args.map_align)
 
+        map_frame = load_map_frame(args.map_align)
+    return startup_started, json_out, map_frame
+
+
+def _prepare_benchmark_seed(args, tracker, xmap):
+    force_track_ref_resolved: int | None = None
+    force_track_label = None
+    seed_local_prior = None
+    if args.force_track_bench or args.runtime_benchmark_control:
+        from pose_types import Pose
+
+        centers = xmap.ref_centers
+        if centers is None or len(centers) == 0:
+            raise RuntimeError(
+                "bundle missing ref_centers; cannot seed local benchmark prior"
+            )
+        n = len(centers)
+        try:
+            force_track_ref_resolved = resolve_force_track_ref(args.force_track_ref, n)
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
+        center = np.asarray(centers[force_track_ref_resolved], np.float32)
+        seed_yaw = 0.0
+        if xmap.ref_yaws is not None and len(xmap.ref_yaws) == n:
+            seed_yaw = float(xmap.ref_yaws[force_track_ref_resolved])
+        distances = np.linalg.norm(
+            np.asarray(centers, np.float32) - center[None, :], axis=1
+        )
+        seed_near = [int(j) for j in np.argsort(distances)[:5]]
+        if args.force_track_bench:
+            force_track_label = "fixed_prior_cold_cache"
+
+        def seed_local_prior(target_mode: str, *, reset_temporal: bool = False) -> None:
+            """Seed a fixed map-reference pose for TRACK/WEAK speed tests."""
+            pose0 = Pose(
+                x=float(center[0]), y=float(center[1]), z=float(center[2]),
+                yaw=seed_yaw, stamp=time.monotonic(),
+            )
+            state = tracker.state
+            state.mode = str(target_mode)
+            state.last_pose = pose0
+            state.prev_pose = pose0
+            state.last_center = center.copy()
+            state.prev_center = center.copy()
+            state.last_yaw = seed_yaw
+            state.prev_yaw = seed_yaw
+            state.last_refs = list(seed_near)
+            state.fail_count = 0
+            state.bad_count = 0
+            if reset_temporal:
+                tracker.temporal_cache = type(tracker.temporal_cache)()
+
+        if args.force_track_bench:
+            seed_local_prior("TRACK", reset_temporal=True)
+            print(
+                f"[live_worker] FORCE_TRACK_BENCH label={force_track_label} "
+                f"ref_requested={args.force_track_ref} "
+                f"ref_resolved={force_track_ref_resolved} "
+                "(fixed prior, temporal cache reset, MegaLoc/BOOT_INIT skipped each frame)",
+                file=sys.stderr,
+                flush=True,
+            )
+        else:
+            print(
+                f"[live_worker] runtime benchmark modes ready ref={force_track_ref_resolved} "
+                "(default auto; UI controls global/weak/track at frame boundaries)",
+                file=sys.stderr,
+                flush=True,
+            )
+    return force_track_ref_resolved, force_track_label, seed_local_prior
+
+
+def _build_worker_backend(args, backend: str, query_camera_override, map_frame):
     with redirect_native_stdout_to_stderr(), contextlib.redirect_stdout(sys.stderr):
         import torch
 
@@ -632,6 +709,7 @@ def main() -> None:
             )
             if args.neuflow_track:
                 from neuflow_refresh_experiment import NeuFlowRefreshTracker, NeuFlowV2Backend
+
                 neuflow_backend = NeuFlowV2Backend(
                     repo=DEFAULT_NEUFLOW_REPO,
                     weights=DEFAULT_NEUFLOW_WEIGHTS,
@@ -648,6 +726,7 @@ def main() -> None:
                 from projection_guided_tracker import (
                     ProjectionGuidedTracker, TrackLandmarkSidecar,
                 )
+
                 landmark_sidecar = TrackLandmarkSidecar.load(
                     Path(args.track_landmarks), xmap.ref_names)
                 tracker = ProjectionGuidedTracker(
@@ -692,67 +771,37 @@ def main() -> None:
         else:
             tracker.ensure_models()
 
-        force_track_ref_resolved: int | None = None
-        force_track_label = None
-        seed_local_prior = None
-        if args.force_track_bench or args.runtime_benchmark_control:
-            from pose_types import Pose
-            centers = xmap.ref_centers
-            if centers is None or len(centers) == 0:
-                raise RuntimeError(
-                    "bundle missing ref_centers; cannot seed local benchmark prior")
-            n = len(centers)
-            try:
-                force_track_ref_resolved = resolve_force_track_ref(args.force_track_ref, n)
-            except ValueError as exc:
-                raise SystemExit(str(exc)) from exc
-            C = np.asarray(centers[force_track_ref_resolved], np.float32)
-            seed_yaw = 0.0
-            if xmap.ref_yaws is not None and len(xmap.ref_yaws) == n:
-                seed_yaw = float(xmap.ref_yaws[force_track_ref_resolved])
-            d = np.linalg.norm(np.asarray(centers, np.float32) - C[None, :], axis=1)
-            seed_near = [int(j) for j in np.argsort(d)[:5]]
-            if args.force_track_bench:
-                force_track_label = "fixed_prior_cold_cache"
+        benchmark_seed = _prepare_benchmark_seed(args, tracker, xmap)
+    return (
+        torch,
+        tracker,
+        xmap,
+        cam,
+        cfg,
+        tracker_variant,
+        DEVICE,
+        *benchmark_seed,
+    )
 
-            def seed_local_prior(target_mode: str, *, reset_temporal: bool = False) -> None:
-                """Seed a fixed map-reference pose for TRACK/WEAK speed tests."""
-                pose0 = Pose(
-                    x=float(C[0]), y=float(C[1]), z=float(C[2]),
-                    yaw=seed_yaw, stamp=time.monotonic(),
-                )
-                st = tracker.state
-                st.mode = str(target_mode)
-                st.last_pose = pose0
-                st.prev_pose = pose0
-                st.last_center = C.copy()
-                st.prev_center = C.copy()
-                st.last_yaw = seed_yaw
-                st.prev_yaw = seed_yaw
-                st.last_refs = list(seed_near)
-                st.fail_count = 0
-                st.bad_count = 0
-                if reset_temporal:
-                    tracker.temporal_cache = type(tracker.temporal_cache)()
 
-            if args.force_track_bench:
-                seed_local_prior("TRACK", reset_temporal=True)
-                print(
-                    f"[live_worker] FORCE_TRACK_BENCH label={force_track_label} "
-                    f"ref_requested={args.force_track_ref} "
-                    f"ref_resolved={force_track_ref_resolved} "
-                    f"(fixed prior, temporal cache reset, MegaLoc/BOOT_INIT skipped each frame)",
-                    file=sys.stderr,
-                    flush=True,
-                )
-            else:
-                print(
-                    f"[live_worker] runtime benchmark modes ready ref={force_track_ref_resolved} "
-                    "(default auto; UI controls global/weak/track at frame boundaries)",
-                    file=sys.stderr,
-                    flush=True,
-                )
+def main() -> None:
+    configure_offline_environment()
+    install_network_guard(InterfaceMode.SIMULATED_STREAM)
+    args, query_camera_override, backend = _parse_worker_args()
+    startup_started, json_out, map_frame = _prepare_worker_runtime(args, backend)
 
+    (
+        torch,
+        tracker,
+        xmap,
+        cam,
+        cfg,
+        tracker_variant,
+        DEVICE,
+        force_track_ref_resolved,
+        force_track_label,
+        seed_local_prior,
+    ) = _build_worker_backend(args, backend, query_camera_override, map_frame)
     startup_ms = (time.perf_counter() - startup_started) * 1000.0
     print(
         f"[live_worker] ready backend={backend} device={DEVICE} "
@@ -770,6 +819,147 @@ def main() -> None:
         }, ensure_ascii=False) + "\n")
         json_out.flush()
 
+    _run_worker_loop(
+        args,
+        json_out,
+        backend,
+        torch,
+        tracker,
+        tracker_variant,
+        force_track_ref_resolved,
+        force_track_label,
+        seed_local_prior,
+    )
+
+
+def _read_benchmark_request(args):
+    benchmark_mode_requested = "track" if args.force_track_bench else "auto"
+    capture_stamp = None
+    if args.runtime_benchmark_control:
+        header = read_exact(sys.stdin.buffer, HEADER_SIZE)
+        if not header:
+            return None
+        if len(header) != HEADER_SIZE:
+            print(
+                f"[live_worker] partial control header: {len(header)}/{HEADER_SIZE}",
+                file=sys.stderr,
+                flush=True,
+            )
+            return None
+        if bytes(header[:4]) == TIMED_MAGIC:
+            suffix = read_exact(sys.stdin.buffer, TIMED_HEADER_SIZE - HEADER_SIZE)
+            if len(suffix) != TIMED_HEADER_SIZE - HEADER_SIZE:
+                print(
+                    "[live_worker] partial timed control header",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                return None
+            header.extend(suffix)
+        try:
+            benchmark_mode_requested, capture_stamp = decode_request(header)
+        except ValueError as exc:
+            print(f"[live_worker] {exc}", file=sys.stderr, flush=True)
+            return None
+    return benchmark_mode_requested, capture_stamp
+
+
+def _read_worker_frame(args, frame_buffer, frame_shm, frame_size: int):
+    if frame_shm is None:
+        assert frame_buffer is not None
+        frame_bytes = read_exact_into(sys.stdin.buffer, frame_buffer)
+        if not frame_bytes:
+            return None
+        if frame_bytes != frame_size:
+            print(
+                f"[live_worker] partial frame: {frame_bytes}/{frame_size}",
+                file=sys.stderr,
+                flush=True,
+            )
+            return None
+        return frame_view_from_rgb_bytes(frame_buffer, args.width, args.height)
+    slot_byte = read_exact(sys.stdin.buffer, 1)
+    if not slot_byte:
+        return None
+    return frame_view_from_shared_memory(
+        frame_shm.buf,
+        slot_byte[0],
+        args.frame_shm_slots,
+        args.width,
+        args.height,
+    )
+
+
+def _prepare_benchmark_frame(
+    args,
+    tracker,
+    seed_local_prior,
+    benchmark_mode_requested: str,
+    previous_runtime_mode: str,
+):
+    force_track_seed_ms = 0.0
+    benchmark_setup_ms = 0.0
+    benchmark_seeded = False
+    benchmark_mode_active = (
+        "track" if args.force_track_bench else previous_runtime_mode
+    )
+    if args.force_track_bench:
+        seed_t0 = time.perf_counter()
+        assert seed_local_prior is not None
+        seed_local_prior("TRACK", reset_temporal=True)
+        force_track_seed_ms = (time.perf_counter() - seed_t0) * 1000.0
+        benchmark_setup_ms = force_track_seed_ms
+        benchmark_seeded = True
+    elif args.runtime_benchmark_control:
+        setup_t0 = time.perf_counter()
+        assert seed_local_prior is not None
+        if benchmark_mode_requested == "relocalize":
+            # Preserve the last trustworthy spatial prior and force this
+            # frame into LOST recovery. EDM itself allows MegaLoc only on
+            # the first frame of each LOST episode; later retries stay local.
+            tracker.state.mode = "LOST"
+            tracker.state.fail_count = 0
+            tracker.state.bad_count = 0
+            benchmark_mode_active = previous_runtime_mode
+        else:
+            benchmark_seeded = apply_runtime_benchmark_mode(
+                tracker,
+                benchmark_mode_requested,
+                previous_runtime_mode,
+                lambda target: seed_local_prior(target, reset_temporal=False),
+            )
+            previous_runtime_mode = benchmark_mode_requested
+            benchmark_mode_active = benchmark_mode_requested
+        benchmark_setup_ms = (time.perf_counter() - setup_t0) * 1000.0
+    return (
+        force_track_seed_ms,
+        benchmark_setup_ms,
+        benchmark_seeded,
+        benchmark_mode_active,
+        previous_runtime_mode,
+    )
+
+
+def _run_tracker_localization(
+    tracker,
+    frame,
+    capture_stamp,
+    gpu_start_event,
+    gpu_end_event,
+):
+    if gpu_start_event is not None:
+        gpu_start_event.record()
+    with redirect_native_stdout_to_stderr(), contextlib.redirect_stdout(sys.stderr):
+        pose = tracker.localize_frame(frame, capture_stamp=capture_stamp)
+    gpu_span_ms = None
+    if gpu_end_event is not None:
+        gpu_end_event.record()
+        gpu_end_event.synchronize()
+        gpu_span_ms = float(gpu_start_event.elapsed_time(gpu_end_event))
+    return pose, gpu_span_ms
+
+
+def _prepare_frame_io(args, torch):
     frame_size = int(args.width) * int(args.height) * 3
     frame_buffer = None if args.frame_shm_name else bytearray(frame_size)
     frame_shm = (
@@ -789,271 +979,394 @@ def main() -> None:
         torch.cuda.Event(enable_timing=True) if gpu_timing_profiled else None)
     gpu_end_event = (
         torch.cuda.Event(enable_timing=True) if gpu_timing_profiled else None)
+    return (
+        frame_size,
+        frame_buffer,
+        frame_shm,
+        gpu_timing_profiled,
+        gpu_start_event,
+        gpu_end_event,
+    )
+
+
+def _close_worker_frame_shm(frame_shm) -> None:
+    if frame_shm is not None:
+        frame_shm.close()
+
+
+def _build_success_payload(
+    *,
+    args,
+    seq: int,
+    pose,
+    tracker,
+    capture_stamp,
+    worker_read_done_mono_ns: int,
+    worker_read_done_mono: float,
+    worker_core_start_mono: float,
+    worker_core_start_mono_ns: int,
+    worker_core_done_mono_ns: int,
+    wall_t0: float,
+    core_t0: float,
+    gpu_timing_profiled: bool,
+    gpu_span_ms,
+    tracker_variant: str,
+    force_track_label,
+    force_track_ref_resolved,
+    force_track_seed_ms: float,
+    benchmark_mode_requested: str,
+    benchmark_mode_active: str,
+    benchmark_setup_ms: float,
+    benchmark_seeded: bool,
+) -> dict:
+    worker_core_done_mono = worker_core_done_mono_ns * 1e-9
+    core_wall_ms = (time.perf_counter() - core_t0) * 1000.0
+    # Backward-compatible wall_ms retains the old forced-bench seed cost.
+    wall_ms = (time.perf_counter() - wall_t0) * 1000.0
+    info = dict(tracker.last_info)
+    # A non-finite pose (NaN/inf) would serialize as the bare token `NaN`
+    # (invalid JSON) and could steer the UI trajectory -> report it as no fix.
+    pose_ok = pose is not None and bool(
+        np.isfinite([pose.x, pose.y, pose.z, pose.yaw]).all())
+    raw_confidence = info.get("confidence", info.get("inlier_ratio"))
+    try:
+        confidence = float(raw_confidence)
+    except (TypeError, ValueError, OverflowError):
+        confidence = 1.0 if pose_ok else 0.0
+    if not math.isfinite(confidence):
+        confidence = 1.0 if pose_ok else 0.0
+    confidence = min(1.0, max(0.0, confidence))
+    capture_mono_ns = (
+        int(round(float(capture_stamp) * 1_000_000_000.0))
+        if capture_stamp is not None
+        else worker_read_done_mono_ns
+    )
+    return {
+        "seq": seq,
+        "frame_id": f"worker-{seq}",
+        "capture_mono_ns": capture_mono_ns,
+        "pose_mono_ns": worker_core_done_mono_ns,
+        "localization_contract_version": 1,
+        "validity": bool(pose_ok),
+        "confidence": confidence,
+        "success": pose_ok,
+        "wall_ms": wall_ms,
+        "core_wall_ms": core_wall_ms,
+        "worker_read_done_mono": worker_read_done_mono,
+        "worker_core_start_mono": worker_core_start_mono,
+        "worker_core_done_mono": worker_core_done_mono,
+        "worker_read_done_mono_ns": worker_read_done_mono_ns,
+        "worker_core_start_mono_ns": worker_core_start_mono_ns,
+        "worker_core_done_mono_ns": worker_core_done_mono_ns,
+        "gpu_timing_profiled": gpu_timing_profiled,
+        "gpu_span_ms": gpu_span_ms,
+        "tracker_variant": tracker_variant,
+        "force_track_bench": bool(args.force_track_bench),
+        "force_track_label": force_track_label,
+        "force_track_ref_requested": (
+            int(args.force_track_ref) if args.force_track_bench else None),
+        "force_track_ref_resolved": (
+            force_track_ref_resolved if args.force_track_bench else None),
+        "force_track_seed_ms": force_track_seed_ms,
+        "benchmark_mode_requested": benchmark_mode_requested,
+        "benchmark_mode_active": benchmark_mode_active,
+        "relocalize_requested": benchmark_mode_requested == "relocalize",
+        "benchmark_prior_kind": (
+            "fixed_ref" if benchmark_mode_active in {"weak", "track"} else None),
+        "benchmark_prior_ref": (
+            force_track_ref_resolved
+            if benchmark_mode_active in {"weak", "track"} else None),
+        "benchmark_setup_ms": benchmark_setup_ms,
+        "benchmark_seeded": benchmark_seeded,
+        "pose": None if not pose_ok else {
+            "x": float(pose.x),
+            "y": float(pose.y),
+            "z": float(pose.z),
+            "yaw_raw": float(pose.yaw),
+        },
+        "mode": info.get("mode"),
+        "next_mode": info.get("next_mode"),
+        "inliers": int(info.get("inliers", 0) or 0),
+        "n_corr": info.get("n_corr"),
+        "reference_count": info.get("reference_count"),
+        "candidate_mode": info.get("candidate_mode"),
+        "global_retrieval_calls": info.get("global_retrieval_calls"),
+        "camera_axes_world": info.get("camera_axes_world"),
+        "camera_forward_world": info.get("camera_forward_world"),
+        "reproj_rms": info.get("reproj_rms"),
+        "inlier_ratio": info.get("inlier_ratio"),
+        "inlier_grid_cells": info.get("inlier_grid_cells"),
+        "requested_reference_count": info.get("requested_reference_count"),
+        "staged_early_stop": info.get("staged_early_stop"),
+        "rejected": info.get("rejected"),
+        "limited_jump": info.get("limited_jump"),
+        "limited_jump_confirmed": info.get(
+            "limited_jump_confirmed", False
+        ),
+        "composite_stage": info.get("composite_stage"),
+        "vpr_ms": info.get("vpr_ms"),
+        "feature_ms": info.get("feature_ms"),
+        "match_ms": info.get("match_ms"),
+        "pnp_ms": info.get("pnp_ms"),
+        "neuflow_stage": info.get("neuflow_stage"),
+        "neuflow_anchor_count": info.get("neuflow_anchor_count"),
+        "neuflow_flow_ms": info.get("neuflow_flow_ms"),
+        "neuflow_gpu_ms": info.get("neuflow_gpu_ms"),
+        "projection_fallback": info.get("projection_fallback"),
+        "projection_reason": info.get("projection_reason"),
+        "projection_radius_px": info.get("projection_radius_px"),
+        "projection_anchor_count": info.get("projection_anchor_count"),
+        "projection_visible_count": info.get("projection_visible_count"),
+        "projection_match_count": info.get("projection_match_count"),
+        "projection_best_inliers": info.get("projection_best_inliers"),
+        "projection_project_ms": info.get("projection_project_ms"),
+        "projection_feature_ms": info.get("projection_feature_ms"),
+        "projection_match_ms": info.get("projection_match_ms"),
+    }
+
+
+def _build_exception_payload(
+    *,
+    args,
+    seq: int,
+    error: Exception,
+    backend: str,
+    torch,
+    capture_stamp,
+    worker_read_done_mono_ns: int,
+    worker_read_done_mono: float,
+    worker_core_start_mono,
+    worker_core_start_mono_ns,
+    worker_core_done_mono_ns: int,
+    wall_t0: float,
+    core_t0,
+    gpu_timing_profiled: bool,
+    tracker_variant: str,
+    force_track_label,
+    force_track_ref_resolved,
+    force_track_seed_ms: float,
+    benchmark_mode_requested: str,
+    benchmark_mode_active: str,
+    benchmark_setup_ms: float,
+    benchmark_seeded: bool,
+) -> tuple[dict, bool]:
+    worker_core_done_mono = worker_core_done_mono_ns * 1e-9
+    core_wall_ms = (
+        (time.perf_counter() - core_t0) * 1000.0 if core_t0 is not None else None)
+    wall_ms = (time.perf_counter() - wall_t0) * 1000.0
+    worker_fatal = edm_cuda_oom_requires_restart(backend, error, torch)
+    payload = localization_exception_payload(
+        seq=seq,
+        error="cuda_oom" if worker_fatal else error,
+        frame_id=f"worker-{seq}",
+        capture_mono_ns=(
+            int(round(float(capture_stamp) * 1_000_000_000.0))
+            if capture_stamp is not None
+            else worker_read_done_mono_ns
+        ),
+        pose_mono_ns=worker_core_done_mono_ns or worker_read_done_mono_ns,
+    )
+    payload.update({
+        "wall_ms": wall_ms,
+        "core_wall_ms": core_wall_ms,
+        "worker_read_done_mono": worker_read_done_mono,
+        "worker_core_start_mono": worker_core_start_mono,
+        "worker_core_done_mono": worker_core_done_mono,
+        "worker_read_done_mono_ns": worker_read_done_mono_ns,
+        "worker_core_start_mono_ns": worker_core_start_mono_ns,
+        "worker_core_done_mono_ns": worker_core_done_mono_ns,
+        "gpu_timing_profiled": gpu_timing_profiled,
+        "gpu_span_ms": None,
+        "tracker_variant": tracker_variant,
+        "force_track_bench": bool(args.force_track_bench),
+        "force_track_label": force_track_label,
+        "force_track_ref_requested": (
+            int(args.force_track_ref) if args.force_track_bench else None),
+        "force_track_ref_resolved": (
+            force_track_ref_resolved if args.force_track_bench else None),
+        "force_track_seed_ms": force_track_seed_ms,
+        "benchmark_mode_requested": benchmark_mode_requested,
+        "benchmark_mode_active": benchmark_mode_active,
+        "benchmark_prior_kind": (
+            "fixed_ref" if benchmark_mode_active in {"weak", "track"} else None),
+        "benchmark_prior_ref": (
+            force_track_ref_resolved
+            if benchmark_mode_active in {"weak", "track"} else None),
+        "benchmark_setup_ms": benchmark_setup_ms,
+        "benchmark_seeded": benchmark_seeded,
+    })
+    if worker_fatal:
+        payload.update(cuda_oom_failure_fields(error))
+    print(f"[live_worker] localization error: {error!r}", file=sys.stderr, flush=True)
+    return payload, worker_fatal
+
+
+def _process_worker_frame(
+    *,
+    args,
+    backend: str,
+    torch,
+    tracker,
+    tracker_variant: str,
+    frame,
+    seq: int,
+    benchmark_mode_requested: str,
+    capture_stamp,
+    worker_read_done_mono_ns: int,
+    worker_read_done_mono: float,
+    gpu_timing_profiled: bool,
+    gpu_start_event,
+    gpu_end_event,
+    force_track_ref_resolved,
+    force_track_label,
+    seed_local_prior,
+    previous_runtime_mode: str,
+):
+    wall_t0 = time.perf_counter()
+    core_t0 = None
+    worker_core_start_mono = None
+    worker_core_start_mono_ns = None
+    worker_core_done_mono_ns = None
+    force_track_seed_ms = 0.0
+    benchmark_setup_ms = 0.0
+    benchmark_seeded = False
+    benchmark_mode_active = (
+        "track" if args.force_track_bench else previous_runtime_mode
+    )
+    worker_fatal = False
+    try:
+        (
+            force_track_seed_ms,
+            benchmark_setup_ms,
+            benchmark_seeded,
+            benchmark_mode_active,
+            previous_runtime_mode,
+        ) = _prepare_benchmark_frame(
+            args,
+            tracker,
+            seed_local_prior,
+            benchmark_mode_requested,
+            previous_runtime_mode,
+        )
+        worker_core_start_mono_ns = time.monotonic_ns()
+        worker_core_start_mono = worker_core_start_mono_ns * 1e-9
+        core_t0 = time.perf_counter()
+        pose, gpu_span_ms = _run_tracker_localization(
+            tracker, frame, capture_stamp, gpu_start_event, gpu_end_event
+        )
+        worker_core_done_mono_ns = time.monotonic_ns()
+        payload = _build_success_payload(
+            args=args,
+            seq=seq,
+            pose=pose,
+            tracker=tracker,
+            capture_stamp=capture_stamp,
+            worker_read_done_mono_ns=worker_read_done_mono_ns,
+            worker_read_done_mono=worker_read_done_mono,
+            worker_core_start_mono=worker_core_start_mono,
+            worker_core_start_mono_ns=worker_core_start_mono_ns,
+            worker_core_done_mono_ns=worker_core_done_mono_ns,
+            wall_t0=wall_t0,
+            core_t0=core_t0,
+            gpu_timing_profiled=gpu_timing_profiled,
+            gpu_span_ms=gpu_span_ms,
+            tracker_variant=tracker_variant,
+            force_track_label=force_track_label,
+            force_track_ref_resolved=force_track_ref_resolved,
+            force_track_seed_ms=force_track_seed_ms,
+            benchmark_mode_requested=benchmark_mode_requested,
+            benchmark_mode_active=benchmark_mode_active,
+            benchmark_setup_ms=benchmark_setup_ms,
+            benchmark_seeded=benchmark_seeded,
+        )
+    except Exception as exc:
+        worker_core_done_mono_ns = time.monotonic_ns()
+        payload, worker_fatal = _build_exception_payload(
+            args=args,
+            seq=seq,
+            error=exc,
+            backend=backend,
+            torch=torch,
+            capture_stamp=capture_stamp,
+            worker_read_done_mono_ns=worker_read_done_mono_ns,
+            worker_read_done_mono=worker_read_done_mono,
+            worker_core_start_mono=worker_core_start_mono,
+            worker_core_start_mono_ns=worker_core_start_mono_ns,
+            worker_core_done_mono_ns=worker_core_done_mono_ns,
+            wall_t0=wall_t0,
+            core_t0=core_t0,
+            gpu_timing_profiled=gpu_timing_profiled,
+            tracker_variant=tracker_variant,
+            force_track_label=force_track_label,
+            force_track_ref_resolved=force_track_ref_resolved,
+            force_track_seed_ms=force_track_seed_ms,
+            benchmark_mode_requested=benchmark_mode_requested,
+            benchmark_mode_active=benchmark_mode_active,
+            benchmark_setup_ms=benchmark_setup_ms,
+            benchmark_seeded=benchmark_seeded,
+        )
+    if worker_fatal:
+        payload["cuda_cache_cleanup"] = cleanup_cuda_cache(torch)
+        print(
+            "[live_worker] fatal EDM CUDA OOM: cache cleanup complete; exiting for restart",
+            file=sys.stderr,
+            flush=True,
+        )
+    return payload, worker_fatal, previous_runtime_mode
+
+
+def _run_worker_loop(
+    args,
+    json_out,
+    backend: str,
+    torch,
+    tracker,
+    tracker_variant: str,
+    force_track_ref_resolved,
+    force_track_label,
+    seed_local_prior,
+) -> None:
+    (
+        frame_size,
+        frame_buffer,
+        frame_shm,
+        gpu_timing_profiled,
+        gpu_start_event,
+        gpu_end_event,
+    ) = _prepare_frame_io(args, torch)
     seq = 0
     previous_runtime_mode = "auto"
+    frame = None
     while True:
-        benchmark_mode_requested = "track" if args.force_track_bench else "auto"
-        capture_stamp = None
-        if args.runtime_benchmark_control:
-            header = read_exact(sys.stdin.buffer, HEADER_SIZE)
-            if not header:
-                break
-            if len(header) != HEADER_SIZE:
-                print(
-                    f"[live_worker] partial control header: {len(header)}/{HEADER_SIZE}",
-                    file=sys.stderr,
-                    flush=True,
-                )
-                break
-            if bytes(header[:4]) == TIMED_MAGIC:
-                suffix = read_exact(
-                    sys.stdin.buffer, TIMED_HEADER_SIZE - HEADER_SIZE)
-                if len(suffix) != TIMED_HEADER_SIZE - HEADER_SIZE:
-                    print(
-                        "[live_worker] partial timed control header",
-                        file=sys.stderr,
-                        flush=True,
-                    )
-                    break
-                header.extend(suffix)
-            try:
-                benchmark_mode_requested, capture_stamp = decode_request(header)
-            except ValueError as exc:
-                print(f"[live_worker] {exc}", file=sys.stderr, flush=True)
-                break
-        if frame_shm is None:
-            assert frame_buffer is not None
-            frame_bytes = read_exact_into(sys.stdin.buffer, frame_buffer)
-            if not frame_bytes:
-                break
-            if frame_bytes != frame_size:
-                print(f"[live_worker] partial frame: {frame_bytes}/{frame_size}", file=sys.stderr, flush=True)
-                break
-            frame = frame_view_from_rgb_bytes(frame_buffer, args.width, args.height)
-        else:
-            slot_byte = read_exact(sys.stdin.buffer, 1)
-            if not slot_byte:
-                break
-            frame = frame_view_from_shared_memory(
-                frame_shm.buf, slot_byte[0], args.frame_shm_slots,
-                args.width, args.height,
-            )
+        request = _read_benchmark_request(args)
+        if request is None:
+            break
+        benchmark_mode_requested, capture_stamp = request
+        frame = _read_worker_frame(args, frame_buffer, frame_shm, frame_size)
+        if frame is None:
+            break
         worker_read_done_mono_ns = time.monotonic_ns()
         worker_read_done_mono = worker_read_done_mono_ns * 1e-9
-        # The parent never overwrites the active slot until this synchronous request
-        # returns, so both pipe and shared-memory paths need no second 720p copy.
-        wall_t0 = time.perf_counter()
-        core_t0: float | None = None
-        worker_core_start_mono: float | None = None
-        worker_core_start_mono_ns: int | None = None
-        gpu_span_ms: float | None = None
-        force_track_seed_ms = 0.0
-        benchmark_setup_ms = 0.0
-        benchmark_seeded = False
-        benchmark_mode_active = "track" if args.force_track_bench else previous_runtime_mode
-        worker_fatal = False
-        try:
-            if args.force_track_bench:
-                seed_t0 = time.perf_counter()
-                assert seed_local_prior is not None
-                seed_local_prior("TRACK", reset_temporal=True)
-                force_track_seed_ms = (time.perf_counter() - seed_t0) * 1000.0
-                benchmark_setup_ms = force_track_seed_ms
-                benchmark_seeded = True
-            elif args.runtime_benchmark_control:
-                setup_t0 = time.perf_counter()
-                assert seed_local_prior is not None
-                if benchmark_mode_requested == "relocalize":
-                    # Preserve the last trustworthy spatial prior and force this
-                    # frame into LOST recovery. EDM itself allows MegaLoc only on
-                    # the first frame of each LOST episode; later retries stay local.
-                    tracker.state.mode = "LOST"
-                    tracker.state.fail_count = 0
-                    tracker.state.bad_count = 0
-                    benchmark_mode_active = previous_runtime_mode
-                else:
-                    benchmark_seeded = apply_runtime_benchmark_mode(
-                        tracker,
-                        benchmark_mode_requested,
-                        previous_runtime_mode,
-                        lambda target: seed_local_prior(target, reset_temporal=False),
-                    )
-                    previous_runtime_mode = benchmark_mode_requested
-                    benchmark_mode_active = benchmark_mode_requested
-                benchmark_setup_ms = (time.perf_counter() - setup_t0) * 1000.0
-            worker_core_start_mono_ns = time.monotonic_ns()
-            worker_core_start_mono = worker_core_start_mono_ns * 1e-9
-            core_t0 = time.perf_counter()
-            if gpu_start_event is not None:
-                gpu_start_event.record()
-            with redirect_native_stdout_to_stderr(), contextlib.redirect_stdout(sys.stderr):
-                pose = tracker.localize_frame(frame, capture_stamp=capture_stamp)
-            if gpu_end_event is not None:
-                gpu_end_event.record()
-                gpu_end_event.synchronize()
-                gpu_span_ms = float(gpu_start_event.elapsed_time(gpu_end_event))
-            worker_core_done_mono_ns = time.monotonic_ns()
-            worker_core_done_mono = worker_core_done_mono_ns * 1e-9
-            core_wall_ms = (time.perf_counter() - core_t0) * 1000.0
-            # Backward-compatible wall_ms retains the old forced-bench seed cost.
-            wall_ms = (time.perf_counter() - wall_t0) * 1000.0
-            info = dict(tracker.last_info)
-            # A non-finite pose (NaN/inf) would serialize as the bare token `NaN`
-            # (invalid JSON) and could steer the UI trajectory -> report it as no fix.
-            pose_ok = pose is not None and bool(
-                np.isfinite([pose.x, pose.y, pose.z, pose.yaw]).all())
-            raw_confidence = info.get("confidence", info.get("inlier_ratio"))
-            try:
-                confidence = float(raw_confidence)
-            except (TypeError, ValueError, OverflowError):
-                confidence = 1.0 if pose_ok else 0.0
-            if not math.isfinite(confidence):
-                confidence = 1.0 if pose_ok else 0.0
-            confidence = min(1.0, max(0.0, confidence))
-            capture_mono_ns = (
-                int(round(float(capture_stamp) * 1_000_000_000.0))
-                if capture_stamp is not None
-                else worker_read_done_mono_ns
-            )
-            payload = {
-                "seq": seq,
-                "frame_id": f"worker-{seq}",
-                "capture_mono_ns": capture_mono_ns,
-                "pose_mono_ns": worker_core_done_mono_ns,
-                "localization_contract_version": 1,
-                "validity": bool(pose_ok),
-                "confidence": confidence,
-                "success": pose_ok,
-                "wall_ms": wall_ms,
-                "core_wall_ms": core_wall_ms,
-                "worker_read_done_mono": worker_read_done_mono,
-                "worker_core_start_mono": worker_core_start_mono,
-                "worker_core_done_mono": worker_core_done_mono,
-                "worker_read_done_mono_ns": worker_read_done_mono_ns,
-                "worker_core_start_mono_ns": worker_core_start_mono_ns,
-                "worker_core_done_mono_ns": worker_core_done_mono_ns,
-                "gpu_timing_profiled": gpu_timing_profiled,
-                "gpu_span_ms": gpu_span_ms,
-                "tracker_variant": tracker_variant,
-                "force_track_bench": bool(args.force_track_bench),
-                "force_track_label": force_track_label,
-                "force_track_ref_requested": (
-                    int(args.force_track_ref) if args.force_track_bench else None),
-                "force_track_ref_resolved": (
-                    force_track_ref_resolved if args.force_track_bench else None),
-                "force_track_seed_ms": force_track_seed_ms,
-                "benchmark_mode_requested": benchmark_mode_requested,
-                "benchmark_mode_active": benchmark_mode_active,
-                "relocalize_requested": benchmark_mode_requested == "relocalize",
-                "benchmark_prior_kind": (
-                    "fixed_ref" if benchmark_mode_active in {"weak", "track"} else None),
-                "benchmark_prior_ref": (
-                    force_track_ref_resolved
-                    if benchmark_mode_active in {"weak", "track"} else None),
-                "benchmark_setup_ms": benchmark_setup_ms,
-                "benchmark_seeded": benchmark_seeded,
-                "pose": None if not pose_ok else {
-                    "x": float(pose.x),
-                    "y": float(pose.y),
-                    "z": float(pose.z),
-                    "yaw_raw": float(pose.yaw),
-                },
-                "mode": info.get("mode"),
-                "next_mode": info.get("next_mode"),
-                "inliers": int(info.get("inliers", 0) or 0),
-                "n_corr": info.get("n_corr"),
-                "reference_count": info.get("reference_count"),
-                "candidate_mode": info.get("candidate_mode"),
-                "global_retrieval_calls": info.get("global_retrieval_calls"),
-                "camera_axes_world": info.get("camera_axes_world"),
-                "camera_forward_world": info.get("camera_forward_world"),
-                "reproj_rms": info.get("reproj_rms"),
-                "inlier_ratio": info.get("inlier_ratio"),
-                "inlier_grid_cells": info.get("inlier_grid_cells"),
-                "requested_reference_count": info.get("requested_reference_count"),
-                "staged_early_stop": info.get("staged_early_stop"),
-                "rejected": info.get("rejected"),
-                "limited_jump": info.get("limited_jump"),
-                "limited_jump_confirmed": info.get(
-                    "limited_jump_confirmed", False
-                ),
-                "composite_stage": info.get("composite_stage"),
-                "vpr_ms": info.get("vpr_ms"),
-                "feature_ms": info.get("feature_ms"),
-                "match_ms": info.get("match_ms"),
-                "pnp_ms": info.get("pnp_ms"),
-                "neuflow_stage": info.get("neuflow_stage"),
-                "neuflow_anchor_count": info.get("neuflow_anchor_count"),
-                "neuflow_flow_ms": info.get("neuflow_flow_ms"),
-                "neuflow_gpu_ms": info.get("neuflow_gpu_ms"),
-                "projection_fallback": info.get("projection_fallback"),
-                "projection_reason": info.get("projection_reason"),
-                "projection_radius_px": info.get("projection_radius_px"),
-                "projection_anchor_count": info.get("projection_anchor_count"),
-                "projection_visible_count": info.get("projection_visible_count"),
-                "projection_match_count": info.get("projection_match_count"),
-                "projection_best_inliers": info.get("projection_best_inliers"),
-                "projection_project_ms": info.get("projection_project_ms"),
-                "projection_feature_ms": info.get("projection_feature_ms"),
-                "projection_match_ms": info.get("projection_match_ms"),
-            }
-        except Exception as exc:
-            worker_core_done_mono_ns = time.monotonic_ns()
-            worker_core_done_mono = worker_core_done_mono_ns * 1e-9
-            core_wall_ms = (
-                (time.perf_counter() - core_t0) * 1000.0 if core_t0 is not None else None)
-            wall_ms = (time.perf_counter() - wall_t0) * 1000.0
-            worker_fatal = edm_cuda_oom_requires_restart(backend, exc, torch)
-            payload = localization_exception_payload(
-                seq=seq,
-                error="cuda_oom" if worker_fatal else exc,
-                frame_id=f"worker-{seq}",
-                capture_mono_ns=(
-                    int(round(float(capture_stamp) * 1_000_000_000.0))
-                    if capture_stamp is not None
-                    else worker_read_done_mono_ns
-                ),
-                pose_mono_ns=worker_core_done_mono_ns or worker_read_done_mono_ns,
-            )
-            payload.update({
-                "wall_ms": wall_ms,
-                "core_wall_ms": core_wall_ms,
-                "worker_read_done_mono": worker_read_done_mono,
-                "worker_core_start_mono": worker_core_start_mono,
-                "worker_core_done_mono": worker_core_done_mono,
-                "worker_read_done_mono_ns": worker_read_done_mono_ns,
-                "worker_core_start_mono_ns": worker_core_start_mono_ns,
-                "worker_core_done_mono_ns": worker_core_done_mono_ns,
-                "gpu_timing_profiled": gpu_timing_profiled,
-                "gpu_span_ms": None,
-                "tracker_variant": tracker_variant,
-                "force_track_bench": bool(args.force_track_bench),
-                "force_track_label": force_track_label,
-                "force_track_ref_requested": (
-                    int(args.force_track_ref) if args.force_track_bench else None),
-                "force_track_ref_resolved": (
-                    force_track_ref_resolved if args.force_track_bench else None),
-                "force_track_seed_ms": force_track_seed_ms,
-                "benchmark_mode_requested": benchmark_mode_requested,
-                "benchmark_mode_active": benchmark_mode_active,
-                "benchmark_prior_kind": (
-                    "fixed_ref" if benchmark_mode_active in {"weak", "track"} else None),
-                "benchmark_prior_ref": (
-                    force_track_ref_resolved
-                    if benchmark_mode_active in {"weak", "track"} else None),
-                "benchmark_setup_ms": benchmark_setup_ms,
-                "benchmark_seeded": benchmark_seeded,
-            })
-            if worker_fatal:
-                payload.update(cuda_oom_failure_fields(exc))
-            print(f"[live_worker] localization error: {exc!r}", file=sys.stderr, flush=True)
-        if worker_fatal:
-            payload["cuda_cache_cleanup"] = cleanup_cuda_cache(torch)
-            print(
-                "[live_worker] fatal EDM CUDA OOM: cache cleanup complete; exiting for restart",
-                file=sys.stderr,
-                flush=True,
-            )
+        payload, worker_fatal, previous_runtime_mode = _process_worker_frame(
+            args=args,
+            backend=backend,
+            torch=torch,
+            tracker=tracker,
+            tracker_variant=tracker_variant,
+            frame=frame,
+            seq=seq,
+            benchmark_mode_requested=benchmark_mode_requested,
+            capture_stamp=capture_stamp,
+            worker_read_done_mono_ns=worker_read_done_mono_ns,
+            worker_read_done_mono=worker_read_done_mono,
+            gpu_timing_profiled=gpu_timing_profiled,
+            gpu_start_event=gpu_start_event,
+            gpu_end_event=gpu_end_event,
+            force_track_ref_resolved=force_track_ref_resolved,
+            force_track_label=force_track_label,
+            seed_local_prior=seed_local_prior,
+            previous_runtime_mode=previous_runtime_mode,
+        )
         json_out.write(json.dumps(payload, ensure_ascii=False) + "\n")
         json_out.flush()
         seq += 1
@@ -1062,9 +1375,8 @@ def main() -> None:
         if args.max_frames and seq >= args.max_frames:
             break
     if frame_shm is not None:
-        if "frame" in locals():
-            del frame
-        frame_shm.close()
+        frame = None
+        _close_worker_frame_shm(frame_shm)
 
 
 if __name__ == "__main__":

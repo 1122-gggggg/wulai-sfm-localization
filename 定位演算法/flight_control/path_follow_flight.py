@@ -600,6 +600,80 @@ def require_landed_for_firmware_config(drone) -> None:
             f"firmware limits may only be changed while landed; current state={state_name}")
 
 
+def _positive_firmware_limit(value: float | None, label: str) -> float:
+    if value is None:
+        raise RuntimeError("firmware altitude/distance limits were not provided")
+    limit = float(value)
+    if not math.isfinite(limit) or limit <= 0.0:
+        raise RuntimeError(f"{label} must be finite and > 0 m")
+    return limit
+
+
+def _preflight_battery_percent(drone, battery_message) -> int:
+    state = drone.get_state(battery_message)
+    battery = state.get("percent") if isinstance(state, dict) else None
+    if not isinstance(battery, (int, float)) or not 0 <= float(battery) <= 100:
+        raise RuntimeError(f"battery state unavailable/invalid: {battery!r}")
+    if float(battery) < 30.0:
+        raise RuntimeError(f"battery {float(battery):.0f}% is below the 30% advisory floor")
+    return int(battery)
+
+
+def _require_distance_geofence_gps(drone) -> None:
+    from olympe.messages.ardrone3.GPSSettingsState import GPSFixStateChanged
+
+    state = drone.get_state(GPSFixStateChanged)
+    fixed = state.get("fixed") if isinstance(state, dict) else None
+    if int(fixed or 0) != 1:
+        raise RuntimeError("distance geofence requires a confirmed GPS fix")
+
+
+def _confirm_firmware_limit(
+    drone,
+    command,
+    state_message,
+    requested: float,
+    label: str,
+) -> None:
+    before = drone.get_state(state_message)
+    minimum = before.get("min") if isinstance(before, dict) else None
+    maximum = before.get("max") if isinstance(before, dict) else None
+    if not all(
+        isinstance(value, (int, float)) and math.isfinite(float(value))
+        for value in (minimum, maximum)
+    ):
+        raise RuntimeError(f"{label} firmware bounds unavailable")
+    if not float(minimum) <= requested <= float(maximum):
+        raise RuntimeError(
+            f"{label} {requested:g} outside firmware range "
+            f"[{float(minimum):g}, {float(maximum):g}]"
+        )
+    _await_confirmed_action(drone(command), label)
+    after = drone.get_state(state_message)
+    actual = after.get("current") if isinstance(after, dict) else None
+    if not isinstance(actual, (int, float)) or not math.isclose(
+        float(actual), requested, rel_tol=1e-5, abs_tol=0.05
+    ):
+        raise RuntimeError(
+            f"{label} readback mismatch: requested={requested:g} actual={actual!r}"
+        )
+
+
+def _configure_distance_geofence(drone, command_type, state_message, enabled: bool) -> None:
+    requested = int(bool(enabled))
+    _await_confirmed_action(
+        drone(command_type(shouldNotFlyOver=requested)),
+        "NoFlyOverMaxDistance",
+    )
+    state = drone.get_state(state_message)
+    actual = state.get("shouldNotFlyOver") if isinstance(state, dict) else None
+    if int(actual if actual is not None else -1) != requested:
+        raise RuntimeError(
+            "NoFlyOverMaxDistance readback mismatch: "
+            f"requested={requested} actual={actual!r}"
+        )
+
+
 def configure_flight_preflight(drone, max_altitude_m: float, max_distance_m: float,
                                distance_geofence: bool = False, *,
                                check_landed: bool = True) -> dict:
@@ -614,66 +688,35 @@ def configure_flight_preflight(drone, max_altitude_m: float, max_distance_m: flo
     )
     from olympe.messages.common.CommonState import BatteryStateChanged
 
-    if max_altitude_m is None or max_distance_m is None:
-        raise RuntimeError("firmware altitude/distance limits were not provided")
-    altitude = float(max_altitude_m)
-    distance = float(max_distance_m)
-    if not math.isfinite(altitude) or altitude <= 0.0:
-        raise RuntimeError("max altitude must be finite and > 0 m")
-    if not math.isfinite(distance) or distance <= 0.0:
-        raise RuntimeError("max distance must be finite and > 0 m")
-
-    battery_state = drone.get_state(BatteryStateChanged)
-    battery = battery_state.get("percent") if isinstance(battery_state, dict) else None
-    if not isinstance(battery, (int, float)) or not 0 <= float(battery) <= 100:
-        raise RuntimeError(f"battery state unavailable/invalid: {battery!r}")
-    if float(battery) < 30.0:
-        raise RuntimeError(f"battery {float(battery):.0f}% is below the 30% advisory floor")
+    altitude = _positive_firmware_limit(max_altitude_m, "max altitude")
+    distance = _positive_firmware_limit(max_distance_m, "max distance")
+    battery = _preflight_battery_percent(drone, BatteryStateChanged)
 
     if distance_geofence:
-        from olympe.messages.ardrone3.GPSSettingsState import GPSFixStateChanged
-        gps_state = drone.get_state(GPSFixStateChanged)
-        gps_fixed = gps_state.get("fixed") if isinstance(gps_state, dict) else None
-        if int(gps_fixed or 0) != 1:
-            raise RuntimeError("distance geofence requires a confirmed GPS fix")
+        _require_distance_geofence_gps(drone)
 
-    def confirm_limit(command, state_message, requested: float, label: str) -> None:
-        before = drone.get_state(state_message)
-        minimum = before.get("min") if isinstance(before, dict) else None
-        maximum = before.get("max") if isinstance(before, dict) else None
-        if not all(isinstance(v, (int, float)) and math.isfinite(float(v))
-                   for v in (minimum, maximum)):
-            raise RuntimeError(f"{label} firmware bounds unavailable")
-        if not float(minimum) <= requested <= float(maximum):
-            raise RuntimeError(
-                f"{label} {requested:g} outside firmware range "
-                f"[{float(minimum):g}, {float(maximum):g}]")
-        _await_confirmed_action(drone(command), label)
-        after = drone.get_state(state_message)
-        actual = after.get("current") if isinstance(after, dict) else None
-        if not isinstance(actual, (int, float)) or not math.isclose(
-                float(actual), requested, rel_tol=1e-5, abs_tol=0.05):
-            raise RuntimeError(
-                f"{label} readback mismatch: requested={requested:g} actual={actual!r}")
-
-    confirm_limit(MaxAltitude(current=altitude), MaxAltitudeChanged,
-                  altitude, "MaxAltitude")
-    confirm_limit(MaxDistance(value=distance), MaxDistanceChanged,
-                  distance, "MaxDistance")
-    geofence_value = int(bool(distance_geofence))
-    _await_confirmed_action(
-        drone(NoFlyOverMaxDistance(shouldNotFlyOver=geofence_value)),
-        "NoFlyOverMaxDistance",
+    _confirm_firmware_limit(
+        drone,
+        MaxAltitude(current=altitude),
+        MaxAltitudeChanged,
+        altitude,
+        "MaxAltitude",
     )
-    geofence_state = drone.get_state(NoFlyOverMaxDistanceChanged)
-    geofence_actual = (geofence_state.get("shouldNotFlyOver")
-                       if isinstance(geofence_state, dict) else None)
-    if int(geofence_actual if geofence_actual is not None else -1) != geofence_value:
-        raise RuntimeError(
-            "NoFlyOverMaxDistance readback mismatch: "
-            f"requested={geofence_value} actual={geofence_actual!r}")
+    _confirm_firmware_limit(
+        drone,
+        MaxDistance(value=distance),
+        MaxDistanceChanged,
+        distance,
+        "MaxDistance",
+    )
+    _configure_distance_geofence(
+        drone,
+        NoFlyOverMaxDistance,
+        NoFlyOverMaxDistanceChanged,
+        distance_geofence,
+    )
     return {
-        "battery_percent": int(battery),
+        "battery_percent": battery,
         "max_altitude_m": altitude,
         "max_distance_m": distance,
         "distance_geofence": bool(distance_geofence),
@@ -824,51 +867,93 @@ def _gimbal_state_value(state, key: str):
     return None
 
 
+def _valid_gimbal_request(target: float, timeout_s: float, tolerance_deg: float) -> bool:
+    return (
+        math.isfinite(target)
+        and math.isfinite(timeout_s)
+        and timeout_s > 0.0
+        and math.isfinite(tolerance_deg)
+        and tolerance_deg > 0.0
+    )
+
+
+def _gimbal_target_in_bounds(drone, state_message, target: float) -> bool:
+    try:
+        bounds = drone.get_state(state_message)
+        minimum = float(_gimbal_state_value(bounds, "min_pitch"))
+        maximum = float(_gimbal_state_value(bounds, "max_pitch"))
+    except (KeyError, TypeError, ValueError, RuntimeError):
+        return False
+    return math.isfinite(minimum) and math.isfinite(maximum) and minimum <= target <= maximum
+
+
+def _send_gimbal_target(drone, command_type, target: float, timeout_s: float) -> bool:
+    try:
+        result = _bounded_wait(
+            drone(
+                command_type(
+                    gimbal_id=0,
+                    control_mode="position",
+                    yaw_frame_of_reference="none",
+                    yaw=0.0,
+                    pitch_frame_of_reference="absolute",
+                    pitch=target,
+                    roll_frame_of_reference="none",
+                    roll=0.0,
+                )
+            ),
+            timeout_s,
+            "gimbal target",
+        )
+    except Exception:
+        return False
+    if hasattr(result, "success") and not result.success():
+        print("[flight] warning: gimbal target command did not report success", flush=True)
+        return False
+    return True
+
+
+def _wait_for_gimbal_pitch(
+    drone,
+    state_message,
+    target: float,
+    timeout_s: float,
+    tolerance_deg: float,
+) -> bool:
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        try:
+            state = drone.get_state(state_message)
+            actual = float(_gimbal_state_value(state, "pitch_absolute"))
+        except (KeyError, TypeError, ValueError, RuntimeError):
+            actual = float("nan")
+        if math.isfinite(actual) and abs(actual - target) <= tolerance_deg:
+            return True
+        time.sleep(0.05)
+    return False
+
+
 def set_gimbal(drone, pitch_deg: float, *, require_confirmation: bool = False,
                timeout_s: float = 2.0, tolerance_deg: float = 3.0):
     """Point the camera to a fixed absolute (horizon-referenced) tilt so live frames
     resemble the map reference views. Absolute frame == EIS-stabilized vs horizon."""
     target = float(pitch_deg)
-    if (not math.isfinite(target) or not math.isfinite(float(timeout_s))
-            or timeout_s <= 0.0 or not math.isfinite(float(tolerance_deg))
-            or tolerance_deg <= 0.0):
+    timeout = float(timeout_s)
+    tolerance = float(tolerance_deg)
+    if not _valid_gimbal_request(target, timeout, tolerance):
         return False
     from olympe.messages.gimbal import absolute_attitude_bounds, attitude, set_target
-    if require_confirmation:
-        try:
-            bounds = drone.get_state(absolute_attitude_bounds)
-            lo = float(_gimbal_state_value(bounds, "min_pitch"))
-            hi = float(_gimbal_state_value(bounds, "max_pitch"))
-        except (KeyError, TypeError, ValueError, RuntimeError):
-            return False
-        if not (math.isfinite(lo) and math.isfinite(hi) and lo <= target <= hi):
-            return False
-    try:
-        res = _bounded_wait(
-            drone(set_target(
-                gimbal_id=0, control_mode="position",
-                yaw_frame_of_reference="none", yaw=0.0,
-                pitch_frame_of_reference="absolute", pitch=target,
-                roll_frame_of_reference="none", roll=0.0)),
-            float(timeout_s), "gimbal target")
-    except Exception:
+    if require_confirmation and not _gimbal_target_in_bounds(
+        drone, absolute_attitude_bounds, target
+    ):
         return False
-    if hasattr(res, "success") and not res.success():
-        print("[flight] warning: gimbal target command did not report success", flush=True)
+    if not _send_gimbal_target(drone, set_target, target, timeout):
         return False
-    if not require_confirmation:
-        return True
-    deadline = time.monotonic() + float(timeout_s)
-    while time.monotonic() < deadline:
-        try:
-            state = drone.get_state(attitude)
-            actual = float(_gimbal_state_value(state, "pitch_absolute"))
-        except (KeyError, TypeError, ValueError, RuntimeError):
-            actual = float("nan")
-        if math.isfinite(actual) and abs(actual - target) <= float(tolerance_deg):
-            return True
-        time.sleep(0.05)
-    return False
+    return (
+        _wait_for_gimbal_pitch(drone, attitude, target, timeout, tolerance)
+        if require_confirmation
+        else True
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1146,103 +1231,141 @@ class SafetyMonitor:
                 return None, "piloting source Controller not confirmed"
             return schedule(), reason
 
+    def _refresh_command_inputs(self, stream_healthy, stop_requested) -> tuple[bool, bool]:
+        if self._safety is not None:
+            try:
+                self.mode = str(self._safety.poll()).upper()
+            except Exception:
+                self.mode = "HOVER"
+        try:
+            stream_ok = bool(stream_healthy())
+        except Exception:
+            stream_ok = False
+        try:
+            stopped = bool(stop_requested())
+        except Exception:
+            stopped = True
+        if self.mode == "EMERGENCY":
+            self._latch_terminal("EMERGENCY", "EMERGENCY command -> motor cut")
+        elif self.mode == "LAND":
+            self._latch_terminal("LAND", "safety LAND command -> land")
+        elif stopped:
+            self._latch_terminal("LAND", "operator termination signal -> land")
+        return stream_ok, stopped
+
+    def _remember_desired(
+        self,
+        pcmd: tuple[int, int, int, int],
+        stream_healthy,
+        stop_requested,
+        *,
+        stamp: bool,
+    ) -> None:
+        self._desired_pcmd = pcmd
+        self._desired_valid = True
+        self._desired_stream_healthy = stream_healthy
+        self._desired_stop_requested = stop_requested
+        if stamp:
+            self._desired_updated_mono_ns = time.monotonic_ns()
+
+    def _command_source(self) -> str:
+        return (
+            "SkyController"
+            if self.terminal_action == "NONE" and self.mode == "MANUAL"
+            else "Controller"
+        )
+
+    def _ensure_command_source(self, stream_healthy, stop_requested):
+        target = self._command_source()
+        source_ok = self.terminal_action == "EMERGENCY" or self._ensure_piloting_source(target)
+        if source_ok:
+            return None
+        self._remember_desired(
+            (0, 0, 0, 0),
+            stream_healthy,
+            stop_requested,
+            stamp=False,
+        )
+        actual = (0, 0, 0, 0) if self._send_counted(0, 0, 0, 0) else None
+        return False, f"piloting source {target} not confirmed", actual
+
+    def _validated_authorized_pcmd(self, pcmd) -> tuple[int, int, int, int] | None:
+        try:
+            desired = tuple(pcmd)
+        except TypeError:
+            return None
+        if len(desired) != 4:
+            return None
+        if not all(
+            isinstance(value, (int, np.integer))
+            and not isinstance(value, (bool, np.bool_))
+            for value in desired
+        ):
+            return None
+        command = tuple(int(value) for value in desired)
+        if (
+            abs(command[0]) > self._max_translation_pcmd
+            or abs(command[1]) > self._max_translation_pcmd
+            or abs(command[2]) > self._max_yaw_pcmd
+            or abs(command[3]) > self._max_translation_pcmd
+        ):
+            return None
+        return command
+
+    def _reject_invalid_pcmd(self, stream_healthy, stop_requested):
+        zero = (0, 0, 0, 0)
+        self._remember_desired(zero, stream_healthy, stop_requested, stamp=True)
+        actual = zero if self._send_counted(*zero) else None
+        self._control_wake.set()
+        return False, "PCMD malformed or outside approved envelope", actual
+
+    def _accept_authorized_pcmd(self, desired, stream_healthy, stop_requested):
+        self._remember_desired(desired, stream_healthy, stop_requested, stamp=True)
+        if self._thread.is_alive():
+            # Wake the independent 20 Hz sender. Perception never waits for
+            # command completion and cannot starve PCMD refreshes.
+            self._control_wake.set()
+        elif not self._send_counted(*desired):
+            return False, f"PCMD send failed: {self.last_pcmd_send_error}", None
+        return True, "atomic AUTO authorization; latest PCMD queued", desired
+
+    def _block_unauthorized_pcmd(self, why, stream_healthy, stop_requested):
+        actual = None
+        if (
+            self.mode not in {"MANUAL", "EMERGENCY"}
+            and self.terminal_action != "EMERGENCY"
+        ):
+            zero = (0, 0, 0, 0)
+            self._remember_desired(zero, stream_healthy, stop_requested, stamp=True)
+            if self._send_counted(*zero):
+                actual = zero
+            self._control_wake.set()
+        else:
+            self._desired_valid = False
+        return False, why, actual
+
     def send_authorized(self, pcmd, stream_healthy, stop_requested):
         """Authorize every autonomy PCMD, including zero, under one lock."""
         with self._io_lock:
-            if self._safety is not None:
-                try:
-                    self.mode = str(self._safety.poll()).upper()
-                except Exception:
-                    self.mode = "HOVER"
-            try:
-                stream_ok = bool(stream_healthy())
-            except Exception:
-                stream_ok = False
-            try:
-                stopped = bool(stop_requested())
-            except Exception:
-                stopped = True
-            if self.mode == "EMERGENCY":
-                self._latch_terminal("EMERGENCY", "EMERGENCY command -> motor cut")
-            elif self.mode == "LAND":
-                self._latch_terminal("LAND", "safety LAND command -> land")
-            elif stopped:
-                self._latch_terminal("LAND", "operator termination signal -> land")
-            target_source = ("SkyController" if self.terminal_action == "NONE"
-                             and self.mode == "MANUAL" else "Controller")
-            source_ok = (self.terminal_action == "EMERGENCY"
-                         or self._ensure_piloting_source(target_source))
-            if not source_ok:
-                actual = None
-                self._desired_pcmd = (0, 0, 0, 0)
-                self._desired_valid = True
-                self._desired_stream_healthy = stream_healthy
-                self._desired_stop_requested = stop_requested
-                if self._send_counted(0, 0, 0, 0):
-                    actual = (0, 0, 0, 0)
-                return False, f"piloting source {target_source} not confirmed", actual
+            stream_ok, stopped = self._refresh_command_inputs(
+                stream_healthy,
+                stop_requested,
+            )
+            source_failure = self._ensure_command_source(stream_healthy, stop_requested)
+            if source_failure is not None:
+                return source_failure
             ok, why = arming_allowed(
                 self.mode, stream_ok, stopped, self.terminated.is_set())
             if ok:
-                try:
-                    desired = tuple(pcmd)
-                except TypeError:
-                    desired = ()
-                valid_shape = len(desired) == 4
-                valid_types = valid_shape and all(
-                    isinstance(value, (int, np.integer))
-                    and not isinstance(value, (bool, np.bool_))
-                    for value in desired
+                desired = self._validated_authorized_pcmd(pcmd)
+                if desired is None:
+                    return self._reject_invalid_pcmd(stream_healthy, stop_requested)
+                return self._accept_authorized_pcmd(
+                    desired,
+                    stream_healthy,
+                    stop_requested,
                 )
-                if valid_types:
-                    desired = tuple(int(value) for value in desired)
-                in_envelope = valid_types and (
-                    abs(desired[0]) <= self._max_translation_pcmd
-                    and abs(desired[1]) <= self._max_translation_pcmd
-                    and abs(desired[2]) <= self._max_yaw_pcmd
-                    and abs(desired[3]) <= self._max_translation_pcmd
-                )
-                if not in_envelope:
-                    self._desired_pcmd = (0, 0, 0, 0)
-                    self._desired_valid = True
-                    self._desired_stream_healthy = stream_healthy
-                    self._desired_stop_requested = stop_requested
-                    self._desired_updated_mono_ns = time.monotonic_ns()
-                    actual = ((0, 0, 0, 0)
-                              if self._send_counted(0, 0, 0, 0) else None)
-                    self._control_wake.set()
-                    return False, "PCMD malformed or outside approved envelope", actual
-                self._desired_pcmd = desired
-                self._desired_valid = True
-                self._desired_stream_healthy = stream_healthy
-                self._desired_stop_requested = stop_requested
-                self._desired_updated_mono_ns = time.monotonic_ns()
-                if self._thread.is_alive():
-                    # Wake the independent 20 Hz sender. Perception never waits
-                    # for command completion and cannot starve PCMD refreshes.
-                    self._control_wake.set()
-                else:
-                    # Unit tests and pre-start/final cleanup keep the historical
-                    # synchronous behavior because no sender thread exists.
-                    if not self._send_counted(*desired):
-                        return (False,
-                                f"PCMD send failed: {self.last_pcmd_send_error}",
-                                None)
-                return True, "atomic AUTO authorization; latest PCMD queued", desired
-            actual = None
-            if (self.mode not in {"MANUAL", "EMERGENCY"}
-                    and self.terminal_action != "EMERGENCY"):
-                self._desired_pcmd = (0, 0, 0, 0)
-                self._desired_valid = True
-                self._desired_stream_healthy = stream_healthy
-                self._desired_stop_requested = stop_requested
-                self._desired_updated_mono_ns = time.monotonic_ns()
-                if self._send_counted(0, 0, 0, 0):
-                    actual = (0, 0, 0, 0)
-                self._control_wake.set()
-            else:
-                self._desired_valid = False
-            return False, why, actual
+            return self._block_unauthorized_pcmd(why, stream_healthy, stop_requested)
 
     def send_auto(self, pcmd, stream_healthy, stop_requested):
         """Backward-compatible alias for the unified command authority."""
@@ -1376,6 +1499,132 @@ class SafetyMonitor:
             self._attempt_callback("LAND", self._land_cb, time.monotonic())
             raise
 
+    def _external_stop_requested(self) -> bool:
+        if self._stop_requested is None:
+            return False
+        try:
+            return bool(self._stop_requested())
+        except Exception:
+            return True
+
+    def _poll_safety_mode(self, warned: bool) -> tuple[str, bool]:
+        if self._safety is None:
+            return str(self.mode).upper(), warned
+        try:
+            return str(self._safety.poll()).upper(), False
+        except Exception as exc:
+            if not warned:
+                print(
+                    f"[safety] SafetyMonitor.poll() FAILING ({exc!r}); operator "
+                    "LAND/HOVER/EMERGENCY may be unseen; failing closed to HOVER",
+                    flush=True,
+                )
+            return "HOVER", True
+
+    def _latch_polled_terminal(self, mode: str, external_stop: bool) -> None:
+        if mode == "EMERGENCY":
+            self._latch_terminal("EMERGENCY", "EMERGENCY command -> motor cut")
+        elif external_stop:
+            self._latch_terminal("LAND", "operator termination signal -> land")
+        elif mode == "LAND":
+            self._latch_terminal("LAND", "safety LAND command -> land")
+
+    def _terminal_callback_request(self):
+        if self.terminal_action == "EMERGENCY":
+            now = time.monotonic()
+            request = None
+            if not self._emergency_acted:
+                request = ("EMERGENCY", self._emergency_cb, now)
+            return True, request
+        if self.terminal_action != "LAND":
+            return False, None
+        now = time.monotonic()
+        request = None
+        if not self._land_acted:
+            if now >= self._land_retry_at:
+                self._send_counted(0, 0, 0, 0)
+            request = ("LAND", self._land_cb, now)
+        return True, request
+
+    def _handle_non_auto_mode(self, mode: str, source_ok: bool) -> bool:
+        if not source_ok:
+            self._desired_pcmd = (0, 0, 0, 0)
+            self._desired_valid = True
+            self._send_counted(0, 0, 0, 0)
+            return True
+        if mode == "HOVER":
+            self._desired_pcmd = (0, 0, 0, 0)
+            self._desired_valid = True
+            self._send_counted(0, 0, 0, 0)
+            return True
+        if mode == "MANUAL":
+            self._desired_valid = False
+            return True
+        if self._inspection_hold.is_set():
+            self._send_counted(0, 0, 0, 0)
+            return True
+        return False
+
+    def _handle_control_stall(self, warned: bool) -> tuple[bool, bool]:
+        stalled = self._beat_seen and (time.monotonic() - self._beat_t) > self._timeout
+        if not stalled:
+            self._stall_since = None
+            return False, False
+        self._desired_pcmd = (0, 0, 0, 0)
+        self._desired_valid = True
+        self._send_counted(0, 0, 0, 0)
+        now = time.monotonic()
+        if self._stall_since is None:
+            self._stall_since = now
+        elif now - self._stall_since >= WATCHDOG_LAND_S:
+            print(
+                f"[safety] WATCHDOG: control loop stalled > "
+                f"{now - self._stall_since:.1f}s -> land",
+                flush=True,
+            )
+            self._latch_terminal("LAND", "control loop stalled -> land")
+        if not warned:
+            print(
+                f"[safety] WATCHDOG: control loop stalled > {self._timeout:.1f}s; "
+                "forcing zero PCMD (hover)",
+                flush=True,
+            )
+        return True, True
+
+    def _desired_inputs_are_safe(self) -> bool:
+        try:
+            stream_ok = (
+                self._desired_stream_healthy is None
+                or bool(self._desired_stream_healthy())
+            )
+        except Exception:
+            stream_ok = False
+        try:
+            stopped = (
+                self._desired_stop_requested is not None
+                and bool(self._desired_stop_requested())
+            )
+        except Exception:
+            stopped = True
+        return stream_ok and not stopped
+
+    def _send_fresh_desired(self) -> None:
+        if not self._desired_valid:
+            return
+        stamp = self._desired_updated_mono_ns
+        fresh = (
+            stamp is not None
+            and time.monotonic_ns() - stamp <= int(self._command_ttl_s * 1e9)
+        )
+        desired = (
+            self._desired_pcmd
+            if self._desired_inputs_are_safe() and fresh
+            else (0, 0, 0, 0)
+        )
+        if desired == (0, 0, 0, 0):
+            self._desired_pcmd = desired
+        self._send_counted(*desired)
+
     def _run_loop(self) -> None:
         warned = False
         poll_warned = False
@@ -1388,113 +1637,23 @@ class SafetyMonitor:
             callback_request = None
             terminal_handled = False
             with self._io_lock:
-                external_stop = False
-                if self._stop_requested is not None:
-                    try:
-                        external_stop = bool(self._stop_requested())
-                    except Exception:
-                        external_stop = True
-                polled_mode = self.mode
-                if self._safety is not None:
-                    try:
-                        polled_mode = self._safety.poll()
-                        poll_warned = False
-                    except Exception as exc:
-                        polled_mode = "HOVER"
-                        if not poll_warned:
-                            poll_warned = True
-                            print(f"[safety] SafetyMonitor.poll() FAILING ({exc!r}); operator "
-                                  "LAND/HOVER/EMERGENCY may be unseen; failing closed to HOVER", flush=True)
-                self.mode = str(polled_mode).upper()
-                mode = self.mode
-                if mode == "EMERGENCY":
-                    self._latch_terminal("EMERGENCY", "EMERGENCY command -> motor cut")
-                elif external_stop:
-                    self._latch_terminal("LAND", "operator termination signal -> land")
-                elif mode == "LAND":
-                    self._latch_terminal("LAND", "safety LAND command -> land")
-
-                target_source = ("SkyController" if self.terminal_action == "NONE"
-                                 and mode == "MANUAL" else "Controller")
-                source_ok = (self.terminal_action == "EMERGENCY"
-                             or self._ensure_piloting_source(target_source))
-
-                if self.terminal_action == "EMERGENCY":
-                    terminal_handled = True
-                    now = time.monotonic()
-                    if not self._emergency_acted:
-                        callback_request = ("EMERGENCY", self._emergency_cb, now)
-                elif self.terminal_action == "LAND":
-                    terminal_handled = True
-                    now = time.monotonic()
-                    if not self._land_acted:
-                        if now >= self._land_retry_at:
-                            self._send_counted(0, 0, 0, 0)
-                        callback_request = ("LAND", self._land_cb, now)
-                elif not source_ok:
-                    self._desired_pcmd = (0, 0, 0, 0)
-                    self._desired_valid = True
-                    self._send_counted(0, 0, 0, 0)
-                    continue
+                mode, poll_warned = self._poll_safety_mode(poll_warned)
+                self.mode = mode
+                self._latch_polled_terminal(mode, self._external_stop_requested())
+                source_ok = (
+                    self.terminal_action == "EMERGENCY"
+                    or self._ensure_piloting_source(self._command_source())
+                )
+                terminal_handled, callback_request = self._terminal_callback_request()
                 if terminal_handled:
                     pass
-                elif mode == "HOVER":
-                    self._desired_pcmd = (0, 0, 0, 0)
-                    self._desired_valid = True
-                    self._send_counted(0, 0, 0, 0)
+                elif self._handle_non_auto_mode(mode, source_ok):
                     continue
-                elif mode == "MANUAL":
-                    self._desired_valid = False
-                    continue
-                elif self._inspection_hold.is_set():
-                    self._send_counted(0, 0, 0, 0)
-                    continue
-                elif self._beat_seen and (time.monotonic() - self._beat_t) > self._timeout:
-                    self._desired_pcmd = (0, 0, 0, 0)
-                    self._desired_valid = True
-                    self._send_counted(0, 0, 0, 0)
-                    stall_now = time.monotonic()
-                    if self._stall_since is None:
-                        self._stall_since = stall_now
-                    elif stall_now - self._stall_since >= WATCHDOG_LAND_S:
-                        # Holding zero forever leaves the aircraft hovering until the
-                        # battery dies with nobody driving it. Escalate to LAND.
-                        print(f"[safety] WATCHDOG: control loop stalled > "
-                              f"{stall_now - self._stall_since:.1f}s -> land", flush=True)
-                        self._latch_terminal(
-                            "LAND", "control loop stalled -> land")
-                    if not warned:
-                        print(f"[safety] WATCHDOG: control loop stalled > {self._timeout:.1f}s; "
-                              "forcing zero PCMD (hover)", flush=True)
-                        warned = True
-                else:
+                elif not self._handle_control_stall(warned)[0]:
                     warned = False
-                    self._stall_since = None
-                    if not self._desired_valid:
-                        continue
-                    try:
-                        desired_stream_ok = (
-                            self._desired_stream_healthy is None
-                            or bool(self._desired_stream_healthy()))
-                    except Exception:
-                        desired_stream_ok = False
-                    try:
-                        desired_stopped = (
-                            self._desired_stop_requested is not None
-                            and bool(self._desired_stop_requested()))
-                    except Exception:
-                        desired_stopped = True
-                    desired = (
-                        self._desired_pcmd
-                        if (desired_stream_ok and not desired_stopped
-                            and self._desired_updated_mono_ns is not None
-                            and time.monotonic_ns() - self._desired_updated_mono_ns
-                            <= int(self._command_ttl_s * 1e9))
-                        else (0, 0, 0, 0)
-                    )
-                    if desired == (0, 0, 0, 0):
-                        self._desired_pcmd = desired
-                    self._send_counted(*desired)
+                    self._send_fresh_desired()
+                else:
+                    warned = True
             if terminal_handled:
                 # LAND/EMERGENCY callbacks may wait on an SDK expectation. Run
                 # them after releasing _io_lock so stop(), cleanup, and a safety
@@ -1587,514 +1746,795 @@ def stop_skycontroller_stick_override(stick_monitor) -> None:
         print(f"[fly] warning: could not stop stick monitor: {exc}", flush=True)
 
 
-def run_loop(hooks: LoopHooks, ctrl, waypoints, yaw_sign: int = 1, verbose: bool = True,
-             *, enforce_weak_pose_gate: bool = True):
-    """Localize -> fuse heading -> RouteAutoController -> PCMD, at CTRL_HZ.
+@dataclass(frozen=True)
+class _LoopOutcome:
+    reason: str | None = None
+    sleep: bool = True
 
-    Returns the terminal reason string. `ctrl` is a RouteAutoController; `waypoints`
-    are raw-GLOMAP np arrays (its own list). Import here so --selftest needs no deps.
-    Real flight calls this with the weak-pose gate forced on; only offline runners
-    may explicitly disable it for a benchmark.
-    """
-    import real_path_follow_controller as rpf
 
-    heading = HeadingEstimator(ctrl.cfg.map_frame if ctrl is not None else None)
-    pcmd_controller = (
-        rpf.YawAlignedPcmdController(ctrl.cfg) if ctrl is not None else None
-    )
+class _FlightLoopRunner:
+    """Stateful implementation of one localization-to-PCMD control loop."""
 
-    def reset_pcmd_controller():
-        if pcmd_controller is not None:
-            pcmd_controller.reset()
-    period = 1.0 / CTRL_HZ
-    last_good = None
-    uncertainty = LocalizationState()
-    stream_lost_since = None
-    last_stream_warn = 0.0
-    pending_jump = None
-    pending_jump_stamp = None
-    inspection_started = {}
-    steps = 0
-    reason = "stopped"
-    manual_requested = False
+    def __init__(
+        self,
+        hooks: LoopHooks,
+        ctrl,
+        waypoints,
+        *,
+        yaw_sign: int,
+        verbose: bool,
+        enforce_weak_pose_gate: bool,
+    ) -> None:
+        import real_path_follow_controller as rpf
 
-    def emit(rec, pcmd, blocked, why):
-        """Structured per-tick command record. Must never disturb the loop."""
-        if hooks.log_tick is None:
+        self.rpf = rpf
+        self.hooks = hooks
+        self.ctrl = ctrl
+        self.waypoints = waypoints
+        self.yaw_sign = yaw_sign
+        self.verbose = verbose
+        self.enforce_weak_pose_gate = enforce_weak_pose_gate
+        self.heading = HeadingEstimator(ctrl.cfg.map_frame if ctrl is not None else None)
+        self.pcmd_controller = (
+            rpf.YawAlignedPcmdController(ctrl.cfg) if ctrl is not None else None
+        )
+        self.period = 1.0 / CTRL_HZ
+        self.last_good = None
+        self.uncertainty = LocalizationState()
+        self.stream_lost_since = None
+        self.last_stream_warn = 0.0
+        self.pending_jump = None
+        self.pending_jump_stamp = None
+        self.inspection_started = {}
+        self.steps = 0
+        self.manual_requested = False
+
+    def run(self) -> str:
+        while True:
+            started_at = self.hooks.now()
+            if self.hooks.loop_beat is not None:
+                self.hooks.loop_beat()
+            safety_mode = (
+                self.hooks.safety_poll()
+                if self.hooks.safety_poll is not None
+                else "AUTO"
+            )
+            record = {
+                "step": self.steps,
+                "t": round(started_at, 3),
+                "t_mono_ns": time.monotonic_ns(),
+                "safety": safety_mode,
+            }
+            outcome = self._tick(started_at, safety_mode, record)
+            if outcome.reason is not None:
+                return outcome.reason
+            self.steps += 1
+            if outcome.sleep:
+                self._sleep_remaining(started_at)
+
+    def _sleep_remaining(self, started_at: float) -> None:
+        elapsed = self.hooks.now() - started_at
+        if elapsed < self.period:
+            time.sleep(self.period - elapsed)
+
+    def _reset_pcmd_controller(self) -> None:
+        if self.pcmd_controller is not None:
+            self.pcmd_controller.reset()
+
+    def _emit(self, record: dict, pcmd, blocked: bool, why: str) -> None:
+        """Write a per-tick record without disturbing the flight loop."""
+        if self.hooks.log_tick is None:
             return
-        rec["pcmd"] = None if pcmd is None else [int(v) for v in pcmd]
-        rec["blocked"] = bool(blocked)
-        rec["reason"] = str(why)
-        if hooks.pose_info is not None:
-            try:
-                info = hooks.pose_info() or {}
-                rec["loc"] = {k: info.get(k) for k in
-                              ("frame", "idx", "mode", "next_mode", "inliers", "reproj_rms", "weak")}
-            except Exception:
-                pass
-        if hooks.pcmd_timing is not None:
-            try:
-                rec.update(hooks.pcmd_timing() or {})
-            except Exception:
-                pass
+        record["pcmd"] = None if pcmd is None else [int(value) for value in pcmd]
+        record["blocked"] = bool(blocked)
+        record["reason"] = str(why)
+        self._add_pose_log(record)
+        self._add_pcmd_timing_log(record)
         try:
-            hooks.log_tick(rec)
+            self.hooks.log_tick(record)
         except Exception:
             pass
 
-    def send_command(pcmd):
-        """Route every loop-originated PCMD through one final authority."""
-        pcmd = tuple(int(v) for v in pcmd)
-        if hooks.send_authorized_pcmd is not None:
-            return hooks.send_authorized_pcmd(pcmd)
-        mode = hooks.safety_poll() if hooks.safety_poll is not None else "AUTO"
+    def _add_pose_log(self, record: dict) -> None:
+        if self.hooks.pose_info is None:
+            return
         try:
-            stream_ok = hooks.stream_healthy is None or bool(hooks.stream_healthy())
+            info = self.hooks.pose_info() or {}
+            record["loc"] = {
+                key: info.get(key)
+                for key in (
+                    "frame",
+                    "idx",
+                    "mode",
+                    "next_mode",
+                    "inliers",
+                    "reproj_rms",
+                    "weak",
+                )
+            }
+        except Exception:
+            pass
+
+    def _add_pcmd_timing_log(self, record: dict) -> None:
+        if self.hooks.pcmd_timing is None:
+            return
+        try:
+            record.update(self.hooks.pcmd_timing() or {})
+        except Exception:
+            pass
+
+    def _send_command(self, pcmd):
+        """Route every loop-originated PCMD through one final authority."""
+        command = tuple(int(value) for value in pcmd)
+        if self.hooks.send_authorized_pcmd is not None:
+            return self.hooks.send_authorized_pcmd(command)
+        mode = (
+            self.hooks.safety_poll()
+            if self.hooks.safety_poll is not None
+            else "AUTO"
+        )
+        try:
+            stream_ok = (
+                self.hooks.stream_healthy is None
+                or bool(self.hooks.stream_healthy())
+            )
         except Exception:
             stream_ok = False
         if mode in {"MANUAL", "EMERGENCY"}:
             return False, f"safety mode is {mode}", None
-        authorized = mode == "AUTO" and stream_ok
-        if authorized:
-            hooks.send_pcmd(*pcmd)
-            return True, "fallback AUTO authorization", pcmd
-        hooks.send_pcmd(0, 0, 0, 0)
+        if mode == "AUTO" and stream_ok:
+            self.hooks.send_pcmd(*command)
+            return True, "fallback AUTO authorization", command
+        self.hooks.send_pcmd(0, 0, 0, 0)
         return False, f"safety mode={mode} stream={stream_ok}", (0, 0, 0, 0)
 
-    while True:
-        t0 = hooks.now()
-        if hooks.loop_beat is not None:
-            hooks.loop_beat()
-        safety_mode = hooks.safety_poll() if hooks.safety_poll is not None else "AUTO"
-        rec = {
-            "step": steps,
-            "t": round(t0, 3),
-            "t_mono_ns": time.monotonic_ns(),
-            "safety": safety_mode,
-        }
-        if safety_mode == "EMERGENCY":
-            reason = "EMERGENCY command -> motor cut"
-            emit(rec, None, True, reason)
-            break
-        if safety_mode == "LAND":
-            _sent, _why, actual = send_command((0, 0, 0, 0))
-            reason = "safety LAND command -> land"
-            emit(rec, actual, True, reason)
-            break
-        if safety_mode == "HOVER":
-            reset_pcmd_controller()
-            _sent, _why, actual = send_command((0, 0, 0, 0))
-            emit(rec, actual, True, "safety HOVER: authorized zero PCMD")
-            steps += 1
-            dt = hooks.now() - t0
-            if dt < period:
-                time.sleep(period - dt)
-            continue
-        if safety_mode == "MANUAL":
-            reset_pcmd_controller()
-            emit(rec, None, True, "MANUAL: autonomy sends nothing (pilot has the sticks)")
-            steps += 1
-            dt = hooks.now() - t0
-            if dt < period:
-                time.sleep(period - dt)
-            continue
-        # The physical override. Checked every tick, before anything pose-derived,
-        # because it is the pilot taking the aircraft back: nothing the autonomy is
-        # in the middle of computing may delay it. Zero PCMD goes out FIRST, while
-        # the PC still owns the piloting source; only then is MANUAL latched, after
-        # which the loop is silent so it cannot fight the sticks.
-        if hooks.stick_active is not None:
-            try:
-                sticks_moved = bool(hooks.stick_active())
-            except Exception as exc:
-                # A monitor that cannot answer is not evidence that the pilot is
-                # idle. Treat it as an override and let the human sort it out.
-                sticks_moved = True
-                print(f"[safety] stick monitor raised ({exc!r}); assuming override",
-                      flush=True)
-            if sticks_moved:
-                _sent, _why, actual = send_command((0, 0, 0, 0))
-                reset_pcmd_controller()
-                took_over = bool(hooks.request_manual()) if hooks.request_manual else False
-                rec["stick_override"] = True
-                emit(rec, actual, True,
-                     "stick override -> hover + manual" if took_over
-                     else "stick override -> hover (no manual pilot; staying suspended)")
-                print("[safety] STICK_OVERRIDE: pilot moved the sticks -> "
-                      "zero PCMD, autonomy suspended", flush=True)
-                if not took_over:
-                    # No SkyController pilot configured: MANUAL downgrades to HOVER,
-                    # so autonomy must not simply carry on as if nothing happened.
-                    reason = "stick override without a manual pilot -> land"
-                    break
-                steps += 1
-                dt = hooks.now() - t0
-                if dt < period:
-                    time.sleep(period - dt)
-                continue
-
-        now = hooks.now()
-        if hooks.stream_healthy is not None and not hooks.stream_healthy():
-            reset_pcmd_controller()
-            _sent, _why, actual = send_command((0, 0, 0, 0))
-            stream_lost_since = stream_lost_since or now
-            uncertainty = LocalizationState(
-                recovery_good_fixes=uncertainty.recovery_good_fixes
-            )
-            rec["stream_ok"] = False
-            if now - stream_lost_since >= STREAM_LOST_LAND_S:
-                reason = (f"stream lost {now - stream_lost_since:.1f}s "
-                          f">= {STREAM_LOST_LAND_S:.0f}s -> land")
-                emit(rec, actual, True, reason)
-                break
-            emit(rec, actual, True,
-                 f"stream stale/lost {now - stream_lost_since:.1f}s -> hover")
-            if verbose and now - last_stream_warn > 1.0:
-                detail = hooks.stream_status() if hooks.stream_status is not None else "stream stale/lost"
-                print(
-                    f"[safety] STREAM_LOST_HOVER: {detail}; "
-                    f"lost_for={now - stream_lost_since:.1f}s; zero PCMD, waiting for stream/manual/land",
-                    flush=True,
-                )
-                last_stream_warn = now
-            steps += 1
-            dt = hooks.now() - t0
-            if dt < period:
-                time.sleep(period - dt)
-            continue
-        stream_lost_since = None
-
-        try:
-            oyaw = hooks.olympe_yaw()
-        except Exception:
-            oyaw = None                                    # attitude not yet received
-        try:
-            ploc = hooks.get_pose()
-        except Exception as exc:
-            # A single raising frame (CUDA OOM, PnP blow-up, bad decode) must be a
-            # missed fix -> hover, never an aborted mission.
-            ploc = None
-            if verbose:
-                print(f"[safety] localizer raised ({exc!r}); treating as no fix -> hover", flush=True)
-        now = hooks.now()
-        # Inference is synchronous and can take long enough for the operator to
-        # switch mode or for video to disappear. Re-authorize after inference,
-        # before any pose-derived command is allowed to reach the drone.
-        final_safety = hooks.safety_poll() if hooks.safety_poll is not None else "AUTO"
-        rec["safety_final"] = final_safety
-        if final_safety == "EMERGENCY":
-            reason = "EMERGENCY command during inference -> motor cut"
-            emit(rec, None, True, reason)
-            break
-        if final_safety == "LAND":
-            _sent, _why, actual = send_command((0, 0, 0, 0))
-            reason = "safety LAND command during inference -> land"
-            emit(rec, actual, True, reason)
-            break
-        if final_safety == "HOVER":
-            reset_pcmd_controller()
-            _sent, _why, actual = send_command((0, 0, 0, 0))
-            emit(rec, actual, True,
-                 "safety changed to HOVER during inference -> zero PCMD")
-            steps += 1
-            continue
-        if final_safety == "MANUAL":
-            reset_pcmd_controller()
-            emit(rec, None, True,
-                 "safety changed to MANUAL during inference -> autonomy sends nothing")
-            steps += 1
-            continue
-        try:
-            stream_ok_after_inference = (hooks.stream_healthy is None
-                                         or bool(hooks.stream_healthy()))
-        except Exception:
-            stream_ok_after_inference = False
-        if not stream_ok_after_inference:
-            reset_pcmd_controller()
-            _sent, _why, actual = send_command((0, 0, 0, 0))
-            stream_lost_since = stream_lost_since or now
-            uncertainty = LocalizationState(
-                recovery_good_fixes=uncertainty.recovery_good_fixes
-            )
-            rec["stream_ok"] = False
-            emit(rec, actual, True,
-                 "stream became stale/lost during inference -> hover")
-            steps += 1
-            continue
-        # A NaN/inf pose would pass every `x > threshold` gate below (all False for
-        # NaN) and steer the drone with garbage -> reject non-finite as no fix.
-        pose_finite = ploc is not None and all(
-            math.isfinite(float(v)) for v in (ploc.x, ploc.y, ploc.z, ploc.yaw, ploc.stamp))
-        if ploc is not None and not pose_finite and verbose:
-            print("[safety] NON_FINITE_POSE_REJECT: localizer returned NaN/inf -> hover", flush=True)
-        if ploc is not None and pose_finite:
-            rec["pose"] = [round(float(ploc.x), 3), round(float(ploc.y), 3), round(float(ploc.z), 3)]
-            rec["pose_age"] = round(now - float(ploc.stamp), 3)
-        elif ploc is not None:
-            rec["pose"] = "non-finite"
-        fresh = pose_finite and -0.05 <= (now - ploc.stamp) <= POSE_STALE_S
-        jump_rejected = False
-        if fresh and last_good is not None:
-            # Outlier gate: one spurious PnP pose must not steer the drone.
-            # A single fix jumping > MAX_POSE_JUMP_U is rejected (hover); if the
-            # NEXT fix agrees with it, treat it as genuine relocalization.
-            cand = np.array([ploc.x, ploc.y, ploc.z], float)
-            prev = np.array([last_good.x, last_good.y, last_good.z], float)
-            if float(np.linalg.norm(cand - prev)) > MAX_POSE_JUMP_U:
-                # The confirming fix must come from a DIFFERENT capture. Re-localizing
-                # the same frame reproduces the same centre, so it would agree with
-                # itself and promote one bad frame straight to an accepted relocation.
-                independent = (
-                    pending_jump is not None
-                    and pending_jump_stamp is not None
-                    and float(ploc.stamp) > float(pending_jump_stamp)
-                )
-                if (independent
-                        and float(np.linalg.norm(cand - pending_jump)) <= MAX_POSE_JUMP_U):
-                    pending_jump = None
-                    pending_jump_stamp = None
-                    if verbose:
-                        print("[safety] POSE_JUMP confirmed by consecutive fix; accepting relocation", flush=True)
-                else:
-                    pending_jump = cand
-                    pending_jump_stamp = float(ploc.stamp)
-                    fresh = False
-                    jump_rejected = True
-                    rec["jump_reject_u"] = round(float(np.linalg.norm(cand - prev)), 2)
-                    if verbose:
-                        print(f"[safety] POSE_JUMP_REJECT: fix jumped "
-                              f"{float(np.linalg.norm(cand - prev)):.2f}u > {MAX_POSE_JUMP_U}u; "
-                              "hover, waiting for confirmation", flush=True)
-            else:
-                pending_jump = None
-                pending_jump_stamp = None
-        if fresh:
-            last_good = ploc
-        elif (not jump_rejected) and last_good is not None and (now - last_good.stamp) <= POSE_STALE_S:
-            # Missed/stale fix within the freshness window -> keep last accepted pose.
-            # NOT on a jump reject: a contradicting fix means high uncertainty; hover
-            # this tick (as documented above) instead of driving on the previous pose.
-            ploc, fresh = last_good, True
-
-        # Low confidence (WEAK, or PnP inliers below threshold) OR no fresh fix -> HOVER and
-        # ask the tracker to relocalize with MegaLoc. If MegaLoc cannot recover within
-        # LOST_MANUAL_S, hand to the human pilot. Missing fixes land at
-        # LOST_LAND_S; fresh-but-weak fixes use WEAK_HOVER_LAND_S.
-        # The drone is never driven on a low-confidence fix.
-        low_conf = bool(fresh and (
-            (enforce_weak_pose_gate and hooks.pose_is_weak is not None
-             and hooks.pose_is_weak())
-            or (hooks.pose_confidence is not None and hooks.pose_confidence() < LOW_CONF_INLIERS)))
+    def _tick(self, started_at: float, safety_mode: str, record: dict) -> _LoopOutcome:
+        outcome = self._initial_safety_outcome(safety_mode, record)
+        if outcome is not None:
+            return outcome
+        outcome = self._stick_override_outcome(record)
+        if outcome is not None:
+            return outcome
+        now = self.hooks.now()
+        outcome = self._stream_loss_outcome(now, record)
+        if outcome is not None:
+            return outcome
+        olympe_yaw = self._read_olympe_yaw()
+        localized_pose = self._read_localized_pose()
+        now = self.hooks.now()
+        outcome = self._post_inference_safety_outcome(record)
+        if outcome is not None:
+            return outcome
+        if not self._stream_healthy_after_inference():
+            return self._post_inference_stream_loss(now, record)
+        localized_pose, fresh = self._accepted_pose(localized_pose, now, record)
+        low_confidence = self._is_low_confidence(fresh)
         transition = decide_localization_transition(
-            uncertainty,
+            self.uncertainty,
             now=now,
             fresh=fresh,
-            low_confidence=low_conf,
+            low_confidence=low_confidence,
             weak_hover_land_s=WEAK_HOVER_LAND_S,
             lost_land_s=LOST_LAND_S,
             recovery_good_fixes_required=RECOVERY_GOOD_FIXES,
         )
-        uncertainty = transition.state
-        if transition.action in {"uncertain_hover", "land"}:
-            reset_pcmd_controller()
-            _sent, _why, actual = send_command((0, 0, 0, 0))
-            waited = float(transition.waited_s)
-            if hooks.force_relocalize is not None:
-                hooks.force_relocalize()                  # ask the tracker to run MegaLoc
-            emit(rec, actual, True,
-                 ("low confidence" if low_conf else
-                  "pose jump rejected" if "jump_reject_u" in rec else
-                  "no fresh pose (lost/stale/PnP fail/non-finite)")
-                 + f" -> hover ({waited:.1f}s)")
-            if (not manual_requested and waited >= LOST_MANUAL_S
-                    and hooks.request_manual is not None and hooks.request_manual()):
-                manual_requested = True
-                print("[safety] LOW_CONF/LOST: MegaLoc could not relocalize in "
-                      f"{waited:.1f}s -> switching to MANUAL (pilot takeover)", flush=True)
-            elif transition.action == "land":
-                reason = ("localization lost" if not fresh else "low confidence") + " -> land"
-                break
-            elif verbose and steps % 10 == 0:
-                print(f"[safety] LOW_CONF_HOVER: hover + MegaLoc relocalize; waited={waited:.1f}s", flush=True)
-            steps += 1
-            dt = hooks.now() - t0
-            if dt < period:
-                time.sleep(period - dt)
-            continue
-        else:
-            if transition.action == "recovery_hover":
-                reset_pcmd_controller()
-                _sent, _why, actual = send_command((0, 0, 0, 0))
-                emit(
-                    rec,
-                    actual,
-                    True,
-                    f"localization recovery confirmation {uncertainty.recovery_good_fixes}/"
-                    f"{RECOVERY_GOOD_FIXES} -> hover",
-                )
-                # Do not force another global pass: the next frame must prove
-                # the normal TRACK path is also trustworthy before motion resumes.
-                steps += 1
-                dt = hooks.now() - t0
-                if dt < period:
-                    time.sleep(period - dt)
-                continue
+        self.uncertainty = transition.state
+        outcome = self._localization_transition_outcome(
+            transition,
+            fresh=fresh,
+            low_confidence=low_confidence,
+            record=record,
+        )
+        if outcome is not None:
+            return outcome
+        return self._localized_motion_outcome(
+            localized_pose,
+            olympe_yaw,
+            now,
+            record,
+        )
 
-            manual_requested = False
-            heading.update(ploc.yaw, oyaw)
-            hdg = heading.heading(oyaw)
-            if hdg is None:
-                reset_pcmd_controller()
-                _sent, _why, actual = send_command((0, 0, 0, 0))
-                emit(rec, actual, True, "heading unavailable -> hover")
-            else:
-                pose = rpf.Pose(x=ploc.x, y=ploc.y, z=ploc.z, yaw=hdg, stamp=ploc.stamp)
-                cmd = ctrl.step(pose, now)
-                if cmd.look_at_pole is not None:
-                    reset_pcmd_controller()
-                    roll, pitch, yaw, gaz = rpf.command_to_body_percent(
-                        cmd,
-                        pose,
-                        config=ctrl.cfg,
-                        yaw_sign=yaw_sign,
-                    )
-                else:
-                    roll, pitch, yaw, gaz = pcmd_controller.update(
-                        cmd,
-                        pose,
-                        now,
-                        # Alignment belongs to the clicked target waypoint, not
-                        # merely the geometric segment number. This guarantees a
-                        # fresh hover/turn gate for the first leg and every target.
-                        target_key=ctrl.target_index,
-                        yaw_sign=yaw_sign,
-                    )
-                rec["heading_deg"] = round(math.degrees(hdg), 1)
-                rec["path_error_u"] = round(float(cmd.path_error), 3)
-                rec["progress"] = round(float(cmd.progress), 4)
-                rec["action"] = cmd.status
-                rec["pcmd_phase"] = pcmd_controller.phase
-                if pcmd_controller.abort_reason is not None:
-                    _sent, _why, actual = send_command((0, 0, 0, 0))
-                    reason = f"{pcmd_controller.abort_reason} -> land"
-                    emit(rec, actual, True, reason)
-                    break
-                if cmd.path_error > MAX_ROUTE_DEVIATION_U:
-                    # Route-corridor bound: never REJOIN across long distances.
-                    _sent, _why, actual = send_command((0, 0, 0, 0))
-                    reason = (f"route deviation {cmd.path_error:.2f}u "
-                              f"> {MAX_ROUTE_DEVIATION_U}u -> land")
-                    emit(rec, actual, True, reason)
-                    break
-                if cmd.should_land or ctrl.state in ("LANDING", "DONE"):
-                    _sent, _why, actual = send_command((0, 0, 0, 0))
-                    speed_sample = None
-                    if cmd.action == "LAND":
-                        try:
-                            speed_sample = (
-                                hooks.ground_speed() if hooks.ground_speed is not None else None
-                            )
-                        except Exception:
-                            speed_sample = None
-                    transition = decide_route_completion_landing(
-                        cmd.action,
-                        speed_sample,
-                        now,
-                        threshold_mps=LANDING_SPEED_THRESHOLD_MPS,
-                        max_age_s=GROUND_SPEED_MAX_AGE_S,
-                    )
-                    rec.update(dict(transition.log_fields))
-                    if transition.outcome == "hover":
-                        reset_pcmd_controller()
-                        emit(rec, actual, True, transition.reason)
-                        steps += 1
-                        dt = hooks.now() - t0
-                        if dt < period:
-                            time.sleep(period - dt)
-                        continue
-                    reason = transition.reason
-                    emit(rec, actual, True, transition.reason)
-                    break
-                oldest_inspection = min(inspection_started.values(), default=None)
-                if (cmd.look_at_pole is None and oldest_inspection is not None
-                        and now - oldest_inspection >= INSPECTION_TIMEOUT_S):
-                    _sent, _why, actual = send_command((0, 0, 0, 0))
-                    reason = "inspection alignment/capture timeout -> land"
-                    emit(rec, actual, True, reason)
-                    break
-                if cmd.look_at_pole is not None:
-                    key = (cmd.look_at_pole.get("waypoint"), cmd.look_at_pole.get("pole_id"))
-                    inspection_since = inspection_started.setdefault(key, now)
-                    hold_ok, hold_reason, hold_actual = send_command((0, 0, 0, 0))
-                    if not hold_ok:
-                        emit(rec, hold_actual, True,
-                             f"inspection pre-action hold blocked ({hold_reason})")
-                        upper_reason = str(hold_reason).upper()
-                        if "EMERGENCY" in upper_reason:
-                            reason = "EMERGENCY command during inspection -> motor cut"
-                            break
-                        if "LAND" in upper_reason or "STOP SIGNAL" in upper_reason or "TERMINATED" in upper_reason:
-                            reason = f"{hold_reason} -> land"
-                            break
-                    elif not cmd.look_at_pole.get("body_yaw_required", False):
-                        reason = "inspection body-yaw orientation unavailable -> land"
-                        emit(rec, hold_actual, True, reason)
-                        break
-                    elif now - inspection_since >= INSPECTION_TIMEOUT_S:
-                        reason = "inspection alignment/capture timeout -> land"
-                        emit(rec, hold_actual, True, reason)
-                        break
-                    else:
-                        yaw_error = _wrap(float(cmd.yaw_target) - float(pose.yaw))
-                        yaw_tol = math.radians(float(ctrl.cfg.inspect_yaw_tolerance_deg))
-                        if abs(yaw_error) > yaw_tol:
-                            yaw_only = (0, 0, yaw, 0)
-                            sent, send_reason, actual = send_command(yaw_only)
-                            emit(rec, actual, not sent,
-                                 (f"inspection body-yaw align error={math.degrees(yaw_error):.1f}deg"
-                                  if sent else send_reason))
-                        else:
-                            capture_acked = False
-                            try:
-                                if hooks.inspection_ack is not None:
-                                    action = lambda: hooks.inspection_ack(cmd.look_at_pole, pose)
-                                    capture_acked = bool(
-                                        hooks.inspection_hold(action)
-                                        if hooks.inspection_hold is not None else action())
-                            except Exception as exc:
-                                if verbose:
-                                    print(f"[inspection] gimbal/capture hook failed ({exc!r})", flush=True)
-                            post_ok, post_reason, post_actual = send_command((0, 0, 0, 0))
-                            acked = bool(capture_acked and post_ok
-                                         and ctrl.ack_inspection(
-                                             cmd.look_at_pole, orientation_confirmed=True))
-                            if acked:
-                                inspection_started.pop(key, None)
-                            emit(rec, post_actual, True,
-                                 ("inspection target aligned + capture acknowledged" if acked
-                                  else f"inspection capture not acknowledged ({post_reason})"))
-                else:
-                    pcmd = (roll, pitch, yaw, gaz)
-                    sent, send_reason, actual = send_command(pcmd)
-                    emit(rec, actual, not sent, cmd.status if sent else send_reason)
-                    if not sent:
-                        upper_reason = str(send_reason).upper()
-                        if "EMERGENCY" in upper_reason:
-                            reason = "EMERGENCY command before PCMD -> motor cut"
-                            break
-                        if "LAND" in upper_reason or "STOP SIGNAL" in upper_reason or "TERMINATED" in upper_reason:
-                            reason = f"{send_reason} -> land"
-                            break
-                    elif verbose and steps % 10 == 0:
-                        print(f"[{cmd.status:26s}] pos=({ploc.x:5.1f},{ploc.y:5.1f},{ploc.z:4.1f}) "
-                              f"hdg={math.degrees(hdg):6.1f} err={cmd.path_error:4.2f} "
-                              f"prog={cmd.progress:4.2f} phase={pcmd_controller.phase} "
-                              f"PCMD(r={roll:+d},p={pitch:+d},y={yaw:+d},g={gaz:+d})")
-        steps += 1
-        dt = hooks.now() - t0
-        if dt < period:
-            time.sleep(period - dt)
-    return reason
+    def _initial_safety_outcome(self, mode: str, record: dict) -> _LoopOutcome | None:
+        if mode == "EMERGENCY":
+            reason = "EMERGENCY command -> motor cut"
+            self._emit(record, None, True, reason)
+            return _LoopOutcome(reason)
+        if mode == "LAND":
+            _sent, _why, actual = self._send_command((0, 0, 0, 0))
+            reason = "safety LAND command -> land"
+            self._emit(record, actual, True, reason)
+            return _LoopOutcome(reason)
+        if mode == "HOVER":
+            self._reset_pcmd_controller()
+            _sent, _why, actual = self._send_command((0, 0, 0, 0))
+            self._emit(record, actual, True, "safety HOVER: authorized zero PCMD")
+            return _LoopOutcome()
+        if mode == "MANUAL":
+            self._reset_pcmd_controller()
+            self._emit(
+                record,
+                None,
+                True,
+                "MANUAL: autonomy sends nothing (pilot has the sticks)",
+            )
+            return _LoopOutcome()
+        return None
+
+    def _stick_override_outcome(self, record: dict) -> _LoopOutcome | None:
+        if self.hooks.stick_active is None:
+            return None
+        try:
+            sticks_moved = bool(self.hooks.stick_active())
+        except Exception as exc:
+            sticks_moved = True
+            print(
+                f"[safety] stick monitor raised ({exc!r}); assuming override",
+                flush=True,
+            )
+        if not sticks_moved:
+            return None
+        _sent, _why, actual = self._send_command((0, 0, 0, 0))
+        self._reset_pcmd_controller()
+        took_over = bool(self.hooks.request_manual()) if self.hooks.request_manual else False
+        record["stick_override"] = True
+        self._emit(
+            record,
+            actual,
+            True,
+            (
+                "stick override -> hover + manual"
+                if took_over
+                else "stick override -> hover (no manual pilot; staying suspended)"
+            ),
+        )
+        print(
+            "[safety] STICK_OVERRIDE: pilot moved the sticks -> "
+            "zero PCMD, autonomy suspended",
+            flush=True,
+        )
+        return (
+            _LoopOutcome()
+            if took_over
+            else _LoopOutcome("stick override without a manual pilot -> land")
+        )
+
+    def _stream_loss_outcome(self, now: float, record: dict) -> _LoopOutcome | None:
+        if self.hooks.stream_healthy is None or self.hooks.stream_healthy():
+            self.stream_lost_since = None
+            return None
+        self._reset_pcmd_controller()
+        _sent, _why, actual = self._send_command((0, 0, 0, 0))
+        self.stream_lost_since = self.stream_lost_since or now
+        self.uncertainty = LocalizationState(
+            recovery_good_fixes=self.uncertainty.recovery_good_fixes
+        )
+        record["stream_ok"] = False
+        lost_for = now - self.stream_lost_since
+        if lost_for >= STREAM_LOST_LAND_S:
+            reason = f"stream lost {lost_for:.1f}s >= {STREAM_LOST_LAND_S:.0f}s -> land"
+            self._emit(record, actual, True, reason)
+            return _LoopOutcome(reason)
+        self._emit(record, actual, True, f"stream stale/lost {lost_for:.1f}s -> hover")
+        self._warn_stream_loss(now, lost_for)
+        return _LoopOutcome()
+
+    def _warn_stream_loss(self, now: float, lost_for: float) -> None:
+        if not self.verbose or now - self.last_stream_warn <= 1.0:
+            return
+        detail = (
+            self.hooks.stream_status()
+            if self.hooks.stream_status is not None
+            else "stream stale/lost"
+        )
+        print(
+            f"[safety] STREAM_LOST_HOVER: {detail}; lost_for={lost_for:.1f}s; "
+            "zero PCMD, waiting for stream/manual/land",
+            flush=True,
+        )
+        self.last_stream_warn = now
+
+    def _read_olympe_yaw(self):
+        try:
+            return self.hooks.olympe_yaw()
+        except Exception:
+            return None
+
+    def _read_localized_pose(self):
+        try:
+            return self.hooks.get_pose()
+        except Exception as exc:
+            if self.verbose:
+                print(
+                    f"[safety] localizer raised ({exc!r}); "
+                    "treating as no fix -> hover",
+                    flush=True,
+                )
+            return None
+
+    def _post_inference_safety_outcome(self, record: dict) -> _LoopOutcome | None:
+        mode = (
+            self.hooks.safety_poll()
+            if self.hooks.safety_poll is not None
+            else "AUTO"
+        )
+        record["safety_final"] = mode
+        if mode == "EMERGENCY":
+            reason = "EMERGENCY command during inference -> motor cut"
+            self._emit(record, None, True, reason)
+            return _LoopOutcome(reason)
+        if mode == "LAND":
+            _sent, _why, actual = self._send_command((0, 0, 0, 0))
+            reason = "safety LAND command during inference -> land"
+            self._emit(record, actual, True, reason)
+            return _LoopOutcome(reason)
+        if mode == "HOVER":
+            self._reset_pcmd_controller()
+            _sent, _why, actual = self._send_command((0, 0, 0, 0))
+            self._emit(
+                record,
+                actual,
+                True,
+                "safety changed to HOVER during inference -> zero PCMD",
+            )
+            return _LoopOutcome(sleep=False)
+        if mode == "MANUAL":
+            self._reset_pcmd_controller()
+            self._emit(
+                record,
+                None,
+                True,
+                "safety changed to MANUAL during inference -> autonomy sends nothing",
+            )
+            return _LoopOutcome(sleep=False)
+        return None
+
+    def _stream_healthy_after_inference(self) -> bool:
+        try:
+            return (
+                self.hooks.stream_healthy is None
+                or bool(self.hooks.stream_healthy())
+            )
+        except Exception:
+            return False
+
+    def _post_inference_stream_loss(self, now: float, record: dict) -> _LoopOutcome:
+        self._reset_pcmd_controller()
+        _sent, _why, actual = self._send_command((0, 0, 0, 0))
+        self.stream_lost_since = self.stream_lost_since or now
+        self.uncertainty = LocalizationState(
+            recovery_good_fixes=self.uncertainty.recovery_good_fixes
+        )
+        record["stream_ok"] = False
+        self._emit(
+            record,
+            actual,
+            True,
+            "stream became stale/lost during inference -> hover",
+        )
+        return _LoopOutcome(sleep=False)
+
+    @staticmethod
+    def _pose_is_finite(pose) -> bool:
+        return pose is not None and all(
+            math.isfinite(float(value))
+            for value in (pose.x, pose.y, pose.z, pose.yaw, pose.stamp)
+        )
+
+    def _record_pose(self, pose, now: float, finite: bool, record: dict) -> None:
+        if pose is not None and finite:
+            record["pose"] = [
+                round(float(pose.x), 3),
+                round(float(pose.y), 3),
+                round(float(pose.z), 3),
+            ]
+            record["pose_age"] = round(now - float(pose.stamp), 3)
+        elif pose is not None:
+            record["pose"] = "non-finite"
+
+    def _apply_jump_gate(self, pose, fresh: bool, record: dict) -> tuple[bool, bool]:
+        if not fresh or self.last_good is None:
+            return fresh, False
+        candidate = np.array([pose.x, pose.y, pose.z], float)
+        previous = np.array(
+            [self.last_good.x, self.last_good.y, self.last_good.z],
+            float,
+        )
+        distance = float(np.linalg.norm(candidate - previous))
+        if distance <= MAX_POSE_JUMP_U:
+            self.pending_jump = None
+            self.pending_jump_stamp = None
+            return True, False
+        independent = (
+            self.pending_jump is not None
+            and self.pending_jump_stamp is not None
+            and float(pose.stamp) > float(self.pending_jump_stamp)
+        )
+        confirmed = independent and float(
+            np.linalg.norm(candidate - self.pending_jump)
+        ) <= MAX_POSE_JUMP_U
+        if confirmed:
+            self.pending_jump = None
+            self.pending_jump_stamp = None
+            if self.verbose:
+                print(
+                    "[safety] POSE_JUMP confirmed by consecutive fix; "
+                    "accepting relocation",
+                    flush=True,
+                )
+            return True, False
+        self.pending_jump = candidate
+        self.pending_jump_stamp = float(pose.stamp)
+        record["jump_reject_u"] = round(distance, 2)
+        if self.verbose:
+            print(
+                f"[safety] POSE_JUMP_REJECT: fix jumped {distance:.2f}u > "
+                f"{MAX_POSE_JUMP_U}u; hover, waiting for confirmation",
+                flush=True,
+            )
+        return False, True
+
+    def _accepted_pose(self, pose, now: float, record: dict):
+        finite = self._pose_is_finite(pose)
+        if pose is not None and not finite and self.verbose:
+            print(
+                "[safety] NON_FINITE_POSE_REJECT: localizer returned "
+                "NaN/inf -> hover",
+                flush=True,
+            )
+        self._record_pose(pose, now, finite, record)
+        fresh = bool(finite and -0.05 <= now - pose.stamp <= POSE_STALE_S)
+        fresh, jump_rejected = self._apply_jump_gate(pose, fresh, record)
+        if fresh:
+            self.last_good = pose
+        elif (
+            not jump_rejected
+            and self.last_good is not None
+            and now - self.last_good.stamp <= POSE_STALE_S
+        ):
+            pose, fresh = self.last_good, True
+        return pose, fresh
+
+    def _is_low_confidence(self, fresh: bool) -> bool:
+        weak = (
+            self.enforce_weak_pose_gate
+            and self.hooks.pose_is_weak is not None
+            and self.hooks.pose_is_weak()
+        )
+        few_inliers = (
+            self.hooks.pose_confidence is not None
+            and self.hooks.pose_confidence() < LOW_CONF_INLIERS
+        )
+        return bool(fresh and (weak or few_inliers))
+
+    @staticmethod
+    def _uncertainty_reason(low_confidence: bool, record: dict) -> str:
+        if low_confidence:
+            return "low confidence"
+        if "jump_reject_u" in record:
+            return "pose jump rejected"
+        return "no fresh pose (lost/stale/PnP fail/non-finite)"
+
+    def _request_manual_after_loss(self, waited: float) -> bool:
+        if (
+            self.manual_requested
+            or waited < LOST_MANUAL_S
+            or self.hooks.request_manual is None
+            or not self.hooks.request_manual()
+        ):
+            return False
+        self.manual_requested = True
+        print(
+            "[safety] LOW_CONF/LOST: MegaLoc could not relocalize in "
+            f"{waited:.1f}s -> switching to MANUAL (pilot takeover)",
+            flush=True,
+        )
+        return True
+
+    def _localization_transition_outcome(
+        self,
+        transition,
+        *,
+        fresh: bool,
+        low_confidence: bool,
+        record: dict,
+    ) -> _LoopOutcome | None:
+        if transition.action in {"uncertain_hover", "land"}:
+            self._reset_pcmd_controller()
+            _sent, _why, actual = self._send_command((0, 0, 0, 0))
+            waited = float(transition.waited_s)
+            if self.hooks.force_relocalize is not None:
+                self.hooks.force_relocalize()
+            reason = self._uncertainty_reason(low_confidence, record)
+            self._emit(record, actual, True, f"{reason} -> hover ({waited:.1f}s)")
+            took_over = self._request_manual_after_loss(waited)
+            if not took_over and transition.action == "land":
+                terminal = "localization lost" if not fresh else "low confidence"
+                return _LoopOutcome(f"{terminal} -> land")
+            if not took_over and self.verbose and self.steps % 10 == 0:
+                print(
+                    "[safety] LOW_CONF_HOVER: hover + MegaLoc relocalize; "
+                    f"waited={waited:.1f}s",
+                    flush=True,
+                )
+            return _LoopOutcome()
+        if transition.action != "recovery_hover":
+            return None
+        self._reset_pcmd_controller()
+        _sent, _why, actual = self._send_command((0, 0, 0, 0))
+        self._emit(
+            record,
+            actual,
+            True,
+            f"localization recovery confirmation "
+            f"{self.uncertainty.recovery_good_fixes}/{RECOVERY_GOOD_FIXES} -> hover",
+        )
+        return _LoopOutcome()
+
+    def _compute_route_pcmd(self, command, pose, now: float):
+        if command.look_at_pole is not None:
+            self._reset_pcmd_controller()
+            return self.rpf.command_to_body_percent(
+                command,
+                pose,
+                config=self.ctrl.cfg,
+                yaw_sign=self.yaw_sign,
+            )
+        return self.pcmd_controller.update(
+            command,
+            pose,
+            now,
+            target_key=self.ctrl.target_index,
+            yaw_sign=self.yaw_sign,
+        )
+
+    def _record_route_command(self, record: dict, command, heading: float) -> None:
+        record["heading_deg"] = round(math.degrees(heading), 1)
+        record["path_error_u"] = round(float(command.path_error), 3)
+        record["progress"] = round(float(command.progress), 4)
+        record["action"] = command.status
+        record["pcmd_phase"] = self.pcmd_controller.phase
+
+    def _route_command_gate_outcome(self, command, record: dict) -> _LoopOutcome | None:
+        if self.pcmd_controller.abort_reason is not None:
+            _sent, _why, actual = self._send_command((0, 0, 0, 0))
+            reason = f"{self.pcmd_controller.abort_reason} -> land"
+            self._emit(record, actual, True, reason)
+            return _LoopOutcome(reason)
+        if command.path_error <= MAX_ROUTE_DEVIATION_U:
+            return None
+        _sent, _why, actual = self._send_command((0, 0, 0, 0))
+        reason = (
+            f"route deviation {command.path_error:.2f}u > "
+            f"{MAX_ROUTE_DEVIATION_U}u -> land"
+        )
+        self._emit(record, actual, True, reason)
+        return _LoopOutcome(reason)
+
+    def _ground_speed_sample(self, command):
+        if command.action != "LAND":
+            return None
+        try:
+            return self.hooks.ground_speed() if self.hooks.ground_speed is not None else None
+        except Exception:
+            return None
+
+    def _route_completion_outcome(
+        self,
+        command,
+        now: float,
+        record: dict,
+    ) -> _LoopOutcome | None:
+        if not command.should_land and self.ctrl.state not in ("LANDING", "DONE"):
+            return None
+        _sent, _why, actual = self._send_command((0, 0, 0, 0))
+        transition = decide_route_completion_landing(
+            command.action,
+            self._ground_speed_sample(command),
+            now,
+            threshold_mps=LANDING_SPEED_THRESHOLD_MPS,
+            max_age_s=GROUND_SPEED_MAX_AGE_S,
+        )
+        record.update(dict(transition.log_fields))
+        if transition.outcome == "hover":
+            self._reset_pcmd_controller()
+            self._emit(record, actual, True, transition.reason)
+            return _LoopOutcome()
+        self._emit(record, actual, True, transition.reason)
+        return _LoopOutcome(transition.reason)
+
+    def _stale_inspection_outcome(
+        self,
+        command,
+        now: float,
+        record: dict,
+    ) -> _LoopOutcome | None:
+        oldest = min(self.inspection_started.values(), default=None)
+        timed_out = (
+            command.look_at_pole is None
+            and oldest is not None
+            and now - oldest >= INSPECTION_TIMEOUT_S
+        )
+        if not timed_out:
+            return None
+        _sent, _why, actual = self._send_command((0, 0, 0, 0))
+        reason = "inspection alignment/capture timeout -> land"
+        self._emit(record, actual, True, reason)
+        return _LoopOutcome(reason)
+
+    @staticmethod
+    def _blocked_send_outcome(send_reason: str, *, context: str) -> _LoopOutcome | None:
+        upper = str(send_reason).upper()
+        if "EMERGENCY" in upper:
+            return _LoopOutcome(f"EMERGENCY command {context} -> motor cut")
+        if "LAND" in upper or "STOP SIGNAL" in upper or "TERMINATED" in upper:
+            return _LoopOutcome(f"{send_reason} -> land")
+        return None
+
+    def _inspection_capture(self, command, pose, key, record: dict) -> None:
+        capture_acked = False
+        try:
+            if self.hooks.inspection_ack is not None:
+                action = lambda: self.hooks.inspection_ack(command.look_at_pole, pose)
+                capture_acked = bool(
+                    self.hooks.inspection_hold(action)
+                    if self.hooks.inspection_hold is not None
+                    else action()
+                )
+        except Exception as exc:
+            if self.verbose:
+                print(
+                    f"[inspection] gimbal/capture hook failed ({exc!r})",
+                    flush=True,
+                )
+        post_ok, post_reason, post_actual = self._send_command((0, 0, 0, 0))
+        acknowledged = bool(
+            capture_acked
+            and post_ok
+            and self.ctrl.ack_inspection(
+                command.look_at_pole,
+                orientation_confirmed=True,
+            )
+        )
+        if acknowledged:
+            self.inspection_started.pop(key, None)
+        self._emit(
+            record,
+            post_actual,
+            True,
+            (
+                "inspection target aligned + capture acknowledged"
+                if acknowledged
+                else f"inspection capture not acknowledged ({post_reason})"
+            ),
+        )
+
+    def _inspection_outcome(
+        self,
+        command,
+        pose,
+        yaw: int,
+        now: float,
+        record: dict,
+    ) -> _LoopOutcome:
+        metadata = command.look_at_pole
+        key = (metadata.get("waypoint"), metadata.get("pole_id"))
+        inspection_since = self.inspection_started.setdefault(key, now)
+        hold_ok, hold_reason, hold_actual = self._send_command((0, 0, 0, 0))
+        if not hold_ok:
+            self._emit(
+                record,
+                hold_actual,
+                True,
+                f"inspection pre-action hold blocked ({hold_reason})",
+            )
+            terminal = self._blocked_send_outcome(
+                hold_reason,
+                context="during inspection",
+            )
+            return terminal or _LoopOutcome()
+        if not metadata.get("body_yaw_required", False):
+            reason = "inspection body-yaw orientation unavailable -> land"
+            self._emit(record, hold_actual, True, reason)
+            return _LoopOutcome(reason)
+        if now - inspection_since >= INSPECTION_TIMEOUT_S:
+            reason = "inspection alignment/capture timeout -> land"
+            self._emit(record, hold_actual, True, reason)
+            return _LoopOutcome(reason)
+        yaw_error = _wrap(float(command.yaw_target) - float(pose.yaw))
+        tolerance = math.radians(float(self.ctrl.cfg.inspect_yaw_tolerance_deg))
+        if abs(yaw_error) > tolerance:
+            sent, send_reason, actual = self._send_command((0, 0, yaw, 0))
+            detail = (
+                f"inspection body-yaw align error={math.degrees(yaw_error):.1f}deg"
+                if sent
+                else send_reason
+            )
+            self._emit(record, actual, not sent, detail)
+        else:
+            self._inspection_capture(command, pose, key, record)
+        return _LoopOutcome()
+
+    def _route_pcmd_outcome(
+        self,
+        command,
+        localized_pose,
+        heading: float,
+        pcmd,
+        record: dict,
+    ) -> _LoopOutcome:
+        sent, send_reason, actual = self._send_command(pcmd)
+        self._emit(record, actual, not sent, command.status if sent else send_reason)
+        if not sent:
+            terminal = self._blocked_send_outcome(send_reason, context="before PCMD")
+            if terminal is not None:
+                return terminal
+        elif self.verbose and self.steps % 10 == 0:
+            roll, pitch, yaw, gaz = pcmd
+            print(
+                f"[{command.status:26s}] pos=({localized_pose.x:5.1f},"
+                f"{localized_pose.y:5.1f},{localized_pose.z:4.1f}) "
+                f"hdg={math.degrees(heading):6.1f} err={command.path_error:4.2f} "
+                f"prog={command.progress:4.2f} phase={self.pcmd_controller.phase} "
+                f"PCMD(r={roll:+d},p={pitch:+d},y={yaw:+d},g={gaz:+d})"
+            )
+        return _LoopOutcome()
+
+    def _localized_motion_outcome(
+        self,
+        localized_pose,
+        olympe_yaw,
+        now: float,
+        record: dict,
+    ) -> _LoopOutcome:
+        self.manual_requested = False
+        self.heading.update(localized_pose.yaw, olympe_yaw)
+        heading = self.heading.heading(olympe_yaw)
+        if heading is None:
+            self._reset_pcmd_controller()
+            _sent, _why, actual = self._send_command((0, 0, 0, 0))
+            self._emit(record, actual, True, "heading unavailable -> hover")
+            return _LoopOutcome()
+        pose = self.rpf.Pose(
+            x=localized_pose.x,
+            y=localized_pose.y,
+            z=localized_pose.z,
+            yaw=heading,
+            stamp=localized_pose.stamp,
+        )
+        command = self.ctrl.step(pose, now)
+        pcmd = self._compute_route_pcmd(command, pose, now)
+        self._record_route_command(record, command, heading)
+        outcome = self._route_command_gate_outcome(command, record)
+        if outcome is not None:
+            return outcome
+        outcome = self._route_completion_outcome(command, now, record)
+        if outcome is not None:
+            return outcome
+        outcome = self._stale_inspection_outcome(command, now, record)
+        if outcome is not None:
+            return outcome
+        if command.look_at_pole is not None:
+            return self._inspection_outcome(command, pose, pcmd[2], now, record)
+        return self._route_pcmd_outcome(
+            command,
+            localized_pose,
+            heading,
+            pcmd,
+            record,
+        )
+
+
+def run_loop(hooks: LoopHooks, ctrl, waypoints, yaw_sign: int = 1, verbose: bool = True,
+             *, enforce_weak_pose_gate: bool = True):
+    """Localize, authorize, and route PCMD until a terminal condition."""
+    return _FlightLoopRunner(
+        hooks,
+        ctrl,
+        waypoints,
+        yaw_sign=yaw_sign,
+        verbose=verbose,
+        enforce_weak_pose_gate=enforce_weak_pose_gate,
+    ).run()
 
 
 # ---------------------------------------------------------------------------
@@ -2202,14 +2642,402 @@ def build_controller(*, require_approved: bool = True):
 # ---------------------------------------------------------------------------
 # Real flight
 
+def _wait_for_fresh_auto_consent(safety, stop: dict[str, bool], command_log) -> None:
+    print(
+        f"[fly] waiting <= {AUTO_CONSENT_TIMEOUT_S:.0f}s for a fresh AUTO command "
+        "written after this run started",
+        flush=True,
+    )
+    deadline = time.monotonic() + AUTO_CONSENT_TIMEOUT_S
+    while True:
+        mode = safety.poll()
+        if mode == "AUTO":
+            return
+        timed_out = time.monotonic() >= deadline
+        if mode in {"LAND", "EMERGENCY"} or stop["f"] or timed_out:
+            if stop["f"]:
+                reason = "operator stop"
+            elif timed_out:
+                reason = "fresh AUTO consent timeout"
+            else:
+                reason = f"preflight safety mode {mode}"
+            command_log.event(event="terminal", reason=reason)
+            command_log.close()
+            raise SystemExit(f"[fly] {reason}; refusing to connect/take off")
+        time.sleep(0.1)
+
+
+def _install_flight_stop_handlers() -> dict[str, bool]:
+    stop = {"f": False}
+    for signal_name in ("SIGINT", "SIGTERM", "SIGHUP"):
+        termination_signal = getattr(signal, signal_name, None)
+        if termination_signal is not None:
+            signal.signal(
+                termination_signal,
+                lambda *_args: stop.__setitem__("f", True),
+            )
+    return stop
+
+
+def _configure_flight_preflight_for_live(
+    drone,
+    command_log,
+    max_altitude_m: float | None,
+    max_distance_m: float | None,
+    distance_geofence: bool,
+) -> None:
+    try:
+        preflight = configure_flight_preflight(
+            drone,
+            max_altitude_m,
+            max_distance_m,
+            distance_geofence,
+            check_landed=False,
+        )
+    except Exception as exc:
+        command_log.event(
+            event="firmware_preflight",
+            confirmed=False,
+            warning=str(exc),
+            max_altitude_m=max_altitude_m,
+            max_distance_m=max_distance_m,
+            distance_geofence=bool(distance_geofence),
+        )
+        print(
+            f"[fly] WARNING: {exc}; continuing without confirmed firmware limits",
+            flush=True,
+        )
+        return
+    command_log.event(event="firmware_preflight", confirmed=True, **preflight)
+    print(
+        "[fly] firmware preflight confirmed: "
+        f"battery={preflight['battery_percent']}% "
+        f"max_altitude={preflight['max_altitude_m']:.1f}m "
+        f"max_distance={preflight['max_distance_m']:.1f}m "
+        f"distance_geofence={preflight['distance_geofence']}",
+        flush=True,
+    )
+
+
+def _boot_pose(localizer):
+    try:
+        return localizer.get_pose()
+    except Exception as exc:
+        print(f"[fly] BOOT_INIT localizer raised ({exc!r}); retrying", flush=True)
+        return None
+
+
+def _wait_for_boot_lock(monitor, grabber, localizer, start_waypoint, stop) -> str | None:
+    lock = BootPoseLock(start_waypoint)
+    locked = False
+    started_at = time.monotonic()
+    while not locked and not stop["f"] and not monitor.terminated.is_set():
+        allowed, _reason = monitor.arming_allowed(grabber.is_healthy, lambda: stop["f"])
+        if allowed:
+            locked = lock.observe(_boot_pose(localizer), now=time.monotonic())
+        else:
+            lock.reset()
+        monitor.send_authorized(
+            (0, 0, 0, 0),
+            grabber.is_healthy,
+            lambda: stop["f"],
+        )
+        if time.monotonic() - started_at > FIRST_FIX_TIMEOUT_S:
+            raise SystemExit(
+                "[fly] BOOT lock failed (need consecutive fresh fixes near route start) "
+                "-> landing (no AUTO)"
+            )
+        time.sleep(0.1)
+    if monitor.terminated.is_set():
+        return monitor.reason or "safety command before AUTO -> land"
+    if stop["f"]:
+        return "operator stop signal before AUTO -> land"
+    return None
+
+
+def _capture_inspection_frame(drone, grabber, metadata, pose, map_frame) -> bool:
+    pitch_target = inspection_gimbal_pitch_deg(metadata, pose, map_frame)
+    if pitch_target is None:
+        return False
+    if not set_gimbal(
+        drone,
+        pitch_target,
+        require_confirmation=True,
+        timeout_s=2.0,
+        tolerance_deg=3.0,
+    ):
+        return False
+    baseline_source_us = grabber.latest_source_ntp_us()
+    if baseline_source_us is None:
+        return False
+    receipt_after = time.monotonic() + INSPECTION_PIPELINE_DRAIN_S
+    sample = None
+    frame_deadline = receipt_after + STREAM_STALE_S
+    while time.monotonic() < frame_deadline:
+        candidate = grabber.inspection_sample_after(
+            baseline_source_us,
+            min_source_advance_s=INSPECTION_PIPELINE_DRAIN_S,
+            receipt_after=receipt_after,
+        )
+        if candidate is not None:
+            sample = candidate
+            break
+        time.sleep(0.02)
+    if sample is None:
+        return False
+    frame, capture_stamp = sample
+    if time.monotonic() - float(capture_stamp) > STREAM_STALE_S:
+        return False
+    import cv2
+
+    output_dir = SYSTEM_ROOT / "outputs" / "flight_inspections"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output = output_dir / (
+        f"wp{int(metadata['waypoint']):02d}_pole{int(metadata['pole_id']):02d}_"
+        f"{time.strftime('%Y%m%d_%H%M%S')}_{time.time_ns() % 1_000_000_000:09d}.jpg"
+    )
+    written = bool(
+        cv2.imwrite(str(output), cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+    )
+    if written:
+        print(
+            f"[inspection] body aligned; gimbal pitch={pitch_target:.1f}deg; "
+            f"captured {output}",
+            flush=True,
+        )
+    return written
+
+
+def _live_stream_status(grabber) -> str:
+    age = grabber.last_frame_age()
+    return (
+        "no 720p frame yet"
+        if age is None
+        else f"last 720p frame age={age:.2f}s source={grabber.stamp_source}"
+    )
+
+
+def _make_live_loop_hooks(
+    *,
+    localizer,
+    safety,
+    stick_monitor,
+    drone,
+    send_pcmd,
+    monitor,
+    grabber,
+    stop,
+    ground_speed,
+    command_log,
+    inspection_ack,
+) -> LoopHooks:
+    request_manual = (
+        (lambda: safety.force("manual"))
+        if safety.allow_manual
+        else (lambda: False)
+    )
+
+    def send_if_active(roll, pitch, yaw, gaz):
+        if not stop["f"] and not monitor.terminated.is_set():
+            send_pcmd(roll, pitch, yaw, gaz)
+
+    return LoopHooks(
+        get_pose=localizer.get_pose,
+        pose_is_weak=lambda: bool(dict(localizer.last_info).get("weak", False)),
+        pose_confidence=lambda: int(
+            dict(localizer.last_info).get("inliers", 0) or 0
+        ),
+        force_relocalize=lambda: setattr(localizer.state, "mode", "LOST"),
+        request_manual=request_manual,
+        stick_active=getattr(stick_monitor, "is_active", None),
+        olympe_yaw=lambda: olympe_yaw_of(drone),
+        send_pcmd=send_if_active,
+        send_authorized_pcmd=lambda pcmd: monitor.send_authorized(
+            pcmd,
+            grabber.is_healthy,
+            lambda: stop["f"],
+        ),
+        safety_poll=lambda: monitor.mode,
+        stream_healthy=grabber.is_healthy,
+        stream_status=lambda: _live_stream_status(grabber),
+        loop_beat=monitor.beat,
+        pose_info=lambda: dict(localizer.last_info),
+        inspection_ack=inspection_ack,
+        inspection_hold=lambda action: monitor.run_while_holding_zero(
+            action,
+            grabber.is_healthy,
+            lambda: stop["f"],
+        ),
+        pcmd_timing=monitor.pcmd_timing_snapshot,
+        ground_speed=ground_speed.sample,
+        log_tick=command_log,
+    )
+
+
+def _run_live_route_after_takeoff(
+    *,
+    monitor,
+    grabber,
+    localizer,
+    waypoints,
+    stop,
+    controller,
+    safety,
+    stick_monitor,
+    drone,
+    send_pcmd,
+    ground_speed,
+    command_log,
+    yaw_sign: int,
+) -> str:
+    boot_reason = _wait_for_boot_lock(
+        monitor,
+        grabber,
+        localizer,
+        waypoints[0],
+        stop,
+    )
+    if boot_reason is not None:
+        return boot_reason
+    auto_ok, auto_reason = monitor.arming_allowed(
+        grabber.is_healthy,
+        lambda: stop["f"],
+    )
+    if not auto_ok:
+        raise SystemExit(f"[fly] final AUTO authorization failed: {auto_reason}")
+    print(
+        f"[fly] locked (mode={dict(localizer.last_info).get('next_mode')}, "
+        f"inliers={dict(localizer.last_info).get('inliers')}). START AUTO."
+    )
+
+    def inspection_ack(metadata, pose):
+        return _capture_inspection_frame(
+            drone,
+            grabber,
+            metadata,
+            pose,
+            controller.cfg.map_frame,
+        )
+
+    hooks = _make_live_loop_hooks(
+        localizer=localizer,
+        safety=safety,
+        stick_monitor=stick_monitor,
+        drone=drone,
+        send_pcmd=send_pcmd,
+        monitor=monitor,
+        grabber=grabber,
+        stop=stop,
+        ground_speed=ground_speed,
+        command_log=command_log,
+        inspection_ack=inspection_ack,
+    )
+    reason = _run_until(hooks, controller, waypoints, yaw_sign, stop)
+    return monitor.reason or reason if monitor.terminated.is_set() else reason
+
+
+def _authorize_cleanup_zero(monitor, grabber, stop, must_land: bool, reason: str) -> str:
+    if monitor is None:
+        return reason
+    monitor.stop()
+    if monitor.reason:
+        reason = monitor.reason
+    if not must_land or reason.startswith("EMERGENCY"):
+        return reason
+    _sent, authorization_reason, _actual = monitor.send_authorized(
+        (0, 0, 0, 0),
+        lambda: grabber is not None and grabber.is_healthy(),
+        lambda: stop["f"],
+    )
+    if "EMERGENCY" in str(authorization_reason).upper():
+        return "EMERGENCY command during cleanup -> motor cut"
+    return reason
+
+
+def _perform_terminal_flight_action(
+    *,
+    must_land: bool,
+    drone,
+    reason: str,
+    monitor,
+    emergency_action,
+    landing_action,
+) -> None:
+    if not must_land:
+        if drone is not None:
+            print(
+                "[fly] no TakeOff attempt; closing stream/connection without Landing()",
+                flush=True,
+            )
+        else:
+            print("[fly] never connected; nothing to land", flush=True)
+        return
+    if drone is None:
+        print("[fly] never connected; nothing to land", flush=True)
+        return
+    if not reason.startswith("EMERGENCY"):
+        print("[fly] landing")
+        try:
+            landing_action("landing/landed")
+        except (Exception, SystemExit) as exc:
+            print(f"[fly] warning: landing did not confirm: {exc}", flush=True)
+        return
+    print("[fly] EMERGENCY: cutting motors (drone will drop)", flush=True)
+    if monitor is not None and monitor.emergency_issued:
+        return
+    try:
+        emergency_action()
+    except Exception as exc:
+        print(
+            f"[fly] Emergency() failed ({exc}); falling back to Landing()",
+            flush=True,
+        )
+        try:
+            landing_action("emergency fallback landing/landed")
+        except (Exception, SystemExit) as fallback_exc:
+            print(
+                f"[fly] warning: Landing() also failed: {fallback_exc}",
+                flush=True,
+            )
+
+
+def _close_live_flight_resources(
+    *,
+    grabber,
+    drone,
+    via_skycontroller: bool,
+    command_log,
+    reason: str,
+) -> None:
+    if grabber is not None:
+        try:
+            grabber.stop()
+        except Exception:
+            pass
+    if drone is not None and via_skycontroller:
+        try:
+            set_piloting_source(drone, "SkyController")
+        except Exception as exc:
+            print(
+                f"[fly] warning: could not restore SkyController ownership: {exc}",
+                flush=True,
+            )
+    if drone is not None:
+        try:
+            drone.disconnect()
+        except Exception:
+            pass
+    try:
+        command_log.event(event="terminal", reason=reason)
+    except Exception:
+        pass
+    command_log.close()
+
+
 def fly(ip: str, yaw_sign: int, gimbal_pitch: float, controller: str, safety_file: str,
         cmd_log_path: str = "", max_altitude_m: float | None = None,
         max_distance_m: float | None = None, distance_geofence: bool = False):
-    stop = {"f": False}
-    for sig_name in ("SIGINT", "SIGTERM", "SIGHUP"):
-        sig = getattr(signal, sig_name, None)
-        if sig is not None:
-            signal.signal(sig, lambda *_: stop.__setitem__("f", True))
+    stop = _install_flight_stop_handlers()
     ctrl, wp = build_controller()
     import olympe_frame_source as ofs
     from olympe.messages.ardrone3.Piloting import TakeOff, PCMD, Landing, Emergency
@@ -2223,22 +3051,7 @@ def fly(ip: str, yaw_sign: int, gimbal_pitch: float, controller: str, safety_fil
         keyboard=True,
         require_fresh_auto=True,
     )
-    print(f"[fly] waiting <= {AUTO_CONSENT_TIMEOUT_S:.0f}s for a fresh AUTO command "
-          "written after this run started", flush=True)
-    consent_deadline = time.monotonic() + AUTO_CONSENT_TIMEOUT_S
-    while True:
-        preflight_safety = safety.poll()
-        if preflight_safety == "AUTO":
-            break
-        if preflight_safety in {"LAND", "EMERGENCY"} or stop["f"] \
-                or time.monotonic() >= consent_deadline:
-            why = ("operator stop" if stop["f"] else
-                   "fresh AUTO consent timeout" if time.monotonic() >= consent_deadline else
-                   f"preflight safety mode {preflight_safety}")
-            clog.event(event="terminal", reason=why)
-            clog.close()
-            raise SystemExit(f"[fly] {why}; refusing to connect/take off")
-        time.sleep(0.1)
+    _wait_for_fresh_auto_consent(safety, stop, clog)
 
     # Bind everything the finally touches BEFORE the try, so a failure at connect,
     # stream start, model load, or takeoff can never raise UnboundLocalError in the
@@ -2251,6 +3064,19 @@ def fly(ip: str, yaw_sign: int, gimbal_pitch: float, controller: str, safety_fil
     reason = ""
     via_skycontroller = False
     send_pcmd = lambda *_: None
+
+    def emergency_action() -> None:
+        _await_confirmed_action(drone(Emergency()), "emergency")
+
+    def landing_action(label: str) -> None:
+        wait_success(
+            drone(
+                Landing()
+                >> FlyingStateChanged(state="landed", _timeout=20)
+            ),
+            label,
+        )
+
     try:
         drone = ofs.connect(ip, controller=controller)
         via_skycontroller = manual_override_available(ip, controller)
@@ -2258,30 +3084,13 @@ def fly(ip: str, yaw_sign: int, gimbal_pitch: float, controller: str, safety_fil
             # Keep the physical pilot authoritative throughout ground setup.
             set_piloting_source(drone, "SkyController")
         require_landed_for_firmware_config(drone)
-        try:
-            preflight = configure_flight_preflight(
-                drone, max_altitude_m, max_distance_m, distance_geofence,
-                check_landed=False)
-        except Exception as exc:
-            clog.event(
-                event="firmware_preflight", confirmed=False, warning=str(exc),
-                max_altitude_m=max_altitude_m, max_distance_m=max_distance_m,
-                distance_geofence=bool(distance_geofence),
-            )
-            print(
-                f"[fly] WARNING: {exc}; continuing without confirmed firmware limits",
-                flush=True,
-            )
-        else:
-            clog.event(event="firmware_preflight", confirmed=True, **preflight)
-            print(
-                "[fly] firmware preflight confirmed: "
-                f"battery={preflight['battery_percent']}% "
-                f"max_altitude={preflight['max_altitude_m']:.1f}m "
-                f"max_distance={preflight['max_distance_m']:.1f}m "
-                f"distance_geofence={preflight['distance_geofence']}",
-                flush=True,
-            )
+        _configure_flight_preflight_for_live(
+            drone,
+            clog,
+            max_altitude_m,
+            max_distance_m,
+            distance_geofence,
+        )
         # True flight rejects callback-receipt timestamps: without source NTP,
         # upstream queue latency cannot be distinguished from a fresh frame.
         grab = ofs.OlympePdrawGrabber(
@@ -2337,189 +3146,40 @@ def fly(ip: str, yaw_sign: int, gimbal_pitch: float, controller: str, safety_fil
             raise SystemExit("[fly] gimbal did not acknowledge target -> landing (no AUTO)")
         print(f"[fly] BOOT_INIT: require {BOOT_LOCK_FIXES} stable fixes near route start "
               f"(<= {BOOT_START_MAX_U:.2f}u, timeout {FIRST_FIX_TIMEOUT_S:.0f}s)...")
-
-        def _boot_pose():
-            try:
-                return loc.get_pose()
-            except Exception as exc:
-                print(f"[fly] BOOT_INIT localizer raised ({exc!r}); retrying", flush=True)
-                return None
-
-        boot_lock = BootPoseLock(wp[0])
-        boot_locked = False
-        t0 = time.monotonic()
-        while not boot_locked and not stop["f"] and not monitor.terminated.is_set():
-            boot_ok, _boot_reason = monitor.arming_allowed(grab.is_healthy, lambda: stop["f"])
-            if boot_ok:
-                boot_locked = boot_lock.observe(_boot_pose(), now=time.monotonic())
-            else:
-                boot_lock.reset()
-            monitor.send_authorized(
-                (0, 0, 0, 0), grab.is_healthy, lambda: stop["f"])
-            if time.monotonic() - t0 > FIRST_FIX_TIMEOUT_S:
-                raise SystemExit(
-                    "[fly] BOOT lock failed (need consecutive fresh fixes near route start) "
-                    "-> landing (no AUTO)")
-            time.sleep(0.1)
-        if monitor.terminated.is_set():
-            reason = monitor.reason or "safety command before AUTO -> land"
-        elif stop["f"]:
-            reason = "operator stop signal before AUTO -> land"
-        else:
-            auto_ok, auto_reason = monitor.arming_allowed(grab.is_healthy, lambda: stop["f"])
-            if not auto_ok:
-                raise SystemExit(f"[fly] final AUTO authorization failed: {auto_reason}")
-            print(f"[fly] locked (mode={dict(loc.last_info).get('next_mode')}, "
-                  f"inliers={dict(loc.last_info).get('inliers')}). START AUTO.")
-
-            def _inspection_ack(meta, pose):
-                pitch_target = inspection_gimbal_pitch_deg(
-                    meta, pose, ctrl.cfg.map_frame
-                )
-                if pitch_target is None:
-                    return False
-                if not set_gimbal(
-                        drone, pitch_target, require_confirmation=True,
-                        timeout_s=2.0, tolerance_deg=3.0):
-                    return False
-                baseline_source_us = grab.latest_source_ntp_us()
-                if baseline_source_us is None:
-                    return False
-                # Raw NTP is a source sequence clock, not a host-synchronized
-                # capture time. Drain both source time and host receipt time so
-                # a pre-confirmation frame arriving late cannot be acknowledged.
-                receipt_after = time.monotonic() + INSPECTION_PIPELINE_DRAIN_S
-                sample = None
-                frame_deadline = receipt_after + STREAM_STALE_S
-                while time.monotonic() < frame_deadline:
-                    candidate = grab.inspection_sample_after(
-                        baseline_source_us,
-                        min_source_advance_s=INSPECTION_PIPELINE_DRAIN_S,
-                        receipt_after=receipt_after,
-                    )
-                    if candidate is not None:
-                        sample = candidate
-                        break
-                    time.sleep(0.02)
-                if sample is None:
-                    return False
-                frame, capture_stamp = sample
-                if time.monotonic() - float(capture_stamp) > STREAM_STALE_S:
-                    return False
-                import cv2
-                out_dir = SYSTEM_ROOT / "outputs" / "flight_inspections"
-                out_dir.mkdir(parents=True, exist_ok=True)
-                out = out_dir / (f"wp{int(meta['waypoint']):02d}_pole{int(meta['pole_id']):02d}_"
-                                 f"{time.strftime('%Y%m%d_%H%M%S')}_{time.time_ns() % 1_000_000_000:09d}.jpg")
-                ok = bool(cv2.imwrite(str(out), cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)))
-                if ok:
-                    print(f"[inspection] body aligned; gimbal pitch={pitch_target:.1f}deg; "
-                          f"captured {out}", flush=True)
-                return ok
-
-            hooks = LoopHooks(
-                get_pose=loc.get_pose,
-                pose_is_weak=lambda: bool(dict(loc.last_info).get("weak", False)),
-                pose_confidence=lambda: int(dict(loc.last_info).get("inliers", 0) or 0),
-                force_relocalize=lambda: setattr(loc.state, "mode", "LOST"),  # run MegaLoc next deep frame
-                request_manual=(lambda: safety.force("manual")) if safety.allow_manual else (lambda: False),
-                stick_active=getattr(stick_monitor, "is_active", None),
-                olympe_yaw=lambda: olympe_yaw_of(drone),
-                # Once the monitor has commanded LAND/EMERGENCY, a loop resuming from a
-                # blocked get_pose() must NOT send a countermanding nonzero PCMD.
-                send_pcmd=lambda r, p, y, g: (
-                    None if (stop["f"] or monitor.terminated.is_set()) else send_pcmd(r, p, y, g)),
-                send_authorized_pcmd=lambda pcmd: monitor.send_authorized(
-                    pcmd, grab.is_healthy, lambda: stop["f"]),
-                safety_poll=lambda: monitor.mode,       # the monitor thread is the sole poller
-                stream_healthy=grab.is_healthy,
-                stream_status=lambda: (lambda age: (
-                    "no 720p frame yet" if age is None
-                    else f"last 720p frame age={age:.2f}s source={grab.stamp_source}"
-                ))(grab.last_frame_age()),
-                loop_beat=monitor.beat,
-                pose_info=lambda: dict(loc.last_info),
-                inspection_ack=_inspection_ack,
-                inspection_hold=lambda action: monitor.run_while_holding_zero(
-                    action, grab.is_healthy, lambda: stop["f"]),
-                pcmd_timing=monitor.pcmd_timing_snapshot,
-                ground_speed=ground_speed.sample,
-                log_tick=clog,
-            )
-            # run_loop returns when route done / lost / (Ctrl-C flips stop -> next hover then we break)
-            reason = _run_until(hooks, ctrl, wp, yaw_sign, stop)
-            if monitor.terminated.is_set():
-                reason = monitor.reason or reason
+        reason = _run_live_route_after_takeoff(
+            monitor=monitor,
+            grabber=grab,
+            localizer=loc,
+            waypoints=wp,
+            stop=stop,
+            controller=ctrl,
+            safety=safety,
+            stick_monitor=stick_monitor,
+            drone=drone,
+            send_pcmd=send_pcmd,
+            ground_speed=ground_speed,
+            command_log=clog,
+            yaw_sign=yaw_sign,
+        )
         print(f"[fly] {reason}")
     finally:
         stop_skycontroller_stick_override(stick_monitor)
-        if monitor is not None:
-            monitor.stop()
-            if monitor.reason:
-                reason = monitor.reason
-            # Even the terminal zero goes through the same authority lock. A
-            # late MANUAL/EMERGENCY command therefore cannot receive a PCMD.
-            if must_land and not reason.startswith("EMERGENCY"):
-                _sent, final_auth_reason, _actual = monitor.send_authorized(
-                    (0, 0, 0, 0),
-                    lambda: grab is not None and grab.is_healthy(),
-                    lambda: stop["f"],
-                )
-                if "EMERGENCY" in str(final_auth_reason).upper():
-                    reason = "EMERGENCY command during cleanup -> motor cut"
-        if must_land and drone is not None:
-            if reason.startswith("EMERGENCY"):
-                print("[fly] EMERGENCY: cutting motors (drone will drop)", flush=True)
-                if monitor is None or not monitor.emergency_issued:
-                    try:
-                        _await_confirmed_action(drone(Emergency()), "emergency")
-                    except Exception as exc:
-                        print(f"[fly] Emergency() failed ({exc}); falling back to Landing()", flush=True)
-                        try:
-                            wait_success(
-                                drone(Landing() >> FlyingStateChanged(
-                                    state="landed", _timeout=20)),
-                                "emergency fallback landing/landed",
-                            )
-                        except (Exception, SystemExit) as exc2:
-                            print(f"[fly] warning: Landing() also failed: {exc2}", flush=True)
-            else:
-                print("[fly] landing")
-                try:
-                    # wait_success raises SystemExit (a BaseException) on a landing-
-                    # confirmation timeout; catch it too, or grab.stop()/disconnect leak.
-                    wait_success(
-                        drone(Landing() >> FlyingStateChanged(
-                            state="landed", _timeout=20)),
-                        "landing/landed",
-                    )
-                except (Exception, SystemExit) as exc:
-                    print(f"[fly] warning: landing did not confirm: {exc}", flush=True)
-        elif drone is not None:
-            print("[fly] no TakeOff attempt; closing stream/connection without Landing()", flush=True)
-        else:
-            print("[fly] never connected; nothing to land", flush=True)
-        if grab is not None:
-            try:
-                grab.stop()
-            except Exception:
-                pass
-        if drone is not None and via_skycontroller:
-            try:
-                set_piloting_source(drone, "SkyController")
-            except Exception as exc:
-                print(f"[fly] warning: could not restore SkyController ownership: {exc}",
-                      flush=True)
-        if drone is not None:
-            try:
-                drone.disconnect()
-            except Exception:
-                pass
-        try:
-            clog.event(event="terminal", reason=reason)
-        except Exception:
-            pass
-        clog.close()
+        reason = _authorize_cleanup_zero(monitor, grab, stop, must_land, reason)
+        _perform_terminal_flight_action(
+            must_land=must_land,
+            drone=drone,
+            reason=reason,
+            monitor=monitor,
+            emergency_action=emergency_action,
+            landing_action=landing_action,
+        )
+        _close_live_flight_resources(
+            grabber=grab,
+            drone=drone,
+            via_skycontroller=via_skycontroller,
+            command_log=clog,
+            reason=reason,
+        )
 
 
 def _run_until(hooks, ctrl, wp, yaw_sign, stop):
@@ -2678,36 +3338,57 @@ def _run_capped(hooks, ctrl, wp, yaw_sign, max_steps):
 # ---------------------------------------------------------------------------
 # Self-test: heading fusion + PCMD sign sanity (pure python, no deps)
 
-def selftest():
-    import real_path_follow_controller as rpf
+def _selftest_heading_and_pcmd(rpf) -> None:
+    estimator = HeadingEstimator()
+    olympe_yaw = math.radians(110.0)
+    true_heading = math.radians(40.0)
+    estimator.update(true_heading, olympe_yaw)
+    estimate = estimator.heading(olympe_yaw)
+    assert abs(_wrap(estimate - true_heading)) < 1e-9, (
+        f"heading fusion off: {math.degrees(estimate):.1f} "
+        f"vs {math.degrees(true_heading):.1f}"
+    )
 
-    # 1) visual map heading anchors converted Olympe NED yaw exactly.
-    he = HeadingEstimator()
-    oyaw = math.radians(110.0)
-    true_map_heading = math.radians(40.0)
-    he.update(true_map_heading, oyaw)
-    est = he.heading(oyaw)
-    assert abs(_wrap(est - true_map_heading)) < 1e-9, \
-        f"heading fusion off: {math.degrees(est):.1f} vs {math.degrees(true_map_heading):.1f}"
+    pose = rpf.Pose(x=0, y=0, z=0, yaw=0.0)
+    ahead = rpf.Command(
+        "FOLLOW",
+        np.array([1.2, 0.0, 0.0]),
+        yaw_target=0.0,
+        goal=np.array([1.2, 0.0, 0.0]),
+        path_error=0.0,
+        progress=0.0,
+    )
+    roll, pitch, yaw, gaz = rpf.command_to_body_percent(ahead, pose)
+    assert pitch > 0 and abs(yaw) < 3 and roll == 0, (roll, pitch, yaw, gaz)
+    behind = rpf.Command(
+        "FOLLOW",
+        np.array([-1.2, 0.0, 0.0]),
+        yaw_target=math.pi,
+        goal=np.array([-1.2, 0.0, 0.0]),
+        path_error=0.0,
+        progress=0.0,
+    )
+    roll, pitch, yaw, gaz = rpf.command_to_body_percent(behind, pose)
+    assert pitch == 0 and abs(yaw) == 20, (
+        "should spin in place, not fly backward",
+        roll,
+        pitch,
+        yaw,
+        gaz,
+    )
+    upward = rpf.Command(
+        "FOLLOW",
+        np.array([0.0, -1.0, 0.0]),
+        yaw_target=0.0,
+        goal=np.array([0.0, -1.0, 0.0]),
+        path_error=0.0,
+        progress=0.0,
+    )
+    _, _, _, gaz = rpf.command_to_body_percent(upward, pose)
+    assert gaz > 0, f"+gaz should be ascend, got {gaz}"
 
-    # 2) PCMD sign sanity: facing the goal -> forward pitch>0, small yaw; behind -> yaw drives, no forward
-    pose = rpf.Pose(x=0, y=0, z=0, yaw=0.0)      # facing +X
-    ahead = rpf.Command("FOLLOW", np.array([1.2, 0.0, 0.0]), yaw_target=0.0,
-                        goal=np.array([1.2, 0.0, 0.0]), path_error=0.0, progress=0.0)
-    r, p, y, g = rpf.command_to_body_percent(ahead, pose)
-    assert p > 0 and abs(y) < 3 and r == 0, (r, p, y, g)
-    behind = rpf.Command("FOLLOW", np.array([-1.2, 0.0, 0.0]), yaw_target=math.pi,
-                         goal=np.array([-1.2, 0.0, 0.0]), path_error=0.0, progress=0.0)
-    r, p, y, g = rpf.command_to_body_percent(behind, pose)
-    assert p == 0 and abs(y) == 20, ("should spin in place, not fly backward", r, p, y, g)
 
-    # 3) +gaz == up (-Y): a "go up" command (target y lower) yields gaz>0
-    up = rpf.Command("FOLLOW", np.array([0.0, -1.0, 0.0]), yaw_target=0.0,
-                     goal=np.array([0.0, -1.0, 0.0]), path_error=0.0, progress=0.0)
-    _, _, _, g = rpf.command_to_body_percent(up, pose)
-    assert g > 0, f"+gaz should be ascend, got {g}"
-
-    # 4) stream lost must preempt localization and command hover.
+def _selftest_stream_and_pose_gates(rpf) -> None:
     sent = []
     ticks = {"n": 0, "t": 0.0}
 
@@ -2724,7 +3405,9 @@ def selftest():
     hooks = LoopHooks(
         get_pose=should_not_localize,
         olympe_yaw=lambda: None,
-        send_pcmd=lambda r, p, y, g: sent.append((r, p, y, g)),
+        send_pcmd=lambda roll, pitch, yaw, gaz: sent.append(
+            (roll, pitch, yaw, gaz)
+        ),
         stream_healthy=lambda: False,
         stream_status=lambda: "selftest disconnected",
         now=fake_now,
@@ -2733,111 +3416,174 @@ def selftest():
         run_loop(hooks, None, None, verbose=False)
     except KeyboardInterrupt:
         pass
-    assert sent and all(cmd == (0, 0, 0, 0) for cmd in sent), sent
+    assert sent and all(command == (0, 0, 0, 0) for command in sent), sent
 
-    # 5) a NaN/inf pose must be rejected (hover), never steer the drone.
     nan_sent = []
-    nt = {"n": 0, "t": 0.0}
+    nan_ticks = {"n": 0, "t": 0.0}
 
     def nan_now():
-        nt["n"] += 1
-        nt["t"] += 1.0 / CTRL_HZ
-        if nt["n"] > 8:
+        nan_ticks["n"] += 1
+        nan_ticks["t"] += 1.0 / CTRL_HZ
+        if nan_ticks["n"] > 8:
             raise KeyboardInterrupt
-        return nt["t"]
+        return nan_ticks["t"]
 
-    wpn = [np.array([0.0, 0.0, 0.0]), np.array([2.0, 0.0, 0.0])]
-    ctrln = rpf.RouteAutoController(wpn, poles=[], config=rpf.ControlConfig(inspect_waypoints=()))
+    waypoints = [np.array([0.0, 0.0, 0.0]), np.array([2.0, 0.0, 0.0])]
+    controller = rpf.RouteAutoController(
+        waypoints,
+        poles=[],
+        config=rpf.ControlConfig(inspect_waypoints=()),
+    )
     hooks = LoopHooks(
-        get_pose=lambda: rpf.Pose(x=float("nan"), y=0.0, z=0.0, yaw=0.0, stamp=nt["t"]),
+        get_pose=lambda: rpf.Pose(
+            x=float("nan"),
+            y=0.0,
+            z=0.0,
+            yaw=0.0,
+            stamp=nan_ticks["t"],
+        ),
         olympe_yaw=lambda: None,
-        send_pcmd=lambda r, p, y, g: nan_sent.append((r, p, y, g)),
+        send_pcmd=lambda roll, pitch, yaw, gaz: nan_sent.append(
+            (roll, pitch, yaw, gaz)
+        ),
         now=nan_now,
     )
     try:
-        run_loop(hooks, ctrln, wpn, verbose=False)
+        run_loop(hooks, controller, waypoints, verbose=False)
     except KeyboardInterrupt:
         pass
-    assert nan_sent and all(cmd == (0, 0, 0, 0) for cmd in nan_sent), ("NaN pose must hover", nan_sent[:5])
+    assert nan_sent and all(command == (0, 0, 0, 0) for command in nan_sent), (
+        "NaN pose must hover",
+        nan_sent[:5],
+    )
 
-    # 6) SafetyMonitor is an INDEPENDENT authority: a LAND command reaches land_cb
-    #    and sets terminated with NO control loop running (models "main loop blocked
-    #    in get_pose()"); a HOVER command streams zero PCMD.
-    class _Seq:
-        def __init__(self, seq):
-            self.seq = list(seq)
-            self.i = 0
 
-        def poll(self):
-            v = self.seq[min(self.i, len(self.seq) - 1)]
-            self.i += 1
-            return v
+class _SafetySequence:
+    def __init__(self, sequence):
+        self.sequence = list(sequence)
+        self.index = 0
 
-    mcalls = {"pcmd": [], "land": 0, "emergency": 0}
-    mon = SafetyMonitor(
-        lambda r, p, y, g: mcalls["pcmd"].append((r, p, y, g)),
-        _Seq(["HOVER", "LAND"]),
-        land_cb=lambda: mcalls.__setitem__("land", mcalls["land"] + 1),
-        emergency_cb=lambda: mcalls.__setitem__("emergency", mcalls["emergency"] + 1),
+    def poll(self):
+        value = self.sequence[min(self.index, len(self.sequence) - 1)]
+        self.index += 1
+        return value
+
+
+def _selftest_safety_monitor() -> None:
+    calls = {"pcmd": [], "land": 0, "emergency": 0}
+    monitor = SafetyMonitor(
+        lambda roll, pitch, yaw, gaz: calls["pcmd"].append(
+            (roll, pitch, yaw, gaz)
+        ),
+        _SafetySequence(["HOVER", "LAND"]),
+        land_cb=lambda: calls.__setitem__("land", calls["land"] + 1),
+        emergency_cb=lambda: calls.__setitem__(
+            "emergency", calls["emergency"] + 1
+        ),
         timeout_s=0.06,
     ).start()
     time.sleep(0.4)
-    mon.stop()
-    assert mcalls["land"] == 1, ("LAND must fire exactly once, independent of any loop", mcalls)
-    assert mon.terminated.is_set(), "LAND must terminate the mission"
-    assert (0, 0, 0, 0) in mcalls["pcmd"], "HOVER must stream zero PCMD from the monitor thread"
+    monitor.stop()
+    assert calls["land"] == 1, (
+        "LAND must fire exactly once, independent of any loop",
+        calls,
+    )
+    assert monitor.terminated.is_set(), "LAND must terminate the mission"
+    assert (0, 0, 0, 0) in calls["pcmd"], (
+        "HOVER must stream zero PCMD from the monitor thread"
+    )
 
-    # 7) MANUAL hands control to the physical pilot: the monitor must send NOTHING
-    #    (a zero PCMD would fight the pilot's sticks).
-    mcalls2 = {"pcmd": []}
-    mon2 = SafetyMonitor(lambda r, p, y, g: mcalls2["pcmd"].append((r, p, y, g)),
-                         _Seq(["MANUAL"]), timeout_s=0.06).start()
+    manual_calls = {"pcmd": []}
+    manual_monitor = SafetyMonitor(
+        lambda roll, pitch, yaw, gaz: manual_calls["pcmd"].append(
+            (roll, pitch, yaw, gaz)
+        ),
+        _SafetySequence(["MANUAL"]),
+        timeout_s=0.06,
+    ).start()
     time.sleep(0.3)
-    mon2.stop()
-    assert mcalls2["pcmd"] == [], ("MANUAL must send NOTHING", mcalls2)
+    manual_monitor.stop()
+    assert manual_calls["pcmd"] == [], (
+        "MANUAL must send NOTHING",
+        manual_calls,
+    )
 
-    # 8) the stall watchdog must stay silent until the loop actually beats, so it can
-    #    never false-fire and inject PCMD during the takeoff/BOOT_INIT window.
-    mcalls3 = {"pcmd": []}
-    mon3 = SafetyMonitor(lambda r, p, y, g: mcalls3["pcmd"].append((r, p, y, g)),
-                         _Seq(["AUTO"]), timeout_s=0.06).start()
+    prebeat_calls = {"pcmd": []}
+    prebeat_monitor = SafetyMonitor(
+        lambda roll, pitch, yaw, gaz: prebeat_calls["pcmd"].append(
+            (roll, pitch, yaw, gaz)
+        ),
+        _SafetySequence(["AUTO"]),
+        timeout_s=0.06,
+    ).start()
     time.sleep(0.3)
-    mon3.stop()
-    assert mcalls3["pcmd"] == [], ("stall watchdog must not fire before first beat", mcalls3)
+    prebeat_monitor.stop()
+    assert prebeat_calls["pcmd"] == [], (
+        "stall watchdog must not fire before first beat",
+        prebeat_calls,
+    )
 
-    # 9) a low-confidence fix (inliers < threshold) must HOVER, ask the tracker to relocalize
-    #    (force_relocalize -> MegaLoc), and after LOST_MANUAL_S hand to the pilot (request_manual);
-    #    it must never drive the drone on a weak fix.
-    lc = {"pcmd": [], "reloc": 0, "manual": 0, "t": 0.0}
 
-    def lc_now():
-        lc["t"] += 0.2
-        if lc["t"] > LOST_LAND_S + 20.0:
+def _selftest_low_confidence_handoff(rpf) -> None:
+    state = {"pcmd": [], "reloc": 0, "manual": 0, "t": 0.0}
+
+    def now():
+        state["t"] += 0.2
+        if state["t"] > LOST_LAND_S + 20.0:
             raise KeyboardInterrupt
-        return lc["t"]
+        return state["t"]
 
-    wplc = [np.array([0.0, 0.0, 0.0]), np.array([2.0, 0.0, 0.0])]
-    ctrllc = rpf.RouteAutoController(wplc, poles=[], config=rpf.ControlConfig(inspect_waypoints=()))
+    waypoints = [np.array([0.0, 0.0, 0.0]), np.array([2.0, 0.0, 0.0])]
+    controller = rpf.RouteAutoController(
+        waypoints,
+        poles=[],
+        config=rpf.ControlConfig(inspect_waypoints=()),
+    )
     hooks = LoopHooks(
-        get_pose=lambda: rpf.Pose(x=0.0, y=0.0, z=0.0, yaw=0.0, stamp=lc["t"]),
+        get_pose=lambda: rpf.Pose(
+            x=0.0,
+            y=0.0,
+            z=0.0,
+            yaw=0.0,
+            stamp=state["t"],
+        ),
         olympe_yaw=lambda: None,
-        send_pcmd=lambda r, p, y, g: lc["pcmd"].append((r, p, y, g)),
-        pose_confidence=lambda: 30,                                  # < LOW_CONF_INLIERS (60)
-        force_relocalize=lambda: lc.__setitem__("reloc", lc["reloc"] + 1),
-        request_manual=lambda: (lc.__setitem__("manual", lc["manual"] + 1) or True),
-        now=lc_now,
+        send_pcmd=lambda roll, pitch, yaw, gaz: state["pcmd"].append(
+            (roll, pitch, yaw, gaz)
+        ),
+        pose_confidence=lambda: 30,
+        force_relocalize=lambda: state.__setitem__("reloc", state["reloc"] + 1),
+        request_manual=lambda: (
+            state.__setitem__("manual", state["manual"] + 1) or True
+        ),
+        now=now,
     )
     try:
-        run_loop(hooks, ctrllc, wplc, verbose=False)
+        run_loop(hooks, controller, waypoints, verbose=False)
     except KeyboardInterrupt:
         pass
-    assert lc["pcmd"] and all(cmd == (0, 0, 0, 0) for cmd in lc["pcmd"]), ("low-conf must hover", lc["pcmd"][:5])
-    assert lc["reloc"] > 0, "low-conf must ask the tracker to relocalize (MegaLoc)"
-    assert lc["manual"] == 1, ("MegaLoc-fail must hand to MANUAL exactly once", lc)
+    assert state["pcmd"] and all(
+        command == (0, 0, 0, 0) for command in state["pcmd"]
+    ), ("low-conf must hover", state["pcmd"][:5])
+    assert state["reloc"] > 0, "low-conf must ask the tracker to relocalize (MegaLoc)"
+    assert state["manual"] == 1, (
+        "MegaLoc-fail must hand to MANUAL exactly once",
+        state,
+    )
 
-    print("selftest OK: heading fusion, PCMD signs, stream-lost + NaN-pose hover gates, "
-          "SafetyMonitor LAND/HOVER authority, MANUAL-silence, pre-beat watchdog gating, "
-          "and low-confidence hover+MegaLoc+MANUAL handoff sane")
+
+def selftest():
+    import real_path_follow_controller as rpf
+
+    _selftest_heading_and_pcmd(rpf)
+    _selftest_stream_and_pose_gates(rpf)
+    _selftest_safety_monitor()
+    _selftest_low_confidence_handoff(rpf)
+    print(
+        "selftest OK: heading fusion, PCMD signs, stream-lost + NaN-pose hover gates, "
+        "SafetyMonitor LAND/HOVER authority, MANUAL-silence, pre-beat watchdog gating, "
+        "and low-confidence hover+MegaLoc+MANUAL handoff sane"
+    )
 
 
 # ---------------------------------------------------------------------------

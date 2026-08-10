@@ -38,7 +38,6 @@ REQUIRED_FILES = (
     "文件/README.md",
     "文件/ARCHITECTURE.md",
     "文件/SYSTEM_SPEC.md",
-    "文件/WORKSPACE_AUDIT.md",
     "outputs/README.md",
     "tools/README.md",
     "tools/install_runtime.sh",
@@ -141,37 +140,45 @@ def classify_output(name: str) -> str:
     return "unclassified"
 
 
-def audit_workspace(root: str | Path, *, include_sizes: bool = True) -> dict[str, Any]:
-    workspace = Path(root).expanduser().resolve()
-    missing_directories = [
-        name for name in REQUIRED_DIRECTORIES if not (workspace / name).is_dir()
-    ]
+def _missing_workspace_paths(workspace: Path) -> tuple[list[str], list[str]]:
+    missing_directories = [name for name in REQUIRED_DIRECTORIES if not (workspace / name).is_dir()]
     required_paths = (*REQUIRED_FILES, *CANONICAL_ENTRYPOINTS)
-    missing_files = [
-        name for name in required_paths if not (workspace / name).is_file()
-    ]
+    missing_files = [name for name in required_paths if not (workspace / name).is_file()]
+    return missing_directories, missing_files
 
+
+def _workspace_symlinks(
+    workspace: Path,
+) -> tuple[list[dict[str, Any]], list[str]]:
     symlinks: list[dict[str, Any]] = []
     broken_symlinks: list[str] = []
-    if workspace.is_dir():
-        for path, _stat in _walk_without_following_links(workspace):
-            if not path.is_symlink():
-                continue
-            relative = str(path.relative_to(workspace))
-            target = os.readlink(path)
-            resolved = path.resolve(strict=False)
-            exists = resolved.exists()
-            symlinks.append({"path": relative, "target": target, "valid": exists})
-            if not exists:
-                broken_symlinks.append(relative)
+    if not workspace.is_dir():
+        return symlinks, broken_symlinks
+    for path, _stat in _walk_without_following_links(workspace):
+        if not path.is_symlink():
+            continue
+        relative = str(path.relative_to(workspace))
+        target = os.readlink(path)
+        resolved = path.resolve(strict=False)
+        exists = resolved.exists()
+        symlinks.append({"path": relative, "target": target, "valid": exists})
+        if not exists:
+            broken_symlinks.append(relative)
+    return symlinks, broken_symlinks
 
+
+def _workspace_top_level_sizes(workspace: Path, *, include_sizes: bool) -> dict[str, int]:
     top_level_sizes: dict[str, int] = {}
-    if include_sizes and workspace.is_dir():
-        for path in sorted(workspace.iterdir(), key=lambda item: item.name):
-            if path.name == ".git":
-                continue
-            top_level_sizes[path.name] = directory_size(path)
+    if not include_sizes or not workspace.is_dir():
+        return top_level_sizes
+    for path in sorted(workspace.iterdir(), key=lambda item: item.name):
+        if path.name == ".git":
+            continue
+        top_level_sizes[path.name] = directory_size(path)
+    return top_level_sizes
 
+
+def _workspace_output_classes(workspace: Path) -> dict[str, list[str]]:
     output_classes: dict[str, list[str]] = {
         "operations": [],
         "validation": [],
@@ -183,7 +190,15 @@ def audit_workspace(root: str | Path, *, include_sizes: bool = True) -> dict[str
     if output_root.is_dir():
         for path in sorted(output_root.iterdir(), key=lambda item: item.name):
             output_classes[classify_output(path.name)].append(path.name)
+    return output_classes
 
+
+def _workspace_storage_report(
+    workspace: Path,
+    top_level_sizes: dict[str, int],
+    *,
+    include_sizes: bool,
+) -> tuple[int | None, list[str], dict[str, int | float]]:
     usage_target = workspace if workspace.exists() else workspace.parent
     usage = shutil.disk_usage(usage_target)
     workspace_size_bytes = sum(top_level_sizes.values()) if include_sizes else None
@@ -197,6 +212,26 @@ def audit_workspace(root: str | Path, *, include_sizes: bool = True) -> dict[str
         storage_warnings.append(
             "free space is below 15%; stop before creating large validation artifacts"
         )
+    disk = {
+        "total_bytes": usage.total,
+        "used_bytes": usage.used,
+        "free_bytes": usage.free,
+        "free_percent": free_percent,
+    }
+    return workspace_size_bytes, storage_warnings, disk
+
+
+def audit_workspace(root: str | Path, *, include_sizes: bool = True) -> dict[str, Any]:
+    workspace = Path(root).expanduser().resolve()
+    missing_directories, missing_files = _missing_workspace_paths(workspace)
+    symlinks, broken_symlinks = _workspace_symlinks(workspace)
+    top_level_sizes = _workspace_top_level_sizes(workspace, include_sizes=include_sizes)
+    output_classes = _workspace_output_classes(workspace)
+    workspace_size_bytes, storage_warnings, disk = _workspace_storage_report(
+        workspace,
+        top_level_sizes,
+        include_sizes=include_sizes,
+    )
     structural_failures = [
         *(f"missing directory: {name}" for name in missing_directories),
         *(f"missing file: {name}" for name in missing_files),
@@ -217,12 +252,7 @@ def audit_workspace(root: str | Path, *, include_sizes: bool = True) -> dict[str
         "generated_top_level": sorted(
             name for name in GENERATED_TOP_LEVEL if (workspace / name).exists()
         ),
-        "disk": {
-            "total_bytes": usage.total,
-            "used_bytes": usage.used,
-            "free_bytes": usage.free,
-            "free_percent": usage.free / usage.total * 100.0 if usage.total else 0.0,
-        },
+        "disk": disk,
     }
 
 
@@ -245,9 +275,7 @@ def format_human(report: dict[str, Any]) -> str:
     sizes = report.get("top_level_bytes", {})
     if sizes:
         lines.append("largest top-level entries:")
-        for name, size in sorted(sizes.items(), key=lambda item: item[1], reverse=True)[
-            :10
-        ]:
+        for name, size in sorted(sizes.items(), key=lambda item: item[1], reverse=True)[:10]:
             lines.append(f"  {name}: {_gib(size):.2f} GiB")
     unclassified = report["output_classes"]["unclassified"]
     lines.append(f"output entries not classified: {len(unclassified)}")

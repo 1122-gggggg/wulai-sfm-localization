@@ -671,56 +671,74 @@ class RouteEditorWindow(tk.Toplevel):
         self.request_redraw()
         return "break"
 
+    def _handle_undo_redo(self, *, shift: bool) -> None:
+        changed = self.controller.redo() if shift else self.controller.undo()
+        if changed:
+            self.status_var.set("已重做" if shift else "已復原")
+            self._refresh_labels()
+            self.request_redraw()
+
+    def _handle_begin_move(self) -> None:
+        if self.controller.begin_move():
+            self._move_mouse_start = self._mouse
+            self.status_var.set(
+                "平移中：按 X / Y / Z 鎖定軸；左鍵或 Enter 確認，Esc 取消"
+            )
+
+    def _handle_move_axis(self, key: str) -> None:
+        axis = {"x": 0, "y": 1, "z": 2}[key]
+        self.controller.constrain(axis)
+        self._update_move_preview()
+        self.status_var.set(f"平移中：已鎖定 {key.upper()} 軸")
+
+    def _handle_enter(self) -> None:
+        if self.controller.moving:
+            self.controller.confirm_move()
+            self.status_var.set("已確認航點移動")
+        elif self.controller.phase == "layout":
+            self.finish_layout()
+        self._refresh_labels()
+        self.request_redraw()
+
+    def _handle_escape(self) -> None:
+        if self.controller.cancel_move():
+            self.status_var.set("已取消這次移動；請使用右上角按鈕離開編輯器")
+            self._refresh_labels()
+            self.request_redraw()
+        else:
+            self.status_var.set("Esc 只取消移動；請使用右上角「離開編輯器」")
+
+    def _handle_delete(self) -> None:
+        if self.controller.delete_selected():
+            self.status_var.set("已刪除選取航點")
+            self._refresh_labels()
+            self.request_redraw()
+
     def on_key(self, event) -> str | None:
         key = str(event.keysym).lower()
         ctrl = bool(int(event.state) & 0x0004)
         shift = bool(int(event.state) & 0x0001)
         if ctrl and key == "z":
-            changed = self.controller.redo() if shift else self.controller.undo()
-            if changed:
-                self.status_var.set("已重做" if shift else "已復原")
-                self._refresh_labels()
-                self.request_redraw()
+            self._handle_undo_redo(shift=shift)
             return "break"
         if (
             key == "g"
             and self.controller.phase == "height"
             and not self.controller.moving
         ):
-            if self.controller.begin_move():
-                self._move_mouse_start = self._mouse
-                self.status_var.set(
-                    "平移中：按 X / Y / Z 鎖定軸；左鍵或 Enter 確認，Esc 取消"
-                )
+            self._handle_begin_move()
             return "break"
         if key in {"x", "y", "z"} and self.controller.moving:
-            axis = {"x": 0, "y": 1, "z": 2}[key]
-            self.controller.constrain(axis)
-            self._update_move_preview()
-            self.status_var.set(f"平移中：已鎖定 {key.upper()} 軸")
+            self._handle_move_axis(key)
             return "break"
         if key in {"return", "kp_enter"}:
-            if self.controller.moving:
-                self.controller.confirm_move()
-                self.status_var.set("已確認航點移動")
-            elif self.controller.phase == "layout":
-                self.finish_layout()
-            self._refresh_labels()
-            self.request_redraw()
+            self._handle_enter()
             return "break"
         if key == "escape":
-            if self.controller.cancel_move():
-                self.status_var.set("已取消這次移動；請使用右上角按鈕離開編輯器")
-                self._refresh_labels()
-                self.request_redraw()
-            else:
-                self.status_var.set("Esc 只取消移動；請使用右上角「離開編輯器」")
+            self._handle_escape()
             return "break"
         if key == "delete" and self.controller.phase == "height":
-            if self.controller.delete_selected():
-                self.status_var.set("已刪除選取航點")
-                self._refresh_labels()
-                self.request_redraw()
+            self._handle_delete()
             return "break"
         return None
 

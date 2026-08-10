@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import math
 import threading
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Hashable
@@ -108,8 +108,8 @@ class TakeoffLandingSupervisor:
         self,
         *,
         reason: str,
-        is_landed,
-        land_and_confirm,
+        is_landed: Callable[[], bool],
+        land_and_confirm: Callable[[str], bool],
         force_command: bool = False,
     ) -> LandingOutcome:
         with self._lock:

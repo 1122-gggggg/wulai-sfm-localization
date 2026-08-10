@@ -206,6 +206,64 @@ def _save(poles):
           f"{len(V)} verts / {len(F)} tris -> {POLES_PLY}")
 
 
+def _poles_edit_event(operator, context, event):
+    if event.type == "LEFTMOUSE" and event.value == "PRESS":
+        p = operator._snap(context, event)
+        if p is None:
+            operator.report({"WARNING"}, "no cloud vertex under cursor (zoom in / aim at the pole)")
+            return {"RUNNING_MODAL"}
+        if operator._pending_base is None:
+            operator._pending_base = p
+        else:
+            pole = pole_box(operator._pending_base, p, DEFAULT_RADIUS)
+            operator._poles.append(pole)
+            operator._pending_base = None
+            _redraw(operator._poles)
+        operator._status(context)
+        return {"RUNNING_MODAL"}
+
+    if event.type in {"WHEELUPMOUSE", "WHEELDOWNMOUSE"} and event.value == "PRESS" \
+            and operator._poles:
+        p = operator._poles[-1]
+        r = p["radius"] + (RADIUS_STEP if event.type == "WHEELUPMOUSE" else -RADIUS_STEP)
+        r = max(MIN_RADIUS, r)
+        p["radius"] = r
+        p["half_extents"][0] = r
+        p["half_extents"][1] = r
+        _redraw(operator._poles)
+        operator._status(context)
+        return {"RUNNING_MODAL"}
+
+    if event.type == "Z" and event.value == "PRESS":
+        if operator._pending_base is not None:
+            operator._pending_base = None
+        elif operator._poles:
+            operator._poles.pop()
+            _redraw(operator._poles)
+        operator._status(context)
+        return {"RUNNING_MODAL"}
+    return None
+
+
+def _poles_finish_event(operator, context, event):
+    if event.type == "S" and event.value == "PRESS":
+        _save(operator._poles)
+        operator.report({"INFO"}, f"saved {len(operator._poles)} poles")
+        return {"RUNNING_MODAL"}
+
+    if event.type in {"RET", "NUMPAD_ENTER", "ESC"} and event.value == "PRESS":
+        _save(operator._poles)
+        context.area.header_text_set(None)
+        operator.report({"INFO"}, f"done, {len(operator._poles)} poles saved")
+        return {"FINISHED"}
+
+    if event.type in {"MIDDLEMOUSE", "TRACKPADPAN", "TRACKPADZOOM",
+                      "NUMPAD_1", "NUMPAD_2", "NUMPAD_3", "NUMPAD_4", "NUMPAD_5",
+                      "NUMPAD_6", "NUMPAD_7", "NUMPAD_8", "NUMPAD_9"}:
+        return {"PASS_THROUGH"}
+    return None
+
+
 # ---------------------------------------------------------------- modal operator
 class POLE_OT_draw(bpy.types.Operator):
     bl_idname = "view3d.mark_poles_boxes"
@@ -269,56 +327,12 @@ class POLE_OT_draw(bpy.types.Operator):
         if event.alt:
             return {"PASS_THROUGH"}
 
-        if event.type == "LEFTMOUSE" and event.value == "PRESS":
-            p = self._snap(context, event)
-            if p is None:
-                self.report({"WARNING"}, "no cloud vertex under cursor (zoom in / aim at the pole)")
-                return {"RUNNING_MODAL"}
-            if self._pending_base is None:
-                self._pending_base = p
-            else:
-                pole = pole_box(self._pending_base, p, DEFAULT_RADIUS)
-                self._poles.append(pole)
-                self._pending_base = None
-                _redraw(self._poles)
-            self._status(context)
-            return {"RUNNING_MODAL"}
-
-        if event.type in {"WHEELUPMOUSE", "WHEELDOWNMOUSE"} and event.value == "PRESS" and self._poles:
-            p = self._poles[-1]
-            r = p["radius"] + (RADIUS_STEP if event.type == "WHEELUPMOUSE" else -RADIUS_STEP)
-            r = max(MIN_RADIUS, r)
-            p["radius"] = r
-            p["half_extents"][0] = r
-            p["half_extents"][1] = r
-            _redraw(self._poles)
-            self._status(context)
-            return {"RUNNING_MODAL"}
-
-        if event.type == "Z" and event.value == "PRESS":
-            if self._pending_base is not None:
-                self._pending_base = None
-            elif self._poles:
-                self._poles.pop()
-                _redraw(self._poles)
-            self._status(context)
-            return {"RUNNING_MODAL"}
-
-        if event.type == "S" and event.value == "PRESS":
-            _save(self._poles)
-            self.report({"INFO"}, f"saved {len(self._poles)} poles")
-            return {"RUNNING_MODAL"}
-
-        if event.type in {"RET", "NUMPAD_ENTER", "ESC"} and event.value == "PRESS":
-            _save(self._poles)
-            context.area.header_text_set(None)
-            self.report({"INFO"}, f"done, {len(self._poles)} poles saved")
-            return {"FINISHED"}
-
-        if event.type in {"MIDDLEMOUSE", "TRACKPADPAN", "TRACKPADZOOM",
-                          "NUMPAD_1", "NUMPAD_2", "NUMPAD_3", "NUMPAD_4", "NUMPAD_5",
-                          "NUMPAD_6", "NUMPAD_7", "NUMPAD_8", "NUMPAD_9"}:
-            return {"PASS_THROUGH"}
+        result = _poles_edit_event(self, context, event)
+        if result is not None:
+            return result
+        result = _poles_finish_event(self, context, event)
+        if result is not None:
+            return result
         return {"RUNNING_MODAL"}
 
 

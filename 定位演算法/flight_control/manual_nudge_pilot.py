@@ -47,6 +47,7 @@ import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -450,68 +451,78 @@ class NudgePilot:
             self.safety.airborne = False
             return False
 
-    def nudge(self, name: str, *, operator_approved: bool = False) -> None:
+    def _handle_special_nudge(self, name: str, *, operator_approved: bool) -> bool:
         if name in {"懸停", "hover"}:
             self.hover("key_hover")
-            return
-        if name in {"手動", "manual"}:
+        elif name in {"手動", "manual"}:
             self.give_to_pilot()
-            return
-        if name in {"原地降落", "land"}:
+        elif name in {"原地降落", "land"}:
             self.land("key_land")
-            return
-        if name in {"起飛", "takeoff"}:
+        elif name in {"起飛", "takeoff"}:
             if operator_approved:
                 self.approve_operator_takeoff()
             self.takeoff()
+        else:
+            return False
+        return True
+
+    def _run_nudge_pulse(self, name: str, pcmd: tuple[int, int, int, int], token: int) -> None:
+        if not self.send_pcmd(*pcmd, reason=f"nudge:{name}"):
+            return
+        t_end = time.monotonic() + self.pulse_s
+        pulse_error = None
+        try:
+            while time.monotonic() < t_end:
+                if self.safety.stop or self.safety.pilot_sticks:
+                    return
+                with self._send_lock:
+                    if token != self._pulse_token:
+                        return
+                # re-send periodically so firmware does not time out mid-pulse
+                self.send_pcmd(*pcmd, reason=f"nudge_hold:{name}")
+                time.sleep(1.0 / CTRL_HZ)
+        except Exception as exc:
+            # The tail below is what returns the aircraft to hover. If this thread
+            # dies on the way there the drone keeps the last non-zero PCMD.
+            pulse_error = exc
+        finally:
+            with self._send_lock:
+                if token == self._pulse_token and not self.safety.pilot_sticks:
+                    try:
+                        self._raw_pcmd(0, 0, 0, 0)
+                        self.log.event(
+                            "pcmd",
+                            reason=(f"nudge_error:{name}" if pulse_error
+                                    else f"nudge_end:{name}"),
+                            pcmd=(0, 0, 0, 0),
+                        )
+                    except Exception as zero_exc:
+                        self.log.event("pcmd_zero_failed", reason=f"nudge:{name}",
+                                       error=repr(zero_exc))
+            if pulse_error is not None:
+                self.log.event("nudge_pulse_error", name=name,
+                               error=repr(pulse_error))
+
+    def _start_nudge_pulse(self, name: str, pcmd: tuple[int, int, int, int]) -> None:
+        # cancel previous pulse, start new one
+        with self._send_lock:
+            self._pulse_token += 1
+            token = self._pulse_token
+        threading.Thread(
+            target=self._run_nudge_pulse,
+            args=(name, pcmd, token),
+            name=f"nudge-{name}",
+            daemon=True,
+        ).start()
+
+    def nudge(self, name: str, *, operator_approved: bool = False) -> None:
+        if self._handle_special_nudge(name, operator_approved=operator_approved):
             return
         if name not in NUDGE_DIRS:
             self.log.event("unknown_nudge", name=name)
             return
         pcmd = scale_nudge(NUDGE_DIRS[name], self.pct)
-        # cancel previous pulse, start new one
-        with self._send_lock:
-            self._pulse_token += 1
-            token = self._pulse_token
-
-        def _pulse():
-            if not self.send_pcmd(*pcmd, reason=f"nudge:{name}"):
-                return
-            t_end = time.monotonic() + self.pulse_s
-            pulse_error = None
-            try:
-                while time.monotonic() < t_end:
-                    if self.safety.stop or self.safety.pilot_sticks:
-                        return
-                    with self._send_lock:
-                        if token != self._pulse_token:
-                            return
-                    # re-send periodically so firmware does not time out mid-pulse
-                    self.send_pcmd(*pcmd, reason=f"nudge_hold:{name}")
-                    time.sleep(1.0 / CTRL_HZ)
-            except Exception as exc:
-                # The tail below is what returns the aircraft to hover. If this thread
-                # dies on the way there the drone keeps the last non-zero PCMD.
-                pulse_error = exc
-            finally:
-                with self._send_lock:
-                    if token == self._pulse_token and not self.safety.pilot_sticks:
-                        try:
-                            self._raw_pcmd(0, 0, 0, 0)
-                            self.log.event(
-                                "pcmd",
-                                reason=(f"nudge_error:{name}" if pulse_error
-                                        else f"nudge_end:{name}"),
-                                pcmd=(0, 0, 0, 0),
-                            )
-                        except Exception as zero_exc:
-                            self.log.event("pcmd_zero_failed", reason=f"nudge:{name}",
-                                           error=repr(zero_exc))
-                if pulse_error is not None:
-                    self.log.event("nudge_pulse_error", name=name,
-                                   error=repr(pulse_error))
-
-        threading.Thread(target=_pulse, name=f"nudge-{name}", daemon=True).start()
+        self._start_nudge_pulse(name, pcmd)
 
     def beat(self) -> None:
         self.safety.last_beat = time.monotonic()
@@ -628,6 +639,58 @@ def run_selftest() -> int:
     return 0
 
 
+def _set_ui_status(status: Any, last: Any, msg: str) -> None:
+    status.set(msg)
+    last.set(msg)
+
+
+def _handle_ui_command(
+    pilot: NudgePilot,
+    status: Any,
+    last: Any,
+    name: str,
+    *,
+    operator_approved: bool = False,
+) -> None:
+    pilot.beat()
+    pilot.nudge(name, operator_approved=operator_approved)
+    _set_ui_status(status, last,
+                   f"cmd: {name}  sticks={'ON' if pilot.safety.pilot_sticks else 'PC'}")
+
+
+def _handle_ui_key(pilot: NudgePilot, status: Any, last: Any, event: Any) -> None:
+    pilot.beat()
+    ch = event.keysym.lower() if len(event.keysym) > 1 else event.char.lower()
+    # map keysym names
+    if event.keysym == "space":
+        ch = " "
+    if event.keysym == "Escape":
+        pilot.give_to_pilot()
+        _set_ui_status(status, last, "MANUAL: 搖桿接管")
+        return
+    if ch in KEY_ALIASES:
+        _handle_ui_command(pilot, status, last, KEY_ALIASES[ch], operator_approved=(ch == "t"))
+    elif event.char in KEY_ALIASES:
+        _handle_ui_command(
+            pilot, status, last, KEY_ALIASES[event.char], operator_approved=(event.char == "t")
+        )
+
+
+def _handle_ui_close(pilot: NudgePilot, status: Any, last: Any, root: Any) -> None:
+    _set_ui_status(status, last, "closing -> land")
+    pilot.safety.stop = True
+    pilot.cleanup()
+    root.destroy()
+
+
+def _tk_tick(root: Any, pilot: NudgePilot, t_end: float, on_close) -> None:
+    pilot.beat()
+    if pilot.safety.stop or pilot.safety.landed or time.monotonic() >= t_end:
+        on_close()
+        return
+    root.after(200, lambda: _tk_tick(root, pilot, t_end, on_close))
+
+
 def run_tk(pilot: NudgePilot, secs: float) -> None:
     import tkinter as tk
     from tkinter import ttk
@@ -637,36 +700,10 @@ def run_tk(pilot: NudgePilot, secs: float) -> None:
     root.geometry("720x520")
     status = tk.StringVar(value="ready")
     last = tk.StringVar(value="")
-
-    def set_status(msg: str) -> None:
-        status.set(msg)
-        last.set(msg)
-
-    def on_cmd(name: str, *, operator_approved: bool = False) -> None:
-        pilot.beat()
-        pilot.nudge(name, operator_approved=operator_approved)
-        set_status(f"cmd: {name}  sticks={'ON' if pilot.safety.pilot_sticks else 'PC'}")
-
-    def on_key(event) -> None:
-        pilot.beat()
-        ch = event.keysym.lower() if len(event.keysym) > 1 else event.char.lower()
-        # map keysym names
-        if event.keysym == "space":
-            ch = " "
-        if event.keysym == "Escape":
-            pilot.give_to_pilot()
-            set_status("MANUAL: 搖桿接管")
-            return
-        if ch in KEY_ALIASES:
-            on_cmd(KEY_ALIASES[ch], operator_approved=(ch == "t"))
-        elif event.char in KEY_ALIASES:
-            on_cmd(KEY_ALIASES[event.char], operator_approved=(event.char == "t"))
-
-    def on_close() -> None:
-        set_status("closing -> land")
-        pilot.safety.stop = True
-        pilot.cleanup()
-        root.destroy()
+    set_status = partial(_set_ui_status, status, last)
+    on_cmd = partial(_handle_ui_command, pilot, status, last)
+    on_key = partial(_handle_ui_key, pilot, status, last)
+    on_close = partial(_handle_ui_close, pilot, status, last, root)
 
     root.protocol("WM_DELETE_WINDOW", on_close)
     root.bind("<Key>", on_key)
@@ -715,15 +752,7 @@ def run_tk(pilot: NudgePilot, secs: float) -> None:
 
     # heartbeat + optional auto-exit
     t_end = time.monotonic() + max(1.0, secs)
-
-    def tick() -> None:
-        pilot.beat()
-        if pilot.safety.stop or pilot.safety.landed or time.monotonic() >= t_end:
-            on_close()
-            return
-        root.after(200, tick)
-
-    root.after(200, tick)
+    root.after(200, lambda: _tk_tick(root, pilot, t_end, on_close))
     root.mainloop()
 
 

@@ -36,7 +36,6 @@ COPY_DIRS = (
 COPY_FILES = (
     "README.md",
     "outputs/README.md",
-    "執行環境/README.md",
     ARTIFACT_MANIFEST,
     "pyproject.toml",
     "pytest.ini",

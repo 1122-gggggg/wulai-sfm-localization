@@ -541,6 +541,22 @@ def test_composite_fallback_keeps_temporal_diagnostics_and_aggregates_timings(mo
     assert info["timing_synced"] is False
 
 
+def test_frame_impl_mock_failure_keeps_fail_closed_state_transition():
+    tracker = _composite_tracker()
+    tracker.cfg.adaptive_first_topk = 0
+    tracker.ensure_xfeat = lambda: object()
+    tracker._localize_with_candidates = lambda *_args, **_kwargs: (
+        None, {"inliers": 0, "corr3d": 0, "reproj_rms": None})
+    tracker._gate = lambda *_args, **_kwargs: (False, False, None)
+
+    result = tracker._localize_frame_impl(np.zeros((12, 16, 3), np.uint8))
+
+    assert result is None
+    assert tracker.state.mode == "WEAK_TRACK"
+    assert tracker.last_info["accepted"] is False
+    assert tracker.last_info["next_mode"] == "WEAK_TRACK"
+
+
 @pytest.mark.parametrize("full_ref_available", [True, False])
 def test_full_ref_seed_materializes_inliers_only_as_fallback(full_ref_available):
     tracker = _composite_tracker()

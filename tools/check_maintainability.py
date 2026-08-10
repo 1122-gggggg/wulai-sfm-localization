@@ -1,11 +1,5 @@
 #!/usr/bin/env python3
-"""Ratchet existing cyclomatic-complexity debt without rewriting flight logic.
-
-The project contains mature, highly tested control and localization state
-machines whose Ruff C901 complexity cannot be removed safely in one change.
-This gate records the current debt by subsystem: later changes may reduce it,
-but may not add violations or increase the worst function in any subsystem.
-"""
+"""Reject cyclomatic-complexity regressions in first-party production code."""
 
 from __future__ import annotations
 
@@ -24,15 +18,15 @@ SCAN_PATHS = (
     "控制介面程式",
 )
 
-# Measured with Ruff 0.16.1 on 2026-08-09 after the operator UI seam refactor.
-# Values are ceilings, not targets. Reductions do not require this table to be
-# updated immediately; any increase fails CI.
+# Ruff 0.16.1 reports no C901 findings in these production subsystems. Keep the
+# explicit zero budgets so a future violation fails CI instead of becoming a
+# new ratchet baseline.
 BUDGETS = {
-    "tools": {"violations": 4, "max_complexity": 20},
-    "deploy": {"violations": 13, "max_complexity": 49},
-    "flight": {"violations": 21, "max_complexity": 86},
-    "validation": {"violations": 13, "max_complexity": 39},
-    "control": {"violations": 56, "max_complexity": 60},
+    "tools": {"violations": 0, "max_complexity": 0},
+    "deploy": {"violations": 0, "max_complexity": 0},
+    "flight": {"violations": 0, "max_complexity": 0},
+    "validation": {"violations": 0, "max_complexity": 0},
+    "control": {"violations": 0, "max_complexity": 0},
 }
 
 
@@ -141,7 +135,7 @@ def main() -> int:
         for failure in failures:
             print(f"[maintainability] FAIL: {failure}")
         return 1
-    print("[maintainability] OK: complexity debt did not increase")
+    print("[maintainability] OK: no production C901 violations")
     return 0
 
 

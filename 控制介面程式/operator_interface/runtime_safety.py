@@ -434,6 +434,8 @@ class SessionLogs:
                 "core_wall_ms",
             ):
                 value = fields.get(key)
+                if value is None:
+                    continue
                 try:
                     value = float(value)
                 except (TypeError, ValueError):
@@ -543,6 +545,73 @@ def network_destination_allowed(
 _NETWORK_GUARD_INSTALLED = False
 
 
+def _network_address_host(address: Any) -> str | None:
+    if isinstance(address, tuple) and address:
+        return str(address[0])
+    # AF_UNIX path: local IPC is allowed.
+    if isinstance(address, (str, bytes)):
+        return None
+    return ""
+
+
+def _require_network_destination(
+    mode: InterfaceMode, host: str, allowed: tuple[str, ...]
+) -> None:
+    if not network_destination_allowed(mode, host, allowed_real_hosts=allowed):
+        raise PermissionError(
+            f"offline network policy blocked destination {host!r} in {mode.value}"
+        )
+
+
+def _make_guarded_socket_call(
+    original: Callable[..., Any], mode: InterfaceMode, allowed: tuple[str, ...]
+) -> Callable[..., Any]:
+    def guarded(sock: socket.socket, address: Any) -> Any:
+        host = _network_address_host(address)
+        if host is not None:
+            _require_network_destination(mode, host, allowed)
+        return original(sock, address)
+
+    return guarded
+
+
+def _make_guarded_sendto(
+    original: Callable[..., Any], mode: InterfaceMode, allowed: tuple[str, ...]
+) -> Callable[..., Any]:
+    def guarded(sock: socket.socket, data: Any, *args: Any) -> Any:
+        if not args:
+            return original(sock, data)
+        address = args[-1]
+        host = _network_address_host(address)
+        if host is not None:
+            _require_network_destination(mode, host, allowed)
+        return original(sock, data, *args)
+
+    return guarded
+
+
+def _make_guarded_getaddrinfo(
+    original: Callable[..., Any], mode: InterfaceMode, allowed: tuple[str, ...]
+) -> Callable[..., Any]:
+    def guarded(host: Any, *args: Any, **kwargs: Any) -> Any:
+        _require_network_destination(mode, str(host), allowed)
+        return original(host, *args, **kwargs)
+
+    return guarded
+
+
+def _make_guarded_create_connection(
+    original: Callable[..., Any], mode: InterfaceMode, allowed: tuple[str, ...]
+) -> Callable[..., Any]:
+    def guarded(address: Any, *args: Any, **kwargs: Any) -> Any:
+        host = _network_address_host(address)
+        if host is not None:
+            _require_network_destination(mode, host, allowed)
+        return original(address, *args, **kwargs)
+
+    return guarded
+
+
 def install_network_guard(
     mode: InterfaceMode,
     *,
@@ -558,59 +627,22 @@ def install_network_guard(
     original_sendto = socket.socket.sendto
     original_getaddrinfo = socket.getaddrinfo
     original_create_connection = socket.create_connection
-
-    def address_host(address: Any) -> str | None:
-        if isinstance(address, tuple) and address:
-            return str(address[0])
-        # AF_UNIX path: local IPC is allowed.
-        if isinstance(address, (str, bytes)):
-            return None
-        return ""
-
-    def require(host: str) -> None:
-        if not network_destination_allowed(
-            mode, host, allowed_real_hosts=allowed
-        ):
-            raise PermissionError(
-                f"offline network policy blocked destination {host!r} in {mode.value}"
-            )
-
-    def guarded_connect(sock: socket.socket, address: Any):
-        host = address_host(address)
-        if host is not None:
-            require(host)
-        return original_connect(sock, address)
-
-    def guarded_connect_ex(sock: socket.socket, address: Any):
-        host = address_host(address)
-        if host is not None:
-            require(host)
-        return original_connect_ex(sock, address)
-
-    def guarded_sendto(sock: socket.socket, data: Any, *args: Any):
-        if not args:
-            return original_sendto(sock, data)
-        address = args[-1]
-        host = address_host(address)
-        if host is not None:
-            require(host)
-        return original_sendto(sock, data, *args)
-
-    def guarded_getaddrinfo(host: Any, *args: Any, **kwargs: Any):
-        require(str(host))
-        return original_getaddrinfo(host, *args, **kwargs)
-
-    def guarded_create_connection(address: Any, *args: Any, **kwargs: Any):
-        host = address_host(address)
-        if host is not None:
-            require(host)
-        return original_create_connection(address, *args, **kwargs)
-
-    socket.socket.connect = guarded_connect  # type: ignore[method-assign]
+    guarded_call = _make_guarded_socket_call(original_connect, mode, allowed)
+    guarded_connect_ex = _make_guarded_socket_call(
+        original_connect_ex, mode, allowed
+    )
+    guarded_sendto = _make_guarded_sendto(original_sendto, mode, allowed)
+    guarded_getaddrinfo = _make_guarded_getaddrinfo(
+        original_getaddrinfo, mode, allowed
+    )
+    guarded_create_connection = _make_guarded_create_connection(
+        original_create_connection, mode, allowed
+    )
+    socket.socket.connect = guarded_call  # type: ignore[method-assign]
     socket.socket.connect_ex = guarded_connect_ex  # type: ignore[method-assign]
     socket.socket.sendto = guarded_sendto  # type: ignore[method-assign]
-    socket.getaddrinfo = guarded_getaddrinfo  # type: ignore[assignment]
-    socket.create_connection = guarded_create_connection  # type: ignore[assignment]
+    socket.getaddrinfo = guarded_getaddrinfo
+    socket.create_connection = guarded_create_connection
     _NETWORK_GUARD_INSTALLED = True
 
 

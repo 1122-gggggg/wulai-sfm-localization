@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import FrozenInstanceError
+from unittest.mock import Mock
 
 import pytest
 
@@ -284,3 +285,45 @@ def test_legacy_frame_source_adapter_emits_typed_packet() -> None:
     assert packet.source_timestamp_ns == 12_500_000_000
     assert packet.source_identity == "test-source"
     assert packet.timing["decode_ms"] == 2.0
+
+
+def test_sim_typed_command_mock_logs_one_explicit_result() -> None:
+    session_logs = Mock()
+    backend = DroneBackend(session_logs=session_logs)
+
+    result = backend.command(ControlRequest.create(ControlAction.HOVER, human_origin=True))
+
+    assert result.accepted and result.executed
+    session_logs.command.assert_called_once()
+    fields = session_logs.command.call_args.kwargs
+    assert fields["action"] == ControlAction.HOVER.value
+    assert fields["accepted"] is True
+    assert fields["executed"] is True
+
+
+def test_sim_legacy_nudge_command_mock_keeps_allowlisted_dispatch() -> None:
+    backend = DroneBackend()
+    backend._apply_nudge = Mock()
+
+    result = backend.command("nudge_begin", dir="前")
+
+    assert result is backend.state
+    backend._apply_nudge.assert_called_once_with("前", {"dir": "前"})
+    assert backend.state.last_command == "nudge_begin"
+
+
+def test_sim_poll_mock_records_telemetry_and_preserves_state_fields() -> None:
+    session_logs = Mock()
+    backend = DroneBackend(session_logs=session_logs)
+
+    state = backend.poll()
+
+    assert state.loc == "SIM"
+    assert state.stream_fps > 0.0
+    assert state.stream_mbps > 0.0
+    session_logs.telemetry.assert_called_once()
+    event, fields = session_logs.telemetry.call_args
+    assert event == ("sim_state",)
+    assert fields["mode"] == state.mode
+    assert fields["tracker_state"] == "HOVER"
+    assert fields["pose"] == [0.0, 0.0, 0.0]

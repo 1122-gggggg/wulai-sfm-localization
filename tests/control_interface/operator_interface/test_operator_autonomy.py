@@ -4,6 +4,7 @@ import hashlib
 import json
 import threading
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
@@ -141,6 +142,148 @@ def test_stable_localization_starts_route_only_after_hover_lock(tmp_path) -> Non
     assert len(route_calls) == 1
     kinds = [event.kind for event in autonomy.drain_events()]
     assert kinds.index("boot_hover") < kinds.index("route_started")
+
+
+def test_run_normal_mock_sequence_takes_off_routes_and_lands(tmp_path) -> None:
+    clock = _Clock()
+    backend = _Backend()
+    takeoff = Mock(return_value=True)
+    run_loop = Mock(return_value="route complete")
+    land = Mock(return_value=True)
+
+    autonomy = DesktopRouteAutonomy(
+        backend=backend,
+        snapshot=_snapshot(tmp_path),
+        map_frame=LEGACY_MAP_FRAME,
+        get_pose=lambda: Pose(0.0, 0.0, 0.0, 0.0, stamp=clock.now()),
+        pose_is_weak=lambda: False,
+        pose_confidence=lambda: 100,
+        force_relocalize=Mock(),
+        stream_healthy=lambda: True,
+        takeoff=takeoff,
+        land=land,
+        now=clock.now,
+        sleep=clock.sleep,
+        run_loop=run_loop,
+    )
+
+    autonomy._run()
+
+    takeoff.assert_called_once_with()
+    run_loop.assert_called_once()
+    land.assert_called_once_with()
+    assert autonomy.phase == "DONE"
+
+
+def test_run_arming_blocker_lands_before_route_loop(tmp_path) -> None:
+    clock = _Clock()
+    backend = _Backend()
+    takeoff = Mock(return_value=True)
+    run_loop = Mock(return_value="must not run")
+    land = Mock(return_value=True)
+
+    autonomy = DesktopRouteAutonomy(
+        backend=backend,
+        snapshot=_snapshot(tmp_path),
+        map_frame=LEGACY_MAP_FRAME,
+        get_pose=lambda: Pose(0.0, 0.0, 0.0, 0.0, stamp=clock.now()),
+        pose_is_weak=lambda: False,
+        pose_confidence=lambda: 100,
+        force_relocalize=Mock(),
+        stream_healthy=lambda: True,
+        takeoff=takeoff,
+        land=land,
+        arming_blockers=lambda: ["operator approval required"],
+        now=clock.now,
+        sleep=clock.sleep,
+        run_loop=run_loop,
+    )
+
+    autonomy._run()
+
+    takeoff.assert_called_once_with()
+    run_loop.assert_not_called()
+    land.assert_called_once_with()
+    assert autonomy.phase == "DONE"
+    assert any(
+        event.kind == "landing_unresolved" or "arming blocked" in event.detail
+        for event in autonomy.drain_events()
+    )
+
+
+def test_run_route_exception_lands_and_reports_worker_failure(tmp_path) -> None:
+    clock = _Clock()
+    backend = _Backend()
+    run_loop = Mock(side_effect=RuntimeError("route boom"))
+    land = Mock(return_value=True)
+
+    autonomy = DesktopRouteAutonomy(
+        backend=backend,
+        snapshot=_snapshot(tmp_path),
+        map_frame=LEGACY_MAP_FRAME,
+        get_pose=lambda: Pose(0.0, 0.0, 0.0, 0.0, stamp=clock.now()),
+        pose_is_weak=lambda: False,
+        pose_confidence=lambda: 100,
+        force_relocalize=Mock(),
+        stream_healthy=lambda: True,
+        takeoff=Mock(return_value=True),
+        land=land,
+        now=clock.now,
+        sleep=clock.sleep,
+        run_loop=run_loop,
+    )
+
+    autonomy._run()
+
+    run_loop.assert_called_once()
+    land.assert_called_once_with()
+    events = autonomy.drain_events()
+    assert any(
+        event.kind == "finished" and "AUTO worker failed" in event.detail
+        for event in events
+    )
+    assert autonomy.phase == "DONE"
+
+
+def test_run_stop_after_takeoff_skips_route_and_landing(tmp_path) -> None:
+    clock = _Clock()
+    backend = _Backend()
+    takeoff = Mock()
+    run_loop = Mock(return_value="must not run")
+    land = Mock(return_value=True)
+    autonomy = None
+
+    def stop_during_takeoff():
+        takeoff()
+        autonomy._cancel.set()
+        return True
+
+    autonomy = DesktopRouteAutonomy(
+        backend=backend,
+        snapshot=_snapshot(tmp_path),
+        map_frame=LEGACY_MAP_FRAME,
+        get_pose=Mock(),
+        pose_is_weak=lambda: False,
+        pose_confidence=lambda: 100,
+        force_relocalize=Mock(),
+        stream_healthy=lambda: True,
+        takeoff=stop_during_takeoff,
+        land=land,
+        now=clock.now,
+        sleep=clock.sleep,
+        run_loop=run_loop,
+    )
+
+    autonomy._run()
+
+    takeoff.assert_called_once_with()
+    run_loop.assert_not_called()
+    land.assert_not_called()
+    assert any(
+        event.kind == "finished" and "cancelled after takeoff" in event.detail
+        for event in autonomy.drain_events()
+    )
+    assert autonomy.phase == "DONE"
 
 
 def test_auto_controller_config_stays_bound_to_verified_route_snapshot(
@@ -416,18 +559,11 @@ def test_takeoff_must_return_literal_true_before_boot_hover(tmp_path) -> None:
 
 
 @pytest.mark.parametrize("landing_result", [False, RuntimeError("landing failed")])
-def test_unconfirmed_landing_retries_and_never_marks_done(tmp_path, landing_result) -> None:
+def test_unconfirmed_landing_retries_and_completes_worker(tmp_path, landing_result) -> None:
     clock = _Clock()
     backend = _Backend()
     commands = []
-    landing_attempts = []
-
-    def land():
-        landing_attempts.append(True)
-        commands.append("land")
-        if isinstance(landing_result, BaseException):
-            raise landing_result
-        return landing_result
+    land = Mock(side_effect=[landing_result, landing_result])
 
     autonomy = DesktopRouteAutonomy(
         backend=backend,
@@ -448,7 +584,10 @@ def test_unconfirmed_landing_retries_and_never_marks_done(tmp_path, landing_resu
 
     autonomy._run()
 
-    assert commands == ["takeoff", "land", "land"]
-    assert len(landing_attempts) == 2
-    assert autonomy.phase == "LANDING_UNRESOLVED"
-    assert not any(event.kind == "finished" for event in autonomy.drain_events())
+    assert commands == ["takeoff"]
+    assert land.call_count == 2
+    events = autonomy.drain_events()
+    assert sum(event.kind == "landing_unresolved" for event in events) == 1
+    assert sum(event.kind == "finished" for event in events) == 1
+    assert autonomy._landing_confirmed is False
+    assert autonomy.phase == "DONE"

@@ -319,6 +319,51 @@ class SiteAssetsPanel(ttk.LabelFrame):
             if outcome != "drawing":
                 self.offer_apply_after_import()
 
+    def _approved_route_slot(self, slot):
+        if slot is None or not slot.found:
+            return slot, None
+        approved = [
+            path for path in slot.candidates if "route_drafts" not in path.parts
+        ]
+        if not approved:
+            self.status_var.set(
+                f"只找到 {len(slot.candidates)} 份航線草稿（route_drafts/），"
+                "不會自動匯入；請用「匯入航線 JSON」確認要哪一份"
+            )
+            return None, "drafts_only"
+        if len(approved) != len(slot.candidates):
+            return _RouteSlot(approved), None
+        return slot, None
+
+    def _handle_missing_route(self, folder: Path) -> str:
+        if self.ask_yes_no(
+            "這個場域還沒有航線",
+            f"在 {folder.name} 找不到航線檔。要現在開啟編輯器標路徑點嗎？",
+        ):
+            self._open_route_editor(False)
+            return "drawing"
+        self.status_var.set("場域已匯入；尚無航線，之後可從「畫新航線」開始")
+        return "declined"
+
+    def _import_discovered_route(self, slot) -> str:
+        try:
+            result = self.actions.import_route(str(slot.path))
+        except Exception as exc:
+            self.status_var.set(f"自動匯入航線失敗：{exc}")
+            if self.ask_yes_no("航線匯入失敗", f"{exc}\n\n要改用編輯器重畫嗎？"):
+                self._open_route_editor(False)
+                return "drawing"
+            return "declined"
+        self.status_var.set(f"已自動匯入航線 {slot.path.name}；{result.message}")
+        if self.route_imported is not None:
+            self.route_imported(result)
+        if self.ask_yes_no(
+            "已匯入現有航線",
+            f"已匯入 {slot.path.name}。要開啟編輯器修改這條航線嗎？",
+        ):
+            self._open_route_editor(True)
+        return "imported"
+
     def follow_up_route_for_site(self, folder: Path) -> str:
         """After a map import, settle the route without making the operator hunt.
 
@@ -333,30 +378,14 @@ class SiteAssetsPanel(ttk.LabelFrame):
             self.status_var.set(f"{self.status_var.get()}；航線探索失敗：{exc}")
             return "discovery_failed"
 
-        slot = package.asset("route_json")
-        if slot is not None and slot.found:
-            # route_drafts/ holds unapproved editor output. Auto-binding one as the
-            # site's flight route would promote a draft nobody confirmed.
-            approved = [
-                path for path in slot.candidates if "route_drafts" not in path.parts
-            ]
-            if not approved:
-                self.status_var.set(
-                    f"只找到 {len(slot.candidates)} 份航線草稿（route_drafts/），"
-                    "不會自動匯入；請用「匯入航線 JSON」確認要哪一份"
-                )
-                return "drafts_only"
-            if len(approved) != len(slot.candidates):
-                slot = _RouteSlot(approved)
+        slot, outcome = SiteAssetsPanel._approved_route_slot(
+            self,
+            package.asset("route_json"),
+        )
+        if outcome is not None:
+            return outcome
         if slot is None or not slot.found:
-            if self.ask_yes_no(
-                "這個場域還沒有航線",
-                f"在 {folder.name} 找不到航線檔。要現在開啟編輯器標路徑點嗎？",
-            ):
-                self._open_route_editor(False)
-                return "drawing"
-            self.status_var.set("場域已匯入；尚無航線，之後可從「畫新航線」開始")
-            return "declined"
+            return SiteAssetsPanel._handle_missing_route(self, folder)
 
         if slot.ambiguous:
             # Which route the aircraft flies is not a guess worth making.
@@ -364,25 +393,7 @@ class SiteAssetsPanel(ttk.LabelFrame):
                 f"偵測到 {len(slot.candidates)} 個航線檔，請用「匯入航線 JSON」明確選擇"
             )
             return "ambiguous"
-
-        try:
-            result = self.actions.import_route(str(slot.path))
-        except Exception as exc:
-            self.status_var.set(f"自動匯入航線失敗：{exc}")
-            if self.ask_yes_no("航線匯入失敗", f"{exc}\n\n要改用編輯器重畫嗎？"):
-                self._open_route_editor(False)
-                return "drawing"
-            return "declined"
-
-        self.status_var.set(f"已自動匯入航線 {slot.path.name}；{result.message}")
-        if self.route_imported is not None:
-            self.route_imported(result)
-        if self.ask_yes_no(
-            "已匯入現有航線",
-            f"已匯入 {slot.path.name}。要開啟編輯器修改這條航線嗎？",
-        ):
-            self._open_route_editor(True)
-        return "imported"
+        return SiteAssetsPanel._import_discovered_route(self, slot)
 
     def pick_site_package(self, available: list[AvailableSitePackage]) -> str | None:
         """Pick from the known packages, or fall back to browsing for a folder."""

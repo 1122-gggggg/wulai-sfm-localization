@@ -1618,7 +1618,7 @@ def test_takeoff_button_gate_mirrors_backend_compass_policy():
     assert 'controller_key == "calibrated"' not in source
 
 
-def test_exit_safety_signals_are_declared_and_armed_visibly():
+def test_exit_safety_signals_are_declared_and_armed_visibly(monkeypatch, capsys):
     """'Close the terminal and it lands' must be verifiable, not assumed.
 
     The registration used to swallow failures silently, so the guarantee could be
@@ -1627,15 +1627,44 @@ def test_exit_safety_signals_are_declared_and_armed_visibly():
     import flight_operator_app as app
 
     assert app.EXIT_SAFETY_SIGNALS == {"SIGINT", "SIGTERM", "SIGHUP"}
-    source = inspect.getsource(app.main)
-    # every one of them is armed
-    assert "signal.SIGINT, signal.SIGTERM, signal.SIGHUP" in source
-    # a failure is reported, not swallowed
-    assert "exit safety armed" in source
-    assert "may NOT land" in source
-    assert '"exit_safety"' in source
-    # the handler must run the landing cleanup
-    assert "_emergency_cleanup(f\"signal_{signum}\")" in source
+    handlers = {}
+    atexit_callbacks = []
+    log_events = []
+    cleanup_reasons = []
+    after_calls = []
+    destroyed = []
+    fake_app = SimpleNamespace(
+        backend=SimpleNamespace(
+            log=SimpleNamespace(
+                event=lambda name, **fields: log_events.append((name, fields))
+            )
+        ),
+        after=lambda delay, callback: after_calls.append((delay, callback)),
+        destroy=lambda: destroyed.append(True),
+    )
+    monkeypatch.setattr(
+        app.signal, "signal", lambda sig, handler: handlers.setdefault(sig, handler)
+    )
+    monkeypatch.setattr(
+        app.atexit, "register", lambda callback: atexit_callbacks.append(callback)
+    )
+
+    def cleanup(reason):
+        cleanup_reasons.append(reason)
+        return True
+
+    app._install_live_exit_safety(fake_app, cleanup)
+
+    assert {sig.name for sig in handlers} == app.EXIT_SAFETY_SIGNALS
+    assert len(atexit_callbacks) == 1
+    assert "exit safety armed" in capsys.readouterr().out
+    assert log_events[0][0] == "exit_safety"
+    assert log_events[0][1]["ok"] is True
+    with pytest.raises(SystemExit):
+        handlers[app.signal.SIGTERM](app.signal.SIGTERM, None)
+    assert cleanup_reasons == [f"signal_{app.signal.SIGTERM}"]
+    assert after_calls == []
+    assert destroyed == [True]
 
 
 def test_emergency_cleanup_lands_and_survives_a_failing_backend():
@@ -1645,11 +1674,11 @@ def test_emergency_cleanup_lands_and_survives_a_failing_backend():
 
     source = inspect.getsource(app.main)
     start = source.index("def _emergency_cleanup")
-    body = source[start:start + 700]
-    assert "current_backend.cleanup()" in body, "exit path does not land"
+    body = source[start:start + 2500]
+    assert "coordinator.shutdown(reason=reason)" in body, "exit path does not land"
     assert 'app.__dict__.get("backend")' in body, "exit path can use a stale backend"
     assert "except Exception" in body, "a broken backend would abort the exit path"
-    assert "current_logs.close" in body, "exit path does not close the session log"
+    assert "return result is True" in body, "exit path must fail closed"
 
 
 @pytest.mark.parametrize(
@@ -1671,6 +1700,48 @@ def test_false_takeoff_or_land_completion_is_not_reported_as_success(
     OperatorApp._finish_backend_command(operator, command, False, None)
 
     assert not any(false_success in message for message in messages)
+    assert any("未確認" in message for message in messages)
+
+
+@pytest.mark.parametrize("result", [False, None, 1, "ok"])
+def test_non_true_auto_completion_does_not_confirm_route(result) -> None:
+    operator = OperatorApp.__new__(OperatorApp)
+    confirmed = []
+    operator._pending_auto_route_activation = True
+    operator.mission_route_lock = SimpleNamespace(
+        confirm_auto_started=lambda: confirmed.append(True),
+        cancel_rejected_auto_start=lambda: None,
+    )
+
+    OperatorApp._finish_auto_route_activation(operator, result)
+
+    assert confirmed == []
+    assert operator._pending_auto_route_activation is False
+
+
+@pytest.mark.parametrize("command", ["takeoff", "land"])
+@pytest.mark.parametrize("result", [False, None, 1, "ok"])
+def test_non_true_flight_completion_does_not_confirm_success_or_landing(
+    command: str, result,
+) -> None:
+    operator = OperatorApp.__new__(OperatorApp)
+    messages = []
+    released = []
+    operator.backend = SimpleNamespace(
+        state=SimpleNamespace(tracker_state="HOVER", flight_state="landed"),
+        _flight_state_name=lambda: (_ for _ in ()).throw(
+            AssertionError("landed state must not be checked after failed cleanup")
+        ),
+    )
+    operator.write_log = messages.append
+    operator.mission_route_lock = SimpleNamespace(
+        active=True,
+        release_after_confirmed_landed=lambda _state: released.append(True),
+    )
+
+    assert OperatorApp._finish_flight_expectation(operator, command, result) is True
+
+    assert released == []
     assert any("未確認" in message for message in messages)
 
 
@@ -1751,7 +1822,7 @@ def test_shutdown_coordinator_allows_legacy_non_live_cleanup_none():
     assert destroyed == [True]
 
 
-def test_operator_on_close_keeps_window_when_live_cleanup_fails():
+def test_operator_on_close_keeps_window_when_live_cleanup_fails(monkeypatch):
     operator = OperatorApp.__new__(OperatorApp)
     operator.backend = _ShutdownBackend(result=False)
     operator.session_logs = _ShutdownSessionLog()
@@ -1759,12 +1830,85 @@ def test_operator_on_close_keeps_window_when_live_cleanup_fails():
     operator.write_log = operator.logs.append
     destroyed = []
     operator.destroy = lambda: destroyed.append(True)
+    callbacks = []
+    threads = []
+    operator.after = lambda _delay, callback: callbacks.append(callback)
+
+    class _Thread:
+        def __init__(self, *, target, **_kwargs):
+            self.target = target
+            threads.append(self)
+
+        def start(self):
+            return None
+
+    monkeypatch.setattr(app.threading, "Thread", _Thread)
 
     operator._on_close()
+    assert operator.backend.calls == 0
+    assert len(threads) == 1
+    threads[0].target()
+    assert len(callbacks) == 1
+    callbacks[0]()
 
     assert operator.session_logs.reasons == []
     assert destroyed == []
     assert any("重試" in message for message in operator.logs)
+
+
+def test_operator_on_close_runs_cleanup_in_background_and_retries_after_failure(
+    monkeypatch,
+):
+    operator = OperatorApp.__new__(OperatorApp)
+    operator.backend = SimpleNamespace(is_live=True)
+    operator.write_log = lambda _message: None
+    operator.destroy = lambda: destroyed.append(True)
+    destroyed = []
+    callbacks = []
+    threads = []
+
+    class _Coordinator:
+        def __init__(self):
+            self.results = iter((False, True))
+
+        def shutdown(self, *, reason):
+            assert reason == "ui_window_close"
+            return next(self.results)
+
+    operator._shutdown_coordinator = _Coordinator()
+    operator.after = lambda _delay, callback: callbacks.append(callback)
+
+    class _Thread:
+        def __init__(self, *, target, **_kwargs):
+            self.target = target
+            threads.append(self)
+
+        def start(self):
+            return None
+
+    monkeypatch.setattr(app.threading, "Thread", _Thread)
+
+    operator._on_close()
+    assert len(threads) == 1
+    assert destroyed == []
+    threads[0].target()
+    callbacks.pop(0)()
+    assert destroyed == []
+
+    operator._on_close()
+    assert len(threads) == 2
+    threads[1].target()
+    callbacks.pop(0)()
+    assert destroyed == [True]
+    assert operator._shutdown_completed is True
+
+
+def test_mainloop_exit_does_not_repeat_completed_shutdown_cleanup():
+    import flight_operator_app as app
+
+    launch = SimpleNamespace(app=SimpleNamespace(_shutdown_completed=True))
+
+    app._close_operator_launch(launch)
 
 
 class _FakeStick:

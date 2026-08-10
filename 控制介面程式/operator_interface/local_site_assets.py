@@ -560,14 +560,14 @@ _CAMERA_DISTORTION_RTOL = 1e-3
 _CAMERA_DISTORTION_ATOL = 1e-6
 
 
-def _camera_is_same_lens(reference, query) -> bool:
-    """True when `reference` is `query` captured at a different resolution."""
+def _camera_comparison_scale(
+    reference: tuple[str, int, int, tuple[float, ...]],
+    query: tuple[str, int, int, tuple[float, ...]],
+) -> tuple[float, int, bool] | None:
     ref_model, ref_w, ref_h, ref_params = reference
-    q_model, q_w, q_h, q_params = query
-    if ref_model != q_model or len(ref_params) != len(q_params):
-        return False
+    _, q_w, q_h, _ = query
     if min(ref_w, ref_h, q_w, q_h) <= 0:
-        return False
+        return None
     same_resolution = (ref_w, ref_h) == (q_w, q_h)
     pixel_count = _CAMERA_PIXEL_PARAM_COUNT.get(ref_model)
     unknown_model = pixel_count is None or pixel_count > len(ref_params)
@@ -578,31 +578,58 @@ def _camera_is_same_lens(reference, query) -> bool:
         # applying the 0.05 PIXEL tolerance to an unidentified coefficient is the
         # exact mistake this function was fixed to stop making.
         if not same_resolution:
-            return False
+            return None
         pixel_count = 0
     if same_resolution:
-        scale = 1.0
-    else:
-        scale_x = q_w / ref_w
-        scale_y = q_h / ref_h
-        # A different aspect ratio means the image was cropped, not scaled, and the
-        # principal point no longer maps by a single factor.
-        if abs(scale_x - scale_y) > 1e-6:
-            return False
-        scale = scale_x
-    for index, (raw_ref, raw_query) in enumerate(zip(ref_params, q_params)):
+        return 1.0, pixel_count, unknown_model
+    scale_x = q_w / ref_w
+    scale_y = q_h / ref_h
+    # A different aspect ratio means the image was cropped, not scaled, and the
+    # principal point no longer maps by a single factor.
+    if abs(scale_x - scale_y) > 1e-6:
+        return None
+    return scale_x, pixel_count, unknown_model
+
+
+def _camera_parameters_match(
+    reference: tuple[str, int, int, tuple[float, ...]],
+    query: tuple[str, int, int, tuple[float, ...]],
+    scale: float,
+    pixel_count: int,
+    unknown_model: bool,
+) -> bool:
+    ref_params = reference[3]
+    query_params = query[3]
+    for index, (raw_ref, raw_query) in enumerate(zip(ref_params, query_params)):
         a, b = float(raw_ref), float(raw_query)
         if index < pixel_count:
             if abs(a * scale - b) > _CAMERA_SCALE_TOLERANCE_PX:
                 return False
             continue
-        unscaled = max(_CAMERA_DISTORTION_ATOL,
-                       _CAMERA_DISTORTION_RTOL * max(abs(a), abs(b)))
+        unscaled = max(
+            _CAMERA_DISTORTION_ATOL,
+            _CAMERA_DISTORTION_RTOL * max(abs(a), abs(b)),
+        )
         if unknown_model:
             unscaled = min(unscaled, _CAMERA_SCALE_TOLERANCE_PX)
         if abs(a - b) > unscaled:
             return False
     return True
+
+
+def _camera_is_same_lens(reference, query) -> bool:
+    """True when `reference` is `query` captured at a different resolution."""
+    ref_model, ref_w, ref_h, ref_params = reference
+    q_model, q_w, q_h, q_params = query
+    if ref_model != q_model or len(ref_params) != len(q_params):
+        return False
+    comparison = _camera_comparison_scale(reference, query)
+    if comparison is None:
+        return False
+    scale, pixel_count, unknown_model = comparison
+    return _camera_parameters_match(
+        reference, query, scale, pixel_count, unknown_model
+    )
 
 
 def _validate_reference_poses(
@@ -740,6 +767,52 @@ def load_edm_runtime_profile(path: Path) -> dict:
         raise ValueError(f"invalid EDM runtime profile {path}: {exc}") from exc
 
 
+def _validate_site_package_profile(profile: SiteProfile) -> None:
+    if profile.schema_version != 2:
+        raise ValueError("imported site package must use schema_version 2")
+    if profile.coordinate_frame is None:
+        raise ValueError("site_profile.json must declare coordinate_frame")
+    if profile.query_camera is None:
+        raise ValueError("site_profile.json must declare query_camera")
+    separate_assets = {
+        "route_json": profile.route_json,
+        "poles_json": profile.poles_json,
+        "megaloc_cache": profile.megaloc_cache,
+        "track_landmarks": profile.track_landmarks,
+        "localizer_deploy_dir": profile.localizer_deploy_dir,
+    }
+    configured_separately = sorted(
+        key for key, value in separate_assets.items() if value is not None
+    )
+    if configured_separately:
+        raise ValueError(
+            "base site package must not embed separately managed assets: "
+            + ", ".join(configured_separately)
+        )
+
+
+def _validate_site_package_assets(
+    profile: SiteProfile, root: Path
+) -> list[AssetCheck]:
+    checks = []
+    for key, label in _REQUIRED_ASSETS:
+        asset = getattr(profile, key)
+        expected = getattr(profile.asset_sha256, key)
+        if asset is None:
+            raise ValueError(f"site package is missing required {key}")
+        if not _is_inside(asset, root):
+            raise ValueError(f"{key} must stay inside the selected folder")
+        if expected is None:
+            raise ValueError(f"site_profile.json is missing asset_sha256.{key}")
+        actual = _sha256(asset)
+        if actual != expected:
+            raise ValueError(
+                f"{key} SHA-256 mismatch: expected {expected}, got {actual}"
+            )
+        checks.append(AssetCheck(key, label, asset, actual))
+    return checks
+
+
 class LocalSitePackageProvider:
     def __init__(
         self,
@@ -760,43 +833,8 @@ class LocalSitePackageProvider:
         if not manifest.is_file():
             raise ValueError("selected folder must contain site_profile.json")
         profile = load_site_profile(manifest)
-        if profile.schema_version != 2:
-            raise ValueError("imported site package must use schema_version 2")
-        if profile.coordinate_frame is None:
-            raise ValueError("site_profile.json must declare coordinate_frame")
-        if profile.query_camera is None:
-            raise ValueError("site_profile.json must declare query_camera")
-        separate_assets = {
-            "route_json": profile.route_json,
-            "poles_json": profile.poles_json,
-            "megaloc_cache": profile.megaloc_cache,
-            "track_landmarks": profile.track_landmarks,
-            "localizer_deploy_dir": profile.localizer_deploy_dir,
-        }
-        configured_separately = sorted(
-            key for key, value in separate_assets.items() if value is not None
-        )
-        if configured_separately:
-            raise ValueError(
-                "base site package must not embed separately managed assets: "
-                + ", ".join(configured_separately)
-            )
-        checks = []
-        for key, label in _REQUIRED_ASSETS:
-            asset = getattr(profile, key)
-            expected = getattr(profile.asset_sha256, key)
-            if asset is None:
-                raise ValueError(f"site package is missing required {key}")
-            if not _is_inside(asset, root):
-                raise ValueError(f"{key} must stay inside the selected folder")
-            if expected is None:
-                raise ValueError(f"site_profile.json is missing asset_sha256.{key}")
-            actual = _sha256(asset)
-            if actual != expected:
-                raise ValueError(
-                    f"{key} SHA-256 mismatch: expected {expected}, got {actual}"
-                )
-            checks.append(AssetCheck(key, label, asset, actual))
+        _validate_site_package_profile(profile)
+        checks = _validate_site_package_assets(profile, root)
         _validate_ply(profile.map_ply)
         self.edm_profile_loader(profile.localizer_profile)
         names = self.bundle_inspector(profile.localization_bundle)

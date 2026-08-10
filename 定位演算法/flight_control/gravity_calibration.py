@@ -22,6 +22,7 @@ Pure math + selftest (no drone):
 Live guided session (SkyController / drone WiFi):
   python gravity_calibration.py --live --ip 192.168.53.1 --controller skycontroller3
 """
+
 from __future__ import annotations
 
 import argparse
@@ -43,11 +44,11 @@ PHASE_LABELS = {
 }
 
 # Pass thresholds (tune after a few real benches)
-MAX_LEVEL_TILT_DEG = 6.0          # allow the stable ~5° ANAFI attitude offset
-MIN_YAW_SPAN_DEG = 90.0           # must cover enough yaw
+MAX_LEVEL_TILT_DEG = 6.0  # allow the stable ~5° ANAFI attitude offset
+MIN_YAW_SPAN_DEG = 90.0  # must cover enough yaw
 MIN_PITCH_SPAN_DEG = 25.0
 MIN_ROLL_SPAN_DEG = 25.0
-MAX_G_RMS = 0.08                  # unit-vector scatter of body gravity
+MAX_G_RMS = 0.08  # unit-vector scatter of body gravity
 MIN_SAMPLES_PER_PHASE = 15
 
 
@@ -89,13 +90,6 @@ def _span_deg(values: list[float]) -> float:
     return math.degrees(max(unwrapped) - min(unwrapped))
 
 
-def _rms(xs: list[float]) -> float:
-    if not xs:
-        return float("nan")
-    m = statistics.fmean(xs)
-    return math.sqrt(statistics.fmean((x - m) ** 2 for x in xs))
-
-
 @dataclass
 class AttitudeSample:
     t_mono: float
@@ -130,6 +124,91 @@ class GravityCalResult:
     map_up_hint: str
     summary: str
     t_iso: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+
+@dataclass(frozen=True)
+class _PhaseMetrics:
+    roll_mean: float
+    pitch_mean: float
+    yaw_span: float
+    roll_span: float
+    pitch_span: float
+    level_tilt: float
+    g_mean: tuple[float, float, float]
+    g_rms: float
+
+
+def _phase_metrics(samples: list[AttitudeSample]) -> _PhaseMetrics:
+    rolls = [sample.roll for sample in samples]
+    pitches = [sample.pitch for sample in samples]
+    yaws = [sample.yaw for sample in samples]
+    roll_mean = statistics.fmean(rolls)
+    pitch_mean = statistics.fmean(pitches)
+    yaw_span = _span_deg(yaws)
+    roll_span = _span_deg(rolls)
+    pitch_span = _span_deg(pitches)
+    level_tilt = math.degrees(math.hypot(roll_mean, pitch_mean))
+
+    gravity = [attitude_to_body_gravity(sample.roll, sample.pitch) for sample in samples]
+    gx = statistics.fmean(value[0] for value in gravity)
+    gy = statistics.fmean(value[1] for value in gravity)
+    gz = statistics.fmean(value[2] for value in gravity)
+    norm = math.sqrt(gx * gx + gy * gy + gz * gz) or 1.0
+    g_mean = (gx / norm, gy / norm, gz / norm)
+    dots = [
+        max(
+            -1.0,
+            min(
+                1.0,
+                value[0] * g_mean[0] + value[1] * g_mean[1] + value[2] * g_mean[2],
+            ),
+        )
+        for value in gravity
+    ]
+    angles = [math.acos(dot) for dot in dots]
+    g_rms = math.sqrt(statistics.fmean(angle * angle for angle in angles))
+    return _PhaseMetrics(
+        roll_mean=roll_mean,
+        pitch_mean=pitch_mean,
+        yaw_span=yaw_span,
+        roll_span=roll_span,
+        pitch_span=pitch_span,
+        level_tilt=level_tilt,
+        g_mean=g_mean,
+        g_rms=g_rms,
+    )
+
+
+def _phase_passes(
+    phase: str,
+    sample_count: int,
+    metrics: _PhaseMetrics,
+    notes: list[str],
+) -> bool:
+    ok = sample_count >= MIN_SAMPLES_PER_PHASE
+    if phase == "yaw":
+        if metrics.yaw_span < MIN_YAW_SPAN_DEG:
+            ok = False
+            notes.append(f"yaw span {metrics.yaw_span:.0f}° < {MIN_YAW_SPAN_DEG:.0f}°")
+        if metrics.level_tilt > MAX_LEVEL_TILT_DEG:
+            ok = False
+            notes.append(f"level tilt {metrics.level_tilt:.1f}° > {MAX_LEVEL_TILT_DEG:.0f}°")
+        if metrics.roll_span > 40 or metrics.pitch_span > 40:
+            notes.append(
+                f"yaw phase not level-ish "
+                f"(roll_span={metrics.roll_span:.0f}° "
+                f"pitch_span={metrics.pitch_span:.0f}°)"
+            )
+        if metrics.g_rms > MAX_G_RMS:
+            ok = False
+            notes.append(f"gravity scatter rms {metrics.g_rms:.3f} rad > {MAX_G_RMS}")
+    elif phase == "pitch" and metrics.pitch_span < MIN_PITCH_SPAN_DEG:
+        ok = False
+        notes.append(f"pitch span {metrics.pitch_span:.0f}° < {MIN_PITCH_SPAN_DEG:.0f}°")
+    elif phase == "roll" and metrics.roll_span < MIN_ROLL_SPAN_DEG:
+        ok = False
+        notes.append(f"roll span {metrics.roll_span:.0f}° < {MIN_ROLL_SPAN_DEG:.0f}°")
+    return ok
 
 
 class GravityCalibrator:
@@ -174,17 +253,22 @@ class GravityCalibrator:
         self.begin_phase(nxt)
         return nxt
 
-    def add_sample(self, roll: float, pitch: float, yaw: float,
-                   t_mono: float | None = None) -> None:
+    def add_sample(
+        self, roll: float, pitch: float, yaw: float, t_mono: float | None = None
+    ) -> None:
         if not self.started or self.phase is None or self.finished:
             return
         if not all(_finite(v) for v in (roll, pitch, yaw)):
             return
-        self.samples.append(AttitudeSample(
-            t_mono=time.monotonic() if t_mono is None else float(t_mono),
-            roll=float(roll), pitch=float(pitch), yaw=float(yaw),
-            phase=self.phase,
-        ))
+        self.samples.append(
+            AttitudeSample(
+                t_mono=time.monotonic() if t_mono is None else float(t_mono),
+                roll=float(roll),
+                pitch=float(pitch),
+                yaw=float(yaw),
+                phase=self.phase,
+            )
+        )
 
     def samples_for(self, phase: str) -> list[AttitudeSample]:
         return [s for s in self.samples if s.phase == phase]
@@ -194,72 +278,36 @@ class GravityCalibrator:
         notes: list[str] = []
         if len(ss) < MIN_SAMPLES_PER_PHASE:
             notes.append(f"samples {len(ss)} < {MIN_SAMPLES_PER_PHASE}")
-        rolls = [s.roll for s in ss]
-        pitches = [s.pitch for s in ss]
-        yaws = [s.yaw for s in ss]
         if not ss:
             return PhaseResult(
-                phase=phase, n=0, roll_mean_deg=float("nan"), pitch_mean_deg=float("nan"),
-                yaw_span_deg=0.0, roll_span_deg=0.0, pitch_span_deg=0.0,
-                level_tilt_deg=float("nan"), g_mean=(0.0, 0.0, 1.0), g_rms=float("nan"),
-                ok=False, notes=notes + ["no samples"],
+                phase=phase,
+                n=0,
+                roll_mean_deg=float("nan"),
+                pitch_mean_deg=float("nan"),
+                yaw_span_deg=0.0,
+                roll_span_deg=0.0,
+                pitch_span_deg=0.0,
+                level_tilt_deg=float("nan"),
+                g_mean=(0.0, 0.0, 1.0),
+                g_rms=float("nan"),
+                ok=False,
+                notes=notes + ["no samples"],
             )
 
-        roll_m = statistics.fmean(rolls)
-        pitch_m = statistics.fmean(pitches)
-        yaw_span = _span_deg(yaws)
-        roll_span = _span_deg(rolls)
-        pitch_span = _span_deg(pitches)
-        level_tilt = math.degrees(math.hypot(roll_m, pitch_m))
-
-        gs = [attitude_to_body_gravity(s.roll, s.pitch) for s in ss]
-        gx = statistics.fmean(g[0] for g in gs)
-        gy = statistics.fmean(g[1] for g in gs)
-        gz = statistics.fmean(g[2] for g in gs)
-        n = math.sqrt(gx * gx + gy * gy + gz * gz) or 1.0
-        g_mean = (gx / n, gy / n, gz / n)
-        # RMS of angular deviation of each sample from mean g
-        dots = [max(-1.0, min(1.0, g[0] * g_mean[0] + g[1] * g_mean[1] + g[2] * g_mean[2]))
-                for g in gs]
-        ang = [math.acos(d) for d in dots]
-        g_rms = math.sqrt(statistics.fmean(a * a for a in ang))
-
-        ok = len(ss) >= MIN_SAMPLES_PER_PHASE
-        if phase == "yaw":
-            # Level spin: body gravity must stay stable (same tilt), yaw must cover enough.
-            if yaw_span < MIN_YAW_SPAN_DEG:
-                ok = False
-                notes.append(f"yaw span {yaw_span:.0f}° < {MIN_YAW_SPAN_DEG:.0f}°")
-            if level_tilt > MAX_LEVEL_TILT_DEG:
-                ok = False
-                notes.append(f"level tilt {level_tilt:.1f}° > {MAX_LEVEL_TILT_DEG:.0f}°")
-            if roll_span > 40 or pitch_span > 40:
-                notes.append(
-                    f"yaw phase not level-ish "
-                    f"(roll_span={roll_span:.0f}° pitch_span={pitch_span:.0f}°)")
-            if g_rms > MAX_G_RMS:
-                ok = False
-                notes.append(f"gravity scatter rms {g_rms:.3f} rad > {MAX_G_RMS}")
-        elif phase == "pitch":
-            # Body g is *expected* to move during pitch; only require angle coverage.
-            if pitch_span < MIN_PITCH_SPAN_DEG:
-                ok = False
-                notes.append(f"pitch span {pitch_span:.0f}° < {MIN_PITCH_SPAN_DEG:.0f}°")
-        elif phase == "roll":
-            if roll_span < MIN_ROLL_SPAN_DEG:
-                ok = False
-                notes.append(f"roll span {roll_span:.0f}° < {MIN_ROLL_SPAN_DEG:.0f}°")
+        metrics = _phase_metrics(ss)
+        ok = _phase_passes(phase, len(ss), metrics, notes)
 
         return PhaseResult(
-            phase=phase, n=len(ss),
-            roll_mean_deg=math.degrees(roll_m),
-            pitch_mean_deg=math.degrees(pitch_m),
-            yaw_span_deg=yaw_span,
-            roll_span_deg=roll_span,
-            pitch_span_deg=pitch_span,
-            level_tilt_deg=level_tilt,
-            g_mean=g_mean,
-            g_rms=g_rms,
+            phase=phase,
+            n=len(ss),
+            roll_mean_deg=math.degrees(metrics.roll_mean),
+            pitch_mean_deg=math.degrees(metrics.pitch_mean),
+            yaw_span_deg=metrics.yaw_span,
+            roll_span_deg=metrics.roll_span,
+            pitch_span_deg=metrics.pitch_span,
+            level_tilt_deg=metrics.level_tilt,
+            g_mean=metrics.g_mean,
+            g_rms=metrics.g_rms,
             ok=ok,
             notes=notes,
         )
@@ -278,7 +326,8 @@ class GravityCalibrator:
             f"g_body≈({body_g[0]:+.3f},{body_g[1]:+.3f},{body_g[2]:+.3f}); "
             "after hover+PnP, camera -Y_map should align with world up "
             "(opposite IMU down within a few degrees)."
-            if body_g else "insufficient level samples"
+            if body_g
+            else "insufficient level samples"
         )
         parts = []
         for p in PHASES:
@@ -289,12 +338,16 @@ class GravityCalibrator:
                 f"g_rms={r.g_rms:.3f} {'OK' if r.ok else 'FAIL'}"
                 + (f" ({'; '.join(r.notes)})" if r.notes else "")
             )
-        summary = (
-            f"{'PASS' if ok else 'FAIL'} | level_tilt={level_tilt:.1f}° | " + " || ".join(parts)
+        summary = f"{'PASS' if ok else 'FAIL'} | level_tilt={level_tilt:.1f}° | " + " || ".join(
+            parts
         )
         return GravityCalResult(
-            ok=ok, phases=phases, body_g_level=body_g,
-            level_tilt_deg=level_tilt, map_up_hint=map_up, summary=summary,
+            ok=ok,
+            phases=phases,
+            body_g_level=body_g,
+            level_tilt_deg=level_tilt,
+            map_up_hint=map_up,
+            summary=summary,
         )
 
     def to_jsonable(self) -> dict[str, Any]:
@@ -317,6 +370,7 @@ class GravityCalibrator:
 
 # ---------------------------------------------------------------------------
 # Self-test with synthetic motions
+
 
 def _selftest() -> int:
     cal = GravityCalibrator()
@@ -358,6 +412,7 @@ def _selftest() -> int:
 
 def _run_live(ip: str, controller: str, out: Path | None) -> int:
     import sys
+
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     import olympe_frame_source as ofs
 
@@ -372,6 +427,7 @@ def _run_live(ip: str, controller: str, out: Path | None) -> int:
 
     def reader():
         from olympe.messages.ardrone3.PilotingState import AttitudeChanged
+
         while not stop["f"]:
             try:
                 st = drone.get_state(AttitudeChanged)
@@ -386,6 +442,7 @@ def _run_live(ip: str, controller: str, out: Path | None) -> int:
             time.sleep(0.05)
 
     import threading
+
     th = threading.Thread(target=reader, daemon=True)
     th.start()
     try:
@@ -434,8 +491,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.selftest:
         return _selftest()
     if args.live:
-        return _run_live(args.ip, args.controller,
-                         Path(args.out) if args.out else None)
+        return _run_live(args.ip, args.controller, Path(args.out) if args.out else None)
     ap.print_help()
     return 2
 

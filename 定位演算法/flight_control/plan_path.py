@@ -16,6 +16,7 @@ inside a structure (pole/wire no-go). Built offline from the dense MVS map +
 drawn safe zone + pole/wire buffers. Everything here is scale-free (map units);
 only the YOLO standoff in the LOCAL layer needs a metric notion.
 """
+
 from __future__ import annotations
 
 import heapq
@@ -25,15 +26,16 @@ from dataclasses import dataclass
 import numpy as np
 
 # 26-connected neighborhood
-_NB = [(a, b, c) for a in (-1, 0, 1) for b in (-1, 0, 1) for c in (-1, 0, 1)
-       if (a, b, c) != (0, 0, 0)]
+_NB = [
+    (a, b, c) for a in (-1, 0, 1) for b in (-1, 0, 1) for c in (-1, 0, 1) if (a, b, c) != (0, 0, 0)
+]
 
 
 @dataclass
 class SDFGrid:
-    sdf: np.ndarray          # (nx,ny,nz) signed distance in map units
-    origin: np.ndarray       # world coord of voxel (0,0,0)
-    voxel: float             # voxel edge length (map units)
+    sdf: np.ndarray  # (nx,ny,nz) signed distance in map units
+    origin: np.ndarray  # world coord of voxel (0,0,0)
+    voxel: float  # voxel edge length (map units)
 
     def w2g(self, p):
         return (np.asarray(p, float) - self.origin) / self.voxel
@@ -49,8 +51,9 @@ class SDFGrid:
         """
         nx, ny, nz = self.sdf.shape
         f = self.w2g(p)
-        if not (0.0 <= f[0] <= nx - 1.001 and 0.0 <= f[1] <= ny - 1.001
-                and 0.0 <= f[2] <= nz - 1.001):
+        if not (
+            0.0 <= f[0] <= nx - 1.001 and 0.0 <= f[1] <= ny - 1.001 and 0.0 <= f[2] <= nz - 1.001
+        ):
             return -1.0
         x = min(max(f[0], 0.0), nx - 1.001)
         y = min(max(f[1], 0.0), ny - 1.001)
@@ -73,13 +76,92 @@ class SDFGrid:
         for ax in range(3):
             d = np.zeros(3)
             d[ax] = eps
-            g[ax] = (self.clearance(np.asarray(p) + d) - self.clearance(np.asarray(p) - d)) / (2 * eps)
+            g[ax] = (self.clearance(np.asarray(p) + d) - self.clearance(np.asarray(p) - d)) / (
+                2 * eps
+            )
         n = np.linalg.norm(g)
         return g / n if n > 1e-9 else g
 
 
-def plan(grid: SDFGrid, start, goal, standoff_min: float = 0.0,
-         pref_clear: float | None = None, risk_w: float = 3.0):
+def _is_free(
+    sdf: np.ndarray,
+    shape: tuple[int, int, int],
+    index: tuple[int, int, int],
+    standoff_min: float,
+) -> bool:
+    i, j, k = index
+    nx, ny, nz = shape
+    return 0 <= i < nx and 0 <= j < ny and 0 <= k < nz and sdf[i, j, k] > standoff_min
+
+
+def _risk(sdf: np.ndarray, index: tuple[int, int, int], pref_clear: float) -> float:
+    return max(0.0, (pref_clear - sdf[index]) / pref_clear)
+
+
+def _astar_predecessors(
+    grid: SDFGrid,
+    start: tuple[int, int, int],
+    goal: tuple[int, int, int],
+    *,
+    standoff_min: float,
+    pref_clear: float,
+    risk_w: float,
+) -> dict[tuple[int, int, int], tuple[int, int, int]]:
+    sdf = grid.sdf
+    shape = sdf.shape
+
+    def heuristic(index: tuple[int, int, int]) -> float:
+        return math.dist(index, goal) * grid.voxel
+
+    open_heap = [(heuristic(start), 0.0, start)]
+    predecessors: dict[tuple[int, int, int], tuple[int, int, int]] = {}
+    costs = {start: 0.0}
+    closed: set[tuple[int, int, int]] = set()
+    while open_heap:
+        _, cost, current = heapq.heappop(open_heap)
+        if current == goal:
+            break
+        if current in closed:
+            continue
+        closed.add(current)
+        for offset in _NB:
+            neighbor = tuple(current[axis] + offset[axis] for axis in range(3))
+            if neighbor in closed or not _is_free(sdf, shape, neighbor, standoff_min):
+                continue
+            step = math.dist((0, 0, 0), offset) * grid.voxel
+            next_cost = cost + step * (1.0 + risk_w * _risk(sdf, neighbor, pref_clear))
+            if next_cost < costs.get(neighbor, 1e18):
+                costs[neighbor] = next_cost
+                predecessors[neighbor] = current
+                heapq.heappush(
+                    open_heap,
+                    (next_cost + heuristic(neighbor), next_cost, neighbor),
+                )
+    return predecessors
+
+
+def _reconstruct_indices(
+    predecessors: dict[tuple[int, int, int], tuple[int, int, int]],
+    start: tuple[int, int, int],
+    goal: tuple[int, int, int],
+) -> list[tuple[int, int, int]] | None:
+    if goal != start and goal not in predecessors:
+        return None
+    path = [goal]
+    while path[-1] != start:
+        path.append(predecessors[path[-1]])
+    path.reverse()
+    return path
+
+
+def plan(
+    grid: SDFGrid,
+    start,
+    goal,
+    standoff_min: float = 0.0,
+    pref_clear: float | None = None,
+    risk_w: float = 3.0,
+):
     """Clearance-preferring A* (world coords -> list of world waypoints).
 
     Voxels with clearance <= standoff_min are BLOCKED. Step cost is scaled by a
@@ -88,53 +170,24 @@ def plan(grid: SDFGrid, start, goal, standoff_min: float = 0.0,
     Returns None if unreachable.
     """
     pref_clear = pref_clear if pref_clear is not None else 5 * grid.voxel
-    s = grid.sdf
-    nx, ny, nz = s.shape
-
-    def free(idx):
-        i, j, k = idx
-        return 0 <= i < nx and 0 <= j < ny and 0 <= k < nz and s[i, j, k] > standoff_min
-
-    def risk(idx):
-        return max(0.0, (pref_clear - s[idx]) / pref_clear)   # 0 comfy .. 1 at edge
-
     si = tuple(int(round(v)) for v in grid.w2g(start))
     gi = tuple(int(round(v)) for v in grid.w2g(goal))
-    if not free(si):
+    if not _is_free(grid.sdf, grid.sdf.shape, si, standoff_min):
         raise ValueError(f"start not free (clearance={grid.clearance(start):.3f})")
-    if not free(gi):
+    if not _is_free(grid.sdf, grid.sdf.shape, gi, standoff_min):
         raise ValueError(f"goal not free (clearance={grid.clearance(goal):.3f})")
-
-    def heur(idx):
-        return math.dist(idx, gi) * grid.voxel
-
-    openh = [(heur(si), 0.0, si)]
-    came, gcost, closed = {}, {si: 0.0}, set()
-    while openh:
-        _, gc, cur = heapq.heappop(openh)
-        if cur == gi:
-            break
-        if cur in closed:
-            continue
-        closed.add(cur)
-        for d in _NB:
-            nb = (cur[0] + d[0], cur[1] + d[1], cur[2] + d[2])
-            if nb in closed or not free(nb):
-                continue
-            step = math.dist((0, 0, 0), d) * grid.voxel
-            nc = gc + step * (1.0 + risk_w * risk(nb))
-            if nc < gcost.get(nb, 1e18):
-                gcost[nb] = nc
-                came[nb] = cur
-                heapq.heappush(openh, (nc + heur(nb), nc, nb))
-
-    if gi != si and gi not in came:
+    predecessors = _astar_predecessors(
+        grid,
+        si,
+        gi,
+        standoff_min=standoff_min,
+        pref_clear=pref_clear,
+        risk_w=risk_w,
+    )
+    path = _reconstruct_indices(predecessors, si, gi)
+    if path is None:
         return None
-    path = [gi]
-    while path[-1] != si:
-        path.append(came[path[-1]])
-    path.reverse()
-    return [grid.g2w(idx) for idx in path]
+    return [grid.g2w(index) for index in path]
 
 
 def plan_tour(grid: SDFGrid, start, targets, **kw):
@@ -152,7 +205,9 @@ def plan_tour(grid: SDFGrid, start, targets, **kw):
         if seg is None:
             print(f"[plan_tour] WARN target {nxt} unreachable, skipped")
             continue
-        seg = smooth(grid, seg, standoff_min=kw.get("standoff_min", 0.0))  # per-leg: keeps target endpoints
+        seg = smooth(
+            grid, seg, standoff_min=kw.get("standoff_min", 0.0)
+        )  # per-leg: keeps target endpoints
         full += seg[1:]
         order.append(nxt)
         cur = nxt
@@ -200,10 +255,10 @@ if __name__ == "__main__":
         x = i * vox
         for j in range(ny):
             y = j * vox
-            d_pole = math.hypot(x - 15.0, y - 15.0) - 3.0      # pole r+buffer=3
+            d_pole = math.hypot(x - 15.0, y - 15.0) - 3.0  # pole r+buffer=3
             for k in range(nz):
                 z = k * vox
-                d_box = min(x, L - x, y, L - y, z, H - z)       # inside box (+)
+                d_box = min(x, L - x, y, L - y, z, H - z)  # inside box (+)
                 sdf[i, j, k] = min(d_box, d_pole)
     grid = SDFGrid(sdf, origin, vox)
 
@@ -213,6 +268,8 @@ if __name__ == "__main__":
     sm = smooth(grid, path)
     mn = min(grid.clearance(p) for p in path)
     print(f"straight start->goal clear? {straight_ok}  (False => path must detour around pole)")
-    print(f"A* path pts={len(path)}  smoothed={len(sm)}  min clearance along path={mn:.2f} (>0 = never enters no-go)")
-    g = grid.gradient((15 - 3 + 0.0, 15, 5))   # near pole edge -> should point away from pole
+    print(
+        f"A* path pts={len(path)}  smoothed={len(sm)}  min clearance along path={mn:.2f} (>0 = never enters no-go)"
+    )
+    g = grid.gradient((15 - 3 + 0.0, 15, 5))  # near pole edge -> should point away from pole
     print(f"gradient near pole edge (most-open dir) = [{g[0]:+.2f},{g[1]:+.2f},{g[2]:+.2f}]")

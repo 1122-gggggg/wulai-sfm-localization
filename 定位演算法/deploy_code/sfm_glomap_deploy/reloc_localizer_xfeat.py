@@ -162,7 +162,7 @@ class XFeatRelocMap:
         )
 
 
-def _validate_bundle_schema(bundle: object) -> dict:
+def _validate_bundle_structure(bundle: object) -> tuple[dict, list, dict]:
     if not isinstance(bundle, dict):
         raise ValueError("relocation bundle must be a dictionary")
     required = {"meta", "ref_names", "ref_global", "refs"}
@@ -186,50 +186,63 @@ def _validate_bundle_schema(bundle: object) -> dict:
             or not np.issubdtype(ref_global.dtype, np.floating)
             or not np.isfinite(ref_global).all()):
         raise ValueError("relocation bundle ref_global has an invalid shape, dtype, or value")
-    if not isinstance(bundle["meta"], dict):
+    return bundle, names, refs
+
+
+def _validate_bundle_meta(meta: object) -> None:
+    if not isinstance(meta, dict):
         raise ValueError("relocation bundle meta must be a dictionary")
 
-    feature_keys = {"keypoints", "scores", "descriptors", "image_size"}
-    for name in names:
-        entry = refs[name]
-        if not isinstance(entry, dict) or set(entry) != {"feats", "xyz"}:
-            raise ValueError(f"invalid reference entry: {name}")
-        feats, xyz = entry["feats"], entry["xyz"]
-        if not isinstance(feats, dict) or set(feats) != feature_keys:
-            raise ValueError(f"invalid feature schema: {name}")
-        keypoints = feats["keypoints"]
-        scores = feats["scores"]
-        descriptors = feats["descriptors"]
-        image_size = feats["image_size"]
-        if (not torch.is_tensor(keypoints) or keypoints.ndim != 2 or keypoints.shape[1] != 2
-                or not torch.is_tensor(scores) or scores.ndim != 1
-                or not torch.is_tensor(descriptors) or descriptors.ndim != 2
-                or keypoints.shape[0] != scores.shape[0]
-                or keypoints.shape[0] != descriptors.shape[0]):
-            raise ValueError(f"inconsistent feature tensors: {name}")
-        if (keypoints.dtype != torch.float32 or scores.dtype != torch.float32
-                or descriptors.dtype not in (torch.float16, torch.float32)):
-            raise ValueError(f"illegal feature tensor dtype: {name}")
-        for label, tensor in (("keypoints", keypoints), ("scores", scores),
-                              ("descriptors", descriptors)):
-            if not bool(torch.isfinite(tensor).all().item()):
-                raise ValueError(f"non-finite feature tensor {label}: {name}")
-        if (not isinstance(xyz, np.ndarray) or xyz.shape != (keypoints.shape[0], 3)
-                or xyz.dtype != np.float32):
-            raise ValueError(f"invalid 2D-3D anchors: {name}")
-        valid_xyz_rows = np.isfinite(xyz).all(axis=1) | np.isnan(xyz).all(axis=1)
-        if np.isinf(xyz).any() or not valid_xyz_rows.all():
-            raise ValueError(f"invalid non-finite 2D-3D anchors: {name}")
-        if (not isinstance(image_size, tuple) or len(image_size) != 2
-                or not all(type(value) is int and value > 0 for value in image_size)):
-            raise ValueError(f"invalid image_size: {name}")
 
+def _validate_feature_tensors(name: str, feats: object, feature_keys: set[str]):
+    if not isinstance(feats, dict) or set(feats) != feature_keys:
+        raise ValueError(f"invalid feature schema: {name}")
+    keypoints = feats["keypoints"]
+    scores = feats["scores"]
+    descriptors = feats["descriptors"]
+    image_size = feats["image_size"]
+    if (not torch.is_tensor(keypoints) or keypoints.ndim != 2 or keypoints.shape[1] != 2
+            or not torch.is_tensor(scores) or scores.ndim != 1
+            or not torch.is_tensor(descriptors) or descriptors.ndim != 2
+            or keypoints.shape[0] != scores.shape[0]
+            or keypoints.shape[0] != descriptors.shape[0]):
+        raise ValueError(f"inconsistent feature tensors: {name}")
+    if (keypoints.dtype != torch.float32 or scores.dtype != torch.float32
+            or descriptors.dtype not in (torch.float16, torch.float32)):
+        raise ValueError(f"illegal feature tensor dtype: {name}")
+    for label, tensor in (("keypoints", keypoints), ("scores", scores),
+                          ("descriptors", descriptors)):
+        if not bool(torch.isfinite(tensor).all().item()):
+            raise ValueError(f"non-finite feature tensor {label}: {name}")
+    return keypoints, image_size
+
+
+def _validate_reference_entry(name: str, entry: object, feature_keys: set[str]) -> None:
+    if not isinstance(entry, dict) or set(entry) != {"feats", "xyz"}:
+        raise ValueError(f"invalid reference entry: {name}")
+    feats, xyz = entry["feats"], entry["xyz"]
+    keypoints, image_size = _validate_feature_tensors(name, feats, feature_keys)
+    if (not isinstance(xyz, np.ndarray) or xyz.shape != (keypoints.shape[0], 3)
+            or xyz.dtype != np.float32):
+        raise ValueError(f"invalid 2D-3D anchors: {name}")
+    valid_xyz_rows = np.isfinite(xyz).all(axis=1) | np.isnan(xyz).all(axis=1)
+    if np.isinf(xyz).any() or not valid_xyz_rows.all():
+        raise ValueError(f"invalid non-finite 2D-3D anchors: {name}")
+    if (not isinstance(image_size, tuple) or len(image_size) != 2
+            or not all(type(value) is int and value > 0 for value in image_size)):
+        raise ValueError(f"invalid image_size: {name}")
+
+
+def _validate_bundle_optional_fields(bundle: dict, names: list) -> None:
     for key, shape in (("ref_centers", (len(names), 3)), ("ref_yaws", (len(names),))):
         value = bundle.get(key)
         if value is not None and (not isinstance(value, np.ndarray) or value.shape != shape
                                   or value.dtype != np.float32
                                   or not np.isfinite(value).all()):
             raise ValueError(f"invalid relocation bundle {key}")
+
+
+def _validate_bundle_covis(bundle: dict, names: list) -> None:
     covis = bundle.get("covis")
     if covis is not None:
         if not isinstance(covis, dict) or set(covis) != set(names):
@@ -241,6 +254,16 @@ def _validate_bundle_schema(bundle: object) -> dict:
                            for value in neighbors)
                     or index in neighbors or len(neighbors) != len(set(neighbors))):
                 raise ValueError(f"invalid relocation bundle covis neighbors: {name}")
+
+
+def _validate_bundle_schema(bundle: object) -> dict:
+    bundle, names, refs = _validate_bundle_structure(bundle)
+    _validate_bundle_meta(bundle["meta"])
+    feature_keys = {"keypoints", "scores", "descriptors", "image_size"}
+    for name in names:
+        _validate_reference_entry(name, refs[name], feature_keys)
+    _validate_bundle_optional_fields(bundle, names)
+    _validate_bundle_covis(bundle, names)
     return bundle
 
 

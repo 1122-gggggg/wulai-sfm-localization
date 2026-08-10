@@ -179,7 +179,9 @@ def combined_stream_fields(base_audit,final_audit,paired,stride,min_sampled_fram
         "base_stream":base_audit.as_dict(),
         "final_stream":final_audit.as_dict(),
     }
-def main():
+
+
+def _parse_args():
     ap=argparse.ArgumentParser()
     ap.add_argument("--base",default=BASE)
     ap.add_argument("--final",default=FINAL)
@@ -201,9 +203,15 @@ def main():
     ap.add_argument("--min-sampled-frames",type=int,default=30,
                     help="minimum sampled frames required even when decoding is complete")
     ap.add_argument("--out-json")
-    args=ap.parse_args()
+    return ap.parse_args()
+
+
+def _configure_runtime(args):
     global TOPK, MIN_CONF, ADD
     TOPK=int(args.topk); MIN_CONF=float(args.min_conf); ADD=int(args.min_inliers)
+
+
+def _prepare_eval_inputs(args):
     resize_wh=None
     if args.resize:
         w,h=map(int,args.resize.lower().split("x"))
@@ -229,8 +237,10 @@ def main():
     unused=set(expected_map)-used_expected
     if unused:
         raise SystemExit(f"unused --expected-raw-frames keys: {sorted(unused)}")
-    bb=loadb(args.base,args.base_megaloc_cache,args.base_sha256 or None,args.base_megaloc_meta); log(f"BASE {len(bb[0])} refs kind={bb[3]}")
-    fb=loadb(args.final,expected_sha256=args.final_sha256 or None); log(f"FINAL {len(fb[0])} refs kind={fb[3]}")
+    return resize_wh, sets
+
+
+def _evaluate_sets(args, bb, fb, sets, resize_wh):
     rows=[]
     print(f"\n{'set':10} | {'n':>4} | BASE succ / med  | FINAL succ / med | gain  | fail->ok reg | maxfail(B/F) | ret-new",flush=True)
     for name,src,stride,expected,expected_source in sets:
@@ -254,6 +264,10 @@ def main():
              **stream_fields}
         rows.append(row)
         log(f"{name:10} | {len(rb):4d} | {sb:5.1%} / {np.median(rb):4.0f} | {su:5.1%} / {np.median(ru):4.0f} | {100*(su-sb):+5.1f}pp | {rec:3d} / {reg:2d}    | {mfb:3d}/{mff:3d}     | {rnw:.0%}")
+    return rows
+
+
+def _write_eval_json(args, rows):
     if args.out_json:
         Path(args.out_json).write_text(json.dumps({
             "resize":args.resize,
@@ -265,6 +279,16 @@ def main():
             "error_frame_counters":dict(sorted(_WARN_SEEN.items())),
             "rows":rows
         },indent=2),encoding="utf-8")
+
+
+def main():
+    args=_parse_args()
+    _configure_runtime(args)
+    resize_wh,sets=_prepare_eval_inputs(args)
+    bb=loadb(args.base,args.base_megaloc_cache,args.base_sha256 or None,args.base_megaloc_meta); log(f"BASE {len(bb[0])} refs kind={bb[3]}")
+    fb=loadb(args.final,expected_sha256=args.final_sha256 or None); log(f"FINAL {len(fb[0])} refs kind={fb[3]}")
+    rows=_evaluate_sets(args,bb,fb,sets,resize_wh)
+    _write_eval_json(args,rows)
     if _WARN_SEEN: log(f"error-frame counters (not genuine 0-inlier): {_WARN_SEEN}")
     log("DONE")
 if __name__=="__main__":

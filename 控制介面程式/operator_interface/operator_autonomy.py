@@ -26,6 +26,8 @@ import real_path_follow_controller as rpf
 
 
 LAND_ATTEMPTS = 2
+Pcmd = tuple[int, int, int, int]
+AuthorizedPcmdResult = tuple[bool, str, Pcmd | None]
 
 
 @dataclass(frozen=True)
@@ -183,8 +185,24 @@ class DesktopRouteAutonomy:
             except queue.Empty:
                 return drained
 
-    def _emit(self, kind: str, detail: str = "", **fields: object) -> None:
-        self.events.put(AutonomyEvent(kind=kind, detail=detail, **fields))
+    def _emit(
+        self,
+        kind: str,
+        detail: str = "",
+        *,
+        command: str | None = None,
+        result: object | None = None,
+        error: str | None = None,
+    ) -> None:
+        self.events.put(
+            AutonomyEvent(
+                kind=kind,
+                detail=detail,
+                command=command,
+                result=result,
+                error=error,
+            )
+        )
 
     def _pilot_override(self) -> bool:
         if bool(getattr(self.backend, "pilot_sticks", False)):
@@ -233,7 +251,7 @@ class DesktopRouteAutonomy:
         except Exception:
             return False
 
-    def _send_authorized(self, pcmd: tuple[int, int, int, int]):
+    def _send_authorized(self, pcmd: Pcmd) -> AuthorizedPcmdResult:
         if self._cancel.is_set():
             self._clear_motion()
             return False, f"AUTO cancelled: {self._cancel_reason}", (0, 0, 0, 0)
@@ -254,7 +272,10 @@ class DesktopRouteAutonomy:
             return rejection
         return self._dispatch_route_pcmd(pcmd, speed_guard_active=speed_guard_active)
 
-    def _apply_speed_guard(self, pcmd: tuple[int, int, int, int]):
+    def _apply_speed_guard(
+        self,
+        pcmd: Pcmd,
+    ) -> tuple[bool, AuthorizedPcmdResult | None]:
         """Hover on fresh measured overspeed; stale speed only disables this guard."""
 
         speed_sample = self._ground_speed()
@@ -300,10 +321,10 @@ class DesktopRouteAutonomy:
 
     def _dispatch_route_pcmd(
         self,
-        pcmd: tuple[int, int, int, int],
+        pcmd: Pcmd,
         *,
         speed_guard_active: bool,
-    ):
+    ) -> AuthorizedPcmdResult:
         """Send through the backend's normalized vector seam or direct PCMD."""
 
         pct = max(1, int(getattr(self.backend, "nudge_pct", 10) or 10))
@@ -317,18 +338,18 @@ class DesktopRouteAutonomy:
             return (
                 accepted,
                 self._route_pcmd_reason(accepted, speed_guard_active),
-                tuple(int(value) for value in pcmd) if accepted else None,
+                pcmd if accepted else None,
             )
 
         send = getattr(self.backend, "send_pcmd", None)
+        if not callable(send):
+            return False, "AUTO PCMD unavailable", None
         try:
             accepted = bool(send(*pcmd, reason="desktop_auto_route"))
         except Exception as exc:
             return False, f"AUTO PCMD failed: {exc!r}", None
         reason = self._route_pcmd_reason(accepted, speed_guard_active)
-        return accepted, reason, (
-            tuple(int(value) for value in pcmd) if accepted else None
-        )
+        return accepted, reason, pcmd if accepted else None
 
     def _olympe_yaw(self) -> float | None:
         try:
@@ -416,24 +437,98 @@ class DesktopRouteAutonomy:
             error=last_error,
         )
 
+    def _takeoff_command(self) -> tuple[object | None, str | None]:
+        self.phase = "TAKEOFF"
+        takeoff_result = None
+        takeoff_error = None
+        try:
+            takeoff_result = self.takeoff()
+        except Exception as exc:
+            takeoff_error = repr(exc)
+        self._emit(
+            "command_result",
+            "AUTO takeoff completed",
+            command="takeoff",
+            result=takeoff_result,
+            error=takeoff_error,
+        )
+        return takeoff_result, takeoff_error
+
+    def _hold_boot_hover_paused(self) -> bool:
+        while self._paused.is_set():
+            if self._operator_stop():
+                return False
+            self._send_zero("auto_operator_pause")
+            self.sleep(0.1)
+        return True
+
+    def _observe_boot_pose(
+        self,
+        lock: pff.BootPoseLock,
+        last_pose_stamp: float | None,
+    ) -> tuple[bool, float | None]:
+        pose = self.get_pose()
+        if pose is not None and math.isfinite(float(pose.yaw)):
+            pose_stamp = float(pose.stamp)
+            if last_pose_stamp is None or pose_stamp > last_pose_stamp:
+                last_pose_stamp = pose_stamp
+                if lock.observe(pose, now=self.now()):
+                    return True, last_pose_stamp
+        return False, last_pose_stamp
+
+    def _boot_hover(self) -> str | None:
+        self.phase = "BOOT_HOVER"
+        self._emit(
+            "boot_hover",
+            f"waiting up to {self.boot_timeout_s:g}s for stable localization",
+        )
+        lock = pff.BootPoseLock(self.waypoints[0])
+        started = self.now()
+        last_relocalize = float("-inf")
+        last_pose_stamp: float | None = None
+        while True:
+            if self._operator_stop():
+                return "AUTO cancelled during localization hover"
+            if self._paused.is_set():
+                paused_at = self.now()
+                if not self._hold_boot_hover_paused():
+                    return "AUTO cancelled while paused"
+                started += max(0.0, self.now() - paused_at)
+                continue
+            self._send_zero("auto_boot_hover")
+            locked, last_pose_stamp = self._observe_boot_pose(lock, last_pose_stamp)
+            if locked:
+                return None
+            now = self.now()
+            if now - last_relocalize >= 0.5:
+                try:
+                    self.force_relocalize()
+                except Exception:
+                    pass
+                last_relocalize = now
+            if now - started >= self.boot_timeout_s:
+                detail = "stable localization unavailable after takeoff hover"
+                self._land_after_failure(detail)
+                return detail
+            self.sleep(0.1)
+
+    def _run_route(self) -> str:
+        self.phase = "ROUTE"
+        self._emit("route_started", "stable localization confirmed")
+        reason = self.run_loop(
+            self._route_hooks(),
+            self.controller,
+            self.waypoints,
+            yaw_sign=1,
+            verbose=False,
+        )
+        return str(reason or "AUTO route ended")
+
     def _run(self) -> None:
         airborne = False
         terminal_detail = "AUTO stopped"
         try:
-            self.phase = "TAKEOFF"
-            takeoff_result = None
-            takeoff_error = None
-            try:
-                takeoff_result = self.takeoff()
-            except Exception as exc:
-                takeoff_error = repr(exc)
-            self._emit(
-                "command_result",
-                "AUTO takeoff completed",
-                command="takeoff",
-                result=takeoff_result,
-                error=takeoff_error,
-            )
+            takeoff_result, takeoff_error = self._takeoff_command()
             if takeoff_error is not None or takeoff_result is not True:
                 terminal_detail = "AUTO takeoff failed"
                 return
@@ -442,52 +537,10 @@ class DesktopRouteAutonomy:
                 terminal_detail = "AUTO cancelled after takeoff"
                 return
 
-            self.phase = "BOOT_HOVER"
-            self._emit(
-                "boot_hover",
-                f"waiting up to {self.boot_timeout_s:g}s for stable localization",
-            )
-            lock = pff.BootPoseLock(self.waypoints[0])
-            started = self.now()
-            last_relocalize = float("-inf")
-            last_pose_stamp: float | None = None
-            while True:
-                if self._operator_stop():
-                    terminal_detail = "AUTO cancelled during localization hover"
-                    return
-                if self._paused.is_set():
-                    paused_at = self.now()
-                    while self._paused.is_set():
-                        if self._operator_stop():
-                            terminal_detail = "AUTO cancelled while paused"
-                            return
-                        self._send_zero("auto_operator_pause")
-                        self.sleep(0.1)
-                    started += max(0.0, self.now() - paused_at)
-                    continue
-                self._send_zero("auto_boot_hover")
-                pose = self.get_pose()
-                yaw_ready = bool(
-                    pose is not None and math.isfinite(float(pose.yaw))
-                )
-                if yaw_ready:
-                    pose_stamp = float(pose.stamp)
-                    if last_pose_stamp is None or pose_stamp > last_pose_stamp:
-                        last_pose_stamp = pose_stamp
-                        if lock.observe(pose, now=self.now()):
-                            break
-                now = self.now()
-                if now - last_relocalize >= 0.5:
-                    try:
-                        self.force_relocalize()
-                    except Exception:
-                        pass
-                    last_relocalize = now
-                if now - started >= self.boot_timeout_s:
-                    terminal_detail = "stable localization unavailable after takeoff hover"
-                    self._land_after_failure(terminal_detail)
-                    return
-                self.sleep(0.1)
+            boot_detail = self._boot_hover()
+            if boot_detail is not None:
+                terminal_detail = boot_detail
+                return
 
             blockers = list(self.arming_blockers())
             if blockers:
@@ -495,16 +548,7 @@ class DesktopRouteAutonomy:
                 self._land_after_failure(terminal_detail)
                 return
 
-            self.phase = "ROUTE"
-            self._emit("route_started", "stable localization confirmed")
-            reason = self.run_loop(
-                self._route_hooks(),
-                self.controller,
-                self.waypoints,
-                yaw_sign=1,
-                verbose=False,
-            )
-            terminal_detail = str(reason or "AUTO route ended")
+            terminal_detail = self._run_route()
             if self._operator_stop():
                 return
             self._land_after_failure(terminal_detail)
@@ -515,8 +559,5 @@ class DesktopRouteAutonomy:
         finally:
             self._clear_motion()
             self._paused.clear()
-            if self._landing_confirmed is False:
-                self.phase = "LANDING_UNRESOLVED"
-            else:
-                self.phase = "DONE"
-                self._emit("finished", terminal_detail)
+            self.phase = "DONE"
+            self._emit("finished", terminal_detail)

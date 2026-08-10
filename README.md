@@ -7,9 +7,9 @@ Git 版控不包含實際場域點雲、localization bundle、影片、飛行紀
 本機 workspace 會在被忽略的資料目錄保存它們。系統架構與目錄所有權
 規則見 [`文件/ARCHITECTURE.md`](文件/ARCHITECTURE.md)。
 
-最後整理：2026-08-08。歷史設計決策與安全需求見 [`文件/SYSTEM_SPEC.md`](文件/SYSTEM_SPEC.md)；
-目前可執行的場域與發布契約以本 README、site profile schema 與 preflight 為準。最近一次
-結構／容量與優化稽核見 [`文件/WORKSPACE_AUDIT.md`](文件/WORKSPACE_AUDIT.md)。
+最後整理：2026-08-10。歷史設計決策與安全需求見 [`文件/SYSTEM_SPEC.md`](文件/SYSTEM_SPEC.md)；
+目前可執行的場域與發布契約以本 README、site profile schema 與 preflight 為準。結構／容量
+檢查請直接執行 `tools/workspace_audit.py`。
 
 ```text
 <workspace-root>/                   ← workspace root，同時是 git repo
@@ -25,8 +25,7 @@ Git 版控不包含實際場域點雲、localization bundle、影片、飛行紀
 └── .venv/            Python 3.10 執行環境
 ```
 
-git 只追蹤程式碼、設定與說明；場域資產、影片、權重與 outputs 不進版控，
-但各資料目錄的 `README.md` 例外保留，以固定用途與保留規則。
+git 只追蹤程式碼、設定與必要說明；場域資產、影片、權重與 outputs 不進版控。
 
 工作區整理後可用同一個唯讀入口重查，不會刪除或搬動資料：
 

@@ -40,58 +40,10 @@ def percentile(xs: list[float], p: float) -> float:
     return float(np.percentile(a, p))
 
 
-def main() -> None:
-    ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--video", type=Path, required=True)
-    ap.add_argument("--bundle", type=Path, required=True)
-    ap.add_argument(
-        "--backend",
-        default="onnx_tensorrt",
-        choices=(
-            "torch", "torch_fp32",
-            "onnx_cuda", "onnx_tensorrt", "onnx_cpu",
-        ),
-        help="EDM matching backend",
-    )
-    ap.add_argument("--onnx", type=Path, default=None,
-                    help="Override ONNX path (default flight 1024x576 outdoor export)")
-    ap.add_argument("--max-frames", type=int, default=300)
-    ap.add_argument("--warmup-frames", type=int, default=5,
-                    help="Skip first N timed frames (TRT build / CUDA warmup)")
-    ap.add_argument("--local-topk", type=int, default=2)
-    ap.add_argument("--boot-global-topk", type=int, default=10)
-    ap.add_argument("--target-fps", type=float, default=17.0)
-    ap.add_argument("--stride", type=int, default=1,
-                    help="Keep every Nth source frame (1 = every frame)")
-    ap.add_argument("--out", type=Path, default=None)
-    args = ap.parse_args()
-
-    if not args.video.is_file():
-        raise SystemExit(f"video not found: {args.video}")
-    if not args.bundle.is_file():
-        raise SystemExit(f"bundle not found: {args.bundle}")
-
-    print(f"[bench] backend={args.backend} video={args.video} "
-          f"max_frames={args.max_frames} target_fps={args.target_fps}", flush=True)
-
-    print("[bench] loading map ...", flush=True)
-    rmap = EDMRelocMap.load(args.bundle)
-    cam = Camera(*CAM_720_EDM)
-    cfg = production_edm_config()
-    cfg.local_topk = int(args.local_topk)
-    cfg.boot_global_topk = int(args.boot_global_topk)
-
-    print(f"[bench] loading matcher backend={args.backend} ...", flush=True)
-    matcher_kwargs = {}
-    if args.onnx is not None:
-        matcher_kwargs["onnx_path"] = args.onnx
-    matcher = make_matcher(args.backend, **matcher_kwargs)
-
-    trk = ProductionEDMTracker(rmap, cam, cfg=cfg, matcher=matcher)
-    # Force MegaLoc load before timed loop so VPR init is not attributed to frame 0 only.
-    print("[bench] warming MegaLoc ...", flush=True)
-    _ = trk.loc.megaloc
-
+def _run_stream(
+    args: argparse.Namespace,
+    trk: ProductionEDMTracker,
+) -> tuple[list[str], list[float], list[float], list[float], list[float], list[int], int, int, int, float]:
     cap = cv2.VideoCapture(str(args.video))
     if not cap.isOpened():
         raise SystemExit(f"cannot open video: {args.video}")
@@ -145,6 +97,62 @@ def main() -> None:
 
     cap.release()
     wall_s = time.perf_counter() - t_wall0
+    return states, totals, vprs, matches, pnps, inliers, n_ok, used, timed, wall_s
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--video", type=Path, required=True)
+    ap.add_argument("--bundle", type=Path, required=True)
+    ap.add_argument(
+        "--backend",
+        default="onnx_tensorrt",
+        choices=(
+            "torch", "torch_fp32",
+            "onnx_cuda", "onnx_tensorrt", "onnx_cpu",
+        ),
+        help="EDM matching backend",
+    )
+    ap.add_argument("--onnx", type=Path, default=None,
+                    help="Override ONNX path (default flight 1024x576 outdoor export)")
+    ap.add_argument("--max-frames", type=int, default=300)
+    ap.add_argument("--warmup-frames", type=int, default=5,
+                    help="Skip first N timed frames (TRT build / CUDA warmup)")
+    ap.add_argument("--local-topk", type=int, default=2)
+    ap.add_argument("--boot-global-topk", type=int, default=10)
+    ap.add_argument("--target-fps", type=float, default=17.0)
+    ap.add_argument("--stride", type=int, default=1,
+                    help="Keep every Nth source frame (1 = every frame)")
+    ap.add_argument("--out", type=Path, default=None)
+    args = ap.parse_args()
+
+    if not args.video.is_file():
+        raise SystemExit(f"video not found: {args.video}")
+    if not args.bundle.is_file():
+        raise SystemExit(f"bundle not found: {args.bundle}")
+
+    print(f"[bench] backend={args.backend} video={args.video} "
+          f"max_frames={args.max_frames} target_fps={args.target_fps}", flush=True)
+
+    print("[bench] loading map ...", flush=True)
+    rmap = EDMRelocMap.load(args.bundle)
+    cam = Camera(*CAM_720_EDM)
+    cfg = production_edm_config()
+    cfg.local_topk = int(args.local_topk)
+    cfg.boot_global_topk = int(args.boot_global_topk)
+
+    print(f"[bench] loading matcher backend={args.backend} ...", flush=True)
+    matcher_kwargs = {}
+    if args.onnx is not None:
+        matcher_kwargs["onnx_path"] = args.onnx
+    matcher = make_matcher(args.backend, **matcher_kwargs)
+
+    trk = ProductionEDMTracker(rmap, cam, cfg=cfg, matcher=matcher)
+    # Force MegaLoc load before timed loop so VPR init is not attributed to frame 0 only.
+    print("[bench] warming MegaLoc ...", flush=True)
+    _ = trk.loc.megaloc
+
+    states, totals, vprs, matches, pnps, inliers, n_ok, used, timed, wall_s = _run_stream(args, trk)
 
     n = max(timed, 1)
     med_total = percentile(totals, 50)

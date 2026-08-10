@@ -7,7 +7,7 @@
 
 ## 結論
 
-**Overall Engineering Quality: 7.5 / 10**
+**Overall Engineering Quality: 7.8 / 10**
 
 系統已具備可重複執行的 no-flight validation、場域資產雜湊綁定、四步 preflight、
 AUTO 起飛後定位閘門、手動接管、關閉時降落流程、離線依賴鎖、SBOM 與 portable
@@ -36,20 +36,24 @@ Ruff、format、bounded mypy、maintainability budget、第一方 security rules
 audit/SBOM、runtime ownership、workspace audit、profile asset validation、CUDA/model smoke、
 來源 manifest、portable manifest、clean offline install 與 simulated UI pose smoke。
 
-本次整合修正後的開發階段結果：root `1664 passed, 1 skipped`，Parrot simulator
-`88 passed`；Ruff、format、bounded mypy、maintainability、security/SBOM、module ownership、
-workspace、profile assets、flight selftest、dependency check、CUDA production smoke、EDM/MegaLoc
-offline inference 與 simulated UI valid-pose smoke 均通過。正式 release evidence 只以 clean
-commit 與最終 portable package 建立後重跑的 receipt 為準，不把 dirty-tree 結果當成發行證據。
+本次最後一輪 CPU／no-flight 整合結果：root `1707 passed, 1 skipped`，coverage `61.01%`；
+Parrot simulator `88 passed`。Ruff、固定 format scope、19 檔 bounded mypy、五個 production
+scope 的零 C901 budget、security/SBOM、module ownership、workspace、profile assets、flight
+selftest、dependency check 與 377 檔 source manifest 均通過。最後差異沒有重新執行
+CUDA model inference 或 simulated UI；這兩項只能在最終 clean commit、portable package 與
+目標硬體上另產生 release receipt，不能用較早的 smoke 結果冒充本次發行證據。
 
 ## Critical / High findings 與處置
 
 | 嚴重度 | File / symbol | 問題與影響 | 處置 |
 |---|---|---|---|
 | Critical | `operator_shutdown.py`, AUTO shutdown | cleanup 可能在 AUTO thread 仍輸出非零 PCMD 時進行 | 關閉先 suspend、cancel、送零值並 join；AUTO 未停止時拒絕 backend cleanup |
+| Critical | `operator_shutdown.py`, concurrent close | 視窗關閉 worker 與 SIGTERM 可能同時進入 cleanup | coordinator 以互斥鎖序列化 shutdown；並行請求共用同一次已確認 cleanup |
 | Critical | `path_follow_flight.py`, landing state | 降落失敗一次後可能被視為 DONE | 加入有界重試與 `LANDING_UNRESOLVED`；未確認 landed 不得宣告完成 |
+| High | `operator_autonomy.py`, unresolved completion | 兩次降落未確認後 worker 結束但 UI 永久保留 active AUTO | 先發 `landing_unresolved`，再以單一 terminal completion 清除 UI ownership；不宣稱落地成功 |
 | High | `olympe_live_backend.py`, authority/takeoff/landing | 起降與 ownership 交錯時可能出現競態，`None` 也可能被當成功 | 序列化 authority；只有 literal `True` 算命令成功 |
 | High | `live_localizer_worker.py`, result ordering | 較舊 TRACK 結果可能晚到並覆蓋較新的 LOST | 依 frame/capture 序拒絕 stale result，並加入 out-of-order regression |
+| High | `flight_operator_app.py`, worker sequence | 缺少或非整數 `seq` 可被補成目前序號，讓 malformed result 冒充新 pose | 僅接受 exact built-in `int` 且必須等於 expected sequence |
 | High | `live_localizer_worker.py`, CUDA OOM | OOM 被降成一般 LOST，或連續 OOM 造成無界 worker 重建 | 將 CUDA OOM 分類為 fatal；最多重建 3 次並退避，健康 inference 才重置，超限標記 unavailable |
 | High | `export_edm_onnx_flight.py`, checkpoint loading | 對外部 checkpoint 使用可執行 pickle 載入 | 改用 `weights_only=True` 並拒絕不相容 payload |
 | High | `reloc_localizer_edm.py`, bundle decode | reference、JPEG 解碼、descriptor、XYZ、covis 無界，握手前即可耗盡 RAM/VRAM | 解碼前檢查檔案/JPEG header、encoded/decoded bytes、8448 維 descriptor、XYZ 與 edge 上限 |
@@ -136,38 +140,38 @@ macOS 或無 NVIDIA 環境皆可直接執行的單一檔案。
 
 | 項目 | 分數 | 主要依據 |
 |---|---:|---|
-| Readability | 7.2 | 命名與 seams 已改善；仍有大型流程函式 |
-| Maintainability | 7.0 | 高風險責任已拆出；control 尚有 56 個 complexity hot spots |
-| Simplicity | 6.8 | 發行／安全流程必要但層數偏多 |
-| Modularity | 7.2 | authority、shutdown、site runtime、route domain 已分離 |
+| Readability | 7.5 | 命名與 seams 已改善；仍有大型 module |
+| Maintainability | 8.0 | 五個 production scope 的 C901 違規均為 0；大型 module 仍需漸進拆分 |
+| Simplicity | 7.0 | 發行／安全流程必要但層數偏多 |
+| Modularity | 7.5 | authority、shutdown、site runtime、route domain 已分離 |
 | Cohesion | 7.0 | 新模組內聚；backend 與 app 仍負責較多狀態 |
 | Coupling | 6.8 | profile 與 EDM/runtime 仍有實際耦合 |
 | SOLID | 6.8 | interface seams 增加；localizer abstraction 尚未完全可替換 |
 | DRY | 7.4 | route/profile 驗證已收斂；部分 UI state 映射仍重複 |
 | API Design | 7.2 | typed command 與 domain model 改善；動態 vendor API 限制仍在 |
-| Type Safety | 6.4 | bounded mypy 嚴格通過，但全 UI/ML 尚未納入 |
-| Correctness | 8.0 | 座標／時間／ownership invariants 有回歸測試；真機未驗證 |
-| Robustness | 8.1 | fault injection 覆蓋 worker、OOM、landing、EOF、cleanup |
-| Testability | 7.8 | dependency seams 與 simulator 良好；真硬體仍難隔離 |
-| Testing | 8.5 | unit/integration/regression/smoke 與五類 adversarial matrix |
+| Type Safety | 7.2 | 19 個高風險邊界由 bounded mypy 嚴格檢查；動態 UI/ML 尚未全納入 |
+| Correctness | 8.2 | 座標／時間／ownership／terminal invariants 有回歸測試；真機未驗證 |
+| Robustness | 8.3 | fault injection 覆蓋 worker、OOM、landing、EOF、cleanup |
+| Testability | 8.0 | dependency seams 與 simulator 良好；真硬體仍難隔離 |
+| Testing | 8.7 | 1707 項 root tests、88 項 simulator tests 與五類 adversarial matrix |
 | Performance | 6.7 | UI render 有 budget；100k retrieval 未設計完成 |
 | Memory | 7.1 | bundle/resource bounds 已加入；大型模型仍需實機 soak |
-| Concurrency | 8.0 | ownership、shutdown、stale-result 與 worker lifecycle 有測試 |
+| Concurrency | 8.4 | ownership、互斥 shutdown、stale-result 與 worker lifecycle 有測試 |
 | Security | 7.4 | path/symlink/unsafe load/security gate 已修；缺外部 trust root |
 | Logging | 7.6 | validation receipts 與飛行事件可追蹤；尚非完整 structured telemetry |
 | Configuration | 8.0 | profile/env/lock 集中且有 validation |
-| Portability | 7.8 | 離線 clean install 與一鍵啟動；受硬體平台契約限制 |
-| Reproducibility | 8.1 | commit、manifest、SHA、locks、SBOM、receipt 綁定 |
+| Portability | 7.9 | 最小離線包與一鍵啟動契約完整；受硬體平台契約限制 |
+| Reproducibility | 8.2 | commit、manifest、SHA、locks、SBOM、receipt 綁定 |
 | Documentation | 7.8 | architecture/spec/portable/runbook 已補；現場 E2E 仍需紀錄 |
-| Architecture | 7.2 | boundaries 進步；100k registry 與 multi-localizer 待重設計 |
-| Consistency | 7.4 | error、route、profile contract 較一致；舊動態 UI code 仍混雜 |
-| Dependencies | 7.0 | exact locks 與 offline wheelhouse；存在明列的 audit exceptions |
-| Technical Debt | 6.6 | 複雜度已受 budget 控制但熱點仍多 |
-| Repository Hygiene | 7.8 | runtime mirror、output naming、manifest gates；模型仍使 repo 大 |
+| Architecture | 7.5 | boundaries 進步；100k registry 與 multi-localizer 待重設計 |
+| Consistency | 7.6 | error、route、profile contract 較一致；舊動態 UI code 仍混雜 |
+| Dependencies | 7.2 | exact locks、offline wheelhouse 與 SBOM；仍有明列的 audit exceptions |
+| Technical Debt | 7.8 | 已清除 C901／TODO debt 與確定 dead code；大型 module 與平台債仍在 |
+| Repository Hygiene | 8.0 | 舊文件已正式淘汰，tests、manifest、output naming 與 runtime ownership 一致 |
 | Extensibility | 6.8 | registry/seams 已有，但 site profile 目前仍以 EDM 為主 |
 | Scalability | 5.7 | 現有場域可用，100k reference 尚未完成 |
-| Reliability | 7.9 | shutdown/landing/freshness/failure lifecycle 已強化 |
-| Developer Experience | 7.6 | 一鍵啟動與驗證入口清楚；GPU/Olympe 環境仍重 |
+| Reliability | 8.2 | shutdown/landing/freshness/failure lifecycle 已強化 |
+| Developer Experience | 7.7 | 一鍵啟動與驗證入口清楚；GPU/Olympe 環境仍重 |
 
 總分依專案指定權重計算：Maintainability、Architecture、Correctness、Robustness 各
 10%；Readability、Modularity 各 8%；Testability、Performance、Reliability 各 7%；
@@ -175,31 +179,32 @@ Reproducibility 6%；Type Safety 5%；Configuration、Documentation 各 4%；其
 
 ## Top 20 refactoring hot spots
 
-這些是風險導向排序，不等同「現在全部重寫」。數值為目前 complexity scanner 的
-函式最高值／超預算數量；應一次拆一個 seam 並保留行為測試。
+目前 `tools`、`deploy`、`flight`、`validation`、`control` 五個 production scope 的
+C901 違規全部為 0。以下因此不是未修的 complexity violation，而是依檔案大小與責任面
+排序的後續模組化熱點；每次只拆一個 seam 並保留既有測試。
 
-| Rank | File | Max / count | 建議邊界 |
+| Rank | File | Lines | 建議邊界 |
 |---:|---|---:|---|
-| 1 | `定位演算法/flight_control/path_follow_flight.py` | 85 / 7 | state transition、landing、gate evaluation |
-| 2 | `控制介面程式/operator_interface/live_localizer_worker.py` | 60 / 1 | process lifecycle、result admission |
-| 3 | `控制介面程式/operator_interface/olympe_live_backend.py` | 50 / 16 | command adapter、telemetry、authority |
-| 4 | `控制介面程式/operator_interface/production_xfeat_tracker.py` | 49 / 5 | factory、retrieval、pose conversion |
-| 5 | `控制介面程式/operator_interface/production_edm_tracker.py` | 49 / 4 | factory、bundle validation、inference |
-| 6 | `定位演算法/validation/benchmark_production_stream.py` | 39 / 1 | source runner、metric aggregation |
-| 7 | `控制介面程式/operator_interface/flight_operator_app.py` | 32 / 17 | command coordinator、view model、tick |
-| 8 | `定位演算法/validation/benchmark_edm_site_replay.py` | 30 / 1 | decode、replay、quality verdict |
-| 9 | `定位演算法/deploy_code/sfm_glomap_deploy/reloc_localizer_edm.py` | 28 / 1 | bundle decoder、resource guard |
-| 10 | `控制介面程式/site_profile.py` | 24 / 5 | schema parse、path policy、approval policy |
-| 11 | `定位演算法/deploy_code/sfm_glomap_deploy/reloc_localizer_xfeat.py` | 23 / 1 | retrieval、matching、pose estimate |
-| 12 | `定位演算法/flight_control/passive_flight_session.py` | 23 / 1 | capture lifecycle、result writer |
-| 13 | `控制介面程式/operator_interface/live_non_map_acceptance.py` | 22 / 1 | stream runner、acceptance verdict |
-| 14 | `定位演算法/flight_control/route_domain.py` | 21 / 1 | JSON parse、semantic validation |
-| 15 | `tools/simulator_preflight.py` | 20 / 3 | dependency probes、artifact verdict |
-| 16 | `定位演算法/deploy_code/sfm_glomap_deploy/megaloc_cache.py` | 20 / 1 | cache identity、load policy |
-| 17 | `控制介面程式/operator_interface/operator_autonomy.py` | 20 / 1 | cancel handoff、UI event bridge |
-| 18 | `定位演算法/flight_control/autoflight.py` | 19 / 2 | orchestration、status reporting |
-| 19 | `定位演算法/flight_control/real_path_follow_controller.py` | 18 / 3 | coordinate adapter、command conversion |
-| 20 | `定位演算法/validation/stream_integrity.py` | 18 / 1 | stream invariants、failure verdict |
+| 1 | `控制介面程式/operator_interface/flight_operator_app.py` | 10369 | view model、command completion、shutdown UI bridge |
+| 2 | `控制介面程式/operator_interface/olympe_live_backend.py` | 5149 | vendor adapter、telemetry observer、landing supervisor |
+| 3 | `定位演算法/flight_control/path_follow_flight.py` | 3638 | transition evaluation、landing、CLI orchestration |
+| 4 | `定位演算法/deploy_code/sfm_glomap_deploy/production_xfeat_tracker.py` | 2500 | retrieval、matching、pose conversion |
+| 5 | `定位演算法/flight_control/real_path_follow_controller.py` | 1516 | coordinate adapter、command conversion |
+| 6 | `定位演算法/deploy_code/sfm_glomap_deploy/production_edm_tracker.py` | 1400 | factory、bundle validation、inference |
+| 7 | `控制介面程式/operator_interface/live_localizer_worker.py` | 1383 | process lifecycle、result admission |
+| 8 | `控制介面程式/site_profile.py` | 1371 | schema parse、path policy、approval policy |
+| 9 | `tools/export_simulator_package.py` | 1230 | artifact acquisition、package assembly、publication |
+| 10 | `控制介面程式/operator_interface/local_site_assets.py` | 1140 | import validation、atomic copy、site discovery |
+| 11 | `控制介面程式/operator_interface/route_editor_window.py` | 1100 | Tk view、editor controller、render state |
+| 12 | `定位演算法/validation/benchmark_production_stream.py` | 1062 | source runner、metric aggregation |
+| 13 | `定位演算法/flight_control/olympe_frame_source.py` | 994 | frame ownership、timestamp extraction |
+| 14 | `tools/system_validation.py` | 897 | step catalog、runner、receipt writer |
+| 15 | `定位演算法/EDM工具包/build/build_reloc_map_edm.py` | 857 | authoring input、descriptor build、publication |
+| 16 | `定位演算法/flight_control/manual_nudge_pilot.py` | 832 | input loop、authority、command emission |
+| 17 | `tools/package_manifest.py` | 832 | source manifest、portable assets、verification |
+| 18 | `控制介面程式/operator_interface/hardware_approval_trust.py` | 828 | trust-store parse、signature verification |
+| 19 | `控制介面程式/operator_interface/read_only_flight_advisor.py` | 807 | telemetry interpretation、operator advice |
+| 20 | `控制介面程式/operator_interface/runtime_safety.py` | 772 | approval snapshot、runtime gate、receipt checks |
 
 ## 接下來怎麼改
 
@@ -214,16 +219,17 @@ Reproducibility 6%；Type Safety 5%；Configuration、Documentation 各 4%；其
 
 - localization uncertainty/recovery 已移到純函式並有 transition table；下一步只拆 landing
   transition，不一次重寫 `run_loop`。
-- bounded mypy 已從 5 個擴至 9 個檔案，納管 `route_domain.py`、
-  `localization_contract.py`、`operator_shutdown.py` 與新的純 transition module；後續仍逐模組擴大。
+- bounded mypy 已擴至 19 個高風險邊界，納管 site profile、route domain、command、
+  autonomy、shutdown、rendering 與 runtime safety；動態 Tk／Olympe／模型內部仍逐模組擴大。
 - 將 validation receipt 與現場測試紀錄保留在外部只寫入媒體，避免只存同一台主機。
 
 ### 建議逐步重構
 
-- 從 backend 繼續拆 TelemetryFreshnessStore、TakeoffLandingSupervisor 與 vendor adapter。
-- 從 OperatorApp 拆剩餘 command coordinator、view model 與 shutdown lifecycle。
-- 讓 route 解析、核准、controller conversion 只經過一個 immutable domain model。
-- 將 source repository、artifact acquisition/cache、portable package assembly 完全分層。
+- `TelemetryFreshnessStore`、`TakeoffLandingSupervisor`、`AuthorityController` 已移出 backend；
+  下一步只拆剩餘 vendor observer／message adapter。
+- command coordinator 與 shutdown lifecycle 已移出 OperatorApp；下一步拆 view model 與 tick state。
+- route domain 已收斂 immutable snapshot；下一步讓所有 authoring CLI 也只經過同一入口。
+- artifact acquisition 與 package assembly 已有獨立函式邊界；只有在替換來源或 registry 時再拆 module。
 
 ### 需要重新設計
 

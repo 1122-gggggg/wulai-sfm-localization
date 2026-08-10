@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import threading
+
 from operator_shutdown import OperatorShutdownCoordinator
 
 
@@ -95,6 +97,57 @@ def test_shutdown_is_idempotent_after_confirmed_touchdown() -> None:
     assert coordinator.shutdown(reason="terminal_close_retry") is True
     assert backend.cleanup_calls == 1
     assert logs.reasons == ["terminal_close"]
+    assert destroyed == [True]
+
+
+def test_concurrent_shutdown_requests_share_one_cleanup() -> None:
+    cleanup_started = threading.Event()
+    release_cleanup = threading.Event()
+
+    class _BlockingBackend:
+        is_live = True
+
+        def __init__(self) -> None:
+            self.cleanup_calls = 0
+
+        def cleanup(self) -> bool:
+            self.cleanup_calls += 1
+            cleanup_started.set()
+            assert release_cleanup.wait(timeout=1.0)
+            return True
+
+    backend = _BlockingBackend()
+    logs = _SessionLogs()
+    destroyed = []
+    coordinator = OperatorShutdownCoordinator(
+        backend=backend,
+        session_logs=logs,
+        write_log=None,
+        destroy=lambda: destroyed.append(True),
+    )
+    results = []
+    second_returned = threading.Event()
+
+    first = threading.Thread(
+        target=lambda: results.append(coordinator.shutdown(reason="window"))
+    )
+
+    def second_shutdown() -> None:
+        results.append(coordinator.shutdown(reason="signal"))
+        second_returned.set()
+
+    second = threading.Thread(target=second_shutdown)
+    first.start()
+    assert cleanup_started.wait(timeout=1.0)
+    second.start()
+    assert not second_returned.wait(timeout=0.05)
+    release_cleanup.set()
+    first.join(timeout=1.0)
+    second.join(timeout=1.0)
+
+    assert results == [True, True]
+    assert backend.cleanup_calls == 1
+    assert logs.reasons == ["window"]
     assert destroyed == [True]
 
 

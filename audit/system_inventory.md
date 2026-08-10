@@ -37,7 +37,7 @@
 ├── 執行環境/                        runtime 需求、torch_hub_cache、第二套 manifest
 ├── tools/                           安裝、驗證、打包、稽核工具
 ├── outputs/                         產出（flight_logs 約 100 個 session、benchmark）
-├── 文件/                            ARCHITECTURE.md、SYSTEM_SPEC.md、WORKSPACE_AUDIT.md
+├── 文件/                            ARCHITECTURE.md、SYSTEM_SPEC.md
 └── audit/                           **本次稽核產出**
 ```
 

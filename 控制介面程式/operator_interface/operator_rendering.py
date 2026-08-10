@@ -83,7 +83,10 @@ def _draw_route_and_history(draw: Any, context: MapRenderContext) -> None:
         parts.append(np.asarray(context.route_pts, dtype=float).reshape(-1, 3))
     if history_n:
         parts.append(
-            np.array([point[:3] for point in context.history], dtype=float)
+            np.array(
+                [np.asarray(point, dtype=float)[:3] for point in context.history],
+                dtype=float,
+            )
             .reshape(-1, 3)
         )
     view = context.transform_xyz(np.concatenate(parts, axis=0))
@@ -215,6 +218,19 @@ def draw_map_overlays(draw: Any, context: MapRenderContext) -> None:
     _draw_map_legend(draw, context)
 
 
+def _fit_pil_frame(
+    source: Image.Image,
+    width: int,
+    height: int,
+) -> tuple[Image.Image, float]:
+    scale = min(width / source.width, height / source.height)
+    new_size = (
+        max(1, int(source.width * scale)),
+        max(1, int(source.height * scale)),
+    )
+    return source.resize(new_size, Image.Resampling.BILINEAR), scale
+
+
 def prepare_video_frame(
     source: object | None,
     width: int,
@@ -253,25 +269,20 @@ def prepare_video_frame(
             )
             return frame, scale
 
-        scale = min(width / source.width, height / source.height)  # type: ignore[attr-defined]
-        new_size = (
-            max(1, int(source.width * scale)),  # type: ignore[attr-defined]
-            max(1, int(source.height * scale)),  # type: ignore[attr-defined]
+        pil_source = (
+            source
+            if isinstance(source, Image.Image)
+            else Image.fromarray(np.asarray(source), mode="RGB")
         )
-        frame = source.resize(new_size, Image.Resampling.BILINEAR)  # type: ignore[attr-defined]
-        return frame, scale
+        return _fit_pil_frame(pil_source, width, height)
     except Exception:
         try:
-            if not isinstance(source, Image.Image):
-                source = Image.fromarray(source, mode="RGB")
-            scale = min(source.width / width, source.height / height)
-            new_size = (
-                max(1, int(source.width * min(width / source.width, height / source.height))),
-                max(1, int(source.height * min(width / source.width, height / source.height))),
+            pil_source = (
+                source
+                if isinstance(source, Image.Image)
+                else Image.fromarray(np.asarray(source), mode="RGB")
             )
-            frame = source.resize(new_size, Image.Resampling.BILINEAR)
-            scale = min(width / source.width, height / source.height)
-            return frame, scale
+            return _fit_pil_frame(pil_source, width, height)
         except Exception:
             return None, 1.0
 

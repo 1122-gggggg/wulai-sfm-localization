@@ -45,6 +45,7 @@ Olympe.  It outputs a Command.  A real-flight runner must:
 - enforce geofence / obstacle safety with a real safety layer, not just sparse
   point-cloud proximity.
 """
+
 from __future__ import annotations
 
 import json
@@ -82,6 +83,7 @@ def _reject_json_constant(value: str):
 # ---------------------------------------------------------------------------
 # Data contracts
 
+
 @dataclass
 class Pose:
     """Visual-localizer pose in the raw GLOMAP map frame.
@@ -96,6 +98,7 @@ class Pose:
     Field-compatible with pose_types.Pose, which is what the operator interface's
     localizer worker produces.
     """
+
     x: float
     y: float
     z: float
@@ -117,6 +120,7 @@ class Command:
     `yaw_target` is the heading the camera/drone should face in the X/Z plane.
     A drone adapter can convert this to PCMD or velocity-control commands.
     """
+
     action: str
     vel_map: np.ndarray
     yaw_target: float
@@ -227,8 +231,7 @@ LEGACY_MAP_FRAME = MapFrame.legacy()
 def load_map_frame(path: str | Path) -> MapFrame:
     """Load the measured gravity direction from a site's T_align_gravity.json."""
     source = Path(path)
-    data = json.loads(source.read_text(encoding="utf-8"),
-                      parse_constant=_reject_json_constant)
+    data = json.loads(source.read_text(encoding="utf-8"), parse_constant=_reject_json_constant)
     if not isinstance(data, dict):
         raise ValueError(f"map alignment must be a JSON object: {source}")
     if data.get("schema") != "sfm-align/v2":
@@ -251,11 +254,42 @@ def load_map_frame(path: str | Path) -> MapFrame:
     # basis rebuilt from gravity_glomap catches a file whose two representations
     # disagree -- which would silently pick whichever one the reader happened to use.
     if not np.allclose(R[2], frame.up, atol=1e-6):
-        raise ValueError(
-            f"map alignment R row 2 disagrees with gravity_glomap: {source}"
-        )
+        raise ValueError(f"map alignment R row 2 disagrees with gravity_glomap: {source}")
     return frame
 
+
+_CONTROL_FLOAT_LIMITS = {
+    "lookahead": (0.0, 100.0),
+    "rejoin_tol": (0.0, 100.0),
+    "arrive": (0.0, 100.0),
+    "arrive_fraction": (0.0, 1.0),
+    "min_arrive": (0.0, 100.0),
+    "inspect_radius": (0.0, 100.0),
+    "inspect_resume_margin": (0.0, 100.0),
+    "inspect_yaw_tolerance_deg": (0.0, 45.0),
+    "max_pose_age_s": (0.0, 10.0),
+    "max_progress_regression": (0.0, 100.0),
+    "progress_jump_slack": (0.0, 100.0),
+    "progress_speed_factor": (0.0, 10.0),
+    "yaw_tolerance_deg": (0.0, 45.0),
+    "yaw_alignment_max_rate_deg_s": (0.0, 180.0),
+    "yaw_command_period_s": (0.0, 10.0),
+    "yaw_alignment_timeout_s": (0.0, 120.0),
+    "minimum_yaw_alignment_distance": (0.0, 100.0),
+    "slowdown_distance": (0.0, 100.0),
+    "translation_arrival_tolerance": (0.0, 100.0),
+    "waypoint_arrive_radius": (0.0, 100.0),
+    "final_hold_s": (0.0, 30.0),
+}
+
+_CONTROL_INTEGER_LIMITS = (
+    "yaw_alignment_confirmation_updates",
+    "max_translation_pcmd",
+    "max_yaw_pcmd",
+    "waypoint_arrive_confirm_frames",
+    "waypoint_advance_budget",
+    "final_arrive_confirm_frames",
+)
 
 
 @dataclass
@@ -266,20 +300,20 @@ class ControlConfig:
     # MaxVerticalSpeed) and shaped by slowdown_distance. A `speed` field existed
     # until 2026-08-06 but only ever scaled Command.vel_map, which the PCMD
     # adapter ignores -- tuning it changed nothing about how the drone flew.
-    lookahead: float = 0.8              # map-units ahead on route after rejoin
-    rejoin_tol: float = 0.45            # cross-track error before REJOIN
+    lookahead: float = 0.8  # map-units ahead on route after rejoin
+    rejoin_tol: float = 0.45  # cross-track error before REJOIN
     # Map-unit arrival tolerance. Scale-dependent like radius/max_jump: 0.1 was
     # chosen against urai EDM v1, whose camera track spans 6.07 map units and
     # whose consecutive references sit 0.027 apart. Re-derive it per site.
-    arrive: float = 0.1                 # absolute cap for end tolerance
-    arrive_fraction: float = 0.02       # end tolerance <= 2% of route length
-    min_arrive: float = 0.1             # but never smaller than this map-unit value
+    arrive: float = 0.1  # absolute cap for end tolerance
+    arrive_fraction: float = 0.02  # end tolerance <= 2% of route length
+    min_arrive: float = 0.1  # but never smaller than this map-unit value
     inspect_waypoints: tuple[int, ...] = (9, 10, 11, 15)  # 1-based labels in current 15-point route
-    inspect_radius: float = 0.75        # map-unit trigger around each label
-    inspect_resume_margin: float = 0.25 # arclength margin after last inspected wp
+    inspect_radius: float = 0.75  # map-unit trigger around each label
+    inspect_resume_margin: float = 0.25  # arclength margin after last inspected wp
     inspect_yaw_tolerance_deg: float = 6.0
-    max_pose_age_s: float = 0.5         # stale visual pose -> HOVER
-    segment_window: int = 2             # active segment +/- this many route segments
+    max_pose_age_s: float = 0.5  # stale visual pose -> HOVER
+    segment_window: int = 2  # active segment +/- this many route segments
     max_progress_regression: float = 0.2
     #: Capture radius (map units): how close the drone must be before a waypoint
     #: counts as reached. Bounds how far one fix may advance the target.
@@ -327,79 +361,78 @@ class ControlConfig:
     map_frame: MapFrame = LEGACY_MAP_FRAME
 
     def __post_init__(self):
-        limits = {
-            "lookahead": (0.0, 100.0),
-            "rejoin_tol": (0.0, 100.0),
-            "arrive": (0.0, 100.0),
-            "arrive_fraction": (0.0, 1.0),
-            "min_arrive": (0.0, 100.0),
-            "inspect_radius": (0.0, 100.0),
-            "inspect_resume_margin": (0.0, 100.0),
-            "inspect_yaw_tolerance_deg": (0.0, 45.0),
-            "max_pose_age_s": (0.0, 10.0),
-            "max_progress_regression": (0.0, 100.0),
-            "progress_jump_slack": (0.0, 100.0),
-            "progress_speed_factor": (0.0, 10.0),
-            "yaw_tolerance_deg": (0.0, 45.0),
-            "yaw_alignment_max_rate_deg_s": (0.0, 180.0),
-            "yaw_command_period_s": (0.0, 10.0),
-            "yaw_alignment_timeout_s": (0.0, 120.0),
-            "minimum_yaw_alignment_distance": (0.0, 100.0),
-            "slowdown_distance": (0.0, 100.0),
-            "translation_arrival_tolerance": (0.0, 100.0),
-            "waypoint_arrive_radius": (0.0, 100.0),
-            "final_hold_s": (0.0, 30.0),
-        }
-        for name, (lo, hi) in limits.items():
-            value = float(getattr(self, name))
-            if not math.isfinite(value) or value <= lo or value > hi:
-                raise ValueError(f"{name} must be finite and in ({lo}, {hi}], got {value!r}")
-        if (not isinstance(self.inspect_waypoints, tuple)
-                or any(not isinstance(i, int) or isinstance(i, bool) or i < 1
-                       for i in self.inspect_waypoints)):
-            raise ValueError("inspect_waypoints must be a tuple of positive 1-based integers")
-        if (isinstance(self.segment_window, bool) or not isinstance(self.segment_window, int)
-                or not 0 <= self.segment_window <= 20):
-            raise ValueError("segment_window must be an integer in [0,20]")
-        if float(self.translation_arrival_tolerance) >= float(self.waypoint_arrive_radius):
-            # The adapter must keep commanding until the drone is INSIDE the sphere,
-            # or the sequencer can never retire the waypoint and the route stalls.
-            raise ValueError(
-                "translation_arrival_tolerance must be smaller than "
-                f"waypoint_arrive_radius ({self.translation_arrival_tolerance} >= "
-                f"{self.waypoint_arrive_radius}); autonomy would stall short of "
-                "every waypoint"
-            )
-        final_floor = min(float(self.arrive), float(self.min_arrive))
-        if final_floor <= float(self.translation_arrival_tolerance):
-            raise ValueError(
-                "the end-of-route arrival window must be larger than "
-                f"translation_arrival_tolerance ({final_floor} <= "
-                f"{self.translation_arrival_tolerance}); the final waypoint would "
-                "never terminate the mission"
-            )
-        if float(self.progress_jump_slack) < float(self.waypoint_arrive_radius):
-            # The capture bound must not be tighter than the arrival sphere, or a
-            # waypoint could be "arrived at" and simultaneously refused as too far.
-            raise ValueError(
-                "progress_jump_slack must be >= waypoint_arrive_radius "
-                f"({self.progress_jump_slack} < {self.waypoint_arrive_radius})"
-            )
-        if not isinstance(self.map_frame, MapFrame):
-            raise ValueError("map_frame must be a MapFrame")
-        for name in ("yaw_alignment_confirmation_updates", "max_translation_pcmd",
-                     "max_yaw_pcmd", "waypoint_arrive_confirm_frames",
-                     "waypoint_advance_budget", "final_arrive_confirm_frames"):
-            value = getattr(self, name)
-            if (isinstance(value, bool) or not isinstance(value, int)
-                    or not 1 <= value <= 100):
-                raise ValueError(f"{name} must be an integer in [1,100]")
-        if self.waypoint_advance_budget != 1:
-            raise ValueError("waypoint_advance_budget must be exactly 1")
+        _validate_control_float_limits(self)
+        _validate_control_shape(self)
+        _validate_arrival_contract(self)
+        _validate_map_frame(self)
+        _validate_control_integer_limits(self)
+
+
+def _validate_control_float_limits(config: ControlConfig) -> None:
+    for name, (lo, hi) in _CONTROL_FLOAT_LIMITS.items():
+        value = float(getattr(config, name))
+        if not math.isfinite(value) or value <= lo or value > hi:
+            raise ValueError(f"{name} must be finite and in ({lo}, {hi}], got {value!r}")
+
+
+def _validate_control_shape(config: ControlConfig) -> None:
+    if not isinstance(config.inspect_waypoints, tuple) or any(
+        not isinstance(index, int) or isinstance(index, bool) or index < 1
+        for index in config.inspect_waypoints
+    ):
+        raise ValueError("inspect_waypoints must be a tuple of positive 1-based integers")
+    if (
+        isinstance(config.segment_window, bool)
+        or not isinstance(config.segment_window, int)
+        or not 0 <= config.segment_window <= 20
+    ):
+        raise ValueError("segment_window must be an integer in [0,20]")
+
+
+def _validate_arrival_contract(config: ControlConfig) -> None:
+    # The adapter must keep commanding until the drone is inside the arrival sphere,
+    # or the sequencer can never retire the waypoint and the route stalls.
+    if float(config.translation_arrival_tolerance) >= float(config.waypoint_arrive_radius):
+        raise ValueError(
+            "translation_arrival_tolerance must be smaller than "
+            f"waypoint_arrive_radius ({config.translation_arrival_tolerance} >= "
+            f"{config.waypoint_arrive_radius}); autonomy would stall short of "
+            "every waypoint"
+        )
+    final_floor = min(float(config.arrive), float(config.min_arrive))
+    if final_floor <= float(config.translation_arrival_tolerance):
+        raise ValueError(
+            "the end-of-route arrival window must be larger than "
+            f"translation_arrival_tolerance ({final_floor} <= "
+            f"{config.translation_arrival_tolerance}); the final waypoint would "
+            "never terminate the mission"
+        )
+    # The capture bound cannot be tighter than the arrival sphere, or a waypoint
+    # could be accepted and simultaneously rejected as too far away.
+    if float(config.progress_jump_slack) < float(config.waypoint_arrive_radius):
+        raise ValueError(
+            "progress_jump_slack must be >= waypoint_arrive_radius "
+            f"({config.progress_jump_slack} < {config.waypoint_arrive_radius})"
+        )
+
+
+def _validate_map_frame(config: ControlConfig) -> None:
+    if not isinstance(config.map_frame, MapFrame):
+        raise ValueError("map_frame must be a MapFrame")
+
+
+def _validate_control_integer_limits(config: ControlConfig) -> None:
+    for name in _CONTROL_INTEGER_LIMITS:
+        value = getattr(config, name)
+        if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 100:
+            raise ValueError(f"{name} must be an integer in [1,100]")
+    if config.waypoint_advance_budget != 1:
+        raise ValueError("waypoint_advance_budget must be exactly 1")
 
 
 # ---------------------------------------------------------------------------
 # Frame / geometry helpers
+
 
 def _finite_vec3(value, label: str) -> np.ndarray:
     try:
@@ -413,8 +446,9 @@ def _finite_vec3(value, label: str) -> np.ndarray:
 
 def _validated_waypoints(waypoints) -> list[np.ndarray]:
     """Compatibility adapter to the shared route-domain validator."""
-    return [np.array(point, dtype=float, copy=True)
-            for point in _validated_route_waypoints(waypoints)]
+    return [
+        np.array(point, dtype=float, copy=True) for point in _validated_route_waypoints(waypoints)
+    ]
 
 
 def aligned_to_glomap(p, frame: MapFrame = LEGACY_MAP_FRAME) -> np.ndarray:
@@ -426,9 +460,7 @@ def wrap_angle(a: float) -> float:
     return (a + math.pi) % (2.0 * math.pi) - math.pi
 
 
-
-def heading_from_to(a: np.ndarray, b: np.ndarray,
-                    frame: MapFrame = LEGACY_MAP_FRAME) -> float:
+def heading_from_to(a: np.ndarray, b: np.ndarray, frame: MapFrame = LEGACY_MAP_FRAME) -> float:
     return frame.heading(np.asarray(b, float) - np.asarray(a, float))
 
 
@@ -502,6 +534,7 @@ def point_at_s(wp: list[np.ndarray], cum: np.ndarray, s: float):
 
 # ---------------------------------------------------------------------------
 # Loading JSON artifacts from Blender
+
 
 def _waypoints_from_route_data(
     data: object,
@@ -587,8 +620,7 @@ def config_for_route(
     )
 
 
-def load_poles(poles_json: str | Path,
-               map_frame: MapFrame = LEGACY_MAP_FRAME) -> list[dict]:
+def load_poles(poles_json: str | Path, map_frame: MapFrame = LEGACY_MAP_FRAME) -> list[dict]:
     p = Path(poles_json)
     if not p.exists():
         return []
@@ -611,18 +643,19 @@ def load_poles(poles_json: str | Path,
         center_g = aligned_to_glomap(center, map_frame)
         base_g = aligned_to_glomap(pole.get("base", center), map_frame)
         top_g = aligned_to_glomap(pole.get("top", center), map_frame)
-        out.append({
-            "id": i,
-            "center": center_g,
-            "base": base_g,
-            "top": top_g,
-            "raw": pole,
-        })
+        out.append(
+            {
+                "id": i,
+                "center": center_g,
+                "base": base_g,
+                "top": top_g,
+                "raw": pole,
+            }
+        )
     return out
 
 
-def nearest_pole(poles: list[dict], ref: np.ndarray,
-                 map_frame: MapFrame = LEGACY_MAP_FRAME):
+def nearest_pole(poles: list[dict], ref: np.ndarray, map_frame: MapFrame = LEGACY_MAP_FRAME):
     """Return the pole nearest to ref in the site's measured horizontal plane."""
     if not poles:
         return None, None, None
@@ -643,6 +676,7 @@ def nearest_pole(poles: list[dict], ref: np.ndarray,
 # Real-flight obstacle safety currently relies on the route-deviation bound + the human pilot.
 # Wiring this in as a hover/land trigger is a deliberate design decision (deferred, not done).
 
+
 class SparseCloudCollisionMonitor:
     """Same collision heuristic as the current simulator dashboard.
 
@@ -650,8 +684,14 @@ class SparseCloudCollisionMonitor:
     position.  This is only an operator warning layer: the point cloud is not a
     watertight obstacle model and should not be the only real-flight safety check.
     """
-    def __init__(self, xyz: np.ndarray, collision_radius: float = 0.06,
-                 warning_radius: float = 0.20, max_points: int = 0):
+
+    def __init__(
+        self,
+        xyz: np.ndarray,
+        collision_radius: float = 0.06,
+        warning_radius: float = 0.20,
+        max_points: int = 0,
+    ):
         self.status = "OFF"
         self.collision_radius = float(collision_radius)
         self.warning_radius = float(warning_radius)
@@ -681,11 +721,16 @@ class SparseCloudCollisionMonitor:
 # ---------------------------------------------------------------------------
 # Main controller
 
+
 class RouteAutoController:
     """Path-follow + look-at-pole controller for real deployment wiring."""
 
-    def __init__(self, waypoints: list[np.ndarray], poles: list[dict] | None = None,
-                 config: ControlConfig | None = None):
+    def __init__(
+        self,
+        waypoints: list[np.ndarray],
+        poles: list[dict] | None = None,
+        config: ControlConfig | None = None,
+    ):
         checked_waypoints = _validated_waypoints(waypoints)
         frozen_waypoints = []
         for point in checked_waypoints:
@@ -699,7 +744,8 @@ class RouteAutoController:
         invalid_inspections = [i for i in self.cfg.inspect_waypoints if i > len(self.wp)]
         if invalid_inspections:
             raise ValueError(
-                f"inspection waypoint labels exceed route length {len(self.wp)}: {invalid_inspections}")
+                f"inspection waypoint labels exceed route length {len(self.wp)}: {invalid_inspections}"
+            )
         self.inspect_waypoints = {i - 1 for i in self.cfg.inspect_waypoints}
         self.poles = []
         for i, pole in enumerate(poles or []):
@@ -745,8 +791,7 @@ class RouteAutoController:
         self._final_pose_stamp = None
         self._final_confirm_frames = 0
 
-    def _final_hold_complete(self, pos: np.ndarray, pose_stamp: float,
-                             now: float) -> bool:
+    def _final_hold_complete(self, pos: np.ndarray, pose_stamp: float, now: float) -> bool:
         if float(np.linalg.norm(self.wp[-1] - pos)) > self.final_arrive_tolerance():
             self._reset_final_hold()
             return False
@@ -759,10 +804,9 @@ class RouteAutoController:
         else:
             self._final_confirm_frames += 1
         self._final_pose_stamp = pose_stamp
-        return (
-            self._final_confirm_frames >= int(self.cfg.final_arrive_confirm_frames)
-            and now - self._final_hold_started >= float(self.cfg.final_hold_s)
-        )
+        return self._final_confirm_frames >= int(
+            self.cfg.final_arrive_confirm_frames
+        ) and now - self._final_hold_started >= float(self.cfg.final_hold_s)
 
     def _all_inspections_done(self) -> bool:
         valid = {i for i in self.inspect_waypoints if 0 <= i < len(self.wp)}
@@ -798,9 +842,7 @@ class RouteAutoController:
             self.last_inspect = None
             return None
         _score, idx, eu, ar = best
-        pole_id, pole, pole_dist = nearest_pole(
-            self.poles, self.wp[idx], self.cfg.map_frame
-        )
+        pole_id, pole, pole_dist = nearest_pole(self.poles, self.wp[idx], self.cfg.map_frame)
         if pole is None:
             self.last_inspect = None
             return None
@@ -813,16 +855,15 @@ class RouteAutoController:
         }
         return idx + 1, np.asarray(pole["center"], float), pole_id
 
-    def ack_inspection(self, metadata: dict | None,
-                       orientation_confirmed: bool = False) -> bool:
+    def ack_inspection(self, metadata: dict | None, orientation_confirmed: bool = False) -> bool:
         """Mark only the currently pending inspection complete after capture acknowledgement."""
-        if (not orientation_confirmed or not isinstance(metadata, dict)
-                or self.last_inspect is None):
+        if not orientation_confirmed or not isinstance(metadata, dict) or self.last_inspect is None:
             return False
         waypoint = metadata.get("waypoint")
         pole_id = metadata.get("pole_id")
-        if (waypoint != self.last_inspect.get("waypoint")
-                or pole_id != self.last_inspect.get("pole_id")):
+        if waypoint != self.last_inspect.get("waypoint") or pole_id != self.last_inspect.get(
+            "pole_id"
+        ):
             return False
         idx = int(waypoint) - 1
         if idx not in self.inspect_waypoints:
@@ -840,8 +881,7 @@ class RouteAutoController:
         return None if length < 1e-9 else leg / length
 
     def _waypoint_reached(self, pos: np.ndarray, index: int) -> bool:
-        if float(np.linalg.norm(self.wp[index] - pos)) <= float(
-                self.cfg.waypoint_arrive_radius):
+        if float(np.linalg.norm(self.wp[index] - pos)) <= float(self.cfg.waypoint_arrive_radius):
             return True
         # A 20 Hz tick at real speed steps straight over a small arrival ball, so
         # also accept the waypoint once the drone is past the plane through it
@@ -849,8 +889,7 @@ class RouteAutoController:
         # the drone forever and the cross-track error would then grow without bound.
         # Bounded by the capture radius: without it, one teleported fix sitting far
         # past the plane would consume waypoints it never flew.
-        if float(np.linalg.norm(self.wp[index] - pos)) > float(
-                self.cfg.progress_jump_slack):
+        if float(np.linalg.norm(self.wp[index] - pos)) > float(self.cfg.progress_jump_slack):
             return False
         direction = self._leg_direction(index)
         if direction is None:
@@ -858,12 +897,13 @@ class RouteAutoController:
         reference = self.wp[index] if index >= 1 else self.wp[0]
         return float(np.dot(pos - reference, direction)) >= 0.0
 
-    def _advance_to_reached(self, pos: np.ndarray,
-                            pose_stamp: float | None = None) -> None:
+    def _advance_to_reached(self, pos: np.ndarray, pose_stamp: float | None = None) -> None:
         """Consume at most one reached waypoint per distinct pose. Never regress."""
         if pose_stamp is not None:
-            if (self._last_sequence_pose_stamp is not None
-                    and pose_stamp <= self._last_sequence_pose_stamp):
+            if (
+                self._last_sequence_pose_stamp is not None
+                and pose_stamp <= self._last_sequence_pose_stamp
+            ):
                 return
             self._last_sequence_pose_stamp = pose_stamp
         last = len(self.wp) - 1
@@ -883,8 +923,10 @@ class RouteAutoController:
                     # Inside the sphere, but not for long enough yet. One stray fix
                     # landing in it must not retire a waypoint the drone never reached.
                     break
-            if (self.target_index in self.inspect_waypoints
-                    and self.target_index not in self.completed_inspections):
+            if (
+                self.target_index in self.inspect_waypoints
+                and self.target_index not in self.completed_inspections
+            ):
                 # Reached an inspection point: hold the target here until the
                 # capture is acknowledged, or advancing would fly away mid-shot.
                 self.holding_for_inspection = True
@@ -941,8 +983,7 @@ class RouteAutoController:
         leg_start = self.wp[max(0, self.target_index - 1)]
         path_error, _nearest, _t = point_segment_distance(pos, leg_start, goal)
         progress = float(self.target_index) / float(max(1, last))
-        if (self.target_index < last and self._arrive_frames > 0
-                and not self.holding_for_inspection):
+        if self.target_index < last and self._arrive_frames > 0 and not self.holding_for_inspection:
             # Inside the arrival sphere, waiting out the confirmation window. The
             # sphere IS the arrival criterion, so settle here rather than chase the
             # exact centre -- on a sphere this large the centre can be BEHIND the
@@ -958,10 +999,16 @@ class RouteAutoController:
             return goal, self.target_index, path_error, progress, "ARRIVING"
         if self.target_index >= last:
             if self._final_hold_complete(pos, pose_stamp, now):
-                pending = any(index not in self.completed_inspections
-                              for index in self.inspect_waypoints)
-                return (goal, self.target_index, path_error, progress,
-                        "ABORT_PENDING_INSPECTION" if pending else "LAND")
+                pending = any(
+                    index not in self.completed_inspections for index in self.inspect_waypoints
+                )
+                return (
+                    goal,
+                    self.target_index,
+                    path_error,
+                    progress,
+                    "ABORT_PENDING_INSPECTION" if pending else "LAND",
+                )
             if float(np.linalg.norm(goal - pos)) <= self.final_arrive_tolerance():
                 return goal, self.target_index, path_error, progress, "FINAL_HOLD"
         else:
@@ -976,23 +1023,33 @@ class RouteAutoController:
         """
         now = time.monotonic() if now is None else float(now)
         pose_values = () if pose is None else (pose.x, pose.y, pose.z, pose.yaw, pose.stamp)
-        pose_ok = bool(pose is not None and math.isfinite(now)
-                       and all(math.isfinite(float(v)) for v in pose_values))
+        pose_ok = bool(
+            pose is not None
+            and math.isfinite(now)
+            and all(math.isfinite(float(v)) for v in pose_values)
+        )
         age = float("inf") if not pose_ok else now - float(pose.stamp)
         if not pose_ok or age < -0.05 or age > self.cfg.max_pose_age_s:
             self.state = "HOVER"
-            return Command("HOVER", np.zeros(3), 0.0, np.zeros(3), float("inf"), 0.0,
-                           status="pose missing/stale -> HOVER")
+            return Command(
+                "HOVER",
+                np.zeros(3),
+                0.0,
+                np.zeros(3),
+                float("inf"),
+                0.0,
+                status="pose missing/stale -> HOVER",
+            )
 
         pos = pose.xyz
-        goal, seg, path_error, progress, action = self._auto_goal(
-            pos, float(pose.stamp), now
-        )
+        goal, seg, path_error, progress, action = self._auto_goal(pos, float(pose.stamp), now)
 
         look = self._look_at_pole_target(pos)
-        if (look is None and self.holding_for_inspection
-                and float(np.linalg.norm(goal - pos))
-                <= float(self.cfg.waypoint_arrive_radius)):
+        if (
+            look is None
+            and self.holding_for_inspection
+            and float(np.linalg.norm(goal - pos)) <= float(self.cfg.waypoint_arrive_radius)
+        ):
             # Parked ON an inspection waypoint that yields no look-at target (pole
             # out of range, or already consumed). Holding forever would sit there
             # until an unrelated failsafe fired, so abort explicitly instead.
@@ -1000,45 +1057,95 @@ class RouteAutoController:
             # set holding_for_inspection -- not on the PCMD dead zone, which is now
             # far tighter and would leave the hold unbounded.
             self.state = "LANDING"
-            return Command("ABORT", np.zeros(3), pose.yaw, goal, path_error, progress,
-                           should_land=True,
-                           status="inspection waypoint has no reachable target -> abort/land")
+            return Command(
+                "ABORT",
+                np.zeros(3),
+                pose.yaw,
+                goal,
+                path_error,
+                progress,
+                should_land=True,
+                status="inspection waypoint has no reachable target -> abort/land",
+            )
         if look:
             wpnum, pole_center, pole_id = look
-            look_meta = {"waypoint": wpnum, "pole_id": pole_id,
-                         "target": pole_center.tolist(), "capture_ack_required": True,
-                         "body_yaw_required": bool(self.cfg.pole_body_look)}
-            yaw_target = (heading_from_to(pos, pole_center, self.cfg.map_frame)
-                          if self.cfg.pole_body_look else float(pose.yaw))
+            look_meta = {
+                "waypoint": wpnum,
+                "pole_id": pole_id,
+                "target": pole_center.tolist(),
+                "capture_ack_required": True,
+                "body_yaw_required": bool(self.cfg.pole_body_look),
+            }
+            yaw_target = (
+                heading_from_to(pos, pole_center, self.cfg.map_frame)
+                if self.cfg.pole_body_look
+                else float(pose.yaw)
+            )
             self.state = "INSPECT"
-            return Command("INSPECT", np.zeros(3), yaw_target, pos.copy(), path_error, progress,
-                           look_at_pole=look_meta, should_land=False,
-                           status=f"INSPECT wp={wpnum} pole={pole_id} awaiting gimbal/capture ack")
+            return Command(
+                "INSPECT",
+                np.zeros(3),
+                yaw_target,
+                pos.copy(),
+                path_error,
+                progress,
+                look_at_pole=look_meta,
+                should_land=False,
+                status=f"INSPECT wp={wpnum} pole={pole_id} awaiting gimbal/capture ack",
+            )
 
         if action == "ARRIVING":
             self.state = "CRUISE"
             return Command(
-                "ARRIVING", np.zeros(3), float(pose.yaw), goal, path_error, progress,
-                status=(f"waypoint {self.target_index + 1} arrival confirm "
-                        f"{self._arrive_frames}/{self.cfg.waypoint_arrive_confirm_frames}"),
+                "ARRIVING",
+                np.zeros(3),
+                float(pose.yaw),
+                goal,
+                path_error,
+                progress,
+                status=(
+                    f"waypoint {self.target_index + 1} arrival confirm "
+                    f"{self._arrive_frames}/{self.cfg.waypoint_arrive_confirm_frames}"
+                ),
             )
         if action == "FINAL_HOLD":
             self.state = "CRUISE"
             return Command(
-                "FINAL_HOLD", np.zeros(3), float(pose.yaw), goal,
-                path_error, progress,
-                status=(f"final hold {self._final_confirm_frames}/"
-                        f"{self.cfg.final_arrive_confirm_frames}"),
+                "FINAL_HOLD",
+                np.zeros(3),
+                float(pose.yaw),
+                goal,
+                path_error,
+                progress,
+                status=(
+                    f"final hold {self._final_confirm_frames}/"
+                    f"{self.cfg.final_arrive_confirm_frames}"
+                ),
             )
         if action == "ABORT_PENDING_INSPECTION":
             self.state = "LANDING"
-            return Command("ABORT", np.zeros(3), pose.yaw, goal, path_error, progress,
-                           should_land=True,
-                           status="pending inspection missed at route end -> abort/land")
+            return Command(
+                "ABORT",
+                np.zeros(3),
+                pose.yaw,
+                goal,
+                path_error,
+                progress,
+                should_land=True,
+                status="pending inspection missed at route end -> abort/land",
+            )
         if action == "LAND":
             self.state = "LANDING"
-            return Command("LAND", np.zeros(3), pose.yaw, goal, path_error, progress,
-                           should_land=True, status="final path reached -> LAND")
+            return Command(
+                "LAND",
+                np.zeros(3),
+                pose.yaw,
+                goal,
+                path_error,
+                progress,
+                should_land=True,
+                status="final path reached -> LAND",
+            )
 
         yaw_target = heading_from_to(pos, goal, self.cfg.map_frame)
         look_meta = None
@@ -1048,8 +1155,116 @@ class RouteAutoController:
         dist = float(np.linalg.norm(d))
         vel = np.zeros(3, dtype=float) if dist < 1e-9 else d / dist
         self.state = "CRUISE"
-        return Command(action, vel, yaw_target, goal, path_error, progress,
-                       look_at_pole=look_meta, should_land=False, status=status)
+        return Command(
+            action,
+            vel,
+            yaw_target,
+            goal,
+            path_error,
+            progress,
+            look_at_pole=look_meta,
+            should_land=False,
+            status=status,
+        )
+
+
+def _validated_command_goal(cmd: Command, pose: Pose, yaw_sign: int) -> np.ndarray:
+    _finite_vec3(cmd.vel_map, "command velocity")
+    goal = _finite_vec3(cmd.goal, "command goal")
+    scalars = [
+        cmd.yaw_target,
+        cmd.path_error,
+        cmd.progress,
+        pose.x,
+        pose.y,
+        pose.z,
+        pose.yaw,
+        pose.stamp,
+    ]
+    if not all(math.isfinite(float(value)) for value in scalars):
+        raise ValueError("command and pose scalars must be finite")
+    if int(yaw_sign) not in (-1, 1):
+        raise ValueError("yaw sign must be -1 or 1")
+    return goal
+
+
+def _command_yaw_context(
+    cmd: Command,
+    pose: Pose,
+    delta: np.ndarray,
+    config: ControlConfig,
+    *,
+    inspection: bool,
+) -> tuple[float, float | None]:
+    if inspection:
+        return wrap_angle(float(cmd.yaw_target) - float(pose.yaw)), None
+    projected_error = ground_projected_yaw_error(float(pose.yaw), delta, config.map_frame)
+    yaw_error = 0.0 if projected_error is None else projected_error
+    return yaw_error, projected_error
+
+
+def _yaw_percent_command(
+    yaw_error: float,
+    projected_error: float | None,
+    *,
+    config: ControlConfig,
+    yaw_sign: int,
+    inspection: bool,
+    require_yaw_alignment: bool,
+) -> tuple[int, int, int, int] | None:
+    yaw_error_deg = math.degrees(yaw_error)
+    needs_yaw = inspection or (
+        require_yaw_alignment
+        and projected_error is not None
+        and abs(yaw_error_deg) > config.yaw_tolerance_deg
+    )
+    if not needs_yaw:
+        return None
+    if abs(yaw_error_deg) <= config.yaw_tolerance_deg:
+        return 0, 0, 0, 0
+    yaw_strength = min(
+        config.max_yaw_pcmd,
+        max(
+            1,
+            round(100.0 * abs(yaw_error_deg) / 70.0 / config.yaw_command_period_s),
+        ),
+    )
+    yaw = int(yaw_sign) * (yaw_strength if yaw_error > 0.0 else -yaw_strength)
+    return 0, 0, int(yaw), 0
+
+
+def _translation_percent_command(
+    delta: np.ndarray,
+    pose: Pose,
+    config: ControlConfig,
+) -> tuple[int, int, int, int]:
+    zero = (0, 0, 0, 0)
+    distance = float(np.linalg.norm(delta))
+    if not math.isfinite(distance) or distance <= config.translation_arrival_tolerance:
+        return zero
+
+    forward, right, up = config.map_frame.body_components(delta, float(pose.yaw))
+    forward_fraction = forward / distance
+    right_fraction = right / distance
+    up_fraction = up / distance
+    raw_strength = min(
+        config.max_translation_pcmd,
+        max(2, round(config.max_translation_pcmd * distance / config.slowdown_distance)),
+    )
+    remaining = max(0.0, distance - config.translation_arrival_tolerance)
+    slowdown_span = max(
+        1e-6,
+        config.slowdown_distance - config.translation_arrival_tolerance,
+    )
+    slowdown_scale = max(0.25, min(1.0, remaining / slowdown_span))
+    strength = max(1, round(raw_strength * slowdown_scale))
+    clamp = lambda value: int(round(max(-100.0, min(100.0, float(value)))))
+    return (
+        clamp(strength * right_fraction),
+        clamp(strength * forward_fraction),
+        0,
+        clamp(strength * up_fraction),
+    )
 
 
 def command_to_body_percent(
@@ -1070,14 +1285,7 @@ def command_to_body_percent(
     cfg = config or ControlConfig()
     zero = (0, 0, 0, 0)
     try:
-        _finite_vec3(cmd.vel_map, "command velocity")
-        goal = _finite_vec3(cmd.goal, "command goal")
-        scalars = [cmd.yaw_target, cmd.path_error, cmd.progress,
-                   pose.x, pose.y, pose.z, pose.yaw, pose.stamp]
-        if not all(math.isfinite(float(value)) for value in scalars):
-            return zero
-        if int(yaw_sign) not in (-1, 1):
-            return zero
+        goal = _validated_command_goal(cmd, pose, yaw_sign)
     except (AttributeError, TypeError, ValueError, OverflowError):
         return zero
 
@@ -1087,75 +1295,32 @@ def command_to_body_percent(
         return zero
 
     delta = goal - pose.xyz
-    if inspection:
-        yaw_error = wrap_angle(float(cmd.yaw_target) - float(pose.yaw))
-    else:
-        try:
-            projected_error = ground_projected_yaw_error(
-                float(pose.yaw), delta, cfg.map_frame
-            )
-        except (TypeError, ValueError, OverflowError):
-            return zero
-        # No horizontal target ray exists for a purely vertical move. In that
-        # case yaw is intentionally left unchanged and only the body decomposition
-        # below may produce a vertical command.
-        yaw_error = 0.0 if projected_error is None else projected_error
-    yaw_error_deg = math.degrees(yaw_error)
-    if inspection or (
-        require_yaw_alignment
-        and projected_error is not None
-        and abs(yaw_error_deg) > cfg.yaw_tolerance_deg
-    ):
-        if abs(yaw_error_deg) <= cfg.yaw_tolerance_deg:
-            return zero
-        yaw_strength = min(
-            cfg.max_yaw_pcmd,
-            max(
-                1,
-                round(
-                    100.0 * abs(yaw_error_deg)
-                    / 70.0
-                    / cfg.yaw_command_period_s
-                ),
-            ),
+    try:
+        yaw_error, projected_error = _command_yaw_context(
+            cmd,
+            pose,
+            delta,
+            cfg,
+            inspection=inspection,
         )
-        yaw = int(yaw_sign) * (yaw_strength if yaw_error > 0.0 else -yaw_strength)
-        return 0, 0, int(yaw), 0
+    except (TypeError, ValueError, OverflowError):
+        return zero
+    # A purely vertical target has no defensible yaw direction, so translation
+    # may proceed without changing yaw.
+    yaw_command = _yaw_percent_command(
+        yaw_error,
+        projected_error,
+        config=cfg,
+        yaw_sign=yaw_sign,
+        inspection=inspection,
+        require_yaw_alignment=require_yaw_alignment,
+    )
+    if yaw_command is not None:
+        return yaw_command
 
     if not movement:
         return zero
-
-    distance = float(np.linalg.norm(delta))
-    if not math.isfinite(distance) or distance <= cfg.translation_arrival_tolerance:
-        return zero
-
-    # Split into body forward/right/up using the site's MEASURED horizontal plane.
-    # Assuming X/Z is horizontal costs 22.5 deg on target_site_v1, which leaks
-    # commanded climb into horizontal motion and vice versa.
-    forward, right, up = cfg.map_frame.body_components(delta, float(pose.yaw))
-    forward_fraction = forward / distance
-    right_fraction = right / distance
-    up_fraction = up / distance
-
-    raw_strength = min(
-        cfg.max_translation_pcmd,
-        max(2, round(cfg.max_translation_pcmd * distance / cfg.slowdown_distance)),
-    )
-    remaining = max(0.0, distance - cfg.translation_arrival_tolerance)
-    slowdown_span = max(
-        1e-6,
-        cfg.slowdown_distance - cfg.translation_arrival_tolerance,
-    )
-    slowdown_scale = max(0.25, min(1.0, remaining / slowdown_span))
-    strength = max(1, round(raw_strength * slowdown_scale))
-
-    clamp = lambda value: int(round(max(-100.0, min(100.0, float(value)))))
-    return (
-        clamp(strength * right_fraction),
-        clamp(strength * forward_fraction),
-        0,
-        clamp(strength * up_fraction),
-    )
+    return _translation_percent_command(delta, pose, cfg)
 
 
 class YawAlignedPcmdController:
@@ -1175,35 +1340,32 @@ class YawAlignedPcmdController:
         self.abort_reason: str | None = None
         self.phase = "idle"
 
-    def update(
-        self,
-        cmd: Command,
-        pose: Pose,
-        now: float,
-        *,
-        target_key,
-        yaw_sign: int = 1,
-    ) -> tuple[int, int, int, int]:
+    def _normalized_now(self, now: float) -> float | None:
         try:
-            now = float(now)
-            if not math.isfinite(now):
+            value = float(now)
+            if not math.isfinite(value):
                 raise ValueError("non-finite control timestamp")
         except (TypeError, ValueError):
             self.reset()
-            return 0, 0, 0, 0
+            return None
+        return value
 
-        if (self.previous_timestamp is not None
-                and now - self.previous_timestamp > self.config.max_pose_age_s):
+    def _prepare_target(self, now: float, target_key) -> None:
+        if (
+            self.previous_timestamp is not None
+            and now - self.previous_timestamp > self.config.max_pose_age_s
+        ):
             self.reset()
         if target_key != self.target_key:
             self.reset()
             self.target_key = target_key
             self.alignment_started_at = now
 
-        if cmd.action not in {"FOLLOW", "REJOIN"} or cmd.should_land:
-            self.reset()
-            return 0, 0, 0, 0
-
+    def _alignment_measurement(
+        self,
+        cmd: Command,
+        pose: Pose,
+    ) -> tuple[float, float | None, float] | None:
         try:
             goal = _finite_vec3(cmd.goal, "command goal")
             pose_stamp = float(pose.stamp)
@@ -1215,62 +1377,114 @@ class YawAlignedPcmdController:
             yaw_error = 0.0 if projected_error is None else projected_error
         except (AttributeError, TypeError, ValueError, OverflowError):
             self.reset()
-            return 0, 0, 0, 0
+            return None
+        return pose_stamp, projected_error, yaw_error
 
-        fresh_alignment_sample = (
-            self.previous_timestamp is None
-            or pose_stamp > self.previous_timestamp
-        )
+    def _record_alignment_sample(
+        self,
+        pose_stamp: float,
+        pose_yaw: float,
+    ) -> tuple[bool, float | None]:
+        fresh = self.previous_timestamp is None or pose_stamp > self.previous_timestamp
         yaw_rate_deg_s = None
-        if (fresh_alignment_sample and self.previous_timestamp is not None
-                and self.previous_yaw is not None):
+        if fresh and self.previous_timestamp is not None and self.previous_yaw is not None:
             dt = pose_stamp - self.previous_timestamp
             if dt > 1e-6:
-                yaw_rate_deg_s = math.degrees(
-                    wrap_angle(float(pose.yaw) - self.previous_yaw)
-                ) / dt
-        if fresh_alignment_sample:
+                yaw_rate_deg_s = math.degrees(wrap_angle(float(pose_yaw) - self.previous_yaw)) / dt
+        if fresh:
             self.previous_timestamp = pose_stamp
-            self.previous_yaw = float(pose.yaw)
+            self.previous_yaw = float(pose_yaw)
+        return fresh, yaw_rate_deg_s
+
+    def _alignment_hold_command(
+        self,
+        cmd: Command,
+        pose: Pose,
+        now: float,
+        yaw_error: float,
+        fresh_sample: bool,
+        yaw_rate_deg_s: float | None,
+        yaw_sign: int,
+    ) -> tuple[int, int, int, int]:
+        zero = (0, 0, 0, 0)
+        if self.abort_reason is not None:
+            self.phase = "yaw_alignment_timeout"
+            return zero
+        if self.alignment_started_at is None:
+            self.alignment_started_at = now
+        if now - self.alignment_started_at >= self.config.yaw_alignment_timeout_s:
+            self.abort_reason = (
+                f"waypoint yaw alignment exceeded {self.config.yaw_alignment_timeout_s:.1f}s"
+            )
+            self.phase = "yaw_alignment_timeout"
+            return zero
+
+        stable = (
+            fresh_sample
+            and abs(math.degrees(yaw_error)) <= self.config.yaw_tolerance_deg
+            and yaw_rate_deg_s is not None
+            and abs(yaw_rate_deg_s) <= self.config.yaw_alignment_max_rate_deg_s
+        )
+        self.confirmation_count = self.confirmation_count + 1 if stable else 0
+        if abs(math.degrees(yaw_error)) > self.config.yaw_tolerance_deg:
+            self.phase = "turn"
+            return command_to_body_percent(
+                cmd,
+                pose,
+                config=self.config,
+                yaw_sign=yaw_sign,
+                require_yaw_alignment=True,
+            )
+        if self.confirmation_count >= self.config.yaw_alignment_confirmation_updates:
+            self.aligned_for_translation = True
+            self.phase = "yaw_alignment_confirmed"
+        else:
+            self.phase = "yaw_alignment_hold"
+        return zero
+
+    def update(
+        self,
+        cmd: Command,
+        pose: Pose,
+        now: float,
+        *,
+        target_key,
+        yaw_sign: int = 1,
+    ) -> tuple[int, int, int, int]:
+        normalized_now = self._normalized_now(now)
+        if normalized_now is None:
+            return 0, 0, 0, 0
+        now = normalized_now
+
+        self._prepare_target(now, target_key)
+
+        if cmd.action not in {"FOLLOW", "REJOIN"} or cmd.should_land:
+            self.reset()
+            return 0, 0, 0, 0
+
+        measurement = self._alignment_measurement(cmd, pose)
+        if measurement is None:
+            return 0, 0, 0, 0
+        pose_stamp, projected_error, yaw_error = measurement
+
+        fresh_alignment_sample, yaw_rate_deg_s = self._record_alignment_sample(
+            pose_stamp,
+            float(pose.yaw),
+        )
 
         if projected_error is None:
             self.aligned_for_translation = True
 
         if not self.aligned_for_translation:
-            if self.abort_reason is not None:
-                self.phase = "yaw_alignment_timeout"
-                return 0, 0, 0, 0
-            if self.alignment_started_at is None:
-                self.alignment_started_at = now
-            if now - self.alignment_started_at >= self.config.yaw_alignment_timeout_s:
-                self.abort_reason = (
-                    f"waypoint yaw alignment exceeded "
-                    f"{self.config.yaw_alignment_timeout_s:.1f}s"
-                )
-                self.phase = "yaw_alignment_timeout"
-                return 0, 0, 0, 0
-            stable = (
-                fresh_alignment_sample
-                and abs(math.degrees(yaw_error)) <= self.config.yaw_tolerance_deg
-                and yaw_rate_deg_s is not None
-                and abs(yaw_rate_deg_s) <= self.config.yaw_alignment_max_rate_deg_s
+            return self._alignment_hold_command(
+                cmd,
+                pose,
+                now,
+                yaw_error,
+                fresh_alignment_sample,
+                yaw_rate_deg_s,
+                yaw_sign,
             )
-            self.confirmation_count = self.confirmation_count + 1 if stable else 0
-            if abs(math.degrees(yaw_error)) > self.config.yaw_tolerance_deg:
-                self.phase = "turn"
-                return command_to_body_percent(
-                    cmd,
-                    pose,
-                    config=self.config,
-                    yaw_sign=yaw_sign,
-                    require_yaw_alignment=True,
-                )
-            if self.confirmation_count >= self.config.yaw_alignment_confirmation_updates:
-                self.aligned_for_translation = True
-                self.phase = "yaw_alignment_confirmed"
-            else:
-                self.phase = "yaw_alignment_hold"
-            return 0, 0, 0, 0
 
         self.phase = "translate"
         return command_to_body_percent(
@@ -1284,12 +1498,19 @@ class YawAlignedPcmdController:
 
 if __name__ == "__main__":
     import argparse
+
     ap = argparse.ArgumentParser(description="Smoke-test the route controller without flying.")
-    ap.add_argument("--path", default=str(Path(__file__).resolve().parents[1] / "safezone/flight_path.json"))
-    ap.add_argument("--poles", default=str(Path(__file__).resolve().parents[1] / "safezone/poles.json"))
+    ap.add_argument(
+        "--path", default=str(Path(__file__).resolve().parents[1] / "safezone/flight_path.json")
+    )
+    ap.add_argument(
+        "--poles", default=str(Path(__file__).resolve().parents[1] / "safezone/poles.json")
+    )
     args = ap.parse_args()
     wp = load_waypoints(args.path)
     poles = load_poles(args.poles)
     ctrl = RouteAutoController(wp, poles, config_for_route(args.path))
-    print(f"loaded waypoints={len(wp)} poles={len(poles)} inspect_valid={sorted(i+1 for i in ctrl.inspect_waypoints)}")
+    print(
+        f"loaded waypoints={len(wp)} poles={len(poles)} inspect_valid={sorted(i + 1 for i in ctrl.inspect_waypoints)}"
+    )
     print("This module outputs commands; it does not connect to or fly the drone.")

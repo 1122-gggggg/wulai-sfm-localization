@@ -9,6 +9,7 @@ Examples:
 The monitor is read-only. It emits rate-limited stderr warnings when Linux CPU
 thermal-throttle counters increase or NVIDIA reports thermal slowdown.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -119,7 +120,7 @@ def read_cpu_thermal_zones(root: Path = THERMAL_ROOT) -> dict[str, Any]:
 
 def _numeric_suffix(path: Path) -> tuple[str, int]:
     prefix = path.name.rstrip("0123456789")
-    suffix = path.name[len(prefix):]
+    suffix = path.name[len(prefix) :]
     return prefix, int(suffix) if suffix else -1
 
 
@@ -154,11 +155,13 @@ def read_cpu_frequencies(cpu_root: Path = CPU_ROOT) -> dict[str, Any]:
             except (OSError, ValueError) as exc:
                 values[output_key] = None
                 errors.append(f"{policy_path.name}/{filename}: {exc}")
-        policies.append({
-            "policy": policy_path.name,
-            "available": all(value is not None for value in values.values()),
-            **values,
-        })
+        policies.append(
+            {
+                "policy": policy_path.name,
+                "available": all(value is not None for value in values.values()),
+                **values,
+            }
+        )
 
     complete = [policy for policy in policies if policy["available"]]
     if not policies and not errors:
@@ -167,9 +170,7 @@ def read_cpu_frequencies(cpu_root: Path = CPU_ROOT) -> dict[str, Any]:
         "available": bool(complete),
         "policies": policies,
         "current_mhz": _summary([policy["current_mhz"] for policy in complete]),
-        "scaling_max_mhz": _summary([
-            policy["scaling_max_mhz"] for policy in complete
-        ]),
+        "scaling_max_mhz": _summary([policy["scaling_max_mhz"] for policy in complete]),
         "errors": errors,
     }
 
@@ -204,11 +205,13 @@ def read_cpu_thermal_throttle(cpu_root: Path = CPU_ROOT) -> dict[str, Any]:
             except (OSError, ValueError) as exc:
                 values[filename] = None
                 errors.append(f"{throttle_path.parent.name}/{filename}: {exc}")
-        cpus.append({
-            "cpu": throttle_path.parent.name,
-            "available": all(value is not None for value in values.values()),
-            **values,
-        })
+        cpus.append(
+            {
+                "cpu": throttle_path.parent.name,
+                "available": all(value is not None for value in values.values()),
+                **values,
+            }
+        )
 
     complete = [cpu for cpu in cpus if cpu["available"]]
     if not throttle_paths and not errors:
@@ -227,7 +230,10 @@ def read_cpu_thermal_throttle(cpu_root: Path = CPU_ROOT) -> dict[str, Any]:
 def _optional_float(value: str) -> float | None:
     normalized = value.strip()
     if not normalized or normalized.lower() in {
-        "n/a", "[n/a]", "not supported", "[not supported]",
+        "n/a",
+        "[n/a]",
+        "not supported",
+        "[not supported]",
     }:
         return None
     try:
@@ -240,7 +246,9 @@ def _reason_active(value: str | None) -> bool:
     return isinstance(value, str) and value.strip().lower() == "active"
 
 
-def _parse_nvidia_rows(output: str, fields: tuple[str, ...]) -> tuple[list[dict[str, str]], list[str]]:
+def _parse_nvidia_rows(
+    output: str, fields: tuple[str, ...]
+) -> tuple[list[dict[str, str]], list[str]]:
     parsed: list[dict[str, str]] = []
     errors: list[str] = []
     for row_number, row in enumerate(csv.reader(output.splitlines()), start=1):
@@ -293,13 +301,17 @@ def query_nvidia_smi(
     reason_error: str | None = None
     try:
         rows, parse_errors = _query_nvidia_fields(
-            NVIDIA_FIELDS, timeout_s=timeout_s, runner=runner,
+            NVIDIA_FIELDS,
+            timeout_s=timeout_s,
+            runner=runner,
         )
     except (OSError, subprocess.SubprocessError) as exc:
         reason_error = _command_error(exc)
         try:
             rows, parse_errors = _query_nvidia_fields(
-                NVIDIA_CORE_FIELDS, timeout_s=timeout_s, runner=runner,
+                NVIDIA_CORE_FIELDS,
+                timeout_s=timeout_s,
+                runner=runner,
             )
         except (OSError, subprocess.SubprocessError) as core_exc:
             return {
@@ -315,39 +327,41 @@ def query_nvidia_smi(
     for row in rows:
         reasons = {
             "active_mask": row.get("clocks_event_reasons.active"),
-            "hw_thermal_slowdown": row.get(
-                "clocks_event_reasons.hw_thermal_slowdown"
-            ),
-            "sw_thermal_slowdown": row.get(
-                "clocks_event_reasons.sw_thermal_slowdown"
-            ),
-            "hw_power_brake_slowdown": row.get(
-                "clocks_event_reasons.hw_power_brake_slowdown"
-            ),
+            "hw_thermal_slowdown": row.get("clocks_event_reasons.hw_thermal_slowdown"),
+            "sw_thermal_slowdown": row.get("clocks_event_reasons.sw_thermal_slowdown"),
+            "hw_power_brake_slowdown": row.get("clocks_event_reasons.hw_power_brake_slowdown"),
             "sw_power_cap": row.get("clocks_event_reasons.sw_power_cap"),
         }
-        thermal_active = any(_reason_active(reasons[key]) for key in (
-            "hw_thermal_slowdown", "sw_thermal_slowdown",
-        ))
-        power_limit_active = any(_reason_active(reasons[key]) for key in (
-            "hw_power_brake_slowdown", "sw_power_cap",
-        ))
+        thermal_active = any(
+            _reason_active(reasons[key])
+            for key in (
+                "hw_thermal_slowdown",
+                "sw_thermal_slowdown",
+            )
+        )
+        power_limit_active = any(
+            _reason_active(reasons[key])
+            for key in (
+                "hw_power_brake_slowdown",
+                "sw_power_cap",
+            )
+        )
         index_value = _optional_float(row.get("index", ""))
-        gpus.append({
-            "index": int(index_value) if index_value is not None else None,
-            "name": row.get("name"),
-            "temperature_c": _optional_float(row.get("temperature.gpu", "")),
-            "utilization_percent": _optional_float(row.get("utilization.gpu", "")),
-            "power_w": _optional_float(row.get("power.draw", "")),
-            "graphics_clock_mhz": _optional_float(
-                row.get("clocks.current.graphics", "")
-            ),
-            "memory_clock_mhz": _optional_float(row.get("clocks.current.memory", "")),
-            "pstate": row.get("pstate"),
-            "clock_event_reasons": reasons,
-            "thermal_throttling_active": thermal_active,
-            "power_limit_active": power_limit_active,
-        })
+        gpus.append(
+            {
+                "index": int(index_value) if index_value is not None else None,
+                "name": row.get("name"),
+                "temperature_c": _optional_float(row.get("temperature.gpu", "")),
+                "utilization_percent": _optional_float(row.get("utilization.gpu", "")),
+                "power_w": _optional_float(row.get("power.draw", "")),
+                "graphics_clock_mhz": _optional_float(row.get("clocks.current.graphics", "")),
+                "memory_clock_mhz": _optional_float(row.get("clocks.current.memory", "")),
+                "pstate": row.get("pstate"),
+                "clock_event_reasons": reasons,
+                "thermal_throttling_active": thermal_active,
+                "power_limit_active": power_limit_active,
+            }
+        )
 
     error = "; ".join(parse_errors) if parse_errors else None
     return {
@@ -355,9 +369,7 @@ def query_nvidia_smi(
         "error": error,
         "reason_error": reason_error,
         "gpus": gpus,
-        "thermal_throttling_active": any(
-            gpu["thermal_throttling_active"] for gpu in gpus
-        ),
+        "thermal_throttling_active": any(gpu["thermal_throttling_active"] for gpu in gpus),
         "power_limit_active": any(gpu["power_limit_active"] for gpu in gpus),
     }
 
@@ -409,27 +421,17 @@ def flatten_sample(sample: dict[str, Any]) -> dict[str, Any]:
         "cpu_scaling_max_freq_min_mhz": cpu_frequency["scaling_max_mhz"]["min"],
         "cpu_scaling_max_freq_mean_mhz": cpu_frequency["scaling_max_mhz"]["mean"],
         "cpu_scaling_max_freq_max_mhz": cpu_frequency["scaling_max_mhz"]["max"],
-        "cpu_frequency_policies_json": json.dumps(
-            cpu_frequency["policies"], ensure_ascii=False
-        ),
-        "cpu_frequency_errors_json": json.dumps(
-            cpu_frequency["errors"], ensure_ascii=False
-        ),
+        "cpu_frequency_policies_json": json.dumps(cpu_frequency["policies"], ensure_ascii=False),
+        "cpu_frequency_errors_json": json.dumps(cpu_frequency["errors"], ensure_ascii=False),
         "cpu_throttle_available": cpu_throttle["available"],
         "cpu_core_throttle_count_max": cpu_throttle["max"]["core_throttle_count"],
-        "cpu_core_throttle_total_time_ms_max": cpu_throttle["max"][
-            "core_throttle_total_time_ms"
-        ],
-        "cpu_package_throttle_count_max": cpu_throttle["max"][
-            "package_throttle_count"
-        ],
+        "cpu_core_throttle_total_time_ms_max": cpu_throttle["max"]["core_throttle_total_time_ms"],
+        "cpu_package_throttle_count_max": cpu_throttle["max"]["package_throttle_count"],
         "cpu_package_throttle_total_time_ms_max": cpu_throttle["max"][
             "package_throttle_total_time_ms"
         ],
         "cpu_throttle_cpus_json": json.dumps(cpu_throttle["cpus"], ensure_ascii=False),
-        "cpu_throttle_errors_json": json.dumps(
-            cpu_throttle["errors"], ensure_ascii=False
-        ),
+        "cpu_throttle_errors_json": json.dumps(cpu_throttle["errors"], ensure_ascii=False),
         "nvidia_available": nvidia["available"],
         "nvidia_error": nvidia["error"],
         "nvidia_reason_error": nvidia["reason_error"],
@@ -445,54 +447,66 @@ def flatten_sample(sample: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def thermal_warning_messages(
-    previous: dict[str, Any] | None,
+def _hardware_availability_warnings(
     current: dict[str, Any],
 ) -> list[tuple[str, str]]:
-    """Return stable warning keys and messages without adding hardware reads."""
     warnings: list[tuple[str, str]] = []
     cpu_thermal = current["cpu_thermal"]
     cpu_throttle = current["cpu_thermal_throttle"]
     nvidia = current["nvidia"]
 
     if not cpu_thermal["available"]:
-        warnings.append((
-            "cpu-temperature-unavailable",
-            "CPU temperature telemetry is unavailable",
-        ))
+        warnings.append(
+            (
+                "cpu-temperature-unavailable",
+                "CPU temperature telemetry is unavailable",
+            )
+        )
     if not cpu_throttle["available"]:
-        warnings.append((
-            "cpu-throttle-unavailable",
-            "CPU thermal-throttle counters are unavailable; CPU throttling cannot be confirmed",
-        ))
+        warnings.append(
+            (
+                "cpu-throttle-unavailable",
+                "CPU thermal-throttle counters are unavailable; CPU throttling cannot be confirmed",
+            )
+        )
     if not nvidia["available"]:
-        warnings.append((
-            "nvidia-unavailable",
-            f"NVIDIA telemetry is unavailable: {nvidia.get('error') or 'unknown error'}",
-        ))
+        warnings.append(
+            (
+                "nvidia-unavailable",
+                f"NVIDIA telemetry is unavailable: {nvidia.get('error') or 'unknown error'}",
+            )
+        )
     elif nvidia.get("reason_error"):
-        warnings.append((
-            "nvidia-reasons-unavailable",
-            "NVIDIA slowdown-reason telemetry is unavailable; core GPU metrics were retained",
-        ))
+        warnings.append(
+            (
+                "nvidia-reasons-unavailable",
+                "NVIDIA slowdown-reason telemetry is unavailable; core GPU metrics were retained",
+            )
+        )
     if nvidia.get("thermal_throttling_active"):
-        warnings.append((
-            "gpu-thermal-throttling",
-            "NVIDIA reports active thermal slowdown",
-        ))
+        warnings.append(
+            (
+                "gpu-thermal-throttling",
+                "NVIDIA reports active thermal slowdown",
+            )
+        )
+    return warnings
+
+
+def _cpu_throttle_deltas(
+    previous: dict[str, Any] | None,
+    current: dict[str, Any],
+) -> list[str]:
+    cpu_throttle = current["cpu_thermal_throttle"]
 
     if previous is None or not cpu_throttle["available"]:
-        return warnings
+        return []
     previous_throttle = previous["cpu_thermal_throttle"]
     if not previous_throttle["available"]:
-        return warnings
+        return []
 
-    previous_cpus = {
-        cpu["cpu"]: cpu for cpu in previous_throttle["cpus"] if cpu["available"]
-    }
-    current_cpus = {
-        cpu["cpu"]: cpu for cpu in cpu_throttle["cpus"] if cpu["available"]
-    }
+    previous_cpus = {cpu["cpu"]: cpu for cpu in previous_throttle["cpus"] if cpu["available"]}
+    current_cpus = {cpu["cpu"]: cpu for cpu in cpu_throttle["cpus"] if cpu["available"]}
     deltas: list[str] = []
     for label, field in (
         ("core count", "core_throttle_count"),
@@ -503,17 +517,28 @@ def thermal_warning_messages(
         increases = [
             current_cpus[cpu_name][field] - previous_cpu[field]
             for cpu_name, previous_cpu in previous_cpus.items()
-            if cpu_name in current_cpus
-            and current_cpus[cpu_name][field] > previous_cpu[field]
+            if cpu_name in current_cpus and current_cpus[cpu_name][field] > previous_cpu[field]
         ]
         if increases:
             suffix = " ms" if field.endswith("_time_ms") else ""
             deltas.append(f"{label} +{max(increases)}{suffix}")
+    return deltas
+
+
+def thermal_warning_messages(
+    previous: dict[str, Any] | None,
+    current: dict[str, Any],
+) -> list[tuple[str, str]]:
+    """Return stable warning keys and messages without adding hardware reads."""
+    warnings = _hardware_availability_warnings(current)
+    deltas = _cpu_throttle_deltas(previous, current)
     if deltas:
-        warnings.append((
-            "cpu-thermal-throttling",
-            "CPU thermal-throttle counters increased (" + ", ".join(deltas) + ")",
-        ))
+        warnings.append(
+            (
+                "cpu-thermal-throttling",
+                "CPU thermal-throttle counters increased (" + ", ".join(deltas) + ")",
+            )
+        )
     return warnings
 
 
@@ -535,6 +560,69 @@ class SampleWriter:
         self.handle.flush()
 
 
+def _emit_thermal_warnings(
+    previous_sample: dict[str, Any] | None,
+    sample: dict[str, Any],
+    *,
+    warning_interval_s: float,
+    warning_times: dict[str, float],
+    warning_sink: Callable[[str], None],
+) -> None:
+    if warning_interval_s <= 0:
+        return
+    warning_now = time.monotonic()
+    for warning_key, message in thermal_warning_messages(previous_sample, sample):
+        last_warning = warning_times.get(warning_key)
+        if last_warning is None or warning_now - last_warning >= warning_interval_s:
+            warning_sink(f"WARNING: {message}")
+            warning_times[warning_key] = warning_now
+
+
+def _collect_monitor_samples(
+    writer: SampleWriter,
+    *,
+    started: float,
+    interval_s: float,
+    max_samples: int,
+    stop_event: threading.Event,
+    thermal_root: Path,
+    cpu_root: Path,
+    nvidia_timeout_s: float,
+    warning_interval_s: float,
+    collector: Callable[..., dict[str, Any]],
+    warning_sink: Callable[[str], None],
+) -> int:
+    sample_count = 0
+    previous_sample: dict[str, Any] | None = None
+    warning_times: dict[str, float] = {}
+    try:
+        while not stop_event.is_set():
+            sample = collector(
+                started_monotonic=started,
+                thermal_root=thermal_root,
+                cpu_root=cpu_root,
+                nvidia_timeout_s=nvidia_timeout_s,
+            )
+            writer.write(sample)
+            _emit_thermal_warnings(
+                previous_sample,
+                sample,
+                warning_interval_s=warning_interval_s,
+                warning_times=warning_times,
+                warning_sink=warning_sink,
+            )
+            previous_sample = sample
+            sample_count += 1
+            if max_samples and sample_count >= max_samples:
+                break
+            next_sample_at = started + sample_count * interval_s
+            if stop_event.wait(max(0.0, next_sample_at - time.monotonic())):
+                break
+    except KeyboardInterrupt:
+        stop_event.set()
+    return sample_count
+
+
 def run_monitor(
     *,
     output: Path,
@@ -553,48 +641,27 @@ def run_monitor(
     if not stdout_mode:
         output.parent.mkdir(parents=True, exist_ok=True)
     started = time.monotonic()
-    sample_count = 0
-    previous_sample: dict[str, Any] | None = None
-    warning_times: dict[str, float] = {}
     if warning_sink is None:
         warning_sink = lambda message: print(message, file=sys.stderr)
     handle = sys.stdout if stdout_mode else output.open("w", encoding="utf-8", newline="")
     try:
         writer = SampleWriter(handle, output_format)
-        try:
-            while not stop_event.is_set():
-                sample = collector(
-                    started_monotonic=started,
-                    thermal_root=thermal_root,
-                    cpu_root=cpu_root,
-                    nvidia_timeout_s=nvidia_timeout_s,
-                )
-                writer.write(sample)
-                if warning_interval_s > 0:
-                    warning_now = time.monotonic()
-                    for warning_key, message in thermal_warning_messages(
-                        previous_sample, sample
-                    ):
-                        last_warning = warning_times.get(warning_key)
-                        if (
-                            last_warning is None
-                            or warning_now - last_warning >= warning_interval_s
-                        ):
-                            warning_sink(f"WARNING: {message}")
-                            warning_times[warning_key] = warning_now
-                previous_sample = sample
-                sample_count += 1
-                if max_samples and sample_count >= max_samples:
-                    break
-                next_sample_at = started + sample_count * interval_s
-                if stop_event.wait(max(0.0, next_sample_at - time.monotonic())):
-                    break
-        except KeyboardInterrupt:
-            stop_event.set()
+        return _collect_monitor_samples(
+            writer,
+            started=started,
+            interval_s=interval_s,
+            max_samples=max_samples,
+            stop_event=stop_event,
+            thermal_root=thermal_root,
+            cpu_root=cpu_root,
+            nvidia_timeout_s=nvidia_timeout_s,
+            warning_interval_s=warning_interval_s,
+            collector=collector,
+            warning_sink=warning_sink,
+        )
     finally:
         if not stdout_mode:
             handle.close()
-    return sample_count
 
 
 def _output_format(path: Path, requested: str | None) -> str:

@@ -130,6 +130,79 @@ def test_selftest_remains_profile_free():
     assert args.bundle.endswith("your_site_reloc_map_edm.pt")
 
 
+def test_main_dispatches_profile_free_selftest_without_external_process(monkeypatch):
+    commands = []
+    monkeypatch.setattr(
+        mission_pipeline,
+        "run",
+        lambda command, env: commands.append((command, env)),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["mission_pipeline.py", "--mode", "flight-selftest", "--python", "python-test"],
+    )
+
+    mission_pipeline.main()
+
+    assert len(commands) == 1
+    command, env = commands[0]
+    assert command == [
+        "python-test",
+        str(mission_pipeline.FLIGHT / "path_follow_flight.py"),
+        "--selftest",
+    ]
+    assert "SFM_SITE_PROFILE" not in env
+
+
+def test_main_shadow_readiness_preserves_blocked_output_and_exit(
+    monkeypatch, capsys, tmp_path
+):
+    profile = SimpleNamespace(
+        site_id="alpha",
+        display_name="Alpha",
+        source=tmp_path / "profile.json",
+    )
+    monkeypatch.setattr(
+        mission_pipeline,
+        "resolve_mission_site_assets",
+        lambda args, parser, mode: profile,
+    )
+    monkeypatch.setattr(
+        mission_pipeline,
+        "shadow_readiness_errors",
+        lambda value: ["bad route"],
+    )
+    monkeypatch.setattr(
+        mission_pipeline,
+        "shadow_authorization_blockers",
+        lambda value: ["not approved"],
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "mission_pipeline.py",
+            "--mode",
+            "shadow-readiness",
+            "--site-profile",
+            str(profile.source),
+        ],
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        mission_pipeline.main()
+
+    assert exc.value.code == 1
+    assert capsys.readouterr().out == (
+        f"[mission_pipeline] site='alpha' name='Alpha' profile={profile.source}\n"
+        "[shadow-readiness] package=BLOCKED\n"
+        "  package blocker: bad route\n"
+        "[shadow-readiness] autonomous execution=BLOCKED\n"
+        "  human/field blocker: not approved\n"
+    )
+
+
 def test_safety_commands_use_one_private_default_path(tmp_path):
     runtime = tmp_path / "runtime"
     environment = {"XDG_RUNTIME_DIR": str(runtime)}

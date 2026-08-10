@@ -209,7 +209,7 @@ class EDMRelocMap:
         )
 
 
-def _validate_edm_bundle_schema(bundle: object) -> dict:
+def _validate_edm_bundle_structure(bundle: object) -> tuple[dict, list, dict]:
     if not isinstance(bundle, dict):
         raise ValueError("EDM relocation bundle must be a dictionary")
     required = {"meta", "ref_names", "ref_global", "refs"}
@@ -238,6 +238,10 @@ def _validate_edm_bundle_schema(bundle: object) -> dict:
         raise ValueError("EDM bundle ref_names must be unique non-empty strings")
     if not isinstance(refs, dict):
         raise ValueError("EDM bundle refs must be a dictionary")
+    return meta, names, refs
+
+
+def _validate_edm_bundle_dimensions(meta: dict, names: list) -> tuple[int, int, int, int]:
     dimensions = (
         meta.get("edm_grid_w"),
         meta.get("edm_grid_h"),
@@ -248,7 +252,7 @@ def _validate_edm_bundle_schema(bundle: object) -> dict:
                 for value in dimensions)
             or dimensions != (128, 72, 1024, 576)):
         raise ValueError("EDM bundle grid/input dimensions are incompatible with this runtime")
-    grid_w, grid_h, input_w, input_h = dimensions
+    _, _, input_w, input_h = dimensions
     projected_decoded_bytes = len(names) * input_w * input_h
     if projected_decoded_bytes > EDM_MAX_TOTAL_DECODED_IMAGE_BYTES:
         raise ValueError(
@@ -256,9 +260,15 @@ def _validate_edm_bundle_schema(bundle: object) -> dict:
             f"{projected_decoded_bytes} exceed the load budget "
             f"{EDM_MAX_TOTAL_DECODED_IMAGE_BYTES}"
         )
+    return dimensions
+
+
+def _validate_edm_bundle_refs(refs: dict, names: list) -> None:
     if set(refs) != set(names):
         raise ValueError("EDM bundle refs do not exactly match ref_names")
-    ref_global = bundle["ref_global"]
+
+
+def _validate_edm_global_descriptors(ref_global: object, names: list) -> None:
     if (not isinstance(ref_global, np.ndarray) or ref_global.ndim != 2
             or ref_global.shape != (len(names), EDM_GLOBAL_DESCRIPTOR_DIM)
             or not np.issubdtype(ref_global.dtype, np.floating)
@@ -268,46 +278,82 @@ def _validate_edm_bundle_schema(bundle: object) -> dict:
         raise ValueError(
             "EDM bundle ref_global has an invalid shape, dtype, size, or value"
         )
+
+
+def _validate_edm_reference_entry(name: str, entry: object, cell_count: int) -> tuple[
+    np.ndarray, np.ndarray
+]:
+    if not isinstance(entry, dict) or set(entry) != {"xyz_by_cell", "image_jpg"}:
+        raise ValueError(f"invalid EDM reference entry: {name}")
+    xyz = entry["xyz_by_cell"]
+    image_jpg = entry["image_jpg"]
+    if (not isinstance(xyz, np.ndarray) or xyz.shape != (cell_count, 3)
+            or xyz.dtype != np.float32):
+        raise ValueError(f"invalid EDM xyz_by_cell: {name}")
+    if (not isinstance(image_jpg, np.ndarray) or image_jpg.ndim != 1
+            or image_jpg.dtype != np.uint8 or image_jpg.size == 0):
+        raise ValueError(f"invalid embedded EDM reference image: {name}")
+    return xyz, image_jpg
+
+
+def _validate_edm_reference_budgets(
+    name: str,
+    xyz: np.ndarray,
+    image_jpg: np.ndarray,
+    total_xyz_bytes: int,
+    total_encoded_image_bytes: int,
+) -> tuple[int, int]:
+    total_xyz_bytes += int(xyz.nbytes)
+    if total_xyz_bytes > EDM_MAX_XYZ_BYTES:
+        raise ValueError(
+            "EDM bundle XYZ memory "
+            f"{total_xyz_bytes} exceeds the load budget {EDM_MAX_XYZ_BYTES}"
+        )
+    if image_jpg.nbytes > EDM_MAX_IMAGE_ENCODED_BYTES:
+        raise ValueError(
+            f"EDM reference encoded image is too large at {name}: "
+            f"{image_jpg.nbytes} > {EDM_MAX_IMAGE_ENCODED_BYTES} bytes"
+        )
+    total_encoded_image_bytes += int(image_jpg.nbytes)
+    if total_encoded_image_bytes > EDM_MAX_TOTAL_ENCODED_IMAGE_BYTES:
+        raise ValueError(
+            "EDM bundle encoded image bytes "
+            f"{total_encoded_image_bytes} exceed the load budget "
+            f"{EDM_MAX_TOTAL_ENCODED_IMAGE_BYTES}"
+        )
+    return total_xyz_bytes, total_encoded_image_bytes
+
+
+def _validate_edm_reference_image(name: str, image_jpg: np.ndarray,
+                                  input_w: int, input_h: int) -> None:
+    if _jpeg_dimensions(image_jpg) != (input_w, input_h):
+        raise ValueError(
+            f"EDM reference JPEG dimensions are incompatible at {name}"
+        )
+
+
+def _validate_edm_reference_xyz(name: str, xyz: np.ndarray) -> None:
+    valid_xyz_rows = np.isfinite(xyz).all(axis=1) | np.isnan(xyz).all(axis=1)
+    if np.isinf(xyz).any() or not valid_xyz_rows.all():
+        raise ValueError(f"invalid non-finite EDM anchors: {name}")
+
+
+def _validate_edm_references(names: list, refs: dict,
+                             dimensions: tuple[int, int, int, int]) -> None:
+    grid_w, grid_h, input_w, input_h = dimensions
     cell_count = grid_w * grid_h
     total_xyz_bytes = 0
     total_encoded_image_bytes = 0
     for name in names:
-        entry = refs[name]
-        if not isinstance(entry, dict) or set(entry) != {"xyz_by_cell", "image_jpg"}:
-            raise ValueError(f"invalid EDM reference entry: {name}")
-        xyz = entry["xyz_by_cell"]
-        image_jpg = entry["image_jpg"]
-        if (not isinstance(xyz, np.ndarray) or xyz.shape != (cell_count, 3)
-                or xyz.dtype != np.float32):
-            raise ValueError(f"invalid EDM xyz_by_cell: {name}")
-        if (not isinstance(image_jpg, np.ndarray) or image_jpg.ndim != 1
-                or image_jpg.dtype != np.uint8 or image_jpg.size == 0):
-            raise ValueError(f"invalid embedded EDM reference image: {name}")
-        total_xyz_bytes += int(xyz.nbytes)
-        if total_xyz_bytes > EDM_MAX_XYZ_BYTES:
-            raise ValueError(
-                "EDM bundle XYZ memory "
-                f"{total_xyz_bytes} exceeds the load budget {EDM_MAX_XYZ_BYTES}"
-            )
-        if image_jpg.nbytes > EDM_MAX_IMAGE_ENCODED_BYTES:
-            raise ValueError(
-                f"EDM reference encoded image is too large at {name}: "
-                f"{image_jpg.nbytes} > {EDM_MAX_IMAGE_ENCODED_BYTES} bytes"
-            )
-        total_encoded_image_bytes += int(image_jpg.nbytes)
-        if total_encoded_image_bytes > EDM_MAX_TOTAL_ENCODED_IMAGE_BYTES:
-            raise ValueError(
-                "EDM bundle encoded image bytes "
-                f"{total_encoded_image_bytes} exceed the load budget "
-                f"{EDM_MAX_TOTAL_ENCODED_IMAGE_BYTES}"
-            )
-        if _jpeg_dimensions(image_jpg) != (input_w, input_h):
-            raise ValueError(
-                f"EDM reference JPEG dimensions are incompatible at {name}"
-            )
-        valid_xyz_rows = np.isfinite(xyz).all(axis=1) | np.isnan(xyz).all(axis=1)
-        if np.isinf(xyz).any() or not valid_xyz_rows.all():
-            raise ValueError(f"invalid non-finite EDM anchors: {name}")
+        xyz, image_jpg = _validate_edm_reference_entry(name, refs[name], cell_count)
+        total_xyz_bytes, total_encoded_image_bytes = _validate_edm_reference_budgets(
+            name, xyz, image_jpg, total_xyz_bytes, total_encoded_image_bytes
+        )
+        _validate_edm_reference_image(name, image_jpg, input_w, input_h)
+        _validate_edm_reference_xyz(name, xyz)
+
+
+def _validate_edm_optional_fields(bundle: dict, names: list) -> None:
     for key, shape in (("ref_centers", (len(names), 3)), ("ref_yaws", (len(names),))):
         value = bundle.get(key)
         if value is not None and (
@@ -317,6 +363,9 @@ def _validate_edm_bundle_schema(bundle: object) -> dict:
             or not np.isfinite(value).all()
         ):
             raise ValueError(f"invalid EDM bundle {key}")
+
+
+def _validate_edm_covis(bundle: dict, names: list) -> None:
     covis = bundle.get("covis")
     if covis is not None:
         if not isinstance(covis, dict) or set(covis) != set(names):
@@ -334,6 +383,16 @@ def _validate_edm_bundle_schema(bundle: object) -> dict:
                 raise ValueError(
                     f"EDM bundle covis edge count exceeds {EDM_MAX_COVIS_EDGES}"
                 )
+
+
+def _validate_edm_bundle_schema(bundle: object) -> dict:
+    meta, names, refs = _validate_edm_bundle_structure(bundle)
+    dimensions = _validate_edm_bundle_dimensions(meta, names)
+    _validate_edm_bundle_refs(refs, names)
+    _validate_edm_global_descriptors(bundle["ref_global"], names)
+    _validate_edm_references(names, refs, dimensions)
+    _validate_edm_optional_fields(bundle, names)
+    _validate_edm_covis(bundle, names)
     return bundle
 
 

@@ -58,6 +58,24 @@ def test_live_stream_uses_atomic_no_copy_sample_with_timing():
     assert stream.last_timing == {"frame_callback_enter_mono_ns": 123}
 
 
+def test_live_stream_grabber_failure_keeps_delivery_state_unchanged():
+    class Grabber:
+        @staticmethod
+        def peek_stamp():
+            return time.monotonic()
+
+        @staticmethod
+        def latest_frame_with_timing():
+            raise RuntimeError("decoder unavailable")
+
+    stream = LiveAnafiVideoStream(Grabber())
+
+    assert stream.next_frame() is None
+    assert stream.last_stamp == 0.0
+    assert stream.output_index == 0
+    assert stream.last_timing == {}
+
+
 def test_live_stream_reports_observed_frame_and_pdraw_metadata():
     frame = np.zeros((720, 1280, 3), dtype=np.uint8)
 

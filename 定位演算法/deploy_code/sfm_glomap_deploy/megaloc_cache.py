@@ -47,55 +47,56 @@ def _validate_desc(desc: np.ndarray, ref_names: list[str]) -> np.ndarray:
     return np.ascontiguousarray(result / norms)
 
 
-def load_megaloc_cache(path: str | Path, ref_names: list[str],
-                        meta_path: str | Path | None = None) -> np.ndarray:
-    """Load a named NPZ, or a NPY whose sidecar binds exact names and hashes."""
-    cache = Path(path)
-    _validate_names(ref_names)
-    loaded = np.load(cache, allow_pickle=False)
-    if isinstance(loaded, np.lib.npyio.NpzFile):
-        if cache.suffix.lower() != ".npz":
-            loaded.close()
-            raise ValueError("MegaLoc named archive must use the .npz extension")
-        try:
-            keys = set(loaded.files)
-            portable_keys = {
-                "schema_name", "schema_version", "model", "input_size", "desc", "names",
-            }
-            if keys == portable_keys:
-                if str(np.asarray(loaded["schema_name"]).item()) != "sfm_system.megaloc_cache":
-                    raise ValueError("unsupported MegaLoc NPZ schema")
-                if int(np.asarray(loaded["schema_version"]).item()) != 1:
-                    raise ValueError("unsupported MegaLoc NPZ schema version")
-                if str(np.asarray(loaded["model"]).item()) != "MegaLoc":
-                    raise ValueError("MegaLoc NPZ model metadata mismatch")
-                if int(np.asarray(loaded["input_size"]).item()) <= 0:
-                    raise ValueError("MegaLoc NPZ input_size must be positive")
-            elif keys != {"desc", "names"}:
-                raise ValueError(
-                    "MegaLoc NPZ must use the legacy named schema or "
-                    "sfm_system.megaloc_cache/v1"
-                )
-            desc = np.asarray(loaded["desc"])
-            names_array = np.asarray(loaded["names"])
-        finally:
-            loaded.close()
-        if names_array.ndim != 1:
-            raise ValueError("MegaLoc NPZ names must be one-dimensional")
-        names = [str(name) for name in names_array.tolist()]
-        if names != ref_names:
-            raise ValueError("MegaLoc NPZ ordered reference names do not exactly match the bundle")
-        return _validate_desc(desc, ref_names)
+def _validate_named_npz_metadata(loaded: np.lib.npyio.NpzFile, keys: set[str]) -> None:
+    portable_keys = {
+        "schema_name", "schema_version", "model", "input_size", "desc", "names",
+    }
+    if keys == portable_keys:
+        if str(np.asarray(loaded["schema_name"]).item()) != "sfm_system.megaloc_cache":
+            raise ValueError("unsupported MegaLoc NPZ schema")
+        if int(np.asarray(loaded["schema_version"]).item()) != 1:
+            raise ValueError("unsupported MegaLoc NPZ schema version")
+        if str(np.asarray(loaded["model"]).item()) != "MegaLoc":
+            raise ValueError("MegaLoc NPZ model metadata mismatch")
+        if int(np.asarray(loaded["input_size"]).item()) <= 0:
+            raise ValueError("MegaLoc NPZ input_size must be positive")
+    elif keys != {"desc", "names"}:
+        raise ValueError(
+            "MegaLoc NPZ must use the legacy named schema or "
+            "sfm_system.megaloc_cache/v1"
+        )
 
-    if cache.suffix.lower() != ".npy":
-        raise ValueError("raw MegaLoc NPY content must use the .npy extension")
-    sidecar = Path(meta_path) if meta_path else cache.with_suffix(".json")
+
+def _load_named_npz(cache: Path, loaded: np.lib.npyio.NpzFile,
+                    ref_names: list[str]) -> np.ndarray:
+    if cache.suffix.lower() != ".npz":
+        loaded.close()
+        raise ValueError("MegaLoc named archive must use the .npz extension")
+    try:
+        _validate_named_npz_metadata(loaded, set(loaded.files))
+        desc = np.asarray(loaded["desc"])
+        names_array = np.asarray(loaded["names"])
+    finally:
+        loaded.close()
+    if names_array.ndim != 1:
+        raise ValueError("MegaLoc NPZ names must be one-dimensional")
+    names = [str(name) for name in names_array.tolist()]
+    if names != ref_names:
+        raise ValueError("MegaLoc NPZ ordered reference names do not exactly match the bundle")
+    return _validate_desc(desc, ref_names)
+
+
+def _load_npy_sidecar(sidecar: Path) -> dict:
     if not sidecar.is_file():
         raise ValueError(f"MegaLoc NPY requires a binding sidecar: {sidecar}")
     try:
         metadata = json.loads(sidecar.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise ValueError(f"invalid MegaLoc NPY sidecar {sidecar}: {exc}") from exc
+    return metadata
+
+
+def _validate_npy_sidecar(metadata: object, sidecar: Path, ref_names: list[str]) -> dict:
     required = {"schema", "ref_names", "shape", "cache_sha256", "names_sha256"}
     if not isinstance(metadata, dict) or not required.issubset(metadata):
         raise ValueError(f"MegaLoc NPY sidecar is missing required fields: {sidecar}")
@@ -106,6 +107,16 @@ def load_megaloc_cache(path: str | Path, ref_names: list[str],
     expected_names_hash = canonical_names_sha256(ref_names)
     if metadata["names_sha256"] != expected_names_hash:
         raise ValueError("MegaLoc NPY sidecar canonical names SHA-256 mismatch")
+    return metadata
+
+
+def _load_bound_npy(cache: Path, loaded: np.ndarray, ref_names: list[str],
+                    meta_path: str | Path | None) -> np.ndarray:
+    if cache.suffix.lower() != ".npy":
+        raise ValueError("raw MegaLoc NPY content must use the .npy extension")
+    sidecar = Path(meta_path) if meta_path else cache.with_suffix(".json")
+    metadata = _load_npy_sidecar(sidecar)
+    _validate_npy_sidecar(metadata, sidecar, ref_names)
     actual_cache_hash = _file_sha256(cache)
     if metadata["cache_sha256"] != actual_cache_hash:
         raise ValueError(
@@ -116,6 +127,17 @@ def load_megaloc_cache(path: str | Path, ref_names: list[str],
     if metadata["shape"] != list(desc.shape):
         raise ValueError("MegaLoc NPY sidecar shape does not match the cache")
     return _validate_desc(desc, ref_names)
+
+
+def load_megaloc_cache(path: str | Path, ref_names: list[str],
+                        meta_path: str | Path | None = None) -> np.ndarray:
+    """Load a named NPZ, or a NPY whose sidecar binds exact names and hashes."""
+    cache = Path(path)
+    _validate_names(ref_names)
+    loaded = np.load(cache, allow_pickle=False)
+    if isinstance(loaded, np.lib.npyio.NpzFile):
+        return _load_named_npz(cache, loaded, ref_names)
+    return _load_bound_npy(cache, loaded, ref_names, meta_path)
 
 
 def write_megaloc_cache(path: str | Path, desc: np.ndarray, ref_names: list[str],

@@ -136,12 +136,12 @@ def test_window_sizes_come_from_production_constants_and_selftest_has_no_old_min
     assert operator.geometry().split("+", 1)[0] == _window_geometry(app.UI_STANDARD_SIZE)
     assert tuple(map(int, operator.minsize())) == app.UI_MIN_SIZE
     init_source = inspect.getsource(app.OperatorApp.__init__)
-    main_source = inspect.getsource(app.main)
+    launch_input_source = inspect.getsource(app._prepare_operator_launch_inputs)
     assert any(name in init_source for name in standard_names)
     assert any(name in init_source for name in minimum_names)
-    assert any(name in main_source for name in standard_names)
-    assert any(name in main_source for name in minimum_names)
-    assert f"{980}x{640}" not in main_source
+    assert any(name in launch_input_source for name in standard_names)
+    assert any(name in launch_input_source for name in minimum_names)
+    assert f"{980}x{640}" not in launch_input_source
 
 
 def test_dedup_string_var_suppresses_only_no_op_writes(operator) -> None:

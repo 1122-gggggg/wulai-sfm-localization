@@ -207,6 +207,66 @@ def _save(waypoints, closed):
           f"{len(allp)} pts -> {PATH_PLY}")
 
 
+def _path_edit_event(operator, context, event):
+    if event.type == "LEFTMOUSE" and event.value == "PRESS":
+        xy = operator._pick_xy(context, event)
+        if xy is None:
+            operator.report({"WARNING"}, "could not resolve a point under the cursor")
+            return {"RUNNING_MODAL"}
+        z = operator._last_alt()                     # inherit previous altitude
+        operator._wp.append([xy[0], xy[1], z])
+        _draw(operator._wp, operator._closed)
+        operator._status(context)
+        return {"RUNNING_MODAL"}
+
+    if event.type in {"WHEELUPMOUSE", "WHEELDOWNMOUSE"} and event.value == "PRESS" \
+            and operator._wp:
+        operator._wp[-1][2] += ALT_STEP if event.type == "WHEELUPMOUSE" else -ALT_STEP
+        _draw(operator._wp, operator._closed)
+        operator._status(context)
+        return {"RUNNING_MODAL"}
+
+    if event.type == "A" and event.value == "PRESS" and operator._wp:
+        z = operator._wp[-1][2]
+        for p in operator._wp:
+            p[2] = z
+        _draw(operator._wp, operator._closed)
+        operator._status(context)
+        return {"RUNNING_MODAL"}
+
+    if event.type == "C" and event.value == "PRESS":
+        operator._closed = not operator._closed
+        _draw(operator._wp, operator._closed)
+        operator._status(context)
+        return {"RUNNING_MODAL"}
+
+    if event.type == "Z" and event.value == "PRESS" and operator._wp:
+        operator._wp.pop()
+        _draw(operator._wp, operator._closed)
+        operator._status(context)
+        return {"RUNNING_MODAL"}
+
+    if event.type == "S" and event.value == "PRESS":
+        _save(operator._wp, operator._closed)
+        operator.report({"INFO"}, f"saved {len(operator._wp)} waypoints")
+        return {"RUNNING_MODAL"}
+    return None
+
+
+def _path_finish_event(operator, context, event):
+    if event.type in {"RET", "NUMPAD_ENTER", "ESC"} and event.value == "PRESS":
+        _save(operator._wp, operator._closed)
+        context.area.header_text_set(None)
+        operator.report({"INFO"}, f"done, {len(operator._wp)} waypoints saved")
+        return {"FINISHED"}
+
+    if event.type in {"MIDDLEMOUSE", "TRACKPADPAN", "TRACKPADZOOM",
+                      "NUMPAD_1", "NUMPAD_2", "NUMPAD_3", "NUMPAD_4", "NUMPAD_5",
+                      "NUMPAD_6", "NUMPAD_7", "NUMPAD_8", "NUMPAD_9"}:
+        return {"PASS_THROUGH"}
+    return None
+
+
 # ---------------------------------------------------------------- modal operator
 class PATH_OT_draw(bpy.types.Operator):
     bl_idname = "view3d.draw_flight_path"
@@ -293,58 +353,12 @@ class PATH_OT_draw(bpy.types.Operator):
         if event.alt:                                    # Alt+wheel zoom etc.
             return {"PASS_THROUGH"}
 
-        if event.type == "LEFTMOUSE" and event.value == "PRESS":
-            xy = self._pick_xy(context, event)
-            if xy is None:
-                self.report({"WARNING"}, "could not resolve a point under the cursor")
-                return {"RUNNING_MODAL"}
-            z = self._last_alt()                     # inherit previous altitude
-            self._wp.append([xy[0], xy[1], z])
-            _draw(self._wp, self._closed)
-            self._status(context)
-            return {"RUNNING_MODAL"}
-
-        if event.type in {"WHEELUPMOUSE", "WHEELDOWNMOUSE"} and event.value == "PRESS" and self._wp:
-            self._wp[-1][2] += ALT_STEP if event.type == "WHEELUPMOUSE" else -ALT_STEP
-            _draw(self._wp, self._closed)
-            self._status(context)
-            return {"RUNNING_MODAL"}
-
-        if event.type == "A" and event.value == "PRESS" and self._wp:
-            z = self._wp[-1][2]
-            for p in self._wp:
-                p[2] = z
-            _draw(self._wp, self._closed)
-            self._status(context)
-            return {"RUNNING_MODAL"}
-
-        if event.type == "C" and event.value == "PRESS":
-            self._closed = not self._closed
-            _draw(self._wp, self._closed)
-            self._status(context)
-            return {"RUNNING_MODAL"}
-
-        if event.type == "Z" and event.value == "PRESS" and self._wp:
-            self._wp.pop()
-            _draw(self._wp, self._closed)
-            self._status(context)
-            return {"RUNNING_MODAL"}
-
-        if event.type == "S" and event.value == "PRESS":
-            _save(self._wp, self._closed)
-            self.report({"INFO"}, f"saved {len(self._wp)} waypoints")
-            return {"RUNNING_MODAL"}
-
-        if event.type in {"RET", "NUMPAD_ENTER", "ESC"} and event.value == "PRESS":
-            _save(self._wp, self._closed)
-            context.area.header_text_set(None)
-            self.report({"INFO"}, f"done, {len(self._wp)} waypoints saved")
-            return {"FINISHED"}
-
-        if event.type in {"MIDDLEMOUSE", "TRACKPADPAN", "TRACKPADZOOM",
-                          "NUMPAD_1", "NUMPAD_2", "NUMPAD_3", "NUMPAD_4", "NUMPAD_5",
-                          "NUMPAD_6", "NUMPAD_7", "NUMPAD_8", "NUMPAD_9"}:
-            return {"PASS_THROUGH"}
+        result = _path_edit_event(self, context, event)
+        if result is not None:
+            return result
+        result = _path_finish_event(self, context, event)
+        if result is not None:
+            return result
         return {"RUNNING_MODAL"}
 
 
@@ -353,6 +367,26 @@ _addon_keymaps = []
 
 def _menu_func(self, context):
     self.layout.operator(PATH_OT_draw.bl_idname, text="Draw Flight Path", icon="CURVE_PATH")
+
+
+def _register_path_keymaps(wm):
+    for kc in (wm.keyconfigs.addon, wm.keyconfigs.user, wm.keyconfigs.active):
+        if not kc:
+            continue
+        km = kc.keymaps.get("3D View") or kc.keymaps.new(name="3D View", space_type="VIEW_3D")
+        if not any(k.idname == PATH_OT_draw.bl_idname for k in km.keymap_items):
+            kmi = km.keymap_items.new(PATH_OT_draw.bl_idname, "P", "PRESS", ctrl=True, shift=True)
+            _addon_keymaps.append((km, kmi))
+        # LEFT-mouse navigation so plain LMB stays free for drawing:
+        #   Shift+LMB drag = pan (view3d.move), Alt+LMB drag = orbit (view3d.rotate).
+        # Remove any prior copies first so reloading register() stays idempotent.
+        for k in list(km.keymap_items):
+            if k.type == "LEFTMOUSE" and k.idname in ("view3d.move", "view3d.rotate") \
+                    and (k.shift or k.alt):
+                km.keymap_items.remove(k)
+        _addon_keymaps.append((km, km.keymap_items.new("view3d.move", "LEFTMOUSE", "PRESS", shift=True)))
+        _addon_keymaps.append((km, km.keymap_items.new("view3d.rotate", "LEFTMOUSE", "PRESS", alt=True)))
+        break
 
 
 def register():
@@ -377,24 +411,7 @@ def register():
         pass
     mt.append(_menu_func)
 
-    wm = bpy.context.window_manager
-    for kc in (wm.keyconfigs.addon, wm.keyconfigs.user, wm.keyconfigs.active):
-        if not kc:
-            continue
-        km = kc.keymaps.get("3D View") or kc.keymaps.new(name="3D View", space_type="VIEW_3D")
-        if not any(k.idname == PATH_OT_draw.bl_idname for k in km.keymap_items):
-            kmi = km.keymap_items.new(PATH_OT_draw.bl_idname, "P", "PRESS", ctrl=True, shift=True)
-            _addon_keymaps.append((km, kmi))
-        # LEFT-mouse navigation so plain LMB stays free for drawing:
-        #   Shift+LMB drag = pan (view3d.move), Alt+LMB drag = orbit (view3d.rotate).
-        # Remove any prior copies first so reloading register() stays idempotent.
-        for k in list(km.keymap_items):
-            if k.type == "LEFTMOUSE" and k.idname in ("view3d.move", "view3d.rotate") \
-                    and (k.shift or k.alt):
-                km.keymap_items.remove(k)
-        _addon_keymaps.append((km, km.keymap_items.new("view3d.move", "LEFTMOUSE", "PRESS", shift=True)))
-        _addon_keymaps.append((km, km.keymap_items.new("view3d.rotate", "LEFTMOUSE", "PRESS", alt=True)))
-        break
+    _register_path_keymaps(bpy.context.window_manager)
     print(f"[path] registered (default cruise alt={DEFAULT_ALT}). Open 3 ways: "
           "3D viewport 'View' menu > 'Draw Flight Path'  |  F3 search 'Draw Flight Path'  |  "
           "Ctrl+Shift+P")
