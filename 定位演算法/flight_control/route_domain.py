@@ -15,7 +15,7 @@ import json
 import math
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Protocol
+from typing import Any, Iterable, NoReturn, Protocol
 
 import numpy as np
 
@@ -23,14 +23,14 @@ import numpy as np
 ROUTE_SCHEMA = "sfm-flight-route/v1"
 
 
-def reject_json_constant(value: str):
+def reject_json_constant(value: str) -> NoReturn:
     raise ValueError(f"non-finite JSON number is not allowed: {value}")
 
 
-def finite_vec3(value, label: str) -> np.ndarray:
+def finite_vec3(value: object, label: str) -> np.ndarray:
     """Return a finite numeric 3-vector or raise a contract error."""
     try:
-        out = np.asarray(value, dtype=float)
+        out: np.ndarray = np.asarray(value, dtype=float)
     except (TypeError, ValueError) as exc:
         raise ValueError(f"{label} must be a numeric 3-vector") from exc
     if out.shape != (3,) or not np.isfinite(out).all():
@@ -47,7 +47,10 @@ def _validated_waypoints(waypoints: object) -> tuple[tuple[float, float, float],
     for index, (start, end) in enumerate(zip(checked[:-1], checked[1:])):
         if float(np.linalg.norm(end - start)) <= 1e-9:
             raise ValueError(f"route segment {index}->{index + 1} has zero length")
-    return tuple(tuple(float(value) for value in point) for point in checked)
+    return tuple(
+        (float(point[0]), float(point[1]), float(point[2]))
+        for point in checked
+    )
 
 
 class MapFrameLike(Protocol):
@@ -57,10 +60,17 @@ class MapFrameLike(Protocol):
     this structural avoids a route-domain/controller import cycle.
     """
 
-    east: np.ndarray
-    north: np.ndarray
-    up: np.ndarray
-    source: str
+    @property
+    def east(self) -> np.ndarray: ...
+
+    @property
+    def north(self) -> np.ndarray: ...
+
+    @property
+    def up(self) -> np.ndarray: ...
+
+    @property
+    def source(self) -> str: ...
 
 
 @dataclass(frozen=True)
@@ -84,11 +94,12 @@ def aligned_to_glomap(
 ) -> np.ndarray:
     """Convert an aligned (east, north, up) point to raw GLOMAP."""
     value = finite_vec3(point, "aligned coordinate")
-    return (
+    result: np.ndarray = (
         float(value[0]) * np.asarray(frame.east, dtype=float)
         + float(value[1]) * np.asarray(frame.north, dtype=float)
         + float(value[2]) * np.asarray(frame.up, dtype=float)
     )
+    return result
 
 
 def _read_json_bytes(payload: bytes, source: str) -> object:
@@ -108,7 +119,7 @@ def _strict_bool(value: object, key: str, default: bool = False) -> bool:
     return value
 
 
-def _optional_text(data: dict, key: str) -> str | None:
+def _optional_text(data: dict[str, Any], key: str) -> str | None:
     value = data.get(key)
     if value is None:
         return None
@@ -202,6 +213,7 @@ class RouteDocument:
                         "align_source='legacy' or 'measured' (or export frame='glomap')"
                     )
                 align_source = "legacy"
+            authoring_frame: MapFrameLike
             if align_source == "legacy":
                 authoring_frame = LEGACY_MAP_FRAME
             elif align_source == "measured":
@@ -213,9 +225,16 @@ class RouteDocument:
                 authoring_frame = map_frame
             else:
                 raise ValueError(f"unknown route align_source: {align_source!r}")
-            controller_points = tuple(
-                tuple(float(value) for value in aligned_to_glomap(point, authoring_frame))
-                for point in source_points
+            controller_points: tuple[tuple[float, float, float], ...] = tuple(
+                (
+                    float(value[0]),
+                    float(value[1]),
+                    float(value[2]),
+                )
+                for value in (
+                    aligned_to_glomap(point, authoring_frame)
+                    for point in source_points
+                )
             )
         else:
             controller_points = source_points
@@ -245,11 +264,11 @@ class RouteDocument:
         )
 
     @classmethod
-    def from_bytes(cls, payload: bytes, **kwargs) -> "RouteDocument":
+    def from_bytes(cls, payload: bytes, **kwargs: Any) -> "RouteDocument":
         return cls.from_data(_read_json_bytes(payload, "route bytes"), **kwargs)
 
     @classmethod
-    def from_path(cls, path_json: str | Path, **kwargs) -> "RouteDocument":
+    def from_path(cls, path_json: str | Path, **kwargs: Any) -> "RouteDocument":
         path = Path(path_json)
         try:
             payload = path.read_bytes()
@@ -375,7 +394,10 @@ def capture_mission_route_snapshot(
         sha256=digest,
         site_id=site_id,
         coordinate_frame_id=coordinate_frame_id,
-        waypoints=tuple(tuple(point) for point in route.controller_points),
+        waypoints=tuple(
+            (point[0], point[1], point[2])
+            for point in route.controller_points
+        ),
         arrive_radius_map_units=route.arrive_radius_map_units,
     )
 

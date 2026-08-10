@@ -36,11 +36,11 @@ Ruff、format、bounded mypy、maintainability budget、第一方 security rules
 audit/SBOM、runtime ownership、workspace audit、profile asset validation、CUDA/model smoke、
 來源 manifest、portable manifest、clean offline install 與 simulated UI pose smoke。
 
-本次整合修正後的開發階段結果：root `1652 passed, 1 skipped`，Parrot simulator
+本次整合修正後的開發階段結果：root `1664 passed, 1 skipped`，Parrot simulator
 `88 passed`；Ruff、format、bounded mypy、maintainability、security/SBOM、module ownership、
 workspace、profile assets、flight selftest、dependency check、CUDA production smoke、EDM/MegaLoc
-offline inference 與 simulated UI valid-pose smoke 均通過。正式 release receipt 必須在 clean
-commit 與最終 portable package 建立後重跑，避免把 dirty-tree 結果當成發行證據。
+offline inference 與 simulated UI valid-pose smoke 均通過。正式 release evidence 只以 clean
+commit 與最終 portable package 建立後重跑的 receipt 為準，不把 dirty-tree 結果當成發行證據。
 
 ## Critical / High findings 與處置
 
@@ -81,6 +81,7 @@ commit 與最終 portable package 建立後重跑，避免把 dirty-tree 結果�
 | portable wheelhouse | runtime package 強制攜帶 test/quality locks | live-minimal 只解析 runtime lock；仍保留 exact hashes |
 | portable rebuild/smoke | runtime-only wheelhouse 無法再匯出，且最小包漏掉 UI smoke 的 preflight/core/video | 接受經完整驗證的 runtime-only wheelhouse 作為重建來源；將 preflight、控制核心與 manifest 內的短片 fixture 納入最小包契約 |
 | release environment isolation | validation 全域 `SFM_WORKSPACE_ROOT` 汙染 tmp profile tests 與 portable smoke | root pytest/portable clean-install 移除來源 workspace 綁定；smoke launcher 同時明確綁定自身 package root |
+| validation receipt publication | 可預測 `.json.tmp` 若是外接媒體上的 symlink，原子發布前可能覆寫非預期檔案 | 改用同目錄排他建立的隨機暫存檔、flush/fsync 後 atomic replace，並加入 victim-survival regression |
 | portable scope | 舊 package 含 authoring、測試與多餘場域 | live-minimal 僅含 operator、所選 river bundle、必要定位／飛控與安裝工具 |
 | portable smoke cleanup | 被 manifest 排除的 `outputs` symlink 可能讓 cleanup 指向包外 | 任何寫入／清理前拒絕 symlinked outputs/simulator/venv path，加入 victim-survival regression |
 | portable site marker | marker 可漏 profile 宣告 asset 或 reference-index sibling 仍自洽 | 交叉驗證 profiles、files、實際 profile JSON 與 index siblings |
@@ -179,7 +180,7 @@ Reproducibility 6%；Type Safety 5%；Configuration、Documentation 各 4%；其
 
 | Rank | File | Max / count | 建議邊界 |
 |---:|---|---:|---|
-| 1 | `定位演算法/flight_control/path_follow_flight.py` | 86 / 7 | state transition、landing、gate evaluation |
+| 1 | `定位演算法/flight_control/path_follow_flight.py` | 85 / 7 | state transition、landing、gate evaluation |
 | 2 | `控制介面程式/operator_interface/live_localizer_worker.py` | 60 / 1 | process lifecycle、result admission |
 | 3 | `控制介面程式/operator_interface/olympe_live_backend.py` | 50 / 16 | command adapter、telemetry、authority |
 | 4 | `控制介面程式/operator_interface/production_xfeat_tracker.py` | 49 / 5 | factory、retrieval、pose conversion |
@@ -211,8 +212,10 @@ Reproducibility 6%；Type Safety 5%；Configuration、Documentation 各 4%；其
 
 ### 可以立即、低風險地持續修
 
-- 逐個把 `path_follow_flight.py` 的 gate/landing transition 移到純函式並補 transition table tests。
-- 擴大 mypy 到 `route_domain.py`、`localization_contract.py`、`operator_shutdown.py`。
+- localization uncertainty/recovery 已移到純函式並有 transition table；下一步只拆 landing
+  transition，不一次重寫 `run_loop`。
+- bounded mypy 已從 5 個擴至 9 個檔案，納管 `route_domain.py`、
+  `localization_contract.py`、`operator_shutdown.py` 與新的純 transition module；後續仍逐模組擴大。
 - 將 validation receipt 與現場測試紀錄保留在外部只寫入媒體，避免只存同一台主機。
 
 ### 建議逐步重構

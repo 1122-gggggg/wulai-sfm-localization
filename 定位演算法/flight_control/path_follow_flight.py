@@ -84,6 +84,10 @@ if str(FLIGHT_ROOT) not in sys.path:
 if DEPLOY_ROOT.is_dir() and str(DEPLOY_ROOT) not in sys.path:
     sys.path.append(str(DEPLOY_ROOT))
 
+from localization_uncertainty import (  # noqa: E402
+    LocalizationState,
+    decide_localization_transition,
+)
 from safety_command import (  # noqa: E402
     default_safety_file as _default_safety_file,  # noqa: F401 - compatibility API
     prepare_safety_file as _prepare_safety_file,
@@ -1633,9 +1637,7 @@ def run_loop(hooks: LoopHooks, ctrl, waypoints, yaw_sign: int = 1, verbose: bool
             pcmd_controller.reset()
     period = 1.0 / CTRL_HZ
     last_good = None
-    uncertain_since = None
-    uncertain_land_after = None
-    recovery_good_fixes = 0
+    uncertainty = LocalizationState()
     stream_lost_since = None
     last_stream_warn = 0.0
     pending_jump = None
@@ -1765,8 +1767,9 @@ def run_loop(hooks: LoopHooks, ctrl, waypoints, yaw_sign: int = 1, verbose: bool
             reset_pcmd_controller()
             _sent, _why, actual = send_command((0, 0, 0, 0))
             stream_lost_since = stream_lost_since or now
-            uncertain_since = None
-            uncertain_land_after = None
+            uncertainty = LocalizationState(
+                recovery_good_fixes=uncertainty.recovery_good_fixes
+            )
             rec["stream_ok"] = False
             if now - stream_lost_since >= STREAM_LOST_LAND_S:
                 reason = (f"stream lost {now - stream_lost_since:.1f}s "
@@ -1839,8 +1842,9 @@ def run_loop(hooks: LoopHooks, ctrl, waypoints, yaw_sign: int = 1, verbose: bool
             reset_pcmd_controller()
             _sent, _why, actual = send_command((0, 0, 0, 0))
             stream_lost_since = stream_lost_since or now
-            uncertain_since = None
-            uncertain_land_after = None
+            uncertainty = LocalizationState(
+                recovery_good_fixes=uncertainty.recovery_good_fixes
+            )
             rec["stream_ok"] = False
             emit(rec, actual, True,
                  "stream became stale/lost during inference -> hover")
@@ -1910,20 +1914,20 @@ def run_loop(hooks: LoopHooks, ctrl, waypoints, yaw_sign: int = 1, verbose: bool
             (enforce_weak_pose_gate and hooks.pose_is_weak is not None
              and hooks.pose_is_weak())
             or (hooks.pose_confidence is not None and hooks.pose_confidence() < LOW_CONF_INLIERS)))
-        if low_conf or not fresh:
+        transition = decide_localization_transition(
+            uncertainty,
+            now=now,
+            fresh=fresh,
+            low_confidence=low_conf,
+            weak_hover_land_s=WEAK_HOVER_LAND_S,
+            lost_land_s=LOST_LAND_S,
+            recovery_good_fixes_required=RECOVERY_GOOD_FIXES,
+        )
+        uncertainty = transition.state
+        if transition.action in {"uncertain_hover", "land"}:
             reset_pcmd_controller()
-            recovery_good_fixes = 0
             _sent, _why, actual = send_command((0, 0, 0, 0))
-            current_limit = WEAK_HOVER_LAND_S if low_conf else LOST_LAND_S
-            if uncertain_since is None:
-                uncertain_since = now
-                uncertain_land_after = current_limit
-            else:
-                # WEAK and LOST are one uninterrupted uncertainty episode. If
-                # they alternate, retain the shortest encountered fail-safe.
-                uncertain_land_after = min(float(uncertain_land_after), current_limit)
-            waited = now - uncertain_since
-            land_after = float(uncertain_land_after)
+            waited = float(transition.waited_s)
             if hooks.force_relocalize is not None:
                 hooks.force_relocalize()                  # ask the tracker to run MegaLoc
             emit(rec, actual, True,
@@ -1936,7 +1940,7 @@ def run_loop(hooks: LoopHooks, ctrl, waypoints, yaw_sign: int = 1, verbose: bool
                 manual_requested = True
                 print("[safety] LOW_CONF/LOST: MegaLoc could not relocalize in "
                       f"{waited:.1f}s -> switching to MANUAL (pilot takeover)", flush=True)
-            elif waited >= land_after:
+            elif transition.action == "land":
                 reason = ("localization lost" if not fresh else "low confidence") + " -> land"
                 break
             elif verbose and steps % 10 == 0:
@@ -1947,15 +1951,14 @@ def run_loop(hooks: LoopHooks, ctrl, waypoints, yaw_sign: int = 1, verbose: bool
                 time.sleep(period - dt)
             continue
         else:
-            if uncertain_since is not None and recovery_good_fixes + 1 < RECOVERY_GOOD_FIXES:
+            if transition.action == "recovery_hover":
                 reset_pcmd_controller()
-                recovery_good_fixes += 1
                 _sent, _why, actual = send_command((0, 0, 0, 0))
                 emit(
                     rec,
                     actual,
                     True,
-                    f"localization recovery confirmation {recovery_good_fixes}/"
+                    f"localization recovery confirmation {uncertainty.recovery_good_fixes}/"
                     f"{RECOVERY_GOOD_FIXES} -> hover",
                 )
                 # Do not force another global pass: the next frame must prove
@@ -1965,9 +1968,7 @@ def run_loop(hooks: LoopHooks, ctrl, waypoints, yaw_sign: int = 1, verbose: bool
                 if dt < period:
                     time.sleep(period - dt)
                 continue
-            uncertain_since = None
-            uncertain_land_after = None
-            recovery_good_fixes = 0
+
             manual_requested = False
             heading.update(ploc.yaw, oyaw)
             hdg = heading.heading(oyaw)

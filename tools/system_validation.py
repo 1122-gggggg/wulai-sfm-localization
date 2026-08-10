@@ -11,6 +11,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
@@ -127,6 +128,7 @@ RELEASE_FILES = (
     "定位演算法/deploy_code/sfm_glomap_deploy/localizer_registry.py",
     "定位演算法/deploy_code/sfm_glomap_deploy/production_localizer_factory.py",
     "定位演算法/deploy_code/sfm_glomap_deploy/reference_index.py",
+    "定位演算法/flight_control/localization_uncertainty.py",
     "定位演算法/flight_control/path_follow_flight.py",
     "定位演算法/flight_control/route_domain.py",
     "定位演算法/flight_control/real_path_follow_controller.py",
@@ -679,12 +681,21 @@ def _steps(
 
 
 def _write_receipt(path: Path, payload: dict[str, object]) -> None:
-    temp = path.with_suffix(".json.tmp")
-    temp.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
+    """Atomically publish a receipt without following a predictable temp path."""
+    fd, temp_name = tempfile.mkstemp(
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        suffix=".tmp",
     )
-    os.replace(temp, path)
+    temp = Path(temp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            stream.write(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temp, path)
+    finally:
+        temp.unlink(missing_ok=True)
 
 
 def main() -> int:

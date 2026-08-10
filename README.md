@@ -286,6 +286,9 @@ held frame 改走 LOST recovery（提高 local top-k + 每個 episode 一次 Meg
 
 # 選配：完整解碼 P119，並明確接受已核准的 2935/2934 已知例外
 ./驗證系統.sh --p119-integrity --accept-p119-known-incomplete
+
+# 選配：將 receipt 與逐步 log 直接寫到已掛載的外接檔案系統
+./驗證系統.sh --receipt-dir /media/VALIDATION_RECEIPTS
 ```
 
 入口使用主 Python 3.10 與獨立 Python 3.11 `parrot_stimulate` 環境，執行
@@ -295,6 +298,9 @@ CI 與 `tools/test_clean_install.sh` 由 `requirements-test-lock.txt` 提供固�
 pytest-timeout、coverage 與 pytest-cov；測試使用每測試 300 秒上限並收集 coverage，
 目前對第一方核心模組設 `50.00%` 最低門檻。validation receipt 會彙整 pytest
 各 step 的 conditional skip，未執行的測試不會被當成通過。
+`--receipt-dir` 的目標必須允許建立檔案與原子 rename；驗證器使用排他建立的隨機
+暫存檔，不會跟隨可預測的 `.json.tmp` symlink。真正的 WORM 媒體應在 receipt 完成後
+再封存，因為執行期間會持續更新 `running` 狀態與各 step 結果。
 
 `parrot_stimulate` 明確要求 Python 3.11，因此使用自己的 `.venv` 驗證，
 不由根目錄的 Python 3.10 pytest 跨版本收集。實際通過數以當次輸出為準。

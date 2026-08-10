@@ -18,6 +18,23 @@ def _load_validation_module():
     return module
 
 
+def test_receipt_write_does_not_follow_predictable_temp_symlink(
+    tmp_path: Path,
+) -> None:
+    module = _load_validation_module()
+    receipt = tmp_path / "validation.json"
+    sentinel = tmp_path / "sentinel.txt"
+    sentinel.write_text("do not overwrite", encoding="utf-8")
+    legacy_temp = receipt.with_suffix(".json.tmp")
+    legacy_temp.symlink_to(sentinel)
+
+    module._write_receipt(receipt, {"status": "passed"})
+
+    assert sentinel.read_text(encoding="utf-8") == "do not overwrite"
+    assert json.loads(receipt.read_text(encoding="utf-8")) == {"status": "passed"}
+    assert legacy_temp.is_symlink()
+
+
 def test_release_receipt_tracks_operator_runtime_seams() -> None:
     module = _load_validation_module()
     required = {
@@ -34,6 +51,7 @@ def test_release_receipt_tracks_operator_runtime_seams() -> None:
         "控制介面程式/operator_interface/operator_tick.py",
         "控制介面程式/operator_interface/site_assets_panel.py",
         "控制介面程式/site_profiles/river_site_edm.json",
+        "定位演算法/flight_control/localization_uncertainty.py",
         "定位演算法/flight_control/real_path_follow_controller.py",
     }
 

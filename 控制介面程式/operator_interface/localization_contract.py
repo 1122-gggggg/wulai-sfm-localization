@@ -13,7 +13,7 @@ import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import Any
+from typing import Any, cast
 
 
 class InvalidLocalizationResult(ValueError):
@@ -24,7 +24,7 @@ def _finite_number(value: object, *, field_name: str) -> float:
     if isinstance(value, bool):
         raise InvalidLocalizationResult(f"{field_name} must be numeric")
     try:
-        number = float(value)
+        number = float(cast(Any, value))
     except (TypeError, ValueError, OverflowError) as exc:
         raise InvalidLocalizationResult(f"{field_name} must be numeric") from exc
     if not math.isfinite(number):
@@ -82,11 +82,17 @@ def _pose_tuple(value: object) -> tuple[float, float, float, float] | None:
             raise InvalidLocalizationResult(f"pose missing {exc.args[0]}") from exc
         if yaw_value is None:
             raise InvalidLocalizationResult("pose missing yaw")
-        return (*xyz, _finite_number(yaw_value, field_name="pose.yaw"))
+        return (
+            xyz[0],
+            xyz[1],
+            xyz[2],
+            _finite_number(yaw_value, field_name="pose.yaw"),
+        )
     if isinstance(value, (list, tuple)) and len(value) == 4:
-        return tuple(
+        numbers = tuple(
             _finite_number(item, field_name=f"pose[{index}]") for index, item in enumerate(value)
-        )  # type: ignore[return-value]
+        )
+        return numbers[0], numbers[1], numbers[2], numbers[3]
     raise InvalidLocalizationResult("pose must be a four-value object or sequence")
 
 
