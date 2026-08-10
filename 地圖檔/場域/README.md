@@ -6,8 +6,8 @@
 | 場域 | site profile | runtime profile | EDM bundle | 安全航線 | 大小 |
 |---|---|---|---|---|---|
 | `urai`（烏來/目標場域） | `urai_edm.json` | 共用 `edm_production_profile.json` | 1383 refs | 無（`route_json: null`） | 767M |
-| `river_site`（河濱） | `river_site_edm.json` | `edm_profiles/river_site.json` | 454 refs | `river_site_safezone` | 217M |
-| `football_field`（足球場） | `football_field_edm.json` | `edm_profiles/football_field.json` | 505 refs | 無 | 199M |
+| `river_site`（河濱） | `river_site_edm.json` | `edm_profiles/river_site.json` | 454 refs | `routes/authored/route_20260807_013811.json` | 217M |
+| `football_field`（足球場） | `football_field_edm.json` | `edm_profiles/football_field.json` | 505 refs | 無 | 334M |
 
 ## 各包狀態
 

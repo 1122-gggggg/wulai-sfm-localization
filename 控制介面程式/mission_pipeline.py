@@ -102,7 +102,23 @@ def _reject_json_constant(value: str):
 
 
 def _profile_mission_path(profile: SiteProfile, filename: str) -> Path:
-    return (_WS.mission_routes / profile.site_id / filename).resolve()
+    site_packages = _WS.site_packages.resolve()
+    for asset in (
+        profile.route_json,
+        profile.map_ply,
+        profile.localization_bundle,
+        getattr(profile, "map_reference_poses", None),
+        getattr(profile, "map_align", None),
+    ):
+        if asset is None:
+            continue
+        try:
+            relative = Path(asset).resolve().relative_to(site_packages)
+        except ValueError:
+            continue
+        if relative.parts:
+            return (site_packages / relative.parts[0] / "routes" / filename).resolve()
+    return (site_packages / profile.site_id / "routes" / filename).resolve()
 
 
 def _require_existing_asset(

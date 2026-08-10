@@ -47,8 +47,8 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
 環境變數:
   SFM_PYTHON=python3.10       CPython 3.10 executable
   SFM_VENV_DIR=/tmp/sfm-venv  alternate venv directory for clean-install checks
-  SFM_INSTALL_TEST_DEPS=1     additionally install requirements-test-lock.txt
-  SFM_INSTALL_QUALITY_DEPS=1  additionally install requirements-quality-lock.txt
+  SFM_INSTALL_TEST_DEPS=1     additionally install requirements/test-lock.txt
+  SFM_INSTALL_QUALITY_DEPS=1  additionally install requirements/quality-lock.txt
   SFM_INSTALL_OFFLINE=1       install only from 執行環境/offline_wheelhouse
 
 選項:
@@ -63,9 +63,9 @@ root_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 python_bin="${SFM_PYTHON:-python3.10}"
 venv_dir="${SFM_VENV_DIR:-$root_dir/.venv}"
 venv_python="$venv_dir/bin/python"
-requirements_lock="$root_dir/requirements-lock.txt"
-requirements_test_lock="$root_dir/requirements-test-lock.txt"
-requirements_quality_lock="$root_dir/requirements-quality-lock.txt"
+requirements_lock="$root_dir/requirements/runtime-lock.txt"
+requirements_test_lock="$root_dir/requirements/test-lock.txt"
+requirements_quality_lock="$root_dir/requirements/quality-lock.txt"
 install_requirements_lock="$requirements_lock"
 install_requirements_test_lock="$requirements_test_lock"
 install_requirements_quality_lock="$requirements_quality_lock"

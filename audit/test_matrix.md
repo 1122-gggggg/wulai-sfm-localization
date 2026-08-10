@@ -10,18 +10,18 @@
 
 | 檔案 | 測試數 | **實際層級** | 真實性評估 |
 |---|---|---|---|
-| `控制介面程式/operator_interface/test_olympe_live_backend_safety.py` | 125 函式 / **157 收集** | **整合** | `make_backend()`（`:584`）建構**真實** `OlympeLiveBackend`（`:624`），被使用 **123 次**，另 2 處直接建構 → 幾乎每個測試都跑真實類別，對注入 `sys.modules` 的假 olympe SDK。**注意**：helper 把 `_connect` monkeypatch 成 no-op，故連線路徑本身只在 `:863` 的 4 個參數化案例中執行。這是全庫最強的測試 |
-| `定位演算法/flight_control/test_flight_safety_gates.py` | **149 收集** | **整合** | 31 個驅動真實 `run_loop`，25 個驅動真實 `SafetyMonitor` 執行緒（虛擬時鐘）。96 個故障注入 |
-| `控制介面程式/operator_interface/test_worker_lifecycle.py` | ~90 | **整合（真子程序）** | 實際 `subprocess` 啟動 worker，測崩潰、重啟冷卻、阻塞寫入、EOF |
-| `控制介面程式/operator_interface/test_site_profile.py` | ~60 | 單元 | 設定驗證，覆蓋最完整的區域 |
-| `控制介面程式/operator_interface/test_route_editor.py` | ~70 | 單元 | |
-| `控制介面程式/operator_interface/test_operator_render_perf.py` | 23 | **系統（需 X display）** | **唯一建構真實 `OperatorApp` 的測試** |
-| `控制介面程式/operator_interface/test_operator_command_safety.py` | ~40 | 混合 | **11 個是原始碼字串斷言，非行為驗證** |
-| `控制介面程式/operator_interface/test_autonomy_gate.py` | **43** | 單元 | 本稽核由 20 增至 43（補 NaN/Inf） |
+| `tests/control_interface/operator_interface/test_olympe_live_backend_safety.py` | 125 函式 / **157 收集** | **整合** | `make_backend()`（`:584`）建構**真實** `OlympeLiveBackend`（`:624`），被使用 **123 次**，另 2 處直接建構 → 幾乎每個測試都跑真實類別，對注入 `sys.modules` 的假 olympe SDK。**注意**：helper 把 `_connect` monkeypatch 成 no-op，故連線路徑本身只在 `:863` 的 4 個參數化案例中執行。這是全庫最強的測試 |
+| `tests/localization/flight_control/test_flight_safety_gates.py` | **149 收集** | **整合** | 31 個驅動真實 `run_loop`，25 個驅動真實 `SafetyMonitor` 執行緒（虛擬時鐘）。96 個故障注入 |
+| `tests/control_interface/operator_interface/test_worker_lifecycle.py` | ~90 | **整合（真子程序）** | 實際 `subprocess` 啟動 worker，測崩潰、重啟冷卻、阻塞寫入、EOF |
+| `tests/control_interface/operator_interface/test_site_profile.py` | ~60 | 單元 | 設定驗證，覆蓋最完整的區域 |
+| `tests/control_interface/operator_interface/test_route_editor.py` | ~70 | 單元 | |
+| `tests/control_interface/operator_interface/test_operator_render_perf.py` | 23 | **系統（需 X display）** | **唯一建構真實 `OperatorApp` 的測試** |
+| `tests/control_interface/operator_interface/test_operator_command_safety.py` | ~40 | 混合 | **11 個是原始碼字串斷言，非行為驗證** |
+| `tests/control_interface/operator_interface/test_autonomy_gate.py` | **43** | 單元 | 本稽核由 20 增至 43（補 NaN/Inf） |
 | `定位演算法/validation/tests/*` | ~130 | 單元 + CUDA 條件 | |
-| `定位演算法/flight_control/test_olympe_frame_worker.py` | 16 | 整合 | **唯一同時載入兩份鏡像副本的測試**，但斷言是兩者行為的**交集** |
+| `tests/localization/flight_control/test_olympe_frame_worker.py` | 16 | 整合 | **唯一同時載入兩份鏡像副本的測試**，但斷言是兩者行為的**交集** |
 | `模擬器/parrot_stimulate/tests/*` | 12 檔 / 1357 行 | 整合 | **被 `pytest.ini:17` 排除，不在 1070 內**（見 F-23） |
-| `tools/test_*.py` | 19 | 單元 | 打包／驗證工具 |
+| `tests/tools/test_*.py` | 19 | 單元 | 打包／驗證工具 |
 
 ### 「有多少是真的」量化
 
@@ -108,7 +108,7 @@
 
 | 檔案 | 新增 | 說明 |
 |---|---|---|
-| `控制介面程式/operator_interface/test_autonomy_gate.py` | **+22**（21→**43**） | `test_non_finite_evidence_fails_closed`：7 個欄位 × NaN/+Inf/−Inf = 21 個參數化案例，**雙側**（量測值與其上限）；`test_bool_is_not_accepted_as_a_numeric_reading` |
+| `tests/control_interface/operator_interface/test_autonomy_gate.py` | **+22**（21→**43**） | `test_non_finite_evidence_fails_closed`：7 個欄位 × NaN/+Inf/−Inf = 21 個參數化案例，**雙側**（量測值與其上限）；`test_bool_is_not_accepted_as_a_numeric_reading` |
 | `定位演算法/validation/tests/test_runtime_mirrors.py` | **+2**（1→**3**） | `test_every_same_named_file_is_either_enforced_or_declared_divergent`（強制新增的同名檔必須被分類）；`test_unenforced_identical_copies_have_not_drifted`（對 `manual_nudge_pilot.py` 做位元組比對） |
 
 **全套件回歸**：`1070 passed, 1 skipped` → **`1094 passed, 1 skipped`**（+24，零失敗，29.5 秒）。

@@ -14,20 +14,20 @@
 | `test_clean_install.sh` | 在暫存目錄重建 CPython 3.10 venv 並執行 runtime preflight |
 | `simulated_ui_smoke.sh` | 實際啟動地圖/影片選擇路徑，等 GUI 產生有效 pose 後安全終止 |
 | `test_portable_runtime.sh` | 在 actual portable 暫時匯入固定場域，乾淨安裝並要求 UI 產生有效 pose，後恢復發布邊界 |
-| `test_system_validation.py` | 驗證編排步驟和 Python 環境隔離 |
-| `test_workspace_audit.py` | 驗證工作區結構契約 |
+| `../tests/tools/test_system_validation.py` | 驗證編排步驟和 Python 環境隔離 |
+| `../tests/tools/test_workspace_audit.py` | 驗證工作區結構契約 |
 | `security_dependency_gate.py` | 執行 pip-audit、驗證到期中的安全例外，並輸出 CycloneDX SBOM |
 
-`requirements-lock.txt` 是 runtime 的唯一 hash lock；`requirements-test-lock.txt`
+`requirements/runtime-lock.txt` 是 runtime 的唯一 hash lock；`requirements/test-lock.txt`
 另外固定 pytest、ruff、coverage 與 timeout plugin。正式 portable 先在來源機建立
 wheelhouse：
 
 ```bash
 .venv/bin/python tools/offline_wheelhouse.py build \
   --output /path/to/approved-wheelhouse \
-  --requirements requirements-lock.txt \
-  --requirements requirements-test-lock.txt \
-  --requirements requirements-quality-lock.txt
+  --requirements requirements/runtime-lock.txt \
+  --requirements requirements/test-lock.txt \
+  --requirements requirements/quality-lock.txt
 ```
 
 乾淨測試可用 `bash tools/install_runtime.sh --offline --test-deps`；完整 system
@@ -105,7 +105,7 @@ signature 或 trust store sidecar。
 
 ## 工程品質 gates
 
-`requirements-quality.txt` / `requirements-quality-lock.txt` 是獨立的品質工具
+`requirements/quality.txt` / `requirements/quality-lock.txt` 是獨立的品質工具
 清單，不會改寫 runtime 或 test lock。CPython 3.10 可由安裝器加入現有驗證環境：
 
 ```bash

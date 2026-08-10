@@ -85,7 +85,7 @@ owner-private 路徑。P119 固定 SHA 全片重播通過既有品質 gate，第
 - 新增 `tools/workspace_audit.py`，唯讀檢查目錄、入口、symlink、output 分類、容量與磁碟。
 - 場域資產 UI 已分為 panel／actions／interfaces／local provider，航線編輯器另分為
   model／controller／window，不持有 Olympe backend 或飛行指令接口。
-- 新增根目錄 `requirements.txt`、`tools/install_runtime.sh` 與 `tools/simulator_preflight.py`，統一搬移環境、資產與影片啟動前檢查。
+- 新增集中式 `requirements/`、`tools/install_runtime.sh` 與 `tools/simulator_preflight.py`，統一搬移環境、資產與影片啟動前檢查。
 - `outputs/README.md` 補上 session、validation receipt、P119 與命名／retention 規則。
 - 建立 `文件/` 作為架構、Spec 與稽核的唯一索引；驗證實作與測試收入 `tools/`。
 - 舊獨立 `parrot_stimulate` 封存已於 2026-08-05 經操作員明確授權永久刪除；

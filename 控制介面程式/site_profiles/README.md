@@ -12,10 +12,11 @@
 readiness 的必要 gate，manual 收據也不會升級核准狀態。
 
 Site profile 原子化綁定地圖、定位 bundle、參考位姿、相機與 runtime profile。
-`localizer` 必須是 deployment registry 已註冊的 backend。目前提供 `edm` 與 `xfeat`；
-schema 會拒絕未知 backend，並依 provider capabilities 驗證 backend-specific assets。
-EDM 需要場域 `localizer_profile`；XFeat 不接受 EDM profile，且兩者都以同一套
-bundle SHA 綁定。切換 backend 不會自動升級真機 AUTO approval。
+`localizer` 必須是 deployment registry 已註冊的 backend。正式隨附場域與 portable
+只使用 `edm`；registry 內的 `xfeat` 僅保留研究／舊包遷移，不在 production artifact
+allowlist。schema 會拒絕未知 backend，並依 provider capabilities 驗證
+backend-specific assets。EDM 需要場域 `localizer_profile`；XFeat 不接受 EDM
+profile，且兩者都以 bundle SHA 綁定。切換 backend 不會自動升級真機 AUTO approval。
 
 Profile 內所有資產與 `localizer_deploy_dir` 都相對於 JSON 所在位置解析，但必須
 留在自動發現的 workspace root 內；`../` 或 workspace 外的絕對路徑，以及含有

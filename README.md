@@ -82,9 +82,9 @@ reference index 與核准 sidecar，並產生 `PORTABLE_SITE_ASSETS.json`：
 # 來源電腦一次性建立與三份 hash lock 完全綁定的 Python wheelhouse
 .venv/bin/python tools/offline_wheelhouse.py build \
   --output /path/to/approved-wheelhouse \
-  --requirements requirements-lock.txt \
-  --requirements requirements-test-lock.txt \
-  --requirements requirements-quality-lock.txt
+  --requirements requirements/runtime-lock.txt \
+  --requirements requirements/test-lock.txt \
+  --requirements requirements/quality-lock.txt
 
 python tools/export_simulator_package.py /path/to/portable_localization \
   --artifact-root /path/to/approved-runtime-artifact-seed \
@@ -136,8 +136,9 @@ reference poses 五項都是必需；`query_camera` 與 `coordinate_frame` 必�
 profile，四個資產都必須有 SHA-256。`route_json` 與 `poles_json` 仍是獨立的
 overlay／任務選配。完整格式見
 [`控制介面程式/site_profiles/建圖端輸出規格.md`](控制介面程式/site_profiles/建圖端輸出規格.md)。
-`requirements.txt` 是根目錄的單一 Python
-相依來源，安裝器會使用帶 transitive pins 與 hashes 的 `requirements-lock.txt`；
+`requirements/` 是主專案的單一 Python 相依目錄；正式、測試與品質工具各有
+人類可讀的 direct pins，以及帶 transitive pins 與 hashes 的對應 lockfile。
+安裝器預設使用 `requirements/runtime-lock.txt`；
 `tools/simulator_preflight.py --full-runtime` 會在 GUI 前實際載入
 地圖 bundle、EDM CUDA model、MegaLoc、GUI 與 worker。正式發布目前只支援已驗證的
 NVIDIA RTX 5060 + CUDA 12.8；其他 GPU 必須重新做 CUDA、模型與效能驗證。系統層仍需
@@ -294,7 +295,7 @@ held frame 改走 LOST recovery（提高 local top-k + 每個 episode 一次 Meg
 入口使用主 Python 3.10 與獨立 Python 3.11 `parrot_stimulate` 環境，執行
 pytest、ruff、module ownership、flight selftest、dependency、profile/SHA、CUDA 與離線模型檢查，
 並寫入 `outputs/validation_receipts/`。任一必要項失敗時整體 exit code 非零。
-CI 與 `tools/test_clean_install.sh` 由 `requirements-test-lock.txt` 提供固定的
+CI 與 `tools/test_clean_install.sh` 由 `requirements/test-lock.txt` 提供固定的
 pytest-timeout、coverage 與 pytest-cov；測試使用每測試 300 秒上限並收集 coverage，
 目前對第一方核心模組設 `50.00%` 最低門檻。validation receipt 會彙整 pytest
 各 step 的 conditional skip，未執行的測試不會被當成通過。

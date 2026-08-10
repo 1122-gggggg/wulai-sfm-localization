@@ -310,7 +310,7 @@ markupsafe → /usr/lib/python3/dist-packages/markupsafe  2.0.1  （lock 指定 
 - **嚴重度**：P1
 - **類別**：可測試性
 - **檔案**：`定位演算法/flight_control/path_follow_flight.py:1779-2088`（`fly()`，310 行）；`控制介面程式/operator_interface/flight_operator_app.py:6881`（`main()`，919 行）
-- **測試**：`定位演算法/flight_control/test_flight_safety_gates.py:1366-1379`、`:1662-1685`；`控制介面程式/operator_interface/test_operator_command_safety.py:430-462`、`:586-598`
+- **測試**：`tests/localization/flight_control/test_flight_safety_gates.py:1366-1379`、`:1662-1685`；`tests/control_interface/operator_interface/test_operator_command_safety.py:430-462`、`:586-598`
 
 ### 實際證據
 
@@ -577,7 +577,7 @@ if not result.accepted:
 ## F-08｜`scipy` 未納入 lock，碰撞監控在乾淨安裝上靜默關閉（fail-open）
 
 - **嚴重度**：P2（自主飛行解鎖後升為 P1）
-- **檔案**：`執行環境/requirements_runtime.txt:24-26`（被註解）；`定位演算法/flight_control/real_path_follow_controller.py:59-62, 660, 676`
+- **檔案**：`requirements/runtime.txt:24-26`（被註解）；`定位演算法/flight_control/real_path_follow_controller.py:59-62, 660, 676`
 
 ```python
 try:
@@ -963,7 +963,7 @@ Tk 的 `ttk::button` class binding 綁定 `<space>`（`/usr/share/tcltk/tk8.6/tt
 ## F-24｜沒有覆蓋率量測，也沒有測試逾時機制
 
 - **嚴重度**：P2
-- **檔案**：`pytest.ini`（無 addopts）、`requirements-test.txt`（只有 pytest、ruff）
+- **檔案**：`pytest.ini`（無 addopts）、`requirements/test.txt`（只有 pytest、ruff）
 
 無 `.coveragerc`、`pyproject.toml`、`setup.cfg`、`tox.ini`；`coverage` 與 `pytest-cov` 皆未安裝
 （本稽核嘗試 `--timeout` 時即因缺 `pytest-timeout` 而失敗）。

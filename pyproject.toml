@@ -30,6 +30,7 @@ files = [
   "tools/package_manifest.py",
   "tools/offline_wheelhouse.py",
   "定位演算法/flight_control/safety_command.py",
+  "定位演算法/flight_control/landing_transition.py",
   "定位演算法/flight_control/localization_uncertainty.py",
   "定位演算法/flight_control/route_domain.py",
   "控制介面程式/operator_interface/backend_contract.py",

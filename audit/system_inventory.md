@@ -286,7 +286,7 @@ opencv-python 4.13.0.92、pillow 12.3.0、pycolmap 4.0.4、**protobuf 3.19.4**�
 **parrot-olympe 8.4.0**、safetensors 0.8.0、kornia 0.8.2、einops 0.8.2、joblib 1.5.3、
 loguru 0.7.3、yacs 0.1.8。
 
-`requirements-lock.txt`：49 個 pin / 525 行 hash，由 `uv pip compile --generate-hashes` 產生。
+`requirements/runtime-lock.txt`：49 個 pin / 525 行 hash，由 `uv pip compile --generate-hashes` 產生。
 
 **系統層（非 pip，僅註解提及）**：`ffmpeg`、`python3-tk`。
 

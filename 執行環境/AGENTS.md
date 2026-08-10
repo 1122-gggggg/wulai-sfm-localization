@@ -27,7 +27,7 @@ Environment facts:
 - The spawned localizer worker needs torch+torchvision+pycolmap+opencv.
   Interpreter resolution: `$SFM_LOCALIZER_PYTHON` > current UI/pipeline
   interpreter. pycolmap must load the rig-format map
-  (original machine: pycolmap 4.0.4; see requirements_runtime.txt).
+  (original machine: pycolmap 4.0.4; see `../requirements/runtime.txt`).
 - Model weights load via torch.hub; offline cache ships in
   package-local `torch_hub_cache/`; keep it beside `sfm_system/` when moving
   the package. Runtime does not require copying it into `~/.cache/torch/hub`.

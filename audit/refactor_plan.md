@@ -74,7 +74,7 @@
 |---|---|
 | **預期收益** | 讓「乾淨環境重建」與「現場實跑環境」變成同一個環境；所有已完成的飛行驗證才具備可轉移性 |
 | **風險** | **高影響**（會取代操作員目前可用的 `.venv`），但可逆——先建到 `SFM_VENV_DIR` 的新目錄並平行比對，確認後才切換 |
-| **影響模組** | `.venv`、`執行環境/requirements_runtime.txt`、`requirements-lock.txt` |
+| **影響模組** | `.venv`、`requirements/runtime.txt`、`requirements/runtime-lock.txt` |
 | **前置測試** | 在新 venv 上跑完整 1094 測試 + `驗證系統.sh` 15 步，與現行環境逐項比對 |
 | **遷移方式** | ①把 `scipy`、`onnxruntime-gpu`、`av` 正式納入 requirements 並重產 lock；②移除 `lingbot-map` 死安裝；③`SFM_VENV_DIR=/tmp/sfm-clean bash tools/install_runtime.sh`；④平行比對；⑤確認後切換 |
 | **驗收條件** | 新 venv 的 `pyvenv.cfg` 無 `include-system-site-packages`；`pip freeze` 與 lock 一致；1094 測試全綠；`驗證系統.sh` 15 步全過 |
@@ -85,7 +85,7 @@
 |---|---|
 | **預期收益** | 消除一個 fail-open：`status="OFF"` 目前與「附近沒有障礙物」無法區分 |
 | **風險** | 低。只改回報字串與 preflight 日誌，不改判定邏輯 |
-| **影響模組** | `real_path_follow_controller.py:660, 676`（`CollisionMonitor`）；`執行環境/requirements_runtime.txt` |
+| **影響模組** | `real_path_follow_controller.py:660, 676`（`CollisionMonitor`）；`requirements/runtime.txt` |
 | **前置測試** | monkeypatch `cKDTree = None`，斷言 `update()` 回 `status="UNAVAILABLE"` 而非 `"OFF"`，且 `severity` 不是 0.0 這個「安全值」 |
 | **遷移方式** | 與 B5 同批（scipy 入 lock）。檢查所有讀 `status` 的呼叫端能處理新值 |
 | **驗收條件** | 新測試通過；preflight 日誌出現 collision monitor 狀態一行 |

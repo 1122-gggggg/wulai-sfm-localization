@@ -105,7 +105,7 @@
 | **鏡像補完 + 同步檢查** | `reloc_localizer_xfeat.py` 只在 deploy_code、flight_control 沒有(真飛靠 PYTHONPATH 混用兩份) → 複製補完 + authoritative `validation/check_runtime_mirrors.py`(8 檔 diff, drift 即報錯) |
 | **`find_system_root`** | 5 份複製、硬編 `/media/cihcilab/新增磁碟區/...` fallback(換機靜默解析到外機路徑) → 改吃 `SFM_SYSTEM_ROOT`,否則明確報錯 |
 | **env 變數統一** | UI `SFM_LOC_LOW_INLIERS` vs 飛控 `SFM_LOW_CONF_INLIERS` 兩名 → 統一 `SFM_LOW_CONF_INLIERS` |
-| **依賴補齊** | `requirements_runtime.txt` 漏 `huggingface_hub`/`safetensors`/`kornia`(MegaLoc/LighterGlue 需要) → 補 pin |
+| **依賴補齊** | 現為 `requirements/runtime.txt`；當時漏 `huggingface_hub`/`safetensors`/`kornia`（MegaLoc/LighterGlue 需要）→ 補 pin |
 | **eval 吞例外** | `validation/eval_stream_core.py` match/PnP 例外靜默 → 記錄 + error 幀分開計數 |
 | **死碼標註**(依決定保留不刪) | safe_volume / pole_cruise / `_localize_with_temporal_cache` / `XFeatLightGlueLocalizer` → 加註「未接入生產路徑」 |
 | **避障監控標註** | `SparseCloudCollisionMonitor` 未接入 → 註明「避障靠飛手,接入為待決設計」 |

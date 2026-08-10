@@ -85,7 +85,7 @@ PCMD，再回讀確認 piloting source 已交回 `SkyController`；交接失敗�
 ## 驗證
 
 ```bash
-pytest -q 定位演算法/flight_control/test_flight_safety_gates.py
+pytest -q tests/localization/flight_control/test_flight_safety_gates.py
 python 控制介面程式/mission_pipeline.py --mode flight-selftest
 python 定位演算法/validation/check_runtime_mirrors.py
 ```

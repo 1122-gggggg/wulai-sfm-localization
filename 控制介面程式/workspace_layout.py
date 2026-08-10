@@ -6,7 +6,7 @@ Physical layout (no symlinks):
   <workspace>/
     控制介面程式/   operator_interface, site_profiles, launchers
     定位演算法/     deploy_code, flight_control, configs, validation
-    地圖檔/         maps, bundles, mission_routes
+    地圖檔/         場域/<site>/{maps,bundles,routes,reports}; legacy flat fallbacks
     模擬器/         optional validation videos
     執行環境/       optional runtime caches
     outputs/        flight_logs, benchmarks

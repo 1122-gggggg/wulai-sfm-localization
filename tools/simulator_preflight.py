@@ -221,7 +221,7 @@ def _collision_monitor_status(
     hash-locked runtime requirements.  The monitor is currently a warning-only
     research aid, not an approved production collision-protection layer.
     """
-    lock_path = root / "requirements-lock.txt"
+    lock_path = root / "requirements/runtime-lock.txt"
     hash_locked = False
     lock_error = ""
     if lock_path.is_file():
@@ -231,7 +231,7 @@ def _collision_monitor_status(
                 for line in lock_path.read_text(encoding="utf-8").splitlines()
             )
         except OSError as exc:
-            lock_error = f"cannot read requirements-lock.txt: {exc}"
+            lock_error = f"cannot read requirements/runtime-lock.txt: {exc}"
 
     runtime_import = False
     import_error = ""
@@ -246,7 +246,7 @@ def _collision_monitor_status(
     reasons: list[str] = []
     if not hash_locked:
         reasons.append(
-            "scipy is not present in requirements-lock.txt; clean lock-only installs "
+            "scipy is not present in requirements/runtime-lock.txt; clean lock-only installs "
             "must treat SparseCloudCollisionMonitor as unavailable"
         )
     if lock_error:
@@ -263,7 +263,7 @@ def _collision_monitor_status(
         if not hash_locked:
             failures.append(
                 "production collision monitor required but scipy is absent from "
-                "requirements-lock.txt; preflight is fail-closed"
+                "requirements/runtime-lock.txt; preflight is fail-closed"
             )
         if not runtime_import:
             failures.append(

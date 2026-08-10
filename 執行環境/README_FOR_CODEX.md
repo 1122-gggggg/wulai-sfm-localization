@@ -6,9 +6,9 @@
 ```bash
 .venv/bin/python tools/offline_wheelhouse.py build \
   --output /path/to/approved-wheelhouse \
-  --requirements requirements-lock.txt \
-  --requirements requirements-test-lock.txt \
-  --requirements requirements-quality-lock.txt
+  --requirements requirements/runtime-lock.txt \
+  --requirements requirements/test-lock.txt \
+  --requirements requirements/quality-lock.txt
 python tools/export_simulator_package.py /path/to/portable_localization \
   --artifact-root /path/to/approved-runtime-artifact-seed \
   --wheelhouse-root /path/to/approved-wheelhouse \
@@ -63,7 +63,7 @@ images、完整 source/update workspace，以及重建腳本。
 ## 主要檔案
 
 ```text
-requirements_runtime.txt        # 已驗證 Python 3.10 / CUDA 12.8 釘選
+requirements/runtime.txt       # 已驗證 Python 3.10 / CUDA 12.8 direct pins
 # MANIFEST.tsv / SHA256SUMS      # 只在發布包根目錄；不在此 legacy 資料夾
 # tools/package_manifest.py      # 僅在發布包根目錄；由該處執行 generate / verify
 torch_hub_cache/                # 由 RUNTIME_ARTIFACTS.json allowlist seed 的外部檔案
@@ -193,7 +193,7 @@ PY
 python3 sfm_system/定位/validation/offline_model_smoke.py --model all
 ```
 
-runtime 固定用 pycolmap 4.0.4（見 `requirements_runtime.txt`）。
+runtime 固定用 pycolmap 4.0.4（見 `requirements/runtime.txt`）。
 
 確認操作介面可以讀點雲：
 
@@ -384,14 +384,14 @@ canonical names SHA-256；任一缺失或不符就拒絕。benchmark 的
 
 ```bash
 python3.10 -m venv .venv
-.venv/bin/python -m pip install -r requirements_runtime.txt
+.venv/bin/python -m pip install --require-hashes -r requirements/runtime-lock.txt
 export SFM_LOCALIZER_PYTHON="$PWD/.venv/bin/python"
 ```
 
 若要收集或執行 repo 內的 pytest，再安裝可重現的測試依賴：
 
 ```bash
-.venv/bin/python -m pip install -r requirements_test.txt
+.venv/bin/python -m pip install --require-hashes -r requirements/test-lock.txt
 ```
 
 不要把 EDM 的 ONNX 匯出／簡化 requirements 裝進這個 Olympe runtime
@@ -399,7 +399,7 @@ virtualenv。Olympe 8.4.0 鎖定 protobuf 3.19.4，而新版 ONNX 需要 protobu
 匯出工具請用 `定位演算法/deploy_code/runtime/EDM/deploy/requirements_deploy.txt`
 另建環境。主環境可以保留不衝突的 ONNX Runtime 來執行既有模型。
 
-`requirements_runtime.txt` 已包含 PyTorch CUDA 12.8 官方 wheel index：
+`requirements/runtime.txt` 已包含 PyTorch CUDA 12.8 官方 wheel index：
 
 ```text
 torch 2.11.0+cu128

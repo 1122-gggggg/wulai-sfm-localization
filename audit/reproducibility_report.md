@@ -15,10 +15,10 @@ Git branch：`agent/localization-runtime-optimizations`
 
 | 項目 | 要求 | 證據 |
 |---|---|---|
-| OS | Linux x86_64（manylinux_2_31） | `requirements-lock.txt:2` 的 uv compile 指令 |
-| Python | **CPython 3.10.x**（實測 3.10.12） | `執行環境/requirements_runtime.txt:1`；`tools/install_runtime.sh:44-49` 硬性檢查 `sys.version_info[:2] != (3,10)` 就終止 |
-| GPU | NVIDIA RTX 5060，CUDA 12.8 capable driver | `執行環境/requirements_runtime.txt:2-3` |
-| 系統套件 | `ffmpeg`、`python3-tk`（tkinter） | `執行環境/requirements_runtime.txt:22`（註解形式，非自動安裝） |
+| OS | Linux x86_64（manylinux_2_31） | `requirements/runtime-lock.txt:2` 的 uv compile 指令 |
+| Python | **CPython 3.10.x**（實測 3.10.12） | `requirements/runtime.txt:1`；`tools/install_runtime.sh:44-49` 硬性檢查 `sys.version_info[:2] != (3,10)` 就終止 |
+| GPU | NVIDIA RTX 5060，CUDA 12.8 capable driver | `requirements/runtime.txt:2-3` |
+| 系統套件 | `ffmpeg`、`python3-tk`（tkinter） | `requirements/runtime.txt:22`（註解形式，非自動安裝） |
 | 模擬器子環境 | Python **3.11**（獨立 venv） | `模擬器/parrot_stimulate/.python-version`、`模擬器/parrot_stimulate/.venv/lib/python3.11/` |
 
 實測本機：Python 3.10.12、torch 2.11.0+cu128、parrot-olympe 8.4.0、scipy 1.15.3。
@@ -29,8 +29,8 @@ Git branch：`agent/localization-runtime-optimizations`
 
 **結論：pinning 品質高於一般研究專案。**
 
-- `requirements-lock.txt`（651 行）由 `uv pip compile --generate-hashes` 產生，**每個套件都有 SHA256 hash**，含 transitive 相依。這是可重現安裝的最強形式。
-- `執行環境/requirements_runtime.txt` 為人類可讀的直接 pin，全部使用 `==`：
+- `requirements/runtime-lock.txt`（651 行）由 `uv pip compile --generate-hashes` 產生，**每個套件都有 SHA256 hash**，含 transitive 相依。這是可重現安裝的最強形式。
+- `requirements/runtime.txt` 為人類可讀的直接 pin，全部使用 `==`：
 
 | 套件 | 版本 | 備註 |
 |---|---|---|
@@ -45,7 +45,7 @@ Git branch：`agent/localization-runtime-optimizations`
 | safetensors / kornia | 0.8.0 / 0.8.2 | XFeat / LighterGlue / MegaLoc stack |
 | einops / joblib / loguru / yacs | 0.8.2 / 1.5.3 / 0.7.3 / 0.1.8 | EDM matcher 直接 import |
 
-- 測試環境另 pin `pytest==9.1.1`、`ruff==0.16.1`（`requirements-test.txt`）。
+- 測試環境另 pin `pytest==9.1.1`、`ruff==0.16.1`（`requirements/test.txt`）。
 
 ### 2.1 已知安全漏洞（pip-audit，對 `.venv` 實跑）
 
@@ -61,7 +61,7 @@ setuptools 59.6.0  PYSEC-2022-43012, PYSEC-2025-49, PYSEC-2026-1918, PYSEC-2026-
 
 ### 2.2 未 pin 的相依 — **本報告最重要的可重現性缺陷**
 
-`執行環境/requirements_runtime.txt:24-26`：
+`requirements/runtime.txt:24-26`：
 
 ```
 # Optional: scipy enables the sparse-cloud collision monitor in
@@ -84,7 +84,7 @@ def update(self, pos):
         return {"status": "OFF", "distance": None, "point": None, "severity": 0.0}
 ```
 
-**後果**：依照文件化流程（`tools/install_runtime.sh` + `requirements-lock.txt`）做乾淨安裝，`scipy` **不會被安裝**，碰撞監控會靜默變成 `status="OFF"`、`severity=0.0` —— 與「附近沒有障礙物」在資料上無法區分。本機目前有 scipy 1.15.3 是**歷史殘留**，而非安裝流程的結果；且與註解中的 1.17.1 不符。
+**後果**：依照文件化流程（`tools/install_runtime.sh` + `requirements/runtime-lock.txt`）做乾淨安裝，`scipy` **不會被安裝**，碰撞監控會靜默變成 `status="OFF"`、`severity=0.0` —— 與「附近沒有障礙物」在資料上無法區分。本機目前有 scipy 1.15.3 是**歷史殘留**，而非安裝流程的結果；且與註解中的 1.17.1 不符。
 
 這是 fail-open。詳見 `findings.md` F-07。緩解因素：該監控在程式碼自述中即為「operator warning layer」，且位於目前硬鎖的自主飛行路徑上。
 
@@ -105,7 +105,7 @@ bash tools/install_runtime.sh
 - `set -euo pipefail`
 - 找不到 `python3.10` 直接失敗，並提示 Ubuntu 需 `python3.10-venv`
 - **拒絕** `include-system-site-packages = true` 的 venv（`:35-39`）——避免系統套件污染
-- 以 `requirements-lock.txt`（含 hash）安裝
+- 以 `requirements/runtime-lock.txt`（含 hash）安裝
 
 ---
 
@@ -146,7 +146,7 @@ bash tools/install_runtime.sh
 
 1. **需要 X display**：`flight_operator_app.py` 是 Tk 應用；`控制介面程式/operator_interface/resolve_display.sh` 專門處理 display 解析。無頭環境無法啟動 UI（測試本身可無頭執行）。
 2. **GPU 綁定**：production profile 以 RTX 5060 + CUDA 12.8 為契約。無 GPU 時定位 worker 行為未在本次稽核中驗證。
-3. **模擬器需要獨立 Python 3.11 venv**，與主環境不同版本；`tools/simulator_preflight.py` 有對應檢查（`tools/test_system_validation.py::test_parrot_simulator_validation_stays_in_its_python311_environment`）。
+3. **模擬器需要獨立 Python 3.11 venv**，與主環境不同版本；`tools/simulator_preflight.py` 有對應檢查（`tests/tools/test_system_validation.py::test_parrot_simulator_validation_stays_in_its_python311_environment`）。
 4. **torch_hub_cache 為 package-local**：XFeat / LighterGlue / MegaLoc 以本地 torch.hub repo 提供（`執行環境/torch_hub_cache/`），不從網路抓取——這是刻意的離線設計，正面。
 5. **離線強制**：`runtime_safety.configure_offline_environment()` 設定 `HF_HUB_OFFLINE=1` 等；`install_network_guard()` 以 monkey-patch `socket` 阻擋非白名單外連。副作用：任何期望對外連線的除錯工具在此程序內會失敗，屬預期行為。
 6. **`os.execv` 重啟路徑**：切換 site profile 會 `os.closerange(3, 4096)` 後 `execv`（`flight_operator_app.py:7785-7796`）。註解說明這是為了規避 Olympe pomp loop 無法釋放 fd 的問題。此路徑在無真機時無法完整驗證。
@@ -174,7 +174,7 @@ bash tools/install_runtime.sh
 
 | 優先級 | 動作 | 驗收條件 |
 |---|---|---|
-| **飛行前** | 把 `scipy` 正式加入 `執行環境/requirements_runtime.txt` 並重新產生 lock；同時讓 `CollisionMonitor` 在 `cKDTree is None` 時回報 `status="UNAVAILABLE"`（而非 `"OFF"`），並在啟動 preflight 明確記錄一行 | 乾淨環境安裝後 `update()` 不再回 `OFF`；preflight log 出現 collision monitor 狀態 |
+| **飛行前** | 把 `scipy` 正式加入 `requirements/runtime.txt` 並重新產生 lock；同時讓 `CollisionMonitor` 在 `cKDTree is None` 時回報 `status="UNAVAILABLE"`（而非 `"OFF"`），並在啟動 preflight 明確記錄一行 | 乾淨環境安裝後 `update()` 不再回 `OFF`；preflight log 出現 collision monitor 狀態 |
 | **飛行前** | 提交或明確捨棄目前 63 個變更，重新產生 `MANIFEST.tsv` / `SHA256SUMS` | `git status --porcelain` 為空；manifest 驗證通過 |
 | 近期 | `install_runtime.sh` 增加 `ffmpeg` / `tkinter` 存在性檢查，缺少時明確失敗 | 在無 ffmpeg 的容器中安裝會於安裝期失敗並給出可執行的修正指令 |
 | 近期 | 記錄 `lingbot-map` 的來源（git URL + commit 或 wheel 位置） | 新機器可依文件取得同一版本 |

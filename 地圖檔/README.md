@@ -25,5 +25,6 @@ profile 欄位應維持 `null`。
 
 ## 舊式扁平佈局
 
-`maps/`、`bundles/`、`mission_routes/` 保留給只有單一場域的簡易用法，
-也是 `workspace_layout.py` 的預設路徑。多場域請用 `場域/`。
+`maps/`、`bundles/`、`mission_routes/` 只保留給未指定 site profile 的舊式工具。
+使用 site profile 時，新建航線會跟隨該 profile 已解析的場域資產，寫入
+`場域/<site>/routes/`；正式多場域資料一律以 `場域/` 為準。

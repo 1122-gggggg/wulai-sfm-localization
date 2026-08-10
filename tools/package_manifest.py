@@ -13,6 +13,7 @@ from pathlib import Path
 CONTROL_FILES = {"MANIFEST.tsv", "SHA256SUMS"}
 SITE_ASSET_MANIFEST = "PORTABLE_SITE_ASSETS.json"
 OFFLINE_WHEELHOUSE_RELATIVE = "執行環境/offline_wheelhouse"
+OFFLINE_REQUIREMENTS_RELATIVE = "requirements"
 _SITE_PROFILE_TOP_LEVEL_ASSET_KEYS = (
     "localizer_profile",
     "map_reference_poses",
@@ -336,7 +337,7 @@ def _offline_wheelhouse_issues(root: Path) -> list[str]:
 
         metadata = verify_wheelhouse(
             root / OFFLINE_WHEELHOUSE_RELATIVE,
-            tuple(root / relative for relative in lock_names),
+            tuple(root / OFFLINE_REQUIREMENTS_RELATIVE / name for name in lock_names),
         )
         return _offline_install_metadata_issues(root, offline_install, metadata)
     except (OSError, WheelhouseError) as exc:

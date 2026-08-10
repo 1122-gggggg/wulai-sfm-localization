@@ -1,5 +1,0 @@
-# Portable simulated-stream/operator runtime.
-# Tested with CPython 3.10.12 and CUDA 12.8 wheels on Linux.
-# Human-readable direct pins; tools/install_runtime.sh installs the generated
-# requirements-lock.txt with transitive pins and hashes.
--r 執行環境/requirements_runtime.txt

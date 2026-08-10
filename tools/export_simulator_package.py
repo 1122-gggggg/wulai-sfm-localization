@@ -19,9 +19,9 @@ ARTIFACT_ROOT_ENV = "SFM_RUNTIME_ARTIFACT_ROOT"
 OFFLINE_WHEELHOUSE_ENV = "SFM_OFFLINE_WHEELHOUSE"
 OFFLINE_WHEELHOUSE_RELATIVE = "執行環境/offline_wheelhouse"
 OFFLINE_REQUIREMENT_LOCKS = (
-    "requirements-lock.txt",
-    "requirements-test-lock.txt",
-    "requirements-quality-lock.txt",
+    "requirements/runtime-lock.txt",
+    "requirements/test-lock.txt",
+    "requirements/quality-lock.txt",
 )
 SITE_ASSET_MANIFEST = "PORTABLE_SITE_ASSETS.json"
 REFERENCE_INDEX_SCHEMA = "localization-reference-index-sha256"
@@ -30,18 +30,14 @@ COPY_DIRS = (
     "定位演算法",
     "模擬器/parrot_stimulate",
     "文件",
+    "requirements",
     "tools",
 )
 COPY_FILES = (
     "README.md",
     "outputs/README.md",
+    "執行環境/README.md",
     ARTIFACT_MANIFEST,
-    "requirements.txt",
-    "requirements-lock.txt",
-    "requirements-test.txt",
-    "requirements-test-lock.txt",
-    "requirements-quality.txt",
-    "requirements-quality-lock.txt",
     "pyproject.toml",
     "pytest.ini",
     "驗證系統.sh",
@@ -59,7 +55,7 @@ LIVE_MINIMAL_COPY_FILES = (
     "PORTABLE_README.md",
     "outputs/README.md",
     ARTIFACT_MANIFEST,
-    "requirements-lock.txt",
+    "requirements/runtime-lock.txt",
     "tools/install_runtime.sh",
     "tools/offline_wheelhouse.py",
     "tools/package_manifest.py",
@@ -639,10 +635,10 @@ def _live_minimal_wheelhouse_requirement_names(
     ):
         raise WheelhouseError(f"{MANIFEST_NAME} contains invalid requirement entries")
     names = tuple(sorted(str(entry["name"]) for entry in requirements))
-    runtime_only = ("requirements-lock.txt",)
-    full = tuple(sorted(OFFLINE_REQUIREMENT_LOCKS))
+    runtime_only = ("runtime-lock.txt",)
+    full = tuple(sorted(Path(relative).name for relative in OFFLINE_REQUIREMENT_LOCKS))
     if names == runtime_only:
-        return runtime_only
+        return ("requirements/runtime-lock.txt",)
     if names == full:
         return OFFLINE_REQUIREMENT_LOCKS
     raise WheelhouseError(
@@ -689,16 +685,19 @@ def _copy_offline_wheelhouse(
         source_requirement_names = tuple(
             str(entry["name"]) for entry in requirements
         )
+        lock_paths_by_name = {
+            Path(relative).name: relative for relative in OFFLINE_REQUIREMENT_LOCKS
+        }
         subset_wheelhouse(
             verified.root,
             target_root,
             source_requirement_locks=tuple(
-                ROOT / relative for relative in source_requirement_names
+                ROOT / lock_paths_by_name[name] for name in source_requirement_names
             ),
-            requirement_locks=(destination / "requirements-lock.txt",),
+            requirement_locks=(destination / "requirements/runtime-lock.txt",),
             python_executable=sys.executable,
         )
-        requirement_names = ("requirements-lock.txt",)
+        requirement_names = ("requirements/runtime-lock.txt",)
     else:
         target_root.mkdir(parents=True, exist_ok=True)
         for name in (verified.manifest_name, *verified.wheel_paths):
@@ -1087,16 +1086,6 @@ def _copy_export_payload(
         if not source.is_dir():
             raise FileNotFoundError(source)
         _copy_tree(source, destination / relative, live_minimal=live_minimal)
-    if not live_minimal:
-        runtime_source = ROOT / "執行環境"
-        runtime_target = destination / "執行環境"
-        runtime_target.mkdir(parents=True, exist_ok=True)
-        for relative in ("requirements_runtime.txt", "requirements_test.txt", "README.md"):
-            shutil.copy2(
-                runtime_source / relative,
-                runtime_target / relative,
-                follow_symlinks=False,
-            )
     _copy_resolved_runtime_artifacts(resolved_artifacts, destination)
     if offline_wheelhouse is not None:
         return _copy_offline_wheelhouse(

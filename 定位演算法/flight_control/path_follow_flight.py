@@ -88,6 +88,12 @@ from localization_uncertainty import (  # noqa: E402
     LocalizationState,
     decide_localization_transition,
 )
+from landing_transition import (  # noqa: E402
+    GROUND_SPEED_MAX_AGE_S,
+    LANDING_SPEED_THRESHOLD_MPS,
+    decide_route_completion_landing,
+    landing_speed_allows_land,  # noqa: F401 - compatibility API
+)
 from safety_command import (  # noqa: E402
     default_safety_file as _default_safety_file,  # noqa: F401 - compatibility API
     prepare_safety_file as _prepare_safety_file,
@@ -272,10 +278,6 @@ PCMD_CONTROL_HZ = _env_float(
     "SFM_PCMD_CONTROL_HZ", 20.0, minimum=5.0, maximum=50.0)
 PCMD_COMMAND_TTL_S = _env_float(
     "SFM_PCMD_COMMAND_TTL_S", 0.15, minimum=0.01, maximum=0.15)
-# Keep these fixed to the scale-free safety core's physical-speed contract.
-# Map distances are intentionally never converted to metres for this gate.
-LANDING_SPEED_THRESHOLD_MPS = 0.10
-GROUND_SPEED_MAX_AGE_S = 0.50
 OFFSET_EMA = 0.25           # visual-to-attitude offset smoothing after first anchor
 FIRST_FIX_TIMEOUT_S = 25.0  # how long to wait for BOOT_INIT -> first TRACK
 AUTO_CONSENT_TIMEOUT_S = 30.0
@@ -792,37 +794,6 @@ class OlympeGroundSpeedTracker:
         if not all(math.isfinite(value) for value in (speed_x, speed_y, stamp)):
             return None
         return math.hypot(speed_x, speed_y), float(stamp)
-
-
-def landing_speed_allows_land(
-    sample,
-    now: float,
-    *,
-    threshold_mps: float = LANDING_SPEED_THRESHOLD_MPS,
-    max_age_s: float = GROUND_SPEED_MAX_AGE_S,
-) -> tuple[bool, str, float | None]:
-    """Fail-closed physical-speed gate for normal end-of-route landing."""
-    if sample is None:
-        return False, "ground speed unavailable", None
-    try:
-        speed, stamp = sample
-        if isinstance(speed, bool) or isinstance(stamp, bool):
-            raise ValueError
-        speed = float(speed)
-        stamp = float(stamp)
-        now = float(now)
-    except (TypeError, ValueError, OverflowError):
-        return False, "ground speed invalid", None
-    if not all(math.isfinite(value) for value in (speed, stamp, now)) or speed < 0.0:
-        return False, "ground speed invalid", None
-    age_s = now - stamp
-    if age_s < -0.05:
-        return False, "ground speed timestamp is in the future", speed
-    if age_s > float(max_age_s):
-        return False, f"ground speed stale ({age_s:.2f}s)", speed
-    if speed > float(threshold_mps):
-        return False, f"ground speed {speed:.3f} m/s > {threshold_mps:.3f} m/s", speed
-    return True, f"ground speed {speed:.3f} m/s <= {threshold_mps:.3f} m/s", speed
 
 
 def inspection_gimbal_pitch_deg(meta: dict, pose, map_frame=None) -> float | None:
@@ -2017,6 +1988,7 @@ def run_loop(hooks: LoopHooks, ctrl, waypoints, yaw_sign: int = 1, verbose: bool
                     break
                 if cmd.should_land or ctrl.state in ("LANDING", "DONE"):
                     _sent, _why, actual = send_command((0, 0, 0, 0))
+                    speed_sample = None
                     if cmd.action == "LAND":
                         try:
                             speed_sample = (
@@ -2024,26 +1996,24 @@ def run_loop(hooks: LoopHooks, ctrl, waypoints, yaw_sign: int = 1, verbose: bool
                             )
                         except Exception:
                             speed_sample = None
-                        speed_ok, speed_reason, speed_mps = landing_speed_allows_land(
-                            speed_sample, now
-                        )
-                        rec["ground_speed_mps"] = speed_mps
-                        if not speed_ok:
-                            reset_pcmd_controller()
-                            emit(
-                                rec,
-                                actual,
-                                True,
-                                f"route complete; {speed_reason} -> hover",
-                            )
-                            steps += 1
-                            dt = hooks.now() - t0
-                            if dt < period:
-                                time.sleep(period - dt)
-                            continue
-                    reason = ("pending inspection abort -> land" if cmd.action == "ABORT"
-                              else "route complete -> land")
-                    emit(rec, actual, True, reason)
+                    transition = decide_route_completion_landing(
+                        cmd.action,
+                        speed_sample,
+                        now,
+                        threshold_mps=LANDING_SPEED_THRESHOLD_MPS,
+                        max_age_s=GROUND_SPEED_MAX_AGE_S,
+                    )
+                    rec.update(dict(transition.log_fields))
+                    if transition.outcome == "hover":
+                        reset_pcmd_controller()
+                        emit(rec, actual, True, transition.reason)
+                        steps += 1
+                        dt = hooks.now() - t0
+                        if dt < period:
+                            time.sleep(period - dt)
+                        continue
+                    reason = transition.reason
+                    emit(rec, actual, True, transition.reason)
                     break
                 oldest_inspection = min(inspection_started.values(), default=None)
                 if (cmd.look_at_pole is None and oldest_inspection is not None
