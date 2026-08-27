@@ -57,17 +57,18 @@ if [[ ! -x "$runtime_python" ]]; then
   runtime_python="$venv_dir/bin/python"
 fi
 
-default_profile="$root_dir/控制介面程式/site_profiles/river_site_edm.json"
-has_profile=0
+default_selection="$root_dir/控制介面程式/mission_selections/river_site_b0_p116_p117_localization.json"
 for argument in "$@"; do
   if [[ "$argument" == "--site-profile" || "$argument" == --site-profile=* ]]; then
-    has_profile=1
-    break
+    echo "[一鍵啟動] 真機入口的 site profile 由 mission selection 原子產生；不可直接覆寫 --site-profile" >&2
+    exit 2
   fi
 done
-if [[ "$has_profile" == "0" && -z "${SFM_SITE_PROFILE:-}" ]]; then
-  export SFM_SITE_PROFILE="$default_profile"
+if [[ -n "${SFM_SITE_PROFILE:-}" ]]; then
+  echo "[一鍵啟動] 拒絕既有 SFM_SITE_PROFILE；請改用 SFM_MISSION_SELECTION" >&2
+  exit 2
 fi
+export SFM_MISSION_SELECTION="${SFM_MISSION_SELECTION:-$default_selection}"
 
 export SFM_WORKSPACE_ROOT="$root_dir"
 export SFM_UI_PYTHON="$runtime_python"

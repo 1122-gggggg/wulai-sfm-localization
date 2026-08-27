@@ -46,6 +46,7 @@ class ControlAction(str, Enum):
     RECORD_DISARM = "record_disarm"
     RECORD_START = "record_start"
     RECORD_STOP = "record_stop"
+    RECORD_QUALITY = "record_quality"
     DRONE_MAGNETOMETER_START = "drone_magnetometer_start"
     DRONE_MAGNETOMETER_CANCEL = "drone_magnetometer_cancel"
     SKYCONTROLLER_MAGNETOMETER_START = "skycontroller_magnetometer_start"
@@ -167,6 +168,18 @@ class ScalarPayload:
 
 
 @dataclass(frozen=True)
+class SpeedLimitPayload:
+    speed_limit_mps: float
+    enabled: bool = True
+
+    def __post_init__(self) -> None:
+        value = _finite_control_float(self.speed_limit_mps, "speed_limit_mps")
+        if not isinstance(self.enabled, bool):
+            raise InvalidControlRequest("speed limit enabled must be boolean")
+        object.__setattr__(self, "speed_limit_mps", value)
+
+
+@dataclass(frozen=True)
 class TogglePayload:
     enabled: bool
 
@@ -187,6 +200,20 @@ class CameraResetPayload:
         object.__setattr__(
             self, "zoom", _finite_control_float(self.zoom, "camera zoom")
         )
+
+
+@dataclass(frozen=True)
+class RecordingQualityPayload:
+    profile_id: str
+
+    def __post_init__(self) -> None:
+        from recording_quality import resolve_recording_profile
+
+        try:
+            profile = resolve_recording_profile(self.profile_id)
+        except ValueError as exc:
+            raise InvalidControlRequest(str(exc)) from exc
+        object.__setattr__(self, "profile_id", profile.profile_id)
 
 
 @dataclass(frozen=True)
@@ -226,9 +253,11 @@ ControlPayload = (
     | NudgeVectorPayload
     | LimitsPayload
     | ScalarPayload
+    | SpeedLimitPayload
     | TogglePayload
     | CameraResetPayload
     | MissionRoutePayload
+    | RecordingQualityPayload
 )
 
 
@@ -286,6 +315,7 @@ _LEGACY_ACTIONS = {
     "record_disarm": ControlAction.RECORD_DISARM,
     "record_start": ControlAction.RECORD_START,
     "record_stop": ControlAction.RECORD_STOP,
+    "record_quality": ControlAction.RECORD_QUALITY,
     "drone_magnetometer_start": ControlAction.DRONE_MAGNETOMETER_START,
     "drone_magnetometer_cancel": ControlAction.DRONE_MAGNETOMETER_CANCEL,
     "skycontroller_magnetometer_start": ControlAction.SKYCONTROLLER_MAGNETOMETER_START,
@@ -345,12 +375,23 @@ def _parse_legacy_scalar(
     key = {
         ControlAction.GIMBAL_PITCH: "pitch",
         ControlAction.ZOOM: "zoom",
-        ControlAction.SET_AUTO_SPEED_LIMIT: "speed_limit_mps",
     }[action]
     try:
         return ScalarPayload(payload[key])
     except (KeyError, TypeError, ValueError) as exc:
         raise InvalidControlRequest(f"{action.value} requires {key}") from exc
+
+
+def _parse_legacy_speed_limit(payload: dict[str, Any]) -> SpeedLimitPayload:
+    try:
+        return SpeedLimitPayload(
+            payload["speed_limit_mps"],
+            payload.get("enabled", True),
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise InvalidControlRequest(
+            "set_auto_speed_limit requires speed_limit_mps and boolean enabled"
+        ) from exc
 
 
 def _parse_legacy_start_auto(payload: dict[str, Any]) -> MissionRoutePayload:
@@ -382,9 +423,10 @@ def _parse_legacy_payload(
     if action in {
         ControlAction.GIMBAL_PITCH,
         ControlAction.ZOOM,
-        ControlAction.SET_AUTO_SPEED_LIMIT,
     }:
         return _parse_legacy_scalar(action, payload)
+    if action is ControlAction.SET_AUTO_SPEED_LIMIT:
+        return _parse_legacy_speed_limit(payload)
     if action is ControlAction.RECORD_ARM:
         return TogglePayload(payload.get("enabled", payload.get("value", True)))
     if action is ControlAction.CAMERA_RESET:
@@ -394,6 +436,8 @@ def _parse_legacy_payload(
         )
     if action is ControlAction.START_AUTO:
         return _parse_legacy_start_auto(payload)
+    if action is ControlAction.RECORD_QUALITY:
+        return RecordingQualityPayload(str(payload.get("profile_id") or ""))
     return EmptyPayload()
 
 
@@ -431,10 +475,11 @@ class ControlRequest:
             ControlAction.APPLY_LIMITS: LimitsPayload,
             ControlAction.GIMBAL_PITCH: ScalarPayload,
             ControlAction.ZOOM: ScalarPayload,
-            ControlAction.SET_AUTO_SPEED_LIMIT: ScalarPayload,
+            ControlAction.SET_AUTO_SPEED_LIMIT: SpeedLimitPayload,
             ControlAction.RECORD_ARM: TogglePayload,
             ControlAction.CAMERA_RESET: CameraResetPayload,
             ControlAction.START_AUTO: MissionRoutePayload,
+            ControlAction.RECORD_QUALITY: RecordingQualityPayload,
         }.get(self.action)
         if expected is not None and not isinstance(self.payload, expected):
             raise InvalidControlRequest(
@@ -500,18 +545,20 @@ class ControlRequest:
         elif self.action in {
             ControlAction.GIMBAL_PITCH,
             ControlAction.ZOOM,
-            ControlAction.SET_AUTO_SPEED_LIMIT,
         }:
             assert isinstance(self.payload, ScalarPayload)
             name, key = {
                 ControlAction.GIMBAL_PITCH: (name, "pitch"),
                 ControlAction.ZOOM: (name, "zoom"),
-                ControlAction.SET_AUTO_SPEED_LIMIT: (
-                    "auto_speed_limit_apply",
-                    "speed_limit_mps",
-                ),
             }[self.action]
             payload = {key: self.payload.value}
+        elif self.action is ControlAction.SET_AUTO_SPEED_LIMIT:
+            assert isinstance(self.payload, SpeedLimitPayload)
+            name = "auto_speed_limit_apply"
+            payload = {
+                "speed_limit_mps": self.payload.speed_limit_mps,
+                "enabled": self.payload.enabled,
+            }
         elif self.action is ControlAction.RECORD_ARM:
             assert isinstance(self.payload, TogglePayload)
             payload = {"enabled": self.payload.enabled}
@@ -521,6 +568,9 @@ class ControlRequest:
                 "pitch": self.payload.pitch,
                 "zoom": self.payload.zoom,
             }
+        elif self.action is ControlAction.RECORD_QUALITY:
+            assert isinstance(self.payload, RecordingQualityPayload)
+            payload = {"profile_id": self.payload.profile_id}
         elif self.action is ControlAction.START_AUTO:
             assert isinstance(self.payload, MissionRoutePayload)
             payload = {

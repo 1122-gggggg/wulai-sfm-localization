@@ -35,6 +35,7 @@ EXCLUDED_PARTS = {
     "封存",
     "EDM工具包",
     "inductor_cache",
+    "mission_snapshots",
     "outputs",
     "package_git",
     ".idea",

@@ -1,17 +1,16 @@
 # ANAFI 自動飛行安全操作
 
-河濱自主航線已由操作員於 2026-08-08 核准。`控制介面程式/mission_pipeline.py
---mode fly` 會先驗證 site profile、route schema、座標系與所有資產 SHA-256，再進入
-本目錄的 `path_follow_flight.py --fly`。控制器只使用 map-space 單位方向與全域保守
-設定，不建立 map-to-metre 尺度，也不要求場域專用 `flight.controller`。
+本目錄保留 legacy path-follow runner 與共用控制核心；它不是目前真機公開入口。
+現行真機 UI 只能從 `sfm-mission-selection/v1` resolver snapshot 啟動。
+`mission_pipeline.py --mode fly` 與 `path_follow_flight.py --fly` 都會拒絕起飛。
+真機 TakeOff 只允許操作員在桌面 UI 完成四步 preflight 後親自按下。
 
 ```bash
-.venv/bin/python 控制介面程式/mission_pipeline.py \
-  --site-profile 控制介面程式/site_profiles/river_site_edm.json \
-  --mode fly --controller skycontroller3
+.venv/bin/python 控制介面程式/launch_mission.py \
+  控制介面程式/mission_selections/river_site_b0_p116_p117_localization.json
 ```
 
-此命令只能由現場操作員執行；agent 不得執行 `--fly` 或代為授權 AUTO。
+或 `控制介面程式/真機串流/啟動.sh`。此專案的 agent 不得執行 `--fly` 或代為授權 AUTO。
 
 ## Firmware 高度／距離上限
 
@@ -30,7 +29,7 @@ SafetySwitch 預設 fail closed：
 
 - `SFM_SAFETY_FILE` 缺失時會建立內容為 `hover` 的檔案，不會自動寫入 `auto`。
 - 既有的 `hover`、`manual`、`land` 或 `emergency` 不會被覆寫。
-- 每次啟動 `--fly` 後，operator 確認場地、航線、串流與人工接管均就緒，必須在 30 秒內重新寫入一次 `auto`。前一次任務留下的 `auto` 視為過期，程式不會連線或起飛。
+- 桌面 AUTO 啟動後，operator 確認場地、航線、串流與人工接管均就緒。前一次任務留下的 `auto` 視為過期。
 
 預設檔案是 `${XDG_RUNTIME_DIR}/sfm_drone/safety.cmd`；沒有
 `XDG_RUNTIME_DIR` 時為 `~/.local/state/sfm_drone/safety.cmd`。目錄必須只允許
@@ -41,8 +40,8 @@ owner 存取，檔案不得是 symlink 或可被 group/other 寫入。不要直�
 python 控制介面程式/mission_pipeline.py --mode safety-hover
 ```
 
-`safety-auto` 只寫入本次執行的新鮮 authority token。操作員在已核准的 `--fly`
-啟動後 30 秒內親自寫入時，runner 才會繼續連線與飛行；agent 不得代為執行。
+`safety-auto` 只寫入本次執行的新鮮 authority token。操作員在桌面 UI 親自授權後
+才會起飛；agent 不得代為執行。
 
 推論中切換 HOVER/MANUAL/LAND/EMERGENCY、串流中斷或終止信號時，每一筆自主 PCMD（包括零 PCMD）都會先經過同一把 authority lock 重新檢查。MANUAL 與 EMERGENCY 會完全停止 PCMD；`SIGINT`、`SIGTERM` 與 `SIGHUP` 由獨立安全監視線程執行停止與降落。終止動作只允許 `NONE → LAND → EMERGENCY` 單向升級；即使指令檔隨後變回 AUTO/HOVER/MANUAL，也不會取消已鎖存的動作。Landing／Emergency callback 若丟出例外或明確回傳 `False`，監視線程會限頻重試；只有 callback 成功才標記已執行，Emergency 永遠維持最高優先。
 
@@ -52,13 +51,13 @@ python 控制介面程式/mission_pipeline.py --mode safety-hover
 清成零；之後即使狀態恢復 AUTO，也不會重新送出舊的非零命令。指令 JSONL
 同時保存 desired 更新與實際 PCMD 呼叫的 `monotonic_ns` 時間戳。
 
-使用 SkyController 3 時，`--fly` 在取得 PC 飛行權限前必須先成功啟動
+使用 SkyController 3 時，桌面真機入口在取得 PC 飛行權限前必須先成功啟動
 SC USB HID 搖桿監視器；找不到搖桿裝置或起飛前搖桿已偏轉都會拒絕起飛。
 自主飛行中任一飛行軸離開 deadzone 時，獨立 50 Hz callback 會先送零
 PCMD，再回讀確認 piloting source 已交回 `SkyController`；交接失敗或監視器
 中途斷線會鎖存 LAND。此路徑不依賴主感知迴圈，即使同步推論阻塞仍能交回搖桿。
 
-## BOOT 定位鎖定
+## BOOT 定位鎖定（legacy path-follow runner）
 
 起飛後只會懸停定位，必須在 25 秒內同時滿足：
 
@@ -66,7 +65,9 @@ PCMD，再回讀確認 piloting source 已交回 `SkyController`；交接失敗�
 - 每個 Pose 距航線起點不超過 `1.5` map-units（可用 `SFM_BOOT_START_MAX_U` 在實測尺度後調整）。
 - 連續 fix 之間不可超過 pose-jump gate。
 
-任一條件失敗會重置計數；逾時或 safety/stream 不健康時不進入 AUTO，並降落。
+任一條件失敗會重置計數。桌面操作介面的現行 AUTO 不使用此 legacy
+runner 的逾時降落策略：它會保持懸停，執行 MegaLoc／向右 yaw 搜尋，並等待
+定位恢復或搖桿接管。
 
 ## 巡檢完成條件
 

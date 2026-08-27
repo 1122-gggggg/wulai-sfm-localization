@@ -45,7 +45,12 @@ class SitePackagePort(Protocol):
 
 class RoutePort(Protocol):
     def import_file(
-        self, source: str | Path, profile_path: str | Path
+        self,
+        source: str | Path,
+        profile_path: str | Path,
+        *,
+        approve_for_auto: bool = False,
+        replace_route: str | Path | None = None,
     ) -> ImportedAsset: ...
 
 

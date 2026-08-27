@@ -241,6 +241,24 @@ def test_site_replay_full_run_fails_closed_on_incomplete_decode():
     assert benchmark._result_exit_code(0, audit, all_frames_requested=True) == 2
 
 
+def test_site_replay_camera_override_requires_valid_pinhole_params():
+    benchmark = load_module(
+        "benchmark_edm_site_replay_camera_override",
+        VALIDATION / "benchmark_edm_site_replay.py",
+    )
+
+    assert benchmark.parse_camera_params("960.5,958.2,670.8,358.7") == [
+        960.5,
+        958.2,
+        670.8,
+        358.7,
+    ]
+    with pytest.raises(Exception, match="four finite numbers"):
+        benchmark.parse_camera_params("960,958,nan,359")
+    with pytest.raises(Exception, match="focal lengths must be positive"):
+        benchmark.parse_camera_params("0,958,671,359")
+
+
 def test_site_replay_quality_gate_rejects_baseline_regressions():
     benchmark = load_module(
         "benchmark_edm_site_replay_quality",
@@ -450,15 +468,12 @@ def test_bundle_hash_preflight_rejects_mismatch(tmp_path):
         raise AssertionError("tampered bundle was accepted")
 
 
-def test_football_field_bundle_hash_is_trusted():
+def test_edm_checkpoint_hash_is_trusted():
     integrity = load_module(
-        "artifact_integrity_football",
+        "artifact_integrity_checkpoint",
         VALIDATION.parent / "deploy_code" / "sfm_glomap_deploy" / "artifact_integrity.py",
     )
 
-    assert integrity.KNOWN_SHA256["football_field_reloc_map_xfeat_tri.pt"] == (
-        "1c1774318a71ac29870f78ccb67001150edd934141e4aa288765e745e72db46f"
-    )
     assert integrity.KNOWN_SHA256["edm_outdoor.ckpt"] == (
         "f686bebdd9705bf6918621a1a83695f83d698cbd8c3eed932847fe3678d13a97"
     )
@@ -470,7 +485,7 @@ def test_production_flight_uses_calibrated_720p_full_opencv_camera(monkeypatch):
     monkeypatch.syspath_prepend(str(deploy))
     monkeypatch.syspath_prepend(str(flight_control))
     flight = load_module(
-        "path_follow_flight_football", flight_control / "path_follow_flight.py"
+        "path_follow_flight_camera_calibration", flight_control / "path_follow_flight.py"
     )
 
     assert flight.CAM_720 == (
@@ -692,3 +707,170 @@ def test_localizer_factory_refuses_unverified_default_thresholds() -> None:
             allow_profile_defaults=True,
         )
     assert "production localizer profile is required" not in str(excinfo.value)
+
+
+def _official_edm_profile() -> dict:
+    deploy = PACKAGE_ROOT / "定位演算法" / "deploy_code" / "sfm_glomap_deploy"
+    if str(deploy) not in sys.path:
+        sys.path.insert(0, str(deploy))
+    from edm_profile import load_edm_production_profile
+
+    return load_edm_production_profile(
+        PACKAGE_ROOT / "定位演算法" / "configs" / "edm_production_profile.json"
+    )
+
+
+def test_legacy_profile_uses_one_shot_lost_retrieval_default() -> None:
+    from edm_profile import apply_edm_tracker_profile
+    from production_edm_tracker import EDMConfig
+
+    profile = _official_edm_profile()
+    assert "lost_global_retrieval_interval" not in profile["tracker"]
+    cfg = EDMConfig(lost_global_retrieval_interval=9)
+
+    apply_edm_tracker_profile(cfg, profile)
+
+    assert cfg.lost_global_retrieval_interval == 0
+
+
+def test_absent_or_off_reposed_profile_imports_no_optional_package() -> None:
+    before = {name for name in sys.modules if name.split(".", 1)[0] in {"moge", "poselib"}}
+    profile = _official_edm_profile()
+    assert "reposed" not in profile
+    deploy = PACKAGE_ROOT / "定位演算法" / "deploy_code" / "sfm_glomap_deploy"
+    if str(deploy) not in sys.path:
+        sys.path.insert(0, str(deploy))
+    from production_localizer_factory import build_reposed_motion_validator
+
+    validator, mode = build_reposed_motion_validator(profile, object(), object())
+    assert validator is None
+    assert mode == "off"
+    after = {name for name in sys.modules if name.split(".", 1)[0] in {"moge", "poselib"}}
+    assert after == before
+
+
+def test_unknown_or_missing_reposed_keys_fail(tmp_path: Path) -> None:
+    deploy = PACKAGE_ROOT / "定位演算法" / "deploy_code" / "sfm_glomap_deploy"
+    if str(deploy) not in sys.path:
+        sys.path.insert(0, str(deploy))
+    from edm_profile import load_edm_production_profile
+
+    raw = _official_edm_profile()
+    raw["reposed"] = {
+        "mode": "off",
+        "model_path": "missing.pt",
+        "model_sha256": "0" * 64,
+        "num_tokens": 1200,
+        "max_matches": 1200,
+        "min_inliers": 30,
+        "max_rotation_delta_deg": 3.0,
+        "max_translation_direction_delta_deg": 15.0,
+        "extra": True,
+    }
+    path = tmp_path / "extra.json"
+    path.write_text(json.dumps(raw), encoding="utf-8")
+    with pytest.raises(ValueError, match="unknown"):
+        load_edm_production_profile(path)
+
+    raw["reposed"].pop("extra")
+    raw["reposed"].pop("min_inliers")
+    path.write_text(json.dumps(raw), encoding="utf-8")
+    with pytest.raises(ValueError, match="missing"):
+        load_edm_production_profile(path)
+
+
+def test_enabled_reposed_hash_mismatch_fails_before_model_allocation(tmp_path: Path, monkeypatch) -> None:
+    deploy = PACKAGE_ROOT / "定位演算法" / "deploy_code" / "sfm_glomap_deploy"
+    if str(deploy) not in sys.path:
+        sys.path.insert(0, str(deploy))
+    import reposed_motion_validator as validator_module
+    from edm_profile import load_edm_production_profile
+
+    model = tmp_path / "model.pt"
+    model.write_bytes(b"not-the-real-weights")
+    raw = _official_edm_profile()
+    raw["reposed"] = {
+        "mode": "shadow",
+        "model_path": str(model),
+        "model_sha256": "0" * 64,
+        "num_tokens": 1200,
+        "max_matches": 1200,
+        "min_inliers": 30,
+        "max_rotation_delta_deg": 3.0,
+        "max_translation_direction_delta_deg": 15.0,
+    }
+    path = tmp_path / "bad_hash.json"
+    path.write_text(json.dumps(raw), encoding="utf-8")
+
+    def _boom(*_args, **_kwargs):
+        raise AssertionError("model allocation must not run after a hash mismatch")
+
+    monkeypatch.setattr(validator_module.RePoseDMotionValidator, "_ensure_runtime", _boom)
+    with pytest.raises(ValueError, match="SHA-256 mismatch"):
+        load_edm_production_profile(path)
+
+
+def test_factory_passes_one_validated_wrapper_to_the_tracker(tmp_path: Path) -> None:
+    deploy = PACKAGE_ROOT / "定位演算法" / "deploy_code" / "sfm_glomap_deploy"
+    if str(deploy) not in sys.path:
+        sys.path.insert(0, str(deploy))
+    from edm_localizer_adapter import EDMTrackerAdapter
+    from production_edm_tracker import EDMConfig
+    from production_localizer_factory import build_reposed_motion_validator
+
+    model = tmp_path / "model.pt"
+    payload = b"fixture-weights"
+    model.write_bytes(payload)
+    digest = hashlib.sha256(payload).hexdigest()
+    camera = type(
+        "Cam",
+        (),
+        {"model": "PINHOLE", "width": 1280, "height": 720, "params": [900.0, 900.0, 640.0, 360.0]},
+    )()
+    profile = {
+        "reposed": {
+            "mode": "shadow",
+            "model_path": str(model),
+            "model_sha256": digest,
+            "num_tokens": 1200,
+            "max_matches": 1200,
+            "min_inliers": 30,
+            "max_rotation_delta_deg": 3.0,
+            "max_translation_direction_delta_deg": 15.0,
+        }
+    }
+    validator, mode = build_reposed_motion_validator(profile, camera, object(), source=model)
+    assert mode == "shadow"
+    assert validator is not None
+    created = []
+
+    class _Map:
+        ref_centers = None
+        ref_yaws = None
+        ref_names = ["ref0"]
+
+    original = EDMTrackerAdapter.__init__
+
+    def wrapped(self, *args, **kwargs):
+        created.append(kwargs.get("motion_validator"))
+        self.trk = type("T", (), {"cfg": EDMConfig(), "st": None})()
+        self.map = args[0]
+        self.cfg = self.trk.cfg
+        self.frame_source = kwargs.get("frame_source")
+        self.map_frame = kwargs.get("map_frame")
+        self.state = None
+        self.temporal_cache = None
+        self._last_info = {}
+
+    EDMTrackerAdapter.__init__ = wrapped
+    try:
+        adapter = EDMTrackerAdapter(
+            _Map(),
+            camera,
+            motion_validator=validator,
+            motion_validation_mode=mode,
+        )
+    finally:
+        EDMTrackerAdapter.__init__ = original
+    assert created == [validator]
+    assert adapter.trk is not None

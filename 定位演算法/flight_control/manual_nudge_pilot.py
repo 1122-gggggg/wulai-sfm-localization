@@ -14,7 +14,8 @@ Directional nudges (body frame, small PCMD percent pulses)
 SAFETY (non-negotiable)
   - Default mode after each pulse is zero-PCMD hover.
   - Ctrl-C / SIGTERM / SIGHUP / window close / process exit:
-      zero PCMD -> Landing() -> restore piloting source to SkyController sticks.
+      PC control: zero PCMD -> bounded Landing() -> restore SkyController sticks;
+      existing SkyController control: preserve the manual connection.
   - Key `m` or button 手動: stop PC PCMD, restore SkyController sticks immediately
     (pilot flies; computer silent).
   - Key `h` / Space: zero PCMD hover (PC still holds piloting source).
@@ -245,6 +246,7 @@ class NudgePilot:
         self.safety = SafetyState(last_beat=time.monotonic())
         self.drone = None
         self._send_lock = threading.RLock()
+        self._cleanup_lock = threading.RLock()
         self._pulse_token = 0
         self._cleanup_done = False
         self._operator_takeoff_approval = False
@@ -527,29 +529,82 @@ class NudgePilot:
     def beat(self) -> None:
         self.safety.last_beat = time.monotonic()
 
+    def _cleanup_zero_and_restore_sticks(self, reason: str) -> bool:
+        """Silence PC control and leave SkyController as the owner."""
+        zero_ok = True
+        source_ok = False
+        with self._send_lock:
+            self.safety.pilot_sticks = True
+            try:
+                self._raw_pcmd(0, 0, 0, 0)
+            except Exception as exc:
+                zero_ok = False
+                self.log.event("pcmd_zero_failed", reason=reason,
+                               ok=False, error=repr(exc))
+            try:
+                source_ok = bool(self._set_piloting_source("SkyController"))
+            except Exception as exc:
+                self.log.event("piloting_source", source="SkyController",
+                               ok=False, error=repr(exc), reason=reason)
+        self.log.event(
+            "cleanup_manual_control_preserved",
+            reason=reason,
+            zero_ok=zero_ok,
+            source_ok=source_ok,
+            connection_preserved=True,
+        )
+        return zero_ok and source_ok
+
     def cleanup(self) -> None:
-        if self._cleanup_done:
-            return
-        self._cleanup_done = True
-        self.log.event("cleanup_begin")
-        try:
-            # if we might still be airborne under PC control, land
-            if not self.safety.landed and not self.safety.pilot_sticks:
-                self.land("cleanup_exit")
-            else:
+        """Safely finish without disconnecting an airborne/unconfirmed aircraft."""
+        with self._cleanup_lock:
+            if self._cleanup_done:
+                return
+            self.log.event("cleanup_begin")
+
+            # Once the safety pilot owns the sticks, preserve that live manual
+            # connection.  Disconnecting here would strand an airborne aircraft.
+            if self.safety.pilot_sticks:
+                self._cleanup_zero_and_restore_sticks("cleanup_manual")
+                self._cleanup_done = True
+                self.log.event(
+                    "cleanup_done",
+                    touchdown_confirmed=bool(self.safety.landed),
+                    manual_control_preserved=True,
+                )
+                self.log.close()
+                return
+
+            landed = bool(self.safety.landed)
+            if not landed and self.drone is not None:
                 try:
-                    self._raw_pcmd(0, 0, 0, 0)
+                    landed = bool(self.land("cleanup_exit"))
                 except Exception as exc:
-                    self.log.event("pcmd_zero_failed", reason="cleanup_exit",
-                                   ok=False, error=repr(exc))
-                self._set_piloting_source("SkyController")
-        finally:
+                    self.log.event("cleanup_land_error", ok=False,
+                                   error=repr(exc))
+
+            if not landed:
+                self._cleanup_zero_and_restore_sticks("cleanup_land_unconfirmed")
+                self.safety.airborne = True
+                self.log.event(
+                    "cleanup_unresolved",
+                    reason="LAND_UNCONFIRMED",
+                    touchdown_confirmed=False,
+                    connection_preserved=True,
+                )
+                return
+
+            self.safety.landed = True
+            self.safety.airborne = False
             if self.drone is not None:
                 try:
                     self.drone.disconnect()
                 except Exception as exc:
                     self.log.event("disconnect_error", error=repr(exc))
-            self.log.event("cleanup_done")
+                else:
+                    self.drone = None
+            self._cleanup_done = True
+            self.log.event("cleanup_done", touchdown_confirmed=True)
             self.log.close()
 
 
@@ -777,7 +832,7 @@ def main(argv: list[str] | None = None) -> int:
         print(
             "!!! LIVE MODE: will take Olympe piloting source (sticks silent until Esc/手動).\n"
             "    Safety pilot must hold the SkyController. Props-off first for bench.\n"
-            "    Ctrl-C / close window / kill terminal -> land + restore sticks.",
+            "    Ctrl-C / close window / kill terminal -> bounded safety cleanup.",
             flush=True,
         )
 

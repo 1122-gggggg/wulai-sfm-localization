@@ -10,11 +10,12 @@ from site_profile import SCHEMA_VERSION, flight_readiness_errors, load_site_prof
 
 
 ROOT = Path(__file__).resolve().parent
+WORKSPACE_ROOT = ROOT.parent
 PROFILES = ROOT / "site_profiles"
+CANONICAL_PROFILE_DIR = WORKSPACE_ROOT / "地圖檔" / "場域"
 TEMPLATE_NAMES = {"example_site_edm.json"}
-# River-site is the currently approved AUTO profile.  Hardware receipt material
-# remains optional metadata and is not part of ``flight_readiness_errors``.
-APPROVED_PROFILE_NAMES: set[str] = {"river_site_edm.json"}
+# No shipped profile is AUTO-approved until a route is redrawn on the current map.
+APPROVED_PROFILES: set[Path] = set()
 
 
 def _digest(path: Path) -> str:
@@ -34,7 +35,7 @@ def _validate_profile_fields(source: Path, raw: dict, profile: object) -> list[s
     if "map_units_per_meter" in raw.get("flight", {}):
         failures.append(f"{source.name}: metric map scale is prohibited")
     approved = bool(profile.flight and profile.flight.approved)
-    expected_approved = source.name in APPROVED_PROFILE_NAMES
+    expected_approved = source.resolve() in APPROVED_PROFILES
     if approved is not expected_approved:
         failures.append(f"{source.name}: flight.approved must be {expected_approved}")
     if expected_approved:
@@ -57,6 +58,16 @@ def _validate_asset_digests(source: Path, profile: object) -> tuple[list[str], i
         ("reference_index", profile.reference_index),
         ("poles_json", profile.poles_json),
         ("map_align", profile.map_align),
+        (
+            "site_alignment",
+            None if profile.pose_chain is None else profile.pose_chain.site_alignment,
+        ),
+        (
+            "camera_body_extrinsic",
+            None
+            if profile.pose_chain is None
+            else profile.pose_chain.camera_body_extrinsic,
+        ),
     ):
         expected = getattr(profile.asset_sha256, key)
         if expected is None:
@@ -123,7 +134,7 @@ def _validate_one(source: Path) -> tuple[dict[str, object] | None, list[str]]:
     failures.extend(asset_failures)
     failures.extend(hardware_failures)
     return {
-        "profile": source.name,
+        "profile": str(source.relative_to(WORKSPACE_ROOT)),
         "site_id": profile.site_id,
         "schema_version": profile.schema_version,
         "flight_approved": bool(profile.flight and profile.flight.approved),
@@ -135,7 +146,11 @@ def _validate_one(source: Path) -> tuple[dict[str, object] | None, list[str]]:
 def validate() -> tuple[list[dict[str, object]], list[str]]:
     rows: list[dict[str, object]] = []
     failures: list[str] = []
-    for source in sorted(PROFILES.glob("*.json")):
+    sources = [
+        *PROFILES.glob("*.json"),
+        *CANONICAL_PROFILE_DIR.glob("*/site_profile.json"),
+    ]
+    for source in sorted(sources):
         row, profile_failures = _validate_one(source)
         failures.extend(profile_failures)
         if row is not None:

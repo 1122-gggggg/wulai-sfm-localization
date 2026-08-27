@@ -262,3 +262,464 @@ def test_edm_replay_loop_keeps_mock_frame_audit_and_row_schema():
     assert rows[0]["success"] is True
     assert rows[0]["next_mode"] == "TRACK"
     assert rows[0]["inliers"] == 12
+
+
+P167_MEASURED = {
+    "frames": 2318,
+    "source_fps": 23.976,
+    "processing_fps": 20.864,
+    "wall_ms": {"p50": 28.27, "p95": 105.51},
+    "match_ms": {"p50": 24.01, "p95": 94.28},
+    "pnp_ms": {"p50": 3.03, "p95": 13.62},
+    "accepted": 743,
+    "accepted_rate": 0.3205,
+    "state_counts": {"TRACK": 1233, "WEAK_TRACK": 541, "LOST": 544},
+    "limited_jump_unconfirmed": 495,
+    "cache_hit_rate": 0.875,
+    "startup_ms": 3576.6,
+}
+
+
+def _replay_receipt(**overrides):
+    receipt = {
+        "radius": 0.5881852149963379,
+        "mconf_thr": 0.2,
+        "coarse_topk": 3225,
+        "cache_capacity": 32,
+        "lost_strategy": "boot_and_lost_once",
+        "lost_global_retrieval_interval": 15,
+        "fused_coarse_mode": "fused",
+        "runtime_sigma_mode": "reference_grid",
+        "temporal_feature_cache_size": 0,
+        "acquire_stage_mode": "full_set",
+        "lost_prior_strategy": "restrict_nearby",
+        "lost_prior_fusion_weight": 1.0,
+        "worker_mode": "sequential",
+    }
+    receipt.update(overrides)
+    return receipt
+
+
+
+def test_receipt_identity_fails_closed_on_override_mismatch():
+    replay = load_script("benchmark_edm_site_replay_helpers", "benchmark_edm_site_replay.py")
+    actual = _replay_receipt()
+    baseline = {"receipt": dict(actual, worker_mode="production-path")}
+    failures = replay.receipt_identity_failures(baseline, actual)
+    assert any("receipt.worker_mode mismatch" in item for item in failures)
+    assert replay.receipt_identity_failures({"receipt": actual}, actual) == []
+
+
+def test_receipt_identity_requires_every_override_key():
+    replay = load_script("benchmark_edm_site_replay_helpers", "benchmark_edm_site_replay.py")
+    actual = _replay_receipt()
+    failures = replay.receipt_identity_failures({"receipt": {"radius": actual["radius"]}}, actual)
+    assert any("baseline is missing receipt.mconf_thr" in item for item in failures)
+    assert any("baseline is missing receipt.coarse_topk" in item for item in failures)
+    assert any("baseline is missing receipt.cache_capacity" in item for item in failures)
+    assert any("baseline is missing receipt.lost_strategy" in item for item in failures)
+    assert any("baseline is missing receipt.fused_coarse_mode" in item for item in failures)
+    assert any("baseline is missing receipt.runtime_sigma_mode" in item for item in failures)
+    assert any("baseline is missing receipt.temporal_feature_cache_size" in item for item in failures)
+    assert any("baseline is missing receipt.acquire_stage_mode" in item for item in failures)
+    assert any("baseline is missing receipt.lost_prior_strategy" in item for item in failures)
+    assert any("baseline is missing receipt.lost_prior_fusion_weight" in item for item in failures)
+    assert any("baseline is missing receipt.worker_mode" in item for item in failures)
+    assert not any("baseline is missing receipt.sigma_mode" in item for item in failures)
+
+
+def test_invalid_public_overrides_fail_closed(tmp_path):
+    replay = load_script("benchmark_edm_site_replay_helpers", "benchmark_edm_site_replay.py")
+    video = tmp_path / "clip.mp4"
+    video.write_bytes(b"mock")
+    args = SimpleNamespace(
+        stride=1, max_frames=0, max_corr_total=0, radius=None,
+        site_profile=tmp_path / "site.json", video=video, require_cuda=False,
+        worker_mode="sequential", mconf_thr=1.5, coarse_topk=None,
+        cache_capacity=None, lost_strategy=None,
+        lost_global_retrieval_interval=None, sigma_mode=None,
+        runtime_sigma_mode=None, temporal_feature_cache_size=None,
+        acquire_stage_mode=None, lost_prior_strategy=None,
+        lost_prior_fusion_weight=None,
+    )
+    with pytest.raises(SystemExit, match="mconf-thr"):
+        replay._validate_run_inputs(args)
+    args.mconf_thr = 0.2
+    args.coarse_topk = 0
+    with pytest.raises(SystemExit, match="coarse-topk"):
+        replay._validate_run_inputs(args)
+    args.coarse_topk = 3225
+    args.worker_mode = "inline"
+    with pytest.raises(SystemExit, match="worker-mode"):
+        replay._validate_run_inputs(args)
+    args.worker_mode = "sequential"
+    args.runtime_sigma_mode = "fused"
+    with pytest.raises(SystemExit, match="runtime-sigma-mode"):
+        replay._validate_run_inputs(args)
+    args.runtime_sigma_mode = "bidirectional"
+    args.temporal_feature_cache_size = -1
+    with pytest.raises(SystemExit, match="temporal-feature-cache-size"):
+        replay._validate_run_inputs(args)
+    args.temporal_feature_cache_size = 2
+    args.acquire_stage_mode = "skip_gates"
+    with pytest.raises(SystemExit, match="acquire-stage-mode"):
+        replay._validate_run_inputs(args)
+    args.acquire_stage_mode = "initial_topk"
+    args.lost_prior_strategy = "teleport"
+    with pytest.raises(SystemExit, match="lost-prior-strategy"):
+        replay._validate_run_inputs(args)
+    args.lost_prior_strategy = "score_fusion"
+    args.lost_prior_fusion_weight = 0.0
+    with pytest.raises(SystemExit, match="lost-prior-fusion-weight"):
+        replay._validate_run_inputs(args)
+
+
+
+class _FakeLiveClient:
+    def __init__(self):
+        self.ready = True
+        self.unavailable = False
+        self.timeout_s = 1.0
+        self.restart_warmup_s = 0.0
+        self._coalesce_drops = 0
+        self._coalesce = None
+        self._active = None
+        self.in_flight = False
+        self.submits = []
+        self.closed = False
+        self.startup_info = {"event": "ready", "ready_latency_ms": 12.0}
+
+    def submit(self, seq, frame_name, frame, *, timing_metadata=None):
+        self.submits.append((seq, frame_name))
+        item = (seq, frame_name, frame, dict(timing_metadata or {}))
+        if self.in_flight:
+            if self._coalesce is not None:
+                self._coalesce_drops += 1
+            self._coalesce = item
+            return True
+        self.in_flight = True
+        self._active = item
+        return True
+
+    def poll_results(self):
+        return []
+
+
+    def busy(self):
+        return self.in_flight or self._coalesce is not None
+
+    def close(self):
+        self.closed = True
+
+
+
+
+class _Clock:
+    def __init__(self, t=1000.0):
+        self.t = t
+        self.sleeps = []
+
+    def monotonic(self):
+        return self.t
+
+    def sleep(self, seconds):
+        self.sleeps.append(seconds)
+        self.t += seconds
+
+
+def test_source_cadence_coalesces_to_latest_frame_and_records_drops():
+    replay = load_script("benchmark_edm_site_replay_helpers", "benchmark_edm_site_replay.py")
+    clock = _Clock()
+    client = _FakeLiveClient()
+    rgb = np.zeros((2, 2, 3), dtype=np.uint8)
+    decoded = [
+        {
+            "source_index": i, "rgb": rgb, "decode_ms": 1.0, "copy_ms": 0.5,
+            "recorded_stamp": i / 23.976, "frame_id": f"src_{i:08d}",
+            "frame_sha256": f"{i:064d}",
+        }
+        for i in range(3)
+    ]
+    rows, stats = replay.run_source_cadence(
+        decoded, 23.976, client, sleep=clock.sleep, monotonic=clock.monotonic,
+        drain_timeout_s=0.0,
+    )
+    assert stats["decoded"] == 3
+    assert stats["submit_ok"] == 3
+    assert stats["coalesce_drops"] == 1
+    assert [name for _seq, name in client.submits] == [
+        "src_00000000", "src_00000001", "src_00000002",
+    ]
+    assert clock.sleeps == pytest.approx([1.0 / 23.976, 1.0 / 23.976])
+    assert client._coalesce[1] == "src_00000002"
+    client.close()
+    assert client.closed is True
+
+
+
+
+def test_pipeline_summary_uses_measured_p167_shape():
+    replay = load_script("benchmark_edm_site_replay_helpers", "benchmark_edm_site_replay.py")
+    rows = [{
+        "success": True, "source_index": 0, "next_mode": "TRACK",
+        "capture_source_age_ms": 0.0, "submit_source_age_ms": 1.0,
+        "promote_source_age_ms": 2.0, "inference_source_age_ms": 28.27,
+        "result_source_age_ms": 28.27, "copy_ms": 0.4, "gpu_span_ms": None,
+        "coalesce_drops": 0, "submit_drop": 0,
+        "edm_cache_hits": int(0.875 * 16), "edm_cache_misses": 2,
+        "edm_cache_evictions": 0,
+    }]
+    summary = replay.pipeline_summary(rows, startup_ms=P167_MEASURED["startup_ms"])
+    assert summary["startup_ms"] == P167_MEASURED["startup_ms"]
+    assert summary["first_fix_frame"] == 0
+    assert summary["copies"] == 1
+    assert summary["cache"]["hits"] == 14
+
+
+def test_production_stream_receipt_includes_behavior_changing_overrides():
+    stream = load_script("benchmark_production_stream_helpers", "benchmark_production_stream.py")
+    args = SimpleNamespace(
+        radius=0.8, nn_min_score=0.85, boot_topk=30, temporal_cache_max_anchors=2048,
+        lost_topk=30, worker_mode="sequential", sigma_mode=None,
+        mconf_thr=None, coarse_topk=None, cache_capacity=None, lost_strategy=None,
+        lost_global_retrieval_interval=None,
+    )
+    receipt = stream.build_receipt(args)
+    assert receipt["radius"] == 0.8
+    assert receipt["mconf_thr"] == 0.85
+    assert receipt["coarse_topk"] == 30
+    assert receipt["cache_capacity"] == 2048
+    assert receipt["worker_mode"] == "sequential"
+    assert receipt["fused_coarse_mode"] == "fused"
+    assert "runtime_sigma_mode" in receipt
+    assert "temporal_feature_cache_size" in receipt
+    assert "acquire_stage_mode" in receipt
+    assert "lost_prior_strategy" in receipt
+    assert "lost_prior_fusion_weight" in receipt
+    assert "sigma_mode" not in receipt
+    mismatched = stream.receipt_identity_failures(
+        {"receipt": dict(receipt, radius=1.25)}, receipt,
+    )
+    assert any("receipt.radius mismatch" in item for item in mismatched)
+
+
+def test_streaming_corpus_receipt_defaults_preserve_current_profile():
+    path = ROOT / "定位演算法" / "EDM工具包" / "tests" / "bench_streaming_corpus_edm.py"
+    spec = importlib.util.spec_from_file_location("bench_streaming_corpus_edm_helpers", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    args = SimpleNamespace(
+        mconf_thr=0.2, edm_topk=3225, radius=None, cache_capacity=32,
+        lost_strategy=None, lost_global_retrieval_interval=15,
+        sigma_mode=None, worker_mode="sequential",
+    )
+    receipt = module.build_receipt(args)
+    assert receipt["mconf_thr"] == 0.2
+    assert receipt["coarse_topk"] == 3225
+    assert receipt["cache_capacity"] == 32
+    assert receipt["lost_global_retrieval_interval"] == 15
+    assert receipt["lost_strategy"] == "boot_and_lost_once"
+    assert receipt["worker_mode"] == "sequential"
+    assert receipt.get("fused_coarse_mode", receipt.get("sigma_mode")) == "fused"
+
+
+
+def _fake_built():
+    return SimpleNamespace(
+        config=SimpleNamespace(
+            radius=0.5881852149963379,
+            global_retrieval_policy="boot_and_lost_once",
+            lost_global_retrieval_interval=15,
+            acquire_stage_mode="full_set",
+            lost_prior_strategy="restrict_nearby",
+            lost_prior_fusion_weight=1.0,
+            validate=lambda: None,
+        ),
+        _matcher=SimpleNamespace(
+            mconf_thr=0.2,
+            topk=3225,
+            reference_cache_size=32,
+            runtime_sigma_mode="reference_grid",
+            temporal_feature_cache_size=0,
+            _feature_cache_capacity={"map": 32, "temporal": 0},
+        ),
+    )
+
+
+def test_apply_runtime_overrides_mutate_built_objects_and_receipt():
+    replay = load_script("benchmark_edm_site_replay_helpers", "benchmark_edm_site_replay.py")
+    built = _fake_built()
+    args = SimpleNamespace(
+        worker_mode="sequential",
+        sigma_mode="upstream",
+        radius=None,
+        mconf_thr=None,
+        coarse_topk=None,
+        cache_capacity=None,
+        lost_strategy=None,
+        lost_global_retrieval_interval=None,
+        runtime_sigma_mode="bidirectional",
+        temporal_feature_cache_size=3,
+        acquire_stage_mode="initial_topk",
+        lost_prior_strategy="score_fusion",
+        lost_prior_fusion_weight=2.5,
+    )
+    replay.apply_runtime_overrides(args, built)
+    assert built.config.acquire_stage_mode == "initial_topk"
+    assert built.config.lost_prior_strategy == "score_fusion"
+    assert built.config.lost_prior_fusion_weight == 2.5
+    assert built._matcher.runtime_sigma_mode == "bidirectional"
+    assert built._matcher.temporal_feature_cache_size == 3
+    assert built._matcher._feature_cache_capacity["temporal"] == 3
+    receipt = replay.build_receipt(args, built)
+    assert receipt["fused_coarse_mode"] == "upstream"
+    assert receipt["runtime_sigma_mode"] == "bidirectional"
+    assert receipt["temporal_feature_cache_size"] == 3
+    assert receipt["acquire_stage_mode"] == "initial_topk"
+    assert receipt["lost_prior_strategy"] == "score_fusion"
+    assert receipt["lost_prior_fusion_weight"] == 2.5
+    assert receipt["fused_coarse_mode"] != receipt["runtime_sigma_mode"]
+    assert "sigma_mode" not in receipt
+
+
+def test_runtime_stub_defaults_reproduce_active_profile(tmp_path):
+    replay = load_script("benchmark_edm_site_replay_helpers", "benchmark_edm_site_replay.py")
+    profile = tmp_path / "edm_runtime_profile.json"
+    profile.write_text(json.dumps({
+        "matcher": {
+            "mconf_thr": 0.2,
+            "coarse_topk": 3225,
+            "reference_cache_size": 32,
+        },
+        "tracker": {
+            "radius": 0.5881852149963379,
+            "global_retrieval_policy": "boot_and_lost_once",
+            "lost_global_retrieval_interval": 15,
+            "use_temporal_reference": False,
+        },
+    }), encoding="utf-8")
+    site = SimpleNamespace(localizer_profile=profile)
+    args = SimpleNamespace(
+        worker_mode="sequential",
+        sigma_mode=None,
+        radius=None,
+        mconf_thr=None,
+        coarse_topk=None,
+        cache_capacity=None,
+        lost_strategy=None,
+        lost_global_retrieval_interval=None,
+        runtime_sigma_mode=None,
+        temporal_feature_cache_size=None,
+        acquire_stage_mode=None,
+        lost_prior_strategy=None,
+        lost_prior_fusion_weight=None,
+    )
+    stub = replay.runtime_stub_from_profile(site, args)
+    assert stub.config.acquire_stage_mode == "full_set"
+    assert stub.config.lost_prior_strategy == "restrict_nearby"
+    assert stub.config.lost_prior_fusion_weight == 1.0
+    assert stub._matcher.runtime_sigma_mode == "reference_grid"
+    assert stub._matcher.temporal_feature_cache_size == 0
+    receipt = replay.build_receipt(args, stub)
+    assert receipt["fused_coarse_mode"] == "fused"
+    assert receipt["runtime_sigma_mode"] == "reference_grid"
+    assert receipt["temporal_feature_cache_size"] == 0
+    assert receipt["acquire_stage_mode"] == "full_set"
+    assert receipt["lost_prior_strategy"] == "restrict_nearby"
+    assert receipt["lost_prior_fusion_weight"] == 1.0
+    args.runtime_sigma_mode = "bidirectional"
+    args.temporal_feature_cache_size = 4
+    args.acquire_stage_mode = "initial_topk"
+    args.lost_prior_strategy = "full_global"
+    args.lost_prior_fusion_weight = 3.0
+    overridden = replay.runtime_stub_from_profile(site, args)
+    receipt = replay.build_receipt(args, overridden)
+    assert overridden._matcher.runtime_sigma_mode == "bidirectional"
+    assert overridden.config.acquire_stage_mode == "initial_topk"
+    assert receipt["runtime_sigma_mode"] == "bidirectional"
+    assert receipt["temporal_feature_cache_size"] == 4
+    assert receipt["acquire_stage_mode"] == "initial_topk"
+    assert receipt["lost_prior_strategy"] == "full_global"
+    assert receipt["lost_prior_fusion_weight"] == 3.0
+    assert receipt["fused_coarse_mode"] == "fused"
+
+
+def test_production_path_fails_closed_on_untransmitted_overrides(tmp_path):
+    replay = load_script("benchmark_edm_site_replay_helpers", "benchmark_edm_site_replay.py")
+    video = tmp_path / "clip.mp4"
+    video.write_bytes(b"mock")
+    args = SimpleNamespace(
+        stride=1, max_frames=0, max_corr_total=0, radius=None,
+        site_profile=tmp_path / "site.json", video=video, require_cuda=False,
+        worker_mode="production-path", mconf_thr=None, coarse_topk=None,
+        cache_capacity=None, lost_strategy=None,
+        lost_global_retrieval_interval=None, sigma_mode="fused",
+        runtime_sigma_mode="bidirectional", temporal_feature_cache_size=None,
+        acquire_stage_mode=None, lost_prior_strategy=None,
+        lost_prior_fusion_weight=None,
+    )
+    with pytest.raises(SystemExit, match="production-path cannot apply runtime-sigma-mode"):
+        replay._validate_run_inputs(args)
+    args.runtime_sigma_mode = None
+    profile = tmp_path / "edm_runtime_profile.json"
+    profile.write_text(json.dumps({
+        "matcher": {
+            "mconf_thr": 0.2,
+            "coarse_topk": 3225,
+            "reference_cache_size": 32,
+        },
+        "tracker": {
+            "radius": 0.8,
+            "global_retrieval_policy": "boot_and_lost_once",
+            "use_temporal_reference": False,
+        },
+    }), encoding="utf-8")
+    site = SimpleNamespace(localizer_profile=profile)
+    args.lost_prior_strategy = "score_fusion"
+    with pytest.raises(SystemExit, match="production-path cannot apply lost-prior-strategy"):
+        replay.runtime_stub_from_profile(site, args)
+
+
+
+def test_known_incomplete_uses_stream_frame_count_for_coalesced_worker():
+    replay = load_script("benchmark_edm_site_replay_integrity", "benchmark_edm_site_replay.py")
+    summary = {
+        "frames": 2175,
+        "successes": 1622,
+        "state_counts": {"TRACK": 1622, "LOST": 295},
+        "inliers": {"p50": 127.0, "p95": 677.9},
+        "reproj_rms": {"p95": 3.15},
+        "rejection_counts": {"limited_jump_unconfirmed": 0},
+    }
+    baseline = {
+        "thresholds": {
+            "frames": 2175,
+            "min_successes": 1600,
+            "min_track": 1600,
+            "max_lost": 320,
+            "min_inliers_p50": 120,
+            "min_inliers_p95": 650,
+            "max_reproj_rms_p95": 3.2,
+            "max_limited_jump_unconfirmed": 0,
+        },
+        "stream_integrity": {"expected_decoded_frames": 3082},
+    }
+    audit = SimpleNamespace(
+        reported_raw_frames=3083,
+        decoded_raw_frames=3082,
+        sampled_frames=3082,
+        decode_errors=1,
+    )
+    failures, accepted = replay._evaluate_replay_quality(
+        SimpleNamespace(
+            quality_baseline=Path("baseline.json"),
+            accept_known_incomplete=True,
+        ),
+        summary,
+        baseline,
+        audit,
+        True,
+    )
+    assert failures == []
+    assert accepted is True

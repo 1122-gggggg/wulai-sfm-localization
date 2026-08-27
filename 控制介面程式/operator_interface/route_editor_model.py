@@ -73,6 +73,20 @@ def _arrive_radius(raw: object) -> float | None:
     return value
 
 
+def _route_deviation_radius(raw: object) -> float | None:
+    """Validate the operator-confirmed safe tube carried by a route file."""
+    if raw is None:
+        return None
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        raise ValueError("route max_route_deviation_map_units must be a number")
+    value = float(raw)
+    if not math.isfinite(value) or value < 0.0:
+        raise ValueError(
+            "route max_route_deviation_map_units must be finite and >= 0"
+        )
+    return value
+
+
 def _editor_points_from_route(
     raw: dict,
     *,
@@ -118,6 +132,8 @@ class RouteDocument:
     align_source: str = "legacy"
     #: Arrival sphere the operator confirmed, in map units.
     arrive_radius_map_units: float | None = None
+    #: Radius of the safe tube around the route centerline, in map units.
+    max_route_deviation_map_units: float | None = None
 
     @classmethod
     def load(
@@ -174,6 +190,9 @@ class RouteDocument:
             source_path=source,
             align_source=align_source,
             arrive_radius_map_units=_arrive_radius(raw.get("arrive_radius_map_units")),
+            max_route_deviation_map_units=_route_deviation_radius(
+                raw.get("max_route_deviation_map_units")
+            ),
         )
 
     def payload(self, *, preview_only: bool = False) -> dict:
@@ -193,11 +212,12 @@ class RouteDocument:
             "closed": False,
             "waypoints": points,
             "arrive_radius_map_units": self.arrive_radius_map_units,
+            "max_route_deviation_map_units": self.max_route_deviation_map_units,
             "source": "operator_route_editor",
             "note": (
                 "unbound PLY preview; cannot be imported as a flight route"
                 if preview_only
-                else "draft route; flight clearance remains unapproved"
+                else "latest operator route; AUTO clearance is controlled by the site profile"
             ),
         }
         return payload

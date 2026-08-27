@@ -7,6 +7,7 @@ seam used by both the deployment controller and the legacy path loader.
 from __future__ import annotations
 
 import json
+import hashlib
 import sys
 from pathlib import Path
 
@@ -124,6 +125,70 @@ def test_route_arrival_radius_is_preserved_by_controller_conversion(tmp_path):
     assert route.arrive_radius_map_units == pytest.approx(0.42)
     assert config.waypoint_arrive_radius == pytest.approx(0.42)
     assert config.progress_jump_slack >= 0.42
+
+
+@pytest.mark.parametrize(
+    "radius",
+    [True, False, -0.1, float("nan"), float("inf"), float("-inf"), "0.5"],
+)
+def test_route_domain_rejects_invalid_route_deviation_radius(radius):
+    with pytest.raises(ValueError, match="max_route_deviation_map_units"):
+        RouteDocument.from_data(_route(max_route_deviation_map_units=radius))
+
+
+def test_route_deviation_radius_is_preserved_and_cannot_loosen_the_base_limit(
+    tmp_path,
+):
+    path = tmp_path / "route.json"
+    path.write_text(
+        json.dumps(_route(max_route_deviation_map_units=0.075)),
+        encoding="utf-8",
+    )
+
+    route = RouteDocument.from_path(path)
+    tightened = rpf.config_for_route(
+        path,
+        rpf.ControlConfig(max_route_deviation=0.1),
+    )
+    capped = rpf.config_for_route(
+        path,
+        rpf.ControlConfig(max_route_deviation=0.05),
+    )
+
+    assert route.max_route_deviation_map_units == pytest.approx(0.075)
+    assert tightened.max_route_deviation == pytest.approx(0.075)
+    assert capped.max_route_deviation == pytest.approx(0.05)
+
+
+def test_zero_route_deviation_means_centerline_only(tmp_path):
+    path = tmp_path / "route.json"
+    path.write_text(
+        json.dumps(_route(max_route_deviation_map_units=0.0)),
+        encoding="utf-8",
+    )
+
+    route = RouteDocument.from_path(path)
+    config = rpf.config_for_route(path)
+
+    assert route.max_route_deviation_map_units == pytest.approx(0.0)
+    assert config.max_route_deviation == pytest.approx(0.0)
+
+
+def test_mission_snapshot_carries_the_approved_route_deviation_radius(tmp_path):
+    path = tmp_path / "route.json"
+    path.write_text(
+        json.dumps(_route(max_route_deviation_map_units=0.065)),
+        encoding="utf-8",
+    )
+
+    snapshot = rpf.capture_mission_route_snapshot(
+        path,
+        expected_sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+        expected_site_id="field-a",
+        expected_coordinate_frame_id="glomap-a",
+    )
+
+    assert snapshot.max_route_deviation_map_units == pytest.approx(0.065)
 
 
 def test_aligned_conversion_uses_the_declared_legacy_or_measured_authoring_frame():

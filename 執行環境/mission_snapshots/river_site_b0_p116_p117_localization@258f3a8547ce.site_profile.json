@@ -1,0 +1,59 @@
+{
+  "asset_sha256": {
+    "camera_body_extrinsic": null,
+    "localization_bundle": "227124c26ecd4d8ae16bcc80290af1d3c971392c6de038fe610c1068ca3e2ffd",
+    "localizer_profile": "052f8485c4878f016a50a36793344ab10c35ffde3a9977112f5d51e4ae2d726d",
+    "map_align": "e81fdb1de2ed92c22eacaf82e7055eb6a9757696a68e023a460a5f39e751f902",
+    "map_ply": "7dcad2765aba006b24b69043215b0b6f7318350b53b6a9fed1e091cc827840cb",
+    "map_reference_poses": "581ecbe37ae98df80f8a9cf5ac27ccf4001dea069cfb2cf379bb64bd22fe6876",
+    "poles_json": null,
+    "reference_index": null,
+    "route_json": null,
+    "site_alignment": null
+  },
+  "assets": {
+    "localization_bundle": "/home/allen/localization/地圖檔/場域/river_site/releases/river_site_b0_p116_p117_20260818/localization/localization_bundle.pt",
+    "map_ply": "/home/allen/localization/地圖檔/場域/river_site/releases/river_site_b0_p116_p117_20260818/map/map.ply",
+    "megaloc_cache": null,
+    "poles_json": null,
+    "reference_index": null,
+    "route_json": null,
+    "track_landmarks": null
+  },
+  "coordinate_frame": {
+    "convention": "glomap",
+    "handedness": "right",
+    "horizontal_axes": [
+      "x",
+      "z"
+    ],
+    "id": "river_site_b0_p116_p117_reconstruction_18056f835daa",
+    "units": "map",
+    "up_axis": "-y"
+  },
+  "display_name": "河濱場域",
+  "flight": {
+    "approval_note": "Static mission approval is not required; operator preflight remains mandatory.",
+    "approved": false,
+    "controller": null,
+    "coordinate_frame_id": "river_site_b0_p116_p117_reconstruction_18056f835daa",
+    "route_clearance_approved": false
+  },
+  "localizer": "edm",
+  "localizer_profile": "/home/allen/localization/地圖檔/場域/river_site/releases/river_site_b0_p116_p117_20260818/compat/edm_runtime_profile.json",
+  "map_align": "/home/allen/localization/地圖檔/場域/river_site/releases/river_site_b0_p116_p117_20260818/compat/T_align_gravity.json",
+  "map_reference_poses": "/home/allen/localization/地圖檔/場域/river_site/releases/river_site_b0_p116_p117_20260818/localization/reference_poses.json",
+  "query_camera": {
+    "height": 720,
+    "model": "PINHOLE",
+    "params": [
+      960.4853166852678,
+      958.1961495535713,
+      670.8167666480655,
+      358.7191917782738
+    ],
+    "width": 1280
+  },
+  "schema_version": 2,
+  "site_id": "river_site_edm"
+}

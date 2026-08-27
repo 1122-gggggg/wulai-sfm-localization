@@ -22,11 +22,16 @@ from pathlib import Path
 import numpy as np
 
 from live_localizer_protocol import (
+    FUSED_HEADER_SIZE,
+    FUSED_MAGIC,
     HEADER_SIZE,
+    MAX_FUSED_SYNC_ERROR_S,
     TIMED_HEADER_SIZE,
     TIMED_MAGIC,
-    decode_request,
+    decode_control_header,
 )
+from localization_metrics import edm_cache_metric_fields, sample_cuda_memory_stats
+
 
 
 # Workspace layout (physical dirs beneath the repository root).
@@ -382,6 +387,19 @@ def build_argument_parser() -> argparse.ArgumentParser:
     )
     ap.add_argument("--megaloc-cache", default=DEFAULT_MEGALOC)
     ap.add_argument(
+        "--megaloc-backend",
+        choices=("pytorch", "pytorch_fp16", "tensorrt"),
+        default=os.environ.get("SFM_MEGALOC_BACKEND", "tensorrt"),
+    )
+    ap.add_argument(
+        "--megaloc-engine",
+        default=os.environ.get("SFM_MEGALOC_TENSORRT_ENGINE", ""),
+    )
+    ap.add_argument(
+        "--megaloc-engine-sha256",
+        default=os.environ.get("SFM_MEGALOC_TENSORRT_ENGINE_SHA256", ""),
+    )
+    ap.add_argument(
         "--reference-index",
         default="",
         help="IVF index SHA256SUMS.json selected by the site profile",
@@ -636,6 +654,9 @@ def _build_worker_backend(args, backend: str, query_camera_override, map_frame):
                 bundle_sha256=args.bundle_sha256 or None,
                 reference_index=args.reference_index or None,
                 reference_index_sha256=args.reference_index_sha256 or None,
+                megaloc_backend=args.megaloc_backend,
+                megaloc_engine=args.megaloc_engine or None,
+                megaloc_engine_sha256=args.megaloc_engine_sha256 or None,
                 frame_source=lambda: None,
                 camera_tuple=query_camera_override or CAM_720_EDM,
                 production_profile=args.production_profile or None,
@@ -654,6 +675,7 @@ def _build_worker_backend(args, backend: str, query_camera_override, map_frame):
             edm_matcher = tracker.trk.loc.matcher
             print(
                 f"[live_worker] EDM tracker={tracker_variant} "
+                f"megaloc={args.megaloc_backend} "
                 f"mconf={getattr(edm_matcher, 'mconf_thr', 0.2)} "
                 f"track/weak/lost={cfg.local_topk}/{cfg.weak_local_topk}/"
                 f"{getattr(cfg, 'lost_local_topk', 'n/a')} "
@@ -835,6 +857,7 @@ def main() -> None:
 def _read_benchmark_request(args):
     benchmark_mode_requested = "track" if args.force_track_bench else "auto"
     capture_stamp = None
+    fused = None
     if args.runtime_benchmark_control:
         header = read_exact(sys.stdin.buffer, HEADER_SIZE)
         if not header:
@@ -846,9 +869,16 @@ def _read_benchmark_request(args):
                 flush=True,
             )
             return None
-        if bytes(header[:4]) == TIMED_MAGIC:
-            suffix = read_exact(sys.stdin.buffer, TIMED_HEADER_SIZE - HEADER_SIZE)
-            if len(suffix) != TIMED_HEADER_SIZE - HEADER_SIZE:
+        magic = bytes(header[:4])
+        if magic == TIMED_MAGIC:
+            extra = TIMED_HEADER_SIZE - HEADER_SIZE
+        elif magic == FUSED_MAGIC:
+            extra = FUSED_HEADER_SIZE - HEADER_SIZE
+        else:
+            extra = 0
+        if extra:
+            suffix = read_exact(sys.stdin.buffer, extra)
+            if len(suffix) != extra:
                 print(
                     "[live_worker] partial timed control header",
                     file=sys.stderr,
@@ -857,11 +887,12 @@ def _read_benchmark_request(args):
                 return None
             header.extend(suffix)
         try:
-            benchmark_mode_requested, capture_stamp = decode_request(header)
+            benchmark_mode_requested, capture_stamp, fused = decode_control_header(header)
         except ValueError as exc:
             print(f"[live_worker] {exc}", file=sys.stderr, flush=True)
             return None
-    return benchmark_mode_requested, capture_stamp
+    return benchmark_mode_requested, capture_stamp, fused
+
 
 
 def _read_worker_frame(args, frame_buffer, frame_shm, frame_size: int):
@@ -915,8 +946,8 @@ def _prepare_benchmark_frame(
         assert seed_local_prior is not None
         if benchmark_mode_requested == "relocalize":
             # Preserve the last trustworthy spatial prior and force this
-            # frame into LOST recovery. EDM itself allows MegaLoc only on
-            # the first frame of each LOST episode; later retries stay local.
+            # frame into LOST recovery. EDM spends local grace on nearby
+            # references, then one MegaLoc shot if that still fails.
             tracker.state.mode = "LOST"
             tracker.state.fail_count = 0
             tracker.state.bad_count = 0
@@ -1028,6 +1059,30 @@ def _build_success_payload(
     # (invalid JSON) and could steer the UI trajectory -> report it as no fix.
     pose_ok = pose is not None and bool(
         np.isfinite([pose.x, pose.y, pose.z, pose.yaw]).all())
+    pose_payload = None
+    if pose_ok:
+        pose_payload = {
+            "x": float(pose.x),
+            "y": float(pose.y),
+            "z": float(pose.z),
+            "yaw_raw": float(pose.yaw),
+        }
+    elif info.get("prediction_valid"):
+        predicted = info.get("predicted_center")
+        predicted_yaw = info.get("predicted_yaw")
+        try:
+            guessed = [float(predicted[0]), float(predicted[1]), float(predicted[2])]
+            yaw = 0.0 if predicted_yaw is None else float(predicted_yaw)
+        except (TypeError, ValueError, OverflowError, IndexError):
+            guessed = None
+            yaw = 0.0
+        if guessed is not None and all(math.isfinite(value) for value in guessed):
+            pose_payload = {
+                "x": guessed[0],
+                "y": guessed[1],
+                "z": guessed[2],
+                "yaw_raw": yaw if math.isfinite(yaw) else 0.0,
+            }
     raw_confidence = info.get("confidence", info.get("inlier_ratio"))
     try:
         confidence = float(raw_confidence)
@@ -1078,12 +1133,13 @@ def _build_success_payload(
             if benchmark_mode_active in {"weak", "track"} else None),
         "benchmark_setup_ms": benchmark_setup_ms,
         "benchmark_seeded": benchmark_seeded,
-        "pose": None if not pose_ok else {
-            "x": float(pose.x),
-            "y": float(pose.y),
-            "z": float(pose.z),
-            "yaw_raw": float(pose.yaw),
-        },
+        "pose": pose_payload,
+        "pose_status": info.get(
+            "pose_status",
+            "VISUALLY_CONFIRMED" if pose_ok else "NONE",
+        ),
+        "prediction_valid": bool(info.get("prediction_valid", False)),
+        "prediction_mode": info.get("prediction_mode"),
         "mode": info.get("mode"),
         "next_mode": info.get("next_mode"),
         "inliers": int(info.get("inliers", 0) or 0),
@@ -1315,6 +1371,119 @@ def _process_worker_frame(
     return payload, worker_fatal, previous_runtime_mode
 
 
+def _fused_odometry_sample_from_request(fused, capture_stamp, *, now_mono=None):
+    """Build pose-guided IMU from the independent SFM3 stamp. Never backdate."""
+    if fused is None:
+        return None
+    stamp = getattr(fused, "stamp", None)
+    if stamp is None:
+        return None
+    try:
+        stamp = float(stamp)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    now = time.monotonic() if now_mono is None else float(now_mono)
+    if not math.isfinite(now) or not math.isfinite(stamp) or stamp <= 0.0 or stamp > now:
+        return None
+    if capture_stamp is not None:
+        try:
+            capture = float(capture_stamp)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if not math.isfinite(capture) or abs(stamp - capture) > MAX_FUSED_SYNC_ERROR_S:
+            return None
+    try:
+        from pose_guided.types import FusedOdometrySample
+    except ImportError:
+        return None
+    return FusedOdometrySample.from_anafi(
+        timestamp=stamp,
+        roll=fused.roll,
+        pitch=fused.pitch,
+        yaw=fused.yaw,
+        speed_north=fused.speed_north,
+        speed_east=fused.speed_east,
+        speed_down=fused.speed_down,
+    )
+
+
+def _tracker_matcher(tracker):
+    loc = getattr(tracker, "loc", None)
+    matcher = getattr(loc, "matcher", None)
+    if matcher is not None:
+        return matcher
+    return getattr(tracker, "matcher", None)
+
+
+def _sum_edm_cache_classes(classes) -> dict[str, int]:
+    if not isinstance(classes, dict):
+        return {}
+    hits = misses = evictions = None
+    for stats in classes.values():
+        if not isinstance(stats, dict):
+            continue
+        fields = edm_cache_metric_fields(stats)
+        if "edm_cache_hits" in fields:
+            hits = (0 if hits is None else hits) + fields["edm_cache_hits"]
+        if "edm_cache_misses" in fields:
+            misses = (0 if misses is None else misses) + fields["edm_cache_misses"]
+        if "edm_cache_evictions" in fields:
+            evictions = (0 if evictions is None else evictions) + fields["edm_cache_evictions"]
+    combined = {}
+    if hits is not None:
+        combined["hits"] = hits
+    if misses is not None:
+        combined["misses"] = misses
+    if evictions is not None:
+        combined["evictions"] = evictions
+    return edm_cache_metric_fields(combined)
+
+
+def _edm_cache_stats_from_tracker(tracker) -> dict[str, int]:
+    matcher = _tracker_matcher(tracker)
+    read_class = getattr(matcher, "feature_cache_stats_by_class", None)
+    if callable(read_class):
+        fields = _sum_edm_cache_classes(read_class())
+        if fields:
+            return fields
+    info = getattr(tracker, "last_info", None) or {}
+    fields = _sum_edm_cache_classes(info.get("feature_cache_classes"))
+    if fields:
+        return fields
+    read_map = getattr(matcher, "reference_feature_cache_stats", None)
+    if callable(read_map):
+        return edm_cache_metric_fields(read_map())
+    return {}
+
+
+def _attach_sampled_runtime_metrics(
+    payload: dict,
+    torch_module,
+    tracker,
+    last_cuda_sample_mono: float | None,
+    last_cuda_stats: dict[str, int] | None,
+) -> tuple[float | None, dict[str, int] | None]:
+    """Attach interval-sampled CUDA counters and EDM cache totals.
+
+    CUDA fields stay omitted when the device is unavailable. Between samples the
+    last reading is republished so results are not empty; sampling never calls
+    synchronize or nvidia-smi.
+    """
+    cuda = getattr(torch_module, "cuda", None) if torch_module is not None else None
+    stats, sampled_at = sample_cuda_memory_stats(
+        cuda, last_sample_mono=last_cuda_sample_mono,
+    )
+    if stats is not None:
+        last_cuda_stats = stats
+        last_cuda_sample_mono = sampled_at
+    elif last_cuda_sample_mono is None:
+        last_cuda_sample_mono = sampled_at
+    if last_cuda_stats:
+        payload.update(last_cuda_stats)
+    payload.update(_edm_cache_stats_from_tracker(tracker))
+    return last_cuda_sample_mono, last_cuda_stats
+
+
 def _run_worker_loop(
     args,
     json_out,
@@ -1337,11 +1506,19 @@ def _run_worker_loop(
     seq = 0
     previous_runtime_mode = "auto"
     frame = None
+    last_cuda_sample_mono = None
+    last_cuda_stats = None
     while True:
         request = _read_benchmark_request(args)
         if request is None:
             break
-        benchmark_mode_requested, capture_stamp = request
+        benchmark_mode_requested, capture_stamp, fused = request
+        sample = _fused_odometry_sample_from_request(fused, capture_stamp)
+        if sample is not None:
+            observe = getattr(tracker, "observe_fused_state", None)
+            if callable(observe):
+                observe(sample)
+
         frame = _read_worker_frame(args, frame_buffer, frame_shm, frame_size)
         if frame is None:
             break
@@ -1366,6 +1543,13 @@ def _run_worker_loop(
             force_track_label=force_track_label,
             seed_local_prior=seed_local_prior,
             previous_runtime_mode=previous_runtime_mode,
+        )
+        last_cuda_sample_mono, last_cuda_stats = _attach_sampled_runtime_metrics(
+            payload,
+            torch,
+            tracker,
+            last_cuda_sample_mono,
+            last_cuda_stats,
         )
         json_out.write(json.dumps(payload, ensure_ascii=False) + "\n")
         json_out.flush()

@@ -1,12 +1,11 @@
 #!/usr/bin/env bash
 # 接口 B：影片模擬串流 — 預錄影片當 720p 串流（無真機、無起飛）
 #
-# 預設「飛行管線」（與真機定位狀態機一致）：
 #   1) 第一幀凍住 → MegaLoc 跑一次，EDM 候選鎖定
 #   2) 鎖定後進 TRACK 持續定位
-#   3) 連續低信心 → 暫停串流，MegaLoc 跑一次，之後 EDM recovery
-#   4) 中途 LOST → 暫停串流，MegaLoc 跑一次，之後 EDM recovery
-#   5) 找回後解除凍結，恢復 TRACK
+#   3) 連續低信心或 LOST → 凍結目前影格，模擬真機懸停
+#   4) 用 LOST EDM top-k 5，再依 profile 排程 MegaLoc top-k 10/20
+#   5) 找回後恢復 TRACK；同幀無解時有限次重試後改用新影格
 #
 # 可選 LOC_BENCH_TRACK=1：跳過 MegaLoc，每幀純 TRACK 測速（非飛行管線）。
 set -euo pipefail
@@ -15,7 +14,7 @@ ROOT="$(cd "$CTRL_DIR/.." && pwd)"
 OI="$CTRL_DIR/operator_interface"
 PY="${SFM_UI_PYTHON:-$ROOT/.venv/bin/python}"
 VIDEO_DIR="${VIDEO_DIR:-$ROOT/模擬器/測試影片}"
-SITE_PROFILE="${SFM_SITE_PROFILE:-$CTRL_DIR/site_profiles/river_site_edm.json}"
+SITE_PROFILE="${SFM_SITE_PROFILE:-$ROOT/地圖檔/場域/river_site/site_profile.json}"
 EXPECTED_TORCH_HUB_CACHE="$ROOT/執行環境/torch_hub_cache"
 
 canonical_path() {
@@ -61,18 +60,22 @@ check_fixed_environment() {
 
 check_fixed_environment
 P119_SHA256="600bbf70227311cab079d77fcb896f97e6d3e55f6bc40b5bef01d74b65f7826c"
-# Target EDM verified balance: TRACK=1, LOW/WEAK=3.
-LOCAL_TOPK="${LOCAL_TOPK:-1}"
+LOCAL_TOPK="${LOCAL_TOPK:-2}"
 STREAM_FPS="${STREAM_FPS:-30}"
 VIDEO_STRIDE="${VIDEO_STRIDE:-1}"
 # BOOT_INIT hold budget (ms). Released early on first successful MegaLoc lock.
 BOOT_LOCK_MS="${BOOT_LOCK_MS:-20000}"
 LOST_HOLD_MAX="${LOST_HOLD_MAX:-8}"
-LOST_HOLD_TIMEOUT_MS="${LOST_HOLD_TIMEOUT_MS:-15000}"
-POSE_STABILIZE="${POSE_STABILIZE:-0}"
+LOST_HOLD_TIMEOUT_MS="${LOST_HOLD_TIMEOUT_MS:-3000}"
+SFM_HOLD_ON_LOW_CONF="${SFM_HOLD_ON_LOW_CONF:-1}"
+POSE_STABILIZE="${POSE_STABILIZE:-1}"
 DRY_RUN="${SFM_LAUNCH_DRY_RUN:-0}"
 if [[ "$DRY_RUN" != "0" && "$DRY_RUN" != "1" ]]; then
   echo "[影片模擬串流] SFM_LAUNCH_DRY_RUN 必須是 0 或 1" >&2
+  exit 2
+fi
+if [[ "$SFM_HOLD_ON_LOW_CONF" != "0" && "$SFM_HOLD_ON_LOW_CONF" != "1" ]]; then
+  echo "[影片模擬串流] SFM_HOLD_ON_LOW_CONF 必須是 0 或 1" >&2
   exit 2
 fi
 if [[ "$DRY_RUN" == "0" && -n "${SFM_UI_PYTHON:-}" \
@@ -110,7 +113,7 @@ usage() {
 P1190119.MP4；否則只有一部影片時自動使用它。多部影片時請指定 VIDEO 或第一個參數。
 
 飛行管線（預設）:
-  首幀 MegaLoc 一次 → TRACK；LOW/WEAK 提高 EDM top-k；連續低信心或 LOST 時凍幀並跑一次 MegaLoc
+  MegaLoc top-k 10，失敗升到 20 並完整 EDM 驗證；仍失敗才進入後續恢復／旋轉搜尋
 
 串流 30 FPS / 定位 ~15 FPS:
   不堆積舊幀；worker busy 時只保留最新一幀 (latest-frame coalesce)。
@@ -118,13 +121,13 @@ P1190119.MP4；否則只有一部影片時自動使用它。多部影片時請�
 
 常用環境變數:
   VIDEO / 第一個參數     影片路徑
-  LOCAL_TOPK             TRACK 參考數（預設 1；LOW/WEAK 自動升為 3）
+  LOCAL_TOPK             TRACK 參考數（預設 2；WEAK 3、LOST 附近 5）
   STREAM_FPS             餵入串流 FPS（預設 30）
   BOOT_LOCK_MS           首幀 MegaLoc 最長凍幀（預設 20000；鎖定後立刻放行）
-  LOST_HOLD_MAX          LOST 凍幀重試次數（預設 8）
-  LOST_HOLD_TIMEOUT_MS   LOST 凍幀逾時放行（預設 15000）
+  LOST_HOLD_MAX          同一影格高精度重定位上限（預設 8 次）
+  LOST_HOLD_TIMEOUT_MS   凍幀硬逾時（預設 3000 ms；仍受次數限制）
   LOC_BENCH_TRACK=1      改純 TRACK 測速（跳過 MegaLoc / 不走飛行管線）
-  POSE_STABILIZE=1       發布三幀一致性過濾姿態（原始 PnP 仍寫入遙測）
+  POSE_STABILIZE=1       因果發布濾波（過去+當前 3 點中位數＋0.15s 低通；實機可用）
   SFM_SITE_PROFILE       site profile（預設 河濱 EDM；換場域改這個變數即可）
   ANAFI_LINK_PRESET      nominal/loss-1/loss-3/loss-5（預設 nominal）
   ANAFI_LINK_SIM=1       模擬 ANAFI 實機無線串流畫質（白皮書 v1.4 §5.2）
@@ -133,7 +136,7 @@ P1190119.MP4；否則只有一部影片時自動使用它。多部影片時請�
   ANAFI_LINK_KBPS        串流碼率 kbps（預設 5000，即白皮書的 up to 5 Mb/s）
   ANAFI_LINK_LATENCY_MS  端到端延遲 ms（白皮書 280；以解碼後固定影格 backlog 模擬）
   ANAFI_LINK_LOSS_PCT    slice 丟包率 %（模擬 Wi-Fi 遺失 + error concealment）
-  SFM_HOLD_ON_LOW_CONF   連續低信心時凍幀並升級一次 MegaLoc（預設 1）
+  SFM_HOLD_ON_LOW_CONF   連續低信心時凍幀並升級 MegaLoc（預設 1）
   SFM_LOW_CONF_HOLD_RESULTS  升級門檻（預設連續 2 筆）
 
 可用測試片（\$VIDEO_DIR）:
@@ -268,15 +271,22 @@ if [[ "${LOC_BENCH_TRACK:-0}" == "1" ]]; then
   ARGS+=(--boot-lock-ms 0 --loc-force-track-bench --no-lost-hold)
   echo "[影片模擬串流] LOC_BENCH_TRACK=1：純 TRACK 測速（跳過 MegaLoc / 不凍幀）"
 else
-  # Flight-like pipeline (default).
+  # Flight-like pipeline (default): hover/freeze, then staged EDM + MegaLoc recovery.
+  export SFM_HOLD_ON_LOW_CONF
+  export SFM_EDM_REF_FEATURE_CACHE="${SFM_EDM_REF_FEATURE_CACHE:-32}"
   ARGS+=(
     --boot-lock-ms "$BOOT_LOCK_MS"
     --lost-hold
     --lost-hold-max-attempts "$LOST_HOLD_MAX"
     --lost-hold-timeout-ms "$LOST_HOLD_TIMEOUT_MS"
   )
-  echo "[影片模擬串流] 飛行管線：BOOT MegaLoc 一次 → TRACK=1；LOW/WEAK=3；連續低信心或 LOST 時 MegaLoc 一次 → EDM recovery"
-  echo "[影片模擬串流] boot_lock_ms=$BOOT_LOCK_MS lost_hold_max=$LOST_HOLD_MAX lost_timeout_ms=$LOST_HOLD_TIMEOUT_MS"
+  if [[ "$SFM_HOLD_ON_LOW_CONF" == "1" ]]; then
+    ARGS+=(--hold-on-low-confidence)
+  else
+    ARGS+=(--no-hold-on-low-confidence)
+  fi
+  echo "[影片模擬串流] 飛行管線：低信心/LOST 凍幀；LOST EDM 5 張，再依 profile 排程 MegaLoc 10/20"
+  echo "[影片模擬串流] boot_lock_ms=$BOOT_LOCK_MS lost_hold=on max=$LOST_HOLD_MAX timeout_ms=$LOST_HOLD_TIMEOUT_MS"
 fi
 
 export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
@@ -286,7 +296,7 @@ configure_operator_display "$DRY_RUN"
 
 echo "[影片模擬串流] video=$VIDEO_PATH"
 echo "[影片模擬串流] profile=$SITE_PROFILE topk=$LOCAL_TOPK stream_fps=$STREAM_FPS"
-echo "[影片模擬串流] 低信心 recovery：${SFM_LOW_CONF_HOLD_RESULTS:-2} 筆後凍幀 + 一次 MegaLoc（SFM_HOLD_ON_LOW_CONF=${SFM_HOLD_ON_LOW_CONF:-1}）"
+echo "[影片模擬串流] 低信心 recovery：凍幀=${SFM_HOLD_ON_LOW_CONF}，連續 ${SFM_LOW_CONF_HOLD_RESULTS:-2} 筆觸發"
 echo "[影片模擬串流] 鏈路 preset=$LINK_PRESET：延遲 $ANAFI_LINK_LATENCY_MS ms、丟包 $ANAFI_LINK_LOSS_PCT %"
 echo "[影片模擬串流] ANAFI 串流模擬：H264 $ANAFI_LINK_PROFILE $ANAFI_LINK_KBPS kbps + intra-refresh"
 if [[ "${SFM_SOURCE_INTEGRITY:-}" == "KNOWN_INCOMPLETE" ]]; then

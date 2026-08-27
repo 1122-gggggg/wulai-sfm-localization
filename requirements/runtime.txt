@@ -7,6 +7,8 @@
 pip==26.2.1
 torch==2.11.0+cu128
 torchvision==0.26.0+cu128
+# TensorRT runtime libraries remain an OS/GPU contract; this pins the CPython API.
+tensorrt-cu13-bindings==11.2.1.2
 numpy==2.2.6
 opencv-python==4.13.0.92
 pillow==12.3.0

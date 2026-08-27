@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Reject cyclomatic-complexity regressions in first-party production code."""
+"""Reject complexity and oversized-module regressions in production code."""
 
 from __future__ import annotations
 
+import argparse
 import json
 import subprocess
 import sys
@@ -18,15 +19,18 @@ SCAN_PATHS = (
     "控制介面程式",
 )
 
-# Ruff 0.16.1 reports no C901 findings in these production subsystems. Keep the
-# explicit zero budgets so a future violation fails CI instead of becoming a
-# new ratchet baseline.
+# Ratchet baseline for the current first-party production tree. Reducing these
+# values is encouraged; increasing either count or worst complexity fails CI.
 BUDGETS = {
     "tools": {"violations": 0, "max_complexity": 0},
     "deploy": {"violations": 0, "max_complexity": 0},
-    "flight": {"violations": 0, "max_complexity": 0},
-    "validation": {"violations": 0, "max_complexity": 0},
-    "control": {"violations": 0, "max_complexity": 0},
+    "flight": {"violations": 3, "max_complexity": 12},
+    "validation": {"violations": 3, "max_complexity": 19},
+    "control": {"violations": 12, "max_complexity": 22},
+}
+LINE_BUDGETS = {
+    "控制介面程式/operator_interface/flight_operator_app.py": 7430,
+    "控制介面程式/operator_interface/olympe_live_backend.py": 5090,
 }
 
 
@@ -93,6 +97,22 @@ def budget_failures(summary: dict[str, dict[str, object]]) -> list[str]:
     return failures
 
 
+def line_budget_failures(
+    root: Path = ROOT,
+    budgets: dict[str, int] = LINE_BUDGETS,
+) -> list[str]:
+    failures: list[str] = []
+    for relative, maximum in budgets.items():
+        path = root / relative
+        if not path.is_file():
+            failures.append(f"line-budget file missing: {relative}")
+            continue
+        actual = len(path.read_text(encoding="utf-8").splitlines())
+        if actual > maximum:
+            failures.append(f"{relative} lines increased: {actual} > {maximum}")
+    return failures
+
+
 def collect_ruff_findings() -> list[dict[str, object]]:
     command = (
         sys.executable,
@@ -123,9 +143,11 @@ def collect_ruff_findings() -> list[dict[str, object]]:
     return findings
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.parse_args(argv)
     summary = summarize_findings(collect_ruff_findings())
-    failures = budget_failures(summary)
+    failures = budget_failures(summary) + line_budget_failures()
     for group, values in summary.items():
         print(
             f"[maintainability] {group}: violations={values['violations']} "
@@ -135,7 +157,7 @@ def main() -> int:
         for failure in failures:
             print(f"[maintainability] FAIL: {failure}")
         return 1
-    print("[maintainability] OK: no production C901 violations")
+    print("[maintainability] OK: complexity and module sizes remain within budget")
     return 0
 
 

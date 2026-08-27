@@ -38,7 +38,7 @@ def production_edm_config() -> EDMConfig:
     path_follow_flight.production_config() pins the XFeat sweep.
 
     local_topk=1 is the measured RTX 5060 speed/accuracy balance. LOW/WEAK
-    raises local top-k to 3. MegaLoc runs once at BOOT and once per LOST episode.
+    raises local top-k to 3. BOOT/LOST stage MegaLoc from top-k 10 to 20.
     """
     return EDMConfig(
         global_retrieval_policy="boot_and_lost_once",
@@ -78,9 +78,12 @@ class InertTemporalCache:
 
 class EDMTrackerAdapter(Localizer):
     def __init__(self, reloc_map: EDMRelocMap, camera: Camera,
-                 cfg: EDMConfig | None = None, megaloc=None, matcher=None,
+                 cfg: EDMConfig | None = None, megaloc=None, megaloc_factory=None,
+                 matcher=None,
                  frame_source=lambda: None, map_frame=None,
-                 reference_index=None):
+                 reference_index=None,
+                 motion_validator=None,
+                 motion_validation_mode: str = "off"):
         # matcher: EDMMatcher (torch FP16) or EDMOnnxMatcher (ORT CUDA/TensorRT).
         # None -> ProductionEDMTracker builds the default torch EDMMatcher.
         self.trk = ProductionEDMTracker(
@@ -88,7 +91,10 @@ class EDMTrackerAdapter(Localizer):
             cfg=cfg or production_edm_config(),
             matcher=matcher,
             megaloc=megaloc,
+            megaloc_factory=megaloc_factory,
             reference_index=reference_index,
+            motion_validator=motion_validator,
+            motion_validation_mode=motion_validation_mode,
         )
         self.map = reloc_map
         self.cfg = self.trk.cfg
@@ -129,6 +135,13 @@ class EDMTrackerAdapter(Localizer):
                 maxlen=self.cfg.adaptive_jump_history_size
             ),
         )
+        clear_visual = getattr(self.trk, "_clear_visual_motion_cache", None)
+        if callable(clear_visual):
+            clear_visual()
+        controller = getattr(self.trk, "pose_guided", None)
+        if controller is not None:
+            controller.reset()
+
 
     # ---------- state mirror ----------
     # self.state is the worker-facing mirror; self.trk.st is EDM's own. Push before each
@@ -158,6 +171,16 @@ class EDMTrackerAdapter(Localizer):
         s.last_yaw = st.yaw
         s.last_refs = list(st.last_refs)
         s.fail_count = s.bad_count = int(st.misses)
+
+    def observe_fused_state(self, sample) -> None:
+        observe = getattr(self.trk, "observe_fused_state", None)
+        if callable(observe):
+            observe(sample)
+
+    def attach_pose_guided(self, controller) -> None:
+        attach = getattr(self.trk, "attach_pose_guided", None)
+        if callable(attach):
+            attach(controller)
 
     # ---------- one frame ----------
     def localize_frame(self, frame: np.ndarray,
@@ -219,9 +242,18 @@ class EDMTrackerAdapter(Localizer):
             "global_retrieval_calls": info.get("global_retrieval_calls"),
             "rejected": info.get("rejected"),
             "limited_jump": info.get("limited_jump"),
+            "relative_motion_check": info.get("relative_motion_check"),
             "limited_jump_confirmed": info.get("limited_jump_confirmed", False),
             "camera_axes_world": camera_axes_world,
             "camera_forward_world": camera_forward_world,
+            "pose_status": info.get(
+                "pose_status",
+                "VISUALLY_CONFIRMED" if info.get("ok") else "NONE",
+            ),
+            "prediction_valid": info.get("prediction_valid", False),
+            "prediction_mode": info.get("prediction_mode"),
+            "predicted_center": info.get("predicted_center"),
+            "predicted_yaw": info.get("predicted_yaw"),
         }
         return pose
 

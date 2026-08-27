@@ -9,8 +9,67 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import re
 import statistics
 from pathlib import Path
+
+
+SUPPORTED_REFERENCE_EVIDENCE_KINDS = frozenset({
+    "surveyed",
+    "motion_capture",
+    "map_aligned_apriltag",
+    "rtk_map_aligned",
+})
+_LOWER_SHA256 = re.compile(r"[0-9a-f]{64}")
+
+
+def _reference_claim_scope(reference: dict) -> dict:
+    """Classify the strongest claim supported by independent reference evidence."""
+    evidence = reference.get("reference_evidence")
+    errors: list[str] = []
+    if not isinstance(evidence, dict):
+        errors.append("reference_evidence is missing or is not an object")
+        evidence_view = None
+    else:
+        kind = evidence.get("kind")
+        if not isinstance(kind, str) or kind not in SUPPORTED_REFERENCE_EVIDENCE_KINDS:
+            errors.append("kind is not a supported independent reference type")
+        if evidence.get("map_aligned") is not True:
+            errors.append("map_aligned must be true")
+        if evidence.get("independent_of_localizer") is not True:
+            errors.append("independent_of_localizer must be true")
+        source_sha256 = evidence.get("source_sha256")
+        if not isinstance(source_sha256, str) or _LOWER_SHA256.fullmatch(source_sha256) is None:
+            errors.append("source_sha256 must be 64 lowercase hexadecimal characters")
+        evidence_view = {
+            "kind": kind,
+            "map_aligned": evidence.get("map_aligned"),
+            "independent_of_localizer": evidence.get("independent_of_localizer"),
+            "source_sha256": source_sha256,
+        }
+
+    absolute_accuracy_validated = not errors
+    scope = "absolute_accuracy" if absolute_accuracy_validated else "pseudo/continuity-only"
+    interpretation = {
+        "absolute_accuracy_validated": absolute_accuracy_validated,
+        "reference_type": (
+            "independent_map_aligned_ground_truth"
+            if absolute_accuracy_validated
+            else "image_only_pseudo_reference"
+        ),
+        "basis": (
+            "reference_evidence satisfies the independent, map-aligned evidence gate"
+            if absolute_accuracy_validated
+            else "reference_evidence does not satisfy the independent, map-aligned evidence gate"
+        ),
+        "validation_errors": errors,
+    }
+    return {
+        "scope": scope,
+        "absolute_accuracy_validated": absolute_accuracy_validated,
+        "reference_evidence": evidence_view,
+        "interpretation": interpretation,
+    }
 
 
 def _percentile(values: list[float], q: float) -> float | None:
@@ -188,11 +247,20 @@ def compare_pose_reference(reference: dict, candidate: dict) -> dict:
 
     ref_summary = reference.get("summary", {})
     cand_summary = candidate.get("summary", {})
+    claim_scope = _reference_claim_scope(reference)
+    legacy_interpretation = (
+        "Independent map-aligned reference evidence supports absolute-accuracy validation; "
+        "the report also describes trajectory disagreement and continuity."
+        if claim_scope["absolute_accuracy_validated"]
+        else "Image-only disagreement against full XFeat+LightGlue pseudo-ground-truth; "
+        "this is not surveyed ground truth."
+    )
     return {
-        "interpretation": (
-            "Image-only disagreement against full XFeat+LightGlue pseudo-ground-truth; "
-            "this is not surveyed ground truth."
-        ),
+        # Keep the legacy prose field stable for pseudo references.  The structured
+        # claim_scope below is the machine-readable authority for new consumers.
+        "interpretation": legacy_interpretation,
+        "claim_scope": claim_scope,
+        "absolute_accuracy_validated": claim_scope["absolute_accuracy_validated"],
         "frames": len(ref_rows),
         "success_overlap": {
             "both": common,
@@ -229,8 +297,17 @@ def main() -> int:
     parser.add_argument("reference")
     parser.add_argument("candidate")
     parser.add_argument("--json-out", default="")
+    parser.add_argument(
+        "--require-absolute-ground-truth",
+        action="store_true",
+        help="fail before comparison unless reference_evidence passes the absolute-accuracy gate",
+    )
     args = parser.parse_args()
     reference = json.loads(Path(args.reference).read_text(encoding="utf-8"))
+    claim_scope = _reference_claim_scope(reference)
+    if args.require_absolute_ground_truth and not claim_scope["absolute_accuracy_validated"]:
+        details = "; ".join(claim_scope["interpretation"]["validation_errors"])
+        parser.error(f"reference lacks valid absolute ground truth evidence: {details}")
     candidate = json.loads(Path(args.candidate).read_text(encoding="utf-8"))
     report = compare_pose_reference(reference, candidate)
     rendered = json.dumps(report, indent=2, ensure_ascii=False)

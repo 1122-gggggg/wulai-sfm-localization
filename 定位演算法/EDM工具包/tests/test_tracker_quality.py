@@ -144,12 +144,17 @@ def test_boot_staging_evaluates_the_complete_retrieved_set(
         def retrieve(self, _rgb, _topk):
             return names
 
-        def correspondences(self, _gray, refs, **_kwargs):
+        def correspondences_by_ref(self, _gray, refs, **_kwargs):
             calls.append(list(refs))
-            return (
-                points2d.copy(), points3d.copy(), np.ones(100, np.float32),
-                [50] * len(refs),
-            )
+            return [
+                (
+                    points2d.copy(),
+                    points3d.copy(),
+                    np.ones(100, np.float32),
+                    100,
+                )
+                for _name in refs
+            ]
 
     def estimate(_points2d, _points3d, _camera, _options):
         return {
@@ -188,7 +193,7 @@ def test_boot_staging_evaluates_the_complete_retrieved_set(
         assert info["ok"]
         assert not info["staged_early_stop"]
         assert info["refs"] == names
-        assert calls == [names[:2], names[2:]]
+        assert calls == [names]
         assert tracker.temporal_gray is None
         assert tracker.temporal_xyz_by_cell is None
     else:
@@ -196,4 +201,200 @@ def test_boot_staging_evaluates_the_complete_retrieved_set(
         assert not info["staged_early_stop"]
         assert info["rejected"] == "reprojection"
         assert info["reproj_rms"] == pytest.approx(pixel_offset)
-        assert calls == [names[:2], names[2:]]
+        assert calls == [names]
+
+
+sys.path.insert(0, str(ROOT / "tests"))
+from bench_video_edm import (  # noqa: E402
+    STRESS_MATRIX,
+    STRESS_SEED,
+    apply_stress_transform,
+    build_stress_report,
+    camera_contract,
+    frame_sha256,
+    require_frame_camera_contract,
+    sequence_sha256,
+    stress_deltas,
+    summarize_stress_frames,
+    transform_record,
+)
+
+
+def _stress_camera(width: int = 64, height: int = 48):
+    return SimpleNamespace(
+        model="PINHOLE",
+        width=width,
+        height=height,
+        params=[50.0, 50.0, width / 2.0, height / 2.0],
+    )
+
+
+def _stress_frame(width: int = 64, height: int = 48) -> np.ndarray:
+    column = np.linspace(0, 255, width, dtype=np.uint8)
+    row = np.linspace(32, 223, height, dtype=np.uint8)
+    plane = (column[None, :] // 2 + row[:, None] // 2).astype(np.uint8)
+    high = ((np.arange(height)[:, None] * 13 + np.arange(width)[None, :] * 17) % 251).astype(np.uint8)
+    return np.stack([plane, np.flipud(plane) ^ high, np.fliplr(plane)], axis=2)
+
+
+def test_stress_matrix_starts_with_unmodified_baseline() -> None:
+    assert STRESS_MATRIX[0]["id"] == "identity"
+    assert tuple(STRESS_MATRIX[0]["ops"]) == ()
+    families = {op["op"] for spec in STRESS_MATRIX for op in spec["ops"]}
+    assert families == {"crop", "rotate", "exposure", "gamma", "contrast", "blur", "jpeg"}
+    assert any(len(spec["ops"]) > 1 for spec in STRESS_MATRIX)
+
+
+def test_each_stress_transform_is_deterministic_and_preserves_camera_frame() -> None:
+    camera = _stress_camera()
+    frame = _stress_frame()
+    before = camera_contract(camera)
+    original = frame.copy()
+    for spec in STRESS_MATRIX:
+        first = apply_stress_transform(frame, spec, camera=camera)
+        second = apply_stress_transform(frame, spec, camera=camera)
+        require_frame_camera_contract(first, camera)
+        assert first.shape == frame.shape
+        assert first.dtype == np.uint8
+        assert np.isfinite(first.astype(np.float32)).all()
+        assert frame_sha256(first) == frame_sha256(second)
+        assert np.array_equal(first, second)
+        if spec["id"] == "identity":
+            assert np.array_equal(first, frame)
+            assert frame_sha256(first) == frame_sha256(frame)
+        else:
+            assert frame_sha256(first) != frame_sha256(frame)
+    assert np.array_equal(frame, original)
+    assert camera_contract(camera) == before
+
+
+def test_stress_transform_records_identity_params_and_hashes() -> None:
+    frame = _stress_frame()
+    spec = next(item for item in STRESS_MATRIX if item["id"] == "hcrop_0.10+jpeg_70")
+    warped = apply_stress_transform(frame, spec)
+    record = transform_record(frame, warped, spec, seed=STRESS_SEED)
+    assert record["id"] == "hcrop_0.10+jpeg_70"
+    assert [op["op"] for op in record["ops"]] == ["crop", "jpeg"]
+    assert record["ops"][0]["axis"] == "horizontal"
+    assert record["ops"][0]["fraction"] == 0.10
+    assert record["ops"][1]["quality"] == 70
+    assert record["seed"] == STRESS_SEED
+    assert record["input_sha256"] == frame_sha256(frame)
+    assert record["output_sha256"] == frame_sha256(warped)
+    assert record["input_sha256"] != record["output_sha256"]
+    sequential = apply_stress_transform(
+        apply_stress_transform(frame, {"id": "hcrop_0.10", "ops": (spec["ops"][0],)}),
+        {"id": "jpeg_70", "ops": (spec["ops"][1],)},
+    )
+    assert frame_sha256(sequential) == record["output_sha256"]
+
+
+def test_stress_summary_reports_accepted_states_lost_and_deltas() -> None:
+    baseline_infos = [
+        {"ok": True, "state_out": "TRACK", "inliers": 120, "reproj_rms": 0.4, "total_ms": 10.0},
+        {"ok": True, "state_out": "TRACK", "inliers": 100, "reproj_rms": 0.6, "total_ms": 12.0},
+        {"ok": True, "state_out": "WEAK_TRACK", "inliers": 80, "reproj_rms": 0.8, "total_ms": 11.0},
+        {"ok": False, "state_out": "LOST", "inliers": 0, "reproj_rms": None, "total_ms": 9.0},
+    ]
+    stressed_infos = [
+        {"ok": True, "state_out": "TRACK", "inliers": 90, "reproj_rms": 1.0, "total_ms": 14.0},
+        {"ok": False, "state_out": "LOST", "inliers": 0, "reproj_rms": None, "total_ms": 13.0},
+        {"ok": False, "state_out": "LOST", "inliers": 0, "reproj_rms": None, "total_ms": 15.0},
+        {"ok": False, "state_out": "LOST", "inliers": 0, "reproj_rms": None, "total_ms": 16.0},
+    ]
+    baseline = summarize_stress_frames(baseline_infos)
+    stressed = summarize_stress_frames(stressed_infos)
+    assert baseline["accepted_rate"] == pytest.approx(0.75)
+    assert baseline["states"] == {"TRACK": 2, "WEAK_TRACK": 1, "LOST": 1, "WEAK": 1}
+    assert baseline["longest_lost"] == 1
+    assert baseline["inliers_median"] == pytest.approx(100.0)
+    assert baseline["reproj_rms_median"] == pytest.approx(0.6)
+    assert baseline["latency_median_ms"] == pytest.approx(10.5)
+    assert stressed["accepted_rate"] == pytest.approx(0.25)
+    assert stressed["longest_lost"] == 3
+    deltas = stress_deltas(stressed, baseline)
+    assert deltas["accepted_rate"] == pytest.approx(-0.5)
+    assert deltas["longest_lost"] == pytest.approx(2.0)
+    assert deltas["inliers_median"] == pytest.approx(-10.0)
+    assert deltas["reproj_rms_median"] == pytest.approx(0.4)
+    assert deltas["latency_median_ms"] == pytest.approx(4.0)
+    assert deltas["states"]["LOST"] == 2
+    assert deltas["states"]["TRACK"] == -1
+
+    camera = _stress_camera()
+    frame = _stress_frame()
+    identity = STRESS_MATRIX[0]
+    crop = next(item for item in STRESS_MATRIX if item["id"] == "hcrop_0.10")
+    identity_out = apply_stress_transform(frame, identity, camera=camera)
+    crop_out = apply_stress_transform(frame, crop, camera=camera)
+    report = build_stress_report(
+        video="probe.mp4",
+        bundle="unused-bundle.pt",
+        camera=camera,
+        seed=STRESS_SEED,
+        rows=[
+            {
+                "id": identity["id"],
+                "ops": [],
+                "input_sha256": sequence_sha256([frame_sha256(frame)], STRESS_SEED),
+                "output_sha256": sequence_sha256([frame_sha256(identity_out)], STRESS_SEED),
+                "probe": transform_record(frame, identity_out, identity),
+                "metrics": baseline,
+            },
+            {
+                "id": crop["id"],
+                "ops": [dict(crop["ops"][0])],
+                "input_sha256": sequence_sha256([frame_sha256(frame)], STRESS_SEED),
+                "output_sha256": sequence_sha256([frame_sha256(crop_out)], STRESS_SEED),
+                "probe": transform_record(frame, crop_out, crop),
+                "metrics": stressed,
+            },
+        ],
+    )
+    assert report["schema"] == "edm-video-stress-matrix/v1"
+    assert report["robustness_kind"] == "2d_appearance_image_plane"
+    assert "not proof of 3D parallax" in report["note"]
+    assert report["camera"] == camera_contract(camera)
+    assert report["transforms"][0]["id"] == "identity"
+    assert report["transforms"][0]["delta_vs_baseline"]["accepted_rate"] == pytest.approx(0.0)
+    assert report["transforms"][1]["delta_vs_baseline"]["accepted_rate"] == pytest.approx(-0.5)
+    assert report["transforms"][1]["probe"]["input_sha256"] != report["transforms"][1]["probe"]["output_sha256"]
+
+
+def test_stress_helpers_leave_map_and_profile_assets_untouched(tmp_path) -> None:
+    bundle = tmp_path / "bundle.pt"
+    profile = tmp_path / "localizer_profile.json"
+    bundle.write_bytes(b"map-bytes")
+    profile.write_text("{}", encoding="utf-8")
+    stamp = (bundle.stat().st_mtime_ns, profile.stat().st_mtime_ns)
+    camera = _stress_camera()
+    frame = _stress_frame()
+    for spec in STRESS_MATRIX:
+        apply_stress_transform(frame, spec, camera=camera)
+    summarize_stress_frames([])
+    assert bundle.read_bytes() == b"map-bytes"
+    assert profile.read_text(encoding="utf-8") == "{}"
+    assert (bundle.stat().st_mtime_ns, profile.stat().st_mtime_ns) == stamp
+
+
+def test_stress_transform_rejects_camera_frame_mismatch() -> None:
+    camera = _stress_camera(width=64, height=48)
+    with pytest.raises(ValueError, match="does not match camera"):
+        apply_stress_transform(_stress_frame(width=32, height=24), STRESS_MATRIX[0], camera=camera)
+    with pytest.raises(ValueError, match="must start with the unmodified identity"):
+        build_stress_report(
+            video="probe.mp4",
+            bundle="unused-bundle.pt",
+            camera=camera,
+            seed=STRESS_SEED,
+            rows=[{
+                "id": "hcrop_0.10",
+                "ops": [],
+                "input_sha256": "0" * 64,
+                "output_sha256": "1" * 64,
+                "probe": {"input_sha256": "0" * 64, "output_sha256": "1" * 64},
+                "metrics": summarize_stress_frames([]),
+            }],
+        )
+
+

@@ -1,13 +1,14 @@
 # 場域地圖定位系統
 
-一套 EDM 定位演算法 + 一個操作介面，場域可隨時更換。演算法只有一份實體，
-每個場域是一個獨立資產包，換場域＝換一個 site profile。
+一套可插拔定位演算法 + 一個操作介面。無人機、場域、地圖版本、定位器版本、
+路徑與校正由獨立 manifest 組成；既有 site profile 保留為啟動相容層。
+元件設計與更換流程見 [`文件/MISSION_COMPONENTS.md`](文件/MISSION_COMPONENTS.md)。
 
 Git 版控不包含實際場域點雲、localization bundle、影片、飛行紀錄或模型權重；
 本機 workspace 會在被忽略的資料目錄保存它們。系統架構與目錄所有權
 規則見 [`文件/ARCHITECTURE.md`](文件/ARCHITECTURE.md)。
 
-最後整理：2026-08-10。歷史設計決策與安全需求見 [`文件/SYSTEM_SPEC.md`](文件/SYSTEM_SPEC.md)；
+最後整理：2026-08-12。歷史設計決策與安全需求見 [`文件/SYSTEM_SPEC.md`](文件/SYSTEM_SPEC.md)；
 目前可執行的場域與發布契約以本 README、site profile schema 與 preflight 為準。結構／容量
 檢查請直接執行 `tools/workspace_audit.py`。
 
@@ -38,14 +39,26 @@ python tools/workspace_audit.py --strict-output-names
 | 接口 | 唯一入口 | 影像來源 | 飛控 backend |
 |---|---|---|---|
 | 模擬串流 | `控制介面程式/影片模擬串流/選擇啟動.sh` | 本機影片 / FFmpeg | 模擬，永不載入 Olympe |
-| 實機人工飛行 | `控制介面程式/真機串流/啟動.sh` | ANAFI PDRAW | Olympe，操作員 UI 控制 |
-| 河濱自主航線 | `控制介面程式/mission_pipeline.py --mode fly` | ANAFI PDRAW | Olympe，僅操作員可核准並啟動 |
+| 實機操作（人工／preflight 後 AUTO） | `控制介面程式/真機串流/啟動.sh` | ANAFI PDRAW | Olympe，操作員 UI 控制；只接受 mission selection |
+| 任務 authoring／檢查 | `控制介面程式/mission_pipeline.py` | 本機資產 | 不直接取代真機操作入口 |
 
-三個入口互斥。模擬入口拒絕 `--live` / `real-flight`；實機入口拒絕
-`--video`，且 PDRAW 不可用時不會拿錄影檔冒充實機畫面。自主入口只接受
-已核准、座標系一致且資產 SHA-256 相符的 site profile 與 route。
+兩個 runtime 入口互斥。模擬入口拒絕 `--live` / `real-flight`；實機入口拒絕
+`--video`，且 PDRAW 不可用時不會拿錄影檔冒充實機畫面。真機入口只接受
+`sfm-mission-selection/v1`；resolver 驗證所有 component SHA、定位品質、必要校正與
+route 契約後產生唯讀 site-profile snapshot。AUTO 仍須由操作員在當次 UI 完成四步
+preflight 並親自按下按鈕。
+
+AUTO 的水平輸出同時受短 TTL、`nudge_pct` 指令強度上限與 fail-closed 地速安全
+閘門保護：地速缺失／超過 0.5 秒或達閾值時只送零 PCMD；超速後降到閾值 80%
+以下才解除。這是遙測 interlock，不是物理硬速度保證。路線結束也要在新鮮地速
+不高於 0.10 m/s 才要求 Landing。AUTO worker 若 2 秒沒有 heartbeat、發生例外或
+連續三次發送失敗，會進入 `AUTO_FAILED` 並保持零輸出，不會自動續行。
 
 ## 換地圖
+
+新架構優先以 `sfm-mission-selection/v1` 選擇獨立元件，resolver 驗證完成後再產生
+既有啟動器可讀的 site profile 快照。本次河濱 official69 map_v000 已使用此格式，
+且已綁定同一重建座標系內唯一的新繪 route。
 
 在操作介面的「場域資產」區選取一個完整建圖資料夾即可原子化匯入。建圖端必須
 一起輸出 `site_profile.json`、顯示點雲 `.ply`、EDM 定位 bundle `.pt`、
@@ -54,7 +67,8 @@ EDM runtime profile `.json` 與參考影像位姿 `.json`；缺少任何一項�
 寫在 `site_profile.json.coordinate_frame`，不需要額外的軸向檔案。
 
 預畫航線與電桿／目標物不屬於基本定位包，分別由另外兩個接口選配匯入。匯入完成
-後，換場域只需切換 site profile，演算法與 UI 不需修改：
+後，模擬模式可切換 site profile；真機模式必須切換 mission selection，演算法與 UI
+不需修改：
 
 ```bash
 # 影片目錄中只有一部影片時自動選用它（P119 會先驗證 SHA）
@@ -88,7 +102,7 @@ reference index 與核准 sidecar，並產生 `PORTABLE_SITE_ASSETS.json`：
 python tools/export_simulator_package.py /path/to/portable_localization \
   --artifact-root /path/to/approved-runtime-artifact-seed \
   --wheelhouse-root /path/to/approved-wheelhouse \
-  --site-profile 控制介面程式/site_profiles/river_site_edm.json
+  --site-profile 地圖檔/場域/river_site/site_profile.json
 cd /path/to/portable_localization
 python tools/package_manifest.py verify
 
@@ -129,7 +143,8 @@ fail closed。
 lock 檔建立乾淨環境，從其 selector/UI 產生有效 pose 後自動清理；
 因此 receipt 同時證明雜湊及實際輸出包可執行。
 
-選擇介面也保留直接選取現有有效 site profile 的相容入口，但 PLY 不能單獨定位。
+模擬選擇介面保留直接選取現有有效 site profile 的相容入口，但 PLY 不能單獨定位；
+真機入口不接受 profile 直接覆寫 mission resolver 的核准結果。
 對新建圖端的一鍵匯入契約，profile、PLY、EDM bundle、runtime profile 與
 reference poses 五項都是必需；`query_camera` 與 `coordinate_frame` 必須寫在
 profile，四個資產都必須有 SHA-256。`route_json` 與 `poles_json` 仍是獨立的
@@ -147,8 +162,12 @@ Python wheelhouse 內，必須由目標電腦的離線 OS 安裝媒體預先供�
 內已收錄 PyTorch/CUDA 及所有固定 Python wheels；目標電腦的
 `install_runtime.sh --offline` 不需要 Internet。
 
-`scipy` 已固定在 runtime hash lock，讓 `SparseCloudCollisionMonitor` 可提供
-非 production 的稀疏點雲警告；它仍未接入 autonomous safety。
+`scipy` 已固定在 runtime hash lock，讓桌面操作介面的
+`SparseCloudCollisionMonitor` 提供可調整 3D 半徑的稀疏點雲近接懸停互鎖。
+未開始定位時，地圖中心的模擬相機與半徑圈只做預覽；取得新鮮有效位姿後，
+半徑內命中點雲會清除手動微移、暫停桌面 AUTO 並送零 PCMD 懸停，且不會自動恢復。
+這條 UI 輔助互鎖未接入獨立的 `RouteAutoController` 飛行入口，也不構成 production
+碰撞保護：稀疏 SfM 點雲會漏掉動態、細小、無紋理及未建圖障礙物。
 `tools/simulator_preflight.py --json` 會在
 `runtime.collision_monitor` 明確記錄 `status=available_non_production`、
 `production_safety=false` 與
@@ -162,16 +181,15 @@ Python wheelhouse 內，必須由目標電腦的離線 OS 安裝媒體預先供�
 | site profile | 資產包 | runtime profile | 航線 | 狀態 |
 |---|---|---|---|---|
 | `urai_edm.json` | `地圖檔/場域/urai/` | 共用 | **無** | 地面定位可用；自主飛行未核准 |
-| `river_site_edm.json` | `地圖檔/場域/river_site/` | `edm_profiles/river_site.json` | route 僅供顯示 | 地面定位可用；自主飛行未核准 |
-| `football_field_edm.json` | `地圖檔/場域/football_field/` | `edm_profiles/football_field.json` | **無** | 待 replay；自主飛行未核准 |
+| `mission_selections/river_site_official69_localization.json` | `river_site_official69_map_v000_20260811` | resolver 產生 snapshot | **已刪** | 舊圖仍可定位；舊航線已移除 |
+| `mission_selections/river_site_b0_p116_p117_localization.json` | `river_site_b0_p116_p117_20260818` | resolver 產生 snapshot | **無** | 目前預設地面定位；須重畫 route 才能 AUTO |
 | `example_site_edm.json` | — | — | — | 新場域範本 |
 
 全部使用 EDM。XFeat / LighterGlue 的地圖、bundle 與設定已於 2026-07-26 移除
 （程式碼保留）。`urai`（烏來）就是交付包代號 `target_site` 的實體場域。
-目前所有場域（包含河濱）的 `flight.approved` 與
-`route_clearance_approved` 都為 `false`，全部維持 fail-closed。河濱自主控制只使用
-map-space 方向，不建立或使用
-`map_units_per_meter`，並以全域保守控制設定執行。
+烏來與範例場域維持未核准。河濱 route 與定位 pose 直接共用同一次重建的 raw map
+frame，不建立 `map→site` 對齊、不使用 `map_units_per_meter`，相機光心直接作為導航
+中心；真機起飛與 AUTO 仍受四步檢查、定位新鮮度、航線雜湊及搖桿優先權保護。
 
 ## 新增場域
 
@@ -202,8 +220,8 @@ map-space 方向，不建立或使用
 
 ### 一包一座標系
 
-**同一個實體場地的不同次 SfM 重建，座標系不通用**（scale-free 也 gauge-free，
-要對齊得解 Sim3）。`map_ply`、`localization_bundle`、`map_reference_poses` 與
+**同一個實體場地的不同次 SfM 重建，座標系不通用**（scale-free 也 gauge-free）。
+本系統不推測跨重建 Sim3，換地圖時直接重畫 route。`map_ply`、`localization_bundle`、`map_reference_poses` 與
 `route_json` 必須全部來自同一次重建。
 
 混用的症狀很隱蔽：定位數值完全正常（inliers 95–108）但軌跡畫在錯誤的位置。
@@ -215,9 +233,9 @@ map-space 方向，不建立或使用
 `定位演算法/configs/edm_production_profile.json` 是共用的正式設定：1024×576、
 PyTorch CUDA FP16、coarse top-k 3225、confidence 0.2、reference tensor cache 32、
 TRACK/WEAK/LOST top-k 1/3/5、BOOT MegaLoc top-k 10（先驗證前 2 張，不足才展開）、
-batch size 2、LOST grace 12、recovery bank/scan 192/2、correspondence 上限 900、
-inliers 80/50/30。MegaLoc 只在 BOOT 與每個 LOST episode 各執行一次，
-temporal reference 關閉，PnP acquire/track/RANSAC gate 固定為 5/6/5，
+batch size 2、LOST grace 2、recovery bank/scan 192/2、correspondence 上限 900、
+inliers 80/50/30。MegaLoc 在 BOOT 執行；LOST 預設每個 episode 一次，場域 profile
+可設定週期重試。共用預設的 temporal reference 關閉，PnP acquire/track/RANSAC gate 固定為 5/6/5，
 capture-time 預測上限為 0.25 秒。
 
 ### coarse tail 融合（不改任何參數）
@@ -247,7 +265,8 @@ mconf 最大差 4.8e-07），只有 `torch.topk` 在 ~5e-7 等值處的 tie-brea
 |---|---:|---:|
 | urai | 1383 | 5.007236 |
 | river_site | 454 | 1.900843 |
-| football_field | 505 | 1.840396 |
+| river_site B0+P116/P117 | 340 | 1.470463 |
+
 
 需要校正時在 `定位演算法/configs/edm_profiles/<site>.json` 建一份場域專屬 profile。
 
@@ -263,7 +282,7 @@ ANAFI_LINK_SIM=1 ANAFI_LINK_LATENCY_MS=280 ANAFI_LINK_LOSS_PCT=1.0 \
 ```
 
 `SFM_HOLD_ON_LOW_CONF=1` 為精度優先模式：連續低信心即暫停串流（等同懸停），
-held frame 改走 LOST recovery（提高 local top-k + 每個 episode 一次 MegaLoc）。
+held frame 改走 LOST recovery（提高 local top-k + 依場域 profile 排程 MegaLoc）。
 預設開啟。實機端對應的是 `SFM_GATE_WEAK`（預設開啟，WEAK fix 直接 hover）。
 
 ## 演算法只有一份

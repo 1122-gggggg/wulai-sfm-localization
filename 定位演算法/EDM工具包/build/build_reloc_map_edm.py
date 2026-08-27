@@ -54,6 +54,14 @@ from hloc.utils.io import names_to_pair
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "deploy"))
 from edm_matcher import COARSE_STRIDE, EDM_H, EDM_W, GRID_H, GRID_W, EDMMatcher  # noqa: E402
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "validation"))
+from edm_coverage_sidecar import (  # noqa: E402
+    CoverageRecords,
+    extract_coverage_records,
+    merge_records,
+    write_coverage_sidecar,
+)
+
 N_CELLS = GRID_W * GRID_H
 KEYPOINT_IDENTITY = (
     "coarse cell = round(kpt/8); landmark position = anchor cell centre; "
@@ -243,7 +251,6 @@ def build_keypoint_tables(
     unknown_anchors = anchor_set - set(ref_names)
     if unknown_anchors:
         raise ValueError(f"anchor names absent from reference table: {sorted(unknown_anchors)}")
-
     grid_idx = {n: np.full(N_CELLS, -1, np.int32) for n in ref_names}
     kpts = {n: [] for n in ref_names}          # list of (x, y) in EDM px
     pair_idx: dict[tuple[str, str], tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
@@ -390,7 +397,6 @@ def pack_bundle(
 ):
     """Pack cell->xyz LUTs, reference JPEGs, and inherited tracking metadata."""
     refs, per_ref = {}, []
-
     for i, name in enumerate(ref_names, 1):
         xyz_by_cell = np.asarray(xyz_by_name[name], dtype=np.float32)
         if xyz_by_cell.shape != (N_CELLS, 3):
@@ -475,6 +481,10 @@ def main():
     )
     ap.add_argument("--work-dir", default=str(DEF_WORK))
     ap.add_argument("--out", default=str(DEF_OUT))
+    ap.add_argument(
+        "--coverage-sidecar",
+        help="optional exact EDM anchor observation sidecar (.npz) for offline coverage",
+    )
     ap.add_argument("--pair-topk", type=int, default=20)
     ap.add_argument("--mconf-thr", type=float, default=0.2)
     ap.add_argument("--batch", type=int, default=4)
@@ -500,7 +510,6 @@ def main():
         ),
     )
     args = ap.parse_args()
-
     model_path, image_root = Path(args.model), Path(args.image_root)
     work = Path(args.work_dir)
     work.mkdir(parents=True, exist_ok=True)
@@ -542,6 +551,7 @@ def main():
 
     opts = pycolmap.IncrementalPipelineOptions()
     opts.extract_colors = False
+    coverage_chunks: list[CoverageRecords] = []
 
     if args.anchor_batch_size <= 0:
         # Legacy one-shot path, retained for smaller maps such as river_site.
@@ -583,6 +593,10 @@ def main():
             f"points3D={tri.num_points3D()}"
         )
         xyz_by_name = extract_anchor_xyz(tri, tables, active)
+        if args.coverage_sidecar:
+            coverage_chunks.append(
+                extract_coverage_records(tri, tables, active, active)
+            )
         triangulation_points = int(tri.num_points3D())
         batch_meta = {}
     else:
@@ -615,6 +629,7 @@ def main():
                 "source_model": str(model_path.resolve()),
                 "pair_artifact": pair_artifact,
             }
+            batch_coverage = None
 
             if checkpoint.exists():
                 payload = torch.load(
@@ -629,6 +644,14 @@ def main():
                 batch_xyz = payload["xyz_by_name"]
                 batch_stats = payload["keypoint_stats"]
                 batch_points = int(payload["triangulation_points3D"])
+                if args.coverage_sidecar:
+                    raw_coverage = payload.get("coverage_records")
+                    if raw_coverage is None:
+                        raise RuntimeError(
+                            f"anchor-batch checkpoint {checkpoint} predates exact "
+                            "coverage tracks; rebuild it in a fresh work directory"
+                        )
+                    batch_coverage = CoverageRecords.from_payload(raw_coverage)
                 log(
                     f"reuse anchor batch {batch_index + 1}/{len(batches)}: "
                     f"{len(anchor_batch)} anchors, {batch_points} points"
@@ -688,6 +711,10 @@ def main():
                     mapper_options=opts,
                 )
                 batch_xyz = extract_anchor_xyz(tri, tables, anchor_batch)
+                if args.coverage_sidecar:
+                    batch_coverage = extract_coverage_records(
+                        tri, tables, anchor_batch, active
+                    )
                 batch_points = int(tri.num_points3D())
                 payload = {
                     **expected,
@@ -695,6 +722,8 @@ def main():
                     "keypoint_stats": batch_stats,
                     "triangulation_points3D": batch_points,
                 }
+                if batch_coverage is not None:
+                    payload["coverage_records"] = batch_coverage.as_payload()
                 tmp_checkpoint = checkpoint.with_suffix(".tmp.pt")
                 torch.save(payload, tmp_checkpoint)
                 tmp_checkpoint.rename(checkpoint)
@@ -708,6 +737,8 @@ def main():
             if overlap:
                 raise RuntimeError(f"duplicate anchor ownership: {sorted(overlap)}")
             xyz_by_name.update(batch_xyz)
+            if batch_coverage is not None:
+                coverage_chunks.append(batch_coverage)
             triangulation_points += batch_points
             total_keypoints += int(batch_stats["keypoints_total"])
             total_anchors += int(batch_stats["anchor_cells_total"])
@@ -748,6 +779,15 @@ def main():
                     )
                 repairs = payload["xyz_by_name"]
                 repair_points = int(payload["triangulation_points3D"])
+                repair_coverage = None
+                if args.coverage_sidecar:
+                    raw_coverage = payload.get("coverage_records")
+                    if raw_coverage is None:
+                        raise RuntimeError(
+                            f"zero-anchor checkpoint {checkpoint} predates exact "
+                            "coverage tracks; rebuild it in a fresh work directory"
+                        )
+                    repair_coverage = CoverageRecords.from_payload(raw_coverage)
                 log(
                     f"reuse zero-anchor repair: {len(empty_anchors)} anchors, "
                     f"{repair_points} points"
@@ -800,6 +840,11 @@ def main():
                     mapper_options=opts,
                 )
                 repairs = extract_anchor_xyz(tri, tables, empty_anchors)
+                repair_coverage = None
+                if args.coverage_sidecar:
+                    repair_coverage = extract_coverage_records(
+                        tri, tables, empty_anchors, active
+                    )
                 repair_points = int(tri.num_points3D())
                 payload = {
                     **expected,
@@ -807,6 +852,8 @@ def main():
                     "keypoint_stats": repair_stats,
                     "triangulation_points3D": repair_points,
                 }
+                if repair_coverage is not None:
+                    payload["coverage_records"] = repair_coverage.as_payload()
                 tmp_checkpoint = checkpoint.with_suffix(".tmp.pt")
                 torch.save(payload, tmp_checkpoint)
                 tmp_checkpoint.rename(checkpoint)
@@ -815,6 +862,8 @@ def main():
             repaired_zero_anchors = apply_zero_anchor_repairs(
                 xyz_by_name, repairs
             )
+            if repair_coverage is not None:
+                coverage_chunks.append(repair_coverage)
             log(f"repaired zero anchors: {repaired_zero_anchors}")
             del repairs
             gc.collect()
@@ -834,12 +883,13 @@ def main():
         }
 
     # F
+    out_path = Path(args.out)
     pack_bundle(
         xyz_by_name,
         active,
         xb,
         image_root,
-        Path(args.out),
+        out_path,
         {
             "triangulation_pair_topk": args.pair_topk,
             "triangulation_pairs": len(pairs),
@@ -851,6 +901,26 @@ def main():
             **batch_meta,
         },
     )
+    if args.coverage_sidecar:
+        coverage = merge_records(
+            coverage_chunks,
+            ref_count=len(active),
+            cell_count=N_CELLS,
+        )
+        expected_anchors = sum(anchored_cell_count(xyz) for xyz in xyz_by_name.values())
+        if len(coverage.anchor_ref_idx) != expected_anchors:
+            raise RuntimeError(
+                "coverage sidecar does not cover every finite production EDM anchor: "
+                f"{len(coverage.anchor_ref_idx)} != {expected_anchors}"
+            )
+        sidecar = write_coverage_sidecar(
+            args.coverage_sidecar,
+            coverage,
+            bundle_path=out_path,
+            ref_names=active,
+            cell_count=N_CELLS,
+        )
+        log(f"SAVED exact coverage observations -> {sidecar}")
 
 
 if __name__ == "__main__":

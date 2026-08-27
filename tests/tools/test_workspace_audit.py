@@ -65,10 +65,7 @@ def test_workspace_audit_reports_missing_paths_and_broken_links(tmp_path: Path) 
 
 def test_workspace_audit_requires_embedded_parrot_control_core(tmp_path: Path) -> None:
     _minimal_workspace(tmp_path)
-    core = (
-        tmp_path
-        / "模擬器/parrot_stimulate/src/anafi_pcmd_sim/scale_free_control.py"
-    )
+    core = tmp_path / "模擬器/parrot_stimulate/src/anafi_pcmd_sim/scale_free_control.py"
     core.unlink()
 
     result = audit_workspace(tmp_path, include_sizes=False)
@@ -82,6 +79,8 @@ def test_workspace_audit_requires_embedded_parrot_control_core(tmp_path: Path) -
 
 def test_output_classification_keeps_new_names_visible() -> None:
     assert classify_output("edm_speed_20260803") == "experiment_evidence"
+    assert classify_output("megaloc_tensorrt_full5_20260813") == "experiment_evidence"
+    assert classify_output("river_site_generalization") == "experiment_evidence"
     assert classify_output("validation_receipts") == "validation"
     assert classify_output("security") == "validation"
     assert classify_output("flight_logs") == "operations"
@@ -124,4 +123,6 @@ def test_workspace_audit_warns_when_workspace_exceeds_20_gib(tmp_path: Path, mon
 
     result = audit_workspace(tmp_path, include_sizes=True)
 
-    assert any("workspace size is above 20 GiB" in warning for warning in result["storage_warnings"])
+    assert any(
+        "workspace size is above 20 GiB" in warning for warning in result["storage_warnings"]
+    )

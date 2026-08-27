@@ -3,13 +3,13 @@
 | 欄位 | 內容 |
 |---|---|
 | 文件狀態 | 歷史設計與安全決策記錄；現行執行契約以根 README、site profile schema 與 preflight 為準 |
-| 規格版本 | 0.2 |
-| 日期 | 2026-08-08，Asia/Taipei |
+| 規格版本 | 0.3 |
+| 日期 | 2026-08-12，Asia/Taipei |
 | 適用工作區 | `/home/allen/localization` |
 | 規格範圍 | 建圖、定位、控制介面、模擬串流、真機接口、安全、測試、部署、監控 |
 | 實作限制 | 本文件保留 To-Be 與當時 As-Is 背景；不得覆蓋現行 fail-closed 程式契約 |
 
-> 2026-08-08 維護註記：第 3 節的 As-Is 原為 2026-08-02 盤點。下列已改成
+> 2026-08-12 維護註記：第 3 節的 As-Is 原為 2026-08-02 盤點。下列已改成
 > 目前實作的關鍵事實；其他分階段與待辦表保留為歷史規劃，不是執行時預設值。
 
 ## 1. 決策摘要
@@ -22,9 +22,9 @@
 4. 接口模式與場域 profile 在程序生命週期內不可變。禁止模擬／真機熱切換，也禁止飛行中或執行中熱換地圖；必須完全關閉後重啟。
 5. 模擬接口本階段只保證影片檔。啟動器優先選用工作區內的 P1190119.MP4，否則只有一部匯入影片時自動選用，播放完停在最後一個可解碼畫面，不循環。
 6. 模擬介面的起飛、降落、懸停與微移只更新模擬狀態，永不載入 Olympe、連接真機或送出真機命令。
-7. 真機接口涵蓋連線與影像、即時定位、人工起飛／降落、人工微移、懸停、手動接管、緊急停止及人類按鈕啟動的自主路徑飛行。自主按鈕先起飛懸停，可靠定位後才移動；定位逾時則原地降落。
+7. 真機接口涵蓋連線與影像、即時定位、人工起飛／降落、人工微移、懸停、手動接管、緊急停止及人類按鈕啟動的自主路徑飛行。自主按鈕先起飛懸停，可靠定位後才移動；定位失敗時保持懸停，執行一次 MegaLoc／右轉搜尋並等待恢復或搖桿接管，不會自動降落。
 8. 地圖及路徑不建立公尺尺度，也不要求 `map_units_per_meter`。地圖座標只作定位、方向、相對路徑進度與畫面顯示。
-9. 未來自主路徑的初始實際水平速度上限為 **0.30 m/s**。它是飛機端速度限制，不是 map unit 尺度；必須由真機速度遙測及實機 PCMD 響應測試驗證。速度日後可修改，但只能在確認落地時修改，且每次修改都使原自主飛行核准失效，必須重新測試與核准。
+9. 自主路徑同時使用 backend `nudge_pct` PCMD 百分比指令上限與 fail-closed 地速安全閘門。水平 AUTO 在地速缺失／超過 0.5 s、或達設定閾值時送零並懸停；超速 latch 只在新鮮地速嚴格低於閾值 80% 後解除。這不是閉迴路速度控制或物理硬上限；真機 PCMD 響應、遙測延遲、煞停距離與風況仍須現場驗證。
 10. 路徑由操作員避開已知障礙物。系統不宣稱具備動態避障或可靠碰撞偵測；稀疏點雲碰撞監控不是正式安全層。每條真機路徑仍須做人工現場淨空審查。
 11. 規劃路徑線預設隱藏，操作員可勾選顯示；即時定位軌跡、相機視錐及 XYZ 軸持續顯示。
 12. 河濱不是唯一場域。任何具備完整原子化 site profile 的場域都可使用。
@@ -33,8 +33,8 @@
 15. 系統完全離線運作。模擬模式不可連網；真機模式只允許本機、SkyController／ANAFI 私有網路，不可存取 Internet、DNS 下載模型或執行碼。
 16. 主系統維持 Python 3.10；`模擬器/parrot_stimulate` 維持 Python 3.11 獨立環境，但提供一個統一驗證入口。
 17. 系統手動啟動，不建立開機或登入自動啟動服務。
-18. 高度／距離預設為 30 m／100 m，操作員可在 UI 修改，但只允許在飛機確認落地、連線健康且 firmware readback 可用時套用。
-19. 影像、定位或 worker 故障但控制鏈仍在時：立即送零 PCMD、原地懸停、取消自動／電腦連續動作，切換成手動操作。SkyController 搖桿優先；若無 SkyController 但 PC 控制鏈仍健康，保留電腦手動控制。
+18. 真機 UI launcher 的高度／距離預設為 50 m／100 m，操作員可在 UI 修改，但只允許在飛機確認落地、連線健康且 firmware readback 可用時套用。
+19. 影像或定位故障但控制鏈仍在時：立即送零 PCMD並原地懸停；不因故障自動降落或強制切換人工。AUTO worker 例外、連續三次 PCMD 發送失敗或 2 秒無 heartbeat 時進入 `AUTO_FAILED`、送零並停止路線，必須由操作員處置或重啟，不可自動續行。SkyController 搖桿永遠優先，任一偏轉立即取消 AUTO 並取回控制權。
 20. 完全失去飛機控制連線時使用機載安全策略：先懸停／重連；逾時後，GPS 與 Home Point 有效則 RTH，否則依經現場確認的 firmware 策略受控降落。主機端不可假裝斷線後仍能控制飛機。
 21. UI 採繁體中文，標準尺寸 1440×900、最低 1180×768；SIM 使用藍色識別，REAL 使用紅橘色永久警告。
 22. 定位／效能 log 保留 30 天或總量 20 GB，先到者為準；command／safety／incident log 不自動刪除，只能手動封存或匯出。
@@ -50,7 +50,7 @@
 - 讓單一操作員可安全使用模擬影片或真機 ANAFI，而不可能誤用另一個接口。
 - 真機故障時先停止電腦動作，再交回人工，不沿用過期姿態或過期 PCMD。
 - 以可重現的資產 SHA、測試、紀錄與監控，證明修改沒有讓目前定位品質或速度退步。
-- 自主飛行採慢速、短有效期、每次依新 pose 重算的控制，初始速度上限 0.30 m/s。
+- 自主飛行採低 PCMD 百分比、短有效期、每次依新 pose 重算的控制；百分比上限不等於 m/s 保證。
 
 ### 2.2 非目標
 
@@ -59,7 +59,7 @@
 - 不把稀疏點雲或 YOLO 當作正式碰撞避免系統。
 - 不宣稱絕對公尺定位精度、絕對姿態精度或 ground-truth 飛行誤差。
 - 不允許 agent、LLM、腳本或其他自動化替操作員按下真機起飛。
-- 本階段不核准真機自主路徑飛行。
+- 不允許無人值守、自動按鍵或繞過當次四步 preflight 的真機自主路徑飛行。
 - 不在執行時下載模型、程式碼、套件或場域資產。
 
 ### 2.3 使用者與角色
@@ -125,7 +125,7 @@ Pose + TRACK / WEAK_TRACK / LOST
 | 接口 | 現有入口 | 現況 |
 |---|---|---|
 | 模擬串流 | `控制介面程式/影片模擬串流/選擇啟動.sh` | 固定 `simulated-stream`，拒絕 real/override 參數，不載入 Olympe；由使用者選擇完整場域 profile/PLY 與影片，CLI launcher 預設 river profile 並只在 P119 或唯一影片時自動選擇；EOF 保留最後一幀且不循環 |
-| 真機串流 | `控制介面程式/真機串流/啟動.sh` | 固定 `real-flight`，拒絕 `--video`；明確要求 site profile；透過 SkyController 3 或 direct Wi-Fi 連線，PDRAW 失敗不會退回影片 |
+| 真機串流 | `控制介面程式/真機串流/啟動.sh` | 固定 `real-flight`，拒絕 `--video`；明確要求 mission selection 並由 resolver 產生 site-profile snapshot；透過 SkyController 3 或 direct Wi-Fi 連線，PDRAW 失敗不會退回影片 |
 
 兩個 launcher 已有跨接口參數拒絕測試，並共用 `resolve_display.sh`
 探測及驗證本機 X/XWayland `DISPLAY`。
@@ -134,11 +134,9 @@ Pose + TRACK / WEAK_TRACK / LOST
 
 - Site profile 必須綁定 UI 顯示 PLY 與 EDM localization bundle；portable full-runtime
   另要求 `query_camera`。reference poses、route、poles 與場域特調 runtime profile 為選配。
-- `river_site_edm.json` 目前為 `flight.approved=false`，route 只供顯示。
-- 河濱 route 有 20 個 waypoint，但缺少正式 `sfm-flight-route/v1` 的 `site_id`、`coordinate_frame_id`、`purpose` 等欄位，因此不能通過自主飛行 gate。
-- 河濱 profile 的 `flight.coordinate_frame_id` 與 controller 都是 `null`，
-  `flight.approved=false`；schema v2 不定義也不要求 `map_units_per_meter`。
-- 河濱 EDM runtime profile 中的 `S=1.900843` 是參考相機分布所算出的演算法場景尺度，只用於 `radius`／jump gate；它不是 map-unit-to-metre 比例。現有文字 `scale-calibrated` 容易和公尺尺度混淆。
+- 河濱 canonical 相容 profile 為 `地圖檔/場域/river_site/site_profile.json`；真機不直接採信該 profile，而只採信 mission selection resolver 產生的 snapshot。目前預設 `river_site_b0_p116_p117_localization.json` 只有地面定位（`flight_ready=false`，無新座標系 route）。ANAFI 不要求靜態 IMU receipt；真機羅盤校正完成且韌體回讀為有效後，preflight 第一步自動通過，其餘步驟仍由操作員當次確認。
+- 河濱 profile 的 `flight.coordinate_frame_id` 綁定同一次 reconstruction，controller 為 `null`；schema v2 不定義也不要求 `map_units_per_meter`。
+- 目前河濱 B0+P116/P117 EDM runtime 的 `S=1.470463` 是參考相機分布所算出的演算法場景尺度，只用於 `radius`／jump gate；它不是 map-unit-to-metre 比例。舊 454-ref `river_site.json` 的 `S=1.900843` 不再是預設地圖。現有文字 `scale-calibrated` 容易和公尺尺度混淆。
 - 同一 profile 實際有提供的 PLY、bundle、reference poses 與 route
   必須來自同一次重建；不同 SfM 重建不可直接混用。
 
@@ -186,16 +184,16 @@ Pose + TRACK / WEAK_TRACK / LOST
 - SkyController 搖桿偏轉會強制取回控制權。
 - Space 懸停、Esc 手動接管、微移按住才送 PCMD、放開或 heartbeat 過期歸零。
 - 關窗、Ctrl+C 或 signal 會嘗試零 PCMD、原地降落，再交還 SkyController。
-- 高度／距離只有落地時可寫並嘗試 firmware ack/readback；失敗會顯示及記錄警示，但不阻擋起飛。
+- 高度／距離只有落地時可寫；已設定的值必須取得 firmware ack/readback，否則拒絕起飛。
 - 起飛前要求至少 30% 電量；GPS fix 僅作狀態提示，不阻擋手動或自主起飛。
 - legacy autonomous runner 有獨立 20 Hz SafetyMonitor、pose freshness、WEAK/LOST、jump、route deviation 與終止安全 gate。
-- UI 的「自動飛行」由同一個 Olympe backend 起飛並持續零 PCMD 懸停；連續可靠定位後才交給 production route loop，25 秒仍無定位則原地降落。
+- UI 的「自動飛行」由同一個 Olympe backend 起飛並持續零 PCMD 懸停；連續可靠定位後才交給 production route loop。定位失敗會先持續嘗試 MegaLoc 10 秒，再以低 yaw PCMD 向右搜尋一圈；仍找不到則持續懸停等待恢復、操作員重新操作或搖桿接管。
 
 尚未符合本規格之處：
 
-- 真機 UI 的 stream stale 會送 hover，但尚未一併交還人工。
+- 真機 UI 的 stream stale 會送 hover 並暫停 AUTO；不會自動降落或強制切換人工，操作員可在狀況恢復後按下繼續 AUTO。
 - Olympe link loss 目前只記錄並顯示警告 `display_only_no_auto_land`，未完成 B1 lost-link firmware policy 驗證。
-- UI localization-only 模式的 worker crash／定位 LOST 尚未形成單一、明確的「零 PCMD後交人工」契約。
+- UI localization-only 模式的 worker crash／定位 LOST 統一為零 PCMD並懸停；不自動降落或強制切人工。
 - 連線時尚未完整讀取並記錄 aircraft/controller 型號、serial、firmware、連線路徑及 RTH/Home policy。
 - 現有 `Emergency` safety mode 與 Space／Esc 分散，UI 尚無明確且醒目的「緊急停止電腦動作」控制。
 
@@ -289,13 +287,13 @@ flowchart LR
 
 1. 用 pose 到下一 waypoint／lookahead 的 map-space 向量決定方向，送出前只取單位方向。
 2. 以已校正的 map-to-body 軸向與機體 yaw 將方向轉成 body forward/right，不把 map 距離換成公尺。
-3. 實際速度由 ANAFI 的飛機端速度遙測、短 PCMD pulse 與獨立 20 Hz sender 限制；初始 `speed_limit_mps=0.30`。
+3. 平移輸出由 backend `nudge_pct` 限制 PCMD 百分比；另以新鮮機體地速作 fail-closed 上限閘門。兩者都不等於可保證的實際硬地速上限。
 4. 每筆 autonomous desired PCMD 的有效期不得超過 0.25 s；沒有更新即歸零。
-5. 缺少、過期或不可信的飛機速度遙測時，不允許 autonomous translation。
+5. 飛機地速遙測會作為上限 interlock 與降落前 gate，但不回授調節 PCMD 大小，故不宣稱形成 m/s 閉迴路；缺失或超過 0.5 s 時不得發水平非零 AUTO PCMD。
 6. waypoint arrival、route deviation、pose jump 等幾何門檻以場域 profile 的 map unit 欄位保存，不能跨場域複製。
-7. 速度上限變更只允許落地時操作；變更後目前 session 的 AUTO 核准失效，必須重新完成四步 preflight；不會暗中改寫 site profile。
+7. PCMD 百分比由 backend 啟動設定提供；變更後必須重新做 PCMD 響應、煞停與低高度驗證，不會暗中改寫 site profile。
 
-真機 PCMD 不是直接的 m/s 命令，因此「0.30 m/s」是必須由速度回授保護的上限，不得只以固定 PCMD 百分比推算。硬體 receipt 可選擇性留作稽核證據，不是 AUTO readiness gate。
+真機 PCMD 不是直接的 m/s 命令；production route controller 只把地速當 fail-closed interlock，不用它閉迴路調節速度。因此 UI 必須標示「地速安全閘門（非硬上限）」，不得推算或顯示成固定 m/s 保證。硬體 receipt 可選擇性留作稽核證據，不是 AUTO readiness gate。
 
 ### 5.3 建圖與換圖流程
 
@@ -344,8 +342,9 @@ flowchart TD
 | 項目 | 值 |
 |---|---|
 | interface | `simulated-stream`，唯讀 |
-| site profile | `控制介面程式/site_profiles/river_site_edm.json` |
-| video | `模擬器/測試影片/` 內的 P1190119.MP4，或單一匯入影片；多部時必須明確指定 |
+| mission selection | `控制介面程式/mission_selections/river_site_b0_p116_p117_localization.json`（地面定位；無 route） |
+| resolver site-profile snapshot | `執行環境/mission_snapshots/`（runtime 產生，不是另一份核准來源） |
+| video | `模擬器/測試影片/` 內明確指定的影片；P167 為目前驗證片，P119 仍可用 |
 | output stream | 1280×720、30 fps、H.264 Main、5,000 kbps |
 | artificial latency | 280 ms |
 | artificial loss | 0% nominal |
@@ -371,7 +370,7 @@ P119 容器宣告 2,935 幀但只解碼 2,934 幀。對這個固定 SHA，UI 可
 唯一入口：
 
 ```bash
-SFM_SITE_PROFILE=/absolute/path/to/site.json \
+SFM_MISSION_SELECTION=/absolute/path/to/selection.json \
   ./控制介面程式/真機串流/啟動.sh
 ```
 
@@ -387,13 +386,16 @@ SFM_SITE_PROFILE=/absolute/path/to/site.json \
 
 正式飛行一律經 SkyController 3，確保人工搖桿接管。Direct drone Wi-Fi 只屬地面診斷／實驗模式，沒有 SkyController 時不得啟用自主路徑；是否允許人工 PC 起飛仍受獨立現場核准。
 
-真機接口不得接受 `--video`，PDRAW 不可用時不得用影片代替。啟動時必須明確指定 site profile；不得猜河濱或沿用上一次場域。
+真機接口不得接受 `--video`，PDRAW 不可用時不得用影片代替。啟動時必須明確指定
+mission selection；resolver 驗證 component SHA、定位品質、必要校正與 route 契約後
+才產生 site-profile snapshot。真機入口不得直接接受另一份 profile 覆寫 readiness，
+也不得沿用上一次場域。
 
 ### 6.3 模式與地圖不可熱切換
 
 - UI 不提供 SIM/REAL toggle。
 - backend 建立後不得替換。
-- `interface_mode`、site profile path、profile SHA、asset SHA 在 session log 首筆寫入並保持不變。
+- `interface_mode`、mission selection path/SHA、resolver snapshot path/profile SHA、asset SHA 在 session log 首筆寫入並保持不變。
 - 任何切換需求都執行安全關閉、結束 worker、釋放 shared memory，再由另一啟動器建立新 session。
 
 ## 7. 共用 Python backend contract
@@ -506,7 +508,7 @@ TRACK
 
 固定要求：
 
-- MegaLoc 只由三種自動事件觸發：落地狀態的起飛初始化 `BOOT_INIT` 一次、連續 2 筆低信心 EDM 結果後一次，以及每個真正 `LOST` episode 進入時一次。單筆 `WEAK_TRACK` 只提高 EDM top-k；低信心升級前 SIM 凍幀、REAL 歸零 PCMD 並交還人工。正式操作 UI 不得提供手動強制 global retrieval／MegaLoc 的控制。
+- MegaLoc 只由三種自動事件觸發：落地狀態的起飛初始化 `BOOT_INIT` 一次、連續 2 筆低信心 EDM 結果後一次，以及每個真正 `LOST` episode 進入時一次。單筆 `WEAK_TRACK` 只提高 EDM top-k；低信心升級前 SIM 凍幀、REAL 歸零 PCMD並懸停。正式操作 UI 不得提供手動強制 global retrieval／MegaLoc 的控制。
 - 河濱 `max_corr_total=900`。
 - 正式 device 必須是 `cuda` 且 GPU identity 符合核准 deployment；CPU fallback 禁止。
 - query camera 先驗 schema 與幾何參數；bundle、runtime profile 與 EDM checkpoint
@@ -543,7 +545,7 @@ WEAK、LOST、stale pose 或 worker error 都不可沿用上一筆非零 autonom
 
 人工起飛按鈕只有在下列條件全部為真時可用：
 
-- interface 固定為 `real-flight`，site profile 與所有 SHA 已驗證。
+- interface 固定為 `real-flight`，mission selection、resolver snapshot 與所有 component SHA 已驗證。
 - aircraft/controller identity、firmware、Olympe、連線路徑已讀取並記錄。
 - ANAFI 羅盤狀態已明確回讀且不是 required／failed／calibrating；經
   SkyController 3 連線時，控制器羅盤也必須明確為 Calibrated。firmware 僅回報
@@ -551,52 +553,55 @@ WEAK、LOST、stale pose 或 worker error 都不可沿用上一筆非零 autonom
 - SkyController 搖桿接管已實測；正式飛行不可只相信設定值。
 - battery 至少 30%。
 - Home Point 與 firmware lost-link/RTH policy 符合 B1；GPS fix 不是起飛門檻，無可用 Home 時失聯策略必須原地降落。
-- 高度 30 m／距離 100 m 或操作員當次設定值已 ack/readback。
+- 高度 50 m／距離 100 m 或操作員當次設定值已 ack/readback。
 - distance geofence 狀態已明確確認：GPS／Home 可用時應開啟；無 GPS 時可關閉或僅提示，且不得把這個狀態當成人工起飛門檻。
 - 影像串流、定位 worker、CUDA、logging、磁碟空間健康。
 - 真機起飛只能由操作員在本機 UI 實際按下；不得有 CLI、環境變數或自動化旁路。
 
-### 10.2 自主飛行外部核准 gate
+### 10.2 自主飛行操作員 preflight
 
-所有場域維持 `flight.approved=false`，直到書面／artifact 證據齊全：
+不要求獨立的靜態 mission approval manifest。resolver 驗證元件後，操作員仍須在
+當次真機 session 自行確認下列項目；程式不得自動代按：
 
 1. 同一次 SfM 重建的 coordinate frame 與資產 SHA 綁定確認。
 2. 操作員逐段 route 淨空審查。
 3. 拆槳 yaw、body-axis、PCMD 正負號與 stick takeover 測試。
 4. 在 `landed` 狀態由操作員分別完成 ANAFI 與 SkyController 3 韌體羅盤校正，
    並確認介面能回讀每一軸進度；校正命令不得啟動馬達或移動機體。
-5. 真機 PCMD response 測試，證明速度回授與 0.30 m/s 上限可執行；這不是 map scale 校正。
+5. 真機 PCMD response、煞停與低高度測試，確認設定的 PCMD 百分比足夠保守；這不是 map scale 或 m/s 校正。
 6. 地面測試與低高度、低速測試。
 7. 真機 PDRAW + EDM 定位驗證。
 8. frame/body 軸向、機體 yaw、camera-to-body yaw offset 校正；不要求 map distance scale。
 9. 高度、距離、lost-link、RTH/Home、低電量及 logging fail-closed 測試。
 10. `parrot_stimulate` 共用控制器測試、固定 worst-case 測試全部通過。
 11. 兩人確認、實體安全監控員及起飛前 checklist 已落實。
-12. 操作員明確更新 `flight.approved=true` 並核准新 SHA manifest。
+12. 操作員在 UI 完成四步 preflight，並親自按下「自動飛行」。
 
-### 10.3 0.30 m/s scale-free 自主控制
+### 10.3 PCMD 指令上限的無尺度自主控制
 
 - 真機自主 route 實作不得繼續使用目前依賴 `map_units_per_meter` 的 continuous-polyline conversion。
 - 正式 route controller 必須和 `parrot_stimulate` 的逐點控制邏輯共用單一實作或單一權威核心，不得維護兩套 PCMD 公式。
-- map-space target vector 只提供方向；實際速度只採 airframe telemetry。
+- map-space target vector 只提供方向；airframe ground-speed telemetry 構成 fail-closed 上限 interlock 與降落 gate，但不構成閉迴路速度調節或物理硬上限。
 - 先轉向、確認穩定、再以短時限 PCMD 平移；每次取得新 pose 後重算。
-- 任何速度超過 0.30 m/s、速度未知、pose 過期、WEAK/LOST、route deviation 或 command TTL 過期都立即歸零並進入人工模式。
-- 使用者日後可修改速度，但只能落地修改；修改後必須重新做 PCMD response、braking、low-altitude 與 worst-case 測試。
+- pose 過期、WEAK/LOST、route deviation 或 command TTL 過期都立即歸零並懸停；不因這些事件自動降落或強制切換人工。
+- 地速閾值只可在 confirmed landed 狀態修改，修改會使當次 AUTO preflight 失效；`nudge_pct` 變更同樣必須重新做 PCMD response、braking、low-altitude 與 worst-case 測試。兩者都不得標示成物理硬 m/s 上限。
+- 路線完成後只有新鮮地速 ≤0.10 m/s 才要求 Landing；地速缺失、過期或較高時維持零 PCMD 懸停並於下一控制 tick 重試。
 
 ### 10.4 故障策略
 
 | 故障 | 立即動作 | 後續狀態 | 自動恢復 AUTO |
 |---|---|---|---|
-| 影像 stale／中斷 | 清除 desired PCMD、送零、懸停 | SkyController 手動；無 SC 但 PC link 健康則 PC manual | 否 |
-| 定位 WEAK／LOST／pose stale | 同上；停止使用舊 pose | 手動，定位可在背景重抓 | 否 |
-| worker exit／stall／OOM | 獨立 safety supervisor 先歸零與交人工，再重啟 worker | 手動 | 否 |
+| 影像 stale／中斷 | 清除 desired PCMD、送零、懸停並暫停 AUTO | 等待恢復、操作員繼續 AUTO 或搖桿接管 | 僅由操作員繼續 |
+| 定位 WEAK／LOST／pose stale | 同上；停止使用舊 pose，執行一次 MegaLoc／右轉搜尋 | AUTO 保持懸停等待定位恢復或搖桿接管 | 定位恢復後可續行 |
+| AUTO worker 例外／stall（2 s 無 heartbeat）／連續三次 PCMD 失敗 | 獨立 watchdog 先歸零並鎖存 `AUTO_FAILED` | 路線終止；保留連線供操作員停止電腦動作、降落或接管 | 否，須人工處置／重啟 |
+| 地速缺失／超過 0.5 s／達安全閘門 | 清除水平 desired PCMD、送零並懸停；超速狀態 latch | 新鮮地速嚴格低於閾值 80% 後才解除 latch | 控制迴圈可續行，但不宣稱硬限速 |
 | UI freeze／focus loss | nudge heartbeat/desired PCMD TTL 到期歸零 | 手動或 hover | 否 |
 | SkyController stick movement | 立即停止 PC PCMD並交回 sticks | SkyController manual | 否 |
 | PC 與 SkyController/aircraft 完全斷線 | 主機停止假設可控；機載懸停／重連 | GPS+Home 有效逾時 RTH；否則經驗證的受控降落 | 否 |
 | battery 低於 30% 或核心安全讀回不合格 | 起飛前拒絕；空中依 firmware 與操作員處置 | 手動／安全降落 | 否 |
-| GPS／Home／distance geofence／高度或距離限制未就緒 | 文字提示；無 GPS 時 distance geofence 可關閉或僅提示，不阻擋手動起飛；AUTO 先懸停等待定位，逾時原地降落 | 手動可飛／AUTO 等待 | 否 |
+| GPS／Home／distance geofence／高度或距離限制未就緒 | 文字提示；無 GPS 時 distance geofence 可關閉或僅提示，不阻擋手動起飛；AUTO 先懸停等待定位，不自動降落 | 手動可飛／AUTO 等待 | 定位恢復後可續行 |
 | logging 或磁碟無法保證 safety log | 起飛前拒絕；空中發出 incident 並交人工 | 手動 | 否 |
-| 關窗／Ctrl+C／SIGTERM | 零 PCMD、停止錄影、原地 Landing、交還 sticks | CLOSED | 不適用 |
+| 關窗／Ctrl+C／SIGTERM／SIGHUP | 先以 backend shutdown latch 永久拒絕晚到 PCMD，再取消 AUTO 並獨立原地 Landing；AUTO worker 卡死也不得阻止降落 | 僅 touchdown 已確認才關 UI／斷線；否則保留介面與連線重試 | 不適用 |
 
 ### 10.5 緊急停止定義
 
@@ -649,7 +654,9 @@ stateDiagram-v2
     TRACK --> LOST: consecutive failure/stale
     WEAK_TRACK --> LOST: consecutive failure/stale
     LOST --> TRACK: confirmed recovery
-    LOST --> MANUAL_HOLD: REAL failure policy
+    LOST --> AUTO_HOVER_WAIT: REAL failure policy
+    AUTO_HOVER_WAIT --> TRACK: confirmed recovery
+    AUTO_HOVER_WAIT --> MANUAL_HOLD: stick movement
     WORKER_LOADING --> WORKER_DOWN: exit/stall
     TRACK --> WORKER_DOWN: exit/stall
     WEAK_TRACK --> WORKER_DOWN: exit/stall
@@ -657,7 +664,7 @@ stateDiagram-v2
     WORKER_DOWN --> WORKER_LOADING: bounded restart
 ```
 
-SIM 在 LOST 可凍住影片做 bounded recovery；REAL 不可凍 camera，只能懸停並交人工。
+SIM 在 LOST 可凍住影片做 bounded recovery；REAL 不可凍 camera，只能送零並懸停等待恢復或搖桿接管。
 
 ### 11.3 控制權狀態
 
@@ -668,7 +675,12 @@ stateDiagram-v2
     AIRBORNE_STICKS --> PC_MANUAL: explicit PC control
     PC_MANUAL --> AIRBORNE_STICKS: Esc/stick input/failure
     PC_MANUAL --> HOVER_HANDOFF: stream/pose/worker failure
-    FUTURE_AUTO --> HOVER_HANDOFF: any safety failure
+    GROUND_STICKS --> AUTO: human AUTO + four-step preflight
+    AIRBORNE_STICKS --> AUTO: human AUTO + four-step preflight
+    AUTO --> AUTO_HOVER_WAIT: recoverable stream/pose failure
+    AUTO --> AUTO_FAILED: worker/watchdog/PCMD failure
+    AUTO --> LANDING: route complete or operator LAND
+    AUTO_FAILED --> PC_MANUAL_ZERO: operator stops computer motion
     HOVER_HANDOFF --> AIRBORNE_STICKS: SkyController healthy
     HOVER_HANDOFF --> PC_MANUAL_ZERO: no SC, PC link healthy
     AIRBORNE_STICKS --> LANDING: LAND
@@ -681,7 +693,9 @@ stateDiagram-v2
     LINK_LOST_ONBOARD --> ONBOARD_LAND: no valid GPS/Home
 ```
 
-`FUTURE_AUTO` 在本階段不可進入。
+`AUTO` 只有在 mission selection `flight_ready=true` 且四步 preflight 完成後可進入；
+目前隨附 selection 為 `flight_ready=false`（無 route），未完成當次 preflight 或任一後端硬檢查
+仍會 fail closed。
 
 ## 12. 效能與品質 KPI
 
@@ -710,7 +724,9 @@ stateDiagram-v2
 | worker busy queue depth | ≤1 latest frame | 不允許舊 frame backlog |
 | safety command observation-to-zero | ≤100 ms | 由獨立 safety log 驗證；不含故障偵測門檻 |
 | pose freshness cutoff | ≤500 ms | 過期即不得控制 |
-| stream stale cutoff | ≤750 ms | 過期即 hover/manual |
+| stream stale cutoff | ≤750 ms | 過期即送零並 hover；不自動降落或強制切人工 |
+| AUTO ground-speed freshness | ≤500 ms | 缺失或過期即禁止水平非零 AUTO PCMD |
+| AUTO worker heartbeat timeout | 2.0 s | 超時即 `AUTO_FAILED`、送零且不可自動續行 |
 | nudge deadman | ≤250 ms | UI freeze/release 後必須歸零 |
 
 「定位成功率」只表示演算法在該影片成功輸出通過 gate 的 pose，不表示絕對位置正確。正式品質判定還要通過第 9.3 節的人工影像審查。
@@ -721,14 +737,14 @@ stateDiagram-v2
 |---|---|---|---|
 | profile／asset 不存在 | 拒絕啟動 | 拒絕啟動 | 列出缺少路徑與 site ID |
 | SHA mismatch | 拒絕啟動 | 拒絕啟動 | expected/actual，不載入 artifact |
-| CUDA 不可用／GPU 不符 | 拒絕 production localization | 不阻擋手動起飛；自主起飛後只懸停並在定位逾時時原地降落 | 顯示 driver/GPU 診斷，不降級 CPU |
+| CUDA 不可用／GPU 不符 | 拒絕 production localization | 不阻擋手動起飛；自主起飛後只懸停等待恢復或搖桿接管，不自動降落 | 顯示 driver/GPU 診斷，不降級 CPU |
 | 影片目錄沒影片／多部未指定 | 拒絕啟動 | 不適用 | 提示匯入影片或明確指定 `VIDEO` |
 | P119 2,934/2,935 | 播放、標示已知不完整、EOF hold | 不適用 | integrity verdict 非正常完整 |
 | 一般影片 decode error | 保留最後完整 frame，進 `DECODE_ERROR_HOLD` | 不適用 | frame index、ffmpeg status |
-| PDRAW 無 frame | 不適用 | 零 PCMD、懸停、手動 | 全寬紅色警告與 incident |
-| worker 啟動太久 | 保持首幀／不播放 | 地面不得起飛；空中交人工 | ready/error/log path |
-| worker stall／exit | bounded restart | 先安全 handoff，再 restart | 每次 restart reason/count |
-| 非有限 pose／錯 schema | 當定位失敗 | 當定位失敗並安全 handoff | 原始錯誤不得污染 state |
+| PDRAW 無 frame | 不適用 | 零 PCMD、懸停；不強制切人工 | 全寬紅色警告與 incident |
+| worker 啟動太久 | 保持首幀／不播放 | 地面不得起飛；空中送零並懸停 | ready/error/log path |
+| worker stall／exit | bounded restart | 先送零並懸停，再 restart | 每次 restart reason/count |
+| 非有限 pose／錯 schema | 當定位失敗 | 當定位失敗並送零懸停 | 原始錯誤不得污染 state |
 | control request 不合法 | 明確拒絕 | 明確拒絕 | request ID、reason code |
 | firmware write/readback mismatch | 更新模擬狀態失敗 | 拒絕起飛 | desired、bounds、readback |
 | log 開檔／寫入失敗 | 顯示警告，可停止模擬 | 起飛前 fail closed；空中交人工 | stderr fallback + incident banner |

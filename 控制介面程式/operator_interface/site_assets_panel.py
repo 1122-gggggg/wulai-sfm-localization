@@ -1,7 +1,6 @@
 """Tk layout for the three explicit site-asset import interfaces."""
 from __future__ import annotations
 
-import hashlib
 import threading
 import queue
 from pathlib import Path
@@ -48,7 +47,10 @@ class SiteAssetsPanel(ttk.LabelFrame):
         site_pack_root: Path | None = None,
         flight_state_check: Callable[[], tuple[bool, str]] | None = None,
     ):
-        super().__init__(parent, text="場域資產（匯入不會起飛，也不會解鎖自主飛行）")
+        super().__init__(
+            parent,
+            text="場域資產（一般匯入不解鎖；編輯器可明確核准航線）",
+        )
         self.actions = actions
         self.request_apply = request_apply
         self.request_route_editor = request_route_editor
@@ -152,8 +154,8 @@ class SiteAssetsPanel(ttk.LabelFrame):
         route_row.grid(row=row + 1, column=1, columnspan=2, sticky="w",
                        padx=5, pady=(2, 2))
         for label, callback in (
-            ("編輯目前航線", lambda: self._open_route_editor(True)),
-            ("畫新航線", lambda: self._open_route_editor(False)),
+            ("編輯路線", lambda: self._open_route_editor(True)),
+            ("新增路線", lambda: self._open_route_editor(False)),
             ("匯入航線 JSON", self._choose_route),
         ):
             button = ttk.Button(route_row, text=label, command=callback)
@@ -169,9 +171,7 @@ class SiteAssetsPanel(ttk.LabelFrame):
         if self.site_pack_root is None:
             return row
         try:
-            routes = self._dedupe_route_choices(
-                describe_site_routes(self.site_pack_root)
-            )
+            routes = describe_site_routes(self.site_pack_root)
         except Exception as exc:
             self.status_var.set(f"航線清單讀取失敗，請用「匯入航線 JSON」：{exc}")
             return row
@@ -179,7 +179,7 @@ class SiteAssetsPanel(ttk.LabelFrame):
             return row
         ttk.Label(
             self,
-            text="可選航線（點擊後切換顯示）",
+            text="可選航線（點擊後選為下次 AUTO；可再按「編輯路線」修改）",
             font=("Sans", 9, "bold"),
         ).grid(
             row=row, column=0, sticky="w", padx=(8, 5), pady=(2, 2)
@@ -198,27 +198,6 @@ class SiteAssetsPanel(ttk.LabelFrame):
             button.pack(side="left", padx=(0, 6))
             self._buttons.append(button)
         return row + 1
-
-    @staticmethod
-    def _dedupe_route_choices(routes):
-        """Keep one deterministic, operator-meaningful entry per route payload."""
-        unique = {}
-        for item in routes:
-            digest = hashlib.sha256(item.path.read_bytes()).hexdigest()
-            current = unique.get(digest)
-            if current is None or (
-                SiteAssetsPanel._route_choice_key(item)
-                < SiteAssetsPanel._route_choice_key(current)
-            ):
-                unique[digest] = item
-        return sorted(unique.values(), key=SiteAssetsPanel._route_choice_key)
-
-    @staticmethod
-    def _route_choice_key(item):
-        """Prefer canonical route names, then use path spelling as a stable tie-break."""
-        name = item.path.name.casefold()
-        canonical = name in {"flight_route.json", "flight_path.json"}
-        return (not canonical, name, item.path.as_posix().casefold())
 
     def _preview_existing_route(self, path: Path) -> None:
         """Validate and select one route for this session's next AUTO request.
@@ -307,8 +286,15 @@ class SiteAssetsPanel(ttk.LabelFrame):
         self._busy = False
         self._set_busy(False)
         self.status_var.set(result.message)
-        if result.kind == "route" and self.route_imported is not None:
-            self.route_imported(result)
+        if result.kind == "route":
+            if self.route_imported is not None:
+                self.route_imported(result)
+            for child in self.winfo_children():
+                child.destroy()
+            self._buttons.clear()
+            self._permanently_disabled.clear()
+            self._build()
+            self.status_var.set(result.message)
         elif result.kind == "site":
             folder, self._pending_site_folder = self._pending_site_folder, None
             outcome = "declined"
@@ -342,7 +328,7 @@ class SiteAssetsPanel(ttk.LabelFrame):
         ):
             self._open_route_editor(False)
             return "drawing"
-        self.status_var.set("場域已匯入；尚無航線，之後可從「畫新航線」開始")
+        self.status_var.set("場域已匯入；尚無航線，之後可從「新增路線」開始")
         return "declined"
 
     def _import_discovered_route(self, slot) -> str:
@@ -521,9 +507,17 @@ class SiteAssetsPanel(ttk.LabelFrame):
         except Exception as exc:
             self.status_var.set(f"開啟航線編輯器失敗：{exc}")
 
-    def import_authored_route(self, source: str | Path) -> ActionResult:
-        """Import an editor-produced file through the same validated route port."""
-        result = self.actions.import_route(source)
+    def import_authored_route(
+        self,
+        source: str | Path,
+        *,
+        replace_route: str | Path | None = None,
+    ) -> ActionResult:
+        """Validate and approve an editor-produced route for AUTO."""
+        result = self.actions.import_authored_route(
+            source,
+            replace_route=replace_route,
+        )
         self._finish_ok(result)
         return result
 

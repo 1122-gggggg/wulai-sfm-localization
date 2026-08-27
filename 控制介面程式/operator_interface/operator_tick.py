@@ -8,17 +8,62 @@ this module does not become an implicit-self mixin.
 
 from __future__ import annotations
 
+import json
+import math
 import time
 from typing import Any, Callable
 
 import numpy as np
 
 from backend_contract import FailureReason
+from operator_localization_config import (
+    LIVE_STATUS_PATH,
+    POSE_JUMP_U,
+    normalize_camera_axes,
+    normalize_camera_forward,
+)
+from localization_result_ui import (
+    annotate_ui_arrival_timing,
+    normalize_live_localization_result,
+    validate_live_localization_result,
+)
 
 
 RollingEventFps = Callable[[list[float], float], tuple[list[float], float]]
 NextTickDeadline = Callable[[float, float, float], tuple[float, int]]
 StreamTerminalText = Callable[[object], str | None]
+
+
+def _rolling_event_fps(
+    event_times: list[float], now: float, window_s: float = 5.0,
+) -> tuple[list[float], float]:
+    """Return recent event timestamps and their observed delivery rate."""
+    cutoff = float(now) - float(window_s)
+    recent = [stamp for stamp in event_times if stamp >= cutoff]
+    if len(recent) < 2:
+        return recent, 0.0
+    span = recent[-1] - recent[0]
+    return recent, (len(recent) - 1) / span if span > 0.0 else 0.0
+
+
+def stream_terminal_text(stream_state: object) -> str | None:
+    return {
+        "EOF_HOLD": "影片已播完，保留最後一幀",
+        "DECODE_ERROR_HOLD": "解碼錯誤，保留最後一幀",
+    }.get(str(stream_state or ""))
+
+
+def next_tick_deadline(
+        previous_deadline: float, now: float, period_s: float) -> tuple[float, int]:
+    """Advance a fixed-rate UI deadline without accumulating callback runtime."""
+    deadline = float(previous_deadline)
+    period = max(0.001, float(period_s))
+    if deadline <= 0.0:
+        deadline = float(now) + period
+    while deadline <= now:
+        deadline += period
+    delay_ms = max(1, int(math.ceil((deadline - now) * 1000.0 - 1e-9)))
+    return deadline, delay_ms
 
 
 def _refresh_held_controls(app: Any) -> None:
@@ -39,22 +84,24 @@ def _refresh_held_controls(app: Any) -> None:
         app._send_stick_vector(app.stick_left.value, app.stick_right.value)
 
 
-def _schedule_after_poll_failure(
-    app: Any, *, next_tick_deadline: NextTickDeadline,
-) -> None:
-    now = time.monotonic()
-    app._next_tick_deadline, delay_ms = next_tick_deadline(
-        getattr(app, "_next_tick_deadline", 0.0),
-        now,
-        getattr(app, "_tick_period_s", 0.1),
-    )
-    app.after(delay_ms, app.tick)
+def _fail_safe_dead_localizer(app: Any) -> None:
+    localizer = getattr(app, "localizer", None)
+    if localizer is None or not getattr(localizer, "unavailable", False):
+        return
+    if getattr(app, "_worker_exit_fail_safe_done", False):
+        return
+    fail_safe = getattr(getattr(app, "backend", None), "fail_safe", None)
+    if not callable(fail_safe):
+        return
+    fail_safe(FailureReason.WORKER_EXIT)
+    app._worker_exit_fail_safe_done = True
+    write_log = getattr(app, "write_log", None)
+    if callable(write_log):
+        write_log("WORKER_EXIT: 定位 worker 已不可用，已 fail-safe")
 
 
-def _poll_backend(
-    app: Any, *, next_tick_deadline: NextTickDeadline,
-) -> Any | None:
-    """Poll telemetry and retain the original fail-safe/schedule contract."""
+def _poll_backend(app: Any) -> Any | None:
+    """Poll telemetry; on failure hold zero without changing control owner."""
     try:
         return app.backend.poll()
     except Exception as exc:
@@ -72,19 +119,39 @@ def _poll_backend(
             app.write_log(f"BACKEND_POLL_FAILED: {exc!r}")
         except Exception:
             pass
+        pause_auto = getattr(app, "_pause_integrated_auto", None)
+        if callable(pause_auto):
+            try:
+                pause_auto("backend_poll_failed")
+            except Exception:
+                pass
         try:
-            app.backend.fail_safe(FailureReason.INVALID_TELEMETRY)
+            clear_motion = getattr(app.backend, "nudge_clear", None)
+            if callable(clear_motion):
+                clear_motion(reason="backend_poll_failed")
+            send_pcmd = getattr(app.backend, "send_pcmd", None)
+            if callable(send_pcmd):
+                hovered = bool(send_pcmd(
+                    0, 0, 0, 0, reason="backend_poll_failed_hover"
+                ))
+            else:
+                state = getattr(app.backend, "state", None)
+                if state is not None:
+                    state.tracker_state = "HOVER"
+                    state.last_command = "backend_poll_failed_hover"
+                hovered = True
+            if not hovered:
+                raise RuntimeError("zero PCMD was rejected")
         except Exception as safe_exc:
             if callable(incident):
                 try:
                     incident(
-                        "backend_poll_fail_safe_failed",
+                        "backend_poll_hover_failed",
                         error=repr(safe_exc),
                         resolved=False,
                     )
                 except Exception:
                     pass
-        _schedule_after_poll_failure(app, next_tick_deadline=next_tick_deadline)
         return None
 
 
@@ -222,6 +289,12 @@ def _handle_live_missing_frame(app: Any, state: Any) -> Any:
         str(getattr(state, "active_incident", ""))
         == FailureReason.STREAM_STALE.value
     ):
+        pause_auto = getattr(app, "_pause_integrated_auto", None)
+        if callable(pause_auto):
+            try:
+                pause_auto("stream_stale")
+            except Exception:
+                pass
         return app.backend.state
     state.stream = "OK"
     return state
@@ -422,19 +495,31 @@ def _map_dirty_key(app: Any, state: Any, *, width: int, height: int) -> tuple:
         tuple(round(float(value), 4) for value in app.camera_axes_world.reshape(-1))
         if app.camera_axes_world is not None else None
     )
+    guard = getattr(app, "collision_guard_snapshot", {}) or {}
+    guard_center = guard.get("center")
+    guard_point = guard.get("point")
+    guard_key = (
+        str(guard.get("status", "")),
+        round(float(guard.get("radius", 0.0) or 0.0), 4),
+        tuple(round(float(value), 4) for value in guard_center)
+        if guard_center is not None else None,
+        tuple(round(float(value), 4) for value in guard_point)
+        if guard_point is not None else None,
+        bool(guard.get("preview", False)),
+    )
     return (
         app.map_base_key(width, height),
         len(app.history),
         id(app.history[-1]) if app.history else 0,
         id(app.history[0]) if app.history else 0,
         len(app.route_pts),
-        app.route_visible,
         len(app.no_loc_markers),
         pose_key,
         camera_axes_key,
         camera_forward_key,
         int(state.inliers),
         None if state.reproj is None else round(float(state.reproj), 4),
+        guard_key,
     )
 
 
@@ -502,34 +587,303 @@ def _schedule_next_tick(app: Any, *, next_tick_deadline: NextTickDeadline) -> No
     app.after(delay_ms, app.tick)
 
 
+def _record_tick_failure(app: Any, *, stage: str, error: str) -> None:
+    incident = getattr(getattr(app, "session_logs", None), "incident", None)
+    if callable(incident):
+        try:
+            incident(
+                "operator_tick_failed",
+                stage=stage,
+                error=error,
+                resolved=False,
+            )
+        except Exception as incident_exc:
+            try:
+                app.write_log(
+                    f"OPERATOR_TICK_INCIDENT_FAILED stage={stage} "
+                    f"error={incident_exc!r}"
+                )
+            except Exception:
+                pass
+    try:
+        app.write_log(f"OPERATOR_TICK_FAILED stage={stage} error={error}")
+    except Exception:
+        pass
+
+
+def _handle_tick_failure(app: Any, *, stage: str, exc: Exception) -> None:
+    """Record a failed UI stage and use the existing AUTO pause seam."""
+    error = repr(exc)
+    _record_tick_failure(app, stage=stage, error=error)
+    reason = f"operator_tick_failed:{stage}"
+    pause_auto = getattr(app, "_pause_integrated_auto", None)
+    if callable(pause_auto):
+        try:
+            pause_auto(reason)
+        except Exception as safety_exc:
+            try:
+                app.write_log(
+                    f"OPERATOR_TICK_AUTO_PAUSE_FAILED stage={stage} "
+                    f"error={safety_exc!r}"
+                )
+            except Exception:
+                pass
+        return
+
+    # Narrow test doubles or older integrations may expose only the backend's
+    # existing fail-safe seam. Do not synthesize a real-flight command here.
+    fail_safe = getattr(getattr(app, "backend", None), "fail_safe", None)
+    if callable(fail_safe):
+        try:
+            fail_safe(FailureReason.INVALID_TELEMETRY)
+        except Exception as safety_exc:
+            try:
+                app.write_log(
+                    f"OPERATOR_TICK_FAIL_SAFE_FAILED stage={stage} "
+                    f"error={safety_exc!r}"
+                )
+            except Exception:
+                pass
+
+
+def _publish_live_result_state(app: Any, result: dict) -> None:
+    app.live_result = result
+    app.live_result_frame_name = str(result.get("frame_name", ""))
+    app._apply_lost_hold_result(result)
+    app.update_localization_metrics(result)
+    now = time.monotonic()
+    if now - app._last_status_write < 0.2:
+        return
+    app._last_status_write = now
+    try:
+        LIVE_STATUS_PATH.write_text(
+            json.dumps(result, ensure_ascii=False), encoding="utf-8"
+        )
+    except Exception as exc:
+        app._record_diagnostic_failure(LIVE_STATUS_PATH, exc)
+
+
+def _live_result_failed(app: Any, result: dict, *, invalid_success_pose: bool) -> bool:
+    if result.get("success") and result.get("pose"):
+        return False
+    if invalid_success_pose:
+        app.loc_health = "FAIL"
+        app._record_no_loc()
+    now = time.monotonic()
+    if now - app._last_loc_fail_log >= 2.0:
+        app._last_loc_fail_log = now
+        error = result.get("error", "no pose")
+        app.write_log(
+            f"LIVE_LOCALIZE_FAIL (throttled) last={app.live_result_frame_name} "
+            f"err={error} | ok={app._loc_ok_count} fail={app._loc_fail_count} "
+            f"loc_fps={app.loc_fps:.1f} wall_ms={result.get('wall_ms')}"
+        )
+    return True
+
+
+def _live_pose_is_continuous(app: Any, xyz: np.ndarray) -> bool:
+    if app.live_last_xyz is None:
+        app._live_pending = None
+        return True
+    jump = float(np.linalg.norm(xyz - app.live_last_xyz))
+    if jump <= POSE_JUMP_U:
+        app._live_pending = None
+        return True
+    if (
+        app._live_pending is not None
+        and float(np.linalg.norm(xyz - app._live_pending)) <= POSE_JUMP_U
+    ):
+        app._live_pending = None
+        return True
+    app._live_pending = xyz
+    app.write_log(
+        f"POSE_JUMP_REJECT {app.live_result_frame_name}: "
+        f"{jump:.2f}u > {POSE_JUMP_U}u; trajectory break, skipped"
+    )
+    app.loc_health = "FAIL"
+    app._record_no_loc()
+    return False
+
+
+def _update_live_camera_orientation(app: Any, result: dict, xyz: np.ndarray) -> None:
+    camera_forward = normalize_camera_forward(result.get("camera_forward_world"))
+    camera_axes = normalize_camera_axes(result.get("camera_axes_world"))
+    app.camera_forward_world = camera_forward
+    app.camera_axes_world = camera_axes
+    _update_live_heading(app, camera_forward, xyz)
+
+
+def _update_live_heading(
+        app: Any, camera_forward: np.ndarray | None, xyz: np.ndarray) -> None:
+    map_frame = getattr(app, "_integrated_auto_map_frame", None)
+    if camera_forward is not None and map_frame is not None:
+        heading = float(map_frame.heading(camera_forward))
+        if math.isfinite(heading):
+            app.live_heading = heading
+        return
+    if app.live_last_xyz is None:
+        return
+    displacement = xyz - app.live_last_xyz
+    horizontal = (
+        map_frame.horizontal_distance(displacement)
+        if map_frame is not None
+        else math.hypot(float(displacement[0]), float(displacement[2]))
+    )
+    if horizontal < 0.05:
+        return
+    app.live_heading = (
+        float(map_frame.heading(displacement))
+        if map_frame is not None
+        else math.atan2(float(displacement[2]), float(displacement[0]))
+    )
+
+
+def _accept_live_pose(app: Any, result: dict, xyz: np.ndarray) -> None:
+    _update_live_camera_orientation(app, result, xyz)
+    app.live_last_xyz = xyz
+    app.live_pose[:] = [
+        float(xyz[0]),
+        float(xyz[1]),
+        float(xyz[2]),
+        np.nan if app.live_heading is None else float(app.live_heading),
+    ]
+    app.live_locked = True
+    app.live_new_pose = True
+    if app.boot_holding():
+        app.boot_lock_done = True
+        app.write_log(
+            f"BOOT_INIT: live MegaLoc/PnP locked on {app.live_result_frame_name}"
+        )
+
+
+def _accept_predicted_pose(app: Any, result: dict, xyz: np.ndarray) -> None:
+    """Show an IMU guess. Never a visual lock or BOOT fix."""
+    pose_value = result.get("pose")
+    pose = pose_value if isinstance(pose_value, dict) else {}
+    yaw_raw = pose.get("yaw_raw")
+    try:
+        heading = float("nan") if yaw_raw is None else float(yaw_raw)
+    except (TypeError, ValueError, OverflowError):
+        heading = float("nan")
+    if not math.isfinite(heading):
+        heading = app.live_heading
+    app.live_last_xyz = xyz
+    app.live_pose[:] = [
+        float(xyz[0]),
+        float(xyz[1]),
+        float(xyz[2]),
+        np.nan if heading is None else float(heading),
+    ]
+    app.live_new_pose = True
+
+
+def update_live_results(
+    app: Any,
+    *,
+    live_result_is_new: Callable[[Any, dict], bool],
+    handle_localization_exception: Callable[[Any, dict], None],
+    update_benchmark_status: Callable[[Any, dict], None],
+    stabilize_result_pose: Callable[[Any, dict, np.ndarray | None], np.ndarray | None],
+) -> None:
+    if app.localizer is None:
+        return
+    results = app.localizer.poll_results()
+    if not getattr(app, "inspecting", True):
+        return
+    for raw_result in results:
+        validated = validate_live_localization_result(raw_result)
+        result, xyz = normalize_live_localization_result(validated)
+        if not live_result_is_new(app, result):
+            continue
+        annotate_ui_arrival_timing(result)
+        handle_localization_exception(app, result)
+        update_benchmark_status(app, result)
+        xyz = stabilize_result_pose(app, result, xyz)
+        invalid_success_pose = bool(
+            isinstance(raw_result, dict) and raw_result.get("success")
+            and not result.get("success"))
+        _publish_live_result_state(app, result)
+        confidence_hold = getattr(app, "lost_hold", None)
+        if (
+            bool(result.get("confidence_hold_active"))
+            or (
+                bool(result.get("confidence_low"))
+                and bool(getattr(
+                    confidence_hold, "hold_on_low_confidence", False
+                ))
+            )
+        ):
+            # Keep low-confidence and recovery-only poses in telemetry, but
+            # hold the last trustworthy public pose until recovery releases.
+            continue
+        if _live_result_failed(
+                app, result, invalid_success_pose=invalid_success_pose,
+        ):
+            if result.get("pose_status") == "PREDICTED_ONLY" and xyz is not None:
+                _accept_predicted_pose(app, result, xyz)
+            continue
+        assert xyz is not None
+        if not _live_pose_is_continuous(app, xyz):
+            continue
+        _accept_live_pose(app, result, xyz)
+
+
 def run_tick(
     app: Any,
     *,
-    rolling_event_fps: RollingEventFps,
-    next_tick_deadline: NextTickDeadline,
-    stream_terminal_text: StreamTerminalText,
+    rolling_event_fps: RollingEventFps = _rolling_event_fps,
+    next_tick_deadline: NextTickDeadline = next_tick_deadline,
+    stream_terminal_text: StreamTerminalText = stream_terminal_text,
 ) -> None:
     """Run one UI cycle in the same order as the legacy callback."""
-    app._drain_flight_command_results()
-    app._drain_integrated_autonomy_events()
-    _refresh_held_controls(app)
-    state = _poll_backend(app, next_tick_deadline=next_tick_deadline)
-    if state is None:
-        return
-    _handle_stick_override(app, state)
-    app._gravity_tick(state)
-    app.video_frame_fresh = False
-    app.update_boot_lock()
-    app.update_live_results()
-    app.update_lost_hold()
-    app.update_detection_results()
-    state = _update_stream(app, state, rolling_event_fps=rolling_event_fps)
-    state = _update_state_and_history(app, state)
-    _update_hud_metrics(
-        app,
-        state,
-        rolling_event_fps=rolling_event_fps,
-        stream_terminal_text=stream_terminal_text,
-    )
-    _render_if_dirty(app, state)
-    _schedule_next_tick(app, next_tick_deadline=next_tick_deadline)
+    stage = "drain_flight_command_results"
+    try:
+        app._drain_flight_command_results()
+        stage = "drain_integrated_autonomy_events"
+        app._drain_integrated_autonomy_events()
+        stage = "refresh_held_controls"
+        _refresh_held_controls(app)
+        stage = "poll_backend"
+        state = _poll_backend(app)
+        stage = "fail_safe_dead_localizer"
+        _fail_safe_dead_localizer(app)
+        stage = "handle_stick_override"
+        if state is None:
+            return
+        stage = "handle_stick_override"
+        _handle_stick_override(app, state)
+        stage = "gravity_tick"
+        app._gravity_tick(state)
+        app.video_frame_fresh = False
+        stage = "update_boot_lock"
+        app.update_boot_lock()
+        stage = "update_live_results"
+        app.update_live_results()
+        stage = "update_lost_hold"
+        app.update_lost_hold()
+        stage = "update_detection_results"
+        app.update_detection_results()
+        stage = "update_stream"
+        state = _update_stream(app, state, rolling_event_fps=rolling_event_fps)
+        stage = "update_state_and_history"
+        state = _update_state_and_history(app, state)
+        stage = "update_sparse_cloud_collision_interlock"
+        update_collision_interlock = getattr(
+            app, "update_sparse_cloud_collision_interlock", None
+        )
+        if callable(update_collision_interlock):
+            update_collision_interlock(state)
+        stage = "update_hud_metrics"
+        _update_hud_metrics(
+            app,
+            state,
+            rolling_event_fps=rolling_event_fps,
+            stream_terminal_text=stream_terminal_text,
+        )
+        stage = "render_if_dirty"
+        _render_if_dirty(app, state)
+    except Exception as exc:
+        _handle_tick_failure(app, stage=stage, exc=exc)
+        raise
+    finally:
+        _schedule_next_tick(app, next_tick_deadline=next_tick_deadline)

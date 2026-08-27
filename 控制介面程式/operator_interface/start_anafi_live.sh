@@ -108,11 +108,22 @@ if [[ -z "$UI_PYTHON" ]]; then
   done
 fi
 if [[ -z "$UI_PYTHON" ]]; then
+  if [[ "$DRY_RUN" != "1" ]]; then
+    echo "[start] ERROR: real-flight requires .venv/bin/python or SFM_UI_PYTHON; refusing PATH python3" >&2
+    exit 2
+  fi
   UI_PYTHON="$(command -v python3 || true)"
 fi
 if [[ -z "$UI_PYTHON" ]]; then
   echo "[start] ERROR: no Python interpreter found; set SFM_UI_PYTHON" >&2
   exit 2
+fi
+if [[ "$UI_PYTHON" == */.venv/bin/python ]] \
+   && "$UI_PYTHON" -c 'import sys' >/dev/null 2>&1; then
+  if ! "$UI_PYTHON" -c 'import sys; raise SystemExit(0 if sys.version_info[:2] == (3, 10) else 1)'; then
+    echo "[start] ERROR: real-flight requires CPython 3.10: $UI_PYTHON" >&2
+    exit 2
+  fi
 fi
 if [[ "$UI_PYTHON" == */* ]]; then
   if [[ ! -x "$UI_PYTHON" ]]; then
@@ -258,7 +269,8 @@ fi
 #   LOC_BENCH=1        -> auto 開始定位 + no boot-lock (BOOT_INIT/MegaLoc path; NO takeoff)
 #   LOC_BENCH_TRACK=1  -> same + force TRACK path each frame (no MegaLoc; in-flight FPS)
 #   LOCAL_TOPK=N       -> explicit TRACK local_topk override (0/profile default)
-#   SFM_SITE_PROFILE=  -> required site profile JSON unless passed on the CLI
+#   POSE_STABILIZE=1   -> causal published-pose filter (past+current only)
+
 #   SFM_CPU_THREADS=N  -> override the verified four-thread sustained-performance budget
 # Extra args after script are passed through (e.g. --no-live-localize).
 EXTRA=()
@@ -269,6 +281,18 @@ if [[ -n "$SITE_PROFILE" ]]; then
   EXTRA+=(--site-profile "$SITE_PROFILE")
   echo "[start] site-profile: $SITE_PROFILE"
 fi
+if [[ "$DRY_RUN" != "1" && "${SFM_SKIP_LIVE_PREFLIGHT:-0}" != "1" \
+      && -n "$SITE_PROFILE" && "$UI_PYTHON" == */.venv/bin/python ]]; then
+  echo "[start] live runtime preflight (CUDA/bundle/models; no video)"
+  "$UI_PYTHON" "$WORKSPACE_ROOT/tools/simulator_preflight.py" \
+    --workspace-root "$WORKSPACE_ROOT" \
+    --site-profile "$SITE_PROFILE" \
+    --check-runtime \
+    --full-runtime
+fi
+
+export SFM_EDM_REF_FEATURE_CACHE="${SFM_EDM_REF_FEATURE_CACHE:-32}"
+
 # Let the selected site's production profile choose TRACK top-k by default.
 LOCAL_TOPK="${LOCAL_TOPK:-0}"
 if [[ -n "$LOCAL_TOPK" && "$LOCAL_TOPK" != "0" ]]; then
@@ -282,6 +306,10 @@ fi
 if [[ "${LOC_BENCH_TRACK:-0}" == "1" ]]; then
   EXTRA+=(--loc-force-track-bench)
   echo "[start] LOC_BENCH_TRACK=1: force TRACK path (skip MegaLoc/BOOT_INIT)"
+fi
+if [[ "${POSE_STABILIZE:-0}" == "1" ]]; then
+  EXTRA+=(--pose-stabilize)
+  echo "[start] pose_stabilize=on (causal)"
 fi
 # YOLO is not part of this flight localization UI (default off).
 # Optional: LOC_EVERY_N=2 to submit every 2nd stream frame to the localizer.

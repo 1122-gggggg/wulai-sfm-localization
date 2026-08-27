@@ -5,7 +5,7 @@
 拒絕。**不載入 Olympe、不連真機、無真機 TakeOff**。UI 的起飛、降落、
 懸停與微移只更新模擬狀態。
 
-不帶參數時預設使用 `../site_profiles/river_site_edm.json`。影片從
+不帶參數時預設使用 `../../地圖檔/場域/river_site/site_profile.json`。影片從
 `模擬器/測試影片/` 自動選擇：P1190119.MP4 優先，或只有一部影片時使用它；多部影片必須用 `VIDEO=` 或第一個參數指定。P119 啟動前核對固定 SHA-256。串流預設為 720p30、
 H.264 Main、5 Mb/s、280 ms、0% 丟包；`ANAFI_LINK_PRESET` 可選
 `nominal`、`loss-1`、`loss-3` 或 `loss-5`。P119 容器宣告 2,935 幀、實際

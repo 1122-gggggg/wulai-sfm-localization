@@ -219,6 +219,20 @@ def _arrival_radius(data: dict[str, Any]) -> float | None:
     return arrive_radius
 
 
+def _route_deviation_radius(data: dict[str, Any]) -> float | None:
+    raw_radius = data.get("max_route_deviation_map_units")
+    if raw_radius is None:
+        return None
+    if isinstance(raw_radius, bool) or not isinstance(raw_radius, (int, float)):
+        raise ValueError("route max_route_deviation_map_units must be a number")
+    radius = float(raw_radius)
+    if not math.isfinite(radius) or radius < 0.0:
+        raise ValueError(
+            "route max_route_deviation_map_units must be finite and >= 0"
+        )
+    return radius
+
+
 @dataclass(frozen=True)
 class RouteDocument:
     """One validated route and its canonical controller coordinates.
@@ -240,6 +254,7 @@ class RouteDocument:
     purpose: str | None = None
     align_source: str | None = None
     arrive_radius_map_units: float | None = None
+    max_route_deviation_map_units: float | None = None
 
     @classmethod
     def from_data(
@@ -281,6 +296,7 @@ class RouteDocument:
             map_frame=map_frame,
         )
         arrive_radius = _arrival_radius(data)
+        route_deviation_radius = _route_deviation_radius(data)
 
         return cls(
             waypoints=source_points,
@@ -294,6 +310,7 @@ class RouteDocument:
             purpose=purpose,
             align_source=align_source,
             arrive_radius_map_units=arrive_radius,
+            max_route_deviation_map_units=route_deviation_radius,
         )
 
     @classmethod
@@ -375,6 +392,7 @@ class MissionRouteSnapshot:
     coordinate_frame_id: str
     waypoints: tuple[tuple[float, float, float], ...]
     arrive_radius_map_units: float | None = None
+    max_route_deviation_map_units: float | None = None
 
     def controller_waypoints(self) -> list[np.ndarray]:
         return [np.array(point, dtype=float, copy=True) for point in self.waypoints]
@@ -433,6 +451,7 @@ def capture_mission_route_snapshot(
         coordinate_frame_id=coordinate_frame_id,
         waypoints=tuple((point[0], point[1], point[2]) for point in route.controller_points),
         arrive_radius_map_units=route.arrive_radius_map_units,
+        max_route_deviation_map_units=route.max_route_deviation_map_units,
     )
 
 

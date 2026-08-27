@@ -98,6 +98,27 @@ skip_reason = "Dependency not found on PyPI and could not be audited: torchvisio
 reason = "The official PyTorch cu128 extra index (https://download.pytorch.org/whl/cu128) provides this CUDA wheel. The runtime and test locks pin its exact version and hashes, installation is offline after seeding the approved artifact bundle, and the gate records this skipped component in the CycloneDX SBOM. Revisit before expiry."
 expires = "2027-02-09"
 
+[[tool.security_dependency_gate.skip_exceptions]]
+package = "moge"
+version = "2.0.0"
+skip_reason = "Dependency not found on PyPI and could not be audited: moge (2.0.0)"
+reason = "Optional RePoseD source wheel from microsoft/MoGe@925b8ed835a7a9cdb7578ba15c658a0afc969030 is hash locked at 176363a4de409b926f8c9b554d350b21398d334c7c6cebb181d493c59c20fd5c; it is excluded from the B0 base and may only be installed from an approved optional wheelhouse. Revisit before expiry."
+expires = "2027-02-09"
+
+[[tool.security_dependency_gate.skip_exceptions]]
+package = "utils3d"
+version = "1.3"
+skip_reason = "Dependency not found on PyPI and could not be audited: utils3d (1.3)"
+reason = "Optional RePoseD source wheel from EasternJournalist/utils3d@3fab839f0be9931dac7c8488eb0e1600c236e183 is hash locked at e426f98cd2bf8fdeed6c3377cc574dc4f1d7c1b865664447edaa31977db69da3; it is excluded from the B0 base and may only be installed from an approved optional wheelhouse. Revisit before expiry."
+expires = "2027-02-09"
+
+[[tool.security_dependency_gate.skip_exceptions]]
+package = "poselib"
+version = "3.0.0"
+skip_reason = "Dependency not found on PyPI and could not be audited: poselib (3.0.0)"
+reason = "Optional PoseLib source wheel from PoseLib/PoseLib@fa7280fee27f97aff31ae7f98bab7f583fac7d08 is hash locked at a7fbb352765662b22e7cfc50b6d47548e79d13726afc91d696768c0ce480a849; it provides the pinned monodepth-relative-pose API, is excluded from the B0 base, and may only be installed from an approved optional wheelhouse. Revisit before expiry."
+expires = "2027-02-09"
+
 [tool.coverage.run]
 branch = true
 source = [

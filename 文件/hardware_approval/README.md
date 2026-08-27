@@ -40,7 +40,7 @@ The CLI only verifies or prepares unsigned material:
 
 ```bash
 python tools/hardware_approval_receipt.py create-request \
-  --profile 控制介面程式/site_profiles/river_site_edm.json \
+  --profile 地圖檔/場域/river_site/site_profile.json \
   --output river_site_receipt_v2.request.json
 
 python tools/hardware_approval_receipt.py create-payload \

@@ -86,10 +86,12 @@ OUTPUT_EVIDENCE_PREFIXES = (
     "edm_",
     "exact_latency_",
     "localization_fps_",
+    "megaloc_",
     "onnx_flow_",
     "optimization_",
     "regression_",
     "reverse_topk_",
+    "river_",
     "video720_",
 )
 WORKSPACE_SIZE_WARNING_BYTES = 20 * 1024**3

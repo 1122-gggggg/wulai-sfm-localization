@@ -17,7 +17,7 @@
     "local_topk": 1,
     "weak_local_topk": 3,
     "lost_local_topk": 5,
-    "lost_local_grace_frames": 12,
+    "lost_local_grace_frames": 2,
     "recovery_bank_size": 192,
     "recovery_scan_topk": 2,
     "use_temporal_reference": false,

@@ -37,16 +37,59 @@ import real_path_follow_controller as rpf
 ZERO = (0, 0, 0, 0)
 
 
+def test_sparse_cloud_collision_monitor_uses_adjustable_3d_radius() -> None:
+    monitor = rpf.SparseCloudCollisionMonitor(
+        np.array([[0.0, 0.0, 0.0], [4.0, 0.0, 0.0]], dtype=float),
+        collision_radius=0.025,
+        warning_radius=0.025,
+    )
+    if monitor.tree is None:
+        pytest.skip("scipy cKDTree is unavailable")
+
+    clear = monitor.update(np.array([0.04, 0.0, 0.0]))
+    assert clear["status"] == "CLEAR"
+    assert clear["distance"] == pytest.approx(0.04)
+
+    monitor.set_radii(0.05)
+    collision = monitor.update(np.array([0.04, 0.0, 0.0]))
+    assert collision["status"] == "COLLISION"
+    assert collision["point"] == pytest.approx([0.0, 0.0, 0.0])
+
+
+def test_sparse_cloud_collision_monitor_rejects_invalid_radii_and_points() -> None:
+    zero_radius = rpf.SparseCloudCollisionMonitor(
+        np.zeros((1, 3)), collision_radius=0.0, warning_radius=0.0
+    )
+    if zero_radius.tree is not None:
+        assert zero_radius.update(np.zeros(3))["status"] == "COLLISION"
+        assert zero_radius.update(np.array([0.001, 0.0, 0.0]))["status"] == "CLEAR"
+    with pytest.raises(ValueError, match="within"):
+        rpf.SparseCloudCollisionMonitor(np.zeros((1, 3)), collision_radius=-0.001)
+    with pytest.raises(ValueError, match="within"):
+        rpf.SparseCloudCollisionMonitor(np.zeros((1, 3)), collision_radius=0.061)
+    with pytest.raises(ValueError, match="Nx3"):
+        rpf.SparseCloudCollisionMonitor(np.zeros((3,)))
+
+    monitor = rpf.SparseCloudCollisionMonitor(
+        np.array([[np.nan, 0.0, 0.0], [1.0, 2.0, 3.0]]),
+        collision_radius=0.02,
+        warning_radius=0.02,
+    )
+    assert monitor.xyz.tolist() == [[1.0, 2.0, 3.0]]
+    with pytest.raises(ValueError, match="warning_radius"):
+        monitor.set_radii(0.02, 0.01)
+
+
 def run_ticks(max_ticks, pose_fn, *, route=((0.0, 0.0, 0.0), (8.0, 0.0, 0.0)),
-              hooks_extra=None, enforce_weak_pose_gate=None):
+              hooks_extra=None, enforce_weak_pose_gate=None, control_config=None):
     """Run the real run_loop against mock hooks on a virtual clock.
 
     pose_fn(st) -> rpf.Pose | None; st has "t" (virtual now) and "tick".
     Returns (sent_pcmds, terminal_reason, log_records).
     """
     wp = [np.array(p, float) for p in route]
-    ctrl = rpf.RouteAutoController(wp, poles=[],
-                                   config=rpf.ControlConfig(inspect_waypoints=()))
+    config = control_config or rpf.ControlConfig(inspect_waypoints=())
+    ctrl = rpf.RouteAutoController(wp, poles=[], config=config)
     sent, records = [], []
     st = {"calls": 0, "t": 0.0, "tick": 0}
 
@@ -64,9 +107,10 @@ def run_ticks(max_ticks, pose_fn, *, route=((0.0, 0.0, 0.0), (8.0, 0.0, 0.0)),
     extra = dict(hooks_extra or {})
     extra.setdefault("log_tick", records.append)
     extra.setdefault("ground_speed", lambda: (0.0, st["t"]))
+    olympe_yaw = extra.pop("olympe_yaw", lambda: None)
     hooks = pff.LoopHooks(
         get_pose=get_pose,
-        olympe_yaw=lambda: None,
+        olympe_yaw=olympe_yaw,
         send_pcmd=lambda r, p, y, g: sent.append((r, p, y, g)),
         now=now,
         **extra,
@@ -116,24 +160,19 @@ def test_grab_only_source_never_arms():
         assert token not in src, f"grab_only must never reference {token}"
 
 
-def test_fly_is_the_only_arming_entrypoint():
-    module_src = inspect.getsource(pff)
-    fly_lines, fly_start = inspect.getsourcelines(pff.fly)
-    fly_end = fly_start + len(fly_lines) - 1
-    tree = ast.parse(module_src)
-    # Count actual constructors, not matching text in comments/error messages.
-    for token in ("TakeOff", "Emergency", "Landing"):
-        calls = [
-            node
-            for node in ast.walk(tree)
-            if isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Name)
-            and node.func.id == token
-        ]
-        assert calls, f"{token}() is no longer constructed by the approved entry point"
-        assert all(fly_start <= node.lineno <= fly_end for node in calls), (
-            f"{token}() is constructed outside fly()"
-        )
+def test_fly_is_not_an_arming_entrypoint():
+    fly_src = inspect.getsource(pff.fly)
+    assert "TakeOff()" not in fly_src
+    assert "operator UI" in fly_src
+    tree = ast.parse(inspect.getsource(pff))
+    takeoffs = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "TakeOff"
+    ]
+    assert takeoffs == []
 
 
 def test_flight_localizer_uses_site_selected_edm_factory(monkeypatch):
@@ -231,18 +270,19 @@ def test_approved_route_builds_the_global_scale_free_controller(tmp_path, monkey
     assert len(waypoints) == 2
     assert controller.cfg.inspect_waypoints == ()
     assert controller.cfg.waypoint_arrive_radius == pytest.approx(0.02)
+    assert controller.cfg.waypoint_arrive_confirm_frames == 1
 
 
 # ---------------------------------------------------------------------------
 # Frame / stream gates
 
-def test_stream_lost_zero_then_land():
+def test_stream_lost_continues_hovering_past_previous_land_threshold():
     def never_localize(st):
         raise AssertionError("stream gate must run before localization")
     sent, reason, records = run_ticks(
         400, never_localize, hooks_extra={"stream_healthy": lambda: False})
     assert sent and all(c == ZERO for c in sent)
-    assert "stream lost" in reason
+    assert reason == "tick cap"
     assert records and all(r["blocked"] for r in records)
     assert any("stream" in r["reason"] for r in records)
 
@@ -517,6 +557,316 @@ def test_lost_pose_zero_then_land_never_emergency():
     assert "EMERGENCY" not in reason
 
 
+def test_enabled_lost_pose_search_rotates_right_once_before_land(monkeypatch):
+    monkeypatch.setattr(pff, "LOST_YAW_SEARCH_DELAY_S", 0.0)
+    monkeypatch.setattr(pff, "LOST_YAW_SEARCH_TIMEOUT_S", 10.0)
+    monkeypatch.setattr(pff, "LOST_LAND_S", 0.1)
+    telemetry = {"yaw": 0.0}
+    events = []
+
+    def lost_pose(_st):
+        telemetry["yaw"] = (telemetry["yaw"] + math.radians(45.0)) % (2.0 * math.pi)
+        return None
+
+    sent, reason, records = run_ticks(
+        100,
+        lost_pose,
+        hooks_extra={
+            "olympe_yaw": lambda: telemetry["yaw"],
+            "localization_yaw_search_pcmd": 8,
+            "localization_yaw_search_event": (
+                lambda state, progress: events.append((state, progress))
+            ),
+            "request_manual": lambda: pytest.fail(
+                "localization timeout must not request automatic manual takeover"
+            ),
+        },
+    )
+
+    yaw_commands = [command for command in sent if command != ZERO]
+    assert yaw_commands
+    assert all(command == (0, 0, 8, 0) for command in yaw_commands)
+    assert reason == "localization lost -> land"
+    assert [state for state, _progress in events] == ["started", "completed"]
+    assert events[-1][1] >= 360.0
+    last_yaw = max(index for index, command in enumerate(sent) if command != ZERO)
+    assert all(command == ZERO for command in sent[last_yaw + 1:])
+    assert any("right yaw localization search" in record["reason"] for record in records)
+
+
+def test_enabled_lost_pose_search_waits_ten_seconds_before_rotating(monkeypatch):
+    monkeypatch.setattr(pff, "LOST_LAND_S", 0.1)
+    manual_requests = []
+    events = []
+
+    sent, reason, records = run_ticks(
+        180,
+        lambda _st: None,
+        hooks_extra={
+            "olympe_yaw": lambda: 0.0,
+            "localization_yaw_search_pcmd": 8,
+            "localization_yaw_search_event": (
+                lambda state, progress: events.append((state, progress))
+            ),
+            "request_manual": lambda: manual_requests.append(True) or True,
+        },
+    )
+
+    assert pff.LOST_YAW_SEARCH_DELAY_S == 10.0
+    assert reason == "tick cap"
+    first_yaw = next(index for index, command in enumerate(sent) if command != ZERO)
+    assert all(command == ZERO for command in sent[:first_yaw])
+    assert sent[first_yaw] == (0, 0, 8, 0)
+    assert any("hover (9." in record["reason"] for record in records)
+    assert not manual_requests
+    assert [state for state, _progress in events] == ["started"]
+
+
+def test_enabled_lost_pose_search_stops_on_recovered_pose(monkeypatch):
+    monkeypatch.setattr(pff, "LOST_YAW_SEARCH_DELAY_S", 0.0)
+    monkeypatch.setattr(pff, "LOST_LAND_S", 5.0)
+    telemetry = {"yaw": 0.0}
+    events = []
+
+    def pose_recovers(st):
+        if st["tick"] <= 6:
+            telemetry["yaw"] = (
+                telemetry["yaw"] + math.radians(20.0)
+            ) % (2.0 * math.pi)
+            return None
+        return fresh_pose(st, yaw=telemetry["yaw"])
+
+    sent, reason, records = run_ticks(
+        30,
+        pose_recovers,
+        hooks_extra={
+            "olympe_yaw": lambda: telemetry["yaw"],
+            "localization_yaw_search_pcmd": 8,
+            "localization_yaw_search_event": (
+                lambda state, progress: events.append((state, progress))
+            ),
+        },
+    )
+
+    assert (0, 0, 8, 0) in sent
+    assert reason == "tick cap"
+    assert [state for state, _progress in events] == ["started", "recovered"]
+    assert any(
+        "localization recovery confirmation" in record.get("reason", "")
+        and record["pcmd"] == [0, 0, 0, 0]
+        for record in records
+    )
+
+
+def test_lost_pose_search_never_rotates_without_a_healthy_stream(monkeypatch):
+    monkeypatch.setattr(pff, "LOST_YAW_SEARCH_DELAY_S", 0.0)
+    sent, reason, _records = run_ticks(
+        30,
+        lambda _st: None,
+        hooks_extra={
+            "olympe_yaw": lambda: 0.0,
+            "localization_yaw_search_pcmd": 8,
+            "stream_healthy": lambda: False,
+        },
+    )
+
+    assert reason == "tick cap"
+    assert sent and all(command == ZERO for command in sent)
+
+
+def test_lost_pose_search_never_rotates_without_yaw_telemetry(monkeypatch):
+    monkeypatch.setattr(pff, "LOST_YAW_SEARCH_DELAY_S", 0.0)
+    monkeypatch.setattr(pff, "LOST_LAND_S", 0.1)
+    sent, reason, _records = run_ticks(
+        30,
+        lambda _st: None,
+        hooks_extra={"localization_yaw_search_pcmd": 8},
+    )
+
+    assert reason == "localization lost -> land"
+    assert sent and all(command == ZERO for command in sent)
+
+
+def test_hover_interrupts_lost_pose_search_without_restarting_it(monkeypatch):
+    monkeypatch.setattr(pff, "LOST_YAW_SEARCH_DELAY_S", 0.0)
+    monkeypatch.setattr(pff, "LOST_LAND_S", 100.0)
+    telemetry = {"yaw": 0.0}
+    safety_calls = {"count": 0}
+    events = []
+
+    def lost_pose(st):
+        telemetry["yaw"] += math.radians(5.0)
+        return None
+
+    def safety_poll():
+        safety_calls["count"] += 1
+        return "HOVER" if 7 <= safety_calls["count"] <= 10 else "AUTO"
+
+    sent, reason, _records = run_ticks(
+        30,
+        lost_pose,
+        hooks_extra={
+            "olympe_yaw": lambda: telemetry["yaw"],
+            "localization_yaw_search_pcmd": 8,
+            "localization_yaw_search_event": (
+                lambda state, progress: events.append((state, progress))
+            ),
+            "safety_poll": safety_poll,
+        },
+    )
+
+    assert reason == "tick cap"
+    assert (0, 0, 8, 0) in sent
+    assert [state for state, _progress in events].count("started") == 1
+
+
+def test_localization_loss_can_hover_indefinitely_without_auto_land():
+    sent, reason, records = run_ticks(
+        200,
+        lambda st: None,
+        hooks_extra={
+            "land_on_localization_loss": False,
+            "force_relocalize": lambda: (_ for _ in ()).throw(
+                RuntimeError("relocalizer unavailable")
+            ),
+        },
+    )
+    assert sent and all(command == ZERO for command in sent)
+    assert reason == "tick cap"
+    assert any("no fresh pose" in record["reason"] for record in records)
+    assert any("relocalizer unavailable" in record["relocalize_error"] for record in records)
+
+
+def test_legacy_live_entrypoint_disables_localization_loss_auto_land():
+    forced_modes = []
+    hooks = pff._make_live_loop_hooks(
+        localizer=SimpleNamespace(
+            get_pose=lambda: None,
+            last_info={},
+            state=SimpleNamespace(mode="TRACK"),
+        ),
+        safety=SimpleNamespace(
+            allow_manual=False,
+            force=lambda mode: forced_modes.append(mode),
+        ),
+        stick_monitor=SimpleNamespace(is_active=lambda: False),
+        drone=object(),
+        send_pcmd=lambda *_command: None,
+        monitor=SimpleNamespace(
+            terminated=threading.Event(),
+            send_authorized=lambda *_args: (True, "ok", ZERO),
+            mode="AUTO",
+            beat=lambda: None,
+            run_while_holding_zero=lambda action, *_args: action(),
+            pcmd_timing_snapshot=lambda: {},
+        ),
+        grabber=SimpleNamespace(
+            is_healthy=lambda: True,
+            last_frame_age=lambda: 0.0,
+            stamp_source="test",
+        ),
+        stop={"f": False},
+        ground_speed=SimpleNamespace(sample=lambda: (0.0, 0.0)),
+        command_log=lambda _record: None,
+        inspection_ack=lambda *_args: True,
+    )
+
+    assert hooks.land_on_localization_loss is False
+    hooks.pose_jump_pause(3.0)
+    assert forced_modes == ["hover"]
+
+
+def test_lost_pose_search_completes_then_hovers_zero_pcmd_without_auto_land(
+    monkeypatch,
+):
+    monkeypatch.setattr(pff, "LOST_YAW_SEARCH_DELAY_S", 0.0)
+    monkeypatch.setattr(pff, "LOST_LAND_S", 0.01)
+    telemetry = {"yaw": 0.0}
+    events = []
+
+    def lost_pose(_st):
+        telemetry["yaw"] = (
+            telemetry["yaw"] + math.radians(90.0)
+        ) % (2.0 * math.pi)
+        return None
+
+    sent, reason, records = run_ticks(
+        60,
+        lost_pose,
+        hooks_extra={
+            "olympe_yaw": lambda: telemetry["yaw"],
+            "localization_yaw_search_pcmd": 8,
+            "localization_yaw_search_event": (
+                lambda state, progress: events.append((state, progress))
+            ),
+            "land_on_localization_loss": False,
+        },
+    )
+
+    yaw_commands = [command for command in sent if command != ZERO]
+    assert yaw_commands
+    assert all(command == (0, 0, 8, 0) for command in yaw_commands)
+    assert reason == "tick cap"
+    assert [state for state, _progress in events] == ["started", "completed"]
+    last_yaw = max(
+        index for index, command in enumerate(sent) if command != ZERO
+    )
+    assert all(command == ZERO for command in sent[last_yaw + 1:])
+    assert not any(
+        "-> land" in record.get("reason", "")
+        for record in records
+    )
+
+
+def test_position_without_orientation_holds_zero_until_same_frame_recovery(
+    monkeypatch,
+):
+    monkeypatch.setattr(pff, "LOST_YAW_SEARCH_DELAY_S", 0.0)
+    monkeypatch.setattr(pff, "LOST_LAND_S", 0.01)
+    telemetry = {"yaw": 0.0}
+    events = []
+    lost_until_tick = 10
+
+    def pose(st):
+        # App-level same-frame contract: a fresh position WITHOUT orientation
+        # yields no AUTO pose at all (None) instead of a pose with stale yaw.
+        if st["tick"] < lost_until_tick:
+            telemetry["yaw"] = (
+                telemetry["yaw"] + math.radians(90.0)
+            ) % (2.0 * math.pi)
+            return None
+        return fresh_pose(
+            st, x=min(7.99, 0.5 * (st["tick"] - lost_until_tick))
+        )
+
+    sent, reason, records = run_ticks(
+        120,
+        pose,
+        hooks_extra={
+            "olympe_yaw": lambda: telemetry["yaw"],
+            "localization_yaw_search_pcmd": 8,
+            "localization_yaw_search_event": (
+                lambda state, progress: events.append((state, progress))
+            ),
+            "land_on_localization_loss": False,
+        },
+    )
+
+    lost_window = sent[:lost_until_tick]
+    assert all(
+        command == ZERO or command == (0, 0, 8, 0)
+        for command in lost_window
+    )
+    assert reason == "route complete -> land"
+    assert [state for state, _progress in events] == ["started", "completed"]
+    moving = [command for command in sent[lost_until_tick:] if command != ZERO]
+    assert moving
+    assert any(
+        "localization recovery confirmation" in record.get("reason", "")
+        for record in records
+    )
+
+
 def test_weak_pose_hovers():
     sent, reason, _ = run_ticks(
         600, fresh_pose, hooks_extra={"pose_is_weak": lambda: True})
@@ -567,6 +917,82 @@ def test_recovery_requires_two_consecutive_good_fixes_before_motion():
     assert any(cmd != ZERO for cmd in sent[2:])
 
 
+def test_brief_pose_dropout_uses_imu_heading_without_treating_failure_as_weak(
+    monkeypatch,
+):
+    monkeypatch.setattr(pff, "POSE_HOLDOVER_S", pff.POSE_STALE_S)
+    telemetry = {"yaw": math.pi / 2.0, "inliers": 100}
+
+    def pose_fn(st):
+        if st["tick"] == 8:
+            telemetry.update(yaw=math.pi / 2.0 - 0.05, inliers=0)
+            return None
+        if st["tick"] == 9:
+            telemetry.update(yaw=math.pi / 2.0 - 0.10, inliers=0)
+            return None
+        visual_yaw = 0.10 if st["tick"] > 9 else 0.0
+        telemetry["inliers"] = 100
+        return fresh_pose(st, yaw=visual_yaw)
+
+    _sent, _reason, records = run_ticks(
+        16,
+        pose_fn,
+        hooks_extra={
+            "olympe_yaw": lambda: telemetry["yaw"],
+            "pose_confidence": lambda: telemetry["inliers"],
+        },
+    )
+
+    holdover = [record for record in records if record.get("pose_source") == "holdover"]
+    assert holdover, "a short failed-frame run should use the bounded last-good holdover"
+    assert any(abs(float(record.get("heading_deg", 0.0))) > 1.0 for record in holdover)
+    assert all("low confidence" not in record.get("reason", "") for record in holdover)
+
+
+def test_repeated_latest_pose_is_holdover_not_a_new_visual_yaw_anchor(monkeypatch):
+    monkeypatch.setattr(pff, "POSE_HOLDOVER_S", pff.POSE_STALE_S)
+    telemetry = {"yaw": math.pi / 2.0}
+    frozen = {"pose": None}
+
+    def pose_fn(st):
+        if st["tick"] < 8:
+            return fresh_pose(st)
+        if frozen["pose"] is None:
+            frozen["pose"] = fresh_pose(st)
+        telemetry["yaw"] = math.pi / 2.0 - 0.05 * (st["tick"] - 7)
+        return frozen["pose"]
+
+    _sent, _reason, records = run_ticks(
+        14,
+        pose_fn,
+        hooks_extra={"olympe_yaw": lambda: telemetry["yaw"]},
+    )
+
+    holdover = [record for record in records if record.get("pose_source") == "holdover"]
+    assert holdover
+    assert any(abs(float(record.get("heading_deg", 0.0))) > 1.0 for record in holdover)
+
+
+def test_pose_dropout_past_holdover_hovers_then_confirms_recovery(monkeypatch):
+    monkeypatch.setattr(pff, "POSE_HOLDOVER_S", 0.0)
+
+    def pose_fn(st):
+        if st["tick"] in (8, 9):
+            return None
+        return fresh_pose(st)
+
+    sent, _reason, records = run_ticks(16, pose_fn)
+
+    assert sent[7] == ZERO
+    assert any("no fresh pose" in record.get("reason", "") for record in records)
+    recovered = next(
+        record for record in records[9:]
+        if "recovery confirmation 1/2" in record.get("reason", "")
+    )
+    assert recovered["pcmd"] == [0, 0, 0, 0]
+    assert any(command != ZERO for command in sent[10:])
+
+
 @pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
 def test_non_finite_pose_hovers(bad):
     sent, reason, _ = run_ticks(200, lambda st: fresh_pose(st, x=bad))
@@ -583,6 +1009,97 @@ def test_pose_jump_rejected_then_confirmed():
     assert any(c != ZERO for c in sent[4:]), "confirmed relocation must resume driving"
 
 
+def test_live_pose_jump_latches_hover_until_operator_resumes_auto():
+    mode = {"value": "AUTO", "hover_polls": 0}
+    pauses = []
+
+    def pause_for_jump(distance):
+        pauses.append(distance)
+        mode["value"] = "HOVER"
+
+    def safety_poll():
+        value = mode["value"]
+        if value == "HOVER":
+            mode["hover_polls"] += 1
+            if mode["hover_polls"] >= 4:
+                mode["value"] = "AUTO"
+        return value
+
+    sent, reason, records = run_ticks(
+        30,
+        lambda st: fresh_pose(st, x=0.0 if st["tick"] <= 3 else 3.0),
+        hooks_extra={
+            "pose_jump_pause": pause_for_jump,
+            "safety_poll": safety_poll,
+        },
+    )
+
+    assert reason == "tick cap"
+    assert pauses == [pytest.approx(3.0)]
+    latched = next(record for record in records if record.get("pose_jump_pause_latched"))
+    resumed = next(record for record in records if record.get("pose_jump_resume_authorized"))
+    latched_index = records.index(latched)
+    resumed_index = records.index(resumed)
+    assert all(
+        record.get("pcmd") in (None, [0, 0, 0, 0])
+        for record in records[latched_index:resumed_index]
+    )
+    assert any(command != ZERO for command in sent[resumed_index:])
+
+
+def test_isolated_low_confidence_jump_is_rejected_without_latching_hover():
+    quality = {"inliers": 100}
+    pauses = []
+
+    def pose_fn(st):
+        jumped = st["tick"] == 4
+        quality["inliers"] = 10 if jumped else 100
+        return fresh_pose(st, x=3.0 if jumped else 0.0)
+
+    sent, reason, records = run_ticks(
+        20,
+        pose_fn,
+        hooks_extra={
+            "pose_confidence": lambda: quality["inliers"],
+            "pose_jump_pause": pauses.append,
+        },
+    )
+
+    assert reason == "tick cap"
+    assert sent[3] == ZERO
+    assert pauses == []
+    rejected = next(record for record in records if record.get("jump_reject_u"))
+    assert rejected["jump_low_confidence"] is True
+    assert rejected["low_conf_jump_count"] == 1
+
+
+def test_repeated_low_confidence_jumps_in_window_latch_hover():
+    quality = {"inliers": 100}
+    pauses = []
+
+    def pose_fn(st):
+        jumped = st["tick"] in {4, 6, 8}
+        quality["inliers"] = 10 if jumped else 100
+        return fresh_pose(st, x=3.0 if jumped else 0.0)
+
+    _sent, reason, records = run_ticks(
+        20,
+        pose_fn,
+        hooks_extra={
+            "pose_confidence": lambda: quality["inliers"],
+            "pose_jump_pause": pauses.append,
+        },
+    )
+
+    assert reason == "tick cap"
+    assert pauses == [pytest.approx(3.0)]
+    rejected = [record for record in records if record.get("jump_low_confidence")]
+    assert [record["low_conf_jump_count"] for record in rejected] == [1, 2, 3]
+    assert "pose_jump_pause_latched" not in rejected[0]
+    assert "pose_jump_pause_latched" not in rejected[1]
+    assert rejected[2]["pose_jump_pause_latched"] is True
+
+
 def test_stale_pose_hovers():
     # stamps frozen in the past -> freshness gate blocks, hover, then land
     sent, reason, _ = run_ticks(200, lambda st: rpf.Pose(0.0, 0.0, 0.0, 0.0, stamp=-10.0))
@@ -593,10 +1110,104 @@ def test_stale_pose_hovers():
 # ---------------------------------------------------------------------------
 # Route gates
 
-def test_route_deviation_lands():
-    sent, reason, _ = run_ticks(20, lambda st: fresh_pose(st, z=5.0))
-    assert "route deviation" in reason
-    assert sent[-1] == ZERO, "deviation abort must end on zero PCMD"
+def test_route_deviation_hovers_once_then_rejoins_without_yaw():
+    sent, reason, records = run_ticks(20, lambda st: fresh_pose(st, z=5.0))
+    assert reason == "tick cap"
+    assert sent[0] == ZERO
+    assert any(command != ZERO for command in sent[1:])
+    assert any(
+        "hover before rejoin" in record.get("reason", "") for record in records
+    )
+    rejoin_records = [record for record in records if record.get("action") == "REJOIN"]
+    assert rejoin_records
+    assert all(record["pcmd"][2] == 0 for record in rejoin_records)
+
+
+def test_route_deviation_hover_uses_the_active_route_controller_limit():
+    sent, reason, records = run_ticks(
+        20,
+        lambda st: fresh_pose(st, z=0.3),
+        control_config=rpf.ControlConfig(
+            inspect_waypoints=(),
+            max_route_deviation=0.25,
+        ),
+    )
+
+    assert reason == "tick cap"
+    assert sent[0] == ZERO
+    assert any(command != ZERO for command in sent[1:])
+    assert any(
+        "0.25u -> hover before rejoin" in record.get("reason", "")
+        for record in records
+    )
+
+
+def test_zero_route_deviation_hovers_on_any_nonzero_cross_track_error():
+    sent, reason, records = run_ticks(
+        20,
+        lambda st: fresh_pose(st, z=0.0001),
+        control_config=rpf.ControlConfig(
+            inspect_waypoints=(),
+            max_route_deviation=0.0,
+        ),
+    )
+
+    assert reason == "tick cap"
+    assert sent[0] == ZERO
+    assert any(
+        "0.0u -> hover before rejoin" in record.get("reason", "")
+        for record in records
+    )
+    assert any(
+        record.get("reason") == "route rejoin complete -> hover"
+        for record in records
+    )
+
+
+def test_route_rejoin_uses_fixed_projection_and_hovers_on_completion():
+    def pose_fn(st):
+        z_by_tick = {1: 0.30, 2: 0.20, 3: 0.10, 4: 0.0}
+        return fresh_pose(st, x=2.0, z=z_by_tick.get(st["tick"], 0.0))
+
+    sent, reason, records = run_ticks(
+        12,
+        pose_fn,
+        control_config=rpf.ControlConfig(
+            inspect_waypoints=(),
+            max_route_deviation=0.25,
+        ),
+    )
+
+    assert reason == "tick cap"
+    breach = next(record for record in records if "hover before rejoin" in record.get("reason", ""))
+    assert breach["pcmd"] == [0, 0, 0, 0]
+    assert breach["route_rejoin_target"] == [2.0, 0.0, 0.0]
+    rejoin = [record for record in records if record.get("action") == "REJOIN"]
+    assert any(record["pcmd"] != [0, 0, 0, 0] for record in rejoin)
+    assert all(record["pcmd"][2] == 0 for record in rejoin)
+    assert any(
+        record.get("reason") == "route rejoin complete -> hover"
+        for record in records
+    )
+
+
+def test_route_tube_distance_uses_the_whole_polyline():
+    route = ((0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (1.0, 0.0, 1.0))
+    _sent, reason, records = run_ticks(
+        8,
+        lambda st: fresh_pose(st, x=1.0, z=0.5),
+        route=route,
+        control_config=rpf.ControlConfig(
+            inspect_waypoints=(),
+            max_route_deviation=0.1,
+        ),
+    )
+
+    assert reason == "tick cap"
+    assert any(record.get("route_distance_u") == 0.0 for record in records)
+    assert not any(
+        "hover before rejoin" in record.get("reason", "") for record in records
+    )
 
 
 def test_route_completion_lands():
@@ -648,6 +1259,27 @@ def test_route_completion_waits_for_fresh_low_ground_speed():
         "ground speed 0.110 m/s" in record.get("reason", "")
         for record in records
     ) == 2
+
+
+def test_route_completion_holds_when_ground_speed_is_stale():
+    def ground_speed():
+        return 0.0, clock["t"] - 1.0
+
+    clock = {"t": 0.0}
+
+    def pose(st):
+        clock["t"] = st["t"]
+        return fresh_pose(st, x=min(7.99, 0.5 * st["tick"]))
+
+    sent, reason, records = run_ticks(
+        80,
+        pose,
+        hooks_extra={"ground_speed": ground_speed},
+    )
+
+    assert reason == "tick cap"
+    assert sent[-1] == ZERO
+    assert any("ground speed stale" in record.get("reason", "") for record in records)
 
 
 @pytest.mark.parametrize(
@@ -947,6 +1579,40 @@ def test_boot_lock_requires_consecutive_fixes_near_route_start():
     assert lock.count == 0
 
 
+def test_boot_lock_accepts_stable_fixes_near_any_route_waypoint():
+    route = np.array([
+        [0.0, 0.0, 0.0],
+        [5.0, 0.0, 0.0],
+        [10.0, 0.0, 0.0],
+        [15.0, 0.0, 0.0],
+    ])
+    lock = pff.BootPoseLock(
+        route,
+        required_fixes=3,
+        max_start_distance=1.0,
+        max_fix_jump=0.4,
+    )
+
+    assert not lock.observe(rpf.Pose(9.8, 0.0, 0.0, 0.0, stamp=1.0), now=1.1)
+    assert not lock.observe(rpf.Pose(9.9, 0.0, 0.0, 0.0, stamp=1.1), now=1.2)
+    assert lock.observe(rpf.Pose(10.0, 0.0, 0.0, 0.0, stamp=1.2), now=1.3)
+    assert lock.nearest_waypoint_index == 2
+    np.testing.assert_allclose(lock.position, [10.0, 0.0, 0.0])
+    assert not lock.observe(rpf.Pose(30.0, 0.0, 0.0, 0.0, stamp=1.3), now=1.4)
+    assert lock.count == 0
+    assert lock.nearest_waypoint_index is None
+
+
+def test_boot_lock_recovers_after_initial_hover_has_no_localization():
+    lock = pff.BootPoseLock(np.zeros(3), required_fixes=3)
+
+    assert not lock.observe(None, now=1.0)
+    assert not lock.observe(None, now=1.1)
+    assert not lock.observe(rpf.Pose(0.0, 0.0, 0.0, 0.0, stamp=1.2), now=1.2)
+    assert not lock.observe(rpf.Pose(0.1, 0.0, 0.0, 0.0, stamp=1.3), now=1.3)
+    assert lock.observe(rpf.Pose(0.1, 0.0, 0.0, 0.0, stamp=1.4), now=1.4)
+
+
 def test_inspection_requires_explicit_capture_ack():
     wp = [np.array([0.0, 0.0, 0.0]), np.array([1.0, 0.0, 0.0]),
           np.array([3.0, 0.0, 0.0])]
@@ -1030,6 +1696,45 @@ def test_run_loop_inspection_hook_controls_completion(capture_ok):
     assert (1 in ctrl.completed_inspections) is capture_ok
     if not capture_ok:
         assert sent and all(cmd == ZERO for cmd in sent)
+
+
+def test_inspection_without_body_yaw_requirement_can_capture():
+    wp = [np.array([0.0, 0.0, 0.0]), np.array([1.0, 0.0, 0.0]),
+          np.array([3.0, 0.0, 0.0])]
+    pole = {"id": 1, "center": np.array([2.0, 0.0, 0.0]),
+            "base": np.array([2.0, 0.0, 0.0]), "top": np.array([2.0, -1.0, 0.0])}
+    ctrl = rpf.RouteAutoController(
+        wp,
+        [pole],
+        rpf.ControlConfig(
+            inspect_waypoints=(2,), inspect_radius=0.3, pole_body_look=False,
+        ),
+    )
+    clock = {"t": 1.0, "calls": 0, "captures": 0}
+
+    def now():
+        clock["calls"] += 1
+        if clock["calls"] > 60:
+            raise KeyboardInterrupt
+        clock["t"] += 0.05
+        return clock["t"]
+
+    def capture(*_args):
+        clock["captures"] += 1
+        return True
+
+    hooks = pff.LoopHooks(
+        get_pose=lambda: rpf.Pose(1.0, 0.0, 0.0, 0.0, stamp=clock["t"]),
+        olympe_yaw=lambda: 0.0,
+        send_pcmd=lambda *_: None,
+        inspection_ack=capture,
+        now=now,
+    )
+    with pytest.raises(KeyboardInterrupt):
+        pff.run_loop(hooks, ctrl, wp, verbose=False)
+
+    assert clock["captures"] > 0
+    assert ctrl.completed_inspections == {1}
 
 
 def test_inspection_zero_hold_precedes_blocking_capture_hook():
@@ -1131,8 +1836,7 @@ def test_visual_yaw_allows_inspection_when_olympe_yaw_is_missing():
     assert sent and all(cmd == ZERO for cmd in sent)
 
 
-def test_inspection_radius_jitter_does_not_reset_timeout(monkeypatch):
-    monkeypatch.setattr(pff, "INSPECTION_TIMEOUT_S", 0.4)
+def test_inspection_radius_jitter_never_forces_landing():
     wp = [np.array([0.0, 0.0, 0.0]), np.array([1.0, 0.0, 0.0]),
           np.array([3.0, 0.0, 0.0])]
     pole = {"id": 1, "center": np.array([2.0, 0.0, 0.0]),
@@ -1164,7 +1868,7 @@ def test_inspection_radius_jitter_does_not_reset_timeout(monkeypatch):
         reason = pff.run_loop(hooks, ctrl, wp, verbose=False)
     except KeyboardInterrupt:
         reason = "tick cap"
-    assert reason == "inspection alignment/capture timeout -> land"
+    assert reason == "tick cap"
 
 
 def test_a_pending_inspection_waypoint_cannot_be_skipped():
@@ -1190,13 +1894,7 @@ def test_a_pending_inspection_waypoint_cannot_be_skipped():
     assert 1 not in ctrl.completed_inspections
 
 
-def test_parking_on_an_unreachable_inspection_waypoint_aborts():
-    """Holding forever would sit there until an unrelated failsafe fired.
-
-    Reachable whenever inspect_radius is tighter than the arrival tolerance: the
-    drone parks on the waypoint, the look-at region never opens, and the hold that
-    protects the inspection would otherwise never release.
-    """
+def test_parking_on_an_unreachable_inspection_waypoint_hovers():
     wp = [np.array([0.0, 0.0, 0.0]), np.array([1.0, 0.0, 0.0]),
           np.array([3.0, 0.0, 0.0])]
     pole = {"id": 1, "center": np.array([1.0, 0.0, 0.4]),
@@ -1210,8 +1908,9 @@ def test_parking_on_an_unreachable_inspection_waypoint_aborts():
     _settle(ctrl, rpf.Pose(0.4, 0.0, 0.0, 0.0, stamp=1.0), 1.0)
     cmd = _settle(ctrl, rpf.Pose(1.02, 0.0, 0.0, 0.0, stamp=1.5), 1.5)
 
-    assert cmd.should_land and cmd.action == "ABORT"
+    assert not cmd.should_land and cmd.action == "HOVER"
     assert "no reachable target" in cmd.status
+    assert "hover" in cmd.status
 
 
 def test_waypoint_target_advances_on_overshoot_not_only_on_proximity():
@@ -1793,6 +2492,12 @@ def test_fly_cli_defaults_to_no_gps_or_firmware_limits(monkeypatch):
     assert captured["distance_geofence"] is False
 
 
+def test_fly_refuses_live_takeoff() -> None:
+    with pytest.raises(SystemExit, match="operator UI"):
+        pff.fly("192.168.53.1", 1, -20.0, "skycontroller3", "/tmp/safety")
+
+
+
 def test_manual_handoff_and_auto_reacquire_are_atomic_with_pcmd():
     class _Safety:
         mode = "MANUAL"
@@ -1826,26 +2531,16 @@ def test_fly_confirms_controller_before_pcmd_takeoff_and_waits_for_landed():
     src = inspect.getsource(pff.fly)
     firmware_src = inspect.getsource(pff._configure_flight_preflight_for_live)
     cleanup_src = inspect.getsource(pff._close_live_flight_resources)
-    initial_sticks_i = src.index('set_piloting_source(drone, "SkyController")')
-    preflight_i = src.index("configure_flight_preflight")
-    models_i = src.index("loc.ensure_models()")
-    pcmd_def_i = src.index("def send_pcmd")
-    controller_i = src.index("start_skycontroller_stick_override")
-    takeoff_i = src.index("TakeOff() >>")
-    assert initial_sticks_i < preflight_i < models_i < pcmd_def_i < controller_i
-    assert src.index("SafetyMonitor(") < controller_i < src.index("monitor.start()") < takeoff_i
+    assert "TakeOff()" not in src
+    assert "operator UI" in src
     helper = inspect.getsource(pff.start_skycontroller_stick_override)
     assert helper.index("stick_monitor.start()") < helper.index(
         'set_piloting_source(drone, "Controller")'
     )
     restore_i = cleanup_src.index('set_piloting_source(drone, "SkyController")')
     assert restore_i < cleanup_src.index("drone.disconnect()")
-    assert src.index("require_landed_for_firmware_config") < src.index(
-        "_configure_flight_preflight_for_live")
     assert "except Exception as exc" in firmware_src
     assert "continuing without confirmed firmware limits" in firmware_src
-    assert "--fly requires explicit --max-altitude-m and --max-distance-m" not in src
-    assert 'state="landed"' in src
 
 
 def test_dry_run_does_not_apply_yaw_sign_twice():
@@ -2189,18 +2884,15 @@ def test_takeoff_has_final_arming_gate_cleanup_and_termination_signals():
     terminal_src = inspect.getsource(pff._perform_terminal_flight_action)
     inspection_src = inspect.getsource(pff._capture_inspection_frame)
     signal_src = inspect.getsource(pff._install_flight_stop_handlers)
-    assert src.index("must_land = True") < src.index("TakeOff() >>")
-    assert "schedule_authorized_takeoff" in src
+    assert "TakeOff()" not in src
+    assert "operator UI" in src
     assert "arming_allowed" in boot_src and "arming_allowed" in route_src
-    assert "require_fresh_auto=True" in src
     assert authorize_src.index("monitor.stop()") < authorize_src.index(
         "reason = monitor.reason")
     assert authorize_src.index("reason = monitor.reason") < authorize_src.index(
         "if not must_land")
     assert "monitor.send_authorized" in authorize_src
-    assert src.index("finally:") < src.index("_authorize_cleanup_zero")
     assert "emergency_issued" in terminal_src
-    assert "require_source_timestamps=True" in src
     assert inspection_src.index("require_confirmation=True") < inspection_src.index(
         "baseline_source_us =")
     assert "inspection_sample_after" in inspection_src
@@ -2212,15 +2904,14 @@ def test_takeoff_has_final_arming_gate_cleanup_and_termination_signals():
 def test_fly_arms_and_cleans_up_physical_stick_override_before_takeoff():
     src = inspect.getsource(pff.fly)
     hooks_src = inspect.getsource(pff._make_live_loop_hooks)
-    assert src.index("start_skycontroller_stick_override") < src.index("monitor.start()")
-    assert src.index("monitor.start()") < src.index("schedule_authorized_takeoff")
+    assert "TakeOff()" not in src
+    assert "operator UI" in src
     assert 'stick_active=getattr(stick_monitor, "is_active", None)' in hooks_src
-    assert src.index("stop_skycontroller_stick_override") < src.index(
-        "_authorize_cleanup_zero")
 
     helper = inspect.getsource(pff.start_skycontroller_stick_override)
     assert "if not stick_monitor.start()" in helper
     assert "refusing autonomous takeoff" in helper
+
 
 
 @pytest.mark.parametrize("mode, stream_ok, stop, terminated", [
@@ -2254,7 +2945,6 @@ def test_low_confidence_uses_weak_timeout_not_lost_timeout(monkeypatch):
 def test_alternating_weak_and_lost_share_one_uncertainty_deadline(monkeypatch):
     monkeypatch.setattr(pff, "WEAK_HOVER_LAND_S", 0.8)
     monkeypatch.setattr(pff, "LOST_LAND_S", 0.4)
-    monkeypatch.setattr(pff, "LOST_MANUAL_S", 100.0)
     mode = {"weak": False}
 
     def alternating(st):
@@ -2379,6 +3069,15 @@ def test_yaw_error_uses_both_rays_projected_on_the_measured_ground_plane():
     assert rpf.ground_projected_yaw_error(0.0, frame.up, frame) is None
 
 
+def test_camera_6dof_heading_uses_ground_projection_and_rejects_vertical_view():
+    frame = rpf.MapFrame.from_gravity([0.0, 1.0, 1.0])
+
+    assert rpf.camera_heading_from_forward(
+        frame.north + 2.0 * frame.up, frame
+    ) == pytest.approx(math.pi / 2.0)
+    assert rpf.camera_heading_from_forward(frame.up, frame) is None
+
+
 def test_pcmd_alignment_is_derived_from_the_waypoint_ray_not_stale_metadata():
     frame = rpf.MapFrame.from_gravity([0.0, 1.0, 1.0])
     pose = rpf.Pose(0.0, 0.0, 0.0, yaw=0.0)
@@ -2421,6 +3120,28 @@ def test_pcmd_normalizes_right_forward_vertical_diagonals(goal, expected):
     ) == expected
 
 
+def test_vertical_pcmd_uses_map_gravity_not_camera_pitch_or_roll():
+    frame = rpf.MapFrame.from_gravity([0.0, 1.0, 1.0])
+    cfg = rpf.ControlConfig(inspect_waypoints=(), map_frame=frame)
+    pose = rpf.Pose(0.0, 0.0, 0.0, yaw=0.0)
+
+    horizontal = rpf.Command(
+        "FOLLOW", frame.east + frame.north, 0.0,
+        frame.east + frame.north, 0.0, 0.0,
+    )
+    climb = rpf.Command("FOLLOW", frame.up, 0.0, frame.up, 0.0, 0.0)
+
+    assert rpf.command_to_body_percent(
+        horizontal, pose, config=cfg, require_yaw_alignment=False,
+    )[3] == 0
+    assert rpf.command_to_body_percent(
+        climb, pose, config=cfg, require_yaw_alignment=False,
+    )[:3] == (0, 0, 0)
+    assert rpf.command_to_body_percent(
+        climb, pose, config=cfg, require_yaw_alignment=False,
+    )[3] > 0
+
+
 def test_yaw_alignment_requires_three_quiet_updates_then_translates():
     cfg = rpf.ControlConfig(inspect_waypoints=())
     control = rpf.YawAlignedPcmdController(cfg)
@@ -2444,6 +3165,75 @@ def test_yaw_alignment_requires_three_quiet_updates_then_translates():
 
     assert control.update(cmd, pose, 0.25, target_key=1) == ZERO
     assert control.phase == "yaw_alignment_hold"
+
+
+def test_translation_keeps_yaw_zero_while_error_stays_within_thirty_degrees():
+    cfg = rpf.ControlConfig(
+        inspect_waypoints=(),
+        yaw_alignment_confirmation_updates=1,
+        yaw_alignment_max_rate_deg_s=100.0,
+    )
+    control = rpf.YawAlignedPcmdController(cfg)
+    cmd = rpf.Command(
+        "FOLLOW",
+        np.array([1.0, 0.0, 0.0]),
+        yaw_target=0.0,
+        goal=np.array([1.0, 0.0, 0.0]),
+        path_error=0.0,
+        progress=0.0,
+    )
+
+    control.update(cmd, rpf.Pose(0, 0, 0, yaw=0.0, stamp=0.0), 0.0, target_key=1)
+    control.update(cmd, rpf.Pose(0, 0, 0, yaw=0.0, stamp=0.1), 0.1, target_key=1)
+    translated = control.update(
+        cmd,
+        rpf.Pose(0.2, 0, 0, yaw=math.radians(20.0), stamp=0.2),
+        0.2,
+        target_key=1,
+    )
+
+    assert translated[2] == 0
+    assert translated[0] > 0
+    assert translated[1] > 0
+    assert control.phase == "translate"
+
+
+def test_translation_over_thirty_degree_yaw_error_hovers_realigns_then_resumes():
+    cfg = rpf.ControlConfig(
+        inspect_waypoints=(),
+        yaw_alignment_confirmation_updates=1,
+        yaw_alignment_max_rate_deg_s=100.0,
+    )
+    control = rpf.YawAlignedPcmdController(cfg)
+    cmd = rpf.Command(
+        "FOLLOW", np.array([1.0, 0.0, 0.0]), 0.0,
+        np.array([1.0, 0.0, 0.0]), 0.0, 0.0,
+    )
+
+    for now in (0.0, 0.1, 0.2):
+        pose = rpf.Pose(0.0, 0.0, 0.0, yaw=0.0, stamp=now)
+        translated = control.update(cmd, pose, now, target_key=1)
+    assert translated[1] > 0 and translated[2] == 0
+
+    pose = rpf.Pose(0.2, 0.0, 0.0, yaw=math.radians(31.0), stamp=0.3)
+    correcting = control.update(cmd, pose, 0.3, target_key=1)
+    assert correcting[:2] == (0, 0)
+    assert correcting[2] != 0
+    assert correcting[3] == 0
+    assert not control.aligned_for_translation
+    assert control.phase == "turn"
+
+    for now in (0.4, 0.5):
+        pose = rpf.Pose(0.2, 0.0, 0.0, yaw=0.0, stamp=now)
+        assert control.update(cmd, pose, now, target_key=1) == ZERO
+    resumed = control.update(
+        cmd,
+        rpf.Pose(0.2, 0.0, 0.0, yaw=0.0, stamp=0.6),
+        0.6,
+        target_key=1,
+    )
+    assert resumed[1] > 0 and resumed[2] == 0
+    assert control.phase == "translate"
 
 
 def test_repeated_capture_cannot_confirm_yaw_alignment():
@@ -2486,7 +3276,7 @@ def test_short_horizontal_leg_still_requires_nose_alignment():
     assert control.phase == "turn"
 
 
-def test_yaw_alignment_timeout_returns_zero_and_latches_abort_reason():
+def test_yaw_alignment_has_no_timeout():
     cfg = rpf.ControlConfig(inspect_waypoints=(), yaw_alignment_timeout_s=0.2)
     control = rpf.YawAlignedPcmdController(cfg)
     cmd = rpf.Command(
@@ -2500,9 +3290,8 @@ def test_yaw_alignment_timeout_returns_zero_and_latches_abort_reason():
     pose = rpf.Pose(0.0, 0.0, 0.0, yaw=0.0, stamp=1.0)
 
     assert control.update(cmd, pose, 1.0, target_key=1)[2] != 0
-    assert control.update(cmd, pose, 1.21, target_key=1) == ZERO
-    assert control.phase == "yaw_alignment_timeout"
-    assert control.abort_reason
+    assert control.update(cmd, pose, 121.0, target_key=1)[2] != 0
+    assert control.phase == "turn"
 
 def test_pcmd_conversion_bounds():
     pose = rpf.Pose(0.0, 0.0, 0.0, yaw=0.3)
@@ -2924,6 +3713,16 @@ def test_heading_estimator_converts_clockwise_ned_yaw_before_fusion():
     assert estimator.heading(math.pi) == pytest.approx(-math.pi / 2.0, abs=1e-9)
 
 
+def test_heading_estimator_rejects_visual_yaw_increment_that_disagrees_with_imu():
+    estimator = pff.HeadingEstimator(max_increment_mismatch_rad=math.radians(10.0))
+    assert estimator.update(0.0, math.pi / 2.0)
+    assert estimator.update(0.10, math.pi / 2.0 - 0.10)
+
+    assert not estimator.update(1.0, math.pi / 2.0 - 0.20)
+    assert estimator.last_increment_mismatch_rad == pytest.approx(0.80)
+    assert estimator.heading(math.pi / 2.0 - 0.20) == pytest.approx(0.20)
+
+
 def test_heading_estimator_has_no_position_or_path_seed_api():
     estimator = pff.HeadingEstimator()
 
@@ -3101,6 +3900,91 @@ def test_heading_seed_survives_a_smaller_arrival_radius():
         assert goal[0] > pos[0], (
             f"radius={radius}: seeded toward {goal.tolist()}, which is behind the drone"
         )
+
+
+def test_route_start_targets_the_waypoint_after_nearest_takeoff_point():
+    wp = [
+        np.array([0.0, 0.0, 0.0]),
+        np.array([5.0, 0.0, 0.0]),
+        np.array([10.0, 0.0, 0.0]),
+        np.array([15.0, 0.0, 0.0]),
+    ]
+    ctrl = rpf.RouteAutoController(
+        wp,
+        poles=[],
+        config=rpf.ControlConfig(inspect_waypoints=()),
+    )
+
+    nearest = ctrl.start_after_nearest_waypoint(np.array([9.8, 0.0, 0.0]))
+
+    assert nearest == 2
+    assert ctrl.target_index == 3
+    np.testing.assert_allclose(ctrl.current_target(np.array([9.8, 0.0, 0.0])), wp[3])
+
+
+def test_route_start_at_final_waypoint_does_not_wrap_to_route_start():
+    wp = [
+        np.array([0.0, 0.0, 0.0]),
+        np.array([5.0, 0.0, 0.0]),
+        np.array([10.0, 0.0, 0.0]),
+    ]
+    ctrl = rpf.RouteAutoController(
+        wp,
+        poles=[],
+        config=rpf.ControlConfig(inspect_waypoints=()),
+    )
+
+    nearest = ctrl.start_after_nearest_waypoint(np.array([10.0, 0.0, 0.0]))
+
+    assert nearest == 2
+    assert ctrl.target_index == 2
+
+
+def test_raw_map_route_runs_nearest_next_turn_translate_then_repeats():
+    waypoints = [
+        np.array([0.0, 0.0, 0.0]),
+        np.array([1.0, 0.0, 0.0]),
+        np.array([1.0, 0.0, 1.0]),
+    ]
+    cfg = rpf.ControlConfig(inspect_waypoints=())
+    route = rpf.RouteAutoController(waypoints, poles=[], config=cfg)
+    pcmd = rpf.YawAlignedPcmdController(cfg)
+    assert route.start_after_nearest_waypoint(np.array([0.01, 0.0, 0.0])) == 0
+    assert route.target_index == 1
+
+    pose = rpf.Pose(0.0, 0.0, 0.0, yaw=math.pi / 2.0, stamp=0.0)
+    command = route.step(pose, now=0.0)
+    assert pcmd.update(command, pose, 0.0, target_key=route.target_index)[2] != 0
+
+    for now in (0.1, 0.2, 0.3, 0.4):
+        pose = rpf.Pose(0.0, 0.0, 0.0, yaw=0.0, stamp=now)
+        command = route.step(pose, now=now)
+        output = pcmd.update(command, pose, now, target_key=route.target_index)
+    pose = rpf.Pose(0.0, 0.0, 0.0, yaw=0.0, stamp=0.5)
+    command = route.step(pose, now=0.5)
+    output = pcmd.update(command, pose, 0.5, target_key=route.target_index)
+    assert output[1] > 0 and output[2] == 0
+
+    for now in (0.6, 0.7, 0.8):
+        pose = rpf.Pose(1.0, 0.0, 0.0, yaw=0.0, stamp=now)
+        command = route.step(pose, now=now)
+    assert route.target_index == 2
+    assert pcmd.update(command, pose, 0.8, target_key=route.target_index)[2] != 0
+
+    for now in (0.9, 1.0, 1.1, 1.2):
+        pose = rpf.Pose(1.0, 0.0, 0.0, yaw=math.pi / 2.0, stamp=now)
+        command = route.step(pose, now=now)
+        output = pcmd.update(command, pose, now, target_key=route.target_index)
+    pose = rpf.Pose(1.0, 0.0, 0.0, yaw=math.pi / 2.0, stamp=1.3)
+    command = route.step(pose, now=1.3)
+    output = pcmd.update(command, pose, 1.3, target_key=route.target_index)
+    assert output[1] > 0 and output[2] == 0
+
+    for now in (1.4, 1.7, 2.0, 2.3, 2.6):
+        pose = rpf.Pose(1.0, 0.0, 1.0, yaw=math.pi / 2.0, stamp=now)
+        command = route.step(pose, now=now)
+    assert command.action == "LAND"
+    assert command.should_land
 
 
 # --- physical stick override during autonomous flight -----------------------

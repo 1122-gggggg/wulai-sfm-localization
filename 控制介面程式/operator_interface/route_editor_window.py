@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import queue
+import tempfile
 import threading
 import time
 import tkinter as tk
@@ -15,9 +16,12 @@ from PIL import Image, ImageDraw, ImageTk
 from route_editor_controller import OrthoView, RouteEditorController, pointer_is_drag
 from local_site_assets import discover_site_package
 from route_editor_model import RouteDocument, glomap_to_editor
+from x11_pinch_zoom import install_x11_pinch_zoom
 
 _BG = (18, 21, 25)
 _ARRIVE = "#3fbf7f"
+_ARRIVE_FILL = (63, 191, 127, 52)
+_SAFE_TUBE = (0, 229, 255, 128)
 #: Matches ControlConfig.waypoint_arrive_radius; the exported route carries the
 #: value the operator actually confirmed, so the two cannot drift apart.
 #: Operator decision 2026-08-06: the arrival sphere is 0.005 to 0.05 map units.
@@ -26,10 +30,23 @@ _ARRIVE = "#3fbf7f"
 DEFAULT_ARRIVE_RADIUS_U = 0.02
 ARRIVE_RADIUS_MIN_U = 0.005
 ARRIVE_RADIUS_MAX_U = 0.05
+DEFAULT_ROUTE_DEVIATION_U = 0.1
+ROUTE_DEVIATION_MIN_U = 0.0
+ROUTE_DEVIATION_MAX_U = 0.1
 _ROUTE = "#ff3ea5"
 _SELECTED = "#ffe169"
 _AXIS = ("#ff6b5f", "#55d187", "#5aa7e8")
 
+
+def _profile_route_deviation_cap(profile) -> float:
+    controller = getattr(getattr(profile, "flight", None), "controller", None)
+    raw = getattr(controller, "max_route_deviation_map_units", None)
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        return DEFAULT_ROUTE_DEVIATION_U
+    value = float(raw)
+    if not np.isfinite(value) or value < 0.0:
+        return DEFAULT_ROUTE_DEVIATION_U
+    return min(ROUTE_DEVIATION_MAX_U, max(ROUTE_DEVIATION_MIN_U, value))
 
 
 def _resolve_map_frame(profile):
@@ -107,9 +124,21 @@ class RouteEditorWindow(tk.Toplevel):
         self.arrive_radius_var = tk.DoubleVar(
             value=DEFAULT_ARRIVE_RADIUS_U if saved_radius is None
             else min(ARRIVE_RADIUS_MAX_U, max(ARRIVE_RADIUS_MIN_U, saved_radius)))
+        self.route_deviation_max_u = _profile_route_deviation_cap(profile)
+        saved_deviation = document.max_route_deviation_map_units
+        route_deviation = (
+            self.route_deviation_max_u
+            if saved_deviation is None
+            else min(
+                self.route_deviation_max_u,
+                max(ROUTE_DEVIATION_MIN_U, saved_deviation),
+            )
+        )
+        self.route_deviation_var = tk.DoubleVar(value=route_deviation)
         self.discovery_var = tk.StringVar(value="尚未導入資料夾")
         self._discovered = None
         self.show_arrive_var = tk.BooleanVar(value=False)
+        self.show_route_deviation_var = tk.BooleanVar(value=False)
         self.document = document
         self.import_route = import_route
         self.discover_map_ply = discover_map_ply
@@ -156,18 +185,21 @@ class RouteEditorWindow(tk.Toplevel):
             ]
         ] = queue.Queue(maxsize=1)
         self._preview_only = not bound
+        self._editing_current_route = route_path is not None
         self._map_source = profile.map_ply if bound else map_source
         self._saved_signature = self._signature()
-        self._last_saved_path: Path | None = None
         self._closed = False
 
         self.title_var = tk.StringVar(value=f"航線編輯器｜{display_name}")
         self.mode_var = tk.StringVar()
         self.selection_var = tk.StringVar()
         self.marking_mode_var = tk.BooleanVar(value=False)
-        self.status_var = tk.StringVar(
-            value="第一階段：請先開啟右側「標路徑點模式」；此功能不會發送任何飛行指令"
+        initial_status = (
+            f"正在編輯 {route_path.name}；儲存後只會更新這條航線"
+            if self._editing_current_route
+            else "正在新增航線；儲存後會保留所有既有航線"
         )
+        self.status_var = tk.StringVar(value=initial_status)
         self._build()
         self._bind_controls()
         self._refresh_labels()
@@ -227,13 +259,14 @@ class RouteEditorWindow(tk.Toplevel):
             toolbar, text="進入第二階段：逐點調整", command=self.finish_layout
         )
         self.finish_button.pack(side="left", padx=(12, 2))
-        ttk.Button(toolbar, text="儲存草稿", command=self.save_draft).pack(
+        self.save_button = ttk.Button(
+            toolbar,
+            text="另存預覽航線" if self._preview_only else "儲存路線",
+            command=self.save_route,
+        )
+        self.save_button.pack(
             side="right", padx=2
         )
-        self.import_button = ttk.Button(
-            toolbar, text="儲存並匯入目前航線", command=self.save_and_import
-        )
-        self.import_button.pack(side="right", padx=2)
         ttk.Button(toolbar, text="離開編輯器", command=self.close_editor).pack(
             side="right", padx=(2, 10)
         )
@@ -282,6 +315,30 @@ class RouteEditorWindow(tk.Toplevel):
             variable=self.arrive_radius_var, command=self._on_arrive_radius,
         ).pack(fill="x", padx=6, pady=(0, 6))
         self._on_arrive_radius(None)
+        safe_tube = ttk.LabelFrame(side, text="航線安全管確認")
+        safe_tube.pack(fill="x", padx=12, pady=(0, 10))
+        ttk.Checkbutton(
+            safe_tube,
+            text="顯示航線安全管",
+            variable=self.show_route_deviation_var,
+            command=self.request_redraw,
+        ).pack(anchor="w", padx=6, pady=(4, 0))
+        self.route_deviation_label_var = tk.StringVar()
+        ttk.Label(
+            safe_tube,
+            textvariable=self.route_deviation_label_var,
+            style="RouteEditor.TLabel",
+            wraplength=260,
+        ).pack(anchor="w", padx=6)
+        self.route_deviation_scale = ttk.Scale(
+            safe_tube,
+            from_=ROUTE_DEVIATION_MIN_U,
+            to=self.route_deviation_max_u,
+            variable=self.route_deviation_var,
+            command=self._on_route_deviation,
+        )
+        self.route_deviation_scale.pack(fill="x", padx=6, pady=(0, 6))
+        self._on_route_deviation(None)
         ttk.Label(
             side,
             textvariable=self.selection_var,
@@ -309,9 +366,10 @@ class RouteEditorWindow(tk.Toplevel):
             "  左鍵拖曳：旋轉\n"
             "  左鍵雙擊：切換地圖中心\n"
             "  右鍵拖曳：平移\n"
-            "  滾輪：縮放\n\n"
+            "  觸控板捏合／滾輪：縮放\n\n"
             "編輯器座標：Z 永遠向上。\n"
-            "儲存只會產生草稿／預覽，不會解鎖飛行。"
+            "新增模式會建立另一條路線；編輯模式只更新所選路線。\n"
+            "「儲存路線」會同步 SHA，並將儲存結果設為目前 AUTO 航線。"
         )
         ttk.Label(
             side,
@@ -346,10 +404,20 @@ class RouteEditorWindow(tk.Toplevel):
         self.canvas.bind("<Button-4>", self.on_wheel)
         self.canvas.bind("<Button-5>", self.on_wheel)
         self.bind("<KeyPress>", self.on_key)
+        self._pinch_zoom = install_x11_pinch_zoom(
+            self.canvas,
+            lambda: self.view.zoom,
+            self._set_zoom,
+        )
 
     def _signature(self) -> tuple:
-        return tuple(
+        points = tuple(
             tuple(float(value) for value in point) for point in self.controller.points
+        )
+        return (
+            points,
+            float(self.arrive_radius_var.get()),
+            float(self.route_deviation_var.get()),
         )
 
     def _refresh_labels(self) -> None:
@@ -381,8 +449,8 @@ class RouteEditorWindow(tk.Toplevel):
         self.marking_mode_button.configure(
             state="normal" if self.controller.phase == "layout" else "disabled"
         )
-        self.import_button.configure(
-            state="disabled" if self._preview_only or self._asset_loading else "normal"
+        self.save_button.configure(
+            state="disabled" if self._asset_loading else "normal"
         )
         asset_state = "disabled" if self._asset_loading else "normal"
         self.ply_button.configure(state=asset_state)
@@ -414,7 +482,7 @@ class RouteEditorWindow(tk.Toplevel):
                 points[:, 3:6][inside][order], 0, 255
             ).astype(np.uint8)
         image = Image.fromarray(arr, "RGB")
-        draw = ImageDraw.Draw(image)
+        draw = ImageDraw.Draw(image, "RGBA")
         self._draw_axes(draw, width, height)
         self._draw_route(draw, width, height)
         photo = ImageTk.PhotoImage(image)
@@ -441,6 +509,28 @@ class RouteEditorWindow(tk.Toplevel):
         sx, sy, _ = self.view.project(self.controller.points, width, height)
         projected = list(zip(sx.tolist(), sy.tolist()))
         if len(projected) > 1:
+            if self.show_route_deviation_var.get():
+                tube_pixels = float(self.route_deviation_var.get()) * self.view.scale(
+                    width, height
+                )
+                if tube_pixels >= 1.0:
+                    tube_width = max(2, int(round(tube_pixels * 2.0)))
+                    draw.line(
+                        projected,
+                        fill=_SAFE_TUBE,
+                        width=tube_width,
+                        joint="curve",
+                    )
+                    for x, y in projected:
+                        draw.ellipse(
+                            (
+                                x - tube_pixels,
+                                y - tube_pixels,
+                                x + tube_pixels,
+                                y + tube_pixels,
+                            ),
+                            fill=_SAFE_TUBE,
+                        )
             draw.line(projected, fill=_ROUTE, width=3, joint="curve")
         if self.show_arrive_var.get():
             # The arrival sphere in MAP units, drawn at the view's own scale so
@@ -453,7 +543,9 @@ class RouteEditorWindow(tk.Toplevel):
                 for x, y in projected:
                     draw.ellipse(
                         (x - pixels, y - pixels, x + pixels, y + pixels),
-                        outline=_ARRIVE, width=2,
+                        fill=_ARRIVE_FILL,
+                        outline=_ARRIVE,
+                        width=2,
                     )
         for index, (x, y) in enumerate(projected):
             selected = index == self.controller.selected
@@ -495,7 +587,7 @@ class RouteEditorWindow(tk.Toplevel):
         self._mouse = (int(event.x), int(event.y))
         if self.controller.moving:
             self.controller.confirm_move()
-            self.status_var.set("已確認航點移動；航線仍是未核准草稿")
+            self.status_var.set("已確認航點移動；按「儲存路線」即可更新正式航線")
             self._left_confirmed_move = True
             self._refresh_labels()
             self.request_redraw()
@@ -667,9 +759,12 @@ class RouteEditorWindow(tk.Toplevel):
             if getattr(event, "num", None) == 4 or getattr(event, "delta", 0) > 0
             else 1.0 / 1.12
         )
-        self.view.zoom = float(np.clip(self.view.zoom * factor, 0.08, 120.0))
-        self.request_redraw()
+        self._set_zoom(self.view.zoom * factor)
         return "break"
+
+    def _set_zoom(self, zoom: float) -> None:
+        self.view.zoom = float(np.clip(zoom, 0.08, 120.0))
+        self.request_redraw()
 
     def _handle_undo_redo(self, *, shift: bool) -> None:
         changed = self.controller.redo() if shift else self.controller.undo()
@@ -743,6 +838,8 @@ class RouteEditorWindow(tk.Toplevel):
         return None
 
     def _on_arrive_radius(self, _value) -> None:
+        if _value is not None:
+            self.show_arrive_var.set(True)
         radius = float(self.arrive_radius_var.get())
         shortest = self.controller.shortest_leg()
         note = ""
@@ -751,7 +848,25 @@ class RouteEditorWindow(tk.Toplevel):
             # translating between them: it settles, advances, settles, advances.
             note = f"　⚠ 半徑 >= 最短段 {shortest:.3f}u 的一半，相鄰球體會重疊"
         self.arrive_label_var.set(f"半徑 {radius:.3f} 地圖單位{note}")
+        if hasattr(self, "route_deviation_label_var"):
+            self._set_route_deviation_label()
         if self.show_arrive_var.get():
+            self.request_redraw()
+
+    def _set_route_deviation_label(self) -> None:
+        radius = float(self.route_deviation_var.get())
+        note = ""
+        if radius < float(self.arrive_radius_var.get()):
+            note = "；⚠ 小於到達半徑"
+        self.route_deviation_label_var.set(
+            f"半徑 {radius:.3f} 地圖單位{note}\n超出後立即結束 AUTO 並原地降落"
+        )
+
+    def _on_route_deviation(self, _value) -> None:
+        if _value is not None:
+            self.show_route_deviation_var.set(True)
+        self._set_route_deviation_label()
+        if self.show_route_deviation_var.get():
             self.request_redraw()
 
     def finish_layout(self) -> None:
@@ -763,9 +878,11 @@ class RouteEditorWindow(tk.Toplevel):
         # Stage two is where the arrival spheres matter, so show them by default:
         # the operator confirms the radius against the real geometry before export.
         self.show_arrive_var.set(True)
+        self.show_route_deviation_var.set(True)
         self._on_arrive_radius(None)
+        self._on_route_deviation(None)
         self.status_var.set(
-            "第二階段：綠圈為到達球體，確認半徑後再匯出；"
+            "第二階段：綠圈為到達球體、藍綠管為安全範圍，確認兩個半徑後再匯出；"
             "選取路徑點後按 G，可用 X／Y／Z 調整位置"
         )
         self._refresh_labels()
@@ -992,6 +1109,12 @@ class RouteEditorWindow(tk.Toplevel):
                 site_id="", coordinate_frame_id="", align_source=self.align_source)
             self._preview_only = True
             display_name = "未綁定 PLY"
+        self.route_deviation_max_u = _profile_route_deviation_cap(profile)
+        self.route_deviation_scale.configure(to=self.route_deviation_max_u)
+        self.route_deviation_var.set(
+            min(float(self.route_deviation_var.get()), self.route_deviation_max_u)
+        )
+        self._on_route_deviation(None)
         self._map_source = source
         self.title(f"航線編輯器 — {display_name}")
         self.title_var.set(f"航線編輯器｜{display_name}")
@@ -1002,71 +1125,71 @@ class RouteEditorWindow(tk.Toplevel):
         center, radius = self._bounds(self.map_points[:, :3])
         self.view = OrthoView(center=center, radius=radius, zoom=1.0)
         self.view.top()
-        self._last_saved_path = None
+        self._editing_current_route = False
+        self.save_button.configure(
+            text="另存預覽航線" if self._preview_only else "儲存路線"
+        )
         self._saved_signature = self._signature()
         self.status_var.set(message)
         self._refresh_labels()
         self.request_redraw()
 
-    def _choose_draft_path(self) -> Path | None:
-        if self._preview_only:
-            draft_dir = (
-                self._map_source.parent if self._map_source is not None else Path.cwd()
-            )
-        else:
-            assert self.profile is not None
-            draft_dir = self.profile.source.parent / "route_drafts"
-        draft_dir.mkdir(parents=True, exist_ok=True)
-        initial = f"route_{time.strftime('%Y%m%d_%H%M%S')}.json"
+    def _choose_preview_path(self) -> Path | None:
+        preview_dir = (
+            self._map_source.parent if self._map_source is not None else Path.cwd()
+        )
+        preview_dir.mkdir(parents=True, exist_ok=True)
+        initial = f"route_preview_{time.strftime('%Y%m%d_%H%M%S')}.json"
         selected = filedialog.asksaveasfilename(
             parent=self,
-            title="另存航線草稿",
-            initialdir=str(draft_dir),
+            title="另存預覽航線",
+            initialdir=str(preview_dir),
             initialfile=initial,
             defaultextension=".json",
             filetypes=(("航線 JSON", "*.json"),),
         )
         return Path(selected).resolve() if selected else None
 
-    def save_draft(self) -> Path | None:
+    def _update_document(self) -> None:
         if self.controller.moving:
             self.controller.confirm_move()
-        path = self._last_saved_path or self._choose_draft_path()
-        if path is None:
-            return None
         self.document.points = self.controller.points
         self.document.arrive_radius_map_units = float(self.arrive_radius_var.get())
-        try:
-            saved = self.document.save(path, preview_only=self._preview_only)
-        except Exception as exc:
-            self.status_var.set(f"草稿儲存失敗：{exc}")
-            return None
-        self._last_saved_path = saved
-        self._saved_signature = self._signature()
-        suffix = (
-            "PLY 預覽草稿不可匯入正式航線"
-            if self._preview_only
-            else "尚未匯入、未核准飛行"
+        self.document.max_route_deviation_map_units = float(
+            self.route_deviation_var.get()
         )
-        self.status_var.set(f"草稿已儲存：{saved}；{suffix}")
-        return saved
 
-    def save_and_import(self) -> None:
+    def save_route(self) -> Path | None:
+        self._update_document()
         if self._preview_only:
+            path = self._choose_preview_path()
+            if path is None:
+                return None
+            try:
+                saved = self.document.save(path, preview_only=True)
+            except Exception as exc:
+                self.status_var.set(f"預覽航線儲存失敗：{exc}")
+                return None
+            self._saved_signature = self._signature()
             self.status_var.set(
-                "目前只有 PLY，缺少 site_id / coordinate_frame_id，禁止匯入正式航線"
+                f"預覽航線已儲存：{saved}；未綁定場域，不能供 AUTO 使用"
             )
-            return
-        saved = self.save_draft()
-        if saved is None:
-            return
+            return saved
+
         try:
-            result = self.import_route(saved)
+            with tempfile.TemporaryDirectory(prefix="sfm-route-") as temporary:
+                staged = self.document.save(Path(temporary) / "flight_route.json")
+                result = self.import_route(staged)
         except Exception as exc:
-            self.status_var.set(f"匯入失敗：{exc}")
-            return
+            self.status_var.set(f"航線儲存失敗：{exc}")
+            return None
+        saved = Path(getattr(result, "asset_path", None) or self.profile.route_json)
+        self.document.source_path = saved
+        self._saved_signature = self._signature()
         message = str(getattr(result, "message", "航線已匯入"))
-        self.status_var.set(f"{message}；只更新預覽，不會執行航線")
+        self.status_var.set(f"{message}；SHA 已同步，但不會立即起飛")
+        self.close_editor(force=True)
+        return saved
 
     def close_editor(self, *, force: bool = False) -> None:
         if self._closed:

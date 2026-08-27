@@ -371,10 +371,17 @@ def test_route_and_target_are_independent_profile_ports(tmp_path: Path) -> None:
     )
 
     LocalRouteProvider(managed).import_file(route, profile_path)
+    route_profile = load_site_profile(profile_path)
+    assert route_profile.flight is not None
+    assert route_profile.flight.approved is False
+    assert route_profile.flight.route_clearance_approved is False
+
     LocalTargetProvider(managed).import_file(targets, profile_path)
     profile = load_site_profile(profile_path)
 
-    assert profile.route_json == managed / "test-yard" / "routes" / "flight_route.json"
+    assert profile.route_json is not None
+    assert profile.route_json.parent == managed / "test-yard" / "routes"
+    assert profile.route_json.name.startswith("flight_route_")
     assert (
         profile.poles_json
         == managed / "test-yard" / "targets" / "inspection_targets.json"
@@ -382,6 +389,119 @@ def test_route_and_target_are_independent_profile_ports(tmp_path: Path) -> None:
     assert profile.asset_sha256.route_json == _sha(profile.route_json)
     assert profile.asset_sha256.poles_json == _sha(profile.poles_json)
     assert profile.flight is not None and profile.flight.approved is False
+
+
+def test_editor_authored_route_can_be_approved_for_auto(tmp_path: Path) -> None:
+    package = _write_site_package(tmp_path)
+    managed = tmp_path / "managed"
+    site_provider = LocalSitePackageProvider(
+        managed,
+        bundle_inspector=lambda _path: ("ref-a.jpg",),
+        edm_profile_loader=_profile_loader,
+    )
+    profile_path = site_provider.import_folder(package).profile_path
+    route = _write_valid_route(tmp_path / "route.json")
+    route_payload = json.loads(route.read_text(encoding="utf-8"))
+    route_payload["source"] = "operator_route_editor"
+    route.write_text(json.dumps(route_payload), encoding="utf-8")
+
+    imported = LocalRouteProvider(managed).import_file(
+        route,
+        profile_path,
+        approve_for_auto=True,
+    )
+    profile = load_site_profile(profile_path)
+
+    assert imported.asset_path == profile.route_json
+    assert profile.flight is not None
+    assert profile.flight.approved is True
+    assert profile.flight.route_clearance_approved is True
+    assert "operator route editor" in profile.flight.approval_note.lower()
+    assert profile.asset_sha256.route_json == _sha(imported.asset_path)
+
+
+def test_route_import_updates_linked_component_and_selection_sha(tmp_path: Path) -> None:
+    package = _write_site_package(tmp_path)
+    managed = tmp_path / "地圖檔" / "場域"
+    profile_path = LocalSitePackageProvider(
+        managed,
+        bundle_inspector=lambda _path: ("ref-a.jpg",),
+        edm_profile_loader=_profile_loader,
+    ).import_folder(package).profile_path
+    component_path = (
+        tmp_path
+        / "控制介面程式"
+        / "mission_components"
+        / "routes"
+        / "test_route.json"
+    )
+    selection_path = (
+        tmp_path
+        / "控制介面程式"
+        / "mission_selections"
+        / "test_selection.json"
+    )
+    component_path.parent.mkdir(parents=True)
+    selection_path.parent.mkdir(parents=True)
+    component_path.write_text(
+        json.dumps(
+            {
+                "schema": "sfm-route-package/v1",
+                "route": {
+                    "path": "../../../地圖檔/場域/test-yard/routes/flight_route.json",
+                    "sha256": "0" * 64,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    selection_path.write_text(
+        json.dumps(
+            {
+                "schema": "sfm-mission-selection/v1",
+                "route": {
+                    "path": "../mission_components/routes/test_route.json",
+                    "sha256": "0" * 64,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    route = _write_valid_route(tmp_path / "route.json")
+    route_payload = json.loads(route.read_text(encoding="utf-8"))
+    route_payload["source"] = "operator_route_editor"
+    route.write_text(json.dumps(route_payload), encoding="utf-8")
+
+    imported = LocalRouteProvider(managed).import_file(
+        route, profile_path, approve_for_auto=True
+    )
+
+    component = json.loads(component_path.read_text(encoding="utf-8"))
+    selection = json.loads(selection_path.read_text(encoding="utf-8"))
+    assert Path(component["route"]["path"]).name == imported.asset_path.name
+    assert component["route"]["sha256"] == _sha(imported.asset_path)
+    assert selection["route"]["sha256"] == _sha(component_path)
+
+
+def test_auto_approval_rejects_a_route_not_authored_by_the_editor(
+    tmp_path: Path,
+) -> None:
+    package = _write_site_package(tmp_path)
+    managed = tmp_path / "managed"
+    site_provider = LocalSitePackageProvider(
+        managed,
+        bundle_inspector=lambda _path: ("ref-a.jpg",),
+        edm_profile_loader=_profile_loader,
+    )
+    profile_path = site_provider.import_folder(package).profile_path
+    route = _write_valid_route(tmp_path / "external-route.json")
+
+    with pytest.raises(ValueError, match="operator route editor"):
+        LocalRouteProvider(managed).import_file(
+            route,
+            profile_path,
+            approve_for_auto=True,
+        )
 
 
 def test_route_commit_rolls_back_asset_when_profile_replace_fails(
@@ -443,13 +563,81 @@ def test_concurrent_route_imports_commit_without_temp_collision(tmp_path: Path,
     with ThreadPoolExecutor(max_workers=2) as pool:
         results = list(pool.map(lambda _index: import_route(), range(2)))
 
-    target = managed / "test-yard" / "routes" / "flight_route.json"
     profile = load_site_profile(profile_path)
-    assert all(result.asset_path == target for result in results)
-    assert target.read_bytes() == route.read_bytes()
-    assert profile.route_json == target
-    assert profile.asset_sha256.route_json == _sha(target)
+    targets = {result.asset_path for result in results}
+    assert len(targets) == 2
+    assert all(target.read_bytes() == route.read_bytes() for target in targets)
+    assert profile.route_json in targets
+    assert profile.asset_sha256.route_json == _sha(profile.route_json)
     assert not [path for path in managed.rglob("*") if ".tmp" in path.name]
+
+
+def test_adding_route_preserves_existing_route_files(
+    tmp_path: Path,
+) -> None:
+    package = _write_site_package(tmp_path)
+    managed = tmp_path / "managed"
+    site_provider = LocalSitePackageProvider(
+        managed,
+        bundle_inspector=lambda _path: ("ref-a.jpg",),
+        edm_profile_loader=_profile_loader,
+    )
+    profile_path = site_provider.import_folder(package).profile_path
+    site_root = profile_path.parent
+    draft = site_root / "route_drafts" / "route_old.json"
+    authored = site_root / "routes" / "authored" / "route_old.json"
+    draft.parent.mkdir(parents=True)
+    authored.parent.mkdir(parents=True)
+    draft.write_text("{}", encoding="utf-8")
+    authored.write_text("{}", encoding="utf-8")
+    route = _write_valid_route(tmp_path / "latest_route.json")
+
+    imported = LocalRouteProvider(managed).import_file(route, profile_path)
+
+    assert imported.asset_path.name.startswith("flight_route_")
+    assert imported.asset_path.is_file()
+    assert draft.exists()
+    assert authored.exists()
+
+
+def test_editing_route_replaces_only_the_selected_route(tmp_path: Path) -> None:
+    package = _write_site_package(tmp_path)
+    managed = tmp_path / "managed"
+    profile_path = LocalSitePackageProvider(
+        managed,
+        bundle_inspector=lambda _path: ("ref-a.jpg",),
+        edm_profile_loader=_profile_loader,
+    ).import_folder(package).profile_path
+    provider = LocalRouteProvider(managed)
+    first = provider.import_file(_write_valid_route(tmp_path / "first.json"), profile_path)
+    second_source = _write_valid_route(tmp_path / "second.json")
+    second_payload = json.loads(second_source.read_text(encoding="utf-8"))
+    second_payload["waypoints"] = [[0, 0, 0], [2, 0, 0]]
+    second_source.write_text(json.dumps(second_payload), encoding="utf-8")
+    second = provider.import_file(second_source, profile_path)
+    first_before = first.asset_path.read_bytes()
+
+    edited_source = _write_valid_route(tmp_path / "edited.json")
+    edited_payload = json.loads(edited_source.read_text(encoding="utf-8"))
+    edited_payload["waypoints"] = [[0, 0, 0], [3, 0, 0]]
+    edited_payload["source"] = "operator_route_editor"
+    edited_source.write_text(json.dumps(edited_payload), encoding="utf-8")
+    edited = provider.import_file(
+        edited_source,
+        profile_path,
+        approve_for_auto=True,
+        replace_route=second.asset_path,
+    )
+
+    profile = load_site_profile(profile_path)
+    assert edited.asset_path == second.asset_path
+    assert first.asset_path.read_bytes() == first_before
+    assert len(list((profile_path.parent / "routes").glob("*.json"))) == 2
+    assert profile.route_json == second.asset_path
+    assert json.loads(second.asset_path.read_text(encoding="utf-8"))["waypoints"] == [
+        [0, 0, 0],
+        [3, 0, 0],
+    ]
 
 
 def test_concurrent_site_package_imports_have_one_winner(tmp_path: Path,
@@ -533,7 +721,8 @@ def test_route_import_resolves_system_profile_to_its_managed_site(
     imported = LocalRouteProvider(managed).import_file(route, system_profile_path)
 
     assert imported.profile_path == managed_profile_path
-    assert imported.asset_path == site_folder / "routes" / "flight_route.json"
+    assert imported.asset_path.parent == site_folder / "routes"
+    assert imported.asset_path.name.startswith("flight_route_")
     updated = load_site_profile(managed_profile_path)
     assert updated.route_json == imported.asset_path
     assert updated.asset_sha256.route_json == _sha(imported.asset_path)

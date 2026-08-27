@@ -55,7 +55,7 @@ def test_route_document_writes_the_validated_site_bound_contract(tmp_path) -> No
     assert payload["purpose"] == "flight"
     assert payload["closed"] is False
     assert payload["waypoints"] == document.points
-    assert "unapproved" in payload["note"]
+    assert "site profile" in payload["note"]
 
 
 def test_ply_only_draft_is_explicitly_unbound_and_not_a_flight_route(tmp_path) -> None:
@@ -73,6 +73,47 @@ def test_ply_only_draft_is_explicitly_unbound_and_not_a_flight_route(tmp_path) -
     assert payload["coordinate_frame_id"] is None
     assert payload["purpose"] == "preview_only"
     assert "cannot be imported" in payload["note"]
+
+
+def test_successful_route_save_approves_and_closes_the_finished_editor(tmp_path) -> None:
+    import route_editor_window as rew
+
+    saved = tmp_path / "flight_route.json"
+    status = []
+    closed = []
+    imported_payloads = []
+
+    def import_route(path):
+        imported_payloads.append(json.loads(path.read_text(encoding="utf-8")))
+        return SimpleNamespace(
+            message="航線已核准供自動巡航使用",
+            asset_path=saved,
+        )
+
+    editor = SimpleNamespace(
+        _preview_only=False,
+        controller=SimpleNamespace(
+            moving=False,
+            points=[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
+        ),
+        document=RouteDocument(site_id="yard", coordinate_frame_id="yard-map-v1"),
+        arrive_radius_var=SimpleNamespace(get=lambda: 0.025),
+        route_deviation_var=SimpleNamespace(get=lambda: 0.06),
+        import_route=import_route,
+        profile=SimpleNamespace(route_json=saved),
+        _signature=lambda: ("saved",),
+        status_var=SimpleNamespace(set=status.append),
+        close_editor=lambda *, force=False: closed.append(force),
+    )
+    editor._update_document = lambda: rew.RouteEditorWindow._update_document(editor)
+
+    result = rew.RouteEditorWindow.save_route(editor)
+
+    assert result == saved
+    assert imported_payloads[0]["arrive_radius_map_units"] == pytest.approx(0.025)
+    assert imported_payloads[0]["max_route_deviation_map_units"] == pytest.approx(0.06)
+    assert "SHA 已同步" in status[-1]
+    assert closed == [True]
 
 
 def test_route_document_loads_raw_glomap_into_editor_z_up(tmp_path) -> None:
@@ -208,6 +249,7 @@ def test_saved_route_declares_which_alignment_produced_it(tmp_path):
     document.points = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]]
     document.align_source = "measured"
     document.arrive_radius_map_units = 0.3
+    document.max_route_deviation_map_units = 0.08
 
     saved = document.save(tmp_path / "flight_path.json")
     payload = json.loads(saved.read_text(encoding="utf-8"))
@@ -215,6 +257,240 @@ def test_saved_route_declares_which_alignment_produced_it(tmp_path):
     assert payload["frame"] == "aligned"
     assert payload["align_source"] == "measured"
     assert payload["arrive_radius_map_units"] == 0.3
+    assert payload["max_route_deviation_map_units"] == 0.08
+
+
+def test_editor_route_limits_round_trip_together(tmp_path):
+    source = tmp_path / "route.json"
+    source.write_text(
+        json.dumps(
+            {
+                "site_id": "yard",
+                "coordinate_frame_id": "yard-map-v1",
+                "frame": "aligned",
+                "closed": False,
+                "waypoints": [[0, 0, 0], [1, 0, 0]],
+                "arrive_radius_map_units": 0.02,
+                "max_route_deviation_map_units": 0.07,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    document = RouteDocument.load(
+        source,
+        site_id="yard",
+        coordinate_frame_id="yard-map-v1",
+    )
+
+    assert document.arrive_radius_map_units == pytest.approx(0.02)
+    assert document.max_route_deviation_map_units == pytest.approx(0.07)
+
+
+def test_save_preview_persists_both_dragged_route_limits(tmp_path):
+    import route_editor_window as rew
+
+    target = tmp_path / "route_preview.json"
+    document = RouteDocument(site_id="yard", coordinate_frame_id="yard-map-v1")
+    points = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]]
+    editor = SimpleNamespace(
+        controller=SimpleNamespace(moving=False, points=points),
+        _choose_preview_path=lambda: target,
+        document=document,
+        arrive_radius_var=SimpleNamespace(get=lambda: 0.025),
+        route_deviation_var=SimpleNamespace(get=lambda: 0.06),
+        _preview_only=True,
+        _signature=lambda: ("saved",),
+        status_var=SimpleNamespace(set=lambda _message: None),
+    )
+    editor._update_document = lambda: rew.RouteEditorWindow._update_document(editor)
+
+    rew.RouteEditorWindow.save_route(editor)
+    payload = json.loads(target.read_text(encoding="utf-8"))
+
+    assert payload["purpose"] == "preview_only"
+    assert payload["arrive_radius_map_units"] == pytest.approx(0.025)
+    assert payload["max_route_deviation_map_units"] == pytest.approx(0.06)
+
+
+def test_bound_save_stages_before_atomic_route_import(tmp_path):
+    import route_editor_window as rew
+
+    target = tmp_path / "current_route.json"
+    RouteDocument(
+        site_id="yard",
+        coordinate_frame_id="yard-map-v1",
+        points=[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
+    ).save(target)
+    document = RouteDocument.load(
+        target,
+        site_id="yard",
+        coordinate_frame_id="yard-map-v1",
+    )
+    replacement = [[0.0, 0.0, 0.0], [2.0, 1.0, 0.5]]
+    imported = []
+
+    def import_route(path):
+        imported.append(json.loads(path.read_text(encoding="utf-8")))
+        current = json.loads(target.read_text(encoding="utf-8"))
+        assert current["waypoints"] != replacement
+        return SimpleNamespace(message="saved", asset_path=target)
+
+    editor = SimpleNamespace(
+        controller=SimpleNamespace(moving=False, points=replacement),
+        document=document,
+        arrive_radius_var=SimpleNamespace(get=lambda: 0.025),
+        route_deviation_var=SimpleNamespace(get=lambda: 0.06),
+        _preview_only=False,
+        import_route=import_route,
+        profile=SimpleNamespace(route_json=target),
+        _signature=lambda: ("saved",),
+        status_var=SimpleNamespace(set=lambda _message: None),
+        close_editor=lambda *, force=False: None,
+    )
+    editor._update_document = lambda: rew.RouteEditorWindow._update_document(editor)
+
+    saved = rew.RouteEditorWindow.save_route(editor)
+
+    assert saved == target.resolve()
+    assert imported[0]["waypoints"] == replacement
+    assert not (tmp_path / "route_drafts").exists()
+
+
+def test_route_deviation_tube_is_drawn_at_the_dragged_map_radius():
+    import route_editor_window as rew
+
+    assert rew._SAFE_TUBE == (0, 229, 255, 128)
+
+    class View:
+        @staticmethod
+        def project(_points, _width, _height):
+            return np.array([10.0, 110.0]), np.array([20.0, 20.0]), np.zeros(2)
+
+        @staticmethod
+        def scale(_width, _height):
+            return 100.0
+
+    class Draw:
+        def __init__(self):
+            self.lines = []
+
+        def line(self, points, **kwargs):
+            self.lines.append((points, kwargs))
+
+        def ellipse(self, *_args, **_kwargs):
+            return None
+
+        def text(self, *_args, **_kwargs):
+            return None
+
+    draw = Draw()
+    editor = SimpleNamespace(
+        controller=SimpleNamespace(points=[[0, 0, 0], [1, 0, 0]], selected=None),
+        view=View(),
+        show_route_deviation_var=SimpleNamespace(get=lambda: True),
+        route_deviation_var=SimpleNamespace(get=lambda: 0.04),
+        show_arrive_var=SimpleNamespace(get=lambda: False),
+    )
+
+    rew.RouteEditorWindow._draw_route(editor, draw, 800, 600)
+
+    tube = next(kwargs for _points, kwargs in draw.lines if kwargs["fill"] == rew._SAFE_TUBE)
+    assert tube["width"] == 8
+
+
+def test_route_deviation_slider_range_is_zero_to_point_one():
+    import route_editor_window as rew
+
+    assert rew.ROUTE_DEVIATION_MIN_U == pytest.approx(0.0)
+    assert rew.ROUTE_DEVIATION_MAX_U == pytest.approx(0.1)
+    assert rew.DEFAULT_ROUTE_DEVIATION_U == pytest.approx(0.1)
+
+
+def test_dragging_either_limit_turns_on_its_live_visualization():
+    import route_editor_window as rew
+
+    class Variable:
+        def __init__(self, value):
+            self.value = value
+
+        def get(self):
+            return self.value
+
+        def set(self, value):
+            self.value = value
+
+    redraws = []
+    arrive = SimpleNamespace(
+        arrive_radius_var=Variable(0.02),
+        arrive_label_var=Variable(""),
+        show_arrive_var=Variable(False),
+        controller=SimpleNamespace(
+            shortest_leg=lambda: 1.0,
+            spheres_overlap=lambda _radius: False,
+        ),
+        request_redraw=lambda: redraws.append("arrive"),
+    )
+    rew.RouteEditorWindow._on_arrive_radius(arrive, "0.02")
+
+    safe_tube = SimpleNamespace(
+        route_deviation_var=Variable(0.05),
+        arrive_radius_var=Variable(0.02),
+        route_deviation_label_var=Variable(""),
+        show_route_deviation_var=Variable(False),
+        request_redraw=lambda: redraws.append("tube"),
+    )
+    safe_tube._set_route_deviation_label = lambda: (
+        rew.RouteEditorWindow._set_route_deviation_label(safe_tube)
+    )
+    rew.RouteEditorWindow._on_route_deviation(safe_tube, "0.05")
+
+    assert arrive.show_arrive_var.get() is True
+    assert safe_tube.show_route_deviation_var.get() is True
+    assert redraws == ["arrive", "tube"]
+
+
+def test_arrival_sphere_draws_a_scaled_translucent_fill():
+    import route_editor_window as rew
+
+    class View:
+        @staticmethod
+        def project(_points, _width, _height):
+            return np.array([10.0, 110.0]), np.array([20.0, 20.0]), np.zeros(2)
+
+        @staticmethod
+        def scale(_width, _height):
+            return 100.0
+
+    class Draw:
+        def __init__(self):
+            self.ellipses = []
+
+        def line(self, *_args, **_kwargs):
+            return None
+
+        def ellipse(self, bounds, **kwargs):
+            self.ellipses.append((bounds, kwargs))
+
+        def text(self, *_args, **_kwargs):
+            return None
+
+    draw = Draw()
+    editor = SimpleNamespace(
+        controller=SimpleNamespace(points=[[0, 0, 0], [1, 0, 0]], selected=None),
+        view=View(),
+        show_route_deviation_var=SimpleNamespace(get=lambda: False),
+        route_deviation_var=SimpleNamespace(get=lambda: 0.05),
+        show_arrive_var=SimpleNamespace(get=lambda: True),
+        arrive_radius_var=SimpleNamespace(get=lambda: 0.03),
+    )
+
+    rew.RouteEditorWindow._draw_route(editor, draw, 800, 600)
+
+    bounds, style = next(
+        item for item in draw.ellipses if item[1].get("fill") == rew._ARRIVE_FILL
+    )
+    assert bounds == pytest.approx((7.0, 17.0, 13.0, 23.0))
 
 
 def test_overlap_predicate_fires_exactly_at_half_the_shortest_leg():
@@ -511,7 +787,7 @@ def test_site_shortcut_labels_are_the_short_field_name():
     short = sap.SiteAssetsPanel._short_site_name
     assert short("烏來（目標場域）EDM v1 — 2026-07-19 驗證") == "烏來"
     assert short("河濱場域 EDM") == "河濱場域"
-    assert short("足球場 EDM") == "足球場"
+    assert short("測試場域 EDM") == "測試場域"
     # No separator: keep it whole rather than truncating arbitrarily.
     assert short("Alpha") == "Alpha"
 
@@ -667,9 +943,7 @@ def test_describe_site_routes_marks_display_only_and_legacy_routes(tmp_path):
     assert "2 點" in by_name["flight.json"].label
 
 
-def test_route_choice_candidates_dedupe_content_and_keep_canonical_name(tmp_path):
-    import site_assets_panel as sap
-
+def test_route_choice_candidates_keep_distinct_formal_route_files(tmp_path):
     canonical = _write_route(tmp_path / "routes" / "flight_route.json")
     duplicate = _write_route(
         tmp_path / "routes" / "authored" / "route_20260807_013944.json"
@@ -679,13 +953,10 @@ def test_route_choice_candidates_dedupe_content_and_keep_canonical_name(tmp_path
         waypoints=[[0.0, 0.0, 0.0], [2.0, 0.0, 0.0]],
     )
 
-    choices = sap.SiteAssetsPanel._dedupe_route_choices(
-        list(reversed(lsa.describe_site_routes(tmp_path)))
-    )
+    choices = lsa.describe_site_routes(tmp_path)
 
     assert duplicate.read_bytes() == canonical.read_bytes()
-    assert [item.path for item in choices] == [canonical, other]
-    assert choices[0].label.startswith("flight_route.json")
+    assert {item.path for item in choices} == {canonical, duplicate, other}
 
 
 def test_existing_route_selection_is_refused_until_landed(tmp_path):
@@ -843,12 +1114,12 @@ def test_site_switch_hides_the_site_that_is_already_loaded(tmp_path):
     import site_assets_panel as sap
 
     active = tmp_path / "river_site"
-    other = tmp_path / "football_field"
+    other = tmp_path / "test_field"
     active.mkdir()
     other.mkdir()
     listed = [
         SimpleNamespace(folder=active, display_name="河濱場域 EDM"),
-        SimpleNamespace(folder=other, display_name="足球場 EDM"),
+        SimpleNamespace(folder=other, display_name="測試場域 EDM"),
     ]
     panel = SimpleNamespace(
         site_pack_root=active,
@@ -940,11 +1211,11 @@ def test_arrival_radius_slider_matches_the_operator_range():
 def test_a_site_and_its_imported_copy_are_listed_once(tmp_path):
     """Importing copies a package to managed_root/<site_id>, and managed_root is
     the sites directory -- so both live here and describe the same field."""
-    for name in ("football_field", "football_field_edm"):
+    for name in ("test_field", "test_field_edm"):
         folder = tmp_path / name
         folder.mkdir()
         (folder / "site_profile.json").write_text(
-            json.dumps({"site_id": "football_field_edm", "display_name": "足球場 EDM"}),
+            json.dumps({"site_id": "test_field_edm", "display_name": "測試場域 EDM"}),
             encoding="utf-8")
 
     packages = lsa.list_site_packages(tmp_path)
@@ -954,7 +1225,7 @@ def test_a_site_and_its_imported_copy_are_listed_once(tmp_path):
     # its bundle at localization/localization_bundle.pt, which carries no trusted
     # digest, so validate_folder refuses it. Listing it gave the operator a button
     # that could not import.
-    assert packages[0].folder.name == "football_field"
+    assert packages[0].folder.name == "test_field"
 
 
 def test_two_genuinely_different_sites_are_both_listed(tmp_path):
@@ -987,9 +1258,9 @@ def test_the_panel_keeps_a_standing_route_entry_point():
     import site_assets_panel as sap
 
     source = _inspect.getsource(sap.SiteAssetsPanel._build_site_shortcuts)
-    assert "編輯目前航線" in source, "no way back to an existing route"
+    assert "編輯路線" in source, "no way back to an existing route"
     assert "_open_route_editor(True)" in source, "the entry must open in EDIT mode"
-    assert "畫新航線" in source
+    assert "新增路線" in source
 
 
 def test_site_routes_are_listed_newest_first(tmp_path):
@@ -1011,7 +1282,7 @@ def test_site_routes_are_listed_newest_first(tmp_path):
 
     routes = lsa.list_site_routes(tmp_path)
 
-    assert [path.name for path in routes] == [new.name, old.name]
+    assert [path.name for path in routes] == [old.name]
     assert all(path.name != "site_profile.json" for path in routes)
 
 

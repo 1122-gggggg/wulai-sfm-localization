@@ -3,9 +3,24 @@
 from __future__ import annotations
 
 import math
+import time
 from collections.abc import Mapping
 from numbers import Real
 from typing import Any
+
+
+CUDA_SAMPLE_MIN_INTERVAL_S = 1.0
+
+RESTART_REASONS = (
+    "stall",
+    "worker_exit",
+    "response_desync",
+    "startup",
+    "oom",
+    "fatal",
+    "circuit_open",
+)
+CIRCUIT_BREAKER_STATES = ("closed", "open")
 
 
 RESULT_FIELDS = (
@@ -116,6 +131,19 @@ RESULT_FIELDS = (
     "benchmark_prior_ref",
     "benchmark_setup_ms",
     "benchmark_seeded",
+    "restart_reason",
+    "outage_duration_s",
+    "rejected_submits",
+    "ready_latency_ms",
+    "first_result_latency_ms",
+    "circuit_breaker_state",
+    "oom_transition",
+    "cuda_allocated_bytes",
+    "cuda_reserved_bytes",
+    "cuda_peak_allocated_bytes",
+    "edm_cache_hits",
+    "edm_cache_misses",
+    "edm_cache_evictions",
 )
 
 
@@ -157,3 +185,150 @@ def build_localization_metric_record(
         }
     )
     return _json_safe(record)
+
+
+def _optional_nonneg_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        number = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if number < 0:
+        return None
+    return number
+
+
+def _cuda_sample_now(now_mono: float | None) -> float:
+    now = time.monotonic() if now_mono is None else float(now_mono)
+    if not math.isfinite(now):
+        raise ValueError(f"invalid CUDA sample timestamp: {now_mono!r}")
+    return now
+
+
+def _cuda_sample_interval(min_interval_s: Any) -> float:
+    try:
+        interval = float(min_interval_s)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"invalid CUDA sample interval: {min_interval_s!r}") from exc
+    if not math.isfinite(interval) or interval < 0.0:
+        raise ValueError(f"invalid CUDA sample interval: {min_interval_s!r}")
+    return interval
+
+
+def _cuda_previous_sample(
+    now: float,
+    last_sample_mono: float | None,
+    interval: float,
+) -> float | None:
+    """Return the previous stamp when the sampling interval has not elapsed."""
+    if last_sample_mono is None:
+        return None
+    try:
+        previous = float(last_sample_mono)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"invalid CUDA last-sample timestamp: {last_sample_mono!r}") from exc
+    if not math.isfinite(previous):
+        raise ValueError(f"invalid CUDA last-sample timestamp: {last_sample_mono!r}")
+    if now - previous < interval:
+        return previous
+    return None
+
+
+def _cuda_available(cuda: Any) -> bool:
+    if cuda is None:
+        return False
+    is_available = getattr(cuda, "is_available", None)
+    if not callable(is_available):
+        return True
+    try:
+        return bool(is_available())
+    except Exception:
+        return False
+
+
+def _cuda_memory_counters(cuda: Any) -> dict[str, int] | None:
+    try:
+        allocated = int(cuda.memory_allocated())
+        reserved = int(cuda.memory_reserved())
+        peak = int(cuda.max_memory_allocated())
+    except (AttributeError, TypeError, ValueError, OverflowError):
+        return None
+    if allocated < 0 or reserved < 0 or peak < 0:
+        return None
+    return {
+        "cuda_allocated_bytes": allocated,
+        "cuda_reserved_bytes": reserved,
+        "cuda_peak_allocated_bytes": peak,
+    }
+
+
+def sample_cuda_memory_stats(
+    cuda: Any,
+    *,
+    now_mono: float | None = None,
+    last_sample_mono: float | None = None,
+    min_interval_s: float = CUDA_SAMPLE_MIN_INTERVAL_S,
+) -> tuple[dict[str, int] | None, float]:
+    """Sample process CUDA counters without nvidia-smi or device synchronize."""
+    now = _cuda_sample_now(now_mono)
+    interval = _cuda_sample_interval(min_interval_s)
+    previous = _cuda_previous_sample(now, last_sample_mono, interval)
+    if previous is not None:
+        return None, previous
+    if not _cuda_available(cuda):
+        return None, now
+    return _cuda_memory_counters(cuda), now
+
+
+def edm_cache_metric_fields(stats: Mapping[str, Any] | None) -> dict[str, int]:
+    if not stats:
+        return {}
+    fields = {}
+    hits = _optional_nonneg_int(stats.get("hits"))
+    misses = _optional_nonneg_int(stats.get("misses"))
+    evictions = _optional_nonneg_int(stats.get("evictions"))
+    if hits is not None:
+        fields["edm_cache_hits"] = hits
+    if misses is not None:
+        fields["edm_cache_misses"] = misses
+    if evictions is not None:
+        fields["edm_cache_evictions"] = evictions
+    return fields
+
+
+def _fused_telemetry_mono_s(telemetry_ns: Any) -> float | None:
+    """Convert a backend poll stamp to seconds. Never use the image capture stamp."""
+    if telemetry_ns is None:
+        return None
+    try:
+        fused_mono = int(telemetry_ns) / 1_000_000_000.0
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if math.isfinite(fused_mono) and fused_mono > 0.0:
+        return fused_mono
+    return None
+
+
+def attach_fused_localization_telemetry(
+    timing: dict[str, Any],
+    state: Any,
+) -> None:
+    """Copy fused IMU/velocity and its independent acquisition stamp."""
+    if state is None:
+        return
+    timing.update(
+        {
+            "fused_roll": getattr(state, "att_roll", None),
+            "fused_pitch": getattr(state, "att_pitch", None),
+            "fused_yaw": getattr(state, "att_yaw", None),
+            "fused_speed_north": getattr(state, "speed_north_mps", None),
+            "fused_speed_east": getattr(state, "speed_east_mps", None),
+            "fused_speed_down": getattr(state, "speed_down_mps", None),
+        }
+    )
+    fused_mono = _fused_telemetry_mono_s(
+        getattr(state, "telemetry_read_mono_ns", None),
+    )
+    if fused_mono is not None:
+        timing["fused_telemetry_mono"] = fused_mono

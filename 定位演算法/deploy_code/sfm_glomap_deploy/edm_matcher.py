@@ -349,7 +349,92 @@ def _checkpoint_sha256_for_load(
 #
 # Set SFM_EDM_REF_FEATURE_CACHE=0 to disable, or to another size to retune.
 # ---------------------------------------------------------------------------
-DEFAULT_REF_FEATURE_CACHE = 16
+DEFAULT_REF_FEATURE_CACHE = 32
+DEFAULT_TEMPORAL_FEATURE_CACHE = 0
+RUNTIME_SIGMA_MODES = ("bidirectional", "reference_grid")
+FEATURE_CACHE_KINDS = ("map", "temporal")
+MAX_MATCHER_CACHE_BYTES = 8 * 1024 ** 3
+# Conservative vs the measured 8.16 MiB fp16 feature blob per reference.
+FEATURE_CACHE_BYTES_PER_ENTRY = 9 * 1024 * 1024
+TENSOR_CACHE_BYTES_PER_ENTRY = EDM_W * EDM_H * 4
+
+
+def _non_negative_int(name: str, value) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"{name} must be a non-negative integer")
+    return value
+
+
+def _validate_matcher_cache_budget(
+    *,
+    map_feature_entries: int,
+    temporal_feature_entries: int,
+    map_tensor_entries: int,
+    temporal_tensor_entries: int,
+) -> None:
+    total = (
+        (map_feature_entries + temporal_feature_entries) * FEATURE_CACHE_BYTES_PER_ENTRY
+        + (map_tensor_entries + temporal_tensor_entries) * TENSOR_CACHE_BYTES_PER_ENTRY
+    )
+    if total > MAX_MATCHER_CACHE_BYTES:
+        raise ValueError("EDM matcher cache exceeds the 8 GiB bound")
+
+
+def select_reference_grid_matches(fine, data) -> None:
+    """Keep direction-01 (reference on its coarse cell) and apply confidence filters.
+
+    Map-build keeps the upstream bidirectional sigma winner. Runtime lookup can
+    only consume reference-grid anchors, so a higher direction-10 sigma must not
+    discard a usable direction-01 correspondence.
+    """
+    offset = data["pred_coord"] * fine.local_resolution
+    clamped = torch.clamp(
+        offset, -fine.local_resolution / 2, fine.local_resolution / 2
+    )
+    if fine.bi_directional_refine:
+        fine_offset01, _fine_offset10 = clamped.chunk(2)
+        pred_score01, _pred_score10 = data["pred_score"].chunk(2)
+    else:
+        fine_offset01 = clamped
+        pred_score01 = data["pred_score"]
+
+    h0, w0 = data["hw0_i"]
+    h1, w1 = data["hw1_i"]
+    scale0 = data["scale0"][data["b_ids"]] if "scale0" in data else 1.0
+    scale1 = data["scale1"][data["b_ids"]] if "scale1" in data else 1.0
+    scale0_w = scale0[:, 0] if "scale0" in data else 1.0
+    scale0_h = scale0[:, 1] if "scale0" in data else 1.0
+    scale1_w = scale1[:, 0] if "scale1" in data else 1.0
+    scale1_h = scale1[:, 1] if "scale1" in data else 1.0
+
+    mkpts0_f = data["mkpts0_c"]
+    mkpts1_f = data["mkpts1_c"] + fine_offset01 * scale1
+    mconf = data["mconf"]
+    mask = (
+        torch.isfinite(mconf)
+        & (mconf > fine.mconf_thr)
+        & torch.isfinite(pred_score01)
+        & (pred_score01 > fine.sigma_thr)
+        & torch.isfinite(mkpts0_f).all(dim=1)
+        & torch.isfinite(mkpts1_f).all(dim=1)
+        & (mkpts0_f[:, 0] >= fine.border_rm)
+        & (mkpts0_f[:, 0] <= w0 * scale0_w - fine.border_rm)
+        & (mkpts0_f[:, 1] >= fine.border_rm)
+        & (mkpts0_f[:, 1] <= h0 * scale0_h - fine.border_rm)
+        & (mkpts1_f[:, 0] >= fine.border_rm)
+        & (mkpts1_f[:, 0] <= w1 * scale1_w - fine.border_rm)
+        & (mkpts1_f[:, 1] >= fine.border_rm)
+        & (mkpts1_f[:, 1] <= h1 * scale1_h - fine.border_rm)
+    )
+    data.update(
+        {
+            "m_bids": data["b_ids"][mask],
+            "mkpts0_f": mkpts0_f[mask],
+            "mkpts1_f": mkpts1_f[mask],
+            "mconf": mconf[mask],
+        }
+    )
+
 
 
 class EDMMatcher:
@@ -361,7 +446,9 @@ class EDMMatcher:
                  device: str = "cuda", fp16: bool = True,
                  reference_cache_size: int = 32,
                  ckpt_sha256: str | None = None,
-                 reference_feature_cache_size: int | None = None):
+                 reference_feature_cache_size: int | None = None,
+                 temporal_feature_cache_size: int = DEFAULT_TEMPORAL_FEATURE_CACHE,
+                 runtime_sigma_mode: str = "bidirectional"):
         # fp16 autocast + channels_last: 1.6x faster with byte-identical match counts on
         # this site (tests/bench_edm_speed.py: 3085 matches/ref either way). On by default
         # because EDM pays a full forward per reference and that cost is the whole budget.
@@ -386,18 +473,49 @@ class EDMMatcher:
         self._reference_tensor_cache: OrderedDict[
             int, tuple[object, torch.Tensor]
         ] = OrderedDict()
-        self.reference_feature_cache_size = (
+        if runtime_sigma_mode not in RUNTIME_SIGMA_MODES:
+            raise ValueError(
+                "runtime_sigma_mode must be 'bidirectional' or 'reference_grid'"
+            )
+        self.runtime_sigma_mode = runtime_sigma_mode
+        resolved_feature_cache = (
             _env_int("SFM_EDM_REF_FEATURE_CACHE", DEFAULT_REF_FEATURE_CACHE)
             if reference_feature_cache_size is None
-            else max(0, int(reference_feature_cache_size))
+            else reference_feature_cache_size
         )
-        self._reference_feature_cache: OrderedDict[
-            int, tuple[object, tuple]
+        self.reference_feature_cache_size = _non_negative_int(
+            "reference_feature_cache_size", resolved_feature_cache
+        )
+        self.temporal_feature_cache_size = _non_negative_int(
+            "temporal_feature_cache_size", temporal_feature_cache_size
+        )
+        _validate_matcher_cache_budget(
+            map_feature_entries=self.reference_feature_cache_size,
+            temporal_feature_entries=self.temporal_feature_cache_size,
+            map_tensor_entries=self.reference_cache_size,
+            temporal_tensor_entries=self.temporal_feature_cache_size,
+        )
+        self._feature_caches: dict[str, OrderedDict] = {
+            "map": OrderedDict(),
+            "temporal": OrderedDict(),
+        }
+        self._feature_cache_capacity = {
+            "map": self.reference_feature_cache_size,
+            "temporal": self.temporal_feature_cache_size,
+        }
+        self._feature_cache_stats = {
+            "map": {"hits": 0, "misses": 0, "evictions": 0},
+            "temporal": {"hits": 0, "misses": 0, "evictions": 0},
+        }
+        # Alias preserved for the existing map-cache unit tests.
+        self._reference_feature_cache = self._feature_caches["map"]
+        self._temporal_tensor_cache: OrderedDict[
+            int, tuple[object, torch.Tensor]
         ] = OrderedDict()
-        self._feature_cache_stats = {"hits": 0, "misses": 0, "evictions": 0}
         # Set only while a match_many_to_one forward is in flight; it tells the
         # patched backbone which rows of its input are cacheable references.
         self._backbone_plan: list | None = None
+        self._sigma_plan: str | None = None
 
         self.fp16 = fp16 and device.startswith("cuda")
         model = EDM(config=lower_config(cfg)["edm"])
@@ -412,12 +530,16 @@ class EDMMatcher:
         self.model = model
         self.fused_coarse = _FUSED_COARSE_STATE["reason"]
         self._install_reference_feature_cache()
+        self._install_runtime_sigma_selection()
         self.warmup_fused_coarse()
 
     # ---------- reference backbone cache ----------
     def _install_reference_feature_cache(self) -> None:
         """Patch this model's backbone only; other matchers keep the plain one."""
-        if self.reference_feature_cache_size <= 0:
+        if (
+            self.reference_feature_cache_size <= 0
+            and self.temporal_feature_cache_size <= 0
+        ):
             return
         backbone = self.model.backbone
         original = backbone.forward
@@ -431,6 +553,22 @@ class EDMMatcher:
             return self._backbone_from_cache(original, x, plan)
 
         backbone.forward = cached_forward
+
+    def _install_runtime_sigma_selection(self) -> None:
+        """Runtime-only: prefer direction-01. Map-build match() keeps upstream sigma."""
+        if self.runtime_sigma_mode != "reference_grid":
+            return
+        fine = self.model.fine_matching
+        original = fine.final_matching_selection
+
+        def runtime_selection(data):
+            if self._sigma_plan == "reference_grid":
+                select_reference_grid_matches(fine, data)
+                return
+            return original(data)
+
+        fine.final_matching_selection = runtime_selection
+
 
     @staticmethod
     def _own_row(level: torch.Tensor, index: int) -> torch.Tensor:
@@ -447,33 +585,45 @@ class EDMMatcher:
             return stacked.contiguous(memory_format=torch.channels_last)
         return stacked
 
-    def _store_reference_features(self, source, features: tuple) -> None:
-        cache = self._reference_feature_cache
+    def _store_reference_features(self, source, features: tuple, kind: str = "map") -> None:
+        capacity = self._feature_cache_capacity[kind]
+        stats = self._feature_cache_stats[kind]
+        if capacity <= 0:
+            return
+        cache = self._feature_caches[kind]
         key = id(source)
         cache[key] = (source, features)
         cache.move_to_end(key)
-        while len(cache) > self.reference_feature_cache_size:
+        while len(cache) > capacity:
             cache.popitem(last=False)
-            self._feature_cache_stats["evictions"] += 1
+            stats["evictions"] += 1
 
     def _extract_one(self, original, image: torch.Tensor) -> tuple:
         """Always a batch of one, so an image's features never depend on what it
         was extracted alongside -- see the note above about output purity."""
         return tuple(self._own_row(level, 0) for level in original(image))
 
+    def _plan_source(self, item) -> tuple[object, str]:
+        if isinstance(item, tuple) and len(item) == 2 and item[1] in FEATURE_CACHE_KINDS:
+            return item[0], item[1]
+        return item, "map"
+
     def _backbone_from_cache(self, original, x: torch.Tensor, sources: list):
         b = len(sources)
         per_reference: list = []
-        for index, source in enumerate(sources):
-            entry = self._reference_feature_cache.get(id(source))
+        for index, item in enumerate(sources):
+            source, kind = self._plan_source(item)
+            cache = self._feature_caches[kind]
+            stats = self._feature_cache_stats[kind]
+            entry = cache.get(id(source))
             if entry is not None and entry[0] is source:
-                self._reference_feature_cache.move_to_end(id(source))
-                self._feature_cache_stats["hits"] += 1
+                cache.move_to_end(id(source))
+                stats["hits"] += 1
                 per_reference.append(entry[1])
                 continue
-            self._feature_cache_stats["misses"] += 1
+            stats["misses"] += 1
             features = self._extract_one(original, x[index:index + 1])
-            self._store_reference_features(source, features)
+            self._store_reference_features(source, features, kind)
             per_reference.append(features)
         query = self._extract_one(original, x[b:b + 1])
 
@@ -486,12 +636,25 @@ class EDMMatcher:
         )
 
     def reference_feature_cache_stats(self) -> dict:
-        """Hit accounting for replay telemetry; counters are cumulative."""
+        """Hit accounting for replay telemetry; counters are cumulative map-cache."""
+        map_stats = self._feature_cache_stats["map"]
         return {
-            **self._feature_cache_stats,
-            "size": len(self._reference_feature_cache),
+            **map_stats,
+            "size": len(self._feature_caches["map"]),
             "capacity": self.reference_feature_cache_size,
         }
+
+    def feature_cache_stats_by_class(self) -> dict:
+        """Per-class LRU telemetry for map vs transient temporal features."""
+        return {
+            kind: {
+                **self._feature_cache_stats[kind],
+                "size": len(self._feature_caches[kind]),
+                "capacity": self._feature_cache_capacity[kind],
+            }
+            for kind in FEATURE_CACHE_KINDS
+        }
+
 
     def warmup_fused_coarse(self, batch_sizes: tuple | list | None = None) -> None:
         """Compile the fused tail now, not on the operator's first frame.
@@ -547,20 +710,29 @@ class EDMMatcher:
     def to_tensor(self, gray: np.ndarray) -> torch.Tensor:
         return torch.from_numpy(gray)[None][None].to(self.device).float() / 255.0
 
-    def reference_tensor(self, source) -> torch.Tensor:
-        """Return a cached device tensor for an immutable map reference image."""
+    def reference_tensor(self, source, kind: str = "map") -> torch.Tensor:
+        """Return a cached device tensor for an immutable map or transient image."""
+        if kind not in FEATURE_CACHE_KINDS:
+            raise ValueError(f"unsupported EDM cache kind: {kind!r}")
+        cache = (
+            self._temporal_tensor_cache if kind == "temporal" else self._reference_tensor_cache
+        )
+        capacity = (
+            self.temporal_feature_cache_size if kind == "temporal" else self.reference_cache_size
+        )
         key = id(source)
-        cached = self._reference_tensor_cache.get(key)
+        cached = cache.get(key)
         if cached is not None and cached[0] is source:
-            self._reference_tensor_cache.move_to_end(key)
+            cache.move_to_end(key)
             return cached[1]
         tensor = self.to_tensor(self.load_gray(source))
-        if self.reference_cache_size > 0:
-            self._reference_tensor_cache[key] = (source, tensor)
-            self._reference_tensor_cache.move_to_end(key)
-            while len(self._reference_tensor_cache) > self.reference_cache_size:
-                self._reference_tensor_cache.popitem(last=False)
+        if capacity > 0:
+            cache[key] = (source, tensor)
+            cache.move_to_end(key)
+            while len(cache) > capacity:
+                cache.popitem(last=False)
         return tensor
+
 
     # ---------- cells ----------
     @staticmethod
@@ -622,27 +794,43 @@ class EDMMatcher:
                 for i in range(b)]
 
     @torch.no_grad()
-    def match_many_to_one(self, imgs0: list, img1) -> list[dict]:
+    def match_many_to_one(self, imgs0: list, img1, source_kinds: list[str] | None = None) -> list[dict]:
         """K references (image0, batched) vs ONE query (image1, tiled). The localizer path."""
         b = len(imgs0)
         if b == 0:
             return []
-        references = [self.reference_tensor(source) for source in imgs0]
+        if source_kinds is None:
+            kinds = ["map"] * b
+        else:
+            if len(source_kinds) != b:
+                raise ValueError("source_kinds must match the reference count")
+            kinds = list(source_kinds)
+            unknown = sorted({kind for kind in kinds if kind not in FEATURE_CACHE_KINDS})
+            if unknown:
+                raise ValueError(f"unsupported EDM cache kind: {unknown[0]!r}")
+        references = [
+            self.reference_tensor(source, kind) for source, kind in zip(imgs0, kinds)
+        ]
         t0 = references[0] if b == 1 else torch.cat(references, dim=0)
         t1 = self.to_tensor(self.load_gray(img1)).repeat(b, 1, 1, 1)
         batch = {"image0": t0, "image1": t1}
-        self._backbone_plan = list(imgs0)
+        self._backbone_plan = list(zip(imgs0, kinds))
+        self._sigma_plan = (
+            "reference_grid" if self.runtime_sigma_mode == "reference_grid" else None
+        )
         try:
             with self._autocast():
                 self.model(batch)
         finally:
             self._backbone_plan = None
+            self._sigma_plan = None
         bids = batch["m_bids"].cpu().numpy()
         k0 = batch["mkpts0_f"].cpu().numpy()
         k1 = batch["mkpts1_f"].cpu().numpy()
         mc = batch["mconf"].cpu().numpy()
         return [{"mkpts0": k0[bids == i], "mkpts1": k1[bids == i], "mconf": mc[bids == i]}
                 for i in range(b)]
+
 
 
 if __name__ == "__main__":

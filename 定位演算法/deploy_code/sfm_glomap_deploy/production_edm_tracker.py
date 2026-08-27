@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Production EDM tracker: the state machine of ProductionXFeatTracker, EDM local matching.
 
-Same shape as the XFeat tracker (BOOT_INIT / TRACK / WEAK_TRACK / LOST, MegaLoc once at
-BOOT and once per LOST episode, pose-prior + covisibility for tracking), because it keeps
+Same shape as the XFeat tracker (BOOT_INIT / TRACK / WEAK_TRACK / LOST, staged MegaLoc
+at BOOT and per LOST episode, pose-prior + covisibility for tracking), because it keeps
 the per-frame cost down -- and it matters MORE for EDM, not less:
 
   XFeat amortises the map side (descriptors are precomputed, so an extra candidate
@@ -25,7 +25,7 @@ from __future__ import annotations
 import math
 import time
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Sequence
 
 import numpy as np
@@ -33,6 +33,32 @@ import pycolmap
 
 from edm_matcher import GRID_H, GRID_W, EDMMatcher
 from reloc_localizer_edm import Camera, EDMLocalizer, EDMRelocMap
+from reposed_motion_validator import RelativeMotionCheck, cam_from_world_matrix
+from edm_pose_selection import (
+    acquire_consensus_limit,
+    candidate_inliers,
+    _select_acquire_candidate,
+    _select_track_candidate,
+    _strong_centers_disagree,
+)
+
+
+
+GLOBAL_RETRIEVAL_ATTEMPTS = 2
+LOST_GLOBAL_RETRIEVAL_ATTEMPTS = 1
+GLOBAL_RETRIEVAL_RETRY_MULTIPLIER = 2
+LOST_PRIOR_STRATEGIES = ("restrict_nearby", "full_global", "score_fusion")
+ACQUIRE_STAGE_MODES = ("full_set", "initial_topk")
+EDM_OPTIONAL_RUNTIME_TRACKER_KEYS = {
+    "lost_prior_strategy",
+    "lost_prior_fusion_weight",
+    "acquire_stage_mode",
+    "pose_consensus_mode",
+    "consensus_max_rotation_deg",
+    "reference_quality_weight",
+    "reference_quality_floor",
+}
+POSE_CONSENSUS_MODES = ("pairwise", "cluster")
 
 
 _POSITIVE_INTEGER_CONFIG_FIELDS = (
@@ -58,6 +84,7 @@ _POSITIVE_INTEGER_CONFIG_FIELDS = (
 
 _NONNEGATIVE_INTEGER_CONFIG_FIELDS = (
     "lost_local_grace_frames",
+    "lost_global_retrieval_interval",
     "recovery_bank_size",
     "recovery_scan_topk",
     "max_corr_total",
@@ -78,6 +105,8 @@ _POSITIVE_FLOAT_CONFIG_FIELDS = (
     "acquire_max_jump_factor",
     "acquire_max_yaw_diff_deg",
     "lost_prior_max_age_s",
+    "lost_prior_fusion_weight",
+    "consensus_max_rotation_deg",
 )
 
 
@@ -87,11 +116,16 @@ class EDMConfig:
     boot_global_topk: int = 10
     acquire_initial_topk: int = 2
     acquire_min_inliers: int = 80
-    # Run MegaLoc once at BOOT and once on entry to each LOST episode. LOW/WEAK
-    # remains geometry-only and raises only the local EDM candidate count.
+    # BOOT tries MegaLoc at boot_global_topk, then once at twice that count.
+    # Each LOST episode first spends lost_local_grace_frames on nearby EDM;
+    # a still-failed episode fires MegaLoc at lost_local_topk, then only retries
+    # when lost_global_retrieval_interval is positive. LOW/WEAK remains geometry-only.
     global_retrieval_policy: str = "boot_and_lost_once"
     lost_local_topk: int = 5
-    lost_local_grace_frames: int = 12
+    lost_local_grace_frames: int = 2
+    # A zero interval preserves the legacy one-shot LOST retrieval. When set,
+    # retry MegaLoc every interval-th LOST frame after the first grace-window shot.
+    lost_global_retrieval_interval: int = 0
     recovery_bank_size: int = 192
     recovery_scan_topk: int = 2
     # Bound EDM's reference batch so boot_global_topk=10 does not allocate a
@@ -134,6 +168,18 @@ class EDMConfig:
     acquire_max_jump_factor: float = 2.0
     acquire_max_yaw_diff_deg: float = 90.0
     lost_prior_max_age_s: float = 3.0
+    # Default preserves today's nearby restriction. full_global and score_fusion
+    # are measured A/B modes and must be selected explicitly.
+    lost_prior_strategy: str = "restrict_nearby"
+    lost_prior_fusion_weight: float = 1.0
+    # Default evaluates the complete retrieved BOOT/LOST set. initial_topk
+    # stages acquire_initial_topk first, then falls back to the full set.
+    acquire_stage_mode: str = "full_set"
+    # getattr-only pose selection / ranking knobs become profile-owned fields.
+    pose_consensus_mode: str = "pairwise"
+    consensus_max_rotation_deg: float = 90.0
+    reference_quality_weight: float = 0.0
+    reference_quality_floor: float = 0.0
     # EDM emits thousands of correspondences; PnP cost is linear in them and RANSAC
     # gains nothing past a well-spread ~900. Cap spatially so the cap does not bias
     # the pose toward whichever image region happened to match densely.
@@ -146,12 +192,29 @@ class EDMConfig:
     def validate(self) -> None:
         if self.global_retrieval_policy not in {"boot_once", "boot_and_lost_once"}:
             raise ValueError("global_retrieval_policy must be 'boot_once' or 'boot_and_lost_once'")
+        if self.lost_prior_strategy not in LOST_PRIOR_STRATEGIES:
+            raise ValueError(
+                "lost_prior_strategy must be 'restrict_nearby', 'full_global', or 'score_fusion'"
+            )
+        if self.acquire_stage_mode not in ACQUIRE_STAGE_MODES:
+            raise ValueError("acquire_stage_mode must be 'full_set' or 'initial_topk'")
+        if self.pose_consensus_mode not in POSE_CONSENSUS_MODES:
+            raise ValueError("pose_consensus_mode must be 'pairwise' or 'cluster'")
         _validate_integer_config_fields(self)
         if not isinstance(self.use_temporal_reference, bool):
             raise ValueError("use_temporal_reference must be boolean")
         _validate_float_config_fields(self)
         _validate_acquisition_config(self)
         _validate_jump_config(self)
+
+
+def register_optional_runtime_tracker_keys() -> None:
+    from edm_profile import EDM_OPTIONAL_TRACKER_KEYS
+
+    EDM_OPTIONAL_TRACKER_KEYS.update(EDM_OPTIONAL_RUNTIME_TRACKER_KEYS)
+
+
+register_optional_runtime_tracker_keys()
 
 
 def _validate_integer_config_fields(config: EDMConfig) -> None:
@@ -184,6 +247,15 @@ def _validate_acquisition_config(config: EDMConfig) -> None:
         or not 0.0 < float(config.min_inlier_ratio) <= 1.0
     ):
         raise ValueError("min_inlier_ratio must be finite and within (0, 1]")
+    for name in ("reference_quality_weight", "reference_quality_floor"):
+        value = getattr(config, name)
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+            or float(value) < 0.0
+        ):
+            raise ValueError(f"{name} must be finite and >= 0")
     if config.min_inlier_grid_cells > config.corr_grid * config.corr_grid:
         raise ValueError("min_inlier_grid_cells cannot exceed corr_grid squared")
     if config.local_topk > config.weak_local_topk or config.local_topk > config.lost_local_topk:
@@ -224,6 +296,8 @@ class RuntimeState:
     pending_limited_limit: float | None = None
     boot_refs: list[str] = field(default_factory=list)
     global_retrieval_calls: int = 0
+    boot_global_retrieval_attempts: int = 0
+    lost_global_retrieval_attempts: int = 0
     lost_global_retrieval_done: bool = False
     lost_frames: int = 0
     recovery_cursor: int = 0
@@ -256,6 +330,8 @@ class _PoseAttempt:
     metrics: dict
     selected_ref: str | None
     pnp_ms: float
+    reject_reason: str | None = None
+    strong_count: int = 0
 
 
 def _merge_correspondence_rows(rows: list) -> tuple[np.ndarray, np.ndarray, np.ndarray, list]:
@@ -550,7 +626,10 @@ class ProductionEDMTracker:
         cfg: EDMConfig | None = None,
         matcher: EDMMatcher | None = None,
         megaloc=None,
+        megaloc_factory=None,
         reference_index=None,
+        motion_validator=None,
+        motion_validation_mode: str = "off",
     ):
         self.cfg = cfg or EDMConfig()
         self.cfg.validate()
@@ -561,6 +640,7 @@ class ProductionEDMTracker:
             camera,
             matcher=matcher,
             megaloc=megaloc,
+            megaloc_factory=megaloc_factory,
             pnp_max_error=self.cfg.pnp_ransac_max_error,
             reference_index=reference_index,
         )
@@ -583,6 +663,35 @@ class ProductionEDMTracker:
         self.temporal_xyz_by_cell: np.ndarray | None = None
         self._pcam: pycolmap.Camera | None = None
         self._pnp_options: pycolmap.AbsolutePoseEstimationOptions | None = None
+        self.pose_guided = None
+        if motion_validation_mode not in {"off", "shadow", "confirm_limited_jump"}:
+            raise ValueError(
+                "motion_validation_mode must be off, shadow, or confirm_limited_jump"
+            )
+        self.motion_validator = motion_validator
+        self.motion_validation_mode = motion_validation_mode
+        self._last_accepted_bgr: np.ndarray | None = None
+        self._last_accepted_cam_from_world: np.ndarray | None = None
+        count = len(reloc_map.ref_names)
+        self._reference_quality = np.full(count, np.nan, dtype=np.float32)
+        self._reference_stability = np.full(count, np.nan, dtype=np.float32)
+
+
+
+    def attach_pose_guided(self, controller) -> None:
+        self.pose_guided = controller
+
+    def observe_fused_state(self, sample) -> None:
+        controller = getattr(self, "pose_guided", None)
+        if controller is not None:
+            controller.observe_fused(sample)
+
+    def _active_pose_guided(self):
+        controller = getattr(self, "pose_guided", None)
+        if controller is None or not getattr(controller, "enabled", False):
+            return None
+        return controller
+
 
     def _pose_estimation_context(
         self,
@@ -601,15 +710,33 @@ class ProductionEDMTracker:
 
     # ---------- candidate selection ----------
     def _predict_center(self, capture_stamp: float | None = None):
-        if self.st.center is None:
-            return None
-        if self.st.velocity is None or self.st.last_capture_stamp is None or capture_stamp is None:
-            return self.st.center
-        dt = float(capture_stamp) - float(self.st.last_capture_stamp)
-        if not math.isfinite(dt) or dt <= 0.0:
-            return self.st.center
-        dt = min(dt, max(0.0, float(self.cfg.prediction_max_dt)))
-        return self.st.center + self.st.velocity * dt
+        visual = None
+        if self.st.center is not None:
+            visual = self.st.center
+            if (
+                self.st.velocity is not None
+                and self.st.last_capture_stamp is not None
+                and capture_stamp is not None
+            ):
+                dt = float(capture_stamp) - float(self.st.last_capture_stamp)
+                if math.isfinite(dt) and dt > 0.0:
+                    dt = min(dt, max(0.0, float(self.cfg.prediction_max_dt)))
+                    visual = self.st.center + self.st.velocity * dt
+        controller = getattr(self, "pose_guided", None)
+        if controller is None or capture_stamp is None:
+            return visual
+        prediction = controller.predict(
+            float(capture_stamp),
+            visual_center=None if self.st.center is None else np.asarray(self.st.center, dtype=float),
+            visual_yaw=self.st.yaw,
+            visual_velocity=self.st.velocity,
+            visual_stamp=self.st.last_capture_stamp,
+        )
+
+        if prediction.valid and prediction.position is not None:
+            return np.asarray(prediction.position, dtype=float)
+        return visual
+
 
     def _near_reference_indices(
         self,
@@ -617,24 +744,42 @@ class ProductionEDMTracker:
         finite: np.ndarray,
     ) -> list[int]:
         near = []
+        radius = float(self.cfg.radius)
         max_yaw = math.radians(self.cfg.max_yaw_diff_deg)
+        predicted_yaw = self.st.yaw
+        controller = self._active_pose_guided()
+        if controller is not None:
+            limits = controller.search_limits(
+                state=self.st.state,
+                misses=int(self.st.misses),
+                weak_after=int(self.cfg.weak_after),
+                base_radius=float(self.cfg.radius),
+                base_yaw_rad=math.radians(self.cfg.max_yaw_diff_deg),
+                base_max_refs=int(self.cfg.near_pool),
+            )
+            radius = limits.radius
+            max_yaw = limits.max_yaw_rad
+            prediction = getattr(controller, "last_prediction", None)
+            if prediction is not None and prediction.valid and prediction.yaw is not None:
+                predicted_yaw = prediction.yaw
         for raw_index in np.argsort(np.where(finite, distances, np.inf)):
             index = int(raw_index)
             if not finite[index]:
                 continue
-            if distances[index] > self.cfg.radius and len(near) >= self.cfg.near_pool:
+            if distances[index] > radius and len(near) >= self.cfg.near_pool:
                 break
             if (
-                self.st.yaw is not None
+                predicted_yaw is not None
                 and self.yaws is not None
                 and np.isfinite(self.yaws[index])
-                and abs(_angle_diff(float(self.yaws[index]), self.st.yaw)) > max_yaw
+                and abs(_angle_diff(float(self.yaws[index]), predicted_yaw)) > max_yaw
             ):
                 continue
             near.append(index)
             if len(near) >= self.cfg.near_pool:
                 break
         return near
+
 
     def _covisible_reference_indices(self, near: list[int]) -> list[int]:
         covis_refs: list[int] = []
@@ -657,13 +802,88 @@ class ProductionEDMTracker:
             )
         else:
             score += 0.4
-        return score + (1.0 if index in last else 0.0)
+        score += 1.0 if index in last else 0.0
+        weight = float(self.cfg.reference_quality_weight)
+        if weight > 0.0:
+            score += weight * self._reference_rank_score(index)
+        return score
+
+    def _reference_rank_score(self, index: int) -> float:
+        quality_row = getattr(self, "_reference_quality", None)
+        stability_row = getattr(self, "_reference_stability", None)
+        if quality_row is None or stability_row is None:
+            return 0.0
+        quality = self._reference_row_value(quality_row, index)
+        stability = self._reference_row_value(stability_row, index)
+        if quality is None and stability is None:
+            return 0.0
+        if quality is None:
+            combined = stability
+        elif stability is None:
+            combined = quality
+        else:
+            combined = 0.5 * (quality + stability)
+        return max(float(combined), float(self.cfg.reference_quality_floor))
+
+    def _reference_row_value(self, row: np.ndarray, index: int) -> float | None:
+        if row is None or index < 0 or index >= len(row):
+            return None
+        value = float(row[index])
+        if not math.isfinite(value):
+            return None
+        return value
+
+    def _record_reference_stability(self, indices: Sequence[int], metrics: dict) -> None:
+        quality_row = getattr(self, "_reference_quality", None)
+        stability_row = getattr(self, "_reference_stability", None)
+        if quality_row is None or stability_row is None:
+            return
+        ratio = metrics.get("inlier_ratio")
+        quality = None
+        if not isinstance(ratio, bool) and isinstance(ratio, (int, float)):
+            number = float(ratio)
+            if math.isfinite(number):
+                quality = max(0.0, min(1.0, number))
+        for index in indices:
+            if index < 0 or index >= len(quality_row):
+                continue
+            previous = self._reference_row_value(stability_row, index)
+            stability_row[index] = 1.0 if previous is None else 0.5 * previous + 0.5
+            if quality is not None:
+                quality_row[index] = quality
+
+
 
     def _track_candidates(self, topk: int, capture_stamp: float | None = None) -> list[str]:
         """Geometry only: nearest references to the predicted pose, plus their covisibles."""
         C = self._predict_center(capture_stamp)
         if C is None or self.centers is None:
             return []
+        controller = self._active_pose_guided()
+        if controller is not None and controller.last_prediction is not None:
+            quality_scores = None
+            stability_scores = None
+            if float(self.cfg.reference_quality_weight) > 0.0:
+                quality_scores = np.asarray(self._reference_quality, dtype=float)
+                stability_scores = np.asarray(self._reference_stability, dtype=float)
+            selected = controller.select_references(
+                names=list(self.map.ref_names),
+                centers=self.centers,
+                yaws=self.yaws,
+                prediction=controller.last_prediction,
+                state=self.st.state,
+                misses=int(self.st.misses),
+                weak_after=int(self.cfg.weak_after),
+                base_radius=float(self.cfg.radius),
+                base_yaw_rad=math.radians(self.cfg.max_yaw_diff_deg),
+                base_max_refs=int(topk),
+                last_indices=list(self.st.last_refs),
+                covisible_indices=self._covisible_reference_indices([]),
+                quality_scores=quality_scores,
+                stability_scores=stability_scores,
+            )
+            if selected:
+                return selected[:topk]
         d = np.linalg.norm(self.centers - C[None, :], axis=1)
         finite = np.isfinite(d)
         near = self._near_reference_indices(d, finite)
@@ -676,6 +896,7 @@ class ProductionEDMTracker:
             reverse=True,
         )
         return [self.name_of[i] for i in union[:topk]]
+
 
     def _recovery_candidates(self, topk: int) -> list[str]:
         if topk <= 0 or not self.recovery_bank:
@@ -695,24 +916,91 @@ class ProductionEDMTracker:
                 self.st.observed_capture_dts.append(capture_stamp - previous)
             self.st.last_observed_capture_stamp = capture_stamp
 
-    def _global_retrieval(self, frame_bgr: np.ndarray) -> tuple[list[str], float]:
+    def _global_retrieval(
+        self,
+        frame_bgr: np.ndarray,
+        capture_stamp: float,
+    ) -> tuple[list[str], float, bool]:
         import cv2
 
+        lost = self.st.state == "LOST"
+        attempts = (
+            self.st.lost_global_retrieval_attempts
+            if lost
+            else self.st.boot_global_retrieval_attempts
+        )
+        topk = (
+            self.cfg.lost_local_topk
+            if lost
+            else self.cfg.boot_global_topk * (
+                GLOBAL_RETRIEVAL_RETRY_MULTIPLIER if attempts else 1
+            )
+        )
+        candidates = None
+        prior_fresh = False
+        if lost and attempts == 0:
+            prior_age = (
+                None
+                if self.st.last_capture_stamp is None
+                else capture_stamp - self.st.last_capture_stamp
+            )
+            prior_fresh = (
+                prior_age is not None
+                and math.isfinite(prior_age)
+                and 0.0 <= prior_age <= self.cfg.lost_prior_max_age_s
+            )
+            if self.cfg.lost_prior_strategy == "restrict_nearby" and prior_fresh:
+                nearby = self._track_candidates(self.cfg.near_pool, capture_stamp)
+                candidates = nearby or None
         rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
         started = time.perf_counter()
-        refs = self.loc.retrieve(rgb, self.cfg.boot_global_topk)
+        if lost and self.cfg.lost_prior_strategy == "score_fusion":
+            refs = self._lost_score_fusion_refs(rgb, topk, capture_stamp, prior_fresh)
+            self._last_retrieval_kind = "fused"
+        elif candidates is not None:
+            refs = self.loc.retrieve(rgb, topk, candidates=candidates)
+            self._last_retrieval_kind = "near"
+        else:
+            refs = self.loc.retrieve(rgb, topk)
+            self._last_retrieval_kind = "global"
         elapsed_ms = (time.perf_counter() - started) * 1e3
         self.st.global_retrieval_calls += 1
-        if self.st.state == "LOST":
-            self.st.lost_global_retrieval_done = True
-        if not self.st.boot_refs:
+        if lost:
+            self.st.lost_global_retrieval_attempts += 1
+            self.st.lost_global_retrieval_done = (
+                self.st.lost_global_retrieval_attempts
+                >= LOST_GLOBAL_RETRIEVAL_ATTEMPTS
+            )
+        else:
+            self.st.boot_global_retrieval_attempts += 1
+        if not lost and len(refs) > len(self.st.boot_refs):
             self.st.boot_refs = list(refs)
-        return refs, elapsed_ms
+        return refs, elapsed_ms, candidates is not None
 
     def _should_run_global_retrieval(self) -> bool:
         if self.cfg.global_retrieval_policy == "boot_and_lost_once":
-            return (self.st.state == "BOOT_INIT" and self.st.global_retrieval_calls == 0) or (
-                self.st.state == "LOST" and not self.st.lost_global_retrieval_done
+            if (
+                self.st.state == "BOOT_INIT"
+                and self.st.boot_global_retrieval_attempts
+                < GLOBAL_RETRIEVAL_ATTEMPTS
+            ):
+                return True
+            return (
+                self.st.state == "LOST"
+                and self.st.lost_frames > self.cfg.lost_local_grace_frames
+                and (
+                    self.st.lost_global_retrieval_attempts == 0
+                    or (
+                        self.cfg.lost_global_retrieval_interval > 0
+                        and (
+                            self.st.lost_frames
+                            - self.cfg.lost_local_grace_frames
+                            - 1
+                        )
+                        % self.cfg.lost_global_retrieval_interval
+                        == 0
+                    )
+                )
             )
         if self.cfg.global_retrieval_policy == "boot_once":
             return self.st.global_retrieval_calls == 0
@@ -742,8 +1030,25 @@ class ProductionEDMTracker:
         capture_stamp: float,
     ) -> _CandidateSelection:
         if self._should_run_global_retrieval():
-            refs, vpr_ms = self._global_retrieval(frame_bgr)
-            mode = "megaloc_lost" if self.st.state == "LOST" else "megaloc_boot"
+            retry = (
+                self.st.lost_global_retrieval_attempts
+                if self.st.state == "LOST"
+                else self.st.boot_global_retrieval_attempts
+            ) > 0
+            refs, vpr_ms, nearby = self._global_retrieval(
+                frame_bgr,
+                capture_stamp,
+            )
+            if self.st.state == "LOST" and getattr(self, "_last_retrieval_kind", None) == "fused":
+                mode = "megaloc_lost_fused"
+            elif self.st.state == "LOST" and nearby:
+                mode = "megaloc_lost_near"
+            elif self.st.state == "LOST" and retry:
+                mode = "megaloc_lost_global_retry"
+            else:
+                mode = "megaloc_lost" if self.st.state == "LOST" else "megaloc_boot"
+            if retry and self.st.state != "LOST":
+                mode += "_retry"
         else:
             refs, mode = self._local_acquisition_candidates(capture_stamp)
             vpr_ms = 0.0
@@ -783,7 +1088,10 @@ class ProductionEDMTracker:
                 refs = list(self.st.boot_refs[: self.cfg.lost_local_topk])
                 mode = "edm_boot_refs"
             else:
-                refs, vpr_ms = self._global_retrieval(frame_bgr)
+                refs, vpr_ms, _nearby = self._global_retrieval(
+                    frame_bgr,
+                    capture_stamp,
+                )
                 mode = "megaloc_reacquire"
         min_inliers = (
             self.cfg.track_min_inliers if self.st.state == "TRACK" else self.cfg.weak_min_inliers
@@ -805,41 +1113,6 @@ class ProductionEDMTracker:
             return self._acquisition_candidates(frame_bgr, capture_stamp)
         return self._tracking_candidates(frame_bgr, capture_stamp)
 
-    def _standard_correspondences(
-        self,
-        gray: np.ndarray,
-        selection: _CandidateSelection,
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, list]:
-        refs = selection.refs
-        initial_topk = min(max(0, int(self.cfg.acquire_initial_topk)), len(refs))
-        staged = selection.acquiring and 0 < initial_topk < len(refs)
-        if not staged:
-            return self.loc.correspondences(
-                gray,
-                refs,
-                batch_size=self.cfg.match_batch_size,
-            )
-
-        points2d, points3d, confidence, per_ref = self.loc.correspondences(
-            gray,
-            refs[:initial_topk],
-            batch_size=self.cfg.match_batch_size,
-        )
-        # Acquisition must consider the complete retrieved set. A plausible pose
-        # from the first two similar references is not multi-reference agreement.
-        rest = self.loc.correspondences(
-            gray,
-            refs[initial_topk:],
-            batch_size=self.cfg.match_batch_size,
-        )
-        rest_points2d, rest_points3d, rest_confidence, rest_counts = rest
-        if len(rest_points2d):
-            points2d = np.concatenate([points2d, rest_points2d])
-            points3d = np.concatenate([points3d, rest_points3d])
-            confidence = np.concatenate([confidence, rest_confidence])
-        per_ref.extend(rest_counts)
-        return points2d, points3d, confidence, per_ref
-
     def _collect_correspondences(
         self,
         gray: np.ndarray,
@@ -854,25 +1127,22 @@ class ProductionEDMTracker:
         )
         by_ref = None
         if temporal_used:
+            kinds = ["temporal"] + ["map"] * len(refs)
             rows = self.loc.correspondences_for_sources(
                 gray,
                 [self.temporal_gray] + [self.map.images[name] for name in refs],
                 [self.temporal_xyz_by_cell] + [self.map.xyz_by_cell[name] for name in refs],
                 batch_size=self.cfg.match_batch_size,
+                source_kinds=kinds,
             )
             points2d, points3d, confidence, per_ref = _merge_correspondence_rows(rows)
-        elif selection.mode == "edm_map_scan":
+        else:
             by_ref = self.loc.correspondences_by_ref(
                 gray,
                 refs,
                 batch_size=self.cfg.match_batch_size,
             )
             points2d, points3d, confidence, per_ref = _merge_correspondence_rows(by_ref)
-        else:
-            points2d, points3d, confidence, per_ref = self._standard_correspondences(
-                gray,
-                selection,
-            )
         return _CorrespondenceBatch(
             points2d=points2d,
             points3d=points3d,
@@ -926,6 +1196,34 @@ class ProductionEDMTracker:
             metrics,
         ), elapsed_ms
 
+    def _acquire_consensus_limit(self) -> float:
+        return acquire_consensus_limit(self.cfg)
+
+    @staticmethod
+    def _candidate_inliers(candidate: tuple) -> int:
+        return candidate_inliers(candidate)
+
+    def _strong_centers_disagree(
+        self,
+        scored: list[tuple[str, tuple]],
+        min_inl: int,
+    ) -> bool:
+        return _strong_centers_disagree(scored, min_inl, self.cfg)
+
+    def _select_acquire_candidate(
+        self,
+        selection: _CandidateSelection,
+        scored: list[tuple[str, tuple]],
+    ) -> tuple[str, tuple] | None:
+        return _select_acquire_candidate(selection, scored, self.cfg)
+
+    def _select_track_candidate(
+        self,
+        selection: _CandidateSelection,
+        scored: list[tuple[str, tuple]],
+    ) -> tuple[str, tuple] | None:
+        return _select_track_candidate(selection, scored, self.cfg)
+
     def _best_pose_attempt(
         self,
         selection: _CandidateSelection,
@@ -938,7 +1236,10 @@ class ProductionEDMTracker:
         points3d = np.zeros((0, 3))
         metrics = {"reproj_rms": None, "inlier_ratio": 0.0, "inlier_grid_cells": 0}
         pnp_ms = 0.0
+        reject_reason = None
+        strong_count = 0
         if batch.by_ref is not None:
+            scored: list[tuple[str, tuple]] = []
             for name, (ref_p2, ref_p3, ref_confidence, _) in zip(
                 selection.refs,
                 batch.by_ref,
@@ -951,19 +1252,25 @@ class ProductionEDMTracker:
                     options,
                 )
                 pnp_ms += elapsed_ms
-                if candidate is not None and (
-                    result is None
-                    or (
-                        int(candidate[0]["num_inliers"]),
-                        reprojection_rank(candidate[3]["reproj_rms"]),
-                    )
-                    > (
-                        int(result["num_inliers"]),
-                        reprojection_rank(metrics["reproj_rms"]),
-                    )
-                ):
-                    result, points2d, points3d, metrics = candidate
-                    selected_ref = name
+                if candidate is not None:
+                    scored.append((name, candidate))
+            strong_count = sum(
+                1
+                for _name, candidate in scored
+                if self._candidate_inliers(candidate) >= selection.min_inliers
+            )
+            chosen = None
+            if selection.acquiring:
+                chosen = self._select_acquire_candidate(selection, scored)
+                if scored and chosen is None:
+                    reject_reason = "acquire_consensus"
+            else:
+                chosen = self._select_track_candidate(selection, scored)
+                if scored and chosen is None:
+                    reject_reason = "track_consensus"
+            if chosen is not None:
+                selected_ref, candidate = chosen
+                result, points2d, points3d, metrics = candidate
         else:
             candidate, pnp_ms = self._estimate_pose_candidate(
                 batch.points2d,
@@ -981,6 +1288,8 @@ class ProductionEDMTracker:
             metrics=metrics,
             selected_ref=selected_ref,
             pnp_ms=pnp_ms,
+            reject_reason=reject_reason,
+            strong_count=strong_count,
         )
 
     def _match_and_estimate(
@@ -994,6 +1303,147 @@ class ProductionEDMTracker:
         match_ms = max(0.0, (time.perf_counter() - started) * 1e3 - attempt.pnp_ms)
         return batch, attempt, match_ms
 
+    def _lost_score_fusion_refs(
+        self,
+        rgb: np.ndarray,
+        topk: int,
+        capture_stamp: float,
+        prior_fresh: bool,
+    ) -> list[str]:
+        pool = min(
+            len(self.map.ref_names),
+            max(int(topk) * 4, int(self.cfg.near_pool)),
+        )
+        if pool <= 0 or topk <= 0:
+            return []
+        descriptor = self.loc.megaloc.extract_one(rgb)
+        scored = list(
+            self.loc.retrieve_scored(rgb, pool, descriptor=descriptor)
+        )
+        if prior_fresh:
+            nearby = self._track_candidates(self.cfg.near_pool, capture_stamp)
+            have = {name for name, _score in scored}
+            missing = [name for name in nearby if name not in have]
+            if missing:
+                scored.extend(
+                    self.loc.retrieve_scored(
+                        rgb, len(missing), candidates=missing, descriptor=descriptor
+                    )
+                )
+        center = self._predict_center(capture_stamp)
+        weight = float(self.cfg.lost_prior_fusion_weight)
+        radius = max(float(self.cfg.radius), 1e-6)
+        fused: list[tuple[str, float]] = []
+        for name, vpr_score in scored:
+            geom = 0.0
+            index = self.idx_of.get(name)
+            if (
+                center is not None
+                and self.centers is not None
+                and index is not None
+            ):
+                distance = float(np.linalg.norm(self.centers[index] - center))
+                if np.isfinite(distance):
+                    geom = math.exp(-distance / radius)
+            fused.append((name, float(vpr_score) + weight * geom))
+        fused.sort(key=lambda item: (-item[1], item[0]))
+        return [name for name, _score in fused[:topk]]
+
+    def _pose_quality_ok(
+        self,
+        result: Any | None,
+        metrics: dict,
+        *,
+        min_inliers: int,
+        reproj_limit: float,
+    ) -> bool:
+        if result is None or int(result["num_inliers"]) < min_inliers:
+            return False
+        rms = metrics.get("reproj_rms")
+        if rms is None or float(rms) > float(reproj_limit):
+            return False
+        if float(metrics.get("inlier_ratio", 0.0)) < float(self.cfg.min_inlier_ratio):
+            return False
+        if int(metrics.get("inlier_grid_cells", 0)) < self.cfg.min_inlier_grid_cells:
+            return False
+        return True
+
+    def _trajectory_would_allow(
+        self,
+        center: np.ndarray,
+        yaw: float,
+        capture_stamp: float,
+        state_in: str,
+    ) -> bool:
+        if self.st.center is None:
+            return True
+        if state_in != "LOST":
+            raw_step = float(np.linalg.norm(center - self.st.center))
+            if raw_step > self.cfg.max_jump:
+                return False
+            capture_dt = (
+                None
+                if self.st.last_capture_stamp is None
+                else capture_stamp - self.st.last_capture_stamp
+            )
+            _limited, jump_info = limit_center_step(
+                self.st.center,
+                center,
+                self.st.accepted_step_norms,
+                self.cfg,
+                capture_dt=capture_dt,
+                capture_dt_history=self.st.observed_capture_dts,
+            )
+            return not jump_info["limited"]
+        prior_age = (
+            None
+            if self.st.last_capture_stamp is None
+            else capture_stamp - self.st.last_capture_stamp
+        )
+        prior_fresh = (
+            prior_age is not None
+            and math.isfinite(prior_age)
+            and 0.0 <= prior_age <= self.cfg.lost_prior_max_age_s
+        )
+        if not prior_fresh:
+            return True
+        acquire_limit = float(self.cfg.acquire_max_jump_factor) * float(self.cfg.max_jump)
+        if float(np.linalg.norm(center - self.st.center)) > acquire_limit:
+            return False
+        prior_yaw = self.st.yaw
+        if prior_yaw is not None and math.isfinite(float(prior_yaw)):
+            if abs(_angle_diff(yaw, float(prior_yaw))) > math.radians(
+                float(self.cfg.acquire_max_yaw_diff_deg)
+            ):
+                return False
+        return True
+
+    def _acquire_stage_can_stop(
+        self,
+        selection: _CandidateSelection,
+        attempt: _PoseAttempt,
+        capture_stamp: float,
+    ) -> bool:
+        if attempt.reject_reason or attempt.result is None:
+            return False
+        if attempt.strong_count < 2:
+            return False
+        reproj_limit = (
+            self.cfg.max_reproj_error_acquire
+            if selection.acquiring
+            else self.cfg.max_reproj_error_track
+        )
+        if not self._pose_quality_ok(
+            attempt.result,
+            attempt.metrics,
+            min_inliers=selection.min_inliers,
+            reproj_limit=reproj_limit,
+        ):
+            return False
+        _rotation, center, yaw = self._pose_components(attempt.result)
+        return self._trajectory_would_allow(center, yaw, capture_stamp, self.st.state)
+
+
     def _localization_info(
         self,
         selection: _CandidateSelection,
@@ -1003,6 +1453,11 @@ class ProductionEDMTracker:
         match_ms: float,
         started: float,
     ) -> dict:
+        matcher = getattr(self.loc, "matcher", None)
+        cache_stats = None
+        read_class_stats = getattr(matcher, "feature_cache_stats_by_class", None)
+        if callable(read_class_stats):
+            cache_stats = read_class_stats()
         info = {
             "frame": self.st.frame,
             "state_in": self.st.state,
@@ -1012,6 +1467,12 @@ class ProductionEDMTracker:
             "selected_ref": attempt.selected_ref,
             "requested_reference_count": len(selection.refs),
             "staged_early_stop": False,
+            "acquire_stage_mode": self.cfg.acquire_stage_mode,
+            "lost_prior_strategy": self.cfg.lost_prior_strategy,
+            "lost_prior_fusion_weight": float(self.cfg.lost_prior_fusion_weight),
+            "runtime_sigma_mode": getattr(matcher, "runtime_sigma_mode", None),
+            "feature_cache_classes": cache_stats,
+            "motion_cache_active": self._motion_cache_active(),
             "n_corr": int(len(batch.points3d)),
             "per_ref": batch.per_ref,
             "global_retrieval_calls": self.st.global_retrieval_calls,
@@ -1022,12 +1483,68 @@ class ProductionEDMTracker:
             "total_ms": (time.perf_counter() - started) * 1e3,
         }
         info.update(attempt.metrics)
+        controller = getattr(self, "pose_guided", None)
+        if controller is not None:
+            info.update(controller.predicted_only(controller.last_prediction))
         return info
+
 
     def _clear_pending_jump(self) -> None:
         self.st.pending_limited_center = None
         self.st.pending_limited_stamp = None
         self.st.pending_limited_limit = None
+
+    def _clear_visual_motion_cache(self) -> None:
+        self._last_accepted_bgr = None
+        self._last_accepted_cam_from_world = None
+
+    def _motion_cache_active(self) -> bool:
+        return (
+            getattr(self, "motion_validator", None) is not None
+            and getattr(self, "motion_validation_mode", "off")
+            in {"shadow", "confirm_limited_jump"}
+        )
+
+    def _store_visual_motion_cache(self, frame_bgr: np.ndarray, cam_from_world) -> None:
+        if not self._motion_cache_active():
+            return
+        self._last_accepted_bgr = np.ascontiguousarray(frame_bgr).copy()
+        self._last_accepted_cam_from_world = cam_from_world_matrix(cam_from_world)
+
+
+    def _relative_motion_cache_ready(self) -> bool:
+        return (
+            getattr(self, "_last_accepted_bgr", None) is not None
+            and getattr(self, "_last_accepted_cam_from_world", None) is not None
+        )
+
+
+    def _run_relative_motion_check(
+        self,
+        frame_bgr: np.ndarray,
+        cam_from_world,
+    ) -> RelativeMotionCheck:
+        try:
+            return self.motion_validator.check(
+                self._last_accepted_bgr,
+                frame_bgr,
+                self._last_accepted_cam_from_world,
+                cam_from_world,
+            )
+        except Exception as exc:
+            return RelativeMotionCheck(
+                status="unavailable",
+                reason=f"validator_error:{type(exc).__name__}:{exc}",
+                matches=0,
+                inliers=0,
+                rotation_delta_deg=None,
+                translation_direction_delta_deg=None,
+                depth_ms=0.0,
+                match_ms=0.0,
+                solver_ms=0.0,
+                total_ms=0.0,
+            )
+
 
     def _reject_pose(
         self,
@@ -1121,7 +1638,40 @@ class ProductionEDMTracker:
                     if motion_residual < stationary_residual:
                         model = "constant_velocity"
                         residual = motion_residual
-        return independent, model, residual
+            return independent, model, residual
+        return self._motion_prior_residual(center, capture_stamp)
+
+    def _motion_prior_residual(
+        self,
+        center: np.ndarray,
+        capture_stamp: float,
+    ) -> tuple[bool, str | None, float | None]:
+        controller = getattr(self, "pose_guided", None)
+        prediction = getattr(controller, "last_prediction", None) if controller is not None else None
+        if (
+            prediction is not None
+            and getattr(prediction, "valid", False)
+            and getattr(prediction, "position", None) is not None
+        ):
+            predicted = np.asarray(prediction.position, dtype=float)
+            if predicted.shape == (3,) and np.isfinite(predicted).all():
+                return True, "predicted_center", float(np.linalg.norm(center - predicted))
+        if (
+            self.st.velocity is None
+            or self.st.center is None
+            or self.st.last_capture_stamp is None
+        ):
+            return False, None, None
+        dt = float(capture_stamp) - float(self.st.last_capture_stamp)
+        if not math.isfinite(dt) or dt <= 1e-6:
+            return False, None, None
+        dt = min(dt, float(self.cfg.prediction_max_dt))
+        predicted = np.asarray(self.st.center, dtype=float) + np.asarray(
+            self.st.velocity, dtype=float
+        ) * dt
+        if predicted.shape != (3,) or not np.isfinite(predicted).all():
+            return False, None, None
+        return True, "accepted_velocity_prior", float(np.linalg.norm(center - predicted))
 
     def _confirm_limited_jump(
         self,
@@ -1148,22 +1698,30 @@ class ProductionEDMTracker:
             "confirmation_limit": confirmation_limit,
             "confirmation_independent": independent,
         }
-        if residual is None or residual > confirmation_limit:
-            self.st.pending_limited_center = np.asarray(center, dtype=float).copy()
-            self.st.pending_limited_stamp = capture_stamp
-            self.st.pending_limited_limit = float(jump_info["limit"])
-            info["rejected"] = "limited_jump_unconfirmed"
+        if residual is not None and residual <= confirmation_limit:
+            info["limited_jump_confirmed"] = True
+            self._clear_pending_jump()
+            return True
+        had_pending = bool(independent)
+        self.st.pending_limited_center = np.asarray(center, dtype=float).copy()
+        self.st.pending_limited_stamp = capture_stamp
+        self.st.pending_limited_limit = float(jump_info["limit"])
+        info["rejected"] = "limited_jump_unconfirmed"
+        if had_pending:
             self._on_miss(info)
-            return False
-        info["limited_jump_confirmed"] = True
-        self._clear_pending_jump()
-        return True
+        else:
+            info.update({"state_out": self.st.state, "ok": False})
+            if info.get("pose_status") == "VISUALLY_CONFIRMED":
+                info["pose_status"] = "NONE"
+        return False
 
     def _continuous_trajectory_allows(
         self,
         center: np.ndarray,
         capture_stamp: float,
         info: dict,
+        frame_bgr: np.ndarray,
+        cam_from_world,
     ) -> bool:
         capture_dt = (
             None
@@ -1193,6 +1751,30 @@ class ProductionEDMTracker:
             capture_dt_history=self.st.observed_capture_dts,
         )
         if jump_info["limited"]:
+            pending = self.st.pending_limited_center is not None
+            mode = getattr(self, "motion_validation_mode", "off")
+            validator = getattr(self, "motion_validator", None)
+            if (
+                not pending
+                and validator is not None
+                and mode in {"shadow", "confirm_limited_jump"}
+                and self._relative_motion_cache_ready()
+            ):
+                check = self._run_relative_motion_check(frame_bgr, cam_from_world)
+                info["relative_motion_check"] = check.as_json_dict()
+                if mode == "confirm_limited_jump" and check.status == "agree":
+                    info["limited_jump"] = {
+                        "raw_step": jump_info["raw_step"],
+                        "limit": jump_info["limit"],
+                        "capture_dt": capture_dt,
+                        "confirmation_model": "reposed_relative_pose",
+                        "confirmation_residual": None,
+                        "confirmation_limit": float(jump_info["limit"]),
+                        "confirmation_independent": True,
+                    }
+                    info["limited_jump_confirmed"] = True
+                    self._clear_pending_jump()
+                    return True
             return self._confirm_limited_jump(
                 center,
                 capture_stamp,
@@ -1202,6 +1784,7 @@ class ProductionEDMTracker:
             )
         self._clear_pending_jump()
         return True
+
 
     def _lost_reacquisition_allows(
         self,
@@ -1247,12 +1830,21 @@ class ProductionEDMTracker:
         yaw: float,
         capture_stamp: float,
         info: dict,
+        frame_bgr: np.ndarray,
+        cam_from_world,
     ) -> bool:
         if self.st.center is None:
             return True
         if info["state_in"] != "LOST":
-            return self._continuous_trajectory_allows(center, capture_stamp, info)
+            return self._continuous_trajectory_allows(
+                center,
+                capture_stamp,
+                info,
+                frame_bgr,
+                cam_from_world,
+            )
         return self._lost_reacquisition_allows(center, yaw, capture_stamp, info)
+
 
     def _accept_pose(
         self,
@@ -1265,6 +1857,7 @@ class ProductionEDMTracker:
         selection: _CandidateSelection,
         attempt: _PoseAttempt,
         gray: np.ndarray,
+        frame_bgr: np.ndarray,
     ) -> dict:
         previous_center = self.st.center
         previous_stamp = self.st.last_capture_stamp
@@ -1286,9 +1879,12 @@ class ProductionEDMTracker:
             [attempt.selected_ref] if attempt.selected_ref is not None else selection.refs
         )
         self.st.last_refs = [self.idx_of[name] for name in accepted_refs]
+        self._record_reference_stability(self.st.last_refs, attempt.metrics)
         self.st.misses = 0
         self.st.lost_frames = 0
+        self.st.lost_global_retrieval_attempts = 0
         self.st.lost_global_retrieval_done = False
+        self._store_visual_motion_cache(frame_bgr, result["cam_from_world"])
         self.st.state = "TRACK"
         if self.cfg.use_temporal_reference:
             inlier_mask = np.asarray(
@@ -1315,9 +1911,20 @@ class ProductionEDMTracker:
                 "yaw": yaw,
                 "R": rotation,
                 "ok": True,
+                "pose_status": "VISUALLY_CONFIRMED",
             }
         )
+        controller = getattr(self, "pose_guided", None)
+        if controller is not None:
+            controller.maybe_update_anchor(
+                info,
+                timestamp=capture_stamp,
+                rotation_cam_from_world=rotation,
+                center=center,
+                yaw=yaw,
+            )
         return info
+
 
     # ---------- one frame ----------
     def localize(self, frame_bgr: np.ndarray, capture_stamp: float | None = None) -> dict:
@@ -1333,7 +1940,24 @@ class ProductionEDMTracker:
         gray = EDMMatcher.load_gray(frame_bgr)
 
         selection = self._select_candidates(frame_bgr, capture_stamp)
-        batch, attempt, match_ms = self._match_and_estimate(gray, selection)
+        requested = len(selection.refs)
+        staged_early_stop = False
+        if (
+            selection.acquiring
+            and self.cfg.acquire_stage_mode == "initial_topk"
+            and requested > self.cfg.acquire_initial_topk
+        ):
+            staged = replace(
+                selection, refs=list(selection.refs[: self.cfg.acquire_initial_topk])
+            )
+            batch, attempt, match_ms = self._match_and_estimate(gray, staged)
+            if self._acquire_stage_can_stop(staged, attempt, capture_stamp):
+                selection = staged
+                staged_early_stop = True
+            else:
+                batch, attempt, match_ms = self._match_and_estimate(gray, selection)
+        else:
+            batch, attempt, match_ms = self._match_and_estimate(gray, selection)
         info = self._localization_info(
             selection,
             batch,
@@ -1341,12 +1965,16 @@ class ProductionEDMTracker:
             match_ms=match_ms,
             started=t0,
         )
+        info["requested_reference_count"] = requested
+        info["staged_early_stop"] = staged_early_stop
         ret = attempt.result
         min_inl = selection.min_inliers
         reproj_limit = (
             cfg.max_reproj_error_acquire if selection.acquiring else cfg.max_reproj_error_track
         )
-
+        if attempt.reject_reason:
+            self._reject_pose(info, ret, reason=attempt.reject_reason)
+            return info
         if self._pose_quality_rejected(
             ret,
             info,
@@ -1361,7 +1989,14 @@ class ProductionEDMTracker:
         # Two-layer trajectory gate: hard jumps fail immediately; adaptive jumps
         # require an independent confirming capture. LOST reacquisition uses its
         # separately bounded prior window.
-        if not self._trajectory_allows(C, yaw, capture_stamp, info):
+        if not self._trajectory_allows(
+            C,
+            yaw,
+            capture_stamp,
+            info,
+            frame_bgr,
+            ret["cam_from_world"],
+        ):
             return info
         return self._accept_pose(
             info,
@@ -1373,6 +2008,7 @@ class ProductionEDMTracker:
             selection,
             attempt,
             gray,
+            frame_bgr,
         )
 
     def _on_miss(self, info: dict):
@@ -1384,16 +2020,25 @@ class ProductionEDMTracker:
             and self.st.misses >= self.cfg.weak_after + self.cfg.lost_after
         ):
             self.st.state = "LOST"
-            self.st.velocity = None
             self.st.pending_limited_center = None
             self.st.pending_limited_stamp = None
             self.st.pending_limited_limit = None
+            self.st.lost_global_retrieval_attempts = 0
             self.st.lost_global_retrieval_done = False
+            self._clear_visual_motion_cache()
         if self.st.state == "LOST":
             self.st.lost_frames += 1
         else:
             self.st.lost_frames = 0
         info.update({"state_out": self.st.state, "ok": False})
+        if info.get("pose_status") == "VISUALLY_CONFIRMED":
+            info["pose_status"] = "NONE"
+        controller = getattr(self, "pose_guided", None)
+        if controller is not None and info.get("pose_status") != "VISUALLY_CONFIRMED":
+            predicted = controller.predicted_only(controller.last_prediction)
+            predicted["ok"] = False
+            info.update(predicted)
+
 
 
 if __name__ == "__main__":

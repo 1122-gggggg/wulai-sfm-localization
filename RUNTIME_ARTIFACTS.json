@@ -8,6 +8,13 @@
       "size_bytes": 41417503
     },
     {
+      "fetch_hint": "Seed the RTX 5060 / TensorRT 11.2 MegaLoc engine at this repository-relative path.",
+      "name": "megaloc-tensorrt-engine",
+      "path": "定位演算法/deploy_code/runtime/EDM/weights/megaloc_322_autocast_fp16.engine",
+      "sha256": "07a849aa9085574a5537332bf9a5023c1fc17f2022086047a7f910d87d5d6dfe",
+      "size_bytes": 464285892
+    },
+    {
       "fetch_hint": "Seed the approved MegaLoc torch.hub source at this repository-relative path.",
       "name": "megaloc-hubconf",
       "path": "執行環境/torch_hub_cache/gmberton_MegaLoc_main/hubconf.py",
@@ -27,6 +34,13 @@
       "path": "執行環境/torch_hub_cache/checkpoints/megaloc/7cb9f7970d366fdf059963d04d372e503e8e9df9/model.safetensors",
       "sha256": "d4f9f2bcb60018f91eb6a8e061ed054fd55654e10c2569cf13841ea986ffb4f8",
       "size_bytes": 914577436
+    },
+    {
+      "fetch_hint": "Seed the approved MoGe-2 ViT-S normal checkpoint at this repository-relative path.",
+      "name": "moge-2-vits-normal",
+      "path": "執行環境/models/moge-2-vits-normal/model.pt",
+      "sha256": "79a16621928c2bf0ed04659218c55c01075e950507f40bb3332fb4c873d3e1dc",
+      "size_bytes": 140550416
     }
   ],
   "schema": "sfm-runtime-artifacts/v1",

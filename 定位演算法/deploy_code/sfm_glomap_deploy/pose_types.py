@@ -10,6 +10,14 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 
+LOCALIZER_PROVIDER_API_VERSION = 1
+LOCALIZATION_POSE_CONTRACT_VERSION = 1
+
+
+LOCALIZER_PROVIDER_API_VERSION = 1
+LOCALIZATION_POSE_CONTRACT_VERSION = 1
+
+
 @dataclass
 class Pose:
     """Visual-localizer pose crossing the localization/flight-control boundary.
@@ -58,6 +66,10 @@ class LocalizerCapabilities:
     optional_assets: tuple[str, ...] = ()
     unsupported_assets: tuple[str, ...] = ()
     supports_production_profile: bool = False
+    provider_api_version: int = LOCALIZER_PROVIDER_API_VERSION
+    pose_contract_version: int = LOCALIZATION_POSE_CONTRACT_VERSION
+    provider_api_version: int = LOCALIZER_PROVIDER_API_VERSION
+    pose_contract_version: int = LOCALIZATION_POSE_CONTRACT_VERSION
 
 
 LocalizerBuilder = Callable[..., BuiltLocalizer]

@@ -9,21 +9,35 @@ from pathlib import Path
 import pytest
 
 CONTROL_ROOT = Path(__file__).resolve().parents[3] / "控制介面程式"
+WORKSPACE_ROOT = CONTROL_ROOT.parent
 SIMULATED_LAUNCHER = CONTROL_ROOT / "影片模擬串流" / "啟動.sh"
 REAL_LAUNCHER = CONTROL_ROOT / "真機串流" / "啟動.sh"
-SITE_PROFILE = CONTROL_ROOT / "site_profiles" / "river_site_edm.json"
+SITE_PROFILE = (
+    WORKSPACE_ROOT / "地圖檔" / "場域" / "river_site" / "site_profile.json"
+)
+MISSION_SELECTION = (
+    CONTROL_ROOT
+    / "mission_selections"
+    / "river_site_b0_p116_p117_localization.json"
+)
 P119_VALIDATOR = CONTROL_ROOT / "validate_p119_source.py"
 
 
 def launch(script: Path, *args: str, **extra_env: str) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy()
-    env.update({
-        "SFM_LAUNCH_DRY_RUN": "1",
-        "SFM_MAX_PERFORMANCE": "0",
-        "SFM_SITE_PROFILE": str(SITE_PROFILE),
-        "SFM_UI_PYTHON": sys.executable,
-        **extra_env,
-    })
+    env.update(
+        {
+            "SFM_LAUNCH_DRY_RUN": "1",
+            "SFM_MAX_PERFORMANCE": "0",
+            "SFM_UI_PYTHON": sys.executable,
+        }
+    )
+    if script == REAL_LAUNCHER:
+        env.pop("SFM_SITE_PROFILE", None)
+        env["SFM_MISSION_SELECTION"] = str(MISSION_SELECTION)
+    else:
+        env["SFM_SITE_PROFILE"] = str(SITE_PROFILE)
+    env.update(extra_env)
     return subprocess.run(
         [str(script), *args],
         cwd=script.parent,
@@ -52,6 +66,27 @@ def test_simulated_launcher_is_file_only_and_never_live(tmp_path: Path) -> None:
     assert "real-flight" not in command
 
 
+def test_simulated_launcher_enables_bounded_low_confidence_recovery(
+    tmp_path: Path,
+) -> None:
+    video = tmp_path / "replay.mp4"
+    video.write_bytes(b"test")
+
+    result = launch(SIMULATED_LAUNCHER, str(video))
+
+    assert result.returncode == 0, result.stderr
+    command = next(
+        line for line in result.stdout.splitlines() if "dry-run command:" in line
+    )
+    tokens = command.split()
+    assert "--lost-hold" in tokens
+    assert "--no-lost-hold" not in tokens
+    assert "--hold-on-low-confidence" in tokens
+    assert "--lost-hold-max-attempts 8" in command
+    assert "--lost-hold-timeout-ms 3000" in command
+    assert "低信心 recovery：凍幀=1，連續 2 筆觸發" in result.stdout
+
+
 def test_simulated_launcher_discovers_the_only_imported_video(tmp_path: Path) -> None:
     video_dir = tmp_path / "imported_videos"
     video_dir.mkdir()
@@ -61,7 +96,7 @@ def test_simulated_launcher_discovers_the_only_imported_video(tmp_path: Path) ->
     result = launch(SIMULATED_LAUNCHER, VIDEO_DIR=str(video_dir))
 
     assert result.returncode == 0, result.stderr
-    assert "river_site_edm.json" in result.stdout
+    assert "river_site/site_profile.json" in result.stdout
     assert str(video) in result.stdout
     assert "H264 main 5000 kbps" in result.stdout
     assert "延遲 280 ms、丟包 0 %" in result.stdout
@@ -188,3 +223,22 @@ def test_real_launcher_is_olympe_only_and_has_no_video_argument() -> None:
     assert "--interface real-flight" in command
     assert "--video" not in command
     assert "simulated-stream" not in command
+    assert "mission_snapshots" in command
+
+
+def test_real_launcher_requires_mission_selection() -> None:
+    result = launch(REAL_LAUNCHER, SFM_MISSION_SELECTION="")
+
+    assert result.returncode == 2
+    assert "SFM_MISSION_SELECTION" in result.stderr
+
+
+def test_real_launcher_rejects_direct_site_profile_override() -> None:
+    result = launch(
+        REAL_LAUNCHER,
+        "--site-profile",
+        str(SITE_PROFILE),
+    )
+
+    assert result.returncode == 2
+    assert "mission selection" in result.stderr

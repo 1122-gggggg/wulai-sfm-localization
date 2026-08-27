@@ -243,12 +243,15 @@ def test_typed_sim_speed_limit_change_is_landed_only_and_invalidates_approval() 
         "auto_speed_limit_apply",
         human_origin=True,
         speed_limit_mps=0.2,
+        enabled=False,
     )
 
     result = backend.command(request)
 
     assert result.accepted and result.executed
     assert backend.state.autonomous_speed_limit_mps == pytest.approx(0.2)
+    assert backend.state.autonomous_speed_limit_enabled is False
+    assert backend.state.autonomous_speed_guard_status == "SPEED_LIMIT_DISABLED"
     assert backend.state.autonomous_approval_valid is False
 
     backend.target_altitude_m = 1.0
@@ -257,10 +260,12 @@ def test_typed_sim_speed_limit_change_is_landed_only_and_invalidates_approval() 
             "auto_speed_limit_apply",
             human_origin=True,
             speed_limit_mps=0.1,
+            enabled=True,
         )
     )
     assert not rejected.accepted
     assert backend.state.autonomous_speed_limit_mps == pytest.approx(0.2)
+    assert backend.state.autonomous_speed_limit_enabled is False
 
 
 def test_legacy_frame_source_adapter_emits_typed_packet() -> None:

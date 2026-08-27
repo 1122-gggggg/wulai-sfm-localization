@@ -61,7 +61,10 @@ class OperatorShutdownCoordinator:
         try:
             suspend()
         except Exception as exc:
-            self._log(f"關窗已暫停：無法凍結新控制指令（{exc!r}）；請重試。")
+            self._log(
+                f"無法凍結 UI 新控制指令（{exc!r}）；"
+                "仍由後端鎖存電腦動作並執行獨立降落。"
+            )
             return False
         return True
 
@@ -81,23 +84,49 @@ class OperatorShutdownCoordinator:
             return self.get_autonomy()
         return self.autonomy
 
+    def _latch_backend_motion(self, *, reason: str) -> None:
+        """Retire late PC motion before waiting on a possibly stuck AUTO worker."""
+        latch = getattr(self.backend, "latch_shutdown_motion", None)
+        if not callable(latch):
+            return
+        try:
+            accepted = latch(reason=reason)
+        except Exception as exc:
+            self._log(
+                f"關閉動作鎖存發生例外（{exc!r}）；"
+                "仍繼續取消 AUTO 與執行後端降落。"
+            )
+            return
+        if accepted is False:
+            self._log("關閉動作鎖存未確認；仍繼續取消 AUTO 與執行後端降落。")
+
     def _stop_autonomy(self) -> bool:
-        """Latch AUTO cancellation and join its worker before backend cleanup."""
+        """Cancel AUTO, then let backend cleanup supersede a stuck worker.
+
+        Live backend cleanup latches out every future PC motion before it starts
+        Landing.  A bounded join remains useful for an orderly exit, but it must
+        not prevent that independent safety path from running.
+        """
         try:
             autonomy = self._current_autonomy()
         except Exception as exc:
-            self._log(f"關窗已暫停：無法讀取 AUTO 狀態（{exc!r}）；請重試。")
-            return False
+            self._autonomy_cancel_latched = True
+            self._log(
+                f"無法讀取 AUTO 狀態（{exc!r}）；"
+                "仍由後端鎖存電腦動作並執行獨立降落。"
+            )
+            return True
         if autonomy is None or not bool(getattr(autonomy, "active", False)):
+            self._autonomy_cancel_latched = False
             return True
 
         cancel = getattr(autonomy, "cancel", None)
         if not callable(cancel):
             self._log(
-                "關窗已暫停：AUTO 執行緒沒有可用的取消介面；"
-                "請保持手動控制並重試。"
+                "AUTO 執行緒沒有可用的取消介面；"
+                "仍由後端鎖存電腦動作並執行獨立降落。"
             )
-            return False
+            return True
         self._autonomy_cancel_latched = True
         try:
             # DesktopRouteAutonomy.cancel() is the safety latch: it clears the
@@ -105,22 +134,28 @@ class OperatorShutdownCoordinator:
             # SkyController handoff.  Do not wait for that handoff here.
             cancel("ui_window_close")
         except Exception as exc:
-            self._log(f"關窗已暫停：AUTO 取消失敗（{exc!r}）；請重試。")
-            return False
+            self._log(
+                f"AUTO 取消失敗（{exc!r}）；"
+                "仍由後端鎖存電腦動作並執行獨立降落。"
+            )
+            return True
 
         join = getattr(autonomy, "join", None)
         if callable(join):
             try:
                 joined = join(timeout=1.0)
             except Exception as exc:
-                self._log(f"關窗已暫停：AUTO 執行緒停止失敗（{exc!r}）；請重試。")
-                return False
+                self._log(
+                    f"AUTO 執行緒停止失敗（{exc!r}）；"
+                    "仍繼續獨立降落。"
+                )
+                return True
             if joined is False:
-                self._log("關窗已暫停：AUTO 執行緒尚未停止；請重試。")
-                return False
+                self._log("AUTO 執行緒尚未停止；後端已優先鎖存並繼續獨立降落。")
+                return True
         if bool(getattr(autonomy, "active", False)):
-            self._log("關窗已暫停：AUTO 執行緒尚未停止；請重試。")
-            return False
+            self._log("AUTO 執行緒仍在執行；後端已優先鎖存並繼續獨立降落。")
+            return True
         # AUTO is now stopped, so a failed touchdown confirmation must leave
         # the operator able to issue a manual safety command before retrying.
         self._autonomy_cancel_latched = False
@@ -191,8 +226,12 @@ class OperatorShutdownCoordinator:
     def _shutdown_once(self, *, reason: str) -> bool:
         if self._closed:
             return True
-        if not self._suspend_commands():
-            return False
+        # Suspending the UI dispatcher is diagnostic hardening, not a
+        # prerequisite for the flight-critical path.  The live backend latch
+        # below independently retires late PC motion, so a broken coordinator
+        # must never prevent the Landing attempt.
+        self._suspend_commands()
+        self._latch_backend_motion(reason=reason)
         if not self._stop_autonomy():
             return False
 

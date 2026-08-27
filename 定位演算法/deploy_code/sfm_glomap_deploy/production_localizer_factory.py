@@ -3,13 +3,18 @@
 from __future__ import annotations
 
 import math
+from functools import partial
 from numbers import Real
 from pathlib import Path
 
 import pycolmap
 
 from artifact_integrity import verify_sha256
-from edm_profile import apply_edm_tracker_profile, load_edm_production_profile
+from edm_profile import (
+    apply_edm_tracker_profile,
+    load_edm_production_profile,
+    resolve_reposed_model_path,
+)
 from localizer_registry import register_localizer_provider, get_localizer_provider
 from pose_types import BuiltLocalizer, LocalizerProvider
 from reference_index import ReferenceIndex, open_reference_index
@@ -182,6 +187,33 @@ def production_xfeat_config():
     )
 
 
+
+def build_reposed_motion_validator(profile: dict | None, camera, matcher, source=None):
+    """Construct the lazy wrapper only when the profile enables it."""
+    reposed = None if not profile else profile.get("reposed")
+    if not isinstance(reposed, dict) or reposed.get("mode", "off") == "off":
+        return None, "off"
+    from reposed_motion_validator import RePoseDMotionValidator
+
+    model_source = Path(source).expanduser().resolve() if source is not None else None
+    validator = RePoseDMotionValidator(
+        camera,
+        matcher,
+        model_path=resolve_reposed_model_path(reposed["model_path"], model_source),
+        model_sha256=reposed["model_sha256"],
+        num_tokens=int(reposed["num_tokens"]),
+        max_matches=int(reposed["max_matches"]),
+        min_inliers=int(reposed["min_inliers"]),
+        max_rotation_delta_deg=float(reposed["max_rotation_delta_deg"]),
+        max_translation_direction_delta_deg=float(
+            reposed["max_translation_direction_delta_deg"]
+        ),
+        match_grid=int(reposed.get("match_grid", 1)),
+        min_inlier_ratio=float(reposed.get("min_inlier_ratio", 0.0)),
+        min_spatial_support=int(reposed.get("min_spatial_support", 0)),
+    )
+    return validator, str(reposed["mode"])
+
 def _build_edm_localizer(
     *,
     bundle: str | Path,
@@ -191,6 +223,9 @@ def _build_edm_localizer(
     megaloc_cache: str | Path | None = None,
     reference_index: str | Path | None = None,
     reference_index_sha256: str | None = None,
+    megaloc_backend: str | None = "tensorrt",
+    megaloc_engine: str | Path | None = None,
+    megaloc_engine_sha256: str | None = None,
     production_profile: str | Path | None = None,
     production_profile_sha256: str | None = None,
     matcher_mode: str = "",
@@ -212,7 +247,7 @@ def _build_edm_localizer(
         )
     from edm_localizer_adapter import EDMTrackerAdapter, production_edm_config
     from edm_matcher import EDMMatcher
-    from reloc_localizer_edm import Camera, DEVICE, EDMRelocMap
+    from reloc_localizer_edm import Camera, DEVICE, EDMRelocMap, MegaLocQuery
 
     reloc_map = EDMRelocMap.load(bundle, expected_sha256=bundle_sha256 or None)
     indexed_retrieval = _load_bound_reference_index(
@@ -235,6 +270,14 @@ def _build_edm_localizer(
             topk=int(matcher_cfg["coarse_topk"]),
             fp16=bool(matcher_cfg["fp16"]),
             reference_cache_size=int(matcher_cfg["reference_cache_size"]),
+            runtime_sigma_mode=str(
+                matcher_cfg.get("runtime_sigma_mode", "reference_grid")
+            ),
+            temporal_feature_cache_size=int(
+                matcher_cfg["temporal_feature_cache_size"]
+                if "temporal_feature_cache_size" in matcher_cfg
+                else (2 if config.use_temporal_reference else 0)
+            ),
         )
         profile_name = str(profile.get("name") or "unnamed")
         matcher_tag = (
@@ -245,22 +288,58 @@ def _build_edm_localizer(
         config.weak_local_topk = max(config.weak_local_topk, config.local_topk)
         config.validate()
     camera = Camera(*camera_tuple)
+    motion_validator, motion_validation_mode = build_reposed_motion_validator(
+        profile if production_profile else None,
+        camera,
+        matcher,
+        source=production_profile,
+    )
+    megaloc_factory = partial(
+        MegaLocQuery,
+        device=DEVICE,
+        backend=megaloc_backend,
+        engine_path=megaloc_engine,
+        engine_sha256=megaloc_engine_sha256,
+    )
     tracker = EDMTrackerAdapter(
         reloc_map,
         camera,
         cfg=config,
         matcher=matcher,
+        megaloc_factory=megaloc_factory,
         reference_index=indexed_retrieval,
         frame_source=frame_source,
         map_frame=map_frame,
+        motion_validator=motion_validator,
+        motion_validation_mode=motion_validation_mode,
     )
+    try:
+        from dataclasses import replace
+
+        from pose_guided.config import load_pose_guided_config
+        from pose_guided.controller import PoseGuidedController
+
+        guided = load_pose_guided_config()
+        weight = float(config.reference_quality_weight)
+        if guided.ranking.w_quality != weight:
+            guided = replace(
+                guided,
+                ranking=replace(guided.ranking, w_quality=weight),
+            )
+        tracker.attach_pose_guided(PoseGuidedController(guided))
+    except ValueError:
+        pass
+
     return BuiltLocalizer(
         tracker=tracker,
         reloc_map=reloc_map,
         camera=camera,
         config=config,
         backend="edm",
-        variant=f"production_edm_{profile_name}_topk{config.local_topk}_{matcher_tag}",
+        variant=(
+            f"production_edm_{profile_name}_topk{config.local_topk}_{matcher_tag}"
+            f"_megaloc_{megaloc_backend or 'environment'}"
+        ),
         device=DEVICE,
     )
 
@@ -274,6 +353,9 @@ def _build_xfeat_localizer(
     megaloc_cache: str | Path | None = None,
     reference_index: str | Path | None = None,
     reference_index_sha256: str | None = None,
+    megaloc_backend: str | None = None,
+    megaloc_engine: str | Path | None = None,
+    megaloc_engine_sha256: str | None = None,
     production_profile: str | Path | None = None,
     production_profile_sha256: str | None = None,
     matcher_mode: str = "",
@@ -281,7 +363,14 @@ def _build_xfeat_localizer(
     allow_profile_defaults: bool = False,
     map_frame=None,
 ) -> BuiltLocalizer:
-    del production_profile, production_profile_sha256, allow_profile_defaults
+    del (
+        production_profile,
+        production_profile_sha256,
+        allow_profile_defaults,
+        megaloc_backend,
+        megaloc_engine,
+        megaloc_engine_sha256,
+    )
     from production_xfeat_tracker import MegaLocLayer, ProductionXFeatTracker
     from reloc_localizer_xfeat import Camera, DEVICE, XFeatRelocMap
 
@@ -376,6 +465,9 @@ def build_production_localizer(
     megaloc_cache: str | Path | None = None,
     reference_index: str | Path | None = None,
     reference_index_sha256: str | None = None,
+    megaloc_backend: str | None = "tensorrt",
+    megaloc_engine: str | Path | None = None,
+    megaloc_engine_sha256: str | None = None,
     production_profile: str | Path | None = None,
     production_profile_sha256: str | None = None,
     matcher_mode: str = "",
@@ -396,6 +488,9 @@ def build_production_localizer(
         megaloc_cache=megaloc_cache,
         reference_index=reference_index,
         reference_index_sha256=reference_index_sha256,
+        megaloc_backend=megaloc_backend,
+        megaloc_engine=megaloc_engine,
+        megaloc_engine_sha256=megaloc_engine_sha256,
         production_profile=production_profile,
         production_profile_sha256=production_profile_sha256,
         matcher_mode=matcher_mode,

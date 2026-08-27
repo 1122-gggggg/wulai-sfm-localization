@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Add only the smoke-test video to an exported site bundle, install its pinned
-# runtime, launch its selector/UI, require a valid pose, then remove test outputs.
+# Install an exported site's pinned runtime, launch its selector/UI against an
+# explicit external replay, require a valid pose, then remove test outputs.
 set -euo pipefail
 
 if [[ "$#" -ne 1 ]]; then
@@ -11,14 +11,11 @@ fi
 source_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 portable_root="$(realpath -e -- "$1")"
 temporary_root="$(mktemp -d -t sfm-portable-runtime-XXXXXX)"
-staged_video_root="$portable_root/模擬器/測試影片"
 staged_output_root="$portable_root/outputs"
+smoke_video="${SFM_SMOKE_VIDEO:-$source_root/模擬器/測試影片/P1190119.MP4}"
 staging_owned=0
 
 cleanup() {
-  if [[ "$staging_owned" == "1" ]] && [[ -d "$staged_video_root" ]]; then
-    rm -r -- "$staged_video_root"
-  fi
   if [[ "$staging_owned" == "1" ]] && [[ -d "$staged_output_root/flight_logs" ]]; then
     rm -r -- "$staged_output_root/flight_logs"
   fi
@@ -32,7 +29,7 @@ if [[ "$portable_root" == "$source_root" ]]; then
   echo "[portable-runtime] package must differ from the source workspace" >&2
   exit 2
 fi
-for path in "$staged_output_root" "$portable_root/模擬器"; do
+for path in "$staged_output_root"; do
   if [[ -L "$path" ]]; then
     echo "[portable-runtime] refusing symlinked package path: $path" >&2
     exit 2
@@ -42,11 +39,11 @@ if [[ ! -d "$staged_output_root" ]]; then
   echo "[portable-runtime] package outputs directory is missing: $staged_output_root" >&2
   exit 2
 fi
-if [[ -e "$portable_root/模擬器" ]] && [[ ! -d "$portable_root/模擬器" ]]; then
-  echo "[portable-runtime] package simulator path is not a directory" >&2
+if [[ ! -s "$smoke_video" ]]; then
+  echo "[portable-runtime] smoke video is missing or empty: $smoke_video" >&2
   exit 2
 fi
-for path in "$staged_video_root" "$portable_root/.venv"; do
+for path in "$portable_root/.venv"; do
   if [[ -e "$path" || -L "$path" ]]; then
     echo "[portable-runtime] refusing to overwrite existing path: $path" >&2
     exit 2
@@ -60,12 +57,11 @@ for path in \
   "$portable_root/PORTABLE_SITE_ASSETS.json" \
   "$portable_root/執行環境/offline_wheelhouse/WHEELHOUSE.json" \
   "$portable_root/outputs/README.md" \
-  "$portable_root/控制介面程式/site_profiles/river_site_edm.json" \
-  "$portable_root/地圖檔/場域/river_site/maps/river_site_realrgb_dense_trimmed.ply" \
-  "$portable_root/地圖檔/場域/river_site/maps/river_site_ref_poses.json" \
-  "$portable_root/地圖檔/場域/river_site/maps/T_align_gravity.json" \
-  "$portable_root/地圖檔/場域/river_site/bundles/river_site_reloc_map_edm.pt" \
-  "$portable_root/地圖檔/場域/river_site/routes/authored/route_20260807_013811.json"; do
+  "$portable_root/地圖檔/場域/river_site/site_profile.json" \
+  "$portable_root/地圖檔/場域/river_site/releases/river_site_b0_p116_p117_20260818/map/map.ply" \
+  "$portable_root/地圖檔/場域/river_site/releases/river_site_b0_p116_p117_20260818/localization/reference_poses.json" \
+  "$portable_root/地圖檔/場域/river_site/releases/river_site_b0_p116_p117_20260818/compat/T_align_gravity.json" \
+  "$portable_root/地圖檔/場域/river_site/releases/river_site_b0_p116_p117_20260818/localization/localization_bundle.pt"; do
   if [[ ! -f "$path" ]]; then
     echo "[portable-runtime] portable package is missing: $path" >&2
     exit 1
@@ -108,13 +104,6 @@ fi
 "$source_root/.venv/bin/python" \
   "$portable_root/tools/package_manifest.py" verify --root "$portable_root"
 
-staging_owned=1
-install -d \
-  "$staged_video_root"
-install -m 0644 \
-  "$source_root/模擬器/測試影片/河濱_P1180118_first_2s.mp4" \
-  "$staged_video_root/河濱_P1180118_first_2s.mp4"
-
 portable_venv="$temporary_root/venv"
 install_log="$temporary_root/offline-install.log"
 if ! PIP_NO_INDEX=1 \
@@ -129,9 +118,11 @@ if grep -Eiq 'https?://|looking in indexes:' "$install_log"; then
   echo "[portable-runtime] offline installer attempted a package index or URL" >&2
   exit 1
 fi
+staging_owned=1
 SFM_UI_PYTHON="$portable_venv/bin/python" \
 SFM_LOCALIZER_PYTHON="$portable_venv/bin/python" \
 SFM_PORTABLE_ALLOW_EXTERNAL_PYTHON=1 \
+SFM_SMOKE_VIDEO="$smoke_video" \
   bash "$portable_root/tools/simulated_ui_smoke.sh"
 SFM_UI_PYTHON="$portable_venv/bin/python" \
 SFM_LOCALIZER_PYTHON="$portable_venv/bin/python" \

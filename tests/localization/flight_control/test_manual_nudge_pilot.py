@@ -149,3 +149,64 @@ def test_ui_close_sets_stop_cleans_up_and_destroys_root():
     root.destroy.assert_called_once_with()
     assert status.value == "closing -> land"
     assert last.value == status.value
+
+
+def test_cleanup_after_manual_takeover_preserves_connection():
+    pilot = _pilot()
+    events = []
+    closed = []
+    pilot.log = SimpleNamespace(
+        event=lambda event, **fields: events.append((event, fields)),
+        close=lambda: closed.append(True),
+    )
+    drone = SimpleNamespace(disconnect=Mock())
+    pilot.drone = drone
+    pilot.safety.airborne = True
+    pilot.land = Mock(side_effect=AssertionError("manual cleanup must not land"))
+
+    assert pilot.give_to_pilot()
+    pilot.cleanup()
+
+    pilot.land.assert_not_called()
+    drone.disconnect.assert_not_called()
+    assert pilot.safety.pilot_sticks is True
+    assert pilot._cleanup_done is True
+    assert closed == [True]
+    assert any(
+        event == "cleanup_manual_control_preserved"
+        and fields["connection_preserved"]
+        for event, fields in events
+    )
+
+
+def test_cleanup_landing_failure_keeps_connection_and_logs_unresolved():
+    pilot = _pilot()
+    events = []
+    closed = []
+    pilot.log = SimpleNamespace(
+        event=lambda event, **fields: events.append((event, fields)),
+        close=lambda: closed.append(True),
+    )
+    drone = SimpleNamespace(disconnect=Mock())
+    pilot.drone = drone
+    pilot.safety.airborne = True
+    pilot._set_piloting_source = Mock(return_value=True)
+    pilot.land = Mock(return_value=False)
+
+    pilot.cleanup()
+
+    pilot.land.assert_called_once_with("cleanup_exit")
+    assert pilot._sent[-1] == (0, 0, 0, 0)
+    pilot._set_piloting_source.assert_called_once_with("SkyController")
+    drone.disconnect.assert_not_called()
+    assert pilot._cleanup_done is False
+    assert pilot.safety.landed is False
+    assert pilot.safety.airborne is True
+    assert closed == []
+    assert any(
+        event == "cleanup_unresolved"
+        and fields["reason"] == "LAND_UNCONFIRMED"
+        and fields["connection_preserved"]
+        and not fields["touchdown_confirmed"]
+        for event, fields in events
+    )

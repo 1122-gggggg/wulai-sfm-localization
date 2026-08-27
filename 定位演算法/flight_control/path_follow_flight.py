@@ -30,7 +30,7 @@ SAFETY  -- real flight is irreversible and can injure people or destroy the dron
   --selftest  : pure-python checks (heading fusion + PCMD sign sanity). No deps.
   --dry-run   : no drone; a toy dynamics model closes the loop to exercise logic.
   --grab-only : connect + localize on the LIVE stream, PROPS OFF, never arms motors.
-  --fly       : approved site-profile flight with runtime safety and firmware limits.
+  --fly       : rejected. Live TakeOff is only allowed from the operator UI.
 The aircraft's initial nose direction is measured, never assumed from the route.
 """
 from __future__ import annotations
@@ -94,6 +94,13 @@ from landing_transition import (  # noqa: E402
     decide_route_completion_landing,
     landing_speed_allows_land,  # noqa: F401 - compatibility API
 )
+from heading_fusion import (  # noqa: E402
+    OFFSET_EMA,  # noqa: F401 - compatibility API
+    OlympeGroundSpeedTracker as OlympeGroundSpeedTracker,
+    VISUAL_IMU_YAW_MISMATCH_RAD,  # noqa: F401 - compatibility API
+    HeadingEstimator,
+    olympe_yaw_of,
+)
 from safety_command import (  # noqa: E402
     default_safety_file as _default_safety_file,  # noqa: F401 - compatibility API
     prepare_safety_file as _prepare_safety_file,
@@ -101,7 +108,7 @@ from safety_command import (  # noqa: E402
     validate_safety_directory as _validate_safety_directory,
     validate_safety_file_stat as _validate_safety_file_stat,
 )
-# 2026-08-06 audit: a hard-coded /home/allen/足球場 probe used to sit here and,
+# 2026-08-06 audit: a hard-coded external-site probe used to sit here and,
 # whenever that developer-specific directory happened to exist, silently swapped
 # DEFAULT_BUNDLE and DEFAULT_MEGALOC_CACHE to the football-field site regardless of
 # which site the operator had chosen. The live launcher refuses to start without an
@@ -237,20 +244,24 @@ def _env_int(name: str, default: int, *, minimum: int, maximum: int) -> int:
 
 CTRL_HZ = 20
 POSE_STALE_S = 0.5          # visual pose older than this -> HOVER
+# Reuse one accepted visual position only across a very short failed-frame run.
+# The source timestamp must still satisfy POSE_STALE_S; this second bound limits
+# how long control may continue after the localizer actually stopped producing fixes.
+POSE_HOLDOVER_S = _env_float(
+    "SFM_POSE_HOLDOVER_S", 0.20, minimum=0.0, maximum=POSE_STALE_S)
 # 720p live frame older than this -> HOVER before localization. Distinct from the
 # operator interface's _STREAM_STALE_S (0.75 s), which only feeds its stick-handoff
 # timer; this one decides whether autonomy may run the localizer on the frame.
 STREAM_STALE_S = 0.5
 LOST_LAND_S = 4.0           # no fresh pose for this long -> auto-land
-# Localization lost + MegaLoc cannot relocalize this long -> hand to the human pilot
-# (only if a SkyController manual pilot exists; else the LOST_LAND_S failsafe still lands).
-LOST_MANUAL_S = _env_float("SFM_LOST_MANUAL_S", 3.0, minimum=0.0, maximum=300.0)
+# Give MegaLoc a stationary retry window before moving the camera. The desktop
+# AUTO adapter opts into one slow, telemetry-bounded clockwise turn.
+LOST_YAW_SEARCH_DELAY_S = 10.0
+LOST_YAW_SEARCH_TIMEOUT_S = 300.0
+LOST_YAW_SEARCH_TARGET_RAD = 2.0 * math.pi
 LOW_CONF_INLIERS = _env_int("SFM_LOW_CONF_INLIERS", 60, minimum=1, maximum=10000)
 RECOVERY_GOOD_FIXES = _env_int(
     "SFM_RECOVERY_GOOD_FIXES", 2, minimum=1, maximum=20)
-# Stream lost this long -> auto-land (was: hover forever until battery death).
-STREAM_LOST_LAND_S = _env_float(
-    "SFM_STREAM_LOST_LAND_S", 15.0, minimum=0.5, maximum=600.0)
 # A WEAK (low-confidence) fix in repetitive line-corridor geometry can be plausible
 # but wrong and still pass the jump/deviation gates; treat it as "uncertain" -> hover.
 # SFM_GATE_WEAK is retained for explicit offline benchmark/simulation callers only.
@@ -264,6 +275,12 @@ WEAK_HOVER_LAND_S = _env_float(
 # so genuine relocalization after hover drift still recovers.
 MAX_POSE_JUMP_U = _env_float(
     "SFM_MAX_POSE_JUMP_U", 1.5, minimum=0.01, maximum=100.0)
+POSE_CONTINUITY_HISTORY = _env_int(
+    "SFM_POSE_CONTINUITY_HISTORY", 5, minimum=2, maximum=20)
+LOW_CONF_JUMP_WINDOW_S = _env_float(
+    "SFM_LOW_CONF_JUMP_WINDOW_S", 2.0, minimum=0.1, maximum=30.0)
+LOW_CONF_JUMP_HOVER_COUNT = _env_int(
+    "SFM_LOW_CONF_JUMP_HOVER_COUNT", 3, minimum=2, maximum=20)
 # Route-corridor bound (MAP UNITS): if the accepted pose ends up farther than
 # this from the drawn route, abort and land instead of REJOIN-ing blindly.
 MAX_ROUTE_DEVIATION_U = _env_float(
@@ -278,14 +295,11 @@ PCMD_CONTROL_HZ = _env_float(
     "SFM_PCMD_CONTROL_HZ", 20.0, minimum=5.0, maximum=50.0)
 PCMD_COMMAND_TTL_S = _env_float(
     "SFM_PCMD_COMMAND_TTL_S", 0.15, minimum=0.01, maximum=0.15)
-OFFSET_EMA = 0.25           # visual-to-attitude offset smoothing after first anchor
 FIRST_FIX_TIMEOUT_S = 25.0  # how long to wait for BOOT_INIT -> first TRACK
 AUTO_CONSENT_TIMEOUT_S = 30.0
 BOOT_LOCK_FIXES = 3
 BOOT_START_MAX_U = _env_float(
     "SFM_BOOT_START_MAX_U", 1.5, minimum=0.05, maximum=100.0)
-INSPECTION_TIMEOUT_S = _env_float(
-    "SFM_INSPECTION_TIMEOUT_S", 15.0, minimum=1.0, maximum=120.0)
 # The ANAFI whitepaper's 280 ms is a video latency lower bound, not a safe
 # pipeline upper bound. Drain a conservative, explicitly tunable source-clock
 # interval before an inspection frame can be acknowledged.
@@ -449,14 +463,23 @@ def arming_allowed(safety_mode: str, stream_healthy: bool,
 
 
 class BootPoseLock:
-    """Require stable, fresh consecutive fixes close to the route start."""
+    """Require stable, fresh fixes close to any waypoint on the route."""
 
-    def __init__(self, route_start, required_fixes: int = BOOT_LOCK_FIXES,
+    def __init__(self, route_waypoints, required_fixes: int = BOOT_LOCK_FIXES,
                  max_start_distance: float = BOOT_START_MAX_U,
                  max_fix_jump: float = MAX_POSE_JUMP_U):
-        self.route_start = np.asarray(route_start, dtype=float)
-        if self.route_start.shape != (3,) or not np.isfinite(self.route_start).all():
-            raise ValueError("BOOT route start must be a finite 3-vector")
+        points = np.asarray(route_waypoints, dtype=float)
+        if points.shape == (3,):
+            points = points.reshape(1, 3)
+        if (
+            points.ndim != 2
+            or points.shape[0] < 1
+            or points.shape[1] != 3
+            or not np.isfinite(points).all()
+        ):
+            raise ValueError("BOOT route waypoints must be finite 3-vectors")
+        self.route_waypoints = np.array(points, dtype=float, copy=True)
+        self.route_start = self.route_waypoints[0]
         self.required_fixes = int(required_fixes)
         self.max_start_distance = float(max_start_distance)
         self.max_fix_jump = float(max_fix_jump)
@@ -466,10 +489,16 @@ class BootPoseLock:
             raise ValueError("BOOT lock thresholds must be finite/positive and require >=2 fixes")
         self.count = 0
         self._last = None
+        self.nearest_waypoint_index: int | None = None
+
+    @property
+    def position(self) -> np.ndarray | None:
+        return None if self._last is None else self._last.copy()
 
     def reset(self) -> None:
         self.count = 0
         self._last = None
+        self.nearest_waypoint_index = None
 
     def observe(self, pose, now: float | None = None) -> bool:
         now = time.monotonic() if now is None else float(now)
@@ -480,15 +509,18 @@ class BootPoseLock:
             return False
         age = now - float(values[3])
         pos = values[:3]
+        distances = np.linalg.norm(self.route_waypoints - pos, axis=1)
+        nearest_index = int(np.argmin(distances))
         valid = (math.isfinite(now) and np.isfinite(values).all()
                  and -0.05 <= age <= POSE_STALE_S
-                 and float(np.linalg.norm(pos - self.route_start)) <= self.max_start_distance
+                 and float(distances[nearest_index]) <= self.max_start_distance
                  and (self._last is None
                       or float(np.linalg.norm(pos - self._last)) <= self.max_fix_jump))
         if not valid:
             self.reset()
             return False
-        self._last = pos
+        self._last = pos.copy()
+        self.nearest_waypoint_index = nearest_index
         self.count += 1
         return self.count >= self.required_fixes
 
@@ -730,115 +762,6 @@ def _wrap(a: float) -> float:
     return (a + math.pi) % (2.0 * math.pi) - math.pi
 
 
-class HeadingEstimator:
-    """Fuse visual MapFrame heading with Olympe's clockwise-from-North NED yaw."""
-
-    def __init__(self, map_frame=None):
-        import real_path_follow_controller as rpf
-        self.map_frame = map_frame or rpf.LEGACY_MAP_FRAME
-        self.offset = None
-        self._last_visual_heading = None
-
-    @staticmethod
-    def _olympe_to_map_ccw(olympe_yaw: float) -> float:
-        # Olympe AttitudeChanged.yaw is NED: clockwise from North. MapFrame
-        # heading is counter-clockwise from East.
-        return _wrap(math.pi / 2.0 - float(olympe_yaw))
-
-    def update(self, visual_map_yaw: float, olympe_yaw: float | None):
-        """Anchor attitude telemetry to the localized camera/body forward ray."""
-        try:
-            visual = _wrap(float(visual_map_yaw))
-        except (TypeError, ValueError, OverflowError):
-            return
-        if not math.isfinite(visual):
-            return
-        self._last_visual_heading = visual
-        if olympe_yaw is None:
-            return
-        try:
-            attitude = self._olympe_to_map_ccw(float(olympe_yaw))
-        except (TypeError, ValueError, OverflowError):
-            return
-        if not math.isfinite(attitude):
-            return
-        new = _wrap(visual - attitude)
-        self.offset = new if self.offset is None else _wrap(
-            self.offset + OFFSET_EMA * _wrap(new - self.offset)
-        )
-
-    def heading(self, olympe_yaw: float | None) -> float | None:
-        if olympe_yaw is not None and self.offset is not None:
-            try:
-                attitude = self._olympe_to_map_ccw(float(olympe_yaw))
-            except (TypeError, ValueError, OverflowError):
-                attitude = float("nan")
-            if math.isfinite(attitude):
-                return _wrap(attitude + self.offset)
-        return self._last_visual_heading
-
-
-# ---------------------------------------------------------------------------
-# Olympe helpers (thin, so the module imports without olympe for --selftest/--dry-run)
-
-def olympe_yaw_of(drone) -> float | None:
-    """Latest fused body yaw (radians, drone NED frame) or None if not yet received."""
-    from olympe.messages.ardrone3.PilotingState import AttitudeChanged
-    try:
-        st = drone.get_state(AttitudeChanged)          # raises KeyError if never received
-    except (KeyError, RuntimeError):
-        return None
-    return None if not st else float(st["yaw"])
-
-
-class OlympeGroundSpeedTracker:
-    """Read fresh NED horizontal speed from Olympe ``SpeedChanged`` events.
-
-    ``get_state`` alone cannot distinguish a new event from a cached value.  The
-    event UUID and SDK receipt time make the landing gate fail closed when speed
-    telemetry stops updating.
-    """
-
-    def __init__(self, drone, message=None, *, now=time.monotonic, wall_now=time.time):
-        if message is None:
-            from olympe.messages.ardrone3.PilotingState import SpeedChanged
-            message = SpeedChanged
-        self.drone = drone
-        self.message = message
-        self._now = now
-        self._wall_now = wall_now
-        self._marker = None
-        self._sample = None
-
-    def sample(self) -> tuple[float, float] | None:
-        """Return ``(horizontal_mps, receipt_monotonic_s)`` or ``None``."""
-        try:
-            event = self.drone.get_last_event(self.message)
-            marker = str(event.uuid)
-            state = dict(event.args)
-            now = float(self._now())
-            event_age_s = float(self._wall_now()) - float(event.date.timestamp())
-        except (AttributeError, KeyError, RuntimeError, TypeError, ValueError, OverflowError):
-            return None
-        if (not math.isfinite(now) or not math.isfinite(event_age_s)
-                or event_age_s < -0.05):
-            return None
-        if marker != self._marker:
-            self._marker = marker
-            self._sample = (state, now - max(0.0, event_age_s))
-        if self._sample is None:
-            return None
-        state, stamp = self._sample
-        try:
-            speed_x = float(state["speedX"])
-            speed_y = float(state["speedY"])
-        except (KeyError, TypeError, ValueError, OverflowError):
-            return None
-        if not all(math.isfinite(value) for value in (speed_x, speed_y, stamp)):
-            return None
-        return math.hypot(speed_x, speed_y), float(stamp)
-
-
 def inspection_gimbal_pitch_deg(meta: dict, pose, map_frame=None) -> float | None:
     """Target pitch using the site's measured horizontal and vertical axes."""
     import real_path_follow_controller as rpf
@@ -968,18 +891,22 @@ class LoopHooks:
     pose_is_weak: callable | None = None  # () -> bool; True if the last fix was a WEAK track
     pose_confidence: callable | None = None  # () -> int; last-fix PnP inliers (low -> hover + relocalize)
     force_relocalize: callable | None = None  # () -> None; ask the tracker to run MegaLoc (LOST)
-    request_manual: callable | None = None  # () -> bool; switch to MANUAL on persistent loss (SkyController)
+    request_manual: callable | None = None  # () -> bool; physical-stick/manual safety handoff
     stick_active: callable | None = None    # () -> bool; the pilot has physically moved the sticks
     safety_poll: callable | None = None  # () -> AUTO/HOVER/MANUAL/LAND/EMERGENCY
     stream_healthy: callable | None = None  # () -> bool; false means live stream stale/lost
     stream_status: callable | None = None   # () -> str; operator log detail
     loop_beat: callable | None = None       # () -> None; watchdog heartbeat, called every tick
     pose_info: callable | None = None       # () -> dict; localizer last_info (LOGGING ONLY)
+    pose_jump_pause: callable | None = None  # (distance_map_units) -> latch operator HOVER
     inspection_ack: callable | None = None  # (metadata, pose) -> bool after gimbal+capture success
     inspection_hold: callable | None = None  # (blocking_action) -> bool while zero PCMD is sustained
     pcmd_timing: callable | None = None       # () -> latest desired/wire monotonic_ns markers
     ground_speed: callable | None = None      # () -> (horizontal_mps, monotonic_stamp) | None
     log_tick: callable | None = None        # (dict) -> None; structured per-tick command log
+    land_on_localization_loss: bool = True  # false: zero PCMD and wait for recovery/operator
+    localization_yaw_search_pcmd: int = 0  # 0 disables; positive ANAFI yaw turns right
+    localization_yaw_search_event: callable | None = None  # (state, progress_deg) -> None
     now: callable = time.monotonic
 
 
@@ -1780,14 +1707,33 @@ class _FlightLoopRunner:
         )
         self.period = 1.0 / CTRL_HZ
         self.last_good = None
+        self.last_good_accepted_at = None
         self.uncertainty = LocalizationState()
         self.stream_lost_since = None
         self.last_stream_warn = 0.0
         self.pending_jump = None
         self.pending_jump_stamp = None
-        self.inspection_started = {}
+        self.accepted_pose_history: list[np.ndarray] = []
+        self.low_conf_jump_times: list[float] = []
+        self.pose_jump_pause_latched = False
+        self.pose_jump_pause_observed = False
+        self.pose_jump_resume_authorized = False
+        self.route_rejoin_target = None
+        self.route_rejoin_segment: int | None = None
         self.steps = 0
-        self.manual_requested = False
+        search_pcmd = hooks.localization_yaw_search_pcmd
+        if (
+            isinstance(search_pcmd, bool)
+            or not isinstance(search_pcmd, int)
+            or not 0 <= search_pcmd <= 20
+        ):
+            raise ValueError("localization_yaw_search_pcmd must be an integer within [0, 20]")
+        self.localization_yaw_search_pcmd = search_pcmd
+        self.localization_yaw_search_active = False
+        self.localization_yaw_search_completed = False
+        self.localization_yaw_search_started_at: float | None = None
+        self.localization_yaw_search_last_yaw: float | None = None
+        self.localization_yaw_search_accumulated_rad = 0.0
 
     def run(self) -> str:
         while True:
@@ -1820,6 +1766,10 @@ class _FlightLoopRunner:
     def _reset_pcmd_controller(self) -> None:
         if self.pcmd_controller is not None:
             self.pcmd_controller.reset()
+
+    def _clear_route_rejoin(self) -> None:
+        self.route_rejoin_target = None
+        self.route_rejoin_segment = None
 
     def _emit(self, record: dict, pcmd, blocked: bool, why: str) -> None:
         """Write a per-tick record without disturbing the flight loop."""
@@ -1892,6 +1842,9 @@ class _FlightLoopRunner:
         outcome = self._initial_safety_outcome(safety_mode, record)
         if outcome is not None:
             return outcome
+        outcome = self._pose_jump_pause_outcome(safety_mode, record)
+        if outcome is not None:
+            return outcome
         outcome = self._stick_override_outcome(record)
         if outcome is not None:
             return outcome
@@ -1900,6 +1853,7 @@ class _FlightLoopRunner:
         if outcome is not None:
             return outcome
         olympe_yaw = self._read_olympe_yaw()
+        self._record_olympe_yaw(olympe_yaw, record)
         localized_pose = self._read_localized_pose()
         now = self.hooks.now()
         outcome = self._post_inference_safety_outcome(record)
@@ -1907,8 +1861,20 @@ class _FlightLoopRunner:
             return outcome
         if not self._stream_healthy_after_inference():
             return self._post_inference_stream_loss(now, record)
-        localized_pose, fresh = self._accepted_pose(localized_pose, now, record)
-        low_confidence = self._is_low_confidence(fresh)
+        localized_pose, fresh, new_visual_fix, low_confidence = self._accepted_pose(
+            localized_pose, now, record)
+        if fresh and new_visual_fix and not low_confidence:
+            if self.heading.update(localized_pose.yaw, olympe_yaw):
+                self.last_good = localized_pose
+                self.last_good_accepted_at = now
+                self._remember_accepted_pose(localized_pose)
+                record["pose_source"] = "visual"
+            else:
+                mismatch = self.heading.last_increment_mismatch_rad
+                if mismatch is not None:
+                    record["visual_imu_yaw_mismatch_deg"] = round(
+                        math.degrees(mismatch), 2)
+                fresh = False
         transition = decide_localization_transition(
             self.uncertainty,
             now=now,
@@ -1923,6 +1889,8 @@ class _FlightLoopRunner:
             transition,
             fresh=fresh,
             low_confidence=low_confidence,
+            now=now,
+            olympe_yaw=olympe_yaw,
             record=record,
         )
         if outcome is not None:
@@ -1934,7 +1902,39 @@ class _FlightLoopRunner:
             record,
         )
 
+    @staticmethod
+    def _record_olympe_yaw(olympe_yaw, record: dict) -> None:
+        try:
+            logged_imu_yaw = float(olympe_yaw)
+        except (TypeError, ValueError, OverflowError):
+            logged_imu_yaw = float("nan")
+        if math.isfinite(logged_imu_yaw):
+            record["imu_yaw_ned_rad"] = round(logged_imu_yaw, 6)
+
+    def _pose_jump_pause_outcome(
+        self, mode: str, record: dict
+    ) -> _LoopOutcome | None:
+        if not self.pose_jump_pause_latched:
+            return None
+        if mode == "AUTO" and self.pose_jump_pause_observed:
+            self.pose_jump_pause_latched = False
+            self.pose_jump_resume_authorized = True
+            record["pose_jump_resume_authorized"] = True
+            return None
+        self._reset_pcmd_controller()
+        _sent, _why, actual = self._send_command((0, 0, 0, 0))
+        self._emit(
+            record,
+            actual,
+            True,
+            "pose jump pause latched -> hover; operator must resume AUTO",
+        )
+        return _LoopOutcome()
+
     def _initial_safety_outcome(self, mode: str, record: dict) -> _LoopOutcome | None:
+        if mode in {"EMERGENCY", "LAND", "HOVER", "MANUAL"}:
+            self._interrupt_localization_yaw_search()
+            self._clear_route_rejoin()
         if mode == "EMERGENCY":
             reason = "EMERGENCY command -> motor cut"
             self._emit(record, None, True, reason)
@@ -1945,6 +1945,8 @@ class _FlightLoopRunner:
             self._emit(record, actual, True, reason)
             return _LoopOutcome(reason)
         if mode == "HOVER":
+            if self.pose_jump_pause_latched:
+                self.pose_jump_pause_observed = True
             self._reset_pcmd_controller()
             _sent, _why, actual = self._send_command((0, 0, 0, 0))
             self._emit(record, actual, True, "safety HOVER: authorized zero PCMD")
@@ -1973,6 +1975,8 @@ class _FlightLoopRunner:
             )
         if not sticks_moved:
             return None
+        self._interrupt_localization_yaw_search()
+        self._clear_route_rejoin()
         _sent, _why, actual = self._send_command((0, 0, 0, 0))
         self._reset_pcmd_controller()
         took_over = bool(self.hooks.request_manual()) if self.hooks.request_manual else False
@@ -2002,6 +2006,8 @@ class _FlightLoopRunner:
         if self.hooks.stream_healthy is None or self.hooks.stream_healthy():
             self.stream_lost_since = None
             return None
+        self._reset_localization_yaw_search()
+        self._clear_route_rejoin()
         self._reset_pcmd_controller()
         _sent, _why, actual = self._send_command((0, 0, 0, 0))
         self.stream_lost_since = self.stream_lost_since or now
@@ -2010,10 +2016,6 @@ class _FlightLoopRunner:
         )
         record["stream_ok"] = False
         lost_for = now - self.stream_lost_since
-        if lost_for >= STREAM_LOST_LAND_S:
-            reason = f"stream lost {lost_for:.1f}s >= {STREAM_LOST_LAND_S:.0f}s -> land"
-            self._emit(record, actual, True, reason)
-            return _LoopOutcome(reason)
         self._emit(record, actual, True, f"stream stale/lost {lost_for:.1f}s -> hover")
         self._warn_stream_loss(now, lost_for)
         return _LoopOutcome()
@@ -2058,6 +2060,9 @@ class _FlightLoopRunner:
             else "AUTO"
         )
         record["safety_final"] = mode
+        if mode in {"EMERGENCY", "LAND", "HOVER", "MANUAL"}:
+            self._interrupt_localization_yaw_search()
+            self._clear_route_rejoin()
         if mode == "EMERGENCY":
             reason = "EMERGENCY command during inference -> motor cut"
             self._emit(record, None, True, reason)
@@ -2098,6 +2103,7 @@ class _FlightLoopRunner:
             return False
 
     def _post_inference_stream_loss(self, now: float, record: dict) -> _LoopOutcome:
+        self._reset_localization_yaw_search()
         self._reset_pcmd_controller()
         _sent, _why, actual = self._send_command((0, 0, 0, 0))
         self.stream_lost_since = self.stream_lost_since or now
@@ -2131,18 +2137,49 @@ class _FlightLoopRunner:
         elif pose is not None:
             record["pose"] = "non-finite"
 
-    def _apply_jump_gate(self, pose, fresh: bool, record: dict) -> tuple[bool, bool]:
+    def _remember_accepted_pose(self, pose) -> None:
+        self.accepted_pose_history.append(
+            np.array([pose.x, pose.y, pose.z], dtype=float)
+        )
+        del self.accepted_pose_history[:-POSE_CONTINUITY_HISTORY]
+
+    def _continuity_reference(self) -> np.ndarray:
+        if self.accepted_pose_history:
+            return np.median(np.stack(self.accepted_pose_history), axis=0)
+        return np.array(
+            [self.last_good.x, self.last_good.y, self.last_good.z],
+            dtype=float,
+        )
+
+    def _latch_pose_jump_pause(self, distance: float, record: dict) -> None:
+        if self.hooks.pose_jump_pause is None:
+            return
+        self.pose_jump_pause_latched = True
+        self.pose_jump_pause_observed = False
+        self.pose_jump_resume_authorized = False
+        record["pose_jump_pause_latched"] = True
+        try:
+            self.hooks.pose_jump_pause(distance)
+        except Exception as exc:
+            record["pose_jump_pause_error"] = repr(exc)
+
+    def _apply_jump_gate(
+        self,
+        pose,
+        fresh: bool,
+        low_confidence: bool,
+        now: float,
+        record: dict,
+    ) -> tuple[bool, bool]:
         if not fresh or self.last_good is None:
             return fresh, False
         candidate = np.array([pose.x, pose.y, pose.z], float)
-        previous = np.array(
-            [self.last_good.x, self.last_good.y, self.last_good.z],
-            float,
-        )
+        previous = self._continuity_reference()
         distance = float(np.linalg.norm(candidate - previous))
         if distance <= MAX_POSE_JUMP_U:
             self.pending_jump = None
             self.pending_jump_stamp = None
+            self.pose_jump_resume_authorized = False
             return True, False
         independent = (
             self.pending_jump is not None
@@ -2152,9 +2189,14 @@ class _FlightLoopRunner:
         confirmed = independent and float(
             np.linalg.norm(candidate - self.pending_jump)
         ) <= MAX_POSE_JUMP_U
-        if confirmed:
+        if confirmed and not low_confidence and (
+            self.hooks.pose_jump_pause is None or self.pose_jump_resume_authorized
+        ):
             self.pending_jump = None
             self.pending_jump_stamp = None
+            self.accepted_pose_history.clear()
+            self.pose_jump_resume_authorized = False
+            self.pose_jump_pause_observed = False
             if self.verbose:
                 print(
                     "[safety] POSE_JUMP confirmed by consecutive fix; "
@@ -2165,6 +2207,19 @@ class _FlightLoopRunner:
         self.pending_jump = candidate
         self.pending_jump_stamp = float(pose.stamp)
         record["jump_reject_u"] = round(distance, 2)
+        record["jump_low_confidence"] = bool(low_confidence)
+        if low_confidence:
+            cutoff = now - LOW_CONF_JUMP_WINDOW_S
+            self.low_conf_jump_times = [
+                stamp for stamp in self.low_conf_jump_times if stamp >= cutoff
+            ]
+            self.low_conf_jump_times.append(now)
+            record["low_conf_jump_count"] = len(self.low_conf_jump_times)
+            record["low_conf_jump_window_s"] = LOW_CONF_JUMP_WINDOW_S
+            if len(self.low_conf_jump_times) >= LOW_CONF_JUMP_HOVER_COUNT:
+                self._latch_pose_jump_pause(distance, record)
+        else:
+            self._latch_pose_jump_pause(distance, record)
         if self.verbose:
             print(
                 f"[safety] POSE_JUMP_REJECT: fix jumped {distance:.2f}u > "
@@ -2183,18 +2238,47 @@ class _FlightLoopRunner:
             )
         self._record_pose(pose, now, finite, record)
         fresh = bool(finite and -0.05 <= now - pose.stamp <= POSE_STALE_S)
-        fresh, jump_rejected = self._apply_jump_gate(pose, fresh, record)
-        if fresh:
-            self.last_good = pose
-        elif (
+        if (
+            fresh
+            and self.last_good is not None
+            and float(pose.stamp) <= float(self.last_good.stamp)
+        ):
+            # The desktop adapter exposes its latest accepted pose on every 20 Hz
+            # control tick.  An unchanged capture is holdover, not another visual
+            # observation: it must not refresh the holdover timer or re-anchor yaw.
+            record["repeated_pose_stamp"] = round(float(pose.stamp), 6)
+            fresh = False
+        candidate_low_confidence = self._is_low_confidence(fresh, fresh)
+        fresh, jump_rejected = self._apply_jump_gate(
+            pose,
+            fresh,
+            candidate_low_confidence,
+            now,
+            record,
+        )
+        new_visual_fix = fresh
+        low_confidence = bool(fresh and candidate_low_confidence)
+        if not fresh and (
             not jump_rejected
             and self.last_good is not None
+            and self.last_good_accepted_at is not None
+            and self.uncertainty.uncertain_since is None
+            and 0.0 <= now - self.last_good_accepted_at <= POSE_HOLDOVER_S
             and now - self.last_good.stamp <= POSE_STALE_S
         ):
             pose, fresh = self.last_good, True
-        return pose, fresh
+            record["pose"] = [
+                round(float(pose.x), 3),
+                round(float(pose.y), 3),
+                round(float(pose.z), 3),
+            ]
+            record["pose_age"] = round(now - float(pose.stamp), 3)
+            record["pose_holdover_s"] = round(
+                now - self.last_good_accepted_at, 3)
+            record["pose_source"] = "holdover"
+        return pose, fresh, new_visual_fix, low_confidence
 
-    def _is_low_confidence(self, fresh: bool) -> bool:
+    def _is_low_confidence(self, fresh: bool, new_visual_fix: bool) -> bool:
         weak = (
             self.enforce_weak_pose_gate
             and self.hooks.pose_is_weak is not None
@@ -2204,7 +2288,7 @@ class _FlightLoopRunner:
             self.hooks.pose_confidence is not None
             and self.hooks.pose_confidence() < LOW_CONF_INLIERS
         )
-        return bool(fresh and (weak or few_inliers))
+        return bool(fresh and new_visual_fix and (weak or few_inliers))
 
     @staticmethod
     def _uncertainty_reason(low_confidence: bool, record: dict) -> str:
@@ -2212,23 +2296,129 @@ class _FlightLoopRunner:
             return "low confidence"
         if "jump_reject_u" in record:
             return "pose jump rejected"
+        if "visual_imu_yaw_mismatch_deg" in record:
+            return "visual/IMU yaw increment mismatch"
         return "no fresh pose (lost/stale/PnP fail/non-finite)"
 
-    def _request_manual_after_loss(self, waited: float) -> bool:
-        if (
-            self.manual_requested
-            or waited < LOST_MANUAL_S
-            or self.hooks.request_manual is None
-            or not self.hooks.request_manual()
-        ):
-            return False
-        self.manual_requested = True
-        print(
-            "[safety] LOW_CONF/LOST: MegaLoc could not relocalize in "
-            f"{waited:.1f}s -> switching to MANUAL (pilot takeover)",
-            flush=True,
+    def _notify_localization_yaw_search(self, state: str, progress_deg: float) -> None:
+        callback = self.hooks.localization_yaw_search_event
+        if callback is None:
+            return
+        try:
+            callback(str(state), float(progress_deg))
+        except Exception:
+            pass
+
+    def _reset_localization_yaw_search(self, event: str | None = None) -> None:
+        was_active = self.localization_yaw_search_active
+        progress_deg = math.degrees(self.localization_yaw_search_accumulated_rad)
+        self.localization_yaw_search_active = False
+        self.localization_yaw_search_completed = False
+        self.localization_yaw_search_started_at = None
+        self.localization_yaw_search_last_yaw = None
+        self.localization_yaw_search_accumulated_rad = 0.0
+        if event is not None and was_active:
+            self._notify_localization_yaw_search(event, progress_deg)
+
+    def _interrupt_localization_yaw_search(self) -> None:
+        if not self.localization_yaw_search_active:
+            return
+        self.localization_yaw_search_active = False
+        self.localization_yaw_search_completed = True
+        self.localization_yaw_search_started_at = None
+        self.localization_yaw_search_last_yaw = None
+
+    @staticmethod
+    def _finite_yaw(value) -> float | None:
+        try:
+            yaw = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return yaw if math.isfinite(yaw) else None
+
+    def _localization_yaw_search_outcome(
+        self,
+        *,
+        now: float,
+        waited: float,
+        olympe_yaw,
+        fresh: bool,
+        record: dict,
+    ) -> _LoopOutcome | None:
+        if self.localization_yaw_search_pcmd <= 0:
+            return None
+        if self.localization_yaw_search_completed:
+            return None
+        if fresh and not self.localization_yaw_search_active:
+            return None
+
+        yaw = self._finite_yaw(olympe_yaw)
+        if not self.localization_yaw_search_active:
+            if waited < LOST_YAW_SEARCH_DELAY_S:
+                return None
+            if yaw is None:
+                record["localization_yaw_search"] = "yaw_telemetry_unavailable"
+                return None
+            self.localization_yaw_search_active = True
+            self.localization_yaw_search_started_at = now
+            self.localization_yaw_search_last_yaw = yaw
+            self.localization_yaw_search_accumulated_rad = 0.0
+            self._notify_localization_yaw_search("started", 0.0)
+        elif yaw is None:
+            self.localization_yaw_search_active = False
+            self.localization_yaw_search_completed = True
+            progress_deg = math.degrees(
+                self.localization_yaw_search_accumulated_rad
+            )
+            record["localization_yaw_search"] = "yaw_telemetry_lost"
+            self._notify_localization_yaw_search("yaw_telemetry_lost", progress_deg)
+            return None
+        else:
+            previous = self.localization_yaw_search_last_yaw
+            if previous is not None:
+                delta = (yaw - previous + math.pi) % (2.0 * math.pi) - math.pi
+                self.localization_yaw_search_accumulated_rad = max(
+                    0.0,
+                    self.localization_yaw_search_accumulated_rad + delta,
+                )
+            self.localization_yaw_search_last_yaw = yaw
+
+        progress_deg = math.degrees(self.localization_yaw_search_accumulated_rad)
+        if self.localization_yaw_search_accumulated_rad >= LOST_YAW_SEARCH_TARGET_RAD:
+            self.localization_yaw_search_active = False
+            self.localization_yaw_search_completed = True
+            record["localization_yaw_search"] = "completed"
+            record["localization_yaw_search_deg"] = round(progress_deg, 1)
+            self._notify_localization_yaw_search("completed", progress_deg)
+            return None
+
+        assert self.localization_yaw_search_started_at is not None
+        if now - self.localization_yaw_search_started_at >= LOST_YAW_SEARCH_TIMEOUT_S:
+            self.localization_yaw_search_active = False
+            self.localization_yaw_search_completed = True
+            record["localization_yaw_search"] = "timed_out"
+            record["localization_yaw_search_deg"] = round(progress_deg, 1)
+            self._notify_localization_yaw_search("timed_out", progress_deg)
+            return None
+
+        sent, send_reason, actual = self._send_command(
+            (0, 0, self.localization_yaw_search_pcmd, 0)
         )
-        return True
+        record["localization_yaw_search"] = "searching_right"
+        record["localization_yaw_search_deg"] = round(progress_deg, 1)
+        if not sent:
+            self.localization_yaw_search_active = False
+            self.localization_yaw_search_completed = True
+            record["localization_yaw_search_error"] = send_reason
+            self._notify_localization_yaw_search("command_rejected", progress_deg)
+            return None
+        self._emit(
+            record,
+            actual,
+            False,
+            f"right yaw localization search {progress_deg:.1f}/360.0deg",
+        )
+        return _LoopOutcome()
 
     def _localization_transition_outcome(
         self,
@@ -2236,21 +2426,49 @@ class _FlightLoopRunner:
         *,
         fresh: bool,
         low_confidence: bool,
+        now: float,
+        olympe_yaw,
         record: dict,
     ) -> _LoopOutcome | None:
         if transition.action in {"uncertain_hover", "land"}:
+            self._clear_route_rejoin()
             self._reset_pcmd_controller()
-            _sent, _why, actual = self._send_command((0, 0, 0, 0))
             waited = float(transition.waited_s)
             if self.hooks.force_relocalize is not None:
-                self.hooks.force_relocalize()
+                try:
+                    self.hooks.force_relocalize()
+                except Exception as exc:
+                    record["relocalize_error"] = repr(exc)
             reason = self._uncertainty_reason(low_confidence, record)
+            search_outcome = self._localization_yaw_search_outcome(
+                now=now,
+                waited=waited,
+                olympe_yaw=olympe_yaw,
+                fresh=fresh,
+                record=record,
+            )
+            if search_outcome is not None:
+                return search_outcome
+            _sent, _why, actual = self._send_command((0, 0, 0, 0))
             self._emit(record, actual, True, f"{reason} -> hover ({waited:.1f}s)")
-            took_over = self._request_manual_after_loss(waited)
-            if not took_over and transition.action == "land":
+            # When the desktop adapter opted into the bounded yaw search, keep
+            # the aircraft stationary for the full MegaLoc retry window.  The
+            # ordinary 4 s landing threshold must not end this recovery path
+            # before its configured 10 s delay expires.
+            if (
+                self.localization_yaw_search_pcmd > 0
+                and not fresh
+                and not self.localization_yaw_search_completed
+                and waited < LOST_YAW_SEARCH_DELAY_S
+            ):
+                return _LoopOutcome()
+            if (
+                transition.action == "land"
+                and self.hooks.land_on_localization_loss
+            ):
                 terminal = "localization lost" if not fresh else "low confidence"
                 return _LoopOutcome(f"{terminal} -> land")
-            if not took_over and self.verbose and self.steps % 10 == 0:
+            if self.verbose and self.steps % 10 == 0:
                 print(
                     "[safety] LOW_CONF_HOVER: hover + MegaLoc relocalize; "
                     f"waited={waited:.1f}s",
@@ -2259,6 +2477,7 @@ class _FlightLoopRunner:
             return _LoopOutcome()
         if transition.action != "recovery_hover":
             return None
+        self._reset_localization_yaw_search("recovered")
         self._reset_pcmd_controller()
         _sent, _why, actual = self._send_command((0, 0, 0, 0))
         self._emit(
@@ -2294,21 +2513,28 @@ class _FlightLoopRunner:
         record["action"] = command.status
         record["pcmd_phase"] = self.pcmd_controller.phase
 
-    def _route_command_gate_outcome(self, command, record: dict) -> _LoopOutcome | None:
-        if self.pcmd_controller.abort_reason is not None:
-            _sent, _why, actual = self._send_command((0, 0, 0, 0))
-            reason = f"{self.pcmd_controller.abort_reason} -> land"
-            self._emit(record, actual, True, reason)
-            return _LoopOutcome(reason)
-        if command.path_error <= MAX_ROUTE_DEVIATION_U:
+    def _route_command_gate_outcome(self, command, pose, record: dict) -> _LoopOutcome | None:
+        route_deviation_limit = float(self.ctrl.cfg.max_route_deviation)
+        route_distance, nearest, segment, _progress_s = self.rpf.project_to_path(
+            pose.xyz, self.ctrl.wp, self.ctrl.cum
+        )
+        record["route_distance_u"] = round(float(route_distance), 3)
+        if route_distance <= route_deviation_limit:
             return None
+        self.route_rejoin_target = np.array(nearest, dtype=float, copy=True)
+        self.route_rejoin_segment = int(segment)
+        record["route_rejoin_target"] = [
+            round(float(value), 6) for value in self.route_rejoin_target
+        ]
+        record["route_rejoin_segment"] = self.route_rejoin_segment
         _sent, _why, actual = self._send_command((0, 0, 0, 0))
         reason = (
-            f"route deviation {command.path_error:.2f}u > "
-            f"{MAX_ROUTE_DEVIATION_U}u -> land"
+            f"route deviation {route_distance:.2f}u > "
+            f"{route_deviation_limit}u -> hover before rejoin"
         )
+        self._reset_pcmd_controller()
         self._emit(record, actual, True, reason)
-        return _LoopOutcome(reason)
+        return _LoopOutcome()
 
     def _ground_speed_sample(self, command):
         if command.action != "LAND":
@@ -2317,6 +2543,61 @@ class _FlightLoopRunner:
             return self.hooks.ground_speed() if self.hooks.ground_speed is not None else None
         except Exception:
             return None
+
+    def _route_rejoin_outcome(self, pose, record: dict) -> _LoopOutcome:
+        target = self.route_rejoin_target
+        assert target is not None
+        delta = target - pose.xyz
+        distance = float(np.linalg.norm(delta))
+        record["route_rejoin_target"] = [round(float(value), 6) for value in target]
+        record["route_rejoin_segment"] = self.route_rejoin_segment
+        record["route_rejoin_distance_u"] = round(distance, 6)
+        record["action"] = "REJOIN"
+        record["pcmd_phase"] = "route_rejoin_translate"
+        # A percentage PCMD has a finite minimum step. Stop inside twice the
+        # ordinary translation tolerance so the aircraft cannot oscillate across
+        # an exact projection forever; this remains well inside the route tube.
+        rejoin_tolerance = 2.0 * float(self.ctrl.cfg.translation_arrival_tolerance)
+        route_limit = float(self.ctrl.cfg.max_route_deviation)
+        if route_limit > 0.0:
+            rejoin_tolerance = min(rejoin_tolerance, route_limit)
+        if distance <= rejoin_tolerance:
+            self._clear_route_rejoin()
+            self._reset_pcmd_controller()
+            _sent, _why, actual = self._send_command((0, 0, 0, 0))
+            self._emit(record, actual, True, "route rejoin complete -> hover")
+            return _LoopOutcome()
+
+        command = self.rpf.Command(
+            "REJOIN",
+            delta / distance,
+            float(pose.yaw),
+            target.copy(),
+            distance,
+            float(self.ctrl.target_index) / float(max(1, len(self.ctrl.wp) - 1)),
+            status="route rejoin translate without yaw",
+        )
+        pcmd = self.rpf.command_to_body_percent(
+            command,
+            pose,
+            config=self.ctrl.cfg,
+            yaw_sign=self.yaw_sign,
+            require_yaw_alignment=False,
+        )
+        # REJOIN preserves the current camera heading by contract.
+        pcmd = (pcmd[0], pcmd[1], 0, pcmd[3])
+        sent, send_reason, actual = self._send_command(pcmd)
+        self._emit(
+            record,
+            actual,
+            not sent,
+            command.status if sent else send_reason,
+        )
+        if not sent:
+            terminal = self._blocked_send_outcome(send_reason, context="during route rejoin")
+            if terminal is not None:
+                return terminal
+        return _LoopOutcome()
 
     def _route_completion_outcome(
         self,
@@ -2342,25 +2623,6 @@ class _FlightLoopRunner:
         self._emit(record, actual, True, transition.reason)
         return _LoopOutcome(transition.reason)
 
-    def _stale_inspection_outcome(
-        self,
-        command,
-        now: float,
-        record: dict,
-    ) -> _LoopOutcome | None:
-        oldest = min(self.inspection_started.values(), default=None)
-        timed_out = (
-            command.look_at_pole is None
-            and oldest is not None
-            and now - oldest >= INSPECTION_TIMEOUT_S
-        )
-        if not timed_out:
-            return None
-        _sent, _why, actual = self._send_command((0, 0, 0, 0))
-        reason = "inspection alignment/capture timeout -> land"
-        self._emit(record, actual, True, reason)
-        return _LoopOutcome(reason)
-
     @staticmethod
     def _blocked_send_outcome(send_reason: str, *, context: str) -> _LoopOutcome | None:
         upper = str(send_reason).upper()
@@ -2370,7 +2632,7 @@ class _FlightLoopRunner:
             return _LoopOutcome(f"{send_reason} -> land")
         return None
 
-    def _inspection_capture(self, command, pose, key, record: dict) -> None:
+    def _inspection_capture(self, command, pose, record: dict) -> None:
         capture_acked = False
         try:
             if self.hooks.inspection_ack is not None:
@@ -2395,8 +2657,6 @@ class _FlightLoopRunner:
                 orientation_confirmed=True,
             )
         )
-        if acknowledged:
-            self.inspection_started.pop(key, None)
         self._emit(
             record,
             post_actual,
@@ -2413,12 +2673,8 @@ class _FlightLoopRunner:
         command,
         pose,
         yaw: int,
-        now: float,
         record: dict,
     ) -> _LoopOutcome:
-        metadata = command.look_at_pole
-        key = (metadata.get("waypoint"), metadata.get("pole_id"))
-        inspection_since = self.inspection_started.setdefault(key, now)
         hold_ok, hold_reason, hold_actual = self._send_command((0, 0, 0, 0))
         if not hold_ok:
             self._emit(
@@ -2432,14 +2688,6 @@ class _FlightLoopRunner:
                 context="during inspection",
             )
             return terminal or _LoopOutcome()
-        if not metadata.get("body_yaw_required", False):
-            reason = "inspection body-yaw orientation unavailable -> land"
-            self._emit(record, hold_actual, True, reason)
-            return _LoopOutcome(reason)
-        if now - inspection_since >= INSPECTION_TIMEOUT_S:
-            reason = "inspection alignment/capture timeout -> land"
-            self._emit(record, hold_actual, True, reason)
-            return _LoopOutcome(reason)
         yaw_error = _wrap(float(command.yaw_target) - float(pose.yaw))
         tolerance = math.radians(float(self.ctrl.cfg.inspect_yaw_tolerance_deg))
         if abs(yaw_error) > tolerance:
@@ -2451,7 +2699,7 @@ class _FlightLoopRunner:
             )
             self._emit(record, actual, not sent, detail)
         else:
-            self._inspection_capture(command, pose, key, record)
+            self._inspection_capture(command, pose, record)
         return _LoopOutcome()
 
     def _route_pcmd_outcome(
@@ -2486,8 +2734,7 @@ class _FlightLoopRunner:
         now: float,
         record: dict,
     ) -> _LoopOutcome:
-        self.manual_requested = False
-        self.heading.update(localized_pose.yaw, olympe_yaw)
+        self._reset_localization_yaw_search("recovered")
         heading = self.heading.heading(olympe_yaw)
         if heading is None:
             self._reset_pcmd_controller()
@@ -2501,20 +2748,19 @@ class _FlightLoopRunner:
             yaw=heading,
             stamp=localized_pose.stamp,
         )
+        if self.route_rejoin_target is not None:
+            return self._route_rejoin_outcome(pose, record)
         command = self.ctrl.step(pose, now)
-        pcmd = self._compute_route_pcmd(command, pose, now)
         self._record_route_command(record, command, heading)
-        outcome = self._route_command_gate_outcome(command, record)
+        outcome = self._route_command_gate_outcome(command, pose, record)
         if outcome is not None:
             return outcome
+        pcmd = self._compute_route_pcmd(command, pose, now)
         outcome = self._route_completion_outcome(command, now, record)
         if outcome is not None:
             return outcome
-        outcome = self._stale_inspection_outcome(command, now, record)
-        if outcome is not None:
-            return outcome
         if command.look_at_pole is not None:
-            return self._inspection_outcome(command, pose, pcmd[2], now, record)
+            return self._inspection_outcome(command, pose, pcmd[2], record)
         return self._route_pcmd_outcome(
             command,
             localized_pose,
@@ -2617,6 +2863,7 @@ def build_controller(*, require_approved: bool = True):
             raise ValueError("route control requires an explicit site flight contract")
         map_frame = rpf.load_map_frame(MAP_ALIGN) if MAP_ALIGN else rpf.LEGACY_MAP_FRAME
         waypoints = rpf.load_waypoints(PATH_JSON, map_frame=map_frame)
+        route_source = PATH_JSON
     else:
         for key in ("site_id", "coordinate_frame_id", "route_sha256"):
             if not str(contract.get(key) or "").strip():
@@ -2632,9 +2879,14 @@ def build_controller(*, require_approved: bool = True):
             map_frame=map_frame,
         )
         waypoints = snapshot.controller_waypoints()
+        route_source = snapshot
     config = rpf.config_for_route(
-        PATH_JSON,
-        rpf.ControlConfig(inspect_waypoints=(), map_frame=map_frame),
+        route_source,
+        rpf.ControlConfig(
+            inspect_waypoints=(),
+            map_frame=map_frame,
+            max_route_deviation=MAX_ROUTE_DEVIATION_U,
+        ),
     )
     return rpf.RouteAutoController(waypoints, poles=[], config=config), waypoints
 
@@ -2727,8 +2979,10 @@ def _boot_pose(localizer):
         return None
 
 
-def _wait_for_boot_lock(monitor, grabber, localizer, start_waypoint, stop) -> str | None:
-    lock = BootPoseLock(start_waypoint)
+def _wait_for_boot_lock(
+    monitor, grabber, localizer, route_waypoints, controller, stop
+) -> str | None:
+    lock = BootPoseLock(route_waypoints)
     locked = False
     started_at = time.monotonic()
     while not locked and not stop["f"] and not monitor.terminated.is_set():
@@ -2744,7 +2998,7 @@ def _wait_for_boot_lock(monitor, grabber, localizer, start_waypoint, stop) -> st
         )
         if time.monotonic() - started_at > FIRST_FIX_TIMEOUT_S:
             raise SystemExit(
-                "[fly] BOOT lock failed (need consecutive fresh fixes near route start) "
+                "[fly] BOOT lock failed (need consecutive fresh fixes near a route waypoint) "
                 "-> landing (no AUTO)"
             )
         time.sleep(0.1)
@@ -2752,6 +3006,10 @@ def _wait_for_boot_lock(monitor, grabber, localizer, start_waypoint, stop) -> st
         return monitor.reason or "safety command before AUTO -> land"
     if stop["f"]:
         return "operator stop signal before AUTO -> land"
+    position = lock.position
+    if position is None:
+        return "BOOT lock completed without a takeoff position -> land"
+    controller.start_after_nearest_waypoint(position)
     return None
 
 
@@ -2862,6 +3120,7 @@ def _make_live_loop_hooks(
         stream_status=lambda: _live_stream_status(grabber),
         loop_beat=monitor.beat,
         pose_info=lambda: dict(localizer.last_info),
+        pose_jump_pause=lambda _distance: safety.force("hover"),
         inspection_ack=inspection_ack,
         inspection_hold=lambda action: monitor.run_while_holding_zero(
             action,
@@ -2871,6 +3130,8 @@ def _make_live_loop_hooks(
         pcmd_timing=monitor.pcmd_timing_snapshot,
         ground_speed=ground_speed.sample,
         log_tick=command_log,
+        # Desktop AUTO contract: localization loss holds zero PCMD.
+        land_on_localization_loss=False,
     )
 
 
@@ -2894,7 +3155,8 @@ def _run_live_route_after_takeoff(
         monitor,
         grabber,
         localizer,
-        waypoints[0],
+        waypoints,
+        controller,
         stop,
     )
     if boot_reason is not None:
@@ -3037,149 +3299,11 @@ def _close_live_flight_resources(
 def fly(ip: str, yaw_sign: int, gimbal_pitch: float, controller: str, safety_file: str,
         cmd_log_path: str = "", max_altitude_m: float | None = None,
         max_distance_m: float | None = None, distance_geofence: bool = False):
-    stop = _install_flight_stop_handlers()
-    ctrl, wp = build_controller()
-    import olympe_frame_source as ofs
-    from olympe.messages.ardrone3.Piloting import TakeOff, PCMD, Landing, Emergency
-    from olympe.messages.ardrone3.PilotingState import FlyingStateChanged
-
-    clog = CommandLog(cmd_log_path or default_cmd_log_path("fly"), sink="olympe")
-    print(f"[fly] structured command log: {clog.path}", flush=True)
-    safety = SafetySwitch(
-        safety_file,
-        allow_manual=manual_override_available(ip, controller),
-        keyboard=True,
-        require_fresh_auto=True,
+    raise SystemExit(
+        "[fly] live TakeOff is only allowed from the operator UI "
+        "(控制介面程式/真機串流/啟動.sh). Use --grab-only for live localize "
+        "with props off, or --dry-run."
     )
-    _wait_for_fresh_auto_consent(safety, stop, clog)
-
-    # Bind everything the finally touches BEFORE the try, so a failure at connect,
-    # stream start, model load, or takeoff can never raise UnboundLocalError in the
-    # finally and strand an airborne drone with an abandoned connection.
-    drone = None
-    grab = None
-    monitor = None
-    stick_monitor = None
-    must_land = False
-    reason = ""
-    via_skycontroller = False
-    send_pcmd = lambda *_: None
-
-    def emergency_action() -> None:
-        _await_confirmed_action(drone(Emergency()), "emergency")
-
-    def landing_action(label: str) -> None:
-        wait_success(
-            drone(
-                Landing()
-                >> FlyingStateChanged(state="landed", _timeout=20)
-            ),
-            label,
-        )
-
-    try:
-        drone = ofs.connect(ip, controller=controller)
-        via_skycontroller = manual_override_available(ip, controller)
-        if via_skycontroller:
-            # Keep the physical pilot authoritative throughout ground setup.
-            set_piloting_source(drone, "SkyController")
-        require_landed_for_firmware_config(drone)
-        _configure_flight_preflight_for_live(
-            drone,
-            clog,
-            max_altitude_m,
-            max_distance_m,
-            distance_geofence,
-        )
-        # True flight rejects callback-receipt timestamps: without source NTP,
-        # upstream queue latency cannot be distinguished from a fresh frame.
-        grab = ofs.OlympePdrawGrabber(
-            drone, require_source_timestamps=True).start()
-        loc = build_localizer(grab)
-        loc.ensure_models()                          # load MegaLoc/XFeat NOW (on the ground)
-        ground_speed = OlympeGroundSpeedTracker(drone)
-
-        def send_pcmd(roll, pitch, yaw, gaz):
-            # Single wire to the drone: clamp to the PCMD percent domain [-100, 100].
-            r, p, y, g = (max(-100, min(100, int(v))) for v in (roll, pitch, yaw, gaz))
-            drone(PCMD(1, r, p, y, g, 0))
-
-        # Independent safety authority + stall watchdog: polls the safety switch and
-        # can issue LAND/EMERGENCY/hover from its own thread even while the main loop
-        # is blocked in synchronous get_pose() GPU inference.
-        monitor = SafetyMonitor(
-            send_pcmd, safety,
-            # Confirm that Landing was accepted; the final cleanup below waits
-            # separately for the terminal landed state.
-            land_cb=lambda: drone(Landing()),
-            emergency_cb=lambda: drone(Emergency()),
-            stop_requested=lambda: stop["f"],
-            piloting_source_cb=(
-                (lambda source: set_piloting_source(drone, source))
-                if via_skycontroller else None),
-            max_translation_pcmd=ctrl.cfg.max_translation_pcmd,
-            max_yaw_pcmd=ctrl.cfg.max_yaw_pcmd,
-        )
-        if via_skycontroller:
-            # Only after landed preflight, heavy model loading, and the physical
-            # stick monitor are ready may the PC acquire authority for TakeOff.
-            stick_monitor = start_skycontroller_stick_override(drone, monitor)
-        monitor.start()
-
-        # user's flow: TAKEOFF -> hover -> gimbal -> BOOT_INIT MegaLoc lock -> START AUTO.
-        # We lock WHILE HOVERING (camera at flight height/view, like the map refs), not
-        # on the ground. If it never locks, we hover then land -- we never blind-fly AUTO.
-        # Set before sending TakeOff: a timeout/exception can occur after the aircraft
-        # has physically lifted but before FlyingStateChanged confirms hovering.
-        must_land = True
-        takeoff_expectation, arm_reason = monitor.schedule_authorized_takeoff(
-            lambda: drone(
-                TakeOff() >> FlyingStateChanged(state="hovering", _timeout=12)),
-            grab.is_healthy,
-            lambda: stop["f"],
-        )
-        if takeoff_expectation is None:
-            raise SystemExit(f"[fly] arming denied: {arm_reason}")
-        # Wait outside monitor._io_lock so a post-schedule LAND/EMERGENCY can run.
-        wait_success(takeoff_expectation, "takeoff/hovering")
-        if not set_gimbal(drone, gimbal_pitch):
-            raise SystemExit("[fly] gimbal did not acknowledge target -> landing (no AUTO)")
-        print(f"[fly] BOOT_INIT: require {BOOT_LOCK_FIXES} stable fixes near route start "
-              f"(<= {BOOT_START_MAX_U:.2f}u, timeout {FIRST_FIX_TIMEOUT_S:.0f}s)...")
-        reason = _run_live_route_after_takeoff(
-            monitor=monitor,
-            grabber=grab,
-            localizer=loc,
-            waypoints=wp,
-            stop=stop,
-            controller=ctrl,
-            safety=safety,
-            stick_monitor=stick_monitor,
-            drone=drone,
-            send_pcmd=send_pcmd,
-            ground_speed=ground_speed,
-            command_log=clog,
-            yaw_sign=yaw_sign,
-        )
-        print(f"[fly] {reason}")
-    finally:
-        stop_skycontroller_stick_override(stick_monitor)
-        reason = _authorize_cleanup_zero(monitor, grab, stop, must_land, reason)
-        _perform_terminal_flight_action(
-            must_land=must_land,
-            drone=drone,
-            reason=reason,
-            monitor=monitor,
-            emergency_action=emergency_action,
-            landing_action=landing_action,
-        )
-        _close_live_flight_resources(
-            grabber=grab,
-            drone=drone,
-            via_skycontroller=via_skycontroller,
-            command_log=clog,
-            reason=reason,
-        )
 
 
 def _run_until(hooks, ctrl, wp, yaw_sign, stop):
@@ -3524,7 +3648,7 @@ def _selftest_safety_monitor() -> None:
     )
 
 
-def _selftest_low_confidence_handoff(rpf) -> None:
+def _selftest_low_confidence_hover(rpf) -> None:
     state = {"pcmd": [], "reloc": 0, "manual": 0, "t": 0.0}
 
     def now():
@@ -3566,8 +3690,8 @@ def _selftest_low_confidence_handoff(rpf) -> None:
         command == (0, 0, 0, 0) for command in state["pcmd"]
     ), ("low-conf must hover", state["pcmd"][:5])
     assert state["reloc"] > 0, "low-conf must ask the tracker to relocalize (MegaLoc)"
-    assert state["manual"] == 1, (
-        "MegaLoc-fail must hand to MANUAL exactly once",
+    assert state["manual"] == 0, (
+        "localization timeout must not request automatic manual takeover",
         state,
     )
 
@@ -3578,11 +3702,11 @@ def selftest():
     _selftest_heading_and_pcmd(rpf)
     _selftest_stream_and_pose_gates(rpf)
     _selftest_safety_monitor()
-    _selftest_low_confidence_handoff(rpf)
+    _selftest_low_confidence_hover(rpf)
     print(
         "selftest OK: heading fusion, PCMD signs, stream-lost + NaN-pose hover gates, "
         "SafetyMonitor LAND/HOVER authority, MANUAL-silence, pre-beat watchdog gating, "
-        "and low-confidence hover+MegaLoc+MANUAL handoff sane"
+        "and low-confidence hover+MegaLoc without timer-based manual handoff sane"
     )
 
 
@@ -3593,7 +3717,8 @@ def main():
     mode.add_argument("--selftest", action="store_true", help="pure-python checks, no deps")
     mode.add_argument("--dry-run", action="store_true", help="toy dynamics, no drone")
     mode.add_argument("--grab-only", action="store_true", help="live localize, PROPS OFF, no arm")
-    mode.add_argument("--fly", action="store_true", help="approved autonomous route flight")
+    mode.add_argument("--fly", action="store_true",
+                      help="rejected: live TakeOff is only allowed from the operator UI")
     ap.add_argument("--ip", default=DRONE_IP_REAL,
                     help=f"real {DRONE_IP_REAL} / skyctrl {DRONE_IP_SKYCTRL} / sphinx {DRONE_IP_SIM}")
     ap.add_argument("--yaw-sign", type=int, default=1, choices=(-1, 1),
@@ -3626,7 +3751,6 @@ def main():
               "never sends TakeOff/PCMD", flush=True)
         grab_only(args.ip, args.secs, args.controller)
     elif args.fly:
-        print("[mode] FLY: approved route with runtime safety authority", flush=True)
         fly(args.ip, args.yaw_sign, args.gimbal_pitch, args.controller, args.safety_file,
             cmd_log_path=args.cmd_log,
             max_altitude_m=args.max_altitude_m,

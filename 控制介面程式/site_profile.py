@@ -6,6 +6,7 @@ import hashlib
 import hmac
 import json
 import math
+import os
 import re
 import sys
 from dataclasses import dataclass, field
@@ -29,6 +30,8 @@ SHA256_KEYS = (
     "reference_index",
     "poles_json",
     "map_align",
+    "site_alignment",
+    "camera_body_extrinsic",
 )
 SITE_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 #: display_name stays free-form text -- CJK, spaces, dashes and brackets are all
@@ -100,6 +103,20 @@ class AssetDigests:
     reference_index: str | None = None
     poles_json: str | None = None
     map_align: str | None = None
+    site_alignment: str | None = None
+    camera_body_extrinsic: str | None = None
+
+
+@dataclass(frozen=True)
+class PoseChainProfile:
+    """Frame identities and measured files for B -> C -> M -> W."""
+
+    site_frame_id: str
+    vehicle_id: str
+    body_frame_id: str
+    camera_frame_id: str
+    site_alignment: Path
+    camera_body_extrinsic: Path
 
 
 @dataclass(frozen=True)
@@ -194,6 +211,7 @@ class SiteProfile:
     poles_json: Path | None = None
     query_camera: QueryCamera | None = None
     coordinate_frame: CoordinateFrame | None = None
+    pose_chain: PoseChainProfile | None = None
     asset_sha256: AssetDigests = AssetDigests()
     flight: FlightReadiness | None = None
     hardware_approval: HardwareApprovalReference | None = None
@@ -382,6 +400,60 @@ def _load_coordinate_frame(raw: object, source: Path) -> CoordinateFrame | None:
         up_axis="-y",
         handedness="right",
         units="map",
+    )
+
+
+def _load_pose_chain(
+    raw: object,
+    source: Path,
+    profile_dir: Path,
+    workspace_root: Path,
+) -> PoseChainProfile | None:
+    if raw is None:
+        return None
+    keys = {
+        "site_frame_id",
+        "vehicle_id",
+        "body_frame_id",
+        "camera_frame_id",
+        "site_alignment",
+        "camera_body_extrinsic",
+    }
+    if not isinstance(raw, dict) or set(raw) != keys:
+        actual = set(raw) if isinstance(raw, dict) else set()
+        raise ValueError(
+            "site profile pose_chain fields mismatch: "
+            f"unknown={sorted(actual - keys)} missing={sorted(keys - actual)}: {source}"
+        )
+
+    def identifier(key: str) -> str:
+        value = raw.get(key)
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"site profile pose_chain.{key} must be non-empty: {source}")
+        return value.strip()
+
+    site_alignment = _resolve_asset(
+        profile_dir,
+        raw.get("site_alignment"),
+        "pose_chain.site_alignment",
+        required=True,
+        workspace_root=workspace_root,
+    )
+    camera_body_extrinsic = _resolve_asset(
+        profile_dir,
+        raw.get("camera_body_extrinsic"),
+        "pose_chain.camera_body_extrinsic",
+        required=True,
+        workspace_root=workspace_root,
+    )
+    assert site_alignment is not None and camera_body_extrinsic is not None
+    return PoseChainProfile(
+        site_frame_id=identifier("site_frame_id"),
+        vehicle_id=identifier("vehicle_id"),
+        body_frame_id=identifier("body_frame_id"),
+        camera_frame_id=identifier("camera_frame_id"),
+        site_alignment=site_alignment,
+        camera_body_extrinsic=camera_body_extrinsic,
     )
 
 
@@ -1089,6 +1161,7 @@ def _load_profile_metadata(
         "map_align",
         "query_camera",
         "coordinate_frame",
+        "pose_chain",
         "asset_sha256",
         "hardware_approval",
         "flight",
@@ -1258,6 +1331,7 @@ def _build_site_profile(
         ),
         query_camera=_load_query_camera(raw.get("query_camera"), source),
         coordinate_frame=_load_coordinate_frame(raw.get("coordinate_frame"), source),
+        pose_chain=_load_pose_chain(raw.get("pose_chain"), source, base, workspace_root),
         asset_sha256=_load_asset_digests(raw.get("asset_sha256"), source),
         flight=_load_flight_readiness(
             raw.get("flight"), source, schema_version=schema_version
@@ -1290,6 +1364,10 @@ def _validate_profile_contract(profile: SiteProfile, source: Path) -> None:
             "site profile flight.coordinate_frame_id must match coordinate_frame.id: "
             f"{source}"
         )
+    if profile.pose_chain is not None and profile.coordinate_frame is None:
+        raise ValueError(
+            f"site profile pose_chain requires coordinate_frame: {source}"
+        )
 
 
 def _validate_profile_files(profile: SiteProfile) -> None:
@@ -1306,6 +1384,16 @@ def _validate_profile_files(profile: SiteProfile) -> None:
             ("map_align", profile.map_align),
             ("localizer_profile", profile.localizer_profile),
             ("reference_index", profile.reference_index),
+            (
+                "pose_chain.site_alignment",
+                None if profile.pose_chain is None else profile.pose_chain.site_alignment,
+            ),
+            (
+                "pose_chain.camera_body_extrinsic",
+                None
+                if profile.pose_chain is None
+                else profile.pose_chain.camera_body_extrinsic,
+            ),
             (
                 "hardware_approval.receipt",
                 None
@@ -1369,3 +1457,84 @@ def load_site_profile(path: str | Path, *, validate_files: bool = True) -> SiteP
     if validate_files:
         _validate_profile_files(profile)
     return profile
+
+
+def bind_camera_center_navigation_calibration(
+    profile_path: str | Path,
+    *,
+    site_alignment_path: str | Path,
+    camera_body_extrinsic_path: str | Path,
+) -> SiteProfile:
+    """Atomically bind one approved camera-centred field calibration to a site.
+
+    The two artifacts are loaded before the profile is changed.  A temporary
+    profile must then pass the normal AUTO readiness checks, so a partial write,
+    frame mismatch, stale hash, or unapproved artifact cannot unlock flight.
+    """
+    source = Path(profile_path).expanduser().resolve()
+    current = load_site_profile(source)
+    if current.coordinate_frame is None:
+        raise ValueError("site profile has no coordinate_frame")
+
+    workspace = workspace_from_file(source)
+    flight_control = workspace.flight_control
+    if str(flight_control) not in sys.path:
+        sys.path.insert(0, str(flight_control))
+    from pose_frame_chain import load_camera_body_extrinsic
+    from site_alignment import load_site_alignment
+
+    alignment_path = Path(site_alignment_path).expanduser().resolve()
+    extrinsic_path = Path(camera_body_extrinsic_path).expanduser().resolve()
+    alignment = load_site_alignment(
+        alignment_path,
+        expected_map_frame_id=current.coordinate_frame.id,
+    )
+    extrinsic = load_camera_body_extrinsic(extrinsic_path)
+    if not alignment.approved or not extrinsic.approved:
+        raise ValueError("field calibration artifacts must be approved")
+
+    try:
+        alignment_relative = alignment_path.relative_to(source.parent).as_posix()
+        extrinsic_relative = extrinsic_path.relative_to(source.parent).as_posix()
+    except ValueError as exc:
+        raise ValueError(
+            "field calibration artifacts must stay inside the active site package"
+        ) from exc
+
+    raw = _read_site_profile_json(source)
+    raw["pose_chain"] = {
+        "site_frame_id": alignment.site_frame_id,
+        "vehicle_id": extrinsic.vehicle_id,
+        "body_frame_id": extrinsic.body_frame_id,
+        "camera_frame_id": extrinsic.camera_frame_id,
+        "site_alignment": alignment_relative,
+        "camera_body_extrinsic": extrinsic_relative,
+    }
+    digests = raw.setdefault("asset_sha256", {})
+    if not isinstance(digests, dict):
+        raise ValueError("site profile asset_sha256 must be an object")
+    digests["site_alignment"] = hashlib.sha256(alignment_path.read_bytes()).hexdigest()
+    digests["camera_body_extrinsic"] = hashlib.sha256(
+        extrinsic_path.read_bytes()
+    ).hexdigest()
+
+    temporary = source.with_name(f".{source.name}.{os.getpid()}.calibration.tmp")
+    try:
+        temporary.write_text(
+            json.dumps(raw, ensure_ascii=False, indent=2, allow_nan=False) + "\n",
+            encoding="utf-8",
+        )
+        candidate = load_site_profile(temporary)
+        errors = flight_readiness_errors(candidate)
+        if errors:
+            raise ValueError(
+                "field calibration did not produce an AUTO-ready profile: "
+                + "; ".join(errors)
+            )
+        temporary.replace(source)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+    return load_site_profile(source)

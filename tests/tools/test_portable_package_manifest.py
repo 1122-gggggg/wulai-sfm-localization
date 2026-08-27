@@ -18,6 +18,7 @@ def test_current_manifest_excludes_imported_assets_and_runtime_caches() -> None:
     assert not included(Path("模擬器/測試影片/replay.mp4"))
     assert not included(Path("模擬器/封存/old_worktree/src/module.py"))
     assert not included(Path("執行環境/inductor_cache/kernel.py"))
+    assert not included(Path("執行環境/mission_snapshots/runtime.json"))
     assert included(Path("控制介面程式/影片模擬串流/啟動.sh"))
 
 
@@ -64,8 +65,10 @@ def test_portable_export_keeps_output_governance_readme() -> None:
     assert '"$portable_root/outputs/README.md"' in runtime_script
     assert 'rm -r -- "$staged_output_root/flight_logs"' in runtime_script
     assert 'rm -r -- "$staged_output_root"' not in runtime_script
-    assert "routes/authored/route_20260807_013811.json" in runtime_script
-    assert "maps/T_align_gravity.json" in runtime_script
+    assert "routes/flight_route.json" not in runtime_script
+    assert "river_site_b0_p116_p117_20260818/compat/T_align_gravity.json" in runtime_script
+    assert "routes/authored/" not in runtime_script
+    assert "river_site_realrgb_dense_trimmed.ply" not in runtime_script
     assert '"$portable_root/PORTABLE_SITE_ASSETS.json"' in runtime_script
     assert "reports/hardware_approval_20260806.json" not in runtime_script
     assert "river_site_safezone/flight_path.json" not in runtime_script
@@ -620,7 +623,7 @@ def test_export_cli_passes_wheelhouse_root(monkeypatch: pytest.MonkeyPatch, tmp_
 
 def _write_site_profile(root: Path, *, hardware: dict[str, object] | None = None) -> Path:
     profile = root / "控制介面程式/site_profiles/demo.json"
-    profile.parent.mkdir(parents=True)
+    profile.parent.mkdir(parents=True, exist_ok=True)
     payload: dict[str, object] = {
         "schema_version": 2,
         "site_id": "demo_site",
@@ -689,15 +692,12 @@ def test_site_bundle_copies_and_verifies_all_reference_index_siblings(
     assert {item["path"] for item in marker["files"]} == set(copied)
 
 
-def test_site_bundle_keeps_bound_route_and_distinct_valid_route_siblings(
-    tmp_path: Path,
-) -> None:
+def test_site_bundle_keeps_only_the_profile_bound_route(tmp_path: Path) -> None:
     root = tmp_path / "source"
     site_root = root / "地圖檔/場域/river_site"
     routes_root = site_root / "routes"
-    bound = routes_root / "authored/route_20260807_013811.json"
-    duplicate = routes_root / "flight_route.json"
-    distinct = routes_root / "authored/route_20260807_013944.json"
+    bound = routes_root / "flight_route.json"
+    obsolete = routes_root / "obsolete_route.json"
     valid_route = {
         "schema": "sfm-flight-route/v1",
         "site_id": "river_site_edm",
@@ -711,37 +711,19 @@ def test_site_bundle_keeps_bound_route_and_distinct_valid_route_siblings(
     }
     bound.parent.mkdir(parents=True)
     bound.write_text(json.dumps(valid_route), encoding="utf-8")
-    duplicate.write_bytes(bound.read_bytes())
-    distinct_route = dict(valid_route)
-    distinct_route["waypoints"] = [[0.0, 0.0, 0.0], [2.0, 0.0, 0.0]]
-    distinct.write_text(json.dumps(distinct_route), encoding="utf-8")
+    obsolete_route = dict(valid_route)
+    obsolete_route["waypoints"] = [[0.0, 0.0, 0.0], [2.0, 0.0, 0.0]]
+    obsolete.write_text(json.dumps(obsolete_route), encoding="utf-8")
 
-    invalid = dict(valid_route)
-    invalid["waypoints"] = [[0.0, 0.0, 0.0]]
-    (routes_root / "invalid.json").write_text(json.dumps(invalid), encoding="utf-8")
-    preview = dict(valid_route)
-    preview.update(schema="sfm-route-preview/v1", purpose="preview_only")
-    (routes_root / "preview.json").write_text(json.dumps(preview), encoding="utf-8")
-    wrong_site = dict(valid_route, site_id="other_site")
-    (routes_root / "wrong_site.json").write_text(json.dumps(wrong_site), encoding="utf-8")
-    wrong_frame = dict(valid_route, coordinate_frame_id="other_frame")
-    (routes_root / "wrong_frame.json").write_text(json.dumps(wrong_frame), encoding="utf-8")
-    drafts = routes_root / "route_drafts/draft.json"
-    drafts.parent.mkdir(parents=True)
-    drafts.write_text(json.dumps(valid_route), encoding="utf-8")
-
-    profile = root / "控制介面程式/site_profiles/river_site_edm.json"
-    profile.parent.mkdir(parents=True)
+    profile = root / "地圖檔/場域/river_site/site_profile.json"
+    profile.parent.mkdir(parents=True, exist_ok=True)
     profile.write_text(
         json.dumps(
             {
                 "schema_version": 2,
                 "site_id": "river_site_edm",
                 "coordinate_frame": {"id": "river_site_glomap"},
-                "assets": {
-                    "route_json": "../../地圖檔/場域/river_site/"
-                    "routes/authored/route_20260807_013811.json"
-                },
+                "assets": {"route_json": "routes/flight_route.json"},
                 "asset_sha256": {"route_json": _sha256(bound)},
             }
         ),
@@ -756,15 +738,13 @@ def test_site_bundle_keeps_bound_route_and_distinct_valid_route_siblings(
     route_entries = {
         (item["role"], item["path"])
         for item in marker["files"]
-        if item["role"].startswith("route")
+        if item["role"] == "route_json"
     }
     assert route_entries == {
-        ("route_json", "地圖檔/場域/river_site/routes/authored/route_20260807_013811.json"),
-        ("route_sibling", "地圖檔/場域/river_site/routes/authored/route_20260807_013944.json"),
+        ("route_json", "地圖檔/場域/river_site/routes/flight_route.json"),
     }
     bundled_paths = {item["path"] for item in marker["files"]}
-    assert "地圖檔/場域/river_site/routes/flight_route.json" not in bundled_paths
-    assert "地圖檔/場域/river_site/routes/route_drafts/draft.json" not in bundled_paths
+    assert "地圖檔/場域/river_site/routes/obsolete_route.json" not in bundled_paths
     assert verify(destination) == []
 
 

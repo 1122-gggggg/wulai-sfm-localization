@@ -30,11 +30,11 @@ Safety tests are NOT run here; run them separately and treat any failure as
 an automatic reject regardless of this report.
 """
 
-from __future__ import annotations
-
 import argparse
 import json
+import random
 from pathlib import Path
+
 
 
 EXACT_FRAME_FIELDS = (
@@ -53,6 +53,73 @@ EXACT_FRAME_FIELDS = (
     "candidates",
     "used_refs",
 )
+
+RECEIPT_OVERRIDE_KEYS = (
+    "radius",
+    "mconf_thr",
+    "coarse_topk",
+    "cache_capacity",
+    "lost_strategy",
+    "lost_global_retrieval_interval",
+    "fused_coarse_mode",
+    "runtime_sigma_mode",
+    "temporal_feature_cache_size",
+    "acquire_stage_mode",
+    "lost_prior_strategy",
+    "lost_prior_fusion_weight",
+    "worker_mode",
+)
+
+
+def result_receipt(result: dict) -> dict | None:
+    if not isinstance(result, dict):
+        return None
+    receipt = result.get("receipt")
+    if isinstance(receipt, dict):
+        return receipt
+    identity = result.get("input_identity")
+    if isinstance(identity, dict) and isinstance(identity.get("receipt"), dict):
+        return identity["receipt"]
+    return None
+
+
+def _receipt_values_equal(expected, actual) -> bool:
+    if expected == actual:
+        return True
+    try:
+        return float(expected) == float(actual)
+    except (TypeError, ValueError):
+        return False
+
+
+def receipt_identity_failures(baseline: dict, actual: dict | None) -> list[str]:
+    """Missing receipt is an identity mismatch, not a SHA-only pass."""
+    expected = None
+    if isinstance(baseline, dict):
+        expected = baseline.get("receipt")
+        if expected is None:
+            expected = result_receipt(baseline)
+    if expected is None:
+        return ["baseline is missing receipt identity"]
+    if not isinstance(expected, dict):
+        return ["baseline receipt identity is not an object"]
+    if not isinstance(actual, dict):
+        return ["candidate is missing receipt identity"]
+    failures: list[str] = []
+    for key in RECEIPT_OVERRIDE_KEYS:
+        if key not in expected:
+            failures.append(f"baseline is missing receipt.{key}")
+            continue
+        if key not in actual:
+            failures.append(f"candidate is missing receipt.{key}")
+            continue
+        if not _receipt_values_equal(expected[key], actual[key]):
+            failures.append(
+                f"receipt.{key} mismatch: expected={expected[key]!r} "
+                f"actual={actual[key]!r}"
+            )
+    return failures
+
 
 
 def load_result(path: str) -> dict:
@@ -161,6 +228,189 @@ def compare_frame_rows(
     }
 
 
+def frame_metric_series(result: dict, key: str) -> list[float]:
+    rows = result.get("rows")
+    if not isinstance(rows, list):
+        return []
+    values = []
+    for row in rows:
+        if not isinstance(row, dict) or key not in row or row[key] is None:
+            continue
+        try:
+            value = float(row[key])
+        except (TypeError, ValueError):
+            continue
+        if value == value:  # not NaN
+            values.append(value)
+    return values
+
+
+def contiguous_block_bootstrap(
+    values,
+    *,
+    block_size: int,
+    n_resamples: int = 1000,
+    seed: int = 0,
+    q_low: float = 2.5,
+    q_high: float = 97.5,
+) -> dict:
+    """Resample contiguous blocks. Reports a CI; does not invent a pass gate."""
+    if block_size <= 0 or n_resamples <= 0:
+        raise ValueError("block_size and n_resamples must be positive")
+    series = [float(v) for v in values if v is not None]
+    finite = [v for v in series if v == v]
+    n = len(finite)
+    if n == 0:
+        return {
+            "mean": None,
+            "bootstrap_mean": None,
+            "ci_low": None,
+            "ci_high": None,
+            "n": 0,
+            "block_size": int(block_size),
+            "n_resamples": int(n_resamples),
+            "q_low": float(q_low),
+            "q_high": float(q_high),
+        }
+    rng = random.Random(int(seed))
+    n_blocks = max(1, (n + block_size - 1) // block_size)
+    means = []
+    for _ in range(int(n_resamples)):
+        pieces = []
+        for _block in range(n_blocks):
+            start = rng.randrange(n)
+            end = min(start + block_size, n)
+            pieces.extend(finite[start:end])
+            need = block_size - (end - start)
+            if need:
+                pieces.extend(finite[:need])
+        sample = pieces[:n]
+        means.append(sum(sample) / n)
+    means.sort()
+
+    def _percentile(sorted_vals: list[float], q: float) -> float:
+        if not sorted_vals:
+            return float("nan")
+        if len(sorted_vals) == 1:
+            return float(sorted_vals[0])
+        rank = (q / 100.0) * (len(sorted_vals) - 1)
+        lo = int(rank)
+        hi = min(lo + 1, len(sorted_vals) - 1)
+        frac = rank - lo
+        return float(sorted_vals[lo] * (1.0 - frac) + sorted_vals[hi] * frac)
+
+    return {
+        "mean": sum(finite) / n,
+        "bootstrap_mean": sum(means) / len(means),
+        "ci_low": _percentile(means, q_low),
+        "ci_high": _percentile(means, q_high),
+        "n": n,
+        "block_size": int(block_size),
+        "n_resamples": int(n_resamples),
+        "q_low": float(q_low),
+        "q_high": float(q_high),
+    }
+
+
+def paired_block_bootstrap(baseline, candidate, **kwargs) -> dict:
+    if len(baseline) != len(candidate):
+        raise ValueError(
+            f"paired series length mismatch: {len(baseline)} != {len(candidate)}"
+        )
+    delta = [c - b for b, c in zip(baseline, candidate)]
+    return contiguous_block_bootstrap(delta, **kwargs)
+
+
+def compare_baab_runs(
+    b1: dict,
+    a1: dict,
+    a2: dict,
+    b2: dict,
+    *,
+    metrics: tuple[str, ...] = ("wall_ms", "match_ms", "pnp_ms"),
+    block_size: int = 50,
+    n_resamples: int = 1000,
+    seed: int = 0,
+) -> dict:
+    """B-A-A-B paired comparison. Reports drift and effect; no pass threshold."""
+    labeled = (("B1", b1), ("A1", a1), ("A2", a2), ("B2", b2))
+    receipts = {name: result_receipt(result) for name, result in labeled}
+    receipt_failures: list[str] = []
+    for name, receipt in receipts.items():
+        if receipt is None:
+            receipt_failures.append(f"{name} is missing receipt identity")
+    if not receipt_failures:
+        reference = receipts["B1"]
+        for name, receipt in receipts.items():
+            receipt_failures.extend(
+                f"{name}: {item}"
+                for item in receipt_identity_failures({"receipt": reference}, receipt)
+            )
+    report = {
+        "order": ["B", "A", "A", "B"],
+        "metrics": {},
+        "verdict": None,
+        "receipts": receipts,
+        "receipt_identity_failures": receipt_failures,
+        "notes": (
+            "B-A-A-B reports drift (B2-B1) and candidate effect "
+            "((A1+A2)/2 - (B1+B2)/2). Contiguous-block bootstrap CIs "
+            "are descriptive; this path does not invent a pass threshold. "
+            "Receipt identity is reported and required for comparability; "
+            "a missing receipt is an identity mismatch."
+        ),
+    }
+    for metric in metrics:
+        series = {name: frame_metric_series(result, metric) for name, result in labeled}
+        lengths = {name: len(values) for name, values in series.items()}
+        entry = {
+            "n": lengths,
+            "comparable": (
+                not receipt_failures
+                and len(set(lengths.values())) == 1
+                and lengths["B1"] > 0
+            ),
+        }
+        means = {
+            name: (sum(values) / len(values) if values else None)
+            for name, values in series.items()
+        }
+        entry["means"] = means
+        if means["B1"] is not None and means["B2"] is not None:
+            entry["drift"] = means["B2"] - means["B1"]
+        else:
+            entry["drift"] = None
+        a_mean = None
+        b_mean = None
+        if means["A1"] is not None and means["A2"] is not None:
+            a_mean = 0.5 * (means["A1"] + means["A2"])
+        if means["B1"] is not None and means["B2"] is not None:
+            b_mean = 0.5 * (means["B1"] + means["B2"])
+        entry["effect"] = (
+            None if a_mean is None or b_mean is None else a_mean - b_mean
+        )
+        if entry["comparable"]:
+            entry["bootstrap"] = {
+                "A1_minus_B1": paired_block_bootstrap(
+                    series["B1"], series["A1"],
+                    block_size=block_size, n_resamples=n_resamples, seed=seed,
+                ),
+                "A2_minus_B2": paired_block_bootstrap(
+                    series["B2"], series["A2"],
+                    block_size=block_size, n_resamples=n_resamples, seed=seed + 1,
+                ),
+                "B2_minus_B1": paired_block_bootstrap(
+                    series["B1"], series["B2"],
+                    block_size=block_size, n_resamples=n_resamples, seed=seed + 2,
+                ),
+            }
+        else:
+            entry["bootstrap"] = None
+        report["metrics"][metric] = entry
+    return report
+
+
+
 def g(d: dict, *keys, default=None):
     cur = d
     for k in keys:
@@ -178,9 +428,15 @@ def _parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    ap.add_argument("baseline")
-    ap.add_argument("candidate")
-    ap.add_argument("--kind", choices=["speed", "accuracy"], required=True)
+    ap.add_argument("baseline", nargs="?", default=None)
+    ap.add_argument("candidate", nargs="?", default=None)
+    ap.add_argument(
+        "--baab",
+        nargs=4,
+        metavar=("B1", "A1", "A2", "B2"),
+        help="B-A-A-B JSON paths; reports drift/effect/bootstrap without a pass gate",
+    )
+    ap.add_argument("--kind", choices=["speed", "accuracy"])
     ap.add_argument(
         "--success-tol",
         type=float,
@@ -218,7 +474,11 @@ def _parse_args() -> argparse.Namespace:
         help="absolute tolerance for per-frame reprojection RMS",
     )
     ap.add_argument("--json-out", default="", help="optionally save the verdict as JSON")
+    ap.add_argument("--block-size", type=int, default=50)
+    ap.add_argument("--bootstrap-resamples", type=int, default=1000)
+    ap.add_argument("--bootstrap-seed", type=int, default=0)
     return ap.parse_args()
+
 
 
 def _mode_count(summary: dict, key: str):
@@ -529,6 +789,22 @@ def _write_json_verdict(
 
 def main() -> int:
     args = _parse_args()
+    if args.baab:
+        if args.block_size <= 0 or args.bootstrap_resamples <= 0:
+            raise SystemExit("block-size and bootstrap-resamples must be positive")
+        b1, a1, a2, b2 = (load_result(path) for path in args.baab)
+        report = compare_baab_runs(
+            b1, a1, a2, b2,
+            block_size=args.block_size,
+            n_resamples=args.bootstrap_resamples,
+            seed=args.bootstrap_seed,
+        )
+        print(json.dumps(report, indent=2))
+        if args.json_out:
+            Path(args.json_out).write_text(json.dumps(report, indent=2), encoding="utf-8")
+        return 0
+    if not args.baseline or not args.candidate or not args.kind:
+        raise SystemExit("baseline candidate --kind are required unless --baab is used")
     baseline_result = load_result(args.baseline)
     candidate_result = load_result(args.candidate)
     b = baseline_result["summary"]
@@ -538,6 +814,15 @@ def main() -> int:
     _print_metric_rows(rows)
 
     checks = _shared_checks(b, c, args, deltas)
+    receipt_failures = receipt_identity_failures(
+        baseline_result, result_receipt(candidate_result),
+    )
+    _add_check(
+        checks,
+        "receipt_identity",
+        not receipt_failures,
+        "; ".join(receipt_failures) or "receipt identity matches",
+    )
     if args.kind == "speed":
         checks.extend(_speed_checks(b, c, args))
     else:
@@ -555,6 +840,7 @@ def main() -> int:
     _print_acceptance(args.kind, checks, frame_equivalence, verdict)
     _write_json_verdict(args, rows, checks, frame_equivalence, verdict)
     return 0 if verdict else 1
+
 
 
 if __name__ == "__main__":

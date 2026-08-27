@@ -42,7 +42,11 @@ def load_profile(profile_path: Path):
 def discover_profiles(root: Path) -> list[tuple[Path, object]]:
     profiles: list[tuple[Path, object]] = []
     profile_dir = root / "控制介面程式/site_profiles"
-    for path in sorted(profile_dir.glob("*.json")):
+    paths = [
+        *profile_dir.glob("*.json"),
+        *(root / "地圖檔/場域").glob("*/site_profile.json"),
+    ]
+    for path in sorted(paths):
         try:
             profile = load_profile(path)
         except SelectionError:

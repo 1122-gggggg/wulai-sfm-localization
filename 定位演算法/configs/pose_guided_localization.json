@@ -1,0 +1,62 @@
+{
+  "schema": "pose-guided-localization/v1",
+  "enabled": false,
+  "apply_yaw_increment": true,
+  "allow_weak_anchors": false,
+  "camera_center_is_body_origin": true,
+  "max_sync_error_s": 0.15,
+  "max_sample_age_s": 0.40,
+  "max_prediction_dt_s": 0.25,
+  "max_anchor_age_s": 3.0,
+  "metres_per_map_unit": null,
+  "height_axis": null,
+  "camera_to_body": {
+    "translation_m": [0.0, 0.0, 0.0],
+    "quaternion_wxyz": [1.0, 0.0, 0.0, 0.0],
+    "approved": false
+  },
+
+  "uncertainty": {
+    "sigma_position_base": 0.10,
+    "k_position": 0.40,
+    "sigma_rotation_base_rad": 0.08726646259971647,
+    "k_rotation_rad": 0.2617993877991494,
+    "mahalanobis_threshold": 9.0,
+    "hard_max_radius_factor": 8.0
+  },
+  "search": {
+    "TRACK": {
+      "radius_factor": 1.0,
+      "yaw_factor": 1.0,
+      "max_refs_factor": 1.0
+    },
+    "WEAK_TRACK": {
+      "radius_factor": 2.0,
+      "yaw_factor": 1.25,
+      "max_refs_factor": 1.0
+    },
+    "WEAK_TRACK_2": {
+      "radius_factor": 4.0,
+      "yaw_factor": 1.5,
+      "max_refs_factor": 1.0
+    },
+    "LOST": {
+      "radius_factor": 8.0,
+      "yaw_factor": 2.0,
+      "max_refs_factor": 1.0
+    }
+  },
+  "ranking": {
+    "w_position": 1.0,
+    "w_orientation": 0.8,
+    "w_covisibility": 0.4,
+    "w_temporal": 0.5,
+    "w_quality": 0.0
+  },
+  "anchor": {
+    "min_inliers": 80,
+    "min_inlier_ratio": 0.15,
+    "min_inlier_grid_cells": 6,
+    "max_reproj_rms": 5.0
+  }
+}

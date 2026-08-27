@@ -5,9 +5,11 @@ set -euo pipefail
 root_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 log_file="$(mktemp -t sfm-ui-smoke-XXXXXX.log)"
 process_id=""
-video_path="$root_dir/執行環境/smoke/river_site_first_2s.mp4"
-if [[ ! -f "$video_path" ]]; then
-  video_path="$root_dir/模擬器/測試影片/河濱_P1180118_first_2s.mp4"
+video_path="${SFM_SMOKE_VIDEO:-$root_dir/模擬器/測試影片/P1190119.MP4}"
+if [[ ! -s "$video_path" ]]; then
+  echo "[ui-smoke] test video is missing or empty: $video_path" >&2
+  echo "[ui-smoke] set SFM_SMOKE_VIDEO to an explicit replay video" >&2
+  exit 2
 fi
 
 cleanup() {
@@ -34,7 +36,7 @@ trap cleanup EXIT
 
 SFM_WORKSPACE_ROOT="$root_dir" setsid \
   "$root_dir/控制介面程式/影片模擬串流/選擇啟動.sh" \
-  --map "$root_dir/地圖檔/場域/river_site/maps/river_site_realrgb_dense_trimmed.ply" \
+  --map "$root_dir/地圖檔/場域/river_site/releases/river_site_b0_p116_p117_20260818/map/map.ply" \
   --video "$video_path" \
   >"$log_file" 2>&1 &
 process_id=$!

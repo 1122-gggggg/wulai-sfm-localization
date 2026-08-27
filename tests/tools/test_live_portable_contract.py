@@ -23,10 +23,7 @@ def test_live_minimal_export_contract_excludes_development_payload() -> None:
         "模擬器/parrot_stimulate/src/anafi_pcmd_sim/scale_free_control.py"
         in exporter.LIVE_MINIMAL_COPY_FILES
     )
-    assert (
-        "模擬器/測試影片/河濱_P1180118_first_2s.mp4",
-        "執行環境/smoke/river_site_first_2s.mp4",
-    ) in exporter.LIVE_MINIMAL_COPY_MAPPINGS
+    assert exporter.LIVE_MINIMAL_COPY_MAPPINGS == ()
     assert "控制介面程式" in exporter.LIVE_MINIMAL_COPY_DIRS
     assert "定位演算法/flight_control" in exporter.LIVE_MINIMAL_COPY_DIRS
     assert "模擬器/parrot_stimulate" not in exporter.LIVE_MINIMAL_COPY_DIRS
@@ -83,19 +80,22 @@ def test_live_minimal_export_uses_live_entrypoint_and_filters_tests(
     assert verify(destination) == []
 
 
-def test_one_click_launcher_installs_offline_and_selects_river_profile() -> None:
+def test_one_click_launcher_installs_offline_and_selects_river_mission() -> None:
     script = LAUNCHER.read_text(encoding="utf-8")
 
     assert "tools/install_runtime.sh\" --offline" in script
     assert "tools/package_manifest.py\" verify" in script
-    assert "控制介面程式/site_profiles/river_site_edm.json" in script
+    assert "river_site_b0_p116_p117_localization.json" in script
+    assert "SFM_MISSION_SELECTION" in script
     assert "控制介面程式/真機串流/啟動.sh" in script
     assert ".sfm-portable-runtime" in script
     assert "非 Git 原始碼目錄必須包含 PORTABLE_PACKAGE.json" in script
     assert "exec" in script
 
     smoke_script = (ROOT / "tools/simulated_ui_smoke.sh").read_text(encoding="utf-8")
-    assert "執行環境/smoke/river_site_first_2s.mp4" in smoke_script
+    assert "SFM_SMOKE_VIDEO" in smoke_script
+    assert "模擬器/測試影片/P1190119.MP4" in smoke_script
+    assert "河濱_P1180118_first_2s.mp4" not in smoke_script
     assert 'SFM_WORKSPACE_ROOT="$root_dir" setsid' in smoke_script
 
 
@@ -143,7 +143,60 @@ def test_one_click_launcher_real_flight_dry_run_does_not_connect() -> None:
 
     assert completed.returncode == 0, completed.stderr
     assert "--interface real-flight" in completed.stdout
-    assert "river_site_edm.json" in completed.stdout
+    assert "river_site_b0_p116_p117_localization.json" in completed.stdout
+    assert "mission_snapshots" in completed.stdout
+
+
+def test_one_click_rejects_direct_site_profile_override() -> None:
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "SFM_LAUNCH_DRY_RUN": "1",
+            "SFM_UI_PYTHON": sys.executable,
+            "SFM_MAX_PERFORMANCE": "0",
+        }
+    )
+    environment.pop("SFM_SITE_PROFILE", None)
+    environment.pop("SFM_MISSION_SELECTION", None)
+
+    completed = subprocess.run(
+        ["bash", str(LAUNCHER), "--site-profile=/tmp/old site.json"],
+        cwd=ROOT,
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+
+    assert completed.returncode == 2
+    assert "mission selection" in completed.stderr
+
+
+def test_one_click_rejects_existing_site_profile_environment() -> None:
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "SFM_LAUNCH_DRY_RUN": "1",
+            "SFM_UI_PYTHON": sys.executable,
+            "SFM_MAX_PERFORMANCE": "0",
+            "SFM_SITE_PROFILE": "/tmp/old site.json",
+        }
+    )
+    environment.pop("SFM_MISSION_SELECTION", None)
+
+    completed = subprocess.run(
+        ["bash", str(LAUNCHER)],
+        cwd=ROOT,
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+
+    assert completed.returncode == 2
+    assert "SFM_SITE_PROFILE" in completed.stderr
 
 
 def test_portable_runtime_smoke_rejects_symlinked_outputs(

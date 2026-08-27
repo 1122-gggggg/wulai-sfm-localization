@@ -118,8 +118,12 @@ RELEASE_FILES = (
     "控制介面程式/operator_interface/live_localizer_worker.py",
     "控制介面程式/operator_interface/scale_free_control_adapter.py",
     "控制介面程式/site_profile.py",
+    "控制介面程式/mission_manifest.py",
+    "控制介面程式/mission_resolver.py",
+    "控制介面程式/launch_mission.py",
+    "控制介面程式/validate_mission_selections.py",
     "控制介面程式/validate_system_profiles.py",
-    "控制介面程式/site_profiles/river_site_edm.json",
+    "地圖檔/場域/river_site/site_profile.json",
     "模擬器/parrot_stimulate/src/anafi_pcmd_sim/scale_free_control.py",
     "定位演算法/deploy_code/sfm_glomap_deploy/edm_matcher.py",
     "定位演算法/deploy_code/sfm_glomap_deploy/export_edm_onnx_flight.py",
@@ -558,6 +562,15 @@ def _steps(
             300,
         ),
         Step(
+            "mission_selection_validation",
+            (
+                str(ROOT_PYTHON),
+                str(ROOT / "控制介面程式/validate_mission_selections.py"),
+            ),
+            str(ROOT),
+            300,
+        ),
+        Step(
             "portable_simulator_preflight",
             (
                 str(ROOT_PYTHON),
@@ -565,9 +578,9 @@ def _steps(
                 "--workspace-root",
                 str(ROOT),
                 "--site-profile",
-                str(ROOT / "控制介面程式/site_profiles/river_site_edm.json"),
+                str(ROOT / "地圖檔/場域/river_site/site_profile.json"),
                 "--video",
-                str(ROOT / "模擬器/測試影片/河濱_P1180118_first_2s.mp4"),
+                str(P119_VIDEO),
                 "--check-runtime",
                 "--full-runtime",
                 "--json",
@@ -663,7 +676,7 @@ def _steps(
                     str(ROOT_PYTHON),
                     str(ROOT / "定位演算法/validation/benchmark_edm_site_replay.py"),
                     "--site-profile",
-                    str(ROOT / "控制介面程式/site_profiles/river_site_edm.json"),
+                    str(ROOT / "地圖檔/場域/river_site/site_profile.json"),
                     "--video",
                     str(P119_VIDEO),
                     "--out",
@@ -698,7 +711,82 @@ def _write_receipt(path: Path, payload: dict[str, object]) -> None:
         temp.unlink(missing_ok=True)
 
 
-def main() -> int:
+def _dry_run_plan(
+    *,
+    receipt_dir: Path,
+    stamp: str,
+    p119: bool,
+    accept_p119: bool,
+    p119_quality: bool,
+    portable_package: Path | None,
+    clean_install: bool,
+    ui_smoke: bool,
+) -> dict[str, object]:
+    receipt_dir = receipt_dir.expanduser().resolve()
+    receipt_path = receipt_dir / f"validation_{stamp}.json"
+    log_dir = receipt_dir / f"validation_{stamp}_logs"
+    steps = _steps(
+        p119=p119,
+        accept_p119=accept_p119,
+        p119_quality=p119_quality,
+        quality_out=log_dir / "p119_quality.json",
+        portable_package=portable_package,
+        clean_install=clean_install,
+        ui_smoke=ui_smoke,
+    )
+    checks = []
+    write_targets: list[dict[str, str]] = [
+        {"kind": "receipt_directory", "path": str(receipt_dir)},
+        {
+            "kind": "receipt_temp_pattern",
+            "path": str(receipt_dir / f".{receipt_path.name}.*.tmp"),
+        },
+        {"kind": "receipt", "path": str(receipt_path)},
+        {"kind": "log_directory", "path": str(log_dir)},
+    ]
+    for index, step in enumerate(steps, start=1):
+        log_path = log_dir / f"{index:02d}_{step.name}.log"
+        checks.append(
+            {
+                "index": index,
+                "name": step.name,
+                "argv": list(step.argv),
+                "cwd": step.cwd,
+                "timeout_s": step.timeout_s,
+                "isolate_workspace": step.isolate_workspace,
+                "log": str(log_path),
+            }
+        )
+        write_targets.append({"kind": "step_log", "path": str(log_path)})
+    if p119_quality:
+        write_targets.append(
+            {"kind": "p119_quality_output", "path": str(log_dir / "p119_quality.json")}
+        )
+    if any(step.name == "dependency_security_sbom" for step in steps):
+        write_targets.extend(
+            [
+                {
+                    "kind": "security_audit_output",
+                    "path": str(ROOT / "outputs/security/pip-audit.json"),
+                },
+                {
+                    "kind": "security_sbom_output",
+                    "path": str(ROOT / "outputs/security/sbom.cyclonedx.json"),
+                },
+            ]
+        )
+    return {
+        "dry_run": True,
+        "read_only": True,
+        "subprocesses_executed": False,
+        "filesystem_writes": False,
+        "root": str(ROOT),
+        "checks": checks,
+        "write_targets": write_targets,
+    }
+
+
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--p119-integrity", action="store_true")
     parser.add_argument(
@@ -740,7 +828,12 @@ def main() -> int:
         action="store_true",
         help="development-only opt-out; a dirty tree still fails release mode",
     )
-    args = parser.parse_args()
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="list checks and write targets without mkdir, writes, or subprocesses",
+    )
+    args = parser.parse_args(argv)
     if args.accept_p119_known_incomplete and not args.p119_integrity:
         parser.error("--accept-p119-known-incomplete requires --p119-integrity")
     if args.p119_quality and not (
@@ -750,21 +843,41 @@ def main() -> int:
             "--p119-quality requires --p119-integrity and "
             "--accept-p119-known-incomplete"
         )
-    if not ROOT_PYTHON.is_file() or not PARROT_PYTHON.is_file():
-        parser.error("both pinned Python environments must exist")
-
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     receipt_dir = args.receipt_dir.expanduser().resolve()
-    receipt_dir.mkdir(parents=True, exist_ok=True)
-    receipt_path = receipt_dir / f"validation_{stamp}.json"
-    log_dir = receipt_dir / f"validation_{stamp}_logs"
-    log_dir.mkdir(mode=0o750)
-    started = time.time()
     portable_package = (
         args.portable_package.expanduser().resolve()
         if args.portable_package is not None
         else None
     )
+    if args.dry_run:
+        print(
+            json.dumps(
+                _dry_run_plan(
+                    receipt_dir=receipt_dir,
+                    stamp=stamp,
+                    p119=bool(args.p119_integrity),
+                    accept_p119=bool(args.accept_p119_known_incomplete),
+                    p119_quality=bool(args.p119_quality),
+                    portable_package=portable_package,
+                    clean_install=bool(args.clean_install),
+                    ui_smoke=bool(args.ui_smoke),
+                ),
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        return 0
+
+    if not ROOT_PYTHON.is_file() or not PARROT_PYTHON.is_file():
+        parser.error("both pinned Python environments must exist")
+
+    receipt_dir.mkdir(parents=True, exist_ok=True)
+    receipt_path = receipt_dir / f"validation_{stamp}.json"
+    log_dir = receipt_dir / f"validation_{stamp}_logs"
+    log_dir.mkdir(mode=0o750)
+    started = time.time()
     git = _git_metadata()
     release_gate = _release_gate(git, allow_dirty=bool(args.allow_dirty))
     source_release = source_release_identity(ROOT)
@@ -804,7 +917,7 @@ def main() -> int:
             "SFM_UI_PYTHON": str(ROOT_PYTHON),
             "SFM_LOCALIZER_PYTHON": str(ROOT_PYTHON),
             "SFM_SITE_PROFILE": str(
-                ROOT / "控制介面程式/site_profiles/river_site_edm.json"
+                ROOT / "地圖檔/場域/river_site/site_profile.json"
             ),
         }
     )

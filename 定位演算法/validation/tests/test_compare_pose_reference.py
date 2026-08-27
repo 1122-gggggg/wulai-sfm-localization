@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import math
 import sys
 from pathlib import Path
+
+import pytest
 
 
 VALIDATION = Path(__file__).resolve().parents[1]
@@ -19,7 +22,13 @@ def load_module():
     return module
 
 
-def result(xs: list[float], yaws_deg: list[float], *, failed: set[int] | None = None) -> dict:
+def result(
+    xs: list[float],
+    yaws_deg: list[float],
+    *,
+    failed: set[int] | None = None,
+    reference_evidence: dict | None = None,
+) -> dict:
     failed = failed or set()
     rows = []
     for index, (x, yaw) in enumerate(zip(xs, yaws_deg)):
@@ -35,8 +44,16 @@ def result(xs: list[float], yaws_deg: list[float], *, failed: set[int] | None = 
             "pose": ({"x": x, "y": 0.0, "z": 0.0, "yaw": math.radians(yaw)}
                      if success else None),
         })
-    return {"rows": rows, "summary": {"actual_fps_including_io": 20.0,
-                                        "wall_ms": {"median": 40.0, "p90": 50.0}}}
+    payload = {
+        "rows": rows,
+        "summary": {
+            "actual_fps_including_io": 20.0,
+            "wall_ms": {"median": 40.0, "p90": 50.0},
+        },
+    }
+    if reference_evidence is not None:
+        payload["reference_evidence"] = reference_evidence
+    return payload
 
 
 def test_reference_metrics_handle_wrapped_yaw_and_relative_motion():
@@ -82,3 +99,86 @@ def test_reference_metrics_reject_misaligned_frames():
         assert "alignment" in str(exc)
     else:
         raise AssertionError("misaligned rows must fail")
+
+
+def test_missing_reference_evidence_is_pseudo_continuity_only():
+    compare = load_module()
+    reference = result([0.0], [0.0])
+    candidate = result([0.1], [1.0])
+
+    report = compare.compare_pose_reference(reference, candidate)
+
+    assert report["absolute_accuracy_validated"] is False
+    assert report["claim_scope"]["scope"] == "pseudo/continuity-only"
+    assert report["claim_scope"]["reference_evidence"] is None
+    assert report["claim_scope"]["interpretation"]["absolute_accuracy_validated"] is False
+    assert "pseudo-ground-truth" in report["interpretation"]
+
+
+def test_fake_reference_evidence_cannot_escalate_a_claim():
+    compare = load_module()
+    reference = result(
+        [0.0],
+        [0.0],
+        reference_evidence={
+            "kind": "surveyed",
+            "map_aligned": True,
+            "independent_of_localizer": True,
+            "source_sha256": "A" * 64,
+        },
+    )
+    reference["absolute_accuracy_validated"] = True
+
+    report = compare.compare_pose_reference(reference, result([0.1], [1.0]))
+
+    assert report["absolute_accuracy_validated"] is False
+    assert report["claim_scope"]["scope"] == "pseudo/continuity-only"
+    assert "source_sha256" in report["claim_scope"]["interpretation"]["validation_errors"][0]
+
+
+def test_valid_independent_map_aligned_evidence_validates_absolute_accuracy():
+    compare = load_module()
+    evidence = {
+        "kind": "surveyed",
+        "map_aligned": True,
+        "independent_of_localizer": True,
+        "source_sha256": "a" * 64,
+    }
+    report = compare.compare_pose_reference(
+        result([0.0], [0.0], reference_evidence=evidence),
+        result([0.1], [1.0]),
+    )
+
+    assert report["absolute_accuracy_validated"] is True
+    assert report["claim_scope"]["scope"] == "absolute_accuracy"
+    assert report["claim_scope"]["reference_evidence"] == evidence
+    assert report["claim_scope"]["interpretation"]["validation_errors"] == []
+
+
+def test_cli_gate_rejects_unqualified_reference_before_comparison(tmp_path, monkeypatch, capsys):
+    compare = load_module()
+    reference_path = tmp_path / "reference.json"
+    candidate_path = tmp_path / "candidate.json"
+    reference_path.write_text(json.dumps(result([0.0], [0.0])), encoding="utf-8")
+    candidate_path.write_text(json.dumps(result([0.1], [1.0])), encoding="utf-8")
+    monkeypatch.setattr(
+        compare,
+        "compare_pose_reference",
+        lambda *_args, **_kwargs: pytest.fail("comparison must not run before the claim gate"),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "compare_pose_reference.py",
+            str(reference_path),
+            str(candidate_path),
+            "--require-absolute-ground-truth",
+        ],
+    )
+
+    with pytest.raises(SystemExit) as raised:
+        compare.main()
+
+    assert raised.value.code == 2
+    assert "reference lacks valid absolute ground truth evidence" in capsys.readouterr().err

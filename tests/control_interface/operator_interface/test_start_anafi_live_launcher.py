@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+import hashlib
+import json
 import shutil
 import signal
 import subprocess
@@ -32,6 +34,7 @@ LAUNCH_ENV = {
     "SFM_DISTANCE_GEOFENCE",
     "SFM_LAUNCH_DRY_RUN",
     "SFM_LOCALIZER_PYTHON",
+    "SFM_MISSION_SELECTION",
     "SFM_MAX_ALTITUDE_M",
     "SFM_MAX_DISTANCE_M",
     "SFM_MAX_PERFORMANCE",
@@ -85,6 +88,13 @@ def test_launcher_help_exits_before_live_setup() -> None:
     assert "checking target" not in result.stdout
     assert "sustained CPU thread budget" not in result.stdout
 
+def test_live_launcher_invokes_runtime_preflight_without_video() -> None:
+    text = SCRIPT.read_text(encoding="utf-8")
+    assert "live runtime preflight" in text
+    assert "simulator_preflight.py" in text
+    assert "refusing PATH python3" in text
+
+
 
 def write_executable(path: Path, body: str) -> None:
     path.write_text("#!/usr/bin/env bash\nset -euo pipefail\n" + body)
@@ -92,14 +102,21 @@ def write_executable(path: Path, body: str) -> None:
 
 
 def make_fake_portable_package(tmp_path: Path) -> Path:
-    package = tmp_path / "portable"
+    package = tmp_path / "portable package with spaces"
     for relative in (
         Path("控制介面程式/operator_interface/start_anafi_live.sh"),
         Path("控制介面程式/真機串流/啟動.sh"),
+        Path("控制介面程式/launch_mission.py"),
+        Path("控制介面程式/mission_manifest.py"),
+        Path("控制介面程式/mission_resolver.py"),
+        Path("控制介面程式/navigation_pose_runtime.py"),
+        Path("控制介面程式/workspace_layout.py"),
     ):
         destination = package / relative
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(SCRIPT.parents[2] / relative, destination)
+    (package / "定位演算法").mkdir(parents=True)
+    (package / "地圖檔").mkdir(parents=True)
     display = package / "控制介面程式/operator_interface/resolve_display.sh"
     display.parent.mkdir(parents=True, exist_ok=True)
     display.write_text(
@@ -115,6 +132,7 @@ def make_fake_portable_package(tmp_path: Path) -> Path:
         '"entrypoint":"一鍵啟動.sh"}\n',
         encoding="utf-8",
     )
+    _write_fake_mission_selection(package)
     subprocess.run(
         [sys.executable, str(manifest_tool), "generate", "--root", str(package)],
         check=True,
@@ -122,6 +140,167 @@ def make_fake_portable_package(tmp_path: Path) -> Path:
         text=True,
     )
     return package
+
+
+def _sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _write_fake_mission_selection(package: Path) -> Path:
+    mission_root = package / "mission fixture with spaces"
+    assets = mission_root / "assets"
+    components = mission_root / "components"
+    receipts = mission_root / "receipts"
+    for path, content in (
+        (assets / "map.ply", b"map"),
+        (assets / "reference_poses.json", b"poses"),
+        (assets / "map_align.json", b"align"),
+        (assets / "bundle.pt", b"bundle"),
+        (assets / "profile.json", b"profile"),
+    ):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
+
+    def reference(path: Path, base: Path) -> dict[str, str]:
+        return {
+            "path": os.path.relpath(path, base),
+            "sha256": _sha256(path),
+        }
+
+    vehicle = components / "vehicle.json"
+    vehicle.parent.mkdir(parents=True, exist_ok=True)
+    vehicle.write_text(
+        json.dumps(
+            {
+                "schema": "sfm-vehicle/v1",
+                "vehicle_id": "fixture_aircraft",
+                "revision": "r1",
+                "adapter": "fixture_adapter",
+                "model": "Fixture aircraft",
+                "serials": [],
+                "capabilities": ["rgb_720p"],
+                "required_calibrations": [],
+                "limits": {"max_speed_mps": 1.0},
+                "camera": {
+                    "camera_id": "front",
+                    "pipeline_id": "camera_pipeline_v1",
+                    "model": "PINHOLE",
+                    "width": 1280,
+                    "height": 720,
+                    "params": [900.0, 900.0, 640.0, 360.0],
+                },
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    site = components / "site.json"
+    site.write_text(
+        json.dumps(
+            {
+                "schema": "sfm-site/v1",
+                "site_id": "fixture_site",
+                "display_name": "Fixture site",
+                "site_frame_id": "fixture_site_enu",
+                "units": "m",
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    map_manifest = components / "map.json"
+    map_manifest.write_text(
+        json.dumps(
+            {
+                "schema": "sfm-map-revision/v1",
+                "site_id": "fixture_site",
+                "map_revision_id": "map_v1",
+                "coordinate_frame": {
+                    "id": "map_v1_frame",
+                    "convention": "glomap",
+                    "horizontal_axes": ["x", "z"],
+                    "up_axis": "-y",
+                    "handedness": "right",
+                    "units": "map",
+                },
+                "assets": {
+                    "map_ply": reference(assets / "map.ply", components),
+                    "reference_poses": reference(
+                        assets / "reference_poses.json", components
+                    ),
+                    "map_align": reference(assets / "map_align.json", components),
+                },
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    localizer = components / "localizer.json"
+    localizer.write_text(
+        json.dumps(
+            {
+                "schema": "sfm-localizer-variant/v1",
+                "algorithm_id": "fixture_localizer",
+                "variant_id": "variant_v1",
+                "provider_api_version": 1,
+                "pose_contract_version": 1,
+                "map_revision_id": "map_v1",
+                "coordinate_frame_id": "map_v1_frame",
+                "camera_profiles": ["camera_pipeline_v1"],
+                "required_vehicle_capabilities": ["rgb_720p"],
+                "quality_gate_id": "quality_v1",
+                "artifacts": {
+                    "bundle": reference(assets / "bundle.pt", components),
+                    "profile": reference(assets / "profile.json", components),
+                },
+                "runtime": {"device": "test"},
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    quality = receipts / "quality.json"
+    quality.parent.mkdir(parents=True, exist_ok=True)
+    quality.write_text(
+        json.dumps(
+            {
+                "schema": "sfm-calibration-receipt/v1",
+                "receipt_id": "quality_v1",
+                "kind": "localizer_quality",
+                "subject": "quality_v1",
+                "passed": True,
+                "issued_at": "2026-08-01T00:00:00Z",
+                "expires_at": None,
+                "details": {},
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    selection = mission_root / "selections" / "selected mission.json"
+    selection.parent.mkdir(parents=True, exist_ok=True)
+    selection.write_text(
+        json.dumps(
+            {
+                "schema": "sfm-mission-selection/v1",
+                "selection_id": "fixture_mission",
+                "vehicle": reference(vehicle, selection.parent),
+                "site": reference(site, selection.parent),
+                "map": reference(map_manifest, selection.parent),
+                "localizer": reference(localizer, selection.parent),
+                "route": None,
+                "calibrations": [reference(quality, selection.parent)],
+                "approval": None,
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    return selection
+
+
+def _fake_selection_path(package: Path) -> Path:
+    return package / "mission fixture with spaces/selections/selected mission.json"
 
 
 def run_portable_launcher(
@@ -140,10 +319,13 @@ def run_portable_launcher(
             "SFM_LAUNCH_DRY_RUN": dry_run,
             "SFM_MAX_PERFORMANCE": "0",
             "SFM_UI_PYTHON": sys.executable,
-            "SFM_SITE_PROFILE": str(package / "profile.json"),
             **overrides,
         }
     )
+    if launcher.parent.name == "真機串流":
+        env["SFM_MISSION_SELECTION"] = str(_fake_selection_path(package))
+    else:
+        env["SFM_SITE_PROFILE"] = str(package / "profile.json")
     return subprocess.run(
         [str(launcher)],
         cwd=launcher.parent,

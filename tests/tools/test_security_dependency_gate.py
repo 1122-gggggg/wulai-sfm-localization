@@ -200,6 +200,32 @@ expires = "2027-02-09"
     )
 
 
+def test_repository_skip_exceptions_cover_all_non_pypi_runtime_wheels() -> None:
+    root = Path(__file__).resolve().parents[2]
+    exceptions = load_skip_exceptions(root / "pyproject.toml")
+    by_package = {item.package: item for item in exceptions}
+    expected = {
+        "torch": "2.11.0+cu128",
+        "torchvision": "0.26.0+cu128",
+        "moge": "2.0.0",
+        "utils3d": "1.3",
+        "poselib": "3.0.0",
+    }
+
+    assert {name: by_package[name].version for name in expected} == expected
+    assert all(by_package[name].expires > date.today() for name in expected)
+
+    skipped = [
+        SkippedDependency(
+            name,
+            version,
+            f"Dependency not found on PyPI and could not be audited: {name} ({version})",
+        )
+        for name, version in expected.items()
+    ]
+    assert evaluate_skipped_dependencies(skipped, exceptions) == []
+
+
 def test_expired_skip_exception_is_a_gate_failure(tmp_path: Path) -> None:
     config = _write_config(
         tmp_path,

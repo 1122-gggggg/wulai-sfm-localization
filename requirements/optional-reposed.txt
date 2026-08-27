@@ -1,0 +1,11 @@
+# Optional full RePoseD/MoGe stack; intentionally excluded from the B0 base.
+#
+# These are source-pinned wheels, not interchangeable PyPI releases.  The
+# corresponding lock is an inventory of the exact wheel hashes.  Install it
+# only through the fail-closed procedure in requirements/README.md after an
+# approved wheelhouse also contains every runtime dependency declared by the
+# MoGe and utils3d wheel metadata.
+moge==2.0.0
+utils3d==1.3
+poselib==3.0.0
+huggingface-hub==0.36.2

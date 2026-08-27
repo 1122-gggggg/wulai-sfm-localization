@@ -50,7 +50,10 @@ def test_release_receipt_tracks_operator_runtime_seams() -> None:
         "控制介面程式/operator_interface/operator_site_runtime.py",
         "控制介面程式/operator_interface/operator_tick.py",
         "控制介面程式/operator_interface/site_assets_panel.py",
-        "控制介面程式/site_profiles/river_site_edm.json",
+        "控制介面程式/mission_manifest.py",
+        "控制介面程式/mission_resolver.py",
+        "控制介面程式/validate_mission_selections.py",
+        "地圖檔/場域/river_site/site_profile.json",
         "定位演算法/flight_control/localization_uncertainty.py",
         "定位演算法/flight_control/real_path_follow_controller.py",
     }
@@ -78,6 +81,7 @@ def test_production_offline_smoke_requires_edm_not_research_xfeat() -> None:
 
     assert steps["root_ruff_check"].argv[-3:] == ("ruff", "check", ".")
     assert steps["root_ruff_format"].argv[2:5] == ("ruff", "format", "--check")
+    assert "mission_selection_validation" in steps
     assert steps["maintainability_budget"].argv[-1].endswith(
         "tools/check_maintainability.py"
     )
@@ -305,6 +309,9 @@ def test_simulator_preflight_receipt_includes_collision_monitor_policy() -> None
     }
     preflight = steps["portable_simulator_preflight"]
     assert "--json" in preflight.argv
+    assert preflight.argv[preflight.argv.index("--video") + 1].endswith(
+        "模擬器/測試影片/P1190119.MP4"
+    )
 
 
 def test_dirty_release_is_failed_unless_development_opt_out(monkeypatch) -> None:
@@ -337,3 +344,46 @@ def test_pytest_summary_records_conditional_skips_for_receipts() -> None:
 
     fallback = module._pytest_summary("SKIPPED [3] optional CUDA test\n")
     assert fallback is not None and fallback["skipped"] == 3
+
+
+def test_dry_run_lists_checks_and_targets_without_side_effects(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    module = _load_validation_module()
+    receipt_dir = tmp_path / "validation-receipts"
+
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("dry-run must not execute subprocesses or write files")
+
+    monkeypatch.setattr(module.subprocess, "run", fail_if_called)
+    monkeypatch.setattr(module.Path, "mkdir", fail_if_called)
+    monkeypatch.setattr(module.Path, "write_text", fail_if_called)
+
+    assert (
+        module.main(
+            [
+                "--dry-run",
+                "--receipt-dir",
+                str(receipt_dir),
+                "--p119-integrity",
+                "--p119-quality",
+                "--accept-p119-known-incomplete",
+            ]
+        )
+        == 0
+    )
+
+    plan = json.loads(capsys.readouterr().out)
+    assert plan["dry_run"] is True
+    assert plan["read_only"] is True
+    assert plan["subprocesses_executed"] is False
+    assert plan["filesystem_writes"] is False
+    names = {check["name"] for check in plan["checks"]}
+    assert {"root_ruff_check", "p119_integrity", "p119_quality"} <= names
+    targets = {target["path"] for target in plan["write_targets"]}
+    assert str(receipt_dir) in targets
+    assert any(path.startswith(str(receipt_dir)) for path in targets)
+    assert str(module.ROOT / "outputs/security/pip-audit.json") in targets
+    assert not receipt_dir.exists()

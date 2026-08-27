@@ -342,11 +342,19 @@ def _check_profile_runtime_containment(root: Path, profile, failures: list[str])
             f"{deploy_dir} != {expected_deploy_dir}"
         )
     if profile.localizer_profile is not None:
-        expected_profile_root = (root / "定位演算法/configs").resolve()
-        if not profile.localizer_profile.resolve().is_relative_to(expected_profile_root):
+        allowed_profile_roots = (
+            (root / "定位演算法/configs").resolve(),
+            (root / "地圖檔/場域").resolve(),
+        )
+        resolved_profile = profile.localizer_profile.resolve()
+        if not any(
+            resolved_profile.is_relative_to(allowed_root)
+            for allowed_root in allowed_profile_roots
+        ):
             failures.append(
-                "site profile localizer_profile is outside the fixed package: "
-                f"{profile.localizer_profile}"
+                "site profile localizer_profile is outside approved config roots: "
+                f"{profile.localizer_profile}; expected under "
+                "定位演算法/configs or 地圖檔/場域"
             )
     return deploy_dir
 
@@ -443,7 +451,7 @@ def run_preflight(
     *,
     root: Path,
     profile_path: Path,
-    video_path: Path,
+    video_path: Path | None,
     check_runtime: bool,
     full_runtime: bool = False,
     require_collision_monitor: bool = False,
@@ -466,10 +474,24 @@ def run_preflight(
             "map_ply": str(profile.map_ply),
             "localization_bundle": str(profile.localization_bundle),
         }
+        if profile.route_json is not None:
+            expected_route_sha = profile.asset_sha256.route_json
+            if expected_route_sha is None:
+                failures.append("missing asset_sha256.route_json")
+            else:
+                _check_sha(
+                    profile.route_json,
+                    expected_route_sha,
+                    "route_json",
+                    failures,
+                )
     except (ImportError, OSError, TypeError, ValueError) as exc:
         failures.append(f"site profile invalid: {exc}")
         profile_report = {}
-    video_report = _check_video(video_path, failures)
+    if video_path is None:
+        video_report = {}
+    else:
+        video_report = _check_video(video_path, failures)
     runtime_report = _check_runtime(root, profile_path, failures) if check_runtime else {}
     runtime_report["collision_monitor"] = _collision_monitor_status(
         root,
@@ -481,21 +503,28 @@ def run_preflight(
             failures.append("full runtime check requires --check-runtime")
         else:
             _check_full_runtime(root, profile, failures, runtime_report)
+    video_out = (
+        {"path": None}
+        if video_path is None
+        else {"path": str(video_path.resolve()), **video_report}
+    )
     return {
         "ok": not failures,
         "root": str(root.resolve()),
         "profile": profile_report,
-        "video": {"path": str(video_path.resolve()), **video_report},
+        "video": video_out,
         "runtime": runtime_report,
         "failures": failures,
     }
+
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--workspace-root", default=str(_workspace_root()))
     parser.add_argument("--site-profile", required=True)
-    parser.add_argument("--video", required=True)
+    parser.add_argument("--video", default="",
+                        help="required for simulated-stream; omit for live runtime checks")
     parser.add_argument("--check-runtime", action="store_true")
     parser.add_argument(
         "--require-collision-monitor",
@@ -509,10 +538,13 @@ def main() -> None:
     )
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
+    video_path = (
+        Path(args.video).expanduser().resolve() if str(args.video).strip() else None
+    )
     report = run_preflight(
         root=Path(args.workspace_root).expanduser().resolve(),
         profile_path=Path(args.site_profile).expanduser().resolve(),
-        video_path=Path(args.video).expanduser().resolve(),
+        video_path=video_path,
         check_runtime=bool(args.check_runtime or args.full_runtime),
         full_runtime=bool(args.full_runtime),
         require_collision_monitor=bool(args.require_collision_monitor),

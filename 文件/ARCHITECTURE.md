@@ -103,11 +103,13 @@ OperatorApp
 ```
 
 真機 AUTO 沒有額外的 release latch。操作員必須完成四步 preflight，且選定的
-site/route 核准、座標框架、資產雜湊與 runtime lock 必須一致。AUTO 起飛後先懸停，
+site/route、座標框架、資產雜湊與 runtime lock 必須一致。AUTO 起飛後先懸停，
 只有 TRACK、pose freshness、inliers、reprojection 與連續定位樣本達標後才會開始
 沿路線平移。hardware approval receipt v2 可作為外部稽核證據記錄，但不是 runtime
 readiness gate。GPS 不可用不會阻擋起飛，並停用依賴 GPS 的距離柵欄；其他定位與
-命令安全 gate 不受影響。隨附的河濱 profile 已核准其 SHA 綁定航線。
+命令安全 gate 不受影響。靜態 mission approval 不再是 resolver gate；隨附河濱
+selection 在元件、定位品質與 route 契約通過後即為 flight-ready。ANAFI 羅盤由真機
+韌體即時回讀，校正完成且狀態有效後自動通過 preflight 第一步，不使用靜態 IMU receipt。
 
 ## 路線與定位替換邊界
 

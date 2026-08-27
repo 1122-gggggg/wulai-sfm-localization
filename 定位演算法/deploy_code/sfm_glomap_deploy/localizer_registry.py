@@ -8,7 +8,12 @@ needs the static capabilities below.
 
 from __future__ import annotations
 
-from pose_types import LocalizerCapabilities, LocalizerProvider
+from pose_types import (
+    LOCALIZATION_POSE_CONTRACT_VERSION,
+    LOCALIZER_PROVIDER_API_VERSION,
+    LocalizerCapabilities,
+    LocalizerProvider,
+)
 
 
 _PROVIDERS: dict[str, LocalizerProvider] = {}
@@ -26,6 +31,18 @@ def register_localizer_provider(provider: LocalizerProvider) -> LocalizerProvide
         raise ValueError("localizer provider name must be a normalized non-empty string")
     if provider.capabilities.name != name:
         raise ValueError("localizer provider capabilities name must match provider name")
+    if provider.capabilities.provider_api_version != LOCALIZER_PROVIDER_API_VERSION:
+        raise ValueError(
+            "localizer provider API version mismatch: "
+            f"expected {LOCALIZER_PROVIDER_API_VERSION}, "
+            f"got {provider.capabilities.provider_api_version}"
+        )
+    if provider.capabilities.pose_contract_version != LOCALIZATION_POSE_CONTRACT_VERSION:
+        raise ValueError(
+            "localizer pose contract version mismatch: "
+            f"expected {LOCALIZATION_POSE_CONTRACT_VERSION}, "
+            f"got {provider.capabilities.pose_contract_version}"
+        )
     existing = _PROVIDERS.get(name)
     if existing is not None and existing.capabilities != provider.capabilities:
         raise ValueError(f"localizer provider {name!r} capability contract conflict")

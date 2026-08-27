@@ -28,11 +28,14 @@ from hardware_approval_trust import (
     create_unsigned_signing_payload,
 )
 from site_profile import (
+    bind_camera_center_navigation_calibration,
     flight_readiness_errors,
     load_hardware_approval_receipt,
     load_site_profile,
     site_profile_approval_sha256,
 )
+from pose_frame_chain import CameraBodyExtrinsic, save_camera_body_extrinsic
+from site_alignment import SiteAlignment, save_site_alignment, solve_similarity_alignment
 
 
 def _write_profile(root: Path, *, missing_bundle: bool = False) -> Path:
@@ -205,7 +208,7 @@ def test_site_profile_rejects_shell_unsafe_display_name(
     "display_name",
     [
         "烏來（目標場域）EDM v1 — 2026-07-19 驗證",
-        "足球場 EDM",
+        "一般場域 EDM",
         "Your site EDM profile",
         "Site A (north) [v2]",
     ],
@@ -548,57 +551,48 @@ def test_auto_readiness_does_not_gate_on_unbound_or_manual_hardware_receipt(
     assert not any("hardware approval" in error for error in errors), errors
 
 
-def test_all_shipped_profiles_are_scale_free_and_only_river_is_auto_approved() -> None:
-    profiles_dir = (
-        Path(__file__).resolve().parents[3] / "控制介面程式" / "site_profiles"
-    )
-    for path in profiles_dir.glob("*.json"):
+def test_all_shipped_profiles_are_scale_free() -> None:
+    root = Path(__file__).resolve().parents[3]
+    profiles = (root / "控制介面程式" / "site_profiles").glob("*.json")
+    for path in profiles:
         raw = json.loads(path.read_text(encoding="utf-8"))
         assert raw["schema_version"] == 2, path
         assert "map_units_per_meter" not in raw.get("flight", {}), path
-        expected_approved = path.name == "river_site_edm.json"
-        assert raw["flight"]["approved"] is expected_approved, path
-        assert raw["flight"]["route_clearance_approved"] is expected_approved, path
+        assert raw["flight"]["approved"] is False, path
+        assert raw["flight"]["route_clearance_approved"] is False, path
         profile = load_site_profile(path, validate_files=False)
         assert profile.schema_version == 2
 
 
-def test_urai_profile_loads_the_manual_v2_hardware_reference() -> None:
+def test_current_river_map_route_and_approval_are_consistent() -> None:
     profile_path = (
         Path(__file__).resolve().parents[3]
-        / "控制介面程式"
-        / "site_profiles"
-        / "urai_edm.json"
-    )
-
-    profile = load_site_profile(profile_path)
-    receipt = load_hardware_approval_receipt(profile.hardware_approval)
-
-    assert receipt.approved
-    assert receipt.schema == "anafi-hardware-approval/v2"
-    assert receipt.site_id == "urai_edm_v1"
-    assert receipt.coordinate_frame_id == "target_site_v1_glomap"
-    assert receipt.approved_mode == "manual"
-    assert receipt.aircraft_firmware_versions == ("1.8.2",)
-    assert receipt.controller_firmware_versions == ("1.8.1",)
-    assert receipt.olympe_versions == ("8.4.0",)
-
-
-def test_river_profile_is_approved_without_site_hardware_receipt() -> None:
-    profile_path = (
-        Path(__file__).resolve().parents[3]
-        / "控制介面程式"
-        / "site_profiles"
-        / "river_site_edm.json"
+        / "地圖檔"
+        / "場域"
+        / "river_site"
+        / "site_profile.json"
     )
 
     profile = load_site_profile(profile_path)
 
     assert profile.hardware_approval is None
     assert profile.flight is not None
-    assert profile.flight.approved is True
-    assert profile.flight.route_clearance_approved is True
+    if profile.route_json is None:
+        assert profile.flight.approved is False
+        assert profile.flight.route_clearance_approved is False
+        assert profile.asset_sha256.route_json is None
+    else:
+        assert profile.asset_sha256.route_json is not None
+        if profile.flight.approved:
+            assert profile.flight.route_clearance_approved is True
+    assert profile.coordinate_frame is not None
+    assert profile.coordinate_frame.id == (
+        "river_site_b0_p116_p117_reconstruction_18056f835daa"
+    )
+    assert not any("pose_chain" in error for error in flight_readiness_errors(profile))
     assert not any("hardware approval" in error for error in flight_readiness_errors(profile))
+
+
 
 
 def test_site_profile_loads_query_camera_calibration(tmp_path: Path) -> None:
@@ -820,6 +814,123 @@ def test_operator_rejects_profile_mixed_with_per_asset_override(
         app.resolve_operator_site_assets(args, argparse.ArgumentParser())
 
 
+def test_real_operator_requires_mission_selection_even_with_a_site_profile(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for name in app._SITE_ASSET_ENV_VARS:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.delenv("SFM_MISSION_SELECTION", raising=False)
+    args = _args(_write_profile(tmp_path), live=True)
+
+    with pytest.raises(SystemExit, match="SFM_MISSION_SELECTION"):
+        app._resolve_startup_site(args, argparse.ArgumentParser())
+
+
+def test_real_operator_binds_profile_and_session_identity_to_mission_selection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for name in app._SITE_ASSET_ENV_VARS:
+        monkeypatch.delenv(name, raising=False)
+    profile_path = _write_profile(tmp_path).resolve()
+    selection_path = (tmp_path / "mission selection.json").resolve()
+    selection_path.write_text("{}", encoding="utf-8")
+    mission = SimpleNamespace(
+        identity="test-selection@123456789abc",
+        selection=SimpleNamespace(source=selection_path),
+        selection_sha256="1" * 64,
+        readiness=SimpleNamespace(
+            localization_ready=True,
+            localization_errors=(),
+            flight_ready=False,
+            flight_errors=("test readiness blocker",),
+        ),
+        materialize_legacy_site_profile=lambda _output_dir: profile_path,
+    )
+    monkeypatch.setenv("SFM_MISSION_SELECTION", str(selection_path))
+    monkeypatch.setattr(app, "resolve_mission", lambda *_args, **_kwargs: mission)
+    args = _args(profile_path, live=True)
+
+    selected, approval = app._resolve_startup_site(
+        args, argparse.ArgumentParser()
+    )
+
+    assert selected is not None
+    assert approval is None
+    assert args.mission_selection == str(selection_path)
+    assert args.mission_selection_sha256 == "1" * 64
+    assert args.mission_snapshot_id == "test-selection@123456789abc"
+    assert args.mission_flight_ready is False
+    assert args.mission_flight_errors == ("test readiness blocker",)
+
+
+def test_real_operator_rejects_profile_not_materialized_from_selection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for name in app._SITE_ASSET_ENV_VARS:
+        monkeypatch.delenv(name, raising=False)
+    profile_path = _write_profile(tmp_path).resolve()
+    other_profile = tmp_path / "different.snapshot.json"
+    other_profile.write_text(profile_path.read_text(encoding="utf-8"), encoding="utf-8")
+    selection_path = tmp_path / "selection.json"
+    selection_path.write_text("{}", encoding="utf-8")
+    mission = SimpleNamespace(
+        identity="selection@abcdef123456",
+        selection=SimpleNamespace(source=selection_path.resolve()),
+        selection_sha256="2" * 64,
+        readiness=SimpleNamespace(
+            localization_ready=True,
+            localization_errors=(),
+            flight_ready=True,
+            flight_errors=(),
+        ),
+        materialize_legacy_site_profile=lambda _output_dir: other_profile.resolve(),
+    )
+    monkeypatch.setenv("SFM_MISSION_SELECTION", str(selection_path))
+    monkeypatch.setattr(app, "resolve_mission", lambda *_args, **_kwargs: mission)
+
+    with pytest.raises(SystemExit, match="does not match mission selection snapshot"):
+        app._resolve_startup_site(
+            _args(profile_path, live=True), argparse.ArgumentParser()
+        )
+
+
+def test_real_operator_session_manifest_records_mission_selection_identity() -> None:
+    args = SimpleNamespace(
+        mission_selection="/missions/field-a.json",
+        mission_selection_sha256="3" * 64,
+        mission_snapshot_id="field-a@333333333333",
+        mission_flight_ready=False,
+        mission_flight_errors=("approval missing",),
+        max_altitude_m=None,
+        max_distance_m=None,
+        distance_geofence=True,
+    )
+    identity = app.OperatorSessionIdentity(
+        asset_hashes={},
+        site_profile_sha256="",
+        runtime_profile_sha256="",
+        site_profile_schema_version=0,
+        autonomous_speed_limit_mps=0.3,
+        autonomy_profile_errors=("approval missing",),
+        source_identity="192.168.53.1",
+        source_sha256="",
+    )
+
+    manifest = app._operator_session_manifest(
+        args,
+        app.InterfaceMode.REAL_FLIGHT,
+        None,
+        None,
+        identity,
+    )
+
+    assert manifest["mission_selection"] == "/missions/field-a.json"
+    assert manifest["mission_selection_sha256"] == "3" * 64
+    assert manifest["mission_snapshot_id"] == "field-a@333333333333"
+    assert manifest["mission_flight_ready"] is False
+    assert manifest["mission_flight_errors"] == ["approval missing"]
+
+
 @pytest.mark.parametrize("asset_name", ["map.ply", "route.json"])
 def test_operator_rejects_tampered_display_asset(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, asset_name: str,
@@ -902,10 +1013,12 @@ def test_final_edm_profile_pins_the_validated_runtime_parameters() -> None:
     assert (tracker["local_topk"], tracker["weak_local_topk"], tracker["lost_local_topk"]) == (1, 3, 5)
     assert (tracker["boot_global_topk"], tracker["match_batch_size"]) == (10, 2)
     assert tracker["acquire_initial_topk"] == 2
-    assert (tracker["lost_local_grace_frames"], tracker["recovery_bank_size"], tracker["recovery_scan_topk"]) == (12, 192, 2)
+    assert (tracker["lost_local_grace_frames"], tracker["recovery_bank_size"], tracker["recovery_scan_topk"]) == (2, 192, 2)
     assert tracker["use_temporal_reference"] is False
     assert (tracker["max_reproj_error_acquire"], tracker["max_reproj_error_track"], tracker["pnp_ransac_max_error"]) == (5.0, 6.0, 5.0)
     assert tracker["prediction_max_dt"] == 0.25
+    assert "reposed" not in profile
+
 
 
 def test_edm_tracker_profile_rejects_non_finite_values() -> None:
@@ -1047,12 +1160,61 @@ def _approved_profile(root: Path) -> Path:
     (assets / "refs.json").write_bytes(b"x")
     (assets / "edm.json").write_bytes(b"x")
     (assets / "T_align_gravity.json").write_bytes(b"x")
+    control_points = [
+        [0.0, 0.0, 0.0],
+        [2.0, 0.0, 0.0],
+        [0.0, 2.0, 0.0],
+        [0.0, 0.0, 1.0],
+        [1.0, 1.0, 1.0],
+        [-1.0, 1.0, 0.0],
+    ]
+    alignment = SiteAlignment.from_fit(
+        map_frame_id="test-frame-v1",
+        site_frame_id="test-site-enu-v1",
+        fit=solve_similarity_alignment(control_points, control_points),
+        approved=True,
+    )
+    save_site_alignment(alignment, assets / "site_alignment.json")
+    save_camera_body_extrinsic(
+        CameraBodyExtrinsic(
+            vehicle_id="test-anafi-720p-v1",
+            body_frame_id="test-anafi-frd",
+            camera_frame_id="test-camera-opencv",
+            rotation_camera_from_body=(
+                (0.0, 1.0, 0.0),
+                (0.0, 0.0, 1.0),
+                (1.0, 0.0, 0.0),
+            ),
+            translation_camera_from_body_m=(0.0, 0.0, 0.0),
+            fixed_gimbal_pitch_deg=-10.0,
+            gimbal_pitch_tolerance_deg=1.0,
+            evidence="test fixture",
+            approved=True,
+        ),
+        assets / "camera_body_extrinsic.json",
+    )
     raw = json.loads(profile_path.read_text(encoding="utf-8"))
     raw["schema_version"] = 2
     raw["localizer"] = "edm"
     raw["localizer_profile"] = "assets/edm.json"
     raw["map_reference_poses"] = "assets/refs.json"
     raw["map_align"] = "assets/T_align_gravity.json"
+    raw["coordinate_frame"] = {
+        "id": "test-frame-v1",
+        "convention": "glomap",
+        "horizontal_axes": ["x", "z"],
+        "up_axis": "-y",
+        "handedness": "right",
+        "units": "map",
+    }
+    raw["pose_chain"] = {
+        "site_frame_id": "test-site-enu-v1",
+        "vehicle_id": "test-anafi-720p-v1",
+        "body_frame_id": "test-anafi-frd",
+        "camera_frame_id": "test-camera-opencv",
+        "site_alignment": "assets/site_alignment.json",
+        "camera_body_extrinsic": "assets/camera_body_extrinsic.json",
+    }
     raw["asset_sha256"] = {
         "map_ply": "a" * 64,
         "localization_bundle": "b" * 64,
@@ -1060,6 +1222,8 @@ def _approved_profile(root: Path) -> Path:
         "map_reference_poses": "d" * 64,
         "localizer_profile": "e" * 64,
         "map_align": "f" * 64,
+        "site_alignment": "1" * 64,
+        "camera_body_extrinsic": "2" * 64,
     }
     raw["flight"] = {
         "approved": True,
@@ -1103,6 +1267,82 @@ def test_autonomous_flight_does_not_require_signed_hardware_approval(
     errors = flight_readiness_errors(load_site_profile(_approved_profile(tmp_path)))
 
     assert not any("hardware approval" in error for error in errors), errors
+
+
+def test_camera_center_field_calibration_atomically_binds_and_unlocks_profile(
+    tmp_path: Path,
+) -> None:
+    profile_path = _approved_profile(tmp_path)
+    raw = json.loads(profile_path.read_text(encoding="utf-8"))
+    raw.pop("pose_chain")
+    raw["asset_sha256"].pop("site_alignment")
+    raw["asset_sha256"].pop("camera_body_extrinsic")
+    raw["query_camera"] = {
+        "model": "PINHOLE",
+        "width": 1280,
+        "height": 720,
+        "params": [900.0, 900.0, 640.0, 360.0],
+    }
+    profile_path.write_text(json.dumps(raw), encoding="utf-8")
+
+    calibration = tmp_path / "calibration"
+    calibration.mkdir()
+    controls = (
+        (0.0, 0.0, 0.0),
+        (1.0, 0.0, 0.0),
+        (-1.0, 0.0, 0.0),
+        (0.0, 1.0, 0.0),
+        (0.0, -1.0, 0.0),
+        (0.0, 0.0, 0.3),
+        (0.0, 0.0, -0.3),
+    )
+    alignment_path = save_site_alignment(
+        SiteAlignment.from_fit(
+            map_frame_id="test-frame-v1",
+            site_frame_id="test-site-camera-navigation-v1",
+            fit=solve_similarity_alignment(controls, controls),
+            approved=True,
+        ),
+        calibration / "site_alignment.json",
+    )
+    extrinsic_path = save_camera_body_extrinsic(
+        CameraBodyExtrinsic(
+            vehicle_id="test-anafi-camera-centre-v1",
+            body_frame_id="test-anafi-camera-centre-frd",
+            camera_frame_id="test-camera-opencv",
+            rotation_camera_from_body=(
+                (0.0, 1.0, 0.0),
+                (0.0, 0.0, 1.0),
+                (1.0, 0.0, 0.0),
+            ),
+            translation_camera_from_body_m=(0.0, 0.0, 0.0),
+            fixed_gimbal_pitch_deg=-20.0,
+            gimbal_pitch_tolerance_deg=1.0,
+            evidence="camera optical centre is the navigation origin",
+            approved=True,
+        ),
+        calibration / "camera_center_extrinsic.json",
+    )
+
+    profile = bind_camera_center_navigation_calibration(
+        profile_path,
+        site_alignment_path=alignment_path,
+        camera_body_extrinsic_path=extrinsic_path,
+    )
+
+    assert profile.pose_chain is not None
+    assert profile.pose_chain.site_alignment == alignment_path
+    assert profile.pose_chain.camera_body_extrinsic == extrinsic_path
+    assert flight_readiness_errors(profile) == []
+    persisted = json.loads(profile_path.read_text(encoding="utf-8"))
+    assert persisted["pose_chain"]["body_frame_id"].endswith("camera-centre-frd")
+    assert persisted["asset_sha256"]["site_alignment"] == hashlib.sha256(
+        alignment_path.read_bytes()
+    ).hexdigest()
+    assert persisted["asset_sha256"]["camera_body_extrinsic"] == hashlib.sha256(
+        extrinsic_path.read_bytes()
+    ).hexdigest()
+    assert not list(tmp_path.glob(".*.calibration.tmp"))
 
 
 def test_autonomous_flight_requires_a_measured_map_alignment(tmp_path: Path) -> None:

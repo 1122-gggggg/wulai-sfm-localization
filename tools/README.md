@@ -90,7 +90,7 @@ digest，不會嘗試網路下載。請從受核准的離線 artifact bundle 建
 python tools/export_simulator_package.py /path/to/portable_localization \
   --artifact-root /path/to/seed-root \
   --wheelhouse-root /path/to/approved-wheelhouse \
-  --site-profile 控制介面程式/site_profiles/river_site_edm.json
+  --site-profile 地圖檔/場域/river_site/site_profile.json
 # 或：SFM_RUNTIME_ARTIFACT_ROOT=/path/to/seed-root python tools/export_simulator_package.py ...
 ```
 

@@ -18,15 +18,21 @@ SPEC.loader.exec_module(MODULE)
 
 
 ROOT = SCRIPT.parents[2]
-RIVER_MAP = ROOT / "地圖檔/場域/river_site/maps/river_site_realrgb_dense_trimmed.ply"
-RIVER_PROFILE = ROOT / "控制介面程式/site_profiles/river_site_edm.json"
+RIVER_MAP = (
+    ROOT
+    / "地圖檔/場域/river_site/releases"
+    / "river_site_b0_p116_p117_20260818/map/map.ply"
+)
+RIVER_PROFILE = ROOT / "地圖檔/場域/river_site/site_profile.json"
 
 
-def test_map_selection_resolves_the_matching_profile() -> None:
+def test_map_selection_resolves_the_matching_profile(tmp_path: Path) -> None:
+    video_path = tmp_path / "test.mp4"
+    video_path.write_bytes(b"test-video")
     profile_path, map_path, _video = MODULE.select_inputs(
         ROOT,
         map_path=RIVER_MAP,
-        video_path=ROOT / "模擬器/測試影片/河濱_P1180118_first_2s.mp4",
+        video_path=video_path,
     )
     assert profile_path == RIVER_PROFILE.resolve()
     assert map_path == RIVER_MAP.resolve()

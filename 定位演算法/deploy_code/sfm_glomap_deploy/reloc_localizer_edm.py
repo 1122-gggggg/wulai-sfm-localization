@@ -135,6 +135,170 @@ MEGALOC_WEIGHTS = (
     TORCH_HUB_DIR / "checkpoints" / "megaloc" / MEGALOC_REVISION
     / "model.safetensors"
 )
+MEGALOC_TENSORRT_ENGINE = (
+    Path(__file__).resolve().parents[1]
+    / "runtime"
+    / "EDM"
+    / "weights"
+    / "megaloc_322_autocast_fp16.engine"
+)
+MEGALOC_TENSORRT_ENGINE_SHA256 = (
+    "07a849aa9085574a5537332bf9a5023c1fc17f2022086047a7f910d87d5d6dfe"
+)
+MEGALOC_TENSORRT_ENGINE_SIZE_BYTES = 464285892
+MEGALOC_TENSORRT_GPU_IDENTITY = "nvidia geforce rtx 5060 laptop gpu"
+MEGALOC_TENSORRT_VERSION = (11, 2)
+MEGALOC_TENSORRT_COMPUTE_CAPABILITY = (12, 0)
+MEGALOC_TENSORRT_MAX_ENGINE_BYTES = 512 * 1024 * 1024
+MEGALOC_TENSORRT_STREAM_CHUNK_BYTES = 8 * 1024 * 1024
+MEGALOC_TENSORRT_HEADER_BYTES = 16
+
+
+def normalize_gpu_identity(name: object) -> str:
+    return " ".join(str(name).strip().lower().split())
+
+
+def _parse_tensorrt_version(trt_module) -> tuple[int, int]:
+    version = str(getattr(trt_module, "__version__", "")).strip()
+    parts = version.split(".")
+    if len(parts) < 2:
+        raise ValueError(f"unrecognized TensorRT version: {version!r}")
+    try:
+        major = int(parts[0])
+        minor = int(parts[1])
+    except ValueError as exc:
+        raise ValueError(f"unrecognized TensorRT version: {version!r}") from exc
+    return major, minor
+
+def _validate_megaloc_tensorrt_compatibility(device_index: int, trt_module) -> tuple[int, int]:
+    major, minor = _parse_tensorrt_version(trt_module)
+    if (major, minor) != MEGALOC_TENSORRT_VERSION:
+        raise ValueError(
+            f"TensorRT {major}.{minor} is not the sanctioned MegaLoc plan "
+            f"{MEGALOC_TENSORRT_VERSION[0]}.{MEGALOC_TENSORRT_VERSION[1]}"
+        )
+    capability = torch.cuda.get_device_capability(device_index)
+    if capability != MEGALOC_TENSORRT_COMPUTE_CAPABILITY:
+        expected = MEGALOC_TENSORRT_COMPUTE_CAPABILITY
+        raise ValueError(
+            f"GPU compute capability {capability[0]}.{capability[1]} is not the "
+            f"sanctioned MegaLoc TensorRT sm_{expected[0]}{expected[1]}"
+        )
+    identity = normalize_gpu_identity(torch.cuda.get_device_name(device_index))
+    if identity != MEGALOC_TENSORRT_GPU_IDENTITY:
+        raise ValueError(
+            f"GPU identity {identity!r} is not the sanctioned MegaLoc plan "
+            f"{MEGALOC_TENSORRT_GPU_IDENTITY!r}"
+        )
+    return capability
+
+
+
+def _resolve_cuda_device(device: str | torch.device) -> torch.device:
+    requested = torch.device(device)
+    if requested.type != "cuda":
+        raise ValueError("SFM_MEGALOC_TENSORRT requires a CUDA device")
+    if not torch.cuda.is_available() or torch.cuda.device_count() <= 0:
+        raise ValueError("SFM_MEGALOC_TENSORRT requires a CUDA device")
+    index = (
+        torch.cuda.current_device()
+        if requested.index is None
+        else int(requested.index)
+    )
+    if index < 0 or index >= torch.cuda.device_count():
+        raise ValueError(f"CUDA device index out of range: {index}")
+    return torch.device("cuda", index)
+
+
+
+
+def _validate_megaloc_engine_file(engine_path: Path) -> int:
+    try:
+        size = engine_path.stat().st_size
+    except OSError as exc:
+        raise ValueError(f"cannot read TensorRT MegaLoc engine: {engine_path}") from exc
+    if size <= MEGALOC_TENSORRT_HEADER_BYTES:
+        raise ValueError(f"TensorRT MegaLoc engine is truncated: {engine_path}")
+    if size > MEGALOC_TENSORRT_MAX_ENGINE_BYTES:
+        raise ValueError(
+            f"TensorRT MegaLoc engine exceeds "
+            f"{MEGALOC_TENSORRT_MAX_ENGINE_BYTES} bytes: {engine_path}"
+        )
+    with engine_path.open("rb") as handle:
+        header = handle.read(MEGALOC_TENSORRT_HEADER_BYTES)
+    if len(header) < MEGALOC_TENSORRT_HEADER_BYTES:
+        raise ValueError(f"TensorRT MegaLoc engine is truncated: {engine_path}")
+    return int(size)
+
+def _validate_megaloc_plan_size(engine_path: Path) -> int:
+    size = _validate_megaloc_engine_file(engine_path)
+    if size != MEGALOC_TENSORRT_ENGINE_SIZE_BYTES:
+        raise ValueError(
+            f"TensorRT MegaLoc engine size {size} is not the sanctioned "
+            f"{MEGALOC_TENSORRT_ENGINE_SIZE_BYTES} bytes: {engine_path}"
+        )
+    return size
+
+
+
+def _make_megaloc_engine_stream(trt_module, engine_path: Path, max_bytes: int, chunk_bytes: int):
+    if not hasattr(trt_module, "IStreamReaderV2"):
+        raise RuntimeError(
+            "TensorRT IStreamReaderV2 is required to stream MegaLoc engines"
+        )
+
+    class _BoundedEngineStream(trt_module.IStreamReaderV2):
+        def __init__(self) -> None:
+            trt_module.IStreamReaderV2.__init__(self)
+            self._fh = engine_path.open("rb")
+            self._max_bytes = int(max_bytes)
+            self._chunk_bytes = int(chunk_bytes)
+            self._size = int(max_bytes)
+
+        def read(self, num_bytes: int, stream: int) -> bytes:
+            del stream
+            if num_bytes <= 0:
+                return b""
+            position = self._fh.tell()
+            if position >= self._max_bytes:
+                return b""
+            count = min(int(num_bytes), self._chunk_bytes, self._max_bytes - position)
+            return self._fh.read(count)
+
+
+        def seek(self, offset: int, where) -> bool:
+            whence = {
+                trt_module.SeekPosition.SET: os.SEEK_SET,
+                trt_module.SeekPosition.CUR: os.SEEK_CUR,
+                trt_module.SeekPosition.END: os.SEEK_END,
+            }.get(where)
+            if whence is None:
+                return False
+            try:
+                position = self._fh.seek(int(offset), whence)
+            except OSError:
+                return False
+            return 0 <= position <= self._size
+
+        def close(self) -> None:
+            self._fh.close()
+
+    return _BoundedEngineStream()
+
+
+def deserialize_megaloc_cuda_engine(runtime, engine_path: Path, trt_module):
+    size = _validate_megaloc_engine_file(engine_path)
+    stream = _make_megaloc_engine_stream(
+        trt_module,
+        engine_path,
+        max_bytes=size,
+        chunk_bytes=MEGALOC_TENSORRT_STREAM_CHUNK_BYTES,
+    )
+    try:
+        return runtime.deserialize_cuda_engine(stream)
+    finally:
+        stream.close()
+
 
 
 @dataclass
@@ -396,26 +560,169 @@ def _validate_edm_bundle_schema(bundle: object) -> dict:
     return bundle
 
 
+class _MegaLocTensorRTEngine:
+    """Fixed-shape TensorRT runner for the experimental MegaLoc backend."""
+
+    def __init__(self, engine_path: Path, device: str):
+        try:
+            import tensorrt as trt
+        except ImportError as exc:
+            try:
+                import tensorrt_bindings as trt
+            except ImportError:
+                raise RuntimeError(
+                    "TensorRT Python bindings are required for the MegaLoc "
+                    "TensorRT backend"
+                ) from exc
+
+        self.device = _resolve_cuda_device(device)
+        _validate_megaloc_plan_size(Path(engine_path))
+
+
+        capability = _validate_megaloc_tensorrt_compatibility(self.device.index, trt)
+        self._logger = trt.Logger(trt.Logger.ERROR)
+        with torch.cuda.device(self.device):
+            if torch.cuda.current_device() != self.device.index:
+                raise RuntimeError(
+                    f"failed to bind TensorRT MegaLoc to CUDA device {self.device.index}"
+                )
+            self._runtime = trt.Runtime(self._logger)
+            self._engine = deserialize_megaloc_cuda_engine(
+                self._runtime, Path(engine_path), trt
+            )
+            if self._engine is None:
+                raise RuntimeError(
+                    f"failed to deserialize TensorRT engine on {self.device} "
+                    f"sm_{capability[0]}{capability[1]} TensorRT {trt.__version__}: "
+                    f"{engine_path}"
+                )
+
+            expected = {
+                "images": (
+                    trt.TensorIOMode.INPUT,
+                    (1, 3, MEGALOC_INPUT, MEGALOC_INPUT),
+                ),
+                "descriptors": (
+                    trt.TensorIOMode.OUTPUT,
+                    (1, EDM_GLOBAL_DESCRIPTOR_DIM),
+                ),
+            }
+            actual_names = {
+                self._engine.get_tensor_name(index)
+                for index in range(self._engine.num_io_tensors)
+            }
+            if actual_names != set(expected):
+                raise ValueError(f"unexpected TensorRT MegaLoc tensors: {actual_names}")
+            for name, (mode, shape) in expected.items():
+                if (
+                    self._engine.get_tensor_mode(name) != mode
+                    or tuple(self._engine.get_tensor_shape(name)) != shape
+                    or self._engine.get_tensor_dtype(name) != trt.float32
+                ):
+                    raise ValueError(
+                        f"unexpected TensorRT MegaLoc tensor contract: {name}"
+                    )
+
+            self._context = self._engine.create_execution_context()
+            if self._context is None:
+                raise RuntimeError("failed to create TensorRT MegaLoc execution context")
+            self._output = torch.empty(
+                (1, EDM_GLOBAL_DESCRIPTOR_DIM),
+                dtype=torch.float32,
+                device=self.device,
+            )
+            self._context.set_tensor_address("descriptors", self._output.data_ptr())
+
+    def __call__(self, images: torch.Tensor) -> torch.Tensor:
+        if (
+            images.device != self.device
+            or images.dtype != torch.float32
+            or tuple(images.shape) != (1, 3, MEGALOC_INPUT, MEGALOC_INPUT)
+        ):
+            raise ValueError("unexpected TensorRT MegaLoc input tensor")
+        with torch.cuda.device(self.device):
+            images = images.contiguous()
+            self._context.set_tensor_address("images", images.data_ptr())
+            stream = torch.cuda.current_stream(device=self.device).cuda_stream
+            if not self._context.execute_async_v3(stream_handle=stream):
+                raise RuntimeError("TensorRT MegaLoc inference failed")
+            return self._output
+
+
+
 class MegaLocQuery:
     """Same retrieval front-end as the XFeat localizer -- the bundle's ref_global is MegaLoc."""
 
-    def __init__(self, device: str = DEVICE, input_size: int = MEGALOC_INPUT):
+    def __init__(
+        self,
+        device: str = DEVICE,
+        input_size: int = MEGALOC_INPUT,
+        *,
+        backend: str | None = None,
+        engine_path: str | Path | None = None,
+        engine_sha256: str | None = None,
+    ):
         from PIL import Image
         from torchvision import transforms as T
         self._Image = Image
         self.device = device
-        verify_sha256(MEGALOC_REPO_DIR / "hubconf.py", MEGALOC_HUBCONF_SHA256)
-        verify_sha256(
-            MEGALOC_REPO_DIR / "megaloc_model.py", MEGALOC_MODEL_SOURCE_SHA256
+        if backend is None:
+            backend = os.environ.get("SFM_MEGALOC_BACKEND", "").strip() or (
+                "tensorrt"
+                if os.environ.get("SFM_MEGALOC_TENSORRT", "0") == "1"
+                else "pytorch_fp16"
+                if os.environ.get("SFM_MEGALOC_FP16", "0") == "1"
+                else "tensorrt"
+                if device.startswith("cuda")
+                else "pytorch"
+            )
+        self.backend = backend.strip().lower()
+        if self.backend not in {"pytorch", "pytorch_fp16", "tensorrt"}:
+            raise ValueError(f"unsupported MegaLoc backend: {backend!r}")
+        self.tensorrt = self.backend == "tensorrt"
+        self.fp16 = (
+            self.backend == "pytorch_fp16"
+            and device.startswith("cuda")
         )
-        verify_sha256(MEGALOC_WEIGHTS, MEGALOC_WEIGHTS_SHA256)
-        torch.hub.set_dir(str(TORCH_HUB_DIR))
-        self.model = torch.hub.load(
-            str(MEGALOC_REPO_DIR),
-            "get_trained_model",
-            source="local",
-            weights_path=str(MEGALOC_WEIGHTS),
-        ).eval().to(device)
+        self._trt_engine = None
+        if self.tensorrt:
+            if not device.startswith("cuda"):
+                raise ValueError("SFM_MEGALOC_TENSORRT requires a CUDA device")
+            if input_size != MEGALOC_INPUT:
+                raise ValueError(
+                    f"TensorRT MegaLoc requires input_size={MEGALOC_INPUT}"
+                )
+            engine_path = str(
+                engine_path
+                or os.environ.get("SFM_MEGALOC_TENSORRT_ENGINE", "")
+                or MEGALOC_TENSORRT_ENGINE
+            ).strip()
+            engine_sha256 = str(
+                engine_sha256
+                or os.environ.get("SFM_MEGALOC_TENSORRT_ENGINE_SHA256", "")
+                or MEGALOC_TENSORRT_ENGINE_SHA256
+            ).strip()
+            if not engine_path:
+                raise ValueError("SFM_MEGALOC_TENSORRT_ENGINE is required")
+            verify_sha256(engine_path, engine_sha256)
+            self._trt_engine = _MegaLocTensorRTEngine(Path(engine_path), device)
+            engine_device = getattr(self._trt_engine, "device", None)
+            if engine_device is not None:
+                self.device = engine_device
+            self.model = None
+        else:
+            verify_sha256(MEGALOC_REPO_DIR / "hubconf.py", MEGALOC_HUBCONF_SHA256)
+            verify_sha256(
+                MEGALOC_REPO_DIR / "megaloc_model.py", MEGALOC_MODEL_SOURCE_SHA256
+            )
+            verify_sha256(MEGALOC_WEIGHTS, MEGALOC_WEIGHTS_SHA256)
+            torch.hub.set_dir(str(TORCH_HUB_DIR))
+            self.model = torch.hub.load(
+                str(MEGALOC_REPO_DIR),
+                "get_trained_model",
+                source="local",
+                weights_path=str(MEGALOC_WEIGHTS),
+            ).eval().to(device)
         self.tf = T.Compose([
             T.Resize((input_size, input_size), interpolation=T.InterpolationMode.BICUBIC),
             T.ToTensor(),
@@ -425,7 +732,12 @@ class MegaLocQuery:
     @torch.inference_mode()
     def extract_one(self, rgb: np.ndarray) -> np.ndarray:
         x = self.tf(self._Image.fromarray(rgb[..., :3]).convert("RGB")).unsqueeze(0).to(self.device)
-        d = self.model(x).float().cpu().numpy()[0].astype(np.float32)
+        if self._trt_engine is not None:
+            output = self._trt_engine(x)
+        else:
+            with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=self.fp16):
+                output = self.model(x)
+        d = output.float().cpu().numpy()[0].astype(np.float32)
         return d / (np.linalg.norm(d) + 1e-12)
 
 
@@ -441,11 +753,18 @@ class EDMLocalizer:
     def __init__(self, reloc_map: EDMRelocMap, camera: Camera, matcher: EDMMatcher | None = None,
                  megaloc: MegaLocQuery | None = None, topk: int = 5, min_conf: float = 0.2,
                  pnp_max_error: float = 5.0, min_inliers: int = 50,
-                 reference_index: ReferenceIndex | None = None):
+                 reference_index: ReferenceIndex | None = None,
+                 megaloc_factory=None):
         self.map = reloc_map
+        self._ref_index_by_name = {
+            name: index for index, name in enumerate(reloc_map.ref_names)
+        }
         self.cam = camera
-        self.matcher = matcher or EDMMatcher(mconf_thr=min_conf)
+        self.matcher = matcher or EDMMatcher(
+            mconf_thr=min_conf, runtime_sigma_mode="reference_grid"
+        )
         self._megaloc = megaloc
+        self._megaloc_factory = megaloc_factory
         self.topk = topk
         self.min_inliers = min_inliers
         self.pnp_max_error = pnp_max_error
@@ -465,11 +784,37 @@ class EDMLocalizer:
     @property
     def megaloc(self) -> MegaLocQuery:
         if self._megaloc is None:
-            self._megaloc = MegaLocQuery()
+            self._megaloc = (
+                self._megaloc_factory()
+                if self._megaloc_factory is not None
+                else MegaLocQuery()
+            )
         return self._megaloc
 
-    def retrieve(self, frame_rgb: np.ndarray, k: int, exclude: set[str] | None = None) -> list[str]:
-        d = self.megaloc.extract_one(frame_rgb)
+    def retrieve_scored(
+        self,
+        frame_rgb: np.ndarray,
+        k: int,
+        exclude: set[str] | None = None,
+        candidates: list[str] | None = None,
+        descriptor: np.ndarray | None = None,
+    ) -> list[tuple[str, float]]:
+        d = self.megaloc.extract_one(frame_rgb) if descriptor is None else descriptor
+        if candidates is not None:
+            names = [
+                name
+                for name in dict.fromkeys(candidates)
+                if not exclude or name not in exclude
+            ]
+            indices = np.asarray(
+                [self._ref_index_by_name[name] for name in names],
+                dtype=np.int64,
+            )
+            if not len(indices) or k <= 0:
+                return []
+            sim = self.map.ref_global[indices] @ d
+            order = np.argsort(-sim)[:k]
+            return [(names[int(index)], float(sim[int(index)])) for index in order]
         if self.reference_index is not None:
             requested = max(0, int(k))
             if requested == 0:
@@ -480,22 +825,37 @@ class EDMLocalizer:
             )
             matches = self.reference_index.query(d, top_k=candidate_count)
             out = [
-                match.name
+                (match.name, float(match.score))
                 for match in matches
                 if not exclude or match.name not in exclude
             ]
             return out[:requested]
         sim = self.map.ref_global @ d
         order = np.argsort(-sim)
-        out = []
+        out: list[tuple[str, float]] = []
         for i in order:
             name = self.map.ref_names[i]
             if exclude and name in exclude:
                 continue
-            out.append(name)
+            out.append((name, float(sim[int(i)])))
             if len(out) == k:
                 break
         return out
+
+    def retrieve(
+        self,
+        frame_rgb: np.ndarray,
+        k: int,
+        exclude: set[str] | None = None,
+        candidates: list[str] | None = None,
+    ) -> list[str]:
+        return [
+            name
+            for name, _score in self.retrieve_scored(
+                frame_rgb, k, exclude=exclude, candidates=candidates
+            )
+        ]
+
 
     def correspondences(
         self,
@@ -537,17 +897,27 @@ class EDMLocalizer:
         reference_images: list[np.ndarray],
         xyz_luts: list[np.ndarray],
         batch_size: int | None = None,
+        source_kinds: list[str] | None = None,
     ) -> list[tuple[np.ndarray, np.ndarray, np.ndarray, int]]:
         """Match arbitrary reference images whose coarse cells carry map-frame 3D."""
         if len(reference_images) != len(xyz_luts):
             raise ValueError("reference_images and xyz_luts must have equal length")
+        if source_kinds is not None and len(source_kinds) != len(reference_images):
+            raise ValueError("source_kinds must match the reference count")
         size = len(reference_images) if not batch_size or batch_size <= 0 else batch_size
         results = []
         for start in range(0, len(reference_images), max(size, 1)):
             images = reference_images[start : start + max(size, 1)]
-            results.extend(
-                self.matcher.match_many_to_one(images, query_gray)
-            )
+            if source_kinds is None:
+                results.extend(self.matcher.match_many_to_one(images, query_gray))
+            else:
+                results.extend(
+                    self.matcher.match_many_to_one(
+                        images,
+                        query_gray,
+                        source_kinds=source_kinds[start : start + max(size, 1)],
+                    )
+                )
         out: list[tuple[np.ndarray, np.ndarray, np.ndarray, int]] = []
         for xyz_lut, r in zip(xyz_luts, results):
             k0, k1 = r["mkpts0"], r["mkpts1"]
@@ -555,6 +925,8 @@ class EDMLocalizer:
             if len(k0) == 0:
                 out.append((np.zeros((0, 2)), np.zeros((0, 3)), np.zeros(0), 0))
                 continue
+            if len(confidence) != len(k0) or len(k1) != len(k0):
+                raise ValueError("EDM match confidence is misaligned with keypoints")
             # keep direction-01 only: the reference side must sit on its cell centre,
             # which is the anchor the map build triangulated.
             d01 = ~EDMMatcher.is_refined(k0)
@@ -563,17 +935,22 @@ class EDMLocalizer:
                 continue
             cells = EDMMatcher.cell_ids(k0[d01])
             xyz = xyz_lut[cells]
+            conf = confidence[d01]
+            query_pts = k1[d01]
             ok = np.isfinite(xyz).all(1)
+            ok &= np.isfinite(conf)
+            ok &= np.isfinite(query_pts).all(1)
             if ok.any():
                 out.append((
-                    k1[d01][ok] * self.scale,
+                    query_pts[ok] * self.scale,
                     xyz[ok],
-                    confidence[d01][ok],
+                    conf[ok],
                     int(ok.sum()),
                 ))
             else:
                 out.append((np.zeros((0, 2)), np.zeros((0, 3)), np.zeros(0), 0))
         return out
+
 
     def localize(self, frame_bgr: np.ndarray, ref_names: list[str] | None = None,
                  exclude: set[str] | None = None) -> dict | None:

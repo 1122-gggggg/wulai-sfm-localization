@@ -23,6 +23,8 @@ import os
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
+
 
 import cv2
 import numpy as np
@@ -258,6 +260,194 @@ def baseline_identity_failures(
     return failures
 
 
+WORKER_MODES = ("sequential", "production-path")
+SIGMA_MODES = ("fused", "upstream")
+RECEIPT_OVERRIDE_KEYS = (
+    "radius",
+    "mconf_thr",
+    "coarse_topk",
+    "cache_capacity",
+    "lost_strategy",
+    "lost_global_retrieval_interval",
+    "fused_coarse_mode",
+    "runtime_sigma_mode",
+    "temporal_feature_cache_size",
+    "acquire_stage_mode",
+    "lost_prior_strategy",
+    "lost_prior_fusion_weight",
+    "worker_mode",
+)
+_UNTRANSMITTED_PRODUCTION_PATH_KEYS = (
+    "runtime_sigma_mode",
+    "temporal_feature_cache_size",
+    "acquire_stage_mode",
+    "lost_prior_strategy",
+    "lost_prior_fusion_weight",
+)
+
+
+def _arg(args, name: str, default=None):
+    if isinstance(args, dict):
+        return args[name] if name in args else default
+    return getattr(args, name, default)
+
+
+def effective_sigma_mode(args) -> str:
+    explicit = _arg(args, "sigma_mode")
+    if explicit in SIGMA_MODES:
+        return str(explicit)
+    raw = os.environ.get("SFM_EDM_FUSED_COARSE", "1").strip().lower()
+    return "upstream" if raw in {"0", "false", "no", "off"} else "fused"
+
+
+def apply_sigma_mode(args) -> None:
+    sigma = _arg(args, "sigma_mode")
+    if sigma == "upstream":
+        os.environ["SFM_EDM_FUSED_COARSE"] = "0"
+    elif sigma == "fused":
+        os.environ["SFM_EDM_FUSED_COARSE"] = "1"
+
+
+def _fail_closed_untransmitted_production_path(args) -> None:
+    pending = [
+        key for key in _UNTRANSMITTED_PRODUCTION_PATH_KEYS
+        if _arg(args, key) is not None
+    ]
+    if pending:
+        raise SystemExit(
+            "production-path cannot apply untransmitted overrides: "
+            + ", ".join(pending)
+        )
+
+
+def _tracker_cfg(cfg, tracker):
+    if cfg is not None:
+        return cfg
+    if tracker is None:
+        return None
+    return getattr(tracker, "cfg", None) or getattr(tracker, "config", None)
+
+
+def _tracker_matcher(tracker):
+    if tracker is None:
+        return None
+    explicit = getattr(tracker, "matcher", None)
+    if explicit is not None:
+        return explicit
+    return getattr(getattr(tracker, "loc", None), "matcher", None)
+
+
+def _first_arg(args, *names):
+    for name in names:
+        value = _arg(args, name)
+        if value is not None:
+            return value
+    return None
+
+
+def _arg_or_attr(args, name, obj, attr):
+    value = _arg(args, name)
+    if value is not None:
+        return value
+    return getattr(obj, attr, None)
+
+
+def _lost_strategy_receipt(args):
+    lost_strategy = _arg(args, "lost_strategy")
+    if lost_strategy is not None:
+        return lost_strategy
+    lost_topk = _arg(args, "lost_topk")
+    if lost_topk is None:
+        return None
+    return f"lost_topk={int(lost_topk)}"
+
+
+def _optional_cast(value, caster):
+    return None if value is None else caster(value)
+
+
+def _int_or_zero(value) -> int:
+    return 0 if value is None else int(value)
+
+
+def build_receipt(args, cfg=None, tracker=None) -> dict:
+    tracker_cfg = _tracker_cfg(cfg, tracker)
+    matcher = _tracker_matcher(tracker)
+    radius = _arg(args, "radius")
+    mconf = _first_arg(args, "mconf_thr", "nn_min_score")
+    topk = _first_arg(args, "coarse_topk", "boot_topk")
+    cache = _first_arg(args, "cache_capacity", "temporal_cache_max_anchors")
+    runtime_sigma = _arg_or_attr(
+        args, "runtime_sigma_mode", matcher, "runtime_sigma_mode"
+    )
+    temporal_cache = _arg_or_attr(
+        args, "temporal_feature_cache_size", matcher, "temporal_feature_cache_size"
+    )
+    acquire_mode = _arg_or_attr(
+        args, "acquire_stage_mode", tracker_cfg, "acquire_stage_mode"
+    )
+    lost_prior = _arg_or_attr(
+        args, "lost_prior_strategy", tracker_cfg, "lost_prior_strategy"
+    )
+    fusion_weight = _arg_or_attr(
+        args, "lost_prior_fusion_weight", tracker_cfg, "lost_prior_fusion_weight"
+    )
+    return {
+        "radius": _optional_cast(radius, float),
+        "mconf_thr": _optional_cast(mconf, float),
+        "coarse_topk": _optional_cast(topk, int),
+        "cache_capacity": _optional_cast(cache, int),
+        "lost_strategy": _lost_strategy_receipt(args),
+        "lost_global_retrieval_interval": _int_or_zero(
+            _arg(args, "lost_global_retrieval_interval")
+        ),
+        "fused_coarse_mode": effective_sigma_mode(args),
+        "runtime_sigma_mode": _optional_cast(runtime_sigma, str),
+        "temporal_feature_cache_size": _optional_cast(temporal_cache, int),
+        "acquire_stage_mode": _optional_cast(acquire_mode, str),
+        "lost_prior_strategy": _optional_cast(lost_prior, str),
+        "lost_prior_fusion_weight": _optional_cast(fusion_weight, float),
+        "worker_mode": str(_arg(args, "worker_mode", "sequential") or "sequential"),
+    }
+
+
+def _receipt_values_equal(expected, actual) -> bool:
+    if expected == actual:
+        return True
+    try:
+        left = float(expected)
+        right = float(actual)
+    except (TypeError, ValueError):
+        return False
+    return math.isfinite(left) and math.isfinite(right) and left == right
+
+
+def receipt_identity_failures(baseline: dict, actual: dict | None) -> list[str]:
+    expected = baseline.get("receipt") if isinstance(baseline, dict) else None
+    if expected is None:
+        return ["baseline is missing receipt identity"]
+    if not isinstance(expected, dict):
+        return ["baseline receipt identity is not an object"]
+    if not isinstance(actual, dict):
+        return ["candidate is missing receipt identity"]
+    failures: list[str] = []
+    for key in RECEIPT_OVERRIDE_KEYS:
+        if key not in expected:
+            failures.append(f"baseline is missing receipt.{key}")
+            continue
+        if key not in actual:
+            failures.append(f"candidate is missing receipt.{key}")
+            continue
+        if not _receipt_values_equal(expected[key], actual.get(key)):
+            failures.append(
+                f"receipt.{key} mismatch: expected={expected[key]!r} "
+                f"actual={actual.get(key)!r}"
+            )
+    return failures
+
+
+
+
 def pct(vals, p):
     vals = [float(v) for v in vals if v is not None and np.isfinite(v)]
     if not vals:
@@ -459,8 +649,11 @@ def _validate_quality_baseline(
         localizer_profile_sha256=localizer_profile_sha256,
         camera=camera_identity,
     )
+    receipt_failures = receipt_identity_failures(baseline_identity, build_receipt(args))
+    failures.extend(receipt_failures)
     if failures:
         raise SystemExit("quality baseline identity mismatch: " + "; ".join(failures))
+
 
 
 def _prepare_projection(args, parser):
@@ -602,6 +795,7 @@ def _attach_onnx_matcher(args, tracker) -> None:
 
 
 def _run_frames(args, video, frames, frame_total, tracker) -> tuple[list[dict], float]:
+    gpu_span = bool(_arg(args, "gpu_span", True))
     rows = []
     t_all0 = time.perf_counter()
     if video is not None:
@@ -622,17 +816,32 @@ def _run_frames(args, video, frames, frame_total, tracker) -> tuple[list[dict], 
                 )
         frame_iter = image_frames()
     for i, (frame_name, frame, _orig, _stream, load_ms, capture_stamp) in enumerate(frame_iter, 1):
-        sync(); t0 = time.perf_counter()
+        if gpu_span:
+            sync()
+        t0 = time.perf_counter()
         pose = tracker.localize_frame(frame, capture_stamp=capture_stamp)
-        sync(); wall_ms = (time.perf_counter() - t0) * 1000.0
+        if gpu_span:
+            sync()
+        wall_ms = (time.perf_counter() - t0) * 1000.0
         info = dict(tracker.last_info)
+        identity = hashlib.sha256(np.ascontiguousarray(frame).tobytes()).hexdigest()
         row = {
             "idx": i - 1,
             "frame": frame_name,
+            "frame_id": f"src_{i-1:08d}",
+            "frame_sha256": identity,
             "success": pose is not None,
             "wall_ms": wall_ms,
             "load_ms": load_ms,
             "capture_stamp": capture_stamp,
+            "gpu_span_ms": wall_ms if gpu_span else None,
+            "capture_source_age_ms": 0.0,
+            "submit_source_age_ms": 0.0,
+            "promote_source_age_ms": 0.0,
+            "inference_source_age_ms": wall_ms,
+            "result_source_age_ms": wall_ms,
+            "coalesce_drops": 0,
+            "submit_drop": 0,
             "pose": None if pose is None else {"x": pose.x, "y": pose.y, "z": pose.z, "yaw": pose.yaw},
             **info,
         }
@@ -645,8 +854,66 @@ def _run_frames(args, video, frames, frame_total, tracker) -> tuple[list[dict], 
                 f"feat={row.get('feature_ms',0):.1f} match={row.get('match_ms',0):.1f}",
                 flush=True,
             )
-    sync(); t_all = time.perf_counter() - t_all0
+    if gpu_span:
+        sync()
+    t_all = time.perf_counter() - t_all0
     return rows, t_all
+
+
+def _run_production_path_frames(args, video, cam, source_fps, frame_total):
+    if video is None or source_fps is None:
+        raise SystemExit("production-path mode requires --video with a recorded cadence")
+    replay = __import__("benchmark_edm_site_replay")
+    operator_dir = ROOT.parent / "控制介面程式" / "operator_interface"
+    if str(operator_dir) not in sys.path:
+        sys.path.insert(0, str(operator_dir))
+    from live_worker_clients import LiveLocalizerClient
+
+    worker_py = operator_dir / "live_localizer_worker.py"
+    if not worker_py.is_file():
+        raise SystemExit(f"live localizer worker not found: {worker_py}")
+    client = LiveLocalizerClient(
+        worker_py,
+        sys.executable,
+        int(cam.width),
+        int(cam.height),
+        Path(args.bundle),
+        megaloc_cache=str(args.megaloc_cache or ""),
+        localizer_backend="xfeat",
+        bundle_sha256=str(args.bundle_sha256 or ""),
+        query_camera=cam,
+    )
+    class _Site:
+        query_camera = cam
+    audit = SimpleNamespace(
+        decoded_raw_frames=0, sampled_frames=0, decode_errors=0,
+    )
+    # Reuse the site-replay decoder contract via a thin adapter.
+    cap = cv2.VideoCapture(str(video))
+    if not cap.isOpened():
+        client.close()
+        raise SystemExit(f"cannot decode video: {video}")
+    site = _Site()
+    args_proxy = SimpleNamespace(max_frames=args.limit, stride=args.stride)
+    t0 = time.perf_counter()
+    try:
+        replay._wait_client_ready(
+            client, float(getattr(client, "restart_warmup_s", 20.0) or 20.0),
+            sleep=time.sleep, monotonic=time.monotonic,
+        )
+        decoded = replay.iter_decoded_replay_frames(
+            args_proxy, cap, float(source_fps), site, audit,
+        )
+        rows, stats = replay.run_source_cadence(
+            decoded, float(source_fps), client,
+        )
+        replay.attach_production_path_receipt_fields(rows, stats, client)
+        return rows, time.perf_counter() - t0
+    finally:
+        cap.release()
+        client.close()
+
+
 
 
 def _summarize_rows(rows: list[dict], t_all: float) -> dict:
@@ -914,8 +1181,32 @@ def main():
         "--lg-onnx-provider", choices=["cuda", "tensorrt", "tensorrt_fp32"], default="tensorrt"
     )
     ap.add_argument("--lg-onnx-ref-topk", type=int, default=2048)
+    ap.add_argument(
+        "--worker-mode",
+        choices=list(WORKER_MODES),
+        default="sequential",
+        help="sequential is the in-process baseline; production-path uses LiveLocalizerClient",
+    )
+    ap.add_argument("--mconf-thr", type=float, help="override confidence threshold in the receipt")
+    ap.add_argument("--coarse-topk", type=int, help="override coarse topk in the receipt")
+    ap.add_argument("--cache-capacity", type=int, help="override cache capacity in the receipt")
+    ap.add_argument("--lost-strategy", help="override LOST strategy identity")
+    ap.add_argument("--lost-global-retrieval-interval", type=int)
+    ap.add_argument("--sigma-mode", choices=list(SIGMA_MODES))
+    ap.add_argument(
+        "--gpu-span",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="synchronized CUDA span; default on to preserve current sequential timing",
+    )
+    ap.add_argument("--pair-role", choices=["A", "B"])
+    ap.add_argument("--pair-index", type=int)
+
     args = ap.parse_args()
     _configure_args(args, ap)
+    apply_sigma_mode(args)
+    if str(_arg(args, "worker_mode", "sequential") or "sequential") == "production-path":
+        _fail_closed_untransmitted_production_path(args)
     input_data = _prepare_input(args)
     video = input_data["video"]
     frames = input_data["frames"]
@@ -1018,7 +1309,12 @@ def main():
     _attach_onnx_matcher(args, tracker)
     sync()
 
-    rows, t_all = _run_frames(args, video, frames, frame_total, tracker)
+    if str(_arg(args, "worker_mode", "sequential") or "sequential") == "production-path":
+        rows, t_all = _run_production_path_frames(
+            args, video, cam, source_fps, frame_total)
+    else:
+        rows, t_all = _run_frames(args, video, frames, frame_total, tracker)
+
 
     summary = _summarize_rows(rows, t_all)
     payload = {
@@ -1050,6 +1346,11 @@ def main():
             "localizer_profile_sha256": localizer_profile_sha256,
             "camera": camera_identity,
             "baseline": None if not args.quality_baseline else str(Path(args.quality_baseline).expanduser().resolve()),
+            "receipt": build_receipt(args, cfg, tracker),
+            "pair": {
+                "role": _arg(args, "pair_role"),
+                "index": _arg(args, "pair_index"),
+            },
         },
         "summary": summary,
         "rows": rows,

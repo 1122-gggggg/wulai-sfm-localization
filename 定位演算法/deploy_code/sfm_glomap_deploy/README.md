@@ -18,7 +18,7 @@ EDM 模型的離線檢查與短重播：
 python 定位演算法/validation/offline_model_smoke.py --model edm
 python 定位演算法/validation/benchmark_edm_site_replay.py \
   --require-cuda --max-frames 3 \
-  --site-profile 控制介面程式/site_profiles/river_site_edm.json \
+  --site-profile 地圖檔/場域/river_site/site_profile.json \
   --video /path/to/P1190119.MP4 --out /tmp/edm_gpu_smoke.json
 ```
 
@@ -28,3 +28,12 @@ python 定位演算法/validation/benchmark_edm_site_replay.py \
 以及逐幀拒絕原因、跳躍確認、品質與延遲資料。
 
 自主航線入口永久鎖定；起飛只能由現場操作員在桌面 UI 親自執行。
+
+泛化政策：
+
+- 選參只使用 flight-disjoint 的 P116-P120 開發 fold。
+- P157/P167 在 freeze 之後只做回歸，不得當 tuning 來源。
+- 接受條件是 macro 提升，且 worst-fold 不回退。
+- 確定性 2D appearance / image-plane stress 只是補充證據，不能證明 3D
+  視差泛化。
+- 沒有新的 held-out 航線與對應 ground truth，就不得宣稱任意 3D 視角覆蓋。

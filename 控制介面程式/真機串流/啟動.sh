@@ -45,19 +45,78 @@ verify_portable_package
 source "$OI/resolve_display.sh"
 configure_operator_display "${SFM_LAUNCH_DRY_RUN:-0}"
 
-# 真機必須明確選場域；不可因舊預設而把河濱地圖帶到別的場地。
-HAS_PROFILE=0
+# 真機任務只接受獨立 component mission selection。site profile 是 resolver
+# 產生的唯讀相容 snapshot，不能再由另一個入口提供不同的飛行核准答案。
 for a in "$@"; do
   if [[ "$a" == "--site-profile" || "$a" == --site-profile=* ]]; then
-    HAS_PROFILE=1
-    break
+    echo "[真機串流] ERROR: site profile 由 mission selection 產生；拒絕直接 --site-profile" >&2
+    exit 2
   fi
 done
-if [[ "$HAS_PROFILE" -eq 0 && -z "${SFM_SITE_PROFILE:-}" ]]; then
-  echo "[真機串流] ERROR: 必須用 --site-profile 或 SFM_SITE_PROFILE 明確選擇場域" >&2
-  echo "[真機串流] 請選擇含同座標地圖、定位 bundle 與已驗證安全航線的 site profile（urai_edm 目前 route=null，只允許離線 replay）" >&2
+if [[ -n "${SFM_SITE_PROFILE:-}" ]]; then
+  echo "[真機串流] ERROR: 拒絕既有 SFM_SITE_PROFILE；請只設定 SFM_MISSION_SELECTION" >&2
   exit 2
 fi
+if [[ -z "${SFM_MISSION_SELECTION:-}" ]]; then
+  echo "[真機串流] ERROR: 必須用 SFM_MISSION_SELECTION 明確選擇並驗證任務" >&2
+  exit 2
+fi
+
+MISSION_PYTHON="${SFM_UI_PYTHON:-}"
+if [[ -z "$MISSION_PYTHON" && -x "$ROOT/.venv/bin/python" ]]; then
+  MISSION_PYTHON="$ROOT/.venv/bin/python"
+fi
+if [[ -z "$MISSION_PYTHON" ]]; then
+  echo "[真機串流] ERROR: 需要 .venv/bin/python 或 SFM_UI_PYTHON，拒絕使用 PATH python3" >&2
+  exit 2
+fi
+if [[ -f "$PACKAGE_ROOT/PORTABLE_PACKAGE.json" ]]; then
+  if [[ -L "$PACKAGE_ROOT/.venv" ]]; then
+    echo "[真機串流] ERROR: portable package-local .venv must not be a symlink" >&2
+    exit 2
+  fi
+  case "$MISSION_PYTHON" in
+    "$PACKAGE_ROOT/.venv/"*)
+      portable_marker="$PACKAGE_ROOT/.venv/.sfm-portable-runtime"
+      identity_python="$(command -v python3.10 || command -v python3 || true)"
+      if [[ -z "$identity_python" ]]; then
+        echo "[真機串流] ERROR: no Python interpreter available for portable runtime binding" >&2
+        exit 2
+      fi
+      portable_identity="$($identity_python - "$PACKAGE_ROOT" <<'PY'
+import hashlib
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+digest = hashlib.sha256()
+for name in ("PORTABLE_PACKAGE.json", "MANIFEST.tsv"):
+    digest.update(name.encode("utf-8") + b"\0")
+    digest.update((root / name).read_bytes())
+print(digest.hexdigest())
+PY
+)"
+      if [[ ! -f "$portable_marker" ]] \
+         || [[ "$(<"$portable_marker")" != "$portable_identity" ]]; then
+        echo "[真機串流] ERROR: package-local .venv is not bound to this portable manifest" >&2
+        exit 2
+      fi
+      ;;
+  esac
+fi
+if ! MISSION_REPORT="$("$MISSION_PYTHON" "$CTRL_DIR/launch_mission.py" \
+  "$SFM_MISSION_SELECTION" --check-only)"; then
+  echo "[真機串流] ERROR: mission selection 驗證失敗" >&2
+  exit 2
+fi
+export SFM_SITE_PROFILE="$("$MISSION_PYTHON" -c \
+  'import json,sys; print(json.load(sys.stdin)["site_profile"])' \
+  <<<"$MISSION_REPORT")"
+export SFM_MISSION_SELECTION="$("$MISSION_PYTHON" -c \
+  'import os,sys; print(os.path.realpath(sys.argv[1]))' \
+  "$SFM_MISSION_SELECTION")"
+echo "[真機串流] mission-selection: $SFM_MISSION_SELECTION"
+echo "[真機串流] $MISSION_REPORT"
 
 echo "[真機串流] IP=$IP CTRL=$CTRL LOCAL_TOPK=$LOCAL_TOPK"
 echo "[真機串流] 起飛僅 UI 人工按鍵；動搖桿強制交回搖桿"

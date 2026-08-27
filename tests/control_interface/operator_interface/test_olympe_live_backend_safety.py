@@ -120,6 +120,20 @@ class _FakeDrone:
         self.controller_variant = "SkyController3"
         self.controller_calibration_ack = True
         self.event_markers: dict[str, int] = {}
+        self.recording_mode_state = {
+            0: {
+                "cam_id": 0,
+                "mode": SimpleNamespace(name="recording_mode.standard"),
+                "resolution": SimpleNamespace(name="resolution.res_1080p"),
+                "framerate": SimpleNamespace(name="framerate.fps_30"),
+                "hyperlapse": SimpleNamespace(name="hyperlapse_value.ratio_15"),
+                "bitrate": 50_000_000,
+            }
+        }
+        self.recording_state = "inactive"
+        self.set_recording_mode_ok = True
+
+
 
     @staticmethod
     def _first(message):
@@ -245,6 +259,42 @@ class _FakeDrone:
                 self.controller_calibration_ack,
                 abort_controller_calibration,
             )
+        if first.name == "set_recording_mode":
+            def apply_recording_mode():
+                if self.set_recording_mode_ok:
+                    self.recording_mode_state[0] = {
+                        "cam_id": 0,
+                        "mode": SimpleNamespace(
+                            name=f"recording_mode.{first.kwargs['mode']}",
+                        ),
+                        "resolution": SimpleNamespace(
+                            name=f"resolution.{first.kwargs['resolution']}",
+                        ),
+                        "framerate": SimpleNamespace(
+                            name=f"framerate.{first.kwargs['framerate']}",
+                        ),
+                        "hyperlapse": SimpleNamespace(
+                            name=(
+                                "hyperlapse_value."
+                                f"{first.kwargs.get('hyperlapse', 'ratio_15')}"
+                            ),
+                        ),
+                        "bitrate": 50_000_000,
+                    }
+
+            return _Expectation(self.set_recording_mode_ok, apply_recording_mode)
+        if first.name == "start_recording":
+            return _Expectation(
+                True,
+                lambda: setattr(self, "recording_state", "active"),
+            )
+        if first.name == "stop_recording":
+            return _Expectation(
+                True,
+                lambda: setattr(self, "recording_state", "inactive"),
+            )
+
+
         return _Expectation(True)
 
     def get_state(self, message_type):
@@ -359,6 +409,11 @@ class _FakeDrone:
                 "barometer": {"sensorName": "barometer", "sensorState": 1},
                 "GPS": {"sensorName": "GPS", "sensorState": 0},
             }
+        if name == "recording_mode":
+            return dict(self.recording_mode_state)
+        if name == "recording_state":
+            return {"cam_id": 0, "state": self.recording_state}
+
         return {}
 
     def get_last_event(self, message_type):
@@ -553,8 +608,12 @@ def _install_fake_olympe(monkeypatch: pytest.MonkeyPatch) -> None:
         "olympe.messages.camera": {
             "set_zoom_target": _message_factory("set_zoom_target"),
             "reset_zoom": _message_factory("reset_zoom"),
+            "set_camera_mode": _message_factory("set_camera_mode"),
+            "set_recording_mode": _message_factory("set_recording_mode"),
+            "start_recording": _message_factory("start_recording"),
             "stop_recording": _message_factory("stop_recording"),
             "recording_state": _message_factory("recording_state"),
+            "recording_mode": _message_factory("recording_mode"),
         },
         "olympe.messages.gimbal": {
             "set_target": _message_factory("set_target"),
@@ -813,7 +872,7 @@ def test_critical_disk_pressure_blocks_new_takeoff_but_is_only_logged_in_flight(
     ), "takeoff was blocked without a durable incident"
 
 
-def test_takeoff_battery_floor_is_thirty_percent(make_backend):
+def test_takeoff_battery_floor_is_fail_closed(make_backend):
     default = inspect.signature(
         backend_module.OlympeLiveBackend.__init__
     ).parameters["min_takeoff_battery_pct"].default
@@ -824,7 +883,22 @@ def test_takeoff_battery_floor_is_thirty_percent(make_backend):
     backend.drone.flight_state = "landed"
     backend.drone.battery_pct = 29.0
     assert not backend._takeoff_preflight()
-    assert "30% takeoff floor" in (backend.state.preflight_reason or "")
+    assert backend.state.preflight_reason == (
+        "battery 29% is below the 30% takeoff floor"
+    )
+    assert "TakeOff" not in backend.drone.events
+
+
+@pytest.mark.parametrize("battery_pct", [None, float("nan")])
+def test_unavailable_battery_is_fail_closed_during_preflight(
+        make_backend, battery_pct):
+    backend = make_backend(max_altitude_m=30.0, max_distance_m=100.0)
+    backend.drone.flight_state = "landed"
+    backend.drone.battery_pct = battery_pct
+
+    assert not backend._takeoff_preflight()
+
+    assert backend.state.preflight_reason == "battery state unavailable or invalid"
     assert "TakeOff" not in backend.drone.events
 
 
@@ -1073,17 +1147,20 @@ def test_autonomous_speed_limit_is_landed_only_and_keeps_real_auto_locked(
     backend.state.autonomous_approval_valid = True
 
     assert backend.command(
-        "auto_speed_limit_apply", speed_limit_mps=0.2
+        "auto_speed_limit_apply", speed_limit_mps=0.2, enabled=False
     ) is True
     assert backend.state.autonomous_speed_limit_mps == pytest.approx(0.2)
+    assert backend.state.autonomous_speed_limit_enabled is False
+    assert backend.state.autonomous_speed_guard_status == "SPEED_LIMIT_DISABLED"
     assert backend.state.autonomous_approval_valid is False
     assert backend.state.autonomous_locked is True
 
     backend.drone.flight_state = "flying"
     assert backend.command(
-        "auto_speed_limit_apply", speed_limit_mps=0.1
+        "auto_speed_limit_apply", speed_limit_mps=0.1, enabled=True
     ) is False
     assert backend.state.autonomous_speed_limit_mps == pytest.approx(0.2)
+    assert backend.state.autonomous_speed_limit_enabled is False
 
 
 def test_takeoff_preflight_retries_transient_connect_state_cache_failure(make_backend):
@@ -1124,6 +1201,73 @@ def test_firmware_expectation_failure_stops_remaining_writes(make_backend):
     assert "failed or timed out" in backend.state.preflight_reason
     assert "MaxAltitude" in backend.drone.events
     assert "MaxDistance" not in backend.drone.events
+
+
+def test_firmware_setting_timeout_is_bounded_and_fail_closed(
+        make_backend, monkeypatch):
+    backend = make_backend(max_altitude_m=20.0, max_distance_m=80.0)
+    backend.drone.flight_state = "landed"
+    wait_timeouts = []
+
+    class NeverCompletes:
+        def wait(self, _timeout=None):
+            wait_timeouts.append(_timeout)
+            if _timeout is None:
+                raise AssertionError("firmware expectation wait must be bounded")
+            return self
+
+        def success(self) -> bool:
+            return False
+
+    original_call = type(backend.drone).__call__
+
+    def never_complete_altitude(self, message):
+        first = self._first(message)
+        if first.name == "MaxAltitude":
+            self.events.append(first.name)
+            return NeverCompletes()
+        return original_call(self, message)
+
+    monkeypatch.setattr(type(backend.drone), "__call__", never_complete_altitude)
+
+    assert not backend._configure_firmware_limits_if_safe()
+    assert wait_timeouts == [backend_module._FIRMWARE_SETTING_TIMEOUT_S]
+    assert "failed or timed out" in backend.state.preflight_reason
+    assert "MaxDistance" not in backend.drone.events
+    assert not backend._firmware_config_ok
+
+
+def test_firmware_geofence_failure_is_bounded_and_fail_closed(
+        make_backend, monkeypatch):
+    backend = make_backend(max_altitude_m=20.0, max_distance_m=80.0)
+    backend.drone.flight_state = "landed"
+    wait_timeouts = []
+
+    class FailedExpectation:
+        def wait(self, _timeout=None):
+            wait_timeouts.append(_timeout)
+            return self
+
+        def success(self) -> bool:
+            return False
+
+    original_call = type(backend.drone).__call__
+
+    def fail_geofence(self, message):
+        first = self._first(message)
+        if first.name == "NoFlyOverMaxDistance":
+            self.events.append(first.name)
+            return FailedExpectation()
+        return original_call(self, message)
+
+    monkeypatch.setattr(type(backend.drone), "__call__", fail_geofence)
+
+    assert not backend._configure_firmware_limits_if_safe()
+    assert wait_timeouts == [backend_module._FIRMWARE_SETTING_TIMEOUT_S]
+    assert "NoFlyOverMaxDistance command failed or timed out" in (
+        backend.state.preflight_reason
+    )
+    assert not backend._firmware_config_ok
 
 
 def test_firmware_command_exception_stops_remaining_writes(
@@ -1300,7 +1444,7 @@ def test_first_future_critical_telemetry_is_rejected(
     assert backend.telemetry_freshness.sample(name) is None
 
 
-def test_stale_critical_telemetry_fails_safe_without_requiring_gps(
+def test_stale_altitude_telemetry_does_not_trigger_runtime_safety(
     make_backend,
 ) -> None:
     backend = make_backend(distance_geofence=False)
@@ -1313,11 +1457,102 @@ def test_stale_critical_telemetry_fails_safe_without_requiring_gps(
     )
 
     backend.drone.flight_state = "flying"
+    backend.drone.event_markers["BatteryStateChanged"] = 2
     backend._last_telemetry_t = 0.0
     backend.poll(now_mono_ns=first_ns + 2_000_000_000)
 
-    assert reasons == [FailureReason.INVALID_TELEMETRY.value]
+    assert reasons == []
     assert backend.state.distance_guard_active is None
+
+
+def test_unchanged_battery_event_does_not_fail_runtime_telemetry(make_backend) -> None:
+    backend = make_backend(distance_geofence=False)
+    now_ns = time.monotonic_ns()
+    backend.drone.flight_state = "flying"
+    backend.state.flight_state = "flying"
+    backend.telemetry_freshness.observe(
+        "battery",
+        {"percent": 71.0},
+        marker="battery-unchanged",
+        observed_mono_ns=now_ns - 30_000_000_000,
+    )
+    backend.telemetry_freshness.observe(
+        "altitude",
+        {"altitude": 1.0},
+        marker="altitude-fresh",
+        observed_mono_ns=now_ns,
+    )
+    reasons = []
+    backend._schedule_runtime_safety_action = (
+        lambda reason: reasons.append(reason) or True
+    )
+
+    assert not backend._evaluate_runtime_safety(now_ns)
+    assert reasons == []
+
+
+def test_unavailable_battery_does_not_trigger_runtime_safety(make_backend) -> None:
+    backend = make_backend(distance_geofence=False)
+    now_ns = time.monotonic_ns()
+    backend.drone.flight_state = "flying"
+    backend.state.flight_state = "flying"
+    backend.state.battery_pct = -1.0
+    backend.telemetry_freshness.observe(
+        "altitude",
+        {"altitude": 1.0},
+        marker="altitude-fresh",
+        observed_mono_ns=now_ns,
+    )
+    reasons = []
+    backend._schedule_runtime_safety_action = (
+        lambda reason: reasons.append(reason) or True
+    )
+
+    assert not backend._evaluate_runtime_safety(now_ns)
+    assert reasons == []
+
+
+def test_critical_battery_does_not_trigger_runtime_safety(make_backend) -> None:
+    backend = make_backend(distance_geofence=False)
+    now_ns = time.monotonic_ns()
+    backend.drone.flight_state = "flying"
+    backend.state.flight_state = "flying"
+    backend.telemetry_freshness.observe(
+        "battery",
+        {"percent": 9.0},
+        marker="battery-unchanged",
+        observed_mono_ns=now_ns - 30_000_000_000,
+    )
+    backend.telemetry_freshness.observe(
+        "altitude",
+        {"altitude": 1.0},
+        marker="altitude-fresh",
+        observed_mono_ns=now_ns,
+    )
+    reasons = []
+    backend._schedule_runtime_safety_action = (
+        lambda reason: reasons.append(reason) or True
+    )
+
+    assert not backend._evaluate_runtime_safety(now_ns)
+    assert reasons == []
+
+
+def test_stale_ground_telemetry_does_not_interrupt_takeoff(make_backend) -> None:
+    backend = make_backend(distance_geofence=False)
+    first_ns = time.monotonic_ns()
+    backend.drone.flight_state = "landed"
+    backend.poll(now_mono_ns=first_ns)
+    reasons = []
+    backend._schedule_runtime_safety_action = (
+        lambda reason: reasons.append(reason) or True
+    )
+
+    backend.drone.flight_state = "takingoff"
+    backend._last_telemetry_t = 0.0
+    backend.poll(now_mono_ns=first_ns + 2_000_000_000)
+
+    assert reasons == []
 
 
 def test_stale_distance_event_disables_geofence_without_blocking_no_gps_flight(
@@ -1718,22 +1953,36 @@ def test_mock_takeoff_exception_after_schedule_uses_landing_fallback(
     )
 
 
-def test_limit_mismatch_is_advisory_and_takeoff_remains_available(make_backend):
+def test_limit_mismatch_blocks_takeoff_preflight(make_backend):
     backend = make_backend(max_altitude_m=10.0, max_distance_m=50.0)
     backend.drone.flight_state = "landed"
     backend.pilot_sticks = True
     backend._firmware_config_ok = True
     backend.drone.setting_states["MaxAltitudeChanged"]["current"] = 11.0
 
-    assert backend._takeoff_preflight()
+    assert not backend._takeoff_preflight()
 
-    assert backend.drone.source_state == "Controller"
-    assert any(
-        event == "takeoff_advisory" and any(
-            "MaxAltitude" in warning for warning in fields["warnings"]
-        )
-        for event, fields in backend.log.records
+    assert backend.state.preflight_reason == (
+        "MaxAltitude readback mismatch: requested=10 actual=11.0"
     )
+    assert backend.drone.source_state == "SkyController"
+    assert "TakeOff" not in backend.drone.events
+
+
+def test_firmware_configuration_failure_blocks_takeoff_preflight(make_backend):
+    backend = make_backend(max_altitude_m=20.0, max_distance_m=80.0)
+    backend.drone.flight_state = "landed"
+    backend.drone.setting_ack["MaxAltitude"] = False
+
+    assert not backend._takeoff_preflight()
+
+    assert "firmware limit configuration retry failed" in (
+        backend.state.preflight_reason
+    )
+    assert "MaxAltitude command failed or timed out" in (
+        backend.state.preflight_reason
+    )
+    assert "TakeOff" not in backend.drone.events
 
 
 @pytest.mark.parametrize(
@@ -1769,8 +2018,25 @@ def test_takeoff_preflight_fail_closed_on_each_gate(make_backend, case, reason):
     assert "TakeOff" not in backend.drone.events
 
 
-def test_gps_fix_is_advisory_and_does_not_block_takeoff(make_backend):
+def test_gps_fix_required_by_geofence_blocks_takeoff(make_backend):
     backend = make_backend(max_altitude_m=10.0, max_distance_m=50.0)
+    backend.drone.flight_state = "landed"
+    backend.drone.gps_fixed = 0
+
+    assert not backend._takeoff_preflight()
+    assert backend.state.gps_fixed is False
+    assert backend.state.preflight_reason == (
+        "GPS fix unavailable; required by configured distance geofence"
+    )
+    assert "TakeOff" not in backend.drone.events
+
+
+def test_gps_fix_is_advisory_when_geofence_policy_allows_takeoff(make_backend):
+    backend = make_backend(
+        max_altitude_m=10.0,
+        max_distance_m=50.0,
+        require_gps_for_geofence=False,
+    )
     backend.drone.flight_state = "landed"
     backend.drone.gps_fixed = 0
 
@@ -1796,6 +2062,11 @@ def test_disabled_distance_geofence_does_not_require_gps(make_backend):
     ]["shouldNotFlyOver"] = 0
 
     assert backend._takeoff_preflight()
+    assert any(
+        event == "takeoff_advisory"
+        and "GPS fix unavailable; takeoff remains allowed" in fields["warnings"]
+        for event, fields in backend.log.records
+    )
 
 
 def test_failed_pc_source_does_not_enable_pcmd_or_auto_state(make_backend):
@@ -1812,7 +2083,7 @@ def test_failed_pc_source_does_not_enable_pcmd_or_auto_state(make_backend):
     assert "PCMD" not in backend.drone.events
 
 
-def test_stream_loss_zeros_pcmd_and_hands_back_to_skycontroller(make_backend):
+def test_stream_loss_zeros_pcmd_and_keeps_pc_control(make_backend):
     backend = make_backend()
     backend.pilot_sticks = False
     backend.state.mode = "AUTO"
@@ -1820,10 +2091,10 @@ def test_stream_loss_zeros_pcmd_and_hands_back_to_skycontroller(make_backend):
     backend.stream_lost_hover("test stale")
 
     assert backend.drone.pcmds[-1][1:5] == (0, 0, 0, 0)
-    assert backend.drone.source_requests[-1] == "SkyController"
-    assert backend.pilot_sticks is True
-    assert backend.state.mode == "MANUAL"
-    assert backend.state.tracker_state == "STREAM_LOST_MANUAL"
+    assert backend.drone.source_requests == []
+    assert backend.pilot_sticks is False
+    assert backend.state.mode == "AUTO"
+    assert backend.state.tracker_state == "STREAM_LOST_HOVER"
 
 
 def test_display_frame_lag_does_not_trigger_when_decoder_is_fresh(make_backend):
@@ -1866,7 +2137,7 @@ def test_stream_monitor_arms_only_after_first_decoded_frame(make_backend):
     assert backend.state.active_incident == ""
 
 
-def test_frozen_stream_health_triggers_manual_handoff_once(make_backend):
+def test_frozen_stream_health_triggers_hover_once(make_backend):
     # grace 0 = the historical immediate trigger; the grace window itself is
     # covered by test_brief_stream_latency_does_not_take_pc_control_away.
     backend = make_backend(stream_loss_grace_s=0.0)
@@ -1880,7 +2151,7 @@ def test_frozen_stream_health_triggers_manual_handoff_once(make_backend):
 
     assert backend._evaluate_video_health(100.1)
     first_events = list(backend.drone.events)
-    assert backend.pilot_sticks is True
+    assert backend.pilot_sticks is False
     assert backend.state.active_incident == "stream_stale"
 
     assert not backend._evaluate_video_health(100.2)
@@ -2202,7 +2473,7 @@ def test_unconfirmed_lost_link_policy_still_blocks_takeoff(make_backend):
     assert "lost-link auto-land policy" in backend._inventory_block_reason
 
 
-def test_stream_health_rearms_after_recovery_so_a_second_freeze_still_hands_off(
+def test_stream_health_rearms_after_recovery_so_a_second_freeze_still_hovers(
         make_backend):
     """One handoff per outage — but a SECOND outage must still trigger one.
 
@@ -2229,14 +2500,13 @@ def test_stream_health_rearms_after_recovery_so_a_second_freeze_still_hands_off(
     assert not backend._stream_failure_latched, "stream health never re-armed"
     assert any(event == "stream_health_rearmed" for event, _ in backend.log.records)
 
-    # Second freeze must hand off again.
+    # Second freeze must command hover again without changing control owner.
     stats["duplicate_run"] = 15
     stats["frozen"] = True
-    backend.pilot_sticks = False
     assert backend._evaluate_video_health(100.3), (
-        "a second stream freeze produced no handoff"
+        "a second stream freeze produced no hover"
     )
-    assert backend.pilot_sticks is True
+    assert backend.pilot_sticks is False
 
 
 def test_pc_control_refuses_to_unblock_pcmd_if_safety_latched_during_handoff(
@@ -2419,7 +2689,7 @@ def test_lost_link_policy_write_is_refused_while_airborne(make_backend):
     assert backend.state.rth_policy_configured is False
 
 
-def test_critical_battery_requests_rth_once_when_home_is_reachable(make_backend):
+def test_critical_battery_does_not_request_rth_when_home_is_reachable(make_backend):
     backend = make_backend(max_altitude_m=50.0, max_distance_m=100.0)
     backend.drone.flight_state = "flying"
     backend.state.flight_state = "flying"
@@ -2434,63 +2704,58 @@ def test_critical_battery_requests_rth_once_when_home_is_reachable(make_backend)
     backend.state.distance_from_home_m = 10.0
     backend.state.max_distance_m = 100.0
 
-    assert backend._evaluate_runtime_safety()
-    backend._runtime_safety_action_thread.join(timeout=1.0)
-
-    assert "return_to_home" in backend.drone.events
-    assert "Landing" not in backend.drone.events
-    assert backend.state.active_incident == "battery_critical"
-    assert backend._runtime_safety_action_latched
-    before = list(backend.drone.events)
     assert not backend._evaluate_runtime_safety()
-    assert backend.drone.events == before
+    assert "return_to_home" not in backend.drone.events
+    assert "Landing" not in backend.drone.events
+    assert not backend._runtime_safety_action_latched
 
 
-def test_critical_battery_lands_when_home_is_not_reachable(make_backend):
+def test_critical_battery_does_not_land_when_home_is_not_reachable(make_backend):
     backend = make_backend(max_altitude_m=50.0, max_distance_m=100.0)
     backend.drone.flight_state = "flying"
     backend.drone.home_reachable = False
     backend.state.flight_state = "flying"
     backend.state.battery_pct = 9.0
 
-    assert backend._evaluate_runtime_safety()
-    backend._runtime_safety_action_thread.join(timeout=1.0)
-
+    assert not backend._evaluate_runtime_safety()
     assert "return_to_home" not in backend.drone.events
-    assert "Landing" in backend.drone.events
+    assert "Landing" not in backend.drone.events
 
 
-def test_failed_safety_landing_rearms_instead_of_disabling_protection(make_backend):
-    """A safety action that did NOT succeed must not disarm runtime protection.
+def test_failed_fallback_hover_rearms_instead_of_disabling_protection(make_backend):
+    """A fallback hover that did NOT succeed must not disarm runtime protection.
 
     The latch stops one *successful* action being re-issued. If it stayed set after
-    a failed RTH+Landing the aircraft would keep flying with battery/altitude/
-    distance protection permanently off for the rest of the session.
+    a failed RTH+hover the aircraft would keep flying with altitude/distance
+    protection permanently off for the rest of the session.
     """
     backend = make_backend(max_altitude_m=50.0, max_distance_m=100.0)
     backend.drone.flight_state = "flying"
     backend.drone.home_reachable = False
-    backend.drone.landing_success = False
     backend.state.flight_state = "flying"
-    backend.state.battery_pct = 9.0
+    backend.state.drone_altitude_m = 49.5
+    backend.state.max_altitude_m = 50.0
+    hover_calls = []
+    backend.hover_cmd = lambda reason: hover_calls.append(reason) or False
 
     assert backend._evaluate_runtime_safety()
     backend._runtime_safety_action_thread.join(timeout=2.0)
-    assert "Landing" in backend.drone.events
+    assert hover_calls
+    assert "Landing" not in backend.drone.events
 
     assert not backend._runtime_safety_action_latched, (
-        "a failed safety action left the latch set: every later battery/altitude/"
-        "distance trigger is now permanently ignored"
+        "a failed safety action left the latch set: every later altitude/distance "
+        "trigger is now permanently ignored"
     )
     assert any(event == "runtime_safety_rearmed" for event, _ in backend.log.records)
 
     # Re-arm must be real: while the aircraft is still airborne and still critical,
     # the next evaluation has to issue another safety action.
     backend.drone.flight_state = "flying"
-    before = len([e for e in backend.drone.events if e == "Landing"])
+    before = len(hover_calls)
     assert backend._evaluate_runtime_safety()
     backend._runtime_safety_action_thread.join(timeout=2.0)
-    assert len([e for e in backend.drone.events if e == "Landing"]) > before
+    assert len(hover_calls) > before
 
 
 def test_runtime_safety_action_exception_is_guarded_and_rearmed(make_backend):
@@ -2498,7 +2763,8 @@ def test_runtime_safety_action_exception_is_guarded_and_rearmed(make_backend):
     backend = make_backend(max_altitude_m=50.0, max_distance_m=100.0)
     backend.drone.flight_state = "flying"
     backend.state.flight_state = "flying"
-    backend.state.battery_pct = 9.0
+    backend.state.drone_altitude_m = 49.5
+    backend.state.max_altitude_m = 50.0
 
     def explode():
         raise RuntimeError("pre-action failure")
@@ -2515,17 +2781,18 @@ def test_runtime_safety_action_exception_is_guarded_and_rearmed(make_backend):
     )
 
 
-def test_invalid_geofence_telemetry_uses_bounded_landing(make_backend):
+def test_invalid_geofence_telemetry_hovers_without_rth_or_landing(make_backend):
     backend = make_backend(max_altitude_m=50.0, max_distance_m=100.0)
     backend.drone.flight_state = "flying"
     backend.state.flight_state = "flying"
     backend._execute_runtime_safety_action(FailureReason.INVALID_TELEMETRY.value)
 
-    assert "Landing" in backend.drone.events
+    assert "Landing" not in backend.drone.events
     assert "return_to_home" not in backend.drone.events
+    assert backend.state.tracker_state == "HOVER"
 
 
-def test_failed_rth_command_falls_back_to_in_place_landing(make_backend):
+def test_failed_rth_command_falls_back_to_hover(make_backend):
     backend = make_backend(max_altitude_m=50.0, max_distance_m=100.0)
     backend.drone.flight_state = "flying"
     backend.drone.rth_success = False
@@ -2535,13 +2802,15 @@ def test_failed_rth_command_falls_back_to_in_place_landing(make_backend):
     # correctly refuses to return home. See
     # test_rth_is_refused_when_the_climb_was_never_read_back.
     backend.state.rth_min_altitude_m = 5.0
-    backend.state.battery_pct = 10.0
+    backend.state.drone_altitude_m = 49.5
+    backend.state.max_altitude_m = 50.0
 
     assert backend._evaluate_runtime_safety()
     backend._runtime_safety_action_thread.join(timeout=1.0)
 
     assert "return_to_home" in backend.drone.events
-    assert "Landing" in backend.drone.events
+    assert "Landing" not in backend.drone.events
+    assert backend.state.tracker_state == "HOVER"
 
 
 @pytest.mark.parametrize(
@@ -2655,6 +2924,110 @@ def test_cleanup_still_attempts_bounded_landing_after_pre_action_failure(make_ba
     assert attempts == ["cleanup_force_land"]
 
 
+def test_cleanup_landing_holds_authority_transition_until_touchdown(make_backend):
+    backend = make_backend()
+    backend.drone.flight_state = "flying"
+    events = []
+
+    class Authority:
+        class Transition:
+            def __enter__(self):
+                events.append("authority_enter")
+
+            def __exit__(self, *_args):
+                events.append("authority_exit")
+
+        def transition(self):
+            return self.Transition()
+
+    backend.authority_controller = Authority()
+    backend._set_piloting_source = (
+        lambda source: events.append(("source", source)) or True
+    )
+    backend._is_already_landed = lambda: False
+    backend._land_and_confirm = (
+        lambda reason: events.append(("land", reason)) or True
+    )
+
+    assert backend._cleanup_attempt_landing() is True
+    assert events == [
+        "authority_enter",
+        ("source", "Controller"),
+        ("land", "cleanup_force_land"),
+        ("source", "SkyController"),
+        "authority_exit",
+    ]
+
+
+def test_unconfirmed_cleanup_latches_out_all_future_computer_motion(make_backend):
+    backend = make_backend()
+    backend.drone.flight_state = "flying"
+    backend._land_and_confirm = lambda _reason: False
+
+    assert backend.cleanup() is False
+
+    assert backend._shutdown_latched is True
+    assert backend.pilot_sticks is True
+    assert backend.send_pcmd(10, 0, 0, 0, reason="late_auto") is False
+    assert backend.set_nudge_vector(1.0, 0.0, 0.0, 0.0) is False
+    assert backend.take_pc_control() is False
+    assert backend.takeoff_cmd() is False
+
+
+@pytest.mark.parametrize("motion", ["vector", "nudge"])
+def test_shutdown_latch_wins_race_before_motion_state_is_committed(
+    make_backend, motion: str,
+) -> None:
+    backend = make_backend(skycontroller=False, pulse_s=5.0)
+    backend.pilot_sticks = False
+    underlying = backend._lock
+
+    class LatchOnEnter:
+        def __enter__(self):
+            underlying.acquire()
+            backend._shutdown_latched = True
+            return self
+
+        def __exit__(self, *_args):
+            underlying.release()
+
+    backend._lock = LatchOnEnter()
+    backend._ensure_nudge_loop = lambda: None
+
+    accepted = (
+        backend.set_nudge_vector(1.0, 0.0, 0.0, 0.0)
+        if motion == "vector"
+        else backend.nudge_begin("前")
+    )
+
+    assert accepted is False
+    assert backend._nudge_vector is None
+    assert backend._nudge_held == set()
+
+
+def test_shutdown_latch_wins_race_before_takeoff_is_scheduled(make_backend) -> None:
+    backend = make_backend(skycontroller=False)
+    underlying = backend._lock
+
+    class LatchOnEnter:
+        def __enter__(self):
+            underlying.acquire()
+            backend._shutdown_latched = True
+            return self
+
+        def __exit__(self, *_args):
+            underlying.release()
+
+    backend._lock = LatchOnEnter()
+    backend.nudge_clear = lambda *, reason: None
+    backend._takeoff_preflight = lambda _epoch: pytest.fail(
+        "shutdown-latched takeoff must not reach preflight"
+    )
+
+    assert backend.takeoff_cmd() is False
+    assert backend._maneuver_in_progress is None
+
+
 def test_cleanup_completes_when_resource_close_reports_fault(make_backend):
     backend = make_backend()
     backend.drone.flight_state = "landed"
@@ -2701,6 +3074,46 @@ def test_cleanup_finalizes_recording_without_synchronous_download(make_backend):
         and fields.get("note") == "onboard_only_no_synchronous_download"
         for event, fields in backend.log.records
     )
+
+
+def test_recording_quality_is_applied_before_start(make_backend):
+    backend = make_backend()
+    backend.drone.flight_state = "landed"
+
+    assert backend.set_recording_quality("uhd_4k_30") is True
+    assert backend.recording_profile.profile_id == "uhd_4k_30"
+    assert backend.drone.recording_mode_state[0]["resolution"].name == (
+        "resolution.res_uhd_4k"
+    )
+    assert "set_recording_mode" in backend.drone.events
+    assert backend.start_flight_recording(reason="test") is True
+    assert backend.recording_active is True
+    assert backend.drone.events.count("set_recording_mode") >= 2
+    assert "start_recording" in backend.drone.events
+    assert backend.drone.events.index("set_recording_mode") < backend.drone.events.index(
+        "start_recording"
+    )
+
+
+def test_recording_quality_change_is_refused_while_recording(make_backend):
+    backend = make_backend()
+    assert backend.start_flight_recording(reason="test") is True
+    assert backend.set_recording_quality("uhd_4k_30") is False
+    assert backend.recording_profile.profile_id == "fhd_30"
+
+
+def test_start_recording_fails_closed_when_quality_readback_mismatches(
+        make_backend):
+    backend = make_backend()
+    backend.drone.set_recording_mode_ok = False
+
+    assert backend.set_recording_quality("uhd_4k_30") is False
+    assert backend.start_flight_recording(reason="test") is False
+    assert backend.recording_active is False
+    assert "start_recording" not in backend.drone.events
+
+
+
 
 
 def test_recording_download_waits_have_explicit_timeouts(
@@ -2877,6 +3290,61 @@ def test_nudge_loop_handoff_restarts_when_hold_survives_old_loop_exit(make_backe
     assert backend._nudge_held == set()
 
 
+@pytest.mark.parametrize(
+    "invalidate",
+    ["clear", "cancel", "land", "manual", "cleanup"],
+)
+def test_stale_nudge_snapshot_cannot_send_after_motion_invalidation(
+        make_backend, invalidate):
+    """A nudge snapshot must be rejected after any motion-cancelling action."""
+    backend = make_backend(skycontroller=False, pulse_s=5.0)
+    drone = backend.drone
+    with backend._lock:
+        backend._nudge_held.add("前")
+        backend._nudge_deadline = time.monotonic() + 5.0
+
+    snapshot_ready = threading.Event()
+    release_snapshot = threading.Event()
+    original_combined = backend._combined_nudge_pcmd
+
+    def gated_combined():
+        pcmd = original_combined()
+        snapshot_ready.set()
+        if not release_snapshot.wait(timeout=2.0):
+            raise AssertionError("test interleaving was not released")
+        return pcmd
+
+    backend._combined_nudge_pcmd = gated_combined
+    step_result: list[tuple[bool, bool]] = []
+    step_thread = threading.Thread(
+        target=lambda: step_result.append(backend._nudge_loop_step()),
+    )
+    step_thread.start()
+    assert snapshot_ready.wait(timeout=2.0)
+
+    if invalidate == "clear":
+        backend.nudge_clear(reason="race_clear")
+    elif invalidate == "cancel":
+        assert backend.command("nudge_clear") is True
+    elif invalidate == "land":
+        drone.flight_state = "flying"
+        assert backend.land_cmd("race_land") is True
+    elif invalidate == "manual":
+        assert backend.give_to_pilot(reason="race_manual") is True
+    else:
+        drone.flight_state = "flying"
+        assert backend.cleanup() is True
+
+    release_snapshot.set()
+    step_thread.join(timeout=2.0)
+    assert not step_thread.is_alive()
+    assert step_result == [(True, False)]
+    assert all(
+        pcmd[1:5] == (0, 0, 0, 0)
+        for pcmd in drone.pcmds
+    ), f"stale non-zero PCMD escaped {invalidate}: {drone.pcmds}"
+
+
 def test_land_during_takeoff_wait_wins_epoch_and_prevents_recording(make_backend):
     backend = make_backend(max_altitude_m=10.0, max_distance_m=50.0)
     backend.drone.flight_state = "landed"
@@ -2979,6 +3447,22 @@ def test_hover_invalidates_a_pending_takeoff_epoch(make_backend):
     assert backend.hover_cmd("operator_auto_cancel")
 
     assert backend._pulse_token == before + 1
+    assert backend.drone.pcmds[-1][1:5] == (0, 0, 0, 0)
+
+
+def test_nudge_clear_does_not_cancel_a_pending_takeoff(make_backend):
+    backend = make_backend(max_altitude_m=10.0, max_distance_m=50.0)
+    backend.drone.flight_state = "takingoff"
+    backend._maneuver_in_progress = "takeoff"
+    before = backend._pulse_token
+
+    result = backend.command(ControlRequest.create(
+        ControlAction.NUDGE_CLEAR,
+        human_origin=True,
+    ))
+
+    assert result.accepted and result.executed
+    assert backend._pulse_token == before
     assert backend.drone.pcmds[-1][1:5] == (0, 0, 0, 0)
 
 
@@ -3122,18 +3606,17 @@ def test_stick_monitor_reports_an_unexpected_device_disconnect(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    ("home_reachable", "expected", "not_expected"),
+    ("home_reachable", "expect_rth"),
     [
-        (True, "return_to_home", "Landing"),
-        (False, "Landing", "return_to_home"),
+        (True, True),
+        (False, False),
     ],
 )
 def test_stick_monitor_disconnect_recovers_by_gps_availability(
-    make_backend, home_reachable, expected, not_expected,
+    make_backend, home_reachable, expect_rth,
 ):
     """Operator policy 2026-08-06, end to end: losing the controller while the
-    control link still works recovers by GPS -- usable Home Point returns home,
-    otherwise it lands in place."""
+    control link still works uses RTH when Home is usable, otherwise it hovers."""
     backend = make_backend()
     backend.drone.flight_state = "flying"
     backend.drone.home_reachable = home_reachable
@@ -3143,8 +3626,10 @@ def test_stick_monitor_disconnect_recovers_by_gps_availability(
     backend._runtime_safety_action_thread.join(timeout=2.0)
 
     assert backend.state.stick_monitor_ok is False
-    assert expected in backend.drone.events
-    assert not_expected not in backend.drone.events
+    assert ("return_to_home" in backend.drone.events) is expect_rth
+    assert "Landing" not in backend.drone.events
+    if not expect_rth:
+        assert backend.state.tracker_state == "HOVER"
     assert backend.state.active_incident == "controller_disconnected"
 
 
@@ -3171,6 +3656,22 @@ def test_takeoff_preflight_is_blocked_when_stick_monitor_is_unavailable(
     assert "stick monitor" in backend.state.preflight_reason
 
 
+def test_takeoff_preflight_is_blocked_while_physical_sticks_are_deflected(
+    make_backend,
+):
+    backend = make_backend(max_altitude_m=50.0, max_distance_m=100.0)
+    backend.drone.flight_state = "landed"
+    backend._stick_monitor = SimpleNamespace(
+        healthy=True,
+        is_active=lambda: True,
+    )
+    backend.state.stick_monitor_ok = True
+
+    assert not backend._takeoff_preflight()
+    assert "sticks are deflected" in backend.state.preflight_reason
+    assert "TakeOff" not in backend.drone.events
+
+
 def test_stick_override_reclaims_skycontroller_when_pc_controls(make_backend):
     backend = make_backend(skycontroller=True)
     backend.pilot_sticks = False
@@ -3188,6 +3689,19 @@ def test_stick_override_reclaims_skycontroller_when_pc_controls(make_backend):
     # PCMD was zeroed
     assert any(e == "PCMD" for e in backend.drone.events)
     assert backend.drone.pcmds[-1][1:5] == (0, 0, 0, 0)
+
+
+def test_stick_override_blocks_all_subsequent_pc_motion(make_backend):
+    backend = make_backend(skycontroller=True)
+    backend.pilot_sticks = False
+    backend.drone.source_state = "Controller"
+
+    assert backend._maybe_reclaim_from_sticks({0: 12000})
+
+    assert not backend.send_pcmd(5, 6, 7, 8, reason="after_stick_override")
+    assert not backend.set_nudge_vector(0.5, 0.5, 0.5, 0.5)
+    assert backend.drone.pcmds[-1][1:5] == (0, 0, 0, 0)
+    assert backend.drone.source_state == "SkyController"
 
 
 def test_stick_override_noop_when_already_on_sticks(make_backend):
@@ -3225,6 +3739,62 @@ def test_take_pc_control_refused_while_sticks_deflected(make_backend):
         name == "pc_control" and fields.get("note") == "sticks_active_refuse_pc"
         for name, fields in backend.log.records
     )
+
+
+def test_take_pc_control_aborts_when_sticks_move_during_source_handoff(
+    make_backend,
+):
+    backend = make_backend(skycontroller=True)
+    backend.pilot_sticks = True
+    active = {"value": False}
+    backend._stick_monitor = SimpleNamespace(
+        healthy=True,
+        is_active=lambda: active["value"],
+    )
+    backend.state.stick_monitor_ok = True
+    real_set_source = backend._set_piloting_source
+
+    def move_sticks_during_handoff(source: str) -> bool:
+        result = real_set_source(source)
+        if source == "Controller":
+            active["value"] = True
+        return result
+
+    backend._set_piloting_source = move_sticks_during_handoff
+
+    assert not backend.take_pc_control()
+    assert backend.pilot_sticks is True
+    assert backend.drone.source_state == "SkyController"
+    assert any(
+        name == "pc_control"
+        and fields.get("note") == "sticks_active_during_handoff"
+        for name, fields in backend.log.records
+    )
+
+
+def test_calibration_motion_snapshot_reports_received_pcmd_and_fresh_telemetry(
+    make_backend,
+):
+    backend = make_backend()
+    now_ns = time.monotonic_ns()
+    backend._last_pcmd = (10, 0, 0, 0)
+    backend._last_pcmd_mono_ns = now_ns
+    backend.state.telemetry_read_mono_ns = now_ns
+    backend.state.speed_north_mps = 0.0
+    backend.state.speed_east_mps = 0.2
+    backend.state.speed_down_mps = 0.0
+    backend.state.att_yaw = 0.0
+    backend.state.heading_state = "OK"
+    backend.state.flight_state = "hovering"
+    backend._stick_monitor = SimpleNamespace(snapshot_axes=lambda: {0: 123})
+
+    snapshot = backend.calibration_motion_snapshot()
+
+    assert snapshot["pcmd"] == (10, 0, 0, 0)
+    assert snapshot["pcmd_age_s"] == pytest.approx(0.0, abs=0.05)
+    assert snapshot["telemetry_age_s"] == pytest.approx(0.0, abs=0.05)
+    assert snapshot["speed_east_mps"] == pytest.approx(0.2)
+    assert snapshot["stick_axes"] == {0: 123}
 
 
 # ---------------------------------------------------------------------------
@@ -3383,8 +3953,8 @@ def test_lost_controller_returns_home_when_gps_home_is_usable(make_backend):
     )
 
 
-def test_lost_controller_lands_in_place_without_gps_home(make_backend):
-    """...and no usable Home Point means land in place, never fly blind."""
+def test_lost_controller_hovers_without_gps_home(make_backend):
+    """No usable Home Point means hover instead of landing in place."""
     backend = make_backend(max_altitude_m=50.0, max_distance_m=100.0)
     backend.drone.flight_state = "flying"
     backend.drone.home_reachable = False
@@ -3394,9 +3964,10 @@ def test_lost_controller_lands_in_place_without_gps_home(make_backend):
     backend._execute_runtime_safety_action("controller_disconnected")
 
     assert "return_to_home" not in backend.drone.events
-    assert "Landing" in backend.drone.events
+    assert "Landing" not in backend.drone.events
+    assert backend.state.tracker_state == "HOVER"
     assert any(
-        event == "runtime_safety" and fields.get("action") == "land"
+        event == "runtime_safety" and fields.get("action") == "hover"
         for event, fields in backend.log.records
     )
 
@@ -3426,7 +3997,8 @@ def test_rth_is_skipped_when_it_would_break_the_altitude_ceiling(make_backend):
     backend._execute_runtime_safety_action("controller_disconnected")
 
     assert "return_to_home" not in backend.drone.events
-    assert "Landing" in backend.drone.events
+    assert "Landing" not in backend.drone.events
+    assert backend.state.tracker_state == "HOVER"
     assert any(
         event == "runtime_safety_rth_skipped" and "39.2" in fields["detail"]
         for event, fields in backend.log.records
@@ -3631,8 +4203,8 @@ def test_brief_stream_latency_does_not_take_pc_control_away(make_backend):
     assert recovered and recovered[-1]["stale_for_s"] >= 0.0
 
 
-def test_stream_lost_beyond_the_grace_still_hands_off(make_backend):
-    """A genuinely dead stream must still return control to the pilot."""
+def test_stream_lost_beyond_the_grace_still_hovers(make_backend):
+    """A genuinely dead stream must zero motion without changing ownership."""
     backend = make_backend(skycontroller=False)
     backend.pilot_sticks = False
     backend.stream_loss_grace_s = 0.15                # short grace for the test
@@ -3641,9 +4213,9 @@ def test_stream_lost_beyond_the_grace_still_hands_off(make_backend):
     _stale_grabber(backend, 0.9)
     assert not backend._evaluate_video_health(100.0)   # grace starts
     time.sleep(0.2)
-    assert backend._evaluate_video_health(100.3), "dead stream never handed off"
-    assert backend.pilot_sticks is True
-    assert backend.state.tracker_state == "STREAM_LOST_MANUAL"
+    assert backend._evaluate_video_health(100.3), "dead stream never hovered"
+    assert backend.pilot_sticks is False
+    assert backend.state.tracker_state == "STREAM_LOST_HOVER"
 
 
 def test_stream_loss_grace_is_validated(make_backend):
@@ -3845,7 +4417,7 @@ def test_rth_is_refused_when_the_climb_was_never_read_back(make_backend):
     set independently of MaxAltitude. Connecting to an aircraft that never ran the
     readback leaves it unknown -- the firmware keeps whatever the last FreeFlight
     session left (39.2 m on the reference unit), which is exactly the climb this
-    guard exists to stop. Landing in place is the safe answer.
+    guard exists to stop. The fallback is hover.
     """
     backend = make_backend(max_altitude_m=50.0, max_distance_m=100.0)
     backend.drone.flight_state = "flying"
@@ -3856,8 +4428,9 @@ def test_rth_is_refused_when_the_climb_was_never_read_back(make_backend):
     backend._execute_runtime_safety_action("controller_disconnected")
 
     assert "return_to_home" not in backend.drone.events
-    assert "Landing" in backend.drone.events
+    assert "Landing" not in backend.drone.events
+    assert backend.state.tracker_state == "HOVER"
     assert any(
         event == "runtime_safety_rth_skipped" and "never read back" in fields["detail"]
         for event, fields in backend.log.records
-    ), "the aircraft landed instead of returning home with no record of why"
+    ), "RTH was skipped with no record of why"

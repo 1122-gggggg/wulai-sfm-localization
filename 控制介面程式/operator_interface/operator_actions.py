@@ -19,6 +19,7 @@ FLIGHT_MODE_BUTTONS = (
     CommandButton("恢復電腦控制", "pc_control"),
     CommandButton("懸停", "hover"),
     CommandButton("原地降落", "land"),
+    CommandButton("停止電腦動作", "emergency_stop"),
 )
 
 MISSION_MODE_BUTTONS = (
@@ -37,6 +38,7 @@ class ActionResult:
     profile_path: Path | None = None
     asset_path: Path | None = None
     kind: str | None = None
+    approved_for_auto: bool = False
 
 
 class SiteAssetActions:
@@ -77,6 +79,29 @@ class SiteAssetActions:
             imported.profile_path,
             imported.asset_path,
             "route",
+        )
+
+    def import_authored_route(
+        self,
+        source: str | Path,
+        *,
+        replace_route: str | Path | None = None,
+    ) -> ActionResult:
+        if self.current_profile is None:
+            raise ValueError("請先匯入建圖端場域資料夾")
+        imported = self.routes.import_file(
+            source,
+            self.current_profile,
+            approve_for_auto=True,
+            replace_route=replace_route,
+        )
+        action = "已更新" if replace_route is not None else "已新增"
+        return ActionResult(
+            f"航線{action} {imported.asset_path.name} 並設為目前 AUTO 航線",
+            imported.profile_path,
+            imported.asset_path,
+            "route",
+            approved_for_auto=True,
         )
 
     def import_targets(self, source: str | Path) -> ActionResult:

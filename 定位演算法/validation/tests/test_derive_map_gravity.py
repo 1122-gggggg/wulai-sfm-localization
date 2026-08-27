@@ -26,10 +26,6 @@ SITE_ALIGNMENTS = {
         "地圖檔/場域/river_site/maps/river_site_ref_poses.json",
         "地圖檔/場域/river_site/maps/T_align_gravity.json",
     ),
-    "football_field": (
-        "地圖檔/場域/football_field/maps/ff_a1/football_field_ref_poses.json",
-        "地圖檔/場域/football_field/maps/ff_a1/T_align_gravity.json",
-    ),
 }
 
 

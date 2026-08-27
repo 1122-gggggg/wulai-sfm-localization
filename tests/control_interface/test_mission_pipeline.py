@@ -27,6 +27,15 @@ from site_profile import (  # noqa: E402
     _load_flight_controller,
     site_profile_approval_sha256,
 )
+from pose_frame_chain import (  # noqa: E402
+    CameraBodyExtrinsic,
+    save_camera_body_extrinsic,
+)
+from site_alignment import (  # noqa: E402
+    SiteAlignment,
+    save_site_alignment,
+    solve_similarity_alignment,
+)
 
 SPEC = importlib.util.spec_from_file_location(
     "mission_pipeline_under_test", CONTROL_ROOT / "mission_pipeline.py"
@@ -46,6 +55,7 @@ def clear_site_asset_environment(monkeypatch):
 def _args(**overrides):
     values = {
         "site_profile": "",
+        "mission_selection": "",
         "allow_legacy_assets": False,
         "map_ply": None,
         "bundle": None,
@@ -153,6 +163,43 @@ def test_main_dispatches_profile_free_selftest_without_external_process(monkeypa
         "--selftest",
     ]
     assert "SFM_SITE_PROFILE" not in env
+
+
+def test_mode_fly_is_rejected_before_exec(monkeypatch):
+    commands = []
+    monkeypatch.setattr(
+        mission_pipeline,
+        "run",
+        lambda command, env: commands.append((command, env)),
+    )
+    args = argparse.Namespace(mode="fly")
+    with pytest.raises(SystemExit, match="operator UI"):
+        mission_pipeline._run_mission_mode(args, [], {})
+    assert commands == []
+
+def test_main_mode_fly_is_rejected_before_resolve_or_exec(monkeypatch):
+    commands = []
+    monkeypatch.setattr(
+        mission_pipeline,
+        "run",
+        lambda command, env: commands.append((command, env)),
+    )
+    monkeypatch.setattr(
+        mission_pipeline,
+        "resolve_mission_site_assets",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("fly must not resolve assets")
+        ),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["mission_pipeline.py", "--mode", "fly", "--allow-legacy-assets"],
+    )
+    with pytest.raises(SystemExit, match="operator UI"):
+        mission_pipeline.main()
+    assert commands == []
+
 
 
 def test_main_shadow_readiness_preserves_blocked_output_and_exit(
@@ -265,6 +312,50 @@ def test_profile_uses_canonical_route_paths(monkeypatch, tmp_path):
     assert Path(args.poles_json) == package_root / "routes" / "poles.json"
 
 
+def test_mission_selection_materializes_one_legacy_profile(monkeypatch, tmp_path):
+    profile_path = tmp_path / "snapshot.site_profile.json"
+    selection_path = tmp_path / "mission.json"
+    route = tmp_path / "route.json"
+    poles = tmp_path / "poles.json"
+    profile = SimpleNamespace(
+        source=profile_path,
+        schema_version=2,
+        site_id="alpha",
+        display_name="Alpha",
+        map_ply=tmp_path / "map.ply",
+        localization_bundle=tmp_path / "bundle.pt",
+        route_json=route,
+        poles_json=poles,
+        megaloc_cache=None,
+        reference_index=None,
+        track_landmarks=None,
+        asset_sha256=SimpleNamespace(reference_index=None),
+        flight=None,
+    )
+    resolved = SimpleNamespace(
+        readiness=SimpleNamespace(flight_ready=False, flight_errors=("blocked",)),
+        materialize_legacy_site_profile=lambda _directory: profile_path,
+    )
+    monkeypatch.setattr(
+        mission_pipeline,
+        "resolve_mission",
+        lambda path, workspace_root: resolved,
+    )
+    monkeypatch.setattr(mission_pipeline, "load_site_profile", lambda path: profile)
+
+    args = _args(mission_selection=str(selection_path))
+    result = mission_pipeline.resolve_mission_site_assets(
+        args,
+        _parser(),
+        mode="draw-path",
+    )
+
+    assert result is profile
+    assert args.site_profile == str(profile_path)
+    assert args.map_ply == str(profile.map_ply)
+    assert args.bundle == str(profile.localization_bundle)
+
+
 def test_flight_mode_rejects_files_without_an_approved_contract(monkeypatch, tmp_path):
     route = tmp_path / "route.json"
     poles = tmp_path / "poles.json"
@@ -307,6 +398,43 @@ def test_scale_free_flight_contract_exports_no_map_scale_and_verifies_hashes(tmp
     map_align = tmp_path / "T_align_gravity.json"
     for path in (map_ply, bundle, reference_poses, localizer_profile, map_align):
         path.write_bytes(b"x")
+    control_points = [
+        [0.0, 0.0, 0.0],
+        [2.0, 0.0, 0.0],
+        [0.0, 2.0, 0.0],
+        [0.0, 0.0, 1.0],
+        [1.0, 1.0, 1.0],
+        [-1.0, 1.0, 0.0],
+    ]
+    site_alignment = tmp_path / "site_alignment.json"
+    save_site_alignment(
+        SiteAlignment.from_fit(
+            map_frame_id="alpha-reconstruction-v1",
+            site_frame_id="alpha-site-enu-v1",
+            fit=solve_similarity_alignment(control_points, control_points),
+            approved=True,
+        ),
+        site_alignment,
+    )
+    camera_body_extrinsic = tmp_path / "camera_body_extrinsic.json"
+    save_camera_body_extrinsic(
+        CameraBodyExtrinsic(
+            vehicle_id="test-anafi-720p-v1",
+            body_frame_id="test-anafi-frd",
+            camera_frame_id="test-camera-opencv",
+            rotation_camera_from_body=(
+                (0.0, 1.0, 0.0),
+                (0.0, 0.0, 1.0),
+                (1.0, 0.0, 0.0),
+            ),
+            translation_camera_from_body_m=(0.0, 0.0, 0.0),
+            fixed_gimbal_pitch_deg=-10.0,
+            gimbal_pitch_tolerance_deg=1.0,
+            evidence="test fixture",
+            approved=True,
+        ),
+        camera_body_extrinsic,
+    )
     route = tmp_path / "route.json"
     route.write_text(json.dumps({
         "schema": "sfm-flight-route/v1",
@@ -331,6 +459,22 @@ def test_scale_free_flight_contract_exports_no_map_scale_and_verifies_hashes(tmp
         "localizer_profile": "edm.json",
         "map_reference_poses": "reference_poses.json",
         "map_align": "T_align_gravity.json",
+        "coordinate_frame": {
+            "id": "alpha-reconstruction-v1",
+            "convention": "glomap",
+            "horizontal_axes": ["x", "z"],
+            "up_axis": "-y",
+            "handedness": "right",
+            "units": "map",
+        },
+        "pose_chain": {
+            "site_frame_id": "alpha-site-enu-v1",
+            "vehicle_id": "test-anafi-720p-v1",
+            "body_frame_id": "test-anafi-frd",
+            "camera_frame_id": "test-camera-opencv",
+            "site_alignment": site_alignment.name,
+            "camera_body_extrinsic": camera_body_extrinsic.name,
+        },
         "query_camera": {
             "model": "PINHOLE",
             "width": 1280,
@@ -343,6 +487,8 @@ def test_scale_free_flight_contract_exports_no_map_scale_and_verifies_hashes(tmp
             "map_reference_poses": digest(reference_poses),
             "map_align": digest(map_align),
             "localizer_profile": digest(localizer_profile),
+            "site_alignment": digest(site_alignment),
+            "camera_body_extrinsic": digest(camera_body_extrinsic),
         },
         "flight": {
             "approved": True,

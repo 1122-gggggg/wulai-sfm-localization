@@ -33,6 +33,11 @@ class MapRenderContext:
     pose: Sequence[float]
     camera_axes: np.ndarray | None
     camera_forward: np.ndarray | None
+    collision_center: Sequence[float] | None
+    collision_radius: float
+    collision_status: str
+    collision_point: Sequence[float] | None
+    collision_preview: bool
     transform_xyz: Callable[[np.ndarray], np.ndarray]
     project_world: Callable[[np.ndarray, int, int], tuple[int, int]]
     camera_frustum_world_points: Callable[..., Sequence[np.ndarray]]
@@ -118,6 +123,71 @@ def _draw_route_and_history(draw: Any, context: MapRenderContext) -> None:
                     (x - 4, y - 4, x + 4, y + 4),
                     fill=context.health_color.get(health, "#e0a92e"),
                 )
+
+
+def _draw_collision_guard(draw: Any, context: MapRenderContext) -> None:
+    if context.collision_center is None or context.collision_radius <= 0.0:
+        return
+    center = np.asarray(context.collision_center, dtype=float)
+    if center.shape != (3,) or not np.all(np.isfinite(center)):
+        return
+    screen_x, screen_y = context.project_world(
+        center, context.width, context.height
+    )
+    radius_px = max(1, int(round(context.collision_radius * _map_scale(context))))
+    status = str(context.collision_status)
+    color = {
+        "CLEAR": "#3fbf7f",
+        "COLLISION": "#ff4d4d",
+        "PREVIEW_HIT": "#00d4ff",
+        "PREVIEW_CLEAR": "#00d4ff",
+        "WAITING": "#e0a92e",
+        "UNAVAILABLE": "#e0a92e",
+        "DISABLED": "#7f8a94",
+    }.get(status, "#7f8a94")
+    draw.ellipse(
+        (
+            screen_x - radius_px,
+            screen_y - radius_px,
+            screen_x + radius_px,
+            screen_y + radius_px,
+        ),
+        outline=color,
+        width=3,
+    )
+    draw.ellipse(
+        (screen_x - 5, screen_y - 5, screen_x + 5, screen_y + 5),
+        fill=color,
+        outline="#ffffff",
+        width=1,
+    )
+    if status in {"COLLISION", "PREVIEW_HIT"} and context.collision_point is not None:
+        point = np.asarray(context.collision_point, dtype=float)
+        if point.shape == (3,) and np.all(np.isfinite(point)):
+            hit_x, hit_y = context.project_world(
+                point, context.width, context.height
+            )
+            hit_color = "#ff4d4d" if status == "COLLISION" else "#e6b94f"
+            draw.line((screen_x, screen_y, hit_x, hit_y), fill=hit_color, width=2)
+            draw.ellipse(
+                (hit_x - 5, hit_y - 5, hit_x + 5, hit_y + 5),
+                fill=hit_color,
+                outline="#ffffff",
+                width=1,
+            )
+    label = (
+        "模擬相機"
+        if context.collision_preview
+        else "近接命中" if status == "COLLISION" else "相機近接圈"
+    )
+    draw.text(
+        (screen_x + radius_px + 6, screen_y - 8),
+        f"{label}  r={context.collision_radius:.3g} u",
+        fill=color,
+        font=context.overlay_font,
+        stroke_width=2,
+        stroke_fill="#0b0c0e",
+    )
 
 
 def _draw_camera_overlay(draw: Any, context: MapRenderContext) -> None:
@@ -214,6 +284,7 @@ def draw_map_overlays(draw: Any, context: MapRenderContext) -> None:
     """Paint dynamic map overlays over an already-rendered map base."""
     _draw_no_localization_markers(draw, context)
     _draw_route_and_history(draw, context)
+    _draw_collision_guard(draw, context)
     _draw_camera_overlay(draw, context)
     _draw_map_legend(draw, context)
 

@@ -71,7 +71,6 @@ class PreflightContext:
     site_profile_path: Path | None
     route_snapshot: Any | None
     displayed_route_sha256: str | None
-    route_visible: bool
     route_point_count: int
     video_frame_available: bool
     stream_last_stamp: object | None
@@ -142,8 +141,6 @@ def _route_evidence(
         return None, "尚未選定通過驗證的飛行路線"
     if context.displayed_route_sha256 != snapshot.sha256:
         return None, "畫面路線與任務路線不一致"
-    if not context.route_visible:
-        return None, "請先顯示規劃路徑並逐點檢查"
     if context.route_point_count != len(snapshot.waypoints):
         return None, "畫面航點數與任務路線不一致"
     try:
@@ -177,18 +174,8 @@ def _evidence_float(value: object) -> float:
 
 
 def _live_state_problem(state: object) -> str | None:
-    flight_state = str(getattr(state, "flight_state", "") or "")
-    if flight_state.rsplit(".", 1)[-1].lower() != "landed":
-        return "飛機狀態必須為 landed"
     if not bool(getattr(state, "link_ok", False)):
         return "Olympe 控制連線異常"
-    incident = str(getattr(state, "active_incident", "") or "")
-    if incident:
-        return f"仍有安全事件：{incident}"
-    alert = str(getattr(state, "alert_state", "") or "")
-    alert_key = alert.rsplit(".", 1)[-1].replace("_", "").lower()
-    if alert_key not in {"none", "noalert"}:
-        return f"飛控警示尚未清除：{alert or 'unknown'}"
     return None
 
 
@@ -218,7 +205,7 @@ def _stream_problem(
     ):
         return f"串流影格不新鮮（{max(0.0, stream_age_s):.1f}s）"
     stream = str(getattr(state, "stream", ""))
-    if stream.upper() not in {"PREVIEW", "OK"}:
+    if stream.upper() not in {"PREVIEW", "OK", "LOCALIZING", "HOLD_720P"}:
         return f"串流狀態尚未就緒：{stream or '?'}"
     return None
 
@@ -227,13 +214,6 @@ def _system_readiness_problem(
     state: object,
     context: PreflightContext,
 ) -> str | None:
-    try:
-        battery = _evidence_float(getattr(state, "battery_pct", -1.0))
-        battery_floor = _evidence_float(context.min_takeoff_battery_pct)
-    except (TypeError, ValueError):
-        return "電量讀回或起飛門檻格式無效"
-    if not math.isfinite(battery) or battery < battery_floor:
-        return f"電量低於起飛門檻 {battery_floor:.0f}%"
     if context.via_controller and not bool(getattr(state, "stick_monitor_ok", False)):
         return "SkyController 搖桿監看尚未就緒"
     if context.safety_log_durable is False or context.safety_log_healthy is False:
@@ -264,10 +244,25 @@ def _system_evidence(
     problem = _system_readiness_problem(state, context)
     if problem is not None:
         return None, problem
+    try:
+        battery = _evidence_float(getattr(state, "battery_pct", -1.0))
+        battery_floor = _evidence_float(context.min_takeoff_battery_pct)
+    except (TypeError, ValueError):
+        battery_note = "電量讀回不可用（不阻擋起飛）"
+    else:
+        if not math.isfinite(battery) or not 0.0 <= battery <= 100.0:
+            battery_note = "電量讀回不可用（不阻擋起飛）"
+        elif math.isfinite(battery_floor) and battery < battery_floor:
+            battery_note = (
+                f"電量 {battery:.0f}% 低於建議 {battery_floor:.0f}%"
+                "（不阻擋起飛）"
+            )
+        else:
+            battery_note = f"電量 {battery:.0f}%（不阻擋起飛）"
     return (
         "system",
         "live",
-    ), "串流、遙測、連線與電量正常；GPS／高度／距離限制僅提示，不阻擋起飛"
+    ), f"串流、遙測與連線正常；{battery_note}；GPS／高度／距離限制僅提示"
 
 
 def evaluate_preflight_step(

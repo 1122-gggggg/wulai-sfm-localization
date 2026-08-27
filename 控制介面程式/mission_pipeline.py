@@ -5,7 +5,10 @@ This is the non-expert-facing wrapper for:
   - drawing inspection routes;
   - marking poles/wires;
   - planning/checking the route;
-  - running dry-run, live grab-only, or real ANAFI flight.
+  - running dry-run or live grab-only.
+
+Real-flight TakeOff is only allowed from the operator UI
+(控制介面程式/真機串流/啟動.sh). ``--mode fly`` is rejected.
 
 Operational modes are site-profile first. Legacy per-asset arguments remain available
 only behind --allow-legacy-assets so a missing or stale default cannot silently select
@@ -24,6 +27,8 @@ import sys
 from dataclasses import asdict
 from pathlib import Path
 
+from mission_manifest import ManifestError
+from mission_resolver import resolve_mission
 from site_profile import (
     SiteProfile,
     flight_readiness_errors,
@@ -255,6 +260,19 @@ def validate_profile_flight_assets(profile: SiteProfile) -> None:
         # internally-consistent one, silently rotating every commanded body axis.
         (profile.map_align, profile.asset_sha256.map_align, "map_align"),
     )
+    if getattr(profile, "pose_chain", None) is not None:
+        checks += (
+            (
+                profile.pose_chain.site_alignment,
+                profile.asset_sha256.site_alignment,
+                "site_alignment",
+            ),
+            (
+                profile.pose_chain.camera_body_extrinsic,
+                profile.asset_sha256.camera_body_extrinsic,
+                "camera_body_extrinsic",
+            ),
+        )
     if profile.localizer_profile is not None:
         checks += (
             (
@@ -318,6 +336,19 @@ def _shadow_pinned_asset_errors(profile: SiteProfile) -> list[str]:
             "localizer_profile",
         ),
     )
+    if getattr(profile, "pose_chain", None) is not None:
+        checks += (
+            (
+                profile.pose_chain.site_alignment,
+                profile.asset_sha256.site_alignment,
+                "site_alignment",
+            ),
+            (
+                profile.pose_chain.camera_body_extrinsic,
+                profile.asset_sha256.camera_body_extrinsic,
+                "camera_body_extrinsic",
+            ),
+        )
     for path, expected, label in checks:
         if path is None:
             errors.append(f"missing {label}")
@@ -369,6 +400,24 @@ def resolve_mission_site_assets(
 ) -> SiteProfile | None:
     """Apply one site profile, or an explicitly opted-in legacy asset set."""
     profile_arg = str(getattr(args, "site_profile", "") or "").strip()
+    selection_arg = str(getattr(args, "mission_selection", "") or "").strip()
+    if profile_arg and selection_arg:
+        parser.error("use either --mission-selection or --site-profile, not both")
+    if selection_arg:
+        try:
+            resolved = resolve_mission(selection_arg, workspace_root=SYSTEM_ROOT)
+            if mode == "fly" and not resolved.readiness.flight_ready:
+                raise ManifestError(
+                    "mission is not flight-ready: "
+                    + "; ".join(resolved.readiness.flight_errors)
+                )
+            profile_arg = str(
+                resolved.materialize_legacy_site_profile(
+                    _WS.runtime / "mission_snapshots"
+                )
+            )
+        except (ManifestError, OSError, ValueError) as exc:
+            parser.error(str(exc))
     cli_overrides = [
         flag
         for flag, value in (
@@ -532,6 +581,11 @@ def env_with_mission(args, profile: SiteProfile | None = None) -> dict[str, str]
             env.pop("SFM_FLIGHT_CONTRACT_JSON", None)
     else:
         env.pop("SFM_MAP_ALIGN", None)
+    mission_selection = str(getattr(args, "mission_selection", "") or "").strip()
+    if mission_selection:
+        env["SFM_MISSION_SELECTION"] = str(Path(mission_selection).resolve())
+    else:
+        env.pop("SFM_MISSION_SELECTION", None)
     return env
 
 
@@ -636,22 +690,10 @@ def _run_mission_mode(args, passthrough, env) -> None:
             env,
         )
     elif args.mode == "fly":
-        run(
-            [
-                args.python,
-                str(flight_script),
-                "--fly",
-                "--ip",
-                args.ip,
-                "--controller",
-                args.controller,
-                "--safety-file",
-                args.safety_file,
-                "--yaw-sign",
-                str(args.yaw_sign),
-                *passthrough,
-            ],
-            env,
+        raise SystemExit(
+            "[mission_pipeline] --mode fly is rejected: live TakeOff is only "
+            "allowed from the operator UI (控制介面程式/真機串流/啟動.sh). "
+            "Use --mode grab-only or --mode dry-run."
         )
 
 
@@ -661,6 +703,14 @@ def main() -> None:
         "--site-profile",
         default=os.environ.get("SFM_SITE_PROFILE", ""),
         help="JSON profile that atomically selects this site's map and mission assets",
+    )
+    parser.add_argument(
+        "--mission-selection",
+        default=os.environ.get("SFM_MISSION_SELECTION", ""),
+        help=(
+            "sfm-mission-selection/v1 manifest that independently selects vehicle, "
+            "site, map, localizer, route, calibrations and approval"
+        ),
     )
     parser.add_argument(
         "--allow-legacy-assets",
@@ -710,6 +760,13 @@ def main() -> None:
     parser.add_argument("--secs", type=float, default=20.0)
     parser.add_argument("--yaw-sign", type=int, choices=(-1, 1), default=1)
     args, passthrough = parser.parse_known_args()
+    if args.mode == "fly":
+        raise SystemExit(
+            "[mission_pipeline] --mode fly is rejected: live TakeOff is only "
+            "allowed from the operator UI (控制介面程式/真機串流/啟動.sh). "
+            "Use --mode grab-only or --mode dry-run."
+        )
+
 
     # Emergency safety commands must remain available even when map/profile
     # assets are missing or misconfigured.

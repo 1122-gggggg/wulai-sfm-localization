@@ -18,6 +18,7 @@ from flight_operator_app import (
     OperatorApp,
     PREFLIGHT_GUIDE_STEPS,
     SequentialPreflightGuide,
+    VIRTUAL_STICK_KEY_MAP,
     _positive_env_float,
     _positive_env_int,
     format_magnetometer_calibration,
@@ -58,6 +59,47 @@ def _bare_app(backend=None):
     return app
 
 
+class _CollisionBackend:
+    is_live = False
+
+    def __init__(self):
+        self.state = SimpleNamespace(
+            pose=np.zeros(4, dtype=float),
+            tracker_state="CRUISE",
+            last_command="",
+        )
+        self.calls = []
+
+    def nudge_clear(self, *, reason):
+        self.calls.append(("nudge_clear", reason))
+
+    def send_pcmd(self, *pcmd, reason):
+        self.calls.append(("send_pcmd", pcmd, reason))
+        return True
+
+
+def _collision_guard_app() -> OperatorApp:
+    operator = _bare_app(_CollisionBackend())
+    operator.map_radius = 10.0
+    operator.default_map_center = np.zeros(3, dtype=float)
+    operator.collision_guard_enabled = True
+    operator.collision_guard_radius = None
+    operator._collision_interlock_latched = False
+    operator._collision_guard_monitor = None
+    operator.collision_guard_snapshot = {}
+    operator.inspecting = False
+    operator.current_state = operator.backend.state
+    operator._is_live_backend = lambda: False
+    operator._pause_integrated_auto = lambda _reason: False
+    operator.session_logs = None
+    operator._configure_sparse_cloud_collision_guard(
+        np.array([[0.0, 0.0, 0.0]], dtype=float)
+    )
+    if operator._collision_guard_monitor.tree is None:
+        pytest.skip("scipy cKDTree is unavailable")
+    return operator
+
+
 class _RouteLock:
     def __init__(self, *, digest="a" * 64, fail=None):
         self.active = False
@@ -89,7 +131,7 @@ def _complete_preflight(operator) -> None:
         operator.preflight_guide.confirm_current((step, "confirmed"))
 
 
-def _make_autonomy_runtime_ready(operator) -> None:
+def _make_autonomy_runtime_ready(operator, monkeypatch=None) -> None:
     operator._autonomy_profile_verified = True
     operator.localizer = SimpleNamespace(
         ready=True, request_relocalize=lambda: None
@@ -101,7 +143,193 @@ def _make_autonomy_runtime_ready(operator) -> None:
     operator._zoom_localization_paused = False
     operator.live_locked = True
     operator.live_pose = np.zeros(4, dtype=float)
+    operator.camera_forward_world = np.array([1.0, 0.0, 0.0])
     operator.loc_pose_updated_mono = time.monotonic()
+    operator._autonomy_map_frame = app.LEGACY_MAP_FRAME
+    if monkeypatch is not None:
+        monkeypatch.setattr(app, "validate_profile_flight_assets", lambda _profile: None)
+        monkeypatch.setattr(
+            app, "resolve_site_map_frame", lambda _profile: app.LEGACY_MAP_FRAME
+        )
+
+
+def test_keyboard_keys_match_the_two_virtual_sticks() -> None:
+    assert VIRTUAL_STICK_KEY_MAP == {
+        "a": "左旋",
+        "d": "右旋",
+        "w": "上",
+        "s": "下",
+        "j": "左",
+        "l": "右",
+        "i": "前",
+        "k": "後",
+    }
+
+
+def test_sparse_cloud_center_camera_is_preview_only() -> None:
+    operator = _collision_guard_app()
+
+    operator.update_sparse_cloud_collision_interlock(operator.backend.state)
+
+    assert operator.collision_guard_snapshot["status"] == "PREVIEW_HIT"
+    assert operator.collision_guard_snapshot["preview"] is True
+    assert operator.collision_guard_snapshot["center"] == pytest.approx(
+        operator.default_map_center
+    )
+    assert operator._collision_interlock_latched is False
+    assert operator.backend.calls == []
+
+
+def test_sparse_cloud_hit_clears_motion_hovers_once_and_requires_clearance() -> None:
+    operator = _collision_guard_app()
+    operator.inspecting = True
+    operator.live_locked = True
+    operator.loc_health = "OK"
+    operator.live_pose = np.array([0.02, 0.0, 0.0], dtype=float)
+    operator.loc_pose_updated_mono = time.monotonic()
+    pauses = []
+    incidents = []
+    operator._pause_integrated_auto = lambda reason: pauses.append(reason) or True
+    operator.session_logs = SimpleNamespace(
+        incident=lambda event, **fields: incidents.append((event, fields))
+    )
+
+    operator.update_sparse_cloud_collision_interlock(operator.backend.state)
+    operator.update_sparse_cloud_collision_interlock(operator.backend.state)
+
+    assert operator.collision_guard_snapshot["status"] == "COLLISION"
+    assert operator._collision_interlock_latched is True
+    assert pauses == ["sparse_cloud_collision"]
+    assert operator.backend.calls == [
+        ("nudge_clear", "sparse_cloud_collision"),
+        (
+            "send_pcmd",
+            (0, 0, 0, 0),
+            "sparse_cloud_collision_hover",
+        ),
+    ]
+    assert operator.backend.state.tracker_state == "HOVER"
+    assert operator._collision_motion_blocked("test motion") is True
+    assert incidents[0][0] == "sparse_cloud_collision_hover"
+    assert incidents[0][1]["resolved"] is False
+    calls_at_latch = list(operator.backend.calls)
+    operator._on_nudge_btn_press("前")
+    assert operator.backend.calls == calls_at_latch
+    assert operator._nudge_buttons_held == set()
+
+    operator.inspecting = False
+    operator.update_sparse_cloud_collision_interlock(operator.backend.state)
+    assert operator.collision_guard_snapshot["status"] == "PREVIEW_HIT"
+    assert operator._collision_interlock_latched is True
+
+    operator.inspecting = True
+    operator.live_pose = np.array([2.0, 0.0, 0.0], dtype=float)
+    operator.loc_pose_updated_mono = time.monotonic()
+    operator.update_sparse_cloud_collision_interlock(operator.backend.state)
+    assert operator.collision_guard_snapshot["status"] == "CLEAR"
+    assert operator._collision_interlock_latched is False
+    assert incidents[-1][1]["resolved"] is True
+
+
+def test_sparse_cloud_inspect_without_lock_does_not_latch() -> None:
+    operator = _collision_guard_app()
+    operator.inspecting = True
+    operator.live_locked = False
+    operator.loc_health = "FAIL"
+    operator.backend.state.pose = np.array([0.0, 0.0, 0.0, 0.0])
+
+    operator.update_sparse_cloud_collision_interlock(operator.backend.state)
+
+    assert operator.collision_guard_snapshot["status"] == "WAITING"
+    assert operator._collision_interlock_latched is False
+    assert operator.backend.calls == []
+
+
+def test_sparse_cloud_radius_change_controls_the_collision_boundary() -> None:
+    operator = _collision_guard_app()
+    operator.inspecting = True
+    operator.live_locked = True
+    operator.loc_health = "OK"
+    operator.live_pose = np.array([0.04, 0.0, 0.0], dtype=float)
+    operator.loc_pose_updated_mono = time.monotonic()
+    operator.collision_guard_radius = 0.025
+
+    operator.update_sparse_cloud_collision_interlock(operator.backend.state)
+    assert operator.collision_guard_snapshot["status"] == "CLEAR"
+
+    operator.collision_guard_radius = 0.05
+    operator.update_sparse_cloud_collision_interlock(operator.backend.state)
+    assert operator.collision_guard_snapshot["status"] == "COLLISION"
+
+
+def test_sparse_cloud_collision_still_hovers_when_auto_pause_raises() -> None:
+    operator = _collision_guard_app()
+    operator.inspecting = True
+    operator.live_locked = True
+    operator.loc_health = "OK"
+    operator.live_pose = np.array([0.01, 0.0, 0.0], dtype=float)
+    operator.loc_pose_updated_mono = time.monotonic()
+
+    def fail_pause(_reason):
+        raise RuntimeError("coordinator failed")
+
+    operator._pause_integrated_auto = fail_pause
+    operator.update_sparse_cloud_collision_interlock(operator.backend.state)
+
+    assert operator._collision_interlock_latched is True
+    assert operator.backend.calls[-1] == (
+        "send_pcmd",
+        (0, 0, 0, 0),
+        "sparse_cloud_collision_hover",
+    )
+
+
+def test_keyboard_indicator_moves_without_emitting_a_stick_command() -> None:
+    stick = app.VirtualStick.__new__(app.VirtualStick)
+    stick._x = 0.0
+    stick._y = 0.0
+    stick._draw = lambda: None
+    stick._on_change = lambda *_args: pytest.fail(
+        "keyboard visualization must not emit nudge_vector"
+    )
+
+    stick.show_keyboard(-1.0, 1.0)
+
+    assert stick.value == (0.0, 0.0)
+    assert (stick._keyboard_x, stick._keyboard_y) == (-1.0, 1.0)
+
+
+def test_keyboard_press_and_release_update_the_matching_stick_visual() -> None:
+    class Stick:
+        def __init__(self):
+            self.keyboard = None
+
+        def show_keyboard(self, x, y):
+            self.keyboard = (x, y)
+
+    operator = _bare_app()
+    operator.stick_left = Stick()
+    operator.stick_right = Stick()
+    event = SimpleNamespace(
+        widget=SimpleNamespace(winfo_class=lambda: "TFrame")
+    )
+
+    operator._on_nudge_key_press("w", "上", event)
+    operator._on_nudge_key_press("a", "左旋", event)
+
+    assert operator.stick_left.keyboard == (-1.0, 1.0)
+    assert operator.stick_right.keyboard == (0.0, 0.0)
+
+    operator._on_nudge_key_release("w", "上", event)
+    operator._on_nudge_key_release("a", "左旋", event)
+
+    assert operator.stick_left.keyboard == (0.0, 0.0)
+    assert operator.backend.calls == [
+        ("nudge_begin", {"dir": "上"}),
+        ("nudge_begin", {"dir": "左旋"}),
+        ("nudge_end", {"dir": "上"}),
+        ("nudge_end", {"dir": "左旋"}),
+    ]
 
 
 def test_preflight_guide_is_sequential_and_invalidates_downstream() -> None:
@@ -149,7 +377,138 @@ def test_takeoff_button_path_refuses_until_human_preflight_is_complete() -> None
     assert operator.sent == ["takeoff"]
 
 
-def test_preflight_system_step_requires_fresh_stream_and_telemetry() -> None:
+def test_completing_four_step_preflight_enables_auto_button() -> None:
+    class Var:
+        def __init__(self):
+            self.value = ""
+
+        def set(self, value):
+            self.value = value
+
+    class Widget:
+        def __init__(self):
+            self.states = []
+
+        def state(self, values):
+            self.states.append(tuple(values))
+
+    operator = OperatorApp.__new__(OperatorApp)
+    operator.preflight_guide = SequentialPreflightGuide()
+    operator.preflight_guide_var = Var()
+    operator.preflight_confirm_button = Widget()
+    operator.takeoff_button = Widget()
+    operator.start_auto_button = Widget()
+    operator._preflight_auto_collapsed = False
+    operator._is_live_backend = lambda: False
+    operator._preflight_step_evidence = lambda step, *_args, **_kwargs: (
+        (step, "confirmed"),
+        "ready",
+    )
+    operator._update_preflight_cards = lambda _state: None
+    operator._update_flight_action_guidance = lambda _state: None
+    operator._set_preflight_visible = lambda _visible: None
+    operator._select_flight_tab = lambda: None
+
+    for step in PREFLIGHT_GUIDE_STEPS[:-1]:
+        operator.preflight_guide.confirm_current((step, "confirmed"))
+    state = SimpleNamespace(flight_state="landed")
+    operator._update_preflight_guide(state)
+    assert operator.start_auto_button.states[-1] == ("disabled",)
+
+    final_step = PREFLIGHT_GUIDE_STEPS[-1]
+    operator.preflight_guide.confirm_current((final_step, "confirmed"))
+    operator._update_preflight_guide(state)
+
+    assert operator.start_auto_button.states[-1] == ("!disabled",)
+    assert "「自動飛行」" in operator.preflight_guide_var.value
+
+
+def test_valid_firmware_compass_readback_is_auto_confirmed() -> None:
+    class Var:
+        def set(self, _value):
+            pass
+
+    class Widget:
+        def state(self, _values):
+            pass
+
+    operator = OperatorApp.__new__(OperatorApp)
+    operator.preflight_guide = SequentialPreflightGuide()
+    operator.preflight_guide_var = Var()
+    operator.preflight_confirm_button = Widget()
+    operator.takeoff_button = Widget()
+    operator.start_auto_button = Widget()
+    operator._preflight_auto_collapsed = False
+    operator._is_live_backend = lambda: True
+    operator._preflight_step_evidence = lambda step, *_args, **_kwargs: (
+        (("compass", 0), "校正有效")
+        if step == "compass"
+        else (None, "等待人工確認")
+    )
+    operator._update_preflight_cards = lambda _state: None
+    operator._update_flight_action_guidance = lambda _state: None
+    operator._select_preflight_tab = lambda step: operator.tabs.append(step)
+    operator._set_preflight_visible = lambda _visible: None
+    operator._set_preflight_expanded = lambda _expanded: None
+    operator.logs = []
+    operator.tabs = []
+    operator.write_log = operator.logs.append
+    state = DroneState(
+        flight_state="landed",
+        drone_magnetometer_required=0,
+        drone_magnetometer_started=False,
+        drone_magnetometer_failed=False,
+    )
+
+    operator._update_preflight_guide(state)
+
+    assert operator.preflight_guide.confirmed_steps == ("compass",)
+    assert operator.preflight_guide.current_step == "map"
+    assert operator.tabs == ["map"]
+    assert any("韌體有效回讀自動確認" in message for message in operator.logs)
+
+
+@pytest.mark.parametrize(
+    ("required", "started", "failed"),
+    [
+        (2, False, False),
+        (0, True, False),
+        (0, False, True),
+        (None, False, False),
+    ],
+    ids=["recommended", "in-progress", "failed", "unknown"],
+)
+def test_invalid_compass_state_is_not_auto_confirmed(
+    required: int | None,
+    started: bool,
+    failed: bool,
+) -> None:
+    operator = OperatorApp.__new__(OperatorApp)
+    operator.preflight_guide = SequentialPreflightGuide()
+    operator._preflight_step_evidence = lambda *_args, **_kwargs: (
+        ("compass", required),
+        "羅盤狀態尚未有效",
+    )
+    operator.write_log = lambda _message: None
+    operator._select_preflight_tab = lambda _step: None
+    state = DroneState(
+        flight_state="landed",
+        drone_magnetometer_required=required,
+        drone_magnetometer_started=started,
+        drone_magnetometer_failed=failed,
+    )
+
+    assert operator._auto_confirm_valid_compass_preflight(state, live=True) is False
+    assert operator.preflight_guide.current_step == "compass"
+
+
+@pytest.mark.parametrize(
+    "stream_state",
+    ["PREVIEW", "OK", "LOCALIZING", "HOLD_720P"],
+)
+def test_preflight_system_step_requires_fresh_stream_and_telemetry(
+    stream_state: str,
+) -> None:
     now = time.monotonic()
     operator = OperatorApp.__new__(OperatorApp)
     operator.backend = SimpleNamespace(
@@ -164,7 +523,7 @@ def test_preflight_system_step_requires_fresh_stream_and_telemetry() -> None:
     operator.video_stream = SimpleNamespace(last_stamp=now)
     operator._video_frame_stamp = now
     state = DroneState(
-        stream="PREVIEW",
+        stream=stream_state,
         link_ok=True,
         link_status="OK",
         flight_state="landed",
@@ -180,7 +539,16 @@ def test_preflight_system_step_requires_fresh_stream_and_telemetry() -> None:
     evidence, reason = operator._preflight_step_evidence(
         "system", state, now=now
     )
-    assert evidence is not None, reason
+    assert evidence == ("system", "live"), reason
+
+    for advisory_battery in (1.0, float("nan")):
+        state.battery_pct = advisory_battery
+        evidence, reason = operator._preflight_step_evidence(
+            "system", state, now=now
+        )
+        assert evidence is not None, reason
+        assert "電量" in reason and "不阻擋起飛" in reason
+    state.battery_pct = 80.0
 
     state.gps_fixed = False
     state.max_altitude_m = None
@@ -193,12 +561,50 @@ def test_preflight_system_step_requires_fresh_stream_and_telemetry() -> None:
     assert evidence is not None, reason
     assert "不阻擋起飛" in reason
 
+    for unavailable_stream in ("WAIT", "LOST", "LOST_HOLD"):
+        state.stream = unavailable_stream
+        evidence, reason = operator._preflight_step_evidence(
+            "system", state, now=now
+        )
+        assert evidence is None
+        assert "串流狀態" in reason
+    state.stream = stream_state
+
     state.telemetry_read_mono_ns = int((now - 3.0) * 1_000_000_000)
     evidence, reason = operator._preflight_step_evidence(
         "system", state, now=now
     )
     assert evidence is None
     assert "遙測" in reason
+
+
+def test_preflight_system_step_does_not_block_on_airborne_state_or_alerts() -> None:
+    now = time.monotonic()
+    operator = OperatorApp.__new__(OperatorApp)
+    operator.backend = SimpleNamespace(
+        is_live=True,
+        min_takeoff_battery_pct=15.0,
+        via_skycontroller=lambda: False,
+        log=SimpleNamespace(durable=True, healthy=True),
+    )
+    operator.video_frame = object()
+    operator.video_stream = SimpleNamespace(last_stamp=now)
+    operator._video_frame_stamp = now
+    state = DroneState(
+        stream="PREVIEW",
+        link_ok=True,
+        flight_state="hovering",
+        active_incident="operator_acknowledged",
+        alert_state="critical",
+        battery_pct=80.0,
+        telemetry_read_mono_ns=int(now * 1_000_000_000),
+    )
+
+    evidence, reason = operator._preflight_step_evidence(
+        "system", state, now=now
+    )
+
+    assert evidence is not None, reason
 
 
 @pytest.mark.parametrize("gps_fixed", [False, None], ids=["no-fix", "unknown"])
@@ -253,7 +659,7 @@ def test_manual_takeoff_does_not_require_gps_fix(gps_fixed) -> None:
     assert operator.sent == ["takeoff"]
 
 
-def test_preflight_route_step_requires_visible_hash_verified_route(tmp_path) -> None:
+def test_preflight_route_step_requires_hash_verified_route(tmp_path) -> None:
     route = tmp_path / "route.json"
     route.write_text("{}", encoding="utf-8")
     verified = []
@@ -270,7 +676,6 @@ def test_preflight_route_step_requires_visible_hash_verified_route(tmp_path) -> 
     operator.mission_route_lock = SimpleNamespace(snapshot=snapshot)
     operator._displayed_route_sha256 = snapshot.sha256
     operator.route_pts = list(snapshot.waypoints)
-    operator.route_visible = True
 
     evidence, reason = operator._preflight_step_evidence(
         "route", DroneState(), verify_route_hash=True
@@ -278,11 +683,6 @@ def test_preflight_route_step_requires_visible_hash_verified_route(tmp_path) -> 
 
     assert evidence is not None, reason
     assert verified == [True]
-
-    operator.route_visible = False
-    evidence, reason = operator._preflight_step_evidence("route", DroneState())
-    assert evidence is None
-    assert "顯示規劃路徑" in reason
 
 
 def test_display_only_import_can_be_confirmed_without_becoming_auto_candidate(
@@ -307,7 +707,6 @@ def test_display_only_import_can_be_confirmed_without_becoming_auto_candidate(
     operator.mission_route_lock = SimpleNamespace(active=False, snapshot=None)
     operator.site_profile_path = tmp_path / "profile.json"
     operator._active_site_map_frame = lambda: None
-    operator.show_route_var = SimpleNamespace(set=lambda _value: None)
     operator.redraw_map_only = lambda: None
     monkeypatch.setattr(
         app,
@@ -330,6 +729,72 @@ def test_display_only_import_can_be_confirmed_without_becoming_auto_candidate(
 
     assert evidence is not None, reason
     assert operator.mission_route_lock.snapshot is None
+
+
+def test_approved_editor_import_refreshes_and_binds_the_active_auto_route(
+    tmp_path,
+) -> None:
+    profile_path = tmp_path / "site_profile.json"
+    route_path = tmp_path / "flight_route.json"
+    calls = []
+    operator = OperatorApp.__new__(OperatorApp)
+    operator.site_profile_path = profile_path
+    operator._sync_autonomy_profile_approval = lambda: calls.append("sync")
+    operator._show_route_overlay = lambda path, *, bind_for_auto: calls.append(
+        (Path(path), bind_for_auto)
+    )
+    operator.write_log = lambda message: calls.append(("log", message))
+
+    operator.apply_route_import_preview(
+        SimpleNamespace(
+            asset_path=route_path,
+            profile_path=profile_path,
+            approved_for_auto=True,
+        )
+    )
+
+    assert calls[:2] == ["sync", (route_path, True)]
+
+
+def test_approved_editor_import_switches_to_the_updated_managed_profile(
+    tmp_path, monkeypatch
+) -> None:
+    active_profile = tmp_path / "system-profile.json"
+    managed_profile = tmp_path / "managed" / "site_profile.json"
+    route_path = managed_profile.parent / "routes" / "flight_route.json"
+    calls = []
+    scheduled = []
+    operator = OperatorApp.__new__(OperatorApp)
+    operator.site_profile_path = active_profile
+    operator._show_route_overlay = lambda path, *, bind_for_auto: calls.append(
+        ("show", Path(path), bind_for_auto)
+    )
+    operator.request_site_profile_restart = lambda path: calls.append(
+        ("apply", Path(path))
+    )
+    operator.after_idle = scheduled.append
+    operator.write_log = lambda message: calls.append(("log", message))
+    operator.site_assets_panel = SimpleNamespace(
+        set_status=lambda message: calls.append(("status", message))
+    )
+    monkeypatch.setattr(
+        app,
+        "site_pack_root_for_profile",
+        lambda _profile, _root: tmp_path / "managed",
+    )
+
+    operator.apply_route_import_preview(
+        SimpleNamespace(
+            asset_path=route_path,
+            profile_path=managed_profile,
+            approved_for_auto=True,
+        )
+    )
+
+    assert calls[0] == ("show", route_path, False)
+    assert len(scheduled) == 1
+    scheduled[0]()
+    assert ("apply", managed_profile) in calls
 
 
 def test_confirming_route_step_binds_the_displayed_snapshot_for_auto() -> None:
@@ -422,7 +887,6 @@ def test_route_selection_is_logged_before_the_snapshot_is_bound(
     operator.session_logs = SessionLogs()
     operator.site_profile_path = tmp_path / "profile.json"
     operator._active_site_map_frame = lambda: None
-    operator.show_route_var = SimpleNamespace(set=lambda _value: None)
     operator.redraw_map_only = lambda: None
     monkeypatch.setattr(
         app,
@@ -741,7 +1205,7 @@ def test_integrated_auto_does_not_create_coordinator_when_runtime_approval_is_in
         autonomous_approval_valid=autonomous_approval_valid,
     )
     operator.inspecting = True
-    _make_autonomy_runtime_ready(operator)
+    _make_autonomy_runtime_ready(operator, monkeypatch)
     _complete_preflight(operator)
     operator.mission_route_lock = _RouteLock()
     operator._displayed_route_sha256 = "a" * 64
@@ -771,7 +1235,8 @@ def test_integrated_auto_starts_without_a_separate_live_release_flag(
         phase = "IDLE"
         boot_timeout_s = 1.0
 
-        def __init__(self, **_kwargs):
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
             created.append(self)
 
         def start(self):
@@ -779,10 +1244,12 @@ def test_integrated_auto_starts_without_a_separate_live_release_flag(
 
     profile = SimpleNamespace(
         site_id="field-a",
+        pose_chain=SimpleNamespace(site_frame_id="field-a-enu"),
         flight=SimpleNamespace(
             approved=True,
             route_clearance_approved=True,
             coordinate_frame_id="glomap-a",
+            controller=SimpleNamespace(max_route_deviation_map_units=0.9),
         ),
     )
     operator = _bare_app()
@@ -790,9 +1257,10 @@ def test_integrated_auto_starts_without_a_separate_live_release_flag(
     operator.backend.state = SimpleNamespace(
         autonomous_locked=False,
         autonomous_approval_valid=True,
+        flight_state="landed",
     )
     operator.inspecting = True
-    _make_autonomy_runtime_ready(operator)
+    _make_autonomy_runtime_ready(operator, monkeypatch)
     _complete_preflight(operator)
     operator.mission_route_lock = _RouteLock()
     operator._displayed_route_sha256 = "a" * 64
@@ -811,11 +1279,64 @@ def test_integrated_auto_starts_without_a_separate_live_release_flag(
 
     assert len(created) == 1
     assert operator.__dict__.get("_integrated_autonomy") is created[0]
+    assert created[0].kwargs["max_route_deviation_map_units"] == pytest.approx(0.9)
     assert operator.mission_route_lock.active
     assert not any("發布阻擋" in message for message in operator.logs)
 
 
-def test_integrated_auto_takeoff_event_requires_literal_true() -> None:
+def test_integrated_auto_while_airborne_selects_pc_handoff(tmp_path, monkeypatch) -> None:
+    created = []
+
+    class Coordinator:
+        phase = "IDLE"
+        boot_timeout_s = 1.0
+
+        def __init__(self, **kwargs):
+            created.append(kwargs)
+
+        def start(self):
+            return True
+
+    profile = SimpleNamespace(
+        site_id="field-a",
+        pose_chain=SimpleNamespace(site_frame_id="field-a-enu"),
+        flight=SimpleNamespace(
+            approved=True,
+            route_clearance_approved=True,
+            coordinate_frame_id="glomap-a",
+        ),
+    )
+    operator = _bare_app()
+    operator.backend.is_live = True
+    operator.backend.state = SimpleNamespace(
+        autonomous_locked=False,
+        autonomous_approval_valid=True,
+        flight_state="hovering",
+    )
+    operator.backend.pilot_sticks = True
+    operator.inspecting = True
+    _make_autonomy_runtime_ready(operator, monkeypatch)
+    _complete_preflight(operator)
+    operator.mission_route_lock = _RouteLock()
+    operator._displayed_route_sha256 = "a" * 64
+    operator.site_profile_path = tmp_path / "profile.json"
+    operator._active_site_map_frame = lambda: object()
+    operator._reset_virtual_sticks = lambda: None
+    monkeypatch.setattr(app, "DesktopRouteAutonomy", Coordinator)
+    monkeypatch.setattr(app, "load_site_profile", lambda _path: profile)
+    monkeypatch.setattr(
+        app, "flight_readiness_errors", lambda _profile: [], raising=False
+    )
+
+    operator.send("start_auto")
+
+    assert len(created) == 1
+    assert created[0]["start_airborne"] is True
+    assert callable(created[0]["take_pc_control"])
+
+
+@pytest.mark.parametrize("command", ["takeoff", "pc_control"])
+def test_integrated_auto_start_event_requires_literal_true(command) -> None:
     operator = OperatorApp.__new__(OperatorApp)
     operator._pending_auto_route_activation = True
     operator.cancelled_activation = False
@@ -830,11 +1351,100 @@ def test_integrated_auto_takeoff_event_requires_literal_true() -> None:
 
     OperatorApp._finish_integrated_auto_command_event(
         operator,
-        SimpleNamespace(command="takeoff", result=None, error=None),
+        SimpleNamespace(command=command, result=None, error=None),
     )
 
     assert not operator.confirmed_activation
     assert operator.cancelled_activation
+
+
+def test_integrated_auto_failed_event_is_visible_and_keeps_coordinator_for_shutdown(
+) -> None:
+    logs = []
+    incidents = []
+    coordinator = SimpleNamespace(phase="AUTO_FAILED")
+    operator = OperatorApp.__new__(OperatorApp)
+    operator._integrated_autonomy = coordinator
+    operator._pending_auto_route_activation = False
+    operator.session_logs = SimpleNamespace(
+        incident=lambda event, **fields: incidents.append((event, fields))
+    )
+    operator.write_log = logs.append
+    operator._set_auto_paused = lambda _paused: None
+
+    OperatorApp._log_integrated_auto_failed(
+        operator,
+        SimpleNamespace(detail="AUTO worker stalled", error="heartbeat timeout"),
+    )
+
+    assert operator._integrated_autonomy is coordinator
+    assert logs == [
+        "AUTO 失敗並已鎖定懸停：AUTO worker stalled；"
+        "請使用「停止電腦動作」或「原地降落」，確認安全後重新啟動介面"
+    ]
+    assert incidents == [
+        (
+            "auto_failed",
+            {
+                "detail": "AUTO worker stalled",
+                "error": "heartbeat timeout",
+                "resolved": False,
+            },
+        )
+    ]
+def test_integrated_auto_pc_handoff_event_activates_route() -> None:
+    operator = OperatorApp.__new__(OperatorApp)
+    operator._pending_auto_route_activation = True
+    operator.cancelled_activation = False
+    operator.confirmed_activation = False
+    operator._cancel_pending_auto_route_activation = (
+        lambda: setattr(operator, "cancelled_activation", True)
+    )
+    operator.mission_route_lock = SimpleNamespace(
+        confirm_auto_started=lambda: setattr(operator, "confirmed_activation", True)
+    )
+    operator._finish_backend_command = lambda *_args: None
+
+    OperatorApp._finish_integrated_auto_command_event(
+        operator,
+        SimpleNamespace(command="pc_control", result=True, error=None),
+    )
+
+    assert operator.confirmed_activation
+    assert not operator.cancelled_activation
+    assert operator._pending_auto_route_activation is False
+
+
+def test_integrated_auto_waiting_for_localization_logs_continued_hover() -> None:
+    operator = OperatorApp.__new__(OperatorApp)
+    messages = []
+    operator.write_log = messages.append
+
+    OperatorApp._log_integrated_auto_boot_hover_waiting(
+        operator,
+        SimpleNamespace(detail="stable localization unavailable after 25.0s"),
+    )
+
+    assert len(messages) == 1
+    assert "持續原地懸停" in messages[0]
+    assert "不會自動降落" in messages[0]
+
+
+def test_integrated_auto_pose_jump_enables_explicit_continue_button() -> None:
+    operator = OperatorApp.__new__(OperatorApp)
+    messages = []
+    paused = []
+    operator.write_log = messages.append
+    operator._set_auto_paused = paused.append
+
+    OperatorApp._log_integrated_auto_pose_jump_paused(
+        operator,
+        SimpleNamespace(detail="定位位置單次跳變 2.75 map units"),
+    )
+
+    assert paused == [True]
+    assert "鎖定懸停" in messages[0]
+    assert "繼續自動飛行" in messages[0]
 
 
 def test_profile_verification_sets_only_the_runtime_approval_state() -> None:
@@ -901,6 +1511,7 @@ def test_integrated_auto_takeoff_allows_missing_gps_when_geofence_is_off(
 
     profile = SimpleNamespace(
         site_id="field-a",
+        pose_chain=SimpleNamespace(site_frame_id="field-a-enu"),
         flight=SimpleNamespace(
             approved=True,
             route_clearance_approved=True,
@@ -920,7 +1531,7 @@ def test_integrated_auto_takeoff_allows_missing_gps_when_geofence_is_off(
         link_ok=True,
     )
     operator.inspecting = True
-    _make_autonomy_runtime_ready(operator)
+    _make_autonomy_runtime_ready(operator, monkeypatch)
     _complete_preflight(operator)
     operator.mission_route_lock = _RouteLock()
     operator._displayed_route_sha256 = "a" * 64
@@ -1002,7 +1613,11 @@ def test_write_log_remains_available_without_a_ui_log_widget(capsys) -> None:
 def test_ui_exposes_integrated_autonomy_and_separate_localization() -> None:
     source = inspect.getsource(OperatorApp._build_ui)
     assert 'text="開始定位"' in source
-    assert "command=self.begin_auto_inspect" in source
+    assert "command=self.toggle_localization" in source
+    assert any(
+        button.command == "emergency_stop" and button.label == "停止電腦動作"
+        for button in app.FLIGHT_MODE_BUTTONS
+    )
     assert any(
         button.command == "start_auto" and button.label == "自動飛行"
         for button in app.MISSION_MODE_BUTTONS
@@ -1010,11 +1625,14 @@ def test_ui_exposes_integrated_autonomy_and_separate_localization() -> None:
     assert 'text="自主巡檢未接入此介面"' not in source
 
 
-def test_ui_does_not_claim_an_unconditional_physical_speed_limit() -> None:
+def test_flight_tab_exposes_truthful_autonomous_speed_guard() -> None:
     source = inspect.getsource(OperatorApp._build_ui)
 
-    assert "新鮮速度時強制" in source
-    assert "無速度讀回僅套用 PCMD command cap" in source
+    assert "autonomous_speed_limit_input_var" in source
+    assert "套用速度限制" in source
+    assert "新鮮遙測達上限即送零 PCMD" in source
+    assert "地速缺失或過期時禁止水平 AUTO" in source
+    assert "非硬上限" in source
 
 
 def test_operator_ui_cannot_force_megaloc_outside_boot_or_lost() -> None:
@@ -1048,6 +1666,45 @@ def test_ui_has_textual_sim_real_identity_without_separate_auto_stop() -> None:
     real = video_hud_identity(True, "MANUAL")
     assert "SIMULATED" in simulated and "REAL" in real
     assert simulated != real
+
+
+def test_auto_localization_timeout_guidance_keeps_zero_pcmd_hover_policy() -> None:
+    class Var:
+        def __init__(self):
+            self.value = ""
+
+        def set(self, value):
+            self.value = value
+
+    operator = OperatorApp.__new__(OperatorApp)
+    operator.preflight_guide = SimpleNamespace(
+        complete=False,
+        current_step="system",
+    )
+    operator._preflight_step_evidence = lambda *_args: (None, "等待新鮮定位")
+    operator._auto_paused = False
+    operator.flight_action_hint_var = Var()
+    operator.flight_action_hint = SimpleNamespace(configure=lambda **_kwargs: None)
+
+    OperatorApp._update_flight_action_guidance(
+        operator,
+        SimpleNamespace(flight_state="landed", gps_fixed=False),
+    )
+
+    assert "零 PCMD" in operator.flight_action_hint_var.value
+    assert "定位恢復" in operator.flight_action_hint_var.value
+    assert "人工接管" in operator.flight_action_hint_var.value
+    assert "降落" in operator.flight_action_hint_var.value
+    assert "不會自動降落" in operator.flight_action_hint_var.value
+    assert "逾時原地降落" not in operator.flight_action_hint_var.value
+
+
+def test_stop_computer_action_dispatches_existing_emergency_stop_command() -> None:
+    operator = _bare_app()
+
+    operator.send("emergency_stop")
+
+    assert operator.backend.calls == [("emergency_stop", {})]
 
 
 def test_gps_header_is_advisory_and_invalid_values_are_hidden() -> None:
@@ -1243,6 +1900,14 @@ def test_focus_loss_clears_all_holds_and_backend_nudges():
     assert app.backend.calls == [("nudge_clear", {"reason": "ui_focus_lost"})]
 
 
+def test_focus_change_without_active_input_sends_no_flight_command():
+    app = _bare_app()
+
+    app._on_input_focus_lost()
+
+    assert app.backend.calls == []
+
+
 @pytest.mark.parametrize(
     "widget_class",
     [
@@ -1392,7 +2057,7 @@ def test_space_hover_handler_consumes_event_and_flight_buttons_are_focusable():
     assert invoked == [True]
 
 
-def test_tick_poll_failure_fails_safe_and_schedules_next_tick():
+def test_tick_poll_failure_hovers_without_handoff_and_schedules_next_tick():
     class PollFailureBackend:
         state = SimpleNamespace()
 
@@ -1400,10 +2065,13 @@ def test_tick_poll_failure_fails_safe_and_schedules_next_tick():
             raise RuntimeError("telemetry poll failed")
 
     incidents = []
-    fail_safe_reasons = []
+    hover_commands = []
+    cleared = []
+    pauses = []
     scheduled = []
     operator = OperatorApp.__new__(OperatorApp)
     operator.backend = PollFailureBackend()
+    operator.localizer = None
     operator.session_logs = SimpleNamespace(
         incident=lambda event, **fields: incidents.append((event, fields))
     )
@@ -1412,16 +2080,88 @@ def test_tick_poll_failure_fails_safe_and_schedules_next_tick():
     operator._is_live_backend = lambda: False
     operator._stick_vector_active = False
     operator.write_log = lambda _message: None
+    operator._pause_integrated_auto = lambda reason: pauses.append(reason)
     operator.after = lambda delay, callback: scheduled.append((delay, callback))
     operator._tick_period_s = 0.01
     operator._next_tick_deadline = 0.0
-    operator.backend.fail_safe = lambda reason: fail_safe_reasons.append(reason)
+    operator.backend.nudge_clear = lambda *, reason: cleared.append(reason)
+    operator.backend.send_pcmd = (
+        lambda *pcmd, reason: hover_commands.append((pcmd, reason)) or True
+    )
 
     OperatorApp.tick(operator)
 
-    assert fail_safe_reasons == [app.FailureReason.INVALID_TELEMETRY]
+    assert cleared == ["backend_poll_failed"]
+    assert hover_commands == [((0, 0, 0, 0), "backend_poll_failed_hover")]
+    assert pauses == ["backend_poll_failed"]
     assert incidents and incidents[0][0] == "backend_poll_failed"
     assert scheduled and getattr(scheduled[0][1], "__func__", None) is OperatorApp.tick
+
+
+def test_airborne_manual_state_enables_restarting_auto_cruise() -> None:
+    class Widget:
+        def __init__(self):
+            self.states = []
+
+        def state(self, values):
+            self.states.append(tuple(values))
+
+    operator = OperatorApp.__new__(OperatorApp)
+    _complete_preflight(operator)
+    operator._is_live_backend = lambda: True
+    operator._integrated_auto_active = lambda: False
+    operator._auto_paused = False
+    operator.preflight_guide_var = _Var("")
+    operator.preflight_confirm_button = Widget()
+    operator.takeoff_button = Widget()
+    operator.start_auto_button = Widget()
+    operator._update_preflight_cards = lambda _state: None
+    operator._update_flight_action_guidance = lambda _state: None
+
+    operator._update_preflight_guide(
+        SimpleNamespace(flight_state="hovering")
+    )
+
+    assert operator.takeoff_button.states[-1] == ("disabled",)
+    assert operator.start_auto_button.states[-1] == ("!disabled",)
+
+
+def test_airborne_manual_state_cannot_start_auto_with_final_preflight_step_pending(
+) -> None:
+    class Widget:
+        def __init__(self):
+            self.states = []
+
+        def state(self, values):
+            self.states.append(tuple(values))
+
+    operator = OperatorApp.__new__(OperatorApp)
+    operator.preflight_guide = SequentialPreflightGuide()
+    for step in PREFLIGHT_GUIDE_STEPS[:-1]:
+        operator.preflight_guide.confirm_current((step, "confirmed"))
+    operator._is_live_backend = lambda: True
+    operator._integrated_auto_active = lambda: False
+    operator._auto_paused = False
+    operator.preflight_guide_var = _Var("")
+    operator.preflight_confirm_button = Widget()
+    operator.takeoff_button = Widget()
+    operator.start_auto_button = Widget()
+    operator._preflight_step_evidence = lambda *_args, **_kwargs: (
+        ("system", "live"),
+        "ready",
+    )
+    operator._update_preflight_cards = lambda _state: None
+    operator._update_flight_action_guidance = lambda _state: None
+    operator.current_state = SimpleNamespace(flight_state="hovering")
+    operator.backend = SimpleNamespace(state=operator.current_state)
+
+    operator._update_preflight_guide(operator.current_state)
+
+    assert operator.preflight_guide.current_step == "system"
+    assert operator.preflight_confirm_button.states[-1] == ("!disabled",)
+    assert operator.takeoff_button.states[-1] == ("disabled",)
+    assert operator.start_auto_button.states[-1] == ("disabled",)
+    assert operator._preflight_blocks_flight_command("start_auto")
 
 
 def test_diagnostic_write_failure_is_recorded_as_incident():
@@ -1521,11 +2261,12 @@ def test_limit_editor_can_load_current_firmware_readback_without_writing():
 def test_autonomous_speed_editor_validates_then_sends_one_command():
     app = _bare_app()
     app.autonomous_speed_limit_input_var = _Var("0.30")
+    app.autonomous_speed_limit_enabled_var = _Var(False)
 
     assert app.apply_autonomous_speed_limit_from_ui()
     assert app.backend.calls == [(
         "auto_speed_limit_apply",
-        {"speed_limit_mps": 0.3},
+        {"speed_limit_mps": 0.3, "enabled": False},
     )]
 
 
@@ -1665,6 +2406,47 @@ def test_exit_safety_signals_are_declared_and_armed_visibly(monkeypatch, capsys)
     assert cleanup_reasons == [f"signal_{app.signal.SIGTERM}"]
     assert after_calls == []
     assert destroyed == [True]
+
+
+def test_exit_signal_keeps_ui_open_until_landing_is_confirmed_then_retries(
+    monkeypatch,
+) -> None:
+    import flight_operator_app as app
+
+    handlers = {}
+    destroyed = []
+    cleanup_results = iter([False, True])
+    fake_app = SimpleNamespace(
+        backend=SimpleNamespace(
+            log=SimpleNamespace(event=lambda *_args, **_kwargs: None)
+        ),
+        destroy=lambda: destroyed.append(True),
+    )
+    monkeypatch.setattr(
+        app.signal, "signal", lambda sig, handler: handlers.setdefault(sig, handler)
+    )
+    monkeypatch.setattr(app.atexit, "register", lambda _callback: None)
+
+    app._install_live_exit_safety(
+        fake_app,
+        lambda _reason: next(cleanup_results),
+    )
+
+    handlers[app.signal.SIGINT](app.signal.SIGINT, None)
+    assert destroyed == []
+
+    with pytest.raises(SystemExit):
+        handlers[app.signal.SIGINT](app.signal.SIGINT, None)
+    assert destroyed == [True]
+
+
+def test_main_arms_ctrl_c_shutdown_for_simulation_and_live_modes() -> None:
+    import flight_operator_app as app
+
+    source = inspect.getsource(app.main)
+
+    assert "_install_live_exit_safety(app, _emergency_cleanup)" in source
+    assert "if live_backend is not None:" not in source
 
 
 def test_emergency_cleanup_lands_and_survives_a_failing_backend():
@@ -2050,3 +2832,55 @@ def test_startup_asks_about_a_missing_route_for_the_active_site() -> None:
 
     scheduled = inspect.getsource(app.OperatorApp.__init__)
     assert "_check_active_site_route" in scheduled, "nothing schedules the check"
+
+
+def _localization_timing_from_state(*, source_stamp: float, telemetry_ns):
+    operator = OperatorApp.__new__(OperatorApp)
+    operator.video_display_frame_name = "stream_000001"
+    operator.video_frame = object()
+    operator._video_frame_timing = {}
+    operator._frame_rgb_bytes_for_worker = lambda _frame: b"rgb"
+    operator.backend = SimpleNamespace(
+        state=SimpleNamespace(
+            att_roll=0.1,
+            att_pitch=-0.2,
+            att_yaw=1.3,
+            speed_north_mps=0.4,
+            speed_east_mps=-0.1,
+            speed_down_mps=0.0,
+            telemetry_read_mono_ns=telemetry_ns,
+        )
+    )
+    prepared = OperatorApp._prepare_localization_submission(
+        operator,
+        source_stamp=source_stamp,
+        boot_retry=False,
+        lost_retry=False,
+        hold_retry=False,
+    )
+    assert prepared is not None
+    return prepared[2]
+
+
+def test_localization_submission_stamps_fused_telemetry_at_acquisition() -> None:
+    capture = 100.0
+    fused_ns = 100_050_000_000
+    timing = _localization_timing_from_state(
+        source_stamp=capture, telemetry_ns=fused_ns,
+    )
+    assert timing["source_frame_stamp_mono"] == capture
+    assert timing["fused_telemetry_mono"] == pytest.approx(100.05)
+    assert timing["fused_telemetry_mono"] != timing["source_frame_stamp_mono"]
+    assert timing["fused_roll"] == pytest.approx(0.1)
+    assert timing["fused_yaw"] == pytest.approx(1.3)
+    assert timing["fused_speed_north"] == pytest.approx(0.4)
+
+
+def test_localization_submission_omits_unstamped_fused_telemetry() -> None:
+    timing = _localization_timing_from_state(
+        source_stamp=100.0, telemetry_ns=None,
+    )
+    assert "fused_telemetry_mono" not in timing
+    assert timing["fused_roll"] == pytest.approx(0.1)
+    assert timing["source_frame_stamp_mono"] == 100.0
+

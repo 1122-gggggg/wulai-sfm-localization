@@ -27,6 +27,7 @@ for extra in (HERE, HERE.parent):
         sys.path.insert(0, str(extra))
 
 import flight_operator_app as app  # noqa: E402
+import operator_tick  # noqa: E402
 
 tk = pytest.importorskip("tkinter")
 
@@ -91,7 +92,7 @@ def _contrast_ratio(foreground: str, background: str) -> float:
 def operator():
     backend = app.DroneBackend()
     points = np.random.default_rng(0).random((2000, 6)).astype(np.float32) * 10.0
-    instance = app.OperatorApp(backend, points, tick_ms=10, site_id="test")
+    instance = app.OperatorApp(backend, points, tick_ms=8, site_id="test")
     instance.update_idletasks()
     try:
         yield instance
@@ -110,6 +111,12 @@ def operator():
         # whichever unrelated test happens to trigger the collection.
         instance.destroy()
         gc.collect()
+
+
+def test_ui_refresh_targets_125_hz(operator) -> None:
+    assert app.build_argument_parser().parse_args([]).tick_ms == 8
+    assert operator.tick_ms == 8
+    assert operator._tick_period_s == pytest.approx(0.008)
 
 
 def _force_widget_focus(operator, widget) -> None:
@@ -195,6 +202,52 @@ def test_map_detail_drops_while_interacting_and_settles_after(operator) -> None:
     assert operator._map_dirty_key is None
 
 
+def test_sparse_cloud_guard_has_adjustable_center_preview(operator) -> None:
+    snapshot = operator.collision_guard_snapshot
+    assert snapshot["preview"] is True
+    assert snapshot["center"] == pytest.approx(operator.default_map_center)
+    assert operator.collision_guard_radius_min == pytest.approx(0.0)
+    assert operator.collision_guard_radius_max == pytest.approx(0.06)
+    assert operator.collision_guard_scale.cget("from") == pytest.approx(
+        operator.collision_guard_radius_min
+    )
+    assert operator.collision_guard_scale.cget("to") == pytest.approx(
+        operator.collision_guard_radius_max
+    )
+    assert "中心預覽" in operator.collision_guard_status_var.get()
+
+    image = operator.render_map(400, 300, operator.backend.poll())
+    center_x, center_y = operator.project_world(
+        operator.default_map_center, 400, 300
+    )
+    assert image.getpixel((center_x, center_y)) == (0, 212, 255)
+
+    requested = 0.03
+    operator._on_collision_guard_radius_change(requested)
+    assert operator.collision_guard_radius == pytest.approx(requested)
+    assert operator.collision_guard_snapshot["radius"] == pytest.approx(requested)
+
+    operator._on_collision_guard_radius_change(0.5)
+    assert operator.collision_guard_radius == pytest.approx(0.06)
+    operator._on_collision_guard_radius_change(-0.5)
+    assert operator.collision_guard_radius == pytest.approx(0.0)
+
+
+def test_sparse_cloud_guard_state_is_part_of_the_map_dirty_key(operator) -> None:
+    state = operator.backend.poll()
+    before = operator_tick._map_dirty_key(
+        operator, state, width=400, height=300
+    )
+    operator.collision_guard_snapshot = {
+        **operator.collision_guard_snapshot,
+        "status": "COLLISION",
+    }
+    after = operator_tick._map_dirty_key(
+        operator, state, width=400, height=300
+    )
+    assert after != before
+
+
 def test_incident_banner_only_occupies_a_row_when_something_is_wrong(operator) -> None:
     """2026-08-03 operator decision: no idle 「安全狀態：正常」 row.
 
@@ -220,7 +273,7 @@ def test_controls_use_tabs_without_scrollbars_and_flight_actions_stay_visible(
     operator,
 ) -> None:
     """All panels use fixed tabs; abort actions remain outside those tabs."""
-    wanted = {"懸停", "原地降落", "手動/搖桿 (Esc)"}
+    wanted = {"懸停", "原地降落", "手動/搖桿 (Esc)", "停止電腦動作"}
     found: dict[str, list] = {label: [] for label in wanted}
     descendants = []
     all_labels = []
@@ -288,6 +341,31 @@ def test_flight_actions_are_keyboard_focusable_and_return_invokes_auto(
     auto_button.event_generate("<KeyPress-Return>")
     operator.update()
     assert invoked == ["start_auto"]
+
+    stop_button = operator.flight_buttons["emergency_stop"]
+    stop_button.configure(command=lambda: invoked.append("emergency_stop"))
+    _force_widget_focus(operator, stop_button)
+    stop_button.event_generate("<KeyPress-Return>")
+    operator.update()
+    assert invoked == ["start_auto", "emergency_stop"]
+
+
+def test_map_has_top_right_zoom_buttons_using_the_existing_zoom_path(operator) -> None:
+    operator.update_idletasks()
+    controls = operator.map_zoom_controls
+    assert controls.winfo_manager() == "place"
+    assert controls.winfo_x() + controls.winfo_width() >= operator.map_label.winfo_width() - 10
+
+    for button in (operator.map_zoom_in_button, operator.map_zoom_out_button):
+        assert button.winfo_reqwidth() >= 40
+        assert button.winfo_reqheight() >= 40
+        assert str(button.cget("takefocus")).lower() not in {"0", "false"}
+
+    initial_zoom = operator.map_zoom
+    operator.map_zoom_in_button.invoke()
+    assert operator.map_zoom == pytest.approx(initial_zoom * 1.12)
+    operator.map_zoom_out_button.invoke()
+    assert operator.map_zoom == pytest.approx(initial_zoom)
 
 
 def test_space_on_a_focused_action_only_hovers_all_directions(operator, monkeypatch) -> None:
@@ -376,7 +454,6 @@ def test_long_route_draws_a_bounded_number_of_dots(operator, monkeypatch) -> Non
     monkeypatch.setattr(app.ImageDraw, "Draw", CountingDraw)
     rng = np.random.default_rng(1)
     operator.route_pts = [tuple(p) for p in rng.random((2000, 3)) * 5.0]
-    operator.route_visible = True
     operator.history = []
     operator.history_health = []
     operator.no_loc_markers = []
@@ -685,8 +762,11 @@ def test_map_view_controls_live_on_the_map(operator) -> None:
             except Exception:
                 continue
 
-    for text in ("重設地圖", "上下翻面", "顯示規劃路徑"):
+    for text in ("重設地圖",):
         assert text in labels, f"{text} is no longer a child of the map canvas"
+    assert "顯示規劃路徑" not in labels
+    assert "上下翻面" not in labels
+    assert not hasattr(operator, "flip_map_vertical")
 
     operator.update_idletasks()
     map_bottom = operator.map_label.winfo_rooty() + operator.map_label.winfo_height()
@@ -876,7 +956,7 @@ def test_video_hud_contains_only_requested_engineering_metrics(operator) -> None
     }
     joined = "\n".join(operator._video_diagnostic_lines())
     for token in (
-        "自主速度警戒", "wall_ms", "core", "e2e", "RTH", "GPS",
+        "AUTO 地速安全閘門", "wall_ms", "core", "e2e", "RTH", "GPS",
         "飛控高度", "AGL", "連接品質", "定位 FPS", "inliers",
         "飛控融合姿態", "三軸速度",
     ):
@@ -923,7 +1003,9 @@ def test_flight_tab_only_shows_limit_settings_and_has_no_duplicate_hover(
             except Exception:
                 continue
     joined = "\n".join(settings_texts)
-    for token in ("目前設定", "高度", "距離", "圍欄", "自主速度警戒"):
+    for token in (
+        "目前設定", "高度", "距離", "圍欄", "AUTO 地速安全閘門", "啟用速度限制",
+    ):
         assert token in joined
     for removed in (
         "硬體", "版本", "失聯策略", "起飛資料", "控制器",

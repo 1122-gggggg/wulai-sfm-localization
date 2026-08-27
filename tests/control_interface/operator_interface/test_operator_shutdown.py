@@ -21,6 +21,11 @@ class _LiveBackend:
         self.cleanup_calls = 0
         self.zero_pcmds = []
         self.land_attempts = 0
+        self.shutdown_latches = 0
+
+    def latch_shutdown_motion(self, *, reason):
+        self.shutdown_latches += 1
+        return True
 
     def cleanup(self):
         self.cleanup_calls += 1
@@ -54,6 +59,10 @@ class _OrderedLiveBackend(_LiveBackend):
     def cleanup(self):
         self.events.append("cleanup")
         return super().cleanup()
+
+    def latch_shutdown_motion(self, *, reason):
+        self.events.append(("latch_shutdown_motion", reason))
+        return super().latch_shutdown_motion(reason=reason)
 
 
 def test_shutdown_waits_for_touchdown_confirmation_before_destroying() -> None:
@@ -165,13 +174,14 @@ def test_shutdown_cancels_and_joins_active_auto_before_cleanup() -> None:
 
     assert coordinator.shutdown() is True
     assert events == [
+        ("latch_shutdown_motion", "ui_window_close"),
         ("cancel", "ui_window_close", (0, 0, 0, 0)),
         ("join", 1.0),
         "cleanup",
     ]
 
 
-def test_shutdown_does_not_cleanup_while_auto_worker_is_still_active() -> None:
+def test_shutdown_uses_backend_cleanup_while_auto_worker_is_still_active() -> None:
     events = []
     backend = _OrderedLiveBackend(events, True)
     autonomy = _ActiveAutonomy(events, joins=False)
@@ -183,9 +193,79 @@ def test_shutdown_does_not_cleanup_while_auto_worker_is_still_active() -> None:
         autonomy=autonomy,
     )
 
-    assert coordinator.shutdown() is False
+    assert coordinator.shutdown() is True
     assert events == [
+        ("latch_shutdown_motion", "ui_window_close"),
         ("cancel", "ui_window_close", (0, 0, 0, 0)),
         ("join", 1.0),
+        "cleanup",
     ]
-    assert backend.cleanup_calls == 0
+    assert backend.cleanup_calls == 1
+
+
+def test_shutdown_still_latches_and_lands_when_command_suspend_raises() -> None:
+    events = []
+
+    class BrokenCommands:
+        def suspend(self) -> None:
+            events.append("suspend")
+            raise RuntimeError("coordinator lock failed")
+
+    backend = _OrderedLiveBackend(events, True)
+    coordinator = OperatorShutdownCoordinator(
+        backend=backend,
+        session_logs=None,
+        write_log=None,
+        destroy=None,
+        command_coordinator=BrokenCommands(),
+    )
+
+    assert coordinator.shutdown(reason="signal_SIGINT") is True
+    assert events == [
+        "suspend",
+        ("latch_shutdown_motion", "signal_SIGINT"),
+        "cleanup",
+    ]
+
+
+def test_shutdown_resumes_manual_commands_after_auto_timeout_then_cleanup_failure() -> None:
+    class Commands:
+        def __init__(self) -> None:
+            self.accepting = True
+            self.calls = []
+
+        def suspend(self) -> None:
+            self.accepting = False
+            self.calls.append("suspend")
+
+        def resume(self) -> None:
+            self.accepting = True
+            self.calls.append("resume")
+
+        def dispatch(self, _command: str, _payload: dict) -> bool:
+            return self.accepting
+
+    events = []
+    backend = _OrderedLiveBackend(events, False, False)
+    autonomy = _ActiveAutonomy(events, joins=False)
+    commands = Commands()
+    coordinator = OperatorShutdownCoordinator(
+        backend=backend,
+        session_logs=None,
+        write_log=None,
+        destroy=None,
+        command_coordinator=commands,
+        autonomy=autonomy,
+    )
+
+    assert coordinator.shutdown() is False
+    assert commands.dispatch("manual", {}) is False
+    assert coordinator._autonomy_cancel_latched is True
+    assert backend.cleanup_calls == 1
+
+    autonomy.active = False
+    assert coordinator.shutdown() is False
+    assert commands.dispatch("manual", {}) is True
+    assert coordinator._autonomy_cancel_latched is False
+    assert commands.calls == ["suspend", "suspend", "resume"]
+    assert backend.cleanup_calls == 2

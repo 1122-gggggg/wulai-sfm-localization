@@ -10,6 +10,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
+import uuid
 from contextlib import contextmanager
 from collections.abc import Callable, Iterable
 from pathlib import Path
@@ -65,6 +67,19 @@ def _sha256(path: Path) -> str:
     except OSError as exc:
         raise ValueError(f"cannot hash {path}: {exc}") from exc
     return digest.hexdigest()
+
+
+def _json_bytes(raw: dict) -> bytes:
+    return (json.dumps(raw, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+
+
+def _referenced_path(owner: Path, value: object) -> Path | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    candidate = Path(value).expanduser()
+    if not candidate.is_absolute():
+        candidate = owner.parent / candidate
+    return candidate.resolve()
 
 
 def _is_inside(path: Path, folder: Path) -> bool:
@@ -307,11 +322,11 @@ def list_site_packages(root: str | Path) -> list[AvailableSitePackage]:
 
 
 def list_site_routes(folder: str | Path) -> list[Path]:
-    """Every route JSON under a site folder, newest first.
+    """Every formal route JSON under a site folder, newest first.
 
-    Drafts land in route_drafts/ with a timestamped name and authored routes in
-    routes/, so a field accumulates several. Which one the aircraft flies is the
-    operator's choice, not the first one found.
+    Legacy route_drafts/ files are intentionally excluded: the current workflow
+    has only formal add/edit operations. Which formal route the aircraft flies is
+    the operator's choice, not the first one found.
     """
     root = Path(folder).expanduser().resolve()
     if not root.is_dir():
@@ -321,10 +336,10 @@ def list_site_routes(folder: str | Path) -> list[Path]:
         for path in root.rglob("*.json")
         if path.is_file()
         and not path.is_symlink()
+        and "route_drafts" not in path.parts
         and (
             "route" in path.name.casefold()
             or "flight_path" in path.name.casefold()
-            or "route_drafts" in path.parts
             or "routes" in path.parts
         )
         and path.name != "site_profile.json"
@@ -976,6 +991,14 @@ class _LocalSupplementProvider:
     def __init__(self, managed_root: str | Path):
         self.managed_root = Path(managed_root).expanduser().resolve()
 
+    def _linked_manifest_updates(
+        self,
+        target: Path,
+        digest: str,
+        previous_target: Path | None = None,
+    ) -> dict[Path, bytes]:
+        return {}
+
     def _load_managed_profile(self, profile_path: str | Path) -> tuple[Path, SiteProfile, dict]:
         path = Path(profile_path).expanduser().resolve()
         if not _is_inside(path, self.managed_root):
@@ -996,10 +1019,83 @@ class _LocalSupplementProvider:
             raise ValueError("route and target imports require a managed site profile")
         return path, profile, _json(path)
 
+    def _stage_linked_manifests(
+        self,
+        target: Path,
+        digest: str,
+        previous_target: Path | None,
+        backups: dict[Path, Path],
+        temps: dict[Path, Path],
+    ) -> None:
+        for linked_path, payload in self._linked_manifest_updates(
+            target,
+            digest,
+            previous_target,
+        ).items():
+            if not linked_path.is_file() or linked_path.is_symlink():
+                raise ValueError(
+                    f"linked mission manifest is not a regular file: {linked_path}"
+                )
+            backup = _new_temp_path(
+                linked_path.parent, f".{linked_path.name}.", ".bak"
+            )
+            shutil.copy2(linked_path, backup)
+            backups[linked_path] = backup
+            temp = _new_temp_path(linked_path.parent, f".{linked_path.name}.")
+            temp.write_bytes(payload)
+            temps[linked_path] = temp
+
+    @staticmethod
+    def _replace_linked_manifests(
+        temps: dict[Path, Path], replaced: list[Path]
+    ) -> None:
+        for linked_path, temp in list(temps.items()):
+            os.replace(temp, linked_path)
+            temps.pop(linked_path, None)
+            replaced.append(linked_path)
+
+    @staticmethod
+    def _rollback_asset_transaction(
+        target: Path,
+        backup_asset: Path | None,
+        target_replaced: bool,
+        linked_backups: dict[Path, Path],
+        linked_replaced: list[Path],
+    ) -> Exception | None:
+        rollback_error = None
+        for linked_path in reversed(linked_replaced):
+            backup = linked_backups.get(linked_path)
+            if backup is None:
+                continue
+            try:
+                os.replace(backup, linked_path)
+                linked_backups.pop(linked_path, None)
+            except Exception as exc:
+                rollback_error = rollback_error or exc
+        if target_replaced:
+            try:
+                if backup_asset is None:
+                    target.unlink()
+                else:
+                    os.replace(backup_asset, target)
+            except Exception as exc:
+                rollback_error = rollback_error or exc
+        return rollback_error
+
     def _commit(
-        self, source: Path, profile_path: Path, profile: SiteProfile, raw: dict
+        self,
+        source: Path,
+        profile_path: Path,
+        profile: SiteProfile,
+        raw: dict,
+        *,
+        approve_for_auto: bool = False,
+        relative_path: Path | None = None,
     ) -> ImportedAsset:
-        target = profile_path.parent / self.relative_path
+        selected_relative_path = relative_path or self.relative_path
+        target = (profile_path.parent / selected_relative_path).resolve()
+        if not _is_inside(target, profile_path.parent):
+            raise ValueError("managed asset target must stay inside the site folder")
         target.parent.mkdir(parents=True, exist_ok=True)
         temp_asset = _new_temp_path(target.parent, f".{target.name}.")
         try:
@@ -1011,10 +1107,19 @@ class _LocalSupplementProvider:
         lock_path = _site_asset_lock_path(self.managed_root, profile.site_id)
         backup_asset = None
         temp_profile = None
+        linked_backups: dict[Path, Path] = {}
+        linked_temps: dict[Path, Path] = {}
+        linked_replaced: list[Path] = []
         target_replaced = False
         try:
             with _site_asset_lock(lock_path):
                 current_raw = _json(profile_path)
+                previous_value = current_raw.get("assets", {}).get(self.profile_key)
+                previous_target = (
+                    (profile_path.parent / self.relative_path).resolve()
+                    if not previous_value
+                    else (profile_path.parent / str(previous_value)).resolve()
+                )
                 if target.exists() and not target.is_file():
                     raise ValueError(f"managed asset target is not a file: {target}")
                 if target.is_file():
@@ -1025,13 +1130,18 @@ class _LocalSupplementProvider:
                 temp_asset = None
                 target_replaced = True
 
-                current_raw["assets"][self.profile_key] = self.relative_path.as_posix()
-                current_raw.setdefault("asset_sha256", {})[self.digest_key] = _sha256(target)
+                digest = _sha256(target)
+                current_raw["assets"][self.profile_key] = (
+                    selected_relative_path.as_posix()
+                )
+                current_raw.setdefault("asset_sha256", {})[self.digest_key] = digest
                 flight = current_raw.setdefault("flight", {})
-                flight["approved"] = False
-                flight["route_clearance_approved"] = False
+                flight["approved"] = bool(approve_for_auto)
+                flight["route_clearance_approved"] = bool(approve_for_auto)
                 flight["approval_note"] = (
-                    "Imported asset changed; flight re-approval required."
+                    "In-app operator route editor approval for AUTO."
+                    if approve_for_auto
+                    else "Imported asset changed; flight re-approval required."
                 )
                 temp_profile = _new_temp_path(profile_path.parent, ".site_profile.json.")
                 temp_profile.write_text(
@@ -1039,25 +1149,35 @@ class _LocalSupplementProvider:
                     encoding="utf-8",
                 )
                 load_site_profile(temp_profile)
+                self._stage_linked_manifests(
+                    target,
+                    digest,
+                    previous_target,
+                    linked_backups,
+                    linked_temps,
+                )
+                self._replace_linked_manifests(linked_temps, linked_replaced)
                 os.replace(temp_profile, profile_path)
                 temp_profile = None
         except Exception:
-            if target_replaced:
-                try:
-                    if backup_asset is None:
-                        target.unlink()
-                    else:
-                        os.replace(backup_asset, target)
-                        backup_asset = None
-                except Exception as rollback_error:
-                    raise RuntimeError(
-                        f"asset transaction rollback failed for {target}"
-                    ) from rollback_error
+            rollback_error = self._rollback_asset_transaction(
+                target,
+                backup_asset,
+                target_replaced,
+                linked_backups,
+                linked_replaced,
+            )
+            if rollback_error is not None:
+                raise RuntimeError(
+                    f"asset transaction rollback failed for {target}"
+                ) from rollback_error
             raise
         finally:
             _remove_file(temp_asset)
             _remove_file(temp_profile)
             _remove_file(backup_asset)
+            for path in (*linked_temps.values(), *linked_backups.values()):
+                _remove_file(path)
         return ImportedAsset(profile_path, target)
 
 
@@ -1079,7 +1199,59 @@ class LocalRouteProvider(_LocalSupplementProvider):
     digest_key = "route_json"
     relative_path = Path("routes/flight_route.json")
 
-    def import_file(self, source: str | Path, profile_path: str | Path) -> ImportedAsset:
+    def _linked_manifest_updates(
+        self,
+        target: Path,
+        digest: str,
+        previous_target: Path | None = None,
+    ) -> dict[Path, bytes]:
+        if self.managed_root.name != "場域" or self.managed_root.parent.name != "地圖檔":
+            return {}
+        workspace = self.managed_root.parent.parent
+        route_components = workspace / "控制介面程式" / "mission_components" / "routes"
+        selections = workspace / "控制介面程式" / "mission_selections"
+        if not route_components.is_dir():
+            return {}
+
+        updates: dict[Path, bytes] = {}
+        component_digests: dict[Path, str] = {}
+        for component_path in sorted(route_components.glob("*.json")):
+            component = _json(component_path)
+            route_ref = component.get("route")
+            if not isinstance(route_ref, dict):
+                continue
+            referenced = _referenced_path(component_path, route_ref.get("path"))
+            if referenced not in {target, previous_target}:
+                continue
+            route_ref["path"] = Path(
+                os.path.relpath(target, component_path.parent)
+            ).as_posix()
+            route_ref["sha256"] = digest
+            payload = _json_bytes(component)
+            updates[component_path] = payload
+            component_digests[component_path.resolve()] = hashlib.sha256(payload).hexdigest()
+
+        for selection_path in sorted(selections.glob("*.json")) if selections.is_dir() else ():
+            selection = _json(selection_path)
+            route_ref = selection.get("route")
+            if not isinstance(route_ref, dict):
+                continue
+            component_path = _referenced_path(selection_path, route_ref.get("path"))
+            component_digest = component_digests.get(component_path)
+            if component_digest is None:
+                continue
+            route_ref["sha256"] = component_digest
+            updates[selection_path] = _json_bytes(selection)
+        return updates
+
+    def import_file(
+        self,
+        source: str | Path,
+        profile_path: str | Path,
+        *,
+        approve_for_auto: bool = False,
+        replace_route: str | Path | None = None,
+    ) -> ImportedAsset:
         path, profile, profile_raw = self._load_managed_profile(profile_path)
         route_path = Path(source).expanduser().resolve()
         route = _json(route_path)
@@ -1097,13 +1269,40 @@ class LocalRouteProvider(_LocalSupplementProvider):
                 raise ValueError(f"route {key} must be {value!r}")
         if route.get("frame") not in {"glomap", "aligned"}:
             raise ValueError("route frame must be 'glomap' or 'aligned'")
+        if approve_for_auto and route.get("source") != "operator_route_editor":
+            raise ValueError(
+                "AUTO approval requires a route saved by the operator route editor"
+            )
         waypoints = route.get("waypoints")
         if not isinstance(waypoints, list) or len(waypoints) < 2:
             raise ValueError("route needs at least two waypoints")
         parsed = [_finite_vec3(value, f"waypoint[{index}]") for index, value in enumerate(waypoints)]
         if all(a == b for a, b in zip(parsed, parsed[1:])):
             raise ValueError("route must contain a non-zero segment")
-        return self._commit(route_path, path, profile, profile_raw)
+        if replace_route is None:
+            suffix = f"{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
+            relative_path = Path("routes") / f"flight_route_{suffix}.json"
+        else:
+            replace_path = Path(replace_route).expanduser().resolve()
+            routes_root = (path.parent / "routes").resolve()
+            if (
+                not _is_inside(replace_path, routes_root)
+                or not replace_path.is_file()
+                or replace_path.is_symlink()
+                or replace_path.suffix.casefold() != ".json"
+            ):
+                raise ValueError(
+                    "edited route must be an existing regular JSON file under the site's routes folder"
+                )
+            relative_path = replace_path.relative_to(path.parent)
+        return self._commit(
+            route_path,
+            path,
+            profile,
+            profile_raw,
+            approve_for_auto=approve_for_auto,
+            relative_path=relative_path,
+        )
 
 
 class LocalTargetProvider(_LocalSupplementProvider):

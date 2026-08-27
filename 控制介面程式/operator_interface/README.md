@@ -24,7 +24,7 @@ Layout:
   `UI_MIN_SIZE` = **1180×768**. The desktop app and `--layout-selftest` use the
   same values; no lower minimum is supported.
 
-- Left: point-cloud map and localization trail. The planned route is hidden by default and is shown only when the operator enables `顯示規劃路徑`. Mouse controls: left drag 360-degree rotate, double left click sets the rotation pivot like CloudCompare, middle drag roll, right drag pan, wheel zoom. Use `重設地圖` to reset and `上下翻面` to flip the map by 180 degrees.
+- Left: point-cloud map, planned route, and localization trail. The planned route is always shown when loaded. Mouse controls: left drag 360-degree rotate, double left click sets the rotation pivot like CloudCompare, middle drag roll, right drag pan, wheel zoom. Use `重設地圖` to restore the default upright view.
 - Right: ANAFI-like drone video stream. Input stream is resized to `1280x720`
   and paced as 720p30 by default.
 - Bottom: manual/PC control, hover, land, takeoff, autonomous flight, localization, gimbal pitch, zoom.
@@ -46,7 +46,7 @@ Layout:
 
 ### 自製航線編輯器
 
-「場域資產」的航線列提供 `匯入 JSON`、`建立新航線`、`編輯目前航線`。編輯器
+「場域資產」的航線列提供 `匯入航線 JSON`、`新增路線`、`編輯路線`。編輯器
 頂端只有一個 `導入地圖資料夾`。系統會遞迴偵測資料夾內的 `.ply`；只有一個時
 自動載入，多個時列出相對路徑與檔案大小供使用者選擇。選定後計算 PLY 的
 SHA-256，若唯一匹配到已匯入場域的 `asset_sha256.map_ply`，就自動綁定該場域並
@@ -60,12 +60,29 @@ JSON，正式航線匯入按鈕會鎖住。
 Z-up 顯示座標並輸出 `frame: aligned`；匯入端再轉回 GLOMAP 的 X/Z 水平、-Y
 向上座標。
 
+第二階段會同時顯示可拖曳調整的半透明綠色到達球與半透明藍綠色航線安全管；拖曳
+任一滑桿會自動開啟對應圖形並即時縮放。安全管半徑可在 `0.000–0.100` map units
+內調整，`0` 表示只允許中心線。航線 JSON
+分別以 `arrive_radius_map_units` 與 `max_route_deviation_map_units` 保存兩個半徑；
+真機 AUTO 超出安全管時會先懸停，再平移回完整路徑折線上的最近點。航線值只能收緊場域或
+全域核准上限，不能用單一路線放寬既有安全限制。
+
 真機模式只有明確回讀為 `landed` 且沒有飛行命令處理中才可開啟；狀態改變時
-編輯器會自動關閉。儲存與匯入會更新規劃路徑 overlay，並把通過場域／座標系／
-SHA-256 驗證的路線選定為本次工作階段下一個 AUTO 候選。這不會核准、解鎖或開始
-飛行，不會自行改寫 profile 的 `flight.approved` 與 `route_clearance_approved`。AUTO
-請求送出後，航線選擇鎖定；HOVER、MANUAL 與重新定位不會解除，只有後端拒絕該次
-請求或確認降落完成後才可選下一條航線。
+編輯器會自動關閉。「儲存路線」會
+驗證場域、座標系與航點，原子更新 managed profile 的路線 SHA-256、`flight.approved`
+與 `route_clearance_approved`，再把路線綁為下一個 AUTO 候選；若目前使用 system
+profile，會在編輯器關閉後套用更新過的 managed profile。這不會立即起飛，一般外部
+JSON 匯入也仍維持未核准。AUTO 請求送出後，航線選擇鎖定；HOVER、MANUAL 與重新
+定位不會解除，只有後端拒絕該次請求或確認降落完成後才可選下一條航線。
+
+「新增路線」會建立新的正式航線並保留既有航線；「編輯路線」只覆蓋目前選取的航線。
+儲存結果會成為目前 AUTO 航線並同步 profile、route component 與 selection SHA，不建立草稿。
+只有未綁定場域的 PLY 可另存 `preview_only` 預覽航線，該檔不能進入 AUTO。
+
+AUTO 起飛後以連續穩定的定位姿態判定起飛位置，不要求位於第一個航點附近；系統會找
+出距離最近的航點，將它視為銜接點，第一個飛行目標設為下一個航點。開放航線不循環，
+若最近的是最後航點就維持終點，不會跳回第一點。起飛位置仍須在任一航點的
+`SFM_BOOT_START_MAX_U` 範圍內（預設 `1.5` map units），避免從航線外直接橫切進入。
 
 ## Single-Process Desktop App
 
@@ -135,10 +152,16 @@ with the state shown and logged. Override these conservative startup values with
 ANAFI panel while the aircraft is confirmed landed. The panel always shows the
 aircraft readback separately; applying limits while airborne is rejected.
 Crossing either firmware limit prevents continued flight outward; it does not
-automatically invoke RTH. The separate future-autonomy speed guard starts at
-0.30 m/s and may also be changed only while confirmed landed. Any speed change
-invalidates the current session's AUTO approval, so the four preflight steps
-must be confirmed again.
+automatically invoke RTH. AUTO translation has two independent guards: the
+backend `nudge_pct` PCMD command-strength cap, and a fail-closed ground-speed
+interlock. Horizontal AUTO PCMD is blocked when ground-speed telemetry is
+missing or older than 0.5 s. At or above the configured threshold it sends zero
+PCMD and latches until a fresh sample is strictly below 80% of that threshold.
+The landed-only UI editor changes this interlock and invalidates the prior AUTO
+approval. It is not closed-loop speed control or a physical hard-speed
+guarantee; PCMD response, telemetry latency, wind, and braking distance still
+require field validation. Route completion likewise waits for fresh ground
+speed at or below 0.10 m/s before requesting Landing.
 
 On connection the backend records the actual ANAFI model/serial/firmware,
 SkyController 3 model/serial/software, Olympe version, transport, Home Point,
@@ -184,16 +207,16 @@ This wires the UI buttons to real Olympe:
 | UI | Real action |
 |---|---|
 | 起飛 | TakeOff → hover；不檢查定位；起飛成功後固定開始機載錄影 |
-| 自動飛行 | TakeOff → 原地零 PCMD 懸停 → 連續可靠定位後執行已鎖定路線；25 秒仍無定位則原地降落；暫停後按「繼續自動飛行」沿原路線恢復 |
+| 自動飛行 | TakeOff → 原地零 PCMD 懸停 → 連續可靠定位後找最近航點並以前往下一點開始執行已鎖定路線；定位失敗時持續懸停，等待恢復或操作者手動接管／降落；暫停後按「繼續自動飛行」沿原路線恢復 |
 | 原地降落 | 停止錄影並盡力下載 → Landing + restore sticks |
 | 關窗 / Ctrl+C | **強制原地降落**（即使曾 Esc；已落地則跳過） |
-| 錄影 | 介面啟動時固定武裝；起飛成功後自動錄，降落時存檔；介面只顯示狀態 |
+| 錄影 | 介面啟動時固定武裝；起飛成功後自動錄機載 SD；降落時存檔。下拉選 FHD 1080p30 或 4K UHD 30（只改 SD 編碼，live stream 仍是 720p） |
 | 懸停 / Space | zero PCMD；AUTO 執行中改為暫停 AUTO 並保留原路線狀態 |
 | 手動 / Esc | zero PCMD + `setPilotingSource(SkyController)` |
 | 動搖桿（SC USB） | HID 偵測偏轉 → 強制交回搖桿（即使當下是 PC 控機） |
 | 微移 8 方向 | hold-to-move PCMD; release returns to hover |
 | 俯仰滑桿 | gimbal set_target |
-| 開始定位 | 僅啟動 localization feed；不取回 PC 控制、不起飛、不執行航線 |
+| 開始／取消定位 | 第一次按下啟動 localization feed，按鈕變成「取消定位」；再按一次停止送入影格並忽略待處理結果。全程不取回 PC 控制、不起飛、不執行航線 |
 | 恢復電腦控制 | 明確切換 piloting source 至 PC；仍不會啟動自主航線 |
 | 關窗 | Landing (if PC still piloting) + restore sticks |
 
@@ -332,13 +355,14 @@ consecutive low-confidence EDM results, and one retrieval on entry to each
 actual `LOST` episode. A single WEAK result only raises the EDM local reference
 count. The operator UI has no manual global-retrieval or benchmark-state
 buttons. On sustained LOW, replay freezes its frame; real flight sends zero
-PCMD and hands control to the pilot before requesting MegaLoc. Recovery then
-continues with EDM and requires consecutive good fixes before motion can resume.
+PCMD and hovers before requesting MegaLoc. AUTO does not force a manual handoff
+or landing; recovery continues with EDM and requires consecutive good fixes
+before motion can resume, while any SkyController stick movement still takes
+control immediately.
 
 The route contract defaults to the same `outputs/current_safezone/flight_path.json`
-used by the production runner. It remains loaded and verified, but its map line is
-hidden by default; the operator can enable `顯示規劃路徑` when needed. The app
-prints its resolved path and SHA-256 at startup. A draft route is used only when
+used by the production runner. It remains loaded, verified, and always visible on
+the map. The app prints its resolved path and SHA-256 at startup. A draft route is used only when
 selected explicitly with `--route-json` or `SFM_FLIGHT_PATH_JSON`. Startup fails
 closed if the route is empty, malformed, not three-dimensional, or contains a
 non-finite coordinate.
@@ -378,7 +402,7 @@ non-reading, or partial-response worker is reaped and restarted without blocking
 the UI shutdown path. A `success` response is accepted only with finite XYZ.
 
 The right video panel overlays the latest detection boxes. Its bottom-left HUD
-combines image FPS with the selected engineering telemetry: speed limit,
+combines image FPS with the selected engineering telemetry: AUTO PCMD command cap,
 localization FPS/wall/core/e2e/inliers, RTH/GPS, flight-controller altitude/AGL,
 link quality, fused attitude and three-axis velocity. There is no UI log tab;
 persistent session/audit logs remain on disk. The latest detection JSON is also
@@ -473,8 +497,7 @@ Map note: GLOMAP gravity-up is **-Y**; level-phase `g_body` is NED-down in the b
 Micro-move buttons / keys use the selected backend:
 
 - Buttons: 右上前 / 左上前 / 右下前 / 左下前 / 右上後 / 左上後 (+ 下後 補齊)
-- Keys: `U I O` 左上前/前/右上前, `J L` 左/右, `M , .` 左下前/後/右下前,
-  `7 8 9` 左上後/上/右上後, `1 2 3` 左下後/下/右下後, `W A S D` 前後左右, `R/F` 上下
+- Keys: 左搖桿為 `A/D` 左右旋、`W/S` 上下；右搖桿為 `J/L` 左右、`I/K` 前後。
 
 - With `--interface simulated-stream`, they move only the simulated pose.
 - With `--interface real-flight`, they use the protected hold-to-move PCMD path: press sends the
