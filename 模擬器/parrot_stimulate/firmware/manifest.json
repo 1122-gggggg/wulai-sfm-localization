@@ -1,0 +1,16 @@
+{
+  "model": "Parrot ANAFI",
+  "artifact": "anafi-pc.ext2.zip",
+  "source_url": "https://firmware.parrot.com/Versions/anafi/pc/%23latest/images/anafi-pc.ext2.zip",
+  "retrieved_at": "2026-08-02T00:19:13+08:00",
+  "bytes": 39442307,
+  "sha256": "fcbc8450911e7533763479bed672fd1c4b3a3395c073171ad2d1ce568a15fede",
+  "archive_contents": [
+    {
+      "path": "anafi-pc.ext2",
+      "bytes": 283115520,
+      "archive_timestamp": "2023-10-24T00:43:00"
+    }
+  ],
+  "note": "The URL uses Parrot's #latest alias. The local SHA-256 is the reproducibility pin for this project."
+}

@@ -1,0 +1,6 @@
+# generated outputs (logs, benchmarks); keep the folder + small configs only
+outputs/*
+!outputs/.gitkeep
+__pycache__/
+*.pyc
+.pytest_cache/

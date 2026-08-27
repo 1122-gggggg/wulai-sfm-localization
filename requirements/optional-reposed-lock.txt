@@ -1,0 +1,19 @@
+# Direct source-pinned optional RePoseD/MoGe wheels; this is not a complete
+# transitive lock.
+# This lock is deliberately separate from runtime-lock.txt.  The three local
+# wheels are not the PyPI packages with the same names; install with
+# --require-hashes --no-deps from an approved optional wheelhouse, then run
+# `pip check` and the import smoke test before enabling RePoseD.
+# MoGe metadata additionally requires source-pinned pipeline at commit
+# 866f059d2a05cde05e4a52211ec5051fd5f276d6; this lock intentionally does not
+# invent a version/hash for an artifact that is absent from this repository.
+--index-url https://pypi.org/simple
+
+huggingface-hub==0.36.2 \
+    --hash=sha256:48f0c8eac16145dfce371e9d2d7772854a4f591bcb56c9cf548accf531d54270
+moge==2.0.0 \
+    --hash=sha256:176363a4de409b926f8c9b554d350b21398d334c7c6cebb181d493c59c20fd5c
+poselib==3.0.0 \
+    --hash=sha256:a7fbb352765662b22e7cfc50b6d47548e79d13726afc91d696768c0ce480a849
+utils3d==1.3 \
+    --hash=sha256:e426f98cd2bf8fdeed6c3377cc574dc4f1d7c1b865664447edaa31977db69da3

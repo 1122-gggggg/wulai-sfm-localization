@@ -1,0 +1,35 @@
+# Local environments, maps, model weights, and generated runtime artifacts.
+.venv/
+env/
+outputs/*
+!outputs/README.md
+.codegraph/
+**/torch_hub_cache/
+# Compiled EDM coarse-tail kernels. Regenerable (~5 s cold) and machine-specific.
+執行環境/inductor_cache/
+執行環境/offline_wheelhouse/
+地圖檔/maps/*
+!地圖檔/maps/.gitkeep
+地圖檔/bundles/*
+!地圖檔/bundles/.gitkeep
+地圖檔/mission_routes/*
+!地圖檔/mission_routes/.gitkeep
+# 場域資產包：每個場域的地圖、bundle、航線與報告都是該場域私有資料，
+# 只有說明文件進版控，讓 repo 記錄格式而不攜帶任何場域資料。
+地圖檔/場域/*/
+!地圖檔/場域/README.md
+定位演算法/deploy_code/runtime/EDM/weights/*
+!定位演算法/deploy_code/runtime/EDM/weights/.gitignore
+定位演算法/validation/report_*/
+模擬器/測試影片/*
+!模擬器/測試影片/README.md
+# 舊模擬器封存已刪除；保留 ignore guard，避免未來封存誤進版控。
+模擬器/封存/
+
+**/__pycache__/
+**/.pytest_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.cursor/

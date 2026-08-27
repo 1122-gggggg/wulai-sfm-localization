@@ -1,0 +1,60 @@
+{
+ "schema_version": 2,
+ "site_id": "urai_edm_v1",
+ "display_name": "烏來（目標場域）EDM v1 — 2026-07-19 驗證",
+ "localizer": "edm",
+ "localizer_deploy_dir": "../../定位演算法/deploy_code/sfm_glomap_deploy",
+ "hardware_approval": {
+  "receipt": "../../地圖檔/場域/urai/reports/hardware_approval_20260806_v2.json",
+  "sha256": "941a4210dfe1bcf0d3f91418793a02f372e78ce065e1af12d90bb67f4586b449"
+ },
+ "localizer_profile": "../../定位演算法/configs/edm_production_profile.json",
+ "map_reference_poses": "../../地圖檔/場域/urai/maps/edm_v1/target_site_ref_poses.json",
+ "query_camera": {
+  "model": "PINHOLE",
+  "width": 1280,
+  "height": 720,
+  "params": [
+   931.2057783503648,
+   931.2057783503648,
+   640.0,
+   360.0
+  ]
+ },
+ "asset_sha256": {
+  "map_ply": "495042e13a5185c816ff710c5c2e47a768cceb5b98d6959b250ac34af9c60908",
+  "localization_bundle": "b32866d6595ca30b89e7cf6cef6dacbb4692f3c4992b759d833488c31b489d05",
+  "route_json": null,
+  "map_reference_poses": "b463515edc149a932cc5ff0e99a62ffa7a67e75ff36add9c1b3f2da1dd46ca6c",
+  "localizer_profile": "48977d8c6a47f06cf177dcc9bd2f9c75912b4415588d1fa94c40444282352f0d",
+  "poles_json": null,
+  "map_align": "8865b49e30fd1c9b81ec4736a139fcb672644c5bf333244c40d45d6cd117a5c3"
+ },
+ "flight": {
+  "approved": false,
+  "coordinate_frame_id": "target_site_v1_glomap",
+  "route_clearance_approved": false,
+  "approval_note": "AUTO blocked: the v2 hardware receipt records manual-only ground evidence; a scale-free flight route, route-clearance review, coordinate ID, and props-off yaw-sign test are still required.",
+  "controller": null
+ },
+ "assets": {
+  "map_ply": "../../地圖檔/場域/urai/maps/edm_v1/target_site_v1_dense.ply",
+  "route_json": null,
+  "poles_json": null,
+  "localization_bundle": "../../地圖檔/場域/urai/bundles/target_site_v1_reloc_map_edm.pt",
+  "megaloc_cache": null,
+  "track_landmarks": null
+ },
+ "map_align": "../../地圖檔/場域/urai/maps/edm_v1/T_align_gravity.json",
+ "coordinate_frame": {
+  "id": "target_site_v1_glomap",
+  "convention": "glomap",
+  "horizontal_axes": [
+   "x",
+   "z"
+  ],
+  "up_axis": "-y",
+  "handedness": "right",
+  "units": "map"
+ }
+}

@@ -1,0 +1,4 @@
+# Quality-only tooling. Keep this lock separate from runtime and test locks.
+# CPython 3.10 is the supported root validation interpreter.
+mypy==2.3.0
+pip-audit==2.10.1

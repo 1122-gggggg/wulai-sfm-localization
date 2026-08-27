@@ -1,0 +1,10 @@
+{
+  "pattern": "s_curve",
+  "segment_length_m": 4.0,
+  "start_radius_m": 5.0,
+  "num_trials": 20,
+  "duration": 60.0,
+  "random_seed": 42,
+  "rejoin_algorithm": "compare",
+  "random_yaw_error_deg": 15.0
+}

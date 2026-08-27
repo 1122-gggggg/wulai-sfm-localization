@@ -1,0 +1,1 @@
+執行環境/models/moge-2-vits-normal/model.pt filter=lfs diff=lfs merge=lfs -text

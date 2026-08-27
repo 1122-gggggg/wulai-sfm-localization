@@ -1,0 +1,15 @@
+# torch must cover sm_120 (Blackwell: RTX 5060/5090). cu128 wheels do; the
+# torch 2.0.0/cu118 pin in EDM's own requirements.txt does NOT -- ignore it.
+torch>=2.7
+torchvision
+opencv-python
+numpy
+einops
+yacs
+loguru
+kornia
+huggingface_hub
+safetensors
+pycolmap==4.0.4
+h5py          # map rebuild only
+hloc          # map rebuild only (fixed-pose triangulation)

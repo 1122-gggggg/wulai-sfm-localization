@@ -1,0 +1,27 @@
+{
+  "schema": "sfm-mission-selection/v1",
+  "selection_id": "river_site_official69_localization",
+  "vehicle": {
+    "path": "../mission_components/vehicles/parrot_anafi_720p.json",
+    "sha256": "f01e7a68c754c816287609e344cfadab86aa9c1ff95abb6ea42b73bc3d45325e"
+  },
+  "site": {
+    "path": "../../地圖檔/場域/river_site/manifests/site.json",
+    "sha256": "046db703aecce0bfc15bfde812661fea06167f4b630005aeee4390e81662d0bf"
+  },
+  "map": {
+    "path": "../../地圖檔/場域/river_site/releases/river_site_official69_map_v000_20260811/compat/map_manifest.json",
+    "sha256": "3f885801d21e7c7f9f0ed8d126d3a304e5bae395373c7e71c8bbff8fbc917979"
+  },
+  "localizer": {
+    "path": "../../地圖檔/場域/river_site/releases/river_site_official69_map_v000_20260811/compat/localizer_edm_manifest.json",
+    "sha256": "c154627974ee29ce6952f95354e67730b3cf63cb69fc4fc7fe4dd71fba3da8e7"
+  },
+  "route": null,
+  "calibrations": [
+    {
+      "path": "../../地圖檔/場域/river_site/releases/river_site_official69_map_v000_20260811/compat/localizer_quality_receipt.json",
+      "sha256": "d9e7bbf555cb7180776910c78a35b013d992afc1fe715b3863a95fd486f29ccd"
+    }
+  ]
+}

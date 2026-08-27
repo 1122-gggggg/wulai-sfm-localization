@@ -1,0 +1,32 @@
+{
+  "schema": "sfm-vehicle/v1",
+  "vehicle_id": "parrot_anafi",
+  "revision": "720p_river_b0_v1",
+  "adapter": "olympe",
+  "model": "Parrot ANAFI",
+  "serials": [],
+  "capabilities": [
+    "rgb_stream_1280x720",
+    "imu",
+    "gimbal"
+  ],
+  "required_calibrations": [],
+  "limits": {
+    "max_horizontal_speed_mps": 15.0,
+    "max_vertical_speed_mps": 4.0,
+    "max_yaw_rate_dps": 200.0
+  },
+  "camera": {
+    "camera_id": "front_camera",
+    "pipeline_id": "river_b0_p116_p117_map_scaled_1280x720_pinhole_v1",
+    "model": "PINHOLE",
+    "width": 1280,
+    "height": 720,
+    "params": [
+      960.4853166852678,
+      958.1961495535713,
+      670.8167666480655,
+      358.7191917782738
+    ]
+  }
+}

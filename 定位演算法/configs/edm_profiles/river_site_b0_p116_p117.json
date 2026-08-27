@@ -1,0 +1,69 @@
+{
+  "schema": "edm-deployment-profile/v1",
+  "name": "river_site_b0_p116_p117_20260818",
+  "status": "whole-flight held-out P157/P167 replay validated 2026-08-23; local reference radius widened without speed regression; temporal TRACK and periodic LOST recovery enabled; TRACK adaptive jump gate disabled",
+  "base": "定位演算法/configs/edm_production_profile.json（完整 tracker 契約；覆寫場域尺度與 TRACK jump policy）",
+  "map_scale": {
+    "S": 1.4704630374908447,
+    "definition": "2·p95(‖center − componentwise_median‖) over the 340 EDM references",
+    "note": "共用 profile 的隱含尺度是 target_site 的 5.007236；official69 compat 未重算尺度"
+  },
+  "matcher": {
+    "coarse_topk": 3225,
+    "mconf_thr": 0.2,
+    "fp16": true,
+    "input_size": [1024, 576],
+    "reference_cache_size": 32
+  },
+  "tracker": {
+    "global_retrieval_policy": "boot_and_lost_once",
+    "boot_global_topk": 10,
+    "acquire_initial_topk": 2,
+    "match_batch_size": 2,
+    "local_topk": 2,
+    "weak_local_topk": 3,
+    "lost_local_topk": 5,
+    "lost_local_grace_frames": 2,
+    "lost_global_retrieval_interval": 15,
+    "recovery_bank_size": 192,
+    "recovery_scan_topk": 2,
+    "use_temporal_reference": true,
+    "temporal_map_topk": 1,
+    "near_pool": 24,
+    "covis_per_ref": 20,
+    "radius": 0.5881852149963379,
+    "max_yaw_diff_deg": 90.0,
+    "max_corr_total": 900,
+    "corr_grid": 8,
+    "acquire_min_inliers": 80,
+    "track_min_inliers": 50,
+    "weak_min_inliers": 30,
+    "min_inlier_ratio": 0.15,
+    "min_inlier_grid_cells": 6,
+    "max_reproj_error_acquire": 5.0,
+    "max_reproj_error_track": 6.0,
+    "pnp_ransac_max_error": 5.0,
+    "max_jump": 0.5881852149963379,
+    "prediction_max_dt": 0.25,
+    "adaptive_jump_factor": 8.0,
+    "adaptive_jump_floor": 0.5881852149963379,
+    "adaptive_jump_bootstrap": 0.5881852149963379,
+    "adaptive_jump_ceiling": 0.5881852149963379,
+    "adaptive_jump_min_history": 20,
+    "adaptive_jump_history_size": 120,
+    "weak_after": 1,
+    "lost_after": 2,
+    "acquire_max_jump_factor": 2.0,
+    "acquire_max_yaw_diff_deg": 90.0,
+    "lost_prior_max_age_s": 3.0
+  },
+  "field_notes": {
+    "scale_dependent": [
+      "radius = max_jump = 0.40·S",
+      "max_jump = 0.40·S"
+    ],
+    "adaptive_jump_policy": "disabled for TRACK by setting floor/bootstrap/ceiling=max_jump; hard max_jump remains",
+    "runtime_stability_policy": "TRACK uses previous accepted frame + one map reference (two EDM pairs total); local reference scoring spans one hard-jump radius to preserve cross-pass reference continuity; WEAK begins after one miss; LOST retries MegaLoc every 15 frames",
+    "source_locpack": "地圖檔/場域/river_site/locpacks/river_b0_p116_p117_locpack_20260818"
+  }
+}

@@ -1,0 +1,264 @@
+name: validation
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      run_gpu_validation:
+        description: "Run the self-hosted RTX 5060 validation with private site assets"
+        required: false
+        default: false
+        type: boolean
+
+jobs:
+  system-validation-cpu:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - name: Install hash-locked test dependencies
+        run: python -m pip install --require-hashes -r requirements/test-lock.txt
+      - name: Install hash-locked quality dependencies
+        run: python -m pip install --require-hashes -r requirements/quality-lock.txt
+      - name: First-party code quality gates
+        run: |
+          ruff check .
+          ruff format --check \
+            tools/check_maintainability.py \
+            tests/tools/test_check_maintainability.py \
+            tests/tools/test_documentation_contract.py \
+            tools/offline_wheelhouse.py \
+            tests/tools/test_offline_wheelhouse.py \
+            tests/tools/test_install_runtime_contract.py \
+            定位演算法/flight_control/safety_command.py \
+            定位演算法/validation/check_runtime_mirrors.py \
+            定位演算法/validation/tests/test_runtime_mirrors.py \
+            定位演算法/validation/tests/test_edm_cpp_resource_safety.py \
+            控制介面程式/operator_interface/localization_metrics.py \
+            tests/control_interface/operator_interface/test_localization_metrics.py
+          python tools/check_maintainability.py
+          python -m mypy
+      - name: High-signal Ruff security gate
+        run: |
+          # Tests are assertion-heavy by design.  This bounded rule set targets
+          # dynamic execution, credentials, shell injection, and unsafe SQL/
+          # deserialization without claiming a whole-repository Bandit cleanup.
+          ruff check . \
+            --select S102,S105,S106,S107,S602,S604,S605,S608 \
+            --exclude '**/test*.py' \
+            --exclude '**/tests/**' \
+            --exclude '定位演算法/deploy_code/runtime/**'
+      - name: Dependency vulnerability audit and CycloneDX SBOM
+        run: |
+          python tools/security_dependency_gate.py \
+            --config pyproject.toml \
+            --audit-json outputs/security/pip-audit.json \
+            --sbom outputs/security/sbom.cyclonedx.json
+      - name: Upload dependency audit receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dependency-security-receipts
+          path: outputs/security/
+          if-no-files-found: ignore
+      - name: Release metadata and workspace contracts
+        run: |
+          missing=()
+          non_ignored_missing=()
+          while IFS=$'\t' read -r _ _ path; do
+            path="${path#./}"
+            if [[ ! -f "$path" ]]; then
+              missing+=("$path")
+              if ! git check-ignore --no-index -q -- "$path"; then
+                non_ignored_missing+=("$path")
+              fi
+            fi
+          done < <(tail -n +2 MANIFEST.tsv)
+          if ((${#non_ignored_missing[@]})); then
+            printf 'Manifest references missing non-ignored files:\n- %s\n' \
+              "${non_ignored_missing[@]}" >&2
+            exit 1
+          fi
+          if ((${#missing[@]})); then
+            echo '::notice::Skipping source manifest verification: private ignored release assets are not mounted on hosted CI.'
+          else
+            python tools/package_manifest.py verify --root .
+          fi
+          python 定位演算法/validation/check_runtime_mirrors.py
+          python tools/workspace_audit.py --strict-output-names --no-sizes
+          python 定位演算法/validation/monitor_hardware.py \
+            --output - --samples 1 --interval 0.01
+          python 控制介面程式/mission_pipeline.py --mode flight-selftest
+          python -m pip check
+      - name: Validate private site profile assets when mounted
+        if: >-
+          ${{
+            hashFiles('地圖檔/場域/river_site/maps/river_site_realrgb_dense_trimmed.ply') != '' &&
+            hashFiles('地圖檔/場域/river_site/maps/river_site_ref_poses.json') != '' &&
+            hashFiles('地圖檔/場域/river_site/maps/T_align_gravity.json') != '' &&
+            hashFiles('地圖檔/場域/river_site/bundles/river_site_reloc_map_edm.pt') != '' &&
+            hashFiles('地圖檔/場域/river_site/routes/authored/route_20260807_013811.json') != ''
+          }}
+        run: python 控制介面程式/validate_system_profiles.py
+      - name: Root tests with expanded first-party coverage
+        run: python -m pytest -q --timeout=300 --cov --cov-config="$GITHUB_WORKSPACE/pyproject.toml" --cov-report=term-missing
+
+  parrot-simulator:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: 模擬器/parrot_stimulate
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.11.16"
+      - name: Install and validate simulator lock without private Sphinx firmware
+        run: |
+          uv sync --locked
+          uv sync --locked --offline --check
+      - name: Use the locked simulator environment
+        run: echo "$GITHUB_WORKSPACE/模擬器/parrot_stimulate/.venv/bin" >> "$GITHUB_PATH"
+      - name: Simulator tests
+        run: PYTHONPATH=src python -m pytest -q
+      - name: Simulator lint and format
+        run: |
+          python -m ruff check .
+          python -m ruff format --check .
+
+  portable-package-boundary:
+    name: Portable export boundary (hosted asset check)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - name: Check whether source release assets are mounted
+        id: source_assets
+        run: |
+          missing=()
+          non_ignored_missing=()
+          while IFS=$'\t' read -r _ _ path; do
+            path="${path#./}"
+            if [[ ! -f "$path" ]]; then
+              missing+=("$path")
+              if ! git check-ignore --no-index -q -- "$path"; then
+                non_ignored_missing+=("$path")
+              fi
+            fi
+          done < <(tail -n +2 MANIFEST.tsv)
+          if ((${#non_ignored_missing[@]})); then
+            printf 'Manifest references missing non-ignored files:\n- %s\n' \
+              "${non_ignored_missing[@]}" >&2
+            exit 1
+          fi
+          if ((${#missing[@]})); then
+            echo 'complete=false' >> "$GITHUB_OUTPUT"
+            echo '::notice::Portable export deferred: source MANIFEST.tsv contains private ignored assets absent from hosted CI.'
+            printf 'Missing private files (first 20):\n- %s\n' "${missing[@]:0:20}"
+          else
+            echo 'complete=true' >> "$GITHUB_OUTPUT"
+          fi
+      - name: Export portable simulator package
+        if: steps.source_assets.outputs.complete == 'true'
+        run: python tools/export_simulator_package.py "$RUNNER_TEMP/localization_portable"
+      - name: Verify exported package manifest and release metadata
+        if: steps.source_assets.outputs.complete == 'true'
+        run: |
+          python tools/package_manifest.py verify --root "$RUNNER_TEMP/localization_portable"
+          python - "$RUNNER_TEMP/localization_portable/PORTABLE_PACKAGE.json" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          metadata = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          assert metadata["schema"] == "sfm-portable-simulator/v2"
+          assert metadata["package_kind"] == "simulated-interface-runtime"
+          assert metadata["source_release"]["dirty"] is False
+          PY
+
+  system-validation-gpu:
+    name: Full system validation (self-hosted GPU and private assets)
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_gpu_validation }}
+    runs-on: [self-hosted, linux, x64, gpu]
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Private maps/videos/weights are provisioned on this runner and are
+          # intentionally ignored by Git. Do not let checkout clean them.
+          clean: false
+      - name: Require private validation assets
+        run: |
+          required=(
+            "地圖檔/場域/river_site/maps/river_site_realrgb_dense_trimmed.ply"
+            "地圖檔/場域/river_site/maps/river_site_ref_poses.json"
+            "地圖檔/場域/river_site/maps/T_align_gravity.json"
+            "地圖檔/場域/river_site/bundles/river_site_reloc_map_edm.pt"
+            "地圖檔/場域/river_site/routes/authored/route_20260807_013811.json"
+            "模擬器/測試影片/河濱_P1180118_first_2s.mp4"
+            "定位演算法/deploy_code/runtime/EDM/weights/edm_outdoor.ckpt"
+            "執行環境/torch_hub_cache/checkpoints/megaloc/7cb9f7970d366fdf059963d04d372e503e8e9df9/model.safetensors"
+          )
+          missing=()
+          for path in "${required[@]}"; do
+            [[ -f "$path" ]] || missing+=("$path")
+          done
+          if ((${#missing[@]})); then
+            printf 'Missing private validation assets:\n- %s\n' "${missing[@]}" >&2
+            exit 1
+          fi
+      - name: Verify complete source release manifest
+        run: python tools/package_manifest.py verify --root .
+      - name: Install system dependencies for simulated UI
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes ffmpeg python3-tk xvfb
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - name: Install root pinned runtime and test environment
+        run: |
+          SFM_PYTHON="$(command -v python)" \
+          SFM_VENV_DIR="$GITHUB_WORKSPACE/.venv" \
+            bash tools/install_runtime.sh --test-deps
+          echo "SFM_PYTHON=$GITHUB_WORKSPACE/.venv/bin/python" >> "$GITHUB_ENV"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.11.16"
+      - name: Install simulator pinned environment
+        working-directory: 模擬器/parrot_stimulate
+        run: uv sync --locked
+      - name: Export portable package for the bound validation receipt
+        run: python tools/export_simulator_package.py "$RUNNER_TEMP/localization_portable"
+      - name: Run complete no-flight system validation with clean install and UI smoke
+        env:
+          DISPLAY: :99
+        run: |
+          Xvfb :99 -screen 0 1920x1080x24 -nolisten tcp >/tmp/sfm-xvfb.log 2>&1 &
+          xvfb_pid=$!
+          trap 'kill "$xvfb_pid" 2>/dev/null || true' EXIT
+          ./驗證系統.sh \
+            --portable-package "$RUNNER_TEMP/localization_portable" \
+            --clean-install \
+            --ui-smoke
+      - name: Upload full validation receipt
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: system-validation-gpu-receipt
+          path: outputs/validation_receipts/
+          if-no-files-found: ignore

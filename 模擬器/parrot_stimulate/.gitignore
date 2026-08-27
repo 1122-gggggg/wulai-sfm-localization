@@ -1,0 +1,16 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Generated simulator outputs and downloaded firmware images.
+artifacts/
+firmware/*.zip
+.boot-probe.armed
+.boot-probe.consumed-*

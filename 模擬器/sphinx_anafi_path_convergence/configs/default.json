@@ -1,0 +1,15 @@
+{
+  "backend": "sphinx",
+  "pattern": "s_curve",
+  "segment_length_m": 4.0,
+  "start_radius_m": 5.0,
+  "num_trials": 20,
+  "duration": 60.0,
+  "random_seed": 42,
+  "rejoin_algorithm": "adaptive_lookahead",
+  "horizontal_control_mode": "hybrid",
+  "random_yaw_error_deg": 15.0,
+  "ideal_success_error_m": 0.5,
+  "max_allowed_error_m": 3.0,
+  "min_corridor_time_ratio": 0.8
+}

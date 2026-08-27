@@ -1,0 +1,31 @@
+{
+  "schema": "edm-site-replay-quality-baseline/v1",
+  "video": "/home/allen/下載/P1190119.MP4",
+  "video_sha256": "600bbf70227311cab079d77fcb896f97e6d3e55f6bc40b5bef01d74b65f7826c",
+  "site_profile": "地圖檔/場域/river_site/site_profile.json",
+  "site_profile_sha256": "d40e683842b99d5a4a9c571ab027356eafbd234dfbf8c97c0e7a12200fe25189",
+  "bundle_sha256": "39a817936c0ba314a739701411f974672a94f126830f9f5b9a7a4efdfee08117",
+  "localizer_profile_sha256": "55bd6941891effe20123faea91073baeb5e30dac6b47437225f59928530f7db9",
+  "camera": {
+    "model": "PINHOLE",
+    "width": 1280,
+    "height": 720,
+    "params": [
+      1000.8124857902368,
+      1007.5681084778566,
+      670.8167724609375,
+      358.71917724609375
+    ]
+  },
+  "evidence": "outputs/validation/edm_p119_pnp_ab_20260802/pnp_cap_900_full.json",
+  "thresholds": {
+    "frames": 2934,
+    "min_successes": 1686,
+    "min_track": 2244,
+    "max_lost": 139,
+    "min_inliers_p50": 693.0,
+    "min_inliers_p95": 875.0,
+    "max_reproj_rms_p95": 2.9565321621751037,
+    "max_limited_jump_unconfirmed": 1187
+  }
+}

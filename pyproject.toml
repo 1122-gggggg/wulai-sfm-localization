@@ -1,0 +1,142 @@
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+exclude = [
+  ".git",
+  ".venv",
+  ".codegraph",
+  ".pytest_cache",
+  ".ruff_cache",
+  "outputs",
+  "地圖檔",
+  "執行環境/package_git",
+  # Imported upstream source. It is pinned and smoke-tested, but not restyled.
+  "定位演算法/deploy_code/runtime",
+  "定位演算法/EDM工具包",
+]
+
+[tool.ruff.lint]
+# Full Pyflakes catches dead imports, name shadowing, undefined names, and other
+# correctness issues in first-party code. Syntax errors remain an explicit gate.
+select = ["E9", "F"]
+
+[tool.mypy]
+# This is an intentionally bounded boundary gate, not a claim that the whole
+# robotics application is typed.  Dynamic vendor/UI/ML modules remain outside
+# this list until they have stable interfaces and stubs.
+python_version = "3.10"
+files = [
+  "tools/release_contract.py",
+  "tools/package_manifest.py",
+  "tools/offline_wheelhouse.py",
+  "定位演算法/flight_control/safety_command.py",
+  "定位演算法/flight_control/landing_transition.py",
+  "定位演算法/flight_control/localization_uncertainty.py",
+  "定位演算法/flight_control/route_domain.py",
+  "控制介面程式/site_profile.py",
+  "控制介面程式/operator_interface/backend_contract.py",
+  "控制介面程式/operator_interface/localization_contract.py",
+  "控制介面程式/operator_interface/operator_autonomy.py",
+  "控制介面程式/operator_interface/operator_command_coordinator.py",
+  "控制介面程式/operator_interface/operator_flight_safety.py",
+  "控制介面程式/operator_interface/operator_preflight.py",
+  "控制介面程式/operator_interface/operator_rendering.py",
+  "控制介面程式/operator_interface/operator_site_runtime.py",
+  "控制介面程式/operator_interface/operator_shutdown.py",
+  "控制介面程式/operator_interface/operator_tick.py",
+  "控制介面程式/operator_interface/runtime_safety.py",
+]
+check_untyped_defs = true
+disallow_untyped_defs = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_return_any = true
+warn_unused_ignores = true
+ignore_missing_imports = true
+follow_imports = "skip"
+
+[tool.security_dependency_gate]
+# Avoid noisy style-adjacent rules in the security gate.  These rules catch
+# dynamic code execution, credential literals, shell injection, and unsafe
+# deserialization without turning existing test assertions into findings.
+
+[[tool.security_dependency_gate.exceptions]]
+package = "protobuf"
+advisory_id = "PYSEC-2026-899"
+reason = "parrot-olympe==8.4.0 pins this protobuf wire schema; upgrading it changes the flight SDK protocol. The deployed runtime is isolated and offline; revisit this exception with the next Olympe upgrade."
+expires = "2027-08-09"
+
+[[tool.security_dependency_gate.exceptions]]
+package = "protobuf"
+advisory_id = "PYSEC-2026-1806"
+reason = "parrot-olympe==8.4.0 pins this protobuf wire schema; upgrading it changes the flight SDK protocol. The deployed runtime is isolated and offline; revisit this exception with the next Olympe upgrade."
+expires = "2027-08-09"
+
+[[tool.security_dependency_gate.exceptions]]
+package = "protobuf"
+advisory_id = "PYSEC-2026-1805"
+reason = "parrot-olympe==8.4.0 pins this protobuf wire schema; upgrading it changes the flight SDK protocol. The deployed runtime is isolated and offline; revisit this exception with the next Olympe upgrade."
+expires = "2027-08-09"
+
+[[tool.security_dependency_gate.exceptions]]
+package = "setuptools"
+advisory_id = "PYSEC-2026-3447"
+reason = "torch==2.11.0+cu128 pins setuptools<82. This advisory is limited to macOS sdist Unicode MANIFEST exclusion behavior; this Linux runtime does not build or publish sdists. Revisit when the pinned torch/runtime contract changes."
+expires = "2027-02-09"
+
+[[tool.security_dependency_gate.skip_exceptions]]
+package = "torch"
+version = "2.11.0+cu128"
+skip_reason = "Dependency not found on PyPI and could not be audited: torch (2.11.0+cu128)"
+reason = "The official PyTorch cu128 extra index (https://download.pytorch.org/whl/cu128) provides this CUDA wheel. The runtime and test locks pin its exact version and hashes, installation is offline after seeding the approved artifact bundle, and the gate records this skipped component in the CycloneDX SBOM. Revisit before expiry."
+expires = "2027-02-09"
+
+[[tool.security_dependency_gate.skip_exceptions]]
+package = "torchvision"
+version = "0.26.0+cu128"
+skip_reason = "Dependency not found on PyPI and could not be audited: torchvision (0.26.0+cu128)"
+reason = "The official PyTorch cu128 extra index (https://download.pytorch.org/whl/cu128) provides this CUDA wheel. The runtime and test locks pin its exact version and hashes, installation is offline after seeding the approved artifact bundle, and the gate records this skipped component in the CycloneDX SBOM. Revisit before expiry."
+expires = "2027-02-09"
+
+[[tool.security_dependency_gate.skip_exceptions]]
+package = "moge"
+version = "2.0.0"
+skip_reason = "Dependency not found on PyPI and could not be audited: moge (2.0.0)"
+reason = "Optional RePoseD source wheel from microsoft/MoGe@925b8ed835a7a9cdb7578ba15c658a0afc969030 is hash locked at 176363a4de409b926f8c9b554d350b21398d334c7c6cebb181d493c59c20fd5c; it is excluded from the B0 base and may only be installed from an approved optional wheelhouse. Revisit before expiry."
+expires = "2027-02-09"
+
+[[tool.security_dependency_gate.skip_exceptions]]
+package = "utils3d"
+version = "1.3"
+skip_reason = "Dependency not found on PyPI and could not be audited: utils3d (1.3)"
+reason = "Optional RePoseD source wheel from EasternJournalist/utils3d@3fab839f0be9931dac7c8488eb0e1600c236e183 is hash locked at e426f98cd2bf8fdeed6c3377cc574dc4f1d7c1b865664447edaa31977db69da3; it is excluded from the B0 base and may only be installed from an approved optional wheelhouse. Revisit before expiry."
+expires = "2027-02-09"
+
+[[tool.security_dependency_gate.skip_exceptions]]
+package = "poselib"
+version = "3.0.0"
+skip_reason = "Dependency not found on PyPI and could not be audited: poselib (3.0.0)"
+reason = "Optional PoseLib source wheel from PoseLib/PoseLib@fa7280fee27f97aff31ae7f98bab7f583fac7d08 is hash locked at a7fbb352765662b22e7cfc50b6d47548e79d13726afc91d696768c0ce480a849; it provides the pinned monodepth-relative-pose API, is excluded from the B0 base, and may only be installed from an approved optional wheelhouse. Revisit before expiry."
+expires = "2027-02-09"
+
+[tool.coverage.run]
+branch = true
+source = [
+  "tools",
+  "控制介面程式",
+  "定位演算法/validation",
+  "定位演算法/flight_control",
+  "定位演算法/deploy_code/sfm_glomap_deploy",
+]
+omit = [
+  "*/tests/*",
+  "*/test_*.py",
+]
+
+[tool.coverage.report]
+# Removing committed runtime mirrors made the first-party measurement meaningful:
+# the 2026-08-08 suite covers 53.55%. Keep 50% as a regression floor while
+# high-risk modules receive focused tests.
+fail_under = 50
+precision = 2
+show_missing = true
