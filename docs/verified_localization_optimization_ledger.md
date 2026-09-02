@@ -238,7 +238,8 @@
 - flight profile（`localization/` 與 `compat/edm_runtime_profile.json` 兩份）`lost_global_retrieval_interval`：`15` → `3`。
 - 意義：LOST episode 在 grace window（`lost_local_grace_frames=2`）之後,每第 3 個 LOST 幀重試一次 MegaLoc 全域檢索,而不是每 15 個。**只影響 LOST 恢復路徑,TRACK 完全不動,所以沒有 per-frame latency 成本。**
 - 沒有放寬任何 acceptance gate:錯誤檢索仍要過 `acquire_min_inliers=80`、trajectory bounds、`stale_reacquire_confirmations=2`。
-- profile SHA `93e0c2d1…` → `a65f78ca…`;已同步 `site_profile.json`（頂層+release）`asset_sha256`、`compat/localizer_edm_manifest.json` `artifacts.profile.sha256`、`控制介面程式/mission_selections/river_gluemap_all8_direct_localization.json` `localizer.sha256`（新 manifest SHA `eaff3d6f…`）、`MANIFEST.tsv` / `SHA256SUMS`。`EDMConfig` code default 維持 `0`（legacy one-shot），未指定 profile 的 tracker 不受影響。
+- profile SHA `93e0c2d1…` → `a65f78ca…`;已同步 `site_profile.json`（頂層+release）`asset_sha256`、`compat/localizer_edm_manifest.json` `artifacts.profile.sha256`、`控制介面程式/mission_selections/river_gluemap_all8_direct_localization.json` `localizer.sha256`（新 manifest SHA `eaff3d6f…`）、`MANIFEST.tsv` / `SHA256SUMS`。
+- **2026-09-02（後續）:`EDMConfig.lost_global_retrieval_interval` code default `0` → `3`**（`production_edm_tracker.py:165`）。未指定 profile 的 tracker、`edm_production_profile.json`（該檔仍不寫此 key）都改吃 `3`。同步改測試:`test_edm_tracker_quality.py::test_lost_global_retrieval_interval_is_nonnegative_and_defaults_to_three`、`test_deployment_validation.py::test_profile_absent_lost_retrieval_interval_falls_back_to_code_default`。site profile 仍可明寫 `0` 還原 one-shot。**注意:`3` 是 river 1045-ref 調出來的,見「地圖相依性」。**
 
 **證據：P168 700f + P117 全段,stride 3,seed 0,--require-cuda --gpu-span,RTX 5060,venv torch 2.11.0+cu128**
 
@@ -362,6 +363,42 @@ P157/P167 latency候選的確顯著降低 p50，但 reference trace 與狀態路
 原始負面實驗詳情：`outputs/optimization_20260831_report.md`、`outputs/edm_p168_20260831/`、`outputs/edm_resolution/`、`outputs/megaloc_token_reduction_*`、`outputs/megaloc_boq_resnet50/`、`outputs/edm_tensorrt/`。
 
 ## 地圖更換重做流程
+
+### 換地圖時：可沿用 vs 必須重跑（快速對照）
+
+**可直接沿用（機制/演算法不隨地圖改；只需跑對應的 exact / 回歸測試，不需重調參）**
+
+| 項目 | 沿用範圍 | 換地圖只需 |
+|---|---|---|
+| 項 2 每幀 query backbone feature reuse | 完全沿用 | `test_reference_feature_cache.py::test_prepared_query_features_are_reused…` + 一段固定 replay trace 相同 |
+| 項 6 matcher packed D2H | 完全沿用 | `test_reference_feature_cache.py::test_match_output_pack_preserves_values_and_batch_ids` |
+| 項 7 bundle mmap + JPEG 平行解碼（機制） | 機制沿用，收益隨 reference 數/JPEG 大小變 | 記錄新 cold-load p50/p95；workers 維持 8 |
+| 項 8 latest-frame coalescing + adaptive submit（演算法） | 演算法沿用，cadence 自動跟 latency | `test_worker_lifecycle.py` 那 3 個行為測試；查 source-frame age / coalesce drops |
+| 項 9 sparse localization JSON telemetry | 完全沿用 | `test_localization_metrics.py` 兩個測試 |
+| neck `repeat→expand`（exact） | 完全沿用（數值 identical，非加速） | `SFM_EDM_NECK_NO_EXPAND=1` A/B 逐幀 0 diff |
+| `_track_klt_prior` 移除 `raise StopIteration` | 純重構，完全沿用 | `test_klt_miss_prior.py` |
+| cache 8GiB 預算對 CLI override | 純 correctness fix，完全沿用 | `test_validation_benchmark_helpers.py::test_reference_feature_cache_override_*` |
+| ESEKF / KLT 3D-aware 接線程式碼 | 程式碼沿用（replay 休眠）；EKF 參數可能要調 | 需 live telemetry 才評得到，replay gate 無法 |
+| 實作同步邊界（雙份 `edm_matcher.py` 等） | 規則沿用 | 改任一份就兩份一起改 + 跑對應測試 |
+
+**必須重跑 / 重算（地圖相依；不得沿用 river 的值）**
+
+| 項目 | 為何相依 | 換地圖動作 |
+|---|---|---|
+| 項 1 相機內參、`S`、`radius`、`max_jump` | 座標尺度 + 相機來源 | 依 B 段重算 `S=2·p95(‖center−median‖)`、`0.40·S` 起始，重跑整段 replay |
+| 項 3 GPU feature cache 192 | 量測 working set 相依 | 依 C 段跑 `64 / 192 / 全 reference 數` 三點，輸出完全相同時取最小 p50/p95 的容量 |
+| 項 4 MegaLoc 為 VPR（reference descriptor bank） | `ref_global` 綁地圖 | 重建/驗證 bundle 內 `ref_global`；**不要**因換地圖改 query encoder / engine |
+| 項 5 persistent feature bank | bank identity 綁 bundle SHA + reference 名單 + 每張 image SHA | 用 `SFM_EDM_BUILD_REFERENCE_FEATURE_STORE=1` 建新 bank，關旗標後確認可再載入 + exact matcher output |
+| 項 10 `reference_quality_weight 0.5` | 參考品質分佈相依 | 重跑 `a2_quality` 對照（0.0 vs 0.5），比 p95 與成功率；可退回 0.0 |
+| 項 11 `use_temporal_reference` | 收益隨 reference 密度 | 重跑 temporal on/off 對照；river 現行是 `true`（2026-09-02 gate 上 off 反而 P117 退化） |
+| **項 12 `lost_global_retrieval_interval`（profile=3 + code default=3）** | **LOST 密度相依，sweep 非單調** | **重跑 interval sweep（至少 1/2/3/4/8）+ P168+P117 兩段 holdout；峰值可能不在 3。若新地圖 recovery 差很多可先設回 `0`（one-shot）再調** |
+| 「現行 profile 中仍需場域重驗」整段 | `query_cuda_graph`、`acquire_stage_mode`、`pnp_ranked_batches`、`track_map_first`、`match_batch_size` + 所有 inlier/reproj/jump/yaw/stale-LOST gate | 當候選,不得當已證明的通用優化直接升級;安全 gate 不得為成功率/latency 移除 |
+| 整段 D 回放 gate | video / frame schedule / camera / PnP seed 都要固定為新地圖的 | 兩段完整飛行 replay（BOOT/TRACK/WEAK/LOST/reacquire）+ 一段 hard-negative/off-map |
+
+**換 manifest / SHA 時要跟著重跑的測試**（不論地圖有沒有換，只要動了 profile / manifest chain）：
+`test_deployment_validation.py`、`test_mission_resolver.py`、`test_site_profile.py`、
+`tools/package_manifest.py verify`、`tools/system_validation.py`。項 12 的 SHA 串（profile →
+`localizer_edm_manifest.json` → `mission_selections/*.json`）就是範例。
 
 ### A. 先固定新場域身分
 

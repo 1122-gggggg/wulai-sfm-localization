@@ -160,9 +160,13 @@ class EDMConfig:
     global_retrieval_policy: str = "boot_and_lost_once"
     lost_local_topk: int = 5
     lost_local_grace_frames: int = 2
-    # A zero interval preserves the legacy one-shot LOST retrieval. When set,
-    # retry MegaLoc every interval-th LOST frame after the first grace-window shot.
-    lost_global_retrieval_interval: int = 0
+    # Retry MegaLoc every interval-th LOST frame after the first grace-window shot.
+    # A zero interval restores the legacy one-shot LOST retrieval. Default 3 from the
+    # 2026-09-02 river 1045-ref gate: P168 536->608 (+72), P117 366->366 (0), TRACK
+    # path untouched (docs/verified_localization_optimization_ledger.md item 12). The
+    # peak is map-dependent and non-monotonic (1/2/4/8 -> +14/+47/+47/+47); a new map
+    # must re-run the interval sweep, this is only a better starting point than 0.
+    lost_global_retrieval_interval: int = 3
     recovery_bank_size: int = 192
     recovery_scan_topk: int = 2
     match_batch_size: int = 2

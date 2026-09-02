@@ -296,9 +296,11 @@ def test_edm_config_rejects_non_finite_and_relational_values() -> None:
         EDMConfig(corr_grid=2, min_inlier_grid_cells=5)
 
 
-def test_lost_global_retrieval_interval_is_nonnegative_and_off_by_default() -> None:
-    assert EDMConfig().lost_global_retrieval_interval == 0
-    assert EDMConfig(lost_global_retrieval_interval=3).lost_global_retrieval_interval == 3
+def test_lost_global_retrieval_interval_is_nonnegative_and_defaults_to_three() -> None:
+    # Default 3 from the 2026-09-02 river 1045-ref gate (ledger item 12); 0 restores
+    # the legacy one-shot behavior and is still accepted per site profile.
+    assert EDMConfig().lost_global_retrieval_interval == 3
+    assert EDMConfig(lost_global_retrieval_interval=0).lost_global_retrieval_interval == 0
 
     for value in (-1, True, 1.5):
         with pytest.raises(ValueError, match="lost_global_retrieval_interval"):

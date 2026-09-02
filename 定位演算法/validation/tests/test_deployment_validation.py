@@ -720,7 +720,10 @@ def _official_edm_profile() -> dict:
     )
 
 
-def test_legacy_profile_uses_one_shot_lost_retrieval_default() -> None:
+def test_profile_absent_lost_retrieval_interval_falls_back_to_code_default() -> None:
+    # edm_production_profile.json omits the key; apply_edm_tracker_profile resets it
+    # to the EDMConfig field default, which is 3 since the 2026-09-02 river gate
+    # (ledger item 12). A site profile may still pin 0 to restore one-shot retrieval.
     from edm_profile import apply_edm_tracker_profile
     from production_edm_tracker import EDMConfig
 
@@ -730,7 +733,7 @@ def test_legacy_profile_uses_one_shot_lost_retrieval_default() -> None:
 
     apply_edm_tracker_profile(cfg, profile)
 
-    assert cfg.lost_global_retrieval_interval == 0
+    assert cfg.lost_global_retrieval_interval == 3
 
 
 def test_absent_or_off_reposed_profile_imports_no_optional_package() -> None:
