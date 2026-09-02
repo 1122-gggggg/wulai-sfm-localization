@@ -18,8 +18,18 @@ outputs/*
 # 只有說明文件進版控，讓 repo 記錄格式而不攜帶任何場域資料。
 地圖檔/場域/*/
 !地圖檔/場域/README.md
+# river_site overlay: intrinsic difficult localization spheres (red) — allowed to be tracked
+!地圖檔/場域/river_site/
+地圖檔/場域/river_site/*
+!地圖檔/場域/river_site/overlay/
+!地圖檔/場域/river_site/overlay/**
 定位演算法/deploy_code/runtime/EDM/weights/*
 !定位演算法/deploy_code/runtime/EDM/weights/.gitignore
+# 大型二進位資產：留在本機，不進 git 歷史（feature bank ~8.9GB、bundle ~2.6GB）。
+執行環境/models/edm_reference_features/
+river-localization-bundle-20260831/
+river-localization-bundle-20260831.tar.zst
+river-localization-bundle-20260831.tar.zst.sha256
 定位演算法/validation/report_*/
 模擬器/測試影片/*
 !模擬器/測試影片/README.md

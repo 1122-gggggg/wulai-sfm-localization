@@ -38,6 +38,8 @@ EXCLUDED_PARTS = {
     "mission_snapshots",
     "outputs",
     "package_git",
+    # Large binary artifacts kept local only (see .gitignore); not shipped in the manifest.
+    "edm_reference_features",
     ".idea",
     ".vscode",
     ".fleet",
@@ -52,6 +54,9 @@ EXCLUDED_PREFIXES = (
     "模擬器/測試影片/",
     "定位演算法/validation/report_",
     "定位演算法/validation/source_videos/",
+    # Large source bundle kept local only (see .gitignore); not shipped in the manifest.
+    "river-localization-bundle-20260831/",
+    "river-localization-bundle-20260831.tar.zst",
 )
 SOURCE_EXTERNAL_PARTS = {"offline_wheelhouse", "torch_hub_cache"}
 SOURCE_EXTERNAL_PREFIXES = ("定位演算法/deploy_code/runtime/EDM/weights/",)
