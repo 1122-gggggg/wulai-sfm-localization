@@ -11,78 +11,50 @@ profile、不得移除安全 gate。**
 
 ---
 
-## 0. 本輪（2026-09-02）已完成的安全子集
+## 0. 狀態（2026-09-02，跑在 repo venv + RTX 5060）
 
-| 項目 | 檔案 | 狀態 |
-|---|---|---|
-| `_track_klt_prior` 去掉 `raise StopIteration` 控制流 | `定位演算法/deploy_code/sfm_glomap_deploy/production_edm_tracker.py`（`_track_klt_prior`） | 完成，行為等價（3D-aware LK 成功時 `nxt/stf` 已綁定，fallback 段 `try: nxt except NameError` 直接重用；失敗時 `except Exception` 走 fallback）。`py_compile` 通過。 |
-| 1045-ref temporal-off + quality-0.5 候選 profile | `定位演算法/configs/edm_profiles/river_gluemap_all8_direct_20260831_temporal_off_quality_candidate.json` | 完成，`json.load` 通過；schema key 全部落在 `edm_profile.py` 的 required∪optional 內。標記 candidate / NOT flight approved。 |
-| Reference feature cache 8GiB 預算對 CLI override 失效（SUMMARY.md s1_cache1045） | `定位演算法/validation/benchmark_edm_site_replay.py::_apply_reference_feature_cache_overrides`（行 376-411） | 已在工作樹修好：override 先跑 `_validate_matcher_cache_budget` 再 mutate `reference_feature_cache_size` / `_feature_cache_capacity["map"]`，另有 fallback 內嵌檢查。本輪補上回歸測試。 |
-| 回歸測試 | `定位演算法/validation/tests/test_validation_benchmark_helpers.py`（`test_reference_feature_cache_override_*`、`test_host_reference_feature_cache_override_*`） | 完成。用 repo venv（`/home/allen/localization/.venv`，torch 2.11.0+cu128）跑全套 `2301 passed / 3 skipped / 0 failed`。 |
-| `SFM_EDM_NECK_NO_EXPAND` env toggle | `定位演算法/deploy_code/runtime/EDM/src/edm/neck/neck.py` | 新增，強制回舊的 2*B unary-CNN 路徑，供 exact A/B。預設不設 = 行為不變。用於 2026-09-02 的 neck expand exact 驗證（見總帳）。 |
-| GPU gate（P168 700f + P117 全段） | `outputs/tier1_gate_20260902/`（本機） | 完成，見總帳「2026-09-02 GPU gate 結果」。 |
-| EDMConfig code default 同步 | `production_edm_tracker.py:173`、`:234` | 無需改動：`use_temporal_reference` 已是 `False`、`reference_quality_weight` 已是 `0.5`。 |
-| EDM 工具包 / deploy 雙份同步 | `edm_matcher.py`、`reloc_localizer_edm.py`、`production_localizer_factory.py`、`edm_pose_selection.py`、`edm_profile.py` | 本輪未改動這些雙份檔案；`diff` 兩棵樹目前 0 行差異。若後續改到其中任一，兩份必須一起改並跑對應測試（總帳「實作同步邊界」）。 |
+全套 pytest `2301 passed / 3 skipped`。GPU gate 明細在總帳「2026-09-02 GPU gate 結果」+ 項 12。
 
----
+| 項目 | 結果 |
+|---|---|
+| **`lost_global_retrieval_interval` 15→3** | **已升級進 flight profile**（總帳項 12）。P168 536→608（+72），P117 366→366（0）。profile SHA `93e0c2…`→`a65f78ca…`,manifest chain 已同步。 |
+| `use_temporal_reference` true→false | REJECTED — P168 +20 但 P117 −20 / LOST +12 / p50 +12。候選 profile 已刪。 |
+| `lost_prior_strategy` full_global / score_fusion | REJECTED — 同型（P168 +65，P117 −17）。 |
+| `--no-track-map-first` | REJECTED — +37 但 p50 22.75→41.56 ms。 |
+| `acquire_stage_mode` / `pnp_ranked_batches` / `local_topk` | 無效（P168 successes 不變）。 |
+| EDM neck `repeat→expand` | exact 已驗證（700 幀 0 diff），但無 TRACK 加速。保留 guarded + `SFM_EDM_NECK_NO_EXPAND` 逃生閥。 |
+| ESEKF / KLT 3D-aware | 在 `__init__` 無條件建但 replay 休眠（無 live velocity）；replay gate 評不到。 |
+| `_track_klt_prior` `raise StopIteration` | 移除,行為等價。 |
+| cache 8GiB 預算對 CLI override 失效 | 已修（`_apply_reference_feature_cache_overrides` 先 validate 再 mutate）+ 回歸測試。 |
 
-## 1. Tier 1 — 已有證據、只差版本發布時同步進 flight profile（風險最低）
-
-活躍 river flight profile：
-`地圖檔/場域/river_site/releases/river_gluemap_all8_direct_20260831/{localization,compat}/edm_runtime_profile.json`
-（SHA-256 `93e0c2d1…`，兩份內容相同；`site_profile.json`（頂層 + release）`asset_sha256.localizer_profile`
-記同一 hash）。
-
-### 1a. `use_temporal_reference: true -> false` — 2026-09-02 gate REJECTED
-
-- 2026-09-02 在現行 committed 樹跑了完整 gate（P168 700f + P117 全段，baseline = 現行 flight profile）：
-  - P168：536 → 556（+20），p95 107.78 → 79.36 ms，p50 23.33 → 35.47（+12）
-  - P117：366 → **346（−20）**，LOST 42 → **54（+12）**，p50 23.75 → 34.86（+11），p95 平
-- 分裂結果，P117 退化 5 個百分點。違反准入規則。**flight profile 維持 `true`，候選 profile 標記 REJECTED。**
-- 總帳項 11 的 `s3_no_temporal` +34 建立在 2026-09-01 舊樹（matcher rework 前，s0=486），現行基準已是 536，那個結論不再有效。
-- 原始 JSON：`outputs/tier1_gate_20260902/`（本機，`outputs/` 不進版控）。
-
-### 1b. `reference_quality_weight` 0.5
-
-- 已是 EDMConfig code default，flight profile 未寫此 key → 生效值就是 0.5，2026-09-02 baseline 與 candidate 都在跑。
-- 這個權重本身沒有被 gate 否定；被否定的是與它綁在同一支候選 profile 的 temporal-off。
-- 若日後要「pin against code-default 漂移」，可在下次發版時把 `reference_quality_weight: 0.5` 明寫進 flight profile（`EDM_OPTIONAL_TRACKER_KEYS` 允許），這是純文件化、不改行為。
-
-### 1c. 下一步
-
-- Tier 1 目前沒有可升級的東西。若 Tier 2（recovery 路徑）改善後,可重跑 1a 的 gate 看 P117 是否還退化。
-
-### 發布流程（總帳「E. 升級與記錄」的子集；目前 Tier 1 無升級標的，保留供未來 within-map profile 修正用）
-
-1. 改 `releases/river_gluemap_all8_direct_20260831/localization/edm_runtime_profile.json` 與 `.../compat/edm_runtime_profile.json`（兩份保持相同內容）。
-2. `sha256sum` 兩份 → 應仍相同 → 更新：
-   - `地圖檔/場域/river_site/site_profile.json` 的 `asset_sha256.localizer_profile`
-   - `地圖檔/場域/river_site/releases/river_gluemap_all8_direct_20260831/site_profile.json` 的 `asset_sha256.localizer_profile`
-   - 根目錄 `SHA256SUMS`
-   - `MANIFEST.tsv`
-   - 總帳項 10、11 的 SHA 與「現況」段
-3. 跑 `tools/system_validation.py`、package manifest 檢查、固定 replay、UI smoke。
-4. 候選 profile `river_gluemap_all8_direct_20260831_temporal_off_quality_candidate.json` 的 tracker 區塊就是目標內容，可直接對照。
+雙份同步邊界（`edm_matcher.py` 等,見總帳「實作同步邊界」）本輪未動,兩棵樹 0 行差異。
 
 ---
 
-## 2. Tier 2 — 結構性、證據指向但尚未解掉
+## 1. Tier 1 — 已無升級標的
 
-### 2a. recovery ↔ latency 前緣
+`lost_global_retrieval_interval 15→3` 是本輪唯一過 gate 的改動,已進 flight profile（總帳項 12）。
+`use_temporal_reference` / `lost_prior_strategy` 全部 REJECTED（見 §0 + 總帳）。`reference_quality_weight 0.5`
+已是 code default 且生效中,若要 pin 進 profile 是純文件化動作,下次發版再做。
 
-現行 committed 樹基準（2026-09-02）：P168 536/700 @ p50 23.33 ms、P117 366/416 @ p50 23.75 ms。
-temporal-off gate 顯示「多拿 P168 successes」會連帶 P117 退化 + p50 +12 ms,所以單純調 recovery 力道
-不是免費的。
+**Profile 升級流程**（項 12 已照做一次,供未來參考）:改兩份 `edm_runtime_profile.json` → 重算 SHA →
+同步 `site_profile.json`（頂+release）`asset_sha256`、`compat/localizer_edm_manifest.json`
+`artifacts.profile.sha256`、`控制介面程式/mission_selections/river_gluemap_all8_direct_localization.json`
+`localizer.sha256`（= 新 manifest SHA）、`MANIFEST.tsv`/`SHA256SUMS`、總帳 SHA 行 → 跑 `pytest` +
+`tools/package_manifest.py verify` + `tools/system_validation.py`。
 
-**已經是 state-conditional 的**（不用再做）：top-k（`local_topk=1` TRACK / `weak_local_topk=3` /
-`lost_local_topk=5`,`production_edm_tracker.py:1748-1751`）、min_inliers 門檻（`:1770`）。
+---
 
-**還沒 state-conditional 但價值低**：`max_corr_total`、`pnp_workers` — 兩者在 PnP 路徑,`pnp p50 1.34 ms`,
-不是瓶頸。
+## 2. Tier 2 — 已做完 reference-policy A/B（2026-09-02）
 
-**真正的槓桿是 reference 選擇 policy**（`acquire_stage_mode`、temporal、quality weight、
-`lost_global_retrieval_interval`）—— 這正是 temporal-off gate 測的東西,分裂結果。要有進展得找到
-「P168 recovery 上升但 P117 不退」的組合,靠 §5 gate A/B,不是寫新功能。
+一次掃 11 個單槓桿 + P117 交叉驗證,完整表在總帳「Tier 2 — reference-policy A/B sweep」。**結論:唯一
+過 gate 的是 `lost_global_retrieval_interval 15→3`,已升級。** 其餘全 REJECTED,不要重做。
+
+state-conditional top-k / min_inliers 早已實作（`production_edm_tracker.py:1748-1751`、`:1770`）。
+`max_corr_total` / `pnp_workers` 沒 state-conditional 但在 PnP 路徑（p50 1.34 ms）不值得。
+
+下一輪若要再壓 P168 LOST（現行 608/700,LOST 65）:候選是「WEAK/LOST 專用的 reference 選擇」而非
+全域調參 —— 見 §2b。
 
 ### 2b. EDM detector-free 的單幀成本 ∝ candidate references
 
@@ -92,33 +64,32 @@ temporal-off gate 顯示「多拿 P168 successes」會連帶 P117 退化 + p50 +
 - 實驗：WEAK/LOST 時把「上一次成功 PnP 幀」當一個額外 reference，帶著它的 inlier 3D。
 - gate：§5，另外要確認不會把漂移的上一幀鎖進 recovery。
 
-### 2c. `async_pipeline.py` 仍是空殼
+### 2c. KLT 快路徑 / EDM 慢路徑 解耦（開放題，尚未實作）
 
-`定位演算法/deploy_code/sfm_glomap_deploy/async_pipeline.py` 行 62 / 103 是 `placeholder`，
-`_edm_loop` / `_klt_loop` 沒有呼叫 `self.edm/klt/pnp/vel/fusion`，只 push `time.monotonic()` 的 dict。
-它 docstring 描述的「EDM 低頻非阻塞、KLT/velocity/PnP 快路徑」尚未實作。
-
-- 注意：與總帳已否決的「EDM/PnP overlap pipeline（42.67→42.69 ms 無收益）」不同，那是 PnP 重疊。
-- 這裡是 KLT 快路徑 / EDM 慢路徑 的解耦，未被量測過。
-- 這是大改，需獨立設計 + 完整 replay + production-path source-frame age / coalesce drops 檢查。
+原 `async_pipeline.py` stub 已於 2026-09-02 移除（見 §3）。這條方向仍值得做:EDM 低頻非阻塞、
+KLT/velocity/PnP 走快路徑。與總帳已否決的「EDM/PnP overlap pipeline（42.67→42.69 ms 無收益）」
+不同（那是 PnP 重疊）。是大改,需獨立設計 + 完整 replay + production-path source-frame age /
+coalesce drops 檢查。
 
 ---
 
-## 3. Tier 3 — 本分支進行中的實驗（未跑 gate、未進總帳）
+## 3. Tier 3 — 本分支進行中的實驗
 
-以下多數程式碼已寫在分支上（部分 untracked）。每項都要：預設 off / 有 guard、單獨 commit、
-過 §5 gate（exact 類要 matcher 陣列 + reference trace + inlier + pose 完全相同；policy 類要完整
-replay 不降 recovery/quality gate）才可宣稱「已驗證」。
+**仍在樹上：**
 
-| 實驗 | 檔案 | 目前狀態 / guard | gate 狀態（2026-09-02） |
-|---|---|---|---|
-| ESEKF 15 維融合（IMU/NED 速度 + visual pose） | `esekf.py`；接線於 `production_edm_tracker.py`（`__init__` ~859-887、`localize` ~3327-3340、`_predict_center` / `_search_yaw` / `_on_miss` PREDICTED_ONLY 分支） | **在 `__init__` 無條件實例化**（import 成功即建 `ESEKF(EKFConfig())`）。`predict` 需 `observe_fused_state` 餵 `_latest_velocity_ned`，純 replay 沒這來源 → `prediction_allowed()` 維持 False → ESEKF 分支不觸發 | **replay gate 評不到**：536/700 基準已含這條休眠路徑。實際效果要 live telemetry。不能宣稱已驗證,也沒有 replay 退化證據。 |
-| KLT 3D-aware init（`OPTFLOW_USE_INITIAL_FLOW` + 依 covariance trace 放大 window 15→41） | `production_edm_tracker.py::_track_klt_prior` | 只有 `self.esekf` 存在且 `prediction_allowed()` 才啟用。因 ESEKF 在 replay 休眠 → 3D-aware 分支在 replay 也不觸發，走 fallback LK。`raise StopIteration` 控制流已移除 | `tests/localization/deploy/test_klt_miss_prior.py` 通過（在 2301 全綠內）。3D-aware 路徑本身要 live telemetry 才測得到。 |
-| EDM neck `repeat -> expand` | `定位演算法/deploy_code/runtime/EDM/src/edm/neck/neck.py`（`CIM.forward`）、`.../edm/edm.py`、`.../edm/head/fine_matching.py` | shape-driven `duplicated`（B>1）分流；新增 `SFM_EDM_NECK_NO_EXPAND=1` 逃生閥 | **exact 已驗證**：P168 700 幀 A/B（expand ON vs `SFM_EDM_NECK_NO_EXPAND=1`）0 個欄位差,536 pose `max|Δ|=0`。**但 `match_ms` p50 17.89 vs 17.55 — expand 在 B=2 略慢,不是 TRACK 加速。** 數值安全可保留,不列為已驗證優化。詳見總帳。 |
-| `async_pipeline.py` | 見 §2c | 空殼、無接線 | 見 §2c |
-| `megaloc_token_reduction.py` | untracked | 無接線、無測試 | 總帳已否決 MegaLoc L2/EViT token reduction（ranking / 端到端 replay 退化）。要重新做必須端到端不退化。 |
-| `local_map_manager.py` / `velocity_estimator.py` / `gnss_prior.py` / `sim3_alignment.py` / `telemetry_sync.py` / `replay_system.py` / `evaluation.py` | untracked | 接線 / 用途 / 測試狀態不明 | 逐一釐清是否被 runtime 路徑引用；未引用者不列入 runtime 優化，先歸類為工具/實驗。 |
-| `fine_matching.py` bi-directional 遮罩後 `m_bids` 重新 stable-sort | `定位演算法/deploy_code/runtime/EDM/src/edm/head/fine_matching.py`（已改未提交） | 修正 `bs>1` 時 `m_bids` 非單調導致 `EDMMatcher._split_match_outputs` 邊界錯誤 | 這像是 correctness fix 不是 perf。要 exact test：多 reference batch 下 split 後每 ref 的 match 集合與未排序版一致（只重排不增減）。 |
+| 實驗 | 檔案 | 狀態 |
+|---|---|---|
+| ESEKF 15 維融合（IMU/NED 速度 + visual pose） | `esekf.py`；接線於 `production_edm_tracker.py`（`__init__`、`localize`、`_predict_center` / `_search_yaw` / `_on_miss` PREDICTED_ONLY 分支） | `__init__` 無條件建 `ESEKF(EKFConfig())`。`predict` 需 `observe_fused_state` 餵 `_latest_velocity_ned`；純 replay 無此來源 → `prediction_allowed()` 維持 False → 分支不觸發。**replay gate 評不到**,608/700 基準已含這條休眠路徑,效果要 live telemetry。 |
+| KLT 3D-aware init（`OPTFLOW_USE_INITIAL_FLOW` + covariance window 15→41） | `production_edm_tracker.py::_track_klt_prior` | 只有 `self.esekf.prediction_allowed()` 才啟用 → replay 也休眠,走 fallback LK。`raise StopIteration` 已移除。`test_klt_miss_prior.py` 通過。 |
+| EDM neck `repeat→expand` | `runtime/EDM/src/edm/neck/neck.py`（`SFM_EDM_NECK_NO_EXPAND=1` 逃生閥） | **exact 已驗證**（700 幀 0 diff），**但 B=2 無加速**（match_ms 17.89 vs 17.55）。保留 guarded,不列已驗證優化。 |
+| `megaloc_token_reduction.py` | 接線於 `reloc_localizer_edm.py`（預設 off） | 總帳已否決 L2/EViT token reduction。工具留著,不預設開。 |
+| `fine_matching.py` bi-directional `m_bids` stable-sort | `runtime/EDM/src/edm/head/fine_matching.py` | 修 `bs>1` 時 `m_bids` 非單調 → `_split_match_outputs` 邊界錯誤。像 correctness fix,未單獨 exact 驗證。 |
+
+**2026-09-02 已移除（0 引用、未接線的 WIP 空殼；此處即簡潔紀錄）：**
+`async_pipeline.py`（KLT/EDM 解耦 stub，行 62/103 placeholder，從未 wire）、`klt_tracker.py`（inline KLT
+抽出，未接）、`velocity_estimator.py`（只被 async_pipeline 引用）、`local_map_manager.py`、
+`sim3_alignment.py`、`telemetry_sync.py`、`replay_system.py`、`evaluation.py`。要重做時從 git
+歷史（commit 之前的分支狀態）取回。KLT/EDM 快慢路徑解耦（原 §2c）仍是未實作的開放題。
 
 ---
 

@@ -14,7 +14,7 @@
 - site profile：`地圖檔/場域/river_site/site_profile.json`
 - source archive SHA-256：`dcf3d87ef1e448b95a66ab61e36e8f3a8e94a8fe2132c5128570a64eaf78b879`
 - localization bundle SHA-256：`603dc7c473a88f05c968144d584c47e6807218c7fa87f1d7effeb016a2d58dcb`
-- EDM runtime profile SHA-256：`93e0c2d166f0378f6bf6af992023174baa86339ee6e91ce0c9292030380dac03`
+- EDM runtime profile SHA-256：`a65f78ca0d8b388063c1e259f400b1860d23df5e83924910fb7f6ea1b421f053`（2026-09-02：`lost_global_retrieval_interval` 15→3；舊 SHA `93e0c2d1…`）
 - persistent feature bank：`執行環境/models/edm_reference_features/603dc7c473a88f05c968_dc24014f8f9e8d05d2f6.pt`
 - feature bank SHA-256：`fd86ed9618c2f435f3327e2aa8fd3e323ab7ba4835b2023b17a1d1fdfd98e2fe`
 - feature bank 大小：8,937,437,001 bytes
@@ -211,7 +211,7 @@
 
 **地圖相依性：參考品質分佈相依，但 tail 優化在 1,045-ref river 地圖上已獨立驗證。** 新地圖需重跑 `a2_quality` 對照（0.0 vs 0.5）並比較 p95 與成功率；若新地圖品質訊號不同，可調權重或退回 0.0。
 
-- 2026-09-02：`reference_quality_weight` 0.5 仍是 EDMConfig code default，繼續生效。候選 profile 有把它明寫，但候選 profile 因 temporal-off 部分被 2026-09-02 gate REJECTED（見下方「2026-09-02 GPU gate 結果」），整支候選不採用。此權重本身沒有被 gate 否定。
+- 2026-09-02：`reference_quality_weight` 0.5 仍是 EDMConfig code default，繼續生效。曾與 temporal-off 綁成一支候選 profile,該候選因 temporal-off 被 gate REJECTED、profile 已刪。此權重本身沒有被 gate 否定。
 
 ### 11. Temporal reference 預設關閉（s3_no_temporal，+34 gain）
 
@@ -231,6 +231,30 @@
 
 - 2026-09-02：**在目前樹上 temporal-off gate REJECTED**（P168 +20 但 P117 −20 successes、LOST +12、兩段 +11~12 ms p50）。flight profile 維持 `use_temporal_reference: true`。詳見下方「2026-09-02 GPU gate 結果」。本項的 s3_no_temporal +34 結論建立在 2026-09-01 舊樹,現已被更好的基準吸收,不再有效。
 
+### 12. LOST 全域檢索間隔 `lost_global_retrieval_interval` 15→3（2026-09-02，+72 P168 / P117 flat）
+
+**改動**
+
+- flight profile（`localization/` 與 `compat/edm_runtime_profile.json` 兩份）`lost_global_retrieval_interval`：`15` → `3`。
+- 意義：LOST episode 在 grace window（`lost_local_grace_frames=2`）之後,每第 3 個 LOST 幀重試一次 MegaLoc 全域檢索,而不是每 15 個。**只影響 LOST 恢復路徑,TRACK 完全不動,所以沒有 per-frame latency 成本。**
+- 沒有放寬任何 acceptance gate:錯誤檢索仍要過 `acquire_min_inliers=80`、trajectory bounds、`stale_reacquire_confirmations=2`。
+- profile SHA `93e0c2d1…` → `a65f78ca…`;已同步 `site_profile.json`（頂層+release）`asset_sha256`、`compat/localizer_edm_manifest.json` `artifacts.profile.sha256`、`控制介面程式/mission_selections/river_gluemap_all8_direct_localization.json` `localizer.sha256`（新 manifest SHA `eaff3d6f…`）、`MANIFEST.tsv` / `SHA256SUMS`。`EDMConfig` code default 維持 `0`（legacy one-shot），未指定 profile 的 tracker 不受影響。
+
+**證據：P168 700f + P117 全段,stride 3,seed 0,--require-cuda --gpu-span,RTX 5060,venv torch 2.11.0+cu128**
+
+| holdout | baseline（現行 flight profile） | `interval=3` | 判定 |
+|---|---|---|---|
+| P168 700f | 536/700（76.6%），LOST 103，inliers p50 77，reproj p95 3.17，p50 22.75，p95 107.8 | **608/700（86.9%，+72）**，LOST 65，inliers p50 110，reproj p95 2.73，p50 24.8，p95 84–103 | 進步 |
+| P117 全段 | 366/416（88.0%），LOST 42，p50 23.6，p95 62.2 | **366/416（0），LOST 42（0）**，p50 22–24，p95 74–85 | 持平（無退化） |
+
+- P168 successes 608 連跑兩次完全相同（deterministic）；P117 366 連跑兩次相同。
+- 唯一成本:P117 LOST 幀 p95 tail 62→74–85 ms（LOST 幀本來就 `ok=False`,不交付 pose,controller `pose_max_age_ms=500` 內）。P168 的 p95 反而 108→84 改善。
+- `interval` sweep（P168）:`1`→550(+14)、`2`→583(+47)、**`3`→608(+72)**、`4`→583(+47)、`5`→546(+10)、`8`→583(+47)。`3` 是明顯峰值,非單調。
+
+**地圖相依性:LOST 密度相依。** 新地圖必須重跑 `interval` sweep + 兩段 holdout;若新地圖 recovery 路徑不同,峰值可能不在 3。
+
+**尚缺:** hard-negative / off-map replay（總帳「D. 固定回放 gate」要求）尚未跑;本項與現行 profile 一樣維持 `flight.approved=false` / `validation: NONE`,不作為飛行核准依據。
+
 ## 待辦與進行中優化（不在本總帳，另見 runbook）
 
 排序、gate、狀態追蹤在 `docs/localization_optimization_runbook.md`。摘要：
@@ -245,7 +269,7 @@
 **基準已移動。** 現行 committed 樹（含本分支 matcher/reloc rework）的 flight-profile 基準是
 P168 **536/700（76.6%）** p50 23.33 p95 107.78 ms、P117 **366/416（88.0%）** p50 23.75 p95 62.09 ms。
 總帳舊的 s0=486/700 是 2026-09-01、matcher rework 之前的樹，已不可比。原始 JSON：
-`outputs/tier1_gate_20260902/`（本機，不進版控）。
+`outputs/tier2_sweep_20260902/`（本機，不進版控；只留 baseline + `interval 3` ×2）。
 
 ### Tier 1 — `use_temporal_reference` true→false：REJECTED
 
@@ -256,7 +280,7 @@ P168 **536/700（76.6%）** p50 23.33 p95 107.78 ms、P117 **366/416（88.0%）*
 
 - `reference_quality_weight` 0.5 已是 EDMConfig code default，baseline 與 candidate 都在跑；本次唯一實測 delta 是 temporal off。
 - 分裂結果：P168 贏、P117 輸 5 個百分點且 LOST +12，另外兩段都 +11~12 ms p50。違反准入規則「完整 replay 不得降低核准的 recovery/quality gate」。
-- **結論：flight profile 維持 `use_temporal_reference: true`。** 候選 profile 標記 REJECTED。總帳項 11 的 s3_no_temporal +34 結論建立在舊樹上，已被目前更好的基準吸收；在目前樹上 temporal-off 只是拿一段換另一段。若日後 recovery 路徑再改善，可重跑。
+- **結論：flight profile 維持 `use_temporal_reference: true`。** 候選 profile 已刪。總帳項 11 的 s3_no_temporal +34 結論建立在舊樹上，已被目前更好的基準吸收；在目前樹上 temporal-off 只是拿一段換另一段。若日後 recovery 路徑再改善，可重跑。
 
 ### Tier 3 — EDM neck query `repeat→expand`：exact 已驗證，無 TRACK 加速
 
@@ -271,6 +295,28 @@ P168 **536/700（76.6%）** p50 23.33 p95 107.78 ms、P117 **366/416（88.0%）*
 `observe_fused_state` 餵 `_latest_velocity_ned`，純 replay 沒有這個來源 → `prediction_allowed()`
 維持 False → PREDICTED_ONLY 的 ESEKF 分支在 replay 不會觸發。上面的 536/700 基準已含這條（休眠的）
 程式碼路徑。ESEKF 的實際效果要 live telemetry 才能評，replay gate 評不到。
+
+### Tier 2 — reference-policy A/B sweep（P168 700f，vs baseline 536/700）
+
+一次掃 11 個單槓桿 + P117 交叉驗證。**唯一過 gate 的是 `lost_global_retrieval_interval 15→3`（見上方項 12）。** 其餘全部否決,記錄如下,不要重做:
+
+| 槓桿 | P168 | P117 | 否決原因 |
+|---|---|---|---|
+| `lost_prior_strategy full_global` | 601（+65），LOST 62 | **349（−17），LOST 57（+15）** | 與 temporal-off 同型:買 P168 賠 P117 |
+| `lost_prior_strategy score_fusion` | 601（+65），LOST 62 | **349（−17），LOST 57（+15）** | 同上 |
+| `score_fusion + interval 3` 組合 | 568（+32） | 366（0） | 比 `interval 3` 單獨（608）差,score_fusion 拖累 |
+| `--no-track-map-first` | 573（+37），LOST 88 | 366（0） | p50 22.75→**41.56 ms（近 2×）**,TRACK 路徑變重 |
+| `acquire_stage_mode full_set` | 536（0） | — | P168 successes 無變化,只 p95 微降 p50 +3 ms |
+| `acquire_stage_mode initial_topk` | 536（0） | — | 同上,無效 |
+| `--no-pnp-ranked-batches` | 536（0） | — | 無效（與 ledger「P168 rejected all PnP candidates」一致） |
+| `--local-topk 1`（profile 為 2） | 536（0） | — | 無效,TRACK top-2→top-1 在此 holdout 不 diverge |
+| `lost_global_retrieval_interval 1` | 550（+14） | — | 每 LOST 幀重試反而較差,churn 破壞 grace-window 局部搜尋 |
+| `lost_global_retrieval_interval 2` | 583（+47） | 366（0） | 不如 3 |
+| `lost_global_retrieval_interval 4` | 583（+47） | 366（0） | 不如 3 |
+| `lost_global_retrieval_interval 5` | 546（+10） | — | 幾乎無效 |
+| `lost_global_retrieval_interval 8` | 583（+47） | — | 不如 3 |
+
+原始 JSON:`outputs/tier2_sweep_20260902/`（本機,不進版控;losing run 已刪,只留 baseline + `interval 3` + `interval 3` confirm）。
 
 ## 現行 profile 中仍需場域重驗的組合設定
 

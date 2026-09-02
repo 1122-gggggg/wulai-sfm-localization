@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
-from unittest import mock
 
 import cv2
 import numpy as np
@@ -102,8 +101,6 @@ def test_klt_miss_prior_success(monkeypatch):
     gray_query = np.zeros((720, 1280), dtype=np.uint8)
     tracker._klt_query_gray = gray_query
     tracker._klt_query_stamp = 1.1
-
-    orig_calc = cv2.calcOpticalFlowPyrLK
 
     def fake_calc(prev_gray, next_gray, p0, nxt, **kwargs):
         # forward: p0 is tracker._klt_2d (seed), shift x by +4
@@ -225,16 +222,6 @@ def test_adapter_contract_no_pose_on_predicted_only():
     # Mirror edm_localizer_adapter lines 195-208: Pose only if info.get("ok")
     from edm_localizer_adapter import EDMTrackerAdapter
 
-    # Create minimal fake map and camera
-    fake_map = SimpleNamespace(
-        ref_names=["ref0"],
-        ref_centers=np.zeros((1, 3), dtype=np.float32),
-        ref_yaws=np.zeros(1, dtype=np.float32),
-        images={"ref0": np.zeros((8, 8, 3), dtype=np.uint8)},
-        xyz_by_cell={"ref0": np.zeros((64, 3), dtype=np.float32)},
-        covis={},
-    )
-    fake_cam = SimpleNamespace(model="PINHOLE", width=1280, height=720, params=[900, 900, 640, 360])
     # Use object.__new__ to avoid heavy init
     adapter = object.__new__(EDMTrackerAdapter)
     adapter.trk = SimpleNamespace(cfg=EDMConfig())

@@ -29,7 +29,7 @@ Refs: standard ESEKF — dp_dot=dv, dv_dot=-R*ba, dtheta_dot=-R*bg, bias random 
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
 
 import numpy as np
 

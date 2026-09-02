@@ -7,7 +7,7 @@
   ],
   "localizer": {
     "path": "../../地圖檔/場域/river_site/releases/river_gluemap_all8_direct_20260831/compat/localizer_edm_manifest.json",
-    "sha256": "abeadb9367ebeb427cc452137f5d79b8618fde182eaed85969afa243dcb46ea4"
+    "sha256": "eaff3d6ff6b2e604865665773021df62c238190eb6cfc52bbd8434be5d331cda"
   },
   "map": {
     "path": "../../地圖檔/場域/river_site/releases/river_gluemap_all8_direct_20260831/compat/map_manifest.json",
