@@ -60,23 +60,6 @@ def _map_scale(context: MapRenderContext) -> float:
     )
 
 
-def _draw_no_localization_markers(draw: Any, context: MapRenderContext) -> None:
-    if not context.no_loc_markers:
-        return
-    view = context.transform_xyz(
-        np.asarray(context.no_loc_markers, dtype=float)
-    )
-    scale = _map_scale(context)
-    for point in view:
-        x = int(context.width * 0.5 + context.map_pan[0] + point[0] * scale)
-        y = int(context.height * 0.5 + context.map_pan[1] - point[1] * scale)
-        draw.ellipse(
-            (x - 5, y - 5, x + 5, y + 5),
-            fill="#ff2a2a",
-            outline="#ffffff",
-        )
-
-
 def _draw_route_and_history(draw: Any, context: MapRenderContext) -> None:
     route_n = len(context.route_pts)
     history_n = len(context.history)
@@ -265,28 +248,11 @@ def _draw_camera_overlay(draw: Any, context: MapRenderContext) -> None:
         draw.line(arrow + [arrow[0]], fill="#ffffff", width=2)
 
 
-def _draw_map_legend(draw: Any, context: MapRenderContext) -> None:
-    if not context.no_loc_markers:
-        return
-    draw.rectangle(
-        (4, 4, min(context.width - 4, 420), 26),
-        fill="#0b0c0e",
-    )
-    draw.text(
-        (10, 8),
-        f"紅點 = 最近無法定位位置（最多 {context.no_loc_max_markers} 處）",
-        fill="#ff6a6a",
-        font=context.overlay_font,
-    )
-
-
 def draw_map_overlays(draw: Any, context: MapRenderContext) -> None:
     """Paint dynamic map overlays over an already-rendered map base."""
-    _draw_no_localization_markers(draw, context)
     _draw_route_and_history(draw, context)
     _draw_collision_guard(draw, context)
     _draw_camera_overlay(draw, context)
-    _draw_map_legend(draw, context)
 
 
 def _fit_pil_frame(
