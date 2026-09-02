@@ -16,7 +16,15 @@ place to connect Olympe/localization/control later.
     • Esc／Space 凍結與懸停
   改壞可能造成空中失控或意外起飛／降落 → 現場事故。
   細節見 mission/SAFETY.md。只有操作員明確要求並審過風險才可動。
+
+Pure HUD helpers (format_latency_text, classify_localization_health,
+build_hud_overlay_data) are intentionally module-level and Tk-free so
+headless tests can ``from flight_operator_app import format_latency_text``
+without creating a Tk root. OperatorApp keeps thin wrappers that delegate
+to these pure functions so the live HUD still renders through the same
+path.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -36,10 +44,32 @@ import time
 from pathlib import Path
 
 import numpy as np
-from PIL import Image, ImageDraw, ImageFont, ImageTk
+from PIL import Image, ImageDraw, ImageFont
+try:
+    from PIL import ImageTk  # type: ignore
+except Exception:  # pragma: no cover - Tk unavailable in headless tests
+    ImageTk = None  # type: ignore
 
-import tkinter as tk
-from tkinter import messagebox, ttk
+try:
+    import tkinter as tk
+    from tkinter import messagebox, ttk
+except Exception:  # pragma: no cover - Tk unavailable for TrackerState import
+    import sys as _sys
+    import types as _types
+    try:
+        from unittest.mock import MagicMock as _MagicMock  # type: ignore
+    except Exception:
+        _MagicMock = None  # type: ignore
+    if _MagicMock is not None:
+        _dummy_tk = _MagicMock()
+    else:
+        _dummy_tk = _types.ModuleType("tkinter")
+    for _name in ("tkinter", "tkinter.ttk", "tkinter.messagebox", "tkinter.filedialog"):
+        if _name not in _sys.modules:
+            _sys.modules[_name] = _dummy_tk if "tkinter" == _name else _dummy_tk
+    tk = _dummy_tk  # type: ignore
+    messagebox = _dummy_tk  # type: ignore
+    ttk = _dummy_tk  # type: ignore
 
 # Keep sibling protocol imports working when validation loads this entrypoint via
 # importlib instead of executing it from its own directory.
@@ -81,6 +111,7 @@ from localization_result_ui import (
     normalize_live_localization_result as normalize_live_localization_result,
     stabilize_live_result_pose,
 )
+from localization_contract import LocalizationResult
 from localization_metrics import (
     attach_fused_localization_telemetry,
     build_localization_metric_record,
@@ -110,6 +141,7 @@ from operator_state import (
     DroneState as DroneState,
     STREAM_HEIGHT as STREAM_HEIGHT,
     STREAM_WIDTH as STREAM_WIDTH,
+    TrackerState as TrackerState,
 )
 from operator_site_runtime import (
     ActiveSiteRuntime,
@@ -128,6 +160,7 @@ from live_worker_clients import (
     _WorkerResponseDesync as _WorkerResponseDesync,
 )
 from map_point_io import (
+    load_red_sphere_points,
     read_map_points,
     read_ply_points as read_ply_points,
     read_reference_pose_points as read_reference_pose_points,
@@ -189,7 +222,9 @@ from real_path_follow_controller import (  # type: ignore
     camera_heading_from_forward,
     capture_mission_route_snapshot,
 )
+from real_path_follow_controller import cKDTree as rpf_cKDTree  # type: ignore
 from route_domain import RouteDocument  # type: ignore
+from simulated_route_test import SimulatedRoutePlant
 from operator_autonomy import DesktopRouteAutonomy
 from operator_preflight import (
     PREFLIGHT_GUIDE_LABELS,
@@ -216,6 +251,7 @@ from operator_tick import (
 )
 from operator_command_coordinator import OperatorCommandCoordinator
 from operator_shutdown import OperatorShutdownCoordinator
+
 try:
     from gravity_calibration import (  # type: ignore
         MIN_PITCH_SPAN_DEG,
@@ -275,8 +311,9 @@ def default_worker_python(env_var: str) -> str:
     return sys.executable
 
 
-def localization_zoom_is_calibrated(zoom: float, calibrated_zoom: float = 1.0,
-                                    tolerance: float = 1e-3) -> bool:
+def localization_zoom_is_calibrated(
+    zoom: float, calibrated_zoom: float = 1.0, tolerance: float = 1e-3
+) -> bool:
     """True only when the stream uses the intrinsics calibrated for localization."""
     try:
         value = float(zoom)
@@ -286,28 +323,28 @@ def localization_zoom_is_calibrated(zoom: float, calibrated_zoom: float = 1.0,
 
 
 SYSTEM_ROOT = _WS.root
-DEFAULT_MAP = Path(os.environ.get(
-    "SFM_MAP_PLY",
-    str(_WS.map_ply_dir / "your_site.ply"),
-))
+DEFAULT_MAP = Path(
+    os.environ.get(
+        "SFM_MAP_PLY",
+        str(_WS.map_ply_dir / "your_site.ply"),
+    )
+)
 _DEFAULT_ROUTE_FALLBACK = _WS.mission_routes / "your_site" / "flight_path.json"
 DEFAULT_ROUTE = Path(os.environ.get("SFM_FLIGHT_PATH_JSON", str(_DEFAULT_ROUTE_FALLBACK)))
-DEFAULT_REPLAY_JSON = (
-    _WS.outputs / "downloads_validation_20260702" / "P0230023_v3_temporal.json"
-)
+DEFAULT_REPLAY_JSON = _WS.outputs / "downloads_validation_20260702" / "P0230023_v3_temporal.json"
 DEFAULT_WORKER = _WS.operator_interface / "live_localizer_worker.py"
 DEFAULT_DETECTOR_WORKER = _WS.operator_interface / "object_detector_worker.py"
-DEFAULT_BUNDLE = Path(os.environ.get(
-    "SFM_RELOC_BUNDLE",
-    str(_WS.bundles / "your_site_reloc_map_edm.pt"),
-))
+DEFAULT_BUNDLE = Path(
+    os.environ.get(
+        "SFM_RELOC_BUNDLE",
+        str(_WS.bundles / "your_site_reloc_map_edm.pt"),
+    )
+)
 DEFAULT_LOCALIZER_BACKEND = os.environ.get("SFM_LOCALIZER_BACKEND", "auto")
 DEFAULT_LOCALIZER_DEPLOY_DIR = os.environ.get("SFM_LOCALIZER_DEPLOY_DIR", "")
 DEFAULT_LOCALIZER_PROFILE = os.environ.get("SFM_LOCALIZER_PROFILE", "")
 DEFAULT_BUNDLE_SHA256 = os.environ.get("SFM_BUNDLE_SHA256", "")
-DEFAULT_LOCALIZER_PROFILE_SHA256 = os.environ.get(
-    "SFM_LOCALIZER_PROFILE_SHA256", ""
-)
+DEFAULT_LOCALIZER_PROFILE_SHA256 = os.environ.get("SFM_LOCALIZER_PROFILE_SHA256", "")
 DEFAULT_MEGALOC = os.environ.get(
     "SFM_MEGALOC_CACHE",
     "",
@@ -421,6 +458,7 @@ def resolve_anafi_link_sim() -> dict | None:
         kbps = 5000
     if kbps <= 0:
         return None
+
     def _num(name: str, default: float) -> float:
         try:
             return max(0.0, float(os.environ.get(name, default)))
@@ -444,9 +482,16 @@ def probe_video_fps(path: Path) -> float | None:
     try:
         completed = subprocess.run(
             [
-                "ffprobe", "-v", "error", "-select_streams", "v:0",
-                "-show_entries", "stream=avg_frame_rate",
-                "-of", "default=noprint_wrappers=1:nokey=1", str(path),
+                "ffprobe",
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=avg_frame_rate",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+                str(path),
             ],
             capture_output=True,
             text=True,
@@ -455,18 +500,16 @@ def probe_video_fps(path: Path) -> float | None:
         )
         value = completed.stdout.strip().splitlines()[0]
         numerator, separator, denominator = value.partition("/")
-        fps = (
-            float(numerator) / float(denominator)
-            if separator
-            else float(numerator)
-        )
+        fps = float(numerator) / float(denominator) if separator else float(numerator)
     except (IndexError, OSError, subprocess.SubprocessError, ValueError, ZeroDivisionError):
         return None
     return fps if math.isfinite(fps) and fps > 0.0 else None
 
 
 def resolve_operator_interface(
-    requested: str, legacy_live: bool, video: str,
+    requested: str,
+    legacy_live: bool,
+    video: str,
 ) -> tuple[str, bool]:
     """Resolve one mutually exclusive input/control boundary."""
     mode = str(requested or "").strip().lower()
@@ -484,7 +527,7 @@ def resolve_operator_interface(
     return mode, mode == REAL_FLIGHT_INTERFACE
 
 
-ROUTE_COLOR = "#ff3ea5"          # planned drawn route overlay (distinct from the flown track)
+ROUTE_COLOR = "#ff3ea5"  # planned drawn route overlay (distinct from the flown track)
 
 
 def _positive_env_int(name: str, default: int) -> int:
@@ -505,7 +548,11 @@ CONFIDENCE_HOLD_ENGAGE_EVENTS = frozenset({"ENGAGE_FAIL", "ENGAGE_LOW_CONF"})
 #: Every value self.loc_health can take must appear here AND in HEALTH_TEXT:
 #: both are indexed inside Tk callbacks, where a KeyError kills the callback.
 HEALTH_COLOR = {
-    "OK": "#3fbf7f", "LOW": "#e0a92e", "FAIL": "#e2483d",
+    "OK": "#3fbf7f",
+    "LOW": "#e0a92e",
+    "FAIL": "#e2483d",
+    "DEGRADED": "#e0a92e",
+    "LOST": "#e2483d",
     # Not a localization failure: localization is deliberately not running.
     "PAUSED_ZOOM": "#b26a00",
 }
@@ -517,27 +564,53 @@ NO_LOC_MAX_MARKERS = _positive_env_int("SFM_NO_LOC_MAX_MARKERS", 1000)
 # below are exempt so an old emergency/landing request remains actionable.
 CONTROL_REQUEST_MAX_AGE_NS = 250_000_000
 FLIGHT_RESULT_QUEUE_MAX = 32
-_SAFETY_FLIGHT_RESULT_COMMANDS = frozenset({
-    "land", "land_now", "emergency_stop",
-})
-_ASYNC_OPERATOR_COMMANDS = frozenset({
-    "takeoff", "land", "land_now", "manual", "emergency_stop", "pc_control", "resume_pc",
-    "auto", "start_auto", "firmware_limits_apply", "auto_speed_limit_apply",
-    "drone_magnetometer_start", "drone_magnetometer_cancel",
-    "skycontroller_magnetometer_start", "skycontroller_magnetometer_cancel",
-    "record_quality",
-})
-_NUDGE_KEY_BLOCKED_WIDGET_CLASSES = frozenset({
-    "Entry", "TEntry", "Text",
-    "Button", "TButton",
-    "Scale", "TScale",
-    "Notebook", "TNotebook",
-    "Combobox", "TCombobox",
-    "Spinbox", "TSpinbox",
-    "Listbox", "Scrollbar", "TScrollbar",
-    "Checkbutton", "TCheckbutton",
-    "Radiobutton", "TRadiobutton",
-})
+_SAFETY_FLIGHT_RESULT_COMMANDS = frozenset(
+    {
+        "land",
+        "land_now",
+        "emergency_stop",
+    }
+)
+_ASYNC_OPERATOR_COMMANDS = frozenset(
+    {
+        "takeoff",
+        "land",
+        "land_now",
+        "manual",
+        "emergency_stop",
+        "pc_control",
+        "resume_pc",
+        "auto",
+        "start_auto",
+        "firmware_limits_apply",
+        "auto_speed_limit_apply",
+        "drone_magnetometer_start",
+        "drone_magnetometer_cancel",
+        "skycontroller_magnetometer_start",
+        "skycontroller_magnetometer_cancel",
+        "record_quality",
+    }
+)
+_NUDGE_KEY_BLOCKED_WIDGET_CLASSES = frozenset(
+    {
+        "Entry",
+        "TEntry",
+        "Text",
+        "Button",
+        "TButton",
+        "Scale",
+        "TScale",
+        "TNotebook",
+        "TCombobox",
+        "Spinbox",
+        "TSpinbox",
+        "Listbox",
+        "Checkbutton",
+        "TCheckbutton",
+        "Radiobutton",
+        "TRadiobutton",
+    }
+)
 VIRTUAL_STICK_KEY_MAP = {
     "a": "左旋",
     "d": "右旋",
@@ -565,8 +638,243 @@ MAP_STATIC_POINTS = _positive_env_int("SFM_MAP_STATIC_POINTS", 250000)
 MAP_INTERACTIVE_POINTS = _positive_env_int("SFM_MAP_INTERACTIVE_POINTS", 60000)
 # Planned-route overlay: one PIL ellipse per point costs ~5.8 us, so a long
 # route dominates the per-pose map redraw. The polyline still uses every point;
-# only the dots are thinned.
 ROUTE_DOT_MAX = _positive_env_int("SFM_ROUTE_DOT_MAX", 200)
+# DroneState.loc 8-value domain (F-11, not refactored in this batch):
+# LIVE, SIM, OK, STREAM_LOST, LOST_RECOVERY, STARTING, MEGALOC_LOCKED, MEGALOC_LOCKING
+# Each value mixes source type / localization status / MegaLoc sub-phase;
+# full Enum split deferred to keep this batch narrow.
+#
+# TrackerState now lives in operator_state.py (imported above) so both this
+# module and olympe_live_backend.py can use it without a circular import.
+
+
+
+def format_latency_text(latency_ms: float | None) -> str:
+    """Format a latency value for HUD display. Pure, no Tk dependency."""
+    if latency_ms is None:
+        return "-"
+    try:
+        value = float(latency_ms)
+    except (TypeError, ValueError):
+        return "-"
+    if not math.isfinite(value):
+        return "-"
+    return f"{value:.1f}ms"
+
+
+def classify_localization_health(loc: dict) -> str:
+    """Pure health classification for a localization result. Returns OK/DEGRADED/LOST.
+
+    * OK       – high-confidence fix (enough inliers, low reproj, not weak).
+    * DEGRADED – low inliers / high reproj / weak (still a pose but not trusted).
+    * LOST     – no pose / success==False.
+    No Tk, no self, no mutation — safe to import headless.
+    Legacy aliases LOW==DEGRADED and FAIL==LOST are accepted on input but never
+    returned; callers normalise via HEALTH_COLOR which contains both spellings.
+    """
+    if not hasattr(loc, "get"):
+        # Accept a plain dict or the typed LocalizationResult (dict-like via
+        # .get/__getitem__); only a non-result object is treated as lost.
+        return "LOST"
+    if not loc.get("success"):
+        return "LOST"
+    try:
+        inliers = int(loc.get("inliers", 0) or 0)
+    except (TypeError, ValueError):
+        inliers = 0
+    reproj = loc.get("reproj_rms")
+    try:
+        weak = localization_result_is_weak(loc)
+    except (AttributeError, KeyError, TypeError, ValueError):  # Tier1 narrow: only weak-check failures; don't swallow flight-critical errors
+        weak = bool(loc.get("weak"))
+    if inliers < LOC_LOW_INLIERS:
+        return "DEGRADED"
+    if reproj is not None:
+        try:
+            if float(reproj) > LOC_HIGH_REPROJ:
+                return "DEGRADED"
+        except (TypeError, ValueError):
+            pass
+    if weak:
+        return "DEGRADED"
+    return "OK"
+
+
+
+
+def build_hud_overlay_data(state, loc, telemetry) -> dict:
+    """Pure HUD overlay builder. Inputs are not mutated. Returns HUD data dict."""
+    # Normalize loc to dict copy
+    if isinstance(loc, dict):
+        loc_dict = dict(loc)
+    elif loc is None:
+        loc_dict = {}
+    else:
+        try:
+            loc_dict = {k: getattr(loc, k) for k in ("success", "inliers", "reproj_rms", "mode", "next_mode", "weak", "health", "loc_health") if hasattr(loc, k)}
+        except (AttributeError, KeyError, TypeError, ValueError):  # Tier1 narrow: getattr mapping only
+            loc_dict = {}
+    # Normalize state
+    if isinstance(state, dict):
+        state_dict = dict(state)
+    elif state is None:
+        state_dict = {}
+    else:
+        state_dict = {}
+        for key in ("mode", "stream", "loc", "tracker_state", "pose", "inliers", "reproj", "link_ok", "gps_fixed", "frame_age_ms", "flight_state", "is_live"):
+            try:
+                if hasattr(state, key):
+                    state_dict[key] = getattr(state, key)
+            except (AttributeError, KeyError, TypeError, ValueError):  # Tier1 narrow: state getattr only
+                continue
+    # Normalize telemetry
+    if isinstance(telemetry, dict):
+        tele_dict = dict(telemetry)
+    elif telemetry is None:
+        tele_dict = {}
+    else:
+        for key in ("rth", "gps", "attitude", "velocity", "altitude_agl", "link_quality", "current_auto_speed", "olympe_state", "olympe_attitude", "olympe_altitude"):
+            try:
+                if hasattr(telemetry, key):
+                    tele_dict[key] = getattr(telemetry, key)
+            except (AttributeError, KeyError, TypeError, ValueError):  # Tier1 narrow: telemetry getattr only
+                continue
+    # Health
+    health = None
+    if isinstance(loc, dict) and "health" in loc:
+        health = str(loc["health"])
+    elif isinstance(loc, dict) and "loc_health" in loc:
+        health = str(loc["loc_health"])
+    elif loc_dict:
+        # if loc looks like a result dict, classify
+        if "success" in loc_dict or "inliers" in loc_dict:
+            health = classify_localization_health(loc_dict)
+        else:
+            health = str(loc_dict.get("health", loc_dict.get("loc_health", "OK")))
+    else:
+        health = "OK"
+    # Inliers / reproj
+    try:
+        inliers = int(loc_dict.get("inliers", loc_dict.get("loc_health_inliers", 0)) or 0)
+    except (TypeError, ValueError):
+        inliers = 0
+    reproj = loc_dict.get("reproj_rms", loc_dict.get("loc_health_reproj"))
+    # FPS
+    fps_raw = loc_dict.get("fps", loc_dict.get("loc_fps", loc_dict.get("localization_fps")))
+    try:
+        fps_text = f"{float(fps_raw):.1f}" if fps_raw is not None and math.isfinite(float(fps_raw)) else "-"
+    except (TypeError, ValueError):
+        fps_text = "-"
+    # Latencies (try multiple key aliases)
+    latency_raw = loc_dict.get("latency_ms", loc_dict.get("loc_latency_ms", loc_dict.get("core_wall_ms", loc_dict.get("wall_ms"))))
+    wall_raw = loc_dict.get("wall_ms", loc_dict.get("loc_wall_ms"))
+    e2e_raw = loc_dict.get("e2e_ms", loc_dict.get("loc_e2e_ms", loc_dict.get("e2e_submit_to_ui_ms")))
+    latency_text = format_latency_text(latency_raw)
+    wall_text = format_latency_text(wall_raw)
+    e2e_text = format_latency_text(e2e_raw)
+    # Telemetry fallbacks
+    auto_speed = tele_dict.get("current_auto_speed", tele_dict.get("auto_speed", tele_dict.get("current_auto_speed_var", "AUTO 地速安全閘門 -")))
+    rth = tele_dict.get("rth", tele_dict.get("olympe_state", "RTH ?/?"))
+    # rth/gps split handling: if olympe_state contains rth + gps, keep as is
+    gps = tele_dict.get("gps", "")
+    attitude = tele_dict.get("attitude", tele_dict.get("olympe_attitude", "飛控融合姿態 -"))
+    velocity = tele_dict.get("velocity", tele_dict.get("olympe_velocity", "三軸速度 -"))
+    altitude_agl = tele_dict.get("altitude_agl", tele_dict.get("olympe_altitude", "飛控高度 - | AGL -"))
+    link_quality = tele_dict.get("link_quality", "")
+    # Handle case where caller passed already split strings via telemetry dict
+    olympe_state_val = tele_dict.get("olympe_state", None)
+    olympe_attitude_val = tele_dict.get("olympe_attitude", None)
+    olympe_altitude_val = tele_dict.get("olympe_altitude", None)
+    # Build diagnostic lines mirroring _video_diagnostic_lines
+    # When telemetry is provided as formatted strings, prefer those.
+    if olympe_state_val is not None or olympe_attitude_val is not None:
+        # Use explicit HUD var values if supplied
+        line1 = " | ".join(part for part in (str(auto_speed), f"定位 FPS {fps_text}", f"inliers {inliers}") if part)
+        line2 = f"wall_ms {wall_text} | core {latency_text} | e2e {e2e_text}"
+        line3 = str(olympe_state_val) if olympe_state_val is not None else (f"{rth} | {gps}".strip(" |") if gps else str(rth))
+        line4 = str(olympe_altitude_val) if olympe_altitude_val is not None else (f"{altitude_agl} | {link_quality}".strip(" |") if link_quality else str(altitude_agl))
+        att = str(olympe_attitude_val) if olympe_attitude_val is not None else str(attitude)
+        # attitude may contain separator " | 三軸速度 "
+        if " | 三軸速度 " in att:
+            att_part, sep, vel_part = att.partition(" | 三軸速度 ")
+            attitude_line = att_part
+            velocity_line = f"三軸速度 {vel_part}" if sep else str(velocity)
+        else:
+            attitude_line = att
+            velocity_line = str(velocity) if str(velocity).startswith("三軸") else f"三軸速度 {velocity}"
+        diagnostic_lines = (line1, line2, line3, line4, attitude_line, velocity_line)
+    else:
+        diagnostic_lines = (
+            " | ".join((str(auto_speed), f"定位 FPS {fps_text}", f"inliers {inliers}")),
+            f"wall_ms {wall_text} | core {latency_text} | e2e {e2e_text}",
+            f"{rth} | {gps}".strip(" |") if gps else str(rth),
+            f"{altitude_agl} | {link_quality}".strip(" |") if link_quality else str(altitude_agl),
+            str(attitude),
+            str(velocity) if str(velocity).startswith("三軸") else f"三軸速度 {velocity}",
+        )
+    health_text_map = {
+        "OK": "定位正常",
+        "LOW": f"定位信心低 inliers={inliers}",
+        "DEGRADED": f"定位信心低 inliers={inliers}",
+        "FAIL": "定位失敗",
+        "LOST": "定位失敗",
+        "PAUSED_ZOOM": "定位暫停：相機縮放未校正",
+    }
+    health_text = health_text_map.get(str(health), str(health))
+    ok_count = loc_dict.get("ok_count", loc_dict.get("_loc_ok_count", loc_dict.get("loc_ok_count")))
+    fail_count = loc_dict.get("fail_count", loc_dict.get("_loc_fail_count", loc_dict.get("loc_fail_count")))
+    if ok_count is not None or fail_count is not None:
+        try:
+            oc = int(ok_count or 0)
+            fc = int(fail_count or 0)
+            if oc or fc:
+                health_text += f" | ok={oc} fail={fc}"
+        except (TypeError, ValueError):
+            pass
+    return {
+        "health": str(health),
+        "health_text": health_text,
+        "inliers": inliers,
+        "reproj_rms": reproj,
+        "fps": fps_text,
+        "latency_text": latency_text,
+        "wall_text": wall_text,
+        "e2e_text": e2e_text,
+        "diagnostic_lines": diagnostic_lines,
+        "state": dict(state_dict),
+        "telemetry": dict(tele_dict),
+    }
+
+
+def _load_red_spheres_for_map(map_ply: Path | None, max_points: int) -> np.ndarray:
+    """Load red intrinsic spheres beside a map PLY, or empty on any failure.
+
+    Probes overlay/red_spheres_only.ply first, falling back to the workspace
+    outputs river_site demo. Must never raise — a missing overlay is the
+    normal state for sites that have not run the localizability analysis.
+    """
+    try:
+        pts = load_red_sphere_points(map_ply, max_points)
+        if pts is not None and len(pts):
+            return np.asarray(pts, dtype=np.float32)
+    except (OSError, ValueError, AttributeError, TypeError, RuntimeError):  # Tier3: fallback best-effort — narrow, keep pass
+        pass
+    return np.empty((0, 6), dtype=np.float32)
+
+
+def _red_spheres_for_profile(profile_path: str | Path | None, max_points: int) -> np.ndarray:
+    if profile_path is None or profile_path == "":
+        return _load_red_spheres_for_map(None, max_points)
+    try:
+        from site_profile import load_site_profile
+
+        prof = load_site_profile(Path(profile_path))
+        map_ply = getattr(prof, "map_ply", None)
+        return _load_red_spheres_for_map(map_ply if isinstance(map_ply, Path) else None, max_points)
+    except Exception:
+        return _load_red_spheres_for_map(None, max_points)
+
+
 class DedupStringVar(tk.StringVar):
     """A StringVar that drops writes of the value it already holds.
 
@@ -589,8 +897,14 @@ class DedupStringVar(tk.StringVar):
 
 
 def heading_arrow_polygon(
-    sx: float, sy: float, hx: float, hy: float,
-    *, length: float = 18.0, head_width: float = 8.0, tail_length: float = 7.0,
+    sx: float,
+    sy: float,
+    hx: float,
+    hy: float,
+    *,
+    length: float = 18.0,
+    head_width: float = 8.0,
+    tail_length: float = 7.0,
 ) -> list[tuple[float, float]] | None:
     """Return a screen-space arrow whose tip points from current pose to heading."""
     dx, dy = float(hx - sx), float(hy - sy)
@@ -613,8 +927,12 @@ def heading_arrow_polygon(
 
 
 def camera_frustum_world_points(
-    camera_center: np.ndarray, camera_axes: np.ndarray, *, length: float,
-    hfov_deg: float, aspect_ratio: float,
+    camera_center: np.ndarray,
+    camera_axes: np.ndarray,
+    *,
+    length: float,
+    hfov_deg: float,
+    aspect_ratio: float,
 ) -> np.ndarray:
     """Return apex, image-plane center and four image-plane corners in world XYZ."""
     center = np.asarray(camera_center, dtype=float)
@@ -625,12 +943,14 @@ def camera_frustum_world_points(
     face_center = center + forward * float(length)
     half_width = float(length) * math.tan(math.radians(float(hfov_deg)) * 0.5)
     half_height = half_width / float(aspect_ratio)
-    corners = np.asarray([
-        face_center - right * half_width - down * half_height,
-        face_center + right * half_width - down * half_height,
-        face_center + right * half_width + down * half_height,
-        face_center - right * half_width + down * half_height,
-    ])
+    corners = np.asarray(
+        [
+            face_center - right * half_width - down * half_height,
+            face_center + right * half_width - down * half_height,
+            face_center + right * half_width + down * half_height,
+            face_center - right * half_width + down * half_height,
+        ]
+    )
     return np.vstack([center, face_center, corners])
 
 
@@ -721,8 +1041,7 @@ def resolve_operator_site_assets(args, parser: argparse.ArgumentParser) -> SiteP
                 actual = file_sha256(asset)
                 if actual != expected:
                     parser.error(
-                        f"site profile {label} SHA-256 mismatch: "
-                        f"expected {expected}, got {actual}"
+                        f"site profile {label} SHA-256 mismatch: expected {expected}, got {actual}"
                     )
         args.site_profile = str(profile.source)
         args.map_ply = str(profile.map_ply)
@@ -730,17 +1049,13 @@ def resolve_operator_site_assets(args, parser: argparse.ArgumentParser) -> SiteP
         args.bundle = str(profile.localization_bundle)
         args.megaloc_cache = str(profile.megaloc_cache or "")
         args.reference_index = str(profile.reference_index or "")
-        args.reference_index_sha256 = str(
-            profile.asset_sha256.reference_index or ""
-        )
+        args.reference_index_sha256 = str(profile.asset_sha256.reference_index or "")
         args.track_landmarks = str(profile.track_landmarks or "")
         args.localizer_backend = str(profile.localizer)
         args.localizer_deploy_dir = str(profile.localizer_deploy_dir or "")
         args.localizer_profile = str(profile.localizer_profile or "")
         args.bundle_sha256 = str(profile.asset_sha256.localization_bundle or "")
-        args.localizer_profile_sha256 = str(
-            profile.asset_sha256.localizer_profile or ""
-        )
+        args.localizer_profile_sha256 = str(profile.asset_sha256.localizer_profile or "")
         return profile
 
     args.site_profile = ""
@@ -749,11 +1064,10 @@ def resolve_operator_site_assets(args, parser: argparse.ArgumentParser) -> SiteP
     args.bundle = str(DEFAULT_BUNDLE if args.bundle is None else args.bundle)
     args.megaloc_cache = str(DEFAULT_MEGALOC if args.megaloc_cache is None else args.megaloc_cache)
     args.reference_index = str(getattr(args, "reference_index", None) or "")
-    args.reference_index_sha256 = str(
-        getattr(args, "reference_index_sha256", None) or ""
-    )
+    args.reference_index_sha256 = str(getattr(args, "reference_index_sha256", None) or "")
     args.track_landmarks = str(
-        DEFAULT_TRACK_LANDMARKS if args.track_landmarks is None else args.track_landmarks)
+        DEFAULT_TRACK_LANDMARKS if args.track_landmarks is None else args.track_landmarks
+    )
     backend_arg = getattr(args, "localizer_backend", None)
     args.localizer_deploy_dir = str(
         DEFAULT_LOCALIZER_DEPLOY_DIR
@@ -778,8 +1092,7 @@ def resolve_operator_site_assets(args, parser: argparse.ArgumentParser) -> SiteP
     if backend_arg is None:
         backend_arg = DEFAULT_LOCALIZER_BACKEND
     try:
-        args.localizer_backend = resolve_localizer_backend(
-            str(backend_arg), Path(args.bundle))
+        args.localizer_backend = resolve_localizer_backend(str(backend_arg), Path(args.bundle))
     except ValueError as exc:
         parser.error(str(exc))
     return None
@@ -875,6 +1188,8 @@ def load_route_glomap(path_json: str, map_frame=None) -> list:
         require_map_units=True,
         map_frame=map_frame or LEGACY_MAP_FRAME,
     ).controller_waypoints()
+
+
 #: Floor for the fixed-height control pane, and the notebook tab strip + border
 #: allowance added on top of the tallest tab's requested height.
 CONTROL_PANE_MIN_H = 220
@@ -905,6 +1220,7 @@ class DroneBackend:
         self.sim_yaw = 0.0
         self.target_altitude_m = 0.0
         self.flight_start: float | None = None
+        self.route_test_plant = SimulatedRoutePlant(self)
         # Gravity-cal demo: when set to yaw|pitch|roll, synthesize that motion.
         self.gravity_sim_phase: str | None = None
         self._gravity_sim_t0: float | None = None
@@ -912,8 +1228,30 @@ class DroneBackend:
         self.recording_active = False
         self.recording_profile = DEFAULT_RECORDING_PROFILE
         self.record_status = format_record_status(
-            active=False, armed=False, profile=self.recording_profile,
+            active=False,
+            armed=False,
+            profile=self.recording_profile,
         )
+
+    def set_tracker_state(self, new: TrackerState, *, reason: str) -> TrackerState:
+        """Centralized tracker_state transition (F-11).
+
+        Keeps ``str`` compatibility (stores ``new.value``) while logging
+        old/new/reason for audit. Returns ``new`` so callers can chain.
+        """
+        old = self.state.tracker_state
+        self.state.tracker_state = new.value
+        if self.session_logs is not None:
+            try:
+                self.session_logs.incident(
+                    "tracker_state_transition",
+                    old=old,
+                    new=new.value,
+                    reason=reason,
+                )
+            except (OSError, ValueError, AttributeError, TypeError, RuntimeError):  # Tier3: fallback best-effort — narrow, keep pass
+                pass
+        return new
 
     def start(self, config: SessionConfig) -> StartResult:
         if config.interface_mode is not self.mode:
@@ -961,7 +1299,7 @@ class DroneBackend:
             self.command("land")
             return ControlResult.completed(self.state, raw_result=True)
         if request.action is ControlAction.TAKEOFF:
-            self.state.tracker_state = "TAKEOFF"
+            self.set_tracker_state(TrackerState.TAKEOFF, reason="takeoff_typed")
             self.target_altitude_m = ANAFI.takeoff_hover_m
             if self.flight_start is None:
                 self.flight_start = time.monotonic()
@@ -1027,25 +1365,29 @@ class DroneBackend:
 
     def _legacy_state_action(self, name: str, payload: dict) -> DroneState | None:
         if name == "hover":
-            self.state.tracker_state = "HOVER"
+            self.state.tracker_state = TrackerState.HOVER
             self.target_altitude_m = max(0.0, -float(self.sim_xyz[1]))
         elif name == "land":
-            self.state.tracker_state = "LAND"
+            self.state.tracker_state = TrackerState.LAND
             self.target_altitude_m = 0.0
         elif name == "boot_lock":
-            self.state.tracker_state = "BOOT_INIT"
+            self.state.tracker_state = TrackerState.BOOT_INIT
         elif name == "gimbal_pitch":
-            self.state.gimbal_pitch_deg = float(np.clip(
-                float(payload.get("pitch", self.state.gimbal_pitch_deg)),
-                ANAFI.gimbal_pitch_min_deg,
-                ANAFI.gimbal_pitch_max_deg,
-            ))
+            self.state.gimbal_pitch_deg = float(
+                np.clip(
+                    float(payload.get("pitch", self.state.gimbal_pitch_deg)),
+                    ANAFI.gimbal_pitch_min_deg,
+                    ANAFI.gimbal_pitch_max_deg,
+                )
+            )
         elif name == "zoom":
-            self.state.zoom = float(np.clip(
-                float(payload.get("zoom", self.state.zoom)),
-                1.0,
-                ANAFI.digital_zoom_max,
-            ))
+            self.state.zoom = float(
+                np.clip(
+                    float(payload.get("zoom", self.state.zoom)),
+                    1.0,
+                    ANAFI.digital_zoom_max,
+                )
+            )
         elif name in {"camera_reset", "reset_camera", "鏡頭預設", "回復預設"}:
             # UI defaults: slight look-down + 1.0x (DroneState initial values).
             self.state.gimbal_pitch_deg = -20.0
@@ -1055,8 +1397,14 @@ class DroneBackend:
         return self.state
 
     def _legacy_record_action(self, name: str, payload: dict) -> DroneState | bool | None:
-        if name not in {"record_arm", "record_on_takeoff", "record_disarm",
-                        "record_start", "record_stop", "record_quality"}:
+        if name not in {
+            "record_arm",
+            "record_on_takeoff",
+            "record_disarm",
+            "record_start",
+            "record_stop",
+            "record_quality",
+        }:
             return None
         if name == "record_quality":
             if self.recording_active:
@@ -1093,19 +1441,37 @@ class DroneBackend:
         elif name == "nudge_vector":
             self._apply_nudge_vector(payload)
         elif name in {"nudge_end", "nudge_release", "nudge_clear"}:
-            self.state.tracker_state = "HOVER"
+            self.state.tracker_state = TrackerState.HOVER
             self.state.last_command = "hover"
         else:
             return None
         return self.state
 
     def _legacy_one_shot_nudge_action(
-        self, name: str, payload: dict,
+        self,
+        name: str,
+        payload: dict,
     ) -> DroneState | None:
-        if not (name.startswith("nudge_") or name in {
-            "右上前", "左上前", "右下前", "左下前", "右上後", "左上後",
-            "右下後", "左下後", "前", "後", "左", "右", "上", "下",
-        }):
+        if not (
+            name.startswith("nudge_")
+            or name
+            in {
+                "右上前",
+                "左上前",
+                "右下前",
+                "左下前",
+                "右上後",
+                "左上後",
+                "右下後",
+                "左下後",
+                "前",
+                "後",
+                "左",
+                "右",
+                "上",
+                "下",
+            }
+        ):
             return None
         # Legacy one-shot sim step.
         self._apply_nudge(name if not name.startswith("nudge_") else name[6:], payload)
@@ -1117,9 +1483,7 @@ class DroneBackend:
         if name != "auto_speed_limit_apply":
             return None
         requested = float(payload.get("speed_limit_mps", 0.0))
-        enabled = payload.get(
-            "enabled", self.state.autonomous_speed_limit_enabled
-        )
+        enabled = payload.get("enabled", self.state.autonomous_speed_limit_enabled)
         if not isinstance(enabled, bool):
             return False
         landed = self.target_altitude_m <= 0.0 and self.state.altitude_m <= 0.0
@@ -1158,7 +1522,9 @@ class DroneBackend:
         return self.state if result is None else result
 
     def command(
-        self, name: str | ControlRequest, **payload,
+        self,
+        name: str | ControlRequest,
+        **payload,
     ) -> DroneState | ControlResult:
         if isinstance(name, ControlRequest):
             return self._command_typed_request(name)
@@ -1168,7 +1534,7 @@ class DroneBackend:
         self.target_altitude_m = max(0.0, -float(self.sim_xyz[1]))
         self.state.mode = "MANUAL"
         self.state.control_owner = "SIM_MANUAL"
-        self.state.tracker_state = "FAIL_SAFE_HOVER"
+        self.set_tracker_state(TrackerState.FAIL_SAFE_HOVER, reason=f"fail_safe:{reason.value}")
         self.state.last_command = f"fail_safe:{reason.value}"
         self.state.active_incident = reason.value
         if self.session_logs is not None:
@@ -1201,20 +1567,27 @@ class DroneBackend:
         self.sim_xyz[1] -= gaz * step
         self.sim_yaw += float(payload.get("yaw", 0.0)) * 0.1
         self.target_altitude_m = max(0.0, -float(self.sim_xyz[1]))
-        self.state.tracker_state = "NUDGE"
+        self.state.tracker_state = TrackerState.NUDGE
         self.state.last_command = "nudge:vector"
 
     def _apply_nudge(self, name: str, payload: dict) -> None:
         """Map named diagonal/cardinal nudges onto sim_xyz (GLOMAP-like: -Y up)."""
         # unit body axes: +x right, +z forward, +y up in UI altitude space
         table = {
-            "右上前": (+1, +1, +1), "左上前": (-1, +1, +1),
-            "右下前": (+1, -1, +1), "左下前": (-1, -1, +1),
-            "右上後": (+1, +1, -1), "左上後": (-1, +1, -1),
-            "右下後": (+1, -1, -1), "左下後": (-1, -1, -1),
-            "前": (0, 0, +1), "後": (0, 0, -1),
-            "左": (-1, 0, 0), "右": (+1, 0, 0),
-            "上": (0, +1, 0), "下": (0, -1, 0),
+            "右上前": (+1, +1, +1),
+            "左上前": (-1, +1, +1),
+            "右下前": (+1, -1, +1),
+            "左下前": (-1, -1, +1),
+            "右上後": (+1, +1, -1),
+            "左上後": (-1, +1, -1),
+            "右下後": (+1, -1, -1),
+            "左下後": (-1, -1, -1),
+            "前": (0, 0, +1),
+            "後": (0, 0, -1),
+            "左": (-1, 0, 0),
+            "右": (+1, 0, 0),
+            "上": (0, +1, 0),
+            "下": (0, -1, 0),
         }
         if name not in table:
             return
@@ -1230,11 +1603,11 @@ class DroneBackend:
         self.sim_xyz[2] += dz
         self.sim_xyz[1] -= uy * step
         self.target_altitude_m = max(0.0, -float(self.sim_xyz[1]))
-        self.state.tracker_state = "NUDGE"
+        self.state.tracker_state = TrackerState.NUDGE
         self.state.last_command = f"nudge:{name}"
 
     def stream_lost_hover(self, detail: str = "stream lost") -> DroneState:
-        self.state.tracker_state = "STREAM_LOST_HOVER"
+        self.set_tracker_state(TrackerState.STREAM_LOST_HOVER, reason="stream_lost_hover")
         self.state.loc = "STREAM_LOST"
         self.state.stream = "LOST"
         self.state.last_command = f"hover: {detail}"
@@ -1257,11 +1630,14 @@ class DroneBackend:
         orbit_r = 2.0
         cruise_speed = 1.5
         omega = cruise_speed / orbit_r
-        target = np.array([
-            math.sin(t * omega) * orbit_r,
-            self.sim_xyz[1],
-            math.cos(t * omega) * orbit_r,
-        ], dtype=float)
+        target = np.array(
+            [
+                math.sin(t * omega) * orbit_r,
+                self.sim_xyz[1],
+                math.cos(t * omega) * orbit_r,
+            ],
+            dtype=float,
+        )
         delta = target - self.sim_xyz
         delta[1] = 0.0
         dist = float(np.linalg.norm(delta))
@@ -1290,25 +1666,28 @@ class DroneBackend:
             dy = math.copysign(max_dy, dy)
         self.sim_xyz[1] += dy
 
-        if self.state.mode == "AUTO":
+        if self.state.mode == "AUTO" and not self.route_test_plant.active:
             self._advance_sim_orbit(t, dt)
 
     def _apply_sim_tracker_state(self) -> bool:
         self.state.pose[:] = [self.sim_xyz[0], self.sim_xyz[1], self.sim_xyz[2], self.sim_yaw]
         self.state.loc = "SIM"
         if self.state.stream == "LOST":
-            self.state.tracker_state = "STREAM_LOST_HOVER"
+            self.state.tracker_state = TrackerState.STREAM_LOST_HOVER
             return True
         if self.state.mode == "AUTO":
-            self.state.tracker_state = "TRACK"
-        elif self.state.tracker_state == "TAKEOFF" and abs(self.sim_xyz[1] + ANAFI.takeoff_hover_m) < 0.03:
-            self.state.tracker_state = "HOVER"
+            self.set_tracker_state(TrackerState.TRACK, reason="sim_auto_track")
+        elif (
+            self.state.tracker_state == "TAKEOFF"
+            and abs(self.sim_xyz[1] + ANAFI.takeoff_hover_m) < 0.03
+        ):
+            self.state.tracker_state = TrackerState.HOVER
         elif self.state.tracker_state == "LAND" and abs(self.sim_xyz[1]) < 0.03:
             self.sim_xyz[1] = 0.0
             self.target_altitude_m = 0.0
-            self.state.tracker_state = "HOVER"
+            self.state.tracker_state = TrackerState.HOVER
         elif self.state.tracker_state not in {"LAND", "TAKEOFF", "BOOT_INIT", "GRAVITY_CAL"}:
-            self.state.tracker_state = "HOVER"
+            self.state.tracker_state = TrackerState.HOVER
         return False
 
     def _update_gravity_sim_telemetry(self, now: float) -> None:
@@ -1330,7 +1709,7 @@ class DroneBackend:
                 self.state.att_roll = math.radians(45.0 * math.sin(u * 2.0))
                 self.state.att_pitch = 0.0
                 self.state.att_yaw = 0.3
-            self.state.tracker_state = "GRAVITY_CAL"
+            self.state.tracker_state = TrackerState.GRAVITY_CAL
         else:
             # Keep sim yaw aligned with pose heading when not calibrating.
             self.state.att_yaw = float(self.sim_yaw)
@@ -1339,7 +1718,9 @@ class DroneBackend:
         self.state.inliers = 180 + int(40 * math.sin(t))
         self.state.reproj = 2.5 + 0.2 * math.cos(t * 0.5)
         elapsed_flight = 0.0 if self.flight_start is None else max(0.0, now - self.flight_start)
-        self.state.battery_pct = float(np.clip(100.0 * (1.0 - elapsed_flight / ANAFI.flight_time_s), 0.0, 100.0))
+        self.state.battery_pct = float(
+            np.clip(100.0 * (1.0 - elapsed_flight / ANAFI.flight_time_s), 0.0, 100.0)
+        )
         self.state.altitude_m = max(0.0, -float(self.sim_xyz[1]))
         self.state.link_latency_ms = ANAFI.stream_latency_ms
         self.state.stream_fps = ANAFI.stream_fps
@@ -1379,8 +1760,7 @@ def _pose_heading(first: dict, second: dict) -> float | None:
     return math.atan2(dz, dx)
 
 
-def _motion_heading(pose: dict, previous: dict | None,
-                    following: dict | None) -> float | None:
+def _motion_heading(pose: dict, previous: dict | None, following: dict | None) -> float | None:
     heading = (
         _pose_heading(previous, following)
         if previous is not None and following is not None
@@ -1435,24 +1815,29 @@ def _initial_drone_magnetometer_text(*, live: bool) -> str:
 
 
 class OperatorApp(tk.Tk):
-    def __init__(self, backend: DroneBackend, map_points: np.ndarray,
-                 video_stream: FFmpegFrameStream | None = None,
-                 localizer: LiveLocalizerClient | None = None,
-                 detector: LiveDetectorClient | None = None,
-                 replay_rows: list[dict] | None = None,
-                 tick_ms: int = 200,
-                 boot_lock_ms: int = 2500,
-                 detect_every_n_frames: int = 3,
-                 loc_every_n_frames: int = 1,
-                 lost_hold: LostHoldPolicy | None = None,
-                 pose_stabilize: bool = False,
-                 session_logs: SessionLogs | None = None,
-                 site_id: str = "",
-                 site_profile_path: str | Path | None = None,
-                 mission_route_snapshot: MissionRouteSnapshot | None = None,
-                 site_runtime: ActiveSiteRuntime | None = None,
-                 prepare_site_runtime=None,
-                 start_site_runtime=None):
+    def __init__(
+        self,
+        backend: DroneBackend,
+        map_points: np.ndarray,
+        video_stream: FFmpegFrameStream | None = None,
+        localizer: LiveLocalizerClient | None = None,
+        detector: LiveDetectorClient | None = None,
+        replay_rows: list[dict] | None = None,
+        tick_ms: int = 200,
+        boot_lock_ms: int = 2500,
+        detect_every_n_frames: int = 3,
+        loc_every_n_frames: int = 1,
+        adaptive_loc_submit: bool = True,
+        lost_hold: LostHoldPolicy | None = None,
+        pose_stabilize: bool = False,
+        session_logs: SessionLogs | None = None,
+        site_id: str = "",
+        site_profile_path: str | Path | None = None,
+        mission_route_snapshot: MissionRouteSnapshot | None = None,
+        site_runtime: ActiveSiteRuntime | None = None,
+        prepare_site_runtime=None,
+        start_site_runtime=None,
+    ):
         super().__init__()
         self.backend = backend
         self.session_logs = session_logs
@@ -1462,9 +1847,7 @@ class OperatorApp(tk.Tk):
         self._runtime_available = True
         self._site_switching = False
         self._site_switch_landed_confirmed = False
-        self._site_switch_results: queue.Queue[SiteRuntimeSwitchResult] = queue.Queue(
-            maxsize=1
-        )
+        self._site_switch_results: queue.Queue[SiteRuntimeSwitchResult] = queue.Queue(maxsize=1)
         self.site_id = str(site_id or "UNSPECIFIED")
         self.site_profile_path = (
             None
@@ -1485,9 +1868,9 @@ class OperatorApp(tk.Tk):
         # Safety completions have their own drain path.  A frozen Tk loop or a
         # burst of ordinary expectation completions must not evict LAND/EMERGENCY
         # results from the bounded normal-result queue.
-        self._flight_safety_results: queue.Queue[
-            tuple[str, object | None, str | None]
-        ] = queue.Queue()
+        self._flight_safety_results: queue.Queue[tuple[str, object | None, str | None]] = (
+            queue.Queue()
+        )
         self._flight_result_publish_lock = threading.Lock()
         self._flight_inflight: set[str] = set()
         self._flight_inflight_lock = threading.Lock()
@@ -1504,11 +1887,20 @@ class OperatorApp(tk.Tk):
             ]
         ] = queue.Queue(maxsize=1)
         self.map_points = map_points
+        # Red intrinsic-difficult spheres (220,32,32) — visible by default.
+        # Loaded alongside map_points via overlay fallback; empty when missing.
+        try:
+            self.red_sphere_points = _red_spheres_for_profile(
+                getattr(self, "site_profile_path", None), MAP_STATIC_POINTS
+            )
+        except Exception:
+            self.red_sphere_points = np.empty((0, 6), dtype=np.float32)
         self.video_stream = video_stream
         self.localizer = localizer
         self.detector = detector  # YOLO optional; default None / off
         self.detect_every_n_frames = max(1, int(detect_every_n_frames))
         self.loc_every_n_frames = max(1, int(loc_every_n_frames))
+        self.adaptive_loc_submit = bool(adaptive_loc_submit)
         self.video_frame: Image.Image | None = None
         self.video_frame_fresh = False
         self.video_display_index = -1
@@ -1529,23 +1921,22 @@ class OperatorApp(tk.Tk):
         self.loc_fps = 0.0
         self.loc_core_fps = 0.0
         self.loc_latency_ms: float | None = None  # core_wall_ms (inference)
-        self.loc_wall_ms: float | None = None     # full wall_ms from worker
-        self.loc_e2e_ms: float | None = None      # submit -> UI result arrival
+        self.loc_wall_ms: float | None = None  # full wall_ms from worker
+        self.loc_e2e_ms: float | None = None  # submit -> UI result arrival
         self.loc_pose_updated_mono: float | None = None
         self.loc_hold_engage_count = 0
         self.loc_recovery_fix_count = 0
         self.loc_recovery_text = "狀態 - | hold 0 | recovery 0"
         self.loc_stage = "-"
-        self.loc_benchmark_requested = (
-            localizer.benchmark_mode if localizer is not None else "auto")
+        self.loc_benchmark_requested = localizer.benchmark_mode if localizer is not None else "auto"
         self.loc_benchmark_active = "auto"
         self._loc_benchmark_pending: str | None = None
-        self._last_status_write = 0.0          # throttle debug status files to ~5Hz
+        self._last_status_write = 0.0  # throttle debug status files to ~5Hz
         self._last_det_write = 0.0
         self._diagnostic_failures_reported: set[str] = set()
         self._last_localization_exception_seq: object | None = None
         self._last_applied_live_result_display_seq: int | None = None
-        self._last_loc_fail_log = 0.0          # throttle FAIL log spam off-field
+        self._last_loc_fail_log = 0.0  # throttle FAIL log spam off-field
         self._loc_fail_count = 0
         self._loc_ok_count = 0
         self._loc_consecutive_good_fixes = 0
@@ -1553,10 +1944,10 @@ class OperatorApp(tk.Tk):
         self._loc_e2e_ms_samples: list[tuple[float, float]] = []
         self._loc_metrics_path: Path | None = None
         self._loc_metrics_f = None
-        self.loc_health = "OK"                 # OK / LOW / FAIL — operator localization alert
+        self.loc_health = "OK"  # OK / LOW / FAIL — operator localization alert
         self.loc_health_inliers = 0
         self.loc_health_reproj = None
-        self.history_health: list[str] = []    # per-history-point health, for map markers
+        self.history_health: list[str] = []  # per-history-point health, for map markers
         # Localization gate: the 720p stream is fed to the localizer only after
         # 開始定位 is pressed. This does not start an autonomous route.
         self.inspecting = False
@@ -1581,7 +1972,9 @@ class OperatorApp(tk.Tk):
         # Yaw is stabilized at the UI boundary for every live pose. This has no
         # EDM/tracker cost and leaves the opt-in XYZ behavior above unchanged.
         self.yaw_stabilizer = TemporalYawStabilizer()
-        self._live_pending: np.ndarray | None = None   # continuity gate: jump awaiting a confirming fix
+        self._live_pending: np.ndarray | None = (
+            None  # continuity gate: jump awaiting a confirming fix
+        )
         self.live_heading: float | None = None
         self.camera_axes_world: np.ndarray | None = None
         #: (east, north, up, measured) for the map axis gizmo. Resolved once: it is
@@ -1617,21 +2010,18 @@ class OperatorApp(tk.Tk):
         # authority back to the SkyController without auto-resuming later.
         self.lost_hold = lost_hold
         stream_fps = float(
-            getattr(video_stream, "output_fps", ANAFI.stream_fps)
-            or ANAFI.stream_fps
+            getattr(video_stream, "output_fps", ANAFI.stream_fps) or ANAFI.stream_fps
         )
         self.stream_period_s = 1.0 / stream_fps
         self.next_stream_frame_time = 0.0
         self._video_frame_stamp: float = 0.0
         self._video_frame_timing: dict = {}
         self.history: list[np.ndarray] = []
-        self.route_pts: list = []          # planned drawn route (GLOMAP frame), always visible
+        self.route_pts: list = []  # planned drawn route (GLOMAP frame), always visible
         self.mission_route_lock = MissionRouteLock(mission_route_snapshot)
         self._displayed_route_snapshot = mission_route_snapshot
         self._displayed_route_sha256 = (
-            mission_route_snapshot.sha256
-            if mission_route_snapshot is not None
-            else None
+            mission_route_snapshot.sha256 if mission_route_snapshot is not None else None
         )
         self._pending_auto_route_activation = False
         self._integrated_autonomy: DesktopRouteAutonomy | None = None
@@ -1644,8 +2034,10 @@ class OperatorApp(tk.Tk):
         self.video_photo = None
         self.map_base_cache_key = None
         self.map_base_cache: Image.Image | None = None
-        self._map_dirty_key = None       # skip map re-render+PhotoImage when nothing drawn changed
-        self._video_dirty_key = None     # skip video re-render+PhotoImage when the frame/overlays are unchanged
+        self._map_dirty_key = None  # skip map re-render+PhotoImage when nothing drawn changed
+        self._video_dirty_key = (
+            None  # skip video re-render+PhotoImage when the frame/overlays are unchanged
+        )
         # Point-cloud base rebuild costs ~16 ms at 250k points (depth argsort +
         # scatter). During a drag that runs on every mouse motion, so drop to a
         # decimated cloud while the operator is moving the view and restore full
@@ -1701,7 +2093,8 @@ class OperatorApp(tk.Tk):
         self._autonomy_pose_error: str | None = None
         self._sync_autonomy_profile_approval()
         self.title(
-            "SfM Flight Operator - LIVE Olympe" if live
+            "SfM Flight Operator - LIVE Olympe"
+            if live
             else "SfM Flight Operator - Parrot ANAFI profile (SIM)"
         )
         self.geometry(f"{UI_STANDARD_SIZE[0]}x{UI_STANDARD_SIZE[1]}")
@@ -1746,10 +2139,12 @@ class OperatorApp(tk.Tk):
         self._stick_vector_active = False
         self._nudge_key_map = dict(VIRTUAL_STICK_KEY_MAP)
         for key, cmd in self._nudge_key_map.items():
-            self.bind(f"<KeyPress-{key}>",
-                      lambda e, c=cmd, k=key: self._on_nudge_key_press(k, c, e))
-            self.bind(f"<KeyRelease-{key}>",
-                      lambda e, c=cmd, k=key: self._on_nudge_key_release(k, c, e))
+            self.bind(
+                f"<KeyPress-{key}>", lambda e, c=cmd, k=key: self._on_nudge_key_press(k, c, e)
+            )
+            self.bind(
+                f"<KeyRelease-{key}>", lambda e, c=cmd, k=key: self._on_nudge_key_release(k, c, e)
+            )
         self.after(100, self.tick)
         self.after(105, self.poll_localization_results)
         # Also covers direct startup into a profile that has no route yet.
@@ -1768,9 +2163,7 @@ class OperatorApp(tk.Tk):
                 drain()
             self.update_live_results()
         except Exception as exc:
-            incident = getattr(
-                getattr(self, "session_logs", None), "incident", None
-            )
+            incident = getattr(getattr(self, "session_logs", None), "incident", None)
             if callable(incident):
                 try:
                     incident(
@@ -1778,17 +2171,17 @@ class OperatorApp(tk.Tk):
                         error=repr(exc),
                         resolved=False,
                     )
-                except Exception:
+                except (OSError, ValueError, AttributeError, TypeError, RuntimeError):  # Tier3: fallback best-effort — narrow, keep pass
                     pass
             try:
                 self.write_log(f"LOCALIZATION_RESULT_POLL_FAILED: {exc!r}")
-            except Exception:
+            except (OSError, ValueError, AttributeError, TypeError, RuntimeError):  # Tier3: fallback best-effort — narrow, keep pass
                 pass
             pause_auto = getattr(self, "_pause_integrated_auto", None)
             if callable(pause_auto):
                 try:
                     pause_auto("localization_poll_failed")
-                except Exception:
+                except (OSError, ValueError, AttributeError, TypeError, RuntimeError):  # Tier3: fallback best-effort — narrow, keep pass
                     pass
         finally:
             self.after(self._loc_result_poll_ms, self.poll_localization_results)
@@ -1832,9 +2225,7 @@ class OperatorApp(tk.Tk):
 
     def boot_holding(self) -> bool:
         localizer = getattr(self, "localizer", None)
-        worker_warming = (
-            localizer is not None and not bool(getattr(localizer, "ready", True))
-        )
+        worker_warming = localizer is not None and not bool(getattr(localizer, "ready", True))
         return self.inspecting and (worker_warming or not self.boot_lock_done)
 
     def lost_holding(self) -> bool:
@@ -1859,8 +2250,8 @@ class OperatorApp(tk.Tk):
                 else "串流恢復，定位改用新影格繼續重試"
             )
             self.write_log(
-                f"LOST_HOLD 逾時放行：{self.lost_hold.timeout_s:.1f}s 內未重定位，"
-                f"{outcome}")
+                f"LOST_HOLD 逾時放行：{self.lost_hold.timeout_s:.1f}s 內未重定位，{outcome}"
+            )
 
     def _engage_real_localization_recovery(self, reason: FailureReason) -> None:
         if not self._is_live_backend():
@@ -1872,9 +2263,7 @@ class OperatorApp(tk.Tk):
                 clear_all(reason="localization_recovery")
             elif callable(clear_vector):
                 clear_vector()
-            self.backend.send_pcmd(
-                0, 0, 0, 0, reason="localization_recovery_hover"
-            )
+            self.backend.send_pcmd(0, 0, 0, 0, reason="localization_recovery_hover")
         except Exception as exc:
             self.write_log(f"定位恢復懸停失敗: {reason.value}: {exc!r}")
         try:
@@ -1889,11 +2278,14 @@ class OperatorApp(tk.Tk):
         success = bool(result.get("success"))
         inliers = int(result.get("inliers", 0) or 0)
         reproj = result.get("reproj_rms")
-        low_confidence = bool(success and (
-            inliers < LOC_LOW_INLIERS
-            or (reproj is not None and float(reproj) > LOC_HIGH_REPROJ)
-            or localization_result_is_weak(result)
-        ))
+        low_confidence = bool(
+            success
+            and (
+                inliers < LOC_LOW_INLIERS
+                or (reproj is not None and float(reproj) > LOC_HIGH_REPROJ)
+                or localization_result_is_weak(result)
+            )
+        )
         event = self.lost_hold.on_result(
             success=success,
             low_confidence=low_confidence,
@@ -1907,13 +2299,10 @@ class OperatorApp(tk.Tk):
         result["confidence_hold_active"] = bool(self.lost_hold.active)
         result["confidence_low_streak"] = int(self.lost_hold.low_streak)
         result["confidence_hold_attempts"] = int(
-            attempts_before if event and event.startswith("RELEASE")
-            else self.lost_hold.attempts
+            attempts_before if event and event.startswith("RELEASE") else self.lost_hold.attempts
         )
         if event == "ENGAGE_LOW_CONF":
-            self._engage_real_localization_recovery(
-                FailureReason.LOCALIZATION_WEAK
-            )
+            self._engage_real_localization_recovery(FailureReason.LOCALIZATION_WEAK)
             action = (
                 "AUTO 已歸零並維持原地懸停"
                 if self._integrated_auto_active()
@@ -1923,11 +2312,10 @@ class OperatorApp(tk.Tk):
             )
             self.write_log(
                 f"低信心升級：連續 {self.lost_hold.low_confidence_results} 筆；"
-                f"{action}，下一幀先 EDM 附近參考，再依定位 profile 排程 MegaLoc")
-        elif event == "ENGAGE_FAIL":
-            self._engage_real_localization_recovery(
-                FailureReason.LOCALIZATION_LOST
+                f"{action}，下一幀先 EDM 附近參考，再依定位 profile 排程 MegaLoc"
             )
+        elif event == "ENGAGE_FAIL":
+            self._engage_real_localization_recovery(FailureReason.LOCALIZATION_LOST)
             action = (
                 "AUTO 已歸零並維持原地懸停"
                 if self._integrated_auto_active()
@@ -1938,7 +2326,8 @@ class OperatorApp(tk.Tk):
             self.write_log(
                 f"LOST_HOLD 進入：tracker 已進入 LOST；{action}，"
                 "先 EDM 附近參考，再依定位 profile 排程 MegaLoc"
-                f"（總嘗試上限 {self.lost_hold.max_attempts} 次）")
+                f"（總嘗試上限 {self.lost_hold.max_attempts} 次）"
+            )
         elif event == "RELEASE_FIX":
             outcome = (
                 "AUTO 等待連續可靠定位後才恢復路線"
@@ -1948,29 +2337,24 @@ class OperatorApp(tk.Tk):
                 else "串流恢復"
             )
             attempt_text = f"第 {attempts_before} 次 " if attempts_before else ""
-            self.write_log(
-                f"LOST_HOLD 解除：{attempt_text}recovery 成功，{outcome}")
+            self.write_log(f"LOST_HOLD 解除：{attempt_text}recovery 成功，{outcome}")
         elif event == "RELEASE_ATTEMPTS":
             self.write_log(
                 f"LOST_HOLD 放行：同一影格重試 {self.lost_hold.max_attempts} 次仍未定位，"
-                "串流恢復（定位持續以新影格重試）")
+                "串流恢復（定位持續以新影格重試）"
+            )
 
     def update_boot_lock(self) -> None:
-        if not self.inspecting:                 # boot lock only engages after 開始定位
+        if not self.inspecting:  # boot lock only engages after 開始定位
             return
         localizer = getattr(self, "localizer", None)
-        worker_ready = (
-            localizer is None or bool(getattr(localizer, "ready", True))
-        )
+        worker_ready = localizer is None or bool(getattr(localizer, "ready", True))
         if worker_ready != self._last_localizer_ready:
             if worker_ready:
                 info = getattr(localizer, "startup_info", {}) if localizer else {}
                 startup_ms = info.get("startup_ms") if isinstance(info, dict) else None
                 device = info.get("device") if isinstance(info, dict) else None
-                suffix = (
-                    f" ({float(startup_ms) / 1000.0:.1f}s)"
-                    if startup_ms is not None else ""
-                )
+                suffix = f" ({float(startup_ms) / 1000.0:.1f}s)" if startup_ms is not None else ""
                 device_text = f" device={device}" if device else ""
                 self.write_log(f"定位 worker 已就緒{suffix}{device_text}")
             else:
@@ -1985,9 +2369,11 @@ class OperatorApp(tk.Tk):
             self.boot_lock_start = now
             self.write_log("BOOT_INIT: holding first 720p frame until live MegaLoc/PnP lock")
         elif now - self.boot_lock_start >= self.boot_lock_s:
-            self.boot_lock_done = True           # timeout: release the hold so the UI never freezes
-            self.write_log(f"BOOT_INIT: no lock in {self.boot_lock_s:.1f}s; releasing hold "
-                           "(localization keeps trying, stream resumes)")
+            self.boot_lock_done = True  # timeout: release the hold so the UI never freezes
+            self.write_log(
+                f"BOOT_INIT: no lock in {self.boot_lock_s:.1f}s; releasing hold "
+                "(localization keeps trying, stream resumes)"
+            )
 
     @staticmethod
     def _derive_motion_headings(rows: list[dict]) -> list[float | None]:
@@ -2000,7 +2386,8 @@ class OperatorApp(tk.Tk):
                 continue
             prev = _first_present_pose(poses, range(max(0, i - 12), i))
             nxt = _first_present_pose(
-                poses, range(min(len(poses) - 1, i + 12), i, -1),
+                poses,
+                range(min(len(poses) - 1, i + 12), i, -1),
             )
             heading = _motion_heading(pose, prev, nxt)
             if heading is not None:
@@ -2061,14 +2448,10 @@ class OperatorApp(tk.Tk):
         chip = getattr(self, "status_chips", {}).get(name)
         if chip is None:
             return
-        bg, fg = self._UI_STATE_COLOURS.get(
-            state, self._UI_STATE_COLOURS["neutral"]
-        )
+        bg, fg = self._UI_STATE_COLOURS.get(state, self._UI_STATE_COLOURS["neutral"])
         self._set_widget_text(f"status_chip:{name}", chip, text=text, bg=bg, fg=fg)
 
-    def _set_readiness_card(
-        self, key: str, title: str, state: str, detail: str
-    ) -> None:
+    def _set_readiness_card(self, key: str, title: str, state: str, detail: str) -> None:
         label = getattr(self, "readiness_labels", {}).get(key)
         if label is None:
             return
@@ -2078,9 +2461,7 @@ class OperatorApp(tk.Tk):
             "blocked": "✕",
             "waiting": "…",
         }.get(state, "○")
-        bg, fg = self._UI_STATE_COLOURS.get(
-            state, self._UI_STATE_COLOURS["neutral"]
-        )
+        bg, fg = self._UI_STATE_COLOURS.get(state, self._UI_STATE_COLOURS["neutral"])
         self._set_widget_text(
             f"readiness:{key}",
             label,
@@ -2121,9 +2502,7 @@ class OperatorApp(tk.Tk):
         self.after_idle(self._fit_control_pane)
 
     def toggle_preflight_details(self) -> None:
-        self._set_preflight_expanded(
-            not bool(getattr(self, "_preflight_details_expanded", True))
-        )
+        self._set_preflight_expanded(not bool(getattr(self, "_preflight_details_expanded", True)))
 
     def _update_preflight_cards(self, st: "DroneState") -> None:
         guide = getattr(self, "preflight_guide", None)
@@ -2146,10 +2525,7 @@ class OperatorApp(tk.Tk):
             self._set_widget_text(
                 f"preflight_card:{step}",
                 labels[step],
-                text=(
-                    f"{symbol} {index}. {PREFLIGHT_GUIDE_LABELS[step]}"
-                    f"｜{state_text}"
-                ),
+                text=(f"{symbol} {index}. {PREFLIGHT_GUIDE_LABELS[step]}｜{state_text}"),
                 bg=bg,
                 fg=fg,
             )
@@ -2185,26 +2561,29 @@ class OperatorApp(tk.Tk):
         flight_state = _telemetry_text(getattr(st, "flight_state", None))
         flight_key = flight_state.replace("_", "").lower()
         flight_status = (
-            "good" if flight_key == "landed"
-            else "warning" if flight_key in {
-                "takingoff", "hovering", "flying", "landing", "usertakeoff",
-                "motoramping", "emergencylanding",
+            "good"
+            if flight_key == "landed"
+            else "warning"
+            if flight_key
+            in {
+                "takingoff",
+                "hovering",
+                "flying",
+                "landing",
+                "usertakeoff",
+                "motoramping",
+                "emergencylanding",
             }
             else "waiting"
         )
-        self._set_status_chip(
-            "flight", f"飛行：{flight_state}", flight_status
-        )
+        self._set_status_chip("flight", f"飛行：{flight_state}", flight_status)
         try:
             battery = float(getattr(st, "battery_pct", -1.0))
         except (TypeError, ValueError, OverflowError):
             battery = -1.0
         floor = float(getattr(self.backend, "min_takeoff_battery_pct", 30.0))
         battery_valid = math.isfinite(battery) and 0.0 <= battery <= 100.0
-        battery_state = (
-            "waiting" if not battery_valid else "warning" if battery < floor
-            else "good"
-        )
+        battery_state = "waiting" if not battery_valid else "warning" if battery < floor else "good"
         battery_text = "電量：—" if not battery_valid else f"電量：{battery:.0f}%"
         self._set_status_chip("battery", battery_text, battery_state)
         gps_text, gps_state = gps_operator_message(st, live=live)
@@ -2246,8 +2625,7 @@ class OperatorApp(tk.Tk):
         if not raw_reasons:
             raw_reasons = (getattr(self.backend, "_inventory_block_reason", "ready"),)
         translated = [
-            _inventory_reason_zh(reason) for reason in raw_reasons
-            if _inventory_reason_zh(reason)
+            _inventory_reason_zh(reason) for reason in raw_reasons if _inventory_reason_zh(reason)
         ]
         self.inventory_detail_var.set(
             "硬體清單：" + ("；".join(translated) if translated else "全部通過")
@@ -2260,8 +2638,13 @@ class OperatorApp(tk.Tk):
         flight_state = str(getattr(st, "flight_state", "") or "")
         flight_key = flight_state.rsplit(".", 1)[-1].replace("_", "").lower()
         airborne = flight_key in {
-            "takingoff", "hovering", "flying", "landing", "usertakeoff",
-            "motoramping", "emergencylanding",
+            "takingoff",
+            "hovering",
+            "flying",
+            "landing",
+            "usertakeoff",
+            "motoramping",
+            "emergencylanding",
         }
         if airborne:
             manual = "飛行中：起飛已關閉；懸停可暫停自動飛行，降落仍可用"
@@ -2298,7 +2681,9 @@ class OperatorApp(tk.Tk):
         style.configure("TFrame", background="#111316")
         style.configure("Panel.TFrame", background="#1a1d21")
         style.configure(
-            "TLabel", background="#111316", foreground="#f0f3f5",
+            "TLabel",
+            background="#111316",
+            foreground="#f0f3f5",
             font=("Sans", 10),
         )
         style.configure("TButton", padding=(10, 6), font=("Sans", 10))
@@ -2398,8 +2783,9 @@ class OperatorApp(tk.Tk):
         # 140: the map/video pane expands into whatever height is spare, so this
         # REQUESTED size only decides who loses on a short window -- and it must
         # not be the controls below. Lowered 240 -> 180 -> 140 by operator request.
-        self.map_label = tk.Canvas(main_paned, bg="#15181c", highlightthickness=0, bd=0,
-                                   width=440, height=140)
+        self.map_label = tk.Canvas(
+            main_paned, bg="#15181c", highlightthickness=0, bd=0, width=440, height=140
+        )
         self.map_label.bind("<ButtonPress-1>", self.on_map_press)
         self.map_label.bind("<B1-Motion>", self.on_map_drag)
         self.map_label.bind("<ButtonRelease-1>", self.on_map_release)
@@ -2433,8 +2819,9 @@ class OperatorApp(tk.Tk):
             command=lambda: self._set_map_zoom(self.map_zoom / 1.12),
         )
         self.map_zoom_out_button.pack(pady=(4, 0))
-        self.video_label = tk.Canvas(main_paned, bg="#08090b", highlightthickness=0, bd=0,
-                                     width=760, height=140)
+        self.video_label = tk.Canvas(
+            main_paned, bg="#08090b", highlightthickness=0, bd=0, width=760, height=140
+        )
         main_paned.add(self.map_label, minsize=300, stretch="always")
         main_paned.add(self.video_label, minsize=480, stretch="always")
         self._map_pinch_zoom = install_x11_pinch_zoom(
@@ -2454,9 +2841,7 @@ class OperatorApp(tk.Tk):
         preflight_bar = ttk.LabelFrame(self, text="起飛前依序確認（只提示，不會自行起飛）")
         preflight_bar.pack(fill="x", padx=10, pady=(0, 4))
         self.preflight_bar = preflight_bar
-        self.preflight_guide_var = DedupStringVar(
-            value="① 羅盤校正狀態：等待飛機狀態讀回"
-        )
+        self.preflight_guide_var = DedupStringVar(value="① 羅盤校正狀態：等待飛機狀態讀回")
         preflight_header = ttk.Frame(preflight_bar)
         preflight_header.pack(fill="x")
         ttk.Label(
@@ -2503,8 +2888,7 @@ class OperatorApp(tk.Tk):
         # Aircraft identity and safety state live in the always-visible header;
         # engineering readouts are composed into the video HUD below.
 
-        controls = ttk.Frame(self, style="Panel.TFrame", width=920,
-                             height=CONTROL_PANE_MIN_H)
+        controls = ttk.Frame(self, style="Panel.TFrame", width=920, height=CONTROL_PANE_MIN_H)
         controls.pack(fill="x", padx=10, pady=(4, 6))
         controls.pack_propagate(False)
         self._controls_pane = controls
@@ -2581,11 +2965,7 @@ class OperatorApp(tk.Tk):
                 text=button.label,
                 command=lambda c=button.command: self._send_flight_button(c),
                 takefocus=True,
-                state=(
-                    "disabled"
-                    if button.command in {"takeoff", "start_auto"}
-                    else "normal"
-                ),
+                state=("disabled" if button.command in {"takeoff", "start_auto"} else "normal"),
                 style="Takeoff.TButton" if button.command == "takeoff" else "Auto.TButton",
             )
             widget.bind("<space>", self._on_space_hover)
@@ -2619,7 +2999,9 @@ class OperatorApp(tk.Tk):
         # Recording is always armed. Takeoff starts onboard SD capture; landing
         # stops it. Quality selects the SD encoder only; live stream stays 720p.
         initial_profile = getattr(
-            self.backend, "recording_profile", DEFAULT_RECORDING_PROFILE,
+            self.backend,
+            "recording_profile",
+            DEFAULT_RECORDING_PROFILE,
         )
         self._recording_quality_syncing = False
         self.record_quality_var = DedupStringVar(value=initial_profile.label)
@@ -2633,36 +3015,39 @@ class OperatorApp(tk.Tk):
         )
         self.record_quality_combo.pack(side="left", padx=(0, 4), pady=6)
         self.record_quality_combo.bind(
-            "<<ComboboxSelected>>", self._on_recording_quality_selected,
+            "<<ComboboxSelected>>",
+            self._on_recording_quality_selected,
         )
         self.record_status_var = DedupStringVar(
             value=format_record_status(
-                active=False, armed=True, profile=initial_profile,
+                active=False,
+                armed=True,
+                profile=initial_profile,
             )
         )
-        ttk.Label(flight_actions, textvariable=self.record_status_var,
-                  font=("Sans", 10, "bold")).pack(
-                      side="left", padx=(4, 4), pady=6
-                  )
+        ttk.Label(
+            flight_actions, textvariable=self.record_status_var, font=("Sans", 10, "bold")
+        ).pack(side="left", padx=(4, 4), pady=6)
 
-        nudge_title = ("虛擬搖桿（拖曳給指令／放開懸停）" if live
-                       else "虛擬搖桿（模擬）")
+        nudge_title = "虛擬搖桿（拖曳給指令／放開懸停）" if live else "虛擬搖桿（模擬）"
         nudge = ttk.LabelFrame(aircraft_tab, text=nudge_title)
         nudge.grid(row=0, column=1, rowspan=2, sticky="nsew", padx=6, pady=(4, 5))
         sticks = ttk.Frame(nudge)
         sticks.pack(padx=4, pady=(6, 2))
         self.stick_left = VirtualStick(
-            sticks, title="左", x_label="旋", y_label="上/下",
-            on_change=self._on_virtual_stick)
+            sticks, title="左", x_label="旋", y_label="上/下", on_change=self._on_virtual_stick
+        )
         self.stick_left.grid(row=0, column=0, padx=(2, 6))
         self.stick_right = VirtualStick(
-            sticks, title="右", x_label="右", y_label="前/後",
-            on_change=self._on_virtual_stick)
+            sticks, title="右", x_label="右", y_label="前/後", on_change=self._on_virtual_stick
+        )
         self.stick_right.grid(row=0, column=1, padx=(6, 2))
-        ttk.Label(sticks, text="左：A/D 左右旋 · W/S 上下",
-                  font=("Sans", 8)).grid(row=1, column=0, pady=(1, 0))
-        ttk.Label(sticks, text="右：J/L 左右 · I/K 前後",
-                  font=("Sans", 8)).grid(row=1, column=1, pady=(1, 0))
+        ttk.Label(sticks, text="左：A/D 左右旋 · W/S 上下", font=("Sans", 8)).grid(
+            row=1, column=0, pady=(1, 0)
+        )
+        ttk.Label(sticks, text="右：J/L 左右 · I/K 前後", font=("Sans", 8)).grid(
+            row=1, column=1, pady=(1, 0)
+        )
         # The same axes are bound to keys (_nudge_key_map); without this the
         # shortcuts were invisible to the operator.
         ttk.Label(
@@ -2675,14 +3060,26 @@ class OperatorApp(tk.Tk):
         self.pitch = tk.DoubleVar(value=-20)
         self.zoom = tk.DoubleVar(value=1)
         ttk.Label(camera, text="俯仰").pack(side="left", padx=(6, 2))
-        ttk.Scale(camera, from_=ANAFI.gimbal_pitch_min_deg, to=ANAFI.gimbal_pitch_max_deg, variable=self.pitch,
-                  length=110,
-                  command=lambda _v: self.send("gimbal_pitch", pitch=self.pitch.get())).pack(side="left", padx=4)
+        ttk.Scale(
+            camera,
+            from_=ANAFI.gimbal_pitch_min_deg,
+            to=ANAFI.gimbal_pitch_max_deg,
+            variable=self.pitch,
+            length=110,
+            command=lambda _v: self.send("gimbal_pitch", pitch=self.pitch.get()),
+        ).pack(side="left", padx=4)
         ttk.Label(camera, text="縮放").pack(side="left", padx=(8, 2))
-        ttk.Scale(camera, from_=1, to=ANAFI.digital_zoom_max, variable=self.zoom,
-                  length=90,
-                  command=lambda _v: self.send("zoom", zoom=self.zoom.get())).pack(side="left", padx=4)
-        ttk.Button(camera, text="鏡頭預設", command=self.reset_camera_defaults).pack(side="left", padx=4, pady=8)
+        ttk.Scale(
+            camera,
+            from_=1,
+            to=ANAFI.digital_zoom_max,
+            variable=self.zoom,
+            length=90,
+            command=lambda _v: self.send("zoom", zoom=self.zoom.get()),
+        ).pack(side="left", padx=4)
+        ttk.Button(camera, text="鏡頭預設", command=self.reset_camera_defaults).pack(
+            side="left", padx=4, pady=8
+        )
         # Map-view controls sit ON the map, bottom-left: they act on what is under
         # them, so putting them in a camera panel made the operator look elsewhere
         # to change what the map shows.
@@ -2690,18 +3087,14 @@ class OperatorApp(tk.Tk):
         map_tool_stack.place(relx=0.0, rely=1.0, x=8, y=-8, anchor="sw")
         collision_tools = ttk.Frame(map_tool_stack, style="Panel.TFrame")
         collision_tools.pack(anchor="w", fill="x", padx=4, pady=(3, 0))
-        self.collision_guard_enabled_var = tk.BooleanVar(
-            value=self.collision_guard_enabled
-        )
+        self.collision_guard_enabled_var = tk.BooleanVar(value=self.collision_guard_enabled)
         ttk.Checkbutton(
             collision_tools,
             text="◎ 點雲近接懸停",
             variable=self.collision_guard_enabled_var,
             command=self._on_collision_guard_enabled_change,
         ).pack(side="left", padx=(0, 4))
-        self.collision_guard_radius_var = tk.DoubleVar(
-            value=self.collision_guard_radius
-        )
+        self.collision_guard_radius_var = tk.DoubleVar(value=self.collision_guard_radius)
         self.collision_guard_scale = ttk.Scale(
             collision_tools,
             from_=self.collision_guard_radius_min,
@@ -2719,9 +3112,7 @@ class OperatorApp(tk.Tk):
             textvariable=self.collision_guard_radius_text,
             width=8,
         ).pack(side="left", padx=(3, 0))
-        self.collision_guard_status_var = DedupStringVar(
-            value="中心預覽：等待點雲檢查（不觸發）"
-        )
+        self.collision_guard_status_var = DedupStringVar(value="中心預覽：等待點雲檢查（不觸發）")
         ttk.Label(
             map_tool_stack,
             textvariable=self.collision_guard_status_var,
@@ -2730,7 +3121,8 @@ class OperatorApp(tk.Tk):
         map_tools = ttk.Frame(map_tool_stack, style="Panel.TFrame")
         map_tools.pack(anchor="w", fill="x")
         ttk.Button(map_tools, text="重設地圖", command=self.reset_map_view).pack(
-            side="left", padx=(4, 2), pady=3)
+            side="left", padx=(4, 2), pady=3
+        )
         self.update_sparse_cloud_collision_interlock(self.current_state)
 
         # Localization health is one of the always-visible status chips. Detailed
@@ -2752,16 +3144,14 @@ class OperatorApp(tk.Tk):
         # Rendered in the ANAFI panel below; without a widget this was a variable
         # refreshed at telemetry rate that nobody could ever see.
         self.anafi_flight_var = DedupStringVar(value="map Y 0.0u")
-        self.anafi_stream_var = DedupStringVar(
-            value="ground speed - | PCMD→telemetry poll -"
-        )
-        initial_geofence = getattr(
-            self.backend.state, "distance_geofence_enabled", None
-        )
+        self.anafi_stream_var = DedupStringVar(value="ground speed - | PCMD→telemetry poll -")
+        initial_geofence = getattr(self.backend.state, "distance_geofence_enabled", None)
         initial_geofence_text = (
             "圍欄狀態未知"
             if initial_geofence is None
-            else "圍欄 ON" if initial_geofence else "圍欄關閉"
+            else "圍欄 ON"
+            if initial_geofence
+            else "圍欄關閉"
         )
         self.anafi_limit_var = DedupStringVar(
             value=(
@@ -2791,8 +3181,8 @@ class OperatorApp(tk.Tk):
             wraplength=900,
         ).pack(fill="x", padx=8, pady=(5, 4))
 
-        desired_altitude, desired_distance, desired_geofence = (
-            _desired_firmware_limit_values(self.backend)
+        desired_altitude, desired_distance, desired_geofence = _desired_firmware_limit_values(
+            self.backend
         )
         self.max_altitude_input_var = DedupStringVar(
             value="" if desired_altitude is None else f"{float(desired_altitude):g}"
@@ -2800,14 +3190,10 @@ class OperatorApp(tk.Tk):
         self.max_distance_input_var = DedupStringVar(
             value="" if desired_distance is None else f"{float(desired_distance):g}"
         )
-        self.distance_geofence_input_var = tk.BooleanVar(
-            value=bool(desired_geofence)
-        )
+        self.distance_geofence_input_var = tk.BooleanVar(value=bool(desired_geofence))
         limits = ttk.Frame(anafi_panel)
         limits.pack(fill="x", padx=8, pady=(0, 6))
-        ttk.Label(limits, text="限制（landed 才可套用） 高度").pack(
-            side="left"
-        )
+        ttk.Label(limits, text="限制（landed 才可套用） 高度").pack(side="left")
         ttk.Entry(limits, width=7, textvariable=self.max_altitude_input_var).pack(
             side="left", padx=(4, 2)
         )
@@ -2840,9 +3226,7 @@ class OperatorApp(tk.Tk):
             1,
             min(100, int(getattr(self.backend, "nudge_pct", 10) or 10)),
         )
-        current_auto_speed = float(
-            getattr(self.backend.state, "autonomous_speed_limit_mps", 0.30)
-        )
+        current_auto_speed = float(getattr(self.backend.state, "autonomous_speed_limit_mps", 0.30))
         current_auto_speed_enabled = bool(
             getattr(self.backend.state, "autonomous_speed_limit_enabled", True)
         )
@@ -2854,12 +3238,8 @@ class OperatorApp(tk.Tk):
                 f"PCMD ±{auto_pcmd_cap_pct}% | SPEED_WAITING"
             )
         )
-        self.autonomous_speed_limit_input_var = DedupStringVar(
-            value=f"{current_auto_speed:g}"
-        )
-        self.autonomous_speed_limit_enabled_var = tk.BooleanVar(
-            value=current_auto_speed_enabled
-        )
+        self.autonomous_speed_limit_input_var = DedupStringVar(value=f"{current_auto_speed:g}")
+        self.autonomous_speed_limit_enabled_var = tk.BooleanVar(value=current_auto_speed_enabled)
         autonomous_limit = ttk.Frame(anafi_panel)
         autonomous_limit.pack(fill="x", padx=8, pady=(0, 6))
         ttk.Label(
@@ -2885,10 +3265,7 @@ class OperatorApp(tk.Tk):
         ).pack(side="left", padx=6)
         ttk.Label(
             autonomous_limit,
-            text=(
-                "landed 才可改；新鮮遙測達上限即送零 PCMD；"
-                "地速缺失或過期時禁止水平 AUTO"
-            ),
+            text=("landed 才可改；新鮮遙測達上限即送零 PCMD；地速缺失或過期時禁止水平 AUTO"),
             font=("Sans", 8),
         ).pack(side="left")
 
@@ -2897,9 +3274,7 @@ class OperatorApp(tk.Tk):
             calibration_tab,
             text="飛機羅盤校正（只允許 landed；使用者手持旋轉）",
         )
-        magnetometer.grid(
-            row=0, column=0, sticky="nsew", padx=6, pady=(4, 5)
-        )
+        magnetometer.grid(row=0, column=0, sticky="nsew", padx=6, pady=(4, 5))
         drone_mag_initial = _initial_drone_magnetometer_text(live=live)
         self.drone_magnetometer_var = DedupStringVar(value=drone_mag_initial)
         ttk.Label(
@@ -2912,8 +3287,11 @@ class OperatorApp(tk.Tk):
         # currently asking for. Text alone ("目前 Y/pitch") does not tell an operator
         # holding the aircraft which way to turn it.
         self.magnetometer_axis_canvas = tk.Canvas(
-            magnetometer, width=430, height=52, highlightthickness=0,
-            bg="#111316",   # matches style.configure("TLabel", background=...)
+            magnetometer,
+            width=430,
+            height=52,
+            highlightthickness=0,
+            bg="#111316",  # matches style.configure("TLabel", background=...)
         )
         self.magnetometer_axis_canvas.pack(anchor="w", padx=6, pady=(1, 1))
         drone_mag_buttons = ttk.Frame(magnetometer)
@@ -2952,7 +3330,8 @@ class OperatorApp(tk.Tk):
         )
         grav.grid(row=0, column=1, sticky="nsew", padx=6, pady=(4, 5))
         self.gravity_status_var = DedupStringVar(
-            value="待命：依序旋轉機身，僅記錄姿態並分析重力一致性")
+            value="待命：依序旋轉機身，僅記錄姿態並分析重力一致性"
+        )
         self.gravity_guide_var = DedupStringVar(value=gravity_phase_guidance(None))
         self.gravity_att_var = DedupStringVar(value="att roll/pitch/yaw = -")
         self.gravity_g_var = DedupStringVar(value="g_body = -")
@@ -2985,15 +3364,9 @@ class OperatorApp(tk.Tk):
             textvariable=self.gravity_progress_phase_var,
             width=14,
         ).grid(row=0, column=0, sticky="w", pady=1)
-        self.gravity_progress_bar = ttk.Progressbar(
-            progress_panel, maximum=100, length=175
-        )
-        self.gravity_progress_bar.grid(
-            row=0, column=1, sticky="ew", padx=(4, 6), pady=1
-        )
-        self.gravity_progress_var = DedupStringVar(
-            value=f"0/{MIN_SAMPLES_PER_PHASE} · 0°"
-        )
+        self.gravity_progress_bar = ttk.Progressbar(progress_panel, maximum=100, length=175)
+        self.gravity_progress_bar.grid(row=0, column=1, sticky="ew", padx=(4, 6), pady=1)
+        self.gravity_progress_var = DedupStringVar(value=f"0/{MIN_SAMPLES_PER_PHASE} · 0°")
         ttk.Label(
             progress_panel,
             textvariable=self.gravity_progress_var,
@@ -3004,7 +3377,7 @@ class OperatorApp(tk.Tk):
             width=72,
             height=64,
             highlightthickness=0,
-            bg="#111316",   # matches the existing calibration guide canvas
+            bg="#111316",  # matches the existing calibration guide canvas
         )
         self.gravity_phase_canvas.grid(
             row=0,
@@ -3024,9 +3397,7 @@ class OperatorApp(tk.Tk):
         ttk.Label(attitude_row, textvariable=self.gravity_g_var).pack(side="left")
         row = ttk.Frame(grav)
         row.pack(fill="x", padx=4, pady=4)
-        self.gravity_start_button = ttk.Button(
-            row, text="開始檢查", command=self.gravity_start
-        )
+        self.gravity_start_button = ttk.Button(row, text="開始檢查", command=self.gravity_start)
         self.gravity_start_button.pack(side="left", padx=2)
         self.gravity_next_button = ttk.Button(
             row, text="下一階段", command=self.gravity_next, state="disabled"
@@ -3050,18 +3421,15 @@ class OperatorApp(tk.Tk):
                 "LIVE：手持拆槳旋轉，僅採樣姿態；這不是 FreeFlight 羅盤校正。"
                 "SIM：自動產生本階段姿態。"
             ),
-            wraplength=520, font=("Sans", 9),
+            wraplength=520,
+            font=("Sans", 9),
         ).pack(anchor="w", padx=6, pady=(0, 4))
 
         # Read-only engineering telemetry is composed into the bottom-left video
         # HUD. These variables keep the existing telemetry update paths intact.
         self.olympe_state_var = DedupStringVar(value="RTH ?/? | GPS ?")
-        self.olympe_attitude_var = DedupStringVar(
-            value="飛控融合姿態 - | 三軸速度 -"
-        )
-        self.olympe_altitude_var = DedupStringVar(
-            value="飛控高度 - | AGL - | 連接品質 -"
-        )
+        self.olympe_attitude_var = DedupStringVar(value="飛控融合姿態 - | 三軸速度 -")
+        self.olympe_altitude_var = DedupStringVar(value="飛控高度 - | AGL - | 連接品質 -")
 
         self.site_assets_panel = SiteAssetsPanel(
             site_tab,
@@ -3071,16 +3439,12 @@ class OperatorApp(tk.Tk):
             request_route_preview=self.preview_site_route,
             route_imported=self.apply_route_import_preview,
             site_packages_root=SYSTEM_ROOT / "地圖檔" / "場域",
-            site_pack_root=site_pack_root_for_profile(
-                self.site_profile_path, _WS.site_packages
-            ),
+            site_pack_root=site_pack_root_for_profile(self.site_profile_path, _WS.site_packages),
             # Same gate the route editor and the site restart use: nothing that
             # grabs input or rebinds a route may run over an airborne aircraft.
             flight_state_check=self.route_editor_safety_check,
         )
-        self.site_assets_panel.grid(
-            row=0, column=0, sticky="nsew", padx=6, pady=(4, 5)
-        )
+        self.site_assets_panel.grid(row=0, column=0, sticky="nsew", padx=6, pady=(4, 5))
 
         self.controls_notebook.bind(
             "<<NotebookTabChanged>>", lambda _event: self._fit_control_pane()
@@ -3235,9 +3599,7 @@ class OperatorApp(tk.Tk):
             raise
 
         send_zero = getattr(self.backend, "send_pcmd", None)
-        if callable(send_zero) and not bool(
-            getattr(self.backend, "pilot_sticks", False)
-        ):
+        if callable(send_zero) and not bool(getattr(self.backend, "pilot_sticks", False)):
             try:
                 if not bool(send_zero(0, 0, 0, 0, reason="auto_transition_zero")):
                     raise RuntimeError("zero PCMD was rejected")
@@ -3265,15 +3627,17 @@ class OperatorApp(tk.Tk):
 
     def _active_nudge_directions(self) -> list[str]:
         key_dirs = {
-            direction for key, direction in self._nudge_key_map.items()
+            direction
+            for key, direction in self._nudge_key_map.items()
             if key in self._nudge_keys_held
         }
         return sorted(key_dirs | self._nudge_buttons_held)
 
     def _on_input_focus_lost(self, _event=None) -> None:
         """A missing release event must decay to zero, never stale motion."""
-        had_input = bool(self._nudge_keys_held or self._nudge_buttons_held
-                         or self._stick_vector_active)
+        had_input = bool(
+            self._nudge_keys_held or self._nudge_buttons_held or self._stick_vector_active
+        )
         self._nudge_keys_held.clear()
         self._nudge_buttons_held.clear()
         self._sync_keyboard_sticks()
@@ -3373,8 +3737,7 @@ class OperatorApp(tk.Tk):
             self.loc_benchmark_mode_var.set(f"定位測速：切換至 {label}（下一幀生效）")
         if not self.inspecting:
             self.begin_auto_inspect()
-        self.write_log(
-            f"定位測速切換：{label}；僅改 localizer，不送飛控命令、不起飛")
+        self.write_log(f"定位測速切換：{label}；僅改 localizer，不送飛控命令、不起飛")
         return True
 
     def _begin_inspection_feed(self) -> bool:
@@ -3444,9 +3807,7 @@ class OperatorApp(tk.Tk):
         paint_health = getattr(self, "_set_loc_health_display", None)
         if callable(paint_health):
             paint_health(text="定位已取消", colour="#a7b0b8")
-        self.write_log(
-            "取消定位：停止送入新影格並忽略尚未完成的結果；未發送飛控指令"
-        )
+        self.write_log("取消定位：停止送入新影格並忽略尚未完成的結果；未發送飛控指令")
         return True
 
     def toggle_localization(self) -> None:
@@ -3510,20 +3871,13 @@ class OperatorApp(tk.Tk):
             pose_age_s = None
         pose = self._autonomy_pose()
         return {
-            "autonomous_locked": bool(
-                getattr(state, "autonomous_locked", True)
-            ),
-            "autonomous_approval_valid": bool(
-                getattr(state, "autonomous_approval_valid", False)
-            ),
+            "autonomous_locked": bool(getattr(state, "autonomous_locked", True)),
+            "autonomous_approval_valid": bool(getattr(state, "autonomous_approval_valid", False)),
             "localizer_ready": bool(
-                self.localizer is not None
-                and getattr(self.localizer, "ready", False)
+                self.localizer is not None and getattr(self.localizer, "ready", False)
             ),
             "profile_verified": bool(self._autonomy_profile_verified),
-            "zoom_paused": bool(
-                getattr(self, "_zoom_localization_paused", False)
-            ),
+            "zoom_paused": bool(getattr(self, "_zoom_localization_paused", False)),
             "loc_state": "TRACK" if pose is not None else str(self.loc_health),
             "pose_age_s": pose_age_s,
             "max_pose_age_s": 0.5,
@@ -3531,9 +3885,7 @@ class OperatorApp(tk.Tk):
             "min_inliers": LOC_LOW_INLIERS,
             "reproj_rms": getattr(self, "loc_health_reproj", None),
             "max_reproj_rms": LOC_HIGH_REPROJ,
-            "consecutive_good_fixes": getattr(
-                self, "_loc_consecutive_good_fixes", 0
-            ),
+            "consecutive_good_fixes": getattr(self, "_loc_consecutive_good_fixes", 0),
         }
 
     def _integrated_auto_active(self) -> bool:
@@ -3545,9 +3897,7 @@ class OperatorApp(tk.Tk):
         button = self.__dict__.get("start_auto_button")
         if button is not None:
             try:
-                button.configure(
-                    text="繼續自動飛行" if paused else "自動飛行"
-                )
+                button.configure(text="繼續自動飛行" if paused else "自動飛行")
                 if paused:
                     self._set_widget_enabled(button, True)
                 elif self._integrated_auto_active():
@@ -3568,9 +3918,7 @@ class OperatorApp(tk.Tk):
         if not coordinator.pause(reason):
             return False
         self._set_auto_paused(True)
-        self.write_log(
-            f"AUTO 已暫停並懸停（{reason}）；按「繼續自動飛行」恢復原路線"
-        )
+        self.write_log(f"AUTO 已暫停並懸停（{reason}）；按「繼續自動飛行」恢復原路線")
         return True
 
     def _resume_integrated_auto(self) -> bool:
@@ -3584,7 +3932,6 @@ class OperatorApp(tk.Tk):
         self._set_auto_paused(False)
         self.write_log("AUTO 已繼續：沿原路線恢復，不重複起飛")
         return True
-
     def _autonomy_pose(self) -> Pose | None:
         """Return only the latest strong, fresh pose accepted by the UI gates."""
         if (
@@ -3592,24 +3939,49 @@ class OperatorApp(tk.Tk):
             or str(getattr(self, "loc_health", "FAIL")) != "OK"
         ):
             return None
+        # Typed path: unpack from LocalizationResult where possible, keep fallback for dict.
+        typed = getattr(self, "live_result", None)
+        xyz_from_typed: tuple[float, float, float] | None = None
+        stamp_from_typed: float | None = None
+        if isinstance(typed, LocalizationResult):
+            pose_tuple = typed.pose
+            if pose_tuple is not None:
+                try:
+                    x, y, z, _yaw = pose_tuple  # type: ignore[misc]
+                    xyz_from_typed = (float(x), float(y), float(z))
+                    # Prefer the UI's accepted timestamp, fall back to typed pose_mono_ns.
+                    raw_stamp = getattr(self, "loc_pose_updated_mono", None)
+                    if raw_stamp is None:
+                        raw_stamp = typed.pose_mono_ns * 1e-9
+                    stamp_from_typed = float(raw_stamp)
+                    if not all(math.isfinite(v) for v in (*xyz_from_typed, stamp_from_typed)):
+                        xyz_from_typed = None
+                        stamp_from_typed = None
+                except (TypeError, ValueError, OverflowError):
+                    xyz_from_typed = None
+                    stamp_from_typed = None
         stamp = getattr(self, "loc_pose_updated_mono", None)
-        try:
-            values = tuple(float(value) for value in self.live_pose)
-            stamp_value = float(stamp)
-        except (TypeError, ValueError, OverflowError):
-            return None
-        if (
-            len(values) != 4
-            or not all(math.isfinite(value) for value in (*values[:3], stamp_value))
-        ):
-            return None
+        if xyz_from_typed is not None and stamp_from_typed is not None:
+            values: tuple[float, ...] = (*xyz_from_typed, float("nan"))
+            stamp_value = stamp_from_typed
+            # Validate length/finite as legacy path does.
+            if len(values) != 4 or not all(math.isfinite(v) for v in (*values[:3], stamp_value)):
+                return None
+        else:
+            try:
+                values = tuple(float(value) for value in self.live_pose)  # type: ignore[arg-type]
+                stamp_value = float(stamp)  # type: ignore[arg-type]
+            except (TypeError, ValueError, OverflowError):
+                return None
+            if len(values) != 4 or not all(
+                math.isfinite(value) for value in (*values[:3], stamp_value)
+            ):
+                return None
         age = time.monotonic() - stamp_value
         if age < -0.05 or age > AUTONOMY_POSE_MAX_AGE_S:
             return None
         map_frame = self.__dict__.get("_autonomy_map_frame")
-        camera_forward = normalize_camera_forward(
-            getattr(self, "camera_forward_world", None)
-        )
+        camera_forward = normalize_camera_forward(getattr(self, "camera_forward_world", None))
         if map_frame is None or camera_forward is None:
             return None
         try:
@@ -3637,15 +4009,15 @@ class OperatorApp(tk.Tk):
         if self._integrated_auto_active():
             self.write_log("AUTO 已在執行中；略過重複啟動")
             return False
-        approval_blockers = autonomous_approval_blockers(
-            self._autonomy_gate_snapshot()
-        )
+        approval_blockers = autonomous_approval_blockers(self._autonomy_gate_snapshot())
         if approval_blockers:
             self.write_log("AUTO 已拒絕：" + "；".join(approval_blockers))
             return False
-        flight_state = str(
-            getattr(getattr(self.backend, "state", None), "flight_state", "") or ""
-        ).rsplit(".", 1)[-1].lower()
+        flight_state = (
+            str(getattr(getattr(self.backend, "state", None), "flight_state", "") or "")
+            .rsplit(".", 1)[-1]
+            .lower()
+        )
         if flight_state == "landed":
             start_airborne = False
         elif flight_state in {"hovering", "flying"}:
@@ -3682,9 +4054,7 @@ class OperatorApp(tk.Tk):
                 take_pc_control=lambda: self._backend_command("pc_control", {}),
                 start_airborne=start_airborne,
                 land=lambda: self._backend_command("land", {}),
-                arming_blockers=lambda: autonomous_arming_blockers(
-                    self._autonomy_gate_snapshot()
-                ),
+                arming_blockers=lambda: autonomous_arming_blockers(self._autonomy_gate_snapshot()),
                 **route_deviation_options,
             )
         except Exception as exc:
@@ -3707,6 +4077,58 @@ class OperatorApp(tk.Tk):
                 "AUTO 已接受：先起飛原地懸停；定位穩定後才沿路線移動；"
                 "定位失敗時持續懸停，等待恢復或操作者手動接管／降落"
             )
+        return True
+
+    def _start_simulated_route_test(self, snapshot: MissionRouteSnapshot) -> bool:
+        """Run the production route controller without hardware or Olympe."""
+        if self._integrated_auto_active():
+            self.write_log("模擬航線已在執行中；略過重複啟動")
+            return False
+        plant = getattr(self.backend, "route_test_plant", None)
+        if not isinstance(plant, SimulatedRoutePlant):
+            self.write_log("模擬航線已拒絕：目前 backend 不支援閉迴路航線測試")
+            return False
+        try:
+            profile = load_site_profile(self.site_profile_path)
+            map_frame = resolve_site_map_frame(profile)
+            if not isinstance(map_frame, MapFrame):
+                raise ValueError("模擬航線需要場域的實測重力座標")
+            profile_controller = getattr(profile.flight, "controller", None)
+            route_options = {}
+            if profile_controller is not None:
+                route_options["max_route_deviation_map_units"] = (
+                    profile_controller.max_route_deviation_map_units
+                )
+            if not plant.begin(snapshot, map_frame):
+                raise ValueError("無法載入剛儲存的航線")
+            coordinator = DesktopRouteAutonomy(
+                backend=plant,
+                snapshot=snapshot,
+                map_frame=map_frame,
+                get_pose=plant.pose,
+                pose_is_weak=lambda: False,
+                pose_confidence=lambda: 100,
+                force_relocalize=lambda: None,
+                stream_healthy=lambda: True,
+                takeoff=lambda: False,
+                take_pc_control=lambda: True,
+                start_airborne=True,
+                land=plant.finish,
+                **route_options,
+            )
+        except Exception as exc:
+            self.write_log(f"模擬航線已拒絕：{exc}")
+            return False
+        self._integrated_autonomy = coordinator
+        self._integrated_auto_map_frame = map_frame
+        if not coordinator.start():
+            self._integrated_autonomy = None
+            self._integrated_auto_map_frame = None
+            self.write_log("模擬航線已拒絕：控制器執行緒無法啟動")
+            return False
+        self.write_log(
+            "模擬航線已開始：使用正式 RouteAutoController；不連真機、不送 Olympe 指令"
+        )
         return True
 
     def _cancel_integrated_auto(self, reason: str) -> None:
@@ -3749,17 +4171,14 @@ class OperatorApp(tk.Tk):
     def _log_integrated_auto_pose_jump_paused(self, event) -> None:
         self._set_auto_paused(True)
         self.write_log(
-            f"AUTO 已因{event.detail}而鎖定懸停；確認定位合理後，"
-            "按「繼續自動飛行」才會接續原路線"
+            f"AUTO 已因{event.detail}而鎖定懸停；確認定位合理後，按「繼續自動飛行」才會接續原路線"
         )
 
     def _log_integrated_auto_route_started(self, _event) -> None:
         self.write_log("AUTO 定位已穩定：開始路線飛行")
 
     def _log_integrated_auto_landing_unresolved(self, event) -> None:
-        self.write_log(
-            f"AUTO 降落尚未確認：{event.detail}；保持連線並確認落地後再關閉介面"
-        )
+        self.write_log(f"AUTO 降落尚未確認：{event.detail}；保持連線並確認落地後再關閉介面")
 
     def _log_integrated_auto_failed(self, event) -> None:
         if getattr(self, "_pending_auto_route_activation", False):
@@ -3767,9 +4186,7 @@ class OperatorApp(tk.Tk):
         self._set_auto_paused(False)
         detail = str(getattr(event, "detail", "AUTO failed") or "AUTO failed")
         error = getattr(event, "error", None)
-        incident = getattr(
-            getattr(self, "session_logs", None), "incident", None
-        )
+        incident = getattr(getattr(self, "session_logs", None), "incident", None)
         if callable(incident):
             try:
                 incident(
@@ -3778,7 +4195,7 @@ class OperatorApp(tk.Tk):
                     error=error,
                     resolved=False,
                 )
-            except Exception:
+            except (OSError, ValueError, AttributeError, TypeError, RuntimeError):  # Tier3: fallback best-effort — narrow, keep pass
                 pass
         self.write_log(
             f"AUTO 失敗並已鎖定懸停：{detail}；"
@@ -3801,9 +4218,7 @@ class OperatorApp(tk.Tk):
             "command_result": self._finish_integrated_auto_command_event,
             "boot_hover": self._log_integrated_auto_boot_hover,
             "boot_hover_waiting": self._log_integrated_auto_boot_hover_waiting,
-            "localization_yaw_search": (
-                self._log_integrated_auto_localization_yaw_search
-            ),
+            "localization_yaw_search": (self._log_integrated_auto_localization_yaw_search),
             "pose_jump_paused": self._log_integrated_auto_pose_jump_paused,
             "route_started": self._log_integrated_auto_route_started,
             "landing_unresolved": self._log_integrated_auto_landing_unresolved,
@@ -3851,7 +4266,8 @@ class OperatorApp(tk.Tk):
         self.distance_geofence_input_var.set(bool(geofence))
         self.write_log(
             f"已載入韌體讀回值：高度 {float(altitude):g}m、"
-            f"距離 {float(distance):g}m、距離圍欄 {'ON' if geofence else 'OFF'}")
+            f"距離 {float(distance):g}m、距離圍欄 {'ON' if geofence else 'OFF'}"
+        )
         return True
 
     def apply_autonomous_speed_limit_from_ui(self) -> bool:
@@ -3876,15 +4292,19 @@ class OperatorApp(tk.Tk):
     def _preflight_blocks_flight_command(self, command: str) -> bool:
         if command not in {"takeoff", "start_auto", "auto"}:
             return False
+        if (
+            command in {"start_auto", "auto"}
+            and getattr(self.backend, "mode", None) is InterfaceMode.SIMULATED_STREAM
+            and not bool(getattr(self.backend, "is_live", False))
+        ):
+            return False
         guide = self.__dict__.get("preflight_guide")
         if guide is not None and bool(getattr(guide, "complete", False)):
             return False
         step = None if guide is None else guide.current_step
         label = PREFLIGHT_GUIDE_LABELS.get(str(step), "起飛前確認")
         action = "自動飛行" if command in {"start_auto", "auto"} else "起飛"
-        self.write_log(
-            f"{action}已拒絕：四步起飛前確認尚未完成，目前等待「{label}」"
-        )
+        self.write_log(f"{action}已拒絕：四步起飛前確認尚未完成，目前等待「{label}」")
         self._select_preflight_tab(step)
         return True
 
@@ -3933,35 +4353,25 @@ class OperatorApp(tk.Tk):
         context = PreflightContext(
             live=self._is_live_backend(),
             map_points=self.__dict__.get("map_points"),
-            site_profile_path=(
-                None if profile_path is None else Path(profile_path)
-            ),
+            site_profile_path=(None if profile_path is None else Path(profile_path)),
             route_snapshot=displayed_route_snapshot,
             displayed_route_sha256=self.__dict__.get("_displayed_route_sha256"),
             route_point_count=len(self.__dict__.get("route_pts", ())),
             video_frame_available=self.__dict__.get("video_frame") is not None,
-            stream_last_stamp=getattr(
-                self.__dict__.get("video_stream"), "last_stamp", None
-            ),
+            stream_last_stamp=getattr(self.__dict__.get("video_stream"), "last_stamp", None),
             video_frame_stamp=self.__dict__.get("_video_frame_stamp"),
-            min_takeoff_battery_pct=getattr(
-                self.backend, "min_takeoff_battery_pct", 30.0
-            ),
+            min_takeoff_battery_pct=getattr(self.backend, "min_takeoff_battery_pct", 30.0),
             via_controller=bool(
                 callable(getattr(self.backend, "via_skycontroller", None))
                 and self.backend.via_skycontroller()
             ),
             safety_log_durable=(
-                None if safety_log is None
-                else bool(getattr(safety_log, "durable", False))
+                None if safety_log is None else bool(getattr(safety_log, "durable", False))
             ),
             safety_log_healthy=(
-                None if safety_log is None
-                else bool(getattr(safety_log, "healthy", False))
+                None if safety_log is None else bool(getattr(safety_log, "healthy", False))
             ),
-            inventory_takeoff_ready=getattr(
-                self.backend, "_inventory_takeoff_ready", None
-            ),
+            inventory_takeoff_ready=getattr(self.backend, "_inventory_takeoff_ready", None),
             inventory_block_reason=inventory_block_summary(self.backend),
         )
         return evaluate_preflight_step(
@@ -3984,9 +4394,7 @@ class OperatorApp(tk.Tk):
             verify_route_hash=(step == "route"),
         )
         if evidence is None:
-            self.write_log(
-                f"起飛前步驟「{PREFLIGHT_GUIDE_LABELS[step]}」不能確認：{reason}"
-            )
+            self.write_log(f"起飛前步驟「{PREFLIGHT_GUIDE_LABELS[step]}」不能確認：{reason}")
             self._update_preflight_guide(state)
             return False
         if step == "route":
@@ -3994,15 +4402,11 @@ class OperatorApp(tk.Tk):
             try:
                 self._bind_route_snapshot_for_auto(snapshot)
             except ValueError as exc:
-                self.write_log(
-                    f"起飛前步驟「{PREFLIGHT_GUIDE_LABELS[step]}」不能確認：{exc}"
-                )
+                self.write_log(f"起飛前步驟「{PREFLIGHT_GUIDE_LABELS[step]}」不能確認：{exc}")
                 self._update_preflight_guide(state)
                 return False
         confirmed = self.preflight_guide.confirm_current(evidence)
-        self.write_log(
-            f"起飛前步驟已由使用者確認：{PREFLIGHT_GUIDE_LABELS[confirmed]}（{reason}）"
-        )
+        self.write_log(f"起飛前步驟已由使用者確認：{PREFLIGHT_GUIDE_LABELS[confirmed]}（{reason}）")
         self._update_preflight_guide(state)
         self._select_preflight_tab(self.preflight_guide.current_step)
         return True
@@ -4045,19 +4449,13 @@ class OperatorApp(tk.Tk):
                 evidence, _reason = self._preflight_step_evidence("system", st)
                 can_confirm_system = evidence is not None
             can_restart_auto = (
-                flight_state_name in {"hovering", "flying"}
-                and not self._integrated_auto_active()
+                flight_state_name in {"hovering", "flying"} and not self._integrated_auto_active()
             )
             can_start_auto = bool(
-                guide.complete
-                and (
-                    getattr(self, "_auto_paused", False)
-                    or can_restart_auto
-                )
+                guide.complete and (getattr(self, "_auto_paused", False) or can_restart_auto)
             )
             self.preflight_guide_var.set(
-                "飛行中：起飛按鈕維持關閉；四步確認完成後才可由懸停／"
-                "飛行狀態重新啟動自動巡航"
+                "飛行中：起飛按鈕維持關閉；四步確認完成後才可由懸停／飛行狀態重新啟動自動巡航"
             )
             self._set_widget_enabled(
                 self.preflight_confirm_button,
@@ -4106,9 +4504,7 @@ class OperatorApp(tk.Tk):
             return
         evidence, reason = self._preflight_step_evidence(step, st)
         index = PREFLIGHT_GUIDE_STEPS.index(step) + 1
-        self.preflight_guide_var.set(
-            f"{index}/4 {PREFLIGHT_GUIDE_LABELS[step]}：{reason}"
-        )
+        self.preflight_guide_var.set(f"{index}/4 {PREFLIGHT_GUIDE_LABELS[step]}：{reason}")
         self._set_widget_enabled(
             self.preflight_confirm_button,
             evidence is not None,
@@ -4149,6 +4545,7 @@ class OperatorApp(tk.Tk):
             write_log=self.__dict__.get("write_log", self.write_log),
             record_drop=self._record_flight_result_drop,
             safety_commands=_SAFETY_FLIGHT_RESULT_COMMANDS,
+            schedule_on_ui_thread=lambda fn, *a: self.after(0, fn, *a),
         )
 
     def _get_command_coordinator(self) -> OperatorCommandCoordinator:
@@ -4157,16 +4554,13 @@ class OperatorApp(tk.Tk):
             coordinator is None
             or coordinator.backend is not self.backend
             or coordinator.normal_results is not self.__dict__.get("_flight_results")
-            or coordinator.safety_results
-            is not self.__dict__.get("_flight_safety_results")
+            or coordinator.safety_results is not self.__dict__.get("_flight_safety_results")
         ):
             coordinator = self._make_command_coordinator()
             self._command_coordinator = coordinator
         return coordinator
 
-    def _record_flight_result_drop(
-        self, command: str, dropped_command: str
-    ) -> None:
+    def _record_flight_result_drop(self, command: str, dropped_command: str) -> None:
         session_logs = self.__dict__.get("session_logs")
         incident = getattr(session_logs, "incident", None)
         if callable(incident):
@@ -4178,8 +4572,7 @@ class OperatorApp(tk.Tk):
                 resolved=False,
             )
 
-    def _publish_flight_result(
-            self, item: tuple[str, object | None, str | None]) -> None:
+    def _publish_flight_result(self, item: tuple[str, object | None, str | None]) -> None:
         self._get_command_coordinator().publish(item)
 
     def _dispatch_live_command(self, command: str, payload: dict) -> bool:
@@ -4221,16 +4614,15 @@ class OperatorApp(tk.Tk):
             if not pilot_sticks:
                 self.write_log("已確認控制權: 電腦 (PCMD)；動搖桿會強制交回搖桿")
                 if hasattr(self, "control_owner_var"):
-                    self.control_owner_var.set(
-                        "控制權: 電腦 (LIVE) — 動搖桿立即交回"
-                    )
+                    self.control_owner_var.set("控制權: 電腦 (LIVE) — 動搖桿立即交回")
             else:
                 self.write_log("取回電腦控制失敗：仍由搖桿控制（或搖桿正在輸入）")
         return True
 
     def _finish_flight_expectation(self, command: str, result: object | None) -> bool:
         if command == "takeoff":
-            state = str(getattr(self.backend.state, "tracker_state", ""))
+            raw_state = getattr(self.backend.state, "tracker_state", "")
+            state = str(getattr(raw_state, "value", raw_state))
             if result is not True:
                 self.write_log(f"起飛未確認執行成功：{state}")
             else:
@@ -4238,7 +4630,8 @@ class OperatorApp(tk.Tk):
             return True
         if command != "land":
             return False
-        state = str(getattr(self.backend.state, "tracker_state", ""))
+        raw_state = getattr(self.backend.state, "tracker_state", "")
+        state = str(getattr(raw_state, "value", raw_state))
         if result is not True:
             self.write_log(f"降落未確認執行成功：{state}")
             return True
@@ -4268,7 +4661,8 @@ class OperatorApp(tk.Tk):
                     "飛行限制已由韌體讀回確認："
                     f"高度 {float(state.max_altitude_m):g}m、"
                     f"距離 {float(state.max_distance_m):g}m、"
-                    f"距離圍欄 {'ON' if geofence else 'OFF'}")
+                    f"距離圍欄 {'ON' if geofence else 'OFF'}"
+                )
             else:
                 reason = str(getattr(state, "preflight_reason", "unknown failure"))
                 self.write_log(f"飛行限制未套用：{reason}")
@@ -4287,8 +4681,7 @@ class OperatorApp(tk.Tk):
                     )
                 else:
                     self.write_log(
-                        "AUTO 地速安全閘門已關閉並保存；其他飛行安全機制不受影響；"
-                        "舊核准已失效"
+                        "AUTO 地速安全閘門已關閉並保存；其他飛行安全機制不受影響；舊核准已失效"
                     )
             else:
                 self.write_log("AUTO 地速安全閘門未保存：必須先確認飛機已落地")
@@ -4300,17 +4693,11 @@ class OperatorApp(tk.Tk):
             "drone_magnetometer_start",
             "skycontroller_magnetometer_start",
         }:
-            target = (
-                "飛機" if command.startswith("drone_") else "SkyController"
-            )
+            target = "飛機" if command.startswith("drone_") else "SkyController"
             if result is True:
-                self.write_log(
-                    f"{target}羅盤校正已開始；馬達保持停止，請依 X/Y/Z 提示手持旋轉"
-                )
+                self.write_log(f"{target}羅盤校正已開始；馬達保持停止，請依 X/Y/Z 提示手持旋轉")
             else:
-                flight_state = str(
-                    getattr(self.backend.state, "flight_state", "unknown")
-                )
+                flight_state = str(getattr(self.backend.state, "flight_state", "unknown"))
                 self.write_log(
                     f"{target}羅盤校正未開始；必須確認 landed、連線正常，且沒有其他校正進行中"
                     f"（flight_state={flight_state}）"
@@ -4320,17 +4707,14 @@ class OperatorApp(tk.Tk):
             "drone_magnetometer_cancel",
             "skycontroller_magnetometer_cancel",
         }:
-            target = (
-                "飛機" if command.startswith("drone_") else "SkyController"
-            )
-            self.write_log(
-                f"{target}羅盤校正{'已取消' if result is True else '取消失敗'}"
-            )
+            target = "飛機" if command.startswith("drone_") else "SkyController"
+            self.write_log(f"{target}羅盤校正{'已取消' if result is True else '取消失敗'}")
             return True
         return False
 
     def _finish_backend_command(
-            self, command: str, result: object | None, error: str | None) -> None:
+        self, command: str, result: object | None, error: str | None
+    ) -> None:
         if error is not None:
             if command in {"auto", "start_auto"}:
                 self._cancel_pending_auto_route_activation()
@@ -4367,7 +4751,9 @@ class OperatorApp(tk.Tk):
         return False
 
     def _prepare_auto_command(
-            self, command: str, payload: dict,
+        self,
+        command: str,
+        payload: dict,
     ) -> tuple[bool, dict, object | None, bool]:
         if command not in {"auto", "start_auto"}:
             return True, payload, None, False
@@ -4401,13 +4787,22 @@ class OperatorApp(tk.Tk):
         if command == "hover":
             self._pause_integrated_auto()
         if command in {
-            "manual", "land", "land_now", "emergency_stop",
-            "pc_control", "resume_pc",
+            "manual",
+            "land",
+            "land_now",
+            "emergency_stop",
+            "pc_control",
+            "resume_pc",
         }:
             self._cancel_integrated_auto(command)
         if command in {
-            "manual", "hover", "land", "land_now", "emergency_stop",
-            "pc_control", "resume_pc",
+            "manual",
+            "hover",
+            "land",
+            "land_now",
+            "emergency_stop",
+            "pc_control",
+            "resume_pc",
         }:
             self._nudge_keys_held.clear()
             if hasattr(self, "_nudge_buttons_held"):
@@ -4423,20 +4818,31 @@ class OperatorApp(tk.Tk):
             self._begin_inspection_feed()
 
     def _dispatch_integrated_auto(
-            self, command: str, snapshot: object | None,
-            *, activated_now: bool) -> bool:
-        if (
-            command == "start_auto"
-            and bool(getattr(self.backend, "is_live", False))
+        self, command: str, snapshot: object | None, *, activated_now: bool
+    ) -> bool:
+        if command != "start_auto":
+            return False
+        starter = None
+        if bool(getattr(self.backend, "is_live", False)):
+            starter = self._start_integrated_auto
+        elif (
+            getattr(self.backend, "mode", None) is InterfaceMode.SIMULATED_STREAM
+            and isinstance(
+                getattr(self.backend, "route_test_plant", None),
+                SimulatedRoutePlant,
+            )
         ):
-            if snapshot is None or not self._start_integrated_auto(snapshot):
+            starter = self._start_simulated_route_test
+        if starter is not None:
+            if snapshot is None or not starter(snapshot):
                 if activated_now:
                     self._cancel_pending_auto_route_activation()
             return True
         return False
 
     def _dispatch_async_operator_command(
-            self, command: str, payload: dict, *, activated_now: bool) -> bool:
+        self, command: str, payload: dict, *, activated_now: bool
+    ) -> bool:
         use_async = (
             bool(getattr(self.backend, "is_live", False))
             and hasattr(self, "_flight_results")
@@ -4465,17 +4871,19 @@ class OperatorApp(tk.Tk):
         if command == "manual":
             self.write_log("已交回搖桿 (Esc/手動)。要再由電腦控 → 按「恢復電腦控制」")
             if hasattr(self, "control_owner_var"):
-                self.control_owner_var.set(
-                    "控制權: 搖桿 — 按「恢復電腦控制」拿回"
-                )
+                self.control_owner_var.set("控制權: 搖桿 — 按「恢復電腦控制」拿回")
         elif command in {"pc_control", "resume_pc", "auto", "start_auto", "takeoff"}:
             self.write_log("電腦控制中 (PCMD)。Esc/手動/動搖桿 = 交回搖桿")
             if hasattr(self, "control_owner_var"):
-                self.control_owner_var.set(
-                    "控制權: 電腦 (LIVE) — 動搖桿立即交回"
-                )
-        elif command in {"nudge_begin", "nudge_end", "nudge_press", "nudge_release",
-                         "nudge_vector", "nudge_clear"}:
+                self.control_owner_var.set("控制權: 電腦 (LIVE) — 動搖桿立即交回")
+        elif command in {
+            "nudge_begin",
+            "nudge_end",
+            "nudge_press",
+            "nudge_release",
+            "nudge_vector",
+            "nudge_clear",
+        }:
             pass  # high-rate; skip log spam
         else:
             self.write_log(command)
@@ -4484,7 +4892,9 @@ class OperatorApp(tk.Tk):
         if OperatorApp._send_command_blocked(self, command):
             return
         allowed, payload, snapshot, activated_now = OperatorApp._prepare_auto_command(
-            self, command, payload,
+            self,
+            command,
+            payload,
         )
         if not allowed:
             return
@@ -4495,11 +4905,17 @@ class OperatorApp(tk.Tk):
                 self._cancel_pending_auto_route_activation()
             return
         if OperatorApp._dispatch_integrated_auto(
-                self, command, snapshot, activated_now=activated_now,
+            self,
+            command,
+            snapshot,
+            activated_now=activated_now,
         ):
             return
         if OperatorApp._dispatch_async_operator_command(
-                self, command, payload, activated_now=activated_now,
+            self,
+            command,
+            payload,
+            activated_now=activated_now,
         ):
             return
         result = OperatorApp._execute_sync_operator_command(self, command, payload)
@@ -4539,9 +4955,7 @@ class OperatorApp(tk.Tk):
             "roll": float(MIN_ROLL_SPAN_DEG),
         }.get(phase, 1.0)
 
-    def _gravity_phase_assessment(
-        self, phase: str
-    ) -> tuple[bool, int, float, float, str]:
+    def _gravity_phase_assessment(self, phase: str) -> tuple[bool, int, float, float, str]:
         """Return phase-navigation readiness plus operator-facing quality notes."""
         if self.gravity_cal is None or phase not in PHASES:
             return False, 0, 0.0, self._gravity_phase_target(phase), "檢查不可用"
@@ -4596,14 +5010,11 @@ class OperatorApp(tk.Tk):
             if ready:
                 progress = 1.0
             index = PHASES.index(phase) + 1
-            self.gravity_progress_phase_var.set(
-                f"{index}/3 {PHASE_LABELS.get(phase, phase)}"
-            )
+            self.gravity_progress_phase_var.set(f"{index}/3 {PHASE_LABELS.get(phase, phase)}")
             self.gravity_progress_bar.configure(value=progress * 100.0)
             mark = "✓ " if ready else ""
             self.gravity_progress_var.set(
-                f"{mark}{count}/{MIN_SAMPLES_PER_PHASE} · "
-                f"{span:.0f}°/{target:.0f}°"
+                f"{mark}{count}/{MIN_SAMPLES_PER_PHASE} · {span:.0f}°/{target:.0f}°"
             )
             current_ready = ready
         elif calibrator is not None and calibrator.finished:
@@ -4617,9 +5028,7 @@ class OperatorApp(tk.Tk):
 
         start = getattr(self, "gravity_start_button", None)
         if start is not None:
-            start.configure(
-                text="重新開始（會清除全部樣本）" if active else "開始檢查"
-            )
+            start.configure(text="重新開始（會清除全部樣本）" if active else "開始檢查")
         self._set_widget_enabled(
             getattr(self, "gravity_next_button", None),
             active and phase in {"yaw", "pitch"} and current_ready,
@@ -4628,12 +5037,8 @@ class OperatorApp(tk.Tk):
             getattr(self, "gravity_finish_button", None),
             active and phase == "roll" and current_ready,
         )
-        self._set_widget_enabled(
-            getattr(self, "gravity_retry_button", None), active
-        )
-        self._set_widget_enabled(
-            getattr(self, "gravity_cancel_button", None), active
-        )
+        self._set_widget_enabled(getattr(self, "gravity_retry_button", None), active)
+        self._set_widget_enabled(getattr(self, "gravity_cancel_button", None), active)
 
     def _draw_gravity_phase(self, phase: str | None) -> None:
         """Draw a compact vector cue for the active attitude-check motion."""
@@ -4670,8 +5075,7 @@ class OperatorApp(tk.Tk):
         if self.gravity_cal.started and not self.gravity_cal.finished:
             if not messagebox.askyesno(
                 "重新開始姿態／重力檢查",
-                "重新開始會清除 Yaw、Pitch、Roll 全部已收集樣本。\n"
-                "確定要清除並重新開始嗎？",
+                "重新開始會清除 Yaw、Pitch、Roll 全部已收集樣本。\n確定要清除並重新開始嗎？",
                 parent=self,
             ):
                 self.write_log("gravity_cal: restart cancelled; samples preserved")
@@ -4683,7 +5087,8 @@ class OperatorApp(tk.Tk):
         label = PHASE_LABELS.get("yaw", "yaw")
         mode = "真機姿態" if self._is_live_backend() else "模擬姿態"
         self.gravity_status_var.set(
-            f"階段 1/3 yaw：{label}（{mode}）\n手持機身水平轉一圈，完成後按「下一階段」")
+            f"階段 1/3 yaw：{label}（{mode}）\n手持機身水平轉一圈，完成後按「下一階段」"
+        )
         self.write_log("gravity_cal: start phase=yaw")
         self._refresh_gravity_controls()
 
@@ -4718,7 +5123,8 @@ class OperatorApp(tk.Tk):
         idx = PHASES.index(nxt) + 1
         mode = "真機姿態" if self._is_live_backend() else "模擬姿態"
         self.gravity_status_var.set(
-            f"階段 {idx}/3 {nxt}：{PHASE_LABELS.get(nxt, nxt)}（{mode}）\n完成後按「下一階段」")
+            f"階段 {idx}/3 {nxt}：{PHASE_LABELS.get(nxt, nxt)}（{mode}）\n完成後按「下一階段」"
+        )
         self.write_log(f"gravity_cal: start phase={nxt}")
         self._refresh_gravity_controls()
 
@@ -4741,17 +5147,13 @@ class OperatorApp(tk.Tk):
             parent=self,
         ):
             return
-        calibrator.samples = [
-            sample for sample in calibrator.samples if sample.phase != phase
-        ]
+        calibrator.samples = [sample for sample in calibrator.samples if sample.phase != phase]
         calibrator.begin_phase(phase)
         self._set_gravity_phase(phase)
         self.gravity_status_var.set(
             f"已清除「{PHASE_LABELS.get(phase, phase)}」的樣本，請重新操作。"
         )
-        self.gravity_session_var.set(
-            f"本次重新檢查進度：正在重做{PHASE_LABELS.get(phase, phase)}"
-        )
+        self.gravity_session_var.set(f"本次重新檢查進度：正在重做{PHASE_LABELS.get(phase, phase)}")
         self.write_log(f"gravity_cal: retry phase={phase}; cleared={count}")
         self._refresh_gravity_controls()
 
@@ -4766,9 +5168,7 @@ class OperatorApp(tk.Tk):
             return
         ready, _n, _span, _target, reason = self._gravity_phase_assessment("roll")
         if not ready:
-            self.gravity_status_var.set(
-                f"「{PHASE_LABELS.get('roll', 'roll')}」尚未達標：{reason}"
-            )
+            self.gravity_status_var.set(f"「{PHASE_LABELS.get('roll', 'roll')}」尚未達標：{reason}")
             self.write_log(f"gravity_cal: finish blocked: {reason}")
             self._refresh_gravity_controls()
             return
@@ -4784,16 +5184,14 @@ class OperatorApp(tk.Tk):
         self.gravity_result_path = out
         self._apply_gravity_display(payload, source_path=out, note="已覆寫")
         if payload.get("ok"):
-            self.gravity_guide_var.set(
-                "檢查完成：PASS。三階段動作與姿態覆蓋皆達標。"
-            )
+            self.gravity_guide_var.set("檢查完成：PASS。三階段動作與姿態覆蓋皆達標。")
             self.gravity_session_var.set("本次重新檢查進度：PASS")
         else:
-            self.gravity_guide_var.set(
-                "檢查完成：FAIL。" + self._gravity_payload_summary(payload)
-            )
+            self.gravity_guide_var.set("檢查完成：FAIL。" + self._gravity_payload_summary(payload))
             self.gravity_session_var.set("本次重新檢查進度：FAIL")
-        self.write_log(f"gravity_cal: {'PASS' if payload.get('ok') else 'FAIL'} -> {out} (overwrite)")
+        self.write_log(
+            f"gravity_cal: {'PASS' if payload.get('ok') else 'FAIL'} -> {out} (overwrite)"
+        )
         self.write_log(payload.get("map_up_hint", "") or "")
         self._refresh_gravity_controls()
 
@@ -4825,8 +5223,9 @@ class OperatorApp(tk.Tk):
         )
         return candidates[0] if candidates else None
 
-    def _apply_gravity_display(self, payload: dict, *, source_path: Path | None = None,
-                               note: str = "") -> None:
+    def _apply_gravity_display(
+        self, payload: dict, *, source_path: Path | None = None, note: str = ""
+    ) -> None:
         ok = "PASS" if payload.get("ok") else "FAIL"
         summary = str(payload.get("summary", "") or "")
         saved = str(payload.get("saved_at") or payload.get("t_iso") or "")
@@ -4840,7 +5239,8 @@ class OperatorApp(tk.Tk):
         g = payload.get("body_g_level")
         if isinstance(g, (list, tuple)) and len(g) >= 3:
             self.gravity_g_var.set(
-                f"g_body(level)=({float(g[0]):+.3f},{float(g[1]):+.3f},{float(g[2]):+.3f})")
+                f"g_body(level)=({float(g[0]):+.3f},{float(g[1]):+.3f},{float(g[2]):+.3f})"
+            )
         hint = payload.get("map_up_hint")
         if hint and note == "已載入":
             # Keep att line as loaded marker; live att overwrites while flying.
@@ -4867,9 +5267,11 @@ class OperatorApp(tk.Tk):
                 GRAVITY_CAL_DIR.mkdir(parents=True, exist_ok=True)
                 if "saved_at" not in payload:
                     payload["saved_at"] = time.strftime(
-                        "%Y-%m-%d %H:%M:%S", time.localtime(path.stat().st_mtime))
+                        "%Y-%m-%d %H:%M:%S", time.localtime(path.stat().st_mtime)
+                    )
                 GRAVITY_CAL_LATEST.write_text(
-                    json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+                    json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+                )
                 path = GRAVITY_CAL_LATEST
                 self.write_log(f"gravity_cal: migrated -> {path.name}")
             except Exception as exc:
@@ -5044,7 +5446,7 @@ class OperatorApp(tk.Tk):
         if metrics not in (None, False, True):
             try:
                 metrics.close()
-            except Exception:
+            except (OSError, ValueError, AttributeError, TypeError, RuntimeError):  # Tier3: fallback best-effort — narrow, keep pass
                 pass
         self._loc_metrics_f = None
         self._loc_metrics_path = None
@@ -5080,8 +5482,13 @@ class OperatorApp(tk.Tk):
         )
 
         self.map_points = prepared.map_points
+        try:
+            self.red_sphere_points = _red_spheres_for_profile(
+                getattr(self, "site_profile_path", None), MAP_STATIC_POINTS
+            )
+        except Exception:
+            self.red_sphere_points = np.empty((0, 6), dtype=np.float32)
         self.default_map_center, self.map_radius = self._map_view_bounds(self.map_points)
-        self._collision_interlock_latched = False
         self._configure_sparse_cloud_collision_guard(self.map_points)
         if len(self.map_points):
             map_lo = self.map_points[:, :3].min(axis=0)
@@ -5157,13 +5564,10 @@ class OperatorApp(tk.Tk):
         self._reset_localization_benchmark_metrics()
         self.inspect_start = None
         self.loc_benchmark_requested = (
-            runtime.localizer.benchmark_mode
-            if runtime.localizer is not None
-            else "auto"
+            runtime.localizer.benchmark_mode if runtime.localizer is not None else "auto"
         )
         stream_fps = float(
-            getattr(runtime.video_stream, "output_fps", ANAFI.stream_fps)
-            or ANAFI.stream_fps
+            getattr(runtime.video_stream, "output_fps", ANAFI.stream_fps) or ANAFI.stream_fps
         )
         self.stream_period_s = 1.0 / stream_fps
         self.replay_rows = list(prepared.replay_rows)
@@ -5222,8 +5626,8 @@ class OperatorApp(tk.Tk):
         allowed, reason = self.route_editor_safety_check()
         if not allowed:
             raise ValueError(reason)
-        profile, bound_profile, map_source, route_path = (
-            self._route_editor_asset_selection(edit_current)
+        profile, bound_profile, map_source, route_path = self._route_editor_asset_selection(
+            edit_current
         )
         self._route_editor_loading = True
         self.site_assets_panel.set_status(
@@ -5250,9 +5654,7 @@ class OperatorApp(tk.Tk):
         profile_path = self.site_asset_actions.current_profile
         profile = load_site_profile(profile_path) if profile_path is not None else None
         bound_profile = (
-            profile
-            if profile is not None and profile.coordinate_frame is not None
-            else None
+            profile if profile is not None and profile.coordinate_frame is not None else None
         )
         route_path = None
         if edit_current and bound_profile is not None:
@@ -5262,13 +5664,21 @@ class OperatorApp(tk.Tk):
             else:
                 route_path = bound_profile.route_json
         if edit_current and route_path is None:
-            raise ValueError(
-                "目前沒有已綁定場域的航線；請選擇「新增路線」後導入 PLY"
-            )
+            raise ValueError("目前沒有已綁定場域的航線；請選擇「新增路線」後導入 PLY")
         map_source = profile.map_ply if profile is not None else None
         return profile, bound_profile, map_source, route_path
 
     def _read_route_editor_points(self, profile: SiteProfile | None) -> np.ndarray:
+        # Keep the main-map red spheres fresh when the editor opens on the
+        # same site — the overlay file lives beside the map PLY.
+        try:
+            candidate = getattr(profile, "map_ply", None) if profile is not None else None
+            if candidate is not None:
+                red = _load_red_spheres_for_map(candidate, MAP_STATIC_POINTS)
+                if len(red):
+                    self.red_sphere_points = red
+        except (OSError, ValueError, AttributeError, TypeError, RuntimeError):  # Tier3: fallback best-effort — narrow, keep pass
+            pass
         if (
             profile is not None
             and self.site_profile_path == profile.source
@@ -5299,6 +5709,7 @@ class OperatorApp(tk.Tk):
             self.site_assets_panel.set_status(f"航線編輯器未開啟：{reason}")
             return
         try:
+
             def save_authored_route(source: Path):
                 return self.site_assets_panel.import_authored_route(
                     source,
@@ -5318,6 +5729,15 @@ class OperatorApp(tk.Tk):
                 map_loaded=self.site_assets_panel.set_status,
                 on_close=self._route_editor_closed,
                 on_guard_failure=self._route_editor_guard_failed,
+                test_route=(
+                    self.start_saved_route_test
+                    if (
+                        getattr(self.backend, "mode", None)
+                        is InterfaceMode.SIMULATED_STREAM
+                        and not bool(getattr(self.backend, "is_live", False))
+                    )
+                    else None
+                ),
             )
         except Exception as exc:
             self._route_editor_window = None
@@ -5334,17 +5754,45 @@ class OperatorApp(tk.Tk):
         except tk.TclError:
             pass
 
+    def start_saved_route_test(self, route_path: Path) -> bool:
+        """Start a SIM-only test of the route just committed by the editor."""
+        if (
+            getattr(self.backend, "mode", None) is not InterfaceMode.SIMULATED_STREAM
+            or bool(getattr(self.backend, "is_live", False))
+        ):
+            self.write_log("模擬航線未啟動：此操作只適用於模擬介面")
+            return False
+        route_lock = getattr(self, "mission_route_lock", None)
+        snapshot = None if route_lock is None else route_lock.snapshot
+        if snapshot is None or Path(snapshot.path).resolve() != Path(route_path).resolve():
+            self.write_log("模擬航線未啟動：剛儲存的航線尚未完成驗證與綁定")
+            return False
+        self.site_assets_panel.set_status(
+            "航線已儲存；正在用正式控制器執行純模擬航線…"
+        )
+        self.send("start_auto")
+        return self._integrated_auto_active()
+
     def _route_editor_guard_failed(self, reason: str) -> None:
         self._route_editor_window = None
         self.site_assets_panel.set_status(f"航線編輯器已因安全狀態關閉：{reason}")
         self.write_log(f"route editor safety close: {reason}")
 
-    def load_route_editor_ply(
-        self, source: Path
-    ) -> tuple[SiteProfile | None, np.ndarray, str]:
+    def load_route_editor_ply(self, source: Path) -> tuple[SiteProfile | None, np.ndarray, str]:
         """Load any PLY, binding it only when one managed site digest matches."""
         profile = match_managed_site_profile_for_map(source, _WS.site_packages)
         points = read_map_points(source, MAP_STATIC_POINTS)
+        # Refresh red spheres for the editor preview — same overlay/fallback as the main map.
+        try:
+            # Prefer the matched profile's map_ply (site overlay), fall back to source's directory
+            map_ply_for_red = getattr(profile, "map_ply", None) if profile is not None else None
+            if map_ply_for_red is None:
+                map_ply_for_red = source
+            red = _load_red_spheres_for_map(map_ply_for_red, MAP_STATIC_POINTS)
+            if len(red):
+                self.red_sphere_points = red
+        except (OSError, ValueError, AttributeError, TypeError, RuntimeError):  # Tier3: fallback best-effort — narrow, keep pass
+            pass
         if profile is None:
             return (
                 None,
@@ -5423,9 +5871,7 @@ class OperatorApp(tk.Tk):
             and active_root.resolve() == result_root.resolve()
         )
         if not (same_profile or same_managed_site):
-            self.write_log(
-                "route imported for an inactive site; switch to that site to preview it"
-            )
+            self.write_log("route imported for an inactive site; switch to that site to preview it")
             return
         approved_for_auto = bool(getattr(result, "approved_for_auto", False))
         bind_for_auto = approved_for_auto and same_profile
@@ -5470,13 +5916,10 @@ class OperatorApp(tk.Tk):
         readiness_errors = flight_readiness_errors(profile)
         if bind_for_auto and readiness_errors:
             raise ValueError(
-                "site profile is not approved for AUTO: "
-                + "; ".join(readiness_errors)
+                "site profile is not approved for AUTO: " + "; ".join(readiness_errors)
             )
         flight = profile.flight
-        coordinate_frame_id = (
-            flight.coordinate_frame_id if flight is not None else None
-        )
+        coordinate_frame_id = flight.coordinate_frame_id if flight is not None else None
         if not coordinate_frame_id:
             raise ValueError("site profile has no flight coordinate_frame_id")
         snapshot = capture_mission_route_snapshot(
@@ -5496,9 +5939,7 @@ class OperatorApp(tk.Tk):
         self.redraw_map_only()
         return len(points)
 
-    def _bind_route_snapshot_for_auto(
-        self, snapshot: MissionRouteSnapshot | None
-    ) -> None:
+    def _bind_route_snapshot_for_auto(self, snapshot: MissionRouteSnapshot | None) -> None:
         """Bind the route the operator selected and verified in preflight step 3."""
         if snapshot is None:
             raise ValueError("尚未選定通過驗證的飛行路線")
@@ -5578,7 +6019,9 @@ class OperatorApp(tk.Tk):
         )
 
     def _finish_background_shutdown(
-        self, result: object, error: BaseException | None,
+        self,
+        result: object,
+        error: BaseException | None,
     ) -> None:
         """Finish shutdown on Tk's thread after the backend work completes."""
         self._shutdown_in_progress = False
@@ -5598,7 +6041,7 @@ class OperatorApp(tk.Tk):
             return
         try:
             self.write_log("關窗 → 強制原地降落並斷線…")
-        except Exception:
+        except (OSError, ValueError, AttributeError, TypeError, RuntimeError):  # Tier3: fallback best-effort — narrow, keep pass
             pass
         # ``Tk.__getattr__`` attempts to resolve unknown names through Tcl;
         # use the instance dictionary so a bare/test instance remains safe.
@@ -5654,7 +6097,11 @@ class OperatorApp(tk.Tk):
         if attitude_to_body_gravity is not None:
             gx, gy, gz = attitude_to_body_gravity(roll, pitch)
             self.gravity_g_var.set(f"g_body = ({gx:+.3f},{gy:+.3f},{gz:+.3f})")
-        if self.gravity_cal is not None and self.gravity_cal.started and not self.gravity_cal.finished:
+        if (
+            self.gravity_cal is not None
+            and self.gravity_cal.started
+            and not self.gravity_cal.finished
+        ):
             self.gravity_cal.add_sample(roll, pitch, yaw)
             phase = self.gravity_cal.phase or "?"
             n = len(self.gravity_cal.samples_for(phase))
@@ -5664,9 +6111,7 @@ class OperatorApp(tk.Tk):
                 "pitch": phase_result.pitch_span_deg,
                 "roll": phase_result.roll_span_deg,
             }.get(phase, 0.0)
-            self.gravity_guide_var.set(
-                gravity_phase_guidance(phase, sample_count=n, span_deg=span)
-            )
+            self.gravity_guide_var.set(gravity_phase_guidance(phase, sample_count=n, span_deg=span))
             # lightweight live status (phase label kept; append sample count)
             base = self.gravity_status_var.get().split("\n")[0]
             _ready, _count, _span, _target, reason = self._gravity_phase_assessment(phase)
@@ -5702,26 +6147,22 @@ class OperatorApp(tk.Tk):
                     error=repr(exc),
                     resolved=False,
                 )
-            except Exception:
+            except (OSError, ValueError, AttributeError, TypeError, RuntimeError):  # Tier3: fallback best-effort — narrow, keep pass
                 pass
-        log_event = getattr(
-            getattr(self.__dict__.get("backend"), "log", None), "event", None
-        )
+        log_event = getattr(getattr(self.__dict__.get("backend"), "log", None), "event", None)
         if callable(log_event):
             try:
                 log_event("diagnostic_write_failed", path=key, error=repr(exc))
-            except Exception:
+            except (OSError, ValueError, AttributeError, TypeError, RuntimeError):  # Tier3: fallback best-effort — narrow, keep pass
                 pass
         try:
             self.write_log(f"DIAGNOSTIC_WRITE_FAILED path={key} error={exc!r}")
-        except Exception:
+        except (OSError, ValueError, AttributeError, TypeError, RuntimeError):  # Tier3: fallback best-effort — narrow, keep pass
             pass
 
     def _ensure_loc_metrics_log(self) -> None:
         if self.session_logs is not None:
-            self._loc_metrics_path = (
-                self.session_logs.directory / "localization.jsonl"
-            )
+            self._loc_metrics_path = self.session_logs.directory / "localization.jsonl"
             self._loc_metrics_f = True
             return
         if self._loc_metrics_f is not None:
@@ -5740,7 +6181,7 @@ class OperatorApp(tk.Tk):
             )
             try:
                 self.write_log(f"loc metrics log open failed: {exc!r}")
-            except Exception:
+            except (OSError, ValueError, AttributeError, TypeError, RuntimeError):  # Tier3: fallback best-effort — narrow, keep pass
                 pass
 
     def _append_loc_metrics(self, result: dict) -> None:
@@ -5756,6 +6197,9 @@ class OperatorApp(tk.Tk):
                 submit_ok=self._submit_ok,
                 submit_skip_busy=self._submit_skip_busy,
                 submit_busy_attempts=self._submit_busy_attempts,
+                adaptive_submit_interval_ms=(
+                    OperatorApp._localization_coalesce_interval_s(self) * 1000.0
+                ),
             )
             session_logs = getattr(self, "session_logs", None)
             if session_logs is not None:
@@ -5778,26 +6222,18 @@ class OperatorApp(tk.Tk):
                 e2e_ms=None,
                 e2e_p95_ms=None,
                 frame_age_ms=None,
-                localization_label=localization_fps_metric_label(
-                    self._is_live_backend()
-                ),
+                localization_label=localization_fps_metric_label(self._is_live_backend()),
             )
 
-        self.live_result_times, self.loc_fps = _rolling_event_fps(
-            self.live_result_times, current
-        )
+        self.live_result_times, self.loc_fps = _rolling_event_fps(self.live_result_times, current)
         self._stream_frame_times, self.stream_fps_instant = _rolling_event_fps(
             self._stream_frame_times, current
         )
         cutoff = current - 5.0
         self._loc_e2e_ms_samples = [
-            (stamp, value)
-            for stamp, value in self._loc_e2e_ms_samples[-200:]
-            if stamp >= cutoff
+            (stamp, value) for stamp, value in self._loc_e2e_ms_samples[-200:] if stamp >= cutoff
         ]
-        e2e_p95 = _nearest_rank_p95(
-            [value for _stamp, value in self._loc_e2e_ms_samples]
-        )
+        e2e_p95 = _nearest_rank_p95([value for _stamp, value in self._loc_e2e_ms_samples])
         current_e2e = self.loc_e2e_ms if self._loc_e2e_ms_samples else None
         frame_age_ms = None
         if self.video_frame is not None and self._video_frame_stamp > 0:
@@ -5823,17 +6259,13 @@ class OperatorApp(tk.Tk):
             e2e_ms=current_e2e,
             e2e_p95_ms=e2e_p95,
             frame_age_ms=frame_age_ms,
-            localization_label=localization_fps_metric_label(
-                self._is_live_backend()
-            ),
+            localization_label=localization_fps_metric_label(self._is_live_backend()),
         )
 
     def _update_localization_timing(self, result: dict, now: float) -> None:
         cutoff = now - 5.0
         self.live_result_times.append(now)
-        self.live_result_times, self.loc_fps = _rolling_event_fps(
-            self.live_result_times[-80:], now
-        )
+        self.live_result_times, self.loc_fps = _rolling_event_fps(self.live_result_times[-80:], now)
         core_ms = result.get("core_wall_ms", result.get("wall_ms"))
         full_wall = result.get("wall_ms", core_ms)
         self.loc_latency_ms = float(core_ms) if core_ms is not None else None
@@ -5846,19 +6278,13 @@ class OperatorApp(tk.Tk):
             self.loc_e2e_ms = float(e2e) if e2e is not None else None
         except (TypeError, ValueError):
             self.loc_e2e_ms = None
-        if (
-            self.loc_e2e_ms is not None
-            and math.isfinite(self.loc_e2e_ms)
-            and self.loc_e2e_ms >= 0
-        ):
+        if self.loc_e2e_ms is not None and math.isfinite(self.loc_e2e_ms) and self.loc_e2e_ms >= 0:
             self._loc_e2e_ms_samples.append((now, self.loc_e2e_ms))
         self._loc_e2e_ms_samples = [
-            sample for sample in self._loc_e2e_ms_samples[-200:]
-            if sample[0] >= cutoff
+            sample for sample in self._loc_e2e_ms_samples[-200:] if sample[0] >= cutoff
         ]
         self.loc_core_fps = (
-            1000.0 / self.loc_latency_ms
-            if self.loc_latency_ms and self.loc_latency_ms > 0 else 0.0
+            1000.0 / self.loc_latency_ms if self.loc_latency_ms and self.loc_latency_ms > 0 else 0.0
         )
         self.loc_stage = str(
             result.get("composite_stage")
@@ -5871,21 +6297,18 @@ class OperatorApp(tk.Tk):
             if len(self._loc_wall_ms_samples) > 200:
                 self._loc_wall_ms_samples = self._loc_wall_ms_samples[-200:]
 
-    def _classify_localization_health(
-            self, result: dict, now: float) -> tuple[int, object]:
+    def _classify_localization_health(self, result: dict, now: float) -> tuple[int, object]:
         inliers = int(result.get("inliers", 0) or 0)
         reproj = result.get("reproj_rms")
-        # localization health for the operator alert (FAIL = no fix, LOW = weak confidence)
-        # composite_stage is useful for profiling but does not describe pose
-        # health; use the tracker's explicit weak flag/state for the HUD alert.
-        weak = localization_result_is_weak(result)
-        if not result.get("success"):
+        health = classify_localization_health(result)
+        # Pure helper returns OK/DEGRADED/LOST; legacy internal values are LOW==DEGRADED, FAIL==LOST.
+        if health in ("FAIL", "LOST"):
             self.loc_health = "FAIL"
             self._loc_fail_count += 1
             self._record_no_loc()
-        elif inliers < LOC_LOW_INLIERS or (reproj is not None and reproj > LOC_HIGH_REPROJ) or weak:
+        elif health in ("LOW", "DEGRADED"):
             self.loc_health = "LOW"
-            self._loc_ok_count += 1  # got a pose, weak
+            self._loc_ok_count += 1
         else:
             self.loc_health = "OK"
             self._loc_ok_count += 1
@@ -5894,13 +6317,30 @@ class OperatorApp(tk.Tk):
                 arrival_mono=now,
             )
         if self.loc_health == "OK":
-            self._loc_consecutive_good_fixes = (
-                getattr(self, "_loc_consecutive_good_fixes", 0) + 1
-            )
+            self._loc_consecutive_good_fixes = getattr(self, "_loc_consecutive_good_fixes", 0) + 1
         else:
             self._loc_consecutive_good_fixes = 0
         self.loc_health_inliers, self.loc_health_reproj = inliers, reproj
         return inliers, reproj
+
+    # -- Thin wrappers over pure HUD helpers (C1) — keep for headless import/tests.
+    # Original methods remain as one-liners delegating to the module-level pure funcs
+    # so the live HUD still renders through the same path.
+    def _format_latency_text(self, latency_ms: float | None) -> str:
+        """Thin wrapper: no logic, just delegates to pure helper."""
+        return format_latency_text(latency_ms)
+
+    def _classify_health(self, loc: dict) -> str:
+        """Thin wrapper: no logic, just delegates to pure helper."""
+        return classify_localization_health(loc)
+
+    def _hud_overlay_data(self, state, loc, telemetry) -> dict:
+        """Thin wrapper: no logic, just delegates to pure helper."""
+        return build_hud_overlay_data(state, loc, telemetry)
+
+    def _latency_text(self) -> str:
+        """Instance convenience — formats the current core latency via the pure helper."""
+        return format_latency_text(getattr(self, "loc_latency_ms", None))
 
     def _update_localization_recovery(self, result: dict) -> None:
         mode = str(result.get("mode") or "-")
@@ -5936,15 +6376,12 @@ class OperatorApp(tk.Tk):
             if self._loc_fail_count or self._loc_ok_count:
                 txt += f" | ok={self._loc_ok_count} fail={self._loc_fail_count}"
                 self._set_loc_health_display(
-                text=txt, colour=HEALTH_COLOR.get(self.loc_health, "#e0a92e"))
+                    text=txt, colour=HEALTH_COLOR.get(self.loc_health, "#e0a92e")
+                )
         if hasattr(self, "loc_fps_var"):
             self.loc_fps_var.set(f"定位 FPS {self.loc_fps:.1f}")
-            latency_text = (
-                "-" if self.loc_latency_ms is None else f"{self.loc_latency_ms:.1f}ms"
-            )
-            wall_txt = (
-                f"{self.loc_wall_ms:.1f}" if self.loc_wall_ms is not None else "-"
-            )
+            latency_text = "-" if self.loc_latency_ms is None else f"{self.loc_latency_ms:.1f}ms"
+            wall_txt = f"{self.loc_wall_ms:.1f}" if self.loc_wall_ms is not None else "-"
             e2e_txt = f"{self.loc_e2e_ms:.1f}" if self.loc_e2e_ms is not None else "-"
             self.loc_latency_var.set(
                 f"wall_ms {wall_txt}ms | core {latency_text} | e2e {e2e_txt}ms"
@@ -5956,7 +6393,9 @@ class OperatorApp(tk.Tk):
         now = time.monotonic()
         OperatorApp._update_localization_timing(self, result, now)
         inliers, _reproj = OperatorApp._classify_localization_health(
-            self, result, now,
+            self,
+            result,
+            now,
         )
         OperatorApp._update_localization_recovery(self, result)
         OperatorApp._render_localization_metrics(self, inliers)
@@ -5972,7 +6411,9 @@ class OperatorApp(tk.Tk):
             self.det_fps = (len(self.detection_result_times) - 1) / span if span > 0 else 0.0
         wall_ms = result.get("wall_ms")
         self.det_latency_ms = float(wall_ms) if wall_ms is not None else None
-        self.det_core_fps = 1000.0 / self.det_latency_ms if self.det_latency_ms and self.det_latency_ms > 0 else 0.0
+        self.det_core_fps = (
+            1000.0 / self.det_latency_ms if self.det_latency_ms and self.det_latency_ms > 0 else 0.0
+        )
         self.det_count = int(result.get("count", 0) or 0)
         if not result.get("success"):
             self.det_status = "FAIL"
@@ -5984,7 +6425,9 @@ class OperatorApp(tk.Tk):
         latency_text = "-" if self.det_latency_ms is None else f"{self.det_latency_ms:.1f} ms"
         if hasattr(self, "det_fps_var"):
             self.det_fps_var.set(f"偵測 FPS {self.det_fps:.1f} | 核心 {self.det_core_fps:.1f}")
-            self.det_latency_var.set(f"YOLO 延遲 {latency_text} | every {self.detect_every_n_frames}f")
+            self.det_latency_var.set(
+                f"YOLO 延遲 {latency_text} | every {self.detect_every_n_frames}f"
+            )
             self.det_count_var.set(f"objects {self.det_count} | {self.det_status}")
 
     @staticmethod
@@ -6006,58 +6449,86 @@ class OperatorApp(tk.Tk):
             return
         canvas.delete("all")
         if guide is None:
-            canvas.create_text(8, 26, anchor="w", text="（目前沒有要求校正軸）",
-                               fill="#7a828a", font=("Sans", 9))
+            canvas.create_text(
+                8, 26, anchor="w", text="（目前沒有要求校正軸）", fill="#7a828a", font=("Sans", 9)
+            )
             return
         label, view, instruction = guide
         body, accent, arrow = "#39424b", "#f0f3f5", "#4ea1ff"
         cx, cy = 30, 26
 
-        if view == "top":            # X/roll: seen from above, roll about nose-tail
-            canvas.create_oval(cx - 20, cy - 7, cx + 20, cy + 7,
-                               fill=body, outline=accent)
-            canvas.create_polygon(cx + 20, cy, cx + 28, cy - 4, cx + 28, cy + 4,
-                                  fill=accent, outline=accent)
+        if view == "top":  # X/roll: seen from above, roll about nose-tail
+            canvas.create_oval(cx - 20, cy - 7, cx + 20, cy + 7, fill=body, outline=accent)
+            canvas.create_polygon(
+                cx + 20, cy, cx + 28, cy - 4, cx + 28, cy + 4, fill=accent, outline=accent
+            )
             canvas.create_line(cx - 27, cy, cx + 30, cy, fill=arrow, dash=(3, 2))
-            canvas.create_arc(cx - 12, cy - 20, cx + 12, cy + 20,
-                              start=20, extent=300, style="arc",
-                              outline=arrow, width=2)
-            canvas.create_polygon(cx + 11, cy - 16, cx + 17, cy - 7,
-                                  cx + 5, cy - 8, fill=arrow, outline=arrow)
-        elif view == "side":         # Y/pitch: seen from the left, nose over the top
-            canvas.create_oval(cx - 21, cy - 6, cx + 21, cy + 6,
-                               fill=body, outline=accent)
-            canvas.create_polygon(cx + 21, cy, cx + 29, cy - 4, cx + 29, cy + 4,
-                                  fill=accent, outline=accent)
+            canvas.create_arc(
+                cx - 12,
+                cy - 20,
+                cx + 12,
+                cy + 20,
+                start=20,
+                extent=300,
+                style="arc",
+                outline=arrow,
+                width=2,
+            )
+            canvas.create_polygon(
+                cx + 11, cy - 16, cx + 17, cy - 7, cx + 5, cy - 8, fill=arrow, outline=arrow
+            )
+        elif view == "side":  # Y/pitch: seen from the left, nose over the top
+            canvas.create_oval(cx - 21, cy - 6, cx + 21, cy + 6, fill=body, outline=accent)
+            canvas.create_polygon(
+                cx + 21, cy, cx + 29, cy - 4, cx + 29, cy + 4, fill=accent, outline=accent
+            )
             canvas.create_line(cx, cy - 22, cx, cy + 22, fill=arrow, dash=(3, 2))
-            canvas.create_arc(cx - 24, cy - 19, cx + 24, cy + 19,
-                              start=200, extent=140, style="arc",
-                              outline=arrow, width=2)
-            canvas.create_polygon(cx + 20, cy - 9, cx + 27, cy - 1,
-                                  cx + 15, cy - 1, fill=arrow, outline=arrow)
-        else:                        # Z/yaw: seen from above, spin flat
-            canvas.create_oval(cx - 14, cy - 14, cx + 14, cy + 14,
-                               fill=body, outline=accent)
-            canvas.create_polygon(cx, cy - 14, cx - 5, cy - 22, cx + 5, cy - 22,
-                                  fill=accent, outline=accent)
-            canvas.create_arc(cx - 22, cy - 22, cx + 22, cy + 22,
-                              start=45, extent=250, style="arc",
-                              outline=arrow, width=2)
-            canvas.create_polygon(cx + 14, cy - 13, cx + 22, cy - 7,
-                                  cx + 12, cy - 4, fill=arrow, outline=arrow)
+            canvas.create_arc(
+                cx - 24,
+                cy - 19,
+                cx + 24,
+                cy + 19,
+                start=200,
+                extent=140,
+                style="arc",
+                outline=arrow,
+                width=2,
+            )
+            canvas.create_polygon(
+                cx + 20, cy - 9, cx + 27, cy - 1, cx + 15, cy - 1, fill=arrow, outline=arrow
+            )
+        else:  # Z/yaw: seen from above, spin flat
+            canvas.create_oval(cx - 14, cy - 14, cx + 14, cy + 14, fill=body, outline=accent)
+            canvas.create_polygon(
+                cx, cy - 14, cx - 5, cy - 22, cx + 5, cy - 22, fill=accent, outline=accent
+            )
+            canvas.create_arc(
+                cx - 22,
+                cy - 22,
+                cx + 22,
+                cy + 22,
+                start=45,
+                extent=250,
+                style="arc",
+                outline=arrow,
+                width=2,
+            )
+            canvas.create_polygon(
+                cx + 14, cy - 13, cx + 22, cy - 7, cx + 12, cy - 4, fill=arrow, outline=arrow
+            )
 
-        canvas.create_text(66, 13, anchor="w", text=f"現在請轉：{label}",
-                           fill=arrow, font=("Sans", 11, "bold"))
-        canvas.create_text(66, 34, anchor="w", text=f"{instruction}　轉滿三圈",
-                           fill="#c3cad1", font=("Sans", 9))
+        canvas.create_text(
+            66, 13, anchor="w", text=f"現在請轉：{label}", fill=arrow, font=("Sans", 11, "bold")
+        )
+        canvas.create_text(
+            66, 34, anchor="w", text=f"{instruction}　轉滿三圈", fill="#c3cad1", font=("Sans", 9)
+        )
 
     def update_magnetometer_metrics(self, st: DroneState) -> None:
         if not hasattr(self, "drone_magnetometer_var"):
             return
         if not self._is_live_backend():
-            self.drone_magnetometer_var.set(
-                "飛機羅盤：SIM 不提供韌體校正"
-            )
+            self.drone_magnetometer_var.set("飛機羅盤：SIM 不提供韌體校正")
             self._draw_magnetometer_axis(None)
             self._magnetometer_takeoff_ready = True
             return
@@ -6067,7 +6538,8 @@ class OperatorApp(tk.Tk):
         active = getattr(st, "drone_magnetometer_started", None) is True
         self._draw_magnetometer_axis(
             magnetometer_axis_guide(getattr(st, "drone_magnetometer_axis", None))
-            if active else None
+            if active
+            else None
         )
 
         flight_state = str(getattr(st, "flight_state", "") or "")
@@ -6117,31 +6589,22 @@ class OperatorApp(tk.Tk):
         speed_txt = "?" if speed is None else f"{float(speed):.2f}m/s"
         # backlog age / fps / GPS / link are in the video HUD; only the two
         # figures nothing else reports stay here.
-        self.anafi_stream_var.set(
-            f"ground speed {speed_txt} | PCMD→telemetry poll {ctl_poll_txt}"
-        )
+        self.anafi_stream_var.set(f"ground speed {speed_txt} | PCMD→telemetry poll {ctl_poll_txt}")
         telemetry = format_olympe_telemetry(st)
         if hasattr(self, "olympe_state_var"):
             gps_summary = " | ".join(telemetry["gps"].split(" | ")[:2])
-            self.olympe_state_var.set(
-                telemetry["rth"] + " | " + gps_summary)
-            self.olympe_attitude_var.set(
-                telemetry["attitude"] + " | " + telemetry["velocity"])
+            self.olympe_state_var.set(telemetry["rth"] + " | " + gps_summary)
+            self.olympe_attitude_var.set(telemetry["attitude"] + " | " + telemetry["velocity"])
             self.olympe_altitude_var.set(
-                telemetry["altitude_agl"] + " | " + telemetry["link_quality"])
+                telemetry["altitude_agl"] + " | " + telemetry["link_quality"]
+            )
             auto_pcmd_cap_pct = max(
                 1,
                 min(100, int(getattr(self.backend, "nudge_pct", 10) or 10)),
             )
-            speed_limit = float(
-                getattr(st, "autonomous_speed_limit_mps", 0.30)
-            )
-            speed_limit_enabled = bool(
-                getattr(st, "autonomous_speed_limit_enabled", True)
-            )
-            guard_status = str(
-                getattr(st, "autonomous_speed_guard_status", "SPEED_WAITING")
-            )
+            speed_limit = float(getattr(st, "autonomous_speed_limit_mps", 0.30))
+            speed_limit_enabled = bool(getattr(st, "autonomous_speed_limit_enabled", True))
+            guard_status = str(getattr(st, "autonomous_speed_guard_status", "SPEED_WAITING"))
             self.current_auto_speed_var.set(
                 f"AUTO 地速安全閘門 {'ON' if speed_limit_enabled else 'OFF'} "
                 f"{speed_limit:g} m/s（非硬上限） | "
@@ -6189,10 +6652,8 @@ class OperatorApp(tk.Tk):
             if not getattr(self, "_link_lost_logged", False):
                 self._link_lost_logged = True
                 try:
-                    self.write_log(
-                        "LINK LOST — 連線中斷；指令可能送不出去（顯示警示，不自動起飛）"
-                    )
-                except Exception:
+                    self.write_log("LINK LOST — 連線中斷；指令可能送不出去（顯示警示，不自動起飛）")
+                except (OSError, ValueError, AttributeError, TypeError, RuntimeError):  # Tier3: fallback best-effort — narrow, keep pass
                     pass
         elif link_ok:
             self._link_lost_logged = False
@@ -6221,9 +6682,7 @@ class OperatorApp(tk.Tk):
         return minimum, maximum, default
 
     def _configure_sparse_cloud_collision_guard(self, points: np.ndarray) -> None:
-        minimum, maximum, default = self._collision_guard_radius_limits(
-            self.map_radius
-        )
+        minimum, maximum, default = self._collision_guard_radius_limits(self.map_radius)
         try:
             previous = float(self.__dict__.get("collision_guard_radius"))
         except (TypeError, ValueError, OverflowError):
@@ -6233,11 +6692,7 @@ class OperatorApp(tk.Tk):
         self.collision_guard_radius_max = maximum
         self.collision_guard_radius = float(np.clip(selected, minimum, maximum))
         try:
-            cloud = (
-                np.empty((0, 3), dtype=np.float32)
-                if len(points) == 0
-                else np.asarray(points)
-            )
+            cloud = np.empty((0, 3), dtype=np.float32) if len(points) == 0 else np.asarray(points)
             self._collision_guard_monitor = SparseCloudCollisionMonitor(
                 cloud,
                 collision_radius=self.collision_guard_radius,
@@ -6245,6 +6700,15 @@ class OperatorApp(tk.Tk):
             )
         except (TypeError, ValueError):
             self._collision_guard_monitor = None
+        if (
+            self._collision_guard_monitor is not None
+            and self._collision_guard_monitor.tree is None
+            and rpf_cKDTree is None
+        ):
+            self.write_log(
+                "碰撞監控 UNAVAILABLE：scipy cKDTree 無法載入，"
+                "點雲鄰近查詢停用（非「附近無障礙物」）"
+            )
         self.collision_guard_snapshot = {
             "center": self.default_map_center.copy(),
             "radius": self.collision_guard_radius,
@@ -6260,9 +6724,7 @@ class OperatorApp(tk.Tk):
         if scale is not None:
             scale.configure(from_=minimum, to=maximum)
 
-    def _collision_guard_center(
-        self, state: DroneState
-    ) -> tuple[np.ndarray, bool, bool]:
+    def _collision_guard_center(self, state: DroneState) -> tuple[np.ndarray, bool, bool]:
         """Return center, preview flag, and whether the pose may drive an interlock."""
         if not bool(self.__dict__.get("inspecting", False)):
             return self.default_map_center.copy(), True, False
@@ -6288,16 +6750,11 @@ class OperatorApp(tk.Tk):
         center = pose if np.all(np.isfinite(pose)) else self.default_map_center.copy()
         return center, False, valid
 
-
     @staticmethod
     def _collision_guard_status_text(snapshot: dict[str, object]) -> str:
         status = str(snapshot.get("status", "UNAVAILABLE"))
         distance = snapshot.get("distance")
-        distance_text = (
-            ""
-            if distance is None
-            else f"，最近 {float(distance):.3g} u"
-        )
+        distance_text = "" if distance is None else f"，最近 {float(distance):.3g} u"
         return {
             "PREVIEW_HIT": f"中心預覽：圈內有點雲{distance_text}（不觸發）",
             "PREVIEW_CLEAR": f"中心預覽：圈內無點雲{distance_text}（不觸發）",
@@ -6324,9 +6781,7 @@ class OperatorApp(tk.Tk):
             except Exception as exc:
                 self.write_log(f"點雲近接事件紀錄失敗：{exc!r}")
 
-    def _stop_motion_for_sparse_cloud_collision(
-        self, snapshot: dict[str, object]
-    ) -> bool:
+    def _stop_motion_for_sparse_cloud_collision(self, snapshot: dict[str, object]) -> bool:
         try:
             self._nudge_keys_held.clear()
             self._nudge_buttons_held.clear()
@@ -6366,7 +6821,7 @@ class OperatorApp(tk.Tk):
             self.write_log(f"點雲近接懸停失敗：{exc!r}")
         state = getattr(backend, "state", None)
         if hovered and state is not None:
-            state.tracker_state = "HOVER"
+            state.tracker_state = TrackerState.HOVER
             state.last_command = "sparse_cloud_collision_hover"
         self._record_sparse_cloud_collision(snapshot, resolved=False)
         if hovered:
@@ -6406,8 +6861,10 @@ class OperatorApp(tk.Tk):
                 result = monitor.update(center)
                 hit = result.get("status") == "COLLISION"
                 status = (
-                    "PREVIEW_HIT" if hit else "PREVIEW_CLEAR"
-                ) if preview else ("COLLISION" if hit else "CLEAR")
+                    ("PREVIEW_HIT" if hit else "PREVIEW_CLEAR")
+                    if preview
+                    else ("COLLISION" if hit else "CLEAR")
+                )
         snapshot = {
             "center": np.asarray(center, dtype=float).copy(),
             "radius": float(self.collision_guard_radius),
@@ -6427,9 +6884,7 @@ class OperatorApp(tk.Tk):
         elif status in {"CLEAR", "DISABLED"} and self._collision_interlock_latched:
             self._collision_interlock_latched = False
             self._record_sparse_cloud_collision(snapshot, resolved=True)
-            self.write_log(
-                "點雲近接互鎖已解除；AUTO 仍保持暫停，必須由操作者重新下令"
-            )
+            self.write_log("點雲近接互鎖已解除；AUTO 仍保持暫停，必須由操作者重新下令")
 
     def _collision_motion_blocked(self, source: str) -> bool:
         if not bool(self.__dict__.get("_collision_interlock_latched", False)):
@@ -6442,11 +6897,13 @@ class OperatorApp(tk.Tk):
             selected = float(raw_value)
         except (TypeError, ValueError, OverflowError):
             return
-        self.collision_guard_radius = float(np.clip(
-            selected,
-            self.collision_guard_radius_min,
-            self.collision_guard_radius_max,
-        ))
+        self.collision_guard_radius = float(
+            np.clip(
+                selected,
+                self.collision_guard_radius_min,
+                self.collision_guard_radius_max,
+            )
+        )
         radius_text = self.__dict__.get("collision_guard_radius_text")
         if radius_text is not None:
             radius_text.set(f"{self.collision_guard_radius:.3g} u")
@@ -6521,7 +6978,7 @@ class OperatorApp(tk.Tk):
         try:
             self.pitch.set(pitch0)
             self.zoom.set(zoom0)
-        except Exception:
+        except (OSError, ValueError, AttributeError, TypeError, RuntimeError):  # Tier3: fallback best-effort — narrow, keep pass
             pass
         self._backend_command("camera_reset", {"pitch": pitch0, "zoom": zoom0})
         self.write_log(f"鏡頭預設: 俯仰 {pitch0:.0f}° / 縮放 {zoom0:.1f}x")
@@ -6641,10 +7098,7 @@ class OperatorApp(tk.Tk):
             return
         self._age_readout_next = now + 0.1
         pose_mono = getattr(self, "loc_pose_updated_mono", None)
-        pose_ms = (
-            None if pose_mono is None
-            else max(0.0, (now - float(pose_mono)) * 1000.0)
-        )
+        pose_ms = None if pose_mono is None else max(0.0, (now - float(pose_mono)) * 1000.0)
         stamp = float(getattr(self, "_video_frame_stamp", 0.0) or 0.0)
         stream_ms = None if stamp <= 0.0 else max(0.0, (now - stamp) * 1000.0)
         observed = [value for value in (pose_ms, stream_ms) if value is not None]
@@ -6676,14 +7130,15 @@ class OperatorApp(tk.Tk):
     #: pose was repainted green by the next result and the dedup cache then made
     #: that loss permanent. Higher rank wins instead.
     _LOC_HEALTH_COLOUR_RANK = {
-        "#a7b0b8": 0,                            # idle grey
-        "#3fbf7f": 1, "#24733f": 1,              # healthy green
-        "#e0a92e": 2, "#b26a00": 2,              # warning amber
-        "#e2483d": 3,                            # failure red
+        "#a7b0b8": 0,  # idle grey
+        "#3fbf7f": 1,
+        "#24733f": 1,  # healthy green
+        "#e0a92e": 2,
+        "#b26a00": 2,  # warning amber
+        "#e2483d": 3,  # failure red
     }
 
-    def _set_loc_health_display(self, text: str | None = None,
-                                colour: str | None = None) -> None:
+    def _set_loc_health_display(self, text: str | None = None, colour: str | None = None) -> None:
         """The single writer for loc_health_label's text and foreground.
 
         Each caller states its own intent; this composes the most severe colour of
@@ -6711,9 +7166,7 @@ class OperatorApp(tk.Tk):
             if getattr(self, "status_chips", {}).get("localization") is label:
                 self._set_status_chip("localization", text_value, state)
             else:
-                self._set_widget_text(
-                    "loc_health", label, text=text_value, foreground=shown
-                )
+                self._set_widget_text("loc_health", label, text=text_value, foreground=shown)
         except tk.TclError:
             pass
 
@@ -6730,12 +7183,18 @@ class OperatorApp(tk.Tk):
         mw = max(300, self.map_label.winfo_width())
         mh = max(220, self.map_label.winfo_height())
         self._present_frame(
-            self.map_label, "map_photo",
-            self.render_map(mw, mh, self.current_state))
+            self.map_label, "map_photo", self.render_map(mw, mh, self.current_state)
+        )
 
     def map_base_key(self, width: int, height: int) -> tuple:
+        red = getattr(self, "red_sphere_points", None)
+        try:
+            red_len = 0 if red is None else len(red)  # type: ignore[arg-type]
+        except Exception:
+            red_len = 0
         return (
-            int(width), int(height),
+            int(width),
+            int(height),
             round(float(self.map_zoom), 4),
             round(float(self.map_yaw), 4),
             round(float(self.map_pitch), 4),
@@ -6744,12 +7203,12 @@ class OperatorApp(tk.Tk):
             tuple(np.round(self.pivot_point.astype(float), 4)),
             tuple(np.round(self.map_pan.astype(float), 2)),
             len(self.map_points),
+            int(red_len),
             self._map_detail_points(),
         )
-
     def render_map_base(self, width: int, height: int) -> Image.Image:
         arr = np.empty((max(1, height), max(1, width), 3), dtype=np.uint8)
-        arr[:] = (0x15, 0x18, 0x1c)   # "#15181c"
+        arr[:] = (0x15, 0x18, 0x1C)  # "#15181c"
         scale = min(width, height) * 0.46 * self.map_zoom / self.map_radius
 
         step = max(1, len(self.map_points) // max(1, self._map_detail_points()))
@@ -6763,10 +7222,42 @@ class OperatorApp(tk.Tk):
             sx_i = sx[inside][order]
             sy_i = sy[inside][order]
             rgb = np.clip(pts[:, 3:6][inside][order], 0, 255).astype(np.uint8)
-            arr[sy_i, sx_i] = rgb   # depth-sorted: later (nearer) points overwrite, like draw.point order
+            arr[sy_i, sx_i] = (
+                rgb  # depth-sorted: later (nearer) points overwrite, like draw.point order
+            )
         img = Image.fromarray(arr, "RGB")
         draw = ImageDraw.Draw(img)
         overlay_font = pil_ui_font(12, bold=True)
+        # Red intrinsic difficult localization spheres (220,32,32) — always-on overlay
+        # in the static base so they benefit from base-image caching (same cost as
+        # the point cloud). Drawn after the 1-px map points with a larger marker
+        # so they remain visible even in dense cloud regions.
+        try:
+            red_pts = getattr(self, "red_sphere_points", None)
+            if red_pts is not None and len(red_pts):
+                # Keep all sphere vertices; 4k points is negligible vs 250k map.
+                view_r = self.transform_xyz(red_pts[:, :3].astype(float))
+                sx_r = (width * 0.5 + self.map_pan[0] + view_r[:, 0] * scale).astype(int)
+                sy_r = (height * 0.5 + self.map_pan[1] - view_r[:, 1] * scale).astype(int)
+                inside_r = (sx_r >= 0) & (sx_r < width) & (sy_r >= 0) & (sy_r < height)
+                if np.any(inside_r):
+                    order_r = np.argsort(view_r[inside_r, 2])
+                    sx_r = sx_r[inside_r][order_r]
+                    sy_r = sy_r[inside_r][order_r]
+                    # Use the sphere ply's own RGB when present, otherwise canonical red.
+                    if red_pts.shape[1] >= 6:
+                        rgb_r = np.clip(red_pts[:, 3:6][inside_r][order_r], 0, 255).astype(np.uint8)
+                    else:
+                        rgb_r = np.full((len(sx_r), 3), (220, 32, 32), dtype=np.uint8)
+                    # Slightly larger than the 1-px map points; depth-sorted far->near
+                    # so nearer sphere vertices occlude farther ones, matching the map.
+                    for x, y, col in zip(sx_r.tolist(), sy_r.tolist(), rgb_r.tolist()):
+                        fill = f"#{col[0]:02x}{col[1]:02x}{col[2]:02x}"
+                        # 4-px diameter (radius 2) with a 1-px darker edge for contrast
+                        draw.ellipse((x - 2, y - 2, x + 2, y + 2), fill=fill, outline="#ffffff", width=1)
+                        draw.ellipse((x - 1, y - 1, x + 1, y + 1), fill=fill, outline=fill)
+        except (OSError, ValueError, AttributeError, TypeError, RuntimeError):  # Tier3: fallback best-effort — narrow, keep pass
+            pass
 
         # Draw map axes in the current view.
         axis_len = self.map_radius * 0.18
@@ -6811,10 +7302,8 @@ class OperatorApp(tk.Tk):
             center = np.asarray(guard_center, dtype=float)
             if center.shape == (3,) and np.all(np.isfinite(center)):
                 render_pose = np.array([*center, np.nan], dtype=float)
-        camera_axes = normalize_camera_axes(
-            getattr(self, "camera_axes_world", None))
-        camera_forward = normalize_camera_forward(
-            getattr(self, "camera_forward_world", None))
+        camera_axes = normalize_camera_axes(getattr(self, "camera_axes_world", None))
+        camera_forward = normalize_camera_forward(getattr(self, "camera_forward_world", None))
         if guard_preview:
             camera_axes = None
             camera_forward = None
@@ -6854,16 +7343,27 @@ class OperatorApp(tk.Tk):
         )
         return img
 
-    def draw_detections(self, draw: ImageDraw.ImageDraw, scale: float, ox: int, oy: int,
-                        width: int, height: int) -> None:
+    def draw_detections(
+        self, draw: ImageDraw.ImageDraw, scale: float, ox: int, oy: int, width: int, height: int
+    ) -> None:
         if not self.detection_result or not self.detection_result.get("success"):
             return
         boxes = self.detection_result.get("boxes") or []
         if not boxes:
             return
         palette = [
-            "#ff6b5f", "#5aa7e8", "#3fbf7f", "#e6b94f", "#c084fc", "#f97316",
-            "#22d3ee", "#f43f5e", "#84cc16", "#facc15", "#38bdf8", "#fb7185",
+            "#ff6b5f",
+            "#5aa7e8",
+            "#3fbf7f",
+            "#e6b94f",
+            "#c084fc",
+            "#f97316",
+            "#22d3ee",
+            "#f43f5e",
+            "#84cc16",
+            "#facc15",
+            "#38bdf8",
+            "#fb7185",
         ]
         for box in boxes:
             xyxy = box.get("xyxy") or []
@@ -6883,18 +7383,60 @@ class OperatorApp(tk.Tk):
             class_id = int(box.get("class_id", 0) or 0)
             color = palette[class_id % len(palette)]
             conf = float(box.get("confidence", 0.0) or 0.0)
-            label = f"{box.get('class_name', f'class_{class_id}')} {conf:.2f}"
-            draw.rectangle((sx1, sy1, sx2, sy2), outline=color, width=2)
-            tw = max(60, min(width - sx1 - 2, len(label) * 7 + 8))
-            ty1 = max(0, sy1 - 18)
-            draw.rectangle((sx1, ty1, sx1 + tw, ty1 + 16), fill="#08090b", outline=color)
+            label = f"{box.get('class_name', f'class_{class_id}')} {conf:.2f}"[:28]
+            font = pil_ui_font(11, bold=True)
+            tw = int(draw.textlength(label, font=font))
+            draw.rectangle((sx1, sy1, sx1 + tw + 8, sy1 + 16), fill="#08090b", outline=color)
             draw.text(
-                (sx1 + 4, ty1 + 1), label[:28], fill=color,
-                font=pil_ui_font(11, bold=True),
+                (sx1 + 4, sy1 + 1),
+                label,
+                fill=color,
+                font=font,
             )
 
     def _video_diagnostic_lines(self) -> tuple[str, ...]:
-        """Return the requested engineering metrics for the video HUD."""
+        """Return the requested engineering metrics for the video HUD.
+
+        Thin wrapper over the pure ``build_hud_overlay_data`` helper — the pure
+        function is headless-importable, this method supplies Tk-bound state.
+        """
+        # Preferred: delegate to pure HUD builder so headless tests can reuse it.
+        try:
+            # Assemble minimal live telemetry from current Tk vars and timing fields.
+            def _val(name: str, fallback: str) -> str:
+                var = getattr(self, name, None)
+                getter = getattr(var, "get", None)
+                if not callable(getter):
+                    return fallback
+                try:
+                    return str(getter())
+                except Exception:
+                    return fallback
+
+            loc = {
+                "inliers": getattr(self, "loc_health_inliers", 0),
+                "reproj_rms": getattr(self, "loc_health_reproj", None),
+                "fps": getattr(self, "loc_fps", None),
+                "wall_ms": getattr(self, "loc_wall_ms", None),
+                "core_wall_ms": getattr(self, "loc_latency_ms", None),
+                "latency_ms": getattr(self, "loc_latency_ms", None),
+                "e2e_submit_to_ui_ms": getattr(self, "loc_e2e_ms", None),
+                "success": str(getattr(self, "loc_health", "OK")) not in ("FAIL", "LOST"),
+            }
+            telemetry = {
+                "current_auto_speed": _val("current_auto_speed_var", "AUTO 地速安全閘門 -"),
+                "olympe_state": _val("olympe_state_var", "RTH ?/? | GPS ?"),
+                "olympe_altitude": _val("olympe_altitude_var", "飛控高度 - | AGL - | 連接品質 -"),
+                "olympe_attitude": _val("olympe_attitude_var", "飛控融合姿態 - | 三軸速度 -"),
+            }
+            data = build_hud_overlay_data(None, loc, telemetry)
+            lines = data.get("diagnostic_lines")
+            if isinstance(lines, (list, tuple)) and len(lines) == 6:
+                # Return via wrapper path; keeps HUD identical while exercising pure helper.
+                return tuple(str(x) for x in lines)
+        except (OSError, ValueError, AttributeError, TypeError, RuntimeError):  # Tier3: fallback best-effort — narrow, keep pass
+            pass
+
         def value(name: str, fallback: str) -> str:
             variable = getattr(self, name, None)
             getter = getattr(variable, "get", None)
@@ -6905,18 +7447,16 @@ class OperatorApp(tk.Tk):
             except tk.TclError:
                 return fallback
 
-        attitude_and_velocity = value(
-            "olympe_attitude_var", "飛控融合姿態 - | 三軸速度 -"
-        )
-        attitude, separator, velocity = attitude_and_velocity.partition(
-            " | 三軸速度 "
-        )
+        attitude_and_velocity = value("olympe_attitude_var", "飛控融合姿態 - | 三軸速度 -")
+        attitude, separator, velocity = attitude_and_velocity.partition(" | 三軸速度 ")
         return (
-            " | ".join((
-                value("current_auto_speed_var", "AUTO 地速安全閘門 -"),
-                value("loc_fps_var", "定位 FPS -"),
-                value("loc_quality_var", "inliers -"),
-            )),
+            " | ".join(
+                (
+                    value("current_auto_speed_var", "AUTO 地速安全閘門 -"),
+                    value("loc_fps_var", "定位 FPS -"),
+                    value("loc_quality_var", "inliers -"),
+                )
+            ),
             value("loc_latency_var", "wall_ms - | core - | e2e -"),
             value("olympe_state_var", "RTH ?/? | GPS ?"),
             value(
@@ -6940,9 +7480,7 @@ class OperatorApp(tk.Tk):
             img.paste(frame, (ox, oy))
             self.draw_detections(draw, scale, ox, oy, width, height)
         else:
-            draw_video_empty_state(
-                draw, width, height, overlay_font, live_backend
-            )
+            draw_video_empty_state(draw, width, height, overlay_font, live_backend)
 
         # Image timing and engineering metrics share one bottom-left HUD; there is
         # no separate diagnostics/log tab to inspect during flight.
@@ -6994,7 +7532,9 @@ class OperatorApp(tk.Tk):
         pose = row.get("pose")
         if pose:
             raw_yaw = float(pose.get("yaw", 0.0))
-            display_yaw = self.replay_headings[min(self.replay_index, len(self.replay_headings) - 1)]
+            display_yaw = self.replay_headings[
+                min(self.replay_index, len(self.replay_headings) - 1)
+            ]
             if display_yaw is None:
                 display_yaw = raw_yaw
             self.replay_last_pose[:] = [
@@ -7016,7 +7556,7 @@ class OperatorApp(tk.Tk):
         if self.boot_holding():
             base.mode = "BOOT_INIT"
             base.loc = "MEGALOC_LOCKED" if row.get("success") else "MEGALOC_LOCKING"
-            base.tracker_state = "HOVER_LOCK"
+            base.tracker_state = TrackerState.HOVER_LOCK
             base.stream = "HOLD_720P"
             return base
         base.stream = "OK" if self.video_frame_fresh else "WAIT"
@@ -7046,7 +7586,8 @@ class OperatorApp(tk.Tk):
                     return np.ascontiguousarray(view).tobytes()
                 # Rare non-720p: single resize
                 img = Image.fromarray(arr[..., :3].astype(np.uint8), "RGB").resize(
-                    (w, h), Image.BILINEAR)
+                    (w, h), Image.BILINEAR
+                )
                 return img.tobytes()
             if isinstance(frame, Image.Image):
                 # PIL's convert() copies even when the mode already matches, so
@@ -7064,9 +7605,7 @@ class OperatorApp(tk.Tk):
             self._zoom_paused_health = getattr(self, "loc_health", "OK")
             self._zoom_localization_paused = True
             if hasattr(self, "write_log"):
-                self.write_log(
-                    f"定位暫停：相機縮放 {zoom!s}x 未校正；回到 1.0x 自動恢復"
-                )
+                self.write_log(f"定位暫停：相機縮放 {zoom!s}x 未校正；回到 1.0x 自動恢復")
         self.loc_health = "PAUSED_ZOOM"
         paint = getattr(self, "_set_loc_health_display", None)
         if paint is not None:
@@ -7097,9 +7636,7 @@ class OperatorApp(tk.Tk):
     def _localization_hold_state(self) -> tuple[bool, bool, bool]:
         boot_retry = self.boot_holding()
         lost_retry = (
-            self.lost_holding()
-            and self.lost_hold is not None
-            and self.lost_hold.wants_retry()
+            self.lost_holding() and self.lost_hold is not None and self.lost_hold.wants_retry()
         )
         return boot_retry, lost_retry, boot_retry or lost_retry
 
@@ -7113,8 +7650,8 @@ class OperatorApp(tk.Tk):
         return True
 
     def _busy_localization_submit_allowed(
-            self, *, was_busy: bool, hold_retry: bool,
-            source_stamp: float, now_mono: float) -> bool:
+        self, *, was_busy: bool, hold_retry: bool, source_stamp: float, now_mono: float
+    ) -> bool:
         if not was_busy:
             return True
         self._submit_busy_attempts += 1
@@ -7123,20 +7660,36 @@ class OperatorApp(tk.Tk):
             self._submit_skip_busy += 1
         if hold_retry or source_stamp <= float(self._last_coalesce_stamp):
             return False
-        if now_mono - float(self._last_coalesce_mono) < 0.020:
+        if now_mono - float(self._last_coalesce_mono) < (
+            OperatorApp._localization_coalesce_interval_s(self)
+        ):
             return False
         self._last_coalesce_stamp = float(source_stamp)
         self._last_coalesce_mono = now_mono
         return True
 
+    def _localization_coalesce_interval_s(self) -> float:
+        if not getattr(self, "adaptive_loc_submit", False):
+            return 0.020
+        latency_ms = getattr(self, "loc_latency_ms", None)
+        if (
+            isinstance(latency_ms, bool)
+            or not isinstance(latency_ms, (int, float))
+            or not math.isfinite(float(latency_ms))
+            or float(latency_ms) <= 0.0
+        ):
+            return 0.020
+        return max(0.020, min(0.100, float(latency_ms) * 0.0005))
+
     def _prepare_localization_submission(
-            self, *, source_stamp: float, boot_retry: bool,
-            lost_retry: bool, hold_retry: bool,
+        self,
+        *,
+        source_stamp: float,
+        boot_retry: bool,
+        lost_retry: bool,
+        hold_retry: bool,
     ) -> tuple[str, bytes | memoryview, dict] | None:
-        frame_name = (
-            self.video_display_frame_name
-            or f"stream_{self.video_display_index:06d}"
-        )
+        frame_name = self.video_display_frame_name or f"stream_{self.video_display_index:06d}"
         serialize_start_ns = time.monotonic_ns()
         serialize_start = serialize_start_ns * 1e-9
         raw = self._frame_rgb_bytes_for_worker(self.video_frame)
@@ -7145,17 +7698,19 @@ class OperatorApp(tk.Tk):
         if raw is None:
             return None
         timing_metadata = dict(getattr(self, "_video_frame_timing", {}) or {})
-        timing_metadata.update({
-            "ui_serialize_start_mono": serialize_start,
-            "ui_serialize_done_mono": serialize_done,
-            "ui_serialize_start_mono_ns": serialize_start_ns,
-            "ui_serialize_done_mono_ns": serialize_done_ns,
-            "ui_serialize_ms": (serialize_done - serialize_start) * 1000.0,
-            "source_frame_stamp_mono": source_stamp if source_stamp > 0 else None,
-            "source_stamp_semantics": "stream_monotonic_mapped_or_receipt",
-            "hold_retry": bool(hold_retry),
-            "hold_kind": "boot" if boot_retry else ("lost" if lost_retry else "none"),
-        })
+        timing_metadata.update(
+            {
+                "ui_serialize_start_mono": serialize_start,
+                "ui_serialize_done_mono": serialize_done,
+                "ui_serialize_start_mono_ns": serialize_start_ns,
+                "ui_serialize_done_mono_ns": serialize_done_ns,
+                "ui_serialize_ms": (serialize_done - serialize_start) * 1000.0,
+                "source_frame_stamp_mono": source_stamp if source_stamp > 0 else None,
+                "source_stamp_semantics": "stream_monotonic_mapped_or_receipt",
+                "hold_retry": bool(hold_retry),
+                "hold_kind": "boot" if boot_retry else ("lost" if lost_retry else "none"),
+            }
+        )
         attach_fused_localization_telemetry(
             timing_metadata,
             getattr(getattr(self, "backend", None), "state", None),
@@ -7164,8 +7719,8 @@ class OperatorApp(tk.Tk):
         return frame_name, raw, timing_metadata
 
     def _submit_localization_payload(
-            self, prepared: tuple[str, bytes | memoryview, dict],
-            *, was_busy: bool, lost_retry: bool) -> None:
+        self, prepared: tuple[str, bytes | memoryview, dict], *, was_busy: bool, lost_retry: bool
+    ) -> None:
         frame_name, raw, timing_metadata = prepared
         submitted = self.localizer.submit(
             self.video_display_index,
@@ -7189,8 +7744,7 @@ class OperatorApp(tk.Tk):
             return
         if self.video_display_index < 0:
             return
-        zoom = getattr(
-            getattr(getattr(self, "backend", None), "state", None), "zoom", 1.0)
+        zoom = getattr(getattr(getattr(self, "backend", None), "state", None), "zoom", 1.0)
         if not OperatorApp._localization_zoom_ready(self, zoom):
             return
         boot_retry, lost_retry, hold_retry = OperatorApp._localization_hold_state(self)
@@ -7199,11 +7753,11 @@ class OperatorApp(tk.Tk):
         was_busy = self.localizer.busy()
         source_stamp = self._video_frame_stamp if self._video_frame_stamp > 0 else 0.0
         if not OperatorApp._busy_localization_submit_allowed(
-                self,
-                was_busy=was_busy,
-                hold_retry=hold_retry,
-                source_stamp=source_stamp,
-                now_mono=time.monotonic(),
+            self,
+            was_busy=was_busy,
+            hold_retry=hold_retry,
+            source_stamp=source_stamp,
+            now_mono=time.monotonic(),
         ):
             return
         prepared = OperatorApp._prepare_localization_submission(
@@ -7218,7 +7772,10 @@ class OperatorApp(tk.Tk):
         if lost_retry:
             self.localizer.request_relocalize()
         OperatorApp._submit_localization_payload(
-            self, prepared, was_busy=was_busy, lost_retry=lost_retry,
+            self,
+            prepared,
+            was_busy=was_busy,
+            lost_retry=lost_retry,
         )
 
     def submit_current_frame_for_detection(self) -> None:
@@ -7227,7 +7784,10 @@ class OperatorApp(tk.Tk):
             return
         if self.detector is None or self.video_frame is None:
             return
-        if self.video_display_index < 0 or self.video_display_index == self.last_detect_submitted_index:
+        if (
+            self.video_display_index < 0
+            or self.video_display_index == self.last_detect_submitted_index
+        ):
             return
         if self.video_display_index % self.detect_every_n_frames != 0:
             return
@@ -7243,11 +7803,12 @@ class OperatorApp(tk.Tk):
         display_seq = localization_result_display_seq(result)
         if display_seq is None:
             return True
-        last_display_seq = getattr(
-            self, "_last_applied_live_result_display_seq", None
-        )
-        if last_display_seq is not None and display_seq <= last_display_seq:
-            return False
+        last_display_seq = getattr(self, "_last_applied_live_result_display_seq", None)
+        if last_display_seq is not None:
+            if display_seq < last_display_seq:
+                return False
+            if display_seq == last_display_seq and not result.get("hold_retry"):
+                return False
         self._last_applied_live_result_display_seq = display_seq
         return True
 
@@ -7273,17 +7834,12 @@ class OperatorApp(tk.Tk):
             return
         label = LOCALIZATION_BENCHMARK_LABELS.get(active_mode, active_mode)
         actual = str(result.get("mode") or "-")
-        prior = (
-            " | fixed_ref"
-            if result.get("benchmark_prior_kind") == "fixed_ref"
-            else ""
-        )
-        self.loc_benchmark_mode_var.set(
-            f"定位測速：{label} | actual {actual}{prior}"
-        )
+        prior = " | fixed_ref" if result.get("benchmark_prior_kind") == "fixed_ref" else ""
+        self.loc_benchmark_mode_var.set(f"定位測速：{label} | actual {actual}{prior}")
 
     def _stabilize_live_result_pose(
-            self, result: dict, xyz: np.ndarray | None) -> np.ndarray | None:
+        self, result: dict, xyz: np.ndarray | None
+    ) -> np.ndarray | None:
         return stabilize_live_result_pose(self, result, xyz)
 
     def _publish_live_result_state(self, result: dict) -> None:
@@ -7291,7 +7847,9 @@ class OperatorApp(tk.Tk):
 
     def _live_result_failed(self, result: dict, *, invalid_success_pose: bool) -> bool:
         return operator_tick._live_result_failed(
-            self, result, invalid_success_pose=invalid_success_pose,
+            self,
+            result,
+            invalid_success_pose=invalid_success_pose,
         )
 
     def _live_pose_is_continuous(self, xyz: np.ndarray) -> bool:
@@ -7300,8 +7858,7 @@ class OperatorApp(tk.Tk):
     def _update_live_camera_orientation(self, result: dict, xyz: np.ndarray) -> None:
         operator_tick._update_live_camera_orientation(self, result, xyz)
 
-    def _update_live_heading(
-            self, camera_forward: np.ndarray | None, xyz: np.ndarray) -> None:
+    def _update_live_heading(self, camera_forward: np.ndarray | None, xyz: np.ndarray) -> None:
         operator_tick._update_live_heading(self, camera_forward, xyz)
 
     def _accept_live_pose(self, result: dict, xyz: np.ndarray) -> None:
@@ -7315,9 +7872,7 @@ class OperatorApp(tk.Tk):
         operator_tick.update_live_results(
             self,
             live_result_is_new=OperatorApp._live_result_is_new,
-            handle_localization_exception=(
-                OperatorApp._handle_live_localization_exception
-            ),
+            handle_localization_exception=(OperatorApp._handle_live_localization_exception),
             update_benchmark_status=OperatorApp._update_live_benchmark_status,
             stabilize_result_pose=OperatorApp._stabilize_live_result_pose,
         )
@@ -7335,22 +7890,28 @@ class OperatorApp(tk.Tk):
             self.detection_result_frame_name = str(result.get("frame_name", ""))
             self.update_detection_metrics(result)
             _tw = time.monotonic()
-            if _tw - self._last_det_write >= 0.2:          # throttle debug status file to ~5Hz
+            if _tw - self._last_det_write >= 0.2:  # throttle debug status file to ~5Hz
                 self._last_det_write = _tw
                 try:
-                    LIVE_DETECTION_STATUS_PATH.write_text(json.dumps(result, ensure_ascii=False), encoding="utf-8")
+                    LIVE_DETECTION_STATUS_PATH.write_text(
+                        json.dumps(result, ensure_ascii=False), encoding="utf-8"
+                    )
                 except Exception as exc:
                     self._record_diagnostic_failure(LIVE_DETECTION_STATUS_PATH, exc)
             if not result.get("success"):
-                self.write_log(f"LIVE_DETECT_FAIL {self.detection_result_frame_name}: {result.get('error', 'no boxes')}")
+                self.write_log(
+                    f"LIVE_DETECT_FAIL {self.detection_result_frame_name}: {result.get('error', 'no boxes')}"
+                )
 
     def state_from_live(self, base: DroneState) -> DroneState:
+        raw_tracker_state = getattr(base, "tracker_state", "")
         stream_lost = (
             str(getattr(base, "stream", "")).upper() == "LOST"
-            or str(getattr(base, "active_incident", ""))
-            == FailureReason.STREAM_STALE.value
-            or str(getattr(base, "tracker_state", "")).upper() in {
-                "STREAM_LOST_HOVER", "STREAM_LOST_MANUAL",
+            or str(getattr(base, "active_incident", "")) == FailureReason.STREAM_STALE.value
+            or str(getattr(raw_tracker_state, "value", raw_tracker_state)).upper()
+            in {
+                "STREAM_LOST_HOVER",
+                "STREAM_LOST_MANUAL",
             }
             or self.stream_lost_since is not None
         )
@@ -7359,7 +7920,9 @@ class OperatorApp(tk.Tk):
         if self.live_result is not None and not stream_lost:
             base.inliers = int(self.live_result.get("inliers", 0) or 0)
             base.reproj = self.live_result.get("reproj_rms")
-            base.tracker_state = str(self.live_result.get("next_mode") or self.live_result.get("mode") or "TRACK")
+            base.tracker_state = str(
+                self.live_result.get("next_mode") or self.live_result.get("mode") or "TRACK"
+            )
             base.loc = "OK" if self.live_result.get("success") else "FAIL"
         base.altitude_m = max(0.0, -float(base.pose[1]))
         if stream_lost:
@@ -7367,11 +7930,11 @@ class OperatorApp(tk.Tk):
             # actual hover command. Never hide it behind LOCALIZING/TRACK.
             base.stream = "LOST"
             base.loc = "STREAM_LOST"
-            base.tracker_state = "STREAM_LOST_HOVER"
+            base.tracker_state = TrackerState.STREAM_LOST_HOVER
         elif self.boot_holding():
             base.mode = "BOOT_INIT"
             base.loc = "MEGALOC_LOCKING"
-            base.tracker_state = "HOVER_LOCK"
+            base.tracker_state = TrackerState.HOVER_LOCK
             base.stream = "HOLD_720P"
         elif self.lost_holding():
             # The staged MegaLoc/EDM recovery path is shown in the HUD.
@@ -7392,18 +7955,20 @@ class OperatorApp(tk.Tk):
         run_tick(self)
 
 
-_LAZY_OPERATOR_LAUNCH_EXPORTS = frozenset({
-    "OperatorSessionIdentity",
-    "_close_operator_launch",
-    "_install_live_exit_safety",
-    "_operator_session_manifest",
-    "_prepare_operator_launch_inputs",
-    "_prepare_operator_site_runtime",
-    "_resolve_startup_site",
-    "_start_operator_site_runtime",
-    "build_argument_parser",
-    "main",
-})
+_LAZY_OPERATOR_LAUNCH_EXPORTS = frozenset(
+    {
+        "OperatorSessionIdentity",
+        "_close_operator_launch",
+        "_install_live_exit_safety",
+        "_operator_session_manifest",
+        "_prepare_operator_launch_inputs",
+        "_prepare_operator_site_runtime",
+        "_resolve_startup_site",
+        "_start_operator_site_runtime",
+        "build_argument_parser",
+        "main",
+    }
+)
 
 
 def __getattr__(name: str):

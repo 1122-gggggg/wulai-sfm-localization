@@ -83,6 +83,10 @@ RESULT_FIELDS = (
     "feature_ms",
     "match_ms",
     "pnp_ms",
+    "pnp_candidates",
+    "pnp_skipped",
+    "pnp_workers",
+    "edm_host_feature_cache",
     "mode",
     "next_mode",
     "composite_stage",
@@ -90,11 +94,14 @@ RESULT_FIELDS = (
     "n_corr",
     "reference_count",
     "requested_reference_count",
+    "refs",
     "staged_early_stop",
     "rejected",
     "limited_jump",
     "candidate_mode",
     "global_retrieval_calls",
+    "lost_search_stage",
+    "lost_search_radius_factor",
     "reproj_rms",
     "inlier_ratio",
     "inlier_grid_cells",
@@ -134,6 +141,7 @@ RESULT_FIELDS = (
     "restart_reason",
     "outage_duration_s",
     "rejected_submits",
+    "coalesced_submit_drops",
     "ready_latency_ms",
     "first_result_latency_ms",
     "circuit_breaker_state",
@@ -165,6 +173,7 @@ def build_localization_metric_record(
     submit_ok: int,
     submit_skip_busy: int,
     submit_busy_attempts: int,
+    adaptive_submit_interval_ms: float | None = None,
 ) -> dict[str, Any]:
     """Copy only the stable telemetry contract and add UI-side counters."""
     record = {
@@ -174,7 +183,7 @@ def build_localization_metric_record(
         "wall_ms": result.get("wall_ms"),
         "core_wall_ms": result.get("core_wall_ms", result.get("wall_ms")),
     }
-    record.update((field, result.get(field)) for field in RESULT_FIELDS)
+    record.update((field, result[field]) for field in RESULT_FIELDS if field in result)
     record.update(
         {
             "limited_jump_confirmed": result.get("limited_jump_confirmed", False),
@@ -182,6 +191,7 @@ def build_localization_metric_record(
             "submit_ok": submit_ok,
             "submit_skip_busy": submit_skip_busy,
             "submit_busy_attempts": submit_busy_attempts,
+            "adaptive_submit_interval_ms": adaptive_submit_interval_ms,
         }
     )
     return _json_safe(record)
@@ -314,7 +324,7 @@ def attach_fused_localization_telemetry(
     timing: dict[str, Any],
     state: Any,
 ) -> None:
-    """Copy fused IMU/velocity and its independent acquisition stamp."""
+    """Copy fused IMU, velocity, GNSS, and independent acquisition stamps."""
     if state is None:
         return
     timing.update(
@@ -325,6 +335,12 @@ def attach_fused_localization_telemetry(
             "fused_speed_north": getattr(state, "speed_north_mps", None),
             "fused_speed_east": getattr(state, "speed_east_mps", None),
             "fused_speed_down": getattr(state, "speed_down_mps", None),
+            "fused_gps_latitude": getattr(state, "gps_latitude_deg", None),
+            "fused_gps_longitude": getattr(state, "gps_longitude_deg", None),
+            "fused_gps_altitude": getattr(state, "gps_altitude_m", None),
+            "fused_gps_latitude_accuracy": getattr(state, "gps_latitude_accuracy_m", None),
+            "fused_gps_longitude_accuracy": getattr(state, "gps_longitude_accuracy_m", None),
+            "fused_gps_altitude_accuracy": getattr(state, "gps_altitude_accuracy_m", None),
         }
     )
     fused_mono = _fused_telemetry_mono_s(
@@ -332,3 +348,8 @@ def attach_fused_localization_telemetry(
     )
     if fused_mono is not None:
         timing["fused_telemetry_mono"] = fused_mono
+    gps_mono = _fused_telemetry_mono_s(
+        getattr(state, "gps_read_mono_ns", None),
+    )
+    if gps_mono is not None:
+        timing["fused_gps_mono"] = gps_mono

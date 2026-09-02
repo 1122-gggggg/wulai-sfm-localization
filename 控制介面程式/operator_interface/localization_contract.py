@@ -97,6 +97,104 @@ def _pose_tuple(value: object) -> tuple[float, float, float, float] | None:
 
 
 @dataclass(frozen=True, slots=True)
+class Pose:
+    """Immutable, validated pose in the worker's map frame.
+
+    ``stamp`` is a monotonic timestamp in seconds, matching the worker's
+    ``capture_mono_ns``/``pose_mono_ns`` semantics but exposed as a plain
+    ``float`` for callers that historically used ``stamp``.  The class is
+    ``frozen`` with ``slots`` and validates finite numerics on construction
+    through :meth:`from_dict` / :meth:`from_payload`.
+    """
+
+    x: float
+    y: float
+    z: float
+    yaw: float
+    stamp: float
+
+    @classmethod
+    def from_dict(
+        cls,
+        payload: Mapping[str, Any],
+        *,
+        now_mono_ns: int | None = None,
+    ) -> "Pose":
+        if not isinstance(payload, Mapping):
+            raise InvalidLocalizationResult("payload must be an object")
+        for field_name in ("x", "y", "z", "stamp"):
+            if field_name not in payload or payload[field_name] is None:
+                raise InvalidLocalizationResult(f"missing {field_name}")
+        yaw_value = payload.get("yaw", payload.get("yaw_raw"))
+        if yaw_value is None:
+            raise InvalidLocalizationResult("missing yaw")
+        x = _finite_number(payload["x"], field_name="x")
+        y = _finite_number(payload["y"], field_name="y")
+        z = _finite_number(payload["z"], field_name="z")
+        yaw = _finite_number(yaw_value, field_name="yaw")
+        stamp = _finite_number(payload["stamp"], field_name="stamp")
+        return cls(x=x, y=y, z=z, yaw=yaw, stamp=stamp)
+
+    @classmethod
+    def from_payload(
+        cls,
+        payload: Mapping[str, Any],
+        *,
+        now_mono_ns: int | None = None,
+    ) -> "Pose":
+        return cls.from_dict(payload, now_mono_ns=now_mono_ns)
+
+    @classmethod
+    def from_json(
+        cls,
+        raw: str | bytes | bytearray,
+        *,
+        now_mono_ns: int | None = None,
+    ) -> "Pose":
+        try:
+            payload = json.loads(raw)
+        except (TypeError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise InvalidLocalizationResult("payload is not valid JSON") from exc
+        return cls.from_dict(payload, now_mono_ns=now_mono_ns)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"x": self.x, "y": self.y, "z": self.z, "yaw": self.yaw, "yaw_raw": self.yaw, "stamp": self.stamp}
+
+    def to_payload(self) -> dict[str, Any]:
+        return self.to_dict()
+    def __getitem__(self, key: str) -> Any:
+        if key == "yaw_raw":
+            return self.yaw
+        if key in ("x", "y", "z", "yaw", "stamp"):
+            return getattr(self, key)
+        raise KeyError(key)
+
+    def get(self, key: str, default: Any | None = None) -> Any:
+        try:
+            return self.__getitem__(key)
+        except KeyError:
+            return default
+
+    def __contains__(self, key: object) -> bool:
+        return key in ("x", "y", "z", "yaw", "yaw_raw", "stamp")
+
+    def __setitem__(self, key: str, value: Any) -> None:
+        # Pose is frozen; allow overlay for compat but update core fields when possible.
+        if key in ("x", "y", "z", "yaw", "yaw_raw", "stamp"):
+            # Use object.__setattr__ to mutate frozen slots for dict-like compat.
+            target = "yaw" if key in ("yaw", "yaw_raw") else key
+            object.__setattr__(self, target, float(value) if isinstance(value, (int, float)) else value)  # type: ignore[arg-type]
+            return
+        raise KeyError(key)
+
+    def keys(self):  # type: ignore[override]
+        return ("x", "y", "z", "yaw", "stamp").__iter__()
+
+    def __iter__(self):
+        return iter(("x", "y", "z", "yaw", "stamp"))
+
+
+@dataclass(frozen=True, slots=True)
 class LocalizationResult:
     """Validated subset of one worker response.
 
@@ -177,6 +275,16 @@ class LocalizationResult:
         )
 
     @classmethod
+    def from_dict(
+        cls,
+        payload: Mapping[str, Any],
+        *,
+        now_mono_ns: int | None = None,
+    ) -> "LocalizationResult":
+        """Alias for :meth:`from_payload` retained for dict-style callers."""
+        return cls.from_payload(payload, now_mono_ns=now_mono_ns)
+
+    @classmethod
     def from_json(
         cls,
         raw: str | bytes | bytearray,
@@ -200,5 +308,38 @@ class LocalizationResult:
         payload.setdefault("confidence", self.confidence)
         return payload
 
+    def __getitem__(self, key: str) -> Any:
+        payload = self.to_payload()
+        if key in payload:
+            return payload[key]
+        if key in self._payload:
+            return self._payload[key]
+        raise KeyError(key)
 
-__all__ = ["InvalidLocalizationResult", "LocalizationResult"]
+    def get(self, key: str, default: Any | None = None) -> Any:
+        try:
+            return self.__getitem__(key)
+        except KeyError:
+            return default
+
+    def __contains__(self, key: object) -> bool:
+        payload = self.to_payload()
+        return key in payload or key in self._payload
+
+    def __setitem__(self, key: str, value: Any) -> None:
+        # Dict-like mutation for compat while keeping dataclass frozen semantics.
+        # Bypass frozen check via object.__setattr__.
+        new_payload = dict(self._payload)
+        new_payload[key] = value
+        object.__setattr__(self, "_payload", MappingProxyType(new_payload))
+
+    def keys(self):  # type: ignore[override]
+        return self.to_payload().keys()
+
+    def __iter__(self):
+        return iter(self.to_payload())
+
+    def __len__(self) -> int:
+        return len(self.to_payload())
+
+__all__ = ["InvalidLocalizationResult", "LocalizationResult", "Pose"]

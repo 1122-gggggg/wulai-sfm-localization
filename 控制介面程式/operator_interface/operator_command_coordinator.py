@@ -37,6 +37,7 @@ class OperatorCommandCoordinator:
         write_log: Callable[[str], None] | None,
         record_drop: Callable[[str, str], None] | None,
         safety_commands: Iterable[str],
+        schedule_on_ui_thread: Callable[..., None] | None = None,
     ) -> None:
         self.backend = backend
         self.normal_results = normal_results
@@ -47,13 +48,33 @@ class OperatorCommandCoordinator:
         self.write_log = write_log
         self.record_drop = record_drop
         self.safety_commands = frozenset(safety_commands)
+        # execute()/publish() run both on the caller's thread (synchronous
+        # _backend_command) and on the per-command background thread spawned
+        # by dispatch(). write_log() touches a Tk widget, which is only safe
+        # on the UI thread. When the real app supplies this (Tk's `after`),
+        # every _log() call is marshalled onto the UI thread instead of
+        # running wherever execute()/publish() happened to be called from.
+        # Tests that pass no scheduler keep today's synchronous behaviour.
+        self._schedule_on_ui_thread = schedule_on_ui_thread
         self._accepting = True
 
-    def _log(self, message: str) -> None:
+    def _write_log_safely(self, message: str) -> None:
         if self.write_log is None:
             return
         try:
             self.write_log(message)
+        except Exception:
+            pass
+
+    def _log(self, message: str) -> None:
+        if self.write_log is None:
+            return
+        schedule = self._schedule_on_ui_thread
+        if schedule is None:
+            self._write_log_safely(message)
+            return
+        try:
+            schedule(self._write_log_safely, message)
         except Exception:
             pass
 

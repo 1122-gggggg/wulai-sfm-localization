@@ -1,0 +1,295 @@
+{
+  "site_id": "river_site_edm",
+  "map_ply": "地圖檔/場域/river_site/releases/river_gluemap_all8_direct_20260831/map/map.ply",
+  "rule": "empirical: 6 videos 720p stride3, 1604 danger points (fail 1140 + low 464), clustered voxel 0.117, N_fail=14, N_low=13",
+  "source_videos": [
+    "P1180118_720p.mp4 (632 frames, 49 fail, 49 low)",
+    "P1190119_720p.mp4 (978 frames, 357 fail, 48 low)",
+    "P1570157_720p.mp4 (1028 frames, 224 fail, 109 low)",
+    "P1670167_720p.mp4 (773 frames, 194 fail, 97 low)",
+    "P1680168_720p.mp4 (1772 frames, 255 fail, 153 low)",
+    "河濱_P1170117_720p.mp4 (416 frames, 68 fail, 8 low)"
+  ],
+  "counts": {
+    "total_frames": 5599,
+    "total_fail": 1140,
+    "total_low": 464,
+    "total_danger": 1604,
+    "fail_spheres": 14,
+    "danger_spheres": 27
+  },
+  "geometry": {
+    "voxel": 0.11763713972800767,
+    "scene_p95": 1.1673456924442125,
+    "method": "voxel connected 6-neighbor, radius 2.2*voxel split via kmeans",
+    "filter": "voxel_count>=2 or point_count>=3, top N by point_count"
+  },
+  "spheres": [
+    {
+      "segment_id": 0,
+      "status": "red_intrinsic",
+      "center": [
+        -0.34553981572574766,
+        -0.06792380436358289,
+        -0.3420405260560974
+      ],
+      "radius": 0.46645461574878844,
+      "voxel_count": 12,
+      "point_count": 139,
+      "best_fif": 0.0,
+      "best_lwl": 0.0,
+      "aligned_fif": 0.0,
+      "aligned_lwl": 0.0,
+      "best_visible": 139.0,
+      "best_occupancy": 0.0,
+      "best_lambda_min": 0.0
+    },
+    {
+      "segment_id": 1,
+      "status": "red_intrinsic",
+      "center": [
+        -0.03905228134809773,
+        0.024856692926116718,
+        -0.9908853798701518
+      ],
+      "radius": 0.4140932728536803,
+      "voxel_count": 14,
+      "point_count": 131,
+      "best_fif": 0.0,
+      "best_lwl": 0.0,
+      "aligned_fif": 0.0,
+      "aligned_lwl": 0.0,
+      "best_visible": 131.0,
+      "best_occupancy": 0.0,
+      "best_lambda_min": 0.0
+    },
+    {
+      "segment_id": 2,
+      "status": "red_intrinsic",
+      "center": [
+        -0.03877539082704219,
+        -0.06829071440947133,
+        -0.20333029209723352
+      ],
+      "radius": 0.39620919722111714,
+      "voxel_count": 10,
+      "point_count": 84,
+      "best_fif": 0.0,
+      "best_lwl": 0.0,
+      "aligned_fif": 0.0,
+      "aligned_lwl": 0.0,
+      "best_visible": 84.0,
+      "best_occupancy": 0.0,
+      "best_lambda_min": 0.0
+    },
+    {
+      "segment_id": 3,
+      "status": "red_intrinsic",
+      "center": [
+        0.2601851051893077,
+        -0.13462611466631588,
+        -1.6918531474917886
+      ],
+      "radius": 0.3112564265105572,
+      "voxel_count": 8,
+      "point_count": 168,
+      "best_fif": 0.0,
+      "best_lwl": 0.0,
+      "aligned_fif": 0.0,
+      "aligned_lwl": 0.0,
+      "best_visible": 168.0,
+      "best_occupancy": 0.0,
+      "best_lambda_min": 0.0
+    },
+    {
+      "segment_id": 4,
+      "status": "red_intrinsic",
+      "center": [
+        0.30546685465248014,
+        0.05527536387606437,
+        -1.0502286102496772
+      ],
+      "radius": 0.28047736943014157,
+      "voxel_count": 9,
+      "point_count": 161,
+      "best_fif": 0.0,
+      "best_lwl": 0.0,
+      "aligned_fif": 0.0,
+      "aligned_lwl": 0.0,
+      "best_visible": 161.0,
+      "best_occupancy": 0.0,
+      "best_lambda_min": 0.0
+    },
+    {
+      "segment_id": 5,
+      "status": "red_intrinsic",
+      "center": [
+        0.002944669892535837,
+        0.04931759544364321,
+        -1.6215331006768108
+      ],
+      "radius": 0.2699831786835003,
+      "voxel_count": 6,
+      "point_count": 27,
+      "best_fif": 0.0,
+      "best_lwl": 0.0,
+      "aligned_fif": 0.0,
+      "aligned_lwl": 0.0,
+      "best_visible": 27.0,
+      "best_occupancy": 0.0,
+      "best_lambda_min": 0.0
+    },
+    {
+      "segment_id": 6,
+      "status": "red_intrinsic",
+      "center": [
+        0.02363764298319439,
+        -0.17121545551470527,
+        -0.639713977777397
+      ],
+      "radius": 0.26090563647331244,
+      "voxel_count": 7,
+      "point_count": 61,
+      "best_fif": 0.0,
+      "best_lwl": 0.0,
+      "aligned_fif": 0.0,
+      "aligned_lwl": 0.0,
+      "best_visible": 61.0,
+      "best_occupancy": 0.0,
+      "best_lambda_min": 0.0
+    },
+    {
+      "segment_id": 7,
+      "status": "red_intrinsic",
+      "center": [
+        -0.12238725900838784,
+        -0.2879295165492872,
+        -0.5903128199054524
+      ],
+      "radius": 0.19998559929036386,
+      "voxel_count": 4,
+      "point_count": 166,
+      "best_fif": 0.0,
+      "best_lwl": 0.0,
+      "aligned_fif": 0.0,
+      "aligned_lwl": 0.0,
+      "best_visible": 166.0,
+      "best_occupancy": 0.0,
+      "best_lambda_min": 0.0
+    },
+    {
+      "segment_id": 8,
+      "status": "red_intrinsic",
+      "center": [
+        0.36275891635878826,
+        -0.23864479626207283,
+        -1.700643443670591
+      ],
+      "radius": 0.18821942356481225,
+      "voxel_count": 1,
+      "point_count": 81,
+      "best_fif": 0.0,
+      "best_lwl": 0.0,
+      "aligned_fif": 0.0,
+      "aligned_lwl": 0.0,
+      "best_visible": 81.0,
+      "best_occupancy": 0.0,
+      "best_lambda_min": 0.0
+    },
+    {
+      "segment_id": 9,
+      "status": "red_intrinsic",
+      "center": [
+        0.5047692205600223,
+        -0.15644936204237755,
+        -1.395261659957124
+      ],
+      "radius": 0.18821942356481225,
+      "voxel_count": 2,
+      "point_count": 38,
+      "best_fif": 0.0,
+      "best_lwl": 0.0,
+      "aligned_fif": 0.0,
+      "aligned_lwl": 0.0,
+      "best_visible": 38.0,
+      "best_occupancy": 0.0,
+      "best_lambda_min": 0.0
+    },
+    {
+      "segment_id": 10,
+      "status": "red_intrinsic",
+      "center": [
+        0.3059522997676901,
+        0.276724006413389,
+        -1.4700693499569046
+      ],
+      "radius": 0.18821942356481225,
+      "voxel_count": 1,
+      "point_count": 36,
+      "best_fif": 0.0,
+      "best_lwl": 0.0,
+      "aligned_fif": 0.0,
+      "aligned_lwl": 0.0,
+      "best_visible": 36.0,
+      "best_occupancy": 0.0,
+      "best_lambda_min": 0.0
+    },
+    {
+      "segment_id": 11,
+      "status": "red_intrinsic",
+      "center": [
+        0.8226174878408143,
+        0.33690059963378227,
+        -1.685170555962364
+      ],
+      "radius": 0.18821942356481225,
+      "voxel_count": 2,
+      "point_count": 26,
+      "best_fif": 0.0,
+      "best_lwl": 0.0,
+      "aligned_fif": 0.0,
+      "aligned_lwl": 0.0,
+      "best_visible": 26.0,
+      "best_occupancy": 0.0,
+      "best_lambda_min": 0.0
+    },
+    {
+      "segment_id": 12,
+      "status": "red_intrinsic",
+      "center": [
+        0.32154217199752594,
+        -0.3351647388684936,
+        -1.137662330724145
+      ],
+      "radius": 0.18821942356481225,
+      "voxel_count": 2,
+      "point_count": 15,
+      "best_fif": 0.0,
+      "best_lwl": 0.0,
+      "aligned_fif": 0.0,
+      "aligned_lwl": 0.0,
+      "best_visible": 15.0,
+      "best_occupancy": 0.0,
+      "best_lambda_min": 0.0
+    },
+    {
+      "segment_id": 13,
+      "status": "red_intrinsic",
+      "center": [
+        0.6797521128434938,
+        0.18564207323520826,
+        -1.8064511996966979
+      ],
+      "radius": 0.18821942356481225,
+      "voxel_count": 2,
+      "point_count": 2,
+      "best_fif": 0.0,
+      "best_lwl": 0.0,
+      "aligned_fif": 0.0,
+      "aligned_lwl": 0.0,
+      "best_visible": 2.0,
+      "best_occupancy": 0.0,
+      "best_lambda_min": 0.0
+    }
+  ]
+}

@@ -32,6 +32,11 @@ from production_localizer_factory import build_production_localizer  # noqa: E40
 from site_profile import load_site_profile  # noqa: E402
 from stream_integrity import StreamAudit, ffprobe_frame_count  # noqa: E402
 
+try:  # noqa: E402
+    from edm_matcher import _validate_matcher_cache_budget  # noqa: E402
+except ImportError:  # pragma: no cover - fallback for environments without EDM
+    _validate_matcher_cache_budget = None  # type: ignore[assignment]
+
 
 DEFAULT_SITE_PROFILE = (
     CONTROL_ROOT.parent / "地圖檔" / "場域" / "river_site" / "site_profile.json"
@@ -123,10 +128,26 @@ def metric_summary(values: list[float]) -> dict[str, float | None]:
     }
 
 
+def deterministic_trace_sha256(rows: list[dict], *, include_refs: bool) -> str:
+    digest = hashlib.sha256()
+    for row in rows:
+        item = {
+            "source_index": int(row["source_index"]),
+            "frame_sha256": str(row["frame_sha256"]),
+        }
+        if include_refs:
+            item["refs"] = list(row.get("refs") or [])
+        digest.update(
+            json.dumps(item, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        )
+        digest.update(b"\n")
+    return digest.hexdigest()
+
+
 WORKER_MODES = ("sequential", "production-path")
 SIGMA_MODES = ("fused", "upstream")
 RUNTIME_SIGMA_MODES = ("reference_grid", "bidirectional")
-ACQUIRE_STAGE_MODES = ("full_set", "initial_topk")
+ACQUIRE_STAGE_MODES = ("full_set", "initial_topk", "progressive")
 LOST_STRATEGIES = ("boot_and_lost_once", "boot_once")
 LOST_PRIOR_STRATEGIES = ("restrict_nearby", "full_global", "score_fusion")
 RECEIPT_OVERRIDE_KEYS = (
@@ -139,7 +160,10 @@ RECEIPT_OVERRIDE_KEYS = (
     "fused_coarse_mode",
     "runtime_sigma_mode",
     "temporal_feature_cache_size",
+    "query_cuda_graph",
     "acquire_stage_mode",
+    "track_map_first",
+    "pnp_ranked_batches",
     "lost_prior_strategy",
     "lost_prior_fusion_weight",
     "worker_mode",
@@ -147,9 +171,15 @@ RECEIPT_OVERRIDE_KEYS = (
 PRODUCTION_PATH_UNTRANSMITTED_OVERRIDE_KEYS = (
     "runtime_sigma_mode",
     "temporal_feature_cache_size",
+    "query_cuda_graph",
     "acquire_stage_mode",
     "lost_prior_strategy",
     "lost_prior_fusion_weight",
+    "pnp_pipeline",
+    "track_map_first",
+    "pnp_ranked_batches",
+    "reference_feature_cache_size",
+    "host_reference_feature_cache_size",
 )
 PIPELINE_AGE_KEYS = (
     "capture_source_age_ms",
@@ -213,6 +243,36 @@ def apply_sigma_mode(args) -> None:
         os.environ["SFM_EDM_FUSED_COARSE"] = "1"
 
 
+def effective_megaloc_token_keep_ratio(args) -> float:
+    explicit = _arg(args, "megaloc_token_keep_ratio")
+    if explicit is not None:
+        return float(explicit)
+    return 1.0 if _arg(args, "megaloc_token_reduction", "none") == "none" else 0.5
+
+
+def apply_megaloc_token_reduction(args) -> None:
+    os.environ["SFM_MEGALOC_TOKEN_REDUCTION"] = str(
+        _arg(args, "megaloc_token_reduction", "none")
+    )
+    os.environ["SFM_MEGALOC_TOKEN_KEEP_RATIO"] = str(
+        effective_megaloc_token_keep_ratio(args)
+    )
+    os.environ["SFM_MEGALOC_TOKEN_LAYER"] = str(
+        int(_arg(args, "megaloc_token_layer", 6))
+    )
+
+
+def apply_edm_cache_runtime_flags(args) -> None:
+    flags = (
+        ("SFM_EDM_QUERY_FEATURE_REUSE", "query_feature_reuse"),
+        ("SFM_EDM_TEMPORAL_FEATURE_PROMOTION", "temporal_feature_promotion"),
+        ("SFM_EDM_INCLUSIVE_HOST_FEATURE_CACHE", "inclusive_host_feature_cache"),
+    )
+    for env_name, arg_name in flags:
+        value = bool(_arg(args, arg_name, False))
+        os.environ[env_name] = "1" if value else "0"
+
+
 def _matcher_from_built(built):
     explicit = getattr(built, "_matcher", None)
     if explicit is not None:
@@ -264,17 +324,24 @@ def _validate_config_override(cfg) -> None:
 
 _CONFIG_OVERRIDE_FIELDS = (
     ("radius", "radius", float),
+    ("local_topk", "local_topk", int),
     ("lost_strategy", "global_retrieval_policy", str),
     ("lost_global_retrieval_interval", "lost_global_retrieval_interval", int),
     ("acquire_stage_mode", "acquire_stage_mode", str),
+    ("track_map_first", "track_map_first", bool),
+    ("pnp_ranked_batches", "pnp_ranked_batches", bool),
     ("lost_prior_strategy", "lost_prior_strategy", str),
     ("lost_prior_fusion_weight", "lost_prior_fusion_weight", float),
+    ("pnp_pipeline", "pnp_pipeline", bool),
+    ("use_temporal_reference", "use_temporal_reference", bool),
+    ("reference_quality_weight", "reference_quality_weight", float),
 )
 _MATCHER_OVERRIDE_FIELDS = (
     ("mconf_thr", "mconf_thr", float),
     ("coarse_topk", "topk", int),
     ("cache_capacity", "reference_cache_size", int),
     ("runtime_sigma_mode", "runtime_sigma_mode", str),
+    ("query_cuda_graph", "query_cuda_graph", bool),
 )
 _MATCHER_OVERRIDE_ARG_NAMES = tuple(
     name for name, _attr, _caster in _MATCHER_OVERRIDE_FIELDS
@@ -302,8 +369,54 @@ def _apply_temporal_cache_override(matcher, args) -> None:
         capacity["temporal"] = size
 
 
+def _apply_reference_feature_cache_overrides(matcher, args) -> None:
+    gpu_size = _arg(args, "reference_feature_cache_size")
+    if gpu_size is not None:
+        size = int(gpu_size)
+        try:
+            if _validate_matcher_cache_budget is not None:
+                _validate_matcher_cache_budget(
+                    map_feature_entries=size,
+                    temporal_feature_entries=int(getattr(matcher, "temporal_feature_cache_size", 0) or 0),
+                    map_tensor_entries=int(getattr(matcher, "reference_cache_size", 0) or 0),
+                    temporal_tensor_entries=int(getattr(matcher, "temporal_feature_cache_size", 0) or 0),
+                    host_feature_entries=int(getattr(matcher, "host_reference_feature_cache_size", 0) or 0),
+                )
+            elif size * 9 * 1024 * 1024 > 8 * 1024**3:
+                raise ValueError("reference cache exceeds 8GiB budget")
+        except ValueError:
+            raise
+        except Exception as exc:  # pragma: no cover - defensive
+            raise ValueError(f"reference cache exceeds 8GiB budget: {exc}") from exc
+        matcher.reference_feature_cache_size = size
+        matcher._feature_cache_capacity["map"] = int(size)
+    host_size = _arg(args, "host_reference_feature_cache_size")
+    if host_size is not None:
+        hsize = int(host_size)
+        try:
+            if _validate_matcher_cache_budget is not None:
+                _validate_matcher_cache_budget(
+                    map_feature_entries=int(getattr(matcher, "reference_feature_cache_size", 0) or 0),
+                    temporal_feature_entries=int(getattr(matcher, "temporal_feature_cache_size", 0) or 0),
+                    map_tensor_entries=int(getattr(matcher, "reference_cache_size", 0) or 0),
+                    temporal_tensor_entries=int(getattr(matcher, "temporal_feature_cache_size", 0) or 0),
+                    host_feature_entries=hsize,
+                )
+            elif hsize * 9 * 1024 * 1024 > 4 * 1024**3:
+                raise ValueError("EDM pinned host feature cache exceeds the 4 GiB bound")
+        except ValueError:
+            raise
+        except Exception as exc:  # pragma: no cover - defensive
+            raise ValueError(f"EDM pinned host feature cache exceeds the 4 GiB bound: {exc}") from exc
+        matcher.host_reference_feature_cache_size = int(hsize)
+
+
 def _has_matcher_override(args) -> bool:
-    return any(_arg(args, name) is not None for name in _MATCHER_OVERRIDE_ARG_NAMES)
+    return any(_arg(args, name) is not None for name in (
+        *_MATCHER_OVERRIDE_ARG_NAMES,
+        "reference_feature_cache_size",
+        "host_reference_feature_cache_size",
+    ))
 
 
 def apply_runtime_overrides(args, built) -> None:
@@ -320,6 +433,7 @@ def apply_runtime_overrides(args, built) -> None:
         return
     _apply_named_overrides(matcher, args, _MATCHER_OVERRIDE_FIELDS)
     _apply_temporal_cache_override(matcher, args)
+    _apply_reference_feature_cache_overrides(matcher, args)
 
 
 def build_receipt(args, built) -> dict[str, object]:
@@ -352,6 +466,9 @@ def build_receipt(args, built) -> dict[str, object]:
     temporal_cache = _arg(args, "temporal_feature_cache_size")
     if temporal_cache is None:
         temporal_cache = getattr(matcher, "temporal_feature_cache_size", None)
+    query_cuda_graph = _arg(args, "query_cuda_graph")
+    if query_cuda_graph is None:
+        query_cuda_graph = getattr(matcher, "query_cuda_graph", None)
     acquire_mode = _receipt_choice(
         args,
         "acquire_stage_mode",
@@ -367,6 +484,21 @@ def build_receipt(args, built) -> dict[str, object]:
     fusion_weight = _arg(args, "lost_prior_fusion_weight")
     if fusion_weight is None:
         fusion_weight = getattr(cfg, "lost_prior_fusion_weight", None)
+    reference_feature_cache = _arg(args, "reference_feature_cache_size")
+    if reference_feature_cache is None:
+        reference_feature_cache = getattr(matcher, "reference_feature_cache_size", None)
+    host_feature_cache = _arg(args, "host_reference_feature_cache_size")
+    if host_feature_cache is None:
+        host_feature_cache = getattr(matcher, "host_reference_feature_cache_size", None)
+    pnp_pipeline = _arg(args, "pnp_pipeline")
+    if pnp_pipeline is None:
+        pnp_pipeline = getattr(cfg, "pnp_pipeline", None)
+    track_map_first = _arg(args, "track_map_first")
+    if track_map_first is None:
+        track_map_first = getattr(cfg, "track_map_first", None)
+    pnp_ranked_batches = _arg(args, "pnp_ranked_batches")
+    if pnp_ranked_batches is None:
+        pnp_ranked_batches = getattr(cfg, "pnp_ranked_batches", None)
     return {
         "radius": None if radius is None else float(radius),
         "mconf_thr": None if mconf is None else float(mconf),
@@ -379,11 +511,46 @@ def build_receipt(args, built) -> dict[str, object]:
         "temporal_feature_cache_size": (
             None if temporal_cache is None else int(temporal_cache)
         ),
+        "query_cuda_graph": (
+            None if query_cuda_graph is None else bool(query_cuda_graph)
+        ),
+        "reference_feature_cache_size": (
+            None if reference_feature_cache is None else int(reference_feature_cache)
+        ),
+        "host_reference_feature_cache_size": (
+            None if host_feature_cache is None else int(host_feature_cache)
+        ),
         "acquire_stage_mode": acquire_mode,
         "lost_prior_strategy": prior_strategy,
         "lost_prior_fusion_weight": (
             None if fusion_weight is None else float(fusion_weight)
         ),
+        "pnp_pipeline": None if pnp_pipeline is None else bool(pnp_pipeline),
+        "track_map_first": (
+            None if track_map_first is None else bool(track_map_first)
+        ),
+        "pnp_ranked_batches": (
+            None if pnp_ranked_batches is None else bool(pnp_ranked_batches)
+        ),
+        "query_feature_reuse": bool(_arg(args, "query_feature_reuse", True)),
+        "temporal_feature_promotion": bool(
+            _arg(args, "temporal_feature_promotion", False)
+        ),
+        "inclusive_host_feature_cache": bool(
+            _arg(args, "inclusive_host_feature_cache", False)
+        ),
+        "megaloc_backend": str(_arg(args, "megaloc_backend", "tensorrt")),
+        "megaloc_engine": (
+            None
+            if _arg(args, "megaloc_engine") is None
+            else str(Path(_arg(args, "megaloc_engine")).expanduser().resolve())
+        ),
+        "megaloc_engine_sha256": _arg(args, "megaloc_engine_sha256"),
+        "megaloc_token_reduction": str(
+            _arg(args, "megaloc_token_reduction", "none")
+        ),
+        "megaloc_token_keep_ratio": effective_megaloc_token_keep_ratio(args),
+        "megaloc_token_layer": int(_arg(args, "megaloc_token_layer", 6)),
         "worker_mode": str(_arg(args, "worker_mode", "sequential") or "sequential"),
     }
 
@@ -582,12 +749,36 @@ def _row_from_worker_payload(payload: dict, identities: dict) -> dict:
             return None
     pose = payload.get("pose")
     success = bool(payload.get("success"))
+    # Derive center from pose if available: pose may be dict with x,y,z or list/tuple
+    center = None
+    if isinstance(pose, dict):
+        try:
+            cx = float(pose.get("x", pose.get("tx", pose.get("0"))))
+            cy = float(pose.get("y", pose.get("ty", pose.get("1"))))
+            cz = float(pose.get("z", pose.get("tz", pose.get("2"))))
+            if all(v is not None for v in (cx, cy, cz)):
+                center = [cx, cy, cz]
+        except Exception:
+            center = None
+    elif isinstance(pose, (list, tuple)) and len(pose) >= 3:
+        try:
+            center = [float(pose[0]), float(pose[1]), float(pose[2])]
+        except Exception:
+            center = None
+    elif hasattr(pose, "x"):
+        try:
+            center = [float(pose.x), float(pose.y), float(pose.z)]
+        except Exception:
+            center = None
     row = {
         "source_index": identity.get("source_index", payload.get("display_seq")),
         "frame_id": frame_id or identity.get("frame_id"),
         "frame_sha256": identity.get("frame_sha256"),
         "capture_stamp": identity.get("recorded_stamp"),
         "success": success,
+        "center": center,
+        "estimated_center": center,
+        "pose_xyz": center,
         "ok": success if payload.get("ok") is None else bool(payload.get("ok")),
         "mode": payload.get("mode") or payload.get("state_in"),
         "next_mode": payload.get("next_mode") or payload.get("state_out"),
@@ -757,6 +948,8 @@ def runtime_stub_from_profile(site, args):
         lost_prior_fusion_weight=float(
             tracker.get("lost_prior_fusion_weight", 1.0)
         ),
+        track_map_first=bool(tracker.get("track_map_first", False)),
+        pnp_ranked_batches=bool(tracker.get("pnp_ranked_batches", False)),
     )
     matcher_obj = SimpleNamespace(
         mconf_thr=float(matcher["mconf_thr"]),
@@ -766,6 +959,7 @@ def runtime_stub_from_profile(site, args):
         temporal_feature_cache_size=_profile_temporal_feature_cache_size(
             tracker, matcher
         ),
+        query_cuda_graph=bool(matcher.get("query_cuda_graph", False)),
     )
     stub = SimpleNamespace(
         tracker=None,
@@ -847,6 +1041,15 @@ def evaluate_quality(summary: dict, baseline: dict) -> list[str]:
         )
         if not passed:
             failures.append(f"{name}: actual={actual} required {operator} {expected}")
+    deterministic = baseline.get("deterministic")
+    if isinstance(deterministic, dict):
+        actual_trace = summary.get("deterministic") or {}
+        for key in ("frame_schedule_sha256", "reference_trace_sha256"):
+            expected = deterministic.get(key)
+            if expected is not None and actual_trace.get(key) != expected:
+                failures.append(
+                    f"{key}: actual={actual_trace.get(key)!r} required == {expected!r}"
+                )
     return failures
 
 
@@ -873,6 +1076,11 @@ def parse_args() -> argparse.Namespace:
         "--radius",
         type=float,
         help="benchmark-only local reference search radius override",
+    )
+    parser.add_argument(
+        "--local-topk",
+        type=int,
+        help="override TRACK local reference top-k",
     )
     parser.add_argument("--pnp-random-seed", type=int, default=0)
     parser.add_argument(
@@ -902,6 +1110,70 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mconf-thr", type=float, help="override matcher confidence threshold")
     parser.add_argument("--coarse-topk", type=int, help="override matcher coarse topk")
     parser.add_argument("--cache-capacity", type=int, help="override matcher reference cache size")
+    parser.add_argument(
+        "--reference-feature-cache-size",
+        type=int,
+        help="override GPU reference backbone feature-cache entries",
+    )
+    parser.add_argument(
+        "--host-reference-feature-cache-size",
+        type=int,
+        help="override pinned-host reference backbone feature-cache entries",
+    )
+    parser.add_argument(
+        "--pnp-pipeline",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="overlap per-reference CPU PnP with subsequent EDM GPU batches",
+    )
+    parser.add_argument(
+        "--track-map-first",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="try one map reference before adding the temporal reference",
+    )
+    parser.add_argument(
+        "--pnp-ranked-batches",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="rank reference hypotheses and stop PnP after a passing batch",
+    )
+    parser.add_argument(
+        "--query-cuda-graph",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="capture the fixed-shape query backbone in a CUDA graph",
+    )
+    parser.add_argument(
+        "--query-feature-reuse",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument(
+        "--temporal-feature-promotion",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument(
+        "--inclusive-host-feature-cache",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument(
+        "--megaloc-backend",
+        choices=("pytorch", "pytorch_fp16", "tensorrt"),
+        default="tensorrt",
+    )
+    parser.add_argument("--megaloc-engine", type=Path)
+    parser.add_argument("--megaloc-engine-sha256")
+    parser.add_argument(
+        "--megaloc-token-reduction",
+        choices=("none", "l2", "evit"),
+        default="none",
+        help="query-only training-free token reduction from arXiv:2607.15563v1",
+    )
+    parser.add_argument("--megaloc-token-keep-ratio", type=float)
+    parser.add_argument("--megaloc-token-layer", type=int, default=6)
     parser.add_argument(
         "--lost-strategy",
         choices=list(LOST_STRATEGIES),
@@ -941,6 +1213,17 @@ def parse_args() -> argparse.Namespace:
         "--lost-prior-fusion-weight",
         type=float,
         help="override LOST score-fusion prior weight",
+    )
+    parser.add_argument(
+        "--use-temporal-reference",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="override temporal reference enablement",
+    )
+    parser.add_argument(
+        "--reference-quality-weight",
+        type=float,
+        help="override reference quality ranking weight",
     )
     parser.add_argument(
         "--gpu-span",
@@ -1005,12 +1288,41 @@ _OPTIONAL_RUN_INPUT_CHECKS = (
     ),
     ("mconf_thr", None, None, _is_unit_interval, "mconf-thr must be finite and within [0, 1]"),
     ("coarse_topk", None, None, _is_positive_int, "coarse-topk must be a positive integer"),
+    ("local_topk", None, None, _is_positive_int, "local-topk must be a positive integer"),
     (
         "cache_capacity",
         None,
         None,
         _is_nonneg_int,
         "cache-capacity must be a non-negative integer",
+    ),
+    (
+        "reference_feature_cache_size",
+        None,
+        None,
+        _is_nonneg_int,
+        "reference-feature-cache-size must be a non-negative integer",
+    ),
+    (
+        "host_reference_feature_cache_size",
+        None,
+        None,
+        _is_nonneg_int,
+        "host-reference-feature-cache-size must be a non-negative integer",
+    ),
+    (
+        "megaloc_token_keep_ratio",
+        None,
+        None,
+        lambda value: _is_unit_interval(value) and float(value) > 0.0,
+        "megaloc-token-keep-ratio must be within (0, 1]",
+    ),
+    (
+        "megaloc_token_layer",
+        6,
+        None,
+        _is_positive_int,
+        "megaloc-token-layer must be a positive integer",
     ),
     (
         "lost_global_retrieval_interval",
@@ -1073,6 +1385,32 @@ def _validate_run_inputs(args) -> tuple[Path, Path]:
         raise SystemExit("stride must be > 0; frame/correspondence limits must be >= 0")
     _validate_override_run_inputs(args)
     _reject_untransmitted_production_overrides(args)
+    if (
+        args.megaloc_token_reduction != "none"
+        and args.megaloc_backend == "tensorrt"
+    ):
+        raise SystemExit(
+            "token reduction requires --megaloc-backend pytorch or pytorch_fp16"
+        )
+    if args.megaloc_engine is not None:
+        digest = str(args.megaloc_engine_sha256 or "")
+        if len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
+            raise SystemExit("--megaloc-engine requires a lowercase 64-character SHA-256")
+        if not args.megaloc_engine.expanduser().is_file():
+            raise SystemExit(f"MegaLoc engine not found: {args.megaloc_engine}")
+    elif args.megaloc_engine_sha256:
+        raise SystemExit("--megaloc-engine-sha256 requires --megaloc-engine")
+    if args.worker_mode == "production-path" and (
+        args.megaloc_token_reduction != "none"
+        or args.megaloc_backend != "tensorrt"
+        or not args.query_feature_reuse
+        or args.temporal_feature_promotion
+        or args.inclusive_host_feature_cache
+        or args.megaloc_engine is not None
+    ):
+        raise SystemExit(
+            "production-path does not transmit MegaLoc backend/token overrides"
+        )
     site_path = args.site_profile.expanduser().resolve()
     video_path = args.video.expanduser().resolve()
     if not video_path.is_file():
@@ -1136,6 +1474,8 @@ def _load_replay_profile(args, site_path: Path, video_path: Path):
 
 def _build_replay_runtime(args, site, camera_tuple):
     apply_sigma_mode(args)
+    apply_megaloc_token_reduction(args)
+    apply_edm_cache_runtime_flags(args)
     startup_started = time.perf_counter()
     built = build_production_localizer(
         backend="edm",
@@ -1145,6 +1485,9 @@ def _build_replay_runtime(args, site, camera_tuple):
         camera_tuple=camera_tuple,
         production_profile=site.localizer_profile,
         production_profile_sha256=site.asset_sha256.localizer_profile,
+        megaloc_backend=args.megaloc_backend,
+        megaloc_engine=args.megaloc_engine,
+        megaloc_engine_sha256=args.megaloc_engine_sha256,
     )
     if args.max_corr_total:
         built.config.max_corr_total = int(args.max_corr_total)
@@ -1227,6 +1570,9 @@ def _process_replay_frame(
         "frame_sha256": identity["frame_sha256"],
         "capture_stamp": capture_stamp,
         "success": pose is not None,
+        "center": (None if center is None else [float(center[0]), float(center[1]), float(center[2])]),
+        "estimated_center": (None if next_center is None else [float(next_center[0]), float(next_center[1]), float(next_center[2])]),
+        "pose_xyz": (None if center is None else [float(center[0]), float(center[1]), float(center[2])]),
         "mode": info.get("mode"),
         "next_mode": info.get("next_mode"),
         "rejected": info.get("rejected"),
@@ -1480,6 +1826,14 @@ def _summarize_replay(
         "processing_s": processing_s,
         "processing_fps": len(rows) / processing_s if processing_s > 0.0 else 0.0,
         "pipeline": pipeline_summary(rows),
+        "deterministic": {
+            "frame_schedule_sha256": deterministic_trace_sha256(
+                rows, include_refs=False
+            ),
+            "reference_trace_sha256": deterministic_trace_sha256(
+                rows, include_refs=True
+            ),
+        },
 
     }
 

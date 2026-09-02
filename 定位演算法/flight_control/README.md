@@ -7,8 +7,11 @@
 
 ```bash
 .venv/bin/python 控制介面程式/launch_mission.py \
-  控制介面程式/mission_selections/river_site_b0_p116_p117_localization.json
+  控制介面程式/mission_selections/river_gluemap_all8_direct_localization.json
 ```
+
+此全八段地圖尚未通過獨立定位品質與 ANAFI camera-pipeline 驗證，上述入口目前會
+fail closed；這是預期的安全狀態，不得繞過 receipt 守門。
 
 或 `控制介面程式/真機串流/啟動.sh`。此專案的 agent 不得執行 `--fly` 或代為授權 AUTO。
 

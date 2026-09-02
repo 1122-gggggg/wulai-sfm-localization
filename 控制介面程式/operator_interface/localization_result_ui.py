@@ -3,12 +3,12 @@ from __future__ import annotations
 
 import math
 import time
+from collections.abc import Mapping
 from typing import Any
 
 import numpy as np
 
 from localization_contract import InvalidLocalizationResult, LocalizationResult
-
 
 def _stabilized_yaw(
     raw_pose: dict, yaw_update: object, stamp: float
@@ -31,12 +31,16 @@ def _stabilized_yaw(
 
 
 def stabilize_live_result_pose(
-    owner: Any, result: dict, xyz: np.ndarray | None
+    owner: Any, result: Any, xyz: np.ndarray | None
 ) -> np.ndarray | None:
     """Filter the UI/control pose while retaining the raw worker pose."""
     if xyz is None:
         return xyz
-    pose_value = result.get("pose")
+    # Dict-like fallback: support both dict and LocalizationResult typed.
+    try:
+        pose_value = result.get("pose") if hasattr(result, "get") else result["pose"] if isinstance(result, Mapping) else None
+    except Exception:
+        pose_value = None
     if not isinstance(pose_value, dict):
         return xyz
     xyz_stabilizer = getattr(owner, "pose_stabilizer", None)
@@ -74,9 +78,35 @@ def stabilize_live_result_pose(
     return filtered_xyz
 
 
-def normalize_live_localization_result(result: object) -> tuple[dict, np.ndarray | None]:
+def normalize_live_localization_result(result: object) -> tuple[Any, np.ndarray | None]:
     """Downgrade a worker success unless it contains a complete finite XYZ pose."""
+    # Support typed LocalizationResult via Mapping protocol; keep __getitem__ fallback.
+    if isinstance(result, LocalizationResult):
+        payload = result.to_payload()
+        pose = payload.get("pose")
+        xyz = None
+        try:
+            if isinstance(pose, dict):
+                xyz = np.asarray([float(pose[name]) for name in ("x", "y", "z")], dtype=float)
+                if xyz.shape != (3,) or not np.isfinite(xyz).all():
+                    xyz = None
+        except (KeyError, TypeError, ValueError, OverflowError):
+            xyz = None
+        if not payload.get("success"):
+            return result, xyz
+        if xyz is None:
+            downgraded = dict(payload)
+            downgraded["success"] = False
+            downgraded["error"] = "invalid localization pose: x/y/z must be finite"
+            return downgraded, None
+        return result, xyz
     if not isinstance(result, dict):
+        # Mapping-typed fallback for duck-typed results
+        if isinstance(result, Mapping):
+            try:
+                return dict(result), None  # will be re-validated downstream
+            except Exception:
+                pass
         return {"success": False, "error": "invalid localization result: expected object"}, None
     normalized = dict(result)
     pose = normalized.get("pose")
@@ -97,19 +127,25 @@ def normalize_live_localization_result(result: object) -> tuple[dict, np.ndarray
     return normalized, xyz
 
 
-def localization_result_display_seq(result: dict) -> int | None:
+def localization_result_display_seq(result: Any) -> int | None:
     """Return the client publication order, with a legacy worker fallback."""
-    display_seq = result.get("display_seq")
+    try:
+        display_seq = result.get("display_seq") if hasattr(result, "get") else result["display_seq"] if isinstance(result, Mapping) else None
+    except Exception:
+        display_seq = None
     if display_seq is None:
-        display_seq = result.get("seq")
+        try:
+            display_seq = result.get("seq") if hasattr(result, "get") else result["seq"] if isinstance(result, Mapping) else None
+        except Exception:
+            display_seq = None
     if isinstance(display_seq, bool) or not isinstance(display_seq, int):
         return None
     return display_seq if display_seq >= 0 else None
 
 
-def validate_live_localization_result(result: object) -> dict:
+def validate_live_localization_result(result: object) -> Any:
     """Validate new worker payloads once while retaining dict compatibility."""
-    if not isinstance(result, dict):
+    if not isinstance(result, Mapping):
         return {
             "success": False,
             "validity": False,
@@ -118,14 +154,28 @@ def validate_live_localization_result(result: object) -> dict:
             "localization_exception": True,
             "error": "invalid localization result: expected object",
         }
-    if result.get("localization_contract_version") != 1:
+    # Mapping-typed support via duck typing / LocalizationResult.
+    try:
+        version = result.get("localization_contract_version") if hasattr(result, "get") else result["localization_contract_version"]  # type: ignore
+    except Exception:
+        version = None
+    if version != 1:
         # Older test doubles/plugins remain readable until they opt into the
         # explicit boundary fields. Production worker payloads always carry v1.
-        return dict(result)
+        if isinstance(result, LocalizationResult):
+            return result
+        return dict(result)  # type: ignore[arg-type]
     try:
-        return LocalizationResult.from_payload(result).to_payload()
+        # Convert via from_dict once at poll entry; keep typed for downstream.
+        if isinstance(result, LocalizationResult):
+            return result
+        return LocalizationResult.from_dict(result)  # type: ignore[arg-type]
     except InvalidLocalizationResult as exc:
-        invalid = dict(result)
+        invalid = dict(result) if isinstance(result, dict) else dict(result)  # type: ignore[arg-type]
+        try:
+            invalid = dict(result)  # type: ignore[arg-type]
+        except Exception:
+            invalid = {}
         invalid.update({
             "success": False,
             "validity": False,
@@ -297,55 +347,66 @@ class TemporalYawStabilizer:
         }
 
 
-def annotate_ui_arrival_timing(result: dict, now: float | None = None) -> dict:
+def annotate_ui_arrival_timing(result: Any, now: float | None = None) -> Any:
     """Attach UI-consumption timing without calling a stream stamp capture time."""
     arrival_ns = time.monotonic_ns() if now is None else int(round(float(now) * 1e9))
     arrival = arrival_ns * 1e-9
-    result["ui_arrival_mono"] = arrival
-    result["ui_arrival_mono_ns"] = arrival_ns
+    # Dict-like fallback: support LocalizationResult via __setitem__.
+    try:
+        result["ui_arrival_mono"] = arrival  # type: ignore[index]
+        result["ui_arrival_mono_ns"] = arrival_ns  # type: ignore[index]
+    except Exception:
+        try:
+            if isinstance(result, dict):
+                result["ui_arrival_mono"] = arrival
+                result["ui_arrival_mono_ns"] = arrival_ns
+        except Exception:
+            pass
 
     def elapsed_ms(start_key: str, out_key: str) -> None:
-        start = result.get(start_key)
+        try:
+            start = result.get(start_key) if hasattr(result, "get") else None  # type: ignore
+        except Exception:
+            start = None
         if start is None:
             return
         try:
-            result[out_key] = max(0.0, (arrival - float(start)) * 1000.0)
+            value = max(0.0, (arrival - float(start)) * 1000.0)
+            result[out_key] = value  # type: ignore[index]
         except (TypeError, ValueError, OverflowError):
+            pass
+        except Exception:
             pass
 
     elapsed_ms("client_submit_mono", "e2e_submit_to_ui_ms")
     elapsed_ms("client_response_mono", "ui_poll_delay_ms")
-    # This stamp may be NTP-mapped or callback-receipt time. Keep the neutral
-    # "source stamp" name; it is not guaranteed camera capture latency.
     elapsed_ms("source_frame_stamp_mono", "source_stamp_age_at_ui_ms")
-    callback_ns = result.get("frame_callback_enter_mono_ns")
+    try:
+        callback_ns = result.get("frame_callback_enter_mono_ns") if hasattr(result, "get") else None  # type: ignore
+    except Exception:
+        callback_ns = None
     if callback_ns is not None:
         try:
-            result["callback_to_ui_ms"] = max(
+            result["callback_to_ui_ms"] = max(  # type: ignore[index]
                 0.0, (arrival_ns - int(callback_ns)) / 1_000_000.0)
         except (TypeError, ValueError, OverflowError):
+            pass
+        except Exception:
             pass
     return result
 
 
 def localization_pose_timestamp(
-    result: dict,
+    result: Any,
     *,
     arrival_mono: float | None = None,
 ) -> float | None:
-    """Return the conservative monotonic timestamp for a published pose.
-
-    A worker response can arrive well after the frame it localized.  Source and
-    capture timestamps therefore take precedence over UI arrival; the earliest
-    valid timing marker is used so either capture age or processing/queue delay
-    makes the pose stale.  Older payloads without timing fields fall back to
-    their UI arrival timestamp for compatibility.
-    """
+    """Return the conservative monotonic timestamp for a published pose."""
     candidates: list[float] = []
 
     def add(value: object, *, nanoseconds: bool = False) -> None:
         try:
-            number = float(value)
+            number = float(value)  # type: ignore[arg-type]
         except (TypeError, ValueError, OverflowError):
             return
         if nanoseconds:
@@ -353,13 +414,19 @@ def localization_pose_timestamp(
         if math.isfinite(number) and number > 0.0:
             candidates.append(number)
 
+    def _get(key: str) -> Any:
+        try:
+            return result.get(key) if hasattr(result, "get") else None  # type: ignore
+        except Exception:
+            return None
+
     for key in (
         "source_frame_stamp_mono",
         "worker_core_done_mono",
         "client_submit_mono",
         "client_response_mono",
     ):
-        add(result.get(key))
+        add(_get(key))
     for key in (
         "source_frame_stamp_mono_ns",
         "capture_mono_ns",
@@ -368,20 +435,26 @@ def localization_pose_timestamp(
         "client_submit_mono_ns",
         "client_response_mono_ns",
     ):
-        add(result.get(key), nanoseconds=True)
+        add(_get(key), nanoseconds=True)
     if candidates:
         return min(candidates)
 
-    fallback = result.get("ui_arrival_mono", arrival_mono)
+    fallback = _get("ui_arrival_mono")
+    if fallback is None:
+        fallback = arrival_mono
     try:
-        value = float(fallback)
+        value = float(fallback)  # type: ignore[arg-type]
     except (TypeError, ValueError, OverflowError):
         return None
     return value if math.isfinite(value) and value > 0.0 else None
 
 
-def localization_result_is_weak(result: dict) -> bool:
-    state = str(result.get("next_mode") or result.get("mode") or "").upper()
-    return bool(result.get("weak")) or state in {
-        "WEAK", "WEAK_TRACK", "LOST", "FAIL", "TRACK_FAIL", "TRACK_LOST",
-    }
+def localization_result_is_weak(result: Any) -> bool:
+    try:
+        get = result.get if hasattr(result, "get") else lambda k, d=None: result[k] if k in result else d  # type: ignore
+        state = str(get("next_mode") or get("mode") or "").upper()
+        return bool(get("weak")) or state in {
+            "WEAK", "WEAK_TRACK", "LOST", "FAIL", "TRACK_FAIL", "TRACK_LOST",
+        }
+    except Exception:
+        return False

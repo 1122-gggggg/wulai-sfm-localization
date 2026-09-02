@@ -50,12 +50,29 @@ class EDM(nn.Module):
 
         # 1. Feature Extraction
         if data["hw0_i"] == data["hw1_i"]:
-            # faster & better BN convergence
-            feats = self.backbone(
-                torch.cat([data["image0"], data["image1"]], dim=0))
-            f8, f16, f32, f8_fine = feats
-            ms_feats = f8, f16, f32
-            feat_f0, feat_f1 = f8_fine.chunk(2)
+            # GPU redundancy: skip torch.cat([image0,image1], dim=0) (9.4MB alloc) when cache fully hit
+            # and directly pass cached pyramid features to neck via _backbone_from_cache.
+            # Guard: if getattr(self, '_backbone_plan', None) is not None and cache_fully_hit: then bypass cat and call cached path; keep fallback cat when miss to preserve exact cold-frame behavior.
+            # Ledger: 15-25% saving claim for query repeat->expand rejected pending synchronized exact benchmark (docs/verified_localization_optimization_ledger.md: query tensor repeat改expand not yet verified)
+            cache_fully_hit = bool(getattr(self, '_cache_fully_hit', False))
+            if getattr(self, '_backbone_plan', None) is not None and cache_fully_hit and getattr(self, '_cached_pyramid', None) is not None:
+                # Cache fully hit: directly pass cached pyramid features to neck, skip 9.4MB torch.cat([image0,image1]) alloc.
+                # _backbone_from_cache on matcher assembled pyramid from cache without reading pixels; reuse here.
+                f8, f16, f32, f8_fine = self._cached_pyramid
+                ms_feats = f8, f16, f32
+                feat_f0, feat_f1 = f8_fine.chunk(2)
+            elif getattr(self, '_backbone_plan', None) is not None and cache_fully_hit:
+                # Cached but pyramid not precomputed (fallback): backbone's cached_forward will reuse cache.
+                # Still guard before cat; keep fallback cat when miss.
+                feats = self.backbone(torch.cat([data["image0"], data["image1"]], dim=0))
+                f8, f16, f32, f8_fine = feats
+                ms_feats = f8, f16, f32
+                feat_f0, feat_f1 = f8_fine.chunk(2)
+            else:
+                feats = self.backbone(torch.cat([data["image0"], data["image1"]], dim=0))
+                f8, f16, f32, f8_fine = feats
+                ms_feats = f8, f16, f32
+                feat_f0, feat_f1 = f8_fine.chunk(2)
         else:
             # handle different input shapes
             # raise ValueError("image0 and image1 should have the same shape.")

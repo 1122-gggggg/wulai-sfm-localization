@@ -1,13 +1,70 @@
 """Shared ANAFI profile and operator telemetry state."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from enum import Enum
 
 import numpy as np
 
 
 STREAM_WIDTH = 1280
 STREAM_HEIGHT = 720
+
+
+class TrackerState(str, Enum):
+    """UI/backend flight-command state for display and session logging.
+
+    C2: collapses the previously-scattered string literals assigned to
+    DroneState.tracker_state into one enum. A TrackerState member compares
+    equal to its own string value (`TrackerState.HOVER == "HOVER"`), so every
+    existing comparison/log call keeps working unchanged -- this is additive
+    type safety, not a behavior change. Distinct from the localization
+    algorithm's own internal state names (BOOT_INIT/TRACK/WEAK_TRACK/LOST in
+    定位演算法/deploy_code/sfm_glomap_deploy/production_edm_tracker.py).
+
+    Two write sites intentionally still assign a plain ``str`` rather than a
+    member of this enum, and are not refactored in this batch:
+      - olympe_live_backend.py forwards the ANAFI firmware's own
+        FlyingStateChanged string (uppercased) when nothing more specific
+        (this enum's values) already applies.
+      - flight_operator_app.py forwards the localization worker's own
+        next_mode/mode string (TRACK/WEAK_TRACK/LOST/...) for the live HUD.
+    Both are externally-sourced vocabularies this UI does not control, so
+    coercing them into a closed enum would mean silently dropping or
+    mis-mapping a state name the firmware/worker introduces later.
+    """
+
+    BOOT = "BOOT"
+    BOOT_INIT = "BOOT_INIT"
+    EMERGENCY_MANUAL = "EMERGENCY_MANUAL"
+    FAIL_SAFE_HOVER = "FAIL_SAFE_HOVER"
+    FAIL_SAFE_MANUAL = "FAIL_SAFE_MANUAL"
+    GRAVITY_CAL = "GRAVITY_CAL"
+    HOVER = "HOVER"
+    HOVER_LOCK = "HOVER_LOCK"
+    LAND = "LAND"
+    LANDING = "LANDING"
+    LAND_UNCONFIRMED = "LAND_UNCONFIRMED"
+    LINK = "LINK"
+    LINK_LOST_ONBOARD = "LINK_LOST_ONBOARD"
+    LOCALIZATION_ONLY = "LOCALIZATION_ONLY"
+    NUDGE = "NUDGE"
+    PC = "PC"
+    PC_FROZEN = "PC_FROZEN"
+    ROUTE_TEST = "ROUTE_TEST"
+    ROUTE_TEST_COMPLETE = "ROUTE_TEST_COMPLETE"
+    RTH = "RTH"
+    SAFETY_ACTION_PENDING = "SAFETY_ACTION_PENDING"
+    SOURCE_FAIL = "SOURCE_FAIL"
+    STICK_MONITOR_FAIL = "STICK_MONITOR_FAIL"
+    STICKS = "STICKS"
+    STREAM_LOST_HOVER = "STREAM_LOST_HOVER"
+    STREAM_LOST_MANUAL = "STREAM_LOST_MANUAL"
+    TAKEOFF = "TAKEOFF"
+    TAKEOFF_BLOCKED = "TAKEOFF_BLOCKED"
+    TAKEOFF_FAIL = "TAKEOFF_FAIL"
+    TRACK = "TRACK"
 
 
 @dataclass(frozen=True)
@@ -39,7 +96,7 @@ ANAFI = AnafiProfile()
 @dataclass
 class DroneState:
     mode: str = "MANUAL"
-    tracker_state: str = "HOVER"
+    tracker_state: TrackerState = TrackerState.HOVER
     loc: str = "SIM"
     stream: str = "WAIT"
     pose: np.ndarray = field(default_factory=lambda: np.zeros(4, dtype=float))
@@ -53,6 +110,7 @@ class DroneState:
     link_latency_ms: float = ANAFI.stream_latency_ms
     frame_age_ms: float | None = None
     telemetry_read_mono_ns: int | None = None
+    gps_read_mono_ns: int | None = None
     last_pcmd_call_mono_ns: int | None = None
     pcmd_to_telemetry_poll_ms: float | None = None
     stream_fps: float = ANAFI.stream_fps

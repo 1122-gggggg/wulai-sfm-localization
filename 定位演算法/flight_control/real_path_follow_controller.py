@@ -771,7 +771,11 @@ class SparseCloudCollisionMonitor:
 
     def update(self, pos: np.ndarray) -> dict:
         if self.tree is None:
-            return {"status": "OFF", "distance": None, "point": None, "severity": 0.0}
+            # cKDTree is None either because scipy is not installed -- the
+            # monitor cannot check anything, which must not read like "no
+            # obstacle nearby" -- or because the supplied cloud was empty.
+            status = "UNAVAILABLE" if cKDTree is None else "OFF"
+            return {"status": status, "distance": None, "point": None, "severity": 0.0}
         d, idx = self.tree.query(np.asarray(pos, float), k=1)
         d = float(d)
         point = self.xyz[int(idx)].astype(float).tolist() if np.isfinite(d) else None

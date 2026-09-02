@@ -80,7 +80,11 @@ def make_tracker() -> tuple[ProductionEDMTracker, FakeLocalizer, list[int]]:
     tracker.temporal_xyz_by_cell = None
     requested_topk: list[int] = []
 
-    def candidates(topk: int, _capture_stamp: float | None = None) -> list[str]:
+    def candidates(
+        topk: int,
+        _capture_stamp: float | None = None,
+        **_options,
+    ) -> list[str]:
         requested_topk.append(topk)
         return ["ref0"]
 
@@ -112,7 +116,7 @@ def test_boot_and_each_lost_episode_stage_two_megaloc_attempts() -> None:
     assert lost_first["candidate_mode"] == "edm_local_recovery"
     assert lost_second["candidate_mode"] == "edm_local_recovery"
     assert lost_third["candidate_mode"] == "megaloc_lost_near"
-    assert lost_fourth["candidate_mode"] == "edm_map_scan"
+    assert lost_fourth["candidate_mode"] == "edm_local_recovery"
     assert localizer.retrieve_topks == [10, 20, 5]
     assert localizer.retrieve_candidates == [None, None, ["ref0"]]
     assert localizer.retrieve_calls == 3
@@ -129,7 +133,7 @@ def test_boot_and_each_lost_episode_stage_two_megaloc_attempts() -> None:
     assert localizer.retrieve_candidates[-1] == ["ref0"]
 
 
-def test_lost_megaloc_uses_global_search_when_the_pose_prior_is_stale() -> None:
+def test_lost_megaloc_keeps_the_progressive_ring_when_the_pose_prior_is_stale() -> None:
     tracker, localizer, _ = make_tracker()
     tracker.st.state = "LOST"
     tracker.st.lost_frames = 3
@@ -141,8 +145,8 @@ def test_lost_megaloc_uses_global_search_when_the_pose_prior_is_stale() -> None:
         capture_stamp=1.0 + tracker.cfg.lost_prior_max_age_s + 0.1,
     )
 
-    assert result["candidate_mode"] == "megaloc_lost"
-    assert localizer.retrieve_candidates == [None]
+    assert result["candidate_mode"] == "megaloc_lost_near"
+    assert localizer.retrieve_candidates == [["ref0"]]
     assert localizer.retrieve_topks == [5]
 
 
@@ -210,7 +214,7 @@ def test_lost_skips_megaloc_during_local_grace() -> None:
     assert localizer.retrieve_calls == 0
 
 
-def test_lost_fires_one_megaloc_shot_after_grace_then_scans() -> None:
+def test_lost_advances_to_the_next_local_ring_after_the_first_megaloc() -> None:
     tracker, localizer, requested_topk = make_tracker()
     tracker.st.global_retrieval_calls = 1
     tracker.st.boot_refs = ["ref0"]
@@ -224,7 +228,7 @@ def test_lost_fires_one_megaloc_shot_after_grace_then_scans() -> None:
     second = tracker.localize(frame, capture_stamp=1.2)
 
     assert first["candidate_mode"] == "megaloc_lost_near"
-    assert second["candidate_mode"] == "edm_map_scan"
+    assert second["candidate_mode"] == "edm_local_recovery"
     assert localizer.retrieve_calls == 1
     assert localizer.retrieve_topks == [5]
-    assert requested_topk == [24]
+    assert requested_topk == [1, 2]

@@ -37,7 +37,6 @@ from reposed_motion_validator import (
 )
 
 
-
 def _enabled_config(**overrides) -> PoseGuidedConfig:
     config = load_pose_guided_config()
     values = dict(config.__dict__)
@@ -63,12 +62,16 @@ def test_default_config_is_disabled() -> None:
     from pathlib import Path
     import json
 
-    path = Path(__file__).resolve().parents[3] / "定位演算法" / "configs" / "pose_guided_localization.json"
+    path = (
+        Path(__file__).resolve().parents[3]
+        / "定位演算法"
+        / "configs"
+        / "pose_guided_localization.json"
+    )
     raw = json.loads(path.read_text(encoding="utf-8"))
     assert raw["enabled"] is False
     assert raw["camera_center_is_body_origin"] is True
     assert raw["camera_to_body"]["approved"] is False
-
 
 
 def test_anchor_only_from_strong_visual() -> None:
@@ -138,8 +141,13 @@ def test_ned_velocity_is_not_applied_to_map_position() -> None:
     controller = PoseGuidedController(_enabled_config())
     controller.observe_fused(
         FusedOdometrySample.from_anafi(
-            timestamp=1.0, roll=0.0, pitch=0.0, yaw=0.0,
-            speed_north=5.0, speed_east=0.0, speed_down=0.0,
+            timestamp=1.0,
+            roll=0.0,
+            pitch=0.0,
+            yaw=0.0,
+            speed_north=5.0,
+            speed_east=0.0,
+            speed_down=0.0,
         )
     )
     controller.maybe_update_anchor(
@@ -151,8 +159,13 @@ def test_ned_velocity_is_not_applied_to_map_position() -> None:
     )
     controller.observe_fused(
         FusedOdometrySample.from_anafi(
-            timestamp=1.1, roll=0.0, pitch=0.0, yaw=0.0,
-            speed_north=5.0, speed_east=0.0, speed_down=0.0,
+            timestamp=1.1,
+            roll=0.0,
+            pitch=0.0,
+            yaw=0.0,
+            speed_north=5.0,
+            speed_east=0.0,
+            speed_down=0.0,
         )
     )
     prediction = controller.predict(
@@ -206,16 +219,31 @@ def test_map_aligned_fused_pose_is_used_when_explicitly_labeled() -> None:
 def test_search_expands_from_track_to_lost() -> None:
     config = _enabled_config()
     track = search_limits(
-        config, state="TRACK", misses=0, weak_after=2,
-        base_radius=0.8, base_yaw_rad=math.radians(90.0), base_max_refs=1,
+        config,
+        state="TRACK",
+        misses=0,
+        weak_after=2,
+        base_radius=0.8,
+        base_yaw_rad=math.radians(90.0),
+        base_max_refs=1,
     )
     weak = search_limits(
-        config, state="WEAK_TRACK", misses=2, weak_after=2,
-        base_radius=0.8, base_yaw_rad=math.radians(90.0), base_max_refs=3,
+        config,
+        state="WEAK_TRACK",
+        misses=2,
+        weak_after=2,
+        base_radius=0.8,
+        base_yaw_rad=math.radians(90.0),
+        base_max_refs=3,
     )
     lost = search_limits(
-        config, state="LOST", misses=8, weak_after=2,
-        base_radius=0.8, base_yaw_rad=math.radians(90.0), base_max_refs=5,
+        config,
+        state="LOST",
+        misses=8,
+        weak_after=2,
+        base_radius=0.8,
+        base_yaw_rad=math.radians(90.0),
+        base_max_refs=5,
     )
     assert track.radius < weak.radius < lost.radius
     assert track.stage == "TRACK"
@@ -238,8 +266,13 @@ def test_selector_prefers_nearby_similar_view() -> None:
         valid=True,
     )
     limits = search_limits(
-        config, state="TRACK", misses=0, weak_after=2,
-        base_radius=1.0, base_yaw_rad=math.radians(40.0), base_max_refs=2,
+        config,
+        state="TRACK",
+        misses=0,
+        weak_after=2,
+        base_radius=1.0,
+        base_yaw_rad=math.radians(40.0),
+        base_max_refs=2,
     )
     ranked = select_and_rank(
         config=config,
@@ -292,7 +325,6 @@ def test_camera_center_is_treated_as_body_origin() -> None:
     assert config.height_axis is None
 
 
-
 def test_imu_rotates_visual_velocity_after_visual_loss() -> None:
     controller = PoseGuidedController(_enabled_config())
     controller.observe_fused(
@@ -327,8 +359,13 @@ def test_ned_speed_ratio_scales_visual_velocity() -> None:
     controller = PoseGuidedController(_enabled_config())
     controller.observe_fused(
         FusedOdometrySample.from_anafi(
-            timestamp=1.0, roll=0.0, pitch=0.0, yaw=0.0,
-            speed_north=1.0, speed_east=0.0, speed_down=0.0,
+            timestamp=1.0,
+            roll=0.0,
+            pitch=0.0,
+            yaw=0.0,
+            speed_north=1.0,
+            speed_east=0.0,
+            speed_down=0.0,
         )
     )
     controller.maybe_update_anchor(
@@ -340,8 +377,13 @@ def test_ned_speed_ratio_scales_visual_velocity() -> None:
     )
     controller.observe_fused(
         FusedOdometrySample.from_anafi(
-            timestamp=2.0, roll=0.0, pitch=0.0, yaw=0.0,
-            speed_north=2.0, speed_east=0.0, speed_down=0.0,
+            timestamp=2.0,
+            roll=0.0,
+            pitch=0.0,
+            yaw=0.0,
+            speed_north=2.0,
+            speed_east=0.0,
+            speed_down=0.0,
         )
     )
     prediction = controller.predict(
@@ -354,6 +396,57 @@ def test_ned_speed_ratio_scales_visual_velocity() -> None:
     assert prediction.propagation_mode is PropagationMode.VELOCITY_INTEGRATION
     assert prediction.position == pytest.approx([2.0, 0.0, 0.0])
 
+
+def test_calibrated_gnss_prior_recovers_map_center_for_relocalization() -> None:
+    controller = PoseGuidedController(_enabled_config())
+    earth_radius_m = 6_378_137.0
+    latitude0 = 25.033
+    longitude0 = 121.5654
+
+    def sample(timestamp: float, east_m: float, north_m: float) -> FusedOdometrySample:
+        latitude = latitude0 + math.degrees(north_m / earth_radius_m)
+        longitude = longitude0 + math.degrees(
+            east_m / (earth_radius_m * math.cos(math.radians(latitude0)))
+        )
+        fused = FusedOdometrySample.from_anafi(
+            timestamp=timestamp,
+            gps_timestamp=timestamp,
+            latitude=latitude,
+            longitude=longitude,
+            altitude=18.0,
+            latitude_accuracy=0.3,
+            longitude_accuracy=0.3,
+            altitude_accuracy=0.6,
+        )
+        assert fused is not None
+        return fused
+
+    for index, (east_m, north_m) in enumerate(
+        ((0.0, 0.0), (4.0, 0.0), (0.0, 4.0), (4.0, 4.0), (8.0, 0.0), (0.0, 8.0))
+    ):
+        timestamp = 100.0 + index
+        controller.observe_fused(sample(timestamp, east_m, north_m))
+        assert controller.maybe_update_anchor(
+            _visual_ok(),
+            timestamp=timestamp,
+            rotation_cam_from_world=np.eye(3),
+            center=np.array([2.0 + 0.1 * east_m, 4.0 + 0.1 * north_m, 7.0]),
+            yaw=0.2,
+        )
+
+    controller.observe_fused(sample(200.0, 6.0, 3.0))
+    prediction = controller.predict(
+        200.0,
+        visual_center=np.array([2.0, 4.0, 7.0]),
+        visual_yaw=0.2,
+        visual_velocity=None,
+        visual_stamp=105.0,
+        allow_gnss_prior=True,
+    )
+
+    assert prediction.valid
+    assert prediction.propagation_mode is PropagationMode.GNSS_PRIOR
+    assert prediction.position == pytest.approx([2.6, 4.3, 7.0], abs=1e-4)
 
 
 class _Rotation:
@@ -492,7 +585,9 @@ def test_cluster_consensus_uses_rotation_and_fails_closed_on_equal_clusters() ->
         ("b1", _pose_candidate([0.0, 0.0, 0.0], 91, rotation=_rz(180.0))),
         ("b2", _pose_candidate([0.1, 0.0, 0.0], 89, rotation=_rz(175.0))),
     ]
-    assert _select_track_candidate(selection, scored, _pose_cfg(pose_consensus_mode="cluster")) is None
+    assert (
+        _select_track_candidate(selection, scored, _pose_cfg(pose_consensus_mode="cluster")) is None
+    )
     assert last_consensus_info()["reason"] == "cluster_conflict"
 
 
@@ -529,8 +624,13 @@ def test_default_quality_weight_does_not_change_reference_order() -> None:
     config = _enabled_config()
     assert config.ranking.w_quality == 0.0
     limits = search_limits(
-        config, state="TRACK", misses=0, weak_after=2,
-        base_radius=2.0, base_yaw_rad=math.radians(40.0), base_max_refs=2,
+        config,
+        state="TRACK",
+        misses=0,
+        weak_after=2,
+        base_radius=2.0,
+        base_yaw_rad=math.radians(40.0),
+        base_max_refs=2,
     )
     kwargs = dict(
         config=config,
@@ -680,13 +780,22 @@ def test_reposed_geometry_gates_stay_unavailable() -> None:
     )
     assert clustered.status == "unavailable"
     assert clustered.reason == "spatial_support"
-    assert match_spatial_support(
-        points, points + 1.0, width=1280, height=720, grid=8,
-        mask=np.array([True, True, True]),
-    ) == 1
+    assert (
+        match_spatial_support(
+            points,
+            points + 1.0,
+            width=1280,
+            height=720,
+            grid=8,
+            mask=np.array([True, True, True]),
+        )
+        == 1
+    )
     with pytest.raises(ValueError, match="min_inlier_ratio"):
         RePoseDMotionValidator(
-            camera, matcher=None, model_path=".", model_sha256="0" * 64,
+            camera,
+            matcher=None,
+            model_path=".",
+            model_sha256="0" * 64,
             min_inlier_ratio=1.5,
         )
-

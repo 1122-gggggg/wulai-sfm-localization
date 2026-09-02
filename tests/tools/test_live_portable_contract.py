@@ -85,7 +85,7 @@ def test_one_click_launcher_installs_offline_and_selects_river_mission() -> None
 
     assert "tools/install_runtime.sh\" --offline" in script
     assert "tools/package_manifest.py\" verify" in script
-    assert "river_site_b0_p116_p117_localization.json" in script
+    assert "river_gluemap_all8_direct_localization.json" in script
     assert "SFM_MISSION_SELECTION" in script
     assert "控制介面程式/真機串流/啟動.sh" in script
     assert ".sfm-portable-runtime" in script
@@ -120,7 +120,7 @@ def test_export_cli_forwards_live_minimal_mode(
     assert calls["live_minimal"] is True
 
 
-def test_one_click_launcher_real_flight_dry_run_does_not_connect() -> None:
+def test_one_click_launcher_blocks_unvalidated_new_map_before_connecting() -> None:
     environment = os.environ.copy()
     environment.update(
         {
@@ -141,10 +141,10 @@ def test_one_click_launcher_real_flight_dry_run_does_not_connect() -> None:
         timeout=15,
     )
 
-    assert completed.returncode == 0, completed.stderr
-    assert "--interface real-flight" in completed.stdout
-    assert "river_site_b0_p116_p117_localization.json" in completed.stdout
-    assert "mission_snapshots" in completed.stdout
+    assert completed.returncode == 2
+    assert "mission is not localization-ready" in completed.stderr
+    assert "localizer_quality calibration is failed" in completed.stderr
+    assert "mission_snapshots" not in completed.stdout
 
 
 def test_one_click_rejects_direct_site_profile_override() -> None:

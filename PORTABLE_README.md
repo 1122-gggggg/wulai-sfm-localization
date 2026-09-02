@@ -26,10 +26,11 @@ wheelhouse，再從包內 wheels 建立 `.venv`。不會連線到 Python package
 啟動 UI 本身不會起飛；起飛只能由操作員在 UI 完成四步 preflight 後觸發。
 
 預設任務為
-`控制介面程式/mission_selections/river_site_b0_p116_p117_localization.json`。真機入口會先
+`控制介面程式/mission_selections/river_gluemap_all8_direct_localization.json`。真機入口會先
 驗證所有 component SHA，再產生唯讀 site-profile snapshot；不接受另一份 profile
-直接覆寫解析結果。此 selection 目前只有地面定位（無 route，非 flight-ready）。
-AUTO 前必須在新地圖重畫航線。ANAFI 羅盤改由真機韌體即時回讀，
+直接覆寫解析結果。此全八段地圖只有同資料集單幀煙霧測試，尚無獨立 holdout 與
+ANAFI camera-pipeline 品質證據，因此 resolver 會阻擋真機定位；同時無 route，不能 AUTO。
+ANAFI 羅盤仍由真機韌體即時回讀；完成場域驗證、補畫航線並
 完成校正且回讀為有效後，preflight 第一步會自動通過。AUTO 仍只會在操作員完成
 其餘步驟並親自按下按鈕後，使用第三步確認時綁定的 immutable route snapshot。
 

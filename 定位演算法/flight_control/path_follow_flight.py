@@ -935,7 +935,7 @@ class CommandLog:
     def close(self) -> None:
         try:
             self._f.close()
-        except Exception:
+        except (OSError, ValueError, AttributeError, TypeError, RuntimeError):  # Tier3: fallback best-effort — narrow, keep pass
             pass
 
 
@@ -1125,15 +1125,18 @@ class SafetyMonitor:
             if self._safety is not None:
                 try:
                     self.mode = self._safety.poll()
-                except Exception:
+                except (OSError, ValueError, AttributeError, TypeError, RuntimeError) as exc:  # Tier1: safety poll — narrow, no silent pass
+                    print(f"[safety] SafetyMonitor.poll() failed ({exc!r}); failing closed to HOVER", flush=True)
                     self.mode = "HOVER"
             try:
                 stream_ok = bool(stream_healthy())
-            except Exception:
+            except (OSError, ValueError, AttributeError, TypeError, RuntimeError) as exc:  # Tier1: stream health — narrow, no silent pass
+                print(f"[safety] stream_healthy() failed ({exc!r}); assuming unhealthy", flush=True)
                 stream_ok = False
             try:
                 stopped = bool(stop_requested())
-            except Exception:
+            except (OSError, ValueError, AttributeError, TypeError, RuntimeError) as exc:  # Tier1: stop request — narrow, no silent pass
+                print(f"[safety] stop_requested() failed ({exc!r}); assuming stopped", flush=True)
                 stopped = True
             if self.mode == "EMERGENCY":
                 self._latch_terminal("EMERGENCY", "EMERGENCY command -> motor cut")
@@ -1162,15 +1165,18 @@ class SafetyMonitor:
         if self._safety is not None:
             try:
                 self.mode = str(self._safety.poll()).upper()
-            except Exception:
+            except (OSError, ValueError, AttributeError, TypeError, RuntimeError) as exc:  # Tier1: safety poll — narrow, no silent pass
+                print(f"[safety] SafetyMonitor.poll() failed ({exc!r}); failing closed to HOVER", flush=True)
                 self.mode = "HOVER"
         try:
             stream_ok = bool(stream_healthy())
-        except Exception:
+        except (OSError, ValueError, AttributeError, TypeError, RuntimeError) as exc:  # Tier1: stream health — narrow, no silent pass
+            print(f"[safety] stream_healthy() failed ({exc!r}); assuming unhealthy", flush=True)
             stream_ok = False
         try:
             stopped = bool(stop_requested())
-        except Exception:
+        except (OSError, ValueError, AttributeError, TypeError, RuntimeError) as exc:  # Tier1: stop request — narrow, no silent pass
+            print(f"[safety] stop_requested() failed ({exc!r}); assuming stopped", flush=True)
             stopped = True
         if self.mode == "EMERGENCY":
             self._latch_terminal("EMERGENCY", "EMERGENCY command -> motor cut")
@@ -1782,7 +1788,7 @@ class _FlightLoopRunner:
         self._add_pcmd_timing_log(record)
         try:
             self.hooks.log_tick(record)
-        except Exception:
+        except (OSError, ValueError, AttributeError, TypeError, RuntimeError):  # Tier3: fallback best-effort — narrow, keep pass
             pass
 
     def _add_pose_log(self, record: dict) -> None:
@@ -1802,7 +1808,7 @@ class _FlightLoopRunner:
                     "weak",
                 )
             }
-        except Exception:
+        except (OSError, ValueError, AttributeError, TypeError, RuntimeError):  # Tier3: fallback best-effort — narrow, keep pass
             pass
 
     def _add_pcmd_timing_log(self, record: dict) -> None:
@@ -1810,7 +1816,7 @@ class _FlightLoopRunner:
             return
         try:
             record.update(self.hooks.pcmd_timing() or {})
-        except Exception:
+        except (OSError, ValueError, AttributeError, TypeError, RuntimeError):  # Tier3: fallback best-effort — narrow, keep pass
             pass
 
     def _send_command(self, pcmd):
@@ -2306,7 +2312,7 @@ class _FlightLoopRunner:
             return
         try:
             callback(str(state), float(progress_deg))
-        except Exception:
+        except (OSError, ValueError, AttributeError, TypeError, RuntimeError):  # Tier3: fallback best-effort — narrow, keep pass
             pass
 
     def _reset_localization_yaw_search(self, event: str | None = None) -> None:
@@ -3274,7 +3280,7 @@ def _close_live_flight_resources(
     if grabber is not None:
         try:
             grabber.stop()
-        except Exception:
+        except (OSError, ValueError, AttributeError, TypeError, RuntimeError):  # Tier3: fallback best-effort — narrow, keep pass
             pass
     if drone is not None and via_skycontroller:
         try:
@@ -3287,11 +3293,11 @@ def _close_live_flight_resources(
     if drone is not None:
         try:
             drone.disconnect()
-        except Exception:
+        except (OSError, ValueError, AttributeError, TypeError, RuntimeError):  # Tier3: fallback best-effort — narrow, keep pass
             pass
     try:
         command_log.event(event="terminal", reason=reason)
-    except Exception:
+    except (OSError, ValueError, AttributeError, TypeError, RuntimeError):  # Tier3: fallback best-effort — narrow, keep pass
         pass
     command_log.close()
 
@@ -3362,12 +3368,12 @@ def grab_only(ip: str, secs: float, controller: str):
         if grab is not None:
             try:
                 grab.stop()
-            except Exception:
+            except (OSError, ValueError, AttributeError, TypeError, RuntimeError):  # Tier3: fallback best-effort — narrow, keep pass
                 pass
         if drone is not None:
             try:
                 drone.disconnect()
-            except Exception:
+            except (OSError, ValueError, AttributeError, TypeError, RuntimeError):  # Tier3: fallback best-effort — narrow, keep pass
                 pass
 
 

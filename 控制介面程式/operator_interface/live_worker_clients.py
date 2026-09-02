@@ -1,4 +1,5 @@
 """Subprocess worker clients for live localization and detection."""
+
 from __future__ import annotations
 
 import json
@@ -41,10 +42,19 @@ class LiveWorkerClient:
     FATAL_RESTART_BACKOFF_S = 1.0
     FATAL_RESTART_BACKOFF_MAX_S = 10.0
 
-    def __init__(self, cmd: list, width: int, height: int, log_path: str,
-                 thread_name: str, label: str, error_defaults: dict | None = None,
-                 timeout_s: float = 8.0, use_shared_frames: bool = False,
-                 expect_ready_event: bool = False):
+    def __init__(
+        self,
+        cmd: list,
+        width: int,
+        height: int,
+        log_path: str,
+        thread_name: str,
+        label: str,
+        error_defaults: dict | None = None,
+        timeout_s: float = 8.0,
+        use_shared_frames: bool = False,
+        expect_ready_event: bool = False,
+    ):
         self.width = int(width)
         self.height = int(height)
         self.label = label
@@ -84,21 +94,24 @@ class LiveWorkerClient:
         self._coalesce_scratch: bytearray | None = None
         if self._frame_shm_slots:
             self._frame_shm = shared_memory.SharedMemory(
-                create=True, size=self._frame_size * self._frame_shm_slots)
+                create=True, size=self._frame_size * self._frame_shm_slots
+            )
             self._coalesce_scratch = bytearray(self._frame_size)
-            self.cmd.extend([
-                "--frame-shm-name", self._frame_shm.name,
-                "--frame-shm-slots", str(self._frame_shm_slots),
-            ])
+            self.cmd.extend(
+                [
+                    "--frame-shm-name",
+                    self._frame_shm.name,
+                    "--frame-shm-slots",
+                    str(self._frame_shm_slots),
+                ]
+            )
         # Capacity-1 pipeline: never queue old work. While the worker is busy,
         # submit() overwrites a single coalesce slot so the next run uses the
         # newest frame (drop intermediate frames).
-        self.pending: queue.Queue[
-            tuple[int, str, bytes, bytes | memoryview | int, dict]
-        ] = queue.Queue(maxsize=1)
-        self.results: queue.Queue[dict] = queue.Queue(
-            maxsize=self.MAX_PENDING_RESULTS
+        self.pending: queue.Queue[tuple[int, str, bytes, bytes | memoryview | int, dict]] = (
+            queue.Queue(maxsize=1)
         )
+        self.results: queue.Queue[dict] = queue.Queue(maxsize=self.MAX_PENDING_RESULTS)
         self.in_flight = False
         self._coalesce: tuple[int, str, bytes, bytes | memoryview | int, dict] | None = None
         self._coalesce_drops = 0
@@ -208,10 +221,7 @@ class LiveWorkerClient:
         if lock is None:
             return
         with lock:
-            if (
-                self._first_result_latency_ms is None
-                and self._ready_mono is not None
-            ):
+            if self._first_result_latency_ms is None and self._ready_mono is not None:
                 self._first_result_latency_ms = max(
                     0.0, (time.monotonic() - self._ready_mono) * 1000.0
                 )
@@ -222,6 +232,7 @@ class LiveWorkerClient:
                     "restart_reason": self._restart_reason,
                     "outage_duration_s": self._outage_duration_s,
                     "rejected_submits": self._rejected_submits,
+                    "coalesced_submit_drops": getattr(self, "_coalesce_drops", 0),
                     "ready_latency_ms": self._ready_latency_ms,
                     "first_result_latency_ms": self._first_result_latency_ms,
                     "circuit_breaker_state": self._circuit_breaker_state,
@@ -244,10 +255,10 @@ class LiveWorkerClient:
         log = open(self.log_path, mode, encoding="utf-8")
         try:
             proc = subprocess.Popen(
-                self.cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                stderr=log, bufsize=0)
+                self.cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=log, bufsize=0
+            )
         finally:
-            log.close()                    # the child owns its duplicated stderr fd
+            log.close()  # the child owns its duplicated stderr fd
         self._spawned_at = time.monotonic()
         return proc
 
@@ -275,7 +286,7 @@ class LiveWorkerClient:
                     proc.kill()
                     proc.wait(timeout=1.0)
         else:
-            proc.wait(timeout=0.0)          # reap an already-exited child
+            proc.wait(timeout=0.0)  # reap an already-exited child
         try:
             if proc.stdout is not None:
                 proc.stdout.close()
@@ -301,11 +312,13 @@ class LiveWorkerClient:
             frame_name,
             self._startup_error or f"{self.label} worker unavailable",
         )
-        payload.update({
-            "worker_unavailable": True,
-            "failure_kind": "worker_unavailable",
-            "restart_required": False,
-        })
+        payload.update(
+            {
+                "worker_unavailable": True,
+                "failure_kind": "worker_unavailable",
+                "restart_required": False,
+            }
+        )
         self._publish_result(payload)
         self._unavailable_notice_published = True
 
@@ -352,7 +365,9 @@ class LiveWorkerClient:
             view = view[written:]
 
     def _readline_with_timeout(
-        self, proc: subprocess.Popen, timeout_s: float | None = None,
+        self,
+        proc: subprocess.Popen,
+        timeout_s: float | None = None,
     ) -> bytes:
         """Read one complete response line without blocking after a partial write."""
         if proc.stdout is None:
@@ -364,22 +379,25 @@ class LiveWorkerClient:
         while True:
             newline = self._stdout_buffer.find(b"\n")
             if newline >= 0:
-                line = bytes(self._stdout_buffer[:newline + 1])
-                del self._stdout_buffer[:newline + 1]
+                line = bytes(self._stdout_buffer[: newline + 1])
+                del self._stdout_buffer[: newline + 1]
                 return line
             if len(self._stdout_buffer) > self.MAX_RESPONSE_BYTES:
                 raise RuntimeError(
-                    f"{self.label} worker response exceeds {self.MAX_RESPONSE_BYTES} bytes")
+                    f"{self.label} worker response exceeds {self.MAX_RESPONSE_BYTES} bytes"
+                )
             if self._closed.is_set():
                 raise RuntimeError(f"{self.label} worker client closed")
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise TimeoutError(
-                    f"{self.label} worker returned an incomplete response > {timeout:.1f}s")
+                    f"{self.label} worker returned an incomplete response > {timeout:.1f}s"
+                )
             ready, _, _ = select.select([fd], [], [], remaining)
             if not ready:
                 raise TimeoutError(
-                    f"{self.label} worker returned an incomplete response > {timeout:.1f}s")
+                    f"{self.label} worker returned an incomplete response > {timeout:.1f}s"
+                )
             try:
                 chunk = os.read(fd, 65536)
             except BlockingIOError:
@@ -425,8 +443,7 @@ class LiveWorkerClient:
             print(f"[operator] {self.label} worker restart failed: {exc!r}", flush=True)
             return False
 
-    def _restart(self, *, force: bool = False, fatal: bool = False,
-                 reason: str = "stall") -> bool:
+    def _restart(self, *, force: bool = False, fatal: bool = False, reason: str = "stall") -> bool:
         """Respawn a hung/exited worker so localization can recover. Cooldown-guarded so a
         freshly-restarted worker (which needs ~15s to reload models) is not thrashed.
 
@@ -458,7 +475,6 @@ class LiveWorkerClient:
             self._note_outage_start(reason)
             self._last_restart = now
             return self._respawn_worker(delay)
-
 
     def _error_result(self, seq: int, frame_name: str, error: str) -> dict:
         now_ns = time.monotonic_ns()
@@ -502,8 +518,7 @@ class LiveWorkerClient:
             if start is None or end is None:
                 return
             try:
-                payload[out_key] = max(
-                    0.0, (int(end) - int(start)) / 1_000_000.0)
+                payload[out_key] = max(0.0, (int(end) - int(start)) / 1_000_000.0)
             except (TypeError, ValueError, OverflowError):
                 pass
 
@@ -512,24 +527,39 @@ class LiveWorkerClient:
         duration_ms("client_submit_mono", "client_response_mono", "client_roundtrip_ms")
         duration_ms("client_submit_mono", "worker_read_done_mono", "submit_to_worker_read_ms")
         duration_ms("worker_core_done_mono", "client_response_mono", "worker_done_to_client_ms")
-        duration_ms("source_frame_stamp_mono", "client_submit_mono", "source_stamp_age_at_submit_ms")
+        duration_ms(
+            "source_frame_stamp_mono", "client_submit_mono", "source_stamp_age_at_submit_ms"
+        )
         duration_ns("client_submit_mono_ns", "client_dequeue_mono_ns", "client_queue_wait_ns_ms")
-        duration_ns("client_write_start_mono_ns", "client_write_done_mono_ns", "client_pipe_write_ns_ms")
+        duration_ns(
+            "client_write_start_mono_ns", "client_write_done_mono_ns", "client_pipe_write_ns_ms"
+        )
         duration_ns("client_submit_mono_ns", "client_response_mono_ns", "client_roundtrip_ns_ms")
-        duration_ns("frame_callback_enter_mono_ns", "frame_preprocess_start_mono_ns",
-                    "callback_to_preprocess_start_ms")
-        duration_ns("frame_preprocess_start_mono_ns", "frame_yuv_ready_mono_ns",
-                    "yuv_view_ms")
-        duration_ns("frame_preprocess_start_mono_ns", "frame_preprocess_done_mono_ns",
-                    "frame_preprocess_ms")
-        duration_ns("frame_preprocess_done_mono_ns", "client_submit_mono_ns",
-                    "preprocess_done_to_submit_ms")
-        duration_ns("frame_callback_enter_mono_ns", "client_submit_mono_ns",
-                    "callback_to_submit_ms")
-        duration_ns("frame_callback_enter_mono_ns", "worker_core_start_mono_ns",
-                    "callback_to_inference_start_ms")
-        duration_ns("frame_callback_enter_mono_ns", "worker_core_done_mono_ns",
-                    "callback_to_localization_done_ms")
+        duration_ns(
+            "frame_callback_enter_mono_ns",
+            "frame_preprocess_start_mono_ns",
+            "callback_to_preprocess_start_ms",
+        )
+        duration_ns("frame_preprocess_start_mono_ns", "frame_yuv_ready_mono_ns", "yuv_view_ms")
+        duration_ns(
+            "frame_preprocess_start_mono_ns", "frame_preprocess_done_mono_ns", "frame_preprocess_ms"
+        )
+        duration_ns(
+            "frame_preprocess_done_mono_ns", "client_submit_mono_ns", "preprocess_done_to_submit_ms"
+        )
+        duration_ns(
+            "frame_callback_enter_mono_ns", "client_submit_mono_ns", "callback_to_submit_ms"
+        )
+        duration_ns(
+            "frame_callback_enter_mono_ns",
+            "worker_core_start_mono_ns",
+            "callback_to_inference_start_ms",
+        )
+        duration_ns(
+            "frame_callback_enter_mono_ns",
+            "worker_core_done_mono_ns",
+            "callback_to_localization_done_ms",
+        )
 
     def _take_work_item(self):
         """Pop one work item: prefer coalesce (newest), else pending queue."""
@@ -555,9 +585,7 @@ class LiveWorkerClient:
             line = self._readline_with_timeout(proc, timeout_s=self.restart_warmup_s)
             payload = json.loads(line.decode("utf-8"))
             if not isinstance(payload, dict) or payload.get("event") != "ready":
-                raise RuntimeError(
-                    f"{self.label} worker sent an invalid startup handshake"
-                )
+                raise RuntimeError(f"{self.label} worker sent an invalid startup handshake")
             self._startup_info = payload
             self._startup_error = None
             self._note_worker_ready()
@@ -573,8 +601,7 @@ class LiveWorkerClient:
             return
         # Pairing has slipped: never publish an older response as the newest pose.
         raise _WorkerResponseDesync(
-            f"{self.label} worker response desync: "
-            f"got seq={worker_seq!r}, expected {expected}"
+            f"{self.label} worker response desync: got seq={worker_seq!r}, expected {expected}"
         )
 
     def _exchange_work_item(self, item) -> None:
@@ -601,10 +628,7 @@ class LiveWorkerClient:
         self._validate_worker_sequence(payload, expected_worker_seq)
         payload.update({"display_seq": seq, "frame_name": frame_name, "frame_id": frame_name})
         self._attach_client_timing(payload, timing)
-        oom = (
-            payload.get("failure_kind") == "cuda_oom"
-            or payload.get("error") == "cuda_oom"
-        )
+        oom = payload.get("failure_kind") == "cuda_oom" or payload.get("error") == "cuda_oom"
         if oom:
             with self._lock:
                 self._pending_oom_transition = True
@@ -612,13 +636,16 @@ class LiveWorkerClient:
         self._publish_result(payload)
         if payload.get("restart_required") is True:
             self._restart(
-                force=True, fatal=True, reason="oom" if oom else "fatal",
+                force=True,
+                fatal=True,
+                reason="oom" if oom else "fatal",
             )
         else:
             self._note_healthy_response(payload)
 
-    def _handle_work_error(self, item, exc: Exception, *, announce: bool = False,
-                           fatal: bool = False) -> None:
+    def _handle_work_error(
+        self, item, exc: Exception, *, announce: bool = False, fatal: bool = False
+    ) -> None:
         if self._closed.is_set():
             return
         seq, frame_name, _prefix, _raw, timing = item
@@ -636,7 +663,7 @@ class LiveWorkerClient:
     def _write_shm_slot(self, slot: int, payload: bytes | bytearray | memoryview) -> None:
         assert self._frame_shm is not None
         start = slot * self._frame_size
-        self._frame_shm.buf[start:start + self._frame_size] = payload
+        self._frame_shm.buf[start : start + self._frame_size] = payload
 
     @staticmethod
     def _immutable_frame_bytes(raw: memoryview) -> bytes | None:
@@ -686,8 +713,7 @@ class LiveWorkerClient:
             self._exchange_work_item(item)
         except _WorkerResponseDesync as exc:
             self._handle_work_error(item, exc, announce=True, fatal=True)
-        except (TimeoutError, RuntimeError, BrokenPipeError, OSError,
-                json.JSONDecodeError) as exc:
+        except (TimeoutError, RuntimeError, BrokenPipeError, OSError, json.JSONDecodeError) as exc:
             self._handle_work_error(item, exc)
         except Exception as exc:
             # Unexpected protocol/client failures can also leave pairing unknown.
@@ -710,14 +736,17 @@ class LiveWorkerClient:
 
     @staticmethod
     def _frame_memoryview(
-            frame: Image.Image | np.ndarray | bytes | bytearray | memoryview,
+        frame: Image.Image | np.ndarray | bytes | bytearray | memoryview,
     ) -> memoryview:
         if isinstance(frame, memoryview):
             return frame
         if isinstance(frame, (bytes, bytearray)):
             return memoryview(frame)
-        if (isinstance(frame, np.ndarray) and frame.dtype == np.uint8
-                and frame.flags["C_CONTIGUOUS"]):
+        if (
+            isinstance(frame, np.ndarray)
+            and frame.dtype == np.uint8
+            and frame.flags["C_CONTIGUOUS"]
+        ):
             return memoryview(frame).cast("B")
         return memoryview(frame.tobytes())
 
@@ -736,13 +765,18 @@ class LiveWorkerClient:
         self._coalesce = item
         return True
 
-    def _submit_shared_frame(self, seq: int, frame_name: str, prefix: bytes,
-                             raw: memoryview, timing: dict) -> bool:
+    def _submit_shared_frame(
+        self, seq: int, frame_name: str, prefix: bytes, raw: memoryview, timing: dict
+    ) -> bool:
         assert self._frame_shm is not None
         with self._lock:
             if self.in_flight:
                 item = (
-                    seq, frame_name, prefix, self._coalesce_payload(raw), timing,
+                    seq,
+                    frame_name,
+                    prefix,
+                    self._coalesce_payload(raw),
+                    timing,
                 )
                 return self._store_coalesced(item)
             slot = 0
@@ -759,8 +793,9 @@ class LiveWorkerClient:
                 return False
         return True
 
-    def _submit_pipe_frame(self, seq: int, frame_name: str, prefix: bytes,
-                           raw: memoryview, timing: dict) -> bool:
+    def _submit_pipe_frame(
+        self, seq: int, frame_name: str, prefix: bytes, raw: memoryview, timing: dict
+    ) -> bool:
         item = (seq, frame_name, prefix, bytes(raw), timing)
         with self._lock:
             if self.in_flight:
@@ -772,9 +807,14 @@ class LiveWorkerClient:
             return False
         return True
 
-    def submit(self, seq: int, frame_name: str,
-               frame: Image.Image | np.ndarray | bytes | bytearray | memoryview,
-               *, timing_metadata: dict | None = None) -> bool:
+    def submit(
+        self,
+        seq: int,
+        frame_name: str,
+        frame: Image.Image | np.ndarray | bytes | bytearray | memoryview,
+        *,
+        timing_metadata: dict | None = None,
+    ) -> bool:
         """Enqueue at most one pending request; always prefer the newest frame.
 
         While inference is in flight, the request overwrites a single coalesce
@@ -795,8 +835,11 @@ class LiveWorkerClient:
         with self._proc_lock:
             proc = self.proc
         if proc.poll() is not None:
-            self._publish_result(self._error_result(
-                seq, frame_name, f"{self.label} worker exited code={proc.returncode}"))
+            self._publish_result(
+                self._error_result(
+                    seq, frame_name, f"{self.label} worker exited code={proc.returncode}"
+                )
+            )
             self._restart(reason="worker_exit")
             return self._reject_submit()
         raw = self._frame_memoryview(frame)
@@ -862,9 +905,15 @@ class LiveWorkerClient:
 
 
 def _append_localizer_backend_args(
-        command: list[str], *, backend: str, bundle_sha256: str,
-        deploy_dir: str | Path, profile: str | Path,
-        profile_sha256: str, matcher_mode: str) -> None:
+    command: list[str],
+    *,
+    backend: str,
+    bundle_sha256: str,
+    deploy_dir: str | Path,
+    profile: str | Path,
+    profile_sha256: str,
+    matcher_mode: str,
+) -> None:
     if bundle_sha256:
         command.extend(["--bundle-sha256", str(bundle_sha256)])
     if backend == "edm":
@@ -879,27 +928,38 @@ def _append_localizer_backend_args(
         command.extend(["--matcher-mode", str(matcher_mode)])
 
 
-def _append_localizer_query_args(command: list[str], *, local_topk: int,
-                                 query_camera, map_align: str | Path) -> None:
+def _append_localizer_query_args(
+    command: list[str], *, local_topk: int, query_camera, map_align: str | Path
+) -> None:
     if local_topk and int(local_topk) > 0:
         command.extend(["--local-topk", str(int(local_topk))])
     if query_camera is not None:
-        command.extend([
-            "--query-camera-model", str(query_camera.model),
-            "--query-camera-width", str(int(query_camera.width)),
-            "--query-camera-height", str(int(query_camera.height)),
-            "--query-camera-params",
-            *(str(float(value)) for value in query_camera.params),
-        ])
+        command.extend(
+            [
+                "--query-camera-model",
+                str(query_camera.model),
+                "--query-camera-width",
+                str(int(query_camera.width)),
+                "--query-camera-height",
+                str(int(query_camera.height)),
+                "--query-camera-params",
+                *(str(float(value)) for value in query_camera.params),
+            ]
+        )
     if map_align:
         command.extend(["--map-align", str(map_align)])
 
 
 def _append_localizer_reference_args(
-        command: list[str], *, megaloc_cache: str | Path,
-        reference_index: str | Path, reference_index_sha256: str,
-        megaloc_backend: str, megaloc_engine: str | Path,
-        megaloc_engine_sha256: str) -> None:
+    command: list[str],
+    *,
+    megaloc_cache: str | Path,
+    reference_index: str | Path,
+    reference_index_sha256: str,
+    megaloc_backend: str,
+    megaloc_engine: str | Path,
+    megaloc_engine_sha256: str,
+) -> None:
     # Pass an explicit empty cache value so an inherited environment variable
     # cannot override the site profile's bundle descriptors.
     command.extend(["--megaloc-cache", str(megaloc_cache)])
@@ -915,9 +975,14 @@ def _append_localizer_reference_args(
 
 
 def _append_localizer_tracking_args(
-        command: list[str], *, neuflow_track: bool, projection_track: bool,
-        track_landmarks: str | Path, force_track_bench: bool,
-        force_track_ref: int) -> None:
+    command: list[str],
+    *,
+    neuflow_track: bool,
+    projection_track: bool,
+    track_landmarks: str | Path,
+    force_track_bench: bool,
+    force_track_ref: int,
+) -> None:
     if neuflow_track:
         command.append("--neuflow-track")
     if projection_track:
@@ -930,41 +995,53 @@ def _append_localizer_tracking_args(
 
 
 class LiveLocalizerClient(LiveWorkerClient):
-    def __init__(self, worker_py: Path, python_bin: str, width: int, height: int,
-                 bundle: Path, megaloc_cache: str | Path = "",
-                 megaloc_backend: str = "tensorrt",
-                 megaloc_engine: str | Path = "",
-                 megaloc_engine_sha256: str = "",
-                 reference_index: str | Path = "",
-                 reference_index_sha256: str = "",
-                 force_track_bench: bool = False,
-                 force_track_ref: int = -1,
-                 neuflow_track: bool = False,
-                 projection_track: bool = False,
-                 track_landmarks: str | Path = "",
-                 matcher_mode: str = "",
-                 localizer_backend: str = "auto",
-                 localizer_deploy_dir: str | Path = "",
-                 localizer_profile: str | Path = "",
-                 bundle_sha256: str = "",
-                 localizer_profile_sha256: str = "",
-                 local_topk: int = 0,
-                 query_camera=None,
-                 map_align: str | Path = ""):
+    def __init__(
+        self,
+        worker_py: Path,
+        python_bin: str,
+        width: int,
+        height: int,
+        bundle: Path,
+        megaloc_cache: str | Path = "",
+        megaloc_backend: str = "tensorrt",
+        megaloc_engine: str | Path = "",
+        megaloc_engine_sha256: str = "",
+        reference_index: str | Path = "",
+        reference_index_sha256: str = "",
+        force_track_bench: bool = False,
+        force_track_ref: int = -1,
+        neuflow_track: bool = False,
+        projection_track: bool = False,
+        track_landmarks: str | Path = "",
+        matcher_mode: str = "",
+        localizer_backend: str = "auto",
+        localizer_deploy_dir: str | Path = "",
+        localizer_profile: str | Path = "",
+        bundle_sha256: str = "",
+        localizer_profile_sha256: str = "",
+        local_topk: int = 0,
+        query_camera=None,
+        map_align: str | Path = "",
+    ):
         self._runtime_benchmark_control = not bool(force_track_bench)
         self._benchmark_mode_lock = threading.Lock()
         self._benchmark_mode = "track" if force_track_bench else "auto"
         self._relocalize_once = False
         import flight_operator_app as _app
-        self.localizer_backend = _app.resolve_localizer_backend(
-            localizer_backend, Path(bundle))
+
+        self.localizer_backend = _app.resolve_localizer_backend(localizer_backend, Path(bundle))
         self.edm_matcher = "torch"
         cmd = [
-            str(python_bin), str(worker_py),
-            "--width", str(width),
-            "--height", str(height),
-            "--bundle", str(bundle),
-            "--localizer-backend", self.localizer_backend,
+            str(python_bin),
+            str(worker_py),
+            "--width",
+            str(width),
+            "--height",
+            str(height),
+            "--bundle",
+            str(bundle),
+            "--localizer-backend",
+            self.localizer_backend,
         ]
         _append_localizer_backend_args(
             cmd,
@@ -976,7 +1053,9 @@ class LiveLocalizerClient(LiveWorkerClient):
             matcher_mode=matcher_mode,
         )
         _append_localizer_query_args(
-            cmd, local_topk=local_topk, query_camera=query_camera,
+            cmd,
+            local_topk=local_topk,
+            query_camera=query_camera,
             map_align=map_align,
         )
         _append_localizer_reference_args(
@@ -1000,17 +1079,22 @@ class LiveLocalizerClient(LiveWorkerClient):
         # The client owns the shared-memory segment. Attached workers unregister it
         # from resource_tracker, so a killed/restarted worker cannot unlink it.
         # SFM_SHARED_FRAMES=0 remains the slower pipe fallback.
-        super().__init__(cmd, width, height,
-                         "/tmp/sfm_live_localizer_worker.log",
-                         "live-localizer-client", "localizer",
-                         error_defaults={
-                             "mode": "LOST",
-                             "next_mode": "LOST",
-                             "localization_exception": True,
-                         },
-                         use_shared_frames=os.environ.get(
-                             "SFM_SHARED_FRAMES", "1").strip() not in {"0", "false", "no"},
-                         expect_ready_event=True)
+        super().__init__(
+            cmd,
+            width,
+            height,
+            "/tmp/sfm_live_localizer_worker.log",
+            "live-localizer-client",
+            "localizer",
+            error_defaults={
+                "mode": "LOST",
+                "next_mode": "LOST",
+                "localization_exception": True,
+            },
+            use_shared_frames=os.environ.get("SFM_SHARED_FRAMES", "1").strip()
+            not in {"0", "false", "no"},
+            expect_ready_event=True,
+        )
 
     @property
     def benchmark_mode(self) -> str:
@@ -1053,9 +1137,7 @@ class LiveLocalizerClient(LiveWorkerClient):
                 try:
                     telemetry_stamp = float(fused_stamp)
                 except (TypeError, ValueError, OverflowError) as exc:
-                    raise ValueError(
-                        f"invalid fused telemetry stamp: {fused_stamp!r}"
-                    ) from exc
+                    raise ValueError(f"invalid fused telemetry stamp: {fused_stamp!r}") from exc
             fused = FusedTelemetry(
                 stamp=telemetry_stamp,
                 roll=timing.get("fused_roll"),
@@ -1064,31 +1146,64 @@ class LiveLocalizerClient(LiveWorkerClient):
                 speed_north=timing.get("fused_speed_north"),
                 speed_east=timing.get("fused_speed_east"),
                 speed_down=timing.get("fused_speed_down"),
+                gps_stamp=timing.get("fused_gps_mono"),
+                latitude=timing.get("fused_gps_latitude"),
+                longitude=timing.get("fused_gps_longitude"),
+                altitude=timing.get("fused_gps_altitude"),
+                latitude_accuracy=timing.get("fused_gps_latitude_accuracy"),
+                longitude_accuracy=timing.get("fused_gps_longitude_accuracy"),
+                altitude_accuracy=timing.get("fused_gps_altitude_accuracy"),
             )
-            if telemetry_stamp is not None and (fused.has_attitude or fused.has_velocity):
+            if telemetry_stamp is not None and (
+                fused.has_attitude or fused.has_velocity or fused.has_gnss
+            ):
                 return encode_fused_request(
-                    mode, float(capture_stamp), fused, telemetry_stamp=telemetry_stamp,
+                    mode,
+                    float(capture_stamp),
+                    fused,
+                    telemetry_stamp=telemetry_stamp,
                 )
             return encode_request(mode, capture_stamp)
         return encode_mode(mode)
 
 
-
 class LiveDetectorClient(LiveWorkerClient):
-    def __init__(self, worker_py: Path, python_bin: str, width: int, height: int,
-                 model: Path, imgsz: int = 640, conf: float = 0.25,
-                 iou: float = 0.7, max_det: int = 300):
+    def __init__(
+        self,
+        worker_py: Path,
+        python_bin: str,
+        width: int,
+        height: int,
+        model: Path,
+        imgsz: int = 640,
+        conf: float = 0.25,
+        iou: float = 0.7,
+        max_det: int = 300,
+    ):
         cmd = [
-            str(python_bin), str(worker_py),
-            "--width", str(width),
-            "--height", str(height),
-            "--model", str(model),
-            "--imgsz", str(int(imgsz)),
-            "--conf", str(float(conf)),
-            "--iou", str(float(iou)),
-            "--max-det", str(int(max_det)),
+            str(python_bin),
+            str(worker_py),
+            "--width",
+            str(width),
+            "--height",
+            str(height),
+            "--model",
+            str(model),
+            "--imgsz",
+            str(int(imgsz)),
+            "--conf",
+            str(float(conf)),
+            "--iou",
+            str(float(iou)),
+            "--max-det",
+            str(int(max_det)),
         ]
-        super().__init__(cmd, width, height,
-                         "/tmp/sfm_live_detector_worker.log",
-                         "live-detector-client", "detector",
-                         error_defaults={"count": 0, "boxes": []})
+        super().__init__(
+            cmd,
+            width,
+            height,
+            "/tmp/sfm_live_detector_worker.log",
+            "live-detector-client",
+            "detector",
+            error_defaults={"count": 0, "boxes": []},
+        )

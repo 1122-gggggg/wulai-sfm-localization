@@ -7,6 +7,7 @@ Protocol:
 
 All model logs are redirected to stderr so stdout remains machine-readable.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -24,6 +25,8 @@ import numpy as np
 from live_localizer_protocol import (
     FUSED_HEADER_SIZE,
     FUSED_MAGIC,
+    GNSS_FUSED_HEADER_SIZE,
+    GNSS_FUSED_MAGIC,
     HEADER_SIZE,
     MAX_FUSED_SYNC_ERROR_S,
     TIMED_HEADER_SIZE,
@@ -33,18 +36,20 @@ from live_localizer_protocol import (
 from localization_metrics import edm_cache_metric_fields, sample_cuda_memory_stats
 
 
-
 # Workspace layout (physical dirs beneath the repository root).
 import sys as _sys
+
 _CTRL = Path(__file__).resolve().parents[1]
 if str(_CTRL) not in _sys.path:
     _sys.path.insert(0, str(_CTRL))
 from workspace_layout import workspace_from_file  # noqa: E402
 from backend_contract import InterfaceMode  # noqa: E402
+from localization_contract import InvalidLocalizationResult, LocalizationResult  # noqa: E402
 from runtime_safety import (  # noqa: E402
     configure_offline_environment,
     install_network_guard,
 )
+
 
 _WS = workspace_from_file(__file__)
 SYSTEM_ROOT = _WS.root  # workspace root (replaces old sfm_system parent layout)
@@ -59,22 +64,28 @@ if str(FLIGHT_DIR) not in sys.path:
     sys.path.append(str(FLIGHT_DIR))
 VALIDATION_DIR = _WS.validation
 PACKAGE_ROOT = _WS.runtime
-DEFAULT_BUNDLE = Path(os.environ.get(
-    "SFM_RELOC_BUNDLE",
-    str(_WS.bundles / "your_site_reloc_map_edm.pt"),
-))
+DEFAULT_BUNDLE = Path(
+    os.environ.get(
+        "SFM_RELOC_BUNDLE",
+        str(_WS.bundles / "your_site_reloc_map_edm.pt"),
+    )
+)
 DEFAULT_MEGALOC = os.environ.get(
     "SFM_MEGALOC_CACHE",
     "",
 )
-DEFAULT_NEUFLOW_REPO = Path(os.environ.get(
-    "SFM_NEUFLOW_REPO",
-    str(_WS.root / ".experiment_deps" / "neuflow_v2"),
-))
-DEFAULT_NEUFLOW_WEIGHTS = Path(os.environ.get(
-    "SFM_NEUFLOW_WEIGHTS",
-    str(DEFAULT_NEUFLOW_REPO / "neuflow_mixed.pth"),
-))
+DEFAULT_NEUFLOW_REPO = Path(
+    os.environ.get(
+        "SFM_NEUFLOW_REPO",
+        str(_WS.root / ".experiment_deps" / "neuflow_v2"),
+    )
+)
+DEFAULT_NEUFLOW_WEIGHTS = Path(
+    os.environ.get(
+        "SFM_NEUFLOW_WEIGHTS",
+        str(DEFAULT_NEUFLOW_REPO / "neuflow_mixed.pth"),
+    )
+)
 
 from edm_profile import (  # noqa: E402
     apply_edm_tracker_profile as apply_edm_tracker_profile,  # noqa: F401 - compatibility export
@@ -138,7 +149,7 @@ def read_exact_into(stream, data: bytearray) -> int:
             chunk = stream.read(len(data) - offset)
             count = len(chunk)
             if count:
-                view[offset:offset + count] = chunk
+                view[offset : offset + count] = chunk
         if not count:
             break
         offset += int(count)
@@ -154,7 +165,9 @@ def read_exact(stream, size: int) -> bytearray:
 
 
 def frame_view_from_rgb_bytes(
-    raw: bytes | bytearray | memoryview, width: int, height: int,
+    raw: bytes | bytearray | memoryview,
+    width: int,
+    height: int,
 ) -> np.ndarray:
     """Return a zero-copy RGB view valid for as long as ``raw`` is referenced."""
     expected = int(width) * int(height) * 3
@@ -163,8 +176,9 @@ def frame_view_from_rgb_bytes(
     return np.frombuffer(raw, dtype=np.uint8).reshape((int(height), int(width), 3))
 
 
-def frame_view_from_shared_memory(buffer, slot: int, slots: int,
-                                  width: int, height: int) -> np.ndarray:
+def frame_view_from_shared_memory(
+    buffer, slot: int, slots: int, width: int, height: int
+) -> np.ndarray:
     """Return the selected zero-copy frame slot after validating its bounds."""
     slot = int(slot)
     slots = int(slots)
@@ -172,7 +186,7 @@ def frame_view_from_shared_memory(buffer, slot: int, slots: int,
         raise ValueError(f"shared frame slot {slot} outside [0,{slots})")
     frame_size = int(width) * int(height) * 3
     start = slot * frame_size
-    return frame_view_from_rgb_bytes(buffer[start:start + frame_size], width, height)
+    return frame_view_from_rgb_bytes(buffer[start : start + frame_size], width, height)
 
 
 def resolve_force_track_ref(requested: int, ref_count: int) -> int:
@@ -183,7 +197,8 @@ def resolve_force_track_ref(requested: int, ref_count: int) -> int:
         return int(ref_count) // 2
     if requested < 0 or requested >= int(ref_count):
         raise ValueError(
-            f"--force-track-ref {requested} out of range [0,{int(ref_count) - 1}] (or use -1)")
+            f"--force-track-ref {requested} out of range [0,{int(ref_count) - 1}] (or use -1)"
+        )
     return requested
 
 
@@ -199,9 +214,7 @@ def resolve_query_camera_override(
     if not provided:
         return None
     if not model or width <= 0 or height <= 0 or not params:
-        raise ValueError(
-            "query camera override requires model, positive width/height, and params"
-        )
+        raise ValueError("query camera override requires model, positive width/height, and params")
     if width != stream_width or height != stream_height:
         raise ValueError(
             "query camera resolution must match the worker stream: "
@@ -230,8 +243,7 @@ def apply_xfeat_runtime_overrides(cfg, *, matcher_mode: str, local_topk: int) ->
         cfg.adaptive_first_topk = min(int(cfg.adaptive_first_topk), cfg.local_topk)
 
 
-def apply_runtime_benchmark_mode(tracker, mode: str, previous_mode: str,
-                                 seed_local_prior) -> bool:
+def apply_runtime_benchmark_mode(tracker, mode: str, previous_mode: str, seed_local_prior) -> bool:
     """Prepare one forced benchmark branch at a frame boundary.
 
     Returns True when a fixed local prior was seeded for this frame. ``auto``
@@ -260,9 +272,7 @@ def apply_runtime_benchmark_mode(tracker, mode: str, previous_mode: str,
 
     target = "WEAK_TRACK" if mode == "weak" else "TRACK"
     needs_prior = (
-        previous_mode != mode
-        or tracker.state.last_center is None
-        or not tracker.state.last_refs
+        previous_mode != mode or tracker.state.last_center is None or not tracker.state.last_refs
     )
     if previous_mode != mode:
         reset_to_boot()
@@ -574,9 +584,7 @@ def _prepare_benchmark_seed(args, tracker, xmap):
 
         centers = xmap.ref_centers
         if centers is None or len(centers) == 0:
-            raise RuntimeError(
-                "bundle missing ref_centers; cannot seed local benchmark prior"
-            )
+            raise RuntimeError("bundle missing ref_centers; cannot seed local benchmark prior")
         n = len(centers)
         try:
             force_track_ref_resolved = resolve_force_track_ref(args.force_track_ref, n)
@@ -586,9 +594,7 @@ def _prepare_benchmark_seed(args, tracker, xmap):
         seed_yaw = 0.0
         if xmap.ref_yaws is not None and len(xmap.ref_yaws) == n:
             seed_yaw = float(xmap.ref_yaws[force_track_ref_resolved])
-        distances = np.linalg.norm(
-            np.asarray(centers, np.float32) - center[None, :], axis=1
-        )
+        distances = np.linalg.norm(np.asarray(centers, np.float32) - center[None, :], axis=1)
         seed_near = [int(j) for j in np.argsort(distances)[:5]]
         if args.force_track_bench:
             force_track_label = "fixed_prior_cold_cache"
@@ -596,8 +602,11 @@ def _prepare_benchmark_seed(args, tracker, xmap):
         def seed_local_prior(target_mode: str, *, reset_temporal: bool = False) -> None:
             """Seed a fixed map-reference pose for TRACK/WEAK speed tests."""
             pose0 = Pose(
-                x=float(center[0]), y=float(center[1]), z=float(center[2]),
-                yaw=seed_yaw, stamp=time.monotonic(),
+                x=float(center[0]),
+                y=float(center[1]),
+                z=float(center[2]),
+                yaw=seed_yaw,
+                stamp=time.monotonic(),
             )
             state = tracker.state
             state.mode = str(target_mode)
@@ -646,7 +655,8 @@ def _build_worker_backend(args, backend: str, query_camera_override, map_frame):
                 print(
                     f"[live_worker] ignoring --megaloc-cache {args.megaloc_cache}: "
                     "EDM retrieval reads the bundle's own MegaLoc ref_global",
-                    file=sys.stderr, flush=True,
+                    file=sys.stderr,
+                    flush=True,
                 )
             built = build_production_localizer(
                 backend="edm",
@@ -660,9 +670,7 @@ def _build_worker_backend(args, backend: str, query_camera_override, map_frame):
                 frame_source=lambda: None,
                 camera_tuple=query_camera_override or CAM_720_EDM,
                 production_profile=args.production_profile or None,
-                production_profile_sha256=(
-                    args.production_profile_sha256 or None
-                ),
+                production_profile_sha256=(args.production_profile_sha256 or None),
                 local_topk=int(args.local_topk),
                 map_frame=map_frame,
             )
@@ -682,6 +690,8 @@ def _build_worker_backend(args, backend: str, query_camera_override, map_frame):
                 f"boot_topk={cfg.boot_global_topk} "
                 f"staged_first={getattr(cfg, 'acquire_initial_topk', 'n/a')} "
                 f"batch={getattr(cfg, 'match_batch_size', 'n/a')} "
+                f"pnp_workers/early={getattr(cfg, 'pnp_workers', 'n/a')}/"
+                f"{getattr(cfg, 'pnp_early_stop', 'n/a')} "
                 f"lost_grace={getattr(cfg, 'lost_local_grace_frames', 'n/a')} "
                 f"recovery_bank/scan={getattr(cfg, 'recovery_bank_size', 'n/a')}/"
                 f"{getattr(cfg, 'recovery_scan_topk', 'n/a')} "
@@ -689,7 +699,8 @@ def _build_worker_backend(args, backend: str, query_camera_override, map_frame):
                 f"reproj_gate={getattr(cfg, 'max_reproj_error_acquire', 'n/a')}/"
                 f"{getattr(cfg, 'max_reproj_error_track', 'n/a')} "
                 f"min_inliers={cfg.acquire_min_inliers}/{cfg.track_min_inliers}/{cfg.weak_min_inliers}",
-                file=sys.stderr, flush=True,
+                file=sys.stderr,
+                flush=True,
             )
         else:
             from path_follow_flight import CAM_720
@@ -716,8 +727,7 @@ def _build_worker_backend(args, backend: str, query_camera_override, map_frame):
             DEVICE = built.device
             megaloc = tracker.meg
             tracker_variant = (
-                f"matcher_{cfg.matcher_mode}_topk{cfg.local_topk}"
-                f"_adapt{cfg.adaptive_first_topk}"
+                f"matcher_{cfg.matcher_mode}_topk{cfg.local_topk}_adapt{cfg.adaptive_first_topk}"
             )
             print(
                 f"[live_worker] XFeat TRACK matcher={cfg.matcher_mode} "
@@ -727,7 +737,8 @@ def _build_worker_backend(args, backend: str, query_camera_override, map_frame):
                 f"max_reproj_track={cfg.max_reproj_error_track} "
                 f"max_jump={cfg.max_jump} weak_after={cfg.weak_after} "
                 f"lost_after={cfg.lost_after} xfeat_track={cfg.xfeat_topk_track}",
-                file=sys.stderr, flush=True,
+                file=sys.stderr,
+                flush=True,
             )
             if args.neuflow_track:
                 from neuflow_refresh_experiment import NeuFlowRefreshTracker, NeuFlowV2Backend
@@ -735,27 +746,43 @@ def _build_worker_backend(args, backend: str, query_camera_override, map_frame):
                 neuflow_backend = NeuFlowV2Backend(
                     repo=DEFAULT_NEUFLOW_REPO,
                     weights=DEFAULT_NEUFLOW_WEIGHTS,
-                    width=520, height=320,
+                    width=520,
+                    height=320,
                 )
                 tracker = NeuFlowRefreshTracker(
-                    xmap, megaloc, frame_source=lambda: None, query_cam=cam, cfg=cfg,
-                    neuflow_backend=neuflow_backend, refresh_interval=3,
-                    min_seed=80, min_track=60, min_inliers=50,
-                    min_inlier_ratio=0.35, max_reproj=6.0,
+                    xmap,
+                    megaloc,
+                    frame_source=lambda: None,
+                    query_cam=cam,
+                    cfg=cfg,
+                    neuflow_backend=neuflow_backend,
+                    refresh_interval=3,
+                    min_seed=80,
+                    min_track=60,
+                    min_inliers=50,
+                    min_inlier_ratio=0.35,
+                    max_reproj=6.0,
                 )
                 tracker_variant = "neuflow_v2_r3_s80_t60"
             elif args.projection_track:
                 from projection_guided_tracker import (
-                    ProjectionGuidedTracker, TrackLandmarkSidecar,
+                    ProjectionGuidedTracker,
+                    TrackLandmarkSidecar,
                 )
 
                 landmark_sidecar = TrackLandmarkSidecar.load(
-                    Path(args.track_landmarks), xmap.ref_names)
+                    Path(args.track_landmarks), xmap.ref_names
+                )
                 tracker = ProjectionGuidedTracker(
-                    xmap, megaloc, frame_source=lambda: None, query_cam=cam, cfg=cfg,
+                    xmap,
+                    megaloc,
+                    frame_source=lambda: None,
+                    query_cam=cam,
+                    cfg=cfg,
                     landmark_sidecar=landmark_sidecar,
                     search_radii=(15.0, 25.0, 40.0),
-                    min_score=0.60, ratio=0.95,
+                    min_score=0.60,
+                    ratio=0.95,
                 )
                 tracker_variant = "projection_guided_r15_25_40_s060_ratio095"
 
@@ -772,7 +799,8 @@ def _build_worker_backend(args, backend: str, query_camera_override, map_frame):
             print(
                 "[live_worker] lock_track_only=1: MegaLoc disabled; mode pinned to TRACK "
                 "(success/fail does not escalate to WEAK/LOST)",
-                file=sys.stderr, flush=True,
+                file=sys.stderr,
+                flush=True,
             )
 
         print(
@@ -786,8 +814,7 @@ def _build_worker_backend(args, backend: str, query_camera_override, map_frame):
         if args.force_track_bench:
             # Forced TRACK microbench never takes BOOT/LOST VPR; keep MegaLoc off GPU
             # so its cost is not attributed to the matching path being measured.
-            ensure = getattr(tracker, "ensure_xfeat", None) or getattr(
-                tracker, "ensure_edm", None)
+            ensure = getattr(tracker, "ensure_xfeat", None) or getattr(tracker, "ensure_edm", None)
             if callable(ensure):
                 ensure()
         else:
@@ -832,13 +859,19 @@ def main() -> None:
         flush=True,
     )
     if args.startup_handshake:
-        json_out.write(json.dumps({
-            "event": "ready",
-            "backend": backend,
-            "device": DEVICE,
-            "tracker_variant": tracker_variant,
-            "startup_ms": startup_ms,
-        }, ensure_ascii=False) + "\n")
+        json_out.write(
+            json.dumps(
+                {
+                    "event": "ready",
+                    "backend": backend,
+                    "device": DEVICE,
+                    "tracker_variant": tracker_variant,
+                    "startup_ms": startup_ms,
+                },
+                ensure_ascii=False,
+            )
+            + "\n"
+        )
         json_out.flush()
 
     _run_worker_loop(
@@ -874,6 +907,8 @@ def _read_benchmark_request(args):
             extra = TIMED_HEADER_SIZE - HEADER_SIZE
         elif magic == FUSED_MAGIC:
             extra = FUSED_HEADER_SIZE - HEADER_SIZE
+        elif magic == GNSS_FUSED_MAGIC:
+            extra = GNSS_FUSED_HEADER_SIZE - HEADER_SIZE
         else:
             extra = 0
         if extra:
@@ -892,7 +927,6 @@ def _read_benchmark_request(args):
             print(f"[live_worker] {exc}", file=sys.stderr, flush=True)
             return None
     return benchmark_mode_requested, capture_stamp, fused
-
 
 
 def _read_worker_frame(args, frame_buffer, frame_shm, frame_size: int):
@@ -931,9 +965,7 @@ def _prepare_benchmark_frame(
     force_track_seed_ms = 0.0
     benchmark_setup_ms = 0.0
     benchmark_seeded = False
-    benchmark_mode_active = (
-        "track" if args.force_track_bench else previous_runtime_mode
-    )
+    benchmark_mode_active = "track" if args.force_track_bench else previous_runtime_mode
     if args.force_track_bench:
         seed_t0 = time.perf_counter()
         assert seed_local_prior is not None
@@ -993,23 +1025,18 @@ def _run_tracker_localization(
 def _prepare_frame_io(args, torch):
     frame_size = int(args.width) * int(args.height) * 3
     frame_buffer = None if args.frame_shm_name else bytearray(frame_size)
-    frame_shm = (
-        attach_frame_shm(args.frame_shm_name) if args.frame_shm_name else None
-    )
+    frame_shm = attach_frame_shm(args.frame_shm_name) if args.frame_shm_name else None
     if frame_shm is not None and len(frame_shm.buf) < frame_size * args.frame_shm_slots:
         frame_shm.close()
         raise RuntimeError("shared frame memory is smaller than the declared slot count")
     # CUDA events require a synchronization to read. Keep them strictly opt-in;
     # production never inserts a device-wide/per-frame timing fence.
     gpu_timing_profiled = (
-        os.environ.get("SFM_LOC_PROFILE_GPU", "0").strip().lower()
-        in {"1", "true", "yes", "on"}
+        os.environ.get("SFM_LOC_PROFILE_GPU", "0").strip().lower() in {"1", "true", "yes", "on"}
         and torch.cuda.is_available()
     )
-    gpu_start_event = (
-        torch.cuda.Event(enable_timing=True) if gpu_timing_profiled else None)
-    gpu_end_event = (
-        torch.cuda.Event(enable_timing=True) if gpu_timing_profiled else None)
+    gpu_start_event = torch.cuda.Event(enable_timing=True) if gpu_timing_profiled else None
+    gpu_end_event = torch.cuda.Event(enable_timing=True) if gpu_timing_profiled else None
     return (
         frame_size,
         frame_buffer,
@@ -1057,8 +1084,7 @@ def _build_success_payload(
     info = dict(tracker.last_info)
     # A non-finite pose (NaN/inf) would serialize as the bare token `NaN`
     # (invalid JSON) and could steer the UI trajectory -> report it as no fix.
-    pose_ok = pose is not None and bool(
-        np.isfinite([pose.x, pose.y, pose.z, pose.yaw]).all())
+    pose_ok = pose is not None and bool(np.isfinite([pose.x, pose.y, pose.z, pose.yaw]).all())
     pose_payload = None
     if pose_ok:
         pose_payload = {
@@ -1119,18 +1145,19 @@ def _build_success_payload(
         "force_track_bench": bool(args.force_track_bench),
         "force_track_label": force_track_label,
         "force_track_ref_requested": (
-            int(args.force_track_ref) if args.force_track_bench else None),
-        "force_track_ref_resolved": (
-            force_track_ref_resolved if args.force_track_bench else None),
+            int(args.force_track_ref) if args.force_track_bench else None
+        ),
+        "force_track_ref_resolved": (force_track_ref_resolved if args.force_track_bench else None),
         "force_track_seed_ms": force_track_seed_ms,
         "benchmark_mode_requested": benchmark_mode_requested,
         "benchmark_mode_active": benchmark_mode_active,
         "relocalize_requested": benchmark_mode_requested == "relocalize",
         "benchmark_prior_kind": (
-            "fixed_ref" if benchmark_mode_active in {"weak", "track"} else None),
+            "fixed_ref" if benchmark_mode_active in {"weak", "track"} else None
+        ),
         "benchmark_prior_ref": (
-            force_track_ref_resolved
-            if benchmark_mode_active in {"weak", "track"} else None),
+            force_track_ref_resolved if benchmark_mode_active in {"weak", "track"} else None
+        ),
         "benchmark_setup_ms": benchmark_setup_ms,
         "benchmark_seeded": benchmark_seeded,
         "pose": pose_payload,
@@ -1147,6 +1174,8 @@ def _build_success_payload(
         "reference_count": info.get("reference_count"),
         "candidate_mode": info.get("candidate_mode"),
         "global_retrieval_calls": info.get("global_retrieval_calls"),
+        "lost_search_stage": info.get("lost_search_stage"),
+        "lost_search_radius_factor": info.get("lost_search_radius_factor"),
         "camera_axes_world": info.get("camera_axes_world"),
         "camera_forward_world": info.get("camera_forward_world"),
         "reproj_rms": info.get("reproj_rms"),
@@ -1156,14 +1185,16 @@ def _build_success_payload(
         "staged_early_stop": info.get("staged_early_stop"),
         "rejected": info.get("rejected"),
         "limited_jump": info.get("limited_jump"),
-        "limited_jump_confirmed": info.get(
-            "limited_jump_confirmed", False
-        ),
+        "limited_jump_confirmed": info.get("limited_jump_confirmed", False),
         "composite_stage": info.get("composite_stage"),
         "vpr_ms": info.get("vpr_ms"),
         "feature_ms": info.get("feature_ms"),
         "match_ms": info.get("match_ms"),
         "pnp_ms": info.get("pnp_ms"),
+        "pnp_candidates": info.get("pnp_candidates"),
+        "pnp_skipped": info.get("pnp_skipped"),
+        "pnp_workers": info.get("pnp_workers"),
+        "edm_host_feature_cache": info.get("host_feature_cache"),
         "neuflow_stage": info.get("neuflow_stage"),
         "neuflow_anchor_count": info.get("neuflow_anchor_count"),
         "neuflow_flow_ms": info.get("neuflow_flow_ms"),
@@ -1207,8 +1238,7 @@ def _build_exception_payload(
     benchmark_seeded: bool,
 ) -> tuple[dict, bool]:
     worker_core_done_mono = worker_core_done_mono_ns * 1e-9
-    core_wall_ms = (
-        (time.perf_counter() - core_t0) * 1000.0 if core_t0 is not None else None)
+    core_wall_ms = (time.perf_counter() - core_t0) * 1000.0 if core_t0 is not None else None
     wall_ms = (time.perf_counter() - wall_t0) * 1000.0
     worker_fatal = edm_cuda_oom_requires_restart(backend, error, torch)
     payload = localization_exception_payload(
@@ -1222,35 +1252,40 @@ def _build_exception_payload(
         ),
         pose_mono_ns=worker_core_done_mono_ns or worker_read_done_mono_ns,
     )
-    payload.update({
-        "wall_ms": wall_ms,
-        "core_wall_ms": core_wall_ms,
-        "worker_read_done_mono": worker_read_done_mono,
-        "worker_core_start_mono": worker_core_start_mono,
-        "worker_core_done_mono": worker_core_done_mono,
-        "worker_read_done_mono_ns": worker_read_done_mono_ns,
-        "worker_core_start_mono_ns": worker_core_start_mono_ns,
-        "worker_core_done_mono_ns": worker_core_done_mono_ns,
-        "gpu_timing_profiled": gpu_timing_profiled,
-        "gpu_span_ms": None,
-        "tracker_variant": tracker_variant,
-        "force_track_bench": bool(args.force_track_bench),
-        "force_track_label": force_track_label,
-        "force_track_ref_requested": (
-            int(args.force_track_ref) if args.force_track_bench else None),
-        "force_track_ref_resolved": (
-            force_track_ref_resolved if args.force_track_bench else None),
-        "force_track_seed_ms": force_track_seed_ms,
-        "benchmark_mode_requested": benchmark_mode_requested,
-        "benchmark_mode_active": benchmark_mode_active,
-        "benchmark_prior_kind": (
-            "fixed_ref" if benchmark_mode_active in {"weak", "track"} else None),
-        "benchmark_prior_ref": (
-            force_track_ref_resolved
-            if benchmark_mode_active in {"weak", "track"} else None),
-        "benchmark_setup_ms": benchmark_setup_ms,
-        "benchmark_seeded": benchmark_seeded,
-    })
+    payload.update(
+        {
+            "wall_ms": wall_ms,
+            "core_wall_ms": core_wall_ms,
+            "worker_read_done_mono": worker_read_done_mono,
+            "worker_core_start_mono": worker_core_start_mono,
+            "worker_core_done_mono": worker_core_done_mono,
+            "worker_read_done_mono_ns": worker_read_done_mono_ns,
+            "worker_core_start_mono_ns": worker_core_start_mono_ns,
+            "worker_core_done_mono_ns": worker_core_done_mono_ns,
+            "gpu_timing_profiled": gpu_timing_profiled,
+            "gpu_span_ms": None,
+            "tracker_variant": tracker_variant,
+            "force_track_bench": bool(args.force_track_bench),
+            "force_track_label": force_track_label,
+            "force_track_ref_requested": (
+                int(args.force_track_ref) if args.force_track_bench else None
+            ),
+            "force_track_ref_resolved": (
+                force_track_ref_resolved if args.force_track_bench else None
+            ),
+            "force_track_seed_ms": force_track_seed_ms,
+            "benchmark_mode_requested": benchmark_mode_requested,
+            "benchmark_mode_active": benchmark_mode_active,
+            "benchmark_prior_kind": (
+                "fixed_ref" if benchmark_mode_active in {"weak", "track"} else None
+            ),
+            "benchmark_prior_ref": (
+                force_track_ref_resolved if benchmark_mode_active in {"weak", "track"} else None
+            ),
+            "benchmark_setup_ms": benchmark_setup_ms,
+            "benchmark_seeded": benchmark_seeded,
+        }
+    )
     if worker_fatal:
         payload.update(cuda_oom_failure_fields(error))
     print(f"[live_worker] localization error: {error!r}", file=sys.stderr, flush=True)
@@ -1286,9 +1321,7 @@ def _process_worker_frame(
     force_track_seed_ms = 0.0
     benchmark_setup_ms = 0.0
     benchmark_seeded = False
-    benchmark_mode_active = (
-        "track" if args.force_track_bench else previous_runtime_mode
-    )
+    benchmark_mode_active = "track" if args.force_track_bench else previous_runtime_mode
     worker_fatal = False
     try:
         (
@@ -1372,7 +1405,7 @@ def _process_worker_frame(
 
 
 def _fused_odometry_sample_from_request(fused, capture_stamp, *, now_mono=None):
-    """Build pose-guided IMU from the independent SFM3 stamp. Never backdate."""
+    """Build pose-guided IMU/GNSS from independent acquisition stamps."""
     if fused is None:
         return None
     stamp = getattr(fused, "stamp", None)
@@ -1404,10 +1437,20 @@ def _fused_odometry_sample_from_request(fused, capture_stamp, *, now_mono=None):
         speed_north=fused.speed_north,
         speed_east=fused.speed_east,
         speed_down=fused.speed_down,
+        gps_timestamp=fused.gps_stamp,
+        latitude=fused.latitude,
+        longitude=fused.longitude,
+        altitude=fused.altitude,
+        latitude_accuracy=fused.latitude_accuracy,
+        longitude_accuracy=fused.longitude_accuracy,
+        altitude_accuracy=fused.altitude_accuracy,
     )
 
 
 def _tracker_matcher(tracker):
+    inner = getattr(tracker, "trk", None)
+    if inner is not None:
+        tracker = inner
     loc = getattr(tracker, "loc", None)
     matcher = getattr(loc, "matcher", None)
     if matcher is not None:
@@ -1471,7 +1514,8 @@ def _attach_sampled_runtime_metrics(
     """
     cuda = getattr(torch_module, "cuda", None) if torch_module is not None else None
     stats, sampled_at = sample_cuda_memory_stats(
-        cuda, last_sample_mono=last_cuda_sample_mono,
+        cuda,
+        last_sample_mono=last_cuda_sample_mono,
     )
     if stats is not None:
         last_cuda_stats = stats
@@ -1551,6 +1595,10 @@ def _run_worker_loop(
             last_cuda_sample_mono,
             last_cuda_stats,
         )
+        try:
+            LocalizationResult.from_dict(payload)
+        except InvalidLocalizationResult as exc:
+            print(f"[live_worker] payload failed contract validation: {exc}", file=sys.stderr, flush=True)
         json_out.write(json.dumps(payload, ensure_ascii=False) + "\n")
         json_out.flush()
         seq += 1

@@ -1,4 +1,5 @@
 """CLI and process launch for the desktop operator interface."""
+
 from __future__ import annotations
 
 import argparse
@@ -76,12 +77,17 @@ def build_argument_parser() -> argparse.ArgumentParser:
     ap.add_argument("--map-ply", default=None)
     ap.add_argument("--max-points", type=int, default=250000)
     ap.add_argument("--video", default="")
-    ap.add_argument("--video-stride", type=int, default=1,
-                    help="1 means ANAFI-like 720p30 stream; >1 keeps every Nth source frame")
-    ap.add_argument("--replay-json", default=str(DEFAULT_REPLAY_JSON) if DEFAULT_REPLAY_JSON.exists() else "")
+    ap.add_argument(
+        "--video-stride",
+        type=int,
+        default=1,
+        help="1 means ANAFI-like 720p30 stream; >1 keeps every Nth source frame",
+    )
+    ap.add_argument(
+        "--replay-json", default=str(DEFAULT_REPLAY_JSON) if DEFAULT_REPLAY_JSON.exists() else ""
+    )
     ap.add_argument("--live-localize", action=argparse.BooleanOptionalAction, default=True)
-    ap.add_argument("--localizer-python",
-                    default=default_worker_python("SFM_LOCALIZER_PYTHON"))
+    ap.add_argument("--localizer-python", default=default_worker_python("SFM_LOCALIZER_PYTHON"))
     ap.add_argument("--localizer-worker", default=str(DEFAULT_WORKER))
     ap.add_argument("--bundle", default=None)
     ap.add_argument("--bundle-sha256", default=None)
@@ -135,16 +141,18 @@ def build_argument_parser() -> argparse.ArgumentParser:
         help="Profile-pinned IVF index SHA256SUMS.json for large reference maps",
     )
     ap.add_argument("--reference-index-sha256", default=None)
-    ap.add_argument("--track-landmarks", default=None,
-                    help="XFeat TRACK landmark sidecar selected directly or by site profile")
+    ap.add_argument(
+        "--track-landmarks",
+        default=None,
+        help="XFeat TRACK landmark sidecar selected directly or by site profile",
+    )
     ap.add_argument(
         "--live-detect",
         action=argparse.BooleanOptionalAction,
         default=False,
         help="OPTIONAL YOLO overlay (default OFF; not used for localization/flight)",
     )
-    ap.add_argument("--detector-python",
-                    default=default_worker_python("SFM_DETECTOR_PYTHON"))
+    ap.add_argument("--detector-python", default=default_worker_python("SFM_DETECTOR_PYTHON"))
     ap.add_argument("--detector-worker", default=str(DEFAULT_DETECTOR_WORKER))
     ap.add_argument("--detector-model", default=str(DEFAULT_DETECTOR_MODEL))
     ap.add_argument("--detect-every-n-frames", type=int, default=3)
@@ -157,26 +165,49 @@ def build_argument_parser() -> argparse.ArgumentParser:
         default=1,
         help="Submit every Nth stream frame to the localizer (1=every new frame; 2≈half rate)",
     )
-    ap.add_argument("--tick-ms", type=int, default=8)
-    ap.add_argument("--stream-fps", type=float, default=ANAFI.stream_fps,
-                    help="720p frame-source rate fed to the localizer (real ANAFI live stream is 30)")
-    ap.add_argument("--boot-lock-ms", type=int, default=2500,
-                    help="hold the first 720p frame to simulate takeoff hover + MegaLoc BOOT_INIT")
     ap.add_argument(
-        "--lost-hold", action=argparse.BooleanOptionalAction, default=True,
+        "--adaptive-loc-submit",
+        action=argparse.BooleanOptionalAction,
+        default=os.environ.get("SFM_ADAPTIVE_LOC_SUBMIT", "1").strip()
+        in {"1", "true", "TRUE", "yes"},
+        help=(
+            "Adapt busy-worker coalesce cadence to half the latest localization "
+            "latency while preserving latest-frame delivery"
+        ),
+    )
+    ap.add_argument("--tick-ms", type=int, default=8)
+    ap.add_argument(
+        "--stream-fps",
+        type=float,
+        default=ANAFI.stream_fps,
+        help="720p frame-source rate fed to the localizer (real ANAFI live stream is 30)",
+    )
+    ap.add_argument(
+        "--boot-lock-ms",
+        type=int,
+        default=2500,
+        help="hold the first 720p frame to simulate takeoff hover + MegaLoc BOOT_INIT",
+    )
+    ap.add_argument(
+        "--lost-hold",
+        action=argparse.BooleanOptionalAction,
+        default=True,
         help=(
             "Enable bounded localization recovery. File/video pauses its frame; "
             "real flight sends zero PCMD, hands control to the pilot, and keeps "
             "consuming live frames."
         ),
     )
-    ap.add_argument("--lost-hold-max-attempts", type=int, default=5,
-                    help="total LOST recovery attempts before the held stream is released")
+    ap.add_argument(
+        "--lost-hold-max-attempts",
+        type=int,
+        default=5,
+        help="total LOST recovery attempts before the held stream is released",
+    )
     ap.add_argument(
         "--hold-on-low-confidence",
         action=argparse.BooleanOptionalAction,
-        default=os.environ.get("SFM_HOLD_ON_LOW_CONF", "1").strip()
-        in {"1", "true", "TRUE", "yes"},
+        default=os.environ.get("SFM_HOLD_ON_LOW_CONF", "1").strip() in {"1", "true", "TRUE", "yes"},
         help=(
             "after consecutive low-confidence EDM results, hover/hold and run "
             "staged MegaLoc/EDM recovery (enabled by default)"
@@ -188,10 +219,17 @@ def build_argument_parser() -> argparse.ArgumentParser:
         default=int(os.environ.get("SFM_LOW_CONF_HOLD_RESULTS", "2")),
         help="consecutive low-confidence EDM results before staged MegaLoc recovery",
     )
-    ap.add_argument("--lost-hold-timeout-ms", type=int, default=10000,
-                    help="release the held frame if the retries stall (0 = no timeout)")
-    ap.add_argument("--auto-inspect", action="store_true",
-                    help="after UI start, auto 開始定位 (does NOT send flight commands)")
+    ap.add_argument(
+        "--lost-hold-timeout-ms",
+        type=int,
+        default=10000,
+        help="release the held frame if the retries stall (0 = no timeout)",
+    )
+    ap.add_argument(
+        "--auto-inspect",
+        action="store_true",
+        help="after UI start, auto 開始定位 (does NOT send flight commands)",
+    )
     ap.add_argument(
         "--loc-force-track-bench",
         action="store_true",
@@ -201,8 +239,12 @@ def build_argument_parser() -> argparse.ArgumentParser:
             "(TRACK microbench only; no takeoff)."
         ),
     )
-    ap.add_argument("--loc-force-track-ref", type=int, default=-1,
-                    help="Map ref index for track bench seed (-1=middle)")
+    ap.add_argument(
+        "--loc-force-track-ref",
+        type=int,
+        default=-1,
+        help="Map ref index for track bench seed (-1=middle)",
+    )
     ap.add_argument(
         "--neuflow-track",
         action="store_true",
@@ -238,8 +280,11 @@ def build_argument_parser() -> argparse.ArgumentParser:
             "XFeat: also clamps adaptive_first_topk. EDM: overrides production_edm_config."
         ),
     )
-    ap.add_argument("--route-json", default=None,
-                    help="drawn flight path (aligned frame) to overlay on the map in a distinct colour")
+    ap.add_argument(
+        "--route-json",
+        default=None,
+        help="drawn flight path (aligned frame) to overlay on the map in a distinct colour",
+    )
     ap.add_argument("--layout-selftest", action="store_true")
     ap.add_argument("--selftest", action="store_true")
     ap.add_argument(
@@ -254,24 +299,39 @@ def build_argument_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="legacy alias for --interface real-flight",
     )
-    ap.add_argument("--ip", default="192.168.53.1",
-                    help="192.168.53.1 SkyController / 192.168.42.1 direct drone")
-    ap.add_argument("--controller", default="skycontroller3",
-                    help="skycontroller3 / drone / auto")
-    ap.add_argument("--nudge-pct", type=int, default=8,
-                    help="PCMD percent for micro-moves (keep small; default 8)")
-    ap.add_argument("--nudge-pulse-s", type=float, default=0.20,
-                    help="nudge heartbeat TTL/deadman seconds (default 0.20)")
     ap.add_argument(
-        "--max-altitude-m", type=float, default=optional_env_float("SFM_MAX_ALTITUDE_M"),
+        "--ip",
+        default="192.168.53.1",
+        help="192.168.53.1 SkyController / 192.168.42.1 direct drone",
+    )
+    ap.add_argument("--controller", default="skycontroller3", help="skycontroller3 / drone / auto")
+    ap.add_argument(
+        "--nudge-pct",
+        type=int,
+        default=8,
+        help="PCMD percent for micro-moves (keep small; default 8)",
+    )
+    ap.add_argument(
+        "--nudge-pulse-s",
+        type=float,
+        default=0.20,
+        help="nudge heartbeat TTL/deadman seconds (default 0.20)",
+    )
+    ap.add_argument(
+        "--max-altitude-m",
+        type=float,
+        default=optional_env_float("SFM_MAX_ALTITUDE_M"),
         help="advisory desired firmware MaxAltitude; failure does not block takeoff",
     )
     ap.add_argument(
-        "--max-distance-m", type=float, default=optional_env_float("SFM_MAX_DISTANCE_M"),
+        "--max-distance-m",
+        type=float,
+        default=optional_env_float("SFM_MAX_DISTANCE_M"),
         help="advisory desired firmware MaxDistance; failure does not block takeoff",
     )
     ap.add_argument(
-        "--distance-geofence", action=argparse.BooleanOptionalAction,
+        "--distance-geofence",
+        action=argparse.BooleanOptionalAction,
         # OFF by default. GPS and firmware readback are advisory takeoff inputs;
         # containment for
         # manual flight comes from MaxAltitude plus the operator. Link loss is
@@ -283,56 +343,68 @@ def build_argument_parser() -> argparse.ArgumentParser:
         ),
     )
     ap.add_argument(
-        "--max-tilt-deg", type=float,
-        default=float(os.environ.get("SFM_MAX_TILT_DEG",
-                                     DEFAULT_MAX_TILT_DEG)),
+        "--max-tilt-deg",
+        type=float,
+        default=float(os.environ.get("SFM_MAX_TILT_DEG", DEFAULT_MAX_TILT_DEG)),
         help="firmware MaxTilt pinned at connect; scales every stick command",
     )
     ap.add_argument(
-        "--max-vertical-speed-ms", type=float,
-        default=float(os.environ.get("SFM_MAX_VERTICAL_SPEED_MS",
-                                     DEFAULT_MAX_VERTICAL_SPEED_MS)),
+        "--max-vertical-speed-ms",
+        type=float,
+        default=float(os.environ.get("SFM_MAX_VERTICAL_SPEED_MS", DEFAULT_MAX_VERTICAL_SPEED_MS)),
         help="firmware MaxVerticalSpeed pinned at connect",
     )
     ap.add_argument(
-        "--max-rotation-speed-degs", type=float,
-        default=float(os.environ.get("SFM_MAX_ROTATION_SPEED_DEGS",
-                                     DEFAULT_MAX_ROTATION_SPEED_DEGS)),
+        "--max-rotation-speed-degs",
+        type=float,
+        default=float(
+            os.environ.get("SFM_MAX_ROTATION_SPEED_DEGS", DEFAULT_MAX_ROTATION_SPEED_DEGS)
+        ),
         help="firmware MaxRotationSpeed pinned at connect",
     )
     ap.add_argument(
-        "--stream-loss-grace-s", type=float,
+        "--stream-loss-grace-s",
+        type=float,
         default=float(os.environ.get("SFM_STREAM_LOSS_GRACE_S", 10.0)),
-        help=("how long the video stream must be CONTINUOUSLY stale before control "
-              "is handed back to the sticks; brief latency spikes recover inside it"),
+        help=(
+            "how long the video stream must be CONTINUOUSLY stale before control "
+            "is handed back to the sticks; brief latency spikes recover inside it"
+        ),
     )
     ap.add_argument(
-        "--auto-pc-control", action=argparse.BooleanOptionalAction,
+        "--auto-pc-control",
+        action=argparse.BooleanOptionalAction,
         default=env_bool("SFM_AUTO_PC_CONTROL", True),
-        help=("take PC control automatically on connect (landed + sticks idle "
-              "only); stick movement always hands control back"),
+        help=(
+            "take PC control automatically on connect (landed + sticks idle "
+            "only); stick movement always hands control back"
+        ),
     )
     ap.add_argument(
-        "--rth-min-altitude-m", type=float,
-        default=float(os.environ.get("SFM_RTH_MIN_ALTITUDE_M",
-                                     DEFAULT_RTH_MIN_ALTITUDE_M)),
-        help=("RTH climb altitude pinned at connect; keep at or below "
-              "--max-altitude-m or the recovery breaks your own ceiling"),
+        "--rth-min-altitude-m",
+        type=float,
+        default=float(os.environ.get("SFM_RTH_MIN_ALTITUDE_M", DEFAULT_RTH_MIN_ALTITUDE_M)),
+        help=(
+            "RTH climb altitude pinned at connect; keep at or below "
+            "--max-altitude-m or the recovery breaks your own ceiling"
+        ),
     )
     ap.add_argument(
-        "--min-takeoff-battery-pct", type=float,
+        "--min-takeoff-battery-pct",
+        type=float,
         default=float(os.environ.get("SFM_MIN_TAKEOFF_BATTERY_PCT", "30")),
         help="advisory takeoff battery threshold; never blocks takeoff (default 30%%)",
     )
     ap.add_argument(
-        "--require-gps-for-geofence", action=argparse.BooleanOptionalAction,
+        "--require-gps-for-geofence",
+        action=argparse.BooleanOptionalAction,
         default=env_bool("SFM_REQUIRE_GPS_FOR_GEOFENCE", True),
         help="legacy compatibility flag; GPS status is advisory and never gates takeoff",
     )
-    ap.add_argument("--no-live-video", action="store_true",
-                    help="skip PDRAW video (control+telemetry only)")
-    ap.add_argument("--cmd-log", default="",
-                    help="JSONL path for live command log")
+    ap.add_argument(
+        "--no-live-video", action="store_true", help="skip PDRAW video (control+telemetry only)"
+    )
+    ap.add_argument("--cmd-log", default="", help="JSONL path for live command log")
     return ap
 
 
@@ -382,9 +454,7 @@ def _load_startup_route(
     except Exception as exc:
         # This also covers malformed gravity alignment. It must be an
         # operator-readable startup refusal, not a traceback.
-        raise SystemExit(
-            f"cannot load route {route_path} for this site: {exc}"
-        ) from exc
+        raise SystemExit(f"cannot load route {route_path} for this site: {exc}") from exc
     return route_hash, route_points, mission_snapshot
 
 
@@ -467,9 +537,7 @@ def _resolve_startup_site(
     hardware_approval = None
     if site_profile is not None and site_profile.hardware_approval is not None:
         try:
-            hardware_approval = app.load_hardware_approval_receipt(
-                site_profile.hardware_approval
-            )
+            hardware_approval = app.load_hardware_approval_receipt(site_profile.hardware_approval)
         except ValueError as exc:
             raise SystemExit(str(exc)) from exc
     return site_profile, hardware_approval
@@ -510,6 +578,7 @@ def _announce_interface(args: argparse.Namespace) -> None:
     if args.live:
         try:
             from olympe_live_backend import quiet_olympe_logs
+
             quiet_olympe_logs()
         except Exception:
             pass
@@ -592,9 +661,7 @@ def _load_runtime_map(
     before = len(points)
     points = points[keep]
     if not len(points):
-        raise SystemExit(
-            "map RGB points do not overlap the reference-pose coordinate frame"
-        )
+        raise SystemExit("map RGB points do not overlap the reference-pose coordinate frame")
     print(
         f"[operator] RGB map reference-bound filter kept {len(points)}/{before} points",
         flush=True,
@@ -609,8 +676,7 @@ def _run_operator_selftest(args: argparse.Namespace, points: np.ndarray) -> bool
     if len(points):
         xyz = points[:, :3]
         print(
-            f"bbox min={xyz.min(axis=0).round(3).tolist()} "
-            f"max={xyz.max(axis=0).round(3).tolist()}"
+            f"bbox min={xyz.min(axis=0).round(3).tolist()} max={xyz.max(axis=0).round(3).tolist()}"
         )
     if args.video:
         print(
@@ -663,8 +729,7 @@ def _run_layout_selftest(
     requested_width, requested_height = sizes[-1]
     if requested_width > standard_size[0] or requested_height > standard_size[1]:
         raise SystemExit(
-            "layout exceeds the standard viewport: "
-            f"{requested_width}x{requested_height}"
+            f"layout exceeds the standard viewport: {requested_width}x{requested_height}"
         )
     app.geometry(f"{minimum_viewport[0]}x{minimum_viewport[1]}")
     app.update_idletasks()
@@ -699,9 +764,7 @@ def _operator_session_identity(
     asset_hashes = {}
     if site_profile is not None:
         asset_hashes = {
-            key: value
-            for key, value in asdict(site_profile.asset_sha256).items()
-            if value
+            key: value for key, value in asdict(site_profile.asset_sha256).items() if value
         }
     runtime_profile_sha256 = ""
     if site_profile is not None and site_profile.localizer_profile is not None:
@@ -712,9 +775,7 @@ def _operator_session_identity(
         and site_profile.flight is not None
         and site_profile.flight.controller is not None
     ):
-        autonomous_speed_limit_mps = float(
-            site_profile.flight.controller.speed_limit_mps
-        )
+        autonomous_speed_limit_mps = float(site_profile.flight.controller.speed_limit_mps)
     return OperatorSessionIdentity(
         asset_hashes=asset_hashes,
         site_profile_sha256=(
@@ -725,12 +786,8 @@ def _operator_session_identity(
             int(site_profile.schema_version) if site_profile is not None else 0
         ),
         autonomous_speed_limit_mps=autonomous_speed_limit_mps,
-        autonomy_profile_errors=tuple(
-            _autonomy_profile_readiness_errors(site_profile)
-        ),
-        source_identity=(
-            str(Path(args.video).resolve()) if args.video else args.ip
-        ),
+        autonomy_profile_errors=tuple(_autonomy_profile_readiness_errors(site_profile)),
+        source_identity=(str(Path(args.video).resolve()) if args.video else args.ip),
         source_sha256=(app.file_sha256(Path(args.video)) if args.video else ""),
     )
 
@@ -744,12 +801,8 @@ def _hardware_approval_manifest(hardware_approval: object | None) -> dict | None
         "approved": hardware_approval.approved,
         "aircraft_product": hardware_approval.aircraft_product,
         "controller_product": hardware_approval.controller_product,
-        "aircraft_firmware_versions": list(
-            hardware_approval.aircraft_firmware_versions
-        ),
-        "controller_firmware_versions": list(
-            hardware_approval.controller_firmware_versions
-        ),
+        "aircraft_firmware_versions": list(hardware_approval.aircraft_firmware_versions),
+        "controller_firmware_versions": list(hardware_approval.controller_firmware_versions),
         "olympe_versions": list(hardware_approval.olympe_versions),
     }
 
@@ -763,26 +816,14 @@ def _operator_session_manifest(
 ) -> dict:
     return {
         "site_id": site_profile.site_id if site_profile is not None else "",
-        "site_profile": (
-            str(site_profile.source) if site_profile is not None else ""
-        ),
+        "site_profile": (str(site_profile.source) if site_profile is not None else ""),
         "site_profile_sha256": identity.site_profile_sha256,
         "site_profile_schema_version": identity.site_profile_schema_version,
-        "mission_selection": str(
-            getattr(args, "mission_selection", "") or ""
-        ),
-        "mission_selection_sha256": str(
-            getattr(args, "mission_selection_sha256", "") or ""
-        ),
-        "mission_snapshot_id": str(
-            getattr(args, "mission_snapshot_id", "") or ""
-        ),
-        "mission_flight_ready": bool(
-            getattr(args, "mission_flight_ready", False)
-        ),
-        "mission_flight_errors": list(
-            getattr(args, "mission_flight_errors", ()) or ()
-        ),
+        "mission_selection": str(getattr(args, "mission_selection", "") or ""),
+        "mission_selection_sha256": str(getattr(args, "mission_selection_sha256", "") or ""),
+        "mission_snapshot_id": str(getattr(args, "mission_snapshot_id", "") or ""),
+        "mission_flight_ready": bool(getattr(args, "mission_flight_ready", False)),
+        "mission_flight_errors": list(getattr(args, "mission_flight_errors", ()) or ()),
         "asset_sha256": identity.asset_hashes,
         "runtime_profile_sha256": identity.runtime_profile_sha256,
         "source": identity.source_identity,
@@ -833,9 +874,7 @@ def _create_operator_session(
     session_config = SessionConfig(
         session_id=session_logs.directory.name,
         interface_mode=interface_mode,
-        site_profile=(
-            str(site_profile.source) if site_profile is not None else ""
-        ),
+        site_profile=(str(site_profile.source) if site_profile is not None else ""),
         site_profile_sha256=identity.site_profile_sha256,
         asset_sha256=identity.asset_hashes,
         runtime_profile_sha256=identity.runtime_profile_sha256,
@@ -898,9 +937,7 @@ def _build_operator_backend(
                 fps=ANAFI.stream_fps,
                 link_sim=app.resolve_anafi_link_sim(),
             )
-            backend.video = LegacyFrameSourceAdapter(
-                video_stream, str(Path(args.video).resolve())
-            )
+            backend.video = LegacyFrameSourceAdapter(video_stream, str(Path(args.video).resolve()))
         return backend, video_stream, None
 
     from olympe_live_backend import OlympeLiveBackend
@@ -930,9 +967,7 @@ def _build_operator_backend(
         approved_controller_firmware=_approved_versions(
             hardware_approval, "controller_firmware_versions"
         ),
-        approved_olympe_versions=_approved_versions(
-            hardware_approval, "olympe_versions"
-        ),
+        approved_olympe_versions=_approved_versions(hardware_approval, "olympe_versions"),
         cmd_log=cmd_log,
         event_log=session_logs.command_log,
         session_logs=session_logs,
@@ -941,8 +976,7 @@ def _build_operator_backend(
     video_stream = live_backend.video_stream
     if video_stream is None:
         print(
-            "[live] PDRAW unavailable; file fallback is prohibited in "
-            "real-flight mode",
+            "[live] PDRAW unavailable; file fallback is prohibited in real-flight mode",
             flush=True,
         )
     print(f"[live] command log -> {cmd_log}", flush=True)
@@ -1031,9 +1065,7 @@ def _build_operator_localizer(
         megaloc_engine=str(args.megaloc_engine or ""),
         megaloc_engine_sha256=str(args.megaloc_engine_sha256 or ""),
         reference_index=str(getattr(args, "reference_index", "") or ""),
-        reference_index_sha256=str(
-            getattr(args, "reference_index_sha256", "") or ""
-        ),
+        reference_index_sha256=str(getattr(args, "reference_index_sha256", "") or ""),
         force_track_bench=bool(args.loc_force_track_bench),
         force_track_ref=int(args.loc_force_track_ref),
         neuflow_track=bool(args.neuflow_track),
@@ -1045,18 +1077,12 @@ def _build_operator_localizer(
             else ("lighterglue" if str(args.localizer_backend) == "xfeat" else "")
         ),
         localizer_backend=str(args.localizer_backend),
-        localizer_deploy_dir=str(
-            getattr(args, "localizer_deploy_dir", "") or ""
-        ),
+        localizer_deploy_dir=str(getattr(args, "localizer_deploy_dir", "") or ""),
         localizer_profile=str(getattr(args, "localizer_profile", "") or ""),
         bundle_sha256=str(getattr(args, "bundle_sha256", "") or ""),
-        localizer_profile_sha256=str(
-            getattr(args, "localizer_profile_sha256", "") or ""
-        ),
+        localizer_profile_sha256=str(getattr(args, "localizer_profile_sha256", "") or ""),
         local_topk=int(getattr(args, "local_topk", 0) or 0),
-        query_camera=(
-            site_profile.query_camera if site_profile is not None else None
-        ),
+        query_camera=(site_profile.query_camera if site_profile is not None else None),
         map_align=(site_profile.map_align if site_profile is not None else ""),
     )
     _announce_localizer_mode(args)
@@ -1153,8 +1179,7 @@ def _prepare_operator_site_runtime(
         raise ValueError("site switch requires an explicit site profile")
     query_camera = profile.query_camera
     if query_camera is not None and (
-        query_camera.width != STREAM_WIDTH
-        or query_camera.height != STREAM_HEIGHT
+        query_camera.width != STREAM_WIDTH or query_camera.height != STREAM_HEIGHT
     ):
         raise ValueError(
             "query_camera must describe the exact frame sent to localization: "
@@ -1165,9 +1190,7 @@ def _prepare_operator_site_runtime(
 
     hardware_approval = None
     if profile.hardware_approval is not None:
-        hardware_approval = app.load_hardware_approval_receipt(
-            profile.hardware_approval
-        )
+        hardware_approval = app.load_hardware_approval_receipt(profile.hardware_approval)
     _resolve_startup_localizer(args)
     route_path = Path(args.route_json) if args.route_json else None
     _route_hash, route_points, route_snapshot = _load_startup_route(
@@ -1305,7 +1328,8 @@ def _prepare_operator_launch_inputs() -> _OperatorLaunchInputs | None:
     _resolve_live_safety(args, parser)
     route_path = Path(args.route_json) if args.route_json else None
     route_hash, route_points, mission_route_snapshot = _load_startup_route(
-        route_path, site_profile,
+        route_path,
+        site_profile,
     )
     if args.live_detect and not Path(args.detector_model).is_file():
         raise SystemExit(
@@ -1326,7 +1350,11 @@ def _prepare_operator_launch_inputs() -> _OperatorLaunchInputs | None:
     if _run_operator_selftest(args, points):
         return None
     if _run_layout_selftest(
-        args, points, interface_mode, UI_STANDARD_SIZE, UI_MIN_SIZE,
+        args,
+        points,
+        interface_mode,
+        UI_STANDARD_SIZE,
+        UI_MIN_SIZE,
     ):
         return None
     return _OperatorLaunchInputs(
@@ -1341,11 +1369,16 @@ def _prepare_operator_launch_inputs() -> _OperatorLaunchInputs | None:
 
 
 def _main_site_runtime(
-        inputs: _OperatorLaunchInputs, *, session_logs: SessionLogs,
-        backend: object, video_stream: FFmpegFrameStream | None,
-        live_backend: object | None, localizer: LiveLocalizerClient | None,
-        detector: LiveDetectorClient | None, lost_hold: LostHoldPolicy | None,
-        replay_rows: list[dict],
+    inputs: _OperatorLaunchInputs,
+    *,
+    session_logs: SessionLogs,
+    backend: object,
+    video_stream: FFmpegFrameStream | None,
+    live_backend: object | None,
+    localizer: LiveLocalizerClient | None,
+    detector: LiveDetectorClient | None,
+    lost_hold: LostHoldPolicy | None,
+    replay_rows: list[dict],
 ) -> ActiveSiteRuntime | None:
     if inputs.site_profile is None:
         return None
@@ -1380,7 +1413,9 @@ def _build_operator_launch(inputs: _OperatorLaunchInputs) -> _OperatorLaunch:
         inputs.hardware_approval,
     )
     backend, video_stream, live_backend = _build_operator_backend(
-        args, session_logs, inputs.hardware_approval,
+        args,
+        session_logs,
+        inputs.hardware_approval,
     )
     _start_operator_backend(backend, session_config, session_logs)
     localizer = _build_operator_localizer(args, inputs.site_profile, video_stream)
@@ -1406,6 +1441,7 @@ def _build_operator_launch(inputs: _OperatorLaunchInputs) -> _OperatorLaunch:
         detector=detector,
         detect_every_n_frames=args.detect_every_n_frames,
         loc_every_n_frames=args.loc_every_n_frames,
+        adaptive_loc_submit=bool(args.adaptive_loc_submit),
         replay_rows=replay_rows,
         tick_ms=args.tick_ms,
         boot_lock_ms=args.boot_lock_ms,
@@ -1413,9 +1449,7 @@ def _build_operator_launch(inputs: _OperatorLaunchInputs) -> _OperatorLaunch:
         pose_stabilize=bool(args.pose_stabilize),
         session_logs=session_logs,
         site_id=inputs.site_profile.site_id if inputs.site_profile is not None else "",
-        site_profile_path=(
-            inputs.site_profile.source if inputs.site_profile is not None else None
-        ),
+        site_profile_path=(inputs.site_profile.source if inputs.site_profile is not None else None),
         mission_route_snapshot=inputs.mission_route_snapshot,
         site_runtime=site_runtime,
         prepare_site_runtime=_prepare_operator_site_runtime,
@@ -1431,8 +1465,7 @@ def _build_operator_launch(inputs: _OperatorLaunchInputs) -> _OperatorLaunch:
     )
 
 
-def _configure_operator_launch(
-        launch: _OperatorLaunch, inputs: _OperatorLaunchInputs) -> None:
+def _configure_operator_launch(launch: _OperatorLaunch, inputs: _OperatorLaunchInputs) -> None:
     app = launch.app
     app.route_pts = inputs.route_points
     if app.route_pts:
@@ -1524,7 +1557,10 @@ def _install_live_exit_safety(app: OperatorApp, emergency_cleanup) -> None:
         )
     try:
         app.backend.log.event(
-            "exit_safety", ok=exit_safety_armed, armed=armed, failed=failed,
+            "exit_safety",
+            ok=exit_safety_armed,
+            armed=armed,
+            failed=failed,
         )
     except Exception:
         pass
@@ -1537,6 +1573,7 @@ def main() -> None:
     launch = _build_operator_launch(inputs)
     _configure_operator_launch(launch, inputs)
     app = launch.app
+
     # Exit safety: Ctrl-C / kill terminal / SIGTERM / SIGHUP / atexit all land.
     def _emergency_cleanup(reason: str = "signal") -> bool:
         print(f"[operator] exit safety ({reason}) -> land + restore sticks", flush=True)

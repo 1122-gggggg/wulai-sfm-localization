@@ -38,6 +38,8 @@ Layout:
 - `route_editor_model.py`：航線 schema、場域綁定與 GLOMAP ↔ Z-up 座標轉換。
 - `route_editor_controller.py`：航點、復原／重做、G 與軸向鎖定；不依賴 Tk。
 - `route_editor_window.py`：自製全螢幕點雲編輯畫面；沒有 backend 或飛行指令接口。
+- `simulated_route_test.py`：把正式 route controller 的 PCMD 接到記憶體內運動模型；
+  只供模擬介面測試，不連 Olympe。
 - `flight_operator_app.py`：composition root，接上既有地圖、串流、飛控與安全清理；
   不在 UI view 內實作資產格式。
 
@@ -78,6 +80,11 @@ JSON 匯入也仍維持未核准。AUTO 請求送出後，航線選擇鎖定；H
 「新增路線」會建立新的正式航線並保留既有航線；「編輯路線」只覆蓋目前選取的航線。
 儲存結果會成為目前 AUTO 航線並同步 profile、route component 與 selection SHA，不建立草稿。
 只有未綁定場域的 PLY 可另存 `preview_only` 預覽航線，該檔不能進入 AUTO。
+
+模擬介面另顯示「儲存並開始模擬航線」。操作員按下後會先完成相同的原子儲存、
+SHA 驗證與航線綁定，再用 production `RouteAutoController` 和記憶體內運動模型執行
+閉迴路測試；到達最後一點並通過地速確認後結束。這條流程不會連接真機或送出
+Olympe 指令；真機介面不顯示此按鈕，仍須完成四步 preflight 並親自按「自動飛行」。
 
 AUTO 起飛後以連續穩定的定位姿態判定起飛位置，不要求位於第一個航點附近；系統會找
 出距離最近的航點，將它視為銜接點，第一個飛行目標設為下一個航點。開放航線不循環，

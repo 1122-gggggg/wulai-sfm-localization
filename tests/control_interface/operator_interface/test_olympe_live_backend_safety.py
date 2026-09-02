@@ -21,6 +21,7 @@ from backend_contract import (
     MissionRoutePayload,
     SessionConfig,
 )
+from operator_state import TrackerState
 
 
 class _Message:
@@ -3644,6 +3645,48 @@ def test_pc_control_is_refused_when_stick_monitor_is_unavailable(make_backend):
     assert "Controller" not in backend.drone.source_requests
 
 
+def test_takeoff_battery_blocker_pure_decision() -> None:
+    from olympe_live_backend import takeoff_battery_blocker
+
+    assert takeoff_battery_blocker(50.0, None) == (
+        "takeoff battery floor is unavailable or invalid"
+    )
+    assert takeoff_battery_blocker(20.0, 30.0) == (
+        "battery 20% is below the 30% takeoff floor"
+    )
+    assert takeoff_battery_blocker(30.0, 30.0) is None
+    assert takeoff_battery_blocker(100.0, 30.0) is None
+
+
+def test_takeoff_gps_outcome_pure_decision() -> None:
+    from olympe_live_backend import takeoff_gps_outcome
+
+    fixed_ok = takeoff_gps_outcome(fixed=True, gps_required=True)
+    assert fixed_ok.blocker is None and fixed_ok.advisory is None
+
+    api_unavailable_required = takeoff_gps_outcome(fixed=None, gps_required=True)
+    assert api_unavailable_required.blocker == (
+        "GPS state API unavailable; required by configured distance geofence"
+    )
+    assert api_unavailable_required.advisory is None
+
+    api_unavailable_optional = takeoff_gps_outcome(fixed=None, gps_required=False)
+    assert api_unavailable_optional.blocker is None
+    assert api_unavailable_optional.advisory == (
+        "GPS state API unavailable; takeoff remains allowed"
+    )
+
+    no_fix_required = takeoff_gps_outcome(fixed=False, gps_required=True)
+    assert no_fix_required.blocker == (
+        "GPS fix unavailable; required by configured distance geofence"
+    )
+    assert no_fix_required.advisory is None
+
+    no_fix_optional = takeoff_gps_outcome(fixed=False, gps_required=False)
+    assert no_fix_optional.blocker is None
+    assert no_fix_optional.advisory == "GPS fix unavailable; takeoff remains allowed"
+
+
 def test_takeoff_preflight_is_blocked_when_stick_monitor_is_unavailable(
     make_backend,
 ):
@@ -4348,6 +4391,63 @@ def test_a_failed_safety_zero_is_recorded_not_swallowed(make_backend):
         event == "pcmd_zero_failed" and fields.get("reason") == "unit_test"
         for event, fields in backend.log.records
     ), "a failed safety zero left no record"
+
+
+def test_set_tracker_state_logs_old_new_and_reason_on_a_real_transition(make_backend):
+    backend = make_backend()
+    backend.log.records.clear()
+
+    result = backend._set_tracker_state(TrackerState.RTH, reason="unit_test")
+
+    assert result is TrackerState.RTH
+    assert backend.state.tracker_state == TrackerState.RTH
+    assert any(
+        event == "tracker_state_transition"
+        and fields.get("old") == "LINK"
+        and fields.get("new") == "RTH"
+        and fields.get("reason") == "unit_test"
+        for event, fields in backend.log.records
+    ), "tracker_state transition left no audit record"
+
+
+def test_set_tracker_state_does_not_log_when_the_state_does_not_change(make_backend):
+    """Hot paths (poll(), the nudge hold loop) re-assert state every cycle;
+    logging a no-op transition would flood commands.jsonl/incidents."""
+    backend = make_backend()
+    backend._set_tracker_state(TrackerState.RTH, reason="setup")
+    backend.log.records.clear()
+
+    result = backend._set_tracker_state(TrackerState.RTH, reason="unit_test_noop")
+
+    assert result is TrackerState.RTH
+    assert backend.log.records == []
+
+
+def test_zero_pcmd_reports_failure_not_success_when_there_is_no_drone(make_backend):
+    """drone=None means nothing was sent; True would claim a zero landed."""
+    backend = make_backend(skycontroller=False, pulse_s=5.0)
+    backend.pilot_sticks = False
+    backend.drone = None
+
+    assert backend._zero_pcmd_or_log("unit_test") is False
+
+    assert any(
+        event == "pcmd_zero_skipped_no_drone" and fields.get("reason") == "unit_test"
+        for event, fields in backend.log.records
+    ), "a no-drone safety zero left no record"
+
+
+def test_send_pcmd_reports_failure_not_success_when_there_is_no_drone(make_backend):
+    backend = make_backend(skycontroller=False, pulse_s=5.0)
+    backend.pilot_sticks = False
+    backend.drone = None
+
+    assert backend.send_pcmd(10, 0, 0, 0, reason="unit_test") is False
+
+    assert any(
+        event == "pcmd_skipped_no_drone" and fields.get("reason") == "unit_test"
+        for event, fields in backend.log.records
+    ), "a no-drone pcmd left no record"
 
 
 def test_land_records_a_failed_safety_zero(make_backend):

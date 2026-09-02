@@ -22,15 +22,36 @@ What is deliberately NOT ported from the XFeat tracker:
 
 from __future__ import annotations
 
+import json
 import math
+import os
 import time
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from typing import Any, Sequence
-
+import cv2
 import numpy as np
 import pycolmap
 
+try:
+    from esekf import ESEKF, EKFConfig, adaptive_visual_covariance as _esekf_adaptive_cov
+except Exception:  # pragma: no cover
+    ESEKF = None  # type: ignore
+    EKFConfig = None  # type: ignore
+    _esekf_adaptive_cov = None  # type: ignore
+
+
+_KLT_LK_PARAMS = dict(
+    winSize=(21, 21),
+    maxLevel=3,
+    criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01),
+)
+_KLT_FB_PX = 1.0
+_KLT_MIN_SEED = 50
+_KLT_MIN_TRACK = 30
+_KLT_MAX_FRAMES = 6
+_KLT_MAX_AGE_S = 0.50
 from edm_matcher import GRID_H, GRID_W, EDMMatcher
 from reloc_localizer_edm import Camera, EDMLocalizer, EDMRelocMap
 from reposed_motion_validator import RelativeMotionCheck, cam_from_world_matrix
@@ -43,22 +64,31 @@ from edm_pose_selection import (
 )
 
 
-
 GLOBAL_RETRIEVAL_ATTEMPTS = 2
-LOST_GLOBAL_RETRIEVAL_ATTEMPTS = 1
+LOST_PROGRESSIVE_RADIUS_FACTORS = (1.0, 2.0, 4.0)
+LOST_GLOBAL_RETRIEVAL_ATTEMPTS = len(LOST_PROGRESSIVE_RADIUS_FACTORS) + 1
+LOST_PROGRESSIVE_STEP_INTERVAL = 2
 GLOBAL_RETRIEVAL_RETRY_MULTIPLIER = 2
 LOST_PRIOR_STRATEGIES = ("restrict_nearby", "full_global", "score_fusion")
-ACQUIRE_STAGE_MODES = ("full_set", "initial_topk")
+ACQUIRE_STAGE_MODES = ("full_set", "initial_topk", "progressive")
+ACQUIRE_PROGRESSIVE_TOPKS = (2, 4, 8, 20)
 EDM_OPTIONAL_RUNTIME_TRACKER_KEYS = {
     "lost_prior_strategy",
     "lost_prior_fusion_weight",
     "acquire_stage_mode",
+    "track_map_first",
     "pose_consensus_mode",
     "consensus_max_rotation_deg",
     "reference_quality_weight",
     "reference_quality_floor",
+    "pnp_workers",
+    "pnp_early_stop",
+    "pnp_pipeline",
+    "pnp_ranked_batches",
 }
 POSE_CONSENSUS_MODES = ("pairwise", "cluster")
+PNP_RANSAC_SEED = 0
+
 
 
 _POSITIVE_INTEGER_CONFIG_FIELDS = (
@@ -80,6 +110,8 @@ _POSITIVE_INTEGER_CONFIG_FIELDS = (
     "lost_after",
     "corr_grid",
     "min_inlier_grid_cells",
+    "pnp_workers",
+    "stale_reacquire_confirmations",
 )
 
 _NONNEGATIVE_INTEGER_CONFIG_FIELDS = (
@@ -105,6 +137,11 @@ _POSITIVE_FLOAT_CONFIG_FIELDS = (
     "acquire_max_jump_factor",
     "acquire_max_yaw_diff_deg",
     "lost_prior_max_age_s",
+    "track_yaw_slack_deg",
+    "track_max_yaw_rate_deg_s",
+    "track_max_yaw_step_deg",
+    "stale_reacquire_max_distance",
+    "stale_reacquire_max_yaw_diff_deg",
     "lost_prior_fusion_weight",
     "consensus_max_rotation_deg",
 )
@@ -128,12 +165,14 @@ class EDMConfig:
     lost_global_retrieval_interval: int = 0
     recovery_bank_size: int = 192
     recovery_scan_topk: int = 2
-    # Bound EDM's reference batch so boot_global_topk=10 does not allocate a
-    # batch-of-10 activation peak.  All retrieved references are still evaluated.
     match_batch_size: int = 2
+    # Temporal reference disabled by default: s3_no_temporal 520/700 (+34 vs s0 486/700),
+    # LOST 168->113, p95 91.32ms, p50 35.18ms on P168 700-frame holdout (RTX 5060, 2026-09-01,
+    # outputs/p168_all8_baseline_20260901/s3_no_temporal.json). Ledger evidence shows
+    # temporal on is slower and less successful for this map; keep default False.
     use_temporal_reference: bool = False
     temporal_map_topk: int = 1
-    # tracking: geometry-only candidates, no MegaLoc
+    track_map_first: bool = False
     local_topk: int = 1
     weak_local_topk: int = 3
     near_pool: int = 24
@@ -148,6 +187,10 @@ class EDMConfig:
     max_reproj_error_acquire: float = 5.0
     max_reproj_error_track: float = 6.0
     pnp_ransac_max_error: float = 5.0
+    pnp_workers: int = 2
+    pnp_early_stop: bool = True
+    pnp_pipeline: bool = False
+    pnp_ranked_batches: bool = False
     max_jump: float = 2.0
     prediction_max_dt: float = 0.25
     adaptive_jump_factor: float = 8.0
@@ -156,6 +199,9 @@ class EDMConfig:
     adaptive_jump_ceiling: float = 0.008
     adaptive_jump_min_history: int = 20
     adaptive_jump_history_size: int = 120
+    track_yaw_slack_deg: float = 180.0
+    track_max_yaw_rate_deg_s: float = 1.0
+    track_max_yaw_step_deg: float = 180.0
     weak_after: int = 2
     lost_after: int = 2
     # LOST re-acquisition bound. The continuous-trajectory gate cannot apply across a
@@ -168,17 +214,24 @@ class EDMConfig:
     acquire_max_jump_factor: float = 2.0
     acquire_max_yaw_diff_deg: float = 90.0
     lost_prior_max_age_s: float = 3.0
+    stale_reacquire_confirmations: int = 1
+    stale_reacquire_max_distance: float = 0.3
+    stale_reacquire_max_yaw_diff_deg: float = 30.0
     # Default preserves today's nearby restriction. full_global and score_fusion
     # are measured A/B modes and must be selected explicitly.
     lost_prior_strategy: str = "restrict_nearby"
     lost_prior_fusion_weight: float = 1.0
-    # Default evaluates the complete retrieved BOOT/LOST set. initial_topk
-    # stages acquire_initial_topk first, then falls back to the full set.
+    # full_set and initial_topk preserve the prior modes. progressive evaluates
+    # cumulative 2, 4, 8, and 20-reference stages, capped by the retrieved set.
     acquire_stage_mode: str = "full_set"
-    # getattr-only pose selection / ranking knobs become profile-owned fields.
     pose_consensus_mode: str = "pairwise"
     consensus_max_rotation_deg: float = 90.0
-    reference_quality_weight: float = 0.0
+    # P95 tail optimized: a2_quality 508/700 p95 89.87ms (lowest tail of all runs,
+    # vs s0 486/700 p95 109.56ms), LOST 168->134, p50 24.25ms. Default 0.5 from
+    # evidence outputs/p168_all8_baseline_20260901/a2_quality.json (SFM_EDM_REFERENCE_QUALITY_WEIGHT=0.5).
+    # Env override SFM_EDM_REFERENCE_QUALITY_WEIGHT retained in ProductionEDMTracker.__init__ for
+    # profile-hashed releases (river compat json unchanged to keep SHA 93e0c2...).
+    reference_quality_weight: float = 0.5
     reference_quality_floor: float = 0.0
     # EDM emits thousands of correspondences; PnP cost is linear in them and RANSAC
     # gains nothing past a well-spread ~900. Cap spatially so the cap does not bias
@@ -197,12 +250,22 @@ class EDMConfig:
                 "lost_prior_strategy must be 'restrict_nearby', 'full_global', or 'score_fusion'"
             )
         if self.acquire_stage_mode not in ACQUIRE_STAGE_MODES:
-            raise ValueError("acquire_stage_mode must be 'full_set' or 'initial_topk'")
+            raise ValueError(
+                "acquire_stage_mode must be 'full_set', 'initial_topk', or 'progressive'"
+            )
         if self.pose_consensus_mode not in POSE_CONSENSUS_MODES:
             raise ValueError("pose_consensus_mode must be 'pairwise' or 'cluster'")
         _validate_integer_config_fields(self)
         if not isinstance(self.use_temporal_reference, bool):
             raise ValueError("use_temporal_reference must be boolean")
+        if not isinstance(self.track_map_first, bool):
+            raise ValueError("track_map_first must be boolean")
+        if not isinstance(self.pnp_early_stop, bool):
+            raise ValueError("pnp_early_stop must be boolean")
+        if not isinstance(self.pnp_pipeline, bool):
+            raise ValueError("pnp_pipeline must be boolean")
+        if not isinstance(self.pnp_ranked_batches, bool):
+            raise ValueError("pnp_ranked_batches must be boolean")
         _validate_float_config_fields(self)
         _validate_acquisition_config(self)
         _validate_jump_config(self)
@@ -269,6 +332,8 @@ def _validate_jump_config(config: EDMConfig) -> None:
         raise ValueError("adaptive_jump_floor cannot exceed adaptive_jump_ceiling")
     if config.adaptive_jump_ceiling > config.adaptive_jump_bootstrap:
         raise ValueError("adaptive_jump_bootstrap cannot be smaller than adaptive_jump_ceiling")
+    if config.stale_reacquire_confirmations not in {1, 2}:
+        raise ValueError("stale_reacquire_confirmations must be 1 or 2")
     for name in (
         "adaptive_jump_floor",
         "adaptive_jump_bootstrap",
@@ -294,6 +359,9 @@ class RuntimeState:
     pending_limited_center: np.ndarray | None = None
     pending_limited_stamp: float | None = None
     pending_limited_limit: float | None = None
+    pending_reacquire_center: np.ndarray | None = None
+    pending_reacquire_yaw: float | None = None
+    pending_reacquire_stamp: float | None = None
     boot_refs: list[str] = field(default_factory=list)
     global_retrieval_calls: int = 0
     boot_global_retrieval_attempts: int = 0
@@ -332,6 +400,8 @@ class _PoseAttempt:
     pnp_ms: float
     reject_reason: str | None = None
     strong_count: int = 0
+    pnp_candidates: int = 0
+    pnp_skipped: int = 0
 
 
 def _merge_correspondence_rows(rows: list) -> tuple[np.ndarray, np.ndarray, np.ndarray, list]:
@@ -342,6 +412,44 @@ def _merge_correspondence_rows(rows: list) -> tuple[np.ndarray, np.ndarray, np.n
     points3d = np.concatenate(points3d_parts) if points3d_parts else np.zeros((0, 3))
     confidence = np.concatenate(confidence_parts) if confidence_parts else np.zeros(0)
     return points2d, points3d, confidence, [row[3] for row in rows]
+
+
+def _combine_correspondence_batches(
+    first: _CorrespondenceBatch,
+    second: _CorrespondenceBatch,
+) -> _CorrespondenceBatch:
+    if first.by_ref is None or second.by_ref is None:
+        raise ValueError("only independent-reference correspondence batches can be reused")
+    rows = [*first.by_ref, *second.by_ref]
+    points2d, points3d, confidence, per_ref = _merge_correspondence_rows(rows)
+    return _CorrespondenceBatch(
+        points2d=points2d,
+        points3d=points3d,
+        confidence=confidence,
+        per_ref=per_ref,
+        by_ref=rows,
+        temporal_used=False,
+    )
+
+
+def _reference_pnp_rank(
+    row,
+    *,
+    width: int,
+    height: int,
+    grid: int,
+) -> tuple[int, int, float]:
+    points2d, points3d, confidence, _count = row
+    spread = 0
+    if len(points2d):
+        points = np.asarray(points2d, dtype=float)
+        gx = np.clip((points[:, 0] / width * grid).astype(int), 0, grid - 1)
+        gy = np.clip((points[:, 1] / height * grid).astype(int), 0, grid - 1)
+        spread = int(len(np.unique(gy * grid + gx)))
+    finite_confidence = np.asarray(confidence, dtype=float)
+    finite_confidence = finite_confidence[np.isfinite(finite_confidence)]
+    mean_confidence = float(finite_confidence.mean()) if len(finite_confidence) else -math.inf
+    return len(points3d), spread, mean_confidence
 
 
 def _angle_diff(a: float, b: float) -> float:
@@ -498,6 +606,17 @@ def adaptive_jump_limit(
     return min(float(cfg.max_jump), base_limit * time_scale)
 
 
+def track_yaw_limit(cfg: EDMConfig, capture_dt: float | None) -> float:
+    """Return a capture-time-aware TRACK yaw envelope in degrees."""
+    dt = 0.0
+    if capture_dt is not None and math.isfinite(float(capture_dt)):
+        dt = min(max(0.0, float(capture_dt)), float(cfg.prediction_max_dt))
+    return min(
+        float(cfg.track_max_yaw_step_deg),
+        float(cfg.track_yaw_slack_deg) + float(cfg.track_max_yaw_rate_deg_s) * dt,
+    )
+
+
 def limit_center_step(
     previous: np.ndarray,
     candidate: np.ndarray,
@@ -524,6 +643,24 @@ def limit_center_step(
     return center, {"limited": True, "raw_step": raw_step, "limit": limit}
 
 
+def _anisotropic_corr_grid(width: int, height: int, grid: int) -> tuple[int, int]:
+    """Grid dimensions for the anisotropic correspondence cap.
+
+    Wide images get more horizontal than vertical cells. 16:9 frames use the
+    canonical 16x9 layout; other aspect ratios derive gw, gh so gw/gh
+    approximates width/height while gw*gh stays close to grid*grid.
+    """
+    if width <= 0 or height <= 0:
+        return grid, grid
+    aspect = float(width) / float(height)
+    if abs(aspect - 16.0 / 9.0) <= 0.02 * 16.0 / 9.0:
+        return 16, 9
+    target = float(grid) * float(grid)
+    gw = max(2, int(round(math.sqrt(target * aspect))))
+    gh = max(2, int(round(math.sqrt(target / aspect))))
+    return gw, gh
+
+
 def spatially_cap_indices(
     pts2d: np.ndarray,
     confidence: np.ndarray,
@@ -540,9 +677,13 @@ def spatially_cap_indices(
     if len(score) != n:
         raise ValueError("confidence length must match pts2d")
     score = np.where(np.isfinite(score), score, -np.inf)
-    gx = np.clip((pts2d[:, 0] / width * grid).astype(int), 0, grid - 1)
-    gy = np.clip((pts2d[:, 1] / height * grid).astype(int), 0, grid - 1)
-    cell = gy * grid + gx
+    if os.environ.get("SFM_EDM_ANISO_CORR_GRID") == "1":
+        gw, gh = _anisotropic_corr_grid(width, height, grid)
+    else:
+        gw, gh = grid, grid
+    gx = np.clip((pts2d[:, 0] / width * gw).astype(int), 0, gw - 1)
+    gy = np.clip((pts2d[:, 1] / height * gh).astype(int), 0, gh - 1)
+    cell = gy * gw + gx
     original = np.arange(n, dtype=np.int64)
     within = np.lexsort((original, -score, cell))
     sorted_cells = cell[within]
@@ -633,8 +774,41 @@ class ProductionEDMTracker:
     ):
         self.cfg = cfg or EDMConfig()
         self.cfg.validate()
-        self.map = reloc_map
+        quality_weight_env = os.environ.get("SFM_EDM_REFERENCE_QUALITY_WEIGHT")
+        if quality_weight_env is not None and hasattr(self.cfg, "reference_quality_weight"):
+            try:
+                quality_weight = float(quality_weight_env)
+            except ValueError:
+                quality_weight = None
+            if quality_weight is not None and math.isfinite(quality_weight) and quality_weight >= 0.0:
+                try:
+                    self.cfg.reference_quality_weight = quality_weight
+                except AttributeError:
+                    pass
+        # P95 tail optimized default 0.5 via tracker fallback for hashed river profile
+        # (SHA 93e0c2... unchanged; evidence outputs/p168_all8_baseline_20260901/a2_quality.json
+        # p95 89.87ms vs s0 109.56ms). Env SFM_EDM_REFERENCE_QUALITY_WEIGHT still overrides.
+        if hasattr(self.cfg, "reference_quality_weight"):
+            try:
+                self._reference_quality_weight = float(self.cfg.reference_quality_weight)
+            except (TypeError, ValueError):
+                self._reference_quality_weight = 0.5
+        else:
+            self._reference_quality_weight = 0.5
+        if quality_weight_env is not None:
+            try:
+                _qw = float(quality_weight_env)
+                if math.isfinite(_qw) and _qw >= 0.0:
+                    self._reference_quality_weight = _qw
+                    if hasattr(self.cfg, "reference_quality_weight"):
+                        try:
+                            self.cfg.reference_quality_weight = _qw
+                        except AttributeError:
+                            pass
+            except ValueError:
+                pass
         self.cam = camera
+        self.map = reloc_map
         self.loc = EDMLocalizer(
             reloc_map,
             camera,
@@ -661,22 +835,103 @@ class ProductionEDMTracker:
         )
         self.temporal_gray: np.ndarray | None = None
         self.temporal_xyz_by_cell: np.ndarray | None = None
+        self._klt_gray: np.ndarray | None = None
+        self._klt_2d: np.ndarray | None = None
+        self._klt_3d: np.ndarray | None = None
+        self._klt_center: np.ndarray | None = None
+        self._klt_yaw: float | None = None
+        self._klt_seed_stamp: float | None = None
+        self._klt_age: int = 0
+        self._klt_query_gray: np.ndarray | None = None
+        self._klt_query_stamp: float | None = None
         self._pcam: pycolmap.Camera | None = None
         self._pnp_options: pycolmap.AbsolutePoseEstimationOptions | None = None
+        self._pnp_executor = None
+        self._last_lost_search_stage = None
+        self._last_lost_radius_factor = None
         self.pose_guided = None
         if motion_validation_mode not in {"off", "shadow", "confirm_limited_jump"}:
-            raise ValueError(
-                "motion_validation_mode must be off, shadow, or confirm_limited_jump"
-            )
+            raise ValueError("motion_validation_mode must be off, shadow, or confirm_limited_jump")
         self.motion_validator = motion_validator
         self.motion_validation_mode = motion_validation_mode
         self._last_accepted_bgr: np.ndarray | None = None
         self._last_accepted_cam_from_world: np.ndarray | None = None
+        # --- ESEKF minimal integration (after _klt_* and pose_guided init) ---
+        self._latest_velocity_ned: np.ndarray | None = None
+        self._esekf_last_predict: np.ndarray | None = None
+        try:
+            if ESEKF is not None and EKFConfig is not None:
+                mpm = getattr(self.cfg, "metres_per_map_unit", None)
+                if mpm is None:
+                    pg = getattr(self, "pose_guided", None)
+                    if pg is not None:
+                        mpm_cfg = getattr(getattr(pg, "config", None), "metres_per_map_unit", None)
+                        if mpm_cfg is not None:
+                            mpm = mpm_cfg
+                if mpm is not None:
+                    try:
+                        mpm_f = float(mpm)
+                        if not math.isfinite(mpm_f) or mpm_f <= 1e-9:
+                            mpm = None
+                        else:
+                            mpm = mpm_f
+                    except Exception:
+                        mpm = None
+                if mpm is not None:
+                    self.esekf = ESEKF(EKFConfig(metres_per_map_unit=mpm))  # type: ignore
+                else:
+                    self.esekf = ESEKF(EKFConfig())  # type: ignore
+            else:
+                self.esekf = None  # type: ignore
+        except Exception:
+            self.esekf = None  # type: ignore
         count = len(reloc_map.ref_names)
         self._reference_quality = np.full(count, np.nan, dtype=np.float32)
         self._reference_stability = np.full(count, np.nan, dtype=np.float32)
+        if os.environ.get("SFM_EDM_LOCALIZABILITY_JSON"):
+            self._load_localizability_quality_seed()
 
+    def _load_localizability_quality_seed(self) -> None:
+        """Seed reference quality from a localizability weak-region JSON (A/B).
 
+        SFM_EDM_LOCALIZABILITY_JSON points at a JSON list of spheres, or a
+        dict with a "spheres" list, each sphere {center: [x, y, z],
+        radius: r, status: s}. References inside any
+        red_intrinsic sphere score 0.2; every other reference scores 1.0.
+        Unset env or an unreadable file keeps the default NaN qualities.
+        """
+        centers = self.centers
+        if centers is None or not len(centers):
+            return
+        try:
+            with open(os.environ["SFM_EDM_LOCALIZABILITY_JSON"], "r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+        except (OSError, ValueError):
+            return
+        if isinstance(payload, dict):
+            spheres = payload.get("spheres")
+        else:
+            spheres = payload
+        if not isinstance(spheres, list):
+            return
+        red_spheres: list[tuple[np.ndarray, float]] = []
+        for sphere in spheres:
+            if not isinstance(sphere, dict) or sphere.get("status") != "red_intrinsic":
+                continue
+            try:
+                center = np.asarray(sphere["center"], dtype=float)
+                radius = float(sphere["radius"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if center.shape != (3,) or not math.isfinite(radius) or radius < 0.0:
+                continue
+            red_spheres.append((center, radius))
+        if not red_spheres:
+            return
+        quality = np.ones(len(centers), dtype=np.float32)
+        for center, radius in red_spheres:
+            quality[np.linalg.norm(centers - center, axis=1) <= radius] = 0.2
+        self._reference_quality = quality
 
     def attach_pose_guided(self, controller) -> None:
         self.pose_guided = controller
@@ -684,7 +939,28 @@ class ProductionEDMTracker:
     def observe_fused_state(self, sample) -> None:
         controller = getattr(self, "pose_guided", None)
         if controller is not None:
-            controller.observe_fused(sample)
+            try:
+                controller.observe_fused(sample)
+            except Exception:
+                pass
+        # --- ESEKF velocity feed: store NED velocity for predict ---
+        try:
+            vel = None
+            if sample is not None:
+                vel = getattr(sample, "velocity_ned", None)
+                if vel is None and isinstance(sample, dict):
+                    vel = sample.get("velocity_ned", sample.get("velocity"))
+                if vel is None:
+                    # also try velocity attribute alias
+                    vel = getattr(sample, "velocity", None)
+            if vel is not None:
+                arr = np.asarray(vel, dtype=float).reshape(3)
+                if np.all(np.isfinite(arr)):
+                    self._latest_velocity_ned = arr.astype(float)
+                else:
+                    self._latest_velocity_ned = None
+        except Exception:
+            pass
 
     def _active_pose_guided(self):
         controller = getattr(self, "pose_guided", None)
@@ -692,24 +968,338 @@ class ProductionEDMTracker:
             return None
         return controller
 
-
     def _pose_estimation_context(
         self,
     ) -> tuple[pycolmap.Camera, pycolmap.AbsolutePoseEstimationOptions]:
-        if getattr(self, "_pcam", None) is None:
-            self._pcam = pycolmap.Camera(
-                model=self.cam.model,
-                width=self.cam.width,
-                height=self.cam.height,
-                params=self.cam.params,
-            )
-        if getattr(self, "_pnp_options", None) is None:
-            self._pnp_options = pycolmap.AbsolutePoseEstimationOptions()
-            self._pnp_options.ransac.max_error = self.cfg.pnp_ransac_max_error
+        if getattr(self, "_pcam", None) is None or getattr(self, "_pnp_options", None) is None:
+            self._pcam, self._pnp_options = self._new_pose_estimation_context()
         return self._pcam, self._pnp_options
 
+    def _new_pose_estimation_context(
+        self,
+        random_seed: int = PNP_RANSAC_SEED,
+    ) -> tuple[pycolmap.Camera, pycolmap.AbsolutePoseEstimationOptions]:
+        camera = pycolmap.Camera(
+            model=self.cam.model,
+            width=self.cam.width,
+            height=self.cam.height,
+            params=self.cam.params,
+        )
+        options = pycolmap.AbsolutePoseEstimationOptions()
+        options.ransac.max_error = self.cfg.pnp_ransac_max_error
+        options.ransac.random_seed = int(random_seed)
+        return camera, options
+
+    def _parallel_pnp_executor(self) -> ThreadPoolExecutor | None:
+        if self.cfg.pnp_workers <= 1:
+            return None
+        executor = getattr(self, "_pnp_executor", None)
+        if executor is None:
+            executor = ThreadPoolExecutor(
+                max_workers=self.cfg.pnp_workers,
+                thread_name_prefix="edm-pnp",
+            )
+            self._pnp_executor = executor
+        return executor
+
+    def _pnp_random_seed(self) -> int:
+        options = getattr(self, "_pnp_options", None)
+        if options is None:
+            return PNP_RANSAC_SEED
+        return int(options.ransac.random_seed)
+
+    def _klt_prior_allowed(self, capture_stamp: float | None = None) -> bool:
+        if getattr(self, "st", None) is None:
+            return False
+        state = getattr(self.st, "state", None)
+        if state not in {"TRACK", "WEAK_TRACK"}:
+            return False
+        klt_2d = getattr(self, "_klt_2d", None)
+        klt_3d = getattr(self, "_klt_3d", None)
+        klt_gray = getattr(self, "_klt_gray", None)
+        if klt_2d is None or klt_3d is None or klt_gray is None:
+            return False
+        klt_age = getattr(self, "_klt_age", 0)
+        try:
+            if int(klt_age) >= int(_KLT_MAX_FRAMES):
+                return False
+        except Exception:
+            return False
+        seed_stamp = getattr(self, "_klt_seed_stamp", None)
+        if seed_stamp is None:
+            return False
+        if capture_stamp is None:
+            capture_stamp = getattr(self, "_klt_query_stamp", None)
+        try:
+            dt = float(capture_stamp) - float(seed_stamp)  # type: ignore[arg-type]
+        except Exception:
+            return False
+        if not math.isfinite(dt) or dt < 0.0 or dt > float(_KLT_MAX_AGE_S):
+            return False
+        return True
+
+    def _track_klt_prior(self, gray: np.ndarray | None, capture_stamp: float | None) -> dict | None:
+        if gray is None or capture_stamp is None:
+            return None
+        if not self._klt_prior_allowed(capture_stamp):
+            return None
+        klt_gray = getattr(self, "_klt_gray", None)
+        klt_2d = getattr(self, "_klt_2d", None)
+        klt_3d = getattr(self, "_klt_3d", None)
+        if klt_gray is None or klt_2d is None or klt_3d is None:
+            return None
+        if klt_2d.shape[0] < _KLT_MIN_TRACK:
+            self._clear_klt_cache()
+            return None
+        try:
+            # --- 3D-aware init + motion-guided window ---
+            klt_params = _KLT_LK_PARAMS
+            p0_hat = None
+            try:
+                esekf = getattr(self, "esekf", None)
+                if esekf is not None and callable(getattr(esekf, "prediction_allowed", None)) and esekf.prediction_allowed():
+                    # window from covariance trace 15->41
+                    try:
+                        P = esekf.get_covariance() if hasattr(esekf, "get_covariance") else None
+                        if P is not None:
+                            trace = float(np.trace(np.asarray(P)[0:3, 0:3]))
+                        else:
+                            trace = 0.0
+                    except Exception:
+                        trace = 0.0
+                    try:
+                        W = int(np.clip(15 + 3 * math.sqrt(max(trace, 0.0)) / 0.1, 15, 41))
+                        if W % 2 == 0:
+                            W += 1
+                        klt_params = dict(_KLT_LK_PARAMS, winSize=(W, W))
+                    except Exception:
+                        klt_params = _KLT_LK_PARAMS
+                    # 3D projection: hat p = pi(R_pred*(P - C_pred))
+                    try:
+                        state = esekf.get_state() if hasattr(esekf, "get_state") else None
+                        if state is not None and hasattr(state, "p") and hasattr(state, "q"):
+                            C_pred = np.asarray(state.p, dtype=float).reshape(3)
+                            q_pred = np.asarray(state.q, dtype=float).reshape(4)
+                            # quat to rot (wxyz)
+                            w, x, y, z = q_pred
+                            nrm = math.sqrt(w*w + x*x + y*y + z*z)
+                            if nrm > 1e-12:
+                                w, x, y, z = w/nrm, x/nrm, y/nrm, z/nrm
+                                if w < 0:
+                                    w, x, y, z = -w, -x, -y, -z
+                                R_pred = np.array([
+                                    [1-2*(y*y+z*z), 2*(x*y - w*z), 2*(x*z + w*y)],
+                                    [2*(x*y + w*z), 1-2*(x*x+z*z), 2*(y*z - w*x)],
+                                    [2*(x*z - w*y), 2*(y*z + w*x), 1-2*(x*x+y*y)],
+                                ], dtype=float)
+                            else:
+                                R_pred = np.eye(3)
+                            if hasattr(self, "cam") and hasattr(self.cam, "params"):
+                                fx, fy, cx, cy = [float(v) for v in self.cam.params[:4]]
+                                P3d = np.asarray(klt_3d, dtype=float)
+                                diff = P3d - C_pred[None, :]
+                                p_cam = (R_pred @ diff.T).T
+                                p_hat = np.asarray(klt_2d, dtype=np.float32).copy()
+                                valid = p_cam[:, 2] > 1e-3
+                                if np.any(valid):
+                                    p_hat[valid, 0] = (p_cam[valid, 0] / p_cam[valid, 2] * fx + cx).astype(np.float32)
+                                    p_hat[valid, 1] = (p_cam[valid, 1] / p_cam[valid, 2] * fy + cy).astype(np.float32)
+                                    # clamp to image (optional)
+                                    # keep even if outside; LK will fail those points
+                                    p0_hat = p_hat.reshape(-1, 1, 2).astype(np.float32)
+                                    # use initial flow flag
+                                    p0 = np.asarray(klt_2d, dtype=np.float32).reshape(-1, 1, 2)
+                                    # 3D-aware LK result; the fallback below reuses nxt/stf when they are bound.
+                                    nxt, stf, _ = cv2.calcOpticalFlowPyrLK(klt_gray, gray, p0, p0_hat, winSize=klt_params["winSize"], maxLevel=klt_params["maxLevel"], criteria=klt_params["criteria"], flags=cv2.OPTFLOW_USE_INITIAL_FLOW)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            # fallback: standard LK without initial guess
+            p0 = np.asarray(klt_2d, dtype=np.float32).reshape(-1, 1, 2)
+            # if we already computed nxt via 3D-aware path, reuse; else compute here
+            try:
+                nxt
+            except NameError:
+                nxt, stf, _ = cv2.calcOpticalFlowPyrLK(klt_gray, gray, p0, None, **klt_params)
+            if nxt is None or stf is None:
+                self._clear_klt_cache()
+                return None
+            back, stb, _ = cv2.calcOpticalFlowPyrLK(gray, klt_gray, nxt, None, **klt_params)
+            if back is None or stb is None:
+                self._clear_klt_cache()
+                return None
+            fb = np.linalg.norm((p0 - back).reshape(-1, 2), axis=1)
+            good = (stf.ravel() == 1) & (stb.ravel() == 1) & (fb < float(_KLT_FB_PX))
+            if int(np.count_nonzero(good)) < _KLT_MIN_TRACK:
+                self._clear_klt_cache()
+                return None
+            n2d = nxt.reshape(-1, 2)[good]
+            n3d = np.asarray(klt_3d, dtype=float)[good]
+            fbg = fb[good]
+            # median drop: biased but plausible drifters
+            try:
+                median_fbg = float(np.median(fbg)) if len(fbg) else 0.0
+            except Exception:
+                median_fbg = 0.0
+            drop = (fbg > 2.0 * (median_fbg + 1e-6)) & (fbg > 0.5)
+            if bool(np.any(drop)) and int(np.count_nonzero(~drop)) >= _KLT_MIN_TRACK:
+                s2d = n2d[~drop]
+                s3d = n3d[~drop]
+            else:
+                s2d, s3d = n2d, n3d
+            if s2d.shape[0] < 6:
+                self._clear_klt_cache()
+                return None
+            pcam, options = self._new_pose_estimation_context(self._pnp_random_seed())
+            candidate, _elapsed = self._estimate_pose_candidate(
+                s2d, s3d, np.ones(len(s3d), dtype=float), pcam, options
+            )
+            if candidate is None:
+                self._clear_klt_cache()
+                return None
+            result, _c2d, _c3d, metrics = candidate
+            if result is None:
+                self._clear_klt_cache()
+                return None
+            inliers = int(result.get("num_inliers", 0))
+            if inliers < int(self.cfg.weak_min_inliers):
+                self._clear_klt_cache()
+                return None
+            reproj_rms = metrics.get("reproj_rms")
+            try:
+                rms_val = float(reproj_rms) if reproj_rms is not None else float("nan")
+            except Exception:
+                rms_val = float("nan")
+            if not math.isfinite(rms_val) or rms_val > float(self.cfg.max_reproj_error_track):
+                self._clear_klt_cache()
+                return None
+            _, center, yaw = self._pose_components(result)
+            if getattr(self.st, "center", None) is not None:
+                try:
+                    step = float(np.linalg.norm(np.asarray(center, dtype=float) - np.asarray(self.st.center, dtype=float)))
+                except Exception:
+                    step = float("inf")
+                if step > float(self.cfg.max_jump):
+                    self._clear_klt_cache()
+                    return None
+            # geometric consistency confidence (not just N_track)
+            try:
+                tracked = int(np.count_nonzero(good))
+                inlier_ratio = float(inliers) / max(1, len(s2d))
+                # spatial coverage
+                try:
+                    h, w = gray.shape[:2]
+                    gw, gh = 8, 6
+                    cells = set()
+                    for x, y in n2d:
+                        gx = min(gw - 1, max(0, int(x / max(w, 1) * gw)))
+                        gy = min(gh - 1, max(0, int(y / max(h, 1) * gh)))
+                        cells.add((gx, gy))
+                    spatial_cells = len(cells)
+                except Exception:
+                    spatial_cells = 6
+                try:
+                    fb_med = float(np.median(fbg)) if len(fbg) else 0.0
+                except Exception:
+                    fb_med = 0.0
+                confidence = 0.5 * float(inlier_ratio) + 0.3 * (float(spatial_cells) / 64.0) + 0.2 * (1.0 - min(float(fb_med), 1.0))
+                # 放宽：0.40→0.30, 0.60→0.50 （水面 ratio 0.5-0.6 原被误红）
+                if inlier_ratio < 0.45 and tracked >= 50:
+                    self._clear_klt_cache()
+                    return None
+                if confidence < 0.30:
+                    if inlier_ratio < 0.50:
+                        self._clear_klt_cache()
+                        return None
+                # store for later info
+                _conf = float(confidence)
+                _spatial = int(spatial_cells)
+                _ratio = float(inlier_ratio)
+                _fb_med = float(fb_med)
+            except Exception:
+                _conf = 0.0
+                _spatial = 0
+                _ratio = 0.0
+                _fb_med = 0.0
+            self._klt_2d = n2d.copy()
+            self._klt_3d = n3d.copy()
+            self._klt_gray = np.ascontiguousarray(gray)
+            try:
+                self._klt_age = int(getattr(self, "_klt_age", 0)) + 1
+            except Exception:
+                self._klt_age = 1
+            self._klt_center = np.asarray(center, dtype=float).copy()
+            self._klt_yaw = float(yaw)
+            return {
+                "center": np.asarray(center, dtype=float).copy(),
+                "yaw": float(yaw),
+                "tracked": int(np.count_nonzero(good)),
+                "inliers": int(inliers),
+                "reproj_rms": float(rms_val),
+                "confidence": float(_conf),
+                "spatial_cells": int(_spatial),
+                "inlier_ratio": float(_ratio),
+                "fb_med": float(_fb_med),
+            }
+        except cv2.error:
+            try:
+                self._clear_klt_cache()
+            except Exception:
+                pass
+            return None
+        except Exception:
+            try:
+                self._clear_klt_cache()
+            except Exception:
+                pass
+            return None
+
     # ---------- candidate selection ----------
+    def _pending_reacquire_center(self) -> np.ndarray | None:
+        """Anchor for the next LOST search after an unconfirmed stale reacquire.
+
+        The accepted st.center predates the LOST episode, so predicting from it
+        walks the next frame back into the same stale references that just failed.
+        """
+        if self.st.state != "LOST" or self.st.pending_reacquire_center is None:
+            return None
+        return np.asarray(self.st.pending_reacquire_center, dtype=float)
+
+    def _search_yaw(self) -> float | None:
+        """Yaw anchor for candidate filtering; an unconfirmed stale fix wins."""
+        pending = self.st.pending_reacquire_yaw
+        if self.st.state == "LOST" and pending is not None and math.isfinite(float(pending)):
+            return float(pending)
+        # EKF yaw supersedes KLT when prediction_allowed (cov trace<1.0, yaw sigma<15deg, age<6)
+        try:
+            ekf_yaw = self._esekf_yaw()
+            if ekf_yaw is not None and self.st.state in {"TRACK", "WEAK_TRACK"} and math.isfinite(float(ekf_yaw)):
+                return float(ekf_yaw)
+        except Exception:
+            pass
+        klt_yaw = getattr(self, "_klt_yaw", None)
+        if self.st.state in {"TRACK", "WEAK_TRACK"} and klt_yaw is not None and math.isfinite(float(klt_yaw)):
+            return float(klt_yaw)
+        return self.st.yaw
+
     def _predict_center(self, capture_stamp: float | None = None):
+        pending = self._pending_reacquire_center()
+        if pending is not None:
+            return pending
+        # EKF supersedes KLT when allowed (TRACK/WEAK_TRACK, cov trace<1.0, yaw sigma<15deg, age<6)
+        try:
+            if getattr(self.st, "state", None) in {"TRACK", "WEAK_TRACK"}:
+                esekf = getattr(self, "esekf", None)
+                if esekf is not None and callable(getattr(esekf, "prediction_allowed", None)) and esekf.prediction_allowed():
+                    p_pred = self._esekf_predicted_center(capture_stamp)
+                    if p_pred is not None and p_pred.shape == (3,) and np.all(np.isfinite(p_pred)):
+                        return p_pred
+        except Exception:
+            pass
+        klt_center = getattr(self, "_klt_center", None)
+        if klt_center is not None:
+            return np.asarray(klt_center, dtype=float)
         visual = None
         if self.st.center is not None:
             visual = self.st.center
@@ -727,35 +1317,44 @@ class ProductionEDMTracker:
             return visual
         prediction = controller.predict(
             float(capture_stamp),
-            visual_center=None if self.st.center is None else np.asarray(self.st.center, dtype=float),
+            visual_center=None
+            if self.st.center is None
+            else np.asarray(self.st.center, dtype=float),
             visual_yaw=self.st.yaw,
             visual_velocity=self.st.velocity,
             visual_stamp=self.st.last_capture_stamp,
+            allow_gnss_prior=self.st.state in {"WEAK", "WEAK_TRACK", "LOST"},
         )
 
         if prediction.valid and prediction.position is not None:
             return np.asarray(prediction.position, dtype=float)
         return visual
 
-
     def _near_reference_indices(
         self,
         distances: np.ndarray,
         finite: np.ndarray,
+        *,
+        radius_factor: float = 1.0,
+        strict_radius: bool = False,
     ) -> list[int]:
         near = []
-        radius = float(self.cfg.radius)
+        radius = float(self.cfg.radius) * float(radius_factor)
+        pool_limit = max(
+            int(self.cfg.near_pool),
+            int(math.ceil(float(self.cfg.near_pool) * float(radius_factor))),
+        )
         max_yaw = math.radians(self.cfg.max_yaw_diff_deg)
-        predicted_yaw = self.st.yaw
+        predicted_yaw = self._search_yaw()
         controller = self._active_pose_guided()
         if controller is not None:
             limits = controller.search_limits(
                 state=self.st.state,
                 misses=int(self.st.misses),
                 weak_after=int(self.cfg.weak_after),
-                base_radius=float(self.cfg.radius),
+                base_radius=float(self.cfg.radius) * float(radius_factor),
                 base_yaw_rad=math.radians(self.cfg.max_yaw_diff_deg),
-                base_max_refs=int(self.cfg.near_pool),
+                base_max_refs=pool_limit,
             )
             radius = limits.radius
             max_yaw = limits.max_yaw_rad
@@ -766,8 +1365,9 @@ class ProductionEDMTracker:
             index = int(raw_index)
             if not finite[index]:
                 continue
-            if distances[index] > radius and len(near) >= self.cfg.near_pool:
-                break
+            if distances[index] > radius:
+                if strict_radius or len(near) >= pool_limit:
+                    break
             if (
                 predicted_yaw is not None
                 and self.yaws is not None
@@ -776,10 +1376,9 @@ class ProductionEDMTracker:
             ):
                 continue
             near.append(index)
-            if len(near) >= self.cfg.near_pool:
+            if len(near) >= pool_limit:
                 break
         return near
-
 
     def _covisible_reference_indices(self, near: list[int]) -> list[int]:
         covis_refs: list[int] = []
@@ -795,15 +1394,16 @@ class ProductionEDMTracker:
         distances: np.ndarray,
         last: set[int],
     ) -> float:
+        yaw = self._search_yaw()
         score = 2.0 * math.exp(-float(distances[index]) / max(self.cfg.radius, 1e-6))
-        if self.st.yaw is not None and self.yaws is not None and np.isfinite(self.yaws[index]):
+        if yaw is not None and self.yaws is not None and np.isfinite(self.yaws[index]):
             score += 0.8 * math.exp(
-                -abs(_angle_diff(float(self.yaws[index]), self.st.yaw)) / math.radians(45.0)
+                -abs(_angle_diff(float(self.yaws[index]), yaw)) / math.radians(45.0)
             )
         else:
             score += 0.4
         score += 1.0 if index in last else 0.0
-        weight = float(self.cfg.reference_quality_weight)
+        weight = float(getattr(self, "_reference_quality_weight", getattr(self.cfg, "reference_quality_weight", 0.5)))
         if weight > 0.0:
             score += weight * self._reference_rank_score(index)
         return score
@@ -852,18 +1452,24 @@ class ProductionEDMTracker:
             if quality is not None:
                 quality_row[index] = quality
 
-
-
-    def _track_candidates(self, topk: int, capture_stamp: float | None = None) -> list[str]:
+    def _track_candidates(
+        self,
+        topk: int,
+        capture_stamp: float | None = None,
+        *,
+        radius_factor: float = 1.0,
+        strict_radius: bool = False,
+    ) -> list[str]:
         """Geometry only: nearest references to the predicted pose, plus their covisibles."""
         C = self._predict_center(capture_stamp)
         if C is None or self.centers is None:
             return []
+        d = np.linalg.norm(self.centers - C[None, :], axis=1)
         controller = self._active_pose_guided()
         if controller is not None and controller.last_prediction is not None:
             quality_scores = None
             stability_scores = None
-            if float(self.cfg.reference_quality_weight) > 0.0:
+            if float(getattr(self, "_reference_quality_weight", getattr(self.cfg, "reference_quality_weight", 0.5))) > 0.0:
                 quality_scores = np.asarray(self._reference_quality, dtype=float)
                 stability_scores = np.asarray(self._reference_stability, dtype=float)
             selected = controller.select_references(
@@ -874,7 +1480,7 @@ class ProductionEDMTracker:
                 state=self.st.state,
                 misses=int(self.st.misses),
                 weak_after=int(self.cfg.weak_after),
-                base_radius=float(self.cfg.radius),
+                base_radius=float(self.cfg.radius) * float(radius_factor),
                 base_yaw_rad=math.radians(self.cfg.max_yaw_diff_deg),
                 base_max_refs=int(topk),
                 last_indices=list(self.st.last_refs),
@@ -883,20 +1489,35 @@ class ProductionEDMTracker:
                 stability_scores=stability_scores,
             )
             if selected:
+                if strict_radius:
+                    radius = float(self.cfg.radius) * float(radius_factor)
+                    selected = [
+                        name
+                        for name in selected
+                        if name in self.idx_of
+                        and np.isfinite(d[self.idx_of[name]])
+                        and d[self.idx_of[name]] <= radius
+                    ]
                 return selected[:topk]
-        d = np.linalg.norm(self.centers - C[None, :], axis=1)
         finite = np.isfinite(d)
-        near = self._near_reference_indices(d, finite)
+        near = self._near_reference_indices(
+            d,
+            finite,
+            radius_factor=radius_factor,
+            strict_radius=strict_radius,
+        )
         covis_refs = self._covisible_reference_indices(near)
         union = list(dict.fromkeys(near + covis_refs + list(self.st.last_refs)))
         last = set(self.st.last_refs)
         union = [i for i in union if 0 <= i < len(self.map.ref_names) and finite[i]]
+        if strict_radius:
+            radius = float(self.cfg.radius) * float(radius_factor)
+            union = [index for index in union if d[index] <= radius]
         union.sort(
             key=lambda index: self._track_candidate_score(index, d, last),
             reverse=True,
         )
         return [self.name_of[i] for i in union[:topk]]
-
 
     def _recovery_candidates(self, topk: int) -> list[str]:
         if topk <= 0 or not self.recovery_bank:
@@ -932,13 +1553,11 @@ class ProductionEDMTracker:
         topk = (
             self.cfg.lost_local_topk
             if lost
-            else self.cfg.boot_global_topk * (
-                GLOBAL_RETRIEVAL_RETRY_MULTIPLIER if attempts else 1
-            )
+            else self.cfg.boot_global_topk * (GLOBAL_RETRIEVAL_RETRY_MULTIPLIER if attempts else 1)
         )
         candidates = None
         prior_fresh = False
-        if lost and attempts == 0:
+        if lost:
             prior_age = (
                 None
                 if self.st.last_capture_stamp is None
@@ -949,9 +1568,33 @@ class ProductionEDMTracker:
                 and math.isfinite(prior_age)
                 and 0.0 <= prior_age <= self.cfg.lost_prior_max_age_s
             )
-            if self.cfg.lost_prior_strategy == "restrict_nearby" and prior_fresh:
-                nearby = self._track_candidates(self.cfg.near_pool, capture_stamp)
-                candidates = nearby or None
+            if self.cfg.lost_prior_strategy == "restrict_nearby":
+                if attempts < len(LOST_PROGRESSIVE_RADIUS_FACTORS):
+                    factor = LOST_PROGRESSIVE_RADIUS_FACTORS[attempts]
+                    pool = min(
+                        len(self.map.ref_names),
+                        max(
+                            int(self.cfg.lost_local_topk),
+                            int(math.ceil(self.cfg.near_pool * factor)),
+                        ),
+                    )
+                    candidates = self._track_candidates(
+                        pool,
+                        capture_stamp,
+                        radius_factor=factor,
+                        strict_radius=True,
+                    )
+                    self._last_lost_search_stage = f"near_{int(factor)}x"
+                    self._last_lost_radius_factor = float(factor)
+                else:
+                    self._last_lost_search_stage = "global"
+                    self._last_lost_radius_factor = None
+            elif self.cfg.lost_prior_strategy == "full_global":
+                self._last_lost_search_stage = "global"
+                self._last_lost_radius_factor = None
+        elif not lost:
+            self._last_lost_search_stage = "boot_global"
+            self._last_lost_radius_factor = None
         rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
         started = time.perf_counter()
         if lost and self.cfg.lost_prior_strategy == "score_fusion":
@@ -968,8 +1611,7 @@ class ProductionEDMTracker:
         if lost:
             self.st.lost_global_retrieval_attempts += 1
             self.st.lost_global_retrieval_done = (
-                self.st.lost_global_retrieval_attempts
-                >= LOST_GLOBAL_RETRIEVAL_ATTEMPTS
+                self.st.lost_global_retrieval_attempts >= LOST_GLOBAL_RETRIEVAL_ATTEMPTS
             )
         else:
             self.st.boot_global_retrieval_attempts += 1
@@ -981,10 +1623,20 @@ class ProductionEDMTracker:
         if self.cfg.global_retrieval_policy == "boot_and_lost_once":
             if (
                 self.st.state == "BOOT_INIT"
-                and self.st.boot_global_retrieval_attempts
-                < GLOBAL_RETRIEVAL_ATTEMPTS
+                and self.st.boot_global_retrieval_attempts < GLOBAL_RETRIEVAL_ATTEMPTS
             ):
                 return True
+            progressive_offset = self.st.lost_frames - self.cfg.lost_local_grace_frames - 1
+            if (
+                self.st.state == "LOST"
+                and self.cfg.lost_prior_strategy == "restrict_nearby"
+                and self.cfg.lost_global_retrieval_interval > 0
+                and self.st.lost_global_retrieval_attempts < LOST_GLOBAL_RETRIEVAL_ATTEMPTS
+            ):
+                return (
+                    progressive_offset >= 0
+                    and progressive_offset % LOST_PROGRESSIVE_STEP_INTERVAL == 0
+                )
             return (
                 self.st.state == "LOST"
                 and self.st.lost_frames > self.cfg.lost_local_grace_frames
@@ -992,13 +1644,7 @@ class ProductionEDMTracker:
                     self.st.lost_global_retrieval_attempts == 0
                     or (
                         self.cfg.lost_global_retrieval_interval > 0
-                        and (
-                            self.st.lost_frames
-                            - self.cfg.lost_local_grace_frames
-                            - 1
-                        )
-                        % self.cfg.lost_global_retrieval_interval
-                        == 0
+                        and (progressive_offset) % self.cfg.lost_global_retrieval_interval == 0
                     )
                 )
             )
@@ -1010,7 +1656,29 @@ class ProductionEDMTracker:
         self,
         capture_stamp: float,
     ) -> tuple[list[str], str]:
-        if self.st.state == "LOST" and self.st.lost_frames > self.cfg.lost_local_grace_frames:
+        if self.st.state == "LOST" and self.cfg.lost_prior_strategy == "restrict_nearby":
+            attempts = int(self.st.lost_global_retrieval_attempts)
+            factor = LOST_PROGRESSIVE_RADIUS_FACTORS[
+                min(attempts, len(LOST_PROGRESSIVE_RADIUS_FACTORS) - 1)
+            ]
+            local_topk = (
+                self.cfg.lost_local_topk
+                if self.st.lost_frames <= self.cfg.lost_local_grace_frames
+                else self.cfg.recovery_scan_topk
+            )
+            refs = self._track_candidates(
+                local_topk,
+                capture_stamp,
+                radius_factor=factor,
+                strict_radius=True,
+            )
+            self._last_lost_search_stage = f"near_{int(factor)}x"
+            self._last_lost_radius_factor = float(factor)
+            mode = "edm_local_recovery"
+            if not refs and attempts >= len(LOST_PROGRESSIVE_RADIUS_FACTORS):
+                refs = self._recovery_candidates(self.cfg.recovery_scan_topk)
+                mode = "edm_map_scan"
+        elif self.st.state == "LOST" and self.st.lost_frames > self.cfg.lost_local_grace_frames:
             refs = self._recovery_candidates(self.cfg.recovery_scan_topk)
             mode = "edm_map_scan"
         elif self.st.state == "LOST":
@@ -1019,7 +1687,12 @@ class ProductionEDMTracker:
         else:
             refs = list(self.st.boot_refs)
             mode = "edm_boot_refs"
-        if not refs:
+        progressive_local_pending = (
+            self.st.state == "LOST"
+            and self.cfg.lost_prior_strategy == "restrict_nearby"
+            and self.st.lost_global_retrieval_attempts < len(LOST_PROGRESSIVE_RADIUS_FACTORS)
+        )
+        if not refs and not progressive_local_pending:
             refs = list(self.st.boot_refs[: self.cfg.lost_local_topk])
             mode = "edm_boot_refs"
         return refs, mode
@@ -1109,6 +1782,8 @@ class ProductionEDMTracker:
         frame_bgr: np.ndarray,
         capture_stamp: float,
     ) -> _CandidateSelection:
+        self._last_lost_search_stage = None
+        self._last_lost_radius_factor = None
         if self.st.state in ("BOOT_INIT", "LOST"):
             return self._acquisition_candidates(frame_bgr, capture_stamp)
         return self._tracking_candidates(frame_bgr, capture_stamp)
@@ -1117,6 +1792,9 @@ class ProductionEDMTracker:
         self,
         gray: np.ndarray,
         selection: _CandidateSelection,
+        *,
+        prepared_query=None,
+        on_batch=None,
     ) -> _CorrespondenceBatch:
         refs = selection.refs
         temporal_used = (
@@ -1134,6 +1812,7 @@ class ProductionEDMTracker:
                 [self.temporal_xyz_by_cell] + [self.map.xyz_by_cell[name] for name in refs],
                 batch_size=self.cfg.match_batch_size,
                 source_kinds=kinds,
+                prepared_query=prepared_query,
             )
             points2d, points3d, confidence, per_ref = _merge_correspondence_rows(rows)
         else:
@@ -1141,6 +1820,8 @@ class ProductionEDMTracker:
                 gray,
                 refs,
                 batch_size=self.cfg.match_batch_size,
+                prepared_query=prepared_query,
+                on_batch=on_batch,
             )
             points2d, points3d, confidence, per_ref = _merge_correspondence_rows(by_ref)
         return _CorrespondenceBatch(
@@ -1224,12 +1905,68 @@ class ProductionEDMTracker:
     ) -> tuple[str, tuple] | None:
         return _select_track_candidate(selection, scored, self.cfg)
 
+    def _estimate_reference_row(self, row) -> tuple | None:
+        ref_p2, ref_p3, ref_confidence, _count = row
+        thread_camera, thread_options = self._new_pose_estimation_context(self._pnp_random_seed())
+        return self._estimate_pose_candidate(
+            ref_p2,
+            ref_p3,
+            ref_confidence,
+            thread_camera,
+            thread_options,
+        )[0]
+
+    def _pnp_candidates_can_stop(
+        self,
+        selection: _CandidateSelection,
+        scored: list[tuple[str, tuple]],
+        capture_stamp: float,
+    ) -> bool:
+        strong_count = sum(
+            1
+            for _name, candidate in scored
+            if self._candidate_inliers(candidate) >= selection.min_inliers
+        )
+        if selection.acquiring and strong_count < 2:
+            return False
+        chosen = (
+            self._select_acquire_candidate(selection, scored)
+            if selection.acquiring
+            else self._select_track_candidate(selection, scored)
+        )
+        if chosen is None:
+            return False
+        _name, candidate = chosen
+        result, _points2d, _points3d, metrics = candidate
+        reproj_limit = (
+            self.cfg.max_reproj_error_acquire
+            if selection.acquiring
+            else self.cfg.max_reproj_error_track
+        )
+        if not self._pose_quality_ok(
+            result,
+            metrics,
+            min_inliers=selection.min_inliers,
+            reproj_limit=reproj_limit,
+        ):
+            return False
+        _rotation, center, yaw = self._pose_components(result)
+        return self._trajectory_would_allow(
+            center,
+            yaw,
+            capture_stamp,
+            self.st.state,
+        )
+
     def _best_pose_attempt(
         self,
         selection: _CandidateSelection,
         batch: _CorrespondenceBatch,
+        *,
+        capture_stamp: float | None = None,
+        precomputed: list[tuple[int, str, tuple | None]] | None = None,
+        precomputed_pnp_ms: float = 0.0,
     ) -> _PoseAttempt:
-        pcam, options = self._pose_estimation_context()
         result = None
         selected_ref = None
         points2d = np.zeros((0, 2))
@@ -1238,22 +1975,65 @@ class ProductionEDMTracker:
         pnp_ms = 0.0
         reject_reason = None
         strong_count = 0
+        pnp_candidates = 0
+        pnp_skipped = 0
         if batch.by_ref is not None:
             scored: list[tuple[str, tuple]] = []
-            for name, (ref_p2, ref_p3, ref_confidence, _) in zip(
-                selection.refs,
-                batch.by_ref,
-            ):
-                candidate, elapsed_ms = self._estimate_pose_candidate(
-                    ref_p2,
-                    ref_p3,
-                    ref_confidence,
-                    pcam,
-                    options,
+            rows = list(enumerate(zip(selection.refs, batch.by_ref)))
+            if precomputed is not None:
+                ordered = sorted(precomputed, key=lambda item: item[0])
+                pnp_candidates = len(ordered)
+                pnp_skipped = len(rows) - pnp_candidates
+                pnp_ms = float(precomputed_pnp_ms)
+                for _ordinal, name, candidate in ordered:
+                    if candidate is not None:
+                        scored.append((name, candidate))
+            else:
+                if self.cfg.pnp_early_stop:
+                    eligible = [row for row in rows if len(row[1][1][1]) >= selection.min_inliers]
+                else:
+                    eligible = rows
+                if self.cfg.pnp_ranked_batches:
+                    eligible.sort(
+                        key=lambda row: _reference_pnp_rank(
+                            row[1][1],
+                            width=self.cam.width,
+                            height=self.cam.height,
+                            grid=self.cfg.corr_grid,
+                        ),
+                        reverse=True,
+                    )
+                chunk_size = (
+                    max(1, self.cfg.pnp_workers)
+                    if self.cfg.pnp_ranked_batches
+                    else max(1, len(eligible))
                 )
-                pnp_ms += elapsed_ms
-                if candidate is not None:
-                    scored.append((name, candidate))
+                pnp_started = time.perf_counter()
+                executor = self._parallel_pnp_executor()
+                for start in range(0, len(eligible), chunk_size):
+                    chunk = eligible[start : start + chunk_size]
+                    row_values = [row[1][1] for row in chunk]
+                    if executor is not None and len(chunk) > 1:
+                        candidates = list(executor.map(self._estimate_reference_row, row_values))
+                    else:
+                        candidates = [self._estimate_reference_row(row) for row in row_values]
+                    pnp_candidates += len(chunk)
+                    for (_ordinal, (name, _row)), candidate in zip(chunk, candidates):
+                        if candidate is not None:
+                            scored.append((name, candidate))
+                    if (
+                        self.cfg.pnp_ranked_batches
+                        and capture_stamp is not None
+                        and self._pnp_candidates_can_stop(
+                            selection,
+                            scored,
+                            capture_stamp,
+                        )
+                    ):
+                        break
+                if eligible:
+                    pnp_ms = (time.perf_counter() - pnp_started) * 1e3
+                pnp_skipped = len(rows) - pnp_candidates
             strong_count = sum(
                 1
                 for _name, candidate in scored
@@ -1272,6 +2052,7 @@ class ProductionEDMTracker:
                 selected_ref, candidate = chosen
                 result, points2d, points3d, metrics = candidate
         else:
+            pcam, options = self._pose_estimation_context()
             candidate, pnp_ms = self._estimate_pose_candidate(
                 batch.points2d,
                 batch.points3d,
@@ -1281,6 +2062,7 @@ class ProductionEDMTracker:
             )
             if candidate is not None:
                 result, points2d, points3d, metrics = candidate
+                pnp_candidates = 1
         return _PoseAttempt(
             result=result,
             points2d=points2d,
@@ -1290,16 +2072,68 @@ class ProductionEDMTracker:
             pnp_ms=pnp_ms,
             reject_reason=reject_reason,
             strong_count=strong_count,
+            pnp_candidates=pnp_candidates,
+            pnp_skipped=pnp_skipped,
         )
 
     def _match_and_estimate(
         self,
         gray: np.ndarray,
         selection: _CandidateSelection,
+        *,
+        capture_stamp: float | None = None,
+        prepared_query=None,
     ) -> tuple[_CorrespondenceBatch, _PoseAttempt, float]:
         started = time.perf_counter()
-        batch = self._collect_correspondences(gray, selection)
-        attempt = self._best_pose_attempt(selection, batch)
+        pending = []
+        executor = (
+            self._parallel_pnp_executor()
+            if (
+                self.cfg.pnp_pipeline
+                and not self.cfg.pnp_ranked_batches
+                and self.cfg.pnp_workers > 1
+            )
+            else None
+        )
+
+        def submit_rows(start_index: int, rows: list) -> None:
+            if executor is None:
+                return
+            for offset, row in enumerate(rows):
+                ordinal = start_index + offset
+                if self.cfg.pnp_early_stop and len(row[1]) < selection.min_inliers:
+                    continue
+                pending.append(
+                    (
+                        ordinal,
+                        selection.refs[ordinal],
+                        executor.submit(self._estimate_reference_row, row),
+                    )
+                )
+
+        batch = self._collect_correspondences(
+            gray,
+            selection,
+            prepared_query=prepared_query,
+            on_batch=submit_rows if executor is not None else None,
+        )
+        if executor is not None and batch.by_ref is not None:
+            wait_started = time.perf_counter()
+            precomputed = [(ordinal, name, future.result()) for ordinal, name, future in pending]
+            pnp_wait_ms = (time.perf_counter() - wait_started) * 1e3
+            attempt = self._best_pose_attempt(
+                selection,
+                batch,
+                capture_stamp=capture_stamp,
+                precomputed=precomputed,
+                precomputed_pnp_ms=pnp_wait_ms,
+            )
+        else:
+            attempt = self._best_pose_attempt(
+                selection,
+                batch,
+                capture_stamp=capture_stamp,
+            )
         match_ms = max(0.0, (time.perf_counter() - started) * 1e3 - attempt.pnp_ms)
         return batch, attempt, match_ms
 
@@ -1316,10 +2150,11 @@ class ProductionEDMTracker:
         )
         if pool <= 0 or topk <= 0:
             return []
-        descriptor = self.loc.megaloc.extract_one(rgb)
-        scored = list(
-            self.loc.retrieve_scored(rgb, pool, descriptor=descriptor)
+        extract_tensor = getattr(self.loc.megaloc, "extract_one_tensor", None)
+        descriptor = (
+            extract_tensor(rgb) if callable(extract_tensor) else self.loc.megaloc.extract_one(rgb)
         )
+        scored = list(self.loc.retrieve_scored(rgb, pool, descriptor=descriptor))
         if prior_fresh:
             nearby = self._track_candidates(self.cfg.near_pool, capture_stamp)
             have = {name for name, _score in scored}
@@ -1337,11 +2172,7 @@ class ProductionEDMTracker:
         for name, vpr_score in scored:
             geom = 0.0
             index = self.idx_of.get(name)
-            if (
-                center is not None
-                and self.centers is not None
-                and index is not None
-            ):
+            if center is not None and self.centers is not None and index is not None:
                 distance = float(np.linalg.norm(self.centers[index] - center))
                 if np.isfinite(distance):
                     geom = math.exp(-distance / radius)
@@ -1386,6 +2217,10 @@ class ProductionEDMTracker:
                 if self.st.last_capture_stamp is None
                 else capture_stamp - self.st.last_capture_stamp
             )
+            if self.st.yaw is not None and math.isfinite(float(self.st.yaw)):
+                yaw_delta = abs(_angle_diff(yaw, float(self.st.yaw)))
+                if yaw_delta > math.radians(track_yaw_limit(self.cfg, capture_dt)):
+                    return False
             _limited, jump_info = limit_center_step(
                 self.st.center,
                 center,
@@ -1443,7 +2278,6 @@ class ProductionEDMTracker:
         _rotation, center, yaw = self._pose_components(attempt.result)
         return self._trajectory_would_allow(center, yaw, capture_stamp, self.st.state)
 
-
     def _localization_info(
         self,
         selection: _CandidateSelection,
@@ -1455,9 +2289,13 @@ class ProductionEDMTracker:
     ) -> dict:
         matcher = getattr(self.loc, "matcher", None)
         cache_stats = None
+        host_cache_stats = None
         read_class_stats = getattr(matcher, "feature_cache_stats_by_class", None)
         if callable(read_class_stats):
             cache_stats = read_class_stats()
+        read_host_stats = getattr(matcher, "host_reference_feature_cache_stats", None)
+        if callable(read_host_stats):
+            host_cache_stats = read_host_stats()
         info = {
             "frame": self.st.frame,
             "state_in": self.st.state,
@@ -1472,14 +2310,21 @@ class ProductionEDMTracker:
             "lost_prior_fusion_weight": float(self.cfg.lost_prior_fusion_weight),
             "runtime_sigma_mode": getattr(matcher, "runtime_sigma_mode", None),
             "feature_cache_classes": cache_stats,
+            "host_feature_cache": host_cache_stats,
             "motion_cache_active": self._motion_cache_active(),
             "n_corr": int(len(batch.points3d)),
             "per_ref": batch.per_ref,
             "global_retrieval_calls": self.st.global_retrieval_calls,
             "lost_global_retrieval_done": self.st.lost_global_retrieval_done,
+            "lost_search_stage": self._last_lost_search_stage,
+            "lost_search_radius_factor": self._last_lost_radius_factor,
             "vpr_ms": selection.vpr_ms,
             "match_ms": match_ms,
             "pnp_ms": attempt.pnp_ms,
+            "pnp_candidates": attempt.pnp_candidates,
+            "pnp_skipped": attempt.pnp_skipped,
+            "pnp_workers": int(self.cfg.pnp_workers),
+            "pnp_pipeline": bool(self.cfg.pnp_pipeline),
             "total_ms": (time.perf_counter() - started) * 1e3,
         }
         info.update(attempt.metrics)
@@ -1488,22 +2333,250 @@ class ProductionEDMTracker:
             info.update(controller.predicted_only(controller.last_prediction))
         return info
 
-
     def _clear_pending_jump(self) -> None:
         self.st.pending_limited_center = None
         self.st.pending_limited_stamp = None
         self.st.pending_limited_limit = None
 
+    def _clear_pending_reacquisition(self) -> None:
+        self.st.pending_reacquire_center = None
+        self.st.pending_reacquire_yaw = None
+        self.st.pending_reacquire_stamp = None
+
+    def _stale_reacquisition_allows(
+        self,
+        center: np.ndarray,
+        yaw: float,
+        capture_stamp: float,
+        info: dict,
+    ) -> bool:
+        if self.cfg.stale_reacquire_confirmations == 1:
+            return True
+        pending_center = self.st.pending_reacquire_center
+        pending_yaw = self.st.pending_reacquire_yaw
+        pending_stamp = self.st.pending_reacquire_stamp
+        independent = pending_stamp is not None and capture_stamp > pending_stamp
+        distance = None
+        yaw_delta = None
+        if pending_center is not None and independent:
+            distance = float(np.linalg.norm(center - pending_center))
+            if pending_yaw is not None and math.isfinite(float(pending_yaw)):
+                yaw_delta = abs(_angle_diff(yaw, float(pending_yaw)))
+            position_consistent = distance <= float(self.cfg.stale_reacquire_max_distance)
+            yaw_consistent = yaw_delta is None or yaw_delta <= math.radians(
+                float(self.cfg.stale_reacquire_max_yaw_diff_deg)
+            )
+            if position_consistent and yaw_consistent:
+                info["stale_reacquire_confirmed"] = True
+                self._clear_pending_reacquisition()
+                return True
+        self.st.pending_reacquire_center = np.asarray(center, dtype=float).copy()
+        self.st.pending_reacquire_yaw = float(yaw)
+        self.st.pending_reacquire_stamp = float(capture_stamp)
+        info["stale_reacquire_confirmation"] = {
+            "independent": independent,
+            "distance": distance,
+            "max_distance": float(self.cfg.stale_reacquire_max_distance),
+            "yaw_delta_deg": None if yaw_delta is None else math.degrees(yaw_delta),
+            "max_yaw_diff_deg": float(self.cfg.stale_reacquire_max_yaw_diff_deg),
+        }
+        info["rejected"] = "stale_reacquire_unconfirmed"
+        info.update({"state_out": self.st.state, "ok": False})
+        if info.get("pose_status") == "VISUALLY_CONFIRMED":
+            info["pose_status"] = "NONE"
+        return False
+
     def _clear_visual_motion_cache(self) -> None:
         self._last_accepted_bgr = None
         self._last_accepted_cam_from_world = None
 
+    def _clear_klt_cache(self) -> None:
+        self._klt_gray = None
+        self._klt_2d = None
+        self._klt_3d = None
+        self._klt_center = None
+        self._klt_yaw = None
+        self._klt_seed_stamp = None
+        self._klt_age = 0
+
+    def _seed_klt_from_inliers(
+        self,
+        gray: np.ndarray,
+        points2d: np.ndarray,
+        points3d: np.ndarray,
+        inlier_mask: np.ndarray,
+        capture_stamp: float,
+    ) -> bool:
+        try:
+            mask = np.asarray(inlier_mask, dtype=bool)
+            if mask.shape[0] != points2d.shape[0]:
+                # mismatched length: fall back to all points
+                mask = np.ones(points2d.shape[0], dtype=bool)
+            seed2d = np.asarray(points2d, dtype=float)[mask]
+            seed3d = np.asarray(points3d, dtype=float)[mask]
+            if seed2d.shape[0] == 0 or seed3d.shape[0] == 0:
+                self._clear_klt_cache()
+                return False
+            _, unique_2d = np.unique(seed2d, axis=0, return_index=True)
+            unique_2d = np.sort(unique_2d)
+            _, unique_3d = np.unique(seed3d[unique_2d], axis=0, return_index=True)
+            unique = unique_2d[np.sort(unique_3d)]
+            if len(unique) < _KLT_MIN_SEED:
+                self._clear_klt_cache()
+                return False
+            self._klt_2d = seed2d[unique].copy()
+            self._klt_3d = seed3d[unique].copy()
+            self._klt_gray = np.ascontiguousarray(gray)
+            self._klt_seed_stamp = float(capture_stamp)
+            self._klt_age = 0
+            self._klt_center = None
+            self._klt_yaw = None
+            return True
+        except Exception:
+            self._clear_klt_cache()
+            return False
+    @staticmethod
+    def _pose_to_quaternion(R: np.ndarray) -> np.ndarray:
+        """Rotation matrix 3x3 -> wxyz quaternion normalized (robust trace method)."""
+        try:
+            R = np.asarray(R, dtype=float).reshape(3, 3)
+            t = float(np.trace(R))
+            if t > 0.0:
+                s = math.sqrt(t + 1.0) * 2.0
+                qw = 0.25 * s
+                qx = (R[2, 1] - R[1, 2]) / s
+                qy = (R[0, 2] - R[2, 0]) / s
+                qz = (R[1, 0] - R[0, 1]) / s
+            elif R[0, 0] > R[1, 1] and R[0, 0] > R[2, 2]:
+                s = math.sqrt(1.0 + R[0, 0] - R[1, 1] - R[2, 2]) * 2.0
+                qw = (R[2, 1] - R[1, 2]) / s
+                qx = 0.25 * s
+                qy = (R[0, 1] + R[1, 0]) / s
+                qz = (R[0, 2] + R[2, 0]) / s
+            elif R[1, 1] > R[2, 2]:
+                s = math.sqrt(1.0 + R[1, 1] - R[0, 0] - R[2, 2]) * 2.0
+                qw = (R[0, 2] - R[2, 0]) / s
+                qx = (R[0, 1] + R[1, 0]) / s
+                qy = 0.25 * s
+                qz = (R[1, 2] + R[2, 1]) / s
+            else:
+                s = math.sqrt(1.0 + R[2, 2] - R[0, 0] - R[1, 1]) * 2.0
+                qw = (R[1, 0] - R[0, 1]) / s
+                qx = (R[0, 2] + R[2, 0]) / s
+                qy = (R[1, 2] + R[2, 1]) / s
+                qz = 0.25 * s
+            q = np.array([qw, qx, qy, qz], dtype=float)
+            n = float(np.linalg.norm(q))
+            if n < 1e-12 or not math.isfinite(n):
+                return np.array([1.0, 0.0, 0.0, 0.0], dtype=float)
+            q /= n
+            if q[0] < 0:
+                q = -q
+            return q
+        except Exception:
+            return np.array([1.0, 0.0, 0.0, 0.0], dtype=float)
+
+    def _esekf_yaw(self) -> float | None:
+        """Yaw from ESEKF quaternion if prediction_allowed, else None."""
+        try:
+            esekf = getattr(self, "esekf", None)
+            if esekf is None or not callable(getattr(esekf, "prediction_allowed", None)):
+                return None
+            if not esekf.prediction_allowed():
+                return None
+            q = getattr(esekf, "q", None)
+            if q is None:
+                return None
+            q_arr = np.asarray(q, dtype=float).reshape(4)
+            n = float(np.linalg.norm(q_arr))
+            if n < 1e-12 or not math.isfinite(n):
+                return None
+            q_arr = q_arr / n
+            R = None
+            try:
+                from esekf import _quat_to_rot as _q2r  # type: ignore
+                R = _q2r(q_arr)
+            except Exception:
+                w, x, y, z = q_arr
+                R = np.array(
+                    [
+                        [1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y)],
+                        [2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x)],
+                        [2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)],
+                    ],
+                    dtype=float,
+                )
+            forward = R.T @ np.array([0.0, 0.0, 1.0], dtype=float)
+            yaw = float(math.atan2(float(forward[1]), float(forward[0])))
+            if math.isfinite(yaw):
+                return yaw
+        except Exception:
+            return None
+        return None
+
+    def _esekf_predicted_center(self, capture_stamp: float | None) -> np.ndarray | None:
+        """Return ESEKF predicted p if allowed (propagates only if not already)."""
+        try:
+            esekf = getattr(self, "esekf", None)
+            if esekf is None or not callable(getattr(esekf, "prediction_allowed", None)):
+                return None
+            if not esekf.prediction_allowed():
+                return None
+            # determine stamp
+            if capture_stamp is None or not math.isfinite(float(capture_stamp)):
+                capture_stamp = float(getattr(esekf, "last_predict", 0.0))
+            else:
+                capture_stamp = float(capture_stamp)
+            vel = getattr(self, "_latest_velocity_ned", None)
+            # if already propagated for this stamp, return p without second predict (avoid double age increment)
+            try:
+                last = float(getattr(esekf, "last_predict", float("nan")))
+                if math.isfinite(last) and abs(last - capture_stamp) < 1e-9:
+                    p = getattr(esekf, "p", None)
+                    if p is not None:
+                        p_arr = np.asarray(p, dtype=float).reshape(3)
+                        if p_arr.shape == (3,) and np.all(np.isfinite(p_arr)):
+                            try:
+                                self._esekf_last_predict = p_arr.copy()
+                            except Exception:
+                                self._esekf_last_predict = p_arr
+                            return p_arr
+            except Exception:
+                pass
+            # propagate
+            try:
+                res = esekf.predict(capture_stamp, velocity_ned=vel)
+                if res is not None:
+                    if isinstance(res, (tuple, list)) and len(res) >= 1:
+                        p_pred = np.asarray(res[0], dtype=float).reshape(3)
+                    else:
+                        p_pred = getattr(res, "p", getattr(res, "position", None))
+                        if p_pred is not None:
+                            p_pred = np.asarray(p_pred, dtype=float).reshape(3)
+                        else:
+                            p_pred = None
+                    if p_pred is not None and p_pred.shape == (3,) and np.all(np.isfinite(p_pred)):
+                        try:
+                            self._esekf_last_predict = p_pred.copy()
+                        except Exception:
+                            self._esekf_last_predict = p_pred
+                        return p_pred
+            except Exception:
+                pass
+            # fallback to direct state p without propagate if predict failed
+            p = getattr(esekf, "p", None)
+            if p is not None:
+                p_arr = np.asarray(p, dtype=float).reshape(3)
+                if p_arr.shape == (3,) and np.all(np.isfinite(p_arr)):
+                    return p_arr
+        except Exception:
+            return None
+        return None
+
     def _motion_cache_active(self) -> bool:
-        return (
-            getattr(self, "motion_validator", None) is not None
-            and getattr(self, "motion_validation_mode", "off")
-            in {"shadow", "confirm_limited_jump"}
-        )
+        return getattr(self, "motion_validator", None) is not None and getattr(
+            self, "motion_validation_mode", "off"
+        ) in {"shadow", "confirm_limited_jump"}
 
     def _store_visual_motion_cache(self, frame_bgr: np.ndarray, cam_from_world) -> None:
         if not self._motion_cache_active():
@@ -1511,13 +2584,11 @@ class ProductionEDMTracker:
         self._last_accepted_bgr = np.ascontiguousarray(frame_bgr).copy()
         self._last_accepted_cam_from_world = cam_from_world_matrix(cam_from_world)
 
-
     def _relative_motion_cache_ready(self) -> bool:
         return (
             getattr(self, "_last_accepted_bgr", None) is not None
             and getattr(self, "_last_accepted_cam_from_world", None) is not None
         )
-
 
     def _run_relative_motion_check(
         self,
@@ -1544,7 +2615,6 @@ class ProductionEDMTracker:
                 solver_ms=0.0,
                 total_ms=0.0,
             )
-
 
     def _reject_pose(
         self,
@@ -1647,7 +2717,9 @@ class ProductionEDMTracker:
         capture_stamp: float,
     ) -> tuple[bool, str | None, float | None]:
         controller = getattr(self, "pose_guided", None)
-        prediction = getattr(controller, "last_prediction", None) if controller is not None else None
+        prediction = (
+            getattr(controller, "last_prediction", None) if controller is not None else None
+        )
         if (
             prediction is not None
             and getattr(prediction, "valid", False)
@@ -1656,19 +2728,15 @@ class ProductionEDMTracker:
             predicted = np.asarray(prediction.position, dtype=float)
             if predicted.shape == (3,) and np.isfinite(predicted).all():
                 return True, "predicted_center", float(np.linalg.norm(center - predicted))
-        if (
-            self.st.velocity is None
-            or self.st.center is None
-            or self.st.last_capture_stamp is None
-        ):
+        if self.st.velocity is None or self.st.center is None or self.st.last_capture_stamp is None:
             return False, None, None
         dt = float(capture_stamp) - float(self.st.last_capture_stamp)
         if not math.isfinite(dt) or dt <= 1e-6:
             return False, None, None
         dt = min(dt, float(self.cfg.prediction_max_dt))
-        predicted = np.asarray(self.st.center, dtype=float) + np.asarray(
-            self.st.velocity, dtype=float
-        ) * dt
+        predicted = (
+            np.asarray(self.st.center, dtype=float) + np.asarray(self.st.velocity, dtype=float) * dt
+        )
         if predicted.shape != (3,) or not np.isfinite(predicted).all():
             return False, None, None
         return True, "accepted_velocity_prior", float(np.linalg.norm(center - predicted))
@@ -1718,6 +2786,7 @@ class ProductionEDMTracker:
     def _continuous_trajectory_allows(
         self,
         center: np.ndarray,
+        yaw: float,
         capture_stamp: float,
         info: dict,
         frame_bgr: np.ndarray,
@@ -1728,6 +2797,16 @@ class ProductionEDMTracker:
             if self.st.last_capture_stamp is None
             else capture_stamp - self.st.last_capture_stamp
         )
+        if self.st.yaw is not None and math.isfinite(float(self.st.yaw)):
+            yaw_delta = abs(_angle_diff(yaw, float(self.st.yaw)))
+            yaw_limit_deg = track_yaw_limit(self.cfg, capture_dt)
+            info["track_yaw_delta_deg"] = math.degrees(yaw_delta)
+            info["track_yaw_limit_deg"] = yaw_limit_deg
+            if yaw_delta > math.radians(yaw_limit_deg):
+                self._clear_pending_jump()
+                info["rejected"] = "track_yaw"
+                self._on_miss(info)
+                return False
         raw_step = float(np.linalg.norm(center - self.st.center))
         if raw_step > self.cfg.max_jump:
             self._clear_pending_jump()
@@ -1785,7 +2864,6 @@ class ProductionEDMTracker:
         self._clear_pending_jump()
         return True
 
-
     def _lost_reacquisition_allows(
         self,
         center: np.ndarray,
@@ -1805,7 +2883,7 @@ class ProductionEDMTracker:
         )
         info["acquire_prior_age"] = prior_age
         if not prior_fresh:
-            return True
+            return self._stale_reacquisition_allows(center, yaw, capture_stamp, info)
         acquire_limit = float(self.cfg.acquire_max_jump_factor) * float(self.cfg.max_jump)
         acquire_step = float(np.linalg.norm(center - self.st.center))
         info["acquire_step"] = acquire_step
@@ -1838,13 +2916,13 @@ class ProductionEDMTracker:
         if info["state_in"] != "LOST":
             return self._continuous_trajectory_allows(
                 center,
+                yaw,
                 capture_stamp,
                 info,
                 frame_bgr,
                 cam_from_world,
             )
         return self._lost_reacquisition_allows(center, yaw, capture_stamp, info)
-
 
     def _accept_pose(
         self,
@@ -1858,8 +2936,10 @@ class ProductionEDMTracker:
         attempt: _PoseAttempt,
         gray: np.ndarray,
         frame_bgr: np.ndarray,
+        prepared_query=None,
     ) -> dict:
         previous_center = self.st.center
+        self._clear_pending_reacquisition()
         previous_stamp = self.st.last_capture_stamp
         step = None if previous_center is None else (center - previous_center)
         measured_velocity = None
@@ -1875,6 +2955,116 @@ class ProductionEDMTracker:
         )
         self.st.center, self.st.yaw = center, yaw
         self.st.last_capture_stamp = capture_stamp
+        # --- ESEKF visual update (adaptive R, Mahalanobis gating) ---
+        try:
+            esekf = getattr(self, "esekf", None)
+            if esekf is not None:
+                q_wxyz = self._pose_to_quaternion(rotation)
+                v_for_ekf = self.st.velocity
+                if v_for_ekf is None:
+                    v_arr = np.zeros(3, dtype=float)
+                else:
+                    try:
+                        v_arr = np.asarray(v_for_ekf, dtype=float).reshape(3)
+                        if not np.all(np.isfinite(v_arr)):
+                            v_arr = np.zeros(3, dtype=float)
+                    except Exception:
+                        v_arr = np.zeros(3, dtype=float)
+                is_init = bool(getattr(esekf, "_initialized", False))
+                if not is_init:
+                    try:
+                        esekf.reset_from_pose(p=center, q_wxyz=q_wxyz, v=v_arr, timestamp=capture_stamp)  # type: ignore
+                    except Exception:
+                        try:
+                            esekf.reset_from_pose(center, q_wxyz, v_arr, capture_stamp)  # type: ignore
+                        except Exception:
+                            pass
+                else:
+                    inliers_val = None
+                    reproj_val = None
+                    corr_val = None
+                    try:
+                        if isinstance(result, dict):
+                            inliers_val = result.get("num_inliers", result.get("inliers"))
+                    except Exception:
+                        pass
+                    if inliers_val is None:
+                        try:
+                            m = getattr(attempt, "metrics", None)
+                            if isinstance(m, dict):
+                                inliers_val = m.get("num_inliers", m.get("inliers"))
+                        except Exception:
+                            pass
+                    try:
+                        m = getattr(attempt, "metrics", None)
+                        if isinstance(m, dict):
+                            reproj_val = m.get("reproj_rms", m.get("reproj_rmse"))
+                            if reproj_val is None:
+                                reproj_val = info.get("reproj_rms")
+                        else:
+                            reproj_val = info.get("reproj_rms")
+                    except Exception:
+                        pass
+                    try:
+                        if hasattr(attempt, "points2d"):
+                            corr_val = len(attempt.points2d)  # type: ignore
+                        elif hasattr(attempt, "points3d"):
+                            corr_val = len(attempt.points3d)  # type: ignore
+                    except Exception:
+                        pass
+                    jump_val = None
+                    try:
+                        if previous_center is not None:
+                            jump_val = float(np.linalg.norm(np.asarray(center, dtype=float) - np.asarray(previous_center, dtype=float)))
+                    except Exception:
+                        pass
+                    R_pos = None
+                    R_ori = None
+                    if _esekf_adaptive_cov is not None:
+                        try:
+                            Rp, Ro = _esekf_adaptive_cov(  # type: ignore
+                                inliers=inliers_val,
+                                reproj_rmse=reproj_val,
+                                corr_count=corr_val,
+                                jump=jump_val,
+                            )
+                            R_pos = Rp
+                            R_ori = Ro
+                        except Exception:
+                            R_pos = None
+                            R_ori = None
+                    accepted = False
+                    d2_val = None
+                    try:
+                        if R_pos is not None and R_ori is not None:
+                            accepted, d2_val, _nu = esekf.update_visual(  # type: ignore
+                                z_p=center,
+                                z_q_wxyz=q_wxyz,
+                                R_visual_pos=R_pos,
+                                R_visual_ori=R_ori,
+                                timestamp=capture_stamp,
+                            )
+                        else:
+                            accepted, d2_val, _nu = esekf.update_visual(  # type: ignore
+                                z_p=center,
+                                z_q_wxyz=q_wxyz,
+                                timestamp=capture_stamp,
+                            )
+                    except TypeError:
+                        try:
+                            accepted, d2_val, _nu = esekf.update_visual(center, q_wxyz, timestamp=capture_stamp)  # type: ignore
+                        except Exception:
+                            accepted = False
+                    except Exception:
+                        accepted = False
+                    if d2_val is not None:
+                        try:
+                            info["esekf_d2"] = float(d2_val)
+                            info["esekf_update_accepted"] = bool(accepted)
+                        except Exception:
+                            pass
+        except Exception:
+            pass
         accepted_refs = (
             [attempt.selected_ref] if attempt.selected_ref is not None else selection.refs
         )
@@ -1901,9 +3091,33 @@ class ProductionEDMTracker:
                 camera_to_edm_scale=self.loc.scale,
             )
             self.temporal_gray = gray.copy()
+            matcher = getattr(self.loc, "matcher", None)
+            promote = getattr(matcher, "promote_prepared_query", None)
+            if callable(promote):
+                promote(self.temporal_gray, prepared_query)
         else:
             self.temporal_xyz_by_cell = None
             self.temporal_gray = None
+        try:
+            inlier_mask_for_klt = np.asarray(
+                result.get(
+                    "inlier_mask",
+                    np.ones(len(attempt.points3d), dtype=bool),
+                ),
+                dtype=bool,
+            )
+            self._seed_klt_from_inliers(
+                gray, attempt.points2d, attempt.points3d, inlier_mask_for_klt, capture_stamp
+            )
+        except Exception:
+            try:
+                self._clear_klt_cache()
+            except Exception:
+                pass
+        try:
+            self._klt_center = None
+        except Exception:
+            pass
         info.update(
             {
                 "state_out": "TRACK",
@@ -1925,6 +3139,170 @@ class ProductionEDMTracker:
             )
         return info
 
+    def _acquisition_stage_counts(self, requested: int) -> list[int]:
+        if requested <= 0 or self.cfg.acquire_stage_mode == "full_set":
+            return [requested]
+        if self.cfg.acquire_stage_mode == "initial_topk":
+            candidates = (min(self.cfg.acquire_initial_topk, requested), requested)
+        else:
+            candidates = (
+                *(min(topk, requested) for topk in ACQUIRE_PROGRESSIVE_TOPKS),
+                requested,
+            )
+        return list(dict.fromkeys(count for count in candidates if count > 0))
+
+    def _match_acquisition_stages(
+        self,
+        gray: np.ndarray,
+        selection: _CandidateSelection,
+        capture_stamp: float,
+        prepared_query,
+    ) -> tuple[
+        _CandidateSelection,
+        _CorrespondenceBatch,
+        _PoseAttempt,
+        float,
+        list[int],
+    ]:
+        stage_counts = self._acquisition_stage_counts(len(selection.refs))
+        evaluated: list[int] = []
+        batch = None
+        attempt = None
+        match_ms = 0.0
+        pnp_ms = 0.0
+        previous_count = 0
+        active_selection = selection
+        for count in stage_counts:
+            active_selection = replace(selection, refs=list(selection.refs[:count]))
+            if batch is None:
+                batch, attempt, stage_match_ms = self._match_and_estimate(
+                    gray,
+                    active_selection,
+                    capture_stamp=capture_stamp,
+                    prepared_query=prepared_query,
+                )
+            else:
+                remaining = replace(
+                    selection,
+                    refs=list(selection.refs[previous_count:count]),
+                )
+                if batch.by_ref is not None and remaining.refs:
+                    expanded_started = time.perf_counter()
+                    remaining_batch = self._collect_correspondences(
+                        gray,
+                        remaining,
+                        prepared_query=prepared_query,
+                    )
+                    batch = _combine_correspondence_batches(batch, remaining_batch)
+                    attempt = self._best_pose_attempt(
+                        active_selection,
+                        batch,
+                        capture_stamp=capture_stamp,
+                    )
+                    stage_match_ms = max(
+                        0.0,
+                        (time.perf_counter() - expanded_started) * 1e3 - attempt.pnp_ms,
+                    )
+                else:
+                    batch, attempt, stage_match_ms = self._match_and_estimate(
+                        gray,
+                        active_selection,
+                        capture_stamp=capture_stamp,
+                        prepared_query=prepared_query,
+                    )
+            match_ms += stage_match_ms
+            pnp_ms += attempt.pnp_ms
+            evaluated.append(count)
+            previous_count = count
+            if count < len(selection.refs) and self._acquire_stage_can_stop(
+                active_selection,
+                attempt,
+                capture_stamp,
+            ):
+                break
+        assert batch is not None and attempt is not None
+        return (
+            active_selection,
+            batch,
+            replace(attempt, pnp_ms=pnp_ms),
+            match_ms,
+            evaluated,
+        )
+
+    def _track_stage_can_stop(
+        self,
+        selection: _CandidateSelection,
+        attempt: _PoseAttempt,
+        capture_stamp: float,
+    ) -> bool:
+        if attempt.reject_reason or attempt.result is None:
+            return False
+        if not self._pose_quality_ok(
+            attempt.result,
+            attempt.metrics,
+            min_inliers=selection.min_inliers,
+            reproj_limit=self.cfg.max_reproj_error_track,
+        ):
+            return False
+        _rotation, center, yaw = self._pose_components(attempt.result)
+        return self._trajectory_would_allow(
+            center,
+            yaw,
+            capture_stamp,
+            self.st.state,
+        )
+
+    def _match_track_map_first(
+        self,
+        gray: np.ndarray,
+        selection: _CandidateSelection,
+        capture_stamp: float,
+        prepared_query,
+    ) -> tuple[_CorrespondenceBatch, _PoseAttempt, float, bool]:
+        map_selection = replace(selection, mode="edm_track")
+        batch, attempt, match_ms = self._match_and_estimate(
+            gray,
+            map_selection,
+            capture_stamp=capture_stamp,
+            prepared_query=prepared_query,
+        )
+        if self._track_stage_can_stop(selection, attempt, capture_stamp):
+            return batch, attempt, match_ms, False
+        if batch.by_ref is None:
+            raise ValueError("map-first TRACK requires independent map correspondences")
+        expanded_started = time.perf_counter()
+        temporal_rows = self.loc.correspondences_for_sources(
+            gray,
+            [self.temporal_gray],
+            [self.temporal_xyz_by_cell],
+            batch_size=self.cfg.match_batch_size,
+            source_kinds=["temporal"],
+            prepared_query=prepared_query,
+        )
+        rows = [*temporal_rows, *batch.by_ref]
+        points2d, points3d, confidence, per_ref = _merge_correspondence_rows(rows)
+        batch = _CorrespondenceBatch(
+            points2d=points2d,
+            points3d=points3d,
+            confidence=confidence,
+            per_ref=per_ref,
+            by_ref=None,
+            temporal_used=True,
+        )
+        fallback_attempt = self._best_pose_attempt(
+            selection,
+            batch,
+            capture_stamp=capture_stamp,
+        )
+        match_ms += max(
+            0.0,
+            (time.perf_counter() - expanded_started) * 1e3 - fallback_attempt.pnp_ms,
+        )
+        fallback_attempt = replace(
+            fallback_attempt,
+            pnp_ms=attempt.pnp_ms + fallback_attempt.pnp_ms,
+        )
+        return batch, fallback_attempt, match_ms, True
 
     # ---------- one frame ----------
     def localize(self, frame_bgr: np.ndarray, capture_stamp: float | None = None) -> dict:
@@ -1938,26 +3316,66 @@ class ProductionEDMTracker:
         self._observe_capture_stamp(capture_stamp)
         self.st.frame += 1
         gray = EDMMatcher.load_gray(frame_bgr)
+        try:
+            self._klt_query_gray = gray
+            self._klt_query_stamp = float(capture_stamp)
+        except Exception:
+            pass
+        # ESEKF propagate: constant-velocity + covariance growth; dt clamped inside esekf
+        try:
+            esekf = getattr(self, "esekf", None)
+            if esekf is not None and math.isfinite(float(capture_stamp)):
+                vel = getattr(self, "_latest_velocity_ned", None)
+                try:
+                    esekf.predict(float(capture_stamp), velocity_ned=vel)
+                    p = getattr(esekf, "p", None)
+                    if p is not None:
+                        self._esekf_last_predict = np.asarray(p, dtype=float).copy()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        matcher = getattr(self.loc, "matcher", None)
+        prepare_query = getattr(matcher, "prepare_query", None)
+        prepared_query = prepare_query(gray) if callable(prepare_query) else None
 
         selection = self._select_candidates(frame_bgr, capture_stamp)
         requested = len(selection.refs)
-        staged_early_stop = False
-        if (
-            selection.acquiring
-            and self.cfg.acquire_stage_mode == "initial_topk"
-            and requested > self.cfg.acquire_initial_topk
-        ):
-            staged = replace(
-                selection, refs=list(selection.refs[: self.cfg.acquire_initial_topk])
+        acquire_stage_counts = [requested]
+        track_map_first = (
+            cfg.track_map_first
+            and selection.mode == "edm_temporal_map"
+            and self.temporal_gray is not None
+            and self.temporal_xyz_by_cell is not None
+        )
+        track_temporal_fallback = False
+        if selection.acquiring:
+            (
+                selection,
+                batch,
+                attempt,
+                match_ms,
+                acquire_stage_counts,
+            ) = self._match_acquisition_stages(
+                gray,
+                selection,
+                capture_stamp,
+                prepared_query,
             )
-            batch, attempt, match_ms = self._match_and_estimate(gray, staged)
-            if self._acquire_stage_can_stop(staged, attempt, capture_stamp):
-                selection = staged
-                staged_early_stop = True
-            else:
-                batch, attempt, match_ms = self._match_and_estimate(gray, selection)
+        elif track_map_first:
+            batch, attempt, match_ms, track_temporal_fallback = self._match_track_map_first(
+                gray,
+                selection,
+                capture_stamp,
+                prepared_query,
+            )
         else:
-            batch, attempt, match_ms = self._match_and_estimate(gray, selection)
+            batch, attempt, match_ms = self._match_and_estimate(
+                gray,
+                selection,
+                capture_stamp=capture_stamp,
+                prepared_query=prepared_query,
+            )
         info = self._localization_info(
             selection,
             batch,
@@ -1966,7 +3384,11 @@ class ProductionEDMTracker:
             started=t0,
         )
         info["requested_reference_count"] = requested
-        info["staged_early_stop"] = staged_early_stop
+        info["acquire_stage_counts"] = acquire_stage_counts
+        info["staged_early_stop"] = acquire_stage_counts[-1] < requested
+        info["track_map_first"] = track_map_first
+        info["track_temporal_fallback"] = track_temporal_fallback
+        info["pnp_ranked_batches"] = bool(cfg.pnp_ranked_batches)
         ret = attempt.result
         min_inl = selection.min_inliers
         reproj_limit = (
@@ -2009,6 +3431,7 @@ class ProductionEDMTracker:
             attempt,
             gray,
             frame_bgr,
+            prepared_query,
         )
 
     def _on_miss(self, info: dict):
@@ -2026,6 +3449,10 @@ class ProductionEDMTracker:
             self.st.lost_global_retrieval_attempts = 0
             self.st.lost_global_retrieval_done = False
             self._clear_visual_motion_cache()
+            try:
+                self._clear_klt_cache()
+            except Exception:
+                pass
         if self.st.state == "LOST":
             self.st.lost_frames += 1
         else:
@@ -2038,8 +3465,61 @@ class ProductionEDMTracker:
             predicted = controller.predicted_only(controller.last_prediction)
             predicted["ok"] = False
             info.update(predicted)
-
-
+        # ESEKF PREDICTED_ONLY supersedes KLT/pose_guided when prediction_allowed (cov trace<1.0, yaw sigma<15deg, age<6)
+        esekf_done = False
+        try:
+            if getattr(self.st, "state", None) in {"TRACK", "WEAK_TRACK"}:
+                esekf = getattr(self, "esekf", None)
+                if esekf is not None and callable(getattr(esekf, "prediction_allowed", None)) and esekf.prediction_allowed():
+                    p_pred = getattr(esekf, "p", None)
+                    q_pred = getattr(esekf, "q", None)
+                    if p_pred is not None and q_pred is not None:
+                        p_arr = np.asarray(p_pred, dtype=float).reshape(3)
+                        if p_arr.shape == (3,) and np.all(np.isfinite(p_arr)):
+                            yaw_val = self._esekf_yaw()
+                            if yaw_val is None:
+                                yaw_val = getattr(self.st, "yaw", None)
+                            info["ok"] = False
+                            info["pose_status"] = "PREDICTED_ONLY"
+                            info["prediction_valid"] = True
+                            info["prediction_mode"] = "esekf"
+                            info["prediction_source"] = "esekf"
+                            info["predicted_center"] = p_arr.astype(float).tolist()
+                            info["predicted_yaw"] = float(yaw_val) if yaw_val is not None and math.isfinite(float(yaw_val)) else None
+                            try:
+                                P = getattr(esekf, "P", None)
+                                if P is not None and hasattr(P, "shape") and P.shape == (15, 15):
+                                    info["esekf_pos_trace"] = float(np.trace(P[0:3, 0:3]))
+                            except Exception:
+                                pass
+                            esekf_done = True
+        except Exception:
+            esekf_done = False
+        if not esekf_done and getattr(self, "st", None) is not None and getattr(self.st, "state", None) != "LOST":
+            try:
+                prior = self._track_klt_prior(
+                    getattr(self, "_klt_query_gray", None),
+                    getattr(self, "_klt_query_stamp", None) if getattr(self, "_klt_query_stamp", None) is not None else 0.0,
+                )
+            except Exception:
+                prior = None
+            if prior is not None:
+                try:
+                    center = prior.get("center")
+                    yaw = prior.get("yaw")
+                    tracked = prior.get("tracked")
+                    inliers = prior.get("inliers")
+                    info["ok"] = False
+                    info["pose_status"] = "PREDICTED_ONLY"
+                    info["prediction_valid"] = True
+                    info["prediction_mode"] = "klt_pnp"
+                    info["prediction_source"] = "klt_inlier_pnp"
+                    info["predicted_center"] = np.asarray(center, dtype=float).tolist() if center is not None else None
+                    info["predicted_yaw"] = float(yaw) if yaw is not None else None
+                    info["klt_tracked"] = int(tracked) if tracked is not None else None
+                    info["klt_inliers"] = int(inliers) if inliers is not None else None
+                except Exception:
+                    pass
 
 if __name__ == "__main__":
     print(__doc__)

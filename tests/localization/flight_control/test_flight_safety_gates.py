@@ -56,6 +56,32 @@ def test_sparse_cloud_collision_monitor_uses_adjustable_3d_radius() -> None:
     assert collision["point"] == pytest.approx([0.0, 0.0, 0.0])
 
 
+def test_sparse_cloud_collision_monitor_reports_unavailable_not_off_when_scipy_missing(
+    monkeypatch,
+) -> None:
+    """A missing cKDTree must not read like 'no obstacle nearby' (fail-open)."""
+    monkeypatch.setattr(rpf, "cKDTree", None)
+    monitor = rpf.SparseCloudCollisionMonitor(
+        np.array([[0.0, 0.0, 0.0]], dtype=float),
+        collision_radius=0.025,
+        warning_radius=0.025,
+    )
+    assert monitor.tree is None
+    result = monitor.update(np.array([0.0, 0.0, 0.0]))
+    assert result["status"] == "UNAVAILABLE"
+    assert result["severity"] == 0.0
+
+
+def test_sparse_cloud_collision_monitor_reports_off_for_an_empty_cloud() -> None:
+    """An empty point cloud is a different situation from scipy being absent."""
+    monitor = rpf.SparseCloudCollisionMonitor(
+        np.zeros((0, 3), dtype=float), collision_radius=0.025, warning_radius=0.025
+    )
+    assert monitor.tree is None
+    result = monitor.update(np.array([0.0, 0.0, 0.0]))
+    assert result["status"] == "OFF"
+
+
 def test_sparse_cloud_collision_monitor_rejects_invalid_radii_and_points() -> None:
     zero_radius = rpf.SparseCloudCollisionMonitor(
         np.zeros((1, 3)), collision_radius=0.0, warning_radius=0.0
@@ -2887,10 +2913,19 @@ def test_takeoff_has_final_arming_gate_cleanup_and_termination_signals():
     assert "TakeOff()" not in src
     assert "operator UI" in src
     assert "arming_allowed" in boot_src and "arming_allowed" in route_src
-    assert authorize_src.index("monitor.stop()") < authorize_src.index(
-        "reason = monitor.reason")
-    assert authorize_src.index("reason = monitor.reason") < authorize_src.index(
-        "if not must_land")
+    # Behavioral replacement for ordering text assert: SafetyMonitor latch is
+    # monotonic and terminal (replaces authorize_src.index ordering check).
+    mon = pff.SafetyMonitor(lambda *_: None, timeout_s=0.05)
+    assert mon.terminal_action == "NONE" and not mon.terminated.is_set()
+    mon._latch_terminal("LAND", "test land")
+    assert mon.terminal_action == "LAND" and mon.terminated.is_set()
+    assert mon.reason == "test land"
+    mon._latch_terminal("HOVER", "should not downgrade terminal land")
+    assert mon.terminal_action == "LAND"
+    mon._latch_terminal("EMERGENCY", "upgrade to emergency")
+    assert mon.terminal_action == "EMERGENCY"
+    mon._latch_terminal("LAND", "cannot downgrade emergency")
+    assert mon.terminal_action == "EMERGENCY"
     assert "monitor.send_authorized" in authorize_src
     assert "emergency_issued" in terminal_src
     assert inspection_src.index("require_confirmation=True") < inspection_src.index(

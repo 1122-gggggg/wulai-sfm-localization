@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import pytest
 
-import runtime_safety as rs
+import arming_gate as rs
 
 
 def _good() -> dict:

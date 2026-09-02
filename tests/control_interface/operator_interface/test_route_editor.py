@@ -116,6 +116,26 @@ def test_successful_route_save_approves_and_closes_the_finished_editor(tmp_path)
     assert closed == [True]
 
 
+def test_save_and_test_starts_only_after_a_successful_bound_save(tmp_path) -> None:
+    import route_editor_window as rew
+
+    saved = tmp_path / "flight_route.json"
+    tested = []
+    editor = SimpleNamespace(
+        save_route=lambda: saved,
+        test_route_callback=tested.append,
+    )
+
+    result = rew.RouteEditorWindow.save_and_test_route(editor)
+
+    assert result == saved
+    assert tested == [saved]
+
+    editor.save_route = lambda: None
+    assert rew.RouteEditorWindow.save_and_test_route(editor) is None
+    assert tested == [saved]
+
+
 def test_route_document_loads_raw_glomap_into_editor_z_up(tmp_path) -> None:
     path = tmp_path / "route.json"
     path.write_text(

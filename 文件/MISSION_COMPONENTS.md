@@ -40,25 +40,26 @@ preflight 第三步確認，不要求靜態 mission approval。`site_alignment` 
 作用中的預設選擇檔是：
 
 ```text
-控制介面程式/mission_selections/river_site_b0_p116_p117_localization.json
+控制介面程式/mission_selections/river_gluemap_all8_direct_localization.json
 ```
 
-它選用 B0+P116/P117 fringe 地圖（340 refs，frame
-`river_site_b0_p116_p117_reconstruction_18056f835daa`）與 Parrot ANAFI 720p
-相機 pipeline。official69 舊航線已刪除。現況：
+它選用全八段 GLUEMAP（1,045 refs，frame
+`river_gluemap_all8_direct_20260831_d2b8a5304eff`）與 Parrot ANAFI 720p
+vehicle slot。來源 receipt 明列 `validation: NONE`；目前只有同資料集單幀 production
+runtime 煙霧成功，尚未驗證實際 ANAFI camera pipeline。現況：
 
-- 地面定位：可用。
-- AUTO：沒有新座標系 route，因此 `flight_ready=false`。要 AUTO 必須先重畫航線。
+- 地面定位：resolver fail closed，等候獨立 holdout 與 camera-pipeline 品質 receipt。
+- AUTO：另缺新座標系 route，因此 `flight_ready=false`。
 
-舊的 `river_site_official69_localization.json` 仍可作舊圖定位，同樣沒有 route。
+舊 release 保留供人工回復，但不再是預設 selection。
 
 
 檢查指令：
 
 ```bash
 .venv/bin/python tools/resolve_mission.py \
-  控制介面程式/mission_selections/river_site_official69_localization.json \
-  --require flight --materialize-site-profile
+  控制介面程式/mission_selections/river_gluemap_all8_direct_localization.json \
+  --require valid
 ```
 
 從 selection 啟動既有操作介面可使用相容 launcher；它只建立快照與啟動 UI，

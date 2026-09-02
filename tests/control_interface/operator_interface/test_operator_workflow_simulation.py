@@ -175,6 +175,69 @@ def test_manual_takeoff_command_lifecycle_is_typed_and_simulated() -> None:
     assert backend.state.tracker_state == "HOVER"
 
 
+def test_simulated_route_test_runs_the_production_controller_on_drawn_waypoints(
+    tmp_path,
+) -> None:
+    backend = DroneBackend()
+    snapshot = _snapshot(
+        tmp_path,
+        waypoints=((0.0, 0.0, 0.0), (0.5, 0.0, 0.0), (0.5, 0.0, 0.5)),
+    )
+    plant = backend.route_test_plant
+    assert plant.begin(snapshot, LEGACY_MAP_FRAME)
+
+    autonomy = DesktopRouteAutonomy(
+        backend=plant,
+        snapshot=snapshot,
+        map_frame=LEGACY_MAP_FRAME,
+        get_pose=plant.pose,
+        pose_is_weak=lambda: False,
+        pose_confidence=lambda: 100,
+        force_relocalize=lambda: None,
+        stream_healthy=lambda: True,
+        takeoff=lambda: False,
+        take_pc_control=lambda: True,
+        start_airborne=True,
+        land=plant.finish,
+    )
+
+    assert autonomy.start()
+    assert autonomy.join(timeout=12.0)
+    assert autonomy.phase == "DONE"
+    assert plant.finished
+    assert backend.state.flight_state == "landed"
+    assert backend.sim_xyz == pytest.approx(snapshot.waypoints[-1], abs=0.08)
+
+
+def test_simulated_auto_route_is_not_blocked_by_real_flight_preflight() -> None:
+    operator = OperatorApp.__new__(OperatorApp)
+    operator.backend = DroneBackend()
+    operator.preflight_guide = SimpleNamespace(complete=False, current_step="compass")
+    operator.write_log = lambda _message: None
+
+    assert not OperatorApp._preflight_blocks_flight_command(operator, "start_auto")
+
+
+def test_saved_route_callback_starts_only_the_bound_simulated_route(tmp_path) -> None:
+    route = _snapshot(tmp_path)
+    operator = OperatorApp.__new__(OperatorApp)
+    operator.backend = DroneBackend()
+    operator.mission_route_lock = SimpleNamespace(snapshot=route)
+    statuses = []
+    commands = []
+    operator.site_assets_panel = SimpleNamespace(set_status=statuses.append)
+    operator.send = commands.append
+    operator._integrated_auto_active = lambda: True
+
+    assert OperatorApp.start_saved_route_test(operator, route.path)
+    assert commands == ["start_auto"]
+    assert statuses == ["航線已儲存；正在用正式控制器執行純模擬航線…"]
+
+    commands.clear()
+    assert not OperatorApp.start_saved_route_test(operator, tmp_path / "other.json")
+    assert commands == []
+
+
 class _RouteLock:
     def __init__(self, snapshot) -> None:
         self.snapshot = snapshot

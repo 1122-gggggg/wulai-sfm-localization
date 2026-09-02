@@ -16,6 +16,7 @@ from typing import Any, Callable
 import numpy as np
 
 from backend_contract import FailureReason
+from operator_state import TrackerState
 from operator_localization_config import (
     LIVE_STATUS_PATH,
     POSE_JUMP_U,
@@ -113,17 +114,17 @@ def _poll_backend(app: Any) -> Any | None:
                     error=repr(exc),
                     resolved=False,
                 )
-            except Exception:
+            except Exception:  # Tier3: incident logging best-effort — keep fallback
                 pass
         try:
             app.write_log(f"BACKEND_POLL_FAILED: {exc!r}")
-        except Exception:
+        except Exception:  # Tier3: log sink best-effort — keep fallback
             pass
         pause_auto = getattr(app, "_pause_integrated_auto", None)
         if callable(pause_auto):
             try:
                 pause_auto("backend_poll_failed")
-            except Exception:
+            except Exception:  # Tier3: pause AUTO best-effort — keep fallback
                 pass
         try:
             clear_motion = getattr(app.backend, "nudge_clear", None)
@@ -137,7 +138,7 @@ def _poll_backend(app: Any) -> Any | None:
             else:
                 state = getattr(app.backend, "state", None)
                 if state is not None:
-                    state.tracker_state = "HOVER"
+                    state.tracker_state = TrackerState.HOVER
                     state.last_command = "backend_poll_failed_hover"
                 hovered = True
             if not hovered:
@@ -150,7 +151,7 @@ def _poll_backend(app: Any) -> Any | None:
                         error=repr(safe_exc),
                         resolved=False,
                     )
-                except Exception:
+                except Exception:  # Tier3: incident logging best-effort — keep fallback
                     pass
         return None
 
@@ -293,7 +294,7 @@ def _handle_live_missing_frame(app: Any, state: Any) -> Any:
         if callable(pause_auto):
             try:
                 pause_auto("stream_stale")
-            except Exception:
+            except Exception:  # Tier3: fallback best-effort — keep pass
                 pass
         return app.backend.state
     state.stream = "OK"
@@ -603,11 +604,11 @@ def _record_tick_failure(app: Any, *, stage: str, error: str) -> None:
                     f"OPERATOR_TICK_INCIDENT_FAILED stage={stage} "
                     f"error={incident_exc!r}"
                 )
-            except Exception:
+            except Exception:  # Tier3: fallback best-effort — keep pass
                 pass
     try:
         app.write_log(f"OPERATOR_TICK_FAILED stage={stage} error={error}")
-    except Exception:
+    except Exception:  # Tier3: fallback best-effort — keep pass
         pass
 
 
@@ -626,7 +627,7 @@ def _handle_tick_failure(app: Any, *, stage: str, exc: Exception) -> None:
                     f"OPERATOR_TICK_AUTO_PAUSE_FAILED stage={stage} "
                     f"error={safety_exc!r}"
                 )
-            except Exception:
+            except Exception:  # Tier3: fallback best-effort — keep pass
                 pass
         return
 
@@ -642,7 +643,7 @@ def _handle_tick_failure(app: Any, *, stage: str, exc: Exception) -> None:
                     f"OPERATOR_TICK_FAIL_SAFE_FAILED stage={stage} "
                     f"error={safety_exc!r}"
                 )
-            except Exception:
+            except Exception:  # Tier3: fallback best-effort — keep pass
                 pass
 
 
@@ -799,15 +800,32 @@ def update_live_results(
         handle_localization_exception(app, result)
         update_benchmark_status(app, result)
         xyz = stabilize_result_pose(app, result, xyz)
-        invalid_success_pose = bool(
-            isinstance(raw_result, dict) and raw_result.get("success")
-            and not result.get("success"))
+        try:
+            invalid_success_pose = bool(
+                isinstance(raw_result, dict) and raw_result.get("success")
+                and not result.get("success"))
+        except (ValueError, KeyError, TypeError, AttributeError) as exc:  # Tier1: success flag shape — narrow, no silent pass
+            incident = getattr(getattr(app, "session_logs", None), "incident", None)
+            if callable(incident):
+                incident("localization_success_shape_failed", error=repr(exc), resolved=False)
+            app.write_log(f"LOCALIZATION_SUCCESS_SHAPE_FAILED: {exc!r}")
+            invalid_success_pose = False
         _publish_live_result_state(app, result)
+        try:
+            hold_active = bool(result.get("confidence_hold_active"))
+            low = bool(result.get("confidence_low"))
+        except (ValueError, KeyError, TypeError, AttributeError) as exc:  # Tier1: confidence hold shape — narrow, no silent pass
+            incident = getattr(getattr(app, "session_logs", None), "incident", None)
+            if callable(incident):
+                incident("localization_confidence_shape_failed", error=repr(exc), resolved=False)
+            app.write_log(f"LOCALIZATION_CONFIDENCE_SHAPE_FAILED: {exc!r}")
+            hold_active = False
+            low = False
         confidence_hold = getattr(app, "lost_hold", None)
         if (
-            bool(result.get("confidence_hold_active"))
+            hold_active
             or (
-                bool(result.get("confidence_low"))
+                low
                 and bool(getattr(
                     confidence_hold, "hold_on_low_confidence", False
                 ))
@@ -819,7 +837,15 @@ def update_live_results(
         if _live_result_failed(
                 app, result, invalid_success_pose=invalid_success_pose,
         ):
-            if result.get("pose_status") == "PREDICTED_ONLY" and xyz is not None:
+            try:
+                pose_status = result.get("pose_status")
+            except (ValueError, KeyError, TypeError, AttributeError) as exc:  # Tier1: pose_status shape — narrow, no silent pass
+                incident = getattr(getattr(app, "session_logs", None), "incident", None)
+                if callable(incident):
+                    incident("localization_pose_status_shape_failed", error=repr(exc), resolved=False)
+                app.write_log(f"LOCALIZATION_POSE_STATUS_FAILED: {exc!r}")
+                pose_status = None
+            if pose_status == "PREDICTED_ONLY" and xyz is not None:
                 _accept_predicted_pose(app, result, xyz)
             continue
         assert xyz is not None

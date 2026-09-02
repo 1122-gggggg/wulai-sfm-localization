@@ -142,6 +142,7 @@ def _make_autonomy_runtime_ready(operator, monkeypatch=None) -> None:
     operator._loc_consecutive_good_fixes = 2
     operator._zoom_localization_paused = False
     operator.live_locked = True
+    operator.live_result = None
     operator.live_pose = np.zeros(4, dtype=float)
     operator.camera_forward_world = np.array([1.0, 0.0, 0.0])
     operator.loc_pose_updated_mono = time.monotonic()
@@ -151,6 +152,24 @@ def _make_autonomy_runtime_ready(operator, monkeypatch=None) -> None:
         monkeypatch.setattr(
             app, "resolve_site_map_frame", lambda _profile: app.LEGACY_MAP_FRAME
         )
+
+
+def test_draw_detections_renders_a_label_box_without_crashing() -> None:
+    """Regression: the label background rectangle used to reference the
+    undefined names ty1/tw (NameError on any non-empty detection result)."""
+    from PIL import Image, ImageDraw
+
+    operator = OperatorApp.__new__(OperatorApp)
+    operator.detection_result = {
+        "success": True,
+        "boxes": [
+            {"xyxy": [10, 10, 100, 100], "class_id": 0, "class_name": "person", "confidence": 0.87},
+        ],
+    }
+    img = Image.new("RGB", (200, 200))
+    draw = ImageDraw.Draw(img)
+
+    operator.draw_detections(draw, 1.0, 0, 0, 200, 200)
 
 
 def test_keyboard_keys_match_the_two_virtual_sticks() -> None:
@@ -2525,6 +2544,25 @@ def test_non_true_flight_completion_does_not_confirm_success_or_landing(
 
     assert released == []
     assert any("未確認" in message for message in messages)
+
+
+def test_flight_completion_message_shows_the_plain_state_name_not_the_enum_repr() -> None:
+    """str(TrackerState.HOVER) is "TrackerState.HOVER" (Enum.__str__, not the
+    plain value) unless unwrapped via .value first -- that must never reach
+    an operator-visible log line."""
+    from operator_state import TrackerState
+
+    operator = OperatorApp.__new__(OperatorApp)
+    messages = []
+    operator.backend = SimpleNamespace(
+        state=SimpleNamespace(tracker_state=TrackerState.HOVER, flight_state="landed"),
+    )
+    operator.write_log = messages.append
+    operator.mission_route_lock = SimpleNamespace(active=False)
+
+    assert OperatorApp._finish_flight_expectation(operator, "takeoff", False) is True
+
+    assert messages == ["起飛未確認執行成功：HOVER"]
 
 
 class _ShutdownSessionLog:

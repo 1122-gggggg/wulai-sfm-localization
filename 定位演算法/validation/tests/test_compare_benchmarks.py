@@ -74,7 +74,10 @@ def _receipt(**overrides):
         "fused_coarse_mode": "fused",
         "runtime_sigma_mode": "reference_grid",
         "temporal_feature_cache_size": 0,
+        "query_cuda_graph": False,
         "acquire_stage_mode": "full_set",
+        "track_map_first": False,
+        "pnp_ranked_batches": False,
         "lost_prior_strategy": "restrict_nearby",
         "lost_prior_fusion_weight": 1.0,
         "worker_mode": "sequential",
@@ -222,14 +225,20 @@ def test_baab_identity_failures_name_missing_tuning_keys():
     del missing["fused_coarse_mode"]
     del missing["runtime_sigma_mode"]
     del missing["temporal_feature_cache_size"]
+    del missing["query_cuda_graph"]
     del missing["acquire_stage_mode"]
+    del missing["track_map_first"]
+    del missing["pnp_ranked_batches"]
     del missing["lost_prior_strategy"]
     del missing["lost_prior_fusion_weight"]
     failures = compare.receipt_identity_failures({"receipt": full}, missing)
     assert "candidate is missing receipt.fused_coarse_mode" in failures
     assert "candidate is missing receipt.runtime_sigma_mode" in failures
     assert "candidate is missing receipt.temporal_feature_cache_size" in failures
+    assert "candidate is missing receipt.query_cuda_graph" in failures
     assert "candidate is missing receipt.acquire_stage_mode" in failures
+    assert "candidate is missing receipt.track_map_first" in failures
+    assert "candidate is missing receipt.pnp_ranked_batches" in failures
     assert "candidate is missing receipt.lost_prior_strategy" in failures
     assert "candidate is missing receipt.lost_prior_fusion_weight" in failures
 

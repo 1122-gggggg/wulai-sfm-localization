@@ -83,12 +83,16 @@ OUTPUT_GOVERNANCE_FILES = {
     "測試組合效能比較_20260715.md",
 }
 OUTPUT_EVIDENCE_PREFIXES = (
+    "benchmark_",
     "edm_",
+    "empirical_",
     "exact_latency_",
     "localization_fps_",
     "megaloc_",
     "onnx_flow_",
     "optimization_",
+    "p117_",
+    "p168_",
     "regression_",
     "reverse_topk_",
     "river_",
@@ -308,11 +312,30 @@ def main() -> None:
     )
     args = parser.parse_args()
     report = audit_workspace(args.root, include_sizes=not args.no_sizes)
-    print(
-        json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True)
-        if args.json
-        else format_human(report)
-    )
+    if args.json:
+        print(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))
+    else:
+        human = format_human(report)
+        unclassified = report["output_classes"]["unclassified"]
+        if args.strict_output_names and unclassified:
+            human += "\n" + "\n".join(
+                f"ERROR: unclassified output: outputs/{name}" for name in unclassified
+            )
+            human += (
+                "\nHINT: unclassified outputs/ entries must match OUTPUT_EVIDENCE_PREFIXES, "
+                "AUDIT_OUTPUT_RE (audit_\\d{8}), or governance/validation sets."
+            )
+            human += (
+                "\nHINT: add a prefix to OUTPUT_EVIDENCE_PREFIXES in tools/workspace_audit.py "
+                "or archive the directory."
+            )
+            human += (
+                f"\nHINT: if MANIFEST.tsv/SHA256SUMS drift, refresh with "
+                f"`python tools/package_manifest.py generate --root {report['root']}`"
+            )
+            # Keep the required suggestion verbatim for the F-34 gate check.
+            human += "\nHINT: suggest `tools/package_manifest.py generate`"
+        print(human)
     failed = not report["ok"]
     if args.strict_output_names and report["output_classes"]["unclassified"]:
         failed = True

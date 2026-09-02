@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import math
+import os
 from typing import Any, Callable
 
 import numpy as np
@@ -98,10 +99,41 @@ def _metric_rank(value: Any) -> float:
     return number
 
 
+def _composite_metric(value: Any, missing: float) -> float:
+    """Finite non-negative metric for the composite score; missing/garbage -> missing."""
+    if value is None or isinstance(value, bool):
+        return missing
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return missing
+    if not math.isfinite(number):
+        return missing
+    return max(0.0, number)
+
+
 def _rank_key(selection: Any) -> Callable[[tuple[str, tuple]], tuple]:
     refs = list(getattr(selection, "refs", ()) or ())
     vpr_index = {name: index for index, name in enumerate(refs)}
     last = len(vpr_index)
+    # SFM_EDM_COMPOSITE_POSE_RANK=1: rank by S = n_inliers / (1 + 0.5*rms) * (cells/64)**0.5 * (1 + 0.2*ratio), vpr index tiebreak.
+    if os.environ.get("SFM_EDM_COMPOSITE_POSE_RANK", "0") == "1":
+        def composite_key(item: tuple[str, tuple]) -> tuple[float, int]:
+            name, candidate = item
+            metrics = candidate[3]
+            rms = _composite_metric(metrics.get("reproj_rms"), math.inf)
+            ratio = _composite_metric(metrics.get("inlier_ratio"), 0.0)
+            cells = _composite_metric(metrics.get("inlier_grid_cells"), 0.0)
+            score = (
+                float(candidate_inliers(candidate))
+                / (1.0 + 0.5 * rms)
+                * (cells / 64.0) ** 0.5
+                * (1.0 + 0.2 * ratio)
+            )
+            return (score, -int(vpr_index.get(name, last)))
+
+        return composite_key
+
 
     def key(item: tuple[str, tuple]) -> tuple[int, float, float, float, int]:
         name, candidate = item

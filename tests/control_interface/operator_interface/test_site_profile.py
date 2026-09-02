@@ -577,6 +577,7 @@ def test_current_river_map_route_and_approval_are_consistent() -> None:
 
     assert profile.hardware_approval is None
     assert profile.flight is not None
+    assert profile.flight.controller is not None
     if profile.route_json is None:
         assert profile.flight.approved is False
         assert profile.flight.route_clearance_approved is False
@@ -587,7 +588,7 @@ def test_current_river_map_route_and_approval_are_consistent() -> None:
             assert profile.flight.route_clearance_approved is True
     assert profile.coordinate_frame is not None
     assert profile.coordinate_frame.id == (
-        "river_site_b0_p116_p117_reconstruction_18056f835daa"
+        "river_gluemap_all8_direct_20260831_d2b8a5304eff"
     )
     assert not any("pose_chain" in error for error in flight_readiness_errors(profile))
     assert not any("hardware approval" in error for error in flight_readiness_errors(profile))
@@ -1267,6 +1268,17 @@ def test_autonomous_flight_does_not_require_signed_hardware_approval(
     errors = flight_readiness_errors(load_site_profile(_approved_profile(tmp_path)))
 
     assert not any("hardware approval" in error for error in errors), errors
+
+
+def test_autonomous_flight_requires_controller_contract(tmp_path: Path) -> None:
+    profile_path = _approved_profile(tmp_path)
+    raw = json.loads(profile_path.read_text(encoding="utf-8"))
+    raw["flight"]["controller"] = None
+    profile_path.write_text(json.dumps(raw), encoding="utf-8")
+
+    errors = flight_readiness_errors(load_site_profile(profile_path))
+
+    assert "missing flight.controller" in errors
 
 
 def test_camera_center_field_calibration_atomically_binds_and_unlocks_profile(

@@ -441,16 +441,19 @@ def test_not_localization_ready_selection_is_explicitly_blocked(tmp_path: Path) 
     )
 
 
-def test_bundled_anafi_selection_does_not_require_static_imu_receipt() -> None:
+def test_bundled_anafi_selection_is_blocked_until_new_map_is_validated() -> None:
     selection = (
         CONTROL
         / "mission_selections"
-        / "river_site_b0_p116_p117_localization.json"
+        / "river_gluemap_all8_direct_localization.json"
     )
 
     mission = resolve_mission(selection, workspace_root=ROOT, now=NOW)
 
     assert "imu" not in mission.vehicle.required_calibrations
-    assert mission.readiness.localization_ready
+    assert not mission.readiness.localization_ready
     assert not mission.readiness.flight_ready
+    assert "localizer_quality calibration is failed" in " ".join(
+        mission.readiness.localization_errors
+    )
     assert "no route package selected" in mission.readiness.flight_errors

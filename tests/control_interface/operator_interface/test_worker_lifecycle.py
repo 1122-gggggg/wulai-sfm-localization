@@ -64,8 +64,7 @@ def test_pipeline_metrics_summary_marks_unavailable_measurements() -> None:
     )
 
     assert text == (
-        "定位端到端 FPS N/A | 影像串流 FPS N/A | "
-        "端到端延遲 N/A | p95（近 5 秒）N/A | 影格年齡 N/A"
+        "定位端到端 FPS N/A | 影像串流 FPS N/A | 端到端延遲 N/A | p95（近 5 秒）N/A | 影格年齡 N/A"
     )
 
 
@@ -485,10 +484,12 @@ def test_localization_result_boundary_validates_and_preserves_dict_payload() -> 
     assert result.to_payload()["pose"] == payload["pose"]
 
     with pytest.raises(InvalidLocalizationResult, match="pose"):
-        LocalizationResult.from_payload({
-            **payload,
-            "pose": {"x": 1.0, "y": float("nan"), "z": 3.0},
-        })
+        LocalizationResult.from_payload(
+            {
+                **payload,
+                "pose": {"x": 1.0, "y": float("nan"), "z": 3.0},
+            }
+        )
 
 
 def test_localization_result_boundary_rejects_future_timestamps() -> None:
@@ -533,10 +534,8 @@ def test_edm_cuda_oom_is_structured_fatal_and_cleans_cache() -> None:
     )
     error = FakeCudaOOM("CUDA out of memory")
 
-    assert localizer_worker.edm_cuda_oom_requires_restart(
-        "edm", error, fake_torch)
-    assert not localizer_worker.edm_cuda_oom_requires_restart(
-        "xfeat", error, fake_torch)
+    assert localizer_worker.edm_cuda_oom_requires_restart("edm", error, fake_torch)
+    assert not localizer_worker.edm_cuda_oom_requires_restart("xfeat", error, fake_torch)
 
     payload = localizer_worker.localization_exception_payload(seq=4, error=error)
     payload.update(localizer_worker.cuda_oom_failure_fields(error))
@@ -661,33 +660,50 @@ def test_live_results_drop_publication_inversions_before_autonomy() -> None:
     assert operator._last_applied_live_result_display_seq == 30
 
 
+def test_held_frame_retry_with_same_display_seq_is_not_dropped() -> None:
+    operator = SimpleNamespace(_last_applied_live_result_display_seq=42)
+
+    assert app.OperatorApp._live_result_is_new(operator, {"display_seq": 42, "hold_retry": True})
+    assert not app.OperatorApp._live_result_is_new(
+        operator, {"display_seq": 42, "hold_retry": False}
+    )
+    assert not app.OperatorApp._live_result_is_new(
+        operator, {"display_seq": 41, "hold_retry": True}
+    )
+    assert operator._last_applied_live_result_display_seq == 42
+
+
 def test_low_confidence_recovery_holds_pose_until_trustworthy_fix() -> None:
     batches = [
-        [{
-            "seq": 1,
-            "display_seq": 1,
-            "frame_id": "frame-low",
-            "frame_name": "frame-low",
-            "success": True,
-            "pose": {"x": 9.0, "y": 9.0, "z": 9.0, "yaw_raw": 0.1},
-            "inliers": 20,
-            "reproj_rms": 2.0,
-            "mode": "WEAK_TRACK",
-            "next_mode": "WEAK_TRACK",
-        }],
-        [{
-            "seq": 2,
-            "display_seq": 2,
-            "frame_id": "frame-fix",
-            "frame_name": "frame-fix",
-            "success": True,
-            "pose": {"x": 1.2, "y": 2.1, "z": 3.0, "yaw_raw": 0.1},
-            "inliers": 80,
-            "reproj_rms": 2.0,
-            "mode": "LOST",
-            "next_mode": "TRACK",
-            "relocalize_requested": True,
-        }],
+        [
+            {
+                "seq": 1,
+                "display_seq": 1,
+                "frame_id": "frame-low",
+                "frame_name": "frame-low",
+                "success": True,
+                "pose": {"x": 9.0, "y": 9.0, "z": 9.0, "yaw_raw": 0.1},
+                "inliers": 20,
+                "reproj_rms": 2.0,
+                "mode": "WEAK_TRACK",
+                "next_mode": "WEAK_TRACK",
+            }
+        ],
+        [
+            {
+                "seq": 2,
+                "display_seq": 2,
+                "frame_id": "frame-fix",
+                "frame_name": "frame-fix",
+                "success": True,
+                "pose": {"x": 1.2, "y": 2.1, "z": 3.0, "yaw_raw": 0.1},
+                "inliers": 80,
+                "reproj_rms": 2.0,
+                "mode": "LOST",
+                "next_mode": "TRACK",
+                "relocalize_requested": True,
+            }
+        ],
     ]
     recovery_calls = []
     operator = SimpleNamespace(
@@ -811,26 +827,26 @@ def test_install_site_runtime_allows_localization_exception_seq_zero(monkeypatch
     app.OperatorApp._install_site_runtime(operator, runtime)
 
     recovery_calls = []
-    operator.localizer.poll_results = lambda: [{
-        "seq": 0,
-        "display_seq": 0,
-        "frame_id": "frame-0",
-        "frame_name": "frame-0",
-        "success": False,
-        "mode": "LOST",
-        "next_mode": "LOST",
-        "localization_exception": True,
-        "error": "new worker failure",
-    }]
+    operator.localizer.poll_results = lambda: [
+        {
+            "seq": 0,
+            "display_seq": 0,
+            "frame_id": "frame-0",
+            "frame_name": "frame-0",
+            "success": False,
+            "mode": "LOST",
+            "next_mode": "LOST",
+            "localization_exception": True,
+            "error": "new worker failure",
+        }
+    ]
     operator._loc_benchmark_pending = None
     operator.loc_benchmark_active = "auto"
     operator.loc_benchmark_mode_var = SimpleNamespace(set=lambda _value: None)
     operator._apply_lost_hold_result = lambda _result: None
     operator.update_localization_metrics = lambda _result: None
     operator._is_live_backend = lambda: True
-    operator._engage_real_localization_recovery = (
-        lambda reason: recovery_calls.append(reason)
-    )
+    operator._engage_real_localization_recovery = lambda reason: recovery_calls.append(reason)
     operator._last_status_write = float("inf")
     operator._last_loc_fail_log = float("inf")
     operator._loc_ok_count = 0
@@ -892,7 +908,11 @@ def test_normalize_camera_forward_requires_a_finite_nonzero_vector() -> None:
 
 def test_camera_frustum_square_face_is_ahead_of_camera() -> None:
     points = app.camera_frustum_world_points(
-        np.zeros(3), np.eye(3), length=2.0, hfov_deg=90.0, aspect_ratio=2.0,
+        np.zeros(3),
+        np.eye(3),
+        length=2.0,
+        hfov_deg=90.0,
+        aspect_ratio=2.0,
     )
 
     apex, face_center, *corners = points
@@ -935,11 +955,12 @@ def test_worker_python_defaults_to_current_runtime(monkeypatch: pytest.MonkeyPat
     ),
 )
 def test_operator_interface_modes_are_exactly_two_and_mutually_exclusive(
-    requested: str, legacy_live: bool, expected: str, is_live: bool,
+    requested: str,
+    legacy_live: bool,
+    expected: str,
+    is_live: bool,
 ) -> None:
-    mode, resolved_live = app.resolve_operator_interface(
-        requested, legacy_live, ""
-    )
+    mode, resolved_live = app.resolve_operator_interface(requested, legacy_live, "")
 
     assert mode == expected
     assert resolved_live is is_live
@@ -959,9 +980,7 @@ def test_auto_inspect_while_manual_airborne_preserves_control_without_command() 
     class FakeOperator:
         _begin_inspection_feed = app.OperatorApp._begin_inspection_feed
         begin_auto_inspect = app.OperatorApp.begin_auto_inspect
-        _preflight_blocks_flight_command = (
-            app.OperatorApp._preflight_blocks_flight_command
-        )
+        _preflight_blocks_flight_command = app.OperatorApp._preflight_blocks_flight_command
         _is_live_backend = app.OperatorApp._is_live_backend
         send = app.OperatorApp.send
 
@@ -1169,9 +1188,42 @@ def test_live_localizer_sends_imu_even_when_pose_guided_search_is_off() -> None:
     assert fused.yaw == pytest.approx(1.3)
     assert fused.speed_north == pytest.approx(0.4)
 
+
+def test_live_localizer_sends_gnss_with_its_independent_stamp() -> None:
+    client = object.__new__(app.LiveLocalizerClient)
+    client._runtime_benchmark_control = True
+    client._benchmark_mode_lock = threading.Lock()
+    client._benchmark_mode = "auto"
+    client._relocalize_once = False
+
+    header = client._request_prefix(
+        {
+            "source_frame_stamp_mono": 10.0,
+            "fused_telemetry_mono": 10.05,
+            "fused_roll": 0.1,
+            "fused_pitch": -0.2,
+            "fused_yaw": 1.3,
+            "fused_gps_mono": 9.5,
+            "fused_gps_latitude": 25.033,
+            "fused_gps_longitude": 121.5654,
+            "fused_gps_altitude": 18.2,
+            "fused_gps_latitude_accuracy": 0.8,
+            "fused_gps_longitude_accuracy": 0.9,
+            "fused_gps_altitude_accuracy": 1.4,
+        }
+    )
+
+    assert header.startswith(localizer_protocol.GNSS_FUSED_MAGIC)
+    _mode, _stamp, fused = localizer_protocol.decode_control_header(header)
+    assert fused is not None and fused.has_gnss
+    assert fused.gps_stamp == pytest.approx(9.5)
+    assert fused.latitude == pytest.approx(25.033)
+
+
 @pytest.mark.parametrize("enabled", [False, True])
 def test_live_localizer_client_passes_neuflow_flag_only_when_enabled(
-    monkeypatch: pytest.MonkeyPatch, enabled: bool,
+    monkeypatch: pytest.MonkeyPatch,
+    enabled: bool,
 ) -> None:
     captured = {}
 
@@ -1246,7 +1298,7 @@ def test_live_localizer_client_passes_profile_query_camera(monkeypatch) -> None:
     assert cmd[cmd.index("--query-camera-width") + 1] == "1280"
     assert cmd[cmd.index("--query-camera-height") + 1] == "720"
     start = cmd.index("--query-camera-params") + 1
-    assert [float(value) for value in cmd[start:start + 4]] == list(camera.params)
+    assert [float(value) for value in cmd[start : start + 4]] == list(camera.params)
 
 
 def test_live_localizer_client_passes_measured_map_alignment(monkeypatch) -> None:
@@ -1287,9 +1339,7 @@ def test_live_localizer_client_passes_reference_index_manifest(monkeypatch) -> N
     )
 
     cmd = captured["cmd"]
-    assert cmd[cmd.index("--reference-index") + 1] == (
-        "reference-index/SHA256SUMS.json"
-    )
+    assert cmd[cmd.index("--reference-index") + 1] == ("reference-index/SHA256SUMS.json")
     assert cmd[cmd.index("--reference-index-sha256") + 1] == "a" * 64
 
 
@@ -1356,7 +1406,9 @@ def test_xfeat_topk_override_keeps_validated_three_then_four_retry() -> None:
     )
 
     localizer_worker.apply_xfeat_runtime_overrides(
-        cfg, matcher_mode="", local_topk=4,
+        cfg,
+        matcher_mode="",
+        local_topk=4,
     )
 
     assert cfg.local_topk == 4
@@ -1457,8 +1509,11 @@ def test_offline_localization_benchmark_control_never_touches_backend(mode: str)
 
         def __init__(self):
             self.localizer = FakeLocalizer()
-            self.backend = SimpleNamespace(command=lambda *_a, **_k: pytest.fail(
-                "localization benchmark mode touched the drone backend"))
+            self.backend = SimpleNamespace(
+                command=lambda *_a, **_k: pytest.fail(
+                    "localization benchmark mode touched the drone backend"
+                )
+            )
             self.inspecting = False
             self.inspect_start = None
             self.processed_frames = 0
@@ -1513,33 +1568,27 @@ def test_runtime_benchmark_modes_prepare_only_the_requested_tracker_branch() -> 
         tracker.state.bad_count = 0
 
     untouched = tracker.state
-    assert not localizer_worker.apply_runtime_benchmark_mode(
-        tracker, "auto", "auto", seed)
+    assert not localizer_worker.apply_runtime_benchmark_mode(tracker, "auto", "auto", seed)
     assert tracker.state is untouched
 
-    assert not localizer_worker.apply_runtime_benchmark_mode(
-        tracker, "global", "auto", seed)
+    assert not localizer_worker.apply_runtime_benchmark_mode(tracker, "global", "auto", seed)
     assert tracker.state.mode == "LOST"
     assert tracker.state.last_center is None
 
-    assert localizer_worker.apply_runtime_benchmark_mode(
-        tracker, "weak", "global", seed)
+    assert localizer_worker.apply_runtime_benchmark_mode(tracker, "weak", "global", seed)
     assert tracker.state.mode == "WEAK_TRACK"
     assert tracker.state.last_refs == [2]
 
-    assert localizer_worker.apply_runtime_benchmark_mode(
-        tracker, "track", "weak", seed)
+    assert localizer_worker.apply_runtime_benchmark_mode(tracker, "track", "weak", seed)
     assert tracker.state.mode == "TRACK"
     assert tracker.state.last_refs == [2]
 
-    assert not localizer_worker.apply_runtime_benchmark_mode(
-        tracker, "auto", "track", seed)
+    assert not localizer_worker.apply_runtime_benchmark_mode(tracker, "auto", "track", seed)
     assert tracker.state.mode == "BOOT_INIT"
     assert tracker.state.last_center is None
 
     with pytest.raises(ValueError, match="unsupported"):
-        localizer_worker.apply_runtime_benchmark_mode(
-            tracker, "takeoff", "auto", seed)
+        localizer_worker.apply_runtime_benchmark_mode(tracker, "takeoff", "auto", seed)
 
 
 def test_busy_skip_counts_unique_display_frames_and_all_attempts() -> None:
@@ -1570,6 +1619,17 @@ def test_busy_skip_counts_unique_display_frames_and_all_attempts() -> None:
     assert operator._submit_busy_attempts == 3
 
 
+def test_adaptive_localization_submit_tracks_half_the_latest_latency() -> None:
+    operator = SimpleNamespace(adaptive_loc_submit=True, loc_latency_ms=80.0)
+    assert app.OperatorApp._localization_coalesce_interval_s(operator) == pytest.approx(0.04)
+    operator.loc_latency_ms = 5.0
+    assert app.OperatorApp._localization_coalesce_interval_s(operator) == pytest.approx(0.02)
+    operator.loc_latency_ms = 500.0
+    assert app.OperatorApp._localization_coalesce_interval_s(operator) == pytest.approx(0.1)
+    operator.adaptive_loc_submit = False
+    assert app.OperatorApp._localization_coalesce_interval_s(operator) == pytest.approx(0.02)
+
+
 def test_empty_result_poll_preserves_pose_until_render_tick() -> None:
     operator = SimpleNamespace(
         live_new_pose=True,
@@ -1581,6 +1641,7 @@ def test_empty_result_poll_preserves_pose_until_render_tick() -> None:
 
 def test_localization_result_poll_reschedules_independently() -> None:
     calls = []
+
     class FakeOperator:
         _loc_result_poll_ms = 5
         poll_localization_results = app.OperatorApp.poll_localization_results
@@ -1631,9 +1692,7 @@ def test_localization_result_poll_logs_failure_and_reschedules_in_finally() -> N
 
     operator.poll_localization_results()
 
-    assert logs == [
-        "LOCALIZATION_RESULT_POLL_FAILED: RuntimeError('result pipe broke')"
-    ]
+    assert logs == ["LOCALIZATION_RESULT_POLL_FAILED: RuntimeError('result pipe broke')"]
     assert pauses == ["localization_poll_failed"]
     assert incidents == [
         (
@@ -1743,12 +1802,34 @@ def test_stream_lost_display_precedes_busy_localizer_status() -> None:
         stream_lost_since=time.monotonic(),
         boot_holding=lambda: False,
     )
-    state = app.DroneState(
-        stream="LOST", loc="STREAM_LOST", tracker_state="STREAM_LOST_HOVER")
+    state = app.DroneState(stream="LOST", loc="STREAM_LOST", tracker_state="STREAM_LOST_HOVER")
     result = app.OperatorApp.state_from_live(operator, state)
     assert result.stream == "LOST"
     assert result.loc == "STREAM_LOST"
     assert result.tracker_state == "STREAM_LOST_HOVER"
+
+
+def test_stream_lost_detection_recognizes_the_enum_tracker_state_not_just_a_plain_string() -> None:
+    """str(TrackerState.STREAM_LOST_HOVER) is "TrackerState.STREAM_LOST_HOVER"
+    (Enum.__str__), which would never match the plain-string membership check
+    below and silently defeat stream-lost detection whenever tracker_state
+    holds an enum member rather than a bare str."""
+    from operator_state import TrackerState
+
+    operator = SimpleNamespace(
+        live_pose=app.np.zeros(4),
+        live_result=None,
+        localizer=SimpleNamespace(busy=lambda: False),
+        video_frame_fresh=True,
+        stream_lost_since=None,
+        boot_holding=lambda: False,
+    )
+    state = app.DroneState(
+        stream="OK", active_incident="", tracker_state=TrackerState.STREAM_LOST_HOVER
+    )
+    result = app.OperatorApp.state_from_live(operator, state)
+    assert result.stream == "LOST"
+    assert result.loc == "STREAM_LOST"
 
 
 def test_live_stream_incident_pauses_integrated_auto_without_handoff() -> None:
@@ -1785,44 +1866,82 @@ def test_ui_arrival_timing_uses_submit_and_neutral_source_stamp_names() -> None:
 
 
 def test_composite_stage_does_not_hide_weak_tracker_state() -> None:
-    assert app.localization_result_is_weak({
-        "composite_stage": "nn_fast_accept",
-        "next_mode": "WEAK_TRACK",
-    })
-    assert app.localization_result_is_weak({
-        "composite_stage": "lg_full_after_nn",
-        "next_mode": "TRACK",
-        "weak": True,
-    })
-    assert not app.localization_result_is_weak({
-        "composite_stage": "lg_full_after_nn",
-        "next_mode": "TRACK",
-        "weak": False,
-    })
+    assert app.localization_result_is_weak(
+        {
+            "composite_stage": "nn_fast_accept",
+            "next_mode": "WEAK_TRACK",
+        }
+    )
+    assert app.localization_result_is_weak(
+        {
+            "composite_stage": "lg_full_after_nn",
+            "next_mode": "TRACK",
+            "weak": True,
+        }
+    )
+    assert not app.localization_result_is_weak(
+        {
+            "composite_stage": "lg_full_after_nn",
+            "next_mode": "TRACK",
+            "weak": False,
+        }
+    )
 
 
 def test_confidence_hold_does_not_engage_on_low_results() -> None:
     policy = app.LostHoldPolicy(max_attempts=3, timeout_s=10.0)
 
-    assert policy.on_result(
-        success=True, low_confidence=True, strong_relocalize=False, next_mode="TRACK",
-        frame_index=10, now=1.0) is None
-    assert policy.on_result(
-        success=True, low_confidence=True, strong_relocalize=False, next_mode="WEAK_TRACK",
-        frame_index=11, now=1.1) is None
+    assert (
+        policy.on_result(
+            success=True,
+            low_confidence=True,
+            strong_relocalize=False,
+            next_mode="TRACK",
+            frame_index=10,
+            now=1.0,
+        )
+        is None
+    )
+    assert (
+        policy.on_result(
+            success=True,
+            low_confidence=True,
+            strong_relocalize=False,
+            next_mode="WEAK_TRACK",
+            frame_index=11,
+            now=1.1,
+        )
+        is None
+    )
     assert not policy.active
 
 
 def test_confidence_hold_engages_only_after_tracker_is_lost() -> None:
     policy = app.LostHoldPolicy(max_attempts=3, timeout_s=10.0)
 
-    assert policy.on_result(
-        success=False, low_confidence=False, strong_relocalize=False,
-        next_mode="WEAK_TRACK", frame_index=19, now=1.9) is None
+    assert (
+        policy.on_result(
+            success=False,
+            low_confidence=False,
+            strong_relocalize=False,
+            next_mode="WEAK_TRACK",
+            frame_index=19,
+            now=1.9,
+        )
+        is None
+    )
     assert not policy.active
-    assert policy.on_result(
-        success=False, low_confidence=False, strong_relocalize=False,
-        next_mode="LOST", frame_index=20, now=2.0) == "ENGAGE_FAIL"
+    assert (
+        policy.on_result(
+            success=False,
+            low_confidence=False,
+            strong_relocalize=False,
+            next_mode="LOST",
+            frame_index=20,
+            now=2.0,
+        )
+        == "ENGAGE_FAIL"
+    )
     assert policy.active
 
 
@@ -1845,9 +1964,7 @@ def test_real_low_confidence_escalation_hovers_and_requests_megaloc_once() -> No
         nudge_clear=lambda *, reason: clears.append(reason),
         send_pcmd=lambda *pcmd, reason: pcmds.append((pcmd, reason)) or True,
     )
-    operator.localizer = SimpleNamespace(
-        request_relocalize=lambda: relocalize_calls.append(True)
-    )
+    operator.localizer = SimpleNamespace(request_relocalize=lambda: relocalize_calls.append(True))
     operator.write_log = lambda _message: None
 
     for index in range(2):
@@ -1878,23 +1995,26 @@ def test_metrics_keep_wall_compatibility_and_explicit_core_timing() -> None:
         _submit_skip_busy=2,
         _submit_busy_attempts=5,
     )
-    app.OperatorApp._append_loc_metrics(operator, {
-        "success": False,
-        "wall_ms": 55.0,
-        "core_wall_ms": 50.0,
-        "e2e_submit_to_ui_ms": 70.0,
-        "display_seq": 42,
-        "hold_retry": True,
-        "hold_kind": "lost",
-        "relocalize_requested": True,
-        "confidence_hold_event": "RELEASE_FIX",
-        "limited_jump": {
-            "confirmation_model": "constant_velocity",
-            "confirmation_residual": 0.04,
+    app.OperatorApp._append_loc_metrics(
+        operator,
+        {
+            "success": False,
+            "wall_ms": 55.0,
+            "core_wall_ms": 50.0,
+            "e2e_submit_to_ui_ms": 70.0,
+            "display_seq": 42,
+            "hold_retry": True,
+            "hold_kind": "lost",
+            "relocalize_requested": True,
+            "confidence_hold_event": "RELEASE_FIX",
+            "limited_jump": {
+                "confirmation_model": "constant_velocity",
+                "confirmation_residual": 0.04,
+            },
+            "limited_jump_confirmed": True,
+            "pose": {"x": 1.0, "y": 2.0, "z": 3.0, "yaw_raw": 0.5},
         },
-        "limited_jump_confirmed": True,
-        "pose": {"x": 1.0, "y": 2.0, "z": 3.0, "yaw_raw": 0.5},
-    })
+    )
     record = json.loads(sink.getvalue())
     assert record["wall_ms"] == 55.0
     assert record["core_wall_ms"] == 50.0
@@ -1925,7 +2045,8 @@ def test_operator_and_worker_parsers_are_side_effect_free() -> None:
 
 def test_temporal_pose_stabilizer_suppresses_single_frame_flip() -> None:
     stabilizer = app.TemporalPoseStabilizer(
-        tau_s=0.15, max_speed_u_s=2.0, step_slack_u=0.03, max_step_u=0.15)
+        tau_s=0.15, max_speed_u_s=2.0, step_slack_u=0.03, max_step_u=0.15
+    )
     samples = [
         np.array([0.00, 0.0, 0.0]),
         np.array([0.02, 0.0, 0.0]),
@@ -1941,7 +2062,8 @@ def test_temporal_pose_stabilizer_suppresses_single_frame_flip() -> None:
 
 def test_temporal_pose_stabilizer_rate_limits_sustained_relocation() -> None:
     stabilizer = app.TemporalPoseStabilizer(
-        tau_s=0.15, max_speed_u_s=2.0, step_slack_u=0.03, max_step_u=0.15)
+        tau_s=0.15, max_speed_u_s=2.0, step_slack_u=0.03, max_step_u=0.15
+    )
     first, _ = stabilizer.update(np.zeros(3), 1.0)
     outputs = [first]
     diagnostics = []
@@ -1969,8 +2091,7 @@ def test_temporal_yaw_stabilizer_handles_pi_crossing() -> None:
         -math.pi + 0.12,
     ]
     outputs = [
-        stabilizer.update(value, 1.0 + index * 0.06)[0]
-        for index, value in enumerate(samples)
+        stabilizer.update(value, 1.0 + index * 0.06)[0] for index, value in enumerate(samples)
     ]
 
     assert all(
@@ -1984,8 +2105,7 @@ def test_temporal_yaw_stabilizer_rejects_one_frame_spike() -> None:
     stabilizer = app.TemporalYawStabilizer(tau_s=0.15)
     samples = [0.0, 0.04, 2.8, 0.04, 0.08]
     outputs = [
-        stabilizer.update(value, 1.0 + index * 0.06)[0]
-        for index, value in enumerate(samples)
+        stabilizer.update(value, 1.0 + index * 0.06)[0] for index, value in enumerate(samples)
     ]
 
     assert abs(outputs[2]) < 0.1
@@ -2016,12 +2136,17 @@ def test_yaw_publish_keeps_raw_pose_and_leaves_xyz_unchanged() -> None:
     xyz = np.asarray([1.0, 2.0, 3.0])
 
     published_xyz = app.OperatorApp._stabilize_live_result_pose(
-        operator, result, xyz,
+        operator,
+        result,
+        xyz,
     )
 
     assert published_xyz is xyz
     assert result["pose_raw"] == {
-        "x": 1, "y": 2, "z": 3, "yaw_raw": 0.25,
+        "x": 1,
+        "y": 2,
+        "z": 3,
+        "yaw_raw": 0.25,
     }
     assert result["pose"]["x"] == 1
     assert result["pose"]["y"] == 2
@@ -2106,14 +2231,14 @@ def test_preview_and_flight_loader_agree_on_every_route(tmp_path: Path) -> None:
         preview_error = flight_error = None
         try:
             preview = app.load_route_glomap(str(route), map_frame=site)
-        except Exception as exc:            # noqa: BLE001 - comparing the decision
+        except Exception as exc:  # noqa: BLE001 - comparing the decision
             preview, preview_error = None, type(exc)
         try:
             flown = rpf.load_waypoints(
                 route,
                 map_frame=site if site is not None else rpf.LEGACY_MAP_FRAME,
             )
-        except Exception as exc:            # noqa: BLE001 - comparing the decision
+        except Exception as exc:  # noqa: BLE001 - comparing the decision
             flown, flight_error = None, type(exc)
 
         assert (preview_error is None) == (flight_error is None), (
@@ -2139,7 +2264,8 @@ def test_preview_and_flight_loader_agree_on_every_route(tmp_path: Path) -> None:
 )
 def test_success_payload_with_invalid_pose_is_downgraded(pose: object) -> None:
     result, xyz = app.normalize_live_localization_result(
-        {"success": True, "pose": pose, "frame_name": "bad"})
+        {"success": True, "pose": pose, "frame_name": "bad"}
+    )
     assert result["success"] is False
     assert "invalid localization pose" in result["error"]
     assert xyz is None
@@ -2159,10 +2285,7 @@ def test_failed_visual_result_still_exposes_imu_guess_xyz() -> None:
 
 
 def test_operator_anafi_profile_matches_simulator_contract() -> None:
-    profile_path = (
-        app.SYSTEM_ROOT / "模擬器" /
-        "sphinx_anafi_path_convergence" / "anafi_profile.py"
-    )
+    profile_path = app.SYSTEM_ROOT / "模擬器" / "sphinx_anafi_path_convergence" / "anafi_profile.py"
     if not profile_path.is_file():
         pytest.skip("simulator profile is not shipped in the portable repository")
     spec = importlib.util.spec_from_file_location("_operator_test_anafi_profile", profile_path)
@@ -2186,7 +2309,10 @@ def test_operator_anafi_profile_matches_simulator_contract() -> None:
     assert ui.gimbal_pitch_max_deg == sim.gimbal_pitch_max_deg
     assert ui.gimbal_pitch_rate_dps == sim.gimbal_max_speed_deg_s
     assert (ui.stream_width, ui.stream_height, ui.stream_fps) == (
-        sim.video_width_px, sim.video_height_px, sim.video_fps)
+        sim.video_width_px,
+        sim.video_height_px,
+        sim.video_fps,
+    )
     assert ui.stream_latency_ms == sim.video_latency_ms
     assert ui.stream_mbps * 1_000_000 == sim.video_bitrate_bps
 
@@ -2324,9 +2450,14 @@ finally:
     shm.close()
 """
     client = app.LiveWorkerClient(
-        [sys.executable, "-c", worker], 2, 1,
-        str(tmp_path / "shared.log"), "shared-worker", "shared",
-        timeout_s=1.0, use_shared_frames=True,
+        [sys.executable, "-c", worker],
+        2,
+        1,
+        str(tmp_path / "shared.log"),
+        "shared-worker",
+        "shared",
+        timeout_s=1.0,
+        use_shared_frames=True,
     )
     client.restart_warmup_s = 0.0
     try:
@@ -2342,7 +2473,8 @@ finally:
     finally:
         client.close()
     assert [(row["display_seq"], row["pixel_sum"]) for row in results] == [
-        (1, 6), (3, 18),
+        (1, 6),
+        (3, 18),
     ]
 
 
@@ -2350,8 +2482,7 @@ finally:
     ("requested", "count", "expected"),
     [(-1, 5, 2), (0, 5, 0), (4, 5, 4)],
 )
-def test_force_track_ref_resolution_is_explicit(requested: int, count: int,
-                                                expected: int) -> None:
+def test_force_track_ref_resolution_is_explicit(requested: int, count: int, expected: int) -> None:
     assert localizer_worker.resolve_force_track_ref(requested, count) == expected
 
 
@@ -2419,8 +2550,12 @@ def test_fatal_worker_restarts_are_bounded_and_publish_unavailable(tmp_path: Pat
         "  i+=1"
     )
     client = app.LiveWorkerClient(
-        [sys.executable, "-c", worker], 1, 1,
-        str(tmp_path / "fatal-bounded.log"), "fatal-bounded-worker", "fatal",
+        [sys.executable, "-c", worker],
+        1,
+        1,
+        str(tmp_path / "fatal-bounded.log"),
+        "fatal-bounded-worker",
+        "fatal",
         timeout_s=1.0,
     )
     client.restart_warmup_s = 0.0
@@ -2467,8 +2602,12 @@ def test_healthy_worker_response_resets_fatal_restart_budget(tmp_path: Path) -> 
         "  i+=1"
     )
     client = app.LiveWorkerClient(
-        [sys.executable, "-c", worker], 1, 1,
-        str(tmp_path / "fatal-reset.log"), "fatal-reset-worker", "fatal",
+        [sys.executable, "-c", worker],
+        1,
+        1,
+        str(tmp_path / "fatal-reset.log"),
+        "fatal-reset-worker",
+        "fatal",
         timeout_s=1.0,
     )
     client.restart_warmup_s = 0.0
@@ -2487,8 +2626,12 @@ def test_healthy_worker_response_resets_fatal_restart_budget(tmp_path: Path) -> 
 
 def test_startup_failure_restarts_are_bounded(tmp_path: Path) -> None:
     client = app.LiveWorkerClient(
-        [sys.executable, "-c", "raise SystemExit(3)"], 1, 1,
-        str(tmp_path / "startup-fatal.log"), "startup-fatal-worker", "fatal",
+        [sys.executable, "-c", "raise SystemExit(3)"],
+        1,
+        1,
+        str(tmp_path / "startup-fatal.log"),
+        "startup-fatal-worker",
+        "fatal",
         timeout_s=0.05,
         expect_ready_event=True,
     )
@@ -2517,12 +2660,20 @@ def test_worker_client_reports_submit_pipe_worker_and_response_timing(tmp_path: 
         "'worker_core_start_mono_ns':sn,'worker_core_done_mono_ns':dn}),flush=True)"
     )
     client = app.LiveWorkerClient(
-        [sys.executable, "-c", worker], 1, 1,
-        str(tmp_path / "timing.log"), "timing-worker", "timing", timeout_s=1.0)
+        [sys.executable, "-c", worker],
+        1,
+        1,
+        str(tmp_path / "timing.log"),
+        "timing-worker",
+        "timing",
+        timeout_s=1.0,
+    )
     client.restart_warmup_s = 0.0
     try:
         assert client.submit(
-            1, "timed", Image.new("RGB", (1, 1)),
+            1,
+            "timed",
+            Image.new("RGB", (1, 1)),
             timing_metadata={
                 "ui_serialize_ms": 0.25,
                 "source_frame_stamp_mono": time.monotonic() - 0.01,
@@ -2531,24 +2682,41 @@ def test_worker_client_reports_submit_pipe_worker_and_response_timing(tmp_path: 
                 "frame_preprocess_start_mono_ns": time.monotonic_ns() - 15_000_000,
                 "frame_yuv_ready_mono_ns": time.monotonic_ns() - 14_000_000,
                 "frame_preprocess_done_mono_ns": time.monotonic_ns() - 10_000_000,
-            })
+            },
+        )
         assert _wait_for(lambda: not client.results.empty())
         result = client.poll_results()[0]
     finally:
         client.close()
     for key in (
-        "client_submit_mono", "client_dequeue_mono", "client_write_start_mono",
-        "client_write_done_mono", "worker_read_done_mono", "worker_core_start_mono",
-        "worker_core_done_mono", "client_response_mono", "client_queue_wait_ms",
-        "client_pipe_write_ms", "client_roundtrip_ms", "submit_to_worker_read_ms",
-        "worker_done_to_client_ms", "source_stamp_age_at_submit_ms",
-        "client_submit_mono_ns", "client_dequeue_mono_ns",
-        "client_write_start_mono_ns", "client_write_done_mono_ns",
-        "worker_read_done_mono_ns", "worker_core_start_mono_ns",
-        "worker_core_done_mono_ns", "client_response_mono_ns",
-        "callback_to_preprocess_start_ms", "yuv_view_ms",
-        "frame_preprocess_ms", "callback_to_submit_ms",
-        "callback_to_inference_start_ms", "callback_to_localization_done_ms",
+        "client_submit_mono",
+        "client_dequeue_mono",
+        "client_write_start_mono",
+        "client_write_done_mono",
+        "worker_read_done_mono",
+        "worker_core_start_mono",
+        "worker_core_done_mono",
+        "client_response_mono",
+        "client_queue_wait_ms",
+        "client_pipe_write_ms",
+        "client_roundtrip_ms",
+        "submit_to_worker_read_ms",
+        "worker_done_to_client_ms",
+        "source_stamp_age_at_submit_ms",
+        "client_submit_mono_ns",
+        "client_dequeue_mono_ns",
+        "client_write_start_mono_ns",
+        "client_write_done_mono_ns",
+        "worker_read_done_mono_ns",
+        "worker_core_start_mono_ns",
+        "worker_core_done_mono_ns",
+        "client_response_mono_ns",
+        "callback_to_preprocess_start_ms",
+        "yuv_view_ms",
+        "frame_preprocess_ms",
+        "callback_to_submit_ms",
+        "callback_to_inference_start_ms",
+        "callback_to_localization_done_ms",
     ):
         assert key in result
     assert result["core_wall_ms"] == 1.0
@@ -2577,8 +2745,7 @@ def test_restart_cooldown_check_is_atomic(tmp_path: Path) -> None:
     results: list[bool] = []
     client._last_restart = 0.0
     client._proc_lock.acquire()
-    threads = [threading.Thread(target=lambda: results.append(client._restart()))
-               for _ in range(2)]
+    threads = [threading.Thread(target=lambda: results.append(client._restart())) for _ in range(2)]
     try:
         for thread in threads:
             thread.start()
@@ -2667,8 +2834,7 @@ def test_binary_ply_reader_preserves_xyz_and_rgb(tmp_path: Path) -> None:
         (100.0, b"\x00\x00\x01\x05b\x00\x00\x01\x07c"),
     ],
 )
-def test_annex_b_pump_only_drops_non_idr_slices(loss_pct: float,
-                                                 expected: bytes) -> None:
+def test_annex_b_pump_only_drops_non_idr_slices(loss_pct: float, expected: bytes) -> None:
     class RecordingSink(io.BytesIO):
         def __init__(self) -> None:
             super().__init__()
@@ -2677,9 +2843,7 @@ def test_annex_b_pump_only_drops_non_idr_slices(loss_pct: float,
         def close(self) -> None:
             self.closed_by_pump = True
 
-    source = io.BytesIO(
-        b"\x00\x00\x01\x01a\x00\x00\x01\x05b\x00\x00\x01\x07c"
-    )
+    source = io.BytesIO(b"\x00\x00\x01\x01a\x00\x00\x01\x05b\x00\x00\x01\x07c")
     destination = RecordingSink()
 
     app.FFmpegFrameStream._pump_nals(source, destination, loss_pct, seed=5)
@@ -2797,8 +2961,7 @@ def test_attached_frame_shm_survives_worker_death(tmp_path):
             "print('attached', flush=True)\n"
             "time.sleep(30)\n"
         )
-        proc = subprocess.Popen(
-            [sys.executable, "-c", child, shm.name], stdout=subprocess.PIPE)
+        proc = subprocess.Popen([sys.executable, "-c", child, shm.name], stdout=subprocess.PIPE)
         try:
             assert proc.stdout.readline().strip() == b"attached"
             proc.terminate()
@@ -2817,7 +2980,8 @@ def test_attached_frame_shm_survives_worker_death(tmp_path):
 
 
 def test_stale_response_after_a_refused_restart_is_never_published_as_a_new_fix(
-        tmp_path: Path) -> None:
+    tmp_path: Path,
+) -> None:
     """A worker response must never be attributed to a frame it did not answer.
 
     Two timeouts inside the 30 s restart cooldown used to leave the stalled worker
@@ -2832,14 +2996,15 @@ def test_stale_response_after_a_refused_restart_is_never_published_as_a_new_fix(
         "while True:\n"
         "    b=sys.stdin.buffer.read(3)\n"
         "    if not b: break\n"
-        "    if seq==0: time.sleep(0.8)\n"          # first frame stalls past the timeout
+        "    if seq==0: time.sleep(0.8)\n"  # first frame stalls past the timeout
         "    sys.stdout.write(json.dumps({'seq':seq,'success':True,"
         "'x':float(seq)})+'\\n'); sys.stdout.flush()\n"
         "    seq+=1\n"
     )
     client = app.LiveWorkerClient(
         [sys.executable, "-c", worker],
-        1, 1,
+        1,
+        1,
         str(tmp_path / "desync.log"),
         "desync-worker",
         "desync",
@@ -2857,8 +3022,7 @@ def test_stale_response_after_a_refused_restart_is_never_published_as_a_new_fix(
         # Let the stalled worker finish frame_a, so its late answer is sitting in the
         # pipe when frame_b's response is read.
         time.sleep(1.2)
-        assert _wait_for(
-            lambda: client.submit(2, "frame_b", Image.new("RGB", (1, 1))), timeout=3.0)
+        assert _wait_for(lambda: client.submit(2, "frame_b", Image.new("RGB", (1, 1))), timeout=3.0)
         published: list[dict] = []
         assert _wait_for(
             lambda: bool(published.extend(client.poll_results()) or published),
@@ -2897,7 +3061,10 @@ def test_fused_request_keeps_independent_telemetry_stamp() -> None:
         "auto",
         10.0,
         localizer_protocol.FusedTelemetry(
-            stamp=10.05, roll=0.1, pitch=0.0, yaw=0.2,
+            stamp=10.05,
+            roll=0.1,
+            pitch=0.0,
+            yaw=0.2,
         ),
         telemetry_stamp=10.05,
     )
@@ -2929,7 +3096,10 @@ def test_fused_request_rejects_future_and_stale_telemetry() -> None:
     fused = localizer_protocol.FusedTelemetry(roll=0.0, pitch=0.0, yaw=0.0)
     with pytest.raises(ValueError, match="future"):
         localizer_protocol.encode_fused_request(
-            "auto", 10.0, fused, telemetry_stamp=time.monotonic() + 1.0,
+            "auto",
+            10.0,
+            fused,
+            telemetry_stamp=time.monotonic() + 1.0,
         )
     with pytest.raises(ValueError, match="stale"):
         localizer_protocol.encode_fused_request(
@@ -3001,9 +3171,14 @@ finally:
     shm.close()
 """
     client = app.LiveWorkerClient(
-        [sys.executable, "-c", worker], 2, 1,
-        str(tmp_path / "coalesce-promote.log"), "coalesce-promote", "shared",
-        timeout_s=1.0, use_shared_frames=True,
+        [sys.executable, "-c", worker],
+        2,
+        1,
+        str(tmp_path / "coalesce-promote.log"),
+        "coalesce-promote",
+        "shared",
+        timeout_s=1.0,
+        use_shared_frames=True,
     )
     client.restart_warmup_s = 0.0
     first = np.full((1, 2, 3), 1, np.uint8)
@@ -3014,14 +3189,14 @@ finally:
         active = client._active_shm_slot
         assert active == 0
         free = 1 - active
-        before_free = bytes(client._frame_shm.buf[free * 6:(free + 1) * 6])
+        before_free = bytes(client._frame_shm.buf[free * 6 : (free + 1) * 6])
         middle = np.full((1, 2, 3), 2, np.uint8)
         latest[0, 0, 0] = 4
         assert client.submit(2, "middle", middle)
         assert client.submit(3, "latest", latest)
         latest[:] = 0
         middle[:] = 0
-        after_free = bytes(client._frame_shm.buf[free * 6:(free + 1) * 6])
+        after_free = bytes(client._frame_shm.buf[free * 6 : (free + 1) * 6])
         assert after_free == before_free
         assert client._coalesce is not None
         assert client._coalesce_drops == 1
@@ -3032,7 +3207,8 @@ finally:
         assert client._coalesce is None
         assert client._frame_shm is None
     assert [(row["display_seq"], row["pixel_sum"]) for row in results] == [
-        (1, 6), (3, 4 + 9 * 5),
+        (1, 6),
+        (3, 4 + 9 * 5),
     ]
     assert results[0]["circuit_breaker_state"] == "closed"
     assert results[0]["rejected_submits"] == 0
@@ -3053,8 +3229,12 @@ print(json.dumps({
 sys.stdin.buffer.read()
 """
     client = app.LiveWorkerClient(
-        [sys.executable, "-c", worker], 1, 1,
-        str(tmp_path / "oom.log"), "oom-worker", "oom",
+        [sys.executable, "-c", worker],
+        1,
+        1,
+        str(tmp_path / "oom.log"),
+        "oom-worker",
+        "oom",
         timeout_s=1.0,
     )
     client.restart_warmup_s = 0.0
@@ -3068,9 +3248,9 @@ sys.stdin.buffer.read()
     finally:
         client.close()
     from localization_metrics import CIRCUIT_BREAKER_STATES, RESTART_REASONS
+
     oom_rows = [
-        row for row in results
-        if row.get("oom_transition") or row.get("error") == "cuda_oom"
+        row for row in results if row.get("oom_transition") or row.get("error") == "cuda_oom"
     ]
     assert oom_rows
     assert oom_rows[0]["restart_reason"] in RESTART_REASONS
@@ -3089,40 +3269,95 @@ def test_worker_fused_odometry_uses_telemetry_stamp_not_capture() -> None:
         speed_down=0.0,
     )
     sample = localizer_worker._fused_odometry_sample_from_request(
-        fused, capture_stamp=10.0, now_mono=10.1,
+        fused,
+        capture_stamp=10.0,
+        now_mono=10.1,
     )
     assert sample is not None
     assert sample.timestamp == pytest.approx(10.05)
 
 
+def test_worker_fused_odometry_keeps_independent_gnss_stamp() -> None:
+    fused = localizer_protocol.FusedTelemetry(
+        stamp=10.05,
+        roll=0.1,
+        pitch=-0.2,
+        yaw=1.3,
+        gps_stamp=9.5,
+        latitude=25.033,
+        longitude=121.5654,
+        altitude=18.2,
+        latitude_accuracy=0.8,
+        longitude_accuracy=0.9,
+        altitude_accuracy=1.4,
+    )
+
+    sample = localizer_worker._fused_odometry_sample_from_request(
+        fused,
+        capture_stamp=10.0,
+        now_mono=10.1,
+    )
+
+    assert sample is not None and sample.has_gnss
+    assert sample.timestamp == pytest.approx(10.05)
+    assert sample.geodetic_timestamp == pytest.approx(9.5)
+    assert sample.geodetic_lla == pytest.approx((25.033, 121.5654, 18.2))
+
+
 def test_worker_fused_odometry_does_not_backdate_unstamped_telemetry() -> None:
     fused = localizer_protocol.FusedTelemetry(
-        stamp=None, roll=0.1, pitch=-0.2, yaw=1.3,
+        stamp=None,
+        roll=0.1,
+        pitch=-0.2,
+        yaw=1.3,
     )
-    assert localizer_worker._fused_odometry_sample_from_request(
-        fused, capture_stamp=10.0, now_mono=10.1,
-    ) is None
-    assert localizer_worker._fused_odometry_sample_from_request(
-        None, capture_stamp=10.0, now_mono=10.1,
-    ) is None
+    assert (
+        localizer_worker._fused_odometry_sample_from_request(
+            fused,
+            capture_stamp=10.0,
+            now_mono=10.1,
+        )
+        is None
+    )
+    assert (
+        localizer_worker._fused_odometry_sample_from_request(
+            None,
+            capture_stamp=10.0,
+            now_mono=10.1,
+        )
+        is None
+    )
 
 
 def test_worker_fused_odometry_rejects_future_and_stale_stamps() -> None:
     future = localizer_protocol.FusedTelemetry(
-        stamp=10.2, roll=0.0, pitch=0.0, yaw=0.0,
+        stamp=10.2,
+        roll=0.0,
+        pitch=0.0,
+        yaw=0.0,
     )
-    assert localizer_worker._fused_odometry_sample_from_request(
-        future, capture_stamp=10.0, now_mono=10.1,
-    ) is None
+    assert (
+        localizer_worker._fused_odometry_sample_from_request(
+            future,
+            capture_stamp=10.0,
+            now_mono=10.1,
+        )
+        is None
+    )
     stale = localizer_protocol.FusedTelemetry(
         stamp=10.0 + localizer_protocol.MAX_FUSED_SYNC_ERROR_S + 0.01,
         roll=0.0,
         pitch=0.0,
         yaw=0.0,
     )
-    assert localizer_worker._fused_odometry_sample_from_request(
-        stale, capture_stamp=10.0, now_mono=stale.stamp + 1.0,
-    ) is None
+    assert (
+        localizer_worker._fused_odometry_sample_from_request(
+            stale,
+            capture_stamp=10.0,
+            now_mono=stale.stamp + 1.0,
+        )
+        is None
+    )
 
 
 def test_worker_publishes_sampled_cuda_and_per_class_edm_cache_metrics() -> None:
@@ -3175,6 +3410,28 @@ def test_worker_publishes_sampled_cuda_and_per_class_edm_cache_metrics() -> None
     assert payload["edm_cache_evictions"] == 3
 
 
+def test_worker_reads_edm_cache_metrics_through_adapter_tracker() -> None:
+    tracker = SimpleNamespace(
+        trk=SimpleNamespace(
+            loc=SimpleNamespace(
+                matcher=SimpleNamespace(
+                    feature_cache_stats_by_class=lambda: {
+                        "map": {"hits": 9, "misses": 2, "evictions": 1},
+                        "temporal": {"hits": 3, "misses": 1, "evictions": 0},
+                    }
+                )
+            )
+        ),
+        last_info={},
+    )
+
+    assert localizer_worker._edm_cache_stats_from_tracker(tracker) == {
+        "edm_cache_hits": 12,
+        "edm_cache_misses": 3,
+        "edm_cache_evictions": 1,
+    }
+
+
 def test_worker_loop_observes_independent_fused_stamp(monkeypatch) -> None:
     observed = []
 
@@ -3202,7 +3459,10 @@ def test_worker_loop_observes_independent_fused_stamp(monkeypatch) -> None:
         "auto",
         capture,
         localizer_protocol.FusedTelemetry(
-            stamp=fused_stamp, roll=0.1, pitch=0.0, yaw=0.2,
+            stamp=fused_stamp,
+            roll=0.1,
+            pitch=0.0,
+            yaw=0.2,
         ),
         telemetry_stamp=fused_stamp,
     )
@@ -3263,8 +3523,8 @@ def test_client_lifecycle_metrics_follow_outage_and_ready_transitions() -> None:
     assert payload["restart_reason"] == "stall"
     assert payload["outage_duration_s"] >= 0.02
     assert payload["rejected_submits"] == 0
+    assert payload["coalesced_submit_drops"] == 0
     assert payload["ready_latency_ms"] >= 50.0
     assert payload["first_result_latency_ms"] is not None
     assert payload["circuit_breaker_state"] == "closed"
     assert payload["oom_transition"] is False
-

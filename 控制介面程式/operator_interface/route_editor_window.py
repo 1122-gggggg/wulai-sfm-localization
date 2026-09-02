@@ -18,6 +18,9 @@ from local_site_assets import discover_site_package
 from route_editor_model import RouteDocument, glomap_to_editor
 from x11_pinch_zoom import install_x11_pinch_zoom
 
+_RED_INTRINSIC = "#dc2020"  # STATUS_RGB red_intrinsic (220,32,32)
+_RED_INTRINSIC_RGB = (220, 32, 32)
+
 _BG = (18, 21, 25)
 _ARRIVE = "#3fbf7f"
 _ARRIVE_FILL = (63, 191, 127, 52)
@@ -90,6 +93,7 @@ class RouteEditorWindow(tk.Toplevel):
         map_loaded: Callable[[str], None] | None = None,
         on_close: Callable[[], None] | None = None,
         on_guard_failure: Callable[[str], None] | None = None,
+        test_route: Callable[[Path], object] | None = None,
     ):
         bound = profile is not None and profile.coordinate_frame is not None
         if route_path is not None and not bound:
@@ -147,16 +151,20 @@ class RouteEditorWindow(tk.Toplevel):
         self.map_loaded_callback = map_loaded
         self.on_close_callback = on_close
         self.on_guard_failure = on_guard_failure
+        self.test_route_callback = test_route
         display_name = profile.display_name if bound else "未綁定 PLY"
         self.title(f"航線編輯器 — {display_name}")
         self.configure(bg="#121519")
         self.protocol("WM_DELETE_WINDOW", self.close_editor)
         self.controller = RouteEditorController(self.document.points)
         self.map_points = self._aligned_map_points(map_points)
+        try:
+            self.red_sphere_points = self._load_aligned_red_spheres(map_source)
+        except Exception:
+            self.red_sphere_points = np.empty((0, 6), dtype=np.float32)
         center, radius = self._bounds(self.map_points[:, :3])
         self.view = OrthoView(center=center, radius=radius, zoom=1.0)
         self.view.top()
-
         self._photo = None
         self._canvas_item = None
         self._redraw_pending = False
@@ -220,6 +228,24 @@ class RouteEditorWindow(tk.Toplevel):
             rgb = np.full((len(values), 3), 190.0)
         return np.column_stack((xyz, rgb)).astype(np.float32)
 
+    def _load_aligned_red_spheres(self, map_source: Path | None) -> np.ndarray:
+        """Red intrinsic spheres for this site, aligned to the editor frame.
+
+        Probes overlay/red_spheres_only.ply beside map_source, falling back to
+        the workspace outputs demo. Empty when missing or unreadable so the
+        editor continues to render the base cloud unchanged.
+        """
+        try:
+            from map_point_io import load_red_sphere_points
+
+            raw = load_red_sphere_points(map_source, 250000)
+            if raw is None or len(raw) == 0:
+                return np.empty((0, 6), dtype=np.float32)
+            # Re-use the same glomap->editor transform as the base cloud.
+            return self._aligned_map_points(raw)
+        except Exception:
+            return np.empty((0, 6), dtype=np.float32)
+
     @staticmethod
     def _bounds(points: np.ndarray) -> tuple[np.ndarray, float]:
         if not len(points):
@@ -267,6 +293,14 @@ class RouteEditorWindow(tk.Toplevel):
         self.save_button.pack(
             side="right", padx=2
         )
+        self.test_button = None
+        if self.test_route_callback is not None:
+            self.test_button = ttk.Button(
+                toolbar,
+                text="儲存並開始模擬航線",
+                command=self.save_and_test_route,
+            )
+            self.test_button.pack(side="right", padx=2)
         ttk.Button(toolbar, text="離開編輯器", command=self.close_editor).pack(
             side="right", padx=(2, 10)
         )
@@ -452,6 +486,14 @@ class RouteEditorWindow(tk.Toplevel):
         self.save_button.configure(
             state="disabled" if self._asset_loading else "normal"
         )
+        if self.test_button is not None:
+            self.test_button.configure(
+                state=(
+                    "disabled"
+                    if self._asset_loading or self._preview_only
+                    else "normal"
+                )
+            )
         asset_state = "disabled" if self._asset_loading else "normal"
         self.ply_button.configure(state=asset_state)
 
@@ -483,6 +525,26 @@ class RouteEditorWindow(tk.Toplevel):
             ).astype(np.uint8)
         image = Image.fromarray(arr, "RGB")
         draw = ImageDraw.Draw(image, "RGBA")
+        # Red intrinsic spheres — always visible, slightly larger than base points
+        try:
+            red = getattr(self, "red_sphere_points", None)
+            if red is not None and len(red) > 0:
+                # Keep all sphere vertices (few k) regardless of interacting limit
+                sx_r, sy_r, depth_r = self.view.project(red[:, :3], width, height)
+                ix_r = sx_r.astype(int)
+                iy_r = sy_r.astype(int)
+                inside_r = (ix_r >= 0) & (ix_r < width) & (iy_r >= 0) & (iy_r < height)
+                if np.any(inside_r):
+                    order_r = np.argsort(depth_r[inside_r])
+                    xs = sx_r[inside_r][order_r]
+                    ys = sy_r[inside_r][order_r]
+                    rgb_r = red[:, 3:6][inside_r][order_r] if red.shape[1] >= 6 else np.full((len(xs), 3), _RED_INTRINSIC_RGB)
+                    for x, y, col in zip(xs.tolist(), ys.tolist(), np.clip(rgb_r, 0, 255).astype(np.uint8).tolist()):
+                        fill = f"#{col[0]:02x}{col[1]:02x}{col[2]:02x}"
+                        draw.ellipse((x - 3, y - 3, x + 3, y + 3), fill=fill, outline="#ffffff", width=1)
+                        draw.ellipse((x - 2, y - 2, x + 2, y + 2), fill=fill, outline=fill)
+        except Exception:
+            pass
         self._draw_axes(draw, width, height)
         self._draw_route(draw, width, height)
         photo = ImageTk.PhotoImage(image)
@@ -491,7 +553,6 @@ class RouteEditorWindow(tk.Toplevel):
             self._canvas_item = self.canvas.create_image(0, 0, image=photo, anchor="nw")
         else:
             self.canvas.itemconfigure(self._canvas_item, image=photo)
-
     def _draw_axes(self, draw: ImageDraw.ImageDraw, width: int, height: int) -> None:
         origin = self.view.center
         size = self.view.radius * 0.16
@@ -1122,6 +1183,10 @@ class RouteEditorWindow(tk.Toplevel):
             self.map_loaded_callback(message)
         self.controller = RouteEditorController()
         self.map_points = self._aligned_map_points(points)
+        try:
+            self.red_sphere_points = self._load_aligned_red_spheres(source)
+        except Exception:
+            self.red_sphere_points = np.empty((0, 6), dtype=np.float32)
         center, radius = self._bounds(self.map_points[:, :3])
         self.view = OrthoView(center=center, radius=radius, zoom=1.0)
         self.view.top()
@@ -1189,6 +1254,13 @@ class RouteEditorWindow(tk.Toplevel):
         message = str(getattr(result, "message", "航線已匯入"))
         self.status_var.set(f"{message}；SHA 已同步，但不會立即起飛")
         self.close_editor(force=True)
+        return saved
+
+    def save_and_test_route(self) -> Path | None:
+        """Persist a bound route, then ask the simulation-only host to run it."""
+        saved = self.save_route()
+        if saved is not None and self.test_route_callback is not None:
+            self.test_route_callback(saved)
         return saved
 
     def close_editor(self, *, force: bool = False) -> None:

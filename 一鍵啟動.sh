@@ -57,7 +57,7 @@ if [[ ! -x "$runtime_python" ]]; then
   runtime_python="$venv_dir/bin/python"
 fi
 
-default_selection="$root_dir/控制介面程式/mission_selections/river_site_b0_p116_p117_localization.json"
+default_selection="$root_dir/控制介面程式/mission_selections/river_gluemap_all8_direct_localization.json"
 for argument in "$@"; do
   if [[ "$argument" == "--site-profile" || "$argument" == --site-profile=* ]]; then
     echo "[一鍵啟動] 真機入口的 site profile 由 mission selection 原子產生；不可直接覆寫 --site-profile" >&2

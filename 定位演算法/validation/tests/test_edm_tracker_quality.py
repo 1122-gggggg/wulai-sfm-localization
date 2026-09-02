@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 from collections import OrderedDict
+from dataclasses import replace
 import hashlib
 from pathlib import Path
+import threading
+import time
 from types import SimpleNamespace
 import sys
 
@@ -25,10 +28,12 @@ from edm_matcher import (  # noqa: E402
 )
 from production_edm_tracker import (  # noqa: E402
     adaptive_jump_limit,
+    track_yaw_limit,
     EDMConfig,
     ProductionEDMTracker,
     RuntimeState,
     _CandidateSelection,
+    _CorrespondenceBatch,
     reprojection_metrics,
     reprojection_rank,
     spatially_cap_indices,
@@ -120,8 +125,8 @@ def test_edm_megaloc_tensorrt_is_cuda_default_and_hash_verified(
     created = []
 
     class FakeEngine:
-        def __init__(self, path, device):
-            created.append((path, device))
+        def __init__(self, path, device, *, require_sanctioned_size):
+            created.append((path, device, require_sanctioned_size))
 
     monkeypatch.delenv("SFM_MEGALOC_BACKEND", raising=False)
     monkeypatch.delenv("SFM_MEGALOC_TENSORRT", raising=False)
@@ -146,7 +151,7 @@ def test_edm_megaloc_tensorrt_is_cuda_default_and_hash_verified(
     assert query.fp16 is False
     assert query.model is None
     assert verified == [(engine_path, engine_sha256)]
-    assert created == [(engine_path, "cuda")]
+    assert created == [(engine_path, "cuda", False)]
 
 
 def test_edm_megaloc_tensorrt_requires_cuda(monkeypatch) -> None:
@@ -340,6 +345,26 @@ def test_lost_global_retrieval_retries_only_when_interval_is_reached(
     assert calls == [tracker.cfg.lost_local_grace_frames + 1, 5]
 
 
+def test_progressive_lost_stages_advance_every_two_frames_before_global(
+    monkeypatch,
+) -> None:
+    tracker = _lost_retrieval_policy_tracker(interval=15)
+    calls = []
+
+    def fake_global_retrieval(_frame, _capture_stamp):
+        calls.append(tracker.st.lost_frames)
+        tracker.st.lost_global_retrieval_attempts += 1
+        return [], 0.0, True
+
+    monkeypatch.setattr(tracker, "_global_retrieval", fake_global_retrieval)
+    for lost_frame in range(1, 11):
+        tracker.st.lost_frames = lost_frame
+        if tracker._should_run_global_retrieval():
+            tracker._global_retrieval(None, float(lost_frame))
+
+    assert calls == [3, 5, 7, 9]
+
+
 def test_lost_global_retrieval_interval_zero_keeps_one_shot_behavior() -> None:
     tracker = _lost_retrieval_policy_tracker(interval=0)
     tracker.st.lost_frames = tracker.cfg.lost_local_grace_frames + 1
@@ -348,6 +373,101 @@ def test_lost_global_retrieval_interval_zero_keeps_one_shot_behavior() -> None:
     tracker.st.lost_global_retrieval_attempts = 1
     tracker.st.lost_frames += 100
     assert not tracker._should_run_global_retrieval()
+
+
+def test_lost_megaloc_progresses_through_local_rings_before_global(
+    monkeypatch,
+) -> None:
+    import cv2
+
+    monkeypatch.setattr(cv2, "cvtColor", lambda frame, _code: frame)
+    tracker = object.__new__(ProductionEDMTracker)
+    tracker.cfg = EDMConfig(lost_prior_strategy="restrict_nearby")
+    tracker.st = RuntimeState(
+        state="LOST",
+        center=np.zeros(3, np.float32),
+        last_capture_stamp=0.0,
+    )
+    tracker.map = SimpleNamespace(ref_names=[f"ref{i}" for i in range(340)])
+    calls = []
+
+    def track_candidates(topk, _stamp=None, *, radius_factor=1.0, strict_radius=False):
+        calls.append((topk, radius_factor, strict_radius))
+        return [f"near-{radius_factor}"]
+
+    retrieved = []
+    tracker._track_candidates = track_candidates
+    tracker.loc = SimpleNamespace(
+        retrieve=lambda _rgb, _k, candidates=None: (
+            retrieved.append(candidates) or (["global"] if candidates is None else candidates[:1])
+        )
+    )
+
+    stages = []
+    for attempt in range(4):
+        tracker.st.lost_global_retrieval_attempts = attempt
+        refs, _ms, nearby = tracker._global_retrieval(
+            np.zeros((8, 8, 3), np.uint8), 100.0
+        )
+        stages.append(
+            (
+                refs,
+                nearby,
+                tracker._last_lost_search_stage,
+                tracker._last_lost_radius_factor,
+            )
+        )
+
+    assert [call[1] for call in calls] == [1.0, 2.0, 4.0]
+    assert all(call[2] for call in calls)
+    assert [item[2] for item in stages] == ["near_1x", "near_2x", "near_4x", "global"]
+    assert [item[3] for item in stages] == [1.0, 2.0, 4.0, None]
+    assert [item[1] for item in stages] == [True, True, True, False]
+    assert retrieved[-1] is None
+
+
+def test_lost_local_recovery_uses_the_next_progressive_ring() -> None:
+    tracker = object.__new__(ProductionEDMTracker)
+    tracker.cfg = EDMConfig(lost_prior_strategy="restrict_nearby")
+    tracker.st = RuntimeState(
+        state="LOST",
+        lost_frames=tracker.cfg.lost_local_grace_frames + 2,
+    )
+    calls = []
+    tracker._track_candidates = lambda topk, _stamp=None, **kwargs: (
+        calls.append((topk, kwargs)) or ["near"]
+    )
+    tracker._recovery_candidates = lambda _topk: pytest.fail(
+        "recovery-bank must wait until progressive local rings are exhausted"
+    )
+
+    tracker.st.lost_global_retrieval_attempts = 1
+    refs, mode = tracker._local_acquisition_candidates(1.0)
+    tracker.st.lost_global_retrieval_attempts = 2
+    refs2, mode2 = tracker._local_acquisition_candidates(2.0)
+
+    assert refs == refs2 == ["near"]
+    assert mode == mode2 == "edm_local_recovery"
+    assert [call[0] for call in calls] == [tracker.cfg.recovery_scan_topk] * 2
+    assert [call[1]["radius_factor"] for call in calls] == [2.0, 4.0]
+    assert all(call[1]["strict_radius"] for call in calls)
+
+
+def test_progressive_local_search_does_not_fall_back_to_boot_refs_early() -> None:
+    tracker = object.__new__(ProductionEDMTracker)
+    tracker.cfg = EDMConfig(lost_prior_strategy="restrict_nearby")
+    tracker.st = RuntimeState(
+        state="LOST",
+        lost_frames=tracker.cfg.lost_local_grace_frames + 2,
+        lost_global_retrieval_attempts=1,
+        boot_refs=["global-boot-ref"],
+    )
+    tracker._track_candidates = lambda *_args, **_kwargs: []
+
+    refs, mode = tracker._local_acquisition_candidates(1.0)
+
+    assert refs == []
+    assert mode == "edm_local_recovery"
 
 
 def test_track_does_not_schedule_lost_global_retrieval_retry() -> None:
@@ -390,6 +510,17 @@ def test_adaptive_jump_scales_with_capture_interval_and_clamps_stale_time() -> N
     assert adaptive_jump_limit(
         steps, cfg, capture_dt=0.01, capture_dt_history=capture_dts
     ) == pytest.approx(0.004)
+
+
+def test_track_yaw_limit_scales_with_capture_time_and_has_a_hard_cap() -> None:
+    cfg = EDMConfig(
+        track_yaw_slack_deg=8.0,
+        track_max_yaw_rate_deg_s=120.0,
+        track_max_yaw_step_deg=30.0,
+    )
+
+    assert track_yaw_limit(cfg, 1.0 / 24.0) == pytest.approx(13.0)
+    assert track_yaw_limit(cfg, 1.0) == pytest.approx(30.0)
 
 
 def test_runtime_step_history_is_bounded() -> None:
@@ -545,6 +676,407 @@ def test_correspondence_confidence_stays_aligned_after_3d_filtering() -> None:
     assert count == 1
 
 
+def test_correspondence_chunks_keep_query_preparation_isolated() -> None:
+    class FakeMatcher:
+        def __init__(self):
+            self.calls = []
+
+        def match_many_to_one(self, images, query, *, prepared_query=None):
+            self.calls.append((len(images), query, prepared_query))
+            empty = np.zeros((0, 2), np.float32)
+            return [
+                {"mkpts0": empty, "mkpts1": empty, "mconf": np.zeros(0, np.float32)}
+                for _image in images
+            ]
+
+    matcher = FakeMatcher()
+    localizer = object.__new__(EDMLocalizer)
+    localizer.scale = np.asarray((1.0, 1.0), np.float32)
+    localizer.matcher = matcher
+    query = np.zeros((576, 1024), np.uint8)
+    refs = [np.full_like(query, index) for index in range(5)]
+    xyz = [np.full((128 * 72, 3), np.nan, np.float32) for _ref in refs]
+
+    rows = localizer.correspondences_for_sources(query, refs, xyz, batch_size=2)
+
+    assert len(rows) == 5
+    assert [call[0] for call in matcher.calls] == [2, 2, 1]
+    assert all(call[1] is query and call[2] is None for call in matcher.calls)
+
+
+def test_correspondence_chunks_reuse_one_prepared_query() -> None:
+    prepared = object()
+
+    class FakeMatcher:
+        def __init__(self):
+            self.prepared = 0
+            self.calls = []
+
+        def prepare_query(self, query):
+            self.prepared += 1
+            return prepared
+
+        def match_many_to_one(self, images, query, *, prepared_query=None):
+            self.calls.append((len(images), query, prepared_query))
+            empty = np.zeros((0, 2), np.float32)
+            return [
+                {"mkpts0": empty, "mkpts1": empty, "mconf": np.zeros(0, np.float32)}
+                for _image in images
+            ]
+
+    matcher = FakeMatcher()
+    localizer = object.__new__(EDMLocalizer)
+    localizer.scale = np.asarray((1.0, 1.0), np.float32)
+    localizer.matcher = matcher
+    query = np.zeros((576, 1024), np.uint8)
+    refs = [np.full_like(query, index) for index in range(5)]
+    xyz = [np.full((128 * 72, 3), np.nan, np.float32) for _ref in refs]
+
+    rows = localizer.correspondences_for_sources(query, refs, xyz, batch_size=2)
+
+    assert len(rows) == 5
+    assert matcher.prepared == 1
+    assert [call[0] for call in matcher.calls] == [2, 2, 1]
+    assert all(call[1] is query and call[2] is prepared for call in matcher.calls)
+
+
+def test_edm_retrieval_keeps_similarity_and_topk_on_the_tensor_device() -> None:
+    class FakeMegaLoc:
+        device = edm_localizer_module.torch.device("cpu")
+
+        def __init__(self):
+            self.tensor_calls = 0
+
+        def extract_one_tensor(self, _frame):
+            self.tensor_calls += 1
+            return edm_localizer_module.torch.tensor([1.0, 0.0])
+
+        def extract_one(self, _frame):
+            raise AssertionError("device retrieval must not round-trip the descriptor")
+
+    reloc_map = SimpleNamespace(
+        ref_names=["second", "best", "third"],
+        ref_global=np.asarray(
+            [[0.5, 0.5], [1.0, 0.0], [0.25, 0.75]], dtype=np.float32
+        ),
+    )
+    megaloc = FakeMegaLoc()
+    localizer = EDMLocalizer(
+        reloc_map,
+        SimpleNamespace(width=1280, height=720),
+        matcher=object(),
+        megaloc=megaloc,
+    )
+
+    scored = localizer.retrieve_scored(
+        np.zeros((720, 1280, 3), np.uint8), 2
+    )
+
+    assert [name for name, _score in scored] == ["best", "second"]
+    assert megaloc.tensor_calls == 1
+    assert localizer._ref_global_tensor.device.type == "cpu"
+
+
+def test_edm_config_validates_pnp_acceleration_fields() -> None:
+    with pytest.raises(ValueError, match="pnp_workers"):
+        EDMConfig(pnp_workers=0)
+    with pytest.raises(ValueError, match="pnp_early_stop"):
+        EDMConfig(pnp_early_stop=1)
+    with pytest.raises(ValueError, match="pnp_pipeline"):
+        EDMConfig(pnp_pipeline=1)
+
+
+def test_progressive_acquisition_uses_cumulative_2_4_8_20_stages() -> None:
+    tracker = object.__new__(ProductionEDMTracker)
+    tracker.cfg = EDMConfig(
+        boot_global_topk=20,
+        acquire_stage_mode="progressive",
+    )
+    names = [f"ref{index}" for index in range(20)]
+    selection = _CandidateSelection(True, names, "megaloc_boot", 80, 0.0)
+    calls = []
+    empty = np.zeros((0, 2), np.float32)
+
+    def batch(count):
+        rows = [(empty, np.zeros((0, 3)), np.zeros(0), 0)] * count
+        return _CorrespondenceBatch(empty, np.zeros((0, 3)), np.zeros(0), [0] * count, rows, False)
+
+    attempt = tracker_module._PoseAttempt(
+        None,
+        empty,
+        np.zeros((0, 3)),
+        {"reproj_rms": None, "inlier_ratio": 0.0, "inlier_grid_cells": 0},
+        None,
+        1.0,
+    )
+    tracker._match_and_estimate = lambda _gray, staged, **_kwargs: (
+        calls.append(list(staged.refs)) or batch(len(staged.refs)),
+        attempt,
+        2.0,
+    )
+    tracker._collect_correspondences = lambda _gray, staged, **_kwargs: (
+        calls.append(list(staged.refs)) or batch(len(staged.refs))
+    )
+    tracker._best_pose_attempt = lambda *_args, **_kwargs: attempt
+    tracker._acquire_stage_can_stop = (
+        lambda staged, _attempt, _stamp: len(staged.refs) >= 8
+    )
+
+    active, _batch, result, match_ms, evaluated = tracker._match_acquisition_stages(
+        np.zeros((576, 1024), np.uint8),
+        selection,
+        1.0,
+        None,
+    )
+
+    assert [len(refs) for refs in calls] == [2, 2, 4]
+    assert calls == [names[:2], names[2:4], names[4:8]]
+    assert active.refs == names[:8]
+    assert evaluated == [2, 4, 8]
+    assert result.pnp_ms == pytest.approx(3.0)
+    assert match_ms >= 2.0
+
+
+def test_ranked_pnp_runs_best_batch_first_and_stops_after_gates() -> None:
+    tracker = object.__new__(ProductionEDMTracker)
+    tracker.cfg = EDMConfig(
+        pnp_workers=1,
+        pnp_early_stop=False,
+        pnp_ranked_batches=True,
+    )
+    tracker.cam = SimpleNamespace(width=1280, height=720)
+    tracker.st = RuntimeState(state="TRACK")
+    calls = []
+
+    def estimate(row):
+        marker = int(row[0][0, 0])
+        calls.append(marker)
+        return (
+            {"num_inliers": len(row[1])},
+            row[0],
+            row[1],
+            {"reproj_rms": 1.0, "inlier_ratio": 1.0, "inlier_grid_cells": 8},
+        )
+
+    tracker._estimate_reference_row = estimate
+    tracker._pnp_candidates_can_stop = lambda *_args: True
+    tracker._select_track_candidate = lambda _selection, scored: scored[0]
+    selection = _CandidateSelection(
+        False,
+        ["small", "best", "middle"],
+        "edm_map_scan",
+        50,
+        0.0,
+    )
+
+    attempt = tracker._best_pose_attempt(
+        selection,
+        _pnp_batch([80, 120, 100]),
+        capture_stamp=1.0,
+    )
+
+    assert calls == [1]
+    assert attempt.selected_ref == "best"
+    assert attempt.pnp_candidates == 1
+    assert attempt.pnp_skipped == 2
+
+
+def test_track_map_first_reuses_map_correspondences_for_temporal_fallback() -> None:
+    tracker = object.__new__(ProductionEDMTracker)
+    tracker.cfg = EDMConfig(
+        use_temporal_reference=True,
+        track_map_first=True,
+    )
+    tracker.temporal_gray = np.ones((576, 1024), np.uint8)
+    tracker.temporal_xyz_by_cell = np.ones((128 * 72, 3), np.float32)
+    map_batch = _pnp_batch([60])
+    empty_attempt = tracker_module._PoseAttempt(
+        None,
+        np.zeros((0, 2)),
+        np.zeros((0, 3)),
+        {"reproj_rms": None, "inlier_ratio": 0.0, "inlier_grid_cells": 0},
+        None,
+        1.0,
+    )
+    tracker._match_and_estimate = lambda *_args, **_kwargs: (
+        map_batch,
+        empty_attempt,
+        2.0,
+    )
+    tracker._track_stage_can_stop = lambda *_args: False
+    temporal_row = _pnp_batch([70]).by_ref[0]
+    source_calls = []
+    tracker.loc = SimpleNamespace(
+        correspondences_for_sources=lambda _gray, images, xyz, **kwargs: (
+            source_calls.append((images, xyz, kwargs)) or [temporal_row]
+        )
+    )
+    full_batches = []
+    fallback_attempt = replace(empty_attempt, pnp_ms=3.0)
+    tracker._best_pose_attempt = lambda _selection, batch, **_kwargs: (
+        full_batches.append(batch) or fallback_attempt
+    )
+    selection = _CandidateSelection(
+        False,
+        ["map"],
+        "edm_temporal_map",
+        50,
+        0.0,
+    )
+
+    batch, attempt, _match_ms, fallback = tracker._match_track_map_first(
+        np.zeros((576, 1024), np.uint8),
+        selection,
+        1.0,
+        object(),
+    )
+
+    assert fallback
+    assert len(source_calls) == 1
+    assert source_calls[0][2]["source_kinds"] == ["temporal"]
+    assert batch.temporal_used and batch.by_ref is None
+    assert batch.per_ref == [70, 60]
+    assert attempt.pnp_ms == pytest.approx(4.0)
+
+
+def _pnp_batch(row_sizes: list[int]) -> _CorrespondenceBatch:
+    rows = []
+    for marker, size in enumerate(row_sizes):
+        points2d = np.full((size, 2), marker, dtype=np.float32)
+        points3d = np.full((size, 3), marker, dtype=np.float32)
+        rows.append((points2d, points3d, np.ones(size, np.float32), size))
+    return _CorrespondenceBatch(
+        points2d=np.zeros((0, 2), np.float32),
+        points3d=np.zeros((0, 3), np.float32),
+        confidence=np.zeros(0, np.float32),
+        per_ref=row_sizes,
+        by_ref=rows,
+        temporal_used=False,
+    )
+
+
+def test_pnp_early_stop_skips_rows_that_cannot_reach_the_inlier_gate() -> None:
+    tracker = object.__new__(ProductionEDMTracker)
+    tracker.cfg = EDMConfig(pnp_workers=2, pnp_early_stop=True)
+    tracker.cam = SimpleNamespace(width=1280, height=720)
+    tracker._pose_estimation_context = lambda: (object(), object())
+    tracker._new_pose_estimation_context = lambda _seed=-1: (object(), object())
+    tracker._estimate_pose_candidate = lambda *_args: pytest.fail(
+        "a row with fewer correspondences than min_inliers cannot pass PnP"
+    )
+    selection = _CandidateSelection(
+        acquiring=False,
+        refs=["a", "b"],
+        mode="edm_map_scan",
+        min_inliers=50,
+        vpr_ms=0.0,
+    )
+
+    attempt = tracker._best_pose_attempt(selection, _pnp_batch([20, 49]))
+
+    assert attempt.result is None
+    assert attempt.pnp_ms == 0.0
+
+
+def test_parallel_pnp_preserves_candidate_order() -> None:
+    tracker = object.__new__(ProductionEDMTracker)
+    tracker.cfg = EDMConfig(pnp_workers=2, pnp_early_stop=False)
+    tracker.cam = SimpleNamespace(width=1280, height=720)
+    tracker._pose_estimation_context = lambda: (object(), object())
+    tracker._new_pose_estimation_context = lambda _seed=-1: (object(), object())
+    thread_ids = []
+
+    def estimate(points2d, points3d, _confidence, _pcam, _options):
+        marker = int(points2d[0, 0])
+        thread_ids.append(threading.get_ident())
+        time.sleep(0.02 if marker == 0 else 0.005)
+        candidate = (
+            {"num_inliers": len(points3d)},
+            points2d,
+            points3d,
+            {"reproj_rms": 1.0, "inlier_ratio": 1.0, "inlier_grid_cells": 8},
+        )
+        return candidate, 1.0
+
+    selected_order = []
+    tracker._estimate_pose_candidate = estimate
+    tracker._select_track_candidate = lambda _selection, scored: (
+        selected_order.extend(name for name, _candidate in scored) or scored[0]
+    )
+    selection = _CandidateSelection(
+        acquiring=False,
+        refs=["first", "second", "third"],
+        mode="edm_map_scan",
+        min_inliers=50,
+        vpr_ms=0.0,
+    )
+
+    attempt = tracker._best_pose_attempt(selection, _pnp_batch([80, 90, 100]))
+
+    assert selected_order == ["first", "second", "third"]
+    assert attempt.selected_ref == "first"
+    assert len(set(thread_ids)) == 2
+
+
+def test_pnp_pipeline_starts_before_the_next_edm_batch_finishes() -> None:
+    tracker = object.__new__(ProductionEDMTracker)
+    tracker.cfg = EDMConfig(
+        pnp_workers=2,
+        pnp_early_stop=False,
+        pnp_pipeline=True,
+    )
+    tracker.temporal_gray = None
+    tracker.temporal_xyz_by_cell = None
+    tracker.map = SimpleNamespace()
+    first_started = threading.Event()
+    release_first = threading.Event()
+    rows = _pnp_batch([80, 90]).by_ref
+
+    class FakeLocalizer:
+        def correspondences_by_ref(
+            self, _gray, _refs, *, batch_size, prepared_query, on_batch
+        ):
+            assert batch_size == tracker.cfg.match_batch_size
+            on_batch(0, rows[:1])
+            assert first_started.wait(0.5), "PnP did not overlap the next EDM batch"
+            on_batch(1, rows[1:])
+            release_first.set()
+            return rows
+
+    tracker.loc = FakeLocalizer()
+
+    def estimate(row):
+        marker = int(row[0][0, 0])
+        if marker == 0:
+            first_started.set()
+            assert release_first.wait(0.5)
+        return (
+            {"num_inliers": len(row[1])},
+            row[0],
+            row[1],
+            {"reproj_rms": 1.0, "inlier_ratio": 1.0, "inlier_grid_cells": 8},
+        )
+
+    tracker._estimate_reference_row = estimate
+    tracker._select_track_candidate = lambda _selection, scored: scored[0]
+    selection = _CandidateSelection(
+        acquiring=False,
+        refs=["first", "second"],
+        mode="edm_map_scan",
+        min_inliers=50,
+        vpr_ms=0.0,
+    )
+
+    _batch, attempt, _match_ms = tracker._match_and_estimate(
+        np.zeros((576, 1024), np.uint8),
+        selection,
+        prepared_query=object(),
+    )
+
+    assert attempt.selected_ref == "first"
+    assert attempt.pnp_candidates == 2
+
+
 def _jump_gate_tracker(
     monkeypatch,
     candidate_centers: list[float],
@@ -636,6 +1168,23 @@ def _jump_gate_tracker(
     tracker._last_accepted_cam_from_world = None
     tracker.temporal_xyz_by_cell = None
     return tracker
+
+
+def _add_map_reference(
+    tracker,
+    name: str,
+    center: list[float],
+    yaw: float = 0.0,
+) -> None:
+    """Grow the fake map so a reacquired pose has a reference to search against."""
+    index = len(tracker.centers)
+    tracker.centers = np.vstack([tracker.centers, np.asarray(center, dtype=np.float32)])
+    tracker.yaws = np.append(tracker.yaws, np.float32(yaw))
+    tracker.name_of[index] = name
+    tracker.idx_of[name] = index
+    tracker.map.ref_names = list(tracker.map.ref_names) + [name]
+    tracker.map.images[name] = np.zeros((576, 1024), np.uint8)
+    tracker.map.xyz_by_cell[name] = np.zeros((128 * 72, 3), np.float32)
 
 
 def test_limited_jump_requires_a_second_consistent_pose(monkeypatch) -> None:
@@ -1038,6 +1587,100 @@ def test_lost_reacquisition_is_unbounded_once_the_prior_expires(monkeypatch) -> 
     assert result.get("rejected") is None
 
 
+def test_stale_lost_reacquisition_requires_two_consistent_captures(monkeypatch) -> None:
+    tracker = _jump_gate_tracker(monkeypatch, [100.0, 100.1])
+    tracker.cfg.global_retrieval_policy = "boot_once"
+    tracker.cfg.stale_reacquire_confirmations = 2
+    tracker.cfg.stale_reacquire_max_distance = 0.3
+    tracker.cfg.stale_reacquire_max_yaw_diff_deg = 30.0
+    tracker.st.state = "LOST"
+    tracker.st.global_retrieval_calls = 1
+    tracker.st.boot_refs = ["ref"]
+    tracker.st.last_capture_stamp = 0.0
+    _add_map_reference(tracker, "ref1", [100.0, 0.0, 0.0])
+
+    first = tracker.localize(
+        np.zeros((720, 1280, 3), np.uint8), capture_stamp=4.0
+    )
+    second = tracker.localize(
+        np.zeros((720, 1280, 3), np.uint8), capture_stamp=4.1
+    )
+
+    assert not first["ok"]
+    assert first["rejected"] == "stale_reacquire_unconfirmed"
+    assert second["ok"]
+    assert second["stale_reacquire_confirmed"]
+
+
+def test_stale_lost_reacquisition_rejects_inconsistent_second_fix(monkeypatch) -> None:
+    tracker = _jump_gate_tracker(monkeypatch, [100.0, 101.0])
+    tracker.cfg.global_retrieval_policy = "boot_once"
+    tracker.cfg.stale_reacquire_confirmations = 2
+    tracker.cfg.stale_reacquire_max_distance = 0.3
+    tracker.st.state = "LOST"
+    tracker.st.global_retrieval_calls = 1
+    tracker.st.boot_refs = ["ref"]
+    tracker.st.last_capture_stamp = 0.0
+    _add_map_reference(tracker, "ref1", [100.0, 0.0, 0.0])
+
+    tracker.localize(np.zeros((720, 1280, 3), np.uint8), capture_stamp=4.0)
+    second = tracker.localize(
+        np.zeros((720, 1280, 3), np.uint8), capture_stamp=4.1
+    )
+
+    assert not second["ok"]
+    assert second["rejected"] == "stale_reacquire_unconfirmed"
+    assert second["stale_reacquire_confirmation"]["distance"] == pytest.approx(1.0)
+
+
+def test_stale_lost_reacquisition_anchors_the_next_search_at_the_pending_pose(monkeypatch) -> None:
+    """P119: an unconfirmed reacquire must not send the next frame back to the stale refs."""
+    tracker = _jump_gate_tracker(monkeypatch, [100.0, 100.0])
+    tracker.cfg.global_retrieval_policy = "boot_once"
+    tracker.cfg.stale_reacquire_confirmations = 2
+    tracker.st.state = "LOST"
+    tracker.st.global_retrieval_calls = 1
+    tracker.st.boot_refs = ["ref0"]
+    tracker.st.last_capture_stamp = 0.0
+    _add_map_reference(tracker, "ref1", [100.0, 0.0, 0.0])
+    # ref0 keeps the stale accepted heading; the reacquired heading is 0 degrees.
+    tracker.st.yaw = 120.0
+    tracker.yaws[0] = 120.0
+
+    predicted: list[np.ndarray] = []
+    searched: list[list[str]] = []
+    predict_center = tracker._predict_center
+    track_candidates = tracker._track_candidates
+
+    def _record_prediction(stamp=None):
+        center = predict_center(stamp)
+        predicted.append(np.array(center, dtype=float))
+        return center
+
+    def _record_candidates(topk, stamp=None, **kwargs):
+        refs = track_candidates(topk, stamp, **kwargs)
+        searched.append(list(refs))
+        return refs
+
+    tracker._predict_center = _record_prediction
+    tracker._track_candidates = _record_candidates
+
+    first = tracker.localize(np.zeros((720, 1280, 3), np.uint8), capture_stamp=4.0)
+
+    assert first["rejected"] == "stale_reacquire_unconfirmed"
+    # Unconfirmed: the fix is parked, never accepted as the tracked pose.
+    assert np.allclose(tracker.st.center, [0.0, 0.0, 0.0])
+    assert np.allclose(tracker.st.pending_reacquire_center, [100.0, 0.0, 0.0])
+    assert np.allclose(predicted[-1], [0.0, 0.0, 0.0])
+
+    second = tracker.localize(np.zeros((720, 1280, 3), np.uint8), capture_stamp=4.1)
+
+    assert np.allclose(predicted[-1], [100.0, 0.0, 0.0])
+    assert searched[-1] == ["ref1"]
+    assert second["ok"]
+    assert second["stale_reacquire_confirmed"]
+
+
 def test_lost_reacquisition_rejects_an_impossible_heading_flip(monkeypatch) -> None:
     tracker = _jump_gate_tracker(monkeypatch, [0.0])
     tracker.cfg.global_retrieval_policy = "boot_once"
@@ -1068,6 +1711,36 @@ def test_lost_reacquisition_rejects_an_impossible_heading_flip(monkeypatch) -> N
     assert not result["ok"]
     assert result["rejected"] == "acquire_yaw"
     assert result["acquire_yaw_delta_deg"] == pytest.approx(180.0, abs=1e-6)
+
+
+def test_track_rejects_capture_time_scaled_yaw_spike(monkeypatch) -> None:
+    tracker = _jump_gate_tracker(monkeypatch, [0.0])
+    tracker.cfg.track_yaw_slack_deg = 8.0
+    tracker.cfg.track_max_yaw_rate_deg_s = 120.0
+    tracker.cfg.track_max_yaw_step_deg = 30.0
+    tracker.st.last_capture_stamp = 0.95
+    rotation = np.array(
+        [[0.0, 1.0, 0.0], [0.0, 0.0, -1.0], [-1.0, 0.0, 0.0]]
+    )
+    monkeypatch.setattr(
+        tracker_module.pycolmap,
+        "estimate_and_refine_absolute_pose",
+        lambda *_a, **_k: {
+            "cam_from_world": pycolmap.Rigid3d(
+                pycolmap.Rotation3d(rotation), np.zeros(3)
+            ),
+            "num_inliers": 100,
+            "inlier_mask": np.ones(100, dtype=bool),
+        },
+    )
+
+    result = tracker.localize(
+        np.zeros((720, 1280, 3), np.uint8), capture_stamp=1.0
+    )
+
+    assert not result["ok"]
+    assert result["rejected"] == "track_yaw"
+    assert result["track_yaw_limit_deg"] == pytest.approx(14.0)
 
 
 def test_limited_jump_cannot_be_confirmed_by_relocalizing_the_same_capture(
@@ -1459,7 +2132,7 @@ def test_new_runtime_knobs_default_to_current_behavior_and_reject_invalid() -> N
     assert cfg.lost_prior_fusion_weight == 1.0
     assert cfg.pose_consensus_mode == "pairwise"
     assert cfg.consensus_max_rotation_deg == 90.0
-    assert cfg.reference_quality_weight == 0.0
+    assert cfg.reference_quality_weight == 0.5
     assert cfg.reference_quality_floor == 0.0
     with pytest.raises(ValueError, match="acquire_stage_mode"):
         EDMConfig(acquire_stage_mode="skip_gates")
@@ -1716,7 +2389,8 @@ def test_acquire_stage_falls_back_to_full_set_when_quality_fails(
     assert not info["ok"]
     assert not info["staged_early_stop"]
     assert info["rejected"] == "reprojection"
-    assert calls == [names[:2], names]
+    # The failed first stage is reused; only the remaining references are matched.
+    assert calls == [names[:2], names[2:]]
 
 
 def test_full_global_lost_prior_does_not_restrict_megaloc(monkeypatch) -> None:
@@ -2106,4 +2780,3 @@ def test_flight_fold_report_exposes_macro_and_worst_fold_metrics() -> None:
     assert summary["worst_fold_success"] == pytest.approx(0.25)
     assert summary["worst_fold_error"]["position_map_units"]["median"] == pytest.approx(0.04)
     assert summary["worst_fold_error"]["rotation_degrees"]["median"] == pytest.approx(0.3)
-

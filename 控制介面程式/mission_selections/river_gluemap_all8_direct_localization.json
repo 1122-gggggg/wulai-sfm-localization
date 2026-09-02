@@ -1,0 +1,27 @@
+{
+  "calibrations": [
+    {
+      "path": "../../地圖檔/場域/river_site/releases/river_gluemap_all8_direct_20260831/compat/localizer_quality_receipt.json",
+      "sha256": "5f5b5447dce78ac01395ef01c55a8017c9e8149265bb43cf7eb60d6fc81da245"
+    }
+  ],
+  "localizer": {
+    "path": "../../地圖檔/場域/river_site/releases/river_gluemap_all8_direct_20260831/compat/localizer_edm_manifest.json",
+    "sha256": "abeadb9367ebeb427cc452137f5d79b8618fde182eaed85969afa243dcb46ea4"
+  },
+  "map": {
+    "path": "../../地圖檔/場域/river_site/releases/river_gluemap_all8_direct_20260831/compat/map_manifest.json",
+    "sha256": "dd85ca52659ff0e57196d12375eeaedb2d969b621be14deddc13746d3d3bcde0"
+  },
+  "route": null,
+  "schema": "sfm-mission-selection/v1",
+  "selection_id": "river_gluemap_all8_direct_localization",
+  "site": {
+    "path": "../../地圖檔/場域/river_site/manifests/site.json",
+    "sha256": "02c2c1a00099e0ada0b69676b7c69313c95b459717fe6a7afaf2ca51282dea13"
+  },
+  "vehicle": {
+    "path": "../mission_components/vehicles/parrot_anafi_720p_river_b0.json",
+    "sha256": "4dbd8648ec4db43fc1ca0bdfb97853dc7ef9b2bd652f6077de2de9719a6b3b16"
+  }
+}

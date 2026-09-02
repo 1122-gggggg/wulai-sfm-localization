@@ -182,7 +182,7 @@ Python wheelhouse 內，必須由目標電腦的離線 OS 安裝媒體預先供�
 |---|---|---|---|---|
 | `urai_edm.json` | `地圖檔/場域/urai/` | 共用 | **無** | 地面定位可用；自主飛行未核准 |
 | `mission_selections/river_site_official69_localization.json` | `river_site_official69_map_v000_20260811` | resolver 產生 snapshot | **已刪** | 舊圖仍可定位；舊航線已移除 |
-| `mission_selections/river_site_b0_p116_p117_localization.json` | `river_site_b0_p116_p117_20260818` | resolver 產生 snapshot | **無** | 目前預設地面定位；須重畫 route 才能 AUTO |
+| `mission_selections/river_gluemap_all8_direct_localization.json` | `river_gluemap_all8_direct_20260831` | resolver 產生 snapshot | **無** | 目前預設；僅同資料集單幀煙霧通過，獨立品質與 ANAFI camera pipeline 未驗證，真機定位 fail closed |
 | `example_site_edm.json` | — | — | — | 新場域範本 |
 
 全部使用 EDM。XFeat / LighterGlue 的地圖、bundle 與設定已於 2026-07-26 移除

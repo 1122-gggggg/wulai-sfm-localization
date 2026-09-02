@@ -677,6 +677,7 @@ class DesktopRouteAutonomy:
             pose_jump_pause=self._pause_for_pose_jump,
             localization_yaw_search_pcmd=self.boot_search_config.yaw_pcmd,
             localization_yaw_search_event=self._on_localization_yaw_search,
+            ground_speed=self._ground_speed,
             # Localization loss never auto-lands the AUTO route: the loop holds
             # zero PCMD through the bounded yaw search until the pose recovers
             # or the operator takes over with the sticks. Physical stick

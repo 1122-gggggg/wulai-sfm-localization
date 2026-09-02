@@ -50,10 +50,11 @@ def test_edm_asset_inspection_does_not_mutate_ui_import_path(
     monkeypatch.setattr(local_assets.subprocess, "run", fake_run)
     before = list(sys.path)
 
-    assert inspect_edm_bundle(tmp_path / "bundle.pt") == ("ref-a.jpg",)
+    assert inspect_edm_bundle(tmp_path / "bundle.pt", "a" * 64) == ("ref-a.jpg",)
     assert load_edm_runtime_profile(tmp_path / "profile.json")["schema"].endswith("/v1")
     assert sys.path == before
     assert len(calls) == 2
+    assert calls[0][0][-1] == "a" * 64
     assert all(call[1]["cwd"].name == "sfm_glomap_deploy" for call in calls)
 
 
@@ -168,9 +169,15 @@ def _write_valid_route(path: Path) -> Path:
 def test_site_package_is_validated_and_imported_atomically(tmp_path: Path) -> None:
     package = _write_site_package(tmp_path)
     managed = tmp_path / "managed"
+
+    def inspect_bundle(path: Path, expected_sha256: str) -> tuple[str, ...]:
+        assert path == package / "localization_bundle.pt"
+        assert expected_sha256 == _sha(path)
+        return ("ref-a.jpg",)
+
     provider = LocalSitePackageProvider(
         managed,
-        bundle_inspector=lambda _path: ("ref-a.jpg",),
+        bundle_inspector=inspect_bundle,
         edm_profile_loader=_profile_loader,
     )
 
@@ -192,7 +199,7 @@ def test_ply_digest_uniquely_matches_an_imported_site(tmp_path: Path) -> None:
     managed = tmp_path / "managed"
     provider = LocalSitePackageProvider(
         managed,
-        bundle_inspector=lambda _path: ("ref-a.jpg",),
+        bundle_inspector=lambda _path, _sha256: ("ref-a.jpg",),
         edm_profile_loader=_profile_loader,
     )
     provider.import_folder(package)
@@ -264,7 +271,7 @@ def test_unmatched_ply_stays_unbound(tmp_path: Path) -> None:
     managed = tmp_path / "managed"
     provider = LocalSitePackageProvider(
         managed,
-        bundle_inspector=lambda _path: ("ref-a.jpg",),
+        bundle_inspector=lambda _path, _sha256: ("ref-a.jpg",),
         edm_profile_loader=_profile_loader,
     )
     provider.import_folder(package)
@@ -285,7 +292,7 @@ def test_ambiguous_ply_match_is_rejected(tmp_path: Path) -> None:
     managed = tmp_path / "managed"
     provider = LocalSitePackageProvider(
         managed,
-        bundle_inspector=lambda _path: ("ref-a.jpg",),
+        bundle_inspector=lambda _path, _sha256: ("ref-a.jpg",),
         edm_profile_loader=_profile_loader,
     )
     imported = provider.import_folder(package)
@@ -299,7 +306,7 @@ def test_site_package_rejects_reference_names_not_in_bundle(tmp_path: Path) -> N
     package = _write_site_package(tmp_path)
     provider = LocalSitePackageProvider(
         tmp_path / "managed",
-        bundle_inspector=lambda _path: ("different.jpg",),
+        bundle_inspector=lambda _path, _sha256: ("different.jpg",),
         edm_profile_loader=_profile_loader,
     )
 
@@ -322,7 +329,7 @@ def test_site_package_rejects_asset_path_outside_selected_folder(
     profile_path.write_text(json.dumps(raw), encoding="utf-8")
     provider = LocalSitePackageProvider(
         tmp_path / "managed",
-        bundle_inspector=lambda _path: ("ref-a.jpg",),
+        bundle_inspector=lambda _path, _sha256: ("ref-a.jpg",),
         edm_profile_loader=_profile_loader,
     )
 
@@ -335,7 +342,7 @@ def test_route_and_target_are_independent_profile_ports(tmp_path: Path) -> None:
     managed = tmp_path / "managed"
     site_provider = LocalSitePackageProvider(
         managed,
-        bundle_inspector=lambda _path: ("ref-a.jpg",),
+        bundle_inspector=lambda _path, _sha256: ("ref-a.jpg",),
         edm_profile_loader=_profile_loader,
     )
     profile_path = site_provider.import_folder(package).profile_path
@@ -396,7 +403,7 @@ def test_editor_authored_route_can_be_approved_for_auto(tmp_path: Path) -> None:
     managed = tmp_path / "managed"
     site_provider = LocalSitePackageProvider(
         managed,
-        bundle_inspector=lambda _path: ("ref-a.jpg",),
+        bundle_inspector=lambda _path, _sha256: ("ref-a.jpg",),
         edm_profile_loader=_profile_loader,
     )
     profile_path = site_provider.import_folder(package).profile_path
@@ -425,7 +432,7 @@ def test_route_import_updates_linked_component_and_selection_sha(tmp_path: Path)
     managed = tmp_path / "地圖檔" / "場域"
     profile_path = LocalSitePackageProvider(
         managed,
-        bundle_inspector=lambda _path: ("ref-a.jpg",),
+        bundle_inspector=lambda _path, _sha256: ("ref-a.jpg",),
         edm_profile_loader=_profile_loader,
     ).import_folder(package).profile_path
     component_path = (
@@ -490,7 +497,7 @@ def test_auto_approval_rejects_a_route_not_authored_by_the_editor(
     managed = tmp_path / "managed"
     site_provider = LocalSitePackageProvider(
         managed,
-        bundle_inspector=lambda _path: ("ref-a.jpg",),
+        bundle_inspector=lambda _path, _sha256: ("ref-a.jpg",),
         edm_profile_loader=_profile_loader,
     )
     profile_path = site_provider.import_folder(package).profile_path
@@ -511,7 +518,7 @@ def test_route_commit_rolls_back_asset_when_profile_replace_fails(
     managed = tmp_path / "managed"
     site_provider = LocalSitePackageProvider(
         managed,
-        bundle_inspector=lambda _path: ("ref-a.jpg",),
+        bundle_inspector=lambda _path, _sha256: ("ref-a.jpg",),
         edm_profile_loader=_profile_loader,
     )
     profile_path = site_provider.import_folder(package).profile_path
@@ -541,7 +548,7 @@ def test_concurrent_route_imports_commit_without_temp_collision(tmp_path: Path,
     managed = tmp_path / "managed"
     site_provider = LocalSitePackageProvider(
         managed,
-        bundle_inspector=lambda _path: ("ref-a.jpg",),
+        bundle_inspector=lambda _path, _sha256: ("ref-a.jpg",),
         edm_profile_loader=_profile_loader,
     )
     profile_path = site_provider.import_folder(package).profile_path
@@ -579,7 +586,7 @@ def test_adding_route_preserves_existing_route_files(
     managed = tmp_path / "managed"
     site_provider = LocalSitePackageProvider(
         managed,
-        bundle_inspector=lambda _path: ("ref-a.jpg",),
+        bundle_inspector=lambda _path, _sha256: ("ref-a.jpg",),
         edm_profile_loader=_profile_loader,
     )
     profile_path = site_provider.import_folder(package).profile_path
@@ -605,7 +612,7 @@ def test_editing_route_replaces_only_the_selected_route(tmp_path: Path) -> None:
     managed = tmp_path / "managed"
     profile_path = LocalSitePackageProvider(
         managed,
-        bundle_inspector=lambda _path: ("ref-a.jpg",),
+        bundle_inspector=lambda _path, _sha256: ("ref-a.jpg",),
         edm_profile_loader=_profile_loader,
     ).import_folder(package).profile_path
     provider = LocalRouteProvider(managed)
@@ -646,7 +653,7 @@ def test_concurrent_site_package_imports_have_one_winner(tmp_path: Path,
     managed = tmp_path / "managed"
     provider = LocalSitePackageProvider(
         managed,
-        bundle_inspector=lambda _path: ("ref-a.jpg",),
+        bundle_inspector=lambda _path, _sha256: ("ref-a.jpg",),
         edm_profile_loader=_profile_loader,
     )
     validated = threading.Barrier(2)
@@ -679,7 +686,7 @@ def test_route_import_resolves_system_profile_to_its_managed_site(
     managed = tmp_path / "managed"
     site_provider = LocalSitePackageProvider(
         managed,
-        bundle_inspector=lambda _path: ("ref-a.jpg",),
+        bundle_inspector=lambda _path, _sha256: ("ref-a.jpg",),
         edm_profile_loader=_profile_loader,
     )
     imported_profile_path = site_provider.import_folder(package).profile_path
@@ -767,7 +774,7 @@ def test_site_package_requires_and_carries_its_gravity_alignment(tmp_path: Path)
     package = _write_site_package(tmp_path)
     provider = LocalSitePackageProvider(
         tmp_path / "managed",
-        bundle_inspector=lambda _path: ("ref-a.jpg",),
+        bundle_inspector=lambda _path, _sha256: ("ref-a.jpg",),
         edm_profile_loader=_profile_loader,
     )
 
@@ -790,7 +797,7 @@ def test_site_package_without_a_gravity_alignment_is_refused(tmp_path: Path) -> 
     (package / "site_profile.json").write_text(json.dumps(raw), encoding="utf-8")
     provider = LocalSitePackageProvider(
         tmp_path / "managed",
-        bundle_inspector=lambda _path: ("ref-a.jpg",),
+        bundle_inspector=lambda _path, _sha256: ("ref-a.jpg",),
         edm_profile_loader=_profile_loader,
     )
 

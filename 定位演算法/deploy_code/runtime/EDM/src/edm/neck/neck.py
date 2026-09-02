@@ -101,24 +101,70 @@ class CIM(nn.Module):
     def forward(self, ms_feats, mask_c0=None, mask_c1=None):
         if len(ms_feats) == 3:  # same image shape
             f8, f16, f32 = ms_feats
-            f32 = self.fc32(f32)
-
-            f32_0, f32_1 = f32.chunk(2, dim=0)
-            f32_0, f32_1 = self.loftr_32(f32_0, f32_1, mask_c0, mask_c1)
-            f32 = torch.cat([f32_0, f32_1], dim=0)
-
-            f32_up = F.interpolate(f32, scale_factor=2.0, mode="bilinear")
-            att32_up = F.interpolate(self.att32(
-                f32), scale_factor=2.0, mode="bilinear")
-            f16 = self.fc16(f16)
-            f16 = self.dwconv16(f16 * att32_up + f32_up)
-            f16_up = F.interpolate(f16, scale_factor=2.0, mode="bilinear")
-            att16_up = F.interpolate(self.att16(
-                f16), scale_factor=2.0, mode="bilinear")
-            f8 = self.fc8(f8)
-            f8 = self.dwconv8(f8 * att16_up + f16_up)
-
-            feat_c0, feat_c1 = f8.chunk(2)
+            # GPU redundancy: query unary CNN (fc32/fc16/fc8/att32/att16/dwconv) runs on 2*B with duplicated query.
+            # Ledger rejected 15-25% saving claim for query repeat->expand without synchronized exact benchmark (docs/verified_localization_optimization_ledger.md: query tensor repeat改expand not yet verified).
+            # Optimize by computing query branch once (first query element) then replicate via expand/repeat for cross-attention; keep fallback 2*B path when B==1 or not duplicated to preserve exact behavior.
+            B = f32.shape[0] // 2
+            duplicated = B > 1 and f32.shape[0] % 2 == 0 and f8.shape[0] == f32.shape[0] and f16.shape[0] == f32.shape[0]
+            if duplicated:
+                # Split refs and single query (query is tiled B times in match_many_to_one)
+                f32_ref = f32[:B]
+                f32_qry_one = f32[B:B+1]
+                f16_ref = f16[:B]
+                f16_qry_one = f16[B:B+1]
+                f8_ref = f8[:B]
+                f8_qry_one = f8[B:B+1]
+                # Compute query unary CNN once then expand - saves B-1 redundant convs
+                f32_ref = self.fc32(f32_ref)
+                f32_qry_one = self.fc32(f32_qry_one)
+                f32_qry = f32_qry_one.expand(B, -1, -1, -1)
+                # Ensure contiguous for LoFTR (channels_last aware)
+                if f32_ref.is_contiguous(memory_format=torch.channels_last):
+                    f32_qry = f32_qry.contiguous(memory_format=torch.channels_last)
+                else:
+                    f32_qry = f32_qry.contiguous()
+                f32_0, f32_1 = self.loftr_32(f32_ref, f32_qry, mask_c0, mask_c1)
+                f32 = torch.cat([f32_0, f32_1], dim=0)
+                # f16 path: fc16 once for query
+                f32_up = F.interpolate(f32, scale_factor=2.0, mode="bilinear")
+                att32_up = F.interpolate(self.att32(f32), scale_factor=2.0, mode="bilinear")
+                f16_ref = self.fc16(f16_ref)
+                f16_qry_one = self.fc16(f16_qry_one)
+                f16_qry = f16_qry_one.expand(B, -1, -1, -1)
+                if f16_ref.is_contiguous(memory_format=torch.channels_last):
+                    f16_qry = f16_qry.contiguous(memory_format=torch.channels_last)
+                else:
+                    f16_qry = f16_qry.contiguous()
+                f16 = torch.cat([f16_ref, f16_qry], dim=0)
+                f16 = self.dwconv16(f16 * att32_up + f32_up)
+                f16_up = F.interpolate(f16, scale_factor=2.0, mode="bilinear")
+                att16_up = F.interpolate(self.att16(f16), scale_factor=2.0, mode="bilinear")
+                f8_ref = self.fc8(f8_ref)
+                f8_qry_one = self.fc8(f8_qry_one)
+                f8_qry = f8_qry_one.expand(B, -1, -1, -1)
+                if f8_ref.is_contiguous(memory_format=torch.channels_last):
+                    f8_qry = f8_qry.contiguous(memory_format=torch.channels_last)
+                else:
+                    f8_qry = f8_qry.contiguous()
+                f8 = torch.cat([f8_ref, f8_qry], dim=0)
+                f8 = self.dwconv8(f8 * att16_up + f16_up)
+                feat_c0, feat_c1 = f8.chunk(2)
+            else:
+                f32 = self.fc32(f32)
+                f32_0, f32_1 = f32.chunk(2, dim=0)
+                f32_0, f32_1 = self.loftr_32(f32_0, f32_1, mask_c0, mask_c1)
+                f32 = torch.cat([f32_0, f32_1], dim=0)
+                f32_up = F.interpolate(f32, scale_factor=2.0, mode="bilinear")
+                att32_up = F.interpolate(self.att32(
+                    f32), scale_factor=2.0, mode="bilinear")
+                f16 = self.fc16(f16)
+                f16 = self.dwconv16(f16 * att32_up + f32_up)
+                f16_up = F.interpolate(f16, scale_factor=2.0, mode="bilinear")
+                att16_up = F.interpolate(self.att16(
+                    f16), scale_factor=2.0, mode="bilinear")
+                f8 = self.fc8(f8)
+                f8 = self.dwconv8(f8 * att16_up + f16_up)
+                feat_c0, feat_c1 = f8.chunk(2)
 
         elif len(ms_feats) == 6:  # diffirent image shape
             f8_0, f16_0, f32_0, f8_1, f16_1, f32_1 = ms_feats

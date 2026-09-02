@@ -32,12 +32,21 @@ class ImuStateProvider:
     def clear(self) -> None:
         self._samples.clear()
 
-    def interpolate(self, timestamp: float, *, max_sync_error_s: float) -> FusedOdometrySample | None:
-        if not math.isfinite(timestamp) or not math.isfinite(max_sync_error_s) or max_sync_error_s <= 0.0:
+    def interpolate(
+        self, timestamp: float, *, max_sync_error_s: float
+    ) -> FusedOdometrySample | None:
+        if (
+            not math.isfinite(timestamp)
+            or not math.isfinite(max_sync_error_s)
+            or max_sync_error_s <= 0.0
+        ):
             return None
         if not self._samples:
             return None
-        if timestamp < self._samples[0].timestamp - 1e-9 or timestamp > self._samples[-1].timestamp + 1e-9:
+        if (
+            timestamp < self._samples[0].timestamp - 1e-9
+            or timestamp > self._samples[-1].timestamp + 1e-9
+        ):
             nearest = min(self._samples, key=lambda sample: abs(sample.timestamp - timestamp))
             if abs(nearest.timestamp - timestamp) <= max_sync_error_s:
                 return nearest
@@ -77,12 +86,8 @@ def _interpolate_pair(
     roll = pitch = yaw = None
     quaternion = None
     if before.has_attitude and after.has_attitude:
-        q0 = quaternion_wxyz_from_matrix(
-            ned_rpy_to_rotation(before.roll, before.pitch, before.yaw)
-        )
-        q1 = quaternion_wxyz_from_matrix(
-            ned_rpy_to_rotation(after.roll, after.pitch, after.yaw)
-        )
+        q0 = quaternion_wxyz_from_matrix(ned_rpy_to_rotation(before.roll, before.pitch, before.yaw))
+        q1 = quaternion_wxyz_from_matrix(ned_rpy_to_rotation(after.roll, after.pitch, after.yaw))
         quaternion = tuple(float(value) for value in slerp(q0, q1, fraction))
         roll = _lerp(before.roll, after.roll, fraction)
         pitch = _lerp(before.pitch, after.pitch, fraction)
@@ -103,6 +108,11 @@ def _interpolate_pair(
         position = tuple(
             _lerp(left, right, fraction) for left, right in zip(before.position, after.position)
         )
+    gnss = min(
+        (sample for sample in (before, after) if sample.has_gnss),
+        key=lambda sample: abs(float(sample.geodetic_timestamp) - timestamp),
+        default=None,
+    )
     frame = before.frame if before.frame == after.frame else OdometryFrame.UNKNOWN
     return FusedOdometrySample(
         timestamp=timestamp,
@@ -113,6 +123,9 @@ def _interpolate_pair(
         velocity_ned=velocity,
         position=position,
         quaternion_wxyz=quaternion,
+        geodetic_lla=None if gnss is None else gnss.geodetic_lla,
+        geodetic_accuracy_m=None if gnss is None else gnss.geodetic_accuracy_m,
+        geodetic_timestamp=None if gnss is None else gnss.geodetic_timestamp,
         source=f"{before.source}+interp",
     )
 

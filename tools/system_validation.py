@@ -114,6 +114,8 @@ RELEASE_FILES = (
     "控制介面程式/operator_interface/operator_rendering.py",
     "控制介面程式/operator_interface/operator_site_runtime.py",
     "控制介面程式/operator_interface/operator_tick.py",
+    "控制介面程式/operator_interface/route_editor_window.py",
+    "控制介面程式/operator_interface/simulated_route_test.py",
     "控制介面程式/operator_interface/site_assets_panel.py",
     "控制介面程式/operator_interface/live_localizer_worker.py",
     "控制介面程式/operator_interface/scale_free_control_adapter.py",
@@ -966,12 +968,58 @@ def main(argv: list[str] | None = None) -> int:
             )
             output = stdout + stderr + f"\nTIMEOUT after {step.timeout_s}s\n"
         duration = time.monotonic() - step_started
+        # F-34: enrich workspace_layout failures with itemized offending paths and a
+        # concrete remediation hint. workspace_audit already lists WARN/ERROR lines, but
+        # system_validation must guarantee the receipt log is actionable even if the
+        # audit's human output is terse or the failure is re-raised as JSON.
+        if step.name == "workspace_layout" and exit_code != 0:
+            # Try to derive the unclassified set from a direct audit (most precise),
+            # falling back to parsing the subprocess output.
+            _unclassified: list[str] = []
+            try:
+                from tools.workspace_audit import audit_workspace as _audit_workspace  # type: ignore
+
+                try:
+                    _report = _audit_workspace(ROOT, include_sizes=False)
+                    _unclassified = list(
+                        _report.get("output_classes", {}).get("unclassified", [])
+                    )
+                except Exception:
+                    _unclassified = []
+            except Exception:
+                _unclassified = []
+            if not _unclassified:
+                import re as _re
+
+                for _line in output.splitlines():
+                    if "outputs/" in _line and (
+                        "WARN:" in _line or "ERROR:" in _line or "unclassified" in _line
+                    ):
+                        _m = _re.search(r"outputs/([^\s,]+)", _line)
+                        if _m:
+                            _cand = _m.group(1).strip().rstrip(",")
+                            if _cand and _cand not in _unclassified:
+                                _unclassified.append(_cand)
+            if _unclassified:
+                _extra = "\n".join(f"  - outputs/{name}" for name in _unclassified)
+                _hint = (
+                    f"\n[workspace_layout] strict-output-names failed: {len(_unclassified)} unclassified output(s):\n"
+                    f"{_extra}\n"
+                    "HINT: add a prefix to OUTPUT_EVIDENCE_PREFIXES in tools/workspace_audit.py "
+                    "or archive the directory.\n"
+                    "HINT: if MANIFEST.tsv/SHA256SUMS drift, refresh with `python tools/package_manifest.py generate --root .`\n"
+                    "HINT: suggest `tools/package_manifest.py generate`"
+                )
+                if "tools/package_manifest.py generate" not in output:
+                    output += _hint
+            elif "tools/package_manifest.py generate" not in output:
+                # No itemized list derivable, still guarantee the remediation hint.
+                output += "\nHINT: suggest `tools/package_manifest.py generate`"
         log_path = log_dir / f"{index:02d}_{step.name}.log"
         log_path.write_text(output, encoding="utf-8")
         if output:
             print(output.rstrip(), flush=True)
         ok = exit_code == 0
-        failed = failed or not ok
         pytest_summary = _pytest_summary(output)
         if pytest_summary is not None:
             pytest_receipt = payload["pytest"]

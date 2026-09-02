@@ -710,7 +710,9 @@ def _validate_reference_poses(
 _DEPLOY_RESULT_PREFIX = "SFM_ASSET_RESULT:"
 
 
-def _run_deploy_inspector(path: Path, expression: str) -> object:
+def _run_deploy_inspector(
+    path: Path, expression: str, arguments: tuple[str, ...] = ()
+) -> object:
     """Run production asset code without mutating the UI process import path."""
     deploy = (
         Path(__file__).resolve().parents[2]
@@ -720,7 +722,14 @@ def _run_deploy_inspector(path: Path, expression: str) -> object:
     )
     try:
         completed = subprocess.run(
-            [sys.executable, "-B", "-c", expression, str(path.resolve())],
+            [
+                sys.executable,
+                "-B",
+                "-c",
+                expression,
+                str(path.resolve()),
+                *arguments,
+            ],
             cwd=deploy,
             env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
             text=True,
@@ -751,15 +760,17 @@ def _run_deploy_inspector(path: Path, expression: str) -> object:
         raise ValueError(f"EDM asset inspector returned invalid JSON for {path}") from exc
 
 
-def inspect_edm_bundle(path: Path) -> tuple[str, ...]:
+def inspect_edm_bundle(
+    path: Path, expected_sha256: str | None = None
+) -> tuple[str, ...]:
     """Use the production EDM loader so import and runtime accept the same artifact."""
     expression = (
         "import json,sys; from reloc_localizer_edm import EDMRelocMap; "
-        "bundle=EDMRelocMap.load(sys.argv[1]); "
+        "bundle=EDMRelocMap.load(sys.argv[1], sys.argv[2] or None); "
         f"print({_DEPLOY_RESULT_PREFIX!r}+json.dumps(bundle.ref_names))"
     )
     try:
-        names = _run_deploy_inspector(path, expression)
+        names = _run_deploy_inspector(path, expression, (expected_sha256 or "",))
         if not isinstance(names, list) or not all(isinstance(name, str) for name in names):
             raise ValueError("production loader returned invalid reference names")
         return tuple(names)
@@ -833,7 +844,7 @@ class LocalSitePackageProvider:
         self,
         managed_root: str | Path,
         *,
-        bundle_inspector: Callable[[Path], tuple[str, ...]] = inspect_edm_bundle,
+        bundle_inspector: Callable[[Path, str], tuple[str, ...]] = inspect_edm_bundle,
         edm_profile_loader: Callable[[Path], dict] = load_edm_runtime_profile,
     ):
         self.managed_root = Path(managed_root).expanduser().resolve()
@@ -852,7 +863,9 @@ class LocalSitePackageProvider:
         checks = _validate_site_package_assets(profile, root)
         _validate_ply(profile.map_ply)
         self.edm_profile_loader(profile.localizer_profile)
-        names = self.bundle_inspector(profile.localization_bundle)
+        bundle_sha256 = profile.asset_sha256.localization_bundle
+        assert bundle_sha256 is not None
+        names = self.bundle_inspector(profile.localization_bundle, bundle_sha256)
         reference_count = _validate_reference_poses(
             profile.map_reference_poses, profile.query_camera, names
         )

@@ -38,6 +38,8 @@ _HERE = Path(__file__).resolve().parent
 if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
 
+from operator_state import TrackerState  # noqa: E402
+
 LOG_DIR = _HERE.parents[1] / "outputs" / "flight_logs"
 
 
@@ -102,7 +104,7 @@ class _AcceptanceState:
         import numpy as np
 
         self.mode = "MANUAL"
-        self.tracker_state = "BOOT"
+        self.tracker_state = TrackerState.BOOT
         self.loc = "LIVE"
         self.stream = "WAIT"
         self.pose = np.zeros(4, dtype=float)

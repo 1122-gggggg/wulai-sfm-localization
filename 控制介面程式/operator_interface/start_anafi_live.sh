@@ -281,17 +281,46 @@ if [[ -n "$SITE_PROFILE" ]]; then
   EXTRA+=(--site-profile "$SITE_PROFILE")
   echo "[start] site-profile: $SITE_PROFILE"
 fi
-if [[ "$DRY_RUN" != "1" && "${SFM_SKIP_LIVE_PREFLIGHT:-0}" != "1" \
-      && -n "$SITE_PROFILE" && "$UI_PYTHON" == */.venv/bin/python ]]; then
-  echo "[start] live runtime preflight (CUDA/bundle/models; no video)"
-  "$UI_PYTHON" "$WORKSPACE_ROOT/tools/simulator_preflight.py" \
-    --workspace-root "$WORKSPACE_ROOT" \
-    --site-profile "$SITE_PROFILE" \
-    --check-runtime \
-    --full-runtime
+# Parity with 真機串流/啟動.sh:38-65: warn when site profile is supplied directly
+# without a mission selection. Do not block startup; preflight still runs.
+if [[ -z "${SFM_MISSION_SELECTION:-}" && -n "${SFM_SITE_PROFILE:-}" ]]; then
+  echo "[start] WARNING: SFM_SITE_PROFILE is set directly without SFM_MISSION_SELECTION; prefer mission selection via 控制介面程式/真機串流/啟動.sh (parity with 真機串流/啟動.sh:38-65)" >&2
+fi
+# Parity with 影片模擬串流/啟動.sh:29-60: pin expected runtime env before preflight.
+if [[ -n "${SFM_TORCH_HUB_CACHE:-}" ]]; then
+  _sfm_expected_torch="$WORKSPACE_ROOT/執行環境/torch_hub_cache"
+  _sfm_actual_torch="$(readlink -f -- "$SFM_TORCH_HUB_CACHE" 2>/dev/null || realpath -m -- "$SFM_TORCH_HUB_CACHE" 2>/dev/null || printf '%s' "$SFM_TORCH_HUB_CACHE")"
+  _sfm_expected_torch_canon="$(readlink -f -- "$_sfm_expected_torch" 2>/dev/null || realpath -m -- "$_sfm_expected_torch" 2>/dev/null || printf '%s' "$_sfm_expected_torch")"
+  if [[ "$_sfm_actual_torch" != "$_sfm_expected_torch_canon" ]]; then
+    echo "[start] WARNING: SFM_TORCH_HUB_CACHE mismatched; pinning to $_sfm_expected_torch_canon (parity with 影片模擬串流/啟動.sh)" >&2
+  fi
+fi
+if [[ -n "${SFM_LOCALIZER_PYTHON:-}" ]]; then
+  _sfm_expected_py="$(realpath -s -m -- "$UI_PYTHON" 2>/dev/null || printf '%s' "$UI_PYTHON")"
+  _sfm_actual_py="$(realpath -s -m -- "$SFM_LOCALIZER_PYTHON" 2>/dev/null || printf '%s' "$SFM_LOCALIZER_PYTHON")"
+  if [[ "$_sfm_actual_py" != "$_sfm_expected_py" ]]; then
+    echo "[start] WARNING: SFM_LOCALIZER_PYTHON differs from SFM_UI_PYTHON; pinning to SFM_UI_PYTHON (parity with 影片模擬串流/啟動.sh)" >&2
+  fi
+fi
+export SFM_TORCH_HUB_CACHE="$WORKSPACE_ROOT/執行環境/torch_hub_cache"
+export SFM_LOCALIZER_PYTHON="$UI_PYTHON"
+export SFM_UI_PYTHON="$UI_PYTHON"
+if [[ "$DRY_RUN" != "1" && "${SFM_SKIP_LIVE_PREFLIGHT:-0}" != "1" ]]; then
+  if [[ -n "$SITE_PROFILE" ]]; then
+    echo "[start] live runtime preflight (CUDA/bundle/models; no video)"
+    "$UI_PYTHON" "$WORKSPACE_ROOT/tools/simulator_preflight.py" \
+      --workspace-root "$WORKSPACE_ROOT" \
+      --site-profile "$SITE_PROFILE" \
+      --check-runtime \
+      --full-runtime
+  else
+    echo "[start] WARNING: skipping live preflight: no site profile selected (set SFM_MISSION_SELECTION or SFM_SITE_PROFILE)" >&2
+  fi
 fi
 
-export SFM_EDM_REF_FEATURE_CACHE="${SFM_EDM_REF_FEATURE_CACHE:-32}"
+export SFM_EDM_REF_FEATURE_CACHE="${SFM_EDM_REF_FEATURE_CACHE:-192}"
+export SFM_EDM_HOST_REF_FEATURE_CACHE="${SFM_EDM_HOST_REF_FEATURE_CACHE:-0}"
+export SFM_EDM_QUERY_FEATURE_REUSE="${SFM_EDM_QUERY_FEATURE_REUSE:-1}"
 
 # Let the selected site's production profile choose TRACK top-k by default.
 LOCAL_TOPK="${LOCAL_TOPK:-0}"

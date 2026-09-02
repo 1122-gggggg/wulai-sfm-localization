@@ -6,6 +6,7 @@ import numpy as np
 
 from pose_guided.config import PoseGuidedConfig
 from pose_guided.fused_state import ImuStateProvider
+from pose_guided.gnss_prior import GnssMapPrior
 from pose_guided.propagator import PosePropagator
 from pose_guided.quality import is_safe_visual_anchor
 from pose_guided.reference_selector import (
@@ -54,6 +55,7 @@ class PoseGuidedController:
         self.config = config
         self.provider = ImuStateProvider()
         self.propagator = PosePropagator(config)
+        self.gnss_prior = GnssMapPrior()
         self.anchors = VisualAnchorManager()
         self.policy = TrackingStateMachine()
         self.last_prediction: PosePrediction | None = None
@@ -68,6 +70,7 @@ class PoseGuidedController:
     def reset(self) -> None:
         self.provider.clear()
         self.anchors.clear()
+        self.gnss_prior.clear()
         self.last_prediction = None
 
     def fused_at(self, timestamp: float) -> FusedOdometrySample | None:
@@ -81,6 +84,7 @@ class PoseGuidedController:
         visual_yaw: float | None,
         visual_velocity: np.ndarray | None,
         visual_stamp: float | None,
+        allow_gnss_prior: bool = False,
     ) -> PosePrediction:
         fused = self.fused_at(query_timestamp)
         prediction = self.propagator.predict(
@@ -92,6 +96,27 @@ class PoseGuidedController:
             visual_velocity=visual_velocity,
             visual_stamp=visual_stamp,
         )
+        if allow_gnss_prior:
+            estimate = self.gnss_prior.estimate(fused)
+            if estimate is not None:
+                prediction = PosePrediction(
+                    timestamp=query_timestamp,
+                    position=estimate.center,
+                    yaw=prediction.yaw,
+                    rotation_cam_from_world=None,
+                    position_covariance=estimate.covariance,
+                    orientation_covariance=prediction.orientation_covariance,
+                    age_since_visual_anchor=prediction.age_since_visual_anchor,
+                    propagation_mode=PropagationMode.GNSS_PRIOR,
+                    source=(
+                        "calibrated_gnss"
+                        if prediction.yaw is None
+                        else f"calibrated_gnss+{prediction.source}"
+                    ),
+                    confidence=estimate.confidence,
+                    valid=True,
+                    confirmation=Confirmation.PREDICTED_ONLY,
+                )
         self.last_prediction = prediction
         return prediction
 
@@ -116,6 +141,7 @@ class PoseGuidedController:
             fused=fused,
             odom_pose=odom_pose,
         )
+        self.gnss_prior.observe_visual(fused, center)
         return True
 
     def select_references(
@@ -163,7 +189,6 @@ class PoseGuidedController:
             stability_scores=stability,
         )
         return [item.name for item in ranked]
-
 
     def search_limits(
         self,

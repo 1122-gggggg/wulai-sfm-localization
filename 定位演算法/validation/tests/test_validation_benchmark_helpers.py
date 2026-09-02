@@ -291,7 +291,10 @@ def _replay_receipt(**overrides):
         "fused_coarse_mode": "fused",
         "runtime_sigma_mode": "reference_grid",
         "temporal_feature_cache_size": 0,
+        "query_cuda_graph": False,
         "acquire_stage_mode": "full_set",
+        "track_map_first": False,
+        "pnp_ranked_batches": False,
         "lost_prior_strategy": "restrict_nearby",
         "lost_prior_fusion_weight": 1.0,
         "worker_mode": "sequential",
@@ -532,6 +535,8 @@ def _fake_built():
             global_retrieval_policy="boot_and_lost_once",
             lost_global_retrieval_interval=15,
             acquire_stage_mode="full_set",
+            track_map_first=False,
+            pnp_ranked_batches=False,
             lost_prior_strategy="restrict_nearby",
             lost_prior_fusion_weight=1.0,
             validate=lambda: None,
@@ -540,6 +545,7 @@ def _fake_built():
             mconf_thr=0.2,
             topk=3225,
             reference_cache_size=32,
+            query_cuda_graph=False,
             runtime_sigma_mode="reference_grid",
             temporal_feature_cache_size=0,
             _feature_cache_capacity={"map": 32, "temporal": 0},
@@ -561,15 +567,21 @@ def test_apply_runtime_overrides_mutate_built_objects_and_receipt():
         lost_global_retrieval_interval=None,
         runtime_sigma_mode="bidirectional",
         temporal_feature_cache_size=3,
+        query_cuda_graph=True,
         acquire_stage_mode="initial_topk",
+        track_map_first=True,
+        pnp_ranked_batches=True,
         lost_prior_strategy="score_fusion",
         lost_prior_fusion_weight=2.5,
     )
     replay.apply_runtime_overrides(args, built)
     assert built.config.acquire_stage_mode == "initial_topk"
+    assert built.config.track_map_first is True
+    assert built.config.pnp_ranked_batches is True
     assert built.config.lost_prior_strategy == "score_fusion"
     assert built.config.lost_prior_fusion_weight == 2.5
     assert built._matcher.runtime_sigma_mode == "bidirectional"
+    assert built._matcher.query_cuda_graph is True
     assert built._matcher.temporal_feature_cache_size == 3
     assert built._matcher._feature_cache_capacity["temporal"] == 3
     receipt = replay.build_receipt(args, built)
@@ -577,6 +589,9 @@ def test_apply_runtime_overrides_mutate_built_objects_and_receipt():
     assert receipt["runtime_sigma_mode"] == "bidirectional"
     assert receipt["temporal_feature_cache_size"] == 3
     assert receipt["acquire_stage_mode"] == "initial_topk"
+    assert receipt["query_cuda_graph"] is True
+    assert receipt["track_map_first"] is True
+    assert receipt["pnp_ranked_batches"] is True
     assert receipt["lost_prior_strategy"] == "score_fusion"
     assert receipt["lost_prior_fusion_weight"] == 2.5
     assert receipt["fused_coarse_mode"] != receipt["runtime_sigma_mode"]
@@ -680,6 +695,56 @@ def test_production_path_fails_closed_on_untransmitted_overrides(tmp_path):
     with pytest.raises(SystemExit, match="production-path cannot apply lost-prior-strategy"):
         replay.runtime_stub_from_profile(site, args)
 
+
+
+def _cache_override_stub_matcher():
+    return SimpleNamespace(
+        reference_feature_cache_size=192,
+        host_reference_feature_cache_size=0,
+        temporal_feature_cache_size=0,
+        reference_cache_size=32,
+        _feature_cache_capacity={"map": 192, "temporal": 0},
+    )
+
+
+def test_reference_feature_cache_override_validates_before_mutating():
+    """Regression: an oversized --reference-feature-cache-size must fail closed
+    BEFORE the matcher fields are mutated (SUMMARY.md s1_cache1045 finding)."""
+    replay = load_script("benchmark_edm_site_replay_cache", "benchmark_edm_site_replay.py")
+    matcher = _cache_override_stub_matcher()
+    args = SimpleNamespace(
+        reference_feature_cache_size=200_000,  # ~1.7 TiB of feature entries, far over the 8 GiB bound
+        host_reference_feature_cache_size=None,
+    )
+    with pytest.raises(ValueError):
+        replay._apply_reference_feature_cache_overrides(matcher, args)
+    # the rejected override left the matcher untouched
+    assert matcher.reference_feature_cache_size == 192
+    assert matcher._feature_cache_capacity["map"] == 192
+
+
+def test_reference_feature_cache_override_applies_within_budget():
+    replay = load_script("benchmark_edm_site_replay_cache_ok", "benchmark_edm_site_replay.py")
+    matcher = _cache_override_stub_matcher()
+    args = SimpleNamespace(
+        reference_feature_cache_size=100,  # ~0.9 GiB, within the 8 GiB bound
+        host_reference_feature_cache_size=None,
+    )
+    replay._apply_reference_feature_cache_overrides(matcher, args)
+    assert matcher.reference_feature_cache_size == 100
+    assert matcher._feature_cache_capacity["map"] == 100
+
+
+def test_host_reference_feature_cache_override_validates_before_mutating():
+    replay = load_script("benchmark_edm_site_replay_host_cache", "benchmark_edm_site_replay.py")
+    matcher = _cache_override_stub_matcher()
+    args = SimpleNamespace(
+        reference_feature_cache_size=None,
+        host_reference_feature_cache_size=200_000,  # far over the 4 GiB pinned-host bound
+    )
+    with pytest.raises(ValueError):
+        replay._apply_reference_feature_cache_overrides(matcher, args)
+    assert matcher.host_reference_feature_cache_size == 0
 
 
 def test_known_incomplete_uses_stream_frame_count_for_coalesced_worker():

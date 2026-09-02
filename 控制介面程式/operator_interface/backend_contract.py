@@ -57,10 +57,7 @@ class FailureReason(str, Enum):
     STREAM_STALE = "stream_stale"
     LOCALIZATION_WEAK = "localization_weak"
     LOCALIZATION_LOST = "localization_lost"
-    POSE_STALE = "pose_stale"
     WORKER_EXIT = "worker_exit"
-    WORKER_STALL = "worker_stall"
-    UI_HEARTBEAT_LOST = "ui_heartbeat_lost"
     CONTROL_LINK_LOST = "control_link_lost"
     CONTROLLER_DISCONNECTED = "controller_disconnected"
     BATTERY_CRITICAL = "battery_critical"
@@ -69,7 +66,6 @@ class FailureReason(str, Enum):
     INVALID_TELEMETRY = "invalid_telemetry"
     DISK_OR_LOG_FAILURE = "disk_or_log_failure"
     EMERGENCY_STOP = "emergency_stop"
-    SHUTDOWN = "shutdown"
 
 
 class InvalidControlRequest(ValueError):

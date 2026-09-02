@@ -69,6 +69,7 @@ LOST_HOLD_MAX="${LOST_HOLD_MAX:-8}"
 LOST_HOLD_TIMEOUT_MS="${LOST_HOLD_TIMEOUT_MS:-3000}"
 SFM_HOLD_ON_LOW_CONF="${SFM_HOLD_ON_LOW_CONF:-1}"
 POSE_STABILIZE="${POSE_STABILIZE:-1}"
+ADAPTIVE_LOC_SUBMIT="${ADAPTIVE_LOC_SUBMIT:-1}"
 DRY_RUN="${SFM_LAUNCH_DRY_RUN:-0}"
 if [[ "$DRY_RUN" != "0" && "$DRY_RUN" != "1" ]]; then
   echo "[影片模擬串流] SFM_LAUNCH_DRY_RUN 必須是 0 或 1" >&2
@@ -76,6 +77,10 @@ if [[ "$DRY_RUN" != "0" && "$DRY_RUN" != "1" ]]; then
 fi
 if [[ "$SFM_HOLD_ON_LOW_CONF" != "0" && "$SFM_HOLD_ON_LOW_CONF" != "1" ]]; then
   echo "[影片模擬串流] SFM_HOLD_ON_LOW_CONF 必須是 0 或 1" >&2
+  exit 2
+fi
+if [[ "$ADAPTIVE_LOC_SUBMIT" != "0" && "$ADAPTIVE_LOC_SUBMIT" != "1" ]]; then
+  echo "[影片模擬串流] ADAPTIVE_LOC_SUBMIT 必須是 0 或 1" >&2
   exit 2
 fi
 if [[ "$DRY_RUN" == "0" && -n "${SFM_UI_PYTHON:-}" \
@@ -128,6 +133,7 @@ P1190119.MP4；否則只有一部影片時自動使用它。多部影片時請�
   LOST_HOLD_TIMEOUT_MS   凍幀硬逾時（預設 3000 ms；仍受次數限制）
   LOC_BENCH_TRACK=1      改純 TRACK 測速（跳過 MegaLoc / 不走飛行管線）
   POSE_STABILIZE=1       因果發布濾波（過去+當前 3 點中位數＋0.15s 低通；實機可用）
+  ADAPTIVE_LOC_SUBMIT=0  關閉依最近定位延遲調整的 latest-frame coalesce（預設啟用）
   SFM_SITE_PROFILE       site profile（預設 河濱 EDM；換場域改這個變數即可）
   ANAFI_LINK_PRESET      nominal/loss-1/loss-3/loss-5（預設 nominal）
   ANAFI_LINK_SIM=1       模擬 ANAFI 實機無線串流畫質（白皮書 v1.4 §5.2）
@@ -265,6 +271,11 @@ ARGS=(
 if [[ "$POSE_STABILIZE" == "1" ]]; then
   ARGS+=(--pose-stabilize)
 fi
+if [[ "$ADAPTIVE_LOC_SUBMIT" == "1" ]]; then
+  ARGS+=(--adaptive-loc-submit)
+else
+  ARGS+=(--no-adaptive-loc-submit)
+fi
 
 if [[ "${LOC_BENCH_TRACK:-0}" == "1" ]]; then
   # Pure TRACK microbench: no MegaLoc BOOT/LOST pipeline.
@@ -273,7 +284,9 @@ if [[ "${LOC_BENCH_TRACK:-0}" == "1" ]]; then
 else
   # Flight-like pipeline (default): hover/freeze, then staged EDM + MegaLoc recovery.
   export SFM_HOLD_ON_LOW_CONF
-  export SFM_EDM_REF_FEATURE_CACHE="${SFM_EDM_REF_FEATURE_CACHE:-32}"
+  export SFM_EDM_REF_FEATURE_CACHE="${SFM_EDM_REF_FEATURE_CACHE:-192}"
+  export SFM_EDM_HOST_REF_FEATURE_CACHE="${SFM_EDM_HOST_REF_FEATURE_CACHE:-0}"
+  export SFM_EDM_QUERY_FEATURE_REUSE="${SFM_EDM_QUERY_FEATURE_REUSE:-1}"
   ARGS+=(
     --boot-lock-ms "$BOOT_LOCK_MS"
     --lost-hold
@@ -296,6 +309,7 @@ configure_operator_display "$DRY_RUN"
 
 echo "[影片模擬串流] video=$VIDEO_PATH"
 echo "[影片模擬串流] profile=$SITE_PROFILE topk=$LOCAL_TOPK stream_fps=$STREAM_FPS"
+echo "[影片模擬串流] adaptive_loc_submit=$ADAPTIVE_LOC_SUBMIT"
 echo "[影片模擬串流] 低信心 recovery：凍幀=${SFM_HOLD_ON_LOW_CONF}，連續 ${SFM_LOW_CONF_HOLD_RESULTS:-2} 筆觸發"
 echo "[影片模擬串流] 鏈路 preset=$LINK_PRESET：延遲 $ANAFI_LINK_LATENCY_MS ms、丟包 $ANAFI_LINK_LOSS_PCT %"
 echo "[影片模擬串流] ANAFI 串流模擬：H264 $ANAFI_LINK_PROFILE $ANAFI_LINK_KBPS kbps + intra-refresh"

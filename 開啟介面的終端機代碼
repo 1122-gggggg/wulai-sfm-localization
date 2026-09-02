@@ -2,12 +2,7 @@
 
   cd /home/allen/localization
   SFM_SITE_PROFILE="/home/allen/localization/地圖檔/場域/river_site/site_profile.json" \
-  VIDEO="/home/allen/localization/模擬器/測試影片/P1570157.MP4" \
+  VIDEO="/home/allen/localization/模擬器/測試影片/P1680168.MP4" \
   ./控制介面程式/影片模擬串流/啟動.sh
 
-  河濱真機模式：
-
-  cd /home/allen/localization
-  env -u SFM_SITE_PROFILE \
-  SFM_MISSION_SELECTION="/home/allen/localization/控制介面程式/mission_selections/river_site_b0_p116_p117_localization.json" \
-  ./控制介面程式/真機串流/啟動.sh
+  河濱真機模式：舊版核心地圖已還原，但 mission manifests 尚未完整復原，暫停使用。

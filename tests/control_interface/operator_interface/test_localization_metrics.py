@@ -2,16 +2,45 @@ from __future__ import annotations
 
 import json
 import math
+from types import SimpleNamespace
 
 from localization_metrics import (
     CIRCUIT_BREAKER_STATES,
     CUDA_SAMPLE_MIN_INTERVAL_S,
     RESULT_FIELDS,
     RESTART_REASONS,
+    attach_fused_localization_telemetry,
     build_localization_metric_record,
     edm_cache_metric_fields,
     sample_cuda_memory_stats,
 )
+
+
+def test_fused_telemetry_includes_independent_gnss_stamp() -> None:
+    timing = {}
+    state = SimpleNamespace(
+        att_roll=0.1,
+        att_pitch=-0.2,
+        att_yaw=1.3,
+        speed_north_mps=0.4,
+        speed_east_mps=-0.1,
+        speed_down_mps=0.0,
+        telemetry_read_mono_ns=2_100_000_000,
+        gps_read_mono_ns=2_000_000_000,
+        gps_latitude_deg=25.033,
+        gps_longitude_deg=121.5654,
+        gps_altitude_m=18.2,
+        gps_latitude_accuracy_m=0.8,
+        gps_longitude_accuracy_m=0.9,
+        gps_altitude_accuracy_m=1.4,
+    )
+
+    attach_fused_localization_telemetry(timing, state)
+
+    assert timing["fused_telemetry_mono"] == 2.1
+    assert timing["fused_gps_mono"] == 2.0
+    assert timing["fused_gps_latitude"] == 25.033
+    assert timing["fused_gps_longitude_accuracy"] == 0.9
 
 
 def test_metric_record_has_unique_bounded_fields_and_compatibility_defaults() -> None:
@@ -40,6 +69,22 @@ def test_metric_record_has_unique_bounded_fields_and_compatibility_defaults() ->
     assert record["limited_jump_confirmed"] is True
     assert record["loc_fps"] == 12.346
     assert "untrusted_extra" not in record
+    assert "vpr_ms" not in record
+    assert "refs" not in record
+
+
+def test_metric_record_keeps_explicit_null_but_omits_absent_result_fields() -> None:
+    record = build_localization_metric_record(
+        {"success": False, "wall_ms": 1.0, "rejected": None},
+        metric_mono_ns=1,
+        loc_fps=0.0,
+        submit_ok=0,
+        submit_skip_busy=0,
+        submit_busy_attempts=0,
+    )
+
+    assert "rejected" in record and record["rejected"] is None
+    assert "vpr_ms" not in record
 
 
 def test_metric_record_does_not_mutate_the_worker_result() -> None:
@@ -53,6 +98,7 @@ def test_metric_record_does_not_mutate_the_worker_result() -> None:
         submit_ok=0,
         submit_skip_busy=0,
         submit_busy_attempts=0,
+        adaptive_submit_interval_ms=37.5,
     )
 
     assert source == before
@@ -70,6 +116,7 @@ def test_metric_record_replaces_non_finite_values_before_json_output() -> None:
         submit_ok=0,
         submit_skip_busy=0,
         submit_busy_attempts=0,
+        adaptive_submit_interval_ms=37.5,
     )
 
     json.dumps(record, allow_nan=False)
@@ -87,6 +134,7 @@ def test_lifecycle_and_cuda_fields_are_bounded_and_copied() -> None:
         "restart_reason",
         "outage_duration_s",
         "rejected_submits",
+        "coalesced_submit_drops",
         "ready_latency_ms",
         "first_result_latency_ms",
         "circuit_breaker_state",
@@ -115,6 +163,7 @@ def test_lifecycle_and_cuda_fields_are_bounded_and_copied() -> None:
             "restart_reason": "oom",
             "outage_duration_s": 1.5,
             "rejected_submits": 2,
+            "coalesced_submit_drops": 7,
             "ready_latency_ms": 3576.6,
             "first_result_latency_ms": 40.0,
             "circuit_breaker_state": "open",
@@ -132,11 +181,14 @@ def test_lifecycle_and_cuda_fields_are_bounded_and_copied() -> None:
         submit_ok=1,
         submit_skip_busy=0,
         submit_busy_attempts=0,
+        adaptive_submit_interval_ms=37.5,
     )
     assert record["restart_reason"] == "oom"
     assert record["circuit_breaker_state"] == "open"
     assert record["oom_transition"] is True
     assert record["ready_latency_ms"] == 3576.6
+    assert record["coalesced_submit_drops"] == 7
+    assert record["adaptive_submit_interval_ms"] == 37.5
     assert record["edm_cache_hits"] == 875
     assert record["cuda_peak_allocated_bytes"] == 4096
     assert "untrusted_extra" not in record

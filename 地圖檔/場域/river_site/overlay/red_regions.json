@@ -1,0 +1,14 @@
+{
+  "site_id": "river_site_edm",
+  "map_ply": "地圖檔/場域/river_site/releases/river_gluemap_all8_direct_20260831/map/map.ply",
+  "rule": "empirical raw fail points: 1140 failures from 6 videos 720p stride3, dedup 1cm -> 217 points, no clustering",
+  "counts": {
+    "total_frames": 5599,
+    "total_fail": 1140,
+    "unique_fail_points": 217,
+    "total_danger": 1604
+  },
+  "spheres": [],
+  "raw_points_file": "empirical_fail_raw_points.ply",
+  "note": "raw points are rendered as small red dots, not large spheres"
+}

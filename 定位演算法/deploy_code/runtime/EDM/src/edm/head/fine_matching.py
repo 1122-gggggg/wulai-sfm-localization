@@ -372,12 +372,30 @@ class FineMatching(nn.Module):
             pred_score_mask &= data["pred_score"] > self.sigma_thr
             mask &= pred_score_mask
 
+        m_bids = data["b_ids"][mask]
+        m_mkpts0_f = mkpts0_f[mask]
+        m_mkpts1_f = mkpts1_f[mask]
+        m_mconf = data["mconf"][mask]
+        if self.bi_directional_refine:
+            # The 01/10 concat above is two independently 0..bs-1-sorted copies
+            # of b_ids stacked back to back, so after masking, m_bids is no
+            # longer monotonically non-decreasing whenever bs > 1 (e.g.
+            # [0,0,1,1,0,0,1,1]). Callers that split a batched match result by
+            # searching for per-reference boundaries (EDMMatcher._split_match_outputs)
+            # require a sorted, contiguous-per-batch b_ids. Restore that with a
+            # stable sort: it only reorders the already-selected match set, it
+            # does not change which matches are kept.
+            order = torch.argsort(m_bids, stable=True)
+            m_bids = m_bids[order]
+            m_mkpts0_f = m_mkpts0_f[order]
+            m_mkpts1_f = m_mkpts1_f[order]
+            m_mconf = m_mconf[order]
         data.update(
             {
                 # "gt_mask": data["mconf"] == 0,
-                "m_bids": data["b_ids"][mask],
-                "mkpts0_f": mkpts0_f[mask],
-                "mkpts1_f": mkpts1_f[mask],
-                "mconf": data["mconf"][mask],
+                "m_bids": m_bids,
+                "mkpts0_f": m_mkpts0_f,
+                "mkpts1_f": m_mkpts1_f,
+                "mconf": m_mconf,
             }
         )

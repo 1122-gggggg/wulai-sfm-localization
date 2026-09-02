@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import math
+import os
 from functools import partial
 from numbers import Real
 from pathlib import Path
 
 import pycolmap
 
-from artifact_integrity import verify_sha256
+from artifact_integrity import expected_sha256, verify_sha256
 from edm_profile import (
     apply_edm_tracker_profile,
     load_edm_production_profile,
@@ -54,9 +55,7 @@ def _load_bound_reference_index(
     source = Path(reference_index)
     if source.is_file():
         if source.name != "SHA256SUMS.json":
-            raise ValueError(
-                "reference_index file must be the index SHA256SUMS.json manifest"
-            )
+            raise ValueError("reference_index file must be the index SHA256SUMS.json manifest")
         root = source.parent
     else:
         root = source
@@ -124,9 +123,7 @@ def _validate_xfeat_vpr_metadata(meta: object) -> str:
             raise ValueError(f"XFeat production {key} metadata must declare MegaLoc")
         normalized = value.strip().lower()
         if not normalized.startswith("megaloc"):
-            raise ValueError(
-                f"XFeat production requires MegaLoc VPR metadata; {key}={value!r}"
-            )
+            raise ValueError(f"XFeat production requires MegaLoc VPR metadata; {key}={value!r}")
         declared.append(normalized)
     if not declared:
         raise ValueError("XFeat production bundle must declare MegaLoc VPR metadata")
@@ -187,7 +184,6 @@ def production_xfeat_config():
     )
 
 
-
 def build_reposed_motion_validator(profile: dict | None, camera, matcher, source=None):
     """Construct the lazy wrapper only when the profile enables it."""
     reposed = None if not profile else profile.get("reposed")
@@ -205,14 +201,13 @@ def build_reposed_motion_validator(profile: dict | None, camera, matcher, source
         max_matches=int(reposed["max_matches"]),
         min_inliers=int(reposed["min_inliers"]),
         max_rotation_delta_deg=float(reposed["max_rotation_delta_deg"]),
-        max_translation_direction_delta_deg=float(
-            reposed["max_translation_direction_delta_deg"]
-        ),
+        max_translation_direction_delta_deg=float(reposed["max_translation_direction_delta_deg"]),
         match_grid=int(reposed.get("match_grid", 1)),
         min_inlier_ratio=float(reposed.get("min_inlier_ratio", 0.0)),
         min_spatial_support=int(reposed.get("min_spatial_support", 0)),
     )
     return validator, str(reposed["mode"])
+
 
 def _build_edm_localizer(
     *,
@@ -249,7 +244,11 @@ def _build_edm_localizer(
     from edm_matcher import EDMMatcher
     from reloc_localizer_edm import Camera, DEVICE, EDMRelocMap, MegaLocQuery
 
-    reloc_map = EDMRelocMap.load(bundle, expected_sha256=bundle_sha256 or None)
+    trusted_bundle_sha256 = expected_sha256(bundle, bundle_sha256)
+    reloc_map = EDMRelocMap.load(
+        bundle,
+        expected_sha256=trusted_bundle_sha256,
+    )
     indexed_retrieval = _load_bound_reference_index(
         reference_index,
         ref_names=reloc_map.ref_names,
@@ -270,14 +269,21 @@ def _build_edm_localizer(
             topk=int(matcher_cfg["coarse_topk"]),
             fp16=bool(matcher_cfg["fp16"]),
             reference_cache_size=int(matcher_cfg["reference_cache_size"]),
-            runtime_sigma_mode=str(
-                matcher_cfg.get("runtime_sigma_mode", "reference_grid")
-            ),
+            runtime_sigma_mode=str(matcher_cfg.get("runtime_sigma_mode", "reference_grid")),
             temporal_feature_cache_size=int(
                 matcher_cfg["temporal_feature_cache_size"]
                 if "temporal_feature_cache_size" in matcher_cfg
                 else (2 if config.use_temporal_reference else 0)
             ),
+            query_cuda_graph=bool(matcher_cfg.get("query_cuda_graph", False)),
+        )
+        matcher.bind_reference_feature_store(
+            reloc_map.images,
+            bundle_sha256=trusted_bundle_sha256,
+            build_if_missing=os.environ.get("SFM_EDM_BUILD_REFERENCE_FEATURE_STORE", "0")
+            .strip()
+            .lower()
+            in {"1", "true", "yes", "on"},
         )
         profile_name = str(profile.get("name") or "unnamed")
         matcher_tag = (

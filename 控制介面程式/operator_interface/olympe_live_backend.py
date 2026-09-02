@@ -41,6 +41,7 @@ import os
 import sys
 import threading
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -70,6 +71,7 @@ from backend_contract import (  # noqa: E402
     StartResult,
 )
 from runtime_safety import assess_disk_space  # noqa: E402
+from operator_state import TrackerState  # noqa: E402
 from operator_flight_safety import (  # noqa: E402
     AuthorityController,
     TakeoffLandingSupervisor,
@@ -118,6 +120,44 @@ CRITICAL_TELEMETRY_MAX_AGE_S = 1.0
 
 def _clamp_pct(v: int) -> int:
     return max(-100, min(100, int(v)))
+
+
+def takeoff_battery_blocker(battery: float, battery_floor: float | None) -> str | None:
+    """D1: pure fragment of takeoff preflight -- battery-vs-floor decision only.
+
+    The caller has already fetched ``battery`` from live telemetry; this makes
+    just the threshold decision testable without a drone.
+    """
+    if battery_floor is None:
+        return "takeoff battery floor is unavailable or invalid"
+    if battery < battery_floor:
+        return f"battery {battery:.0f}% is below the {battery_floor:.0f}% takeoff floor"
+    return None
+
+
+@dataclass(frozen=True)
+class _TakeoffGpsOutcome:
+    blocker: str | None
+    advisory: str | None
+
+
+def takeoff_gps_outcome(*, fixed: bool | None, gps_required: bool) -> _TakeoffGpsOutcome:
+    """D1: pure fragment of takeoff preflight -- GPS-vs-geofence decision only.
+
+    ``fixed`` is None when the GPS state API itself is unavailable (distinct
+    from the API being available but reporting no fix). Either way, a
+    configured distance geofence that requires GPS blocks takeoff; otherwise
+    it is only an advisory, since a purely local/manual flight has no need
+    for GPS.
+    """
+    if fixed:
+        return _TakeoffGpsOutcome(None, None)
+    reason = "GPS state API unavailable" if fixed is None else "GPS fix unavailable"
+    if gps_required:
+        return _TakeoffGpsOutcome(
+            f"{reason}; required by configured distance geofence", None
+        )
+    return _TakeoffGpsOutcome(None, f"{reason}; takeoff remains allowed")
 
 
 _LINK_FAILURE_CONFIRM_POLLS = 3
@@ -253,11 +293,11 @@ class _CmdLog:
         if self._f is not None:
             try:
                 self.event("end")
-            except Exception:
+            except Exception:  # Tier3: teardown best-effort — event flush optional
                 pass
             try:
                 self._f.close()
-            except Exception:
+            except Exception:  # Tier3: teardown best-effort — file close optional
                 pass
             self._f = None
 
@@ -318,7 +358,9 @@ class OlympeLiveBackend:
         self.state.loc = "LIVE"
         self.state.stream = "CONNECTING"
         self.state.mode = "MANUAL"
-        self.state.tracker_state = "LINK"
+        # Initial construction, before self.log exists below: not a
+        # transition worth an audit trail entry, just the starting state.
+        self.state.tracker_state = TrackerState.LINK
         self.ip = ip
         self.controller = controller
         self.nudge_pct = safety_config.nudge_pct
@@ -482,6 +524,30 @@ class OlympeLiveBackend:
 
         self._connect()
 
+    def _set_tracker_state(self, new: TrackerState, *, reason: str) -> TrackerState:
+        """Centralized tracker_state transition (C2).
+
+        Single write point for the enum values this backend controls (the ANAFI
+        firmware's own FlyingStateChanged string, forwarded elsewhere, bypasses
+        this on purpose -- see TrackerState's docstring). Logs old/new/reason so
+        an incident reconstruction can see why the displayed state changed, not
+        just that it did.
+        """
+        old = self.state.tracker_state
+        self.state.tracker_state = new
+        if new != old:
+            # Several call sites (poll(), the nudge hold loop) re-assert the
+            # same state every cycle; only a real transition is log-worthy --
+            # logging every re-assertion would flood commands.jsonl/incidents
+            # on a healthy connection and add I/O to hot paths for no benefit.
+            #
+            # `old` is passed as-is, not str(old): TrackerState mixes in str,
+            # so it already serializes as its plain value ("LINK"), but
+            # Enum.__str__ (not str.__str__) wins for an explicit str() call
+            # and would log "TrackerState.LINK" instead.
+            self.log.event("tracker_state_transition", old=old, new=new.value, reason=reason)
+        return new
+
     # ------------------------------------------------------------------ connect
     def via_skycontroller(self) -> bool:
         """True when piloting/video go through SC USB (192.168.53.x)."""
@@ -505,7 +571,7 @@ class OlympeLiveBackend:
         if not self._set_piloting_source(initial_source):
             try:
                 self.drone.disconnect()
-            except Exception:
+            except Exception:  # Tier3: cleanup after failed piloting source — best-effort
                 pass
             self.drone = None
             raise RuntimeError(f"failed to confirm {initial_source} piloting source")
@@ -523,7 +589,7 @@ class OlympeLiveBackend:
         # while takeoff remains fail-closed.
         self._configure_firmware_limits_if_safe()
         self.state.stream = "OK"
-        self.state.tracker_state = "STICKS" if self.pilot_sticks else "HOVER"
+        self._set_tracker_state(TrackerState.STICKS if self.pilot_sticks else TrackerState.HOVER, reason="_connect")
         self.state.link_ok = True
         self.state.link_status = "OK"
         self.log.event("connect_ok")
@@ -1900,7 +1966,7 @@ class OlympeLiveBackend:
             # Block PCMD even if the hardware ownership readback failed.
             self.pilot_sticks = True
         if self.state.tracker_state not in {"LAND", "LANDING", "LAND_UNCONFIRMED"}:
-            self.state.tracker_state = "STICKS" if ok else "SOURCE_FAIL"
+            self._set_tracker_state(TrackerState.STICKS if ok else TrackerState.SOURCE_FAIL, reason="_restore_skycontroller_after_takeoff_abort")
         self.log.event("takeoff_source_restore", ok=ok, reason=reason)
         return ok
 
@@ -2015,15 +2081,9 @@ class OlympeLiveBackend:
                     "battery state unavailable or invalid"
                 )
             self.state.battery_pct = battery
-            if battery_floor is None:
-                return self._takeoff_preflight_fail(
-                    "takeoff battery floor is unavailable or invalid"
-                )
-            if battery < battery_floor:
-                return self._takeoff_preflight_fail(
-                    f"battery {battery:.0f}% is below the "
-                    f"{battery_floor:.0f}% takeoff floor"
-                )
+            battery_blocker = takeoff_battery_blocker(battery, battery_floor)
+            if battery_blocker is not None:
+                return self._takeoff_preflight_fail(battery_blocker)
 
         gps_required = bool(
             self.desired_distance_geofence and self.require_gps_for_geofence
@@ -2032,11 +2092,7 @@ class OlympeLiveBackend:
             from olympe.messages.ardrone3.GPSSettingsState import GPSFixStateChanged
         except Exception:
             self.state.gps_fixed = None
-            if gps_required:
-                return self._takeoff_preflight_fail(
-                    "GPS state API unavailable; required by configured distance geofence"
-                )
-            advisories.append("GPS state API unavailable; takeoff remains allowed")
+            outcome = takeoff_gps_outcome(fixed=None, gps_required=gps_required)
         else:
             gps_state = self._state_dict(GPSFixStateChanged)
             gps_fixed = gps_state.get("fixed") if gps_state is not None else None
@@ -2045,12 +2101,11 @@ class OlympeLiveBackend:
             except (TypeError, ValueError, OverflowError):
                 fixed = False
             self.state.gps_fixed = fixed
-            if not fixed:
-                if gps_required:
-                    return self._takeoff_preflight_fail(
-                        "GPS fix unavailable; required by configured distance geofence"
-                    )
-                advisories.append("GPS fix unavailable; takeoff remains allowed")
+            outcome = takeoff_gps_outcome(fixed=fixed, gps_required=gps_required)
+        if outcome.blocker is not None:
+            return self._takeoff_preflight_fail(outcome.blocker)
+        if outcome.advisory is not None:
+            advisories.append(outcome.advisory)
         return True
 
     def _takeoff_preflight_epoch_current(self, expected_epoch: int | None) -> bool:
@@ -2198,6 +2253,13 @@ class OlympeLiveBackend:
                 failures=self.zero_pcmd_failures,
             )
             return False
+        if call_mono_ns is None:
+            # No transport to send on (drone is None / disconnected). Nothing
+            # was sent, so this must not report success: the aircraft is not
+            # "now confirmed holding still", it just never got a command --
+            # exactly what a caller trusting True would fail to notice.
+            self.log.event("pcmd_zero_skipped_no_drone", reason=reason)
+            return False
         # Deliberately NOT logged on success. Callers hold self._lock across this,
         # and a log write per safety zero perturbed the RTH handoff enough to make
         # test_lost_controller_returns_home_when_gps_home_is_usable land instead
@@ -2246,6 +2308,14 @@ class OlympeLiveBackend:
                                maneuver=maneuver, pcmd=(roll, pitch, yaw, gaz))
                 return False
             pcmd_call_mono_ns = self._raw_pcmd(roll, pitch, yaw, gaz)
+            if pcmd_call_mono_ns is None:
+                # drone is None (disconnected): nothing was sent. Reporting
+                # True here would tell the caller a command reached the
+                # aircraft when none did.
+                self.log.event(
+                    "pcmd_skipped_no_drone", reason=reason, pcmd=(roll, pitch, yaw, gaz)
+                )
+                return False
             # Hold loop is 20 Hz — log at most ~2 Hz for hold reasons to cut latency/IO.
             if str(reason).startswith("nudge_hold:"):
                 now = time.monotonic()
@@ -2283,15 +2353,15 @@ class OlympeLiveBackend:
             ok = self._set_piloting_source("SkyController")
             if ok:
                 detail = "PC silent; SkyController sticks active"
-                self.state.tracker_state = "STICKS"
+                self._set_tracker_state(TrackerState.STICKS, reason="_give_to_pilot")
             else:
                 detail = "PC silent; SkyController source unconfirmed"
-                self.state.tracker_state = "SOURCE_FAIL"
+                self._set_tracker_state(TrackerState.SOURCE_FAIL, reason="_give_to_pilot")
         else:
             # No sticks on the link: Esc freezes PC PCMD (hover) until 恢復電腦控制.
             ok = True
             detail = "PC PCMD frozen (direct WiFi; no SC sticks)"
-            self.state.tracker_state = "PC_FROZEN"
+            self._set_tracker_state(TrackerState.PC_FROZEN, reason="_give_to_pilot")
         self.state.mode = "MANUAL"
         self.state.control_owner = (
             "SKYCONTROLLER" if self.via_skycontroller() else "PC_MANUAL_ZERO"
@@ -2313,7 +2383,7 @@ class OlympeLiveBackend:
         else:
             self._stick_monitor = None
             self.state.stick_monitor_ok = False
-            self.state.tracker_state = "STICK_MONITOR_FAIL"
+            self._set_tracker_state(TrackerState.STICK_MONITOR_FAIL, reason="_start_stick_monitor")
             self.state.active_incident = FailureReason.CONTROLLER_DISCONNECTED.value
 
     def _stop_stick_monitor(self) -> None:
@@ -2340,7 +2410,7 @@ class OlympeLiveBackend:
         """Latch HID loss; land if the command link is still usable."""
         self.state.stick_monitor_ok = False
         self.state.active_incident = FailureReason.CONTROLLER_DISCONNECTED.value
-        self.state.tracker_state = "STICK_MONITOR_FAIL"
+        self._set_tracker_state(TrackerState.STICK_MONITOR_FAIL, reason="_on_stick_monitor_disconnect")
         self.log.event(
             "controller_disconnect",
             reason=reason,
@@ -2441,7 +2511,7 @@ class OlympeLiveBackend:
         if self.via_skycontroller() and not self._stick_monitor_ready():
             with self._lock:
                 self.pilot_sticks = True
-            self.state.tracker_state = "STICK_MONITOR_FAIL"
+            self._set_tracker_state(TrackerState.STICK_MONITOR_FAIL, reason="_take_pc_control")
             self.log.event(
                 "pc_control", ok=False, note="stick_monitor_unavailable"
             )
@@ -2451,7 +2521,7 @@ class OlympeLiveBackend:
         if mon is not None and mon.is_active():
             with self._lock:
                 self.pilot_sticks = True
-            self.state.tracker_state = "STICKS"
+            self._set_tracker_state(TrackerState.STICKS, reason="_take_pc_control")
             self.log.event(
                 "pc_control",
                 ok=False,
@@ -2470,7 +2540,7 @@ class OlympeLiveBackend:
         if not self._set_piloting_source("Controller"):
             with self._lock:
                 self.pilot_sticks = True
-            self.state.tracker_state = "SOURCE_FAIL"
+            self._set_tracker_state(TrackerState.SOURCE_FAIL, reason="_take_pc_control")
             self.log.event("pc_control", ok=False, note="source_unconfirmed")
             return False
         # Re-sample the sticks AFTER the blocking handoff: the pilot may have grabbed
@@ -2479,7 +2549,7 @@ class OlympeLiveBackend:
         if mon is not None and mon.is_active():
             with self._lock:
                 self.pilot_sticks = True
-            self.state.tracker_state = "STICKS"
+            self._set_tracker_state(TrackerState.STICKS, reason="_take_pc_control")
             self.log.event("pc_control", ok=False, note="sticks_active_during_handoff")
             self._set_piloting_source("SkyController")
             return False
@@ -2490,7 +2560,7 @@ class OlympeLiveBackend:
                 return False
             if control_epoch != self._pulse_token:
                 self.pilot_sticks = True
-                self.state.tracker_state = "SOURCE_FAIL"
+                self._set_tracker_state(TrackerState.SOURCE_FAIL, reason="_take_pc_control")
                 self.log.event(
                     "pc_control", ok=False, note="safety_latched_during_handoff",
                 )
@@ -2505,16 +2575,16 @@ class OlympeLiveBackend:
             # returning; leaving firmware on Controller makes the False result
             # lie about who actually owns the aircraft.
             self._give_to_pilot(reason="pc_control_superseded")
-            self.state.tracker_state = "SOURCE_FAIL"
+            self._set_tracker_state(TrackerState.SOURCE_FAIL, reason="_take_pc_control")
             return False
         if not self._landed and not self.send_pcmd(
                 0, 0, 0, 0, reason="pc_control_resumed"):
             self._give_to_pilot(reason="pc_control_zero_failed")
-            self.state.tracker_state = "SOURCE_FAIL"
+            self._set_tracker_state(TrackerState.SOURCE_FAIL, reason="_take_pc_control")
             self.log.event("pc_control", ok=False, note="zero_pcmd_failed")
             return False
         self.state.mode = "MANUAL"
-        self.state.tracker_state = "PC"
+        self._set_tracker_state(TrackerState.PC, reason="_take_pc_control")
         self.log.event("pc_control", ok=True)
         return True
 
@@ -2532,7 +2602,7 @@ class OlympeLiveBackend:
         if not self.send_pcmd(0, 0, 0, 0, reason=reason):
             self.log.event("hover", reason=reason, ok=False)
             return False
-        self.state.tracker_state = "HOVER"
+        self._set_tracker_state(TrackerState.HOVER, reason="hover_cmd")
         self.state.mode = "MANUAL"
         return True
 
@@ -2548,7 +2618,7 @@ class OlympeLiveBackend:
             exp = self.drone(
                 Landing() >> FlyingStateChanged(state="landed", _timeout=20)
             )
-            self.state.tracker_state = "LANDING"
+            self._set_tracker_state(TrackerState.LANDING, reason="_land_and_confirm")
             waited = exp.wait(_timeout=22)
             ok = bool(getattr(waited, "success", lambda: False)())
         except Exception as exc:
@@ -2565,15 +2635,15 @@ class OlympeLiveBackend:
                     "land_cmd", reason=reason, ok=False, command_issued=False,
                     error=repr(exc2),
                 )
-            self.state.tracker_state = "LAND_UNCONFIRMED"
+            self._set_tracker_state(TrackerState.LAND_UNCONFIRMED, reason="_land_and_confirm")
             return False
 
         if ok:
             with self._lock:
                 self._landed = True
-            self.state.tracker_state = "LAND"
+            self._set_tracker_state(TrackerState.LAND, reason="_land_and_confirm")
         else:
-            self.state.tracker_state = "LAND_UNCONFIRMED"
+            self._set_tracker_state(TrackerState.LAND_UNCONFIRMED, reason="_land_and_confirm")
         self.log.event(
             "land_cmd", reason=reason, ok=ok,
             note="touchdown_confirmed" if ok else "touchdown_unconfirmed",
@@ -2624,7 +2694,7 @@ class OlympeLiveBackend:
         if self._is_already_landed():
             with self._lock:
                 self._landed = True
-            self.state.tracker_state = "LAND"
+            self._set_tracker_state(TrackerState.LAND, reason="land_cmd")
             landed = True
             self.log.event(
                 "land_cmd", reason=reason, ok=True, note="already_landed",
@@ -2675,7 +2745,7 @@ class OlympeLiveBackend:
                 "takeoff_exception"
             )
             if not self._landed:
-                self.state.tracker_state = "TAKEOFF_FAIL"
+                self._set_tracker_state(TrackerState.TAKEOFF_FAIL, reason="_takeoff_cmd_handle_exception")
         else:
             self._restore_skycontroller_after_takeoff_abort(
                 "takeoff_exception_superseded"
@@ -2746,11 +2816,11 @@ class OlympeLiveBackend:
                 )
                 self.log.event("takeoff", ok=False, note="hover_unconfirmed")
                 if not self._landed:
-                    self.state.tracker_state = "TAKEOFF_FAIL"
+                    self._set_tracker_state(TrackerState.TAKEOFF_FAIL, reason="_takeoff_cmd_run")
                 return False
 
             self.log.event("takeoff", ok=True)
-            self.state.tracker_state = "HOVER"
+            self._set_tracker_state(TrackerState.HOVER, reason="_takeoff_cmd_run")
             if self.flight_start is None:
                 self.flight_start = time.monotonic()
             self.send_pcmd(0, 0, 0, 0, reason="post_takeoff")
@@ -2800,7 +2870,7 @@ class OlympeLiveBackend:
             self._clear_maneuver("takeoff")
             return False
         if not preflight_ok:
-            self.state.tracker_state = "TAKEOFF_BLOCKED"
+            self._set_tracker_state(TrackerState.TAKEOFF_BLOCKED, reason="takeoff_cmd")
             self._clear_maneuver("takeoff")
             self.log.event(
                 "takeoff", ok=False, note="preflight_blocked",
@@ -2973,8 +3043,8 @@ class OlympeLiveBackend:
                     recording_state(cam_id=0, state="inactive",
                                     _policy="check_wait", _timeout=6)
                 ).wait(_timeout=8)
-            except Exception:
-                pass
+            except (OSError, RuntimeError) as exc:  # Tier1: recording stop — narrow, no silent pass
+                self.log.event("record_stop_wait_inactive_failed", error=repr(exc), reason=reason)
             self.log.event("record_stop", ok=ok_stop, reason=reason)
         except Exception as exc:
             self.log.event("record_stop", ok=False, reason=reason, error=repr(exc))
@@ -3003,14 +3073,14 @@ class OlympeLiveBackend:
     def _prepare_recording_download(self, media: Any) -> None:
         try:
             media.download_dir = str(self.record_dir)
-        except Exception:
-            pass
+        except (OSError, RuntimeError) as exc:  # Tier1: recording media setup — narrow, log, fallback
+            self.log.event("record_prepare_download_dir_failed", error=repr(exc), dir=str(self.record_dir))
         # Allow media indexing a moment after stop_recording.
         time.sleep(1.0)
         try:
             media.wait_for_pending_downloads(timeout=_MEDIA_PENDING_TIMEOUT_S)
-        except Exception:
-            pass
+        except (OSError, RuntimeError) as exc:  # Tier1: recording media setup — narrow, log, fallback
+            self.log.event("record_prepare_pending_wait_failed", error=repr(exc))
 
     def _download_recording_media(self, media: Any, media_id: Any) -> None:
         try:
@@ -3120,7 +3190,7 @@ class OlympeLiveBackend:
             self._nudge_vector = tuple(axes)
             self._nudge_deadline = time.monotonic() + self.nudge_pulse_s
             self._nudge_held.add(_VECTOR_HOLD)
-        self.state.tracker_state = "NUDGE"
+        self._set_tracker_state(TrackerState.NUDGE, reason="set_nudge_vector")
         self._ensure_nudge_loop()
         return True
 
@@ -3187,7 +3257,7 @@ class OlympeLiveBackend:
                 except Exception as exc:
                     self.log.event("pcmd_zero_failed", reason="vector_release",
                                    error=repr(exc))
-                self.state.tracker_state = "HOVER"
+                self._set_tracker_state(TrackerState.HOVER, reason="clear_nudge_vector")
 
     def _combined_nudge_pcmd(self) -> tuple[int, int, int, int]:
         """Sum the stick vector AND every held direction, clamped to ±nudge_pct.
@@ -3253,7 +3323,7 @@ class OlympeLiveBackend:
             motion_epoch=motion_epoch,
         )
         if sent:
-            self.state.tracker_state = "NUDGE"
+            self._set_tracker_state(TrackerState.NUDGE, reason="_nudge_loop_step")
         self._nudge_loop_stop.wait(self._nudge_period_s)
         return True, deadman_expired
 
@@ -3285,7 +3355,7 @@ class OlympeLiveBackend:
                 # failsafe is the remaining authority. Record it, never hide it.
                 self.log.event("pcmd_zero_failed", reason=zero_reason,
                                error=repr(zero_exc))
-            self.state.tracker_state = "HOVER"
+            self._set_tracker_state(TrackerState.HOVER, reason="_finish_nudge_loop")
             if loop_error is not None:
                 self.state.last_command = "nudge_loop_error_hover"
                 self.log.event(
@@ -3397,7 +3467,7 @@ class OlympeLiveBackend:
         self.log.event("nudge_begin", name=name, held=sorted(self._nudge_held),
                        pcmd=self._combined_nudge_pcmd())
         self.state.last_command = f"nudge_begin:{name}"
-        self.state.tracker_state = "NUDGE"
+        self._set_tracker_state(TrackerState.NUDGE, reason="nudge_begin")
         self._ensure_nudge_loop()
         return True
 
@@ -3429,7 +3499,7 @@ class OlympeLiveBackend:
         )
         return False
 
-    def nudge_end(self, name: str) -> None:
+    def nudge_end(self, name: str) -> bool:
         """Key/button released: drop this direction; hover if none left."""
         with self._lock:
             had_name = name in self._nudge_held
@@ -3448,10 +3518,11 @@ class OlympeLiveBackend:
             self._nudge_loop_stop.set()
             if not self.pilot_sticks and not self._landed and not self._cleanup_done:
                 self._zero_pcmd_or_log("nudge_release_hover")
-                self.state.tracker_state = "HOVER"
+                self._set_tracker_state(TrackerState.HOVER, reason="nudge_end")
         else:
             # Recompute loop continues with remaining holds.
             self._ensure_nudge_loop()
+        return True
 
     def nudge_clear(self, reason: str = "clear") -> None:
         """Release all held directions AND the stick vector; stop the hold loop.
@@ -3644,6 +3715,8 @@ class OlympeLiveBackend:
             return handled
         name, payload = request.legacy_call()
         raw = self.command(name, **payload)
+        if isinstance(raw, ControlResult):
+            return raw
         return ControlResult.completed(self.state, raw_result=raw)
 
     def _command_typed_request(self, request: ControlRequest) -> ControlResult:
@@ -3718,7 +3791,7 @@ class OlympeLiveBackend:
             accepted = self.take_pc_control()
             if accepted:
                 self.state.mode = "PC_CONTROL"
-                self.state.tracker_state = "LOCALIZATION_ONLY"
+                self._set_tracker_state(TrackerState.LOCALIZATION_ONLY, reason="_legacy_auto_command")
                 self.log.event(
                     "localization_pc_control",
                     ok=True,
@@ -3732,7 +3805,7 @@ class OlympeLiveBackend:
                 )
             return accepted
         if name == "boot_lock":
-            self.state.tracker_state = "BOOT_INIT"
+            self._set_tracker_state(TrackerState.BOOT_INIT, reason="_legacy_auto_command")
             return True
         accepted = self.hover_cmd(f"ui_{name}")
         self.log.event(name)
@@ -3787,7 +3860,7 @@ class OlympeLiveBackend:
             if not self.send_pcmd(0, 0, 0, 0, reason="nudge_clear"):
                 return False
             if self._maneuver_in_progress is None:
-                self.state.tracker_state = "HOVER"
+                self._set_tracker_state(TrackerState.HOVER, reason="_legacy_nudge_command")
                 self.state.mode = "MANUAL"
             return True
         # Legacy one-shot name: treat as begin (UI should send begin/end).
@@ -3890,9 +3963,9 @@ class OlympeLiveBackend:
         self.state.active_incident = reason.value
         self.state.last_command = f"fail_safe:{reason.value}"
         self.state.tracker_state = (
-            "EMERGENCY_MANUAL"
+            TrackerState.EMERGENCY_MANUAL
             if reason is FailureReason.EMERGENCY_STOP
-            else "FAIL_SAFE_MANUAL"
+            else TrackerState.FAIL_SAFE_MANUAL
         )
         self.log.event(
             "fail_safe",
@@ -3928,7 +4001,7 @@ class OlympeLiveBackend:
         self.state.active_incident = FailureReason.STREAM_STALE.value
         self.state.stream = "LOST"
         self.state.loc = "STREAM_LOST"
-        self.state.tracker_state = "STREAM_LOST_HOVER"
+        self._set_tracker_state(TrackerState.STREAM_LOST_HOVER, reason="stream_lost_hover")
         self.state.last_command = f"stream_lost_hover: {detail}"
         return self.state
 
@@ -4119,7 +4192,7 @@ class OlympeLiveBackend:
         if not ok:
             return False
         self.state.mode = "MANUAL"
-        self.state.tracker_state = "RTH"
+        self._set_tracker_state(TrackerState.RTH, reason="_request_rth")
         self.state.last_command = f"rth:{reason}"
         if self.via_skycontroller():
             handed_off = self._set_piloting_source("SkyController")
@@ -4226,7 +4299,7 @@ class OlympeLiveBackend:
             self._runtime_safety_action_latched = True
             self._runtime_safety_action_reason = str(reason)
             self.state.active_incident = str(reason)
-            self.state.tracker_state = "SAFETY_ACTION_PENDING"
+            self._set_tracker_state(TrackerState.SAFETY_ACTION_PENDING, reason="_schedule_runtime_safety_action")
             self.state.last_command = f"runtime_safety:{reason}"
             thread = threading.Thread(
                 target=self._execute_runtime_safety_action,
@@ -4338,7 +4411,7 @@ class OlympeLiveBackend:
             self._link_failure_count = _LINK_FAILURE_CONFIRM_POLLS
         self.state.mode = "MANUAL"
         self.state.control_owner = "ONBOARD_LOST_LINK_POLICY"
-        self.state.tracker_state = "LINK_LOST_ONBOARD"
+        self._set_tracker_state(TrackerState.LINK_LOST_ONBOARD, reason="_latch_total_link_loss")
         self.state.last_command = "host_commands_blocked:control_link_lost"
         self.state.active_incident = FailureReason.CONTROL_LINK_LOST.value
         self.log.event(
@@ -4977,7 +5050,7 @@ class OlympeLiveBackend:
                 note="landing_attempt_failed",
             )
         if landed and outcome is not None and outcome.reason_code == "ALREADY_LANDED":
-            self.state.tracker_state = "LAND"
+            self._set_tracker_state(TrackerState.LAND, reason="_cleanup_attempt_landing_under_authority")
             self._cleanup_log(
                 "land_cmd",
                 reason="cleanup_exit",
@@ -5019,7 +5092,7 @@ class OlympeLiveBackend:
         if self.grabber is not None:
             try:
                 self.grabber.stop()
-            except Exception:
+            except Exception:  # Tier3: teardown best-effort — grabber stop optional
                 pass
             self.grabber = None
         if self.drone is not None:
@@ -5079,7 +5152,7 @@ class OlympeLiveBackend:
             self._cleanup_log("cleanup_done", touchdown_confirmed=True)
             try:
                 self.log.close()
-            except Exception:
+            except Exception:  # Tier3: teardown best-effort — log close optional
                 pass
             return True
 

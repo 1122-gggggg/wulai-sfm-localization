@@ -45,6 +45,7 @@ files = [
   "控制介面程式/operator_interface/operator_shutdown.py",
   "控制介面程式/operator_interface/operator_tick.py",
   "控制介面程式/operator_interface/runtime_safety.py",
+  "控制介面程式/operator_interface/simulated_route_test.py",
 ]
 check_untyped_defs = true
 disallow_untyped_defs = true

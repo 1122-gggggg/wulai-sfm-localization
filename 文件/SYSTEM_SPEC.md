@@ -134,9 +134,9 @@ Pose + TRACK / WEAK_TRACK / LOST
 
 - Site profile 必須綁定 UI 顯示 PLY 與 EDM localization bundle；portable full-runtime
   另要求 `query_camera`。reference poses、route、poles 與場域特調 runtime profile 為選配。
-- 河濱 canonical 相容 profile 為 `地圖檔/場域/river_site/site_profile.json`；真機不直接採信該 profile，而只採信 mission selection resolver 產生的 snapshot。目前預設 `river_site_b0_p116_p117_localization.json` 只有地面定位（`flight_ready=false`，無新座標系 route）。ANAFI 不要求靜態 IMU receipt；真機羅盤校正完成且韌體回讀為有效後，preflight 第一步自動通過，其餘步驟仍由操作員當次確認。
-- 河濱 profile 的 `flight.coordinate_frame_id` 綁定同一次 reconstruction，controller 為 `null`；schema v2 不定義也不要求 `map_units_per_meter`。
-- 目前河濱 B0+P116/P117 EDM runtime 的 `S=1.470463` 是參考相機分布所算出的演算法場景尺度，只用於 `radius`／jump gate；它不是 map-unit-to-metre 比例。舊 454-ref `river_site.json` 的 `S=1.900843` 不再是預設地圖。現有文字 `scale-calibrated` 容易和公尺尺度混淆。
+- 河濱 canonical 相容 profile 為 `地圖檔/場域/river_site/site_profile.json`；真機不直接採信該 profile，而只採信 mission selection resolver 產生的 snapshot。目前預設 `river_gluemap_all8_direct_localization.json` 使用全八段 GLUEMAP，但來源標示未驗證；獨立 holdout、ANAFI camera-pipeline receipt 與 route 都未提供，因此 resolver 同時阻擋真機定位與 AUTO。
+- 河濱 profile 的 `flight.coordinate_frame_id` 綁定 `river_gluemap_all8_direct_20260831_d2b8a5304eff`；controller 保留 scale-free 守門參數但因 `approved=false` 與 route 缺失不可啟用，schema v2 不定義也不要求 `map_units_per_meter`。
+- 目前全八段 EDM runtime 的 `S=2.334692` 是參考相機分布所算出的演算法場景尺度，只用於 `radius`／jump gate；它不是 map-unit-to-metre 比例。
 - 同一 profile 實際有提供的 PLY、bundle、reference poses 與 route
   必須來自同一次重建；不同 SfM 重建不可直接混用。
 
@@ -342,7 +342,7 @@ flowchart TD
 | 項目 | 值 |
 |---|---|
 | interface | `simulated-stream`，唯讀 |
-| mission selection | `控制介面程式/mission_selections/river_site_b0_p116_p117_localization.json`（地面定位；無 route） |
+| mission selection | `控制介面程式/mission_selections/river_gluemap_all8_direct_localization.json`（來源未獨立驗證；resolver fail closed；無 route） |
 | resolver site-profile snapshot | `執行環境/mission_snapshots/`（runtime 產生，不是另一份核准來源） |
 | video | `模擬器/測試影片/` 內明確指定的影片；P167 為目前驗證片，P119 仍可用 |
 | output stream | 1280×720、30 fps、H.264 Main、5,000 kbps |
@@ -442,7 +442,7 @@ class FrameSource(Protocol):
 | `LAND_NOW` | 模擬降落 | 明確且獨立的緊急降落命令 |
 | `APPLY_LIMITS` | 更新模擬 HUD | 只在確認落地時寫 firmware，ack/readback 不一致即失敗 |
 | `START_LOCALIZATION` | 啟動 worker feed | 啟動 worker feed，不取回 PC 控制、不起飛 |
-| `START_AUTO` | 可進入純模擬 route test | 原始 backend typed request 仍回 `LOCKED_EXTERNAL_APPROVAL`；桌面人類 UI 由已驗證路線鎖與整合協調器執行起飛、定位懸停及 route loop |
+| `START_AUTO` | 可從航線編輯器的「儲存並開始模擬航線」進入純模擬 route test；使用 production `RouteAutoController` 與記憶體內運動模型，不連 Olympe | 原始 backend typed request 仍回 `LOCKED_EXTERNAL_APPROVAL`；桌面人類 UI 由已驗證路線鎖與整合協調器執行起飛、定位懸停及 route loop |
 
 未知 action、缺 payload、錯誤狀態或 backend 不支援時，必須回傳明確拒絕理由，不可只寫 log 後假裝成功。
 

@@ -18,6 +18,7 @@ EDM_REQUIRED_MATCHER_KEYS = {
 EDM_OPTIONAL_MATCHER_KEYS = {
     "runtime_sigma_mode",
     "temporal_feature_cache_size",
+    "query_cuda_graph",
 }
 EDM_RUNTIME_SIGMA_MODES = {"bidirectional", "reference_grid"}
 EDM_REQUIRED_TRACKER_KEYS = {
@@ -68,11 +69,23 @@ EDM_OPTIONAL_TRACKER_KEYS = {
     "lost_global_retrieval_interval",
     "pose_consensus_mode",
     "consensus_max_rotation_deg",
+    # P95 tail optimized default 0.5 via code (EDMConfig) from a2_quality 508/700
+    # p95 89.87ms (lowest tail, vs s0 486/700 p95 109.56ms). Profile may omit this
+    # key; code default applies. Kept optional to preserve river compat SHA
+    # 93e0c2... — use SFM_EDM_REFERENCE_QUALITY_WEIGHT env to override hashed profiles.
     "reference_quality_weight",
     "reference_quality_floor",
     "acquire_stage_mode",
+    "track_map_first",
+    "pnp_ranked_batches",
     "lost_prior_strategy",
     "lost_prior_fusion_weight",
+    "track_yaw_slack_deg",
+    "track_max_yaw_rate_deg_s",
+    "track_max_yaw_step_deg",
+    "stale_reacquire_confirmations",
+    "stale_reacquire_max_distance",
+    "stale_reacquire_max_yaw_diff_deg",
 }
 EDM_REQUIRED_REPOSED_KEYS = {
     "mode",
@@ -90,7 +103,7 @@ EDM_OPTIONAL_REPOSED_KEYS = {
     "min_spatial_support",
 }
 EDM_POSE_CONSENSUS_MODES = {"pairwise", "cluster"}
-EDM_ACQUIRE_STAGE_MODES = {"full_set", "initial_topk"}
+EDM_ACQUIRE_STAGE_MODES = {"full_set", "initial_topk", "progressive"}
 EDM_LOST_PRIOR_STRATEGIES = {"restrict_nearby", "full_global", "score_fusion"}
 EDM_REPOSED_MODES = {"off", "shadow", "confirm_limited_jump"}
 
@@ -161,6 +174,11 @@ def _validate_edm_matcher_profile(matcher: dict, source: Path) -> None:
         raise ValueError(
             f"EDM matcher temporal_feature_cache_size must be a non-negative integer: {source}"
         )
+    query_cuda_graph = matcher.get("query_cuda_graph")
+    if query_cuda_graph is not None and not isinstance(query_cuda_graph, bool):
+        raise ValueError(
+            f"EDM matcher query_cuda_graph must be boolean: {source}"
+        )
 
 
 def _is_strict_int(value: object) -> bool:
@@ -212,7 +230,8 @@ _EDM_TRACKER_CHOICES = (
     (
         "acquire_stage_mode",
         EDM_ACQUIRE_STAGE_MODES,
-        "EDM tracker acquire_stage_mode must be 'full_set' or 'initial_topk': ",
+        "EDM tracker acquire_stage_mode must be "
+        "'full_set', 'initial_topk', or 'progressive': ",
     ),
     (
         "lost_prior_strategy",
@@ -240,6 +259,22 @@ _EDM_TRACKER_NUMBER_CHECKS = (
         ("reference_quality_weight", "reference_quality_floor"),
         _is_nonnegative_finite,
         "must be finite and >= 0",
+    ),
+    (
+        (
+            "track_yaw_slack_deg",
+            "track_max_yaw_rate_deg_s",
+            "track_max_yaw_step_deg",
+            "stale_reacquire_max_distance",
+            "stale_reacquire_max_yaw_diff_deg",
+        ),
+        _is_positive_finite,
+        "must be finite and > 0",
+    ),
+    (
+        ("stale_reacquire_confirmations",),
+        _is_positive_int,
+        "must be a positive integer",
     ),
 )
 
