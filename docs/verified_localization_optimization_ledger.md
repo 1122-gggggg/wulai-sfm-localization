@@ -211,7 +211,7 @@
 
 **地圖相依性：參考品質分佈相依，但 tail 優化在 1,045-ref river 地圖上已獨立驗證。** 新地圖需重跑 `a2_quality` 對照（0.0 vs 0.5）並比較 p95 與成功率；若新地圖品質訊號不同，可調權重或退回 0.0。
 
-- 2026-09-02：候選 profile `定位演算法/configs/edm_profiles/river_gluemap_all8_direct_20260831_temporal_off_quality_candidate.json` 已把此權重明寫 `0.5`（pin against code-default 漂移）。flight profile 尚未改，等版本發布依「E. 升級與記錄」同步 SHA。
+- 2026-09-02：`reference_quality_weight` 0.5 仍是 EDMConfig code default，繼續生效。候選 profile 有把它明寫，但候選 profile 因 temporal-off 部分被 2026-09-02 gate REJECTED（見下方「2026-09-02 GPU gate 結果」），整支候選不採用。此權重本身沒有被 gate 否定。
 
 ### 11. Temporal reference 預設關閉（s3_no_temporal，+34 gain）
 
@@ -229,16 +229,48 @@
 
 **地圖相依性：機制不相依但收益隨 reference 密度改變。** 新地圖需重跑 temporal on/off 對照；若新地圖 temporal 確有增益，可於新 compat profile 明確設 `true`。
 
-- 2026-09-02：候選 profile `定位演算法/configs/edm_profiles/river_gluemap_all8_direct_20260831_temporal_off_quality_candidate.json` 已把 `use_temporal_reference` 設 `false`。flight profile（SHA `93e0c2...`）仍為 `true`，等版本發布時同步。**注意：temporal-off 與 quality-0.5 兩項疊加的合併 profile 尚未跑過任何 holdout（見 `docs/localization_optimization_runbook.md` §1c）。**
+- 2026-09-02：**在目前樹上 temporal-off gate REJECTED**（P168 +20 但 P117 −20 successes、LOST +12、兩段 +11~12 ms p50）。flight profile 維持 `use_temporal_reference: true`。詳見下方「2026-09-02 GPU gate 結果」。本項的 s3_no_temporal +34 結論建立在 2026-09-01 舊樹,現已被更好的基準吸收,不再有效。
 
 ## 待辦與進行中優化（不在本總帳，另見 runbook）
 
 排序、gate、狀態追蹤在 `docs/localization_optimization_runbook.md`。摘要：
 
-- Tier 1：temporal-off、quality-0.5 已有證據，等版本發布同步進 flight profile（候選 profile 已備）。
-- Tier 2：recovery↔latency 前緣（state-conditional reference budget）、EDM 上一幀 anchor、`async_pipeline.py` 空殼。
-- Tier 3（本分支進行中、未過 gate、不得宣稱已驗證）：ESEKF 15 維融合、KLT 3D-aware init、EDM neck `repeat→expand`（總帳明列尚未驗證，需 exact + synchronized benchmark）、`fine_matching.py` bi-directional `m_bids` 重排（疑似 correctness fix）。
+- Tier 1：temporal-off — **2026-09-02 gate 判定 REJECTED（見下）**。
+- Tier 2：recovery↔latency 前緣（state-conditional topk 其實已實作，剩下的是 reference 選擇 policy 調參）、EDM 上一幀 anchor、`async_pipeline.py` 空殼。
+- Tier 3：ESEKF 15 維融合（已在 `__init__` 無條件實例化，純 replay 因無 live velocity 而休眠；不能用 replay gate）；EDM neck `repeat→expand`（**2026-09-02 已驗證 exact，但無 TRACK 加速**，見下）；`fine_matching.py` bi-directional `m_bids` 重排（疑似 correctness fix，未單獨驗證）。
 - 2026-09-02 已做的安全子集：`_track_klt_prior` 移除 `raise StopIteration` 控制流（行為等價）；`benchmark_edm_site_replay._apply_reference_feature_cache_overrides` 的 8GiB 預算對 CLI override 失效（SUMMARY.md s1_cache1045）已修並補回歸測試 `定位演算法/validation/tests/test_validation_benchmark_helpers.py::test_reference_feature_cache_override_*`。
+
+## 2026-09-02 GPU gate 結果（RTX 5060，venv torch 2.11.0+cu128；固定 P168 700f / P117 全段，stride 3，seed 0，--require-cuda --gpu-span）
+
+**基準已移動。** 現行 committed 樹（含本分支 matcher/reloc rework）的 flight-profile 基準是
+P168 **536/700（76.6%）** p50 23.33 p95 107.78 ms、P117 **366/416（88.0%）** p50 23.75 p95 62.09 ms。
+總帳舊的 s0=486/700 是 2026-09-01、matcher rework 之前的樹，已不可比。原始 JSON：
+`outputs/tier1_gate_20260902/`（本機，不進版控）。
+
+### Tier 1 — `use_temporal_reference` true→false：REJECTED
+
+| holdout | baseline | candidate（--no-use-temporal-reference） | 判定 |
+|---|---|---|---|
+| P168 700f | 536/700，p50 23.33，p95 107.78 | 556/700（+20），p50 35.47（+12），p95 79.36（−28） | 進步 |
+| P117 全段 | 366/416，LOST 42，p50 23.75，p95 62.09 | 346/416（**−20**），LOST 54（**+12**），p50 34.86（+11），p95 64.78 | **退化** |
+
+- `reference_quality_weight` 0.5 已是 EDMConfig code default，baseline 與 candidate 都在跑；本次唯一實測 delta 是 temporal off。
+- 分裂結果：P168 贏、P117 輸 5 個百分點且 LOST +12，另外兩段都 +11~12 ms p50。違反准入規則「完整 replay 不得降低核准的 recovery/quality gate」。
+- **結論：flight profile 維持 `use_temporal_reference: true`。** 候選 profile 標記 REJECTED。總帳項 11 的 s3_no_temporal +34 結論建立在舊樹上，已被目前更好的基準吸收；在目前樹上 temporal-off 只是拿一段換另一段。若日後 recovery 路徑再改善，可重跑。
+
+### Tier 3 — EDM neck query `repeat→expand`：exact 已驗證，無 TRACK 加速
+
+- 加 `SFM_EDM_NECK_NO_EXPAND=1` env toggle（`定位演算法/deploy_code/runtime/EDM/src/edm/neck/neck.py`）強制回舊的 2*B 路徑做 A/B。
+- P168 700 幀逐幀比對：**0 個欄位差（tol 1e-9）**，536 個 pose `max|Δpose_xyz| = 0.000e+00`（bit-identical）。success/mode/inliers/reproj/n_corr/refs 全同。→ 總帳「query tensor repeat 改 expand：尚未驗證」的 exact 疑慮解除。
+- 但 `match_ms` p50：expand ON 17.89 ms vs verbatim 17.55 ms（expand 略慢 0.3 ms）；p90 62.2 vs 59.7。TRACK batch 是 B=2，省 B−1=1 次 query unary CNN 抵不過 `.expand().contiguous()` + `torch.cat` 的開銷。大 batch 的 acquisition 可能有利但未量。
+- **結論：expand 路徑數值安全（可保留 guarded），但不是 TRACK 加速，不列為已驗證優化。** 若要簡化程式碼可移除;要保留則維持 shape-driven guard + `SFM_EDM_NECK_NO_EXPAND` 逃生閥。
+
+### Tier 3 — ESEKF
+
+`ESEKF` 在 `ProductionEDMTracker.__init__` 無條件實例化（import 成功即建）。`predict` 需要
+`observe_fused_state` 餵 `_latest_velocity_ned`，純 replay 沒有這個來源 → `prediction_allowed()`
+維持 False → PREDICTED_ONLY 的 ESEKF 分支在 replay 不會觸發。上面的 536/700 基準已含這條（休眠的）
+程式碼路徑。ESEKF 的實際效果要 live telemetry 才能評，replay gate 評不到。
 
 ## 現行 profile 中仍需場域重驗的組合設定
 

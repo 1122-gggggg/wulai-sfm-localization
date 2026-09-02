@@ -1,3 +1,5 @@
+import os
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -105,7 +107,14 @@ class CIM(nn.Module):
             # Ledger rejected 15-25% saving claim for query repeat->expand without synchronized exact benchmark (docs/verified_localization_optimization_ledger.md: query tensor repeat改expand not yet verified).
             # Optimize by computing query branch once (first query element) then replicate via expand/repeat for cross-attention; keep fallback 2*B path when B==1 or not duplicated to preserve exact behavior.
             B = f32.shape[0] // 2
-            duplicated = B > 1 and f32.shape[0] % 2 == 0 and f8.shape[0] == f32.shape[0] and f16.shape[0] == f32.shape[0]
+            # SFM_EDM_NECK_NO_EXPAND=1 forces the verbatim 2*B path for exactness A/B.
+            duplicated = (
+                B > 1
+                and f32.shape[0] % 2 == 0
+                and f8.shape[0] == f32.shape[0]
+                and f16.shape[0] == f32.shape[0]
+                and os.environ.get("SFM_EDM_NECK_NO_EXPAND") != "1"
+            )
             if duplicated:
                 # Split refs and single query (query is tiled B times in match_many_to_one)
                 f32_ref = f32[:B]

@@ -1,7 +1,7 @@
 {
   "schema": "edm-deployment-profile/v1",
   "name": "river_gluemap_all8_direct_20260831_temporal_off_quality_candidate",
-  "status": "candidate: temporal reference OFF + reference_quality_weight 0.5 pinned explicitly; ledger items 10 & 11 evidence on the 1045-ref P168 700-frame holdout; NOT flight approved; flight-release edm_runtime_profile.json still unchanged (SHA 93e0c2...) pending a versioned release sync",
+  "status": "REJECTED by the 2026-09-02 gate on the current tree. temporal-off helps P168 (536 -> 556, p95 107.8 -> 79.4 ms) but regresses P117 (366 -> 346, LOST 42 -> 54) and costs +12 ms p50 on both. Do NOT promote into the flight profile. Kept for reference / re-test after further recovery work. See docs/verified_localization_optimization_ledger.md dated 2026-09-02 and docs/localization_optimization_runbook.md section 1.",
   "base": "地圖檔/場域/river_site/releases/river_gluemap_all8_direct_20260831/localization/edm_runtime_profile.json",
   "map_scale": {
     "S": 2.3346915245056152,
@@ -90,10 +90,13 @@
       "outputs/p168_all8_baseline_20260901/SUMMARY.md",
       "docs/verified_localization_optimization_ledger.md items 10 and 11"
     ],
-    "not_yet_validated": [
-      "The two changes were each measured on their own vs s0; the COMBINED profile (temporal off AND quality 0.5) has not been run on the P168 or P117 holdout.",
-      "No independent ANAFI camera-pipeline holdout exists for this map (validation: NONE per the flight release).",
-      "Do not promote this into the flight-release edm_runtime_profile.json until a versioned release re-issues the localizer_profile SHA in both site_profile.json files, SHA256SUMS and MANIFEST.tsv, per docs/verified_localization_optimization_ledger.md 'E. 升級與記錄'."
+    "gate_result_20260902": [
+      "Baseline = current committed tree, flight profile as-is (NOT the stale ledger s0=486). P168 700f stride3 seed0 --require-cuda.",
+      "P168 baseline 536/700 (76.6%) p50 23.33 p95 107.78 ms; P168 candidate 556/700 (79.4%, +20) p50 35.47 p95 79.36 ms.",
+      "P117 baseline 366/416 (88.0%) LOST 42 p50 23.75 p95 62.09 ms; P117 candidate 346/416 (83.2%, -20) LOST 54 (+12) p50 34.86 p95 64.78 ms.",
+      "Split result: P168 win, P117 regression (-5 pts, LOST +12). Fails the admission rule 'complete replay must not lower an approved recovery/quality gate'. Do not ship.",
+      "quality_weight 0.5 is already the EDMConfig code default and was active in both baseline and candidate; the only real delta measured here is use_temporal_reference false.",
+      "No independent ANAFI camera-pipeline holdout exists for this map (validation: NONE per the flight release)."
     ],
     "how_to_gate": [
       "python 定位演算法/validation/benchmark_edm_site_replay.py --site-profile <release>/site_profile.json --video 模擬器/測試影片/P1680168.MP4 --stride 3 --max-frames 700 --pnp-random-seed 0 --require-cuda --gpu-span --out outputs/<baseline>.json",
