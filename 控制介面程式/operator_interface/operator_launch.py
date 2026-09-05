@@ -176,7 +176,14 @@ def build_argument_parser() -> argparse.ArgumentParser:
             "latency while preserving latest-frame delivery"
         ),
     )
-    ap.add_argument("--tick-ms", type=int, default=8)
+    ap.add_argument(
+        "--tick-ms",
+        type=int,
+        default=33,
+        help="UI tick period in ms, clamped to 8..33; the ~30 Hz ceiling keeps "
+        "render-heavy ticks from starving the result-notification filehandler "
+        "(runbook 0b)",
+    )
     ap.add_argument(
         "--stream-fps",
         type=float,

@@ -154,6 +154,49 @@ EOF
 `./IMU飛行測試.sh` 飛一趟，`tools/imu_flight_test_report.py` 就會直接印出
 「最貴的階段」與每個 stage 的 p50/max。拿到那個名字之後才值得動手改。
 
+### 0b-1-答：兇手是 tick 自我追趕，已修（2026-09-05 同日）
+
+儀表第一次實測（模擬串流預設影片 P119、session `outputs/flight_logs/session_20260905T153849Z_simulated-stream_eb232b58`，130.6 s）回答了上面的問題，而且答案不是任何單一 stage：
+
+- BOOT 期的第一個 window：99 Hz tick、render 3.7 ms —— 便宜。
+- 之後 **`render_if_dirty` 每個 render tick 44–64 ms**（map overlay + 720p 影片 + HUD
+  一起畫；舊估「疊圖 2.10 + 影片 2.52 ms」量不到 in-situ 這個價），8 ms 週期永遠追不上，
+  `next_tick_deadline` 對逾期 tick 以 1 ms 自排程 → **back-to-back tick 把事件圈吃滿**
+  （實測 13–23 Hz、duty ~100%）。§0b-1 的「真機 30 Hz，tick_ms=33」假設不成立：
+  真機啟動鏈（`真機串流/啟動.sh` → `start_anafi_live.sh`）不帶 `--tick-ms`，
+  `min(8, 33)=8`，真機原本同樣跑 125 Hz。
+- Tk 每次迴圈先服務 window、再 timer、最後 file event，所以結果通知的
+  filehandler 只能在 tick 之間的縫隙被消費。`ui_poll_delay_ms` 分佈證實機制：
+  21.9% <5 ms（縫隙裡消費）、46% 落在 20–40 ms 平台；**TRACK 結果（render 多）p50 26 ms、
+  LOST/WEAK 結果（render 少）p50 7.5 ms** —— render 越多、事件圈越堵、結果越遲，
+  自我強化。
+
+**修復（已上樹）**：`OperatorApp.__init__` 把 tick 週期夾到 8–33 ms、CLI `--tick-ms`
+預設 8→33（help 註明理由）。夾兩側都有依據：更慢會讓 live nudge deadman TTL
+（下限 100 ms）在 tick 之間過期；更快就是上面量到的餓死機制。舊行為保留為
+`--tick-ms 8` 明確 opt-out。測試 `test_ui_tick_defaults_to_30_hz_and_clamps_both_sides`
+取代 `test_ui_refresh_targets_125_hz`（125 Hz 是隨 `97cb0ab` 整倉遷入的預設，無量測依據）。
+
+**A/B（同 launcher、同影片；candidate session `session_20260905T161535Z_simulated-stream_ad941f58`，191.5 s）**：
+
+| 指標 | baseline 8 ms | candidate 33 ms |
+|---|---|---|
+| `ui_poll_delay_ms` p50 / p95 | 24.69 / 48.56 | **3.51 / 17.33** |
+| `e2e_submit_to_ui_ms` p50 / p95 | 58.67 / 140.93 | **37.75 / 122.21** |
+| tick 實際節奏 | 13–23 Hz、duty ~100%（body 44–64 ms） | 15.2 Hz、duty ~55% |
+| worker duty / pose_result 成功 | 54.8% / 1626/1938（83.9%） | 55.7% / 2246/2707（83.0%） |
+
+worker duty 與成功率不動（submit 是 per-new-frame，與 tick 頻率無關）——收益全部是
+**位姿送達年齡**：p50 −21 ms、p95 −18 ms。incidents 兩 session 都只有模擬器固有的
+`sparse_cloud_collision_hover`。Gate：control-interface 1234 passed、全套
+**2539 passed / 3 skipped**、ruff 乾淨。
+
+**新浮出的下一個槓桿：`render_if_dirty` 本身（兩邊都 p50 34–54 ms，佔 tick body ~95%）。**
+tick 33 ms 之後它就是唯一的大項；把它拆薄（候選：靜態點雲層 per view cache、
+map/video 交錯渲染）才能把影片面板推回 30 fps（現在 33 ms tick 上限 ~15 fps，
+baseline 飽和時 ~15–20 Hz，兩邊都沒到 30）。真機確認仍欠：飛一趟讀
+`ui_tick_profile` / `ui_poll_delay_ms`（§0b 的腳本），預期同機制。
+
 ---
 
 ## 0b-2. worker 內那 27% 已經拆完了 —— 沒有東西可撿（2026-09-05）

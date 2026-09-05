@@ -1932,11 +1932,15 @@ class OperatorApp(tk.Tk):
         self.replay_headings = self._derive_motion_headings(self.replay_rows)
         self.replay_index = 0
         self.replay_last_pose = np.zeros(4, dtype=float)
-        # Live UI: never allow a slow caller to drop below ~30 Hz. Faster
-        # cadences, including the normal ~125 Hz CLI default, are preserved.
-        if bool(getattr(backend, "is_live", False)):
-            tick_ms = min(int(tick_ms), 33)
-        self.tick_ms = max(8, int(tick_ms))
+        # ~30 Hz on every backend, both sides load-bearing: a slower tick lets
+        # the live nudge deadman TTL (floor 100 ms) expire between refreshes,
+        # and a faster one starves the result-notification filehandler -- a
+        # render-heavy tick overruns its period, next_tick_deadline reschedules
+        # it 1 ms out, and Tk services perpetually-due timers before file
+        # events. Measured on the simulated stream (runbook 0b) at the old
+        # 8 ms default: ui_poll_delay_ms p50 24.7 ms, TRACK results (more
+        # renders) waiting 26 ms while LOST results (fewer renders) wait 7.5 ms.
+        self.tick_ms = max(8, min(int(tick_ms), 33))
         self._tick_period_s = self.tick_ms / 1000.0
         self._next_tick_deadline = time.monotonic() + 0.1
         # Result handling is cheap compared with map/video PhotoImage rendering.

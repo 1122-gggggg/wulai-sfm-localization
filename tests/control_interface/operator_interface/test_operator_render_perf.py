@@ -92,7 +92,7 @@ def _contrast_ratio(foreground: str, background: str) -> float:
 def operator():
     backend = app.DroneBackend()
     points = np.random.default_rng(0).random((2000, 6)).astype(np.float32) * 10.0
-    instance = app.OperatorApp(backend, points, tick_ms=8, site_id="test")
+    instance = app.OperatorApp(backend, points, site_id="test")
     instance.update_idletasks()
     try:
         yield instance
@@ -113,10 +113,23 @@ def operator():
         gc.collect()
 
 
-def test_ui_refresh_targets_125_hz(operator) -> None:
-    assert app.build_argument_parser().parse_args([]).tick_ms == 8
-    assert operator.tick_ms == 8
-    assert operator._tick_period_s == pytest.approx(0.008)
+def test_ui_tick_defaults_to_30_hz_and_clamps_both_sides(operator) -> None:
+    assert app.build_argument_parser().parse_args([]).tick_ms == 33
+    assert operator.tick_ms == 33
+    assert operator._tick_period_s == pytest.approx(0.033)
+    # The 8 ms default used to saturate the Tcl timer queue (overdue ticks
+    # reschedule 1 ms out, and due timers starve the result-notification
+    # filehandler); the old behavior stays reachable as an explicit opt-out.
+    fast = app.OperatorApp(app.DroneBackend(), operator.map_points, tick_ms=8)
+    try:
+        assert fast.tick_ms == 8
+    finally:
+        for callback_id in fast.tk.call("after", "info"):
+            try:
+                fast.after_cancel(callback_id)
+            except tk.TclError:
+                pass
+        fast.destroy()
 
 
 def _force_widget_focus(operator, widget) -> None:
