@@ -588,6 +588,112 @@ def _schedule_next_tick(app: Any, *, next_tick_deadline: NextTickDeadline) -> No
     app.after(delay_ms, app.tick)
 
 
+#: How often the tick profile is summarised into the session telemetry log. One
+#: line every few seconds, not one per tick: the point is a percentile over a
+#: flight, and a per-tick record at 30 Hz would be its own load.
+_TICK_PROFILE_EMIT_S = 5.0
+#: Cap on retained per-stage samples between emits, so a stalled writer cannot
+#: grow these lists without bound.
+_TICK_PROFILE_MAX_SAMPLES = 2048
+
+
+class _TickProfile:
+    """Per-stage wall time for one UI tick.
+
+    runbook 0b measured ui_poll_delay_ms p50 at 25 ms -- the same magnitude as
+    the whole GPU inference -- with a worker duty cycle of 61.7%. The result is
+    already in the client queue; that time is the Tk event loop being busy, and
+    the loop is busy running this tick. The doc's per-tick render costs (2.1 ms
+    map overlay, 2.5 ms video) do not add up to 25 ms, and its two cheap
+    candidates are already implemented (_map_dirty_key / _video_dirty_key), so
+    the next honest step is to measure which stage actually holds the loop
+    rather than guess between the remaining options.
+
+    Those numbers came from the simulated stream, whose ffmpeg read happens
+    inline on the Tk thread; real flight feeds frames from an Olympe callback
+    thread instead, so the runbook is explicit that the real-hardware number has
+    to be taken separately. Emitting from here means one IMU飛行測試.sh flight
+    produces it with no extra step.
+    """
+
+    __slots__ = ("app", "_t", "_stage", "_marks")
+
+    def __init__(self, app: Any, stage: str) -> None:
+        self.app = app
+        self._t = time.perf_counter()
+        self._stage = stage
+        self._marks: list[tuple[str, float]] = []
+
+    def next(self, stage: str) -> str:
+        """Close the running stage and return the name of the next one.
+
+        The elapsed time belongs to the stage that just ran, not the one about
+        to start, so it is filed under the name held before this call.
+        """
+        now = time.perf_counter()
+        self._marks.append((self._stage, (now - self._t) * 1000.0))
+        self._t = now
+        self._stage = stage
+        return stage
+
+    def finish(self) -> None:
+        self.next(self._stage)
+        samples = getattr(self.app, "_tick_profile_samples", None)
+        if samples is None:
+            samples = {}
+            self.app._tick_profile_samples = samples
+        total = 0.0
+        for name, elapsed in self._marks:
+            bucket = samples.setdefault(name, [])
+            if len(bucket) < _TICK_PROFILE_MAX_SAMPLES:
+                bucket.append(elapsed)
+            total += elapsed
+        bucket = samples.setdefault("_total", [])
+        if len(bucket) < _TICK_PROFILE_MAX_SAMPLES:
+            bucket.append(total)
+        _emit_tick_profile(self.app)
+
+
+def _percentile(values: list[float], q: float = 0.5) -> float:
+    ordered = sorted(values)
+    index = min(len(ordered) - 1, max(0, round(q * len(ordered)) - 1))
+    return round(ordered[index], 3)
+
+
+def _emit_tick_profile(app: Any) -> None:
+    now = time.monotonic()
+    last = getattr(app, "_tick_profile_last_emit", None)
+    if last is None:
+        app._tick_profile_last_emit = now
+        return
+    if now - last < _TICK_PROFILE_EMIT_S:
+        return
+    app._tick_profile_last_emit = now
+    samples: dict[str, list[float]] = getattr(app, "_tick_profile_samples", {}) or {}
+    if not samples:
+        return
+    telemetry = getattr(getattr(app, "session_logs", None), "telemetry", None)
+    if callable(telemetry):
+        stages = {
+            name: {"p50": _percentile(values), "p95": _percentile(values, 0.95)}
+            for name, values in sorted(samples.items())
+            if values
+        }
+        try:
+            telemetry(
+                "ui_tick_profile",
+                window_s=round(now - last, 3),
+                ticks=len(samples.get("_total") or ()),
+                tick_period_ms=getattr(app, "tick_ms", None),
+                stages=stages,
+            )
+        except Exception as exc:  # Tier3: diagnostics must never break the tick
+            record = getattr(app, "_record_diagnostic_failure", None)
+            if callable(record):
+                record("ui_tick_profile", exc)
+    samples.clear()
+
+
 def _record_tick_failure(app: Any, *, stage: str, error: str) -> None:
     incident = getattr(getattr(app, "session_logs", None), "incident", None)
     if callable(incident):
@@ -894,51 +1000,55 @@ def run_tick(
 ) -> None:
     """Run one UI cycle in the same order as the legacy callback."""
     stage = "drain_flight_command_results"
+    # profile.next() closes the stage just run and returns the next stage name,
+    # so `stage` still holds exactly what it did before at every point -- the
+    # failure path below reports the same name it always did.
+    profile = _TickProfile(app, stage)
     try:
         app._drain_flight_command_results()
-        stage = "drain_integrated_autonomy_events"
+        stage = profile.next("drain_integrated_autonomy_events")
         app._drain_integrated_autonomy_events()
-        stage = "refresh_held_controls"
+        stage = profile.next("refresh_held_controls")
         _refresh_held_controls(app)
-        stage = "poll_backend"
+        stage = profile.next("poll_backend")
         state = _poll_backend(app)
-        stage = "fail_safe_dead_localizer"
+        stage = profile.next("fail_safe_dead_localizer")
         _fail_safe_dead_localizer(app)
-        stage = "handle_stick_override"
+        stage = profile.next("handle_stick_override")
         if state is None:
             return
-        stage = "handle_stick_override"
         _handle_stick_override(app, state)
-        stage = "gravity_tick"
+        stage = profile.next("gravity_tick")
         app._gravity_tick(state)
         app.video_frame_fresh = False
-        stage = "update_boot_lock"
+        stage = profile.next("update_boot_lock")
         app.update_boot_lock()
-        stage = "update_live_results"
+        stage = profile.next("update_live_results")
         app.update_live_results()
-        stage = "update_lost_hold"
+        stage = profile.next("update_lost_hold")
         app.update_lost_hold()
-        stage = "update_detection_results"
+        stage = profile.next("update_detection_results")
         app.update_detection_results()
-        stage = "update_stream"
+        stage = profile.next("update_stream")
         state = _update_stream(app, state, rolling_event_fps=rolling_event_fps)
-        stage = "update_state_and_history"
+        stage = profile.next("update_state_and_history")
         state = _update_state_and_history(app, state)
-        stage = "update_sparse_cloud_collision_interlock"
+        stage = profile.next("update_sparse_cloud_collision_interlock")
         update_collision_interlock = getattr(
             app, "update_sparse_cloud_collision_interlock", None
         )
         if callable(update_collision_interlock):
             update_collision_interlock(state)
-        stage = "update_hud_metrics"
+        stage = profile.next("update_hud_metrics")
         _update_hud_metrics(
             app,
             state,
             rolling_event_fps=rolling_event_fps,
             stream_terminal_text=stream_terminal_text,
         )
-        stage = "render_if_dirty"
+        stage = profile.next("render_if_dirty")
         _render_if_dirty(app, state)
+        profile.finish()
     except Exception as exc:
         _handle_tick_failure(app, stage=stage, exc=exc)
         raise

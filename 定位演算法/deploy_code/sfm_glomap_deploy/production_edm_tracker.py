@@ -1457,14 +1457,21 @@ class ProductionEDMTracker:
             return PNP_RANSAC_SEED
         return int(options.ransac.random_seed)
 
+    def _klt_prior_states(self) -> frozenset[str]:
+        """Tracker states the KLT chain may run in.
+
+        LOST is opt-in: it is the state the chain was never allowed to serve,
+        and turning it on is the whole subject of
+        docs/klt_lost_prediction_experiment.md.
+        """
+        if getattr(self, "_klt_lost_predict", False) or getattr(self, "_klt_shadow_eval", False):
+            return frozenset({"TRACK", "WEAK_TRACK", "LOST"})
+        return frozenset({"TRACK", "WEAK_TRACK"})
+
     def _klt_prior_allowed(self, capture_stamp: float | None = None) -> bool:
         if getattr(self, "st", None) is None:
             return False
-        state = getattr(self.st, "state", None)
-        allowed_states = {"TRACK", "WEAK_TRACK"}
-        if getattr(self, "_klt_lost_predict", False) or getattr(self, "_klt_shadow_eval", False):
-            allowed_states = allowed_states | {"LOST"}
-        if state not in allowed_states:
+        if getattr(self.st, "state", None) not in self._klt_prior_states():
             return False
         klt_2d = getattr(self, "_klt_2d", None)
         klt_3d = getattr(self, "_klt_3d", None)

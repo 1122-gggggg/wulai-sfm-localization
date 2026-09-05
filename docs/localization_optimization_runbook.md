@@ -131,6 +131,29 @@ EOF
 (c) 影片面板降到 UI 需要的張數，而不是每個 stream 影格都 fit 一次。
 三者都不碰定位數值，所以 gate 是延遲百分位 + 既有 pytest，不需要七段語料庫。
 
+### 0b-1. 三個候選的現況（2026-09-05 覆核）
+
+覆核程式碼後，上面三項有兩項其實**已經做掉了**，所以不要再把它們當待辦：
+
+- **(b) 已實作。** `operator_tick._render_if_dirty` 用 `_map_dirty_key` 比對
+  pose / 相機軸 / 防撞圈 / 路線 / 面板尺寸，不同才重畫並換 PhotoImage。
+- **(c) 已實作。** 同一個函式用 `_video_dirty_key` 擋住影片面板，來源影格沒換就
+  跳過 720p resize + PhotoImage。
+- **(a) 不是問題所在。** `_on_localizer_result_ready`（Tk `createfilehandler`
+  回呼）只做 `drain_result_notifications()` + `update_live_results()`，本來就沒有
+  render。真正擋住事件圈的是**週期性的 tick 本身**（真機 30 Hz，`tick_ms=33`），
+  結果躺在 queue 裡等 tick 跑完。
+
+也就是說 doc 裡列的手段都不能解釋那 25 ms，而 §0b 自己量到的單 tick 成本
+（疊圖 2.10 ms + 影片 2.52 ms）也對不起來。**下一步不是再猜一個手段，是先知道
+是哪一個 stage 佔住事件圈。**
+
+`run_tick` 現在會逐 stage 計時（`_TickProfile`，沿用既有的 `stage` 名稱，
+失敗回報的語意完全不變），每 5 秒把 p50/p95 寫一筆 `ui_tick_profile` 進 session
+的 `telemetry.jsonl`。所以**真機數字不需要另外做一次分析** ——
+`./IMU飛行測試.sh` 飛一趟，`tools/imu_flight_test_report.py` 就會直接印出
+「最貴的階段」與每個 stage 的 p50/max。拿到那個名字之後才值得動手改。
+
 ---
 
 ## 0b-2. worker 內那 27% 已經拆完了 —— 沒有東西可撿（2026-09-05）

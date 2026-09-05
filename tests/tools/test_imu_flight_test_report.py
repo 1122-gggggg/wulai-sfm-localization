@@ -182,3 +182,46 @@ def test_cli_exits_nonzero_only_for_an_unusable_session(tmp_path, capsys) -> Non
     bad = _write_session(tmp_path / "bad", _telemetry_rows(velocity=False), [])
     assert report.main(["--session", str(bad)]) == 1
     assert "IMU 飛行測試報告" in capsys.readouterr().out
+
+
+def test_tick_profile_names_the_stage_that_holds_the_event_loop() -> None:
+    """runbook 0b's open question, answered from one flight's telemetry."""
+    from imu_flight_test_report import summarize_tick_profile
+
+    summary = summarize_tick_profile([
+        {
+            "event": "ui_tick_profile",
+            "ticks": 150,
+            "tick_period_ms": 33,
+            "stages": {
+                "_total": {"p50": 20.0, "p95": 41.0},
+                "render_if_dirty": {"p50": 3.0, "p95": 9.0},
+                "update_stream": {"p50": 14.0, "p95": 30.0},
+            },
+        },
+        {
+            "event": "ui_tick_profile",
+            "ticks": 150,
+            "tick_period_ms": 33,
+            "stages": {
+                "_total": {"p50": 22.0, "p95": 44.0},
+                "render_if_dirty": {"p50": 3.5, "p95": 10.0},
+                "update_stream": {"p50": 15.0, "p95": 33.0},
+            },
+        },
+    ])
+
+    assert summary["windows"] == 2
+    assert summary["ticks"] == 300
+    assert summary["tick_period_ms"] == 33
+    # _total is excluded from the ranking, or it would always "win".
+    assert summary["worst"] == "update_stream"
+    assert summary["stages"]["update_stream"]["max_ms"] == 15.0
+
+
+def test_tick_profile_is_absent_rather_than_wrong_when_nothing_was_logged() -> None:
+    from imu_flight_test_report import summarize_tick_profile
+
+    summary = summarize_tick_profile([])
+    assert summary["ticks"] == 0
+    assert summary["worst"] is None

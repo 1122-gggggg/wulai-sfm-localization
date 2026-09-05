@@ -372,12 +372,55 @@ def verdict(
 
 
 # --------------------------------------------------------------------------
+def summarize_tick_profile(records: list[dict[str, Any]]) -> dict[str, Any]:
+    """Where the Tk event loop spent its time (runbook 0b).
+
+    runbook 0b measured ui_poll_delay_ms p50 at 25 ms on the *simulated* path
+    and is explicit that the real-hardware number must be taken separately,
+    because live frames arrive on an Olympe callback thread instead of inline on
+    the Tk thread. This is that measurement: one flight now answers which stage
+    holds the loop, instead of choosing blind between the doc's candidates.
+    """
+    if not records:
+        return {"windows": 0, "ticks": 0, "stages": {}, "worst": None}
+    stages: dict[str, list[float]] = {}
+    ticks = 0
+    for record in records:
+        ticks += int(record.get("ticks") or 0)
+        for name, value in (record.get("stages") or {}).items():
+            p50 = _finite(value.get("p50")) if isinstance(value, dict) else None
+            if p50 is not None:
+                stages.setdefault(name, []).append(p50)
+    summary = {
+        name: {
+            "p50_ms": _percentile(values, 0.5),
+            "max_ms": max(values),
+        }
+        for name, values in sorted(stages.items())
+    }
+    ranked = [
+        (data["p50_ms"], name)
+        for name, data in summary.items()
+        if name != "_total" and data["p50_ms"] is not None
+    ]
+    return {
+        "windows": len(records),
+        "ticks": ticks,
+        "tick_period_ms": records[-1].get("tick_period_ms"),
+        "stages": summary,
+        "worst": max(ranked)[1] if ranked else None,
+    }
+
+
 def build_report(session: Path) -> dict[str, Any]:
     telemetry = list(read_jsonl(session / "telemetry.jsonl"))
     imu = summarize_imu([r for r in telemetry if r.get("event") == "fused_odometry"])
     sticks = summarize_sticks([r for r in telemetry if r.get("event") == "stick_axes"])
     localization = summarize_localization(list(read_jsonl(session / "localization.jsonl")))
     frames = summarize_frames(session)
+    tick_profile = summarize_tick_profile(
+        [r for r in telemetry if r.get("event") == "ui_tick_profile"]
+    )
     status, notes = verdict(imu, sticks, localization, frames)
     return {
         "session": str(session),
@@ -385,6 +428,7 @@ def build_report(session: Path) -> dict[str, Any]:
         "sticks": sticks,
         "localization": localization,
         "frames": frames,
+        "tick_profile": tick_profile,
         "verdict": status,
         "notes": notes,
     }
@@ -446,6 +490,25 @@ def render(report: dict[str, Any]) -> str:
             f"dropped_queue_full={recorder.get('dropped_queue_full')} "
             f"stop_reason={recorder.get('stop_reason') or '-'}"
         )
+    tick = report.get("tick_profile") or {}
+    if tick.get("ticks"):
+        total = (tick.get("stages") or {}).get("_total") or {}
+        lines += [
+            "",
+            "## UI 事件圈（runbook 0b：真機數字）",
+            f"- {tick['windows']} 個視窗 / {tick['ticks']} 個 tick，"
+            f"tick 週期 {_number(tick.get('tick_period_ms'), 0)} ms",
+            f"- 整個 tick p50 {_number(total.get('p50_ms'))} ms，"
+            f"最慢 {_number(total.get('max_ms'))} ms",
+            f"- 最貴的階段：{tick.get('worst') or '-'}",
+        ]
+        for name, data in (tick.get("stages") or {}).items():
+            if name == "_total":
+                continue
+            lines.append(
+                f"    {name}: p50 {_number(data.get('p50_ms'))} ms / "
+                f"max {_number(data.get('max_ms'))} ms"
+            )
     if report["notes"]:
         lines += ["", "## 要注意的"]
         lines += [f"- {note}" for note in report["notes"]]
