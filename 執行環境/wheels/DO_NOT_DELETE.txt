@@ -1,0 +1,7 @@
+DO NOT DELETE — offline install wheels for the portable runtime.
+
+tools/install_runtime.sh and the offline wheelhouse resolve against this
+directory; a machine without network cannot rebuild it.
+
+Same rule as 執行環境/torch_hub_cache and 執行環境/models: never included in a
+workspace sweep. See the ledger's 2026-09-05 torch_hub_cache incident.

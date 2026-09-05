@@ -67,7 +67,7 @@ runtime 煙霧成功，尚未驗證實際 ANAFI camera pipeline。現況：
 
 ```bash
 .venv/bin/python 控制介面程式/launch_mission.py \
-  控制介面程式/mission_selections/river_site_official69_localization.json \
+  控制介面程式/mission_selections/river_gluemap_all8_direct_localization.json \
   --check-only
 ```
 
@@ -98,8 +98,8 @@ preflight 並親自按下「自動飛行」。
 
 ```text
 地圖檔/場域/river_site/releases/
-├── river_site_official69_map_v000_20260811.tar.gz
-└── river_site_official69_map_v000_20260811.tar.gz.sha256
+├── <release-id>.tar.gz
+└── <release-id>.tar.gz.sha256
 ```
 
 定位所需內容至少包含：

@@ -83,8 +83,12 @@ OUTPUT_GOVERNANCE_FILES = {
     "測試組合效能比較_20260715.md",
 }
 OUTPUT_EVIDENCE_PREFIXES = (
+    "augment_",
+    "baseline_",
     "benchmark_",
+    "corpus_",
     "edm_",
+    "gates_",
     "empirical_",
     "exact_latency_",
     "localization_fps_",

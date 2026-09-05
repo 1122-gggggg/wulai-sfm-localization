@@ -49,9 +49,14 @@ def test_budget_rejects_regressions() -> None:
     summary["tools"]["violations"] = BUDGETS["tools"]["violations"] + 1
     summary["flight"]["max_complexity"] = BUDGETS["flight"]["max_complexity"] + 1
 
+    # Derived from BUDGETS, not hard-coded: the ratchet gets re-baselined
+    # (2026-09-05, for one), and a test that pins the numbers breaks on a
+    # re-baseline while proving nothing about the comparison it exists to test.
+    tools_v = BUDGETS["tools"]["violations"]
+    flight_c = BUDGETS["flight"]["max_complexity"]
     assert budget_failures(summary) == [
-        "tools violations increased: 1 > 0",
-        "flight max_complexity increased: 13 > 12",
+        f"tools violations increased: {tools_v + 1} > {tools_v}",
+        f"flight max_complexity increased: {flight_c + 1} > {flight_c}",
     ]
 
 

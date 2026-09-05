@@ -930,6 +930,7 @@ def _read_benchmark_request(args):
 
 
 def _read_worker_frame(args, frame_buffer, frame_shm, frame_size: int):
+    last_frame = getattr(_read_worker_frame, "_last_frame", None)
     if frame_shm is None:
         assert frame_buffer is not None
         frame_bytes = read_exact_into(sys.stdin.buffer, frame_buffer)
@@ -941,18 +942,34 @@ def _read_worker_frame(args, frame_buffer, frame_shm, frame_size: int):
                 file=sys.stderr,
                 flush=True,
             )
+            if last_frame is not None:
+                return last_frame
             return None
-        return frame_view_from_rgb_bytes(frame_buffer, args.width, args.height)
+        frame = frame_view_from_rgb_bytes(frame_buffer, args.width, args.height)
+        _read_worker_frame._last_frame = frame
+        return frame
     slot_byte = read_exact(sys.stdin.buffer, 1)
     if not slot_byte:
         return None
-    return frame_view_from_shared_memory(
-        frame_shm.buf,
-        slot_byte[0],
-        args.frame_shm_slots,
-        args.width,
-        args.height,
-    )
+    try:
+        frame = frame_view_from_shared_memory(
+            frame_shm.buf,
+            slot_byte[0],
+            args.frame_shm_slots,
+            args.width,
+            args.height,
+        )
+        _read_worker_frame._last_frame = frame
+        return frame
+    except Exception as exc:
+        print(
+            f"[live_worker] invalid/torn shared frame slot {slot_byte[0]}: {exc}",
+            file=sys.stderr,
+            flush=True,
+        )
+        if last_frame is not None:
+            return last_frame
+        raise
 
 
 def _prepare_benchmark_frame(
@@ -1048,6 +1065,8 @@ def _prepare_frame_io(args, torch):
 
 
 def _close_worker_frame_shm(frame_shm) -> None:
+    if hasattr(_read_worker_frame, "_last_frame"):
+        _read_worker_frame._last_frame = None
     if frame_shm is not None:
         frame_shm.close()
 
@@ -1167,6 +1186,11 @@ def _build_success_payload(
         ),
         "prediction_valid": bool(info.get("prediction_valid", False)),
         "prediction_mode": info.get("prediction_mode"),
+        "prediction_source": info.get("prediction_source"),
+        "esekf_pos_trace": info.get("esekf_pos_trace"),
+        "esekf_d2": info.get("esekf_d2"),
+        "esekf_update_accepted": info.get("esekf_update_accepted"),
+        "esekf_update_exceptions": info.get("esekf_update_exceptions"),
         "mode": info.get("mode"),
         "next_mode": info.get("next_mode"),
         "inliers": int(info.get("inliers", 0) or 0),
@@ -1190,6 +1214,11 @@ def _build_success_payload(
         "vpr_ms": info.get("vpr_ms"),
         "feature_ms": info.get("feature_ms"),
         "match_ms": info.get("match_ms"),
+        "total_ms": info.get("total_ms"),
+        "stage_gray_ms": info.get("stage_gray_ms"),
+        "stage_bridge_ms": info.get("stage_bridge_ms"),
+        "stage_query_ms": info.get("stage_query_ms"),
+        "stage_select_ms": info.get("stage_select_ms"),
         "pnp_ms": info.get("pnp_ms"),
         "pnp_candidates": info.get("pnp_candidates"),
         "pnp_skipped": info.get("pnp_skipped"),
@@ -1209,6 +1238,18 @@ def _build_success_payload(
         "projection_project_ms": info.get("projection_project_ms"),
         "projection_feature_ms": info.get("projection_feature_ms"),
         "projection_match_ms": info.get("projection_match_ms"),
+        # Async fast/slow accounting. A starved fast path, a slow thread that
+        # died, and a slow path that simply never matched all look like a wall
+        # of NO_ANCHOR from outside; without these the only way to tell them
+        # apart is to re-run with SFM_EDM_ASYNC_DEBUG on the machine that saw it.
+        "async_inline_syncs": info.get("inline_syncs"),
+        "async_slow_errors": info.get("slow_errors"),
+        "async_slow_last_error": info.get("slow_last_error"),
+        "async_slow_alive": info.get("slow_alive"),
+        "async_fast_prior_feedbacks": info.get("fast_prior_feedbacks"),
+        "async_anchor_accepts": info.get("slow_anchor_accepts"),
+        "async_anchor_rejects": info.get("slow_anchor_rejects"),
+        "async_inline_runs": info.get("slow_inline_runs"),
     }
 
 

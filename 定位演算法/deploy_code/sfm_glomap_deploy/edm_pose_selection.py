@@ -32,6 +32,32 @@ def last_consensus_info() -> dict[str, Any]:
     return dict(_LAST_CONSENSUS)
 
 
+def count_agreeing_refs(
+    scored: list[tuple[str, tuple]],
+    center: Any,
+    min_inliers: int,
+    limit: float,
+) -> int:
+    """Independent references whose PnP center lands within ``limit`` of ``center``.
+
+    Counts every scored candidate at or above ``min_inliers`` inliers, so the
+    chosen reference counts itself. Used by the relaxed LOST acquire tier: a
+    lone weak reference is exactly the shape of a wrong-place lock, two
+    references landing on the same center is not.
+    """
+    anchor = np.asarray(center, dtype=float).reshape(3)
+    floor = int(min_inliers)
+    bound = float(limit)
+    agreeing = 0
+    for _name, candidate in scored:
+        if candidate_inliers(candidate) < floor:
+            continue
+        other = _pose_center(candidate[0])
+        if float(np.linalg.norm(other - anchor)) <= bound:
+            agreeing += 1
+    return agreeing
+
+
 def consensus_mode(cfg: Any) -> str:
     mode = getattr(cfg, "pose_consensus_mode", "pairwise")
     if isinstance(mode, bytes):
@@ -180,6 +206,37 @@ def _strong_centers_disagree(
     return False
 
 
+def _cluster_strong_centers(
+    strong: list[tuple[str, tuple]],
+    center_limit: float,
+) -> list[list[tuple[str, tuple]]]:
+    """Group strong candidates by camera-center distance only (pairwise rule).
+
+    Pairwise mode deliberately ignores rotation: two fixes that put the camera
+    in the same place agree even if their yaw differs (yaw is re-gated
+    downstream by the track-yaw slack). Single-link union-find, same shape as
+    _cluster_strong.
+    """
+    count = len(strong)
+    parent = list(range(count))
+
+    def find(index: int) -> int:
+        while parent[index] != index:
+            parent[index] = parent[parent[index]]
+            index = parent[index]
+        return index
+
+    centers = [_pose_center(candidate[0]) for _name, candidate in strong]
+    for index in range(count):
+        for other in range(index + 1, count):
+            if float(np.linalg.norm(centers[index] - centers[other])) <= center_limit:
+                parent[find(index)] = find(other)
+    groups: dict[int, list[tuple[str, tuple]]] = {}
+    for index in range(count):
+        groups.setdefault(find(index), []).append(strong[index])
+    return list(groups.values())
+
+
 def _poses_agree(
     first: tuple,
     second: tuple,
@@ -257,15 +314,33 @@ def _select_from_clusters(
     strong = _strong_items(scored, min_inl)
     if mode == "pairwise":
         if _strong_centers_disagree(scored, min_inl, cfg):
+            # No veto-all: elect the largest center-cluster and drop the
+            # minority as outliers. A pure 1v1 tie still fails closed.
+            clusters = _cluster_strong_centers(strong, acquire_consensus_limit(cfg))
+            sizes = tuple(len(cluster) for cluster in clusters)
+            biggest = max(sizes) if sizes else 0
+            winners = [cluster for cluster in clusters if len(cluster) == biggest]
+            outliers = sum(len(cluster) for cluster in clusters if len(cluster) < biggest)
+            if len(winners) != 1:
+                _record_consensus(
+                    mode=mode,
+                    reason="pairwise_conflict",
+                    strong_count=len(strong),
+                    cluster_sizes=tuple(1 for _ in strong),
+                    outlier_count=0,
+                    chosen=None,
+                )
+                return None
+            chosen = _pick_ranked(winners[0], selection)
             _record_consensus(
                 mode=mode,
-                reason="pairwise_conflict",
+                reason="pairwise_majority",
                 strong_count=len(strong),
-                cluster_sizes=tuple(1 for _ in strong),
-                outlier_count=0,
-                chosen=None,
+                cluster_sizes=sizes,
+                outlier_count=outliers,
+                chosen=None if chosen is None else chosen[0],
             )
-            return None
+            return chosen
         if prefer_acquire_top1:
             top1_name = selection.refs[0] if selection.refs else None
             by_name = {name: candidate for name, candidate in scored}

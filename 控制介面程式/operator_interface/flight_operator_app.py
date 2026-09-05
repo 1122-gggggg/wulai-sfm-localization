@@ -112,6 +112,11 @@ from localization_result_ui import (
     stabilize_live_result_pose,
 )
 from localization_contract import LocalizationResult
+from imu_flight_test import (
+    capture_frame as capture_imu_flight_test_frame,
+    close_recorder as close_imu_flight_test_recorder,
+    create_recorder as create_imu_flight_test_recorder,
+)
 from localization_metrics import (
     attach_fused_localization_telemetry,
     build_localization_metric_record,
@@ -160,7 +165,6 @@ from live_worker_clients import (
     _WorkerResponseDesync as _WorkerResponseDesync,
 )
 from map_point_io import (
-    load_red_sphere_points,
     read_map_points,
     read_ply_points as read_ply_points,
     read_reference_pose_points as read_reference_pose_points,
@@ -648,7 +652,6 @@ ROUTE_DOT_MAX = _positive_env_int("SFM_ROUTE_DOT_MAX", 200)
 # module and olympe_live_backend.py can use it without a circular import.
 
 
-
 def format_latency_text(latency_ms: float | None) -> str:
     """Format a latency value for HUD display. Pure, no Tk dependency."""
     if latency_ms is None:
@@ -698,8 +701,6 @@ def classify_localization_health(loc: dict) -> str:
     if weak:
         return "DEGRADED"
     return "OK"
-
-
 
 
 def build_hud_overlay_data(state, loc, telemetry) -> dict:
@@ -846,35 +847,6 @@ def build_hud_overlay_data(state, loc, telemetry) -> dict:
     }
 
 
-def _load_red_spheres_for_map(map_ply: Path | None, max_points: int) -> np.ndarray:
-    """Load red intrinsic spheres beside a map PLY, or empty on any failure.
-
-    Probes overlay/red_spheres_only.ply first, falling back to the workspace
-    outputs river_site demo. Must never raise — a missing overlay is the
-    normal state for sites that have not run the localizability analysis.
-    """
-    try:
-        pts = load_red_sphere_points(map_ply, max_points)
-        if pts is not None and len(pts):
-            return np.asarray(pts, dtype=np.float32)
-    except (OSError, ValueError, AttributeError, TypeError, RuntimeError):  # Tier3: fallback best-effort — narrow, keep pass
-        pass
-    return np.empty((0, 6), dtype=np.float32)
-
-
-def _red_spheres_for_profile(profile_path: str | Path | None, max_points: int) -> np.ndarray:
-    if profile_path is None or profile_path == "":
-        return _load_red_spheres_for_map(None, max_points)
-    try:
-        from site_profile import load_site_profile
-
-        prof = load_site_profile(Path(profile_path))
-        map_ply = getattr(prof, "map_ply", None)
-        return _load_red_spheres_for_map(map_ply if isinstance(map_ply, Path) else None, max_points)
-    except Exception:
-        return _load_red_spheres_for_map(None, max_points)
-
-
 class DedupStringVar(tk.StringVar):
     """A StringVar that drops writes of the value it already holds.
 
@@ -924,34 +896,6 @@ def heading_arrow_polygon(
         (tail[0] - px * tail_half_width, tail[1] - py * tail_half_width),
         (head_base[0] - px * head_width, head_base[1] - py * head_width),
     ]
-
-
-def camera_frustum_world_points(
-    camera_center: np.ndarray,
-    camera_axes: np.ndarray,
-    *,
-    length: float,
-    hfov_deg: float,
-    aspect_ratio: float,
-) -> np.ndarray:
-    """Return apex, image-plane center and four image-plane corners in world XYZ."""
-    center = np.asarray(camera_center, dtype=float)
-    axes = normalize_camera_axes(camera_axes)
-    if center.shape != (3,) or axes is None:
-        raise ValueError("camera frustum requires a center and orthonormal camera axes")
-    right, down, forward = axes
-    face_center = center + forward * float(length)
-    half_width = float(length) * math.tan(math.radians(float(hfov_deg)) * 0.5)
-    half_height = half_width / float(aspect_ratio)
-    corners = np.asarray(
-        [
-            face_center - right * half_width - down * half_height,
-            face_center + right * half_width - down * half_height,
-            face_center + right * half_width + down * half_height,
-            face_center - right * half_width + down * half_height,
-        ]
-    )
-    return np.vstack([center, face_center, corners])
 
 
 _SITE_ASSET_ENV_VARS = (
@@ -1841,6 +1785,11 @@ class OperatorApp(tk.Tk):
         super().__init__()
         self.backend = backend
         self.session_logs = session_logs
+        # First session of the process; _install_site_runtime replaces this one
+        # when the operator switches site. Off unless SFM_IMU_FLIGHT_TEST=1.
+        self.imu_flight_test = create_imu_flight_test_recorder(
+            getattr(session_logs, "directory", None), note=self.write_log
+        )
         self._site_runtime = site_runtime
         self._prepare_site_runtime = prepare_site_runtime
         self._start_site_runtime = start_site_runtime
@@ -1887,14 +1836,6 @@ class OperatorApp(tk.Tk):
             ]
         ] = queue.Queue(maxsize=1)
         self.map_points = map_points
-        # Red intrinsic-difficult spheres (220,32,32) — visible by default.
-        # Loaded alongside map_points via overlay fallback; empty when missing.
-        try:
-            self.red_sphere_points = _red_spheres_for_profile(
-                getattr(self, "site_profile_path", None), MAP_STATIC_POINTS
-            )
-        except Exception:
-            self.red_sphere_points = np.empty((0, 6), dtype=np.float32)
         self.video_stream = video_stream
         self.localizer = localizer
         self.detector = detector  # YOLO optional; default None / off
@@ -5450,12 +5391,20 @@ class OperatorApp(tk.Tk):
                 pass
         self._loc_metrics_f = None
         self._loc_metrics_path = None
+        # The recorder writes into the outgoing session directory, so it is
+        # finalized before the new session replaces it. Off unless
+        # SFM_IMU_FLIGHT_TEST=1, in which case both calls are no-ops.
+        close_imu_flight_test_recorder(self.__dict__.get("imu_flight_test"))
+        self.imu_flight_test = None
 
         prepared = runtime.prepared
         profile = prepared.profile
         self._site_runtime = runtime
         self.backend = runtime.backend
         self.session_logs = runtime.session_logs
+        self.imu_flight_test = create_imu_flight_test_recorder(
+            getattr(self.session_logs, "directory", None), note=self.write_log
+        )
         self.video_stream = runtime.video_stream
         self.localizer = runtime.localizer
         self.detector = runtime.detector
@@ -5482,12 +5431,6 @@ class OperatorApp(tk.Tk):
         )
 
         self.map_points = prepared.map_points
-        try:
-            self.red_sphere_points = _red_spheres_for_profile(
-                getattr(self, "site_profile_path", None), MAP_STATIC_POINTS
-            )
-        except Exception:
-            self.red_sphere_points = np.empty((0, 6), dtype=np.float32)
         self.default_map_center, self.map_radius = self._map_view_bounds(self.map_points)
         self._configure_sparse_cloud_collision_guard(self.map_points)
         if len(self.map_points):
@@ -5669,16 +5612,6 @@ class OperatorApp(tk.Tk):
         return profile, bound_profile, map_source, route_path
 
     def _read_route_editor_points(self, profile: SiteProfile | None) -> np.ndarray:
-        # Keep the main-map red spheres fresh when the editor opens on the
-        # same site — the overlay file lives beside the map PLY.
-        try:
-            candidate = getattr(profile, "map_ply", None) if profile is not None else None
-            if candidate is not None:
-                red = _load_red_spheres_for_map(candidate, MAP_STATIC_POINTS)
-                if len(red):
-                    self.red_sphere_points = red
-        except (OSError, ValueError, AttributeError, TypeError, RuntimeError):  # Tier3: fallback best-effort — narrow, keep pass
-            pass
         if (
             profile is not None
             and self.site_profile_path == profile.source
@@ -5782,17 +5715,6 @@ class OperatorApp(tk.Tk):
         """Load any PLY, binding it only when one managed site digest matches."""
         profile = match_managed_site_profile_for_map(source, _WS.site_packages)
         points = read_map_points(source, MAP_STATIC_POINTS)
-        # Refresh red spheres for the editor preview — same overlay/fallback as the main map.
-        try:
-            # Prefer the matched profile's map_ply (site overlay), fall back to source's directory
-            map_ply_for_red = getattr(profile, "map_ply", None) if profile is not None else None
-            if map_ply_for_red is None:
-                map_ply_for_red = source
-            red = _load_red_spheres_for_map(map_ply_for_red, MAP_STATIC_POINTS)
-            if len(red):
-                self.red_sphere_points = red
-        except (OSError, ValueError, AttributeError, TypeError, RuntimeError):  # Tier3: fallback best-effort — narrow, keep pass
-            pass
         if profile is None:
             return (
                 None,
@@ -6028,6 +5950,7 @@ class OperatorApp(tk.Tk):
         if error is not None:
             self.write_log(f"關窗背景清理失敗（{error!r}）；請重試。")
         if result is True:
+            close_imu_flight_test_recorder(self.__dict__.get("imu_flight_test"))
             self._shutdown_completed = True
             self.destroy()
 
@@ -7187,11 +7110,6 @@ class OperatorApp(tk.Tk):
         )
 
     def map_base_key(self, width: int, height: int) -> tuple:
-        red = getattr(self, "red_sphere_points", None)
-        try:
-            red_len = 0 if red is None else len(red)  # type: ignore[arg-type]
-        except Exception:
-            red_len = 0
         return (
             int(width),
             int(height),
@@ -7203,7 +7121,6 @@ class OperatorApp(tk.Tk):
             tuple(np.round(self.pivot_point.astype(float), 4)),
             tuple(np.round(self.map_pan.astype(float), 2)),
             len(self.map_points),
-            int(red_len),
             self._map_detail_points(),
         )
     def render_map_base(self, width: int, height: int) -> Image.Image:
@@ -7228,36 +7145,6 @@ class OperatorApp(tk.Tk):
         img = Image.fromarray(arr, "RGB")
         draw = ImageDraw.Draw(img)
         overlay_font = pil_ui_font(12, bold=True)
-        # Red intrinsic difficult localization spheres (220,32,32) — always-on overlay
-        # in the static base so they benefit from base-image caching (same cost as
-        # the point cloud). Drawn after the 1-px map points with a larger marker
-        # so they remain visible even in dense cloud regions.
-        try:
-            red_pts = getattr(self, "red_sphere_points", None)
-            if red_pts is not None and len(red_pts):
-                # Keep all sphere vertices; 4k points is negligible vs 250k map.
-                view_r = self.transform_xyz(red_pts[:, :3].astype(float))
-                sx_r = (width * 0.5 + self.map_pan[0] + view_r[:, 0] * scale).astype(int)
-                sy_r = (height * 0.5 + self.map_pan[1] - view_r[:, 1] * scale).astype(int)
-                inside_r = (sx_r >= 0) & (sx_r < width) & (sy_r >= 0) & (sy_r < height)
-                if np.any(inside_r):
-                    order_r = np.argsort(view_r[inside_r, 2])
-                    sx_r = sx_r[inside_r][order_r]
-                    sy_r = sy_r[inside_r][order_r]
-                    # Use the sphere ply's own RGB when present, otherwise canonical red.
-                    if red_pts.shape[1] >= 6:
-                        rgb_r = np.clip(red_pts[:, 3:6][inside_r][order_r], 0, 255).astype(np.uint8)
-                    else:
-                        rgb_r = np.full((len(sx_r), 3), (220, 32, 32), dtype=np.uint8)
-                    # Slightly larger than the 1-px map points; depth-sorted far->near
-                    # so nearer sphere vertices occlude farther ones, matching the map.
-                    for x, y, col in zip(sx_r.tolist(), sy_r.tolist(), rgb_r.tolist()):
-                        fill = f"#{col[0]:02x}{col[1]:02x}{col[2]:02x}"
-                        # 4-px diameter (radius 2) with a 1-px darker edge for contrast
-                        draw.ellipse((x - 2, y - 2, x + 2, y + 2), fill=fill, outline="#ffffff", width=1)
-                        draw.ellipse((x - 1, y - 1, x + 1, y + 1), fill=fill, outline=fill)
-        except (OSError, ValueError, AttributeError, TypeError, RuntimeError):  # Tier3: fallback best-effort — narrow, keep pass
-            pass
 
         # Draw map axes in the current view.
         axis_len = self.map_radius * 0.18
@@ -7308,6 +7195,7 @@ class OperatorApp(tk.Tk):
             camera_axes = None
             camera_forward = None
         route_pts = self.route_pts if getattr(self, "route_pts", None) else []
+        map_east, map_north, map_up, _measured = self._map_axis_basis()
         draw_map_overlays(
             draw,
             MapRenderContext(
@@ -7330,15 +7218,16 @@ class OperatorApp(tk.Tk):
                 collision_preview=guard_preview,
                 transform_xyz=self.transform_xyz,
                 project_world=self.project_world,
-                camera_frustum_world_points=camera_frustum_world_points,
-                heading_arrow_polygon=heading_arrow_polygon,
                 route_color=ROUTE_COLOR,
                 health_color=HEALTH_COLOR,
                 route_dot_max=ROUTE_DOT_MAX,
                 no_loc_max_markers=NO_LOC_MAX_MARKERS,
-                video_hfov_deg=ANAFI.video_hfov_deg,
                 video_aspect_ratio=STREAM_WIDTH / STREAM_HEIGHT,
                 overlay_font=overlay_font,
+                map_east=map_east,
+                map_north=map_north,
+                map_up=map_up,
+                gimbal_pitch_deg=getattr(st, "gimbal_pitch_deg", None),
             ),
         )
         return img
@@ -7732,6 +7621,15 @@ class OperatorApp(tk.Tk):
             return
         self.last_submitted_index = self.video_display_index
         self.live_pending_frame_name = frame_name
+        # IMU flight test only: the offline A/B then has a paired image and
+        # telemetry stream instead of an SD recording on another clock.
+        capture_imu_flight_test_frame(
+            self.__dict__.get("imu_flight_test"),
+            self.video_display_index,
+            frame_name,
+            self.video_frame,
+            timing_metadata,
+        )
         if not was_busy:
             self._submit_ok += 1
         if lost_retry:

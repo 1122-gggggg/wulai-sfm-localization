@@ -67,9 +67,13 @@ def run_launcher(*args: str, **overrides: str) -> subprocess.CompletedProcess[st
 
 
 def test_app_help_formats_percent_literals() -> None:
+    # argparse wraps help text to the terminal width, so pin COLUMNS: at 100/110/120
+    # columns the phrase straddles a line break and a width-sensitive assertion fails
+    # even though the `%%` escaping is correct.
     result = subprocess.run(
         [sys.executable, str(APP), "--help"],
         cwd=SCRIPT.parent,
+        env={**os.environ, "COLUMNS": "200"},
         text=True,
         capture_output=True,
         check=False,
@@ -78,6 +82,7 @@ def test_app_help_formats_percent_literals() -> None:
 
     assert result.returncode == 0, result.stderr
     assert "at 95% of the confirmed limit" in result.stdout
+    assert "95%%" not in result.stdout
 
 
 def test_launcher_help_exits_before_live_setup() -> None:

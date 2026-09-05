@@ -19,6 +19,13 @@ from workspace_layout import workspace_from_file
 SCHEMA_VERSION = 2
 SUPPORTED_SCHEMA_VERSIONS = (1, SCHEMA_VERSION)
 
+#: The approval_note the in-app route editor stamps when the operator ticks
+#: "approve for AUTO" while saving a route. It is the only marker that says a
+#: profile's AUTO approval came from a human drawing a route on the current map,
+#: so profile validation keys its allowlist off it rather than off a hardcoded
+#: list of sites that has to be edited by hand for every new route.
+ROUTE_EDITOR_AUTO_APPROVAL_NOTE = "In-app operator route editor approval for AUTO."
+
 
 PRODUCTION_LOCALIZER_BACKEND = "edm"
 SHA256_KEYS = (

@@ -43,6 +43,14 @@ from mission_manifest import (
 SUPPORTED_PROVIDER_API_VERSION = 1
 SUPPORTED_POSE_CONTRACT_VERSION = 1
 
+#: The single localization blocker an evaluation-only session may waive.  An
+#: unvalidated map is precisely what such a session exists to measure, so
+#: refusing to start localization on it makes the measurement impossible.
+#: Every other localization blocker (digest mismatch, camera-profile mismatch,
+#: a missing or wrong-subject receipt) means the snapshot does not describe the
+#: hardware in front of the operator, and no session may proceed on it.
+EVALUATION_WAIVABLE_PREFIX = "localizer_quality calibration is failed or expired"
+
 
 @dataclass(frozen=True, slots=True)
 class MissionReadiness:
@@ -56,6 +64,21 @@ class MissionReadiness:
     @property
     def flight_ready(self) -> bool:
         return not self.flight_errors
+
+    @property
+    def evaluation_only_ready(self) -> bool:
+        """Localization may run for measurement only, never for navigation.
+
+        True when the mission is blocked *solely* by an unvalidated map.  This
+        never implies :attr:`flight_ready`: the quality error stays in
+        ``flight_errors``, so the materialized profile keeps
+        ``flight.approved`` and ``route_clearance_approved`` false and the
+        autonomous-flight contract still rejects the mission.
+        """
+        return bool(self.localization_errors) and all(
+            error.startswith(EVALUATION_WAIVABLE_PREFIX)
+            for error in self.localization_errors
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -489,10 +512,33 @@ def resolve_mission(
     )
 
 
+def evaluation_only_requested() -> bool:
+    """True when the operator explicitly asked for an evaluation-only session.
+
+    Opt-in per process via ``SFM_EVALUATION_ONLY=1``.  ``IMU飛行測試.sh`` sets
+    it; the ordinary ``一鍵啟動.sh`` entry point deliberately does not.
+    """
+    return os.environ.get("SFM_EVALUATION_ONLY") == "1"
+
+
+def evaluation_only_admission(readiness: MissionReadiness) -> tuple[bool, tuple[str, ...]]:
+    """Decide whether an evaluation-only session may start, and what it waives.
+
+    Returns ``(admitted, waived_errors)``.  Admission requires both the explicit
+    opt-in and a mission whose only localization blocker is the unvalidated map.
+    """
+    if not evaluation_only_requested() or not readiness.evaluation_only_ready:
+        return False, ()
+    return True, readiness.localization_errors
+
+
 __all__ = [
+    "EVALUATION_WAIVABLE_PREFIX",
     "MissionReadiness",
     "ResolvedMission",
     "SUPPORTED_POSE_CONTRACT_VERSION",
     "SUPPORTED_PROVIDER_API_VERSION",
+    "evaluation_only_admission",
+    "evaluation_only_requested",
     "resolve_mission",
 ]

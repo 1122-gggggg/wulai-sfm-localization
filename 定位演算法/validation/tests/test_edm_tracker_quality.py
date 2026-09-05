@@ -839,6 +839,118 @@ def test_progressive_acquisition_uses_cumulative_2_4_8_20_stages() -> None:
     assert match_ms >= 2.0
 
 
+def test_lost_grace_progressive_acquisition_avoids_duplicate_matching_and_matches_full_batch() -> None:
+    tracker = object.__new__(ProductionEDMTracker)
+    tracker.cfg = EDMConfig(
+        acquire_stage_mode="progressive",
+        use_temporal_reference=True,
+    )
+    tracker.st = RuntimeState(state="LOST", lost_frames=1)
+    tracker.temporal_gray = np.ones((576, 1024), np.uint8)
+    tracker.temporal_xyz_by_cell = np.ones((128 * 72, 3), np.float32)
+
+    ref_names = ["ref0", "ref1", "ref2", "ref3", "ref4"]
+    selection = _CandidateSelection(True, ref_names, "edm_local_recovery", 50, 0.0)
+
+    def make_row(marker: int, size: int = 10):
+        p2 = np.full((size, 2), marker, dtype=np.float32)
+        p3 = np.full((size, 3), marker, dtype=np.float32)
+        conf = np.full(size, 0.5 + marker * 0.05, dtype=np.float32)
+        return (p2, p3, conf, size)
+
+    source_rows = {
+        "temporal": make_row(0),
+        "ref0": make_row(1),
+        "ref1": make_row(2),
+        "ref2": make_row(3),
+        "ref3": make_row(4),
+        "ref4": make_row(5),
+    }
+
+    forward_calls = []
+
+    def mock_correspondences_for_sources(
+        _gray,
+        images,
+        xyz_luts,
+        batch_size=None,
+        source_kinds=None,
+        **kwargs,
+    ):
+        kinds = source_kinds or ["map"] * len(images)
+        rows = []
+        for i, kind in enumerate(kinds):
+            if kind == "temporal":
+                forward_calls.append("temporal")
+                rows.append(source_rows["temporal"])
+            else:
+                name = None
+                for ref_name in ref_names:
+                    if images[i] is tracker.map.images[ref_name]:
+                        name = ref_name
+                        break
+                forward_calls.append(name or f"map_{i}")
+                rows.append(source_rows[name])
+        return rows
+
+    def mock_correspondences_by_ref(_gray, refs, **kwargs):
+        rows = []
+        for name in refs:
+            forward_calls.append(name)
+            rows.append(source_rows[name])
+        return rows
+
+    tracker.map = SimpleNamespace(
+        images={name: np.ones((576, 1024), np.uint8) * (idx + 2) for idx, name in enumerate(ref_names)},
+        xyz_by_cell={name: np.ones((128 * 72, 3), np.float32) for name in ref_names},
+    )
+    tracker.loc = SimpleNamespace(
+        map=tracker.map,
+        correspondences_for_sources=mock_correspondences_for_sources,
+        correspondences_by_ref=mock_correspondences_by_ref,
+    )
+    tracker.cam = SimpleNamespace(width=1280, height=720)
+    tracker._pose_estimation_context = lambda: (object(), object())
+    tracker._new_pose_estimation_context = lambda _seed=-1: (object(), object())
+    tracker._acquire_stage_can_stop = lambda _staged, _attempt, _stamp: False
+
+    def mock_estimate_pose(p2, p3, conf, _cam, _opt):
+        return ({"num_inliers": len(p3), "center": np.mean(p3, axis=0)}, p2, p3, {}), 1.0
+
+    tracker._estimate_pose_candidate = mock_estimate_pose
+
+    active, staged_batch, staged_attempt, match_ms, evaluated = tracker._match_acquisition_stages(
+        np.zeros((576, 1024), np.uint8),
+        selection,
+        1.0,
+        None,
+    )
+
+    assert forward_calls == ["temporal", "ref0", "ref1", "ref2", "ref3", "ref4"]
+    assert len(forward_calls) == 6
+    assert evaluated == [2, 4, 5]
+
+    full_sources_rows = [
+        source_rows["temporal"],
+        source_rows["ref0"],
+        source_rows["ref1"],
+        source_rows["ref2"],
+        source_rows["ref3"],
+        source_rows["ref4"],
+    ]
+    p2_full, p3_full, conf_full, per_ref_full = tracker_module._merge_correspondence_rows(full_sources_rows)
+
+    assert np.array_equal(staged_batch.points2d, p2_full)
+    assert np.array_equal(staged_batch.points3d, p3_full)
+    assert np.array_equal(staged_batch.confidence, conf_full)
+    assert staged_batch.per_ref == per_ref_full
+    assert staged_batch.temporal_used is True
+    assert staged_batch.by_ref is None
+
+    full_attempt_result, _ = mock_estimate_pose(p2_full, p3_full, conf_full, None, None)
+    assert staged_attempt.result["num_inliers"] == full_attempt_result[0]["num_inliers"]
+    assert np.array_equal(staged_attempt.result["center"], full_attempt_result[0]["center"])
+
 def test_ranked_pnp_runs_best_batch_first_and_stops_after_gates() -> None:
     tracker = object.__new__(ProductionEDMTracker)
     tracker.cfg = EDMConfig(
@@ -968,16 +1080,62 @@ def test_pnp_early_stop_skips_rows_that_cannot_reach_the_inlier_gate() -> None:
     )
     selection = _CandidateSelection(
         acquiring=False,
+        refs=["a", "b", "c"],
+        mode="edm_map_scan",
+        min_inliers=50,
+        vpr_ms=0.0,
+    )
+
+    # Only the 120-corr ref is eligible; the two starved rows stay skipped
+    # because a viable candidate exists.
+    calls = []
+    tracker._estimate_reference_row = lambda row: calls.append(len(row[1])) or None
+    attempt = tracker._best_pose_attempt(selection, _pnp_batch([20, 39, 120]))
+
+    assert attempt.result is None
+    assert attempt.pnp_candidates == 1
+    assert attempt.pnp_skipped == 2
+    assert calls == [120]
+
+
+def test_pnp_early_stop_rescues_best_two_when_every_ref_is_starved() -> None:
+    tracker = object.__new__(ProductionEDMTracker)
+    tracker.cfg = EDMConfig(pnp_workers=2, pnp_early_stop=True)
+    tracker.cam = SimpleNamespace(width=1280, height=720)
+    tracker._pose_estimation_context = lambda: (object(), object())
+    tracker._new_pose_estimation_context = lambda _seed=-1: (object(), object())
+    selection = _CandidateSelection(
+        acquiring=False,
         refs=["a", "b"],
         mode="edm_map_scan",
         min_inliers=50,
         vpr_ms=0.0,
     )
 
-    attempt = tracker._best_pose_attempt(selection, _pnp_batch([20, 49]))
+    # Both refs are corr-starved: the two best still get a PnP chance instead
+    # of forcing LOST. Downstream gates decide; here the mock yields nothing.
+    calls = []
+    tracker._estimate_reference_row = lambda row: calls.append(len(row[1])) or None
+    attempt = tracker._best_pose_attempt(selection, _pnp_batch([20, 39]))
 
     assert attempt.result is None
-    assert attempt.pnp_ms == 0.0
+    assert attempt.pnp_candidates == 2
+    assert attempt.pnp_skipped == 0
+    assert sorted(calls) == [20, 39]
+
+
+def test_blend_velocity_trusts_new_sample_after_long_gaps() -> None:
+    blend = tracker_module._blend_velocity
+    old = np.array([1.0, 0.0, 0.0])
+    measured = np.array([3.0, 0.0, 0.0])
+    # 30 fps frame: mostly the old estimate (alpha = dt/tau ~ 0.13).
+    slow = blend(old, measured, 1.0 / 30.0)
+    assert slow[0] == pytest.approx(1.0 + (3.0 - 1.0) * (1.0 / 30.0 / 0.25))
+    # 0.5 s gap: almost fully the new measurement.
+    assert blend(old, measured, 0.5)[0] == pytest.approx(3.0)
+    # No history or bad dt: fall back to the measurement.
+    assert blend(None, measured, 0.1)[0] == pytest.approx(3.0)
+    assert blend(old, measured, float("nan"))[0] == pytest.approx(3.0)
 
 
 def test_parallel_pnp_preserves_candidate_order() -> None:
@@ -2395,6 +2553,190 @@ def test_acquire_stage_falls_back_to_full_set_when_quality_fails(
     assert calls == [names[:2], names[2:]]
 
 
+def test_acquire_stage_can_stop_single_strong_fast_path(monkeypatch) -> None:
+    tracker = object.__new__(ProductionEDMTracker)
+    tracker.cfg = EDMConfig(
+        acquire_min_inliers=80,
+        max_reproj_error_acquire=5.0,
+        min_inlier_ratio=0.2,
+        min_inlier_grid_cells=1,
+    )
+    tracker.st = RuntimeState()
+
+    selection = _CandidateSelection(
+        acquiring=True,
+        refs=["ref0", "ref1"],
+        mode="megaloc_boot",
+        min_inliers=80,
+        vpr_ms=0.0,
+    )
+
+    def make_attempt(
+        inliers: int,
+        reproj_rms: float,
+        selected_ref: str = "ref0",
+        strong_count: int = 1,
+    ) -> "tracker_module._PoseAttempt":
+        result = {
+            "num_inliers": inliers,
+            "cam_from_world": pycolmap.Rigid3d(),
+        }
+        metrics = {
+            "reproj_rms": reproj_rms,
+            "inlier_ratio": 0.5,
+            "inlier_grid_cells": 4,
+        }
+        return tracker_module._PoseAttempt(
+            result=result,
+            points2d=np.zeros((inliers, 2)),
+            points3d=np.zeros((inliers, 3)),
+            metrics=metrics,
+            selected_ref=selected_ref,
+            pnp_ms=1.0,
+            strong_count=strong_count,
+        )
+
+    # Super-strong single candidate: 120 inliers, 1.5px reproj stops early
+    attempt_120_1p5 = make_attempt(120, 1.5, selected_ref="ref0", strong_count=1)
+    assert tracker._acquire_stage_can_stop(selection, attempt_120_1p5, capture_stamp=1.0) is True
+
+    # Super-strong single candidate: 150 inliers, 1.0px reproj stops early
+    attempt_150_1p0 = make_attempt(150, 1.0, selected_ref="ref0", strong_count=1)
+    assert tracker._acquire_stage_can_stop(selection, attempt_150_1p0, capture_stamp=1.0) is True
+
+    # 119 inliers (< 120 threshold) does not stop
+    attempt_119 = make_attempt(119, 1.5, selected_ref="ref0", strong_count=1)
+    assert tracker._acquire_stage_can_stop(selection, attempt_119, capture_stamp=1.0) is False
+
+    # Reproj 2.1 (> 2.0 threshold) does not stop
+    attempt_2p1 = make_attempt(120, 2.1, selected_ref="ref0", strong_count=1)
+    assert tracker._acquire_stage_can_stop(selection, attempt_2p1, capture_stamp=1.0) is False
+
+    # Reproj 2.0 (exact threshold) stops
+    attempt_2p0 = make_attempt(120, 2.0, selected_ref="ref0", strong_count=1)
+    assert tracker._acquire_stage_can_stop(selection, attempt_2p0, capture_stamp=1.0) is True
+
+    # Non-Top-1 candidate (ref1) does not stop even with strong numbers
+    attempt_ref1 = make_attempt(120, 1.5, selected_ref="ref1", strong_count=1)
+    assert tracker._acquire_stage_can_stop(selection, attempt_ref1, capture_stamp=1.0) is False
+
+    # When acquire_min_inliers is higher (e.g. 100 -> max(150, 120) = 150):
+    tracker_100 = object.__new__(ProductionEDMTracker)
+    tracker_100.cfg = EDMConfig(
+        acquire_min_inliers=100,
+        max_reproj_error_acquire=5.0,
+        min_inlier_ratio=0.2,
+        min_inlier_grid_cells=1,
+    )
+    tracker_100.st = RuntimeState()
+    selection_100 = replace(selection, min_inliers=100)
+    attempt_140 = make_attempt(140, 1.5, selected_ref="ref0", strong_count=1)
+    assert tracker_100._acquire_stage_can_stop(selection_100, attempt_140, capture_stamp=1.0) is False
+    attempt_150 = make_attempt(150, 1.5, selected_ref="ref0", strong_count=1)
+    assert tracker_100._acquire_stage_can_stop(selection_100, attempt_150, capture_stamp=1.0) is True
+
+    # Env switch SFM_EDM_SINGLE_STRONG_EARLY_STOP=0 restores old 2-consensus requirement
+    monkeypatch.setenv("SFM_EDM_SINGLE_STRONG_EARLY_STOP", "0")
+    assert tracker._acquire_stage_can_stop(selection, attempt_120_1p5, capture_stamp=1.0) is False
+    # Under env=0, 2-consensus still succeeds
+    attempt_2cons = make_attempt(85, 3.5, selected_ref="ref0", strong_count=2)
+    assert tracker._acquire_stage_can_stop(selection, attempt_2cons, capture_stamp=1.0) is True
+
+
+def test_acquire_stage_single_strong_skips_stages_and_obeys_env(monkeypatch) -> None:
+    names = [f"ref{i}" for i in range(4)]
+    camera = SimpleNamespace(
+        model="PINHOLE", width=1280, height=720,
+        params=[900.0, 900.0, 640.0, 360.0],
+    )
+    pycamera = pycolmap.Camera(
+        model=camera.model, width=camera.width, height=camera.height,
+        params=camera.params,
+    )
+    points3d = np.stack([
+        np.linspace(-1.0, 1.0, 120),
+        np.linspace(-0.5, 0.5, 120),
+        np.linspace(4.0, 6.0, 120),
+    ], axis=1)
+    points2d = pycamera.img_from_cam(points3d)
+    calls = []
+
+    class FakeLocalizer:
+        scale = 1.25
+
+        def retrieve(self, _rgb, _topk):
+            return names
+
+        def correspondences_by_ref(self, _gray, refs, **_kwargs):
+            calls.append(list(refs))
+            rows = []
+            for name in refs:
+                if name == "ref0":
+                    rows.append((
+                        np.asarray(points2d, dtype=float).copy(),
+                        points3d.copy(),
+                        np.ones(120, np.float32),
+                        120,
+                    ))
+                else:
+                    rows.append((
+                        np.zeros((10, 2), dtype=float),
+                        np.zeros((10, 3), dtype=float),
+                        np.ones(10, np.float32),
+                        10,
+                    ))
+            return rows
+
+    monkeypatch.setattr(
+        tracker_module.pycolmap,
+        "estimate_and_refine_absolute_pose",
+        lambda p2, p3, _camera, _options: {
+            "cam_from_world": pycolmap.Rigid3d(),
+            "num_inliers": len(p3),
+            "inlier_mask": np.ones(len(p3), dtype=bool),
+        },
+    )
+    tracker = object.__new__(ProductionEDMTracker)
+    tracker.cfg = EDMConfig(
+        boot_global_topk=4,
+        acquire_initial_topk=2,
+        acquire_min_inliers=80,
+        max_corr_total=200,
+        min_inlier_grid_cells=1,
+        acquire_stage_mode="initial_topk",
+    )
+    tracker.st = RuntimeState()
+    tracker.map = SimpleNamespace(
+        ref_names=names,
+        images={name: np.zeros((576, 1024), np.uint8) for name in names},
+        xyz_by_cell={name: np.zeros((128 * 72, 3), np.float32) for name in names},
+        covis={},
+    )
+    tracker.cam = camera
+    tracker.loc = FakeLocalizer()
+    tracker.centers = np.zeros((4, 3), np.float32)
+    tracker.yaws = np.zeros(4, np.float32)
+    tracker.name_of = dict(enumerate(names))
+    tracker.idx_of = {name: index for index, name in enumerate(names)}
+    tracker.recovery_bank = names
+    tracker.temporal_gray = None
+    tracker.temporal_xyz_by_cell = None
+    tracker.motion_validator = None
+    tracker.motion_validation_mode = "off"
+
+    # Default env: ref0 has 120 inliers (strong_count=1), stops at stage 1
+    info = tracker.localize(np.zeros((720, 1280, 3), np.uint8), capture_stamp=1.0)
+    assert info["ok"]
+    assert info["staged_early_stop"]
+    assert calls == [names[:2]]
+
+    # Env SFM_EDM_SINGLE_STRONG_EARLY_STOP=0: strong_count=1 cannot early stop, falls back to remaining refs
+    calls.clear()
+    monkeypatch.setenv("SFM_EDM_SINGLE_STRONG_EARLY_STOP", "0")
+    tracker.st = RuntimeState()
+    info = tracker.localize(np.zeros((720, 1280, 3), np.uint8), capture_stamp=1.0)
+    assert calls == [names[:2], names[2:]]
+
 def test_full_global_lost_prior_does_not_restrict_megaloc(monkeypatch) -> None:
     import cv2
 
@@ -2782,3 +3124,901 @@ def test_flight_fold_report_exposes_macro_and_worst_fold_metrics() -> None:
     assert summary["worst_fold_success"] == pytest.approx(0.25)
     assert summary["worst_fold_error"]["position_map_units"]["median"] == pytest.approx(0.04)
     assert summary["worst_fold_error"]["rotation_degrees"]["median"] == pytest.approx(0.3)
+
+
+def test_pnp_early_stop_relaxed_eligibility_boundary(monkeypatch) -> None:
+    tracker = object.__new__(ProductionEDMTracker)
+    tracker.cfg = EDMConfig(pnp_workers=2, pnp_early_stop=True)
+    tracker.cam = SimpleNamespace(width=1280, height=720)
+    tracker._pose_estimation_context = lambda: (object(), object())
+    tracker._new_pose_estimation_context = lambda _seed=-1: (object(), object())
+
+    # Case 1: min_inliers = 50 -> threshold is max(10, ceil(0.8*50)) = 40.
+    # 40 is eligible, 39 is skipped.
+    selection = _CandidateSelection(
+        acquiring=False,
+        refs=["a", "b"],
+        mode="edm_map_scan",
+        min_inliers=50,
+        vpr_ms=0.0,
+    )
+    calls = []
+    tracker._estimate_reference_row = lambda row: calls.append(len(row[1])) or None
+    attempt = tracker._best_pose_attempt(selection, _pnp_batch([39, 40]))
+    assert attempt.pnp_candidates == 1
+    assert attempt.pnp_skipped == 1
+    assert calls == [40]
+
+    # Case 2: min_inliers = 10 -> threshold is max(10, ceil(0.8*10)) = 10.
+    # 10 is eligible, 9 is skipped.
+    selection_10 = _CandidateSelection(
+        acquiring=False,
+        refs=["a", "b"],
+        mode="edm_map_scan",
+        min_inliers=10,
+        vpr_ms=0.0,
+    )
+    calls.clear()
+    attempt = tracker._best_pose_attempt(selection_10, _pnp_batch([9, 10]))
+    assert attempt.pnp_candidates == 1
+    assert attempt.pnp_skipped == 1
+    assert calls == [10]
+
+    # Case 3: min_inliers = 8 (small value) -> threshold is max(10, ceil(0.8*8)) = 10.
+    # Floor of 10 applies: 10 is eligible, 9 is skipped.
+    selection_8 = _CandidateSelection(
+        acquiring=False,
+        refs=["a", "b"],
+        mode="edm_map_scan",
+        min_inliers=8,
+        vpr_ms=0.0,
+    )
+    calls.clear()
+    attempt = tracker._best_pose_attempt(selection_8, _pnp_batch([9, 10]))
+    assert attempt.pnp_candidates == 1
+    assert attempt.pnp_skipped == 1
+    assert calls == [10]
+
+    # Case 4: env SFM_EDM_PNP_ELIGIBLE_RELAX=0 restores legacy min_inliers threshold.
+    # With min_inliers=50, 40 is now skipped and only >=50 is eligible.
+    monkeypatch.setenv("SFM_EDM_PNP_ELIGIBLE_RELAX", "0")
+    calls.clear()
+    attempt = tracker._best_pose_attempt(selection, _pnp_batch([40, 50]))
+    assert attempt.pnp_candidates == 1
+    assert attempt.pnp_skipped == 1
+    assert calls == [50]
+
+
+def test_weak_hysteresis_single_frame_near_miss_buffered(monkeypatch) -> None:
+    monkeypatch.setenv("SFM_EDM_WEAK_HYSTERESIS", "1")
+    tracker = _jump_gate_tracker(monkeypatch, [0.0])
+    tracker.cfg.weak_after = 1
+    tracker.cfg.track_min_inliers = 50
+    tracker.st.state = "TRACK"
+    tracker.st.misses = 0
+
+    # 49 inliers in [45, 50), reproj 1.5 <= 2.5, step is legal -> buffered, stays TRACK
+    info = {
+        "pose_status": "NONE",
+        "inliers": 49,
+        "reproj_rms": 1.5,
+        "step_legal": True,
+    }
+    tracker._on_miss(info)
+
+    assert tracker.st.state == "TRACK"
+    assert tracker.st.misses == 0.5
+    assert info.get("weak_hysteresis_buffered") is True
+    assert info.get("state_out") == "TRACK"
+
+
+def test_weak_hysteresis_two_consecutive_near_misses_downgrades(monkeypatch) -> None:
+    monkeypatch.setenv("SFM_EDM_WEAK_HYSTERESIS", "1")
+    tracker = _jump_gate_tracker(monkeypatch, [0.0])
+    tracker.cfg.weak_after = 1
+    tracker.cfg.track_min_inliers = 50
+    tracker.st.state = "TRACK"
+    tracker.st.misses = 0
+
+    # Frame 1: buffered, stays TRACK
+    info1 = {
+        "pose_status": "NONE",
+        "inliers": 49,
+        "reproj_rms": 1.5,
+        "step_legal": True,
+    }
+    tracker._on_miss(info1)
+    assert tracker.st.state == "TRACK"
+    assert tracker.st.misses == 0.5
+
+    # Frame 2: second near-miss pushes misses to 1.0 >= weak_after -> downgrades to WEAK_TRACK
+    info2 = {
+        "pose_status": "NONE",
+        "inliers": 49,
+        "reproj_rms": 1.5,
+        "step_legal": True,
+    }
+    tracker._on_miss(info2)
+    assert tracker.st.state == "WEAK_TRACK"
+    assert tracker.st.misses == 1.0
+    assert info2.get("state_out") == "WEAK_TRACK"
+
+
+def test_weak_hysteresis_reproj_exceeded_downgrades_immediately(monkeypatch) -> None:
+    monkeypatch.setenv("SFM_EDM_WEAK_HYSTERESIS", "1")
+    tracker = _jump_gate_tracker(monkeypatch, [0.0])
+    tracker.cfg.weak_after = 1
+    tracker.cfg.track_min_inliers = 50
+    tracker.st.state = "TRACK"
+    tracker.st.misses = 0
+
+    # 49 inliers but reproj 3.0 > 2.5 -> not buffered, drops to WEAK_TRACK immediately
+    info = {
+        "pose_status": "NONE",
+        "inliers": 49,
+        "reproj_rms": 3.0,
+        "step_legal": True,
+    }
+    tracker._on_miss(info)
+    assert tracker.st.state == "WEAK_TRACK"
+    assert tracker.st.misses == 1.0
+    assert not info.get("weak_hysteresis_buffered")
+    assert info.get("state_out") == "WEAK_TRACK"
+
+
+def test_weak_hysteresis_step_illegal_downgrades_immediately(monkeypatch) -> None:
+    monkeypatch.setenv("SFM_EDM_WEAK_HYSTERESIS", "1")
+    tracker = _jump_gate_tracker(monkeypatch, [0.0])
+    tracker.cfg.weak_after = 1
+    tracker.cfg.track_min_inliers = 50
+    tracker.st.state = "TRACK"
+    tracker.st.misses = 0
+
+    # Step illegal (step_legal=False) -> drops to WEAK_TRACK immediately
+    info = {
+        "pose_status": "NONE",
+        "inliers": 49,
+        "reproj_rms": 1.5,
+        "step_legal": False,
+    }
+    tracker._on_miss(info)
+    assert tracker.st.state == "WEAK_TRACK"
+    assert tracker.st.misses == 1.0
+
+    # Also test rejected="jump"
+    tracker.st.state = "TRACK"
+    tracker.st.misses = 0
+    info_jump = {
+        "pose_status": "NONE",
+        "inliers": 49,
+        "reproj_rms": 1.5,
+        "rejected": "jump",
+    }
+    tracker._on_miss(info_jump)
+    assert tracker.st.state == "WEAK_TRACK"
+    assert tracker.st.misses == 1.0
+
+
+def test_weak_hysteresis_below_soft_interval_downgrades_immediately(monkeypatch) -> None:
+    monkeypatch.setenv("SFM_EDM_WEAK_HYSTERESIS", "1")
+    tracker = _jump_gate_tracker(monkeypatch, [0.0])
+    tracker.cfg.weak_after = 1
+    tracker.cfg.track_min_inliers = 50
+    tracker.st.state = "TRACK"
+    tracker.st.misses = 0
+
+    # 44 inliers < 45 -> below soft interval, drops to WEAK_TRACK immediately
+    info = {
+        "pose_status": "NONE",
+        "inliers": 44,
+        "reproj_rms": 1.5,
+        "step_legal": True,
+    }
+    tracker._on_miss(info)
+    assert tracker.st.state == "WEAK_TRACK"
+    assert tracker.st.misses == 1.0
+    assert not info.get("weak_hysteresis_buffered")
+    assert info.get("state_out") == "WEAK_TRACK"
+
+
+def test_weak_hysteresis_env_disabled_restores_legacy_behavior(monkeypatch) -> None:
+    # Default/env 0: hysteresis off
+    monkeypatch.setenv("SFM_EDM_WEAK_HYSTERESIS", "0")
+    tracker = _jump_gate_tracker(monkeypatch, [0.0])
+    tracker.cfg.weak_after = 1
+    tracker.cfg.track_min_inliers = 50
+    tracker.st.state = "TRACK"
+    tracker.st.misses = 0
+
+    info = {
+        "pose_status": "NONE",
+        "inliers": 49,
+        "reproj_rms": 1.5,
+        "step_legal": True,
+    }
+    tracker._on_miss(info)
+    assert tracker.st.state == "WEAK_TRACK"
+    assert tracker.st.misses == 1.0
+    assert not info.get("weak_hysteresis_buffered")
+    assert info.get("state_out") == "WEAK_TRACK"
+
+
+def test_adaptive_vpr_blur_gate_boundary(monkeypatch) -> None:
+    monkeypatch.setenv("SFM_EDM_ADAPTIVE_VPR", "1")
+    tracker = _lost_retrieval_policy_tracker(interval=3)
+    tracker.st.lost_frames = 6
+    tracker.st.lost_global_retrieval_attempts = 1
+    tracker._last_vpr_lost_frame = 3
+
+    # Blurry frame (var == 0.0 < _VPR_BLUR_VAR_MIN): skips global retrieval retry
+    blurry = np.full((100, 100), 128, dtype=np.uint8)
+    assert not tracker._should_run_global_retrieval(blurry)
+
+    # Sharp frame (var >> _VPR_BLUR_VAR_MIN): does not skip
+    sharp = np.zeros((100, 100), dtype=np.uint8)
+    sharp[::2, ::2] = 255
+    assert tracker._should_run_global_retrieval(sharp)
+
+    # Disabled env: blur gate does not trigger
+    monkeypatch.setenv("SFM_EDM_ADAPTIVE_VPR", "0")
+    tracker.st.lost_frames = 5
+    assert tracker._should_run_global_retrieval(blurry)
+
+
+def test_adaptive_vpr_backoff_and_reset(monkeypatch) -> None:
+    monkeypatch.setenv("SFM_EDM_ADAPTIVE_VPR", "1")
+    tracker = _lost_retrieval_policy_tracker(interval=3)
+    tracker.cfg.radius = 0.8
+    tracker.cfg.max_jump = 2.0
+
+    # Initial state: 0 failures -> interval=3, radius=1.0x
+    assert tracker._vpr_consec_failures == 0
+    assert tracker._effective_lost_global_retrieval_interval() == 3
+    assert tracker._lost_local_radius_factor() == 1.0
+
+    # 1 failure: interval=3, radius=1.0x
+    tracker._vpr_consec_failures = 1
+    assert tracker._effective_lost_global_retrieval_interval() == 3
+    assert tracker._lost_local_radius_factor() == 1.0
+
+    # 2 consecutive failures: interval=5, radius=2.0x (capped at max_jump)
+    tracker._vpr_consec_failures = 2
+    assert tracker._effective_lost_global_retrieval_interval() == 5
+    assert tracker._lost_local_radius_factor() == 2.0
+
+    # 3 consecutive failures: interval=8, radius=2.0x
+    tracker._vpr_consec_failures = 3
+    assert tracker._effective_lost_global_retrieval_interval() == 8
+    assert tracker._lost_local_radius_factor() == 2.0
+
+    # Success reset: resets back to 0 -> interval=3, radius=1.0x
+    tracker._vpr_consec_failures = 0
+    assert tracker._effective_lost_global_retrieval_interval() == 3
+    assert tracker._lost_local_radius_factor() == 1.0
+
+
+def test_adaptive_vpr_env_disabled_keeps_fixed_interval(monkeypatch) -> None:
+    monkeypatch.setenv("SFM_EDM_ADAPTIVE_VPR", "0")
+    tracker = _lost_retrieval_policy_tracker(interval=3)
+    tracker.cfg.radius = 0.8
+    tracker.cfg.max_jump = 2.0
+    tracker._vpr_consec_failures = 5
+
+    # Even with 5 failures, env=0 keeps fixed interval=3 and radius=1.0x
+    assert tracker._effective_lost_global_retrieval_interval() == 3
+    assert tracker._lost_local_radius_factor() == 1.0
+
+
+def test_prior_pnp_refine_fast_path_selection(monkeypatch) -> None:
+    import pycolmap
+    from types import SimpleNamespace
+
+    camera = pycolmap.Camera(model="PINHOLE", width=640, height=480, params=[500, 500, 320, 240])
+    tracker = object.__new__(ProductionEDMTracker)
+    tracker.cam = camera
+    tracker.cfg = SimpleNamespace(max_corr_total=900, corr_grid=8, pnp_ransac_max_error=5.0)
+    tracker.st = RuntimeState(state="TRACK")
+
+    rng = np.random.RandomState(42)
+    pts3D = rng.uniform(-2, 2, size=(100, 3))
+    pts3D[:, 2] += 5.0
+    pts2D = camera.img_from_cam(pts3D)
+    conf = np.ones(100, dtype=float)
+    prior = pycolmap.Rigid3d(pycolmap.Rotation3d(), np.array([0.01, -0.01, 0.01]))
+
+    refine_calls = []
+    orig_refine = pycolmap.refine_absolute_pose
+    def spy_refine(*args, **kwargs):
+        refine_calls.append(True)
+        return orig_refine(*args, **kwargs)
+
+    ransac_calls = []
+    orig_ransac = pycolmap.estimate_and_refine_absolute_pose
+    def spy_ransac(*args, **kwargs):
+        ransac_calls.append(True)
+        return orig_ransac(*args, **kwargs)
+
+    monkeypatch.setattr(pycolmap, "refine_absolute_pose", spy_refine)
+    monkeypatch.setattr(pycolmap, "estimate_and_refine_absolute_pose", spy_ransac)
+
+    # 1. Qualified (inliers=100 >= 60, ratio=1.0 >= 0.65) with env ON -> calls refine, skips RANSAC
+    monkeypatch.setenv("SFM_EDM_PRIOR_PNP_REFINE", "1")
+    _cam, options = tracker._new_pose_estimation_context()
+    cand, _elapsed = tracker._estimate_pose_candidate(pts2D, pts3D, conf, camera, options, prior=prior)
+    assert cand is not None
+    assert len(refine_calls) == 1
+    assert len(ransac_calls) == 0
+
+    # 2. Unqualified (inliers=40 < 60) -> skips refine, calls full RANSAC
+    refine_calls.clear()
+    ransac_calls.clear()
+    cand, _elapsed = tracker._estimate_pose_candidate(pts2D[:40], pts3D[:40], conf[:40], camera, options, prior=prior)
+    assert cand is not None
+    assert len(refine_calls) == 0
+    assert len(ransac_calls) == 1
+
+    # 3. Refine fails (returns None) -> falls back to full RANSAC
+    monkeypatch.setattr(pycolmap, "refine_absolute_pose", lambda *args, **kwargs: None)
+    refine_calls.clear()
+    ransac_calls.clear()
+    cand, _elapsed = tracker._estimate_pose_candidate(pts2D, pts3D, conf, camera, options, prior=prior)
+    assert cand is not None
+    assert len(ransac_calls) == 1
+
+    # 4. Env OFF -> skips refine even if qualified, runs full RANSAC
+    monkeypatch.setattr(pycolmap, "refine_absolute_pose", spy_refine)
+    monkeypatch.setenv("SFM_EDM_PRIOR_PNP_REFINE", "0")
+    refine_calls.clear()
+    ransac_calls.clear()
+    cand, _elapsed = tracker._estimate_pose_candidate(pts2D, pts3D, conf, camera, options, prior=prior)
+    assert cand is not None
+    assert len(refine_calls) == 0
+    assert len(ransac_calls) == 1
+
+
+def test_pnp_threads_env_passthrough(monkeypatch) -> None:
+    import pycolmap
+    from types import SimpleNamespace
+
+    tracker = object.__new__(ProductionEDMTracker)
+    tracker.cam = pycolmap.Camera(model="PINHOLE", width=640, height=480, params=[500, 500, 320, 240])
+    tracker.cfg = SimpleNamespace(pnp_ransac_max_error=5.0)
+
+    # Set threads via env
+    monkeypatch.setenv("SFM_EDM_PNP_THREADS", "4")
+    _cam, options = tracker._new_pose_estimation_context()
+    assert options.ransac.num_threads == 4
+
+    # Default without env
+    monkeypatch.delenv("SFM_EDM_PNP_THREADS", raising=False)
+    _cam, options = tracker._new_pose_estimation_context()
+    assert options.ransac.num_threads == 1
+
+
+
+def test_prior_refine_survives_noisy_prior(monkeypatch) -> None:
+    """Perturbed prior (+-0.3m, +-10deg) must still yield an accurate pose.
+
+    Either the 1-step refine converges or the code falls back to full RANSAC;
+    both paths must stay within tight error bounds (no local-minimum latch).
+    """
+    import pycolmap
+
+    monkeypatch.setenv("SFM_EDM_PRIOR_PNP_REFINE", "1")
+    tracker = object.__new__(ProductionEDMTracker)
+    tracker.cfg = EDMConfig()
+    tracker.cam = SimpleNamespace(width=1280, height=720)
+    pcam = pycolmap.Camera(model="PINHOLE", width=1280, height=720,
+                           params=[900.0, 900.0, 640.0, 360.0])
+    options = pycolmap.AbsolutePoseEstimationOptions()
+    options.ransac.max_error = 5.0
+    options.ransac.random_seed = 0
+    tracker._pose_estimation_context = lambda: (pcam, options)
+    tracker._new_pose_estimation_context = lambda _seed=-1: (pcam, options)
+
+    rng = np.random.default_rng(0)
+    pts3d = np.column_stack([
+        rng.uniform(-3.0, 3.0, 300),
+        rng.uniform(-2.0, 2.0, 300),
+        rng.uniform(4.0, 10.0, 300),
+    ])
+    q_true = pycolmap.Rotation3d()
+    t_true = np.zeros(3)
+    cam_true = pycolmap.Rigid3d(q_true, t_true)
+    pts_cam = np.asarray(cam_true * pts3d)
+    uv = np.column_stack([
+        pts_cam[:, 0] / pts_cam[:, 2] * 900.0 + 640.0,
+        pts_cam[:, 1] / pts_cam[:, 2] * 900.0 + 360.0,
+    ]) + rng.normal(0.0, 0.5, (300, 2))
+    # 20% gross outliers.
+    uv[:60] = rng.uniform([0, 0], [1280, 720], (60, 2))
+    conf = np.ones(300, np.float32)
+
+    # Perturbed prior: 0.3 m translation + 10 deg yaw.
+    half = np.radians(10.0) / 2.0
+    dq = pycolmap.Rotation3d(np.array([np.cos(half), 0.0, 0.0, np.sin(half)]))
+    noisy = pycolmap.Rigid3d(dq * q_true, t_true + np.array([0.3, 0.0, 0.0]))
+
+    out, _ms = tracker._estimate_pose_candidate(
+        uv, pts3d, conf, pcam, options, prior={"cam_from_world": noisy})
+    assert out is not None
+    result, _p2d, _p3d, metrics = out
+    est = result["cam_from_world"]
+    got_t = np.asarray(est.translation)
+    assert np.linalg.norm(got_t - t_true) < 0.3
+    assert metrics["reproj_rms"] is not None and float(metrics["reproj_rms"]) < 5.0
+    assert int(result["num_inliers"]) >= 60
+
+
+def _acquire_selection(min_inliers: int = 80, refs: list[str] | None = None):
+    return _CandidateSelection(
+        acquiring=True,
+        refs=list(refs or ["a", "b", "c"]),
+        mode="megaloc_lost_global_retry",
+        min_inliers=min_inliers,
+        vpr_ms=1.0,
+    )
+
+
+def _lost_tracker(**cfg_kwargs) -> ProductionEDMTracker:
+    tracker = object.__new__(ProductionEDMTracker)
+    tracker.cfg = EDMConfig(**cfg_kwargs)
+    tracker.st = RuntimeState(state="LOST", lost_frames=9, last_capture_stamp=1.0)
+    return tracker
+
+
+def _relaxed_attempt(inliers: int, agree: int):
+    return tracker_module._PoseAttempt(
+        result={
+            "cam_from_world": pycolmap.Rigid3d(),
+            "num_inliers": inliers,
+            "inlier_mask": np.ones(inliers, dtype=bool),
+        },
+        points2d=np.zeros((inliers, 2)),
+        points3d=np.zeros((inliers, 3)),
+        metrics={"reproj_rms": 2.0, "inlier_ratio": 0.25, "inlier_grid_cells": 8},
+        selected_ref="a",
+        pnp_ms=1.0,
+        strong_count=0,
+        relaxed_agree_count=agree,
+    )
+
+
+def test_relaxed_acquire_floor_requires_agreeing_references() -> None:
+    tracker = _lost_tracker(acquire_relaxed_min_inliers=66)
+    selection = _acquire_selection()
+
+    assert tracker._relaxed_acquire_gate(selection, _relaxed_attempt(70, 1)) is None
+    assert tracker._relaxed_acquire_gate(selection, _relaxed_attempt(70, 2)) == (66, 3.0)
+
+
+def test_relaxed_acquire_floor_is_bounded_to_the_near_miss_band() -> None:
+    tracker = _lost_tracker(acquire_relaxed_min_inliers=66)
+    selection = _acquire_selection()
+
+    # Below the relaxed floor and at/above the standard floor both fall through
+    # to the unchanged single-threshold behaviour.
+    assert tracker._relaxed_acquire_gate(selection, _relaxed_attempt(65, 3)) is None
+    assert tracker._relaxed_acquire_gate(selection, _relaxed_attempt(80, 3)) is None
+
+
+def test_relaxed_acquire_floor_is_off_for_boot_and_tracking() -> None:
+    tracker = _lost_tracker(acquire_relaxed_min_inliers=66)
+    selection = _acquire_selection()
+    attempt = _relaxed_attempt(70, 3)
+
+    tracker.st.state = "BOOT_INIT"
+    assert tracker._relaxed_acquire_gate(selection, attempt) is None
+
+    tracker.st.state = "LOST"
+    track_selection = _CandidateSelection(
+        acquiring=False, refs=["a"], mode="edm_track", min_inliers=80, vpr_ms=0.0
+    )
+    assert tracker._relaxed_acquire_gate(track_selection, attempt) is None
+
+
+def test_relaxed_acquire_floor_defaults_to_66() -> None:
+    # Shipped 2026-09-05 on the seven-video 720p corpus: +231 frames overall,
+    # P168 the only segment that pays (-21/-36/-21 across seeds 0/1/2), and the
+    # off-map hard negative stays 0/241 with the floor on. See EDMConfig.
+    tracker = _lost_tracker()
+    assert tracker.cfg.acquire_relaxed_min_inliers == 66
+    assert tracker._relaxed_acquire_gate(
+        _acquire_selection(), _relaxed_attempt(70, 5)) == (66, 3.0)
+
+
+def test_relaxed_acquire_floor_can_be_turned_off() -> None:
+    tracker = _lost_tracker(acquire_relaxed_min_inliers=0)
+    assert tracker._relaxed_acquire_gate(_acquire_selection(), _relaxed_attempt(70, 5)) is None
+
+
+def test_relaxed_acquire_reproj_limit_never_widens_the_standard_limit() -> None:
+    tracker = _lost_tracker(
+        acquire_relaxed_min_inliers=66,
+        acquire_relaxed_max_reproj_error=9.0,
+        max_reproj_error_acquire=5.0,
+    )
+    relaxed = tracker._relaxed_acquire_gate(_acquire_selection(), _relaxed_attempt(70, 2))
+    assert relaxed == (66, 5.0)
+
+
+def _scored_candidate(inliers: int, x: float):
+    result = {
+        "cam_from_world": pycolmap.Rigid3d(pycolmap.Rotation3d(), np.array([-x, 0.0, 0.0])),
+        "num_inliers": inliers,
+        "inlier_mask": np.ones(inliers, dtype=bool),
+    }
+    return (
+        result,
+        np.zeros((inliers, 2)),
+        np.zeros((inliers, 3)),
+        {"reproj_rms": 2.0, "inlier_ratio": 0.25, "inlier_grid_cells": 8},
+    )
+
+
+def test_relaxed_agreement_counts_only_references_on_the_same_center() -> None:
+    tracker = _lost_tracker(acquire_relaxed_min_inliers=66, max_jump=2.0)
+    selection = _acquire_selection()
+    chosen = _scored_candidate(70, 0.0)
+    scored = [
+        ("a", chosen),
+        ("b", _scored_candidate(68, 0.5)),  # agrees (0.5 m < 4.0 m consensus limit)
+        ("c", _scored_candidate(90, 40.0)),  # strong but somewhere else
+        ("d", _scored_candidate(20, 0.1)),  # same place, below the relaxed floor
+    ]
+
+    assert tracker._count_relaxed_agreement(selection, scored, chosen) == 2
+
+
+def test_relaxed_agreement_is_not_computed_for_strong_candidates() -> None:
+    tracker = _lost_tracker(acquire_relaxed_min_inliers=66)
+    selection = _acquire_selection()
+    chosen = _scored_candidate(120, 0.0)
+    scored = [("a", chosen), ("b", _scored_candidate(110, 0.2))]
+
+    assert tracker._count_relaxed_agreement(selection, scored, chosen) == 0
+
+
+def _starvation_tracker(**cfg_kwargs) -> ProductionEDMTracker:
+    tracker = _lost_tracker(**cfg_kwargs)
+    tracker._last_lost_search_stage = None
+    tracker._last_lost_radius_factor = None
+    return tracker
+
+
+def _local_selection():
+    return _CandidateSelection(
+        acquiring=True,
+        refs=["r0", "r1"],
+        mode="edm_local_recovery",
+        min_inliers=80,
+        vpr_ms=0.0,
+    )
+
+
+def test_consecutive_starved_lost_frames_arm_global_retrieval() -> None:
+    tracker = _starvation_tracker(lost_starved_global_frames=3, lost_starved_corr_max=5)
+    selection = _local_selection()
+
+    for expected in (1, 2):
+        info: dict = {"n_corr": 2}
+        tracker._observe_lost_starvation("LOST", selection, info)
+        assert info["lost_starved_frames"] == expected
+        assert tracker._lost_starvation_armed() is False
+
+    info = {"n_corr": 0}
+    tracker._observe_lost_starvation("LOST", selection, info)
+    assert tracker._lost_starvation_armed() is True
+    assert tracker._should_run_global_retrieval(None) is True
+
+
+def test_starvation_counter_resets_on_dense_matches_and_leaving_lost() -> None:
+    tracker = _starvation_tracker(lost_starved_global_frames=2, lost_starved_corr_max=5)
+    selection = _local_selection()
+
+    tracker._observe_lost_starvation("LOST", selection, {"n_corr": 1})
+    tracker._observe_lost_starvation("LOST", selection, {"n_corr": 300})
+    assert tracker.st.lost_starved_frames == 0
+
+    tracker._observe_lost_starvation("LOST", selection, {"n_corr": 1})
+    tracker._observe_lost_starvation("TRACK", selection, {"n_corr": 1})
+    assert tracker.st.lost_starved_frames == 0
+
+
+def test_retrieval_frames_do_not_clip_a_starved_run() -> None:
+    # The interleaved MegaLoc cadence puts a retrieval frame between every two
+    # local frames, so resetting on retrieval frames would cap the counter at
+    # two and a k>=3 escape hatch could never arm.
+    tracker = _starvation_tracker(lost_starved_global_frames=3, lost_starved_corr_max=5)
+    selection = _local_selection()
+    retrieval = replace(selection, mode="megaloc_lost_near")
+
+    tracker._observe_lost_starvation("LOST", selection, {"n_corr": 2})
+    tracker._observe_lost_starvation("LOST", selection, {"n_corr": 2})
+    tracker._observe_lost_starvation("LOST", retrieval, {"n_corr": 340})
+    assert tracker.st.lost_starved_frames == 2
+    assert tracker._lost_starvation_armed() is False
+
+    tracker._observe_lost_starvation("LOST", selection, {"n_corr": 3})
+    assert tracker.st.lost_starved_frames == 3
+    assert tracker._lost_starvation_armed() is True
+
+
+def test_starvation_accounting_is_off_by_default() -> None:
+    tracker = _starvation_tracker()
+    info: dict = {"n_corr": 0}
+    tracker._observe_lost_starvation("LOST", _local_selection(), info)
+
+    assert "lost_starved_frames" not in info
+    assert tracker.st.lost_starved_frames == 0
+    assert tracker._lost_starvation_armed() is False
+
+
+def test_starved_retrieval_ranks_the_whole_map_instead_of_the_nearby_pool() -> None:
+    tracker = _starvation_tracker(lost_starved_global_frames=2, lost_starved_corr_max=5)
+    tracker.st.lost_starved_frames = 2
+    tracker.map = SimpleNamespace(ref_names=[f"r{i}" for i in range(50)])
+    tracker._track_candidates = lambda *_a, **_k: pytest.fail(
+        "a starved retry must not restrict retrieval to the last-known pose"
+    )
+
+    retrieve_calls = []
+
+    def retrieve(_rgb, topk, candidates=None):
+        retrieve_calls.append((topk, candidates))
+        return ["g0", "g1"]
+
+    tracker.loc = SimpleNamespace(retrieve=retrieve)
+    refs, _vpr_ms, nearby = tracker._global_retrieval(
+        np.zeros((8, 8, 3), np.uint8), 2.0, force_global=True
+    )
+
+    assert refs == ["g0", "g1"]
+    assert nearby is False
+    assert retrieve_calls == [(tracker.cfg.lost_local_topk, None)]
+    assert tracker._last_lost_search_stage == "starved_global"
+    assert tracker._last_lost_radius_factor is None
+
+
+def _widen_tracker(**cfg_kwargs) -> ProductionEDMTracker:
+    tracker = object.__new__(ProductionEDMTracker)
+    tracker.cfg = EDMConfig(**cfg_kwargs)
+    tracker.st = RuntimeState(state="TRACK", last_capture_stamp=1.0)
+    tracker.cam = SimpleNamespace(width=1280, height=720)
+    return tracker
+
+
+def _track_selection(refs: list[str] | None = None):
+    return _CandidateSelection(
+        acquiring=False,
+        refs=list(refs or ["a"]),
+        mode="edm_temporal_map",
+        min_inliers=50,
+        vpr_ms=0.0,
+    )
+
+
+def _attempt_with(inliers: int, reproj: float = 1.5):
+    return tracker_module._PoseAttempt(
+        result={
+            "cam_from_world": pycolmap.Rigid3d(),
+            "num_inliers": inliers,
+            "inlier_mask": np.ones(max(inliers, 1), dtype=bool),
+        },
+        points2d=np.zeros((max(inliers, 1), 2)),
+        points3d=np.zeros((max(inliers, 1), 3)),
+        metrics={"reproj_rms": reproj, "inlier_ratio": 0.8, "inlier_grid_cells": 8},
+        selected_ref="a",
+        pnp_ms=1.0,
+    )
+
+
+def test_track_widening_is_skipped_when_the_frame_already_passes() -> None:
+    tracker = _widen_tracker(track_miss_widen_topk=3)
+    tracker._track_candidates = lambda *_a, **_k: pytest.fail("healthy frames must not retry")
+    assert tracker._widen_track_refs_on_miss(
+        np.zeros((576, 1024), np.uint8),
+        _track_selection(),
+        1.1,
+        None,
+        _attempt_with(80),
+    ) is None
+
+
+def test_track_widening_retries_the_same_frame_with_more_refs() -> None:
+    tracker = _widen_tracker(track_miss_widen_topk=3)
+    tracker._track_candidates = lambda topk, _stamp, **_k: ["a", "b", "c"][:topk]
+    tracker._trajectory_would_allow = lambda *_a, **_k: True
+    calls = []
+
+    def fake_match(gray, selection, *, capture_stamp=None, prepared_query=None):
+        calls.append(list(selection.refs))
+        return (
+            _pnp_batch([120, 90, 60]),
+            _attempt_with(74),
+            7.0,
+        )
+
+    tracker._match_and_estimate = fake_match
+    widened = tracker._widen_track_refs_on_miss(
+        np.zeros((576, 1024), np.uint8),
+        _track_selection(),
+        1.1,
+        None,
+        _attempt_with(34),
+    )
+
+    assert widened is not None
+    selection, _batch, attempt, _ms, widen_info = widened
+    assert calls == [["a", "b", "c"]]
+    assert selection.mode == "edm_track_widen"
+    assert widen_info["inliers_before"] == 34
+    assert widen_info["inliers_after"] == 74
+    assert int(attempt.result["num_inliers"]) == 74
+    assert tracker._track_widen_accepts == 1
+
+
+def test_track_widening_keeps_the_original_miss_when_the_retry_also_fails() -> None:
+    tracker = _widen_tracker(track_miss_widen_topk=3)
+    tracker._track_candidates = lambda topk, _stamp, **_k: ["a", "b", "c"][:topk]
+    tracker._match_and_estimate = lambda *_a, **_k: (
+        _pnp_batch([40]),
+        _attempt_with(41),
+        7.0,
+    )
+    assert tracker._widen_track_refs_on_miss(
+        np.zeros((576, 1024), np.uint8),
+        _track_selection(),
+        1.1,
+        None,
+        _attempt_with(34),
+    ) is None
+    assert tracker._track_widen_attempts == 1
+    assert getattr(tracker, "_track_widen_accepts", 0) == 0
+
+
+def test_track_widening_defaults_to_off_and_skips_non_track_states() -> None:
+    tracker = _widen_tracker()
+    tracker._track_candidates = lambda *_a, **_k: pytest.fail("widening is off by default")
+    assert tracker._widen_track_refs_on_miss(
+        np.zeros((576, 1024), np.uint8), _track_selection(), 1.1, None, _attempt_with(34)
+    ) is None
+
+    tracker = _widen_tracker(track_miss_widen_topk=3)
+    tracker.st.state = "WEAK_TRACK"
+    tracker._track_candidates = lambda *_a, **_k: pytest.fail("only TRACK widens")
+    assert tracker._widen_track_refs_on_miss(
+        np.zeros((576, 1024), np.uint8), _track_selection(), 1.1, None, _attempt_with(34)
+    ) is None
+
+
+def test_weak_widening_retries_the_same_frame_with_more_refs() -> None:
+    tracker = _widen_tracker(weak_miss_widen_topk=5)
+    tracker.st.state = "WEAK_TRACK"
+    tracker._track_candidates = lambda topk, _stamp, **_k: ["a", "b", "c", "d", "e"][:topk]
+    tracker._trajectory_would_allow = lambda *_a, **_k: True
+    calls = []
+
+    def fake_match(gray, selection, *, capture_stamp=None, prepared_query=None):
+        calls.append(list(selection.refs))
+        return (_pnp_batch([80, 70, 60, 50, 40]), _attempt_with(32), 7.0)
+
+    tracker._match_and_estimate = fake_match
+    weak_selection = _CandidateSelection(
+        acquiring=False, refs=["a", "b", "c"], mode="edm_track",
+        min_inliers=30, vpr_ms=0.0,
+    )
+    widened = tracker._widen_track_refs_on_miss(
+        np.zeros((576, 1024), np.uint8),
+        weak_selection,
+        1.1,
+        None,
+        _attempt_with(27),
+    )
+
+    assert widened is not None
+    selection, _batch, attempt, _ms, widen_info = widened
+    assert calls == [["a", "b", "c", "d", "e"]]
+    assert selection.mode == "edm_weak_widen"
+    assert widen_info["inliers_before"] == 27
+    assert int(attempt.result["num_inliers"]) == 32
+
+
+def test_weak_widening_is_independent_of_the_track_knob() -> None:
+    tracker = _widen_tracker(track_miss_widen_topk=3)
+    tracker.st.state = "WEAK_TRACK"
+    tracker._track_candidates = lambda *_a, **_k: pytest.fail(
+        "WEAK widening uses its own knob, not track_miss_widen_topk"
+    )
+    weak_selection = _CandidateSelection(
+        acquiring=False, refs=["a", "b", "c"], mode="edm_track",
+        min_inliers=30, vpr_ms=0.0,
+    )
+    assert tracker._widen_track_refs_on_miss(
+        np.zeros((576, 1024), np.uint8),
+        weak_selection,
+        1.1,
+        None,
+        _attempt_with(27),
+    ) is None
+
+
+def test_boot_relaxed_floor_applies_only_at_boot() -> None:
+    # LOST's floor is turned off here so the assertion below tests the two knobs'
+    # independence rather than the LOST default.
+    tracker = _lost_tracker(boot_relaxed_min_inliers=60, acquire_relaxed_min_inliers=0)
+    selection = _acquire_selection()
+
+    tracker.st.state = "BOOT_INIT"
+    assert tracker._relaxed_acquire_gate(selection, _relaxed_attempt(70, 2)) == (60, 3.0)
+
+    # LOST keeps its own (here disabled) floor: the two knobs are independent.
+    tracker.st.state = "LOST"
+    assert tracker._relaxed_acquire_gate(selection, _relaxed_attempt(70, 2)) is None
+
+
+def test_boot_relaxed_accept_needs_a_second_confirming_frame() -> None:
+    tracker = _lost_tracker(boot_relaxed_min_inliers=60)
+    tracker.st.state = "BOOT_INIT"
+    tracker.st.center = None
+    center = np.array([1.0, 2.0, 3.0])
+    info: dict = {"state_in": "BOOT_INIT", "acquire_relaxed": {"min_inliers": 60}}
+
+    # First frame: nothing to confirm against -> held, and counted as a miss.
+    assert tracker._trajectory_allows(center, 0.1, 10.0, info, None, None) is False
+    assert info["rejected"] == "boot_relaxed_unconfirmed"
+    assert tracker.st.pending_reacquire_center is not None
+
+    # Second, independent frame within the stale-reacquisition window -> accept.
+    info2: dict = {"state_in": "BOOT_INIT", "acquire_relaxed": {"min_inliers": 60}}
+    assert tracker._trajectory_allows(
+        center + np.array([0.05, 0.0, 0.0]), 0.12, 10.1, info2, None, None
+    ) is True
+    assert info2["boot_relaxed_confirmed"] is True
+    assert tracker.st.pending_reacquire_center is None
+
+
+def test_boot_relaxed_accept_rejects_a_disagreeing_second_frame() -> None:
+    tracker = _lost_tracker(boot_relaxed_min_inliers=60)
+    tracker.st.state = "BOOT_INIT"
+    tracker.st.center = None
+    info: dict = {"state_in": "BOOT_INIT", "acquire_relaxed": {"min_inliers": 60}}
+    tracker._trajectory_allows(np.zeros(3), 0.0, 10.0, info, None, None)
+
+    info2: dict = {"state_in": "BOOT_INIT", "acquire_relaxed": {"min_inliers": 60}}
+    assert tracker._trajectory_allows(
+        np.array([5.0, 0.0, 0.0]), 0.0, 10.1, info2, None, None
+    ) is False
+    assert info2["rejected"] == "boot_relaxed_unconfirmed"
+
+
+def test_standard_boot_accept_is_unchanged() -> None:
+    tracker = _lost_tracker(boot_relaxed_min_inliers=60)
+    tracker.st.state = "BOOT_INIT"
+    tracker.st.center = None
+    info: dict = {"state_in": "BOOT_INIT"}
+    assert tracker._trajectory_allows(np.zeros(3), 0.0, 10.0, info, None, None) is True
+    assert "rejected" not in info
+
+
+def test_relaxed_probation_holds_weak_track_for_the_configured_frames() -> None:
+    tracker = _lost_tracker(acquire_relaxed_probation_frames=3, weak_after=2)
+
+    states = [
+        tracker._next_state_after_accept(
+            {"acquire_relaxed": {"min_inliers": 66}} if frame == 0 else {}
+        )
+        for frame in range(5)
+    ]
+
+    assert states == ["WEAK_TRACK", "WEAK_TRACK", "WEAK_TRACK", "TRACK", "TRACK"]
+    assert tracker.st.relaxed_probation_frames == 0
+
+
+def test_relaxed_probation_off_keeps_track_after_a_relaxed_accept() -> None:
+    tracker = _lost_tracker()
+    assert tracker.cfg.acquire_relaxed_probation_frames == 0
+    assert (
+        tracker._next_state_after_accept({"acquire_relaxed": {"min_inliers": 66}})
+        == "TRACK"
+    )

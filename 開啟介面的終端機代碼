@@ -5,4 +5,13 @@
   VIDEO="/home/allen/localization/模擬器/測試影片/P1680168.MP4" \
   ./控制介面程式/影片模擬串流/啟動.sh
 
-  河濱真機模式：舊版核心地圖已還原，但 mission manifests 尚未完整復原，暫停使用。
+  IMU 飛行測試（手動搖桿飛行 + 開定位，全程錄 IMU / 搖桿 / 畫面）：
+
+  cd /home/allen/localization
+  ./IMU飛行測試.sh
+
+  落地關窗後會自動印出這次的 session 與判定；細節見腳本開頭與
+  docs/esekf_live_eval_runbook.md。事後單獨重看某一次：
+
+  .venv/bin/python tools/imu_flight_test_report.py \
+    --session outputs/flight_logs/session_<UTC>_real-flight_<id>

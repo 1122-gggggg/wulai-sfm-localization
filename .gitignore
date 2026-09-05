@@ -38,8 +38,10 @@ river-localization-bundle-20260831.tar.zst.sha256
 
 **/__pycache__/
 **/.pytest_cache/
+**/.ruff_cache/
 .coverage
 .coverage.*
 coverage.xml
 htmlcov/
 .cursor/
+執行環境/mission_snapshots/

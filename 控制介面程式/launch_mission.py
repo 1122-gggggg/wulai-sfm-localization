@@ -10,7 +10,7 @@ import subprocess
 import sys
 
 from mission_manifest import ManifestError
-from mission_resolver import resolve_mission
+from mission_resolver import evaluation_only_admission, resolve_mission
 from workspace_layout import workspace_from_file
 
 
@@ -55,7 +55,8 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     try:
         mission = resolve_mission(args.selection, workspace_root=WORKSPACE.root)
-        if not mission.readiness.localization_ready:
+        evaluation_only, waived = evaluation_only_admission(mission.readiness)
+        if not mission.readiness.localization_ready and not evaluation_only:
             raise ManifestError(
                 "mission is not localization-ready: "
                 + "; ".join(mission.readiness.localization_errors)
@@ -65,10 +66,19 @@ def main(argv: list[str] | None = None) -> int:
         print(f"mission launch rejected: {exc}", file=sys.stderr)
         return 2
 
+    if evaluation_only:
+        print(
+            "EVALUATION-ONLY session: localization runs for measurement only. "
+            "Waived: " + "; ".join(waived),
+            file=sys.stderr,
+        )
+
     report = {
         "snapshot_id": mission.identity,
         "site_profile": str(profile),
-        "localization_ready": True,
+        "localization_ready": not evaluation_only,
+        "evaluation_only": evaluation_only,
+        "evaluation_waived_errors": list(waived),
         "flight_ready": mission.readiness.flight_ready,
         "flight_errors": list(mission.readiness.flight_errors),
     }

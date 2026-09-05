@@ -641,7 +641,15 @@ def config_for_route(
         radius = path_json.arrive_radius_map_units
         route_deviation = path_json.max_route_deviation_map_units
     else:
-        route = RouteDocument.from_path(path_json, require_map_units=True)
+        # Only the scalar limits are wanted here, but parsing the document also
+        # converts its waypoints, and that needs the frame the route was authored
+        # in. cfg already carries it; leaving it out silently substituted the
+        # legacy [x,z,-y] assumption and rejected every route the editor stamped
+        # align_source='measured' -- i.e. every route at a site that has a
+        # measured T_align_gravity.json.
+        route = RouteDocument.from_path(
+            path_json, require_map_units=True, map_frame=cfg.map_frame
+        )
         radius = route.arrive_radius_map_units
         route_deviation = route.max_route_deviation_map_units
     changes = {}

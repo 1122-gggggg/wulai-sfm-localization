@@ -1,0 +1,14 @@
+{
+  "frame": {
+    "id": "river_gluemap_all8_direct_20260831_d2b8a5304eff",
+    "kind": "map"
+  },
+  "revision": "operator_editor_v1",
+  "route": {
+    "path": "../../../地圖檔/場域/river_site/routes/flight_route_20260905_191606_c9398284.json",
+    "sha256": "f467d2b609ed215309dbc2ee276773734aa8046b472d0164c7dface914791201"
+  },
+  "route_id": "river_site_operator_route",
+  "schema": "sfm-route-package/v1",
+  "site_id": "river_site_edm"
+}

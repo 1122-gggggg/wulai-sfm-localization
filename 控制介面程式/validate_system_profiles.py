@@ -6,7 +6,12 @@ import hashlib
 import json
 from pathlib import Path
 
-from site_profile import SCHEMA_VERSION, flight_readiness_errors, load_site_profile
+from site_profile import (
+    ROUTE_EDITOR_AUTO_APPROVAL_NOTE,
+    SCHEMA_VERSION,
+    flight_readiness_errors,
+    load_site_profile,
+)
 
 
 ROOT = Path(__file__).resolve().parent
@@ -14,8 +19,24 @@ WORKSPACE_ROOT = ROOT.parent
 PROFILES = ROOT / "site_profiles"
 CANONICAL_PROFILE_DIR = WORKSPACE_ROOT / "地圖檔" / "場域"
 TEMPLATE_NAMES = {"example_site_edm.json"}
-# No shipped profile is AUTO-approved until a route is redrawn on the current map.
-APPROVED_PROFILES: set[Path] = set()
+# A profile may be AUTO-approved only once a route has been redrawn on the
+# current map. Operator decision 2026-09-05: rather than hand-editing a list of
+# sites for every route, accept the approval the route editor itself recorded --
+# a profile is expected to be approved exactly when it carries the editor's AUTO
+# approval note. That is not a blanket pass: an approved profile must also
+# survive flight_readiness_errors() below, and _validate_asset_digests re-hashes
+# route_json, so a route edited outside the editor, or a profile approved by
+# hand, still fails.
+#
+# This authorizes AUTO through the site profile only -- the in-app AUTO and
+# simulated-route runs. It is NOT flight authorization for the real-aircraft
+# entry point: that path flies the profile materialized from the mission
+# selection, whose flight.approved follows the localizer_quality receipt. No
+# route-editor approval can unblock 一鍵啟動.sh.
+def _expects_auto_approval(profile: object) -> bool:
+    flight = getattr(profile, "flight", None)
+    note = str(getattr(flight, "approval_note", "") or "").strip()
+    return note == ROUTE_EDITOR_AUTO_APPROVAL_NOTE
 
 
 def _digest(path: Path) -> str:
@@ -35,7 +56,7 @@ def _validate_profile_fields(source: Path, raw: dict, profile: object) -> list[s
     if "map_units_per_meter" in raw.get("flight", {}):
         failures.append(f"{source.name}: metric map scale is prohibited")
     approved = bool(profile.flight and profile.flight.approved)
-    expected_approved = source.resolve() in APPROVED_PROFILES
+    expected_approved = _expects_auto_approval(profile)
     if approved is not expected_approved:
         failures.append(f"{source.name}: flight.approved must be {expected_approved}")
     if expected_approved:

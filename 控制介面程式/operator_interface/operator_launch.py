@@ -46,6 +46,7 @@ from live_safety_config import (
 from live_worker_clients import LiveDetectorClient, LiveLocalizerClient
 from lost_hold_policy import LostHoldPolicy
 from mission_manifest import ManifestError
+from mission_resolver import evaluation_only_admission
 from operator_shutdown import OperatorShutdownCoordinator
 from operator_site_runtime import (
     ActiveSiteRuntime,
@@ -513,7 +514,8 @@ def _resolve_startup_site(
             )
         try:
             mission = app.resolve_mission(selection_arg, workspace_root=app._WS.root)
-            if not mission.readiness.localization_ready:
+            evaluation_only, waived = evaluation_only_admission(mission.readiness)
+            if not mission.readiness.localization_ready and not evaluation_only:
                 raise ManifestError(
                     "mission is not localization-ready: "
                     + "; ".join(mission.readiness.localization_errors)
@@ -532,8 +534,14 @@ def _resolve_startup_site(
         args.mission_selection = str(mission.selection.source)
         args.mission_selection_sha256 = mission.selection_sha256
         args.mission_snapshot_id = mission.identity
-        args.mission_flight_ready = bool(mission.readiness.flight_ready)
+        # An evaluation-only session measures localization; it never navigates.
+        # flight_ready is already False (the waived quality error also sits in
+        # flight_errors) -- pin it anyway so no later edit can widen the waiver
+        # from "localization may start" into "this mission may fly itself".
+        args.mission_flight_ready = bool(mission.readiness.flight_ready) and not evaluation_only
         args.mission_flight_errors = tuple(mission.readiness.flight_errors)
+        args.mission_evaluation_only = evaluation_only
+        args.mission_evaluation_waived_errors = tuple(waived)
     hardware_approval = None
     if site_profile is not None and site_profile.hardware_approval is not None:
         try:
@@ -824,6 +832,10 @@ def _operator_session_manifest(
         "mission_snapshot_id": str(getattr(args, "mission_snapshot_id", "") or ""),
         "mission_flight_ready": bool(getattr(args, "mission_flight_ready", False)),
         "mission_flight_errors": list(getattr(args, "mission_flight_errors", ()) or ()),
+        "mission_evaluation_only": bool(getattr(args, "mission_evaluation_only", False)),
+        "mission_evaluation_waived_errors": list(
+            getattr(args, "mission_evaluation_waived_errors", ()) or ()
+        ),
         "asset_sha256": identity.asset_hashes,
         "runtime_profile_sha256": identity.runtime_profile_sha256,
         "source": identity.source_identity,

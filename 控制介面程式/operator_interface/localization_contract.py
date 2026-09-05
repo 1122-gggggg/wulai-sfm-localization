@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import math
 import time
-from collections.abc import Mapping
+from collections.abc import Iterator, KeysView, Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any, cast
@@ -183,14 +183,14 @@ class Pose:
         if key in ("x", "y", "z", "yaw", "yaw_raw", "stamp"):
             # Use object.__setattr__ to mutate frozen slots for dict-like compat.
             target = "yaw" if key in ("yaw", "yaw_raw") else key
-            object.__setattr__(self, target, float(value) if isinstance(value, (int, float)) else value)  # type: ignore[arg-type]
+            object.__setattr__(self, target, float(value) if isinstance(value, (int, float)) else value)
             return
         raise KeyError(key)
 
-    def keys(self):  # type: ignore[override]
+    def keys(self) -> Iterator[str]:
         return ("x", "y", "z", "yaw", "stamp").__iter__()
 
-    def __iter__(self):
+    def __iter__(self) -> Iterator[str]:
         return iter(("x", "y", "z", "yaw", "stamp"))
 
 
@@ -333,10 +333,10 @@ class LocalizationResult:
         new_payload[key] = value
         object.__setattr__(self, "_payload", MappingProxyType(new_payload))
 
-    def keys(self):  # type: ignore[override]
+    def keys(self) -> KeysView[str]:
         return self.to_payload().keys()
 
-    def __iter__(self):
+    def __iter__(self) -> Iterator[str]:
         return iter(self.to_payload())
 
     def __len__(self) -> int:

@@ -717,8 +717,18 @@ def _update_live_camera_orientation(app: Any, result: dict, xyz: np.ndarray) -> 
 def _update_live_heading(
         app: Any, camera_forward: np.ndarray | None, xyz: np.ndarray) -> None:
     map_frame = getattr(app, "_integrated_auto_map_frame", None)
-    if camera_forward is not None and map_frame is not None:
-        heading = float(map_frame.heading(camera_forward))
+    if camera_forward is not None:
+        # Where the camera looks, whenever the localizer measured it. The
+        # measured gravity frame is only bound while integrated AUTO runs; the
+        # legacy [x, z] azimuth is the same convention the displacement branch
+        # below already falls back to, and it beats reporting the travel
+        # direction as a camera heading (they differ by ~77 deg median on the
+        # river map, where the drone flies along the bank looking sideways).
+        heading = (
+            float(map_frame.heading(camera_forward))
+            if map_frame is not None
+            else math.atan2(float(camera_forward[2]), float(camera_forward[0]))
+        )
         if math.isfinite(heading):
             app.live_heading = heading
         return
@@ -750,6 +760,23 @@ def _accept_live_pose(app: Any, result: dict, xyz: np.ndarray) -> None:
     ]
     app.live_locked = True
     app.live_new_pose = True
+    # KLT-bridged frames carry no fresh EDM match: accept for continuity (the
+    # jump gate below still bounds them) but count them so recovery-heavy
+    # segments cannot silently run on optical flow. Counter resets on EDM.
+    # Both spellings matter: the in-tracker bridge reports "klt_bridge", the
+    # async fast path reports "klt_fast" with pose_status KLT_BRIDGED. Counting
+    # only the first meant the async tracker -- which was the code default from
+    # 2026-09-04 to 2026-09-05 -- never incremented this at all, and its
+    # unverified runs reached 710 consecutive frames on the 720p corpus.
+    bridged = (
+        result.get("candidate_mode") in ("klt_bridge", "klt_fast")
+        or result.get("pose_status") == "KLT_BRIDGED"
+        or result.get("bridge")
+    )
+    if bridged:
+        app.loc_bridge_run = int(getattr(app, "loc_bridge_run", 0) or 0) + 1
+    else:
+        app.loc_bridge_run = 0
     if app.boot_holding():
         app.boot_lock_done = True
         app.write_log(

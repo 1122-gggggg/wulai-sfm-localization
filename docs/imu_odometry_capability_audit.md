@@ -4,6 +4,20 @@ Date: 2026-08-17
 Scope: production live localization (GlueMap/EDM/PnP) and ANAFI Olympe telemetry.
 Rule: only quantities that exist in code or sampled logs. No assumed sensors.
 
+> **2026-09-05 update — the transport landed; the capability verdict did not.**
+> "Localization worker currently receives IMU? **No**" below is now stale as a
+> statement about wiring: `live_localizer_protocol` has SFM3/SFM4 fused headers,
+> `localization_metrics.attach_fused_localization_telemetry` attaches the fused
+> attitude/velocity/GNSS sample to each submission, and the worker feeds it to
+> `ProductionEDMTracker.observe_fused_state`, which drives `esekf.py`.
+> Everything else in this audit stands: it is still fused Euler + NED velocity
+> with **no raw gyro/accel**, still **no measured `metres_per_map_unit`** on the
+> river site, and still **no approved camera-body extrinsic** -- so this remains
+> Level D (orientation prior) plus the existing visual-velocity position, and
+> `esekf.prediction_allowed()` is what decides whether any of it is used.
+> To see whether it ever armed on a real flight: `./IMU飛行測試.sh` then
+> `tools/imu_flight_test_report.py` (`docs/esekf_live_eval_runbook.md`).
+
 ## Verdict
 
 | Question | Answer |

@@ -97,6 +97,7 @@ from recording_quality import (  # noqa: E402
 from skycontroller_stick import (  # noqa: E402
     SkyControllerStickMonitor,
     axes_active,
+    stick_log_sample,
     _JS_EVENT_AXIS as _JS_EVENT_AXIS,
     _JS_EVENT_FMT as _JS_EVENT_FMT,
     _STICK_CALLBACK_FAIL_LIMIT as _STICK_CALLBACK_FAIL_LIMIT,
@@ -465,6 +466,8 @@ class OlympeLiveBackend:
         self.flight_start: float | None = None
         # SC stick override: physical stick deflection reclaims SkyController.
         self._stick_monitor: SkyControllerStickMonitor | None = None
+        self._last_stick_axes: dict[int, int] = {}
+        self._last_stick_axes_t = 0.0
         self._stick_reclaim_lock = threading.Lock()
         self._last_stick_reclaim_mono = 0.0
         self.stick_override_count = 0
@@ -4755,7 +4758,50 @@ class OlympeLiveBackend:
         except Exception:
             pass
 
+    def _poll_stick_axes(self, now: float) -> None:
+        """Log what the pilot is asking for; see ``stick_log_sample``."""
+        if self._stick_monitor is None:
+            return
+        sample = stick_log_sample(
+            self._stick_monitor,
+            self._last_stick_axes,
+            since_last_s=now - self._last_stick_axes_t,
+        )
+        if sample is None:
+            return
+        self._last_stick_axes, fields = sample
+        self._last_stick_axes_t = now
+        self.session_logs.telemetry(
+            "stick_axes",
+            t_mono_ns=time.monotonic_ns(),
+            pilot_sticks=bool(self.pilot_sticks),
+            **fields,
+        )
+
     def _poll_session_telemetry(self, now: float) -> None:
+        if self.session_logs is None:
+            return
+        self._poll_stick_axes(now)
+        # High-rate NED velocity + attitude for offline ESEKF/KLT-3D A/B replay
+        # (定位演算法/validation/benchmark_esekf_live_replay.py). The 1 Hz
+        # "readback" event below is too coarse to feed observe_fused_state.
+        last_fused = getattr(self, "_last_fused_odometry_t", 0.0)
+        if now - last_fused >= 0.1:
+            self._last_fused_odometry_t = now
+            self.session_logs.telemetry(
+                "fused_odometry",
+                t_mono_ns=time.monotonic_ns(),
+                speed_north_mps=getattr(self.state, "speed_north_mps", None),
+                speed_east_mps=getattr(self.state, "speed_east_mps", None),
+                speed_down_mps=getattr(self.state, "speed_down_mps", None),
+                att_roll=getattr(self.state, "att_roll", None),
+                att_pitch=getattr(self.state, "att_pitch", None),
+                att_yaw=getattr(self.state, "att_yaw", None),
+                drone_altitude_m=getattr(self.state, "drone_altitude_m", None),
+                gps_latitude_deg=getattr(self.state, "gps_latitude_deg", None),
+                gps_longitude_deg=getattr(self.state, "gps_longitude_deg", None),
+                gps_altitude_m=getattr(self.state, "gps_altitude_m", None),
+            )
         if self.session_logs is not None:
             last_session_tel = getattr(self, "_last_session_telemetry_t", 0.0)
             if now - last_session_tel >= 1.0:

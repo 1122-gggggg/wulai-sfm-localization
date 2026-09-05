@@ -18,8 +18,8 @@
       "fetch_hint": "Seed the approved MegaLoc torch.hub source at this repository-relative path.",
       "name": "megaloc-hubconf",
       "path": "執行環境/torch_hub_cache/gmberton_MegaLoc_main/hubconf.py",
-      "sha256": "0ebf9fc9c455ca38b9e52c69bcfee4b136a0f8872fdfc4307d00469013228b98",
-      "size_bytes": 1718
+      "sha256": "2b75be965414adec2330de9bff4279a86b1a0fea814de2078c831d70eb54367a",
+      "size_bytes": 969
     },
     {
       "fetch_hint": "Seed the approved MegaLoc torch.hub source at this repository-relative path.",

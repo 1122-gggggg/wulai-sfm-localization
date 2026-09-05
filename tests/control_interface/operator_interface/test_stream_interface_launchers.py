@@ -28,6 +28,9 @@ def launch(script: Path, *args: str, **extra_env: str) -> subprocess.CompletedPr
             "SFM_UI_PYTHON": sys.executable,
         }
     )
+    # Never inherit an evaluation-only opt-in from the caller's shell: these
+    # tests assert what the ordinary entry point does, waiver absent.
+    env.pop("SFM_EVALUATION_ONLY", None)
     if script == REAL_LAUNCHER:
         env.pop("SFM_SITE_PROFILE", None)
         env["SFM_MISSION_SELECTION"] = str(MISSION_SELECTION)
@@ -249,6 +252,16 @@ def test_real_launcher_blocks_unvalidated_default_map_before_connecting() -> Non
     assert "mission is not localization-ready" in result.stderr
     assert "localizer_quality calibration is failed" in result.stderr
     assert "dry-run command:" not in result.stdout
+
+
+def test_real_launcher_admits_the_unvalidated_map_only_for_evaluation() -> None:
+    result = launch(REAL_LAUNCHER, SFM_EVALUATION_ONLY="1")
+
+    assert result.returncode != 2
+    assert "EVALUATION-ONLY session" in result.stderr
+    assert "localizer_quality calibration is failed" in result.stderr
+    # The waiver never turns into flight authorization.
+    assert '"flight_ready": false' in result.stdout
 
 
 def test_real_launcher_requires_mission_selection() -> None:

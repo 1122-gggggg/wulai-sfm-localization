@@ -19,7 +19,11 @@ if str(FLIGHT_CONTROL) not in sys.path:
     sys.path.insert(0, str(FLIGHT_CONTROL))
 
 from mission_manifest import ManifestError  # noqa: E402
-from mission_resolver import resolve_mission  # noqa: E402
+from mission_resolver import (  # noqa: E402
+    MissionReadiness,
+    evaluation_only_admission,
+    resolve_mission,
+)
 from pose_frame_chain import CameraBodyExtrinsic, save_camera_body_extrinsic  # noqa: E402
 from site_alignment import (  # noqa: E402
     SiteAlignment,
@@ -456,4 +460,55 @@ def test_bundled_anafi_selection_is_blocked_until_new_map_is_validated() -> None
     assert "localizer_quality calibration is failed" in " ".join(
         mission.readiness.localization_errors
     )
-    assert "no route package selected" in mission.readiness.flight_errors
+    # The operator's drawn route is pinned into the selection, so the route is no
+    # longer what blocks flight. The unvalidated map is the only blocker left,
+    # and it must stay one until the map has an independent holdout.
+    assert mission.route is not None
+    assert "no route package selected" not in mission.readiness.flight_errors
+    assert mission.readiness.flight_errors == mission.readiness.localization_errors
+
+
+def test_evaluation_only_waives_an_unvalidated_map_but_never_flight(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    selection = (
+        CONTROL
+        / "mission_selections"
+        / "river_gluemap_all8_direct_localization.json"
+    )
+    mission = resolve_mission(selection, workspace_root=ROOT, now=NOW)
+
+    assert mission.readiness.evaluation_only_ready
+
+    monkeypatch.delenv("SFM_EVALUATION_ONLY", raising=False)
+    assert evaluation_only_admission(mission.readiness) == (False, ())
+
+    monkeypatch.setenv("SFM_EVALUATION_ONLY", "1")
+    admitted, waived = evaluation_only_admission(mission.readiness)
+    assert admitted
+    assert waived == mission.readiness.localization_errors
+    # The waiver buys localization only. Flight stays blocked, and the profile
+    # the launcher hands the UI must keep saying so.
+    assert not mission.readiness.flight_ready
+
+
+def test_evaluation_only_refuses_any_blocker_other_than_the_unvalidated_map(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("SFM_EVALUATION_ONLY", "1")
+    workspace = tmp_path / "workspace with spaces"
+    selection = _build_selection(workspace, localizer_map_revision="map_v2")
+
+    mission = resolve_mission(selection, workspace_root=workspace, now=NOW)
+
+    # A map-revision mismatch means the snapshot does not describe the hardware.
+    # No opt-in may wave that through.
+    assert not mission.readiness.evaluation_only_ready
+    assert evaluation_only_admission(mission.readiness) == (False, ())
+
+
+def test_evaluation_only_is_not_ready_when_nothing_needs_waiving() -> None:
+    clean = MissionReadiness(localization_errors=(), flight_errors=())
+
+    assert clean.localization_ready
+    assert not clean.evaluation_only_ready

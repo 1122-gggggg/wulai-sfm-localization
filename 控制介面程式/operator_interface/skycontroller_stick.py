@@ -26,6 +26,11 @@ _STICK_DEADZONE = 2000
 _STICK_CALLBACK_FAIL_LIMIT = 3
 _STICK_FLIGHT_AXES = (0, 1, 2, 3)
 _STICK_POLL_S = 0.02  # 50 Hz reclaim path
+#: Stick-axis logging: ~2% of the +-32767 full throw. Deliberately below the
+#: 2000-count override deadzone -- the log records what the pilot asked for,
+#: including sub-deadzone trim, and does not decide who is flying.
+_STICK_LOG_DELTA = 600
+_STICK_LOG_HEARTBEAT_S = 1.0
 
 
 def find_skycontroller_joystick_path() -> str | None:
@@ -280,3 +285,39 @@ class SkyControllerStickMonitor:
                     self._log_event(
                         "stick_monitor_disconnect_handler_failed", error=repr(exc)
                     )
+
+
+def stick_log_sample(
+    monitor: "SkyControllerStickMonitor",
+    previous: dict[int, int],
+    *,
+    since_last_s: float,
+    heartbeat_s: float = _STICK_LOG_HEARTBEAT_S,
+    delta: int = _STICK_LOG_DELTA,
+) -> tuple[dict[int, int], dict] | None:
+    """One telemetry row for the pilot's stick position, or None to stay quiet.
+
+    A manually flown session issues no PCMD, so ``commands.jsonl`` is empty for
+    the whole flight and the recorded IMU has nothing explaining it. These rows
+    are that missing input track. Emitted on deflection change plus a heartbeat,
+    so a parked stick costs one row per ``heartbeat_s`` and a swept stick keeps
+    every poll.
+    """
+    try:
+        axes = monitor.snapshot_axes()
+    except OSError:
+        return None
+    if not axes:
+        return None
+    moved = any(
+        abs(int(value) - int(previous.get(axis, 0))) >= delta
+        for axis, value in axes.items()
+    )
+    if not moved and since_last_s < heartbeat_s:
+        return None
+    fields = {
+        "axes": {str(axis): int(value) for axis, value in sorted(axes.items())},
+        "flight_axes_active": bool(axes_active(axes, deadzone=monitor.deadzone)),
+        "moved": bool(moved),
+    }
+    return dict(axes), fields

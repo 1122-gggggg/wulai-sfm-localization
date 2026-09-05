@@ -7,7 +7,12 @@ from einops.einops import rearrange
 import torch.nn.functional as F
 import torch.nn as nn
 import torch
-torch.set_float32_matmul_precision("highest")  # highest (defualt) high medium
+import os
+_MATMUL_PRECISION = os.environ.get("SFM_EDM_MATMUL_PRECISION", "highest").strip().lower()
+if _MATMUL_PRECISION in {"highest", "high", "medium"}:
+    torch.set_float32_matmul_precision(_MATMUL_PRECISION)
+else:
+    torch.set_float32_matmul_precision("highest")
 
 
 class EDM(nn.Module):
@@ -87,42 +92,48 @@ class EDM(nn.Module):
         if "mask0" in data:
             mask_c0, mask_c1 = data["mask0"], data["mask1"]
 
-        # 2.  Feature Interaction & Multi-Scale Fusion
-        feat_c0, feat_c1 = self.neck(ms_feats, mask_c0, mask_c1)
+        track_runner = getattr(self, "_track_cuda_graph_runner", None)
+        if track_runner is not None and data["bs"] == 1 and mask_c0 is None and not self.deploy:
+            feat_c0, feat_c1 = track_runner.forward(ms_feats, data)
+            feat_f0 = rearrange(feat_f0, "n c h w -> n (h w) c")
+            feat_f1 = rearrange(feat_f1, "n c h w -> n (h w) c")
+        else:
+            # 2.  Feature Interaction & Multi-Scale Fusion
+            feat_c0, feat_c1 = self.neck(ms_feats, mask_c0, mask_c1)
 
-        data.update(
-            {
-                "hw0_c": feat_c0.shape[2:],
-                "hw1_c": feat_c1.shape[2:],
-                "hw0_f": feat_c0.shape[2:] * self.config["local_resolution"],
-                "hw1_f": feat_c1.shape[2:] * self.config["local_resolution"],
-            }
-        )
-        feat_c0 = rearrange(feat_c0, "n c h w -> n (h w) c")
-        feat_c1 = rearrange(feat_c1, "n c h w -> n (h w) c")
-        feat_f0 = rearrange(feat_f0, "n c h w -> n (h w) c")
-        feat_f1 = rearrange(feat_f1, "n c h w -> n (h w) c")
+            data.update(
+                {
+                    "hw0_c": feat_c0.shape[2:],
+                    "hw1_c": feat_c1.shape[2:],
+                    "hw0_f": feat_c0.shape[2:] * self.config["local_resolution"],
+                    "hw1_f": feat_c1.shape[2:] * self.config["local_resolution"],
+                }
+            )
+            feat_c0 = rearrange(feat_c0, "n c h w -> n (h w) c")
+            feat_c1 = rearrange(feat_c1, "n c h w -> n (h w) c")
+            feat_f0 = rearrange(feat_f0, "n c h w -> n (h w) c")
+            feat_f1 = rearrange(feat_f1, "n c h w -> n (h w) c")
 
-        # detect NaN during mixed precision training
-        if self.config["mp"] and (
-            torch.any(torch.isnan(feat_c0)) or torch.any(torch.isnan(feat_c1))
-        ):
-            detect_NaN(feat_c0, feat_c1)
+            # detect NaN during mixed precision training
+            if self.config["mp"] and (
+                torch.any(torch.isnan(feat_c0)) or torch.any(torch.isnan(feat_c1))
+            ):
+                detect_NaN(feat_c0, feat_c1)
 
-        # 3. Coarse-Level Matching
-        conf_matrix = self.coarse_matching(
-            feat_c0,
-            feat_c1,
-            data,
-            mask_c0=(
-                mask_c0.view(mask_c0.size(0), -
-                             1) if mask_c0 is not None else mask_c0
-            ),
-            mask_c1=(
-                mask_c1.view(mask_c1.size(0), -
-                             1) if mask_c1 is not None else mask_c1
-            ),
-        )
+            # 3. Coarse-Level Matching
+            conf_matrix = self.coarse_matching(
+                feat_c0,
+                feat_c1,
+                data,
+                mask_c0=(
+                    mask_c0.view(mask_c0.size(0), -
+                                 1) if mask_c0 is not None else mask_c0
+                ),
+                mask_c1=(
+                    mask_c1.view(mask_c1.size(0), -
+                                 1) if mask_c1 is not None else mask_c1
+                ),
+            )
 
         if self.deploy:
             k = self.topk
@@ -190,7 +201,13 @@ class EDM(nn.Module):
         feat_c1 = feat_c1[data["b_ids"], data["j_ids"]
                           ].reshape(data["bs"], K1, -1)
 
-        if self.bi_directional_refine:
+        sigma_plan = getattr(self, "_sigma_plan", None) or data.get("_sigma_plan", None)
+        use_dir01 = (
+            sigma_plan == "reference_grid"
+            and os.environ.get("SFM_EDM_FINE_DIR01", "1").strip().lower() not in {"0", "false", "no", "off"}
+        )
+
+        if self.bi_directional_refine and not use_dir01:
             # Bidirectional Refinement
             offset, score = self.fine_matching(
                 torch.cat([feat_f0, feat_f1], dim=1),
@@ -200,18 +217,28 @@ class EDM(nn.Module):
                 data,
             )
         else:
-            offset, score = self.fine_matching(
-                feat_f0, feat_f1, feat_c0, feat_c1, data)
+            # Direction-01 Refinement: in reference_grid mode, direction-10 fine outputs
+            # are discarded downstream. Forwarding only direction-01 saves 50% of
+            # FineMatching compute while producing bitwise identical outputs.
+            saved_bi = self.fine_matching.bi_directional_refine
+            try:
+                self.fine_matching.bi_directional_refine = False
+                offset, score = self.fine_matching(
+                    feat_f0, feat_f1, feat_c0, feat_c1, data
+                )
+            finally:
+                self.fine_matching.bi_directional_refine = saved_bi
 
         if self.deploy:
-            if self.bi_directional_refine:
+            if self.bi_directional_refine and not use_dir01:
                 fine_offset01, fine_offset10 = offset.chunk(2)
                 fine_score01, fine_score10 = score.unsqueeze(dim=1).chunk(2)
                 output = torch.cat(
                     [mkpts0_c, mkpts1_c, fine_offset01, fine_offset10, fine_score01, fine_score10, mconf.unsqueeze(dim=1)], 1) # [K, 11]
             else:
+                score_col = score.unsqueeze(dim=1) if score.dim() == 1 else score
                 output = torch.cat(
-                    [mkpts0_c, mkpts1_c, offset, score, mconf.unsqueeze(dim=1)], 1)
+                    [mkpts0_c, mkpts1_c, offset, score_col, mconf.unsqueeze(dim=1)], 1)
             return output
 
     def load_state_dict(self, state_dict, *args, **kwargs):

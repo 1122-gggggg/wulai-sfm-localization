@@ -81,6 +81,11 @@ def test_anchor_only_from_strong_visual() -> None:
     assert not is_safe_visual_anchor(_visual_ok(inliers=20), config)
     assert not is_safe_visual_anchor(_visual_ok(state_in="WEAK_TRACK"), config)
     assert not is_safe_visual_anchor(_visual_ok(pose_status="PREDICTED_ONLY"), config)
+    # KLT-bridged frames must not become visual anchors (drift would latch),
+    # even if they arrive with ok=True and TRACK state.
+    assert not is_safe_visual_anchor(_visual_ok(pose_status="KLT_BRIDGED"), config)
+    assert not is_safe_visual_anchor(_visual_ok(candidate_mode="klt_bridge"), config)
+    assert not is_safe_visual_anchor(_visual_ok(bridge=True), config)
 
 
 def test_visual_anchor_resets_old_odom_drift() -> None:
@@ -541,6 +546,27 @@ def test_pairwise_consensus_still_vetoes_two_strong_disagreements() -> None:
     info = last_consensus_info()
     assert info["mode"] == "pairwise"
     assert info["reason"] == "pairwise_conflict"
+
+
+def test_pairwise_consensus_elects_majority_over_singleton_outlier() -> None:
+    selection = _pose_selection(["keep_a", "keep_b", "outlier"])
+    chosen = _select_track_candidate(
+        selection,
+        [
+            ("keep_a", _pose_candidate([0.0, 0.0, 0.0], 80, ratio=0.4, cells=6)),
+            ("keep_b", _pose_candidate([0.2, 0.0, 0.0], 85, ratio=0.5, cells=8)),
+            ("outlier", _pose_candidate([8.0, 0.0, 0.0], 400, ratio=0.9, cells=12)),
+        ],
+        _pose_cfg(),
+    )
+    # Same geometry as the cluster test, but pairwise ignores rotation and
+    # ranks the majority cluster by the standard rank key.
+    assert chosen is not None
+    assert chosen[0] in ("keep_a", "keep_b")
+    info = last_consensus_info()
+    assert info["mode"] == "pairwise"
+    assert info["reason"] == "pairwise_majority"
+    assert info["outlier_count"] == 1
 
 
 def test_pairwise_acquire_still_keeps_strong_vpr_top1() -> None:

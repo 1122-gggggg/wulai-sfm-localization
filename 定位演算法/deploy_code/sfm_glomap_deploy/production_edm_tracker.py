@@ -48,16 +48,52 @@ _KLT_LK_PARAMS = dict(
     criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01),
 )
 _KLT_FB_PX = 1.0
+# Validation-only hook: when set to ``fn(prev_gray, gray, points) -> (next, status)``
+# the bridge's forward and backward passes use that flow backend instead of
+# pyramidal LK. ``None`` (production) keeps the LK calls exactly as they were.
+# Used by 定位演算法/validation/flow_backend_experiment.py to A/B DIS and
+# FastFlowNet through the replay gate.
+_FLOW_BACKEND = None
 _KLT_MIN_SEED = 50
 _KLT_MIN_TRACK = 30
 _KLT_MAX_FRAMES = 6
 _KLT_MAX_AGE_S = 0.50
+# 3D-aware LK window from ESEKF position-covariance trace (px): grows 15->41
+# as uncertainty grows. Units: window px, trace map-units^2.
+_KLT_COV_WINDOW_MIN = 15
+_KLT_COV_WINDOW_MAX = 41
+_KLT_COV_WINDOW_GAIN = 3.0
+_KLT_COV_WINDOW_SCALE = 0.1
+# KLT bridge anchor/drift gates (fractions of the EDM track gates, so they
+# follow each site's scale calibration). Bridge needs a strong EDM anchor and
+# trips back to EDM when already shaky; _MIN_RATIO stays env-overridable.
+_KLT_BRIDGE_ANCHOR_MIN_INLIERS = 60
+_KLT_BRIDGE_DRIFT_REPROJ_FACTOR = 0.60
+_KLT_BRIDGE_DRIFT_STEP_FACTOR = 0.50
+_KLT_BRIDGE_DRIFT_MIN_RATIO = 0.70
+# KLT track confidence = W_RATIO*ratio + W_SPATIAL*(cells/SPATIAL_NORM) + W_FB*(1-fb_med).
+# NOTE: SPATIAL_NORM is 64.0 while the grid is 8x6=48 cells, so the spatial
+# term maxes at 0.3*48/64=0.225, not 0.3. Kept as-is (gate-verified behavior);
+# change only with a replay A/B.
+# RATIO_HARD_MIN drops the cache outright (needs TRACKED_MIN tracks);
+# below CONF_MIN the track survives only with RATIO_SOFT_MIN.
+_KLT_CONF_W_RATIO = 0.5
+_KLT_CONF_W_SPATIAL = 0.3
+_KLT_CONF_W_FB = 0.2
+_KLT_CONF_SPATIAL_NORM = 64.0
+_KLT_SPATIAL_GRID = (8, 6)
+_KLT_SPATIAL_FALLBACK_CELLS = 6
+_KLT_RATIO_HARD_MIN = 0.45
+_KLT_TRACKED_MIN_FOR_RATIO_GATE = 50
+_KLT_CONF_MIN = 0.30
+_KLT_RATIO_SOFT_MIN = 0.50
 from edm_matcher import GRID_H, GRID_W, EDMMatcher
 from reloc_localizer_edm import Camera, EDMLocalizer, EDMRelocMap
 from reposed_motion_validator import RelativeMotionCheck, cam_from_world_matrix
 from edm_pose_selection import (
     acquire_consensus_limit,
     candidate_inliers,
+    count_agreeing_refs,
     _select_acquire_candidate,
     _select_track_candidate,
     _strong_centers_disagree,
@@ -85,9 +121,79 @@ EDM_OPTIONAL_RUNTIME_TRACKER_KEYS = {
     "pnp_early_stop",
     "pnp_pipeline",
     "pnp_ranked_batches",
+    "acquire_relaxed_min_inliers",
+    "acquire_relaxed_max_reproj_error",
+    "acquire_relaxed_min_agreeing_refs",
+    "lost_starved_global_frames",
+    "acquire_relaxed_probation_frames",
+    "boot_relaxed_min_inliers",
+    "track_miss_widen_topk",
+    "weak_miss_widen_topk",
+    "lost_starved_corr_max",
 }
 POSE_CONSENSUS_MODES = ("pairwise", "cluster")
 PNP_RANSAC_SEED = 0
+# Visual pose statuses: EDM-matched fixes are VISUALLY_CONFIRMED; KLT-bridged
+# frames (no EDM match, optical-flow carry) are KLT_BRIDGED so downstream
+# gates can tell them apart. Both flip to NONE on rejection.
+_VISUAL_POSE_STATUSES = ("VISUALLY_CONFIRMED", "KLT_BRIDGED")
+_VELOCITY_EMA_TAU_S = 0.25
+_ACQUIRE_SINGLE_STRONG_INLIERS = 120
+_ACQUIRE_SINGLE_STRONG_REPROJ = 2.0
+_PNP_ELIGIBLE_RELAX_RATIO = 0.8
+_PNP_ELIGIBLE_MIN_FLOOR = 10
+_WEAK_HYSTERESIS_INLIER_MIN = 45
+_WEAK_HYSTERESIS_REPROJ_MAX = 2.5
+_VPR_BLUR_VAR_MIN: float = 50.0  # Initial Laplacian variance threshold for blur gating; frames below this skip VPR retry. To be tuned on P168 difficult frame holdouts.
+PNP_RANSAC_THREADS_DEFAULT: int = 1
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    val = os.environ.get(name)
+    if val is None:
+        return default
+    return val.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _compute_laplacian_var(img: np.ndarray) -> float:
+    import cv2
+    if img.ndim == 3:
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    else:
+        gray = img
+    return float(cv2.Laplacian(gray, cv2.CV_64F).var())
+
+
+def _pnp_eligible_threshold(min_inliers: int) -> int:
+    """Return the minimum correspondence count required for a ref to be eligible for PnP.
+
+    Relaxation allows refs with >= max(10, ceil(0.8 * min_inliers)) correspondences
+    to attempt PnP, complementing the legacy rescue mechanism.
+    Can be reverted to legacy min_inliers via SFM_EDM_PNP_ELIGIBLE_RELAX=0.
+    """
+    if (
+        os.environ.get("SFM_EDM_PNP_ELIGIBLE_RELAX", "1").strip().lower()
+        in ("0", "false", "no", "off")
+    ):
+        return int(min_inliers)
+    return max(_PNP_ELIGIBLE_MIN_FLOOR, math.ceil(_PNP_ELIGIBLE_RELAX_RATIO * float(min_inliers)))
+
+
+def _blend_velocity(
+    old: np.ndarray | None, measured: np.ndarray, dt: float, tau: float = _VELOCITY_EMA_TAU_S
+) -> np.ndarray:
+    """dt-weighted velocity EMA: trust the new sample after long gaps.
+
+    alpha = clamp(dt / tau): 30 fps frames smooth (alpha ~0.13), a 0.5 s gap
+    almost fully trusts the new measurement. Non-finite dt falls back to the
+    measurement. Replaces the fixed 0.5 average that biased slow-frame
+    segments toward stale velocity.
+    """
+    measured_arr = np.asarray(measured, dtype=float)
+    if old is None:
+        return measured_arr
+    alpha = 1.0 if not math.isfinite(dt) or dt <= 0 else min(1.0, dt / tau)
+    return (1.0 - alpha) * np.asarray(old, dtype=float) + alpha * measured_arr
 
 
 
@@ -120,6 +226,14 @@ _NONNEGATIVE_INTEGER_CONFIG_FIELDS = (
     "recovery_bank_size",
     "recovery_scan_topk",
     "max_corr_total",
+    "acquire_relaxed_min_inliers",
+    "acquire_relaxed_min_agreeing_refs",
+    "lost_starved_global_frames",
+    "boot_relaxed_min_inliers",
+    "track_miss_widen_topk",
+    "weak_miss_widen_topk",
+    "lost_starved_corr_max",
+    "acquire_relaxed_probation_frames",
 )
 
 _POSITIVE_FLOAT_CONFIG_FIELDS = (
@@ -144,6 +258,7 @@ _POSITIVE_FLOAT_CONFIG_FIELDS = (
     "stale_reacquire_max_yaw_diff_deg",
     "lost_prior_fusion_weight",
     "consensus_max_rotation_deg",
+    "acquire_relaxed_max_reproj_error",
 )
 
 
@@ -153,6 +268,50 @@ class EDMConfig:
     boot_global_topk: int = 10
     acquire_initial_topk: int = 2
     acquire_min_inliers: int = 80
+    # Second-tier LOST re-acquisition floor for correspondence-rich near-misses.
+    # The 8-video failure census has 92 LOST frames whose retrieval produced a
+    # ~300-correspondence match and 60-79 inliers -- rejected only by the
+    # acquire_min_inliers floor (rejected=None in every row). This floor accepts
+    # that band ONLY with extra evidence: a tighter reprojection limit than the
+    # standard acquire limit plus independent references agreeing on the same
+    # camera center. Trajectory gates (acquire_jump / acquire_yaw / stale
+    # two-frame confirmation) are untouched, which is what blocks the P119
+    # vegetation false locks (those score 80-183 inliers, i.e. above this band).
+    # 0 = off (single acquire threshold).
+    #
+    # Default 66 since 2026-09-05, on the seven-video 720p corpus rather than
+    # the two- and four-segment sequential runs that had this at 0:
+    #   corpus  5025/6231 (80.6%) -> 5256/6287 (83.6%), +231 frames
+    #   P116 +102, P119 +96, P157 +28, P167 +25, P117/P118 flat, P168 -21
+    #   P168 across seeds 0/1/2: -21 / -36 / -21 -- a real but bounded cost,
+    #     and the only segment that pays one
+    #   off-map hard negative (river video vs the urai map): 0/241 with the
+    #     floor on AND off, so it opens no false lock
+    #   quality: inliers p05 unchanged at 51, p50 77->74; reproj p50
+    #     1.84->1.93 px, p95 2.80->2.77 px
+    # Code default, not pinned into the site profile: pinning rotates the
+    # profile SHA and the whole manifest/mission chain, which is a release
+    # action. Set 0 to restore the single acquire threshold.
+    acquire_relaxed_min_inliers: int = 66
+    acquire_relaxed_max_reproj_error: float = 3.0
+    acquire_relaxed_min_agreeing_refs: int = 2
+    # Relaxed accept probation: a frame accepted on the relaxed floor re-enters
+    # WEAK_TRACK (weak_local_topk references, weak_min_inliers) for this many
+    # frames instead of TRACK (one reference). The 2026-09-04 gate showed the
+    # P168 loss came from exactly this: the three relaxed accepts were correct
+    # (0.03-0.23 m from the previous fix, 64/1/101 following successes) but
+    # single-reference TRACK could not hold them, so inliers p50 fell 82->68
+    # and WEAK_TRACK rose by 47. One frame of probation is provably not enough
+    # (WEAK exits on the first good frame), hence a frame count. 0 = off.
+    acquire_relaxed_probation_frames: int = 0
+    # BOOT has no prior, so acquire_jump / acquire_yaw are not armed and the LOST
+    # relaxed floor deliberately excludes it. The 8-video census still has 96 BOOT
+    # failures with n_corr p50 652 and inliers 52-79 (max 79) -- the same
+    # near-miss shape. This floor accepts that band at BOOT only after an
+    # independent second frame lands within stale_reacquire_max_distance /
+    # stale_reacquire_max_yaw_diff_deg of the first, i.e. two-frame confirmation
+    # replaces the missing prior. 0 = off.
+    boot_relaxed_min_inliers: int = 0
     # BOOT tries MegaLoc at boot_global_topk, then once at twice that count.
     # Each LOST episode first spends lost_local_grace_frames on nearby EDM;
     # a still-failed episode fires MegaLoc at lost_local_topk, then only retries
@@ -167,6 +326,17 @@ class EDMConfig:
     # peak is map-dependent and non-monotonic (1/2/4/8 -> +14/+47/+47/+47); a new map
     # must re-run the interval sweep, this is only a better starting point than 0.
     lost_global_retrieval_interval: int = 3
+    # Starvation-triggered full-map retry. LOST local recovery draws refs from the
+    # last-known pose; inside a valley that pose is wrong, so EDM returns ~2
+    # correspondences frame after frame (8-video census: 163 LOST frames with
+    # n_corr<=5, 104 of them P119, all candidate_mode=edm_local_recovery with 2
+    # refs). After this many consecutive starved LOST frames the next frame skips
+    # the local/progressive-radius pool and runs a full-map MegaLoc retrieval.
+    # 0 = off. This is starvation-triggered on purpose: the interval sweep is
+    # non-monotonic (interval 1 is worse than 3), so "retrieve more often" is not
+    # the lever -- "retrieve when the local pool produced nothing" is.
+    lost_starved_global_frames: int = 0
+    lost_starved_corr_max: int = 5
     recovery_bank_size: int = 192
     recovery_scan_topk: int = 2
     match_batch_size: int = 2
@@ -179,6 +349,19 @@ class EDMConfig:
     track_map_first: bool = False
     local_topk: int = 1
     weak_local_topk: int = 3
+    # Same-frame reference widening after a TRACK miss. TRACK runs one map
+    # reference (local_topk=1, plus the temporal anchor), and the 8-video census
+    # shows 212 failures -- 19.5% of all failures -- that are exactly this:
+    # state TRACK, refs=1, inliers p50 34, n_corr p50 48. Retrying the SAME frame
+    # against this many references costs nothing on healthy frames (it only runs
+    # after a miss) and gives the geometry a second chance before the miss
+    # counter advances toward WEAK/LOST. 0 = off.
+    track_miss_widen_topk: int = 0
+    # Same-frame widening after a WEAK miss: WEAK runs weak_local_topk=3 at
+    # weak_min_inliers=30, and the census shows 83 WEAK failures at inliers p50
+    # 23 with 33 frames in [25, 30). Same miss-only cost profile as above.
+    # 0 = off.
+    weak_miss_widen_topk: int = 0
     near_pool: int = 24
     covis_per_ref: int = 20
     radius: float = 0.8
@@ -284,6 +467,58 @@ def register_optional_runtime_tracker_keys() -> None:
 register_optional_runtime_tracker_keys()
 
 
+# Recovery-policy knobs the hashed release profiles do not carry. The site
+# profile is SHA-pinned, and production-path replay only transmits the profile,
+# so an A/B of these has to travel by environment variable (same reason
+# SFM_EDM_REFERENCE_QUALITY_WEIGHT exists). Unset means "use the cfg value".
+def _env_flag(raw: str) -> bool:
+    """Parse an environment override for a boolean config field."""
+    value = raw.strip().lower()
+    if value in ("1", "true", "yes", "on"):
+        return True
+    if value in ("0", "false", "no", "off"):
+        return False
+    raise ValueError(f"expected a boolean flag, got {raw!r}")
+
+
+_ENV_CONFIG_OVERRIDES = (
+    ("SFM_EDM_ACQUIRE_RELAXED_MIN_INLIERS", "acquire_relaxed_min_inliers", int),
+    ("SFM_EDM_ACQUIRE_RELAXED_REPROJ", "acquire_relaxed_max_reproj_error", float),
+    ("SFM_EDM_ACQUIRE_RELAXED_AGREE", "acquire_relaxed_min_agreeing_refs", int),
+    ("SFM_EDM_LOST_STARVED_FRAMES", "lost_starved_global_frames", int),
+    ("SFM_EDM_LOST_STARVED_CORR", "lost_starved_corr_max", int),
+    ("SFM_EDM_TRACK_WIDEN_TOPK", "track_miss_widen_topk", int),
+    ("SFM_EDM_WEAK_WIDEN_TOPK", "weak_miss_widen_topk", int),
+    ("SFM_EDM_BOOT_RELAXED_MIN_INLIERS", "boot_relaxed_min_inliers", int),
+    # p95 lever: the wall-time tail is entirely LOST recovery frames matching
+    # lost_local_topk references (P168/P119/P157 tail p95 frames: 36-50 of ~50
+    # have 5 refs, match_ms p50 95-100 ms vs 22 ms overall, ~19 ms per ref).
+    ("SFM_EDM_LOST_LOCAL_TOPK", "lost_local_topk", int),
+    (
+        "SFM_EDM_ACQUIRE_RELAXED_PROBATION_FRAMES",
+        "acquire_relaxed_probation_frames",
+        int,
+    ),
+)
+
+
+def _apply_env_config_overrides(config: EDMConfig) -> None:
+    """Apply environment overrides for the recovery-policy knobs, then re-validate."""
+    applied = False
+    for env_name, field_name, caster in _ENV_CONFIG_OVERRIDES:
+        raw = os.environ.get(env_name)
+        if raw is None or not raw.strip():
+            continue
+        try:
+            value = caster(raw.strip())
+        except ValueError as exc:
+            raise ValueError(f"{env_name} must be parseable as {caster.__name__}") from exc
+        setattr(config, field_name, value)
+        applied = True
+    if applied:
+        config.validate()
+
+
 def _validate_integer_config_fields(config: EDMConfig) -> None:
     for name in _POSITIVE_INTEGER_CONFIG_FIELDS:
         value = getattr(config, name)
@@ -355,7 +590,7 @@ class RuntimeState:
     velocity: np.ndarray | None = None
     last_capture_stamp: float | None = None
     last_refs: list = field(default_factory=list)
-    misses: int = 0
+    misses: float = 0.0
     frame: int = 0
     accepted_step_norms: deque[float] = field(default_factory=lambda: deque(maxlen=120))
     observed_capture_dts: deque[float] = field(default_factory=lambda: deque(maxlen=120))
@@ -372,7 +607,14 @@ class RuntimeState:
     lost_global_retrieval_attempts: int = 0
     lost_global_retrieval_done: bool = False
     lost_frames: int = 0
+    # Consecutive LOST frames whose local recovery returned almost no
+    # correspondences; arms the starvation-triggered full-map retrieval.
+    lost_starved_frames: int = 0
+    # Remaining frames of WEAK_TRACK probation after a relaxed-floor accept.
+    relaxed_probation_frames: int = 0
     recovery_cursor: int = 0
+    _vpr_consec_failures: int = 0
+    _last_vpr_lost_frame: int | None = None
 
 
 @dataclass(frozen=True)
@@ -406,6 +648,10 @@ class _PoseAttempt:
     strong_count: int = 0
     pnp_candidates: int = 0
     pnp_skipped: int = 0
+    # References agreeing with the chosen pose at the relaxed floor. Only
+    # computed when the relaxed acquire tier is enabled and the chosen
+    # candidate falls below acquire_min_inliers; 0 otherwise.
+    relaxed_agree_count: int = 0
 
 
 def _merge_correspondence_rows(rows: list) -> tuple[np.ndarray, np.ndarray, np.ndarray, list]:
@@ -778,6 +1024,7 @@ class ProductionEDMTracker:
     ):
         self.cfg = cfg or EDMConfig()
         self.cfg.validate()
+        _apply_env_config_overrides(self.cfg)
         quality_weight_env = os.environ.get("SFM_EDM_REFERENCE_QUALITY_WEIGHT")
         if quality_weight_env is not None and hasattr(self.cfg, "reference_quality_weight"):
             try:
@@ -848,6 +1095,53 @@ class ProductionEDMTracker:
         self._klt_age: int = 0
         self._klt_query_gray: np.ndarray | None = None
         self._klt_query_stamp: float | None = None
+        # SFM_EDM_KLT_BRIDGE_INTERVAL=N (>=2): in steady TRACK run the full EDM
+        # match only every Nth frame and carry the pose with KLT optical flow on
+        # the last EDM anchor's inlier 2D<->3D in between. Code default 0 = OFF
+        # (see docs/verified_localization_optimization_ledger.md "KLT bridge").
+        # It shipped as 3 on 2026-09-03 for the sequential-replay win (+89
+        # successes / -121 LOST over 7 videos); the 2026-09-03 production-path
+        # re-measurement reverted it: 4 same-setting repeats put P168 700f at
+        # 516-528 with the bridge vs a rock-steady 575 without it (-47..-59
+        # successes), far worse than the -18 the original single run recorded.
+        # P117 is a successes wash there but 3.3x lower wall p50, so N>=2 is
+        # still the right setting for smooth footage where latency dominates.
+        try:
+            self._klt_bridge_interval: int = int(
+                os.environ.get("SFM_EDM_KLT_BRIDGE_INTERVAL", "0") or "0"
+            )
+        except ValueError:
+            self._klt_bridge_interval = 0
+        try:
+            self._klt_bridge_min_ratio: float = float(
+                os.environ.get("SFM_EDM_KLT_BRIDGE_MIN_RATIO", "0.66") or "0.66"
+            )
+        except ValueError:
+            self._klt_bridge_min_ratio = 0.66
+        # p95-tail guard: cap on consecutive bridge frames (0 = use N-1), and a
+        # drift trip that forces a full EDM re-anchor the frame after a bridge
+        # whose reproj / step / inlier-ratio is elevated (soft, below the hard
+        # gates in _track_klt_prior). Both cut the worst-case drift before a
+        # WEAK/LOST that would otherwise land a heavy recovery match.
+        try:
+            self._klt_bridge_max_consec: int = int(
+                os.environ.get("SFM_EDM_KLT_BRIDGE_MAX_CONSEC", "0") or "0"
+            )
+        except ValueError:
+            self._klt_bridge_max_consec = 0
+        self._klt_bridge_drift_guard: bool = (
+            os.environ.get("SFM_EDM_KLT_BRIDGE_DRIFT_GUARD", "1") != "0"
+        )
+        # Forward-backward reprojection gate tau (px) for the bridge's KLT: a
+        # track is kept only when ||p_t - LK(LK(p_t))|| < tau. Mirrors the xfeat
+        # flow path's SFM_FLOW_FB_PX so tau can be A/B'd through the replay gate.
+        try:
+            self._klt_fb_px: float = float(
+                os.environ.get("SFM_EDM_KLT_FB_PX", str(_KLT_FB_PX)) or _KLT_FB_PX
+            )
+        except ValueError:
+            self._klt_fb_px = float(_KLT_FB_PX)
+        self._klt_bridge_run: int = 0
         self._pcam: pycolmap.Camera | None = None
         self._pnp_options: pycolmap.AbsolutePoseEstimationOptions | None = None
         self._pnp_executor = None
@@ -860,35 +1154,11 @@ class ProductionEDMTracker:
         self.motion_validation_mode = motion_validation_mode
         self._last_accepted_bgr: np.ndarray | None = None
         self._last_accepted_cam_from_world: np.ndarray | None = None
+        self._last_accepted_rigid3d: pycolmap.Rigid3d | None = None
         # --- ESEKF minimal integration (after _klt_* and pose_guided init) ---
         self._latest_velocity_ned: np.ndarray | None = None
         self._esekf_last_predict: np.ndarray | None = None
-        try:
-            if ESEKF is not None and EKFConfig is not None:
-                mpm = getattr(self.cfg, "metres_per_map_unit", None)
-                if mpm is None:
-                    pg = getattr(self, "pose_guided", None)
-                    if pg is not None:
-                        mpm_cfg = getattr(getattr(pg, "config", None), "metres_per_map_unit", None)
-                        if mpm_cfg is not None:
-                            mpm = mpm_cfg
-                if mpm is not None:
-                    try:
-                        mpm_f = float(mpm)
-                        if not math.isfinite(mpm_f) or mpm_f <= 1e-9:
-                            mpm = None
-                        else:
-                            mpm = mpm_f
-                    except Exception:
-                        mpm = None
-                if mpm is not None:
-                    self.esekf = ESEKF(EKFConfig(metres_per_map_unit=mpm))  # type: ignore
-                else:
-                    self.esekf = ESEKF(EKFConfig())  # type: ignore
-            else:
-                self.esekf = None  # type: ignore
-        except Exception:
-            self.esekf = None  # type: ignore
+        self._init_esekf()
         count = len(reloc_map.ref_names)
         self._reference_quality = np.full(count, np.nan, dtype=np.float32)
         self._reference_stability = np.full(count, np.nan, dtype=np.float32)
@@ -937,6 +1207,44 @@ class ProductionEDMTracker:
             quality[np.linalg.norm(centers - center, axis=1) <= radius] = 0.2
         self._reference_quality = quality
 
+    def _init_esekf(self) -> None:
+        """Build ``self.esekf`` unless ``SFM_EDM_ESEKF_DISABLE=1``.
+
+        The env toggle forces the ESEKF and the KLT 3D-aware prior (which is
+        gated on ``self.esekf.prediction_allowed()``) fully off, so a live
+        recording can be replayed both ways for A/B evaluation
+        (``benchmark_esekf_live_replay.py``). Off by default.
+        """
+        self.esekf_disabled_by_env = os.environ.get("SFM_EDM_ESEKF_DISABLE") == "1"
+        try:
+            if self.esekf_disabled_by_env:
+                self.esekf = None  # type: ignore
+            elif ESEKF is not None and EKFConfig is not None:
+                mpm = getattr(self.cfg, "metres_per_map_unit", None)
+                if mpm is None:
+                    pg = getattr(self, "pose_guided", None)
+                    if pg is not None:
+                        mpm_cfg = getattr(getattr(pg, "config", None), "metres_per_map_unit", None)
+                        if mpm_cfg is not None:
+                            mpm = mpm_cfg
+                if mpm is not None:
+                    try:
+                        mpm_f = float(mpm)
+                        if not math.isfinite(mpm_f) or mpm_f <= 1e-9:
+                            mpm = None
+                        else:
+                            mpm = mpm_f
+                    except Exception:
+                        mpm = None
+                if mpm is not None:
+                    self.esekf = ESEKF(EKFConfig(metres_per_map_unit=mpm))  # type: ignore
+                else:
+                    self.esekf = ESEKF(EKFConfig())  # type: ignore
+            else:
+                self.esekf = None  # type: ignore
+        except Exception:
+            self.esekf = None  # type: ignore
+
     def attach_pose_guided(self, controller) -> None:
         self.pose_guided = controller
 
@@ -979,6 +1287,14 @@ class ProductionEDMTracker:
             self._pcam, self._pnp_options = self._new_pose_estimation_context()
         return self._pcam, self._pnp_options
 
+    def _pnp_ransac_threads(self) -> int:
+        env_val = os.environ.get("SFM_EDM_PNP_THREADS", "1")
+        try:
+            val = int(env_val.strip())
+            return max(1, val)
+        except (ValueError, TypeError, AttributeError):
+            return 1
+
     def _new_pose_estimation_context(
         self,
         random_seed: int = PNP_RANSAC_SEED,
@@ -992,7 +1308,98 @@ class ProductionEDMTracker:
         options = pycolmap.AbsolutePoseEstimationOptions()
         options.ransac.max_error = self.cfg.pnp_ransac_max_error
         options.ransac.random_seed = int(random_seed)
+        options.ransac.num_threads = self._pnp_ransac_threads()
         return camera, options
+
+    @property
+    def _vpr_consec_failures(self) -> int:
+        if hasattr(self, "st") and self.st is not None:
+            return getattr(self.st, "_vpr_consec_failures", 0)
+        return getattr(self, "_vpr_consec_failures_val", 0)
+
+    @_vpr_consec_failures.setter
+    def _vpr_consec_failures(self, val: int) -> None:
+        if hasattr(self, "st") and self.st is not None:
+            self.st._vpr_consec_failures = int(val)
+        self._vpr_consec_failures_val = int(val)
+
+    @property
+    def _last_vpr_lost_frame(self) -> int | None:
+        if hasattr(self, "st") and self.st is not None:
+            return getattr(self.st, "_last_vpr_lost_frame", None)
+        return getattr(self, "_last_vpr_lost_frame_val", None)
+
+    @_last_vpr_lost_frame.setter
+    def _last_vpr_lost_frame(self, val: int | None) -> None:
+        if hasattr(self, "st") and self.st is not None:
+            self.st._last_vpr_lost_frame = val
+        self._last_vpr_lost_frame_val = val
+
+    def _adaptive_vpr_enabled(self) -> bool:
+        return _env_bool("SFM_EDM_ADAPTIVE_VPR", False)
+
+    def _prior_pnp_refine_enabled(self) -> bool:
+        # Default ON (2026-09-03 gate: P168 608 + P117 366 zero-regression,
+        # perturbation test +-0.3m/+-10deg holds; safe fallback to RANSAC).
+        # Set SFM_EDM_PRIOR_PNP_REFINE=0 to restore pure-RANSAC PnP.
+        return _env_bool("SFM_EDM_PRIOR_PNP_REFINE", True)
+
+    def _is_vpr_blur_gated(self, frame_bgr: np.ndarray | None = None) -> bool:
+        if not self._adaptive_vpr_enabled() or frame_bgr is None:
+            return False
+        try:
+            var = _compute_laplacian_var(frame_bgr)
+            return var < _VPR_BLUR_VAR_MIN
+        except Exception:
+            return False
+
+    def _effective_lost_global_retrieval_interval(self) -> int:
+        base = int(getattr(self.cfg, "lost_global_retrieval_interval", 3))
+        if not self._adaptive_vpr_enabled() or base <= 0:
+            return base
+        consec = int(self._vpr_consec_failures)
+        if consec < 2:
+            return base
+        elif consec == 2:
+            return max(base, 5)
+        else:
+            return max(base, 8)
+
+    def _lost_local_radius_factor(self) -> float:
+        if not self._adaptive_vpr_enabled():
+            return 1.0
+        if int(self._vpr_consec_failures) >= 2:
+            base_r = float(getattr(self.cfg, "radius", 0.8))
+            max_j = float(getattr(self.cfg, "max_jump", base_r))
+            if base_r > 1e-6:
+                return min(2.0, max(1.0, max_j / base_r))
+            return 2.0
+        return 1.0
+
+    def _resolve_pose_prior(self, prior: Any | None = None) -> pycolmap.Rigid3d | None:
+        if prior is not None:
+            if isinstance(prior, pycolmap.Rigid3d):
+                return prior
+            if isinstance(prior, dict) and "cam_from_world" in prior:
+                val = prior["cam_from_world"]
+                if isinstance(val, pycolmap.Rigid3d):
+                    return val
+                if hasattr(val, "rotation") and hasattr(val, "translation"):
+                    return val
+            if hasattr(prior, "cam_from_world"):
+                val = getattr(prior, "cam_from_world")
+                if isinstance(val, pycolmap.Rigid3d):
+                    return val
+        last_rigid = getattr(self, "_last_accepted_rigid3d", None)
+        if last_rigid is not None and isinstance(last_rigid, pycolmap.Rigid3d):
+            return last_rigid
+        last_mat = getattr(self, "_last_accepted_cam_from_world", None)
+        if last_mat is not None and hasattr(last_mat, "shape"):
+            try:
+                return pycolmap.Rigid3d(np.asarray(last_mat, dtype=float)[:3, :4])
+            except Exception:
+                pass
+        return None
 
     def _parallel_pnp_executor(self) -> ThreadPoolExecutor | None:
         if self.cfg.pnp_workers <= 1:
@@ -1072,7 +1479,7 @@ class ProductionEDMTracker:
                     except Exception:
                         trace = 0.0
                     try:
-                        W = int(np.clip(15 + 3 * math.sqrt(max(trace, 0.0)) / 0.1, 15, 41))
+                        W = int(np.clip(_KLT_COV_WINDOW_MIN + _KLT_COV_WINDOW_GAIN * math.sqrt(max(trace, 0.0)) / _KLT_COV_WINDOW_SCALE, _KLT_COV_WINDOW_MIN, _KLT_COV_WINDOW_MAX))
                         if W % 2 == 0:
                             W += 1
                         klt_params = dict(_KLT_LK_PARAMS, winSize=(W, W))
@@ -1122,19 +1529,27 @@ class ProductionEDMTracker:
             # fallback: standard LK without initial guess
             p0 = np.asarray(klt_2d, dtype=np.float32).reshape(-1, 1, 2)
             # if we already computed nxt via 3D-aware path, reuse; else compute here
+            backend = _FLOW_BACKEND
             try:
                 nxt
             except NameError:
-                nxt, stf, _ = cv2.calcOpticalFlowPyrLK(klt_gray, gray, p0, None, **klt_params)
+                if backend is None:
+                    nxt, stf, _ = cv2.calcOpticalFlowPyrLK(klt_gray, gray, p0, None, **klt_params)
+                else:
+                    nxt, stf = backend(klt_gray, gray, p0)
             if nxt is None or stf is None:
                 self._clear_klt_cache()
                 return None
-            back, stb, _ = cv2.calcOpticalFlowPyrLK(gray, klt_gray, nxt, None, **klt_params)
+            if backend is None:
+                back, stb, _ = cv2.calcOpticalFlowPyrLK(gray, klt_gray, nxt, None, **klt_params)
+            else:
+                back, stb = backend(gray, klt_gray, nxt)
             if back is None or stb is None:
                 self._clear_klt_cache()
                 return None
             fb = np.linalg.norm((p0 - back).reshape(-1, 2), axis=1)
-            good = (stf.ravel() == 1) & (stb.ravel() == 1) & (fb < float(_KLT_FB_PX))
+            fb_px = float(getattr(self, "_klt_fb_px", _KLT_FB_PX))
+            good = (stf.ravel() == 1) & (stb.ravel() == 1) & (fb < fb_px)
             if int(np.count_nonzero(good)) < _KLT_MIN_TRACK:
                 self._clear_klt_cache()
                 return None
@@ -1178,7 +1593,7 @@ class ProductionEDMTracker:
             if not math.isfinite(rms_val) or rms_val > float(self.cfg.max_reproj_error_track):
                 self._clear_klt_cache()
                 return None
-            _, center, yaw = self._pose_components(result)
+            R_klt, center, yaw = self._pose_components(result)
             if getattr(self.st, "center", None) is not None:
                 try:
                     step = float(np.linalg.norm(np.asarray(center, dtype=float) - np.asarray(self.st.center, dtype=float)))
@@ -1194,7 +1609,7 @@ class ProductionEDMTracker:
                 # spatial coverage
                 try:
                     h, w = gray.shape[:2]
-                    gw, gh = 8, 6
+                    gw, gh = _KLT_SPATIAL_GRID
                     cells = set()
                     for x, y in n2d:
                         gx = min(gw - 1, max(0, int(x / max(w, 1) * gw)))
@@ -1202,18 +1617,18 @@ class ProductionEDMTracker:
                         cells.add((gx, gy))
                     spatial_cells = len(cells)
                 except Exception:
-                    spatial_cells = 6
+                    spatial_cells = _KLT_SPATIAL_FALLBACK_CELLS
                 try:
                     fb_med = float(np.median(fbg)) if len(fbg) else 0.0
                 except Exception:
                     fb_med = 0.0
-                confidence = 0.5 * float(inlier_ratio) + 0.3 * (float(spatial_cells) / 64.0) + 0.2 * (1.0 - min(float(fb_med), 1.0))
+                confidence = _KLT_CONF_W_RATIO * float(inlier_ratio) + _KLT_CONF_W_SPATIAL * (float(spatial_cells) / _KLT_CONF_SPATIAL_NORM) + _KLT_CONF_W_FB * (1.0 - min(float(fb_med), 1.0))
                 # 放宽：0.40→0.30, 0.60→0.50 （水面 ratio 0.5-0.6 原被误红）
-                if inlier_ratio < 0.45 and tracked >= 50:
+                if inlier_ratio < _KLT_RATIO_HARD_MIN and tracked >= _KLT_TRACKED_MIN_FOR_RATIO_GATE:
                     self._clear_klt_cache()
                     return None
-                if confidence < 0.30:
-                    if inlier_ratio < 0.50:
+                if confidence < _KLT_CONF_MIN:
+                    if inlier_ratio < _KLT_RATIO_SOFT_MIN:
                         self._clear_klt_cache()
                         return None
                 # store for later info
@@ -1238,6 +1653,8 @@ class ProductionEDMTracker:
             return {
                 "center": np.asarray(center, dtype=float).copy(),
                 "yaw": float(yaw),
+                "R": np.asarray(R_klt, dtype=float).copy(),
+                "cam_from_world": result.get("cam_from_world"),
                 "tracked": int(np.count_nonzero(good)),
                 "inliers": int(inliers),
                 "reproj_rms": float(rms_val),
@@ -1545,6 +1962,8 @@ class ProductionEDMTracker:
         self,
         frame_bgr: np.ndarray,
         capture_stamp: float,
+        *,
+        force_global: bool = False,
     ) -> tuple[list[str], float, bool]:
         import cv2
 
@@ -1572,7 +1991,13 @@ class ProductionEDMTracker:
                 and math.isfinite(prior_age)
                 and 0.0 <= prior_age <= self.cfg.lost_prior_max_age_s
             )
-            if self.cfg.lost_prior_strategy == "restrict_nearby":
+            if force_global:
+                # Starved: the nearby pool is what produced nothing, so the
+                # progressive radius stages and the prior-fused ranking are
+                # exactly the wrong place to look. Rank the whole map.
+                self._last_lost_search_stage = "starved_global"
+                self._last_lost_radius_factor = None
+            elif self.cfg.lost_prior_strategy == "restrict_nearby":
                 if attempts < len(LOST_PROGRESSIVE_RADIUS_FACTORS):
                     factor = LOST_PROGRESSIVE_RADIUS_FACTORS[attempts]
                     pool = min(
@@ -1601,7 +2026,7 @@ class ProductionEDMTracker:
             self._last_lost_radius_factor = None
         rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
         started = time.perf_counter()
-        if lost and self.cfg.lost_prior_strategy == "score_fusion":
+        if lost and not force_global and self.cfg.lost_prior_strategy == "score_fusion":
             refs = self._lost_score_fusion_refs(rgb, topk, capture_stamp, prior_fresh)
             self._last_retrieval_kind = "fused"
         elif candidates is not None:
@@ -1617,20 +2042,79 @@ class ProductionEDMTracker:
             self.st.lost_global_retrieval_done = (
                 self.st.lost_global_retrieval_attempts >= LOST_GLOBAL_RETRIEVAL_ATTEMPTS
             )
+            self._last_vpr_lost_frame = self.st.lost_frames
         else:
             self.st.boot_global_retrieval_attempts += 1
         if not lost and len(refs) > len(self.st.boot_refs):
             self.st.boot_refs = list(refs)
         return refs, elapsed_ms, candidates is not None
 
-    def _should_run_global_retrieval(self) -> bool:
+    def _lost_starvation_armed(self) -> bool:
+        """True when consecutive corr-starved LOST frames have earned a full-map retry."""
+        threshold = int(getattr(self.cfg, "lost_starved_global_frames", 0) or 0)
+        if threshold <= 0 or self.st.state != "LOST":
+            return False
+        return int(getattr(self.st, "lost_starved_frames", 0) or 0) >= threshold
+
+    def _observe_lost_starvation(
+        self,
+        state_in: str,
+        selection: _CandidateSelection,
+        info: dict,
+    ) -> None:
+        """Count corr-starved local-pool frames inside the current LOST episode.
+
+        Local recovery refs come from the last-known pose. Inside a recovery
+        valley that pose is wrong, so EDM returns a handful of correspondences
+        and the next local scan repeats the same mistake (measured: 328
+        edm_local_recovery frames across P119/P157/P168, 2 successes).
+
+        Retrieval frames neither count nor reset: they exercise a different
+        pool, and the interleaved MegaLoc cadence would otherwise clip every
+        run of local frames to two and the escape hatch could never arm. Only a
+        local frame that actually found geometry, or leaving LOST, clears it.
+        """
+        if int(getattr(self.cfg, "lost_starved_global_frames", 0) or 0) <= 0:
+            return
+        if state_in != "LOST":
+            self.st.lost_starved_frames = 0
+            return
+        if selection.mode.startswith("megaloc"):
+            return
+        n_corr = int(info.get("n_corr", 0) or 0)
+        if n_corr <= int(getattr(self.cfg, "lost_starved_corr_max", 0) or 0):
+            self.st.lost_starved_frames += 1
+        else:
+            self.st.lost_starved_frames = 0
+        info["lost_starved_frames"] = int(self.st.lost_starved_frames)
+
+    def _should_run_global_retrieval(self, frame_bgr: np.ndarray | None = None) -> bool:
         if self.cfg.global_retrieval_policy == "boot_and_lost_once":
             if (
                 self.st.state == "BOOT_INIT"
                 and self.st.boot_global_retrieval_attempts < GLOBAL_RETRIEVAL_ATTEMPTS
             ):
                 return True
+            if self._lost_starvation_armed():
+                return True
             progressive_offset = self.st.lost_frames - self.cfg.lost_local_grace_frames - 1
+            if self._adaptive_vpr_enabled() and self.st.state == "LOST":
+                if self.st.lost_frames <= self.cfg.lost_local_grace_frames:
+                    return False
+                if self.st.lost_global_retrieval_attempts == 0:
+                    return True
+                interval = self._effective_lost_global_retrieval_interval()
+                if interval <= 0:
+                    return False
+                if self._last_vpr_lost_frame is not None:
+                    timing_ok = (self.st.lost_frames - self._last_vpr_lost_frame) >= interval
+                else:
+                    timing_ok = (progressive_offset >= 0 and progressive_offset % interval == 0)
+                if not timing_ok:
+                    return False
+                if self._is_vpr_blur_gated(frame_bgr):
+                    return False
+                return True
             if (
                 self.st.state == "LOST"
                 and self.cfg.lost_prior_strategy == "restrict_nearby"
@@ -1683,10 +2167,22 @@ class ProductionEDMTracker:
                 refs = self._recovery_candidates(self.cfg.recovery_scan_topk)
                 mode = "edm_map_scan"
         elif self.st.state == "LOST" and self.st.lost_frames > self.cfg.lost_local_grace_frames:
+            if self._adaptive_vpr_enabled() and self.st.center is not None:
+                refs = self._track_candidates(
+                    self.cfg.lost_local_topk,
+                    capture_stamp,
+                    radius_factor=self._lost_local_radius_factor(),
+                )
+                if refs:
+                    return refs, "edm_local_recovery"
             refs = self._recovery_candidates(self.cfg.recovery_scan_topk)
             mode = "edm_map_scan"
         elif self.st.state == "LOST":
-            refs = self._track_candidates(self.cfg.lost_local_topk, capture_stamp)
+            refs = self._track_candidates(
+                self.cfg.lost_local_topk,
+                capture_stamp,
+                radius_factor=self._lost_local_radius_factor(),
+            )
             mode = "edm_local_recovery"
         else:
             refs = list(self.st.boot_refs)
@@ -1706,17 +2202,24 @@ class ProductionEDMTracker:
         frame_bgr: np.ndarray,
         capture_stamp: float,
     ) -> _CandidateSelection:
-        if self._should_run_global_retrieval():
+        if self._should_run_global_retrieval(frame_bgr):
             retry = (
                 self.st.lost_global_retrieval_attempts
                 if self.st.state == "LOST"
                 else self.st.boot_global_retrieval_attempts
             ) > 0
+            starved = self._lost_starvation_armed()
             refs, vpr_ms, nearby = self._global_retrieval(
                 frame_bgr,
                 capture_stamp,
+                force_global=starved,
             )
-            if self.st.state == "LOST" and getattr(self, "_last_retrieval_kind", None) == "fused":
+            if starved:
+                # Counter is spent: the next full-map retry needs a fresh run of
+                # starved frames, so one bad valley cannot pin VPR on every frame.
+                self.st.lost_starved_frames = 0
+                mode = "megaloc_lost_starved"
+            elif self.st.state == "LOST" and getattr(self, "_last_retrieval_kind", None) == "fused":
                 mode = "megaloc_lost_fused"
             elif self.st.state == "LOST" and nearby:
                 mode = "megaloc_lost_near"
@@ -1817,6 +2320,7 @@ class ProductionEDMTracker:
                 batch_size=self.cfg.match_batch_size,
                 source_kinds=kinds,
                 prepared_query=prepared_query,
+                on_batch=on_batch,
             )
             points2d, points3d, confidence, per_ref = _merge_correspondence_rows(rows)
         else:
@@ -1844,6 +2348,7 @@ class ProductionEDMTracker:
         confidence: np.ndarray,
         pcam: pycolmap.Camera,
         options: pycolmap.AbsolutePoseEstimationOptions,
+        prior: Any | None = None,
     ) -> tuple[tuple | None, float]:
         if len(points3d) < 6:
             return None, 0.0
@@ -1858,6 +2363,63 @@ class ProductionEDMTracker:
         capped_points2d = points2d[selected]
         capped_points3d = points3d[selected]
         started = time.perf_counter()
+        if self._prior_pnp_refine_enabled() and hasattr(pycolmap, "refine_absolute_pose"):
+            resolved_prior = self._resolve_pose_prior(prior)
+            if resolved_prior is not None:
+                try:
+                    p3d_arr = np.asarray(capped_points3d, float)
+                    p2d_arr = np.asarray(capped_points2d, float)
+                    pts_cam = np.asarray(resolved_prior * p3d_arr, dtype=float)
+                    valid = (pts_cam[:, 2] > 1e-6)
+                    if valid.any():
+                        proj = np.asarray(pcam.img_from_cam(pts_cam), dtype=float)
+                        valid_proj = valid & np.isfinite(proj).all(axis=1)
+                        if valid_proj.any():
+                            errors = np.linalg.norm(proj - p2d_arr, axis=1)
+                            inlier_mask = valid_proj & (errors <= options.ransac.max_error)
+                            num_inl = int(np.sum(inlier_mask))
+                            inl_ratio = float(num_inl / max(1, len(capped_points2d)))
+                            if num_inl >= 60 and inl_ratio >= 0.65:
+                                refine_res = pycolmap.refine_absolute_pose(
+                                    resolved_prior,
+                                    p2d_arr,
+                                    p3d_arr,
+                                    inlier_mask,
+                                    pcam,
+                                )
+                                if refine_res is not None and "cam_from_world" in refine_res:
+                                    refined_cam = refine_res["cam_from_world"]
+                                    p_cam_ref = np.asarray(refined_cam * p3d_arr, dtype=float)
+                                    val_ref = (p_cam_ref[:, 2] > 1e-6)
+                                    proj_ref = np.asarray(pcam.img_from_cam(p_cam_ref), dtype=float)
+                                    val_proj_ref = val_ref & np.isfinite(proj_ref).all(axis=1)
+                                    err_ref = np.linalg.norm(proj_ref - p2d_arr, axis=1)
+                                    mask_ref = val_proj_ref & (err_ref <= options.ransac.max_error)
+                                    ref_inliers = int(np.sum(mask_ref))
+                                    if ref_inliers >= 60:
+                                        estimate = {
+                                            "cam_from_world": refined_cam,
+                                            "num_inliers": ref_inliers,
+                                            "inlier_mask": mask_ref,
+                                        }
+                                        metrics = reprojection_metrics(
+                                            estimate,
+                                            capped_points2d,
+                                            capped_points3d,
+                                            pcam,
+                                            self.cfg.corr_grid,
+                                        )
+                                        if metrics.get("reproj_rms") is not None:
+                                            elapsed_ms = (time.perf_counter() - started) * 1e3
+                                            return (
+                                                estimate,
+                                                capped_points2d,
+                                                capped_points3d,
+                                                metrics,
+                                            ), elapsed_ms
+                except Exception:
+                    pass
+
         estimate = pycolmap.estimate_and_refine_absolute_pose(
             np.asarray(capped_points2d, float),
             np.asarray(capped_points3d, float),
@@ -1895,6 +2457,73 @@ class ProductionEDMTracker:
     ) -> bool:
         return _strong_centers_disagree(scored, min_inl, self.cfg)
 
+    def _relaxed_acquire_floor_value(self, selection: _CandidateSelection) -> int:
+        """Relaxed acquire floor for this state, or 0 when the tier does not apply.
+
+        LOST uses ``acquire_relaxed_min_inliers`` and is guarded by the armed
+        trajectory gates. BOOT_INIT has no prior at all, so it uses its own
+        ``boot_relaxed_min_inliers`` and pays for the missing prior with the
+        two-frame confirmation in ``_boot_relaxed_confirms``.
+        """
+        if not selection.acquiring:
+            return 0
+        state = self.st.state
+        if state == "LOST":
+            floor = int(getattr(self.cfg, "acquire_relaxed_min_inliers", 0) or 0)
+        elif state == "BOOT_INIT":
+            floor = int(getattr(self.cfg, "boot_relaxed_min_inliers", 0) or 0)
+        else:
+            return 0
+        if floor <= 0 or floor >= int(selection.min_inliers):
+            return 0
+        return floor
+
+    def _count_relaxed_agreement(
+        self,
+        selection: _CandidateSelection,
+        scored: list[tuple[str, tuple]],
+        candidate: tuple,
+    ) -> int:
+        """Agreeing references for a below-threshold acquire candidate (0 when N/A)."""
+        floor = self._relaxed_acquire_floor_value(selection)
+        if floor <= 0 or self._candidate_inliers(candidate) >= int(selection.min_inliers):
+            return 0
+        _rotation, center, _yaw = self._pose_components(candidate[0])
+        return count_agreeing_refs(scored, center, floor, self._acquire_consensus_limit())
+
+    def _relaxed_acquire_gate(
+        self,
+        selection: _CandidateSelection,
+        attempt: _PoseAttempt,
+    ) -> tuple[int, float] | None:
+        """Second-tier (min_inliers, reproj_limit) for a corroborated near-miss.
+
+        Returns None unless every relaxed condition holds, so the standard
+        acquire floor stays in force. The floor only drops for a LOST
+        re-acquisition whose match is dense enough to place the pose twice:
+        ``acquire_relaxed_min_agreeing_refs`` references at or above the
+        relaxed floor landing inside the acquire consensus radius. The
+        reprojection limit tightens at the same time, and every trajectory
+        gate downstream (acquire_jump / acquire_yaw / stale confirmation)
+        still runs unchanged.
+        """
+        floor = self._relaxed_acquire_floor_value(selection)
+        if floor <= 0 or attempt.result is None:
+            return None
+        inliers = int(attempt.result["num_inliers"])
+        if not floor <= inliers < int(selection.min_inliers):
+            return None
+        needed = int(getattr(self.cfg, "acquire_relaxed_min_agreeing_refs", 2) or 0)
+        if int(attempt.relaxed_agree_count) < needed:
+            return None
+        reproj_limit = min(
+            float(self.cfg.max_reproj_error_acquire),
+            float(getattr(self.cfg, "acquire_relaxed_max_reproj_error", 0.0) or 0.0),
+        )
+        if reproj_limit <= 0.0:
+            return None
+        return floor, reproj_limit
+
     def _select_acquire_candidate(
         self,
         selection: _CandidateSelection,
@@ -1909,9 +2538,18 @@ class ProductionEDMTracker:
     ) -> tuple[str, tuple] | None:
         return _select_track_candidate(selection, scored, self.cfg)
 
-    def _estimate_reference_row(self, row) -> tuple | None:
+    def _estimate_reference_row(self, row, prior: Any | None = None) -> tuple | None:
         ref_p2, ref_p3, ref_confidence, _count = row
         thread_camera, thread_options = self._new_pose_estimation_context(self._pnp_random_seed())
+        if prior is not None:
+            return self._estimate_pose_candidate(
+                ref_p2,
+                ref_p3,
+                ref_confidence,
+                thread_camera,
+                thread_options,
+                prior=prior,
+            )[0]
         return self._estimate_pose_candidate(
             ref_p2,
             ref_p3,
@@ -1971,6 +2609,7 @@ class ProductionEDMTracker:
         precomputed: list[tuple[int, str, tuple | None]] | None = None,
         precomputed_pnp_ms: float = 0.0,
     ) -> _PoseAttempt:
+        relaxed_agree_count = 0
         result = None
         selected_ref = None
         points2d = np.zeros((0, 2))
@@ -1994,7 +2633,15 @@ class ProductionEDMTracker:
                         scored.append((name, candidate))
             else:
                 if self.cfg.pnp_early_stop:
-                    eligible = [row for row in rows if len(row[1][1][1]) >= selection.min_inliers]
+                    eligible_thr = _pnp_eligible_threshold(selection.min_inliers)
+                    eligible = [row for row in rows if len(row[1][1][1]) >= eligible_thr]
+                    if not eligible and rows:
+                        # Every ref is corr-starved: rescue the two most
+                        # correspondence-rich refs instead of forcing LOST.
+                        # Downstream inlier/reproj/jump gates still apply.
+                        eligible = sorted(
+                            rows, key=lambda row: len(row[1][1][1]), reverse=True
+                        )[:2]
                 else:
                     eligible = rows
                 if self.cfg.pnp_ranked_batches:
@@ -2055,6 +2702,9 @@ class ProductionEDMTracker:
             if chosen is not None:
                 selected_ref, candidate = chosen
                 result, points2d, points3d, metrics = candidate
+                relaxed_agree_count = self._count_relaxed_agreement(
+                    selection, scored, candidate
+                )
         else:
             pcam, options = self._pose_estimation_context()
             candidate, pnp_ms = self._estimate_pose_candidate(
@@ -2078,6 +2728,7 @@ class ProductionEDMTracker:
             strong_count=strong_count,
             pnp_candidates=pnp_candidates,
             pnp_skipped=pnp_skipped,
+            relaxed_agree_count=relaxed_agree_count,
         )
 
     def _match_and_estimate(
@@ -2090,6 +2741,7 @@ class ProductionEDMTracker:
     ) -> tuple[_CorrespondenceBatch, _PoseAttempt, float]:
         started = time.perf_counter()
         pending = []
+        skipped_rows: list = []
         executor = (
             self._parallel_pnp_executor()
             if (
@@ -2105,7 +2757,9 @@ class ProductionEDMTracker:
                 return
             for offset, row in enumerate(rows):
                 ordinal = start_index + offset
-                if self.cfg.pnp_early_stop and len(row[1]) < selection.min_inliers:
+                eligible_thr = _pnp_eligible_threshold(selection.min_inliers)
+                if self.cfg.pnp_early_stop and len(row[1]) < eligible_thr:
+                    skipped_rows.append((ordinal, row))
                     continue
                 pending.append(
                     (
@@ -2123,7 +2777,16 @@ class ProductionEDMTracker:
         )
         if executor is not None and batch.by_ref is not None:
             wait_started = time.perf_counter()
-            precomputed = [(ordinal, name, future.result()) for ordinal, name, future in pending]
+            if not pending and skipped_rows:
+                # Pipeline early-stop dropped every ref: estimate the two most
+                # correspondence-rich refs inline rather than forcing LOST.
+                rescue = sorted(skipped_rows, key=lambda item: len(item[1][1]), reverse=True)[:2]
+                precomputed = [
+                    (ordinal, selection.refs[ordinal], self._estimate_reference_row(row))
+                    for ordinal, row in rescue
+                ]
+            else:
+                precomputed = [(ordinal, name, future.result()) for ordinal, name, future in pending]
             pnp_wait_ms = (time.perf_counter() - wait_started) * 1e3
             attempt = self._best_pose_attempt(
                 selection,
@@ -2218,7 +2881,7 @@ class ProductionEDMTracker:
                 return False
             capture_dt = (
                 None
-                if self.st.last_capture_stamp is None
+                if (self.st.last_capture_stamp is None or capture_stamp is None)
                 else capture_stamp - self.st.last_capture_stamp
             )
             if self.st.yaw is not None and math.isfinite(float(self.st.yaw)):
@@ -2265,20 +2928,50 @@ class ProductionEDMTracker:
     ) -> bool:
         if attempt.reject_reason or attempt.result is None:
             return False
-        if attempt.strong_count < 2:
-            return False
-        reproj_limit = (
-            self.cfg.max_reproj_error_acquire
-            if selection.acquiring
-            else self.cfg.max_reproj_error_track
-        )
-        if not self._pose_quality_ok(
-            attempt.result,
-            attempt.metrics,
-            min_inliers=selection.min_inliers,
-            reproj_limit=reproj_limit,
+        single_strong_ok = False
+        if (
+            os.environ.get("SFM_EDM_SINGLE_STRONG_EARLY_STOP", "1").strip().lower()
+            not in ("0", "false", "no", "off")
+            and attempt.strong_count == 1
         ):
+            is_top1 = (
+                attempt.selected_ref is None
+                or not selection.refs
+                or attempt.selected_ref == selection.refs[0]
+            )
+            if is_top1:
+                acquire_min_inl = float(
+                    getattr(self.cfg, "acquire_min_inliers", selection.min_inliers)
+                )
+                required_inliers = max(
+                    acquire_min_inl * 1.5,
+                    float(_ACQUIRE_SINGLE_STRONG_INLIERS),
+                )
+                if self._pose_quality_ok(
+                    attempt.result,
+                    attempt.metrics,
+                    min_inliers=int(math.ceil(required_inliers)),
+                    reproj_limit=float(_ACQUIRE_SINGLE_STRONG_REPROJ),
+                ):
+                    single_strong_ok = True
+                    self._single_strong_stops = int(getattr(self, "_single_strong_stops", 0) or 0) + 1
+
+        if not single_strong_ok and attempt.strong_count < 2:
             return False
+
+        if not single_strong_ok:
+            reproj_limit = (
+                self.cfg.max_reproj_error_acquire
+                if selection.acquiring
+                else self.cfg.max_reproj_error_track
+            )
+            if not self._pose_quality_ok(
+                attempt.result,
+                attempt.metrics,
+                min_inliers=selection.min_inliers,
+                reproj_limit=reproj_limit,
+            ):
+                return False
         _rotation, center, yaw = self._pose_components(attempt.result)
         return self._trajectory_would_allow(center, yaw, capture_stamp, self.st.state)
 
@@ -2386,14 +3079,64 @@ class ProductionEDMTracker:
         }
         info["rejected"] = "stale_reacquire_unconfirmed"
         info.update({"state_out": self.st.state, "ok": False})
-        if info.get("pose_status") == "VISUALLY_CONFIRMED":
+        if info.get("pose_status") in _VISUAL_POSE_STATUSES:
             info["pose_status"] = "NONE"
+        return False
+
+    def _boot_relaxed_confirms(
+        self,
+        center: np.ndarray,
+        yaw: float,
+        capture_stamp: float,
+        info: dict,
+    ) -> bool:
+        """Two-frame confirmation standing in for BOOT's missing prior.
+
+        BOOT has no accepted pose, so acquire_jump / acquire_yaw are not armed
+        and a relaxed-floor BOOT accept would be unguarded. Require instead that
+        an independent later frame lands within the same stale-reacquisition
+        window (distance / yaw), which is the site-calibrated definition of "two
+        frames agree on where we are".
+        """
+        pending_center = self.st.pending_reacquire_center
+        pending_yaw = self.st.pending_reacquire_yaw
+        pending_stamp = self.st.pending_reacquire_stamp
+        independent = pending_stamp is not None and capture_stamp > pending_stamp
+        distance = None
+        yaw_delta = None
+        if pending_center is not None and independent:
+            distance = float(np.linalg.norm(center - pending_center))
+            if pending_yaw is not None and math.isfinite(float(pending_yaw)):
+                yaw_delta = abs(_angle_diff(yaw, float(pending_yaw)))
+            position_consistent = distance <= float(self.cfg.stale_reacquire_max_distance)
+            yaw_consistent = yaw_delta is None or yaw_delta <= math.radians(
+                float(self.cfg.stale_reacquire_max_yaw_diff_deg)
+            )
+            if position_consistent and yaw_consistent:
+                info["boot_relaxed_confirmed"] = True
+                self._clear_pending_reacquisition()
+                return True
+        self.st.pending_reacquire_center = np.asarray(center, dtype=float).copy()
+        self.st.pending_reacquire_yaw = float(yaw)
+        self.st.pending_reacquire_stamp = float(capture_stamp)
+        info["boot_relaxed_confirmation"] = {
+            "independent": independent,
+            "distance": distance,
+            "max_distance": float(self.cfg.stale_reacquire_max_distance),
+            "yaw_delta_deg": None if yaw_delta is None else math.degrees(yaw_delta),
+            "max_yaw_diff_deg": float(self.cfg.stale_reacquire_max_yaw_diff_deg),
+        }
+        info["rejected"] = "boot_relaxed_unconfirmed"
+        info.update({"state_out": self.st.state, "ok": False})
+        if info.get("pose_status") in _VISUAL_POSE_STATUSES:
+            info["pose_status"] = "NONE"
+        self._on_miss(info)
         return False
 
     def _clear_visual_motion_cache(self) -> None:
         self._last_accepted_bgr = None
         self._last_accepted_cam_from_world = None
-
+        self._last_accepted_rigid3d = None
     def _clear_klt_cache(self) -> None:
         self._klt_gray = None
         self._klt_2d = None
@@ -2583,11 +3326,18 @@ class ProductionEDMTracker:
         ) in {"shadow", "confirm_limited_jump"}
 
     def _store_visual_motion_cache(self, frame_bgr: np.ndarray, cam_from_world) -> None:
+        if isinstance(cam_from_world, pycolmap.Rigid3d):
+            self._last_accepted_rigid3d = cam_from_world
+        else:
+            try:
+                mat = cam_from_world_matrix(cam_from_world)
+                self._last_accepted_rigid3d = pycolmap.Rigid3d(mat[:3, :4])
+            except Exception:
+                self._last_accepted_rigid3d = None
         if not self._motion_cache_active():
             return
         self._last_accepted_bgr = np.ascontiguousarray(frame_bgr).copy()
         self._last_accepted_cam_from_world = cam_from_world_matrix(cam_from_world)
-
     def _relative_motion_cache_ready(self) -> bool:
         return (
             getattr(self, "_last_accepted_bgr", None) is not None
@@ -2634,6 +3384,22 @@ class ProductionEDMTracker:
             info["rejected"] = reason
         if detail:
             info.update(detail)
+        if (
+            result is not None
+            and isinstance(result, dict)
+            and "cam_from_world" in result
+            and self.st.state == "TRACK"
+        ):
+            try:
+                _rot, center, yaw = self._pose_components(result)
+                if self.st.center is not None:
+                    info["step_norm"] = float(np.linalg.norm(center - self.st.center))
+                capture_stamp = info.get("capture_stamp")
+                info["step_legal"] = self._trajectory_would_allow(
+                    center, yaw, capture_stamp, self.st.state
+                )
+            except Exception:
+                pass
         self._on_miss(info)
 
     def _pose_quality_rejected(
@@ -2783,7 +3549,7 @@ class ProductionEDMTracker:
             self._on_miss(info)
         else:
             info.update({"state_out": self.st.state, "ok": False})
-            if info.get("pose_status") == "VISUALLY_CONFIRMED":
+            if info.get("pose_status") in _VISUAL_POSE_STATUSES:
                 info["pose_status"] = "NONE"
         return False
 
@@ -2916,6 +3682,11 @@ class ProductionEDMTracker:
         cam_from_world,
     ) -> bool:
         if self.st.center is None:
+            # No prior at all (BOOT). A standard-floor accept is unchanged; a
+            # relaxed-floor accept pays for the missing prior with a two-frame
+            # confirmation instead.
+            if info.get("acquire_relaxed") and info.get("state_in") == "BOOT_INIT":
+                return self._boot_relaxed_confirms(center, yaw, capture_stamp, info)
             return True
         if info["state_in"] != "LOST":
             return self._continuous_trajectory_allows(
@@ -2927,6 +3698,18 @@ class ProductionEDMTracker:
                 cam_from_world,
             )
         return self._lost_reacquisition_allows(center, yaw, capture_stamp, info)
+
+    def _next_state_after_accept(self, info: dict) -> str:
+        """TRACK, or WEAK_TRACK while a relaxed-accept probation counts down."""
+        probation = int(getattr(self.cfg, "acquire_relaxed_probation_frames", 0) or 0)
+        if probation > 0 and info.get("acquire_relaxed"):
+            self.st.relaxed_probation_frames = probation
+        remaining = int(getattr(self.st, "relaxed_probation_frames", 0) or 0)
+        if remaining > 0:
+            self.st.relaxed_probation_frames = remaining - 1
+            info["acquire_relaxed_probation"] = remaining
+            return "WEAK_TRACK"
+        return "TRACK"
 
     def _accept_pose(
         self,
@@ -2947,16 +3730,18 @@ class ProductionEDMTracker:
         previous_stamp = self.st.last_capture_stamp
         step = None if previous_center is None else (center - previous_center)
         measured_velocity = None
+        dt = None
         if step is not None:
             dt = None if previous_stamp is None else capture_stamp - previous_stamp
             if info["state_in"] != "LOST" and dt is not None and math.isfinite(dt) and dt > 1e-6:
                 self.st.accepted_step_norms.append(float(np.linalg.norm(step)))
                 measured_velocity = step / dt
-        self.st.velocity = (
-            measured_velocity
-            if self.st.velocity is None or measured_velocity is None
-            else 0.5 * (self.st.velocity + measured_velocity)
-        )
+        if measured_velocity is None:
+            pass  # LOST or missing stamp: keep the previous velocity estimate
+        elif self.st.velocity is None:
+            self.st.velocity = np.asarray(measured_velocity, dtype=float)
+        else:
+            self.st.velocity = _blend_velocity(self.st.velocity, measured_velocity, dt)
         self.st.center, self.st.yaw = center, yaw
         self.st.last_capture_stamp = capture_stamp
         # --- ESEKF visual update (adaptive R, Mahalanobis gating) ---
@@ -3059,14 +3844,26 @@ class ProductionEDMTracker:
                             accepted, d2_val, _nu = esekf.update_visual(center, q_wxyz, timestamp=capture_stamp)  # type: ignore
                         except Exception:
                             accepted = False
+                            self._esekf_update_exceptions = (
+                                int(getattr(self, "_esekf_update_exceptions", 0) or 0) + 1
+                            )
                     except Exception:
                         accepted = False
+                        self._esekf_update_exceptions = (
+                            int(getattr(self, "_esekf_update_exceptions", 0) or 0) + 1
+                        )
                     if d2_val is not None:
                         try:
                             info["esekf_d2"] = float(d2_val)
                             info["esekf_update_accepted"] = bool(accepted)
                         except Exception:
                             pass
+                    try:
+                        info["esekf_update_exceptions"] = int(
+                            getattr(self, "_esekf_update_exceptions", 0) or 0
+                        )
+                    except Exception:
+                        pass
         except Exception:
             pass
         accepted_refs = (
@@ -3078,8 +3875,18 @@ class ProductionEDMTracker:
         self.st.lost_frames = 0
         self.st.lost_global_retrieval_attempts = 0
         self.st.lost_global_retrieval_done = False
+        self._vpr_consec_failures = 0
+        self._last_vpr_lost_frame = None
         self._store_visual_motion_cache(frame_bgr, result["cam_from_world"])
-        self.st.state = "TRACK"
+        # Probation: an accept that needed the relaxed floor keeps the tracker in
+        # WEAK_TRACK for a few frames, so the following frames run
+        # weak_local_topk references at weak_min_inliers instead of a single
+        # reference. Measured cause of the P168 relaxed-floor loss: the accepts
+        # themselves were correct but single-reference TRACK could not hold them
+        # (inliers p50 82->68, WEAK_TRACK +47).
+        self.st.state = self._next_state_after_accept(info)
+        if self.st.state == "WEAK_TRACK":
+            self.st.misses = float(self.cfg.weak_after)
         if self.cfg.use_temporal_reference:
             inlier_mask = np.asarray(
                 result.get(
@@ -3103,6 +3910,14 @@ class ProductionEDMTracker:
             self.temporal_xyz_by_cell = None
             self.temporal_gray = None
         try:
+            self._klt_anchor_inliers = int(info.get("inliers", 0) or 0)
+        except (TypeError, ValueError):
+            self._klt_anchor_inliers = 0
+        try:
+            self._klt_anchor_ratio = float(info.get("inlier_ratio") or 0.0)
+        except (TypeError, ValueError):
+            self._klt_anchor_ratio = 0.0
+        try:
             inlier_mask_for_klt = np.asarray(
                 result.get(
                     "inlier_mask",
@@ -3124,7 +3939,7 @@ class ProductionEDMTracker:
             pass
         info.update(
             {
-                "state_out": "TRACK",
+                "state_out": self.st.state,
                 "center": center,
                 "yaw": yaw,
                 "R": rotation,
@@ -3190,19 +4005,44 @@ class ProductionEDMTracker:
                     selection,
                     refs=list(selection.refs[previous_count:count]),
                 )
-                if batch.by_ref is not None and remaining.refs:
+                if (batch.by_ref is not None or batch.temporal_used) and remaining.refs:
                     expanded_started = time.perf_counter()
-                    remaining_batch = self._collect_correspondences(
-                        gray,
-                        remaining,
-                        prepared_query=prepared_query,
-                    )
-                    batch = _combine_correspondence_batches(batch, remaining_batch)
-                    attempt = self._best_pose_attempt(
-                        active_selection,
-                        batch,
-                        capture_stamp=capture_stamp,
-                    )
+                    if batch.temporal_used:
+                        remaining_selection = replace(remaining, mode="edm_track")
+                        remaining_batch = self._collect_correspondences(
+                            gray,
+                            remaining_selection,
+                            prepared_query=prepared_query,
+                        )
+                        combined_p2d = np.concatenate([batch.points2d, remaining_batch.points2d])
+                        combined_p3d = np.concatenate([batch.points3d, remaining_batch.points3d])
+                        combined_conf = np.concatenate([batch.confidence, remaining_batch.confidence])
+                        combined_per_ref = [*batch.per_ref, *remaining_batch.per_ref]
+                        batch = _CorrespondenceBatch(
+                            points2d=combined_p2d,
+                            points3d=combined_p3d,
+                            confidence=combined_conf,
+                            per_ref=combined_per_ref,
+                            by_ref=None,
+                            temporal_used=True,
+                        )
+                        attempt = self._best_pose_attempt(
+                            active_selection,
+                            batch,
+                            capture_stamp=capture_stamp,
+                        )
+                    else:
+                        remaining_batch = self._collect_correspondences(
+                            gray,
+                            remaining,
+                            prepared_query=prepared_query,
+                        )
+                        batch = _combine_correspondence_batches(batch, remaining_batch)
+                        attempt = self._best_pose_attempt(
+                            active_selection,
+                            batch,
+                            capture_stamp=capture_stamp,
+                        )
                     stage_match_ms = max(
                         0.0,
                         (time.perf_counter() - expanded_started) * 1e3 - attempt.pnp_ms,
@@ -3308,6 +4148,211 @@ class ProductionEDMTracker:
         )
         return batch, fallback_attempt, match_ms, True
 
+    def _widen_track_refs_on_miss(
+        self,
+        gray: np.ndarray,
+        selection: _CandidateSelection,
+        capture_stamp: float,
+        prepared_query,
+        attempt: _PoseAttempt,
+    ) -> tuple[_CandidateSelection, _CorrespondenceBatch, _PoseAttempt, float, dict] | None:
+        """Retry a missed TRACK/WEAK frame against more map references, same frame.
+
+        TRACK runs one map reference (212 census failures: refs=1, inliers p50
+        34); WEAK runs three (83 census failures, refs=3, inliers p50 23 with 33
+        frames sitting in [25, 30), one breath below ``weak_min_inliers``).
+        This retry costs nothing on healthy frames -- it only runs after the
+        frame already failed its state's quality gate -- and the wider attempt
+        is kept only if it passes that same gate, so a miss can never be turned
+        into a worse accept.
+
+        Returns ``None`` when disabled, not applicable, or the retry did not
+        produce an acceptable pose (the caller keeps the original attempt).
+        """
+        state = self.st.state
+        if state == "WEAK_TRACK":
+            topk = int(getattr(self.cfg, "weak_miss_widen_topk", 0) or 0)
+            widen_mode = "edm_weak_widen"
+        else:
+            topk = int(getattr(self.cfg, "track_miss_widen_topk", 0) or 0)
+            widen_mode = "edm_track_widen"
+        if topk <= 0 or selection.acquiring or state not in ("TRACK", "WEAK_TRACK"):
+            return None
+        if attempt.reject_reason:
+            return None
+        reproj_limit = float(self.cfg.max_reproj_error_track)
+        if self._pose_quality_ok(
+            attempt.result,
+            attempt.metrics,
+            min_inliers=selection.min_inliers,
+            reproj_limit=reproj_limit,
+        ):
+            return None
+        refs = self._track_candidates(topk, capture_stamp)
+        if len(refs) <= len(selection.refs):
+            return None
+        wide_selection = replace(selection, refs=refs, mode=widen_mode)
+        started = time.perf_counter()
+        batch, wide_attempt, match_ms = self._match_and_estimate(
+            gray,
+            wide_selection,
+            capture_stamp=capture_stamp,
+            prepared_query=prepared_query,
+        )
+        elapsed_ms = max(0.0, (time.perf_counter() - started) * 1e3 - wide_attempt.pnp_ms)
+        self._track_widen_attempts = int(getattr(self, "_track_widen_attempts", 0)) + 1
+        if wide_attempt.reject_reason or not self._pose_quality_ok(
+            wide_attempt.result,
+            wide_attempt.metrics,
+            min_inliers=selection.min_inliers,
+            reproj_limit=reproj_limit,
+        ):
+            return None
+        _rotation, center, yaw = self._pose_components(wide_attempt.result)
+        if not self._trajectory_would_allow(center, yaw, capture_stamp, self.st.state):
+            return None
+        self._track_widen_accepts = int(getattr(self, "_track_widen_accepts", 0)) + 1
+        widen_info = {
+            "refs": len(refs),
+            "inliers_before": (
+                None if attempt.result is None else int(attempt.result["num_inliers"])
+            ),
+            "inliers_after": int(wide_attempt.result["num_inliers"]),
+            "match_ms": float(elapsed_ms),
+        }
+        return (
+            wide_selection,
+            batch,
+            replace(wide_attempt, pnp_ms=attempt.pnp_ms + wide_attempt.pnp_ms),
+            elapsed_ms,
+            widen_info,
+        )
+
+
+    def _try_klt_bridge(
+        self,
+        gray: np.ndarray,
+        frame_bgr: np.ndarray,
+        capture_stamp: float,
+        started: float,
+    ) -> dict | None:
+        """Carry the pose one frame with KLT instead of an EDM match.
+
+        Active only when ``SFM_EDM_KLT_BRIDGE_INTERVAL=N`` (N>=2) and the
+        tracker is in steady TRACK with a healthy KLT cache from the last EDM
+        anchor. Returns an accepted-pose ``info`` dict on success, or ``None``
+        to fall through to the full EDM path (keyframe, degraded state, or a
+        failed / low-confidence KLT track). ``_track_klt_prior`` supplies its
+        own reproj / max_jump / inlier-ratio gates; a rejection there clears the
+        cache and forces EDM next frame.
+        """
+        n = int(getattr(self, "_klt_bridge_interval", 0) or 0)
+        if n < 2 or self.st.state != "TRACK" or self.st.center is None:
+            return None
+        cap = n - 1
+        max_consec = int(getattr(self, "_klt_bridge_max_consec", 0) or 0)
+        if max_consec > 0:
+            cap = min(cap, max_consec)
+        if int(getattr(self, "_klt_bridge_run", 0)) >= cap:
+            return None  # keyframe: re-anchor with a full EDM match
+        # Only bridge out of a strong EDM anchor. P168's WEAK/LOST-prone zones
+        # produce shaky anchors; bridging through them accumulates KLT drift the
+        # yaw / jump gates then reject, tipping TRACK -> WEAK -> LOST.
+        if int(getattr(self, "_klt_anchor_inliers", 0)) < max(
+            2 * int(self.cfg.weak_min_inliers), _KLT_BRIDGE_ANCHOR_MIN_INLIERS
+        ):
+            return None
+        if float(getattr(self, "_klt_anchor_ratio", 0.0)) < float(
+            getattr(self, "_klt_bridge_min_ratio", 0.66)
+        ):
+            return None
+        if not self._klt_prior_allowed(capture_stamp):
+            return None
+        lk_started = time.perf_counter()
+        prior = self._track_klt_prior(gray, capture_stamp)
+        lk_ms = (time.perf_counter() - lk_started) * 1e3
+        if prior is None:
+            self._klt_bridge_run = 0
+            return None
+
+        center = np.asarray(prior["center"], dtype=float)
+        yaw = float(prior["yaw"])
+        rotation = prior.get("R")
+        previous_center = self.st.center
+        previous_stamp = self.st.last_capture_stamp
+        if previous_center is not None and previous_stamp is not None:
+            dt = capture_stamp - previous_stamp
+            if math.isfinite(dt) and dt > 1e-6:
+                measured_velocity = (center - np.asarray(previous_center, dtype=float)) / dt
+                self.st.velocity = _blend_velocity(self.st.velocity, measured_velocity, dt)
+        step_norm = (
+            float(np.linalg.norm(center - np.asarray(previous_center, dtype=float)))
+            if previous_center is not None
+            else 0.0
+        )
+        self.st.center, self.st.yaw = center, yaw
+        self.st.last_capture_stamp = capture_stamp
+        self.st.misses = 0
+        self.st.lost_frames = 0
+        self._klt_bridge_run = int(getattr(self, "_klt_bridge_run", 0)) + 1
+        # Drift trip: if this bridge already looks shaky, re-anchor with EDM next
+        # frame rather than compound the error into a WEAK/LOST + heavy recovery.
+        if getattr(self, "_klt_bridge_drift_guard", True):
+            reproj = float(prior.get("reproj_rms") or 0.0)
+            ratio = float(prior.get("inlier_ratio") or 1.0)
+            if (
+                reproj > _KLT_BRIDGE_DRIFT_REPROJ_FACTOR * float(self.cfg.max_reproj_error_track)
+                or step_norm > _KLT_BRIDGE_DRIFT_STEP_FACTOR * float(self.cfg.max_jump)
+                or ratio < _KLT_BRIDGE_DRIFT_MIN_RATIO
+            ):
+                self._klt_bridge_run = cap  # force EDM keyframe next frame
+        if prior.get("cam_from_world") is not None:
+            self._store_visual_motion_cache(frame_bgr, prior["cam_from_world"])
+
+        ref_names = [
+            self.name_of[i]
+            for i in (self.st.last_refs or [])
+            if i in getattr(self, "name_of", {})
+        ]
+        info = {
+            "frame": self.st.frame,
+            "state_in": "TRACK",
+            "state_out": "TRACK",
+            "ok": True,
+            "center": center,
+            "yaw": yaw,
+            "R": np.asarray(rotation, dtype=float) if rotation is not None else None,
+            "pose_status": "KLT_BRIDGED",
+            "candidate_mode": "klt_bridge",
+            "bridge": True,
+            "bridge_run": int(self._klt_bridge_run),
+            "inliers": int(prior.get("inliers", 0) or 0),
+            "reproj_rms": prior.get("reproj_rms"),
+            "inlier_ratio": prior.get("inlier_ratio"),
+            "n_corr": int(prior.get("tracked", 0) or 0),
+            "refs": ref_names,
+            "reference_count": len(ref_names),
+            "requested_reference_count": 0,
+            "vpr_ms": 0.0,
+            "match_ms": lk_ms,
+            "pnp_ms": None,
+            "global_retrieval_calls": self.st.global_retrieval_calls,
+            "total_ms": (time.perf_counter() - started) * 1e3,
+        }
+        controller = getattr(self, "pose_guided", None)
+        if controller is not None and not info.get("bridge"):
+            try:
+                controller.maybe_update_anchor(
+                    info,
+                    timestamp=capture_stamp,
+                    rotation_cam_from_world=info["R"],
+                    center=center,
+                    yaw=yaw,
+                )
+            except Exception:
+                pass
+        return info
+
     # ---------- one frame ----------
     def localize(self, frame_bgr: np.ndarray, capture_stamp: float | None = None) -> dict:
         cfg = self.st_cfg = self.cfg
@@ -3319,7 +4364,14 @@ class ProductionEDMTracker:
             raise ValueError("capture_stamp must be finite")
         self._observe_capture_stamp(capture_stamp)
         self.st.frame += 1
+        # Stage timers. vpr/match/pnp only cover ~73% of the worker's measured
+        # core_wall (26.30 ms p50 vs 19.09 ms of instrumented stages, 1676
+        # frames), so the rest was invisible to every Tier 1-3 gate. These four
+        # plus the already-computed total_ms close that gap; they are
+        # perf_counter reads on a path that already takes several of them.
+        stage_t = time.perf_counter()
         gray = EDMMatcher.load_gray(frame_bgr)
+        stage_gray_ms = (time.perf_counter() - stage_t) * 1e3
         try:
             self._klt_query_gray = gray
             self._klt_query_stamp = float(capture_stamp)
@@ -3339,11 +4391,23 @@ class ProductionEDMTracker:
                     pass
         except Exception:
             pass
+        stage_t = time.perf_counter()
+        bridge = self._try_klt_bridge(gray, frame_bgr, capture_stamp, t0)
+        stage_bridge_ms = (time.perf_counter() - stage_t) * 1e3
+        if bridge is not None:
+            return bridge
+        self._klt_bridge_run = 0
         matcher = getattr(self.loc, "matcher", None)
         prepare_query = getattr(matcher, "prepare_query", None)
+        # This is a real backbone forward, and it sits outside match_ms.
+        stage_t = time.perf_counter()
         prepared_query = prepare_query(gray) if callable(prepare_query) else None
-
+        stage_query_ms = (time.perf_counter() - stage_t) * 1e3
+        state_in = self.st.state
+        stage_t = time.perf_counter()
         selection = self._select_candidates(frame_bgr, capture_stamp)
+        # vpr_ms is a subset of this: MegaLoc runs inside candidate selection.
+        stage_select_ms = (time.perf_counter() - stage_t) * 1e3
         requested = len(selection.refs)
         acquire_stage_counts = [requested]
         track_map_first = (
@@ -3366,6 +4430,15 @@ class ProductionEDMTracker:
                 capture_stamp,
                 prepared_query,
             )
+            if (
+                self._adaptive_vpr_enabled()
+                and state_in == "LOST"
+                and selection.mode.startswith("megaloc")
+            ):
+                if attempt.strong_count > 0:
+                    self._vpr_consec_failures = 0
+                else:
+                    self._vpr_consec_failures += 1
         elif track_map_first:
             batch, attempt, match_ms, track_temporal_fallback = self._match_track_map_first(
                 gray,
@@ -3380,6 +4453,16 @@ class ProductionEDMTracker:
                 capture_stamp=capture_stamp,
                 prepared_query=prepared_query,
             )
+        widen = self._widen_track_refs_on_miss(
+            gray,
+            selection,
+            capture_stamp,
+            prepared_query,
+            attempt,
+        )
+        if widen is not None:
+            selection, batch, attempt, widen_ms, widen_info = widen
+            match_ms += widen_ms
         info = self._localization_info(
             selection,
             batch,
@@ -3387,17 +4470,33 @@ class ProductionEDMTracker:
             match_ms=match_ms,
             started=t0,
         )
+        info["stage_gray_ms"] = stage_gray_ms
+        info["stage_bridge_ms"] = stage_bridge_ms
+        info["stage_query_ms"] = stage_query_ms
+        info["stage_select_ms"] = stage_select_ms
+        info["capture_stamp"] = capture_stamp
         info["requested_reference_count"] = requested
         info["acquire_stage_counts"] = acquire_stage_counts
         info["staged_early_stop"] = acquire_stage_counts[-1] < requested
         info["track_map_first"] = track_map_first
         info["track_temporal_fallback"] = track_temporal_fallback
         info["pnp_ranked_batches"] = bool(cfg.pnp_ranked_batches)
+        if widen is not None:
+            info["track_widen"] = widen_info
+        self._observe_lost_starvation(state_in, selection, info)
         ret = attempt.result
         min_inl = selection.min_inliers
         reproj_limit = (
             cfg.max_reproj_error_acquire if selection.acquiring else cfg.max_reproj_error_track
         )
+        relaxed = self._relaxed_acquire_gate(selection, attempt)
+        if relaxed is not None:
+            min_inl, reproj_limit = relaxed
+            info["acquire_relaxed"] = {
+                "min_inliers": int(min_inl),
+                "reproj_limit": float(reproj_limit),
+                "agreeing_refs": int(attempt.relaxed_agree_count),
+            }
         if attempt.reject_reason:
             self._reject_pose(info, ret, reason=attempt.reject_reason)
             return info
@@ -3438,10 +4537,58 @@ class ProductionEDMTracker:
             prepared_query,
         )
 
+    def _is_weak_hysteresis_candidate(self, info: dict) -> bool:
+        """Check if a miss qualifies for the soft hysteresis buffer [45, 50)."""
+        # Default ON (2026-09-03 gate: P167 +53/+58 over two seeds, P117/P168
+        # flat): set SFM_EDM_WEAK_HYSTERESIS=0 to restore legacy one-miss drop.
+        if (
+            (os.environ.get("SFM_EDM_WEAK_HYSTERESIS", "1") or "1").strip().lower()
+            in ("0", "false", "no", "off")
+        ):
+            return False
+        if self.st.state != "TRACK":
+            return False
+        inliers = info.get("inliers")
+        if inliers is None:
+            return False
+        try:
+            inliers_val = int(inliers)
+        except (ValueError, TypeError):
+            return False
+        track_min = getattr(self.cfg, "track_min_inliers", 50)
+        soft_min = min(_WEAK_HYSTERESIS_INLIER_MIN, max(0, track_min - 5))
+        if not (soft_min <= inliers_val < track_min):
+            return False
+        reproj = info.get("reproj_rms")
+        if reproj is None:
+            return False
+        try:
+            reproj_val = float(reproj)
+        except (ValueError, TypeError):
+            return False
+        if not (math.isfinite(reproj_val) and reproj_val <= _WEAK_HYSTERESIS_REPROJ_MAX):
+            return False
+        if info.get("rejected") in ("jump", "track_yaw", "acquire_jump", "acquire_yaw"):
+            return False
+        if info.get("step_legal") is False:
+            return False
+        if "step_norm" in info:
+            try:
+                if float(info["step_norm"]) > float(self.cfg.max_jump):
+                    return False
+            except (ValueError, TypeError):
+                pass
+        return True
+
     def _on_miss(self, info: dict):
-        self.st.misses += 1
+        if self._is_weak_hysteresis_candidate(info):
+            self.st.misses += 0.5
+            info["weak_hysteresis_buffered"] = True
+        else:
+            self.st.misses += 1.0
         if self.st.state == "TRACK" and self.st.misses >= self.cfg.weak_after:
             self.st.state = "WEAK_TRACK"
+            self.st.misses = float(self.cfg.weak_after)
         elif (
             self.st.state == "WEAK_TRACK"
             and self.st.misses >= self.cfg.weak_after + self.cfg.lost_after
@@ -3452,6 +4599,8 @@ class ProductionEDMTracker:
             self.st.pending_limited_limit = None
             self.st.lost_global_retrieval_attempts = 0
             self.st.lost_global_retrieval_done = False
+            self._vpr_consec_failures = 0
+            self._last_vpr_lost_frame = None
             self._clear_visual_motion_cache()
             try:
                 self._clear_klt_cache()
@@ -3462,7 +4611,7 @@ class ProductionEDMTracker:
         else:
             self.st.lost_frames = 0
         info.update({"state_out": self.st.state, "ok": False})
-        if info.get("pose_status") == "VISUALLY_CONFIRMED":
+        if info.get("pose_status") in _VISUAL_POSE_STATUSES:
             info["pose_status"] = "NONE"
         controller = getattr(self, "pose_guided", None)
         if controller is not None and info.get("pose_status") != "VISUALLY_CONFIRMED":

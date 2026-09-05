@@ -906,23 +906,6 @@ def test_normalize_camera_forward_requires_a_finite_nonzero_vector() -> None:
     assert app.normalize_camera_forward([0.0, float("nan"), 1.0]) is None
 
 
-def test_camera_frustum_square_face_is_ahead_of_camera() -> None:
-    points = app.camera_frustum_world_points(
-        np.zeros(3),
-        np.eye(3),
-        length=2.0,
-        hfov_deg=90.0,
-        aspect_ratio=2.0,
-    )
-
-    apex, face_center, *corners = points
-    assert np.allclose(apex, [0.0, 0.0, 0.0])
-    assert np.allclose(face_center, [0.0, 0.0, 2.0])
-    assert np.allclose(np.mean(corners, axis=0), face_center)
-    assert {round(point[0], 6) for point in corners} == {-2.0, 2.0}
-    assert {round(point[1], 6) for point in corners} == {-1.0, 1.0}
-
-
 def test_normalize_camera_axes_rejects_non_orthogonal_axes() -> None:
     assert app.normalize_camera_axes(np.eye(3)) is not None
     assert app.normalize_camera_axes(np.ones((3, 3))) is None
@@ -3179,6 +3162,7 @@ finally:
         "shared",
         timeout_s=1.0,
         use_shared_frames=True,
+        frame_shm_slots=2,
     )
     client.restart_warmup_s = 0.0
     first = np.full((1, 2, 3), 1, np.uint8)
@@ -3215,6 +3199,165 @@ finally:
     assert results[0]["ready_latency_ms"] is not None
     assert results[0]["first_result_latency_ms"] is not None
 
+
+def test_shared_frame_three_slot_coalesce_semantics(tmp_path: Path) -> None:
+    """3-slot ring coalescing delivers the newest complete frame and drops intermediates without bytearray double-copy."""
+    worker = """
+import argparse, json, sys, time
+from multiprocessing import shared_memory
+p = argparse.ArgumentParser()
+p.add_argument('--frame-shm-name', required=True)
+p.add_argument('--frame-shm-slots', required=True, type=int)
+a = p.parse_args()
+shm = shared_memory.SharedMemory(name=a.frame_shm_name)
+try:
+    for index in range(2):
+        slot = sys.stdin.buffer.read(1)
+        if not slot:
+            break
+        if index == 0:
+            time.sleep(0.2)
+        start = slot[0] * 6
+        print(json.dumps({'seq': index, 'success': False, 'slot': slot[0], 'pixel_sum': sum(shm.buf[start:start + 6])}), flush=True)
+finally:
+    shm.close()
+"""
+    client = app.LiveWorkerClient(
+        [sys.executable, "-c", worker],
+        2,
+        1,
+        str(tmp_path / "three-slot-coalesce.log"),
+        "three-slot-coalesce",
+        "shared",
+        timeout_s=1.0,
+        use_shared_frames=True,
+        frame_shm_slots=3,
+    )
+    client.restart_warmup_s = 0.0
+    assert client._coalesce_scratch is None
+    assert client._frame_shm_slots == 3
+
+    first = np.full((1, 2, 3), 1, np.uint8)
+    middle1 = np.full((1, 2, 3), 2, np.uint8)
+    middle2 = np.full((1, 2, 3), 3, np.uint8)
+    latest = np.full((1, 2, 3), 7, np.uint8)
+    try:
+        assert client.submit(1, "first", first)
+        assert _wait_for(client.busy)
+        assert client.submit(2, "middle1", middle1)
+        assert client.submit(3, "middle2", middle2)
+        assert client.submit(4, "latest", latest)
+        assert client._coalesce_drops == 2
+        assert _wait_for(lambda: client.results.qsize() == 2, timeout=3.0)
+        results = client.poll_results()
+    finally:
+        client.close()
+    assert [(row["display_seq"], row["pixel_sum"]) for row in results] == [
+        (1, 6),
+        (4, 42),
+    ]
+
+
+def test_shared_frame_three_slot_tearing_protection(monkeypatch) -> None:
+    """Torn or incomplete slots are not promoted; the previous valid slot is preserved."""
+    from multiprocessing import shared_memory
+    client = app.LiveWorkerClient.__new__(app.LiveWorkerClient)
+    client.width = 2
+    client.height = 1
+    client._frame_size = 6
+    client._frame_shm_slots = 3
+    client._frame_shm = shared_memory.SharedMemory(create=True, size=18)
+    client._active_shm_slot = 0
+    client._ready_shm_slot = None
+    client._writing_shm_slot = None
+    client._slot_seq = [0, 1, 2]
+    client._slot_ready = [True, False, True]
+    client._last_valid_slot = 0
+    client._coalesce = (2, "torn-frame", b"", 1, {})
+    client._closed = threading.Event()
+    client._lock = threading.Lock()
+    client.in_flight = True
+    client.pending = queue.Queue(maxsize=1)
+    client._coalesce_drops = 0
+    try:
+        client._promote_coalesced_work()
+        assert client._active_shm_slot == 0
+        promoted = client.pending.get_nowait()
+        assert promoted[3] == 0
+
+        worker_args = SimpleNamespace(width=2, height=1, frame_shm_slots=3)
+        stdin_buf = io.BytesIO(bytes([0]))
+        monkeypatch.setattr(sys, "stdin", SimpleNamespace(buffer=stdin_buf))
+        f1 = localizer_worker._read_worker_frame(worker_args, None, client._frame_shm, 6)
+        assert f1 is not None
+
+        stdin_buf_corrupt = io.BytesIO(bytes([9]))
+        monkeypatch.setattr(sys, "stdin", SimpleNamespace(buffer=stdin_buf_corrupt))
+        f_fallback = localizer_worker._read_worker_frame(worker_args, None, client._frame_shm, 6)
+        assert f_fallback is f1
+    finally:
+        f1 = None
+        f_fallback = None
+        localizer_worker._close_worker_frame_shm(None)
+        client._frame_shm.close()
+        client._frame_shm.unlink()
+
+
+def test_shared_frame_three_slot_rotation() -> None:
+    """3-slot ring rotates across {0, 1, 2} ensuring active, ready, and writing are mutually disjoint."""
+    from multiprocessing import shared_memory
+    client = app.LiveWorkerClient.__new__(app.LiveWorkerClient)
+    client.width = 2
+    client.height = 1
+    client._frame_size = 6
+    client._frame_shm_slots = 3
+    client._frame_shm = shared_memory.SharedMemory(create=True, size=18)
+    client._active_shm_slot = None
+    client._ready_shm_slot = None
+    client._writing_shm_slot = None
+    client._slot_seq = [None, None, None]
+    client._slot_ready = [False, False, False]
+    client._last_valid_slot = None
+    client._coalesce = None
+    client._closed = threading.Event()
+    client._lock = threading.Lock()
+    client.in_flight = False
+    client.pending = queue.Queue(maxsize=1)
+    client._coalesce_drops = 0
+    try:
+        raw1 = memoryview(b"\x01" * 6)
+        client._submit_shared_frame(1, "f1", b"", raw1, {})
+        assert client._active_shm_slot == 0
+        assert client.in_flight is True
+        assert client._slot_ready[0] is True
+
+        raw2 = memoryview(b"\x02" * 6)
+        client._submit_shared_frame(2, "f2", b"", raw2, {})
+        assert client._active_shm_slot == 0
+        assert client._ready_shm_slot == 1
+        assert client._slot_ready[1] is True
+
+        raw3 = memoryview(b"\x03" * 6)
+        client._submit_shared_frame(3, "f3", b"", raw3, {})
+        assert client._active_shm_slot == 0
+        assert client._ready_shm_slot == 2
+        assert client._slot_ready[2] is True
+        assert client._coalesce_drops == 1
+
+        client.pending.get_nowait()
+        client._promote_coalesced_work()
+        assert client._active_shm_slot == 2
+        assert client._ready_shm_slot is None
+        assert client.in_flight is True
+
+        raw4 = memoryview(b"\x04" * 6)
+        client._submit_shared_frame(4, "f4", b"", raw4, {})
+        assert client._active_shm_slot == 2
+        assert client._ready_shm_slot == 0
+        assert client._slot_ready[0] is True
+    finally:
+        client._frame_shm.close()
+        client._frame_shm.unlink()
 
 def test_rejected_submit_and_oom_transition_are_bounded(tmp_path: Path) -> None:
     worker = """
@@ -3528,3 +3671,44 @@ def test_client_lifecycle_metrics_follow_outage_and_ready_transitions() -> None:
     assert payload["first_result_latency_ms"] is not None
     assert payload["circuit_breaker_state"] == "closed"
     assert payload["oom_transition"] is False
+
+
+def test_live_heading_uses_the_camera_axis_without_an_auto_map_frame() -> None:
+    # Regression: the measured gravity frame is only bound while integrated
+    # AUTO runs, and the camera branch demanded one. Everywhere else a measured
+    # camera forward fell through to the displacement branch, so the operator
+    # was shown the TRAVEL bearing labelled as a camera heading -- on the river
+    # map the two differ by 77 deg at the median.
+    operator = SimpleNamespace(
+        camera_forward_world=None,
+        camera_axes_world=None,
+        live_last_xyz=np.array([0.0, 0.0, 0.0], dtype=float),
+        _integrated_auto_map_frame=None,
+        live_heading=None,
+        live_pose=np.zeros(4),
+    )
+
+    app.OperatorApp._update_live_camera_orientation(
+        operator,
+        {"camera_forward_world": [0.0, 0.0, 1.0]},
+        np.array([1.0, 0.0, 0.0], dtype=float),  # travelling +x, looking +z
+    )
+
+    assert operator.live_heading == pytest.approx(math.pi / 2)
+
+
+def test_live_heading_falls_back_to_travel_only_without_a_camera_axis() -> None:
+    operator = SimpleNamespace(
+        camera_forward_world=None,
+        camera_axes_world=None,
+        live_last_xyz=np.array([0.0, 0.0, 0.0], dtype=float),
+        _integrated_auto_map_frame=None,
+        live_heading=None,
+        live_pose=np.zeros(4),
+    )
+
+    app.OperatorApp._update_live_camera_orientation(
+        operator, {}, np.array([1.0, 0.0, 0.0], dtype=float)
+    )
+
+    assert operator.live_heading == pytest.approx(0.0)

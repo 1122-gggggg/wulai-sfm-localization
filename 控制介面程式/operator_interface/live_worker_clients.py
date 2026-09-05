@@ -54,6 +54,7 @@ class LiveWorkerClient:
         timeout_s: float = 8.0,
         use_shared_frames: bool = False,
         expect_ready_event: bool = False,
+        frame_shm_slots: int = 3,
     ):
         self.width = int(width)
         self.height = int(height)
@@ -88,15 +89,21 @@ class LiveWorkerClient:
         if not self._expect_ready_event:
             self._ready_event.set()
         self._frame_size = self.width * self.height * 3
-        self._frame_shm_slots = 2 if use_shared_frames else 0
+        self._frame_shm_slots = int(frame_shm_slots) if use_shared_frames else 0
         self._frame_shm: shared_memory.SharedMemory | None = None
         self._active_shm_slot: int | None = None
+        self._ready_shm_slot: int | None = None
+        self._writing_shm_slot: int | None = None
+        self._slot_seq: list[int | None] = [None] * self._frame_shm_slots
+        self._slot_ready: list[bool] = [False] * self._frame_shm_slots
+        self._last_valid_slot: int | None = None
         self._coalesce_scratch: bytearray | None = None
         if self._frame_shm_slots:
             self._frame_shm = shared_memory.SharedMemory(
                 create=True, size=self._frame_size * self._frame_shm_slots
             )
-            self._coalesce_scratch = bytearray(self._frame_size)
+            if self._frame_shm_slots < 3:
+                self._coalesce_scratch = bytearray(self._frame_size)
             self.cmd.extend(
                 [
                     "--frame-shm-name",
@@ -617,7 +624,18 @@ class LiveWorkerClient:
         self._mark_mono(timing, "client_write_start_mono")
         if prefix:
             self._write_all(proc, prefix)
-        request = bytes((int(raw),)) if self._frame_shm is not None else raw
+        if self._frame_shm is not None:
+            slot = int(raw)
+            if (
+                self._frame_shm_slots >= 3
+                and not self._slot_ready[slot]
+                and self._last_valid_slot is not None
+                and self._slot_ready[self._last_valid_slot]
+            ):
+                slot = self._last_valid_slot
+            request = bytes((slot,))
+        else:
+            request = raw
         self._write_all(proc, request)
         self._worker_requests_written += 1
         expected_worker_seq = self._worker_requests_written - 1
@@ -689,7 +707,26 @@ class LiveWorkerClient:
                 if nxt is None or self._closed.is_set() or self._frame_shm is None:
                     self.in_flight = False
                     self._active_shm_slot = None
+                    self._ready_shm_slot = None
                     nxt = None
+                elif self._frame_shm_slots >= 3:
+                    seq, frame_name, prefix, slot, timing = nxt
+                    if not self._slot_ready[slot]:
+                        if (
+                            self._last_valid_slot is not None
+                            and self._slot_ready[self._last_valid_slot]
+                        ):
+                            slot = self._last_valid_slot
+                        else:
+                            self.in_flight = False
+                            self._active_shm_slot = None
+                            self._ready_shm_slot = None
+                            return
+                    self.in_flight = True
+                    self._active_shm_slot = slot
+                    self._ready_shm_slot = None
+                    self._last_valid_slot = slot
+                    nxt = (seq, frame_name, prefix, slot, timing)
                 else:
                     seq, frame_name, prefix, payload, timing = nxt
                     assert self._active_shm_slot is not None
@@ -769,21 +806,72 @@ class LiveWorkerClient:
         self, seq: int, frame_name: str, prefix: bytes, raw: memoryview, timing: dict
     ) -> bool:
         assert self._frame_shm is not None
+        if self._frame_shm_slots < 3:
+            with self._lock:
+                if self.in_flight:
+                    item = (
+                        seq,
+                        frame_name,
+                        prefix,
+                        self._coalesce_payload(raw),
+                        timing,
+                    )
+                    return self._store_coalesced(item)
+                slot = 0
+                self._write_shm_slot(slot, raw)
+                item = (seq, frame_name, prefix, slot, timing)
+                self.in_flight = True
+                self._active_shm_slot = slot
+                self._discard_pending(count_drops=True)
+                try:
+                    self.pending.put_nowait(item)
+                except queue.Full:
+                    self.in_flight = False
+                    self._active_shm_slot = None
+                    return False
+            return True
+
         with self._lock:
-            if self.in_flight:
-                item = (
-                    seq,
-                    frame_name,
-                    prefix,
-                    self._coalesce_payload(raw),
-                    timing,
-                )
-                return self._store_coalesced(item)
-            slot = 0
+            busy_slots = set()
+            if self._active_shm_slot is not None:
+                busy_slots.add(self._active_shm_slot)
+            if self._ready_shm_slot is not None:
+                busy_slots.add(self._ready_shm_slot)
+            if self._writing_shm_slot is not None:
+                busy_slots.add(self._writing_shm_slot)
+            candidates = [s for s in range(self._frame_shm_slots) if s not in busy_slots]
+            if not candidates:
+                candidates = [s for s in range(self._frame_shm_slots) if s != self._active_shm_slot]
+            slot = candidates[0]
+            self._writing_shm_slot = slot
+            self._slot_ready[slot] = False
+            self._slot_seq[slot] = seq
+
+        try:
             self._write_shm_slot(slot, raw)
-            item = (seq, frame_name, prefix, slot, timing)
+        except Exception:
+            with self._lock:
+                if self._writing_shm_slot == slot:
+                    self._writing_shm_slot = None
+                self._slot_ready[slot] = False
+            raise
+
+        with self._lock:
+            self._slot_ready[slot] = True
+            self._writing_shm_slot = None
+
+            if self.in_flight:
+                if self._ready_shm_slot is not None:
+                    self._coalesce_drops += 1
+                self._ready_shm_slot = slot
+                self._coalesce = (seq, frame_name, prefix, slot, timing)
+                return True
+
             self.in_flight = True
             self._active_shm_slot = slot
+            self._ready_shm_slot = None
+            self._last_valid_slot = slot
+            item = (seq, frame_name, prefix, slot, timing)
             self._discard_pending(count_drops=True)
             try:
                 self.pending.put_nowait(item)
@@ -792,7 +880,6 @@ class LiveWorkerClient:
                 self._active_shm_slot = None
                 return False
         return True
-
     def _submit_pipe_frame(
         self, seq: int, frame_name: str, prefix: bytes, raw: memoryview, timing: dict
     ) -> bool:
@@ -883,7 +970,9 @@ class LiveWorkerClient:
             self._coalesce = None
             self.in_flight = False
             self._active_shm_slot = None
-        self._discard_pending(count_drops=False)
+            self._ready_shm_slot = None
+            self._writing_shm_slot = None
+            self._last_valid_slot = None
         with self._proc_lock:
             try:
                 self._stop_process(self.proc)
@@ -1022,7 +1111,15 @@ class LiveLocalizerClient(LiveWorkerClient):
         local_topk: int = 0,
         query_camera=None,
         map_align: str | Path = "",
+        frame_shm_slots: int | None = None,
     ):
+        resolved_shm_slots = frame_shm_slots
+        if resolved_shm_slots is None:
+            raw_slots = os.environ.get("SFM_FRAME_SHM_SLOTS", "3").strip()
+            try:
+                resolved_shm_slots = int(raw_slots)
+            except ValueError:
+                resolved_shm_slots = 3
         self._runtime_benchmark_control = not bool(force_track_bench)
         self._benchmark_mode_lock = threading.Lock()
         self._benchmark_mode = "track" if force_track_bench else "auto"
@@ -1094,6 +1191,7 @@ class LiveLocalizerClient(LiveWorkerClient):
             use_shared_frames=os.environ.get("SFM_SHARED_FRAMES", "1").strip()
             not in {"0", "false", "no"},
             expect_ready_event=True,
+            frame_shm_slots=resolved_shm_slots,
         )
 
     @property

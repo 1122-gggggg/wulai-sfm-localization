@@ -23,6 +23,7 @@ Git 版控不包含實際場域點雲、localization bundle、影片、飛行紀
 ├── 文件/             系統規格、架構邊界、工作區稽核
 ├── tools/            驗證實作、測試與唯讀工作區稽核
 ├── 驗證系統.sh       唯一的純地面驗證入口
+├── IMU飛行測試.sh    手動飛行 + 定位，錄 IMU／搖桿／畫面（見 docs/esekf_live_eval_runbook.md）
 └── .venv/            Python 3.10 執行環境
 ```
 
@@ -40,6 +41,7 @@ python tools/workspace_audit.py --strict-output-names
 |---|---|---|---|
 | 模擬串流 | `控制介面程式/影片模擬串流/選擇啟動.sh` | 本機影片 / FFmpeg | 模擬，永不載入 Olympe |
 | 實機操作（人工／preflight 後 AUTO） | `控制介面程式/真機串流/啟動.sh` | ANAFI PDRAW | Olympe，操作員 UI 控制；只接受 mission selection |
+| IMU 飛行測試（手動飛行資料採集） | `IMU飛行測試.sh` | ANAFI PDRAW | 同上，只是額外錄 IMU／搖桿／定位當幀畫面 |
 | 任務 authoring／檢查 | `控制介面程式/mission_pipeline.py` | 本機資產 | 不直接取代真機操作入口 |
 
 兩個 runtime 入口互斥。模擬入口拒絕 `--live` / `real-flight`；實機入口拒絕
@@ -181,7 +183,7 @@ Python wheelhouse 內，必須由目標電腦的離線 OS 安裝媒體預先供�
 | site profile | 資產包 | runtime profile | 航線 | 狀態 |
 |---|---|---|---|---|
 | `urai_edm.json` | `地圖檔/場域/urai/` | 共用 | **無** | 地面定位可用；自主飛行未核准 |
-| `mission_selections/river_site_official69_localization.json` | `river_site_official69_map_v000_20260811` | resolver 產生 snapshot | **已刪** | 舊圖仍可定位；舊航線已移除 |
+| ~~`mission_selections/river_site_official69_localization.json`~~ | ~~`river_site_official69_map_v000_20260811`~~ | — | **已刪** | 2026-09-05 一併刪除 selection：該 release 目錄已不在磁碟上，selection 只會讓 `validate_mission_selections.py` 報 SHA 不符 |
 | `mission_selections/river_gluemap_all8_direct_localization.json` | `river_gluemap_all8_direct_20260831` | resolver 產生 snapshot | **無** | 目前預設；僅同資料集單幀煙霧通過，獨立品質與 ANAFI camera pipeline 未驗證，真機定位 fail closed |
 | `example_site_edm.json` | — | — | — | 新場域範本 |
 
@@ -237,6 +239,14 @@ batch size 2、LOST grace 2、recovery bank/scan 192/2、correspondence 上限 9
 inliers 80/50/30。MegaLoc 在 BOOT 執行；LOST 預設每個 episode 一次，場域 profile
 可設定週期重試。共用預設的 temporal reference 關閉，PnP acquire/track/RANSAC gate 固定為 5/6/5，
 capture-time 預測上限為 0.25 秒。
+
+**追蹤器模式：同步（`SFM_EDM_ASYNC_TRACKER` 預設 `0`）。** 每一個發佈出去的 pose 都是當幀
+重新對上地圖的 EDM+PnP 結果。2026-09-04 曾把 async fast/slow 解耦轉為預設（fast path 用光流
+帶 pose、slow path 才跑 EDM），2026-09-05 以七段 720p 語料庫複查後改回：async 的「成功」有
+88% 是沒有當幀視覺確認的光流推算（3,587 個成功幀裡只有 429 幀真的重新對上地圖），
+最長一段連續 710 幀（約 89 秒）；七段成功率也從 sync 的 80.6% 掉到 62.9%。設 `=1` 可換取
+p50 約 26 ms → 5 ms 的延遲，代價是上述未確認推算。詳見
+`docs/verified_localization_optimization_ledger.md` 的 2026-09-05 章節。
 
 ### coarse tail 融合（不改任何參數）
 

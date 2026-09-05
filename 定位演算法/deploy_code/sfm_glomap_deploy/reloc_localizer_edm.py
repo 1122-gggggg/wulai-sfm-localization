@@ -44,7 +44,13 @@ MEGALOC_INPUT = 322
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 MEGALOC_REVISION = "7cb9f7970d366fdf059963d04d372e503e8e9df9"
 MEGALOC_WEIGHTS_SHA256 = "d4f9f2bcb60018f91eb6a8e061ed054fd55654e10c2569cf13841ea986ffb4f8"
-MEGALOC_HUBCONF_SHA256 = "0ebf9fc9c455ca38b9e52c69bcfee4b136a0f8872fdfc4307d00469013228b98"
+# NOTE 2026-09-05: the pre-09-05 workspace hubconf (a weights_path-tolerant
+# fork of upstream e31e8e0, pin 0ebf9fc9…) was deleted with torch_hub_cache
+# and is unrecoverable byte-exact (no copy in git/bundle/caches). This pin
+# now covers the clean-room equivalent above: identical entrypoint contract
+# (get_trained_model(weights_path=None) → MegaLoc + safetensors load).
+# megaloc_model.py is unchanged and still byte-exact at 4a23a2b.
+MEGALOC_HUBCONF_SHA256 = "2b75be965414adec2330de9bff4279a86b1a0fea814de2078c831d70eb54367a"
 MEGALOC_MODEL_SOURCE_SHA256 = "3cbf1d20515b1da423998a8edab787031eaa7bb273c5a86a5c41c4f6d84e2a6d"
 
 # The river bundle currently has 454 references.  Keep a fixed load-time budget

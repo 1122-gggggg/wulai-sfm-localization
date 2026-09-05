@@ -21,7 +21,11 @@ def _safe_anchor_state(pose_result: Mapping[str, object], allow_weak_anchors: bo
         return False
     if pose_result.get("rejected"):
         return False
-    if pose_result.get("pose_status") == "PREDICTED_ONLY":
+    # Predicted-only records never pass; KLT-bridged frames carry no fresh EDM
+    # match, so they must not become visual anchors either (drift would latch).
+    if pose_result.get("pose_status") in ("PREDICTED_ONLY", "KLT_BRIDGED"):
+        return False
+    if pose_result.get("candidate_mode") == "klt_bridge" or pose_result.get("bridge"):
         return False
     state_in = str(pose_result.get("state_in") or "")
     if state_in == "WEAK_TRACK" and not allow_weak_anchors:

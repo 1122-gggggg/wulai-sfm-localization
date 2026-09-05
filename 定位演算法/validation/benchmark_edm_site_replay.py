@@ -167,8 +167,51 @@ RECEIPT_OVERRIDE_KEYS = (
     "lost_prior_strategy",
     "lost_prior_fusion_weight",
     "worker_mode",
+    # Trace-affecting env-only knobs (no CLI flag): a replay run with different
+    # KLT-bridge / ESEKF / FB-tau / quality-weight settings is NOT comparable,
+    # so they join the fail-closed identity. Historical baselines predating
+    # these keys fail the gate as "missing receipt.<key>" by design.
+    "klt_bridge_interval",
+    "esekf_disabled",
+    "klt_fb_px",
+    "reference_quality_weight",
+    # Matcher forward knobs (FINE_DIR01 changes FP16 numerics at 1e-5 level;
+    # matmul/SDPA only matter when enabled off-default).
+    "fine_dir01",
+    "matmul_precision",
+    "sdpa_fusion",
+    # Wave-D trace knobs (recorded even while default-off; any flip changes traces).
+    "adaptive_vpr",
+    "prior_pnp_refine",
+    "pnp_threads",
+    # Recovery-policy knobs (default off). Trace-affecting, so they join the
+    # fail-closed identity even while off.
+    "acquire_relaxed_min_inliers",
+    "acquire_relaxed_reproj",
+    "acquire_relaxed_agree",
+    "lost_starved_global_frames",
+    "lost_starved_corr_max",
+    "track_miss_widen_topk",
+    "weak_miss_widen_topk",
+    "async_fast_min_inliers",
+    "async_fast_reproj",
+    # Tracker selection: sync vs async fast/slow changes every trace bit.
+    # async_inline_sync only matters when async is engaged.
+    "async_tracker",
+    "async_inline_sync",
+    "boot_relaxed_min_inliers",
+    "acquire_relaxed_probation_frames",
+    "lost_local_topk",
 )
 PRODUCTION_PATH_UNTRANSMITTED_OVERRIDE_KEYS = (
+    # The worker builds its matcher from the hashed profile, so nothing here
+    # reaches it. coarse_topk / mconf_thr / cache_capacity were missing from
+    # this list and were instead written onto the local stub, which only the
+    # receipt ever read -- a production-path A/B on them reported the requested
+    # value while replaying the profile unchanged.
+    "coarse_topk",
+    "mconf_thr",
+    "cache_capacity",
     "runtime_sigma_mode",
     "temporal_feature_cache_size",
     "query_cuda_graph",
@@ -180,6 +223,9 @@ PRODUCTION_PATH_UNTRANSMITTED_OVERRIDE_KEYS = (
     "pnp_ranked_batches",
     "reference_feature_cache_size",
     "host_reference_feature_cache_size",
+    "track_miss_widen_topk",
+    "weak_miss_widen_topk",
+    "boot_relaxed_min_inliers",
 )
 PIPELINE_AGE_KEYS = (
     "capture_source_age_ms",
@@ -203,6 +249,17 @@ CONSUMED_WORKER_METRIC_KEYS = (
     "edm_cache_misses",
     "edm_cache_evictions",
     "fused_telemetry_mono",
+    # Async fast/slow accounting: tells a starved fast path apart from a dead
+    # slow thread apart from a slow path that ran and never matched. Without
+    # them a NO_ANCHOR run is indistinguishable from a crashed one.
+    "async_inline_syncs",
+    "async_slow_errors",
+    "async_slow_last_error",
+    "async_slow_alive",
+    "async_fast_prior_feedbacks",
+    "async_anchor_accepts",
+    "async_anchor_rejects",
+    "async_inline_runs",
 )
 
 
@@ -333,8 +390,13 @@ _CONFIG_OVERRIDE_FIELDS = (
     ("lost_prior_strategy", "lost_prior_strategy", str),
     ("lost_prior_fusion_weight", "lost_prior_fusion_weight", float),
     ("pnp_pipeline", "pnp_pipeline", bool),
+    ("track_miss_widen_topk", "track_miss_widen_topk", int),
+    ("weak_miss_widen_topk", "weak_miss_widen_topk", int),
+    ("boot_relaxed_min_inliers", "boot_relaxed_min_inliers", int),
     ("use_temporal_reference", "use_temporal_reference", bool),
     ("reference_quality_weight", "reference_quality_weight", float),
+    ("acquire_relaxed_min_inliers", "acquire_relaxed_min_inliers", int),
+    ("lost_starved_global_frames", "lost_starved_global_frames", int),
 )
 _MATCHER_OVERRIDE_FIELDS = (
     ("mconf_thr", "mconf_thr", float),
@@ -436,21 +498,144 @@ def apply_runtime_overrides(args, built) -> None:
     _apply_reference_feature_cache_overrides(matcher, args)
 
 
+def _receipt_env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, default) or default)
+    except (TypeError, ValueError):
+        return default
+
+
+def _receipt_env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, default) or default)
+    except (TypeError, ValueError):
+        return default
+
+
+def _recovery_knob_receipt(args, cfg) -> dict[str, object]:
+    """Effective recovery-policy knobs: CLI override, then cfg, then env, then default.
+
+    Production-path runs cannot transmit CLI overrides and their cfg stub is
+    built from the hashed profile, so the environment is the only carrier there
+    (see _reject_untransmitted_production_overrides).
+    """
+    knobs = (
+        (
+            "acquire_relaxed_min_inliers",
+            "acquire_relaxed_min_inliers",
+            "SFM_EDM_ACQUIRE_RELAXED_MIN_INLIERS",
+            0,
+            int,
+        ),
+        (
+            "acquire_relaxed_reproj",
+            "acquire_relaxed_max_reproj_error",
+            "SFM_EDM_ACQUIRE_RELAXED_REPROJ",
+            3.0,
+            float,
+        ),
+        (
+            "acquire_relaxed_agree",
+            "acquire_relaxed_min_agreeing_refs",
+            "SFM_EDM_ACQUIRE_RELAXED_AGREE",
+            2,
+            int,
+        ),
+        (
+            "lost_starved_global_frames",
+            "lost_starved_global_frames",
+            "SFM_EDM_LOST_STARVED_FRAMES",
+            0,
+            int,
+        ),
+        (
+            "lost_starved_corr_max",
+            "lost_starved_corr_max",
+            "SFM_EDM_LOST_STARVED_CORR",
+            5,
+            int,
+        ),
+        (
+            "track_miss_widen_topk",
+            "track_miss_widen_topk",
+            "SFM_EDM_TRACK_WIDEN_TOPK",
+            0,
+            int,
+        ),
+        (
+            "weak_miss_widen_topk",
+            "weak_miss_widen_topk",
+            "SFM_EDM_WEAK_WIDEN_TOPK",
+            0,
+            int,
+        ),
+        (
+            "async_fast_min_inliers",
+            None,
+            "SFM_EDM_ASYNC_FAST_MIN_INLIERS",
+            0,
+            int,
+        ),
+        (
+            "async_fast_reproj",
+            None,
+            "SFM_EDM_ASYNC_FAST_REPROJ",
+            0.0,
+            float,
+        ),
+        (
+            "boot_relaxed_min_inliers",
+            "boot_relaxed_min_inliers",
+            "SFM_EDM_BOOT_RELAXED_MIN_INLIERS",
+            0,
+            int,
+        ),
+        (
+            "acquire_relaxed_probation_frames",
+            "acquire_relaxed_probation_frames",
+            "SFM_EDM_ACQUIRE_RELAXED_PROBATION_FRAMES",
+            0,
+            int,
+        ),
+        (
+            "lost_local_topk",
+            "lost_local_topk",
+            "SFM_EDM_LOST_LOCAL_TOPK",
+            5,
+            int,
+        ),
+    )
+    receipt: dict[str, object] = {}
+    for key, field, env_name, default, caster in knobs:
+        value = _arg(args, key)
+        if value is None and field is not None:
+            value = getattr(cfg, field, None)
+        if value is None:
+            value = os.environ.get(env_name, default)
+        receipt[key] = caster(value)
+    return receipt
+
+
 def build_receipt(args, built) -> dict[str, object]:
     cfg = getattr(built, "config", None) if built is not None else None
     matcher = _matcher_from_built(built) if built is not None else None
     radius = _arg(args, "radius")
     if radius is None:
         radius = getattr(cfg, "radius", None)
-    mconf = _arg(args, "mconf_thr")
+    # Effective value first, requested value only as a fallback: these three are
+    # applied to the live matcher by apply_runtime_overrides before the receipt
+    # is built, so reading the matcher back is what the run actually used. Taking
+    # the CLI argument first is how the receipt used to record knobs that never
+    # took effect (see PRODUCTION_PATH_UNTRANSMITTED_OVERRIDE_KEYS).
+    mconf = getattr(matcher, "mconf_thr", None)
     if mconf is None:
-        mconf = getattr(matcher, "mconf_thr", None)
-    topk = _arg(args, "coarse_topk")
+        mconf = _arg(args, "mconf_thr")
+    topk = getattr(matcher, "topk", None)
     if topk is None:
-        topk = getattr(matcher, "topk", None)
-    cache = _arg(args, "cache_capacity")
+        topk = _arg(args, "coarse_topk")
+    cache = getattr(matcher, "reference_cache_size", None)
     if cache is None:
-        cache = getattr(matcher, "reference_cache_size", None)
+        cache = _arg(args, "cache_capacity")
     lost_strategy = _arg(args, "lost_strategy")
     if lost_strategy is None:
         lost_strategy = getattr(cfg, "global_retrieval_policy", None)
@@ -493,6 +678,9 @@ def build_receipt(args, built) -> dict[str, object]:
     pnp_pipeline = _arg(args, "pnp_pipeline")
     if pnp_pipeline is None:
         pnp_pipeline = getattr(cfg, "pnp_pipeline", None)
+    quality_weight = _arg(args, "reference_quality_weight")
+    if quality_weight is None:
+        quality_weight = getattr(cfg, "reference_quality_weight", None)
     track_map_first = _arg(args, "track_map_first")
     if track_map_first is None:
         track_map_first = getattr(cfg, "track_map_first", None)
@@ -539,7 +727,20 @@ def build_receipt(args, built) -> dict[str, object]:
         "inclusive_host_feature_cache": bool(
             _arg(args, "inclusive_host_feature_cache", False)
         ),
-        "megaloc_backend": str(_arg(args, "megaloc_backend", "tensorrt")),
+        "fine_dir01": os.environ.get("SFM_EDM_FINE_DIR01", "1"),
+        # Effective tracker selection (sequential replay pins "0" unless the
+        # caller explicitly set the env; production-path honors the default).
+        "async_tracker": os.environ.get("SFM_EDM_ASYNC_TRACKER", "0"),
+        "async_inline_sync": os.environ.get("SFM_EDM_ASYNC_INLINE_SYNC", "1"),
+        "matmul_precision": os.environ.get("SFM_EDM_MATMUL_PRECISION", "highest"),
+        "sdpa_fusion": os.environ.get("SFM_EDM_SDPA", "0"),
+        "adaptive_vpr": os.environ.get("SFM_EDM_ADAPTIVE_VPR", "0"),
+        "prior_pnp_refine": os.environ.get("SFM_EDM_PRIOR_PNP_REFINE", "1"),
+        "pnp_threads": os.environ.get("SFM_EDM_PNP_THREADS", "1"),
+        "reference_quality_weight": (
+            None if quality_weight is None else float(quality_weight)
+        ),
+        **_recovery_knob_receipt(args, cfg),
         "megaloc_engine": (
             None
             if _arg(args, "megaloc_engine") is None
@@ -650,6 +851,14 @@ def pipeline_summary(rows: list[dict], *, startup_ms: float | None = None) -> di
     }
 
 
+def _adaptive_coalesce_interval_s(latency_ms: float | None) -> float:
+    """Mirror OperatorApp._localization_coalesce_interval_s: 20-100 ms, scaled
+    by recent localization latency (0.0005 * ms)."""
+    if latency_ms is None or not math.isfinite(latency_ms) or latency_ms <= 0.0:
+        return 0.020
+    return max(0.020, min(0.100, latency_ms * 0.0005))
+
+
 def run_source_cadence(
     decoded,
     source_fps: float,
@@ -658,12 +867,18 @@ def run_source_cadence(
     sleep=time.sleep,
     monotonic=time.monotonic,
     drain_timeout_s: float = 8.0,
+    adaptive_submit: bool = False,
 ) -> tuple[list[dict], dict]:
     """Submit frames at recorded cadence through a capacity-one client.
 
     `decoded` yields dicts with rgb, source_index, decode_ms, recorded_stamp,
     frame_id, frame_sha256, and copy_ms. Queues stay bounded: one frame is
     decoded, then submitted (coalesce if busy), then results are polled.
+
+    With ``adaptive_submit`` the coalesce slot is only refreshed once per
+    latency-scaled interval while the worker is busy (the operator app's real
+    cadence), so a burst of fast KLT-bridge results does not let the submitter
+    outrun a following recovery frame.
     """
     if not math.isfinite(source_fps) or source_fps <= 0.0:
         raise ValueError(f"invalid source fps: {source_fps!r}")
@@ -672,9 +887,12 @@ def run_source_cadence(
     payloads: list[dict] = []
     submit_ok = 0
     submit_rejected = 0
+    submit_throttled = 0
     seq = 0
     decoded_count = 0
     coalesce_at_submit: list[int] = []
+    last_latency_ms: float | None = None
+    last_coalesce_mono = origin
     for item in decoded:
         decoded_count += 1
         source_index = int(item["source_index"])
@@ -683,6 +901,21 @@ def run_source_cadence(
         if delay > 0.0:
             sleep(delay)
         capture_mono = monotonic()
+        if (
+            adaptive_submit
+            and callable(getattr(client, "busy", None))
+            and client.busy()
+        ):
+            interval = _adaptive_coalesce_interval_s(last_latency_ms)
+            if capture_mono - last_coalesce_mono < interval:
+                submit_throttled += 1
+                payloads.extend(client.poll_results())
+                for p in payloads[-8:]:
+                    lm = p.get("wall_ms") or p.get("core_wall_ms")
+                    if lm:
+                        last_latency_ms = float(lm)
+                continue
+            last_coalesce_mono = capture_mono
         identity = {
             "source_index": source_index,
             "frame_id": item["frame_id"],
@@ -711,7 +944,12 @@ def run_source_cadence(
         drop_delta = int(getattr(client, "_coalesce_drops", 0) or 0) - drops_before
         identity["coalesce_drops"] = drop_delta
         coalesce_at_submit.append(drop_delta)
-        payloads.extend(client.poll_results())
+        new = client.poll_results()
+        payloads.extend(new)
+        for p in new:
+            lm = p.get("wall_ms") or p.get("core_wall_ms")
+            if lm:
+                last_latency_ms = float(lm)
     drain_deadline = monotonic() + max(0.0, float(drain_timeout_s))
     busy = getattr(client, "busy", None)
     while callable(busy) and busy() and monotonic() < drain_deadline:
@@ -722,6 +960,8 @@ def run_source_cadence(
         "decoded": decoded_count,
         "submit_ok": submit_ok,
         "submit_rejected": submit_rejected,
+        "submit_throttled": submit_throttled,
+        "adaptive_submit": bool(adaptive_submit),
         "coalesce_drops": int(getattr(client, "_coalesce_drops", 0) or 0),
         "coalesce_at_submit": sum(coalesce_at_submit),
         "results": len(payloads),
@@ -802,6 +1042,11 @@ def _row_from_worker_payload(payload: dict, identities: dict) -> dict:
         "vpr_ms": payload.get("vpr_ms"),
         "match_ms": payload.get("match_ms"),
         "pnp_ms": payload.get("pnp_ms"),
+        "total_ms": payload.get("total_ms"),
+        "stage_gray_ms": payload.get("stage_gray_ms"),
+        "stage_bridge_ms": payload.get("stage_bridge_ms"),
+        "stage_query_ms": payload.get("stage_query_ms"),
+        "stage_select_ms": payload.get("stage_select_ms"),
         "step": None,
         "submit_drop": int(identity.get("submit_drop", 0) or 0),
         "coalesce_drops": int(identity.get("coalesce_drops", 0) or 0),
@@ -1172,6 +1417,33 @@ def parse_args() -> argparse.Namespace:
         default="none",
         help="query-only training-free token reduction from arXiv:2607.15563v1",
     )
+    parser.add_argument(
+        "--track-miss-widen-topk",
+        type=int,
+        help=(
+            "TRACK miss retries the same frame against this many references; "
+            "0 keeps single-reference TRACK "
+            "(production-path: use SFM_EDM_TRACK_WIDEN_TOPK)"
+        ),
+    )
+    parser.add_argument(
+        "--weak-miss-widen-topk",
+        type=int,
+        help=(
+            "WEAK miss retries the same frame against this many references; "
+            "0 keeps weak_local_topk "
+            "(production-path: use SFM_EDM_WEAK_WIDEN_TOPK)"
+        ),
+    )
+    parser.add_argument(
+        "--boot-relaxed-min-inliers",
+        type=int,
+        help=(
+            "BOOT second-tier acquire floor with two-frame confirmation; "
+            "0 keeps the single acquire_min_inliers threshold "
+            "(production-path: use SFM_EDM_BOOT_RELAXED_MIN_INLIERS)"
+        ),
+    )
     parser.add_argument("--megaloc-token-keep-ratio", type=float)
     parser.add_argument("--megaloc-token-layer", type=int, default=6)
     parser.add_argument(
@@ -1183,6 +1455,23 @@ def parse_args() -> argparse.Namespace:
         "--lost-global-retrieval-interval",
         type=int,
         help="override LOST MegaLoc retry interval; 0 keeps one-shot LOST",
+    )
+    parser.add_argument(
+        "--acquire-relaxed-min-inliers",
+        type=int,
+        help=(
+            "second-tier LOST acquire floor for corroborated near-misses; "
+            "0 keeps the single acquire_min_inliers threshold "
+            "(production-path: use SFM_EDM_ACQUIRE_RELAXED_MIN_INLIERS)"
+        ),
+    )
+    parser.add_argument(
+        "--lost-starved-global-frames",
+        type=int,
+        help=(
+            "consecutive corr-starved LOST frames that force a full-map MegaLoc "
+            "retry; 0 disables (production-path: use SFM_EDM_LOST_STARVED_FRAMES)"
+        ),
     )
     parser.add_argument(
         "--sigma-mode",
@@ -1233,6 +1522,17 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--live-worker", type=Path, help="production-path worker script")
     parser.add_argument("--live-python", help="production-path worker interpreter")
+    parser.add_argument(
+        "--adaptive-submit",
+        action="store_true",
+        help=(
+            "production-path only: throttle coalesce-slot updates by a "
+            "latency-scaled interval, mirroring the operator app's "
+            "_localization_coalesce_interval_s. Bridge-aware: fast (KLT-bridge) "
+            "frames keep the interval at its floor, slow recovery frames widen "
+            "it so the submitter backs off instead of piling stale frames."
+        ),
+    )
     parser.add_argument("--pair-role", choices=["A", "B"], help="label this run in a B-A-A-B pair")
     parser.add_argument("--pair-index", type=int, help="0-based index in a paired series")
 
@@ -1332,6 +1632,41 @@ _OPTIONAL_RUN_INPUT_CHECKS = (
         "lost-global-retrieval-interval must be a non-negative integer",
     ),
     (
+        "acquire_relaxed_min_inliers",
+        None,
+        None,
+        _is_nonneg_int,
+        "acquire-relaxed-min-inliers must be a non-negative integer",
+    ),
+    (
+        "lost_starved_global_frames",
+        None,
+        None,
+        _is_nonneg_int,
+        "lost-starved-global-frames must be a non-negative integer",
+    ),
+    (
+        "track_miss_widen_topk",
+        None,
+        None,
+        _is_nonneg_int,
+        "track-miss-widen-topk must be a non-negative integer",
+    ),
+    (
+        "weak_miss_widen_topk",
+        None,
+        None,
+        _is_nonneg_int,
+        "weak-miss-widen-topk must be a non-negative integer",
+    ),
+    (
+        "boot_relaxed_min_inliers",
+        None,
+        None,
+        _is_nonneg_int,
+        "boot-relaxed-min-inliers must be a non-negative integer",
+    ),
+    (
         "runtime_sigma_mode",
         None,
         None,
@@ -1386,7 +1721,7 @@ def _validate_run_inputs(args) -> tuple[Path, Path]:
     _validate_override_run_inputs(args)
     _reject_untransmitted_production_overrides(args)
     if (
-        args.megaloc_token_reduction != "none"
+        args.megaloc_token_reduction != "none"  # noqa: S105 - ViT token pruning, not a credential
         and args.megaloc_backend == "tensorrt"
     ):
         raise SystemExit(
@@ -1401,7 +1736,7 @@ def _validate_run_inputs(args) -> tuple[Path, Path]:
     elif args.megaloc_engine_sha256:
         raise SystemExit("--megaloc-engine-sha256 requires --megaloc-engine")
     if args.worker_mode == "production-path" and (
-        args.megaloc_token_reduction != "none"
+        args.megaloc_token_reduction != "none"  # noqa: S105 - ViT token pruning, not a credential
         or args.megaloc_backend != "tensorrt"
         or not args.query_feature_reuse
         or args.temporal_feature_promotion
@@ -1477,6 +1812,16 @@ def _build_replay_runtime(args, site, camera_tuple):
     apply_megaloc_token_reduction(args)
     apply_edm_cache_runtime_flags(args)
     startup_started = time.perf_counter()
+    # Sequential replay feeds frames in a tight loop, faster than any slow-path
+    # thread can answer, and threaded async delivery is not bit-deterministic --
+    # exact per-frame trace gates (reference_trace_sha256 et al.) require a
+    # deterministic tracker. Pin the synchronous tracker here unless the caller
+    # explicitly asked for async sequential (accepting nondeterminism).
+    # Since 2026-09-05 the code default is synchronous too, so this only still
+    # matters for a caller that exported SFM_EDM_ASYNC_TRACKER=1 for the whole
+    # shell and then asked for a sequential exact gate.
+    if "SFM_EDM_ASYNC_TRACKER" not in os.environ:
+        os.environ["SFM_EDM_ASYNC_TRACKER"] = "0"
     built = build_production_localizer(
         backend="edm",
         bundle=site.localization_bundle,
@@ -1589,6 +1934,12 @@ def _process_replay_frame(
         "vpr_ms": info.get("vpr_ms"),
         "match_ms": info.get("match_ms"),
         "pnp_ms": info.get("pnp_ms"),
+        "total_ms": info.get("total_ms"),
+        "stage_gray_ms": info.get("stage_gray_ms"),
+        "stage_bridge_ms": info.get("stage_bridge_ms"),
+        "stage_query_ms": info.get("stage_query_ms"),
+        "stage_select_ms": info.get("stage_select_ms"),
+        "candidate_mode": info.get("candidate_mode"),
         "step": step,
         "capture_source_age_ms": 0.0,
         "submit_source_age_ms": 0.0,
@@ -1769,6 +2120,7 @@ def _run_production_path_replay(
             sleep=sleep,
             monotonic=monotonic,
             drain_timeout_s=float(getattr(client, "timeout_s", 8.0) or 8.0),
+            adaptive_submit=bool(_arg(args, "adaptive_submit", False)),
         )
         attach_production_path_receipt_fields(rows, stats, client)
         return _rows_to_replay_tuple(rows, processing_started)

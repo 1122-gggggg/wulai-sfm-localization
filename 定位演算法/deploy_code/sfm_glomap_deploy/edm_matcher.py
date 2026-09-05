@@ -28,6 +28,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from collections import OrderedDict
 import hashlib
+import math
 import os
 import shutil
 import sys
@@ -36,6 +37,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 from artifact_integrity import verify_sha256
 
@@ -195,8 +197,10 @@ def _make_fused_forward(original_forward, compiled_tail):
 
         feat_c0, feat_c1 = map(lambda feat: feat / feat.shape[-1] ** 0.5, [feat_c0, feat_c1])
         with torch.autocast(enabled=False, device_type="cuda"):
-            sim_matrix = torch.einsum("nlc,nsc->nls", feat_c0, feat_c1) / self.temperature
-        del feat_c0, feat_c1
+            if _env_flag("SFM_EDM_COARSE_BMM", True):
+                sim_matrix = torch.bmm(feat_c0, feat_c1.transpose(1, 2)) / self.temperature
+            else:
+                sim_matrix = torch.einsum("nlc,nsc->nls", feat_c0, feat_c1) / self.temperature
         row_max_val, row_max_idx = compiled_tail(sim_matrix)
         del sim_matrix
         k = self.topk
@@ -292,6 +296,64 @@ def _install_fused_coarse_matching() -> str:
     return _FUSED_COARSE_STATE["reason"]
 
 
+_SDPA_STATE: dict = {
+    "installed": False,
+    "reason": "",
+    "original_attention": None,
+    "attention_class": None,
+}
+
+
+def _install_sdpa_attention() -> str:
+    """Patch Attention in LocalFeatureTransformer to use F.scaled_dot_product_attention.
+
+    Controlled by SFM_EDM_SDPA (default: 0 / off).
+    Revertible at runtime via _restore_sdpa_attention() or via SFM_EDM_SDPA=0.
+    """
+    if _SDPA_STATE["installed"]:
+        return _SDPA_STATE["reason"]
+    if not _env_flag("SFM_EDM_SDPA", False):
+        _SDPA_STATE.update(installed=True, reason="disabled by SFM_EDM_SDPA=0")
+        return _SDPA_STATE["reason"]
+    try:
+        from src.edm.neck.loftr_module.transformer import Attention
+
+        orig_attention = Attention.attention
+
+        def sdpa_attention(self, query, key, value, q_mask=None, kv_mask=None):
+            if q_mask is not None or kv_mask is not None:
+                return orig_attention(self, query, key, value, q_mask=q_mask, kv_mask=kv_mask)
+            query = F.normalize(query, p=2, dim=3)
+            key = F.normalize(key, p=2, dim=3)
+            q = query.permute(0, 2, 1, 3)
+            k = key.permute(0, 2, 1, 3)
+            v = value.permute(0, 2, 1, 3)
+            out = F.scaled_dot_product_attention(q, k, v, scale=20.0)
+            return out.permute(0, 2, 1, 3).contiguous()
+
+        Attention.attention = sdpa_attention
+        _SDPA_STATE.update(
+            installed=True,
+            reason="SDPA attention active",
+            original_attention=orig_attention,
+            attention_class=Attention,
+        )
+    except Exception as exc:
+        _SDPA_STATE.update(
+            installed=True, reason=f"SDPA attention unavailable: {exc!r}"
+        )
+    return _SDPA_STATE["reason"]
+
+
+def _restore_sdpa_attention() -> None:
+    """Restore the unpatched Attention.attention."""
+    orig = _SDPA_STATE.get("original_attention")
+    cls_ = _SDPA_STATE.get("attention_class")
+    if orig is not None and cls_ is not None:
+        cls_.attention = orig
+        _SDPA_STATE["installed"] = False
+        _SDPA_STATE["reason"] = "restored"
+
 def _import_edm():
     if str(EDM_REPO) not in sys.path:
         sys.path.insert(0, str(EDM_REPO))
@@ -300,6 +362,7 @@ def _import_edm():
     from src.utils.misc import lower_config
 
     _install_fused_coarse_matching()
+    _install_sdpa_attention()
     return get_cfg_defaults, EDM, lower_config
 
 
@@ -421,7 +484,7 @@ def select_reference_grid_matches(fine, data) -> None:
     """
     offset = data["pred_coord"] * fine.local_resolution
     clamped = torch.clamp(offset, -fine.local_resolution / 2, fine.local_resolution / 2)
-    if fine.bi_directional_refine:
+    if fine.bi_directional_refine and clamped.shape[0] == 2 * data["b_ids"].shape[0]:
         fine_offset01, _fine_offset10 = clamped.chunk(2)
         pred_score01, _pred_score10 = data["pred_score"].chunk(2)
     else:
@@ -465,6 +528,103 @@ def select_reference_grid_matches(fine, data) -> None:
         }
     )
 
+class _TrackCUDAGraphRunner:
+    """Fixed-shape (B=1, 1024x576) CUDA Graph runner for Neck + Coarse matching.
+
+    Guarded by SFM_EDM_TRACK_CUDAGRAPH (default: False / off).
+    WARNING: Capturing Neck + Coarse in a CUDAGraph creates private memory pools
+    that retain gigabytes of VRAM (measured ~3.4 GiB on RTX 5060). On 8GB GPUs,
+    this risks OutOfMemoryError when running alongside persistent feature caches.
+    """
+
+    def __init__(self, model, device):
+        self.model = model
+        self.device = device
+        self.graph = None
+        self.static_f8 = None
+        self.static_f16 = None
+        self.static_f32 = None
+        self.static_outputs = None
+        self.capture_stream = None
+        self.captured_hw = None
+
+    def clear(self) -> None:
+        self.graph = None
+        self.static_f8 = None
+        self.static_f16 = None
+        self.static_f32 = None
+        self.static_outputs = None
+        self.capture_stream = None
+        self.captured_hw = None
+
+    def _step(self, f8, f16, f32, data):
+        ms_feats = (f8, f16, f32)
+        feat_c0, feat_c1 = self.model.neck(ms_feats)
+        feat_c0_flat = feat_c0.flatten(2).permute(0, 2, 1)
+        feat_c1_flat = feat_c1.flatten(2).permute(0, 2, 1)
+        data.update({
+            "hw0_c": feat_c0.shape[2:],
+            "hw1_c": feat_c1.shape[2:],
+            "hw0_f": feat_c0.shape[2:] * self.model.config["local_resolution"],
+            "hw1_f": feat_c1.shape[2:] * self.model.config["local_resolution"],
+        })
+        self.model.coarse_matching(feat_c0_flat, feat_c1_flat, data)
+        return (
+            feat_c0_flat,
+            feat_c1_flat,
+            data["mconf"],
+            data["mkpts0_c"],
+            data["mkpts1_c"],
+            data["b_ids"],
+            data["i_ids"],
+            data["j_ids"],
+        )
+
+    def forward(self, ms_feats, data):
+        f8, f16, f32 = ms_feats
+        if self.graph is None:
+            self.static_f8 = f8.clone()
+            self.static_f16 = f16.clone()
+            self.static_f32 = f32.clone()
+            self.capture_stream = torch.cuda.Stream(device=f8.device)
+            current_stream = torch.cuda.current_stream(device=f8.device)
+            self.capture_stream.wait_stream(current_stream)
+
+            with torch.cuda.stream(self.capture_stream):
+                for _ in range(3):
+                    d = dict(data)
+                    _ = self._step(self.static_f8, self.static_f16, self.static_f32, d)
+            current_stream.wait_stream(self.capture_stream)
+
+            self.graph = torch.cuda.CUDAGraph()
+            d_cap = dict(data)
+            with torch.cuda.graph(self.graph, stream=self.capture_stream):
+                self.static_outputs = self._step(
+                    self.static_f8, self.static_f16, self.static_f32, d_cap
+                )
+            current_stream.wait_stream(self.capture_stream)
+            self.captured_hw = (d_cap["hw0_c"], d_cap["hw1_c"], d_cap["hw0_f"], d_cap["hw1_f"])
+
+        self.static_f8.copy_(f8)
+        self.static_f16.copy_(f16)
+        self.static_f32.copy_(f32)
+        self.graph.replay()
+        c0, c1, mconf, mk0, mk1, b_ids, i_ids, j_ids = self.static_outputs
+        hw0_c, hw1_c, hw0_f, hw1_f = self.captured_hw
+        data.update({
+            "hw0_c": hw0_c,
+            "hw1_c": hw1_c,
+            "hw0_f": hw0_f,
+            "hw1_f": hw1_f,
+            "mconf": mconf,
+            "mkpts0_c": mk0,
+            "mkpts1_c": mk1,
+            "b_ids": b_ids,
+            "i_ids": i_ids,
+            "j_ids": j_ids,
+        })
+        return c0, c1
+
 
 class EDMMatcher:
     """Detector-free matcher. Coordinates in/out are EDM-input pixels (1024x576)."""
@@ -488,6 +648,7 @@ class EDMMatcher:
         inclusive_host_feature_cache: bool | None = None,
         input_size: tuple[int, int] | None = None,
         query_cuda_graph: bool = False,
+        track_cuda_graph: bool | None = None,
     ):
         # fp16 autocast + channels_last: 1.6x faster with byte-identical match counts on
         # this site (tests/bench_edm_speed.py: 3085 matches/ref either way). On by default
@@ -580,6 +741,14 @@ class EDMMatcher:
         self._query_graph = None
         self._query_graph_input = None
         self._query_graph_features = None
+        if track_cuda_graph is None:
+            track_cuda_graph = _env_flag("SFM_EDM_TRACK_CUDAGRAPH", False)
+        if not isinstance(track_cuda_graph, bool):
+            raise ValueError("track_cuda_graph must be boolean")
+        if track_cuda_graph and not str(device).startswith("cuda"):
+            raise ValueError("track_cuda_graph requires a CUDA device")
+        self.track_cuda_graph = track_cuda_graph
+        self._track_cuda_graph_runner = None
         _validate_matcher_cache_budget(
             map_feature_entries=self.reference_feature_cache_size,
             temporal_feature_entries=self.temporal_feature_cache_size,
@@ -642,7 +811,73 @@ class EDMMatcher:
         self.fused_coarse = _FUSED_COARSE_STATE["reason"]
         self._install_reference_feature_cache()
         self._install_runtime_sigma_selection()
+        if self.track_cuda_graph:
+            self._track_cuda_graph_runner = _TrackCUDAGraphRunner(self.model, self.device)
+            self.model._track_cuda_graph_runner = self._track_cuda_graph_runner
         self.warmup_fused_coarse()
+
+    # ``topk`` and ``mconf_thr`` used to be plain attributes written once here.
+    # The values that actually run live on the model's own submodules --
+    # CoarseMatching.topk / .thr and FineMatching.mconf_thr -- baked in from
+    # ``cfg`` when EDM() was constructed, so assigning to the matcher afterwards
+    # changed nothing. It failed silently: 定位演算法/validation's --coarse-topk
+    # and --mconf-thr wrote the requested value straight into the run receipt
+    # while the replay behaved exactly like the profile, so an A/B on either knob
+    # returned a false "no effect" (measured: --mconf-thr 0.9 vs 0.2 differed on
+    # 0/300 P168 frames; --coarse-topk 900 vs 3225 on 0/700, with n_corr still
+    # reaching 1071). These properties keep the record and the live modules in
+    # step. fused_forward reads CoarseMatching.topk outside the compiled tail, so
+    # a change lands on the next forward with no recompile.
+    @property
+    def topk(self) -> int:
+        return self._topk
+
+    @topk.setter
+    def topk(self, value: int) -> None:
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError("EDM coarse topk must be a positive integer")
+        self._topk = value
+        coarse = getattr(getattr(self, "model", None), "coarse_matching", None)
+        if coarse is not None:
+            coarse.topk = value
+        self._invalidate_track_cuda_graph()
+
+    @property
+    def mconf_thr(self) -> float:
+        return self._mconf_thr
+
+    @mconf_thr.setter
+    def mconf_thr(self, value: float) -> None:
+        number = float(value)
+        if not math.isfinite(number):
+            raise ValueError("EDM mconf_thr must be finite")
+        self._mconf_thr = number
+        model = getattr(self, "model", None)
+        coarse = getattr(model, "coarse_matching", None)
+        if coarse is not None:
+            coarse.thr = number
+        fine = getattr(model, "fine_matching", None)
+        if fine is not None:
+            fine.mconf_thr = number
+        self._invalidate_track_cuda_graph()
+
+    def _invalidate_track_cuda_graph(self) -> None:
+        """Drop the TRACK B=1 graph, which captured coarse_matching's old shapes.
+
+        _TrackCUDAGraphRunner._step replays model.coarse_matching, so a captured
+        graph holds the topk-dependent tensor sizes (and, with the fused tail off,
+        the confidence threshold). Replaying it after a retune would quietly serve
+        the pre-retune value -- the same silent-staleness this pair of properties
+        exists to remove. The graph is off by default and rebuilt on next use.
+        """
+        runner = getattr(self, "_track_cuda_graph_runner", None)
+        if runner is not None:
+            runner.clear()
+
+    def clear_track_cuda_graph(self) -> None:
+        """Release private CUDA graph memory pools for TRACK B=1."""
+        if getattr(self, "_track_cuda_graph_runner", None) is not None:
+            self._track_cuda_graph_runner.clear()
 
     # ---------- reference backbone cache ----------
     def _install_reference_feature_cache(self) -> None:
@@ -1574,6 +1809,7 @@ class EDMMatcher:
             try:
                 self.model._backbone_plan = plan if cache_fully_hit else None
                 self.model._cache_fully_hit = bool(cache_fully_hit)
+                self.model._sigma_plan = self._sigma_plan
                 if getattr(self, '_backbone_plan', None) is not None and cache_fully_hit:
                     try:
                         # Precompute pyramid via _backbone_from_cache to truly skip 9.4MB cat inside EDM.
@@ -1587,6 +1823,8 @@ class EDMMatcher:
             except Exception:
                 pass
         try:
+            if self._sigma_plan is not None and isinstance(batch, dict):
+                batch["_sigma_plan"] = self._sigma_plan
             with self._autocast():
                 self.model(batch)
         finally:
@@ -1598,6 +1836,7 @@ class EDMMatcher:
                     self.model._backbone_plan = None
                     self.model._cache_fully_hit = False
                     self.model._cached_pyramid = None
+                    self.model._sigma_plan = None
                 except Exception:
                     pass
         bids, k0, k1, mc = self._match_outputs_to_numpy(batch)

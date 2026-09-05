@@ -307,7 +307,28 @@ def _build_edm_localizer(
         engine_path=megaloc_engine,
         engine_sha256=megaloc_engine_sha256,
     )
-    tracker = EDMTrackerAdapter(
+    # Default 0 = synchronous tracker. The async fast/slow split was made the
+    # default on 2026-09-04 on P117 + P168 evidence; the seven-video 720p corpus
+    # on 2026-09-05 reversed that. async publishes a KLT-bridged pose as a
+    # success, and over the corpus only 7.5% of its successes were frames that
+    # actually re-matched the map (sync: 100%), with one 710-frame run (~89 s)
+    # of pure dead reckoning and a P116 that came out 0/292 on one run and
+    # 135/273 on the next. See the ledger's 2026-09-05 section.
+    # SFM_EDM_ASYNC_TRACKER=1 keeps the low-latency path available (p50 ~5 ms
+    # against ~26 ms) for callers that can accept unverified carry.
+    async_mode = (os.environ.get("SFM_EDM_ASYNC_TRACKER", "0") or "0").strip().lower() not in (
+        "0", "false", "no", "off",
+    )
+    if async_mode:
+        from edm_localizer_adapter import AsyncEDMTrackerAdapter
+
+        adapter_cls: type = AsyncEDMTrackerAdapter
+    else:
+        adapter_cls = EDMTrackerAdapter
+    # One adapter only: each one builds its own stateful ProductionEDMTracker
+    # (and the async one starts a slow-path thread), so building both and
+    # discarding one leaks a tracker plus its thread.
+    tracker = adapter_cls(
         reloc_map,
         camera,
         cfg=config,
@@ -345,6 +366,7 @@ def _build_edm_localizer(
         variant=(
             f"production_edm_{profile_name}_topk{config.local_topk}_{matcher_tag}"
             f"_megaloc_{megaloc_backend or 'environment'}"
+            + ("_async" if async_mode else "")
         ),
         device=DEVICE,
     )

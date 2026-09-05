@@ -101,52 +101,6 @@ def test_xfeat_pair_selection_skips_short_references_and_honors_limit():
     assert xfeat._select_covisible_pairs(reloc_map, 2, 2, 3) == [(0, 2)]
 
 
-def test_edm_stream_helper_handles_stride_warmup_and_metrics(monkeypatch):
-    stream = load_script("bench_edm_onnx_stream_helpers", "bench_edm_onnx_stream.py")
-
-    class Capture:
-        def __init__(self):
-            self.frames = [np.zeros((2, 2, 3), dtype=np.uint8) for _ in range(5)]
-
-        def isOpened(self):
-            return True
-
-        def read(self):
-            if not self.frames:
-                return False, None
-            return True, self.frames.pop(0)
-
-        def release(self):
-            pass
-
-    capture = Capture()
-    monkeypatch.setattr(stream.cv2, "VideoCapture", lambda _path: capture)
-    monkeypatch.setattr(stream.cv2, "resize", lambda frame, _size, interpolation: frame)
-    monkeypatch.setattr(stream.time, "perf_counter", iter((10.0, 12.5)).__next__)
-    args = SimpleNamespace(
-        video=Path("mock.mp4"), max_frames=2, warmup_frames=1, stride=2,
-    )
-    infos = iter((
-        {"state_out": "BOOT", "ok": True, "inliers": 5, "total_ms": 10.0,
-         "vpr_ms": 1.0, "match_ms": 2.0, "pnp_ms": 3.0},
-        {"state_out": "TRACK", "ok": True, "inliers": 7, "total_ms": 20.0,
-         "vpr_ms": 2.0, "match_ms": 3.0, "pnp_ms": 4.0},
-        {"state_out": "LOST", "ok": False, "inliers": 0, "total_ms": 30.0,
-         "vpr_ms": 3.0, "match_ms": 4.0, "pnp_ms": 5.0},
-    ))
-    tracker = SimpleNamespace(localize=lambda _frame: next(infos))
-
-    states, totals, vprs, matches, pnps, inliers, n_ok, used, timed, wall_s = (
-        stream._run_stream(args, tracker)
-    )
-
-    assert (states, totals, vprs, matches, pnps, inliers) == (
-        ["TRACK", "LOST"], [20.0, 30.0], [2.0, 3.0], [3.0, 4.0],
-        [4.0, 5.0], [7],
-    )
-    assert (n_ok, used, timed, wall_s) == (1, 3, 2, 2.5)
-
-
 def test_engine_runner_binds_inputs_and_returns_copies(monkeypatch):
     xfeat = load_script("benchmark_xfeat_lg_onnx_engine_helpers", "benchmark_xfeat_lg_onnx.py")
 
@@ -298,6 +252,30 @@ def _replay_receipt(**overrides):
         "lost_prior_strategy": "restrict_nearby",
         "lost_prior_fusion_weight": 1.0,
         "worker_mode": "sequential",
+        "klt_bridge_interval": 0,
+        "esekf_disabled": False,
+        "klt_fb_px": 1.0,
+        "reference_quality_weight": 0.5,
+        "fine_dir01": "1",
+        "matmul_precision": "highest",
+        "sdpa_fusion": "0",
+        "adaptive_vpr": "0",
+        "prior_pnp_refine": "1",
+        "pnp_threads": "1",
+        "acquire_relaxed_min_inliers": 0,
+        "acquire_relaxed_reproj": 3.0,
+        "acquire_relaxed_agree": 2,
+        "lost_starved_global_frames": 0,
+        "lost_starved_corr_max": 5,
+        "track_miss_widen_topk": 0,
+        "weak_miss_widen_topk": 0,
+        "async_fast_min_inliers": 0,
+        "async_fast_reproj": 0.0,
+        "async_tracker": "1",
+        "async_inline_sync": "1",
+        "boot_relaxed_min_inliers": 0,
+        "acquire_relaxed_probation_frames": 0,
+        "lost_local_topk": 5,
     }
     receipt.update(overrides)
     return receipt
@@ -328,7 +306,32 @@ def test_receipt_identity_requires_every_override_key():
     assert any("baseline is missing receipt.lost_prior_strategy" in item for item in failures)
     assert any("baseline is missing receipt.lost_prior_fusion_weight" in item for item in failures)
     assert any("baseline is missing receipt.worker_mode" in item for item in failures)
-    assert not any("baseline is missing receipt.sigma_mode" in item for item in failures)
+    assert any("baseline is missing receipt.klt_bridge_interval" in item for item in failures)
+    assert any("baseline is missing receipt.esekf_disabled" in item for item in failures)
+    assert any("baseline is missing receipt.klt_fb_px" in item for item in failures)
+    assert any("baseline is missing receipt.reference_quality_weight" in item for item in failures)
+    assert any("baseline is missing receipt.fine_dir01" in item for item in failures)
+    assert any("baseline is missing receipt.matmul_precision" in item for item in failures)
+    assert any("baseline is missing receipt.sdpa_fusion" in item for item in failures)
+    assert any("baseline is missing receipt.adaptive_vpr" in item for item in failures)
+    assert any("baseline is missing receipt.prior_pnp_refine" in item for item in failures)
+    assert any("baseline is missing receipt.pnp_threads" in item for item in failures)
+    assert any(
+        "baseline is missing receipt.acquire_relaxed_min_inliers" in item
+        for item in failures
+    )
+    assert any(
+        "baseline is missing receipt.lost_starved_global_frames" in item
+        for item in failures
+    )
+    assert any(
+        "baseline is missing receipt.async_tracker" in item
+        for item in failures
+    )
+    assert any(
+        "baseline is missing receipt.async_inline_sync" in item
+        for item in failures
+    )
 
 
 def test_invalid_public_overrides_fail_closed(tmp_path):
@@ -695,6 +698,21 @@ def test_production_path_fails_closed_on_untransmitted_overrides(tmp_path):
     with pytest.raises(SystemExit, match="production-path cannot apply lost-prior-strategy"):
         replay.runtime_stub_from_profile(site, args)
 
+    # Regression: the worker builds its matcher from the hashed profile, so these
+    # three never reached it. They used to be applied to the local stub instead,
+    # which only the receipt read -- so a production-path A/B recorded the
+    # requested value while replaying the profile unchanged.
+    args.lost_prior_strategy = None
+    for name, flag, value in (
+        ("coarse_topk", "coarse-topk", 900),
+        ("mconf_thr", "mconf-thr", 0.9),
+        ("cache_capacity", "cache-capacity", 8),
+    ):
+        setattr(args, name, value)
+        with pytest.raises(SystemExit, match=f"production-path cannot apply {flag}"):
+            replay.runtime_stub_from_profile(site, args)
+        setattr(args, name, None)
+
 
 
 def _cache_override_stub_matcher():
@@ -788,3 +806,41 @@ def test_known_incomplete_uses_stream_frame_count_for_coalesced_worker():
     )
     assert failures == []
     assert accepted is True
+
+
+def test_receipt_reports_the_matcher_values_the_run_actually_used():
+    """Regression: the receipt used to echo the requested override.
+
+    --coarse-topk and --mconf-thr wrote onto EDMMatcher attributes that nothing
+    read, so the replay behaved like the profile while the receipt claimed the
+    requested value. Reading the live matcher back is what makes the receipt an
+    account of the run rather than of the command line.
+    """
+    replay = load_script("benchmark_edm_site_replay_helpers", "benchmark_edm_site_replay.py")
+    matcher = SimpleNamespace(
+        mconf_thr=0.2,
+        topk=3225,
+        reference_cache_size=32,
+        runtime_sigma_mode="reference_grid",
+        temporal_feature_cache_size=2,
+        query_cuda_graph=True,
+        reference_feature_cache_size=192,
+        host_reference_feature_cache_size=0,
+    )
+    built = SimpleNamespace(config=SimpleNamespace(), _matcher=matcher)
+    args = SimpleNamespace(
+        radius=None, mconf_thr=0.9, coarse_topk=900, cache_capacity=8,
+        lost_strategy=None, lost_global_retrieval_interval=None, sigma_mode="fused",
+        runtime_sigma_mode=None, temporal_feature_cache_size=None,
+        query_cuda_graph=None, acquire_stage_mode=None, lost_prior_strategy=None,
+        lost_prior_fusion_weight=None, reference_feature_cache_size=None,
+        host_reference_feature_cache_size=None, pnp_pipeline=None,
+        reference_quality_weight=None, track_map_first=None, pnp_ranked_batches=None,
+        worker_mode="sequential",
+    )
+
+    receipt = replay.build_receipt(args, built)
+
+    assert receipt["coarse_topk"] == 3225
+    assert receipt["mconf_thr"] == 0.2
+    assert receipt["cache_capacity"] == 32

@@ -40,15 +40,58 @@ class MapRenderContext:
     collision_preview: bool
     transform_xyz: Callable[[np.ndarray], np.ndarray]
     project_world: Callable[[np.ndarray, int, int], tuple[int, int]]
-    camera_frustum_world_points: Callable[..., Sequence[np.ndarray]]
-    heading_arrow_polygon: Callable[..., list[tuple[int, int]]]
     route_color: str
     health_color: Mapping[str, str]
     route_dot_max: int
     no_loc_max_markers: int
-    video_hfov_deg: float
     video_aspect_ratio: float
     overlay_font: Any
+    #: Map ground plane in raw GLOMAP coordinates -- the measured gravity basis
+    #: when the site declares one, else the legacy assumption. The camera
+    #: picture plane is a real 3D quad, so it needs the gravity basis to build
+    #: orthonormal image axes from an optical axis or from yaw+gimbal telemetry.
+    map_east: np.ndarray
+    map_north: np.ndarray
+    map_up: np.ndarray
+    #: Telemetry gimbal pitch in degrees, positive up, for the yaw-only
+    #: fallback. Measured camera axes carry their own attitude and ignore it.
+    gimbal_pitch_deg: Any = None
+
+
+#: Camera picture rectangle: a real plane in map space, oriented by the full
+#: camera attitude, drawn ahead of the drone like the screen the stream looks
+#: at. Yaw spins it through 360 deg, gimbal pitch tilts it, and the pitched map
+#: view foreshortens it like any other 3D object -- seen edge-on it collapses
+#: to a line, face-on it fills out, exactly as a screen would.
+#:
+#: The px constants below are on-screen extents, converted to world units with
+#: the CURRENT view scale every frame. The orientation is honest 3D, but the
+#: extent is normalised rather than fixed in world units, for two measured
+#: reasons:
+#:   - a world-fixed plane shrank to 6-10 px at the default view (the original
+#:     frustum sat at ``map_radius * 0.015``, which cancels against
+#:     ``_map_scale``) -- the same size as the position dot under it, and
+#:   - a flat screen-space rectangle (the previous symbol) kept one size but
+#:     could not show tilt at all: it stayed glued to the map no matter where
+#:     the stream pointed, which read as a bearing arrow, not a picture.
+#: Pegging the extent to the view scale keeps the calibrated readable size
+#: while the facing is free to point anywhere on the sphere.
+#:
+#: The quad's front side is the stream direction. The white gaze line runs from
+#: the drone through the picture and ends in an arrowhead beyond it, so the
+#: facing stays readable even when the quad is seen edge-on. Border/dot colour:
+#: cyan = camera-measured attitude, green = yaw+gimbal telemetry fallback.
+#: Gimbal roll is not symbolised; the video HUD reports it numerically.
+#:
+#: 72 px overshot: at the default view the symbol covered a real part of the
+#: point cloud and the route under it. 44 px is still several times the 8 px
+#: position dot, so the bearing stays readable.
+CAMERA_VIEW_RECT_PX = 44.0
+CAMERA_VIEW_RECT_GAP_PX = 8.0
+#: How far the white direction arrow pokes past the picture plane, and the
+#: arrowhead's length; its half-width is 0.6 of the length.
+CAMERA_VIEW_ARROW_PX = 14.0
+CAMERA_VIEW_ARROW_HEAD_PX = 7.0
 
 
 def _map_scale(context: MapRenderContext) -> float:
@@ -58,6 +101,120 @@ def _map_scale(context: MapRenderContext) -> float:
         * context.map_zoom
         / context.map_radius
     )
+
+
+def _basis_from_forward(
+    context: MapRenderContext,
+    forward: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
+    """(right, image-up, forward) unit world vectors for a known optical axis.
+
+    ``right`` is taken against the map gravity axis. Near nadir/zenith that
+    cross product collapses, so map north stands in: the picture top then
+    points along the heading, the only defensible guess left when no measured
+    image axes exist.
+    """
+    vector = np.asarray(forward, dtype=float)
+    if vector.shape != (3,) or not np.isfinite(vector).all():
+        return None
+    norm = float(np.linalg.norm(vector))
+    if norm < 1e-9:
+        return None
+    forward = vector / norm
+    up_map = np.asarray(context.map_up, dtype=float)
+    right = np.cross(forward, up_map)
+    if float(np.linalg.norm(right)) < 1e-6:
+        right = np.cross(forward, np.asarray(context.map_north, dtype=float))
+    norm = float(np.linalg.norm(right))
+    if not math.isfinite(norm) or norm < 1e-9:
+        return None
+    right = right / norm
+    return right, np.cross(right, forward), forward
+
+
+def _camera_picture_basis(
+    context: MapRenderContext,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, bool] | None:
+    """The stream direction as a full 3D camera basis, or None.
+
+    Returns (right, image_up, forward) unit world vectors plus a bool marking
+    the yaw+gimbal telemetry fallback (green border) against a
+    camera-measured attitude (cyan). The picture rectangle is a real plane, so
+    it needs the whole attitude: a ground-flattened azimuth cannot tilt it,
+    and tilt is the point of drawing it in 3D.
+    """
+    if context.camera_axes is not None:
+        axes = np.asarray(context.camera_axes, dtype=float)
+        if axes.shape != (3, 3) or not np.isfinite(axes).all():
+            return None
+        right, down, forward = axes
+        f_norm = float(np.linalg.norm(forward))
+        if f_norm < 1e-9:
+            return None
+        forward = forward / f_norm
+        r_norm = float(np.linalg.norm(right))
+        d_norm = float(np.linalg.norm(down))
+        if r_norm >= 1e-9 and d_norm >= 1e-9:
+            return right / r_norm, -down / d_norm, forward, False
+        # Degenerate in-plane rows (e.g. right collapsed at nadir): rebuild
+        # them off the optical axis instead of drawing nothing.
+        built = _basis_from_forward(context, forward)
+        return (*built, False) if built is not None else None
+    if context.camera_forward is not None:
+        built = _basis_from_forward(context, context.camera_forward)
+        return (*built, False) if built is not None else None
+    try:
+        yaw_value = float(context.pose[3])
+    except (TypeError, ValueError, IndexError):
+        return None
+    if not np.isfinite(yaw_value):
+        return None
+    try:
+        pitch_value = math.radians(float(context.gimbal_pitch_deg))
+    except (TypeError, ValueError):
+        pitch_value = 0.0
+    if not math.isfinite(pitch_value):
+        pitch_value = 0.0
+    pitch_value = max(-math.pi / 2 + 1e-6, min(math.pi / 2 - 1e-6, pitch_value))
+    horizontal = (
+        math.cos(yaw_value) * np.asarray(context.map_east, dtype=float)
+        + math.sin(yaw_value) * np.asarray(context.map_north, dtype=float)
+    )
+    forward = (
+        math.cos(pitch_value) * horizontal
+        + math.sin(pitch_value) * np.asarray(context.map_up, dtype=float)
+    )
+    built = _basis_from_forward(context, forward)
+    return (*built, True) if built is not None else None
+
+
+def camera_view_plane_corners(
+    drone: np.ndarray,
+    right: np.ndarray,
+    image_up: np.ndarray,
+    forward: np.ndarray,
+    scale: float,
+    aspect_ratio: float,
+) -> np.ndarray:
+    """World corners of the picture plane ahead of the drone, in image order.
+
+    Returns top-left, top-right, bottom-right, bottom-left of a quad that is
+    perpendicular to the optical axis: its plane sits
+    ``CAMERA_VIEW_RECT_GAP_PX`` ahead of the drone, is ``CAMERA_VIEW_RECT_PX``
+    wide and width / ``aspect_ratio`` tall -- the stream's picture shape -- all
+    converted to world units with the current view scale.
+    """
+    gap = CAMERA_VIEW_RECT_GAP_PX / scale
+    half_width = CAMERA_VIEW_RECT_PX * 0.5 / scale
+    half_height = half_width / float(aspect_ratio)
+    center = np.asarray(drone, dtype=float) + np.asarray(forward, dtype=float) * gap
+    corners: np.ndarray = np.stack([
+        center - right * half_width + image_up * half_height,
+        center + right * half_width + image_up * half_height,
+        center + right * half_width - image_up * half_height,
+        center - right * half_width - image_up * half_height,
+    ])
+    return corners
 
 
 def _draw_route_and_history(draw: Any, context: MapRenderContext) -> None:
@@ -173,79 +330,63 @@ def _draw_collision_guard(draw: Any, context: MapRenderContext) -> None:
     )
 
 
-def _draw_camera_overlay(draw: Any, context: MapRenderContext) -> None:
-    x, y, z, yaw = context.pose
-    camera_center = np.array([x, y, z], dtype=float)
+def _draw_no_orientation_marker(draw: Any, context: MapRenderContext) -> None:
+    """Hollow ring when no orientation source survives: position without bearing."""
     screen_x, screen_y = context.project_world(
-        camera_center, context.width, context.height
+        np.asarray(context.pose[:3], dtype=float), context.width, context.height
     )
-    arrow = None
-    arrow_color = "#00d4ff"
-    if context.camera_axes is not None:
-        frustum = context.camera_frustum_world_points(
-            camera_center,
-            context.camera_axes,
-            length=context.map_radius * 0.015,
-            hfov_deg=context.video_hfov_deg,
-            aspect_ratio=context.video_aspect_ratio,
-        )
-        projected = [
-            context.project_world(point, context.width, context.height)
-            for point in frustum
-        ]
-        apex, face_center, *face = projected
-        for corner in face:
-            draw.line((*apex, *corner), fill="#00d4ff", width=2)
-        draw.polygon(face, fill="#007f99")
-        draw.line(face + [face[0]], fill="#d8fbff", width=2)
-        draw.line((*apex, *face_center), fill="#ffffff", width=2)
-        draw.ellipse(
-            (
-                face_center[0] - 2,
-                face_center[1] - 2,
-                face_center[0] + 2,
-                face_center[1] + 2,
-            ),
-            fill="#ffffff",
-        )
-        draw.ellipse(
-            (screen_x - 3, screen_y - 3, screen_x + 3, screen_y + 3),
-            fill="#00d4ff",
-        )
-    elif context.camera_forward is not None:
-        head_x, head_y = context.project_world(
-            camera_center + context.camera_forward,
-            context.width,
-            context.height,
-        )
-        arrow = context.heading_arrow_polygon(
-            screen_x, screen_y, head_x, head_y
-        )
-    elif np.isfinite(float(yaw)):
-        heading = np.array(
-            [math.cos(float(yaw)), 0.0, math.sin(float(yaw))],
-            dtype=float,
-        )
-        head_x, head_y = context.project_world(
-            camera_center + heading,
-            context.width,
-            context.height,
-        )
-        arrow = context.heading_arrow_polygon(
-            screen_x, screen_y, head_x, head_y
-        )
-        arrow_color = "#3fbf7f"
-    else:
-        draw.ellipse(
-            (screen_x - 7, screen_y - 7, screen_x + 7, screen_y + 7),
-            outline="#3fbf7f",
-            width=3,
-        )
-        arrow_color = "#3fbf7f"
+    draw.ellipse(
+        (screen_x - 7, screen_y - 7, screen_x + 7, screen_y + 7),
+        outline="#3fbf7f",
+        width=3,
+    )
 
-    if arrow is not None:
-        draw.polygon(arrow, fill=arrow_color)
-        draw.line(arrow + [arrow[0]], fill="#ffffff", width=2)
+
+def _draw_camera_overlay(draw: Any, context: MapRenderContext) -> None:
+    basis = _camera_picture_basis(context)
+    scale = _map_scale(context)
+    if basis is None or not math.isfinite(scale) or scale <= 1e-9:
+        _draw_no_orientation_marker(draw, context)
+        return
+    right, image_up, forward, from_yaw = basis
+    aspect = float(context.video_aspect_ratio)
+    if not math.isfinite(aspect) or aspect < 1e-6:
+        aspect = 16.0 / 9.0
+    drone = np.asarray(context.pose[:3], dtype=float)
+    corners = camera_view_plane_corners(drone, right, image_up, forward, scale, aspect)
+    tip = drone + forward * (
+        (CAMERA_VIEW_RECT_GAP_PX + CAMERA_VIEW_ARROW_PX) / scale
+    )
+    head_base = tip - forward * (CAMERA_VIEW_ARROW_HEAD_PX / scale)
+    head_half = CAMERA_VIEW_ARROW_HEAD_PX * 0.6 / scale
+    # One batched transform for everything: drone, quad corners, arrow tip and
+    # arrowhead base -- the same projection the cloud and the route use.
+    view = context.transform_xyz(np.stack([
+        drone, *corners, tip,
+        head_base + right * head_half,
+        head_base - right * head_half,
+    ]))
+    screen_x = context.width * 0.5 + context.map_pan[0] + view[:, 0] * scale
+    screen_y = context.height * 0.5 + context.map_pan[1] - view[:, 1] * scale
+    border_color = "#3fbf7f" if from_yaw else "#00d4ff"
+    drone_pt = (screen_x[0], screen_y[0])
+    quad = list(zip(screen_x[1:5], screen_y[1:5]))
+    # The gaze line runs under the fill, drone -> picture -> arrowhead: one
+    # stem, not a cone of corner lines, and it carries the facing direction
+    # even when the quad is seen edge-on.
+    draw.line((*drone_pt, screen_x[5], screen_y[5]), fill="#ffffff", width=2)
+    draw.polygon(quad, fill="#0a5f73")
+    draw.line(quad + [quad[0]], fill=border_color, width=3, joint="curve")
+    draw.polygon(
+        [(screen_x[5], screen_y[5]), (screen_x[6], screen_y[6]), (screen_x[7], screen_y[7])],
+        fill="#ffffff",
+    )
+    draw.ellipse(
+        (drone_pt[0] - 4, drone_pt[1] - 4, drone_pt[0] + 4, drone_pt[1] + 4),
+        fill=border_color,
+        outline="#ffffff",
+        width=2,
+    )
 
 
 def draw_map_overlays(draw: Any, context: MapRenderContext) -> None:

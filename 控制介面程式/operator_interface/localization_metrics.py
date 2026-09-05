@@ -83,6 +83,14 @@ RESULT_FIELDS = (
     "feature_ms",
     "match_ms",
     "pnp_ms",
+    # Stage breakdown inside the tracker. core_wall_ms minus total_ms is the
+    # adapter plus the accept/miss tail; total_ms minus the named stages is
+    # what is left inside localize().
+    "total_ms",
+    "stage_gray_ms",
+    "stage_bridge_ms",
+    "stage_query_ms",
+    "stage_select_ms",
     "pnp_candidates",
     "pnp_skipped",
     "pnp_workers",
@@ -152,6 +160,34 @@ RESULT_FIELDS = (
     "edm_cache_hits",
     "edm_cache_misses",
     "edm_cache_evictions",
+    # IMU-aided localization. The fused sample below is the one that actually
+    # rode with this frame's request, so localization.jsonl pairs each image
+    # with its telemetry on one clock instead of leaving the pairing to an
+    # offline guess. pose_status / prediction_* / esekf_* say what the tracker
+    # then did with it -- whether the filter armed at all, and whether it
+    # accepted the visual update.
+    "pose_status",
+    "prediction_valid",
+    "prediction_mode",
+    "prediction_source",
+    "esekf_pos_trace",
+    "esekf_d2",
+    "esekf_update_accepted",
+    "esekf_update_exceptions",
+    "fused_telemetry_mono",
+    "fused_roll",
+    "fused_pitch",
+    "fused_yaw",
+    "fused_speed_north",
+    "fused_speed_east",
+    "fused_speed_down",
+    "fused_gps_mono",
+    "fused_gps_latitude",
+    "fused_gps_longitude",
+    "fused_gps_altitude",
+    "fused_gps_latitude_accuracy",
+    "fused_gps_longitude_accuracy",
+    "fused_gps_altitude_accuracy",
 )
 
 

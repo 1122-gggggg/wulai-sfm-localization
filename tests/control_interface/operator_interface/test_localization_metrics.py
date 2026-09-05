@@ -242,3 +242,50 @@ def test_edm_cache_metric_fields_are_fail_closed() -> None:
     }
     assert edm_cache_metric_fields({"hits": -1, "misses": "x"}) == {}
     assert edm_cache_metric_fields(None) == {}
+
+
+def test_stage_breakdown_reaches_the_session_log() -> None:
+    # vpr/match/pnp accounted for only ~73% of the worker's core_wall (26.30 ms
+    # p50 against 19.09 ms of instrumented stages over 1676 frames), so the
+    # remaining quarter was invisible to every replay gate. The stage fields
+    # close that, and a field the worker sets but RESULT_FIELDS drops is silent
+    # -- exactly how the fused telemetry stayed unlogged.
+    stages = {
+        "total_ms": 25.9,
+        "stage_gray_ms": 0.9,
+        "stage_bridge_ms": 0.02,
+        "stage_query_ms": 5.1,
+        "stage_select_ms": 0.4,
+    }
+    assert set(stages) <= set(RESULT_FIELDS)
+
+    record = build_localization_metric_record(
+        {
+            "success": True,
+            "wall_ms": 26.3,
+            "core_wall_ms": 26.3,
+            "vpr_ms": 0.0,
+            "match_ms": 17.0,
+            "pnp_ms": 2.1,
+            **stages,
+        },
+        metric_mono_ns=1_000_000_000,
+        loc_fps=8.0,
+        submit_ok=1,
+        submit_skip_busy=0,
+        submit_busy_attempts=0,
+    )
+    for key, value in stages.items():
+        assert record[key] == value
+
+    # The point of the set is that it closes: named stages must not exceed the
+    # tracker total, and the tracker total must not exceed the worker's span.
+    named = (
+        record["stage_gray_ms"]
+        + record["stage_bridge_ms"]
+        + record["stage_query_ms"]
+        + record["stage_select_ms"]
+        + record["match_ms"]
+        + record["pnp_ms"]
+    )
+    assert named <= record["total_ms"] <= record["core_wall_ms"]

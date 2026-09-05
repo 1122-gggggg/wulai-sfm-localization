@@ -27,7 +27,12 @@ _CONTROL_ROOT = Path(__file__).resolve().parents[1]
 if str(_CONTROL_ROOT) not in sys.path:
     sys.path.insert(0, str(_CONTROL_ROOT))
 
-from site_profile import QueryCamera, SiteProfile, load_site_profile
+from site_profile import (
+    ROUTE_EDITOR_AUTO_APPROVAL_NOTE,
+    QueryCamera,
+    SiteProfile,
+    load_site_profile,
+)
 
 
 _REQUIRED_ASSETS = (
@@ -1152,7 +1157,7 @@ class _LocalSupplementProvider:
                 flight["approved"] = bool(approve_for_auto)
                 flight["route_clearance_approved"] = bool(approve_for_auto)
                 flight["approval_note"] = (
-                    "In-app operator route editor approval for AUTO."
+                    ROUTE_EDITOR_AUTO_APPROVAL_NOTE
                     if approve_for_auto
                     else "Imported asset changed; flight re-approval required."
                 )
