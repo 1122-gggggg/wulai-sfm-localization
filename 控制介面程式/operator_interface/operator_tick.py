@@ -656,9 +656,13 @@ def _publish_live_result_state(app: Any, result: dict) -> None:
     if now - app._last_status_write < 0.2:
         return
     app._last_status_write = now
+    # result is a typed LocalizationResult on the live path (dict only in tests
+    # and replay), and a frozen dataclass is not JSON serialisable -- every live
+    # session logged diagnostic_write_failed and wrote no status file at all.
+    payload = result.to_payload() if hasattr(result, "to_payload") else result
     try:
         LIVE_STATUS_PATH.write_text(
-            json.dumps(result, ensure_ascii=False), encoding="utf-8"
+            json.dumps(payload, ensure_ascii=False, default=str), encoding="utf-8"
         )
     except Exception as exc:
         app._record_diagnostic_failure(LIVE_STATUS_PATH, exc)

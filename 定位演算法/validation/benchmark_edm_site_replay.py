@@ -261,6 +261,29 @@ CONSUMED_WORKER_METRIC_KEYS = (
     "async_anchor_rejects",
     "async_inline_runs",
 )
+#: Prediction / KLT-shadow diagnostics. Carried through both row builders so a
+#: LOST-prediction run can be scored without a second replay: pose_status and
+#: prediction_state say which frames predicted and from which tracker state,
+#: and the klt_shadow_* fields carry the prediction made for a frame EDM also
+#: solved, which is the only place a ground truth exists to measure against.
+PREDICTION_DIAGNOSTIC_KEYS = (
+    "pose_status",
+    "prediction_mode",
+    "prediction_source",
+    "prediction_state",
+    "predicted_center",
+    "klt_age",
+    "klt_tracked",
+    "klt_inliers",
+    "klt_shadow_alive",
+    "klt_shadow_age",
+    "klt_shadow_horizon_s",
+    "klt_shadow_center",
+    "klt_shadow_error",
+    "klt_shadow_inliers",
+    "klt_shadow_tracked",
+    "klt_shadow_reproj_rms",
+)
 
 
 def _arg(args, name: str, default=None):
@@ -1060,7 +1083,7 @@ def _row_from_worker_payload(payload: dict, identities: dict) -> dict:
         "gpu_span_ms": payload.get("gpu_span_ms"),
         "pose": pose,
     }
-    for key in CONSUMED_WORKER_METRIC_KEYS:
+    for key in (*CONSUMED_WORKER_METRIC_KEYS, *PREDICTION_DIAGNOSTIC_KEYS):
         if payload.get(key) is not None:
             row[key] = payload.get(key)
     return row
@@ -1950,6 +1973,9 @@ def _process_replay_frame(
         "coalesce_drops": 0,
         "submit_drop": 0,
     }
+    for key in PREDICTION_DIAGNOSTIC_KEYS:
+        if info.get(key) is not None:
+            row[key] = info.get(key)
     return row, next_center, step
 
 

@@ -289,3 +289,46 @@ def test_stage_breakdown_reaches_the_session_log() -> None:
         + record["pnp_ms"]
     )
     assert named <= record["total_ms"] <= record["core_wall_ms"]
+
+
+def test_live_status_is_written_for_a_typed_result(tmp_path, monkeypatch) -> None:
+    """A frozen LocalizationResult is not JSON serialisable.
+
+    Every live session logged diagnostic_write_failed with
+    "Object of type LocalizationResult is not JSON serializable" and wrote no
+    status file at all, because the live path hands _publish_live_result_state
+    the typed result while only tests pass a dict.
+    """
+    import json as _json
+
+    import operator_tick
+
+    status = tmp_path / "live_status.json"
+    monkeypatch.setattr(operator_tick, "LIVE_STATUS_PATH", status)
+
+    class _Typed:
+        def __init__(self) -> None:
+            self._payload = {"frame_name": "f.jpg", "success": True, "inliers": 42}
+
+        def get(self, key, default=None):
+            return self._payload.get(key, default)
+
+        def to_payload(self):
+            return dict(self._payload)
+
+    failures: list = []
+
+    class _App:
+        live_result = None
+        live_result_frame_name = ""
+        _last_status_write = -1e9
+
+        def _apply_lost_hold_result(self, _r): ...
+        def update_localization_metrics(self, _r): ...
+        def _record_diagnostic_failure(self, path, exc):
+            failures.append((path, exc))
+
+    operator_tick._publish_live_result_state(_App(), _Typed())
+
+    assert failures == []
+    assert _json.loads(status.read_text(encoding="utf-8"))["inliers"] == 42

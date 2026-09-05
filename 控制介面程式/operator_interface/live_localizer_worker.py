@@ -1187,6 +1187,19 @@ def _build_success_payload(
         "prediction_valid": bool(info.get("prediction_valid", False)),
         "prediction_mode": info.get("prediction_mode"),
         "prediction_source": info.get("prediction_source"),
+        # Which tracker state produced the prediction. LOST only appears when
+        # SFM_EDM_KLT_LOST_PREDICT is on, so this is what separates the opt-in
+        # LOST predictions from the TRACK/WEAK ones that always existed.
+        "prediction_state": info.get("prediction_state"),
+        "klt_age": info.get("klt_age"),
+        "klt_shadow_alive": info.get("klt_shadow_alive"),
+        "klt_shadow_age": info.get("klt_shadow_age"),
+        "klt_shadow_horizon_s": info.get("klt_shadow_horizon_s"),
+        "klt_shadow_center": info.get("klt_shadow_center"),
+        "klt_shadow_error": info.get("klt_shadow_error"),
+        "klt_shadow_inliers": info.get("klt_shadow_inliers"),
+        "klt_shadow_tracked": info.get("klt_shadow_tracked"),
+        "klt_shadow_reproj_rms": info.get("klt_shadow_reproj_rms"),
         "esekf_pos_trace": info.get("esekf_pos_trace"),
         "esekf_d2": info.get("esekf_d2"),
         "esekf_update_accepted": info.get("esekf_update_accepted"),

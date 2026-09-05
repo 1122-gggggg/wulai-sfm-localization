@@ -80,6 +80,26 @@ def _env_bool(name: str, default: bool) -> bool:
     return str(raw).strip().lower() not in ("0", "false", "no", "off")
 
 
+#: KLT / prediction diagnostics forwarded verbatim when the tracker sets them.
+#: last_info is an explicit whitelist, so anything not named here is dropped
+#: before the benchmark or the live session ever sees it. These are opt-in
+#: (SFM_EDM_KLT_LOST_PREDICT / SFM_EDM_KLT_SHADOW_EVAL) and absent otherwise.
+_KLT_DIAGNOSTIC_KEYS = (
+    "prediction_state",
+    "klt_age",
+    "klt_tracked",
+    "klt_inliers",
+    "klt_shadow_alive",
+    "klt_shadow_age",
+    "klt_shadow_horizon_s",
+    "klt_shadow_center",
+    "klt_shadow_error",
+    "klt_shadow_inliers",
+    "klt_shadow_tracked",
+    "klt_shadow_reproj_rms",
+)
+
+
 @dataclass
 class RuntimeState:
     """Field-for-field the XFeat tracker's RuntimeState: the worker seeds these directly
@@ -310,6 +330,9 @@ class EDMTrackerAdapter(Localizer):
             "esekf_update_exceptions": info.get("esekf_update_exceptions"),
             "prediction_source": info.get("prediction_source"),
         }
+        for key in _KLT_DIAGNOSTIC_KEYS:
+            if info.get(key) is not None:
+                self._last_info[key] = info.get(key)
         return pose
 
     def get_pose(self) -> Pose | None:

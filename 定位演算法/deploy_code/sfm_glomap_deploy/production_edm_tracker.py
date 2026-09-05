@@ -1141,6 +1141,44 @@ class ProductionEDMTracker:
             )
         except ValueError:
             self._klt_fb_px = float(_KLT_FB_PX)
+        # LOST-side prediction. Both prediction branches (ESEKF and KLT) are
+        # gated to TRACK/WEAK_TRACK, so a LOST frame currently reports no pose
+        # at all. Opting in lets the KLT chain keep re-solving PnP against its
+        # fixed 3D anchor set while LOST, which is reporting only: the frame
+        # still carries ok=False / pose_status=PREDICTED_ONLY and never becomes
+        # a visual anchor. Measured coverage is the reason this is off by
+        # default -- see docs/klt_lost_prediction_experiment.md.
+        self._klt_lost_predict: bool = (
+            os.environ.get("SFM_EDM_KLT_LOST_PREDICT", "0") == "1"
+        )
+        # Horizon of the KLT chain. The defaults (6 frames / 0.50 s) predate the
+        # LOST question and cover only ~4.5% of corpus LOST frames at the
+        # measured 8 Hz cadence; they are overridable so the horizon can be
+        # swept against drift rather than assumed.
+        try:
+            self._klt_max_frames: int = int(
+                os.environ.get("SFM_EDM_KLT_MAX_FRAMES", str(_KLT_MAX_FRAMES))
+                or _KLT_MAX_FRAMES
+            )
+        except ValueError:
+            self._klt_max_frames = int(_KLT_MAX_FRAMES)
+        try:
+            self._klt_max_age_s: float = float(
+                os.environ.get("SFM_EDM_KLT_MAX_AGE_S", str(_KLT_MAX_AGE_S))
+                or _KLT_MAX_AGE_S
+            )
+        except ValueError:
+            self._klt_max_age_s = float(_KLT_MAX_AGE_S)
+        # Shadow evaluation: run the KLT chain on every frame purely to record
+        # what it would have predicted, then restore the production cache byte
+        # for byte. Used by benchmark_klt_lost_prediction.py to score the
+        # prediction against the EDM fix on the same frame -- the only frames
+        # where a ground truth exists. Never enabled in flight.
+        self._klt_shadow_eval: bool = (
+            os.environ.get("SFM_EDM_KLT_SHADOW_EVAL", "0") == "1"
+        )
+        self._shadow_klt: dict | None = None
+        self._shadow_klt_anchor_frames: int = 0
         self._klt_bridge_run: int = 0
         self._pcam: pycolmap.Camera | None = None
         self._pnp_options: pycolmap.AbsolutePoseEstimationOptions | None = None
@@ -1423,7 +1461,10 @@ class ProductionEDMTracker:
         if getattr(self, "st", None) is None:
             return False
         state = getattr(self.st, "state", None)
-        if state not in {"TRACK", "WEAK_TRACK"}:
+        allowed_states = {"TRACK", "WEAK_TRACK"}
+        if getattr(self, "_klt_lost_predict", False) or getattr(self, "_klt_shadow_eval", False):
+            allowed_states = allowed_states | {"LOST"}
+        if state not in allowed_states:
             return False
         klt_2d = getattr(self, "_klt_2d", None)
         klt_3d = getattr(self, "_klt_3d", None)
@@ -1432,7 +1473,7 @@ class ProductionEDMTracker:
             return False
         klt_age = getattr(self, "_klt_age", 0)
         try:
-            if int(klt_age) >= int(_KLT_MAX_FRAMES):
+            if int(klt_age) >= int(getattr(self, "_klt_max_frames", _KLT_MAX_FRAMES)):
                 return False
         except Exception:
             return False
@@ -1445,7 +1486,9 @@ class ProductionEDMTracker:
             dt = float(capture_stamp) - float(seed_stamp)  # type: ignore[arg-type]
         except Exception:
             return False
-        if not math.isfinite(dt) or dt < 0.0 or dt > float(_KLT_MAX_AGE_S):
+        if not math.isfinite(dt) or dt < 0.0 or dt > float(
+            getattr(self, "_klt_max_age_s", _KLT_MAX_AGE_S)
+        ):
             return False
         return True
 
@@ -3182,6 +3225,95 @@ class ProductionEDMTracker:
         except Exception:
             self._clear_klt_cache()
             return False
+    _SHADOW_KLT_FIELDS = (
+        "_klt_2d",
+        "_klt_3d",
+        "_klt_gray",
+        "_klt_seed_stamp",
+        "_klt_age",
+        "_klt_center",
+        "_klt_yaw",
+    )
+
+    def _klt_shadow_step(
+        self,
+        gray: np.ndarray,
+        capture_stamp: float,
+        accepted_center: np.ndarray | None,
+        info: dict,
+    ) -> None:
+        """Score what the KLT chain would have predicted for a frame EDM solved.
+
+        Runs on accepted frames only, which is the whole point: those are the
+        only frames carrying a visual fix to measure the prediction against.
+        The chain is deliberately NOT re-seeded here, so it ages exactly as it
+        would through a long LOST episode while EDM keeps supplying truth.
+        The production cache is swapped out and restored, so enabling this
+        cannot change tracking.
+        """
+        saved = {name: getattr(self, name, None) for name in self._SHADOW_KLT_FIELDS}
+        try:
+            shadow = self._shadow_klt
+            if shadow is None:
+                return
+            for name in self._SHADOW_KLT_FIELDS:
+                setattr(self, name, shadow.get(name))
+            prior = self._track_klt_prior(gray, capture_stamp)
+            self._shadow_klt = (
+                None
+                if prior is None
+                else {name: getattr(self, name, None) for name in self._SHADOW_KLT_FIELDS}
+            )
+            if prior is None:
+                info["klt_shadow_alive"] = False
+                return
+            self._shadow_klt_anchor_frames += 1
+            predicted = np.asarray(prior["center"], dtype=float)
+            info["klt_shadow_alive"] = True
+            info["klt_shadow_age"] = int(getattr(self, "_klt_age", 0))
+            info["klt_shadow_horizon_s"] = float(
+                capture_stamp - float(shadow.get("_klt_seed_stamp") or capture_stamp)
+            )
+            info["klt_shadow_center"] = predicted.tolist()
+            info["klt_shadow_inliers"] = int(prior.get("inliers") or 0)
+            info["klt_shadow_tracked"] = int(prior.get("tracked") or 0)
+            info["klt_shadow_reproj_rms"] = float(prior.get("reproj_rms") or float("nan"))
+            if accepted_center is not None:
+                truth = np.asarray(accepted_center, dtype=float).reshape(3)
+                if np.all(np.isfinite(truth)) and np.all(np.isfinite(predicted)):
+                    info["klt_shadow_error"] = float(np.linalg.norm(predicted - truth))
+        except Exception:
+            self._shadow_klt = None
+        finally:
+            for name, value in saved.items():
+                setattr(self, name, value)
+
+    def _klt_shadow_reseed(
+        self,
+        gray: np.ndarray,
+        points2d: np.ndarray,
+        points3d: np.ndarray,
+        inlier_mask: np.ndarray,
+        capture_stamp: float,
+    ) -> None:
+        """Restart the shadow chain from this accepted frame once it has died."""
+        if self._shadow_klt is not None:
+            return
+        saved = {name: getattr(self, name, None) for name in self._SHADOW_KLT_FIELDS}
+        try:
+            if self._seed_klt_from_inliers(
+                gray, points2d, points3d, inlier_mask, capture_stamp
+            ):
+                self._shadow_klt = {
+                    name: getattr(self, name, None) for name in self._SHADOW_KLT_FIELDS
+                }
+                self._shadow_klt_anchor_frames = 0
+        except Exception:
+            self._shadow_klt = None
+        finally:
+            for name, value in saved.items():
+                setattr(self, name, value)
+
     @staticmethod
     def _pose_to_quaternion(R: np.ndarray) -> np.ndarray:
         """Rotation matrix 3x3 -> wxyz quaternion normalized (robust trace method)."""
@@ -3925,6 +4057,18 @@ class ProductionEDMTracker:
                 ),
                 dtype=bool,
             )
+            if self._klt_shadow_eval:
+                # Score first, then re-seed: the shadow must see this frame with
+                # the age it carried in, not reset to zero by the production
+                # anchor that is about to be laid down.
+                self._klt_shadow_step(gray, capture_stamp, center, info)
+                self._klt_shadow_reseed(
+                    gray,
+                    attempt.points2d,
+                    attempt.points3d,
+                    inlier_mask_for_klt,
+                    capture_stamp,
+                )
             self._seed_klt_from_inliers(
                 gray, attempt.points2d, attempt.points3d, inlier_mask_for_klt, capture_stamp
             )
@@ -4648,7 +4792,14 @@ class ProductionEDMTracker:
                             esekf_done = True
         except Exception:
             esekf_done = False
-        if not esekf_done and getattr(self, "st", None) is not None and getattr(self.st, "state", None) != "LOST":
+        klt_predict_states_ok = (
+            getattr(self, "st", None) is not None
+            and (
+                getattr(self.st, "state", None) != "LOST"
+                or getattr(self, "_klt_lost_predict", False)
+            )
+        )
+        if not esekf_done and klt_predict_states_ok:
             try:
                 prior = self._track_klt_prior(
                     getattr(self, "_klt_query_gray", None),
@@ -4671,6 +4822,8 @@ class ProductionEDMTracker:
                     info["predicted_yaw"] = float(yaw) if yaw is not None else None
                     info["klt_tracked"] = int(tracked) if tracked is not None else None
                     info["klt_inliers"] = int(inliers) if inliers is not None else None
+                    info["prediction_state"] = str(getattr(self.st, "state", ""))
+                    info["klt_age"] = int(getattr(self, "_klt_age", 0))
                 except Exception:
                     pass
 
