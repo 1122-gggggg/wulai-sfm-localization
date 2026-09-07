@@ -175,7 +175,7 @@ def test_edm_retrieval_can_rank_only_nearby_candidates() -> None:
         reloc_map,
         SimpleNamespace(width=1280, height=720),
         matcher=object(),
-        megaloc=megaloc,
+        vpr=megaloc,
     )
 
     refs = localizer.retrieve(
@@ -257,7 +257,7 @@ def test_edm_megaloc_tensorrt_keeps_fp32_output(monkeypatch) -> None:
     np.testing.assert_allclose(descriptor, np.array([0.6, 0.8], dtype=np.float32))
 
 
-def test_edm_localizer_keeps_configured_megaloc_lazy() -> None:
+def test_edm_localizer_keeps_configured_vpr_lazy() -> None:
     created = []
     sentinel = object()
     reloc_map = edm_localizer_module.EDMRelocMap(
@@ -272,12 +272,12 @@ def test_edm_localizer_keeps_configured_megaloc_lazy() -> None:
         reloc_map,
         camera,
         matcher=object(),
-        megaloc_factory=lambda: created.append(True) or sentinel,
+        vpr_factory=lambda: created.append(True) or sentinel,
     )
 
     assert created == []
-    assert localizer.megaloc is sentinel
-    assert localizer.megaloc is sentinel
+    assert localizer.vpr is sentinel
+    assert localizer.vpr is sentinel
     assert created == [True]
 
 
@@ -399,10 +399,15 @@ def test_lost_megaloc_progresses_through_local_rings_before_global(
 
     retrieved = []
     tracker._track_candidates = track_candidates
+    def retrieve(_rgb, _k, candidates=None):
+        retrieved.append(candidates)
+        return ["global"] if candidates is None else candidates[:1]
+
     tracker.loc = SimpleNamespace(
-        retrieve=lambda _rgb, _k, candidates=None: (
-            retrieved.append(candidates) or (["global"] if candidates is None else candidates[:1])
-        )
+        retrieve=retrieve,
+        retrieve_scored=lambda _rgb, k, candidates=None, descriptor=None: [
+            (name, 0.9) for name in retrieve(_rgb, k, candidates)
+        ],
     )
 
     stages = []
@@ -767,7 +772,7 @@ def test_edm_retrieval_keeps_similarity_and_topk_on_the_tensor_device() -> None:
         reloc_map,
         SimpleNamespace(width=1280, height=720),
         matcher=object(),
-        megaloc=megaloc,
+        vpr=megaloc,
     )
 
     scored = localizer.retrieve_scored(
@@ -1525,6 +1530,9 @@ def test_boot_staging_always_evaluates_the_complete_retrieved_set(
 
         def retrieve(self, _rgb, _topk):
             return names
+
+        def retrieve_scored(self, _rgb, _topk, **_kwargs):
+            return [(name, 0.9) for name in names]
 
         def correspondences_by_ref(self, _gray, refs, **_kwargs):
             calls.append(list(refs))
@@ -2411,6 +2419,9 @@ def test_acquire_stage_early_stops_only_after_consensus_and_gates(
         def retrieve(self, _rgb, _topk):
             return names
 
+        def retrieve_scored(self, _rgb, _topk, **_kwargs):
+            return [(name, 0.9) for name in names]
+
         def correspondences_by_ref(self, _gray, refs, **_kwargs):
             calls.append(list(refs))
             return [
@@ -2494,6 +2505,9 @@ def test_acquire_stage_falls_back_to_full_set_when_quality_fails(
 
         def retrieve(self, _rgb, _topk):
             return names
+
+        def retrieve_scored(self, _rgb, _topk, **_kwargs):
+            return [(name, 0.9) for name in names]
 
         def correspondences_by_ref(self, _gray, refs, **_kwargs):
             calls.append(list(refs))
@@ -2667,6 +2681,9 @@ def test_acquire_stage_single_strong_skips_stages_and_obeys_env(monkeypatch) -> 
         def retrieve(self, _rgb, _topk):
             return names
 
+        def retrieve_scored(self, _rgb, _topk, **_kwargs):
+            return [(name, 0.9) for name in names]
+
         def correspondences_by_ref(self, _gray, refs, **_kwargs):
             calls.append(list(refs))
             rows = []
@@ -2745,8 +2762,15 @@ def test_full_global_lost_prior_does_not_restrict_megaloc(monkeypatch) -> None:
     tracker = object.__new__(ProductionEDMTracker)
     tracker.cfg = EDMConfig(lost_prior_strategy="full_global")
     tracker.st = RuntimeState(state="LOST", last_capture_stamp=1.0)
+    def retrieve(_rgb, _k, candidates=None):
+        calls.append(candidates)
+        return ["ref"]
+
     tracker.loc = SimpleNamespace(
-        retrieve=lambda _rgb, _k, candidates=None: calls.append(candidates) or ["ref"]
+        retrieve=retrieve,
+        retrieve_scored=lambda _rgb, k, candidates=None, descriptor=None: [
+            (name, 0.9) for name in retrieve(_rgb, k, candidates)
+        ],
     )
     tracker._track_candidates = lambda *_args, **_kwargs: ["near"]
 
@@ -2777,7 +2801,7 @@ def test_score_fusion_lost_prior_ranks_geometry_with_vpr(monkeypatch) -> None:
     tracker._predict_center = lambda _stamp=None: tracker.st.center
     tracker._track_candidates = lambda *_args, **_kwargs: ["near"]
     tracker.loc = SimpleNamespace(
-        megaloc=SimpleNamespace(extract_one=lambda _rgb: np.ones(2, np.float32)),
+        vpr=SimpleNamespace(extract_one=lambda _rgb: np.ones(2, np.float32)),
         retrieve_scored=lambda _rgb, _k, candidates=None, descriptor=None: [
             ("far", 0.95),
             ("near", 0.70),
@@ -3768,7 +3792,12 @@ def test_starved_retrieval_ranks_the_whole_map_instead_of_the_nearby_pool() -> N
         retrieve_calls.append((topk, candidates))
         return ["g0", "g1"]
 
-    tracker.loc = SimpleNamespace(retrieve=retrieve)
+    tracker.loc = SimpleNamespace(
+        retrieve=retrieve,
+        retrieve_scored=lambda _rgb, topk, candidates=None, descriptor=None: [
+            (name, 0.9) for name in retrieve(_rgb, topk, candidates)
+        ],
+    )
     refs, _vpr_ms, nearby = tracker._global_retrieval(
         np.zeros((8, 8, 3), np.uint8), 2.0, force_global=True
     )

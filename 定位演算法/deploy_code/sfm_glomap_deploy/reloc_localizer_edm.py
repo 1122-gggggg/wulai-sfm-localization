@@ -881,13 +881,13 @@ class EDMLocalizer:
         reloc_map: EDMRelocMap,
         camera: Camera,
         matcher: EDMMatcher | None = None,
-        megaloc: MegaLocQuery | None = None,
+        vpr: MegaLocQuery | None = None,
         topk: int = 5,
         min_conf: float = 0.2,
         pnp_max_error: float = 5.0,
         min_inliers: int = 50,
         reference_index: ReferenceIndex | None = None,
-        megaloc_factory=None,
+        vpr_factory=None,
     ):
         self.map = reloc_map
         self._ref_index_by_name = {name: index for index, name in enumerate(reloc_map.ref_names)}
@@ -895,8 +895,8 @@ class EDMLocalizer:
         self.matcher = matcher or EDMMatcher(
             mconf_thr=min_conf, runtime_sigma_mode="reference_grid"
         )
-        self._megaloc = megaloc
-        self._megaloc_factory = megaloc_factory
+        self._vpr = vpr
+        self._vpr_factory = vpr_factory
         self.topk = topk
         self.min_inliers = min_inliers
         self.pnp_max_error = pnp_max_error
@@ -962,12 +962,12 @@ class EDMLocalizer:
         return out
 
     @property
-    def megaloc(self) -> MegaLocQuery:
-        if self._megaloc is None:
-            self._megaloc = (
-                self._megaloc_factory() if self._megaloc_factory is not None else MegaLocQuery()
+    def vpr(self) -> MegaLocQuery:
+        if self._vpr is None:
+            self._vpr = (
+                self._vpr_factory() if self._vpr_factory is not None else MegaLocQuery()
             )
-        return self._megaloc
+        return self._vpr
 
     def retrieve_scored(
         self,
@@ -977,15 +977,15 @@ class EDMLocalizer:
         candidates: list[str] | None = None,
         descriptor: np.ndarray | None = None,
     ) -> list[tuple[str, float]]:
-        extract_tensor = getattr(self.megaloc, "extract_one_tensor", None)
+        extract_tensor = getattr(self.vpr, "extract_one_tensor", None)
         if self.reference_index is None and callable(extract_tensor):
             d_tensor = (
                 extract_tensor(frame_rgb)
                 if descriptor is None
-                else torch.as_tensor(descriptor, device=self.megaloc.device)
+                else torch.as_tensor(descriptor, device=self.vpr.device)
             )
             return self._retrieve_scored_device(d_tensor, k, exclude, candidates)
-        d = self.megaloc.extract_one(frame_rgb) if descriptor is None else descriptor
+        d = self.vpr.extract_one(frame_rgb) if descriptor is None else descriptor
         if torch.is_tensor(d):
             d = d.detach().cpu().numpy()
         if candidates is not None:

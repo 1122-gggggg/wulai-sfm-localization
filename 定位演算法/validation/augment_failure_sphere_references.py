@@ -399,7 +399,7 @@ def register_candidates(args: argparse.Namespace) -> None:
         reloc_map,
         camera,
         matcher=matcher,
-        megaloc=MegaLocQuery(),
+        vpr=MegaLocQuery(),
         pnp_max_error=float(tracker_cfg["pnp_ransac_max_error"]),
     )
     pcam = pycolmap.Camera(
@@ -587,7 +587,7 @@ def _attempt_registration(
         }
 
     descriptor = np.asarray(
-        localizer.megaloc.extract_one(
+        localizer.vpr.extract_one(
             cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
         ),
         dtype=np.float32,

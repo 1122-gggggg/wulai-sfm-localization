@@ -148,12 +148,6 @@ def _replay_args(a: argparse.Namespace) -> SimpleNamespace:
         pnp_random_seed=int(a.pnp_random_seed),
         require_cuda=bool(a.require_cuda),
         quality_baseline=None,
-        megaloc_backend=a.megaloc_backend,
-        megaloc_engine=None,
-        megaloc_engine_sha256=None,
-        megaloc_token_reduction="none",  # noqa: S106 - ViT token pruning, not a credential
-        megaloc_token_keep_ratio=1.0,
-        megaloc_token_layer=6,
         sigma_mode="fused",
         runtime_sigma_mode=None,
         temporal_feature_cache_size=None,
@@ -467,9 +461,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--pnp-random-seed", type=int, default=0)
     p.add_argument("--require-cuda", action="store_true", default=True)
     p.add_argument("--no-require-cuda", dest="require_cuda", action="store_false")
-    p.add_argument(
-        "--megaloc-backend", default="tensorrt", choices=("pytorch", "pytorch_fp16", "tensorrt")
-    )
     p.add_argument(
         "--telemetry-offset-s",
         type=float,

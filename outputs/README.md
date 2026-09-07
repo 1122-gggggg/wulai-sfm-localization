@@ -16,6 +16,8 @@
 | `corpus_20260905/` | **七段 720p 語料庫**：`baseline`（async 舊預設）、`sync`（現行預設）、`async_bounded`、`sync_relaxed66`、`p116_matrix`。數值結論在總帳「2026-09-05 全影片 720p 語料庫」 |
 | `augment_20260905/` | 失敗球 reference 補強實驗（**NOT GO**）：候選、單幀 smoke、七段語料庫對照。機制與數值見總帳「2026-09-05 失敗球 reference 補強」 |
 | `baseline_recheck_20260905/` | 上述實驗的 P168 4K seq700 對照基準 |
+| `klt_lost_20260905/` | KLT LOST 預測實驗（見 `docs/klt_lost_prediction_experiment.md`） |
+| `veto_gates_20260906/` | 隨機化配對閘門證據（`定位演算法/validation/randomized_ab_gate.py`）。否決器：`gate_r3c_report.json`（R3 軌跡 21/21 PASS）、`gate_p3_report.json`（P3 重力 21/21 PASS）、`gate_both_report.json`（雙旗標＋另一組 seed）、`injection.json`（故障注入檢出率）、`gate_r3_firstversion_FAIL.json`（**保留反例**：距離語意版 P167 −35、河濱_P117 −30）。profile 旗標定讞：`gate_qgraph_report.json`（query CUDA graph）、`gate_tmf_report.json`（track_map_first）、`gate_asm_report.json`（acquire_stage_mode）、`gate_prb_report.json`（pnp_ranked_batches） |
 
 ## 已濃縮的實驗結論
 

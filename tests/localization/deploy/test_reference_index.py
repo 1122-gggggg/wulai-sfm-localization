@@ -295,7 +295,7 @@ def test_edm_retrieval_uses_index_and_honors_exclusions(tmp_path: Path) -> None:
         ),
         Camera("PINHOLE", 1280, 720, [1000.0, 1000.0, 640.0, 360.0]),
         matcher=object(),
-        megaloc=SimpleNamespace(extract_one=lambda _frame: descriptors[0]),
+        vpr=SimpleNamespace(extract_one=lambda _frame: descriptors[0]),
         reference_index=index,
     )
 

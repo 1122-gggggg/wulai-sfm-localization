@@ -550,34 +550,66 @@ def _video_dirty_key(app: Any, state: Any, *, width: int, height: int) -> tuple:
     )
 
 
-def _render_if_dirty(app: Any, state: Any) -> None:
+def _render_if_dirty(app: Any, state: Any, *, profile: Any = None) -> None:
+    detail = None if profile is None else profile.detail
+    mark = time.perf_counter if detail is not None else None
     width_map = max(300, app.map_label.winfo_width())
     height_map = max(220, app.map_label.winfo_height())
     width_video = max(300, app.video_label.winfo_width())
     height_video = max(220, app.video_label.winfo_height())
     # Map: re-render only when the view, flown history, drawn route or pose/quality
     # readouts changed. Between live fixes these are all static, so reuse the PhotoImage.
+    started = None if mark is None else mark()
     map_key = _map_dirty_key(
         app, state, width=width_map, height=height_map
     )
-    if map_key != app._map_dirty_key:
+    if detail is not None:
+        now = mark()
+        detail("render_if_dirty.map_key", (now - started) * 1000.0)
+        started = now
+    video_key = _video_dirty_key(
+        app, state, width=width_video, height=height_video
+    )
+    if detail is not None:
+        now = mark()
+        detail("render_if_dirty.video_key", (now - started) * 1000.0)
+        started = now
+    map_dirty = map_key != app._map_dirty_key
+    video_dirty = video_key != app._video_dirty_key
+    if map_dirty and video_dirty:
+        # Both panels dirty = the 44-64 ms worst case that ate the event loop
+        # (runbook 0b-1). One panel per tick caps the body near a single render
+        # so the 33 ms tick survives; the deferred panel stays dirty and paints
+        # next tick (<=1 tick / ~33 ms staleness either side).
+        turn = int(getattr(app, "_render_turn", 0) or 0)
+        app._render_turn = turn + 1
+        if turn % 2 == 0:
+            video_dirty = False
+        else:
+            map_dirty = False
+    if map_dirty:
         app._map_dirty_key = map_key
         app._present_frame(
             app.map_label, "map_photo", app.render_map(width_map, height_map, state)
         )
+        if detail is not None:
+            now = mark()
+            detail("render_if_dirty.map", (now - started) * 1000.0)
+            started = now
     # Video: re-render only when the source frame, panel size, the localization
     # alert banner inputs or the detection overlay changed. The expensive 720p resize
     # + PhotoImage is skipped on ticks where the same frame is shown again.
-    video_key = _video_dirty_key(
-        app, state, width=width_video, height=height_video
-    )
-    if video_key != app._video_dirty_key:
+    # HUD-only ticks reuse the cached resize (see _cached_video_frame) instead of
+    # paying cv2.resize again.
+    if video_dirty:
         app._video_dirty_key = video_key
         app._present_frame(
             app.video_label,
             "video_photo",
             app.render_video(width_video, height_video, state),
         )
+        if detail is not None:
+            detail("render_if_dirty.video", (mark() - started) * 1000.0)
 
 
 def _schedule_next_tick(app: Any, *, next_tick_deadline: NextTickDeadline) -> None:
@@ -616,13 +648,14 @@ class _TickProfile:
     produces it with no extra step.
     """
 
-    __slots__ = ("app", "_t", "_stage", "_marks")
+    __slots__ = ("app", "_t", "_stage", "_marks", "_details")
 
     def __init__(self, app: Any, stage: str) -> None:
         self.app = app
         self._t = time.perf_counter()
         self._stage = stage
         self._marks: list[tuple[str, float]] = []
+        self._details: list[tuple[str, float]] = []
 
     def next(self, stage: str) -> str:
         """Close the running stage and return the name of the next one.
@@ -636,6 +669,16 @@ class _TickProfile:
         self._stage = stage
         return stage
 
+    def detail(self, name: str, elapsed_ms: float) -> None:
+        """File a breakdown timing that runs *inside* one of the stages.
+
+        Details are recorded next to the stages but deliberately kept out of
+        ``_total``: they are components of their containing stage, so summing
+        them in would count the same milliseconds twice. Names are dotted
+        (``render_if_dirty.map``) to say which stage they decompose.
+        """
+        self._details.append((name, elapsed_ms))
+
     def finish(self) -> None:
         self.next(self._stage)
         samples = getattr(self.app, "_tick_profile_samples", None)
@@ -648,6 +691,10 @@ class _TickProfile:
             if len(bucket) < _TICK_PROFILE_MAX_SAMPLES:
                 bucket.append(elapsed)
             total += elapsed
+        for name, elapsed in self._details:
+            bucket = samples.setdefault(name, [])
+            if len(bucket) < _TICK_PROFILE_MAX_SAMPLES:
+                bucket.append(elapsed)
         bucket = samples.setdefault("_total", [])
         if len(bucket) < _TICK_PROFILE_MAX_SAMPLES:
             bucket.append(total)
@@ -1047,7 +1094,7 @@ def run_tick(
             stream_terminal_text=stream_terminal_text,
         )
         stage = profile.next("render_if_dirty")
-        _render_if_dirty(app, state)
+        _render_if_dirty(app, state, profile=profile)
         profile.finish()
     except Exception as exc:
         _handle_tick_failure(app, stage=stage, exc=exc)

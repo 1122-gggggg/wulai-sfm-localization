@@ -16,7 +16,7 @@ pycolmap==4.0.4
 # Olympe's wire schema is bound to this protobuf release.
 protobuf==3.19.4
 parrot-olympe[rendering]==8.4.0
-# Load-bearing for the package-local XFeat / LighterGlue / MegaLoc stack:
+# Load-bearing for the package-local XFeat / LighterGlue / BoQ stack:
 safetensors==0.8.0
 kornia==0.8.2
 # Direct imports of the bundled EDM production matcher.
@@ -26,7 +26,7 @@ loguru==0.7.3
 yacs==0.1.8
 scipy==1.15.3
 # System-level (not pip): ffmpeg, tkinter (python3-tk)
-# XFeat / LighterGlue / MegaLoc: package-local torch.hub repos in torch_hub_cache/
+# XFeat / LighterGlue / BoQ: package-local weights in torch_hub_cache/
 # Policy: scipy is hash-locked so SparseCloudCollisionMonitor is reproducibly
 # available for diagnostics.  The monitor remains a warning-only research aid;
 # it is not wired into autonomous safety and must never claim collision protection.

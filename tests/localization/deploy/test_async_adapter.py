@@ -147,7 +147,7 @@ def test_map_frame_heading_wins_over_fast_yaw() -> None:
 
 def test_observe_and_ensure_models_forward_to_slow_tracker() -> None:
     seen = {}
-    loc = SimpleNamespace(megaloc=object(),
+    loc = SimpleNamespace(vpr=object(),
                           matcher=SimpleNamespace(
                               warmup_fused_coarse=lambda: seen.setdefault("warm", True)))
     trk = SimpleNamespace(loc=loc,

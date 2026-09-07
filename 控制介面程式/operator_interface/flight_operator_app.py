@@ -1983,6 +1983,15 @@ class OperatorApp(tk.Tk):
         self._video_dirty_key = (
             None  # skip video re-render+PhotoImage when the frame/overlays are unchanged
         )
+        # Interleave state for _render_if_dirty: when both panels are dirty only
+        # one paints per tick (alternating), capping the worst-case tick body.
+        self._render_turn = 0
+        # Resized-frame cache: HUD-only ticks (battery/age/diagnostic text move
+        # every tick) must not repay the 720p cv2.resize. Keyed by frame stamp +
+        # panel size + source shape/identity; the cached PIL frame is only ever
+        # pasted from, never drawn into, so sharing it is safe.
+        self._video_resized_cache_key = None
+        self._video_resized_cache = None
         # Point-cloud base rebuild costs ~16 ms at 250k points (depth argsort +
         # scatter). During a drag that runs on every mouse motion, so drop to a
         # decimated cloud while the operator is moving the view and restore full
@@ -5457,6 +5466,9 @@ class OperatorApp(tk.Tk):
         self.map_base_cache_key = None
         self.map_base_cache = None
         self._map_dirty_key = None
+        self._render_turn = 0
+        self._video_resized_cache_key = None
+        self._video_resized_cache = None
         self.history.clear()
         self.history_health.clear()
         self.no_loc_markers.clear()
@@ -7360,13 +7372,49 @@ class OperatorApp(tk.Tk):
             f"三軸速度 {velocity}" if separator else "三軸速度 -",
         )
 
+    def _cached_video_frame(self, width: int, height: int):
+        """Return the panel-fitted video frame, reusing the last resize.
+
+        HUD-only ticks change battery/age/diagnostic text every tick while the
+        source frame is identical; without this each of them repays the 720p
+        cv2/PIL resize. The cached image is only pasted from, never drawn
+        into, so callers may use it directly.
+        """
+        source = self.video_frame
+        if source is None:
+            return None, 1.0
+        try:
+            if isinstance(source, np.ndarray):
+                shape = (int(source.shape[0]), int(source.shape[1]))
+            elif isinstance(source, Image.Image):
+                shape = (int(source.height), int(source.width))
+            else:
+                shape = None
+        except Exception:
+            shape = None
+        if shape is None:
+            return prepare_video_frame(source, width, height)
+        key = (
+            round(float(getattr(self, "_video_frame_stamp", 0.0) or 0.0), 4),
+            int(width),
+            int(height),
+            shape,
+            id(source),
+        )
+        if self._video_resized_cache_key == key and self._video_resized_cache is not None:
+            return self._video_resized_cache
+        fitted = prepare_video_frame(source, width, height)
+        self._video_resized_cache_key = key
+        self._video_resized_cache = fitted
+        return fitted
+
     def render_video(self, width: int, height: int, st: DroneState) -> Image.Image:
         img = Image.new("RGB", (max(1, width), max(1, height)), "#08090b")
         draw = ImageDraw.Draw(img)
         overlay_font = pil_ui_font(12)
         banner_font = pil_ui_font(13, bold=True)
         live_backend = self._is_live_backend()
-        frame, scale = prepare_video_frame(self.video_frame, width, height)
+        frame, scale = self._cached_video_frame(width, height)
         if frame is not None:
             ox = (width - frame.width) // 2
             oy = (height - frame.height) // 2

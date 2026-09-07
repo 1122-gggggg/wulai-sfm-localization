@@ -144,6 +144,9 @@ def test_boot_staging_evaluates_the_complete_retrieved_set(
         def retrieve(self, _rgb, _topk):
             return names
 
+        def retrieve_scored(self, _rgb, _topk, **_kwargs):
+            return [(name, 0.9) for name in names]
+
         def correspondences_by_ref(self, _gray, refs, **_kwargs):
             calls.append(list(refs))
             return [

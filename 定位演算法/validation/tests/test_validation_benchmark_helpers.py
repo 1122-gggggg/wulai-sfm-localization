@@ -192,7 +192,9 @@ def test_edm_replay_loop_keeps_mock_frame_audit_and_row_schema():
         def release(self):
             self.released = True
 
-    pose = SimpleNamespace(x=1.0, y=2.0, z=3.0)
+    # Field-for-field the real pose_types.Pose the tracker returns; a stub
+    # missing yaw would hide that the row schema publishes it.
+    pose = SimpleNamespace(x=1.0, y=2.0, z=3.0, yaw=0.25, stamp=0.0)
     tracker = SimpleNamespace(
         trk=None,
         last_info={"next_mode": "TRACK", "inliers": 12},
@@ -216,6 +218,7 @@ def test_edm_replay_loop_keeps_mock_frame_audit_and_row_schema():
     assert rows[0]["success"] is True
     assert rows[0]["next_mode"] == "TRACK"
     assert rows[0]["inliers"] == 12
+    assert rows[0]["pose_yaw"] == 0.25
 
 
 P167_MEASURED = {
@@ -276,6 +279,18 @@ def _replay_receipt(**overrides):
         "boot_relaxed_min_inliers": 0,
         "acquire_relaxed_probation_frames": 0,
         "lost_local_topk": 5,
+        "match_batch_size": 2,
+        "ood_mode": "hard",
+        "ood_vpr_top1": 0.45,
+        "ood_vpr_margin": None,
+        "ood_vpr_entropy": 0.95,
+        "ood_match_corr": 200,
+        "ood_match_mconf": 0.4,
+        "ood_soft_factor": 1.5,
+        "ood_entropy_temperature": 0.05,
+        "boot_hold": False,
+        "lost_hold": False,
+        "klt_fallback": True,
     }
     receipt.update(overrides)
     return receipt

@@ -34,6 +34,16 @@ class FakeLocalizer:
         self.retrieve_candidates.append(None if candidates is None else list(candidates))
         return ["ref0"]
 
+    def retrieve_scored(
+        self,
+        rgb: np.ndarray,
+        topk: int,
+        exclude: set[str] | None = None,
+        candidates: list[str] | None = None,
+        descriptor=None,
+    ) -> list[tuple[str, float]]:
+        names = self.retrieve(rgb, topk, candidates=candidates)
+        return [(name, 0.9) for name in names]
     def correspondences(self, _gray: np.ndarray, refs: list[str], **_kwargs):
         return np.zeros((0, 2)), np.zeros((0, 3)), np.zeros(0), [0] * len(refs)
 

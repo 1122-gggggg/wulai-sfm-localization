@@ -131,7 +131,7 @@ class InertTemporalCache:
 
 class EDMTrackerAdapter(Localizer):
     def __init__(self, reloc_map: EDMRelocMap, camera: Camera,
-                 cfg: EDMConfig | None = None, megaloc=None, megaloc_factory=None,
+                 cfg: EDMConfig | None = None, vpr=None, vpr_factory=None,
                  matcher=None,
                  frame_source=lambda: None, map_frame=None,
                  reference_index=None,
@@ -143,8 +143,8 @@ class EDMTrackerAdapter(Localizer):
             reloc_map, camera,
             cfg=cfg or production_edm_config(),
             matcher=matcher,
-            megaloc=megaloc,
-            megaloc_factory=megaloc_factory,
+            vpr=vpr,
+            vpr_factory=vpr_factory,
             reference_index=reference_index,
             motion_validator=motion_validator,
             motion_validation_mode=motion_validation_mode,
@@ -163,15 +163,15 @@ class EDMTrackerAdapter(Localizer):
 
     # ---------- model lifecycle ----------
     def ensure_edm(self) -> None:
-        """EDM itself is built eagerly by EDMLocalizer.__init__; MegaLoc stays off GPU.
+        """EDM itself is built eagerly by EDMLocalizer.__init__; VPR stays off GPU.
         Mirrors ensure_xfeat(): the local matcher without the retrieval model."""
 
-    # the worker calls ensure_xfeat() only on the force-track bench, where MegaLoc must
+    # the worker calls ensure_xfeat() only on the force-track bench, where VPR must
     # stay off the GPU so its cost is not attributed to the matching path being measured.
     ensure_xfeat = ensure_edm
 
     def ensure_models(self) -> None:
-        self.trk.loc.megaloc  # lazy property: loads MegaLoc now, not on frame 0
+        self.trk.loc.vpr  # lazy property: loads VPR now, not on frame 0
 
     def _clear_tracking_history(self) -> None:
         """Drop priors that must not survive LOST reacquisition."""
@@ -303,10 +303,33 @@ class EDMTrackerAdapter(Localizer):
             "requested_reference_count": info.get("requested_reference_count"),
             "staged_early_stop": info.get("staged_early_stop"),
             "candidate_mode": info.get("candidate_mode"),
+            "bridge": info.get("bridge"),
+            "bridge_run": info.get("bridge_run"),
+            "klt_fallback": info.get("klt_fallback"),
+            "bridge_after_reject": info.get("bridge_after_reject"),
+            "ood_verdict": info.get("ood_verdict"),
+            "ood_vpr_vote": info.get("ood_vpr_vote"),
+            "ood_match_vote": info.get("ood_match_vote"),
+            "ood_reason": info.get("ood_reason"),
+            "vpr_top1": info.get("vpr_top1"),
+            "vpr_margin": info.get("vpr_margin"),
+            "vpr_entropy": info.get("vpr_entropy"),
+            "match_corr_best": info.get("match_corr_best"),
+            "match_mconf_best_p50": info.get("match_mconf_best_p50"),
             "global_retrieval_calls": info.get("global_retrieval_calls"),
             "lost_search_stage": info.get("lost_search_stage"),
             "lost_search_radius_factor": info.get("lost_search_radius_factor"),
             "rejected": info.get("rejected"),
+            "trajectory_veto_reason": info.get("trajectory_veto_reason"),
+            "trajectory_vetoes": info.get("trajectory_vetoes"),
+            "trajectory_veto_step": info.get("trajectory_veto_step"),
+            "trajectory_veto_dt_s": info.get("trajectory_veto_dt_s"),
+            "trajectory_veto_yaw_delta_deg": info.get("trajectory_veto_yaw_delta_deg"),
+            "trajectory_veto_yaw_rate_deg_s": info.get("trajectory_veto_yaw_rate_deg_s"),
+            "gravity_veto_reason": info.get("gravity_veto_reason"),
+            "gravity_vetoes": info.get("gravity_vetoes"),
+            "gravity_roll_deg": info.get("gravity_roll_deg"),
+            "gravity_down_deg": info.get("gravity_down_deg"),
             "limited_jump": info.get("limited_jump"),
             "relative_motion_check": info.get("relative_motion_check"),
             "limited_jump_confirmed": info.get("limited_jump_confirmed", False),
@@ -372,7 +395,7 @@ class AsyncEDMTrackerAdapter(Localizer):
     """
 
     def __init__(self, reloc_map: EDMRelocMap, camera: Camera,
-                 cfg: EDMConfig | None = None, megaloc=None, megaloc_factory=None,
+                 cfg: EDMConfig | None = None, vpr=None, vpr_factory=None,
                  matcher=None,
                  frame_source=lambda: None, map_frame=None,
                  reference_index=None,
@@ -384,8 +407,8 @@ class AsyncEDMTrackerAdapter(Localizer):
             reloc_map, camera,
             cfg=cfg or production_edm_config(),
             matcher=matcher,
-            megaloc=megaloc,
-            megaloc_factory=megaloc_factory,
+            vpr=vpr,
+            vpr_factory=vpr_factory,
             reference_index=reference_index,
             motion_validator=motion_validator,
             motion_validation_mode=motion_validation_mode,
@@ -834,7 +857,7 @@ class AsyncEDMTrackerAdapter(Localizer):
         NO_ANCHOR. Steady-state behavior unchanged.
         """
         try:
-            self.trk.loc.megaloc  # lazy property: loads MegaLoc now
+            self.trk.loc.vpr  # lazy property: loads VPR now
         except Exception:
             pass
         try:

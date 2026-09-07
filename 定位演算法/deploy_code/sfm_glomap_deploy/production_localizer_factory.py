@@ -300,7 +300,7 @@ def _build_edm_localizer(
         matcher,
         source=production_profile,
     )
-    megaloc_factory = partial(
+    vpr_factory = partial(
         MegaLocQuery,
         device=DEVICE,
         backend=megaloc_backend,
@@ -333,7 +333,7 @@ def _build_edm_localizer(
         camera,
         cfg=config,
         matcher=matcher,
-        megaloc_factory=megaloc_factory,
+        vpr_factory=vpr_factory,
         reference_index=indexed_retrieval,
         frame_source=frame_source,
         map_frame=map_frame,

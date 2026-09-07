@@ -90,6 +90,31 @@ _KLT_RATIO_SOFT_MIN = 0.50
 from edm_matcher import GRID_H, GRID_W, EDMMatcher
 from reloc_localizer_edm import Camera, EDMLocalizer, EDMRelocMap
 from reposed_motion_validator import RelativeMotionCheck, cam_from_world_matrix
+try:
+    from trajectory_plausibility import TrajectoryWindow, vote_allow
+except ImportError:  # pragma: no cover - voter unavailable, veto stays off
+    TrajectoryWindow = None  # type: ignore[assignment]
+    vote_allow = None  # type: ignore[assignment]
+try:
+    from gravity_roll_gate import load_gravity as _load_map_gravity
+    from gravity_roll_gate import vote_allow as gravity_vote_allow
+except ImportError:  # pragma: no cover - gate unavailable, veto stays off
+    _load_map_gravity = None  # type: ignore[assignment]
+    gravity_vote_allow = None  # type: ignore[assignment]
+try:
+    from ood_early_exit import (
+        evaluate as _ood_evaluate,
+        matcher_features as _ood_matcher_features,
+        thresholds_from_env as _ood_thresholds_from_env,
+        vpr_features as _ood_vpr_features,
+    )
+    import ood_early_exit as _ood_module
+except ImportError:  # pragma: no cover - gate unavailable, stays audit-silent
+    _ood_evaluate = None  # type: ignore[assignment]
+    _ood_matcher_features = None  # type: ignore[assignment]
+    _ood_thresholds_from_env = None  # type: ignore[assignment]
+    _ood_vpr_features = None  # type: ignore[assignment]
+    _ood_module = None  # type: ignore[assignment]
 from edm_pose_selection import (
     acquire_consensus_limit,
     candidate_inliers,
@@ -1016,8 +1041,8 @@ class ProductionEDMTracker:
         camera: Camera,
         cfg: EDMConfig | None = None,
         matcher: EDMMatcher | None = None,
-        megaloc=None,
-        megaloc_factory=None,
+        vpr=None,
+        vpr_factory=None,
         reference_index=None,
         motion_validator=None,
         motion_validation_mode: str = "off",
@@ -1064,8 +1089,8 @@ class ProductionEDMTracker:
             reloc_map,
             camera,
             matcher=matcher,
-            megaloc=megaloc,
-            megaloc_factory=megaloc_factory,
+            vpr=vpr,
+            vpr_factory=vpr_factory,
             pnp_max_error=self.cfg.pnp_ransac_max_error,
             reference_index=reference_index,
         )
@@ -1169,6 +1194,23 @@ class ProductionEDMTracker:
             )
         except ValueError:
             self._klt_max_age_s = float(_KLT_MAX_AGE_S)
+        # Failure fallback (B7): on an EDM miss in TRACK/WEAK, carry the pose
+        # with KLT instead of counting a miss. Unlike the interval bridge
+        # above it never skips a working EDM match (the 2026-09-03 revert
+        # showed skipping costs -47..-59 successes on P168); it only fires
+        # after a failure. No-consecutive rule (2026-09-06 21-pair gate:
+        # +44 succ, -30 LOST, zero pairs worse) stops temporal-chain
+        # poisoning. Default ON; SFM_EDM_KLT_FALLBACK=0 disables.
+        self._klt_fallback_enabled: bool = (
+            os.environ.get("SFM_EDM_KLT_FALLBACK", "1") != "0"
+        )
+        try:
+            self._klt_fallback_max_consec: int = int(
+                os.environ.get("SFM_EDM_KLT_FALLBACK_MAX_CONSEC", "3") or "3"
+            )
+        except ValueError:
+            self._klt_fallback_max_consec = 3
+        self._klt_fallback_run: int = 0
         # Shadow evaluation: run the KLT chain on every frame purely to record
         # what it would have predicted, then restore the production cache byte
         # for byte. Used by benchmark_klt_lost_prediction.py to score the
@@ -1193,6 +1235,74 @@ class ProductionEDMTracker:
         self._last_accepted_bgr: np.ndarray | None = None
         self._last_accepted_cam_from_world: np.ndarray | None = None
         self._last_accepted_rigid3d: pycolmap.Rigid3d | None = None
+        # --- Trajectory-plausibility veto (R3, default off) ---
+        # Windowed median voter over accepted poses. Only vetoes, never
+        # creates poses. SFM_EDM_TRAJECTORY_VETO=1 enables; default 0 keeps
+        # bit-identical behaviour (no window maintenance, no checks).
+        self._traj_veto_enabled = (
+            os.environ.get("SFM_EDM_TRAJECTORY_VETO", "0").strip().lower()
+            not in ("0", "", "false", "no", "off")
+        )
+        self._traj_window = None
+        self._traj_vetoes = 0
+        if self._traj_veto_enabled and TrajectoryWindow is not None:
+            try:
+                self._traj_window = TrajectoryWindow(
+                    max_points=8,
+                    max_age_s=float(getattr(self.cfg, "lost_prior_max_age_s", 3.0) or 3.0),
+                )
+            except Exception:
+                self._traj_window = None
+        # --- Gravity-consistency veto (P3, default off) ---
+        # The gimbal holds roll ~0, so a correct camera right axis is
+        # horizontal (river map: 1045 references, max residual 2.14 deg).
+        # SFM_EDM_GRAVITY_VETO_DEG sets the limit in degrees; 0/unset = off.
+        # Gravity comes from the site's measured T_align_gravity.json
+        # (SFM_EDM_GRAVITY_JSON, else the SFM_MAP_ALIGN the launcher already
+        # exports). No file, no gravity, no veto.
+        self._gravity_veto_deg = 0.0
+        self._gravity_down_limit_deg = 0.0
+        self._map_gravity: list[float] | None = None
+        self._gravity_vetoes = 0
+        try:
+            limit = float(os.environ.get("SFM_EDM_GRAVITY_VETO_DEG", "0") or 0.0)
+        except ValueError:
+            limit = 0.0
+        if limit > 0.0 and _load_map_gravity is not None:
+            align_path = (
+                os.environ.get("SFM_EDM_GRAVITY_JSON")
+                or os.environ.get("SFM_MAP_ALIGN")
+                or ""
+            ).strip()
+            gravity = _load_map_gravity(align_path) if align_path else None
+            if gravity is not None:
+                self._map_gravity = gravity
+                self._gravity_veto_deg = limit
+                try:
+                    self._gravity_down_limit_deg = float(
+                        os.environ.get("SFM_EDM_GRAVITY_DOWN_VETO_DEG", "110") or 110.0
+                    )
+                except ValueError:
+                    self._gravity_down_limit_deg = 110.0
+            else:
+                print(
+                    "[tracker] gravity veto requested but no usable "
+                    f"T_align_gravity.json at {align_path!r}; veto stays off",
+                    flush=True,
+                )
+        # --- OOD early-exit gate (R2, default audit-only) ---
+        # VPR x matcher conjunction; HARD reports LOST, SOFT tightens.
+        # SFM_EDM_OOD_MODE=off|audit|soft|hard (default audit: record only,
+        # zero behavior change). Thresholds from env, pinned in the receipt.
+        self._ood_thresholds = (
+            _ood_thresholds_from_env() if _ood_thresholds_from_env is not None else None
+        )
+        self._last_vpr_scores: list[float] | None = None
+        self._last_vpr_frame: int | None = None
+        self._ood_last_error: str | None = None
+        self._ood_audit_counts: dict = {"ok": 0, "error": 0}
+        # (P2 window smoother was NOT GO 2026-09-06: never engaged, kept OFF.
+        # Module + wiring removed; record in outputs/p2_window_20260906/REPORT.md.)
         # --- ESEKF minimal integration (after _klt_* and pose_guided init) ---
         self._latest_velocity_ned: np.ndarray | None = None
         self._esekf_last_predict: np.ndarray | None = None
@@ -2079,13 +2189,20 @@ class ProductionEDMTracker:
         if lost and not force_global and self.cfg.lost_prior_strategy == "score_fusion":
             refs = self._lost_score_fusion_refs(rgb, topk, capture_stamp, prior_fresh)
             self._last_retrieval_kind = "fused"
+            # Fused path re-ranks internally; no raw pool scores to judge.
+            self._last_vpr_scores = None
         elif candidates is not None:
-            refs = self.loc.retrieve(rgb, topk, candidates=candidates)
+            scored = self.loc.retrieve_scored(rgb, topk, candidates=candidates)
+            refs = [name for name, _score in scored]
             self._last_retrieval_kind = "near"
+            self._last_vpr_scores = [float(score) for _, score in scored]
         else:
-            refs = self.loc.retrieve(rgb, topk)
+            scored = self.loc.retrieve_scored(rgb, topk)
+            refs = [name for name, _score in scored]
             self._last_retrieval_kind = "global"
+            self._last_vpr_scores = [float(score) for _, score in scored]
         elapsed_ms = (time.perf_counter() - started) * 1e3
+        self._last_vpr_frame = self.st.frame
         self.st.global_retrieval_calls += 1
         if lost:
             self.st.lost_global_retrieval_attempts += 1
@@ -2670,6 +2787,9 @@ class ProductionEDMTracker:
         strong_count = 0
         pnp_candidates = 0
         pnp_skipped = 0
+        ood_skip = self._pre_pnp_ood_veto(selection, batch)
+        if ood_skip is not None:
+            return ood_skip
         if batch.by_ref is not None:
             scored: list[tuple[str, tuple]] = []
             rows = list(enumerate(zip(selection.refs, batch.by_ref)))
@@ -2867,9 +2987,9 @@ class ProductionEDMTracker:
         )
         if pool <= 0 or topk <= 0:
             return []
-        extract_tensor = getattr(self.loc.megaloc, "extract_one_tensor", None)
+        extract_tensor = getattr(self.loc.vpr, "extract_one_tensor", None)
         descriptor = (
-            extract_tensor(rgb) if callable(extract_tensor) else self.loc.megaloc.extract_one(rgb)
+            extract_tensor(rgb) if callable(extract_tensor) else self.loc.vpr.extract_one(rgb)
         )
         scored = list(self.loc.retrieve_scored(rgb, pool, descriptor=descriptor))
         if prior_fresh:
@@ -3864,6 +3984,94 @@ class ProductionEDMTracker:
         frame_bgr: np.ndarray,
         prepared_query=None,
     ) -> dict:
+        # A frame that reaches EDM accept was not bridged: re-arm fallback.
+        self._klt_fallback_run = 0
+        # --- Gravity-consistency veto (P3) ---
+        # Orthogonal to every existing gate: they all measure agreement with
+        # the correspondences, this one measures agreement with measured
+        # gravity. Only runs when SFM_EDM_GRAVITY_VETO_DEG > 0 and the site
+        # ships a T_align_gravity.json.
+        if (
+            getattr(self, "_gravity_veto_deg", 0.0) > 0.0
+            and gravity_vote_allow is not None
+            and getattr(self, "_map_gravity", None) is not None
+        ):
+            try:
+                allow, reason, gdiag = gravity_vote_allow(
+                    np.asarray(rotation, dtype=float),
+                    self._map_gravity,
+                    max_roll_deg=float(self._gravity_veto_deg),
+                    max_down_deg=float(getattr(self, "_gravity_down_limit_deg", 110.0)),
+                )
+                if not allow:
+                    self._gravity_vetoes = int(getattr(self, "_gravity_vetoes", 0) or 0) + 1
+                    detail = dict(gdiag)
+                    detail["gravity_veto_reason"] = reason
+                    detail["gravity_vetoes"] = int(self._gravity_vetoes)
+                    self._reject_pose(
+                        info,
+                        result,
+                        reason="gravity_veto",
+                        detail=detail,
+                    )
+                    return info
+                if gdiag:
+                    info.update(gdiag)
+            except Exception:
+                pass
+        # --- Trajectory-plausibility veto (R3) ---
+        # Pure add-on: only runs when SFM_EDM_TRAJECTORY_VETO=1. A vetoed
+        # candidate is routed to the normal miss path; nothing else changes.
+        if getattr(self, "_traj_veto_enabled", False) and vote_allow is not None:
+            try:
+                window = getattr(self, "_traj_window", None)
+                if window is not None:
+                    allow, veto_reason = vote_allow(
+                        window,
+                        np.asarray(center, dtype=float),
+                        float(yaw),
+                        capture_stamp,
+                        max_jump=float(getattr(self.cfg, "max_jump", 0.0) or 0.0),
+                    )
+                    if not allow:
+                        self._traj_vetoes = int(getattr(self, "_traj_vetoes", 0) or 0) + 1
+                        # Count it so MAX_CONSECUTIVE_VETOES can stand the
+                        # voter down: a window the tracker can no longer
+                        # refresh must not keep refusing forever.
+                        window.note_veto()
+                        diag: dict = {
+                            "trajectory_veto_reason": veto_reason,
+                            "trajectory_vetoes": int(self._traj_vetoes),
+                        }
+                        try:
+                            prev = window.last()
+                            if prev is not None:
+                                pc = np.asarray(prev[0], dtype=float)
+                                cc = np.asarray(center, dtype=float)
+                                diag["trajectory_veto_step"] = float(np.linalg.norm(cc - pc))
+                                dts = float(capture_stamp) - float(prev[2])
+                                diag["trajectory_veto_dt_s"] = float(dts)
+                                if math.isfinite(dts) and dts > 1e-9:
+                                    dyaw = abs(
+                                        (float(yaw) - float(prev[1]) + math.pi)
+                                        % (2.0 * math.pi)
+                                        - math.pi
+                                    )
+                                    diag["trajectory_veto_yaw_delta_deg"] = float(math.degrees(dyaw))
+                                    diag["trajectory_veto_yaw_rate_deg_s"] = float(
+                                        math.degrees(dyaw) / dts
+                                    )
+                        except Exception:
+                            pass
+                        self._reject_pose(
+                            info,
+                            result,
+                            reason="trajectory_veto",
+                            detail=diag,
+                        )
+                        return info
+            except Exception:
+                pass
         previous_center = self.st.center
         self._clear_pending_reacquisition()
         previous_stamp = self.st.last_capture_stamp
@@ -3883,6 +4091,13 @@ class ProductionEDMTracker:
             self.st.velocity = _blend_velocity(self.st.velocity, measured_velocity, dt)
         self.st.center, self.st.yaw = center, yaw
         self.st.last_capture_stamp = capture_stamp
+        # --- Trajectory-plausibility window feed (R3, no-op unless enabled) ---
+        try:
+            window = getattr(self, "_traj_window", None)
+            if window is not None:
+                window.append(np.asarray(center, dtype=float), float(yaw), capture_stamp)
+        except Exception:
+            pass
         # --- ESEKF visual update (adaptive R, Mahalanobis gating) ---
         try:
             esekf = getattr(self, "esekf", None)
@@ -4426,6 +4641,23 @@ class ProductionEDMTracker:
             self._klt_bridge_run = 0
             return None
 
+        return self._klt_bridge_accept(
+            gray, frame_bgr, capture_stamp, started, prior, lk_ms, cap,
+            state_in="TRACK",
+        )
+
+    def _klt_bridge_accept(
+        self,
+        gray,
+        frame_bgr,
+        capture_stamp,
+        started,
+        prior,
+        lk_ms,
+        cap,
+        state_in="TRACK",
+    ):
+        """Shared KLT-carry accept path for the interval bridge and the B7 fallback."""
         center = np.asarray(prior["center"], dtype=float)
         yaw = float(prior["yaw"])
         rotation = prior.get("R")
@@ -4446,6 +4678,7 @@ class ProductionEDMTracker:
         self.st.misses = 0
         self.st.lost_frames = 0
         self._klt_bridge_run = int(getattr(self, "_klt_bridge_run", 0)) + 1
+        self._klt_fallback_run = 1
         # Drift trip: if this bridge already looks shaky, re-anchor with EDM next
         # frame rather than compound the error into a WEAK/LOST + heavy recovery.
         if getattr(self, "_klt_bridge_drift_guard", True):
@@ -4459,7 +4692,6 @@ class ProductionEDMTracker:
                 self._klt_bridge_run = cap  # force EDM keyframe next frame
         if prior.get("cam_from_world") is not None:
             self._store_visual_motion_cache(frame_bgr, prior["cam_from_world"])
-
         ref_names = [
             self.name_of[i]
             for i in (self.st.last_refs or [])
@@ -4467,8 +4699,8 @@ class ProductionEDMTracker:
         ]
         info = {
             "frame": self.st.frame,
-            "state_in": "TRACK",
-            "state_out": "TRACK",
+            "state_in": state_in,
+            "state_out": state_in,
             "ok": True,
             "center": center,
             "yaw": yaw,
@@ -4504,6 +4736,160 @@ class ProductionEDMTracker:
                 pass
         return info
 
+    def _try_klt_fallback(self, info):
+        """B7: carry the pose with KLT after an EDM failure instead of a miss.
+
+        Same safety rails as the interval bridge (strong anchor, prior
+        allowed, drift trip) but fires on failure rather than on schedule,
+        in TRACK or WEAK_TRACK, capped at SFM_EDM_KLT_FALLBACK_MAX_CONSEC
+        (default 3). Returns a bridged info dict, or None to let the miss
+        count. Never skips a working EDM match.
+        """
+        if not getattr(self, "_klt_fallback_enabled", True):
+            return None
+        state = getattr(getattr(self, "st", None), "state", None)
+        if state not in ("TRACK", "WEAK_TRACK"):
+            return None
+        if getattr(getattr(self, "st", None), "center", None) is None:
+            return None
+        try:
+            cap = int(getattr(self, "_klt_fallback_max_consec", 3) or 3)
+        except (TypeError, ValueError):
+            cap = 3
+        if cap < 1:
+            return None
+        if int(getattr(self, "_klt_bridge_run", 0)) >= cap:
+            return None
+        # No consecutive bridges (P119 2026-09-06: 3 back-to-back carries
+        # poisoned the temporal chain; isolated singles helped on P116).
+        if int(getattr(self, "_klt_fallback_run", 0)) != 0:
+            return None
+        gray = getattr(self, "_klt_query_gray", None)
+        frame_bgr = getattr(self, "_klt_query_bgr", None)
+        if gray is None or frame_bgr is None:
+            return None
+        stamp = info.get("capture_stamp", getattr(self, "_klt_query_stamp", None))
+        started = getattr(self, "_klt_query_started", None)
+        if started is None:
+            started = time.perf_counter()
+        if int(getattr(self, "_klt_anchor_inliers", 0)) < max(
+            2 * int(self.cfg.weak_min_inliers), _KLT_BRIDGE_ANCHOR_MIN_INLIERS
+        ):
+            return None
+        if float(getattr(self, "_klt_anchor_ratio", 0.0)) < float(
+            getattr(self, "_klt_bridge_min_ratio", 0.66)
+        ):
+            return None
+        if not self._klt_prior_allowed(stamp):
+            return None
+        lk_started = time.perf_counter()
+        prior = self._track_klt_prior(gray, stamp)
+        lk_ms = (time.perf_counter() - lk_started) * 1e3
+        if prior is None:
+            return None
+        bridged = self._klt_bridge_accept(
+            gray, frame_bgr, stamp, started, prior, lk_ms, cap, state_in=state,
+        )
+        bridged["klt_fallback"] = True
+        if info.get("rejected") is not None:
+            bridged["bridge_after_reject"] = info.get("rejected")
+        return bridged
+
+    def _audit_ood(self, info, selection, batch):
+        """R2 OOD gate, audit phase: record verdict, never act.
+
+        Reads arrays the tracker already has (last retrieval scores +
+        correspondence batch). Runs no model, allocates no GPU work. SOFT/HARD
+        acting (pre-PnP skip) is phase 2, only if the sweep finds FAR=0.
+        """
+        try:
+            if _ood_evaluate is None or self._ood_thresholds is None:
+                return
+            if _ood_module is None:
+                return
+            mode = _ood_module.normalise_mode(_ood_module.mode_from_env())
+            vpr = _ood_vpr_features(
+                list(self._last_vpr_scores or []),
+                self._ood_thresholds.entropy_temperature,
+            )
+            matcher = _ood_matcher_features(
+                batch.per_ref, batch.confidence, batch.by_ref
+            )
+            verdict = _ood_evaluate(vpr, matcher, self._ood_thresholds, mode)
+            info["ood_verdict"] = verdict.decision
+            info["ood_vpr_vote"] = verdict.vpr_vote
+            info["ood_match_vote"] = verdict.match_vote
+            info["ood_reason"] = verdict.reason
+            for key, value in verdict.features.items():
+                info[key] = value
+            try:
+                self._ood_audit_counts["ok"] = int(self._ood_audit_counts.get("ok", 0)) + 1
+            except Exception:
+                pass
+        except Exception as exc:
+            try:
+                counts = getattr(self, "_ood_audit_counts", None)
+                if isinstance(counts, dict):
+                    counts["error"] = int(counts.get("error", 0)) + 1
+                if getattr(self, "_ood_last_error", None) is None:
+                    self._ood_last_error = f"{type(exc).__name__}: {exc}"
+            except Exception:
+                pass
+    def _pre_pnp_ood_veto(self, selection, batch):
+        """R2 HARD acting: skip PnP when the frame is confidently off-map.
+
+        Only in ``hard`` mode, only on frames whose VPR scores were computed
+        THIS frame (stale scores + fresh matches must never meet), and only
+        on a HARD conjunction (both channels out). Returns an empty
+        ``_PoseAttempt`` with ``reject_reason="ood_hard_veto"`` so the normal
+        miss path reports LOST, or None to run PnP. SOFT mode records only
+        (tightening ungated).
+        """
+        try:
+            if _ood_module is None or self._ood_thresholds is None:
+                return None
+            if _ood_module.normalise_mode(_ood_module.mode_from_env()) != "hard":
+                return None
+            if getattr(self, "_last_vpr_frame", None) != getattr(
+                getattr(self, "st", None), "frame", None
+            ):
+                return None
+            vpr = _ood_vpr_features(
+                list(self._last_vpr_scores or []),
+                self._ood_thresholds.entropy_temperature,
+            )
+            matcher = _ood_matcher_features(
+                batch.per_ref, batch.confidence, batch.by_ref
+            )
+            verdict = _ood_evaluate(
+                vpr, matcher, self._ood_thresholds, "hard"
+            )
+            if verdict.decision != _ood_module.DECISION_HARD:
+                return None
+            n_refs = len(getattr(selection, "refs", []) or [])
+            return _PoseAttempt(
+                result=None,
+                points2d=np.zeros((0, 2)),
+                points3d=np.zeros((0, 3)),
+                metrics={"reproj_rms": None, "inlier_ratio": 0.0,
+                         "inlier_grid_cells": 0},
+                selected_ref=None,
+                pnp_ms=0.0,
+                reject_reason="ood_hard_veto",
+                strong_count=0,
+                pnp_candidates=0,
+                pnp_skipped=n_refs,
+                relaxed_agree_count=0,
+            )
+        except Exception as exc:
+            try:
+                if getattr(self, "_ood_last_error", None) is None:
+                    self._ood_last_error = f"{type(exc).__name__}: {exc}"
+            except Exception:
+                pass
+            return None
+
+
     # ---------- one frame ----------
     def localize(self, frame_bgr: np.ndarray, capture_stamp: float | None = None) -> dict:
         cfg = self.st_cfg = self.cfg
@@ -4526,6 +4912,8 @@ class ProductionEDMTracker:
         try:
             self._klt_query_gray = gray
             self._klt_query_stamp = float(capture_stamp)
+            self._klt_query_bgr = frame_bgr
+            self._klt_query_started = t0
         except Exception:
             pass
         # ESEKF propagate: constant-velocity + covariance growth; dt clamped inside esekf
@@ -4635,6 +5023,7 @@ class ProductionEDMTracker:
         if widen is not None:
             info["track_widen"] = widen_info
         self._observe_lost_starvation(state_in, selection, info)
+        self._audit_ood(info, selection, batch)
         ret = attempt.result
         min_inl = selection.min_inliers
         reproj_limit = (
@@ -4732,6 +5121,14 @@ class ProductionEDMTracker:
         return True
 
     def _on_miss(self, info: dict):
+        # B7 failure fallback: first carry with KLT, only count a miss when
+        # the bridge is unavailable, capped, or rejected. The bridged dict
+        # replaces the failure info (keeping the original reject reason).
+        bridged = self._try_klt_fallback(info)
+        if bridged is not None:
+            info.clear()
+            info.update(bridged)
+            return
         if self._is_weak_hysteresis_candidate(info):
             self.st.misses += 0.5
             info["weak_hysteresis_buffered"] = True

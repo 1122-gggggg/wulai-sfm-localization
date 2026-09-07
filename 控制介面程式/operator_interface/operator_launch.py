@@ -123,20 +123,6 @@ def build_argument_parser() -> argparse.ArgumentParser:
     )
     ap.add_argument("--megaloc-cache", default=None)
     ap.add_argument(
-        "--megaloc-backend",
-        choices=("pytorch", "pytorch_fp16", "tensorrt"),
-        default=os.environ.get("SFM_MEGALOC_BACKEND", "tensorrt"),
-        help="MegaLoc query backend; defaults to TensorRT.",
-    )
-    ap.add_argument(
-        "--megaloc-engine",
-        default=os.environ.get("SFM_MEGALOC_TENSORRT_ENGINE", ""),
-    )
-    ap.add_argument(
-        "--megaloc-engine-sha256",
-        default=os.environ.get("SFM_MEGALOC_TENSORRT_ENGINE_SHA256", ""),
-    )
-    ap.add_argument(
         "--reference-index",
         default=None,
         help="Profile-pinned IVF index SHA256SUMS.json for large reference maps",
@@ -1080,9 +1066,6 @@ def _build_operator_localizer(
         STREAM_HEIGHT,
         Path(args.bundle),
         args.megaloc_cache,
-        megaloc_backend=str(args.megaloc_backend),
-        megaloc_engine=str(args.megaloc_engine or ""),
-        megaloc_engine_sha256=str(args.megaloc_engine_sha256 or ""),
         reference_index=str(getattr(args, "reference_index", "") or ""),
         reference_index_sha256=str(getattr(args, "reference_index_sha256", "") or ""),
         force_track_bench=bool(args.loc_force_track_bench),

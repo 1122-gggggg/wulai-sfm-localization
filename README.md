@@ -156,7 +156,7 @@ overlay／任務選配。完整格式見
 人類可讀的 direct pins，以及帶 transitive pins 與 hashes 的對應 lockfile。
 安裝器預設使用 `requirements/runtime-lock.txt`；
 `tools/simulator_preflight.py --full-runtime` 會在 GUI 前實際載入
-地圖 bundle、EDM CUDA model、MegaLoc、GUI 與 worker。正式發布目前只支援已驗證的
+地圖 bundle、EDM CUDA model、BoQ VPR、GUI 與 worker。正式發布目前只支援已驗證的
 NVIDIA RTX 5060 + CUDA 12.8；其他 GPU 必須重新做 CUDA、模型與效能驗證。系統層仍需
 CPython 3.10 的 `venv/ensurepip`（Ubuntu/Debian 通常是 `python3.10-venv`）、
 `ffmpeg`、`python3-tk`、X11/XWayland 與 NVIDIA CUDA driver。這些 OS/driver 先決條件不在
@@ -201,7 +201,7 @@ frame，不建立 `map→site` 對齊、不使用 `map_units_per_meter`，相機
 2. 由操作介面的「① 場域建圖資料夾」選取該資料夾；介面完整驗證後才會原子化
    複製到 `地圖檔/場域/<site_id>/`。`localizer_deploy_dir` 仍指向
    `定位演算法/`，不要在場域包裡放演算法副本。
-3. 固定 EDM checkpoint 與 MegaLoc weights 已由 portable runtime 提供；換場域時
+3. 固定 EDM checkpoint 與 BoQ-ResNet50 weights 已由 portable runtime 提供；換場域時
    不得替換或再放一份場域副本。
 4. 沒有 EDM bundle 的場域要先建：EDM 是 detector-free，無法沿用 XFeat bundle，
    必須用 `定位演算法/EDM工具包/build/build_reloc_map_edm.py` 對同一組 COLMAP
@@ -234,9 +234,9 @@ frame，不建立 `map→site` 對齊、不使用 `map_units_per_meter`，相機
 
 `定位演算法/configs/edm_production_profile.json` 是共用的正式設定：1024×576、
 PyTorch CUDA FP16、coarse top-k 3225、confidence 0.2、reference tensor cache 32、
-TRACK/WEAK/LOST top-k 1/3/5、BOOT MegaLoc top-k 10（先驗證前 2 張，不足才展開）、
+TRACK/WEAK/LOST top-k 1/3/5、BOOT BoQ top-k 10（先驗證前 2 張，不足才展開）、
 batch size 2、LOST grace 2、recovery bank/scan 192/2、correspondence 上限 900、
-inliers 80/50/30。MegaLoc 在 BOOT 執行；LOST 預設每個 episode 一次，場域 profile
+inliers 80/50/30。BoQ 全域檢索在 BOOT 執行；LOST 預設每個 episode 一次，場域 profile
 可設定週期重試。共用預設的 temporal reference 關閉，PnP acquire/track/RANSAC gate 固定為 5/6/5，
 capture-time 預測上限為 0.25 秒。
 
@@ -292,7 +292,7 @@ ANAFI_LINK_SIM=1 ANAFI_LINK_LATENCY_MS=280 ANAFI_LINK_LOSS_PCT=1.0 \
 ```
 
 `SFM_HOLD_ON_LOW_CONF=1` 為精度優先模式：連續低信心即暫停串流（等同懸停），
-held frame 改走 LOST recovery（提高 local top-k + 依場域 profile 排程 MegaLoc）。
+held frame 改走 LOST recovery（提高 local top-k + 依場域 profile 排程 BoQ 全域檢索）。
 預設開啟。實機端對應的是 `SFM_GATE_WEAK`（預設開啟，WEAK fix 直接 hover）。
 
 ## 演算法只有一份
@@ -337,7 +337,7 @@ pytest-timeout、coverage 與 pytest-cov；測試使用每測試 300 秒上限�
 ## 注意事項
 
 「地圖」不只是 PLY 點雲。定位還需要同場域建置的 localization bundle，以及和
-影片／相機一致的內參；固定 EDM checkpoint 與 MegaLoc weights 已包在 portable
+影片／相機一致的內參；固定 EDM checkpoint 與 BoQ weights 已包在 portable
 runtime，換場域不需也不得另行取得或替換。
 
 起飛、降落與即時飛行控制只能由現場操作員在桌面 UI 執行。任何 agent 或自動化

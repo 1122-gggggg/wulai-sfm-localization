@@ -11,6 +11,98 @@ profile、不得移除安全 gate。**
 
 ---
 
+## 0-2026-09-06. 兩個正交否決器（新方向，不動任何既有閾值）
+
+本輪不碰 matcher、cache、async、KLT、檢索與任何既有地板數值。新增的是兩個**只會否決、
+不會放行**的獨立投票器，加上一個**隨機化配對 A/B 閘門**來證明它們不吃精度也不吃速度。
+
+| 項目 | 結果 |
+|---|---|
+| **隨機化配對閘門** `定位演算法/validation/randomized_ab_gate.py` | 新工具。七段影片 × 每段 3 個隨機化排程（stride 3/2/4、frame budget 依 ffprobe 夾住、PnP seed 由 trial seed 抽）× baseline/candidate 同排程配對。**任一列退化即整體 FAIL，不做跨影片平均。** `--aa` 模式兩臂同設定，用來量測時間噪聲底 |
+| **R3 軌跡合理性否決器** `deploy_code/sfm_glomap_deploy/trajectory_plausibility.py`（`SFM_EDM_TRAJECTORY_VETO=1`，預設關） | 只看已接受位姿鏈 (center, yaw, stamp)，比對**窗口中位速率**；四項檢查 jump_vs_median / yaw_rate / reversal / vertical。21/21 配對 PASS，successes 與 verified **逐列 +0**，\|Δp50\| max 2.8%、\|Δp95\| max 3.0% |
+| **P3 重力一致性否決器** `deploy_code/sfm_glomap_deploy/gravity_roll_gate.py`（`SFM_EDM_GRAVITY_VETO_DEG=12`，預設關） | 用場域已量測的 `T_align_gravity.json`：雲台鎖 roll ⇒ 相機 right 軸必須水平。1045 張參考位姿殘差 p50 0.44°／p95 1.53°／max 2.14°，query 幀實測同分佈（p50 0.44／p95 1.53／max 1.71）。12° 上限有 ~7 倍餘裕。21/21 配對 PASS，逐列 +0 |
+| **故障注入量測** `定位演算法/validation/eval_pose_veto_injection.py` | 拿真實 replay 的位姿鏈注入故障（teleport 0.9·max_jump 即**現有單步閘門會放過**的量級、yaw 90°、roll 25°），3 段 × 3 seeds、5029 乾淨幀：teleport 99.2%、roll 100%、yaw 87.5% 檢出；**乾淨幀誤殺 0/5029（兩個否決器都是 0.0%）** |
+| **閘門抓到的實作缺陷（已修）** | 第一版 R3 用「距離 vs 中位距離」，在 miss 之後前一次接受已 1–2 秒前，合法的 0.3–0.7 位移被當 teleport；且被否決的幀無法刷新窗口 → 陳舊窗口自我維持。實測 P167 −35、河濱_P117 −30、P168 −9。改為**速率語意** + `MAX_CONTINUITY_GAP_S=0.5`（超過就不判） + `MAX_CONSECUTIVE_VETOES=2`（stand-down 並重置）。回歸測試 `test_long_gap_after_misses_is_not_judged` / `test_consecutive_vetoes_stand_down` / `test_speed_semantics_not_distance` 直接釘住這三件事 |
+| **時間噪聲底** | 單獨跑時 \|Δp50\|/\|Δp95\| 落在 ±3.3%；**同時跑第二個 replay 行程會把它撐到 ±40%**（首輪污染實測）。閘門必須獨占 GPU 跑，否則時間欄位無意義 |
+
+兩個否決器**都維持預設關**：它們在乾淨語料上一次都沒有開火（安全網，不是精度改善），
+價值在於擋住現有閘門看不到的一類誤鎖 —— 落在 `max_jump` 以下的 teleport，以及靠錯誤
+pitch/roll 湊出高 inlier 的解。要升級為預設，需要一次真機 session 證明重力殘差與
+軌跡速率分佈在 live ANAFI 影像上與 replay 一致。
+
+### 同輪被證偽的三個提案（不要再排）
+
+- **S1「提交/發佈解耦」**：前提不成立。client/worker 協議是嚴格同步的位置配對（無 request id，
+  `_validate_worker_sequence` 靠寫入計數推 `seq`），寫與讀本來就不能重疊；`submit_to_worker_read`
+  的 p95 是 worker 忙碌時間，不是可省的排隊。真正的主機側槓桿已在 §0b-1-答 解掉（tick 8→33 ms）。
+- **S2「零拷貝」**：已經是零拷貝。`_frame_rgb_bytes_for_worker` 對 720p RGB 直接回 `memoryview`
+  （無 `tobytes()`），worker 端 `np.frombuffer` 原地取視圖；剩下的一次 SHM 槽寫入是跨行程必需的。
+  H2D 仍是 pageable（`edm_matcher.to_tensor`，590 KB/幀），pinned 化只值 0.2–0.5 ms，對 25 ms 的
+  `core_wall` 是雜訊。
+- **P5「線上內參精煉」**：對現行地圖不適用。`site_profile.json.query_camera` 與
+  `reference_poses.json.camera` **逐位元相同**（PINHOLE 1280×720，
+  fx 960.4853099760471 / fy 958.1961747147875 / cx 670.8167651412149 / cy 358.7191813450141）。
+  提案引用的 f=934、k1≈0.001 來自舊 `map_intrinsics.json`，不是啟用中的資產。沒有標定債要還。
+
+### 0-2026-09-06b. 用新閘門清掉「profile 裡沒被場域驗證過」的設定
+
+總帳「現行 profile 中仍需場域重驗的組合設定」列了一批**正在生產 profile 裡生效、但只有單段或
+微基準證據**的旗標。新閘門補了 `--candidate-arg`（把 replay 的 CLI 旗標當候選臂），可以逐項用
+七段 × 三排程配對定讞。今日四項全部清掉：
+
+| 設定（profile 現值） | 候選臂 | 結果 | 判定 |
+|---|---|---|---|
+| `matcher.query_cuda_graph = true` | `--no-query-cuda-graph` | 21 對中 12 對時間 FAIL；**精度逐列 +0**；\|Δp50\| 中位 **+5.2%**、max +7.9%（21.7→23.3 ms 級） | **保留 true**。關掉是純退化：同樣結果、每幀多 1.1–1.7 ms |
+| `tracker.track_map_first = true` | `--no-track-map-first` | 21/21 FAIL，其中 **17 對精度退化**（P157 −77、P168 −53、河濱_P117 −40、P167 −31…）；\|Δp50\| 中位 **+92%**（26→50 ms） | **保留 true**。2026-09-03 單段結論（「+37 但 p50 22.75→41.56」）在七段上放大成同時掉精度＋掉速度 |
+| `tracker.acquire_stage_mode = progressive` | `--acquire-stage-mode full_set` | 3 對精度退化（P119 −8 / −6、P168 −9），最好一列只 +2，淨 **−21**；時間中位 +0.81% | **保留 progressive**。2026-09-03 的「無效（P168 successes 不變）」是單段假陰性 |
+| `tracker.pnp_ranked_batches = true` | `--no-pnp-ranked-batches` | 精度 **21/21 完全相同**（d_successes 全 0）；時間中位 \|Δp50\| 0.64%，僅 P167 t0 單列 +10.2% | **維持 true（已驗證為惰性）**。兩個方向都量不到差異，不值得動 SHA 鏈；也不要再拿它當候選優化 |
+| `tracker.global_retrieval_policy = boot_and_lost_once` | `--lost-strategy boot_once` | **21/21 精度崩壞**，最差 262→**73**（−189）；\|Δp50\| 中位 **+129%** | **維持 boot_and_lost_once**。LOST 期不做 MegaLoc 檢索等於放棄恢復 |
+| `tracker.match_batch_size = 2` | `--match-batch-size 1`（**兩個 seed、42 對**） | **42/42 逐列 +0**（完全相同） | Δp50 中位 −0.09% / +0.26%（無效果）；**Δp95 中位 −3.17% / −3.38%，18/21 與 19/21 改善**，最佳 −14%／−21% | **可取但暫不取**：見下 |
+
+六項都不需要改任何值 —— 它們從「候選、未驗證」變成「七段 × 三排程已驗證」，SHA 鏈不動。
+這是本閘門的第二種用途：**不只擋新改動，也把既有的未驗證預設一項一項定讞。**
+
+**`match_batch_size` 是唯一量到真實可得收益的一項，但刻意先不動。** batch=1 在 42 對配對上與
+batch=2 **逐幀完全相同**（successes/verified 全 0 差），只把 p95 尾巴削掉約 3%（最佳單列 −14%／−21%）。
+機制與總帳的 fused-coarse 量測一致：b=2 一次 57.36 ms > 兩次 b=1 的 2×25.57=51.14 ms，
+所以多 reference 的 WEAK/LOST 幀（正是尾巴）拆成兩個 b=1 反而便宜約 11%。
+**不動的理由**：`match_batch_size` 寫在雜湊過的 runtime profile 裡，改它要動 profile SHA →
+site profile → mission manifest 整條鏈，而收益只有 p95 −3%。下次 profile 因其他理由改版時
+一併帶入即可（收益與證據已備齊，不需重測）。
+
+**S3（CUDA Graphs）到此結案**：query 端的圖捕獲**本來就已經在生產 profile 開著**，本日補齊場域證據；
+TRACK 端（`SFM_EDM_TRACK_CUDAGRAPH`）2026-09-03 已測 —— exact 但只快 0.18 ms、鎖 3.42 GiB pool，
+8 GB 卡上維持關。核心不在 kernel launch：`match_ms` 佔 `core_wall` 72.7%（LOST 段 91.8%），
+單個 kernel 本來就大，圖捕獲省不到東西。要再快只剩 S4（coarse 量化／TensorRT）這條重路。
+
+### 0-2026-09-06c. S4（EDM coarse 量化／TensorRT）—— **被離線相依契約卡住，先不要動手**
+
+S4 是剩下唯一針對 `match_ms`（佔 `core_wall` 72.7%、LOST 段 91.8%）的大槓桿，但**現在做不了**，
+原因是相依，不是演算法。實測（本機 venv）：
+
+| 前提 | 現況 | 影響 |
+|---|---|---|
+| TensorRT builder | `tensorrt_bindings 11.2.1.2` 有 `trt.Builder`、`trt.OnnxParser`；`/usr/bin/trtexec` 存在 | ✅ 可建 engine |
+| ONNX 匯出 | **`onnx` / `onnxscript` / `onnxruntime` 全部不在 venv**（`requirements/runtime.txt` 只釘 `tensorrt-cu13-bindings==11.2.1.2`） | ❌ 實跑 `export_edm_onnx_flight.py` → `OnnxExporterError: Module onnx is not installed!` |
+| 精度旗標 | TRT 11 的 `BuilderFlag` **已無 FP16 / INT8 / FP8**（實測列舉只剩 TF32、SPARSE_WEIGHTS…）；量化改走 strongly-typed network + 圖內 Q/DQ | ❌ 要量化就必須先能產生／改寫 ONNX 圖 |
+
+也就是說 S4 的第一步就需要把 `onnx`（很可能還有 `onnxscript`、`onnxruntime-gpu`）加進**三份 hash lock
+與離線 wheelhouse**。那是發布契約變更（`requirements/*-lock.txt`、`WHEELHOUSE.json`、
+`tools/offline_wheelhouse.py` 重建、clean-install 驗證），必須由操作員核准，不能由實作階段自行決定。
+
+**建議的正確順序**（不要跳過第 1 步就開始寫 exporter）：
+
+1. 操作員決定是否把 `onnx`(+`onnxscript`) 納入離線 wheelhouse；只納入**匯出/建置**用途，
+   runtime 仍只靠 `tensorrt_bindings` 反序列化 engine（與現行 MegaLoc engine 路徑一致）。
+2. 匯出 1024×576 coarse 子圖（**幾何/fine head 不量化**），對照 PyTorch 逐張量比對。
+3. 校準集必須用七段語料庫**之外**的獨立 holdout（否則 gate 與校準同源，等於自證）。
+4. 三步 kill-gate：exact/近似比對 → P168 700f ±5 幀 → 七段 `verified` ≥ −1pp；
+   任一步失敗即 NOT GO，PyTorch 路徑零改動保留為預設。
+5. engine 進 `RUNTIME_ARTIFACTS.json` allowlist（大小＋SHA-256），載入期 SHA 不符即拒用。
+
+在第 1 步之前，S4 的工程量是零可交付：沒有 ONNX 就沒有 engine，沒有 engine 就沒有可量測的東西。
+
+
 ## 0. 狀態（2026-09-05，跑在 repo venv + RTX 5060）
 
 **本輪唯一的結構性結論：單段 gate 不足以決定預設。** 七段 720p 語料庫（§5a）第一次全跑，

@@ -66,6 +66,12 @@ COARSE_STRIDE = 8  # EDM.LOCAL_RESOLUTION
 GRID_W, GRID_H = EDM_W // COARSE_STRIDE, EDM_H // COARSE_STRIDE  # 128 x 72
 REFERENCE_FEATURE_STORE_SCHEMA = 1
 REFERENCE_FEATURE_SHARD_SCHEMA = 2
+# Schema 3 (B6 reopen 2026-09-06): pruned + per-channel INT8 sharded store.
+# Same shard layout, but the manifest names only the resident subset (with
+# their positions in full-map order) and shards carry int8 rows + fp32
+# per-(level, channel) scales. Absent refs are persistent-cache misses and
+# fall back to _extract_one through the unchanged restore path.
+REFERENCE_FEATURE_SHARD_SCHEMA_3 = 3
 REFERENCE_FEATURE_SHARD_ENTRIES = 64
 # The all-eight-video River map has 1,045 references (~8.4 GiB of FP16 levels).
 REFERENCE_FEATURE_STORE_MAX_BYTES = 12 * 1024 * 1024 * 1024
@@ -803,6 +809,8 @@ class EDMMatcher:
         self._persistent_feature_levels: tuple[torch.Tensor, ...] | None = None
         self._persistent_feature_shards: tuple[tuple[torch.Tensor, ...], ...] | None = None
         self._persistent_feature_shard_size = 0
+        self._persistent_feature_scales = None
+        self._persistent_feature_resident = None
         self._persistent_feature_store_path: Path | None = None
         self._persistent_feature_stats = {"hits": 0, "misses": 0}
         if self.fp16:
@@ -1027,6 +1035,15 @@ class EDMMatcher:
                 or bound[0] is not source
             ):
                 return False
+            resident = getattr(self, "_persistent_feature_resident", None)
+            if resident is not None:
+                # Schema-3 pruned bank: only resident rows are restorable.
+                # Without this, a pruned ref in a low shard looks available
+                # and the dummy-pixel precompute path explodes downstream.
+                pos = resident[bound[1]] if 0 <= bound[1] < len(resident) else -1
+                if pos is None or pos < 0:
+                    return False
+                continue
             if levels is None:
                 if shards is None or self._persistent_feature_shard_size <= 0:
                     return False
@@ -1150,6 +1167,8 @@ class EDMMatcher:
             except (OSError, RuntimeError, TypeError, ValueError) as exc:
                 self._persistent_feature_levels = None
                 self._persistent_feature_shards = None
+                self._persistent_feature_scales = None
+                self._persistent_feature_resident = None
                 print(
                     f"[edm_matcher] ignoring invalid reference feature store {selected}: {exc}",
                     file=sys.stderr,
@@ -1215,6 +1234,9 @@ class EDMMatcher:
             weights_only=True,
             mmap=True,
         )
+        if manifest.get("schema_version") == REFERENCE_FEATURE_SHARD_SCHEMA_3:
+            self._load_schema3_sharded_store(path, manifest, manifest_path)
+            return
         manifest = self._validate_reference_feature_identity(
             manifest,
             schema_version=REFERENCE_FEATURE_SHARD_SCHEMA,
@@ -1286,6 +1308,124 @@ class EDMMatcher:
         self._persistent_feature_levels = None
         self._persistent_feature_shards = tuple(shards)
         self._persistent_feature_shard_size = shard_size
+        self._persistent_feature_scales = None
+        self._persistent_feature_resident = None
+
+    @staticmethod
+    def _quantize_bank_int8(levels):
+        """Per-(level, channel) symmetric max-abs INT8. Returns (qlevels, scales)."""
+        qlevels, scales = [], []
+        for level in levels:
+            f = level.detach().to(torch.float32)
+            amax = f.abs().amax(dim=(0, 2, 3), keepdim=True).clamp_min(1e-12)
+            scale = (amax / 127.0)
+            q = (f / scale).round().clamp_(-128, 127).to(torch.int8)
+            qlevels.append(q)
+            scales.append(scale.reshape(-1).contiguous())
+        return qlevels, scales
+
+    @staticmethod
+    def _dequantize_bank_rows(qrows, srows):
+        """Dequantize one resident row per level back to float32 CPU."""
+        out = []
+        for q, s in zip(qrows, srows):
+            scale = s.reshape(1, -1, 1, 1)
+            out.append((q.to(torch.float32) * scale))
+        return out
+
+    def _load_schema3_sharded_store(self, path, manifest, manifest_path) -> None:
+        """Load a pruned bank: resident subset + full-order positions."""
+        if manifest.get("model_key") != self.reference_feature_model_key:
+            raise ValueError("EDM reference feature store model mismatch")
+        resident = manifest.get("resident_names")
+        positions = manifest.get("resident_positions")
+        digests = manifest.get("resident_sha256")
+        if (
+            not isinstance(resident, (list, tuple)) or not resident
+            or not isinstance(positions, (list, tuple))
+            or len(positions) != len(resident)
+            or not isinstance(digests, (list, tuple))
+            or len(digests) != len(resident)
+        ):
+            raise ValueError("EDM schema-3 manifest resident list is invalid")
+        session_index = {name: i for i, name in enumerate(self._persistent_feature_names)}
+        session_digests = dict(zip(self._persistent_feature_names, self._persistent_feature_digests))
+        remap = [-1] * len(self._persistent_feature_names)
+        for pos, name, digest in zip(positions, resident, digests):
+            if not isinstance(pos, int) or pos < 0 or pos >= len(remap):
+                raise ValueError("EDM schema-3 resident position is invalid")
+            if session_index.get(name) != pos or session_digests.get(name) != digest:
+                raise ValueError(f"EDM schema-3 resident mismatch: {name}")
+            remap[pos] = None  # filled below in resident order
+        order = sorted(range(len(resident)), key=lambda k: positions[k])
+        for resident_pos, k in enumerate(order):
+            remap[positions[k]] = resident_pos
+        shard_size = manifest.get("shard_size")
+        shard_files = manifest.get("shard_files")
+        if (
+            isinstance(shard_size, bool) or not isinstance(shard_size, int)
+            or shard_size <= 0 or not isinstance(shard_files, (list, tuple))
+            or not shard_files
+        ):
+            raise ValueError("EDM schema-3 manifest shards are invalid")
+        shards, all_scales, expected = [], [], 0
+        quant = manifest.get("quant", "int8")
+        if quant not in ("int8", "none"):
+            raise ValueError("EDM schema-3 quant mode is invalid")
+        level_shapes = None
+        for filename in shard_files:
+            if not isinstance(filename, str) or Path(filename).name != filename:
+                raise ValueError("EDM schema-3 shard filename is invalid")
+            payload = torch.load(path / filename, map_location="cpu", weights_only=True, mmap=True)
+            if not isinstance(payload, Mapping) or payload.get("schema_version") != REFERENCE_FEATURE_SHARD_SCHEMA_3:
+                raise ValueError("EDM schema-3 shard version mismatch")
+            start, stop = payload.get("start"), payload.get("stop")
+            qlevels, scales = payload.get("levels"), payload.get("scales")
+            if (
+                start != expected or not isinstance(stop, int) or stop <= start
+                or not isinstance(qlevels, (list, tuple)) or not qlevels
+            ):
+                raise ValueError("EDM schema-3 shard range is invalid")
+            count = stop - start
+            if quant == "int8":
+                if not isinstance(scales, (list, tuple)) or len(scales) != len(qlevels):
+                    raise ValueError("EDM schema-3 shard scales are invalid")
+                if any(
+                    not torch.is_tensor(q) or q.dtype != torch.int8 or q.dim() != 4
+                    or q.shape[0] != count or q.shape[0] <= 0
+                    for q in qlevels
+                ):
+                    raise ValueError("EDM schema-3 shard tensor contract mismatch")
+                if any(
+                    not torch.is_tensor(s) or not s.is_floating_point() or s.dim() != 2
+                    or s.shape[0] != q.shape[0] or s.shape[1] != q.shape[1]
+                    for s, q in zip(scales, qlevels)
+                ):
+                    raise ValueError("EDM schema-3 shard scale contract mismatch")
+                shards.append(tuple(qlevels))
+                all_scales.append(tuple(s for s in scales))
+            else:
+                if any(
+                    not torch.is_tensor(q) or not q.is_floating_point() or q.dim() != 4
+                    or q.shape[0] != count or q.shape[0] <= 0
+                    for q in qlevels
+                ):
+                    raise ValueError("EDM schema-3 shard tensor contract mismatch")
+                shards.append(tuple(qlevels))
+                all_scales.append(None)
+            shapes = tuple((tuple(q.shape[1:]), q.dtype) for q in qlevels)
+            if level_shapes is None:
+                level_shapes = shapes
+            elif shapes != level_shapes:
+                raise ValueError("EDM schema-3 shard levels are inconsistent")
+            expected = stop
+        if expected != len(resident):
+            raise ValueError("EDM schema-3 shard entry count mismatch")
+        self._persistent_feature_levels = None
+        self._persistent_feature_shards = tuple(shards)
+        self._persistent_feature_shard_size = shard_size
+        self._persistent_feature_scales = tuple(all_scales)
+        self._persistent_feature_resident = remap
 
     def _load_reference_feature_store(self, path: Path) -> None:
         if path.is_dir():
@@ -1307,6 +1447,8 @@ class EDMMatcher:
         self._persistent_feature_levels = self._validate_reference_feature_payload(payload)
         self._persistent_feature_shards = None
         self._persistent_feature_shard_size = 0
+        self._persistent_feature_scales = None
+        self._persistent_feature_resident = None
 
     def _write_sharded_reference_feature_store(
         self,
@@ -1418,7 +1560,29 @@ class EDMMatcher:
             return None
         index = entry[1]
         local_index = index
-        if levels is None:
+        resident = getattr(self, "_persistent_feature_resident", None)
+        if resident is not None:
+            # Schema-3 pruned bank: unmapped refs are cache misses.
+            pos = resident[index] if 0 <= index < len(resident) else -1
+            if pos is None or pos < 0:
+                self._persistent_feature_stats["misses"] += 1
+                return None
+            scales = getattr(self, "_persistent_feature_scales", None)
+            assert shards is not None and scales is not None and self._persistent_feature_shard_size > 0
+            shard_index, local_index = divmod(pos, self._persistent_feature_shard_size)
+            if shard_index >= len(shards):
+                self._persistent_feature_stats["misses"] += 1
+                return None
+            if scales[shard_index] is None:
+                # Lossless pruned bank: rows are stored as-is.
+                levels = [bank[local_index : local_index + 1] for bank in shards[shard_index]]
+            else:
+                levels = self._dequantize_bank_rows(
+                    [bank[local_index : local_index + 1] for bank in shards[shard_index]],
+                    [s[local_index : local_index + 1] for s in scales[shard_index]],
+                )
+            local_index = 0  # rows are already single-row selected
+        elif levels is None:
             assert shards is not None and self._persistent_feature_shard_size > 0
             shard_index, local_index = divmod(
                 index,

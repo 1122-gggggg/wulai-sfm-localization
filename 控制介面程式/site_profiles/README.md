@@ -63,14 +63,14 @@ symlink 的檔案或父目錄，一律拒絕。若要選擇不同 workspace，�
 | `poles_json` | 純定位可為 `null` | 有 `inspect_waypoints` 才需要 |
 | legacy `pose_chain.*` | 可保留歷史檔案；raw-map AUTO 不讀取 | 不需建立或更新 |
 | calibration receipt | 只有 vehicle manifest 明確要求時才是 AUTO gate；目前 ANAFI 不要求 | 換 vehicle revision 時依新 manifest 處理 |
-| `megaloc_cache` | EDM 不使用 | 保持 `null`；MegaLoc descriptors 已在 bundle `ref_global` |
+| `megaloc_cache` | EDM 不使用 | 保持 `null`；BoQ descriptors 已在 bundle `ref_global` |
 | `reference_index` | backend-neutral 的大型 reference retrieval index，可選 | EDM/XFeat 可指向 index 的 `SHA256SUMS.json`；同時更新 `asset_sha256.reference_index` |
 | `track_landmarks` | XFeat/projection legacy | 正式 EDM 保持 `null` |
 | `flight` | 真機自主飛行核准 | route/map 契約與淨空確認後更新 |
 | `hardware_approval` | 綁定場域與硬體身份的 signed v2 收據 | 可選；若存在則保留 receipt、簽章與 trust store 的解析／記錄 |
 
 每個有提供的場域資產都要同步更新 profile 內路徑與 SHA-256。
-換場域不要替換固定 EDM checkpoint、MegaLoc weights、deploy code、UI 或
+換場域不要替換固定 EDM checkpoint、BoQ weights、deploy code、UI 或
 Parrot 模擬器。
 
 ### 現場 raw-map 起航流程

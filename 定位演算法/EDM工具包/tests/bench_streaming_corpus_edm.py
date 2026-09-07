@@ -615,7 +615,7 @@ def run_video(
     source_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     source_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     source_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    tracker = ProductionEDMTracker(rmap, camera, tracker_cfg, matcher=matcher, megaloc=megaloc)
+    tracker = ProductionEDMTracker(rmap, camera, tracker_cfg, matcher=matcher, vpr=megaloc)
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()
     sampler = GPUSampler()

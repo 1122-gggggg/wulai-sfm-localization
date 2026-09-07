@@ -90,20 +90,41 @@
 
 **地圖相依性：容量相依。** 192 只對目前 340-reference 地圖的量測 working set 有效。新地圖必須重跑至少 `64 / 192 / 全 reference 數` 三點；只在輸出完全相同時選最低 p50/p95 的最小容量。
 
-### 4. Full-token MegaLoc TensorRT 作為 VPR 預設
+### 4. BoQ-ResNet50-fp16 作為 VPR 預設（2026-09-07，由 MegaLoc 切換）
 
 **改動**
 
-保留 full-token MegaLoc TensorRT；不使用 token-reduced PyTorch/TensorRT、BoQ 替代或 EDM native TensorRT。
+Query encoder 由 full-token MegaLoc TensorRT 改為 BoQ-ResNet50-fp16（23.8M 參數、
+16384-d、輸入 384、`定位演算法/deploy_code/sfm_glomap_deploy/boq_net.py` +
+`boq_query.py`，權重 `執行環境/torch_hub_cache/checkpoints/boq/resnet50_16384.pth`
+SHA `4691d154…`）。river 20260831 bundle `ref_global` 用 bundle 內嵌 JPEG 重建為 BoQ
+bank（1045 refs、幾何/影像/xyz 零改動，`定位演算法/EDM工具包/build/rebuild_bundle_vpr_boq.py`），
+bundle SHA `603dc7c4…` → `443cdcc7…`，site profile / manifest / receipt / mission
+selection pins 級聯更新，EDM feature bank 重建（8.4GB）。OOD `vpr_top1_out`
+`0.45` → `0.32`（同為 in-map p50 的 ~0.5x）。刪除 MegaLoc TRT 接線、
+`megaloc_token_reduction.py` 及其測試；`--megaloc-backend/engine` 等旗標同步移除。
+`candidate_mode` 的 `megaloc_*` 字串與 `--megaloc-cache` 資產旗標保留（全域檢索階段的
+穩定詞彙，非模型指涉）。
 
 **證據**
 
-- 現有 full-token TensorRT query 約 6.3–8.7 ms。
-- L2 keep-0.5 TensorRT 雖把 75-frame VPR p50 由 8.91 ms 降到 5.32 ms，固定 stride-3、700-frame tracker replay 卻由 46.63/495.61 ms 退化為 53.61/546.91 ms wall p50/p95。
-- L2 keep-0.9 的 EDM+PnP 成功由 62/75 降為 60/75。
-- 原始證據：`outputs/megaloc_token_reduction_trt/`、`outputs/optimization_20260831_report.md`
+- Query forward 6.9 → 4.8 ms（−30%），含檢索 VPR p50 9.8 → 6.9 ms。端到端 wall
+  p50 基本不動（~37–38 ms，VPR 只佔一小部分）。
+- 單幀 EDM+PnP：4 影片 × 75 幀，ok@50 291 → 290，ok@80 286 → 284
+  （`outputs/boq_resnet50_20260907/eval_75x4_top10.json`）。
+- 同版 tracker 代碼 A/B（stride-3）：P168-700 605 → 558（−47）、P167-700
+  483 → 520（+37）、P117-416 358 → 367（+9）、P119-700 583 → 597（+14）；
+  pooled 2029 → 2042（+0.5pp）。兩臂各自完全確定性（重跑逐幀一致），差異來自
+  LOST 山谷的恢復動態，非單幀品質（山谷幀單幀 BoQ top-10 全數可解）。
+- P168 全段 stride-3 production replay：1520/1772（85.8%），OOD hard veto 0
+  （`outputs/boq_resnet50_20260907/replay_p168_stride3.json`）。
+- 500+ 單元測試全綠；`offline_model_smoke --model boq`；preflight/packaging pins 更新。
 
-**地圖相依性：模型執行不相依，reference descriptor bank 相依。** 更換地圖要重建/驗證 bundle 內 `ref_global`，但不要因地圖更換自行切換 query encoder 或 engine。GPU、TensorRT、CUDA 或 model weight 改變時才重建 engine 並重做端到端 gate。
+**地圖相依性：bank 相依。** 換地圖重建 bundle 內 `ref_global`（新版
+`tools/import_direct_edm_bundle.py` 只接受 BoQ portable bank）。OOD 的完整
+R2 cross-product re-gate（FAR=0）待辦：`地圖檔/場域/urai/` 已缺失，off-map
+corpus 目前不可重跑，R2 的 FAR=0 聲稱凍結於 MegaLoc 時代數值。舊 MegaLoc
+權重/source 保留於 `torch_hub_cache`（未刪，供稽核），TRT engine 檔留置但已無引用。
 
 ### 5. 持久化 immutable reference backbone feature bank
 
@@ -430,14 +451,18 @@ camera-pipeline holdout + hard-negative / off-map replay（無此 corpus），fl
 
 ## 現行 profile 中仍需場域重驗的組合設定
 
+**2026-09-06 更新：前六項已用隨機化配對閘門在本地圖定讞（七段 × 三排程 = 21 對；
+`match_batch_size` 跑了兩個 seed 共 42 對），全部維持現值，SHA 鏈不動。**
+詳表見下方「2026-09-06 生產 profile 旗標定讞」。剩下的只有場域 inlier/reproj/jump/yaw/stale-LOST gate。
+
 下列設定目前存在於 river compat profile，但沒有可攜到新地圖的「單項 exact 加速」結論：
 
-- `query_cuda_graph=true`
-- `acquire_stage_mode=progressive`
-- `pnp_ranked_batches=true`
-- `track_map_first=true`
-- `match_batch_size=2`
-- `global_retrieval_policy=boot_and_lost_once`
+- ~~`query_cuda_graph=true`~~ → **2026-09-06 已驗證，維持 true**（關掉每幀多 1.1–1.7 ms，精度不變）
+- ~~`acquire_stage_mode=progressive`~~ → **2026-09-06 已驗證，維持 progressive**（改 full_set 淨 −21 幀）
+- ~~`pnp_ranked_batches=true`~~ → **2026-09-06 已驗證為惰性**：兩個方向精度完全相同、時間無差異；維持 true 只為不動 SHA
+- ~~`track_map_first=true`~~ → **2026-09-06 已驗證，維持 true**（關掉 21/21 退化，p50 +92%、單段最多 −77 幀）
+- ~~`match_batch_size=2`~~ → **2026-09-06 已驗證**：batch=1 逐幀完全相同且 p95 中位 −3.2%（42 對）；維持 2 只為不動 SHA 鏈，下次改版帶入
+- ~~`global_retrieval_policy=boot_and_lost_once`~~ → **2026-09-06 已驗證，維持**（改 boot_once 21/21 崩壞，最差 −189 幀）
 - 場域 inlier/reprojection/jump/yaw/stale-LOST gates
 
 P157/P167 latency候選的確顯著降低 p50，但 reference trace 與狀態路徑有變；P168 的完整 recovery corpus 又拒絕所有 PnP/batch 候選。證據：
@@ -459,7 +484,7 @@ P157/P167 latency候選的確顯著降低 p50，但 reference trace 與狀態路
 | EDM/PnP overlap pipeline | 42.67 → 42.69 ms，無收益；預設 off |
 | MegaLoc L2/EViT token reduction | ranking 或端到端 replay 退化；不升級 |
 | EDM 640x384 / 640x480 | 雖快 3.39x / 1.70x，但成功 26/30 → 20/30；維持 1024x576 |
-| BoQ-ResNet50 VPR replacement | 75-frame final PnP success 降低；不替換 |
+| BoQ-ResNet50 VPR replacement（2026-08-31 第一輪） | 當時 75-frame PnP 下降故否決；2026-09-07 以 fp16 + 重建 bank 重測達 parity（單幀 −0.3pp、四影片 pooled +0.5pp），已替換，見項 4 |
 | Native EDM TensorRT FP32 | PyTorch FP16 的 0.486x/0.560x，且不 identical；不使用 |
 | P168 PnP/batch/cross-stage candidates | recovery gate 退化；已回退 |
 | 四層 persistent features 合併成單次 H2D | 尚未實作/同步 benchmark，不做 |
@@ -1290,6 +1315,119 @@ LUT 來自 SfM 對同一影像的數千個三角化觀測，這是「從既有�
 工具與證據保留：`validation/augment_failure_sphere_references.py`、
 `outputs/augment_20260905/`（candidates、smoke、corpus、compare 腳本）、
 `releases/river_gluemap_all8_direct_20260905_aug/`（候選 release，未接線）。
+
+
+## 2026-09-06 兩個正交位姿否決器 + 隨機化配對閘門（保留，預設關）
+
+**方法先行：新的閘門。** `定位演算法/validation/randomized_ab_gate.py`。七段 720p × 每段 3 個
+隨機化排程（stride 3 / 2 / 4；frame budget 由 `ffprobe_frame_count` 夾到該片實際可解碼張數；
+PnP RANSAC seed 由 trial seed 抽）× baseline / candidate **同排程配對**。判定規則：
+`successes` 與 `verified` 任一列下降即 FAIL，**不做跨影片平均**（2026-09-05 async 事件的直接教訓）。
+時間欄位另有容差並回報 `|Δ|` 分佈。`--aa` 兩臂同設定，用來量測噪聲底。
+
+**噪聲底（必讀）**：閘門必須獨占 GPU。單獨跑時 `|Δp50|`/`|Δp95|` 的 max 落在 ±3.3%；
+首輪與另一個 replay 行程並行時同一組配對出現 −40.8% / +46.2% 的擺動，時間欄位當場失去意義。
+
+### 1. R3 軌跡合理性否決器（`SFM_EDM_TRAJECTORY_VETO=1`，預設 0）
+
+`deploy_code/sfm_glomap_deploy/trajectory_plausibility.py`。只讀已接受位姿鏈
+`(center, yaw, capture_stamp)`；不看像素、不用光流、不用 ESEKF、不用 NED 速度。四項檢查：
+`jump_vs_median`（速率 vs 窗口中位速率）、`yaw_rate`（對窗口中位 yaw，最短基線 0.3 s）、
+`reversal`（前後腿夾角 >150°，兩腿都要 >0.25·max_jump）、`vertical`（|dz| >4× 水平且 >0.5·max_jump）。
+與現有 `_trajectory_would_allow` 的差別：現有閘門只比「上一次接受」，因此落在 `max_jump` 以下的
+誤鎖會變成新基準並污染後續；本投票器比的是窗口中位數，單一次野值搬不動標準。
+
+**只否決，不放行**；任何無法判斷的輸入（點太少、窗口過期、gap 過長、非有限值）都投允許。
+
+**閘門結果**：21/21 配對 PASS。`successes`／`verified` **逐列 +0**（七段全部、三種排程全部）。
+`|Δp50|` p50 0.22% / max 2.82%，`|Δp95|` p50 0.35% / max 3.03%。乾淨語料上**一次都沒開火**
+（0 次否決）——它是安全網，不是精度改善。
+
+**故障注入（`validation/eval_pose_veto_injection.py`）**：拿 P119／P168／P157 真實位姿鏈，
+3 seeds、5029 乾淨幀，注入 0.9·max_jump 的 teleport（**現有單步閘門會放過的量級**）、
+90° yaw flip、25° roll：teleport 檢出 **99.2%**、yaw 87.5%、乾淨幀誤殺 **0/5029**。
+
+**閘門抓到的實作缺陷（重要，別再犯）**：第一版用「距離 vs 中位距離」。miss 之後前一次接受
+已 1.0–2.0 秒前（實測 `trajectory_veto_dt_s` = 1.00 / 1.25 / 1.50 / 1.75 / 2.00），合法的
+0.31–0.72 位移被判 teleport；被否決的幀又無法刷新窗口 → 陳舊窗口自我維持，級聯。
+實測代價 P167 −35、河濱_P117 −30 / −25、P168 −9。修法三件：**速率語意**、
+`MAX_CONTINUITY_GAP_S=0.5`（更久的 gap 不判）、`MAX_CONSECUTIVE_VETOES=2`（stand-down 並重置窗口）。
+回歸測試釘住這三件：`test_long_gap_after_misses_is_not_judged`、
+`test_consecutive_vetoes_stand_down`、`test_speed_semantics_not_distance`。
+
+### 2. P3 重力一致性否決器（`SFM_EDM_GRAVITY_VETO_DEG=12`，預設 0）
+
+`deploy_code/sfm_glomap_deploy/gravity_roll_gate.py`。雲台穩定 roll ⇒ 相機 right 軸必須垂直於
+重力。這不是假設，是 `validation/derive_map_gravity.py` 推導 `T_align_gravity.json` 時用的同一個
+量測（相機 right 軸的最小特徵向量）。現行 river 地圖 1045 張參考位姿殘差：
+**p50 0.44° / p95 1.53° / p99 1.92° / max 2.14°**。
+
+**query 幀同分佈**（P119 700f、stride 3、602 個接受幀）：**p50 0.44° / p95 1.53° / max 1.71°**。
+因此 12° 上限對正確位姿有 ~7 倍餘裕；同時另有 `down` 檢查（相機 down 軸對重力 ≤110°），
+比合法的 nadir 視角（90°）更寬，只擋翻轉解。重力來源是 profile 已 SHA 綁定的
+`map_align`；replay 由 `benchmark_edm_site_replay.py` 匯出 `SFM_MAP_ALIGN`（無檔案就不啟用）。
+
+**閘門結果**：21/21 配對 PASS，`successes`／`verified` 逐列 +0，`|Δp50|` max 2.05%、
+`|Δp95|` max 3.29%。乾淨語料 0 次否決。注入 25° roll 檢出 **100%（109/109）**，乾淨幀誤殺 0。
+
+**為什麼正交**：現有每一道閘門（inlier 地板、reproj RMS、jump/yaw 限制、consensus）都是在量
+「與對應點一致」；重力檢查量的是「與量測到的重力一致」。RANSAC 在重複幾何裡靠錯的 pitch/roll
+湊出高 inlier 時，只有後者看得見。
+
+### 升級為預設所需的證據（尚未取得）
+
+兩者都維持預設關。要開預設，需要一次真機 session 證明 live ANAFI 影像上的重力殘差與軌跡
+速率分佈與 replay 一致（`./IMU飛行測試.sh` → `localization.jsonl` 的 `gravity_roll_deg`、
+`trajectory_veto_*` 欄位已接好，飛完直接可讀）。在那之前它們是可一鍵開啟的安全網。
+
+### 同輪被證偽的三個提案（證據，不要再排）
+
+- **提交/發佈解耦（S1）**：client/worker 協議是嚴格同步的位置配對（無 request id；
+  `_validate_worker_sequence` 用寫入計數推 `seq`），寫與讀本質上不能重疊。
+  `submit_to_worker_read_ms` 的 p95 是 worker 忙碌時間，不是可省的排隊。
+- **零拷貝（S2）**：已經是零拷貝。`_frame_rgb_bytes_for_worker` 對 720p RGB 直接回
+  `memoryview`（不呼叫 `tobytes()`），worker 端 `np.frombuffer` 原地取視圖；剩下的一次
+  SHM 槽寫入是跨行程必需。H2D 仍 pageable（`edm_matcher.to_tensor`，590 KB/幀），
+  pinned 化上限 0.2–0.5 ms，對 25 ms 的 `core_wall` 是雜訊。
+- **線上內參精煉（P5）**：對現行地圖不適用。`site_profile.json.query_camera` 與
+  `reference_poses.json.camera` 逐位元相同（PINHOLE 1280×720、
+  fx 960.4853099760471 / fy 958.1961747147875 / cx 670.8167651412149 / cy 358.7191813450141）。
+  提案引用的 f=934 與 k1≈0.001 來自舊 `map_intrinsics.json`，不是啟用中的資產。
+
+**地圖相依性**：R3 完全不相依（全部是 `max_jump` 的比例與角速率）。P3 相依於場域的
+`T_align_gravity.json`，換地圖必須重跑參考位姿殘差分佈（本文件上面那組數字）再定上限。
+
+## 2026-09-06 生產 profile 旗標定讞（同一支隨機化配對閘門，六項全部維持現值）
+
+閘門新增 `--candidate-arg`，把 replay 的 CLI 旗標當候選臂，於是「profile 裡在跑、但只有單段或
+微基準證據」的設定可以逐項用七段 × 三排程（21 對）定讞。**六項全部維持現值，沒有任何檔案或
+SHA 改動；改變的只是證據等級。** 證據 JSON：`outputs/veto_gates_20260906/`。
+
+| 設定（profile 現值） | 候選臂 | 精度 | 時間 | 判定 |
+|---|---|---|---|---|
+| `matcher.query_cuda_graph = true` | `--no-query-cuda-graph` | **21/21 逐列 +0** | \|Δp50\| 中位 **+5.2%**、max +7.9%（21.7→23.3 ms 級），12 對超容差 | **維持 true**：關掉是純退化，同結果、每幀多 1.1–1.7 ms |
+| `tracker.track_map_first = true` | `--no-track-map-first` | **17/21 退化**（P157 −77、P168 −53、河濱_P117 −40、P167 −31、P157 −1…） | \|Δp50\| 中位 **+92%**（26→50 ms），21/21 超容差 | **維持 true**：2026-09-03 的單段結論（「+37 但 p50 22.75→41.56」）在七段上變成同時掉精度與速度 |
+| `tracker.acquire_stage_mode = progressive` | `--acquire-stage-mode full_set` | 3 對退化（P119 −8 / −6、P168 −9），最佳一列僅 +2，**淨 −21** | 中位 +0.81%，可忽略 | **維持 progressive**：2026-09-03「無效（P168 successes 不變）」是單段假陰性 |
+| `tracker.pnp_ranked_batches = true` | `--no-pnp-ranked-batches` | **21/21 完全相同**（d_successes 全 0） | 中位 \|Δp50\| 0.64%，僅 P167 t0 一列 +10.2% | **維持 true，且記為惰性**：兩個方向都量不到差異；不值得動 SHA，也不要再當候選優化 |
+| `tracker.global_retrieval_policy = boot_and_lost_once` | `--lost-strategy boot_once` | **21/21 崩壞**，最差 262→**73**（−189） | \|Δp50\| 中位 **+129%** | **維持 boot_and_lost_once**：LOST 期不做 MegaLoc 檢索等於放棄恢復 |
+| `tracker.match_batch_size = 2` | `--match-batch-size 1`（兩個 seed、**42 對**） | **42/42 逐幀完全相同** | Δp50 中位 −0.09% / +0.26%（無效果）；**Δp95 中位 −3.17% / −3.38%**，18/21 與 19/21 改善，最佳 −14% / −21% | **證據已備，暫不取**（見下段） |
+
+**方法上的意義**：這支閘門有兩種用途——擋新改動，以及**把既有未驗證預設一項一項定讞**。
+`track_map_first` 那一列特別值得記：單段量測不只是「不夠」，還可能給出**方向相反**的結論。
+
+**`match_batch_size=1` 是唯一量到真實收益的一項，刻意先不取。** 兩個 trial seed、42 對配對上與
+batch=2 **逐幀完全相同**（successes / verified 全 0 差），收益全在尾巴：Δp95 中位 −3.2%／−3.4%，
+18/21 與 19/21 列改善，最佳單列 −14%／−21%。機制與本文件「coarse tail 融合」量測一致：
+b=2 一次 57.36 ms > 兩次 b=1 的 2×25.57 = 51.14 ms，所以多 reference 的 WEAK/LOST 幀（正是尾巴）
+拆成兩個 b=1 便宜約 11%。**不取的理由**：`match_batch_size` 在雜湊過的 runtime profile 內，改它要動
+profile SHA → site profile → mission manifest 整條鏈，而收益只有 p95 −3%。下次 profile 因其他理由
+改版時直接帶入，證據已備齊、不需重測。CLI 覆寫 `--match-batch-size` 已加入 replay 工具並納入
+receipt 的 fail-closed identity（舊 baseline 會報 missing key，屬預期）。
+
+**S3（CUDA Graphs）結案**：query 端圖捕獲本來就在生產 profile 開著，本日補齊場域證據；TRACK 端
+（`SFM_EDM_TRACK_CUDAGRAPH`）2026-09-03 已測——exact 但只快 0.18 ms、鎖 3.42 GiB pool，8 GB 卡維持關。
+瓶頸不在 kernel launch：`match_ms` 佔 `core_wall` 72.7%（LOST 段 91.8%），kernel 本來就大。
+要再快只剩 coarse 量化／TensorRT 這條重路。
 
 
 

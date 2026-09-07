@@ -202,6 +202,22 @@ RECEIPT_OVERRIDE_KEYS = (
     "boot_relaxed_min_inliers",
     "acquire_relaxed_probation_frames",
     "lost_local_topk",
+    "match_batch_size",
+    # OOD early-exit operating point (env-only knobs; audit default records
+    # only, so they join the fail-closed identity like the other env knobs).
+    "ood_mode",
+    "ood_vpr_top1",
+    "ood_vpr_margin",
+    "ood_vpr_entropy",
+    "ood_match_corr",
+    "ood_match_mconf",
+    "ood_soft_factor",
+    "ood_entropy_temperature",
+    # Production-path submit-loop hold modes (change which frames the worker
+    # ever sees, so they join the fail-closed identity).
+    "boot_hold",
+    # KLT failure fallback (default on since the no-consecutive gate).
+    "klt_fallback",
 )
 PRODUCTION_PATH_UNTRANSMITTED_OVERRIDE_KEYS = (
     # The worker builds its matcher from the hashed profile, so nothing here
@@ -226,6 +242,7 @@ PRODUCTION_PATH_UNTRANSMITTED_OVERRIDE_KEYS = (
     "track_miss_widen_topk",
     "weak_miss_widen_topk",
     "boot_relaxed_min_inliers",
+    "match_batch_size",
 )
 PIPELINE_AGE_KEYS = (
     "capture_source_age_ms",
@@ -272,6 +289,19 @@ PREDICTION_DIAGNOSTIC_KEYS = (
     "prediction_source",
     "prediction_state",
     "predicted_center",
+    "bridge",
+    "bridge_run",
+    "klt_fallback",
+    "bridge_after_reject",
+    "ood_verdict",
+    "ood_vpr_vote",
+    "ood_match_vote",
+    "ood_reason",
+    "vpr_top1",
+    "vpr_margin",
+    "vpr_entropy",
+    "match_corr_best",
+    "match_mconf_best_p50",
     "klt_age",
     "klt_tracked",
     "klt_inliers",
@@ -321,25 +351,6 @@ def apply_sigma_mode(args) -> None:
         os.environ["SFM_EDM_FUSED_COARSE"] = "0"
     elif sigma == "fused":
         os.environ["SFM_EDM_FUSED_COARSE"] = "1"
-
-
-def effective_megaloc_token_keep_ratio(args) -> float:
-    explicit = _arg(args, "megaloc_token_keep_ratio")
-    if explicit is not None:
-        return float(explicit)
-    return 1.0 if _arg(args, "megaloc_token_reduction", "none") == "none" else 0.5
-
-
-def apply_megaloc_token_reduction(args) -> None:
-    os.environ["SFM_MEGALOC_TOKEN_REDUCTION"] = str(
-        _arg(args, "megaloc_token_reduction", "none")
-    )
-    os.environ["SFM_MEGALOC_TOKEN_KEEP_RATIO"] = str(
-        effective_megaloc_token_keep_ratio(args)
-    )
-    os.environ["SFM_MEGALOC_TOKEN_LAYER"] = str(
-        int(_arg(args, "megaloc_token_layer", 6))
-    )
 
 
 def apply_edm_cache_runtime_flags(args) -> None:
@@ -420,6 +431,7 @@ _CONFIG_OVERRIDE_FIELDS = (
     ("reference_quality_weight", "reference_quality_weight", float),
     ("acquire_relaxed_min_inliers", "acquire_relaxed_min_inliers", int),
     ("lost_starved_global_frames", "lost_starved_global_frames", int),
+    ("match_batch_size", "match_batch_size", int),
 )
 _MATCHER_OVERRIDE_FIELDS = (
     ("mconf_thr", "mconf_thr", float),
@@ -639,6 +651,33 @@ def _recovery_knob_receipt(args, cfg) -> dict[str, object]:
     return receipt
 
 
+def _ood_knob_receipt() -> dict[str, object]:
+    """Effective OOD operating point, env-only. Mirrors ood_early_exit
+    defaults. Transmitted to production workers through the environment."""
+    def _f(name: str, default: float):
+        value = _receipt_env_float(name, default)
+        return None if isinstance(value, float) and not math.isfinite(value) else value
+    raw = (os.environ.get("SFM_EDM_OOD_MODE") or "").strip().lower()
+    if raw in ("", "hard"):
+        mode = "hard"
+    elif raw in ("1", "true", "yes", "on"):
+        mode = "audit"
+    elif raw in ("0", "false", "no", "off", "audit", "soft"):
+        mode = raw if raw in ("audit", "soft") else "off"
+    else:
+        mode = "hard"
+    return {
+        "ood_mode": mode,
+        "ood_vpr_top1": _f("SFM_EDM_OOD_VPR_TOP1", 0.45),
+        "ood_vpr_margin": _f("SFM_EDM_OOD_VPR_MARGIN", math.inf),
+        "ood_vpr_entropy": _f("SFM_EDM_OOD_VPR_ENTROPY", 0.95),
+        "ood_match_corr": _receipt_env_int("SFM_EDM_OOD_MATCH_CORR", 200),
+        "ood_match_mconf": _f("SFM_EDM_OOD_MATCH_MCONF", 0.4),
+        "ood_soft_factor": _f("SFM_EDM_OOD_SOFT_INLIER_FACTOR", 1.5),
+        "ood_entropy_temperature": _f("SFM_EDM_OOD_ENTROPY_TEMPERATURE", 0.05),
+    }
+
+
 def build_receipt(args, built) -> dict[str, object]:
     cfg = getattr(built, "config", None) if built is not None else None
     matcher = _matcher_from_built(built) if built is not None else None
@@ -710,6 +749,12 @@ def build_receipt(args, built) -> dict[str, object]:
     pnp_ranked_batches = _arg(args, "pnp_ranked_batches")
     if pnp_ranked_batches is None:
         pnp_ranked_batches = getattr(cfg, "pnp_ranked_batches", None)
+    # References per EDM forward. Profile-driven with no env knob, so the CLI
+    # override is the only way it can differ from the hashed profile; it still
+    # joins the fail-closed identity because it changes every batch boundary.
+    match_batch_size = _arg(args, "match_batch_size")
+    if match_batch_size is None:
+        match_batch_size = getattr(cfg, "match_batch_size", None)
     return {
         "radius": None if radius is None else float(radius),
         "mconf_thr": None if mconf is None else float(mconf),
@@ -740,6 +785,9 @@ def build_receipt(args, built) -> dict[str, object]:
         "track_map_first": (
             None if track_map_first is None else bool(track_map_first)
         ),
+        "match_batch_size": (
+            None if match_batch_size is None else int(match_batch_size)
+        ),
         "pnp_ranked_batches": (
             None if pnp_ranked_batches is None else bool(pnp_ranked_batches)
         ),
@@ -764,18 +812,10 @@ def build_receipt(args, built) -> dict[str, object]:
             None if quality_weight is None else float(quality_weight)
         ),
         **_recovery_knob_receipt(args, cfg),
-        "megaloc_engine": (
-            None
-            if _arg(args, "megaloc_engine") is None
-            else str(Path(_arg(args, "megaloc_engine")).expanduser().resolve())
-        ),
-        "megaloc_engine_sha256": _arg(args, "megaloc_engine_sha256"),
-        "megaloc_token_reduction": str(
-            _arg(args, "megaloc_token_reduction", "none")
-        ),
-        "megaloc_token_keep_ratio": effective_megaloc_token_keep_ratio(args),
-        "megaloc_token_layer": int(_arg(args, "megaloc_token_layer", 6)),
-        "worker_mode": str(_arg(args, "worker_mode", "sequential") or "sequential"),
+        **_ood_knob_receipt(),
+        "klt_fallback": (os.environ.get("SFM_EDM_KLT_FALLBACK", "1") != "0"),
+        "boot_hold": bool(_arg(args, "boot_hold", False)),
+        "lost_hold": bool(_arg(args, "lost_hold", False)),
     }
 
 
@@ -891,12 +931,22 @@ def run_source_cadence(
     monotonic=time.monotonic,
     drain_timeout_s: float = 8.0,
     adaptive_submit: bool = False,
+    boot_hold: bool = False,
+    lost_hold: bool = False,
 ) -> tuple[list[dict], dict]:
     """Submit frames at recorded cadence through a capacity-one client.
 
     `decoded` yields dicts with rgb, source_index, decode_ms, recorded_stamp,
     frame_id, frame_sha256, and copy_ms. Queues stay bounded: one frame is
     decoded, then submitted (coalesce if busy), then results are polled.
+
+    With ``boot_hold`` the submitter block-waits for the worker while no
+    frame has succeeded yet (mirrors the operator app's boot_holding: a
+    BOOT frame is never coalesced away, so the acquire ramp cannot be
+    skipped). With ``lost_hold`` it likewise waits while the last known
+    tracker state is LOST (mirrors lost_hold pausing the replay). Both are
+    bounded by ``drain_timeout_s`` per frame and recorded in stats; they
+    only affect the production-path submit loop.
 
     With ``adaptive_submit`` the coalesce slot is only refreshed once per
     latency-scaled interval while the worker is busy (the operator app's real
@@ -916,6 +966,10 @@ def run_source_cadence(
     coalesce_at_submit: list[int] = []
     last_latency_ms: float | None = None
     last_coalesce_mono = origin
+    acquired = False
+    last_state: str | None = None
+    hold_waits = 0
+    hold_budget_s = max(0.0, float(drain_timeout_s))
     for item in decoded:
         decoded_count += 1
         source_index = int(item["source_index"])
@@ -939,6 +993,19 @@ def run_source_cadence(
                         last_latency_ms = float(lm)
                 continue
             last_coalesce_mono = capture_mono
+        holding = (boot_hold and not acquired) or (lost_hold and last_state == "LOST")
+        if holding and callable(getattr(client, "busy", None)):
+            hold_deadline = monotonic() + hold_budget_s
+            while client.busy() and monotonic() < hold_deadline:
+                for p in client.poll_results():
+                    payloads.append(p)
+                    if p.get("success"):
+                        acquired = True
+                    state = p.get("state_out") or p.get("next_mode")
+                    if state:
+                        last_state = str(state)
+                    hold_waits += 1
+                sleep(0.005)
         identity = {
             "source_index": source_index,
             "frame_id": item["frame_id"],
@@ -973,6 +1040,11 @@ def run_source_cadence(
             lm = p.get("wall_ms") or p.get("core_wall_ms")
             if lm:
                 last_latency_ms = float(lm)
+            if p.get("success"):
+                acquired = True
+            state = p.get("state_out") or p.get("next_mode")
+            if state:
+                last_state = str(state)
     drain_deadline = monotonic() + max(0.0, float(drain_timeout_s))
     busy = getattr(client, "busy", None)
     while callable(busy) and busy() and monotonic() < drain_deadline:
@@ -988,6 +1060,9 @@ def run_source_cadence(
         "coalesce_drops": int(getattr(client, "_coalesce_drops", 0) or 0),
         "coalesce_at_submit": sum(coalesce_at_submit),
         "results": len(payloads),
+        "boot_hold": bool(boot_hold),
+        "lost_hold": bool(lost_hold),
+        "hold_waits": hold_waits,
     }
     rows = [
         _row_from_worker_payload(payload, identities)
@@ -1048,10 +1123,31 @@ def _row_from_worker_payload(payload: dict, identities: dict) -> dict:
         "state_in": payload.get("state_in") or payload.get("mode"),
         "state_out": payload.get("state_out") or payload.get("next_mode"),
         "candidate_mode": payload.get("candidate_mode"),
+        "bridge": payload.get("bridge"),
+        "bridge_run": payload.get("bridge_run"),
+        "klt_fallback": payload.get("klt_fallback"),
+        "bridge_after_reject": payload.get("bridge_after_reject"),
+        "ood_verdict": payload.get("ood_verdict"),
+        "ood_vpr_vote": payload.get("ood_vpr_vote"),
+        "ood_match_vote": payload.get("ood_match_vote"),
+        "ood_reason": payload.get("ood_reason"),
+        "vpr_top1": payload.get("vpr_top1"),
+        "vpr_margin": payload.get("vpr_margin"),
+        "vpr_entropy": payload.get("vpr_entropy"),
+        "match_corr_best": payload.get("match_corr_best"),
+        "match_mconf_best_p50": payload.get("match_mconf_best_p50"),
         "global_retrieval_calls": payload.get("global_retrieval_calls"),
         "temporal_used": payload.get("temporal_used"),
         "selected_ref": payload.get("selected_ref"),
         "rejected": payload.get("rejected"),
+        "trajectory_veto_reason": payload.get("trajectory_veto_reason"),
+        "trajectory_veto_step": payload.get("trajectory_veto_step"),
+        "trajectory_veto_dt_s": payload.get("trajectory_veto_dt_s"),
+        "trajectory_veto_yaw_delta_deg": payload.get("trajectory_veto_yaw_delta_deg"),
+        "trajectory_veto_yaw_rate_deg_s": payload.get("trajectory_veto_yaw_rate_deg_s"),
+        "gravity_veto_reason": payload.get("gravity_veto_reason"),
+        "gravity_roll_deg": payload.get("gravity_roll_deg"),
+        "gravity_down_deg": payload.get("gravity_down_deg"),
         "limited_jump": payload.get("limited_jump"),
         "limited_jump_confirmed": bool(payload.get("limited_jump_confirmed")),
         "inliers": int(payload.get("inliers", 0) or 0),
@@ -1428,19 +1524,6 @@ def parse_args() -> argparse.Namespace:
         default=False,
     )
     parser.add_argument(
-        "--megaloc-backend",
-        choices=("pytorch", "pytorch_fp16", "tensorrt"),
-        default="tensorrt",
-    )
-    parser.add_argument("--megaloc-engine", type=Path)
-    parser.add_argument("--megaloc-engine-sha256")
-    parser.add_argument(
-        "--megaloc-token-reduction",
-        choices=("none", "l2", "evit"),
-        default="none",
-        help="query-only training-free token reduction from arXiv:2607.15563v1",
-    )
-    parser.add_argument(
         "--track-miss-widen-topk",
         type=int,
         help=(
@@ -1467,17 +1550,23 @@ def parse_args() -> argparse.Namespace:
             "(production-path: use SFM_EDM_BOOT_RELAXED_MIN_INLIERS)"
         ),
     )
-    parser.add_argument("--megaloc-token-keep-ratio", type=float)
-    parser.add_argument("--megaloc-token-layer", type=int, default=6)
     parser.add_argument(
         "--lost-strategy",
         choices=list(LOST_STRATEGIES),
         help="override global retrieval policy",
     )
     parser.add_argument(
+        "--match-batch-size",
+        type=int,
+        help=(
+            "references matched per EDM forward; production profile uses 2 "
+            "(production-path: profile-only, no worker input)"
+        ),
+    )
+    parser.add_argument(
         "--lost-global-retrieval-interval",
         type=int,
-        help="override LOST MegaLoc retry interval; 0 keeps one-shot LOST",
+        help="override LOST global-retrieval interval; 0 keeps one-shot LOST",
     )
     parser.add_argument(
         "--acquire-relaxed-min-inliers",
@@ -1492,7 +1581,7 @@ def parse_args() -> argparse.Namespace:
         "--lost-starved-global-frames",
         type=int,
         help=(
-            "consecutive corr-starved LOST frames that force a full-map MegaLoc "
+            "consecutive corr-starved LOST frames that force a full-map "
             "retry; 0 disables (production-path: use SFM_EDM_LOST_STARVED_FRAMES)"
         ),
     )
@@ -1554,6 +1643,25 @@ def parse_args() -> argparse.Namespace:
             "_localization_coalesce_interval_s. Bridge-aware: fast (KLT-bridge) "
             "frames keep the interval at its floor, slow recovery frames widen "
             "it so the submitter backs off instead of piling stale frames."
+        ),
+    )
+    parser.add_argument(
+        "--boot-hold",
+        action="store_true",
+        help=(
+            "production-path only: while no frame has succeeded yet, "
+            "block-wait for the worker instead of coalescing (mirrors the "
+            "operator app's boot_holding). Without it a slow BOOT worker "
+            "drops its own acquire ramp and never converges."
+        ),
+    )
+    parser.add_argument(
+        "--lost-hold",
+        action="store_true",
+        help=(
+            "production-path only: while the last known tracker state is "
+            "LOST, block-wait for the worker instead of coalescing "
+            "(mirrors lost_hold pausing the replay)."
         ),
     )
     parser.add_argument("--pair-role", choices=["A", "B"], help="label this run in a B-A-A-B pair")
@@ -1632,20 +1740,6 @@ _OPTIONAL_RUN_INPUT_CHECKS = (
         None,
         _is_nonneg_int,
         "host-reference-feature-cache-size must be a non-negative integer",
-    ),
-    (
-        "megaloc_token_keep_ratio",
-        None,
-        None,
-        lambda value: _is_unit_interval(value) and float(value) > 0.0,
-        "megaloc-token-keep-ratio must be within (0, 1]",
-    ),
-    (
-        "megaloc_token_layer",
-        6,
-        None,
-        _is_positive_int,
-        "megaloc-token-layer must be a positive integer",
     ),
     (
         "lost_global_retrieval_interval",
@@ -1743,31 +1837,13 @@ def _validate_run_inputs(args) -> tuple[Path, Path]:
         raise SystemExit("stride must be > 0; frame/correspondence limits must be >= 0")
     _validate_override_run_inputs(args)
     _reject_untransmitted_production_overrides(args)
-    if (
-        args.megaloc_token_reduction != "none"  # noqa: S105 - ViT token pruning, not a credential
-        and args.megaloc_backend == "tensorrt"
-    ):
-        raise SystemExit(
-            "token reduction requires --megaloc-backend pytorch or pytorch_fp16"
-        )
-    if args.megaloc_engine is not None:
-        digest = str(args.megaloc_engine_sha256 or "")
-        if len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
-            raise SystemExit("--megaloc-engine requires a lowercase 64-character SHA-256")
-        if not args.megaloc_engine.expanduser().is_file():
-            raise SystemExit(f"MegaLoc engine not found: {args.megaloc_engine}")
-    elif args.megaloc_engine_sha256:
-        raise SystemExit("--megaloc-engine-sha256 requires --megaloc-engine")
     if args.worker_mode == "production-path" and (
-        args.megaloc_token_reduction != "none"  # noqa: S105 - ViT token pruning, not a credential
-        or args.megaloc_backend != "tensorrt"
-        or not args.query_feature_reuse
+        not args.query_feature_reuse
         or args.temporal_feature_promotion
         or args.inclusive_host_feature_cache
-        or args.megaloc_engine is not None
     ):
         raise SystemExit(
-            "production-path does not transmit MegaLoc backend/token overrides"
+            "production-path does not transmit query feature overrides"
         )
     site_path = args.site_profile.expanduser().resolve()
     video_path = args.video.expanduser().resolve()
@@ -1832,7 +1908,6 @@ def _load_replay_profile(args, site_path: Path, video_path: Path):
 
 def _build_replay_runtime(args, site, camera_tuple):
     apply_sigma_mode(args)
-    apply_megaloc_token_reduction(args)
     apply_edm_cache_runtime_flags(args)
     startup_started = time.perf_counter()
     # Sequential replay feeds frames in a tight loop, faster than any slow-path
@@ -1845,6 +1920,11 @@ def _build_replay_runtime(args, site, camera_tuple):
     # shell and then asked for a sequential exact gate.
     if "SFM_EDM_ASYNC_TRACKER" not in os.environ:
         os.environ["SFM_EDM_ASYNC_TRACKER"] = "0"
+    # The site's measured gravity file is already a SHA-bound profile asset;
+    # export it so a tracker-side gravity check sees the same file the live
+    # launcher passes as --map-align. Ignored unless that check is enabled.
+    if site.map_align and "SFM_MAP_ALIGN" not in os.environ:
+        os.environ["SFM_MAP_ALIGN"] = str(site.map_align)
     built = build_production_localizer(
         backend="edm",
         bundle=site.localization_bundle,
@@ -1853,9 +1933,6 @@ def _build_replay_runtime(args, site, camera_tuple):
         camera_tuple=camera_tuple,
         production_profile=site.localizer_profile,
         production_profile_sha256=site.asset_sha256.localizer_profile,
-        megaloc_backend=args.megaloc_backend,
-        megaloc_engine=args.megaloc_engine,
-        megaloc_engine_sha256=args.megaloc_engine_sha256,
     )
     if args.max_corr_total:
         built.config.max_corr_total = int(args.max_corr_total)
@@ -1941,9 +2018,18 @@ def _process_replay_frame(
         "center": (None if center is None else [float(center[0]), float(center[1]), float(center[2])]),
         "estimated_center": (None if next_center is None else [float(next_center[0]), float(next_center[1]), float(next_center[2])]),
         "pose_xyz": (None if center is None else [float(center[0]), float(center[1]), float(center[2])]),
+        "pose_yaw": (None if pose is None else float(pose.yaw)),
         "mode": info.get("mode"),
         "next_mode": info.get("next_mode"),
         "rejected": info.get("rejected"),
+        "trajectory_veto_reason": info.get("trajectory_veto_reason"),
+        "trajectory_veto_step": info.get("trajectory_veto_step"),
+        "trajectory_veto_dt_s": info.get("trajectory_veto_dt_s"),
+        "trajectory_veto_yaw_delta_deg": info.get("trajectory_veto_yaw_delta_deg"),
+        "trajectory_veto_yaw_rate_deg_s": info.get("trajectory_veto_yaw_rate_deg_s"),
+        "gravity_veto_reason": info.get("gravity_veto_reason"),
+        "gravity_roll_deg": info.get("gravity_roll_deg"),
+        "gravity_down_deg": info.get("gravity_down_deg"),
         "limited_jump": info.get("limited_jump"),
         "limited_jump_confirmed": bool(info.get("limited_jump_confirmed")),
         "inliers": int(info.get("inliers", 0) or 0),
@@ -2147,6 +2233,8 @@ def _run_production_path_replay(
             monotonic=monotonic,
             drain_timeout_s=float(getattr(client, "timeout_s", 8.0) or 8.0),
             adaptive_submit=bool(_arg(args, "adaptive_submit", False)),
+            boot_hold=bool(_arg(args, "boot_hold", False)),
+            lost_hold=bool(_arg(args, "lost_hold", False)),
         )
         attach_production_path_receipt_fields(rows, stats, client)
         return _rows_to_replay_tuple(rows, processing_started)

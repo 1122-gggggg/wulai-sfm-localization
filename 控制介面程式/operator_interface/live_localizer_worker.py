@@ -683,7 +683,7 @@ def _build_worker_backend(args, backend: str, query_camera_override, map_frame):
             edm_matcher = tracker.trk.loc.matcher
             print(
                 f"[live_worker] EDM tracker={tracker_variant} "
-                f"megaloc={args.megaloc_backend} "
+                f"vpr=megaloc_{args.megaloc_backend} "
                 f"mconf={getattr(edm_matcher, 'mconf_thr', 0.2)} "
                 f"track/weak/lost={cfg.local_topk}/{cfg.weak_local_topk}/"
                 f"{getattr(cfg, 'lost_local_topk', 'n/a')} "
@@ -1214,6 +1214,15 @@ def _build_success_payload(
         "lost_search_stage": info.get("lost_search_stage"),
         "lost_search_radius_factor": info.get("lost_search_radius_factor"),
         "camera_axes_world": info.get("camera_axes_world"),
+        "ood_verdict": info.get("ood_verdict"),
+        "ood_vpr_vote": info.get("ood_vpr_vote"),
+        "ood_match_vote": info.get("ood_match_vote"),
+        "ood_reason": info.get("ood_reason"),
+        "vpr_top1": info.get("vpr_top1"),
+        "vpr_margin": info.get("vpr_margin"),
+        "vpr_entropy": info.get("vpr_entropy"),
+        "match_corr_best": info.get("match_corr_best"),
+        "match_mconf_best_p50": info.get("match_mconf_best_p50"),
         "camera_forward_world": info.get("camera_forward_world"),
         "reproj_rms": info.get("reproj_rms"),
         "inlier_ratio": info.get("inlier_ratio"),

@@ -8,32 +8,11 @@
       "size_bytes": 41417503
     },
     {
-      "fetch_hint": "Seed the RTX 5060 / TensorRT 11.2 MegaLoc engine at this repository-relative path.",
-      "name": "megaloc-tensorrt-engine",
-      "path": "定位演算法/deploy_code/runtime/EDM/weights/megaloc_322_autocast_fp16.engine",
-      "sha256": "07a849aa9085574a5537332bf9a5023c1fc17f2022086047a7f910d87d5d6dfe",
-      "size_bytes": 464285892
-    },
-    {
-      "fetch_hint": "Seed the approved MegaLoc torch.hub source at this repository-relative path.",
-      "name": "megaloc-hubconf",
-      "path": "執行環境/torch_hub_cache/gmberton_MegaLoc_main/hubconf.py",
-      "sha256": "2b75be965414adec2330de9bff4279a86b1a0fea814de2078c831d70eb54367a",
-      "size_bytes": 969
-    },
-    {
-      "fetch_hint": "Seed the approved MegaLoc torch.hub source at this repository-relative path.",
-      "name": "megaloc-model-source",
-      "path": "執行環境/torch_hub_cache/gmberton_MegaLoc_main/megaloc_model.py",
-      "sha256": "3cbf1d20515b1da423998a8edab787031eaa7bb273c5a86a5c41c4f6d84e2a6d",
-      "size_bytes": 15258
-    },
-    {
-      "fetch_hint": "Seed the approved MegaLoc weights at this repository-relative path.",
-      "name": "megaloc-weights",
-      "path": "執行環境/torch_hub_cache/checkpoints/megaloc/7cb9f7970d366fdf059963d04d372e503e8e9df9/model.safetensors",
-      "sha256": "d4f9f2bcb60018f91eb6a8e061ed054fd55654e10c2569cf13841ea986ffb4f8",
-      "size_bytes": 914577436
+      "fetch_hint": "Seed the sanctioned BoQ-ResNet50 weights at this repository-relative path.",
+      "name": "boq-weights",
+      "path": "執行環境/torch_hub_cache/checkpoints/boq/resnet50_16384.pth",
+      "sha256": "4691d1545db847da2c0ba911f34e6c520a5da63f8b94c6415fe87d0d8800ebaa",
+      "size_bytes": 95610672
     },
     {
       "fetch_hint": "Seed the approved MoGe-2 ViT-S normal checkpoint at this repository-relative path.",
