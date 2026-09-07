@@ -28,7 +28,6 @@ SIM_DIR = LOC_ROOT / "simulation"
 
 DEFAULT_BASE = LOC_ROOT / "bundles" / "base_reloc_map_xfeat_tri.pt"
 DEFAULT_FINAL = LOC_ROOT / "bundles" / "current_reloc_map_updated_v3.pt"
-DEFAULT_BASE_CACHE = ""
 DEFAULT_TEST = SYSTEM_ROOT / "更新地圖" / "inputs" / "補拍影片" / "test"
 DEFAULT_INTRINSICS = DEPLOY / "map_intrinsics.json"
 
@@ -66,7 +65,6 @@ def main() -> None:
                         default="production-stream")
     parser.add_argument("--base", default=str(DEFAULT_BASE))
     parser.add_argument("--final", default=str(DEFAULT_FINAL))
-    parser.add_argument("--base-megaloc-cache", default=str(DEFAULT_BASE_CACHE))
     parser.add_argument("--test-dir", default=str(DEFAULT_TEST))
     parser.add_argument("--stride", type=int, default=10)
     parser.add_argument("--resize", default="1280x720")
@@ -109,8 +107,6 @@ def main() -> None:
             "--min-sampled-frames", str(args.min_sampled_frames),
             "--out-json", str(out),
         ] + passthrough
-        if args.base_megaloc_cache:
-            cmd += ["--base-megaloc-cache", args.base_megaloc_cache]
         run(cmd, py_env())
         quality_ok = write_quality_report(out, args.min_success, args.max_ok_to_fail, args.max_final_fail_run)
         if not quality_ok and not args.allow_quality_fail:

@@ -86,6 +86,7 @@ OUTPUT_EVIDENCE_PREFIXES = (
     "augment_",
     "baseline_",
     "benchmark_",
+    "boq_",
     "corpus_",
     "edm_",
     "gates_",

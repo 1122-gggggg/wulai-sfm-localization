@@ -3426,15 +3426,15 @@ def test_flow_cache_is_not_used_outside_track_state():
     assert tracker._last_info["flow_stage"] == "refresh"
 
 
-def test_megaloc_fp16_is_explicit_and_cuda_only(monkeypatch):
+def test_vpr_fp16_is_explicit_and_cuda_only(monkeypatch):
     import production_xfeat_tracker as pxt
 
-    descriptors = np.ones((1, 2), np.float32)
-    monkeypatch.setenv("SFM_MEGALOC_FP16", "1")
-    assert pxt.MegaLocLayer(descriptors, device="cuda").fp16 is True
-    assert pxt.MegaLocLayer(descriptors, device="cpu").fp16 is False
-    monkeypatch.setenv("SFM_MEGALOC_FP16", "0")
-    assert pxt.MegaLocLayer(descriptors, device="cuda").fp16 is False
+    descriptors = np.ones((1, pxt.BOQ_DIM), np.float32)
+    monkeypatch.setenv("SFM_BOQ_FP16", "1")
+    assert pxt.BoQLayer(descriptors, device="cuda").fp16 is True
+    assert pxt.BoQLayer(descriptors, device="cpu").fp16 is False
+    monkeypatch.setenv("SFM_BOQ_FP16", "0")
+    assert pxt.BoQLayer(descriptors, device="cuda").fp16 is False
 
 
 def test_cuda_oom_releases_live_gpu_caches(monkeypatch):

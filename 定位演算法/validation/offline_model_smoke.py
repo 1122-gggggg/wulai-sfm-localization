@@ -34,7 +34,7 @@ def blocked_getaddrinfo(*args, **kwargs):
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--model", choices=["all", "edm", "megaloc", "xfeat"], default="all"
+        "--model", choices=["all", "edm", "boq", "xfeat"], default="all"
     )
     args = parser.parse_args()
     os.environ["HF_HUB_OFFLINE"] = "1"
@@ -47,18 +47,19 @@ def main() -> int:
 
     if args.model in ("all", "edm"):
         from edm_matcher import EDMMatcher
-        from reloc_localizer_edm import MEGALOC_REVISION, MegaLocQuery
+        from boq_query import BoQQuery
 
-        extractor = MegaLocQuery(device="cpu")
+        extractor = BoQQuery(device="cpu")
         descriptor = extractor.extract_one(np.zeros((64, 64, 3), dtype=np.uint8))
         if descriptor.ndim != 1 or not np.isfinite(descriptor).all():
-            raise RuntimeError("EDM MegaLoc produced an invalid descriptor")
+            raise RuntimeError("EDM BoQ produced an invalid descriptor")
+        if descriptor.size != 16384:
+            raise RuntimeError(
+                f"EDM BoQ descriptor dim {descriptor.size} != 16384"
+            )
         if not np.isclose(np.linalg.norm(descriptor), 1.0, atol=1e-4):
-            raise RuntimeError("EDM MegaLoc descriptor is not L2-normalized")
-        print(
-            f"EDM MegaLoc offline load/inference OK: revision={MEGALOC_REVISION} "
-            f"dim={descriptor.size}"
-        )
+            raise RuntimeError("EDM BoQ descriptor is not L2-normalized")
+        print(f"EDM BoQ offline load/inference OK: dim={descriptor.size}")
         del extractor, descriptor
         gc.collect()
 
@@ -89,14 +90,13 @@ def main() -> int:
         gc.collect()
         torch.cuda.empty_cache()
 
-    if args.model in ("all", "megaloc"):
-        from production_xfeat_tracker import MegaLocLayer
-        from reloc_localizer_edm import MEGALOC_REVISION
+    if args.model in ("all", "boq"):
+        from production_xfeat_tracker import BoQLayer
 
-        model = MegaLocLayer(
-            np.empty((0, 8448), dtype=np.float32), input_size=322, device="cpu"
+        model = BoQLayer(
+            np.empty((0, 16384), dtype=np.float32), device="cpu"
         ).model()
-        print(f"MegaLoc offline load OK: revision={MEGALOC_REVISION} params={sum(p.numel() for p in model.parameters())}")
+        print(f"BoQ offline load OK: params={sum(p.numel() for p in model.parameters())}")
         del model
         gc.collect()
 

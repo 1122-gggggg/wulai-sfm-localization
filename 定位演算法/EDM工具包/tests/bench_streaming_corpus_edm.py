@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Benchmark deployment-like video streaming with bounded MegaLoc retrieval.
+"""Benchmark deployment-like video streaming with bounded BoQ retrieval.
 
 The reported wall FPS includes video decoding, resize, EDM matching, PnP, metric
 collection, and synchronous result transfer.  P123/P126 have no pose ground truth;
 their quality metrics are support/continuity proxies, not absolute accuracy.
 
-MegaLoc is allowed once at BOOT and once on entry to each LOST episode. TRACK and
+BoQ is allowed once at BOOT and once on entry to each LOST episode. TRACK and
 LOW/WEAK must remain on EDM candidates only.
 """
 from __future__ import annotations
@@ -37,7 +37,8 @@ from production_edm_tracker import (  # noqa: E402
     LOST_PRIOR_STRATEGIES,
     ProductionEDMTracker,
 )
-from reloc_localizer_edm import Camera, EDMRelocMap, MegaLocQuery  # noqa: E402
+from boq_query import BoQQuery  # noqa: E402
+from reloc_localizer_edm import Camera, EDMRelocMap  # noqa: E402
 
 
 VIDEO_SUFFIXES = {".mp4", ".mov", ".mkv", ".avi", ".m4v"}
@@ -604,7 +605,7 @@ def _frame_csv(path: Path, frames: list[dict[str, Any]]) -> None:
 
 def run_video(
     video: dict[str, Any], rmap: EDMRelocMap, camera: Camera, tracker_cfg: EDMConfig,
-    matcher: EDMMatcher, megaloc: MegaLocQuery, out_dir: Path, max_frames: int,
+    matcher: EDMMatcher, vpr: BoQQuery, out_dir: Path, max_frames: int,
     progress_every: int, *, gpu_span: bool = False,
 ) -> dict[str, Any]:
     path = Path(video["path"])
@@ -615,7 +616,7 @@ def run_video(
     source_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     source_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     source_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    tracker = ProductionEDMTracker(rmap, camera, tracker_cfg, matcher=matcher, vpr=megaloc)
+    tracker = ProductionEDMTracker(rmap, camera, tracker_cfg, matcher=matcher, vpr=vpr)
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()
     sampler = GPUSampler()
@@ -787,7 +788,7 @@ def main() -> None:
         startup = {
             "map_load_seconds": None,
             "matcher_load_seconds": None,
-            "megaloc_load_seconds": None,
+            "vpr_load_seconds": None,
         }
         print("startup: production-path launches one LiveLocalizerClient per video", flush=True)
     else:
@@ -801,12 +802,12 @@ def main() -> None:
         )
         matcher_load_seconds = time.perf_counter() - t0
         t0 = time.perf_counter()
-        megaloc = MegaLocQuery()
-        megaloc_load_seconds = time.perf_counter() - t0
+        vpr = BoQQuery()
+        vpr_load_seconds = time.perf_counter() - t0
         startup = {
             "map_load_seconds": _rounded(map_load_seconds),
             "matcher_load_seconds": _rounded(matcher_load_seconds),
-            "megaloc_load_seconds": _rounded(megaloc_load_seconds),
+            "vpr_load_seconds": _rounded(vpr_load_seconds),
         }
         print(f"startup: {startup}", flush=True)
 
@@ -845,7 +846,7 @@ def main() -> None:
             )
         else:
             summary = run_video(
-                video, rmap, camera, tracker_cfg, matcher, megaloc, out_dir,
+                video, rmap, camera, tracker_cfg, matcher, vpr, out_dir,
                 max_frames=args.max_frames, progress_every=args.progress_every,
                 gpu_span=bool(args.gpu_span),
             )
@@ -861,7 +862,7 @@ def main() -> None:
         })
         print(
             f"done: localized={100*summary['localized_rate']:.1f}% wall={summary['wall_fps']:.1f} FPS "
-            f"realtime={summary['realtime_margin']:.2f}x MegaLoc_calls={summary['global_retrieval_calls']}",
+            f"realtime={summary['realtime_margin']:.2f}x vpr_calls={summary['global_retrieval_calls']}",
             flush=True,
         )
     result = {

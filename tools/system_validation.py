@@ -147,7 +147,7 @@ RELEASE_FILES = (
     "定位演算法/validation/baselines/p119_edm_quality.json",
     "執行環境/torch_hub_cache/gmberton_MegaLoc_main/hubconf.py",
     "執行環境/torch_hub_cache/gmberton_MegaLoc_main/megaloc_model.py",
-    "執行環境/torch_hub_cache/checkpoints/megaloc/7cb9f7970d366fdf059963d04d372e503e8e9df9/model.safetensors",
+    "執行環境/torch_hub_cache/checkpoints/boq/resnet50_16384.pth",
 )
 
 

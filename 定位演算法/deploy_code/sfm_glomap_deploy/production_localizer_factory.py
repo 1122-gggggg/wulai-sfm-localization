@@ -61,8 +61,8 @@ def _load_bound_reference_index(
         root = source
     verify_sha256(root / "SHA256SUMS.json", expected_sha256 or None)
     index = open_reference_index(root, expected_dimension=dimension)
-    if not index.model_identity.startswith("megaloc:"):
-        raise ValueError("reference index model identity must use the megaloc family")
+    if not index.model_identity.startswith("boq:"):
+        raise ValueError("reference index model identity must use the boq family")
     names = tuple(ref_names)
     if index.count != len(names) or set(index.names) != set(names):
         raise ValueError("reference index names do not match localization bundle")
@@ -111,7 +111,7 @@ def validate_camera_tuple(camera_tuple) -> tuple[str, int, int, list[float]]:
 
 
 def _validate_xfeat_vpr_metadata(meta: object) -> str:
-    """Require every declared XFeat bundle VPR identity to be MegaLoc."""
+    """Require every declared XFeat bundle VPR identity to be BoQ."""
     if not isinstance(meta, dict):
         raise ValueError("XFeat production bundle metadata must be a dictionary")
     declared = []
@@ -120,14 +120,14 @@ def _validate_xfeat_vpr_metadata(meta: object) -> str:
             continue
         value = meta[key]
         if not isinstance(value, str) or not value.strip():
-            raise ValueError(f"XFeat production {key} metadata must declare MegaLoc")
+            raise ValueError(f"XFeat production {key} metadata must declare BoQ")
         normalized = value.strip().lower()
-        if not normalized.startswith("megaloc"):
-            raise ValueError(f"XFeat production requires MegaLoc VPR metadata; {key}={value!r}")
+        if not normalized.startswith("boq"):
+            raise ValueError(f"XFeat production requires BoQ VPR metadata; {key}={value!r}")
         declared.append(normalized)
     if not declared:
-        raise ValueError("XFeat production bundle must declare MegaLoc VPR metadata")
-    return "megaloc"
+        raise ValueError("XFeat production bundle must declare BoQ VPR metadata")
+    return "boq"
 
 
 def production_xfeat_config():
@@ -218,9 +218,8 @@ def _build_edm_localizer(
     megaloc_cache: str | Path | None = None,
     reference_index: str | Path | None = None,
     reference_index_sha256: str | None = None,
-    megaloc_backend: str | None = "tensorrt",
-    megaloc_engine: str | Path | None = None,
-    megaloc_engine_sha256: str | None = None,
+    vpr_weights: str | Path | None = None,
+    vpr_weights_sha256: str | None = None,
     production_profile: str | Path | None = None,
     production_profile_sha256: str | None = None,
     matcher_mode: str = "",
@@ -240,9 +239,10 @@ def _build_edm_localizer(
             "map scale. Pass production_profile=..., or set "
             "allow_profile_defaults=True for a deliberate, non-flight experiment."
         )
+    from boq_query import BoQQuery
     from edm_localizer_adapter import EDMTrackerAdapter, production_edm_config
     from edm_matcher import EDMMatcher
-    from reloc_localizer_edm import Camera, DEVICE, EDMRelocMap, MegaLocQuery
+    from reloc_localizer_edm import Camera, DEVICE, EDMRelocMap
 
     trusted_bundle_sha256 = expected_sha256(bundle, bundle_sha256)
     reloc_map = EDMRelocMap.load(
@@ -301,11 +301,10 @@ def _build_edm_localizer(
         source=production_profile,
     )
     vpr_factory = partial(
-        MegaLocQuery,
+        BoQQuery,
         device=DEVICE,
-        backend=megaloc_backend,
-        engine_path=megaloc_engine,
-        engine_sha256=megaloc_engine_sha256,
+        weights_path=vpr_weights,
+        weights_sha256=vpr_weights_sha256,
     )
     # Default 0 = synchronous tracker. The async fast/slow split was made the
     # default on 2026-09-04 on P117 + P168 evidence; the seven-video 720p corpus
@@ -365,7 +364,7 @@ def _build_edm_localizer(
         backend="edm",
         variant=(
             f"production_edm_{profile_name}_topk{config.local_topk}_{matcher_tag}"
-            f"_megaloc_{megaloc_backend or 'environment'}"
+            "_boq_resnet50_fp16"
             + ("_async" if async_mode else "")
         ),
         device=DEVICE,
@@ -381,9 +380,8 @@ def _build_xfeat_localizer(
     megaloc_cache: str | Path | None = None,
     reference_index: str | Path | None = None,
     reference_index_sha256: str | None = None,
-    megaloc_backend: str | None = None,
-    megaloc_engine: str | Path | None = None,
-    megaloc_engine_sha256: str | None = None,
+    vpr_weights: str | Path | None = None,
+    vpr_weights_sha256: str | None = None,
     production_profile: str | Path | None = None,
     production_profile_sha256: str | None = None,
     matcher_mode: str = "",
@@ -395,11 +393,11 @@ def _build_xfeat_localizer(
         production_profile,
         production_profile_sha256,
         allow_profile_defaults,
-        megaloc_backend,
-        megaloc_engine,
-        megaloc_engine_sha256,
+        vpr_weights,
+        vpr_weights_sha256,
     )
-    from production_xfeat_tracker import MegaLocLayer, ProductionXFeatTracker
+    from boq_query import BOQ_INPUT
+    from production_xfeat_tracker import BoQLayer, ProductionXFeatTracker
     from reloc_localizer_xfeat import Camera, DEVICE, XFeatRelocMap
 
     reloc_map = XFeatRelocMap.load(str(bundle), bundle_sha256 or None)
@@ -420,24 +418,24 @@ def _build_xfeat_localizer(
     if indexed_retrieval is not None and cache is not None:
         raise ValueError("choose either reference_index or megaloc_cache, not both")
     if indexed_retrieval is not None:
-        megaloc = MegaLocLayer(
+        vpr = BoQLayer(
             None,
-            input_size=322,
+            input_size=BOQ_INPUT,
             device=DEVICE,
             reference_index=indexed_retrieval,
             ref_names=reloc_map.ref_names,
         )
     elif cache is not None and cache.is_file():
-        megaloc = MegaLocLayer.load_cache(
+        vpr = BoQLayer.load_cache(
             cache,
             reloc_map.ref_names,
-            input_size=322,
+            input_size=BOQ_INPUT,
             device=DEVICE,
         )
     else:
-        megaloc = MegaLocLayer(
+        vpr = BoQLayer(
             reloc_map.ref_global,
-            input_size=322,
+            input_size=BOQ_INPUT,
             device=DEVICE,
         )
     config = production_xfeat_config()
@@ -450,7 +448,7 @@ def _build_xfeat_localizer(
     camera = Camera(*camera_tuple)
     tracker = ProductionXFeatTracker(
         reloc_map,
-        megaloc,
+        vpr,
         frame_source=frame_source,
         query_cam=camera,
         cfg=config,
@@ -493,9 +491,8 @@ def build_production_localizer(
     megaloc_cache: str | Path | None = None,
     reference_index: str | Path | None = None,
     reference_index_sha256: str | None = None,
-    megaloc_backend: str | None = "tensorrt",
-    megaloc_engine: str | Path | None = None,
-    megaloc_engine_sha256: str | None = None,
+    vpr_weights: str | Path | None = None,
+    vpr_weights_sha256: str | None = None,
     production_profile: str | Path | None = None,
     production_profile_sha256: str | None = None,
     matcher_mode: str = "",
@@ -516,9 +513,8 @@ def build_production_localizer(
         megaloc_cache=megaloc_cache,
         reference_index=reference_index,
         reference_index_sha256=reference_index_sha256,
-        megaloc_backend=megaloc_backend,
-        megaloc_engine=megaloc_engine,
-        megaloc_engine_sha256=megaloc_engine_sha256,
+        vpr_weights=vpr_weights,
+        vpr_weights_sha256=vpr_weights_sha256,
         production_profile=production_profile,
         production_profile_sha256=production_profile_sha256,
         matcher_mode=matcher_mode,

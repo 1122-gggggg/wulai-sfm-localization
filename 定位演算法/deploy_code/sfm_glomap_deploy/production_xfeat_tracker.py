@@ -3,7 +3,7 @@
 
 Production default for the ANAFI/GLOMAP runtime:
 
-- BOOT_INIT / LOST: MegaLoc global retrieval topK=30 -> XFeat+LighterGlue -> PnP.
+- BOOT_INIT / LOST: BoQ global retrieval topK=30 -> XFeat+LighterGlue -> PnP.
 - TRACK / WEAK_TRACK: no global retrieval; vpr_ms is intentionally 0.  Candidate
   refs come only from pose prior, nearby camera centers, and SfM covisibility.
 - TRACK / WEAK_TRACK run XFeat+LighterGlue adaptive on every frame: first top3
@@ -18,8 +18,8 @@ Deliberately NOT in the production TRACK path:
 - ALIKED
 - LoMa
 - Efficient LoFTR
-- non-MegaLoc VPR
-- MegaLoc, except BOOT_INIT and LOST acquisition.
+- non-BoQ VPR
+- BoQ, except BOOT_INIT and LOST acquisition.
 
 This module is intentionally additive. It reuses the existing XFeat reloc bundle
 and does not modify the MV-RoMa/GLOMAP base map.
@@ -41,6 +41,7 @@ import torch
 import torch.nn.functional as F
 
 from pose_types import Localizer, Pose
+from boq_query import BOQ_DIM, BOQ_INPUT, BOQ_MODEL_IDENTITY, BoQQuery
 from megaloc_cache import load_megaloc_cache, write_megaloc_cache
 from reference_index import ReferenceIndex, open_reference_index
 from reloc_localizer_xfeat import (
@@ -50,12 +51,8 @@ from reloc_localizer_xfeat import (
     extract_xfeat,
     load_xfeat,
     DEVICE,
-    MEGALOC_REPO_DIR,
-    MEGALOC_WEIGHTS,
-    TORCH_HUB_DIR,
 )
 
-MEGALOC_REPO = "gmberton/MegaLoc"
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
 _LK_PARAMS = dict(winSize=(21, 21), maxLevel=3,
@@ -243,7 +240,7 @@ def dedup_correspondence_indices(pts2d: np.ndarray, pts3d: np.ndarray,
 class ProductionConfig:
     boot_global_topk: int = 30
     lost_global_topk: int = 30
-    weak_global_topk: int = 0          # production: MegaLoc is never used in WEAK_TRACK
+    weak_global_topk: int = 0          # production: BoQ is never used in WEAK_TRACK
     # TRACK: few nearby refs (2–3). WEAK: wider pool (weak_local_topk=8).
     # Loc ~15 FPS vs stream 30 FPS is handled outside by latest-frame coalesce
     # (never queue backlog; always track the newest image).
@@ -253,9 +250,9 @@ class ProductionConfig:
     covis_per_ref: int = 20
     radius: float = 0.8
     max_yaw_diff_deg: float = 90.0
-    # LOST reacquisition on continuous paths: bias MegaLoc toward the last pose
+    # LOST reacquisition on continuous paths: bias BoQ toward the last pose
     # so visually similar far places do not steal the fix. Fall back to pure
-    # global MegaLoc only after an elapsed capture-time timeout.
+    # global BoQ only after an elapsed capture-time timeout.
     lost_prefer_nearby: bool = True
     lost_nearby_radius: float = 3.0
     lost_nearby_topk: int = 12
@@ -587,13 +584,13 @@ def spatially_cap_correspondence_indices(
     return np.asarray(sorted(picked), dtype=int)
 
 
-class MegaLocLayer:
-    """MegaLoc retrieval layer with cached reference descriptors."""
+class BoQLayer:
+    """BoQ retrieval layer with cached reference descriptors."""
 
     def __init__(
         self,
         ref_desc: np.ndarray | None,
-        input_size: int = 322,
+        input_size: int = BOQ_INPUT,
         device: str = DEVICE,
         *,
         reference_index: ReferenceIndex | None = None,
@@ -621,8 +618,10 @@ class MegaLocLayer:
             }
         self.input_size = int(input_size)
         self.device = device
-        self.fp16 = device.startswith("cuda") and os.environ.get("SFM_MEGALOC_FP16", "0") == "1"
-        self._model = None
+        self.fp16 = device.startswith("cuda") and os.environ.get(
+            "SFM_BOQ_FP16", "1"
+        ).strip().lower() not in {"0", "false", "no", "off"}
+        self._query = None
 
     @property
     def reference_count(self) -> int:
@@ -631,26 +630,19 @@ class MegaLocLayer:
         assert self.ref_desc is not None
         return int(self.ref_desc.shape[0])
 
+    @property
+    def query(self) -> BoQQuery:
+        if self._query is None:
+            self._query = BoQQuery(self.device, self.input_size, fp16=self.fp16)
+        return self._query
+
     def model(self):
-        if self._model is None:
-            torch.hub.set_dir(str(TORCH_HUB_DIR))
-            self._model = torch.hub.load(
-                str(MEGALOC_REPO_DIR), "get_trained_model", source="local",
-                weights_path=str(MEGALOC_WEIGHTS),
-            ).eval().to(self.device)
-        return self._model
+        """Torch module behind the lazily built BoQ query extractor."""
+        return self.query.model
 
     @torch.inference_mode()
     def extract_one(self, rgb: np.ndarray) -> np.ndarray:
-        model = self.model()
-        x = torch.from_numpy(np.ascontiguousarray(rgb)).permute(2, 0, 1).float().to(self.device)[None] / 255.0
-        x = F.interpolate(x, size=(self.input_size, self.input_size), mode="bicubic",
-                          align_corners=False, antialias=True)
-        mean = torch.tensor(IMAGENET_MEAN, device=self.device).view(1, 3, 1, 1)
-        std = torch.tensor(IMAGENET_STD, device=self.device).view(1, 3, 1, 1)
-        with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=self.fp16):
-            d = model((x - mean) / std).float().squeeze(0).detach().cpu().numpy()
-        return d / (np.linalg.norm(d) + 1e-12)
+        return self.query.extract_one(rgb)
 
     def topk(self, rgb: np.ndarray, k: int) -> tuple[list[int], float]:
         scored, ms = self.topk_scored(rgb, k)
@@ -680,10 +672,14 @@ class MegaLocLayer:
         return scored, _timing_ms(t0)
 
     @staticmethod
-    def load_cache(cache_path: Path, ref_names: list[str], input_size: int = 322,
-                   device: str = DEVICE, meta_path: Path | None = None) -> "MegaLocLayer":
+    def load_cache(cache_path: Path, ref_names: list[str], input_size: int = BOQ_INPUT,
+                   device: str = DEVICE, meta_path: Path | None = None) -> "BoQLayer":
         desc = load_megaloc_cache(cache_path, ref_names, meta_path)
-        return MegaLocLayer(desc, input_size=input_size, device=device)
+        if desc.shape[1] != BOQ_DIM:
+            raise ValueError(
+                f"BoQ descriptor mismatch: cache dim={desc.shape[1]} expected={BOQ_DIM}"
+            )
+        return BoQLayer(desc, input_size=input_size, device=device)
 
     @staticmethod
     def load_index(
@@ -691,14 +687,14 @@ class MegaLocLayer:
         ref_names: list[str],
         *,
         expected_model_identity: str,
-        input_size: int = 322,
+        input_size: int = BOQ_INPUT,
         device: str = DEVICE,
-    ) -> "MegaLocLayer":
+    ) -> "BoQLayer":
         index = open_reference_index(
             index_path,
             expected_model_identity=expected_model_identity,
         )
-        return MegaLocLayer(
+        return BoQLayer(
             None,
             input_size=input_size,
             device=device,
@@ -709,9 +705,9 @@ class MegaLocLayer:
     @staticmethod
     @torch.inference_mode()
     def build_cache(ref_names: list[str], image_root: Path, cache_path: Path,
-                    meta_json: Path | None = None, input_size: int = 322,
-                    batch: int = 16, device: str = DEVICE) -> "MegaLocLayer":
-        layer = MegaLocLayer(np.empty((0, 0), np.float32), input_size=input_size, device=device)
+                    meta_json: Path | None = None, input_size: int = BOQ_INPUT,
+                    batch: int = 16, device: str = DEVICE) -> "BoQLayer":
+        layer = BoQLayer(np.empty((0, 0), np.float32), input_size=input_size, device=device)
         model = layer.model()
         outs = []
         buf = []
@@ -734,24 +730,23 @@ class MegaLocLayer:
                 outs.append(d)
                 buf.clear()
                 if i % 160 == 0 or i == len(ref_names):
-                    print(f"[{time.strftime('%H:%M:%S')}] MegaLoc refs {i}/{len(ref_names)}", flush=True)
+                    print(f"[{time.strftime('%H:%M:%S')}] BoQ refs {i}/{len(ref_names)}", flush=True)
         desc = np.vstack(outs).astype(np.float32)
         desc /= (np.linalg.norm(desc, axis=1, keepdims=True) + 1e-12)
         write_megaloc_cache(
             cache_path, desc, ref_names, meta_json,
             metadata={
-                "model": "MegaLoc",
-                "repo": MEGALOC_REPO,
+                "model": BOQ_MODEL_IDENTITY,
                 "input_size": input_size,
                 "refs": len(ref_names),
                 "image_root": str(image_root),
             },
         )
-        return MegaLocLayer(desc, input_size=input_size, device=device)
+        return BoQLayer(desc, input_size=input_size, device=device)
 
 
 class ProductionXFeatTracker(Localizer):
-    def __init__(self, reloc_map: XFeatRelocMap, megaloc: MegaLocLayer,
+    def __init__(self, reloc_map: XFeatRelocMap, vpr: BoQLayer,
                  frame_source, query_cam: Camera,
                  cfg: ProductionConfig | None = None,
                  map_frame=None):   # avoid shared mutable default
@@ -766,13 +761,13 @@ class ProductionXFeatTracker(Localizer):
             raise ValueError(
                 f"reloc bundle ref_yaws mismatch: refs={n_refs} ref_yaws={len(reloc_map.ref_yaws)}"
             )
-        if megaloc.reference_count != n_refs:
+        if vpr.reference_count != n_refs:
             raise ValueError(
-                f"MegaLoc descriptor mismatch: refs={n_refs} "
-                f"descriptors={megaloc.reference_count}"
+                f"BoQ descriptor mismatch: refs={n_refs} "
+                f"descriptors={vpr.reference_count}"
             )
         self.map = reloc_map
-        self.meg = megaloc
+        self.vpr = vpr
         self.frame_source = frame_source
         self.cam = query_cam
         self.cfg = cfg if cfg is not None else ProductionConfig()
@@ -811,7 +806,7 @@ class ProductionXFeatTracker(Localizer):
         self._flow_mnn_max_yaw = math.radians(float(self.cfg.flow_mnn_max_yaw_deg))
         self._flow_mnn_min_unique_inliers = int(self.cfg.flow_mnn_min_unique_inliers)
         self._flow_mnn_max_reproj = float(self.cfg.flow_mnn_max_reproj)
-        # Microbench: never leave TRACK, never call MegaLoc/BOOT/LOST acquisition.
+        # Microbench: never leave TRACK, never call BoQ/BOOT/LOST acquisition.
         # Used by live_localizer_worker --force-track-bench for TRACK FPS only.
         self.lock_track_only = False
 
@@ -821,7 +816,7 @@ class ProductionXFeatTracker(Localizer):
         return self._xfeat
 
     def ensure_models(self):
-        self.meg.model()
+        self.vpr.model()
         xfeat = self.ensure_xfeat()
         ensure_matcher = getattr(xfeat, "ensure_lighterglue", None)
         if callable(ensure_matcher):
@@ -864,15 +859,15 @@ class ProductionXFeatTracker(Localizer):
 
     def _global_candidates(self, frame: np.ndarray, k: int) -> tuple[list[int], float]:
         self._frame_counters["megaloc_call_count"] = self._frame_counters.get("megaloc_call_count", 0) + 1
-        return self.meg.topk(frame, k)
+        return self.vpr.topk(frame, k)
 
     def _lost_candidates(self, frame: np.ndarray, k: int) -> tuple[list[int], float]:
         """LOST acquisition: prefer refs near last pose on continuous paths.
 
-        Pure MegaLoc top-K can snap to a visually similar but far place (trees,
-        corridors). When a recent pose prior exists, re-rank MegaLoc by distance
+        Pure BoQ top-K can snap to a visually similar but far place (trees,
+        corridors). When a recent pose prior exists, re-rank BoQ by distance
         and inject geometric neighbors. After lost_pure_global_after_s of capture
-        time, fall back to pure global MegaLoc (kidnapped / true teleport).
+        time, fall back to pure global BoQ (kidnapped / true teleport).
         """
         k = max(1, int(k))
         prefer = bool(self.cfg.lost_prefer_nearby)
@@ -889,7 +884,7 @@ class ProductionXFeatTracker(Localizer):
 
         self._frame_counters["megaloc_call_count"] = self._frame_counters.get("megaloc_call_count", 0) + 1
         fetch_k = max(k, int(self.cfg.lost_global_topk), int(self.cfg.lost_nearby_topk) * 2)
-        scored, vpr_ms = self.meg.topk_scored(frame, fetch_k)
+        scored, vpr_ms = self.vpr.topk_scored(frame, fetch_k)
 
         if not use_nearby or self.map.ref_centers is None:
             self._frame_counters["lost_acquire_mode"] = "global_megaloc"
@@ -911,7 +906,7 @@ class ProductionXFeatTracker(Localizer):
             score = float(sim) - lam * min(dist / radius, 4.0)
             ranked.append((score, idx, float(sim), dist))
         ranked.sort(key=lambda t: t[0], reverse=True)
-        megaloc_biased = [idx for _, idx, _, _ in ranked]
+        vpr_biased = [idx for _, idx, _, _ in ranked]
 
         geo = select_local_candidates(
             self.map.ref_names,
@@ -925,8 +920,8 @@ class ProductionXFeatTracker(Localizer):
             near_pool=int(self.cfg.lost_nearby_pool),
             max_yaw_diff_deg=min(120.0, float(self.cfg.max_yaw_diff_deg) + 30.0),
         )
-        # Geometry first (path continuity), then spatially re-ranked MegaLoc.
-        candidates = list(dict.fromkeys(list(geo) + megaloc_biased))[:k]
+        # Geometry first (path continuity), then spatially re-ranked BoQ.
+        candidates = list(dict.fromkeys(list(geo) + vpr_biased))[:k]
         if not candidates:
             candidates = [i for i, _ in scored[:k]]
         self._frame_counters["lost_acquire_mode"] = "nearby_biased"
@@ -2087,7 +2082,7 @@ class ProductionXFeatTracker(Localizer):
     def _select_frame_candidates(self, frame, mode):
         vpr_ms = 0.0
         if getattr(self, "lock_track_only", False):
-            # TRACK FPS microbench: pin TRACK for the whole frame; never MegaLoc.
+            # TRACK FPS microbench: pin TRACK for the whole frame; never BoQ.
             self.state.mode = "TRACK"
             mode = "TRACK"
             candidates = self._track_candidates(weak=False)

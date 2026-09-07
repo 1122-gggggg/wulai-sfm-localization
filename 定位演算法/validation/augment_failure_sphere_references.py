@@ -15,7 +15,7 @@ references there without re-running SfM:
     the reference-side coarse cells to map-frame 3D through their
     ``xyz_by_cell`` LUTs, PnP a cam_from_world pose, and -- after the same
     inlier / reprojection quality floors the tracker uses for acquire -- pack
-    the frame as a new bundle reference (image JPEG, own 3D anchor LUT, MegaLoc
+    the frame as a new bundle reference (image JPEG, own 3D anchor LUT, BoQ
     descriptor, covisibility). Writes a complete candidate release directory
     plus a candidate site profile; the shipped site profile is not touched.
 
@@ -351,11 +351,11 @@ def register_candidates(args: argparse.Namespace) -> None:
 
     from edm_matcher import EDMMatcher  # noqa: PLC0415
     from production_edm_tracker import reprojection_metrics  # noqa: PLC0415
+    from boq_query import BoQQuery  # noqa: PLC0415
     from reloc_localizer_edm import (  # noqa: PLC0415
         Camera,
         EDMRelocMap,
         EDMLocalizer,
-        MegaLocQuery,
     )
 
     candidates_doc = json.loads(args.candidates.read_text(encoding="utf-8"))
@@ -399,7 +399,7 @@ def register_candidates(args: argparse.Namespace) -> None:
         reloc_map,
         camera,
         matcher=matcher,
-        vpr=MegaLocQuery(),
+        vpr=BoQQuery(),
         pnp_max_error=float(tracker_cfg["pnp_ransac_max_error"]),
     )
     pcam = pycolmap.Camera(

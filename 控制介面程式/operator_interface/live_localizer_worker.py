@@ -397,19 +397,6 @@ def build_argument_parser() -> argparse.ArgumentParser:
     )
     ap.add_argument("--megaloc-cache", default=DEFAULT_MEGALOC)
     ap.add_argument(
-        "--megaloc-backend",
-        choices=("pytorch", "pytorch_fp16", "tensorrt"),
-        default=os.environ.get("SFM_MEGALOC_BACKEND", "tensorrt"),
-    )
-    ap.add_argument(
-        "--megaloc-engine",
-        default=os.environ.get("SFM_MEGALOC_TENSORRT_ENGINE", ""),
-    )
-    ap.add_argument(
-        "--megaloc-engine-sha256",
-        default=os.environ.get("SFM_MEGALOC_TENSORRT_ENGINE_SHA256", ""),
-    )
-    ap.add_argument(
         "--reference-index",
         default="",
         help="IVF index SHA256SUMS.json selected by the site profile",
@@ -654,7 +641,7 @@ def _build_worker_backend(args, backend: str, query_camera_override, map_frame):
             if args.megaloc_cache:
                 print(
                     f"[live_worker] ignoring --megaloc-cache {args.megaloc_cache}: "
-                    "EDM retrieval reads the bundle's own MegaLoc ref_global",
+                    "EDM retrieval reads the bundle's own BoQ ref_global",
                     file=sys.stderr,
                     flush=True,
                 )
@@ -664,9 +651,6 @@ def _build_worker_backend(args, backend: str, query_camera_override, map_frame):
                 bundle_sha256=args.bundle_sha256 or None,
                 reference_index=args.reference_index or None,
                 reference_index_sha256=args.reference_index_sha256 or None,
-                megaloc_backend=args.megaloc_backend,
-                megaloc_engine=args.megaloc_engine or None,
-                megaloc_engine_sha256=args.megaloc_engine_sha256 or None,
                 frame_source=lambda: None,
                 camera_tuple=query_camera_override or CAM_720_EDM,
                 production_profile=args.production_profile or None,
@@ -683,7 +667,7 @@ def _build_worker_backend(args, backend: str, query_camera_override, map_frame):
             edm_matcher = tracker.trk.loc.matcher
             print(
                 f"[live_worker] EDM tracker={tracker_variant} "
-                f"vpr=megaloc_{args.megaloc_backend} "
+                f"vpr=boq_resnet50_fp16 "
                 f"mconf={getattr(edm_matcher, 'mconf_thr', 0.2)} "
                 f"track/weak/lost={cfg.local_topk}/{cfg.weak_local_topk}/"
                 f"{getattr(cfg, 'lost_local_topk', 'n/a')} "
@@ -725,7 +709,7 @@ def _build_worker_backend(args, backend: str, query_camera_override, map_frame):
             cfg = built.config
             tracker_variant = built.variant
             DEVICE = built.device
-            megaloc = tracker.meg
+            megaloc = tracker.vpr
             tracker_variant = (
                 f"matcher_{cfg.matcher_mode}_topk{cfg.local_topk}_adapt{cfg.adaptive_first_topk}"
             )

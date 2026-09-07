@@ -23,17 +23,15 @@ from pathlib import Path
 
 import numpy as np
 import torch
-import torchvision.transforms as T
-from PIL import Image
 
 from pose_types import Localizer, Pose
 from artifact_integrity import verify_sha256
+from boq_query import BoQQuery
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 QUERY_TOPK = 10
 XFEAT_MAX_KP = 2048
 MIN_INLIERS = 30
-MEGALOC_INPUT = 322
 
 
 def _package_root() -> Path:
@@ -64,7 +62,7 @@ def _package_root() -> Path:
             return runtime
     # Keep bundle validation and pure tracker utilities importable in the
     # portable repository. Actual model loading still reports the missing
-    # local torch.hub repository when XFeat or MegaLoc is requested.
+    # local torch.hub repository when XFeat is requested.
     algorithm_root = next(
         (
             parent
@@ -78,48 +76,17 @@ def _package_root() -> Path:
 
 PACKAGE_ROOT = _package_root()
 TORCH_HUB_DIR = PACKAGE_ROOT / "torch_hub_cache"
-MEGALOC_REPO_DIR = TORCH_HUB_DIR / "gmberton_MegaLoc_main"
-MEGALOC_REVISION = "7cb9f7970d366fdf059963d04d372e503e8e9df9"
-MEGALOC_WEIGHTS = (
-    TORCH_HUB_DIR / "checkpoints" / "megaloc" / MEGALOC_REVISION / "model.safetensors"
-)
 XFEAT_REPO_DIR = TORCH_HUB_DIR / "verlab_accelerated_features_main"
-
-
-class MegaLocQuery:
-    """MegaLoc query extractor for bundles whose ref_global is MegaLoc."""
-
-    def __init__(self, device: str = DEVICE, input_size: int = MEGALOC_INPUT):
-        self.device = device
-        self.input_size = input_size
-        torch.hub.set_dir(str(TORCH_HUB_DIR))
-        self.model = torch.hub.load(
-            str(MEGALOC_REPO_DIR), "get_trained_model", source="local",
-            weights_path=str(MEGALOC_WEIGHTS),
-        ).eval().to(device)
-        self.tf = T.Compose([
-            T.Resize((input_size, input_size), interpolation=T.InterpolationMode.BICUBIC),
-            T.ToTensor(),
-            T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-        ])
-
-    @torch.inference_mode()
-    def extract_one(self, frame: np.ndarray) -> np.ndarray:
-        img = Image.fromarray(frame[..., :3]).convert("RGB")
-        x = self.tf(img).unsqueeze(0).to(self.device)
-        d = self.model(x).float().cpu().numpy()[0].astype(np.float32)
-        d /= np.linalg.norm(d) + 1e-12
-        return d
 
 
 def bundle_vpr_kind(meta: dict) -> str:
     v = str(meta.get("bundle_vpr") or meta.get("vpr") or "").lower()
-    if not v.startswith("megaloc"):
+    if not v.startswith("boq"):
         raise ValueError(
-            "This localizer is MegaLoc-only. Rebuild or override the bundle "
-            "ref_global descriptors with MegaLoc before deployment."
+            "This localizer is BoQ-only. Rebuild or override the bundle "
+            "ref_global descriptors with BoQ before deployment."
         )
-    return "megaloc"
+    return "boq"
 
 
 @dataclass
@@ -343,7 +310,7 @@ def _to_device_feats(feats: dict, device: str = DEVICE) -> dict:
 # NOTE: dead code — the production localizer is ProductionXFeatTracker
 # (production_xfeat_tracker.py). This class is unused; kept for reference.
 class XFeatLightGlueLocalizer(Localizer):
-    """MegaLoc retrieval + XFeat + XFeat-LighterGlue + pycolmap PnP."""
+    """BoQ retrieval + XFeat + XFeat-LighterGlue + pycolmap PnP."""
 
     def __init__(self, reloc_map: XFeatRelocMap, frame_source, query_cam: Camera,
                  query_topk: int = QUERY_TOPK, xfeat_max_kp: int = XFEAT_MAX_KP,
@@ -363,7 +330,7 @@ class XFeatLightGlueLocalizer(Localizer):
 
     def _models(self):
         if self._vpr is None:
-            self._vpr = MegaLocQuery(DEVICE)
+            self._vpr = BoQQuery(DEVICE)
             self._xfeat = load_xfeat(self.xfeat_max_kp)
         return self._vpr, self._xfeat
 

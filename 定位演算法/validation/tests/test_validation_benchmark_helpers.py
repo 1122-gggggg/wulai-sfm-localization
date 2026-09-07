@@ -29,7 +29,7 @@ def load_eval_script(monkeypatch):
     monkeypatch.setenv("SFM_SYSTEM_ROOT", str(fake_root))
 
     reloc = types.ModuleType("reloc_localizer_xfeat")
-    reloc.MegaLocQuery = object
+    reloc.BoQQuery = object
     reloc.bundle_vpr_kind = lambda _meta: "mock"
     reloc.extract_xfeat = lambda *_args: None
     reloc.load_verified_bundle = lambda *_args, **_kwargs: {}
@@ -281,7 +281,7 @@ def _replay_receipt(**overrides):
         "lost_local_topk": 5,
         "match_batch_size": 2,
         "ood_mode": "hard",
-        "ood_vpr_top1": 0.45,
+        "ood_vpr_top1": 0.32,
         "ood_vpr_margin": None,
         "ood_vpr_entropy": 0.95,
         "ood_match_corr": 200,

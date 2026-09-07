@@ -3,9 +3,8 @@
 """串流定位驗證: 逐幀餵入驗證資料, XFeat + LighterGlue + PnP.
 
 The default comparison uses the deployed base bundle against an updated bundle.
-For a fair MegaLoc deployment comparison, pass --base-megaloc-cache so the old
-bundle keeps its old geometry/keyframes but uses the same MegaLoc VPR type as
-the updated bundle.
+Both bundles are read with their shipped BoQ ``ref_global`` descriptors, so the
+comparison isolates geometry/keyframe differences under one VPR type.
 """
 import sys, os, time, argparse, json
 import numpy as np
@@ -32,13 +31,12 @@ else:
     sys.path.insert(0, str(SFM_GLOMAP / "deploy"))
 sys.path.insert(0, str(SFM_GLOMAP / "scripts"))
 from reloc_localizer_xfeat import (
-    MegaLocQuery,
     bundle_vpr_kind,
     extract_xfeat,
     load_verified_bundle,
     load_xfeat,
 )
-from megaloc_cache import load_megaloc_cache
+from boq_query import BoQQuery
 from stream_integrity import StreamAudit, ffprobe_frame_count, iter_rgb_frames
 import pycolmap
 DEV="cuda"; QK=4096; ADD=50; TOPK=30; MIN_CONF=0.1
@@ -59,19 +57,15 @@ def _warn(tag,frame,e):
     if c<=5 or c%100==0:  # rate-limit: first few, then every 100th
         print(f"[eval_stream_core] {tag} frame={frame} n={c}: {e!r}",file=sys.stderr,flush=True)
 xf=load_xfeat(QK)
-_MEG=None
+_VPR=None
 def fixed_intrinsics(W,H):
     if (W,H) in FIXED_INTRINSICS:
         return FIXED_INTRINSICS[(W,H)]
     f=1955.5*float(W)/2688.0
     return [f,float(W)/2.0,float(H)/2.0,0.002]
-def loadb(p, megaloc_cache=None, expected_sha256=None, megaloc_meta=None):
+def loadb(p, expected_sha256=None):
     b=load_verified_bundle(p,expected_sha256); rg=np.asarray(b['ref_global']).astype(np.float32)
     meta=dict(b.get('meta',{}))
-    if megaloc_cache:
-        rg=load_megaloc_cache(megaloc_cache,list(b['ref_names']),megaloc_meta)
-        meta.update({"bundle_vpr":"megaloc","vpr":"megaloc-8448","vpr_input":322,
-                     "global_descriptor_source":"MegaLoc eval override"})
     rg/=(np.linalg.norm(rg,axis=1,keepdims=True)+1e-9)
     return b['ref_names'],b['refs'],rg,bundle_vpr_kind(meta)
 def collect(q,qk,rn,rf,rg,qg,topk=None):
@@ -89,10 +83,10 @@ def collect(q,qk,rn,rf,rg,qg,topk=None):
     if not best:return None,None
     return np.array([x[0] for x in best.values()]),np.array([x[1] for x in best.values()])
 def global_desc(bundle,rgb):
-    global _MEG
-    if _MEG is None:
-        _MEG=MegaLocQuery(DEV)
-    return _MEG.extract_one(rgb)
+    global _VPR
+    if _VPR is None:
+        _VPR=BoQQuery(DEV)
+    return _VPR.extract_one(rgb)
 def loc_one(bundle,rgb):
     global _FRAME; _FRAME+=1
     rn,rf,rg,kind=bundle; H,W=rgb.shape[:2]
@@ -185,9 +179,6 @@ def _parse_args():
     ap=argparse.ArgumentParser()
     ap.add_argument("--base",default=BASE)
     ap.add_argument("--final",default=FINAL)
-    ap.add_argument("--base-megaloc-cache")
-    ap.add_argument("--base-megaloc-meta",
-                    help="required binding JSON when --base-megaloc-cache is a legacy NPY")
     ap.add_argument("--base-sha256", default="",
                     help="trusted SHA-256 for a non-package base bundle")
     ap.add_argument("--final-sha256", default="",
@@ -285,7 +276,7 @@ def main():
     args=_parse_args()
     _configure_runtime(args)
     resize_wh,sets=_prepare_eval_inputs(args)
-    bb=loadb(args.base,args.base_megaloc_cache,args.base_sha256 or None,args.base_megaloc_meta); log(f"BASE {len(bb[0])} refs kind={bb[3]}")
+    bb=loadb(args.base,args.base_sha256 or None); log(f"BASE {len(bb[0])} refs kind={bb[3]}")
     fb=loadb(args.final,expected_sha256=args.final_sha256 or None); log(f"FINAL {len(fb[0])} refs kind={fb[3]}")
     rows=_evaluate_sets(args,bb,fb,sets,resize_wh)
     _write_eval_json(args,rows)

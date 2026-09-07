@@ -5,9 +5,9 @@ Default query stream:
   /media/cihcilab/新增磁碟區/目標場域影片/驗證/P0710071_frames
 
 Frames are read sequentially, resized to 1280x720 by default, and fed through:
-  BOOT_INIT/LOST: MegaLoc topK=30 -> XFeat+LighterGlue -> PnP
+  BOOT_INIT/LOST: BoQ topK=30 -> XFeat+LighterGlue -> PnP
   TRACK/WEAK_TRACK: XFeat mutual-NN fast pass; if not strong enough,
-                    XFeat+LighterGlue adaptive top3 -> top5.  No MegaLoc here,
+                    XFeat+LighterGlue adaptive top3 -> top5.  No BoQ here,
                     so vpr_ms is expected to be 0 in TRACK/WEAK_TRACK.
 
 This reports runtime health (FPS, latency, state distribution, inliers). External
@@ -43,7 +43,7 @@ for _cand in (
         sys.path.insert(0, str(_cand))
 
 from production_xfeat_tracker import (
-    MegaLocLayer,
+    BoQLayer,
     ProductionConfig,
     ProductionXFeatTracker,
     scaled_simple_radial_camera,
@@ -56,7 +56,7 @@ QUERY_DIR = ROOT.parents[2] / "建圖" / "inputs" / "目標場域影片" / "驗�
 BUNDLE = ROOT / "bundles" / "current_reloc_map_updated_v3.pt"
 INTRINSICS = ROOT / "deploy_code" / "sfm_glomap_deploy" / "map_intrinsics.json"
 IMAGES_FUSED = ROOT / "maps" / "base_images_fused"
-CACHE_PATH = ROOT / "bundles" / "base_megaloc_cache_v3.npz"
+CACHE_PATH = ROOT / "bundles" / "base_boq_cache_v3.npz"
 OUT_DIR = ROOT / "outputs" / "production_stream_bench"
 NEUFLOW_REPO = PACKAGE_ROOT / ".experiment_deps" / "neuflow_v2"
 NEUFLOW_WEIGHTS = NEUFLOW_REPO / "neuflow_mixed.pth"
@@ -671,35 +671,35 @@ def _prepare_projection(args, parser):
     return ProjectionGuidedTracker, TrackLandmarkSidecar, landmark_path, sidecar_bundle_sha256
 
 
-def _load_megaloc(args, xmap):
+def _load_vpr(args, xmap):
     cache = Path(args.megaloc_cache)
     meta = Path(args.megaloc_meta) if args.megaloc_meta else cache.with_suffix(".json")
     if cache.exists():
-        print(f"loading MegaLoc cache {cache}", flush=True)
+        print(f"loading BoQ cache {cache}", flush=True)
         try:
-            return MegaLocLayer.load_cache(
-                cache, xmap.ref_names, input_size=322, device=DEVICE,
+            return BoQLayer.load_cache(
+                cache, xmap.ref_names, device=DEVICE,
                 meta_path=meta if args.megaloc_meta else None,
             )
         except ValueError as exc:
             print(
-                f"MegaLoc cache incompatible ({exc}); using bundle ref_global descriptors",
+                f"BoQ cache incompatible ({exc}); using bundle ref_global descriptors",
                 flush=True,
             )
-            return MegaLocLayer(xmap.ref_global, input_size=322, device=DEVICE)
+            return BoQLayer(xmap.ref_global, device=DEVICE)
     if Path(args.image_root).exists():
-        print(f"building MegaLoc cache {cache} from {args.image_root}", flush=True)
-        return MegaLocLayer.build_cache(
+        print(f"building BoQ cache {cache} from {args.image_root}", flush=True)
+        return BoQLayer.build_cache(
             xmap.ref_names, Path(args.image_root), cache, meta,
-            input_size=322, batch=16, device=DEVICE)
+            batch=16, device=DEVICE)
     print(
-        "MegaLoc cache and reference images missing; using bundle ref_global descriptors",
+        "BoQ cache and reference images missing; using bundle ref_global descriptors",
         flush=True,
     )
-    return MegaLocLayer(xmap.ref_global, input_size=322, device=DEVICE)
+    return BoQLayer(xmap.ref_global, device=DEVICE)
 
 
-def _build_tracker_variant(args, xmap, megaloc, cam, cfg, projection_types):
+def _build_tracker_variant(args, xmap, vpr, cam, cfg, projection_types):
     neuflow_metadata = None
     projection_metadata = None
     tracker_variant = f"deep_{args.matcher_mode}_{args.adaptive_first_topk}_{args.local_topk}"
@@ -720,7 +720,7 @@ def _build_tracker_variant(args, xmap, megaloc, cam, cfg, projection_types):
         neuflow_metadata = neuflow_backend.metadata()
         tracker = NeuFlowRefreshTracker(
             xmap,
-            megaloc,
+            vpr,
             frame_source=lambda: None,
             query_cam=cam,
             cfg=cfg,
@@ -745,7 +745,7 @@ def _build_tracker_variant(args, xmap, megaloc, cam, cfg, projection_types):
         )
         tracker = ProjectionGuidedTracker(
             xmap,
-            megaloc,
+            vpr,
             frame_source=lambda: None,
             query_cam=cam,
             cfg=cfg,
@@ -764,7 +764,7 @@ def _build_tracker_variant(args, xmap, megaloc, cam, cfg, projection_types):
         tracker_variant = "projection_guided_r15_25_40_s060_ratio095"
     else:
         tracker = ProductionXFeatTracker(
-            xmap, megaloc, frame_source=lambda: None, query_cam=cam, cfg=cfg)
+            xmap, vpr, frame_source=lambda: None, query_cam=cam, cfg=cfg)
     return tracker, neuflow_metadata, projection_metadata, tracker_variant
 
 
@@ -1256,7 +1256,7 @@ def main():
     xmap = XFeatRelocMap.load(args.bundle, expected_bundle_sha256)
     print("bundle meta", xmap.meta, flush=True)
 
-    megaloc = _load_megaloc(args, xmap)
+    vpr = _load_vpr(args, xmap)
 
     cfg = ProductionConfig(
         boot_global_topk=args.boot_topk,
@@ -1303,7 +1303,7 @@ def main():
     os.environ["SFM_FLOW_REFRESH"] = str(args.flow_refresh)
     os.environ["SFM_FLOW_FB_PX"] = str(args.flow_fb_px)
     tracker, neuflow_metadata, projection_metadata, tracker_variant = _build_tracker_variant(
-        args, xmap, megaloc, cam, cfg, projection_types)
+        args, xmap, vpr, cam, cfg, projection_types)
     print("loading models ...", flush=True)
     tracker.ensure_models()
     _attach_onnx_matcher(args, tracker)
@@ -1328,7 +1328,7 @@ def main():
             "SFM_FLOW_QUAL_RATIO": os.environ.get("SFM_FLOW_QUAL_RATIO", "0.25"),
             "SFM_FLOW_QUAL_REPROJ": os.environ.get("SFM_FLOW_QUAL_REPROJ", "4.0"),
             "SFM_FLOW_QUAL_NTRACK": os.environ.get("SFM_FLOW_QUAL_NTRACK", "100"),
-            "SFM_MEGALOC_FP16": os.environ.get("SFM_MEGALOC_FP16", "0"),
+            "SFM_BOQ_FP16": os.environ.get("SFM_BOQ_FP16", "1"),
         },
         "neuflow": neuflow_metadata,
         "projection": projection_metadata,

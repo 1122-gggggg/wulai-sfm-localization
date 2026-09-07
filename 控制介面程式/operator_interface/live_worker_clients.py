@@ -1045,18 +1045,10 @@ def _append_localizer_reference_args(
     megaloc_cache: str | Path,
     reference_index: str | Path,
     reference_index_sha256: str,
-    megaloc_backend: str,
-    megaloc_engine: str | Path,
-    megaloc_engine_sha256: str,
 ) -> None:
     # Pass an explicit empty cache value so an inherited environment variable
     # cannot override the site profile's bundle descriptors.
     command.extend(["--megaloc-cache", str(megaloc_cache)])
-    command.extend(["--megaloc-backend", str(megaloc_backend)])
-    if megaloc_engine:
-        command.extend(["--megaloc-engine", str(megaloc_engine)])
-    if megaloc_engine_sha256:
-        command.extend(["--megaloc-engine-sha256", str(megaloc_engine_sha256)])
     if reference_index:
         command.extend(["--reference-index", str(reference_index)])
     if reference_index_sha256:
@@ -1092,9 +1084,6 @@ class LiveLocalizerClient(LiveWorkerClient):
         height: int,
         bundle: Path,
         megaloc_cache: str | Path = "",
-        megaloc_backend: str = "tensorrt",
-        megaloc_engine: str | Path = "",
-        megaloc_engine_sha256: str = "",
         reference_index: str | Path = "",
         reference_index_sha256: str = "",
         force_track_bench: bool = False,
@@ -1158,9 +1147,6 @@ class LiveLocalizerClient(LiveWorkerClient):
         _append_localizer_reference_args(
             cmd,
             megaloc_cache=megaloc_cache,
-            megaloc_backend=megaloc_backend,
-            megaloc_engine=megaloc_engine,
-            megaloc_engine_sha256=megaloc_engine_sha256,
             reference_index=reference_index,
             reference_index_sha256=reference_index_sha256,
         )

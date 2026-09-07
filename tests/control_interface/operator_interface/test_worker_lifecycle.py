@@ -1326,7 +1326,7 @@ def test_live_localizer_client_passes_reference_index_manifest(monkeypatch) -> N
     assert cmd[cmd.index("--reference-index-sha256") + 1] == "a" * 64
 
 
-def test_live_localizer_client_passes_tensorrt_megaloc_contract(monkeypatch) -> None:
+def test_live_localizer_client_no_longer_spawns_legacy_vpr_backend_flags(monkeypatch) -> None:
     captured = {}
 
     def fake_worker_init(_self, cmd, *_args, **_kwargs) -> None:
@@ -1339,15 +1339,20 @@ def test_live_localizer_client_passes_tensorrt_megaloc_contract(monkeypatch) -> 
         1280,
         720,
         Path("bundle.pt"),
-        megaloc_backend="tensorrt",
-        megaloc_engine=Path("megaloc.engine"),
-        megaloc_engine_sha256="b" * 64,
     )
 
     cmd = captured["cmd"]
-    assert cmd[cmd.index("--megaloc-backend") + 1] == "tensorrt"
-    assert cmd[cmd.index("--megaloc-engine") + 1] == "megaloc.engine"
-    assert cmd[cmd.index("--megaloc-engine-sha256") + 1] == "b" * 64
+    for flag in ("--megaloc-backend", "--megaloc-engine", "--megaloc-engine-sha256"):
+        assert flag not in cmd
+        with pytest.raises(TypeError):
+            app.LiveLocalizerClient(
+                Path("worker.py"),
+                sys.executable,
+                1280,
+                720,
+                Path("bundle.pt"),
+                **{flag.lstrip("-").replace("-", "_"): "tensorrt"},
+            )
 
 
 def test_shipped_edm_production_profile_pins_validated_parameters() -> None:

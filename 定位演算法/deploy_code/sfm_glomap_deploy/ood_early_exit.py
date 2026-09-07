@@ -87,7 +87,7 @@ APPLIED_AUDIT = "audit"
 APPLIED_TIGHTEN = "tighten"
 APPLIED_VETO = "veto"
 
-#: Softmax temperature for the retrieval-pool entropy. VPR scores are
+#: Softmax temperature for the retrieval-pool entropy. BoQ scores are
 #: cosine similarities of L2-normalised descriptors, and the in-map top1/top2
 #: gap on the river map is O(0.01-0.05), so the temperature has to be that
 #: scale for the entropy to separate a peaked pool from a flat one.
@@ -104,16 +104,20 @@ class OODThresholds:
 
     The defaults are the measured operating point from
     ``outputs/r2_ood_20260906/`` -- the lowest-FRR point that still holds
-    ``FAR = 0`` over the cross-product corpus. They are inert unless
+    ``FAR = 0`` over the cross-product corpus -- except ``vpr_top1_out``,
+    which was ratio-rescaled for the BoQ score scale (see below) and awaits
+    the full cross-product re-gate. They are inert unless
     ``SFM_EDM_OOD_MODE`` is ``soft`` or ``hard``.
     """
 
     #: VPR: absolute best cosine at or below which the pool looks foreign.
-    #: 0.45 ~= 0.5x the in-map top1 p50 (0.909 over the MegaLoc river corpus).
+    #: 0.32 ~= 0.5x the in-map top1 p50 (0.647 over 300 river frames,
+    #: outputs/boq_resnet50_20260907/eval_75x4_top10.json) -- the same ratio
+    #: as the MegaLoc operating point (0.45 ~= 0.5x its in-map p50 0.909).
     #: Full R2 cross-product re-gate (FAR=0) is still required once an
     #: off-map site exists again (地圖檔/場域/urai/ is absent, so the
     #: off-map corpus pairs are currently unrepeatable).
-    vpr_top1_out: float = 0.45
+    vpr_top1_out: float = 0.32
     #: VPR: ``top1 - top2`` at or below which no reference wins the pool.
     #: ``math.inf`` disables the term.
     vpr_margin_out: float = math.inf

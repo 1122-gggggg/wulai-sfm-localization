@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Convert a portable direct MegaLoc/EDM/COLMAP map into the production EDM bundle."""
+"""Convert a portable direct BoQ/EDM/COLMAP map into the production EDM bundle."""
 from __future__ import annotations
 
 import argparse
@@ -21,7 +21,7 @@ COARSE_STRIDE = 8
 GRID_W = EDM_W // COARSE_STRIDE
 GRID_H = EDM_H // COARSE_STRIDE
 N_CELLS = GRID_W * GRID_H
-DESCRIPTOR_DIM = 8448
+DESCRIPTOR_DIM = 16384
 COVIS_KEEP = 40
 
 
@@ -61,8 +61,8 @@ def query_camera(source: Path) -> dict:
 
 def load_reference_bank(source: Path) -> tuple[list[str], np.ndarray]:
     localization = source / "map/localization"
-    names = json.loads((localization / "megaloc_references.names.json").read_text())
-    descriptors = np.load(localization / "megaloc_references.npy", allow_pickle=False)
+    names = json.loads((localization / "boq_references.names.json").read_text())
+    descriptors = np.load(localization / "boq_references.npy", allow_pickle=False)
     if not isinstance(names, list) or not names or len(names) != len(set(names)):
         raise ValueError("reference names must be unique and non-empty")
     if descriptors.shape != (len(names), DESCRIPTOR_DIM):
@@ -72,7 +72,7 @@ def load_reference_bank(source: Path) -> tuple[list[str], np.ndarray]:
     descriptors = np.asarray(descriptors, dtype=np.float32)
     norms = np.linalg.norm(descriptors, axis=1, keepdims=True)
     if not np.isfinite(descriptors).all() or np.any(norms <= 1e-12):
-        raise ValueError("MegaLoc descriptors are not finite and non-zero")
+        raise ValueError("BoQ descriptors are not finite and non-zero")
     return [str(name) for name in names], descriptors / norms
 
 
@@ -177,8 +177,8 @@ def write_json(path: Path, value: object) -> None:
 def build(source: Path, out_dir: Path, lift_distance_px: float) -> dict:
     source = source.expanduser().resolve(strict=True)
     manifest = json.loads((source / "BUNDLE_MANIFEST.json").read_text())
-    if manifest.get("artifact_type") != "PORTABLE_MEGALOC_EDM_PNP_BUNDLE":
-        raise ValueError("source is not a portable MegaLoc/EDM/PnP bundle")
+    if manifest.get("artifact_type") != "PORTABLE_BOQ_EDM_PNP_BUNDLE":
+        raise ValueError("source is not a portable BoQ/EDM/PnP bundle")
 
     model_dir = source / "map/model"
     image_root = source / "map/keyframes/images"
@@ -239,9 +239,9 @@ def build(source: Path, out_dir: Path, lift_distance_px: float) -> dict:
         "meta": {
             "feature": "edm",
             "matcher": "edm",
-            "vpr": "MegaLoc",
-            "bundle_vpr": "megaloc",
-            "vpr_input": 322,
+            "vpr": "BoQ",
+            "bundle_vpr": "boq",
+            "vpr_input": 384,
             "edm_input_w": EDM_W,
             "edm_input_h": EDM_H,
             "edm_grid_w": GRID_W,

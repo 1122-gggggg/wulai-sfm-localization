@@ -101,13 +101,13 @@ def test_flow_experiment_gates_are_read_from_environment(monkeypatch):
     reloc_map = SimpleNamespace(
         ref_names=[], ref_centers=np.empty((0, 3)), ref_yaws=None,
     )
-    megaloc = SimpleNamespace(
+    vpr = SimpleNamespace(
         ref_desc=np.empty((0, 4), np.float32),
         reference_count=0,
     )
 
     tracker = pxt.ProductionXFeatTracker(
-        reloc_map, megaloc, None, None, pxt.ProductionConfig(flow_enabled=True),
+        reloc_map, vpr, None, None, pxt.ProductionConfig(flow_enabled=True),
     )
 
     assert tracker._flow_enabled is True
@@ -119,19 +119,19 @@ def test_flow_experiment_gates_are_read_from_environment(monkeypatch):
     assert tracker._flow_qual_ntrack == 120
 
 
-def test_xfeat_only_warmup_does_not_load_megaloc(monkeypatch):
+def test_xfeat_only_warmup_does_not_load_vpr(monkeypatch):
     tracker = pxt.ProductionXFeatTracker.__new__(pxt.ProductionXFeatTracker)
     tracker.cfg = pxt.ProductionConfig()
     tracker._xfeat = None
-    megaloc_calls = []
-    tracker.meg = SimpleNamespace(model=lambda: megaloc_calls.append(1))
+    vpr_calls = []
+    tracker.vpr = SimpleNamespace(model=lambda: vpr_calls.append(1))
     xfeat = object()
     monkeypatch.setattr(pxt, "load_xfeat", lambda _topk: xfeat)
 
     assert tracker.ensure_xfeat() is xfeat
-    assert megaloc_calls == []
+    assert vpr_calls == []
     assert tracker.ensure_models() is xfeat
-    assert megaloc_calls == [1]
+    assert vpr_calls == [1]
 
 
 def test_ensure_models_preloads_lighterglue():
@@ -145,7 +145,7 @@ def test_ensure_models_preloads_lighterglue():
 
     xfeat = FakeXFeat()
     tracker._xfeat = xfeat
-    tracker.meg = SimpleNamespace(model=lambda: None)
+    tracker.vpr = SimpleNamespace(model=lambda: None)
 
     assert tracker.ensure_models() is xfeat
     assert matcher_calls == [1]

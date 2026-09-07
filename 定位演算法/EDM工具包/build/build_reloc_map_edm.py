@@ -29,7 +29,7 @@ Stages (each cached, so a later stage can be retuned without re-running EDM):
   C  per-image keypoint tables        -> feats-edm.h5
   D  pair matches as index arrays     -> matches-edm.h5
   E  hloc fixed-pose triangulation    -> COLMAP model
-  F  pack bundle                      -> cell->xyz LUT + reference JPEGs + MegaLoc
+  F  pack bundle                      -> cell->xyz LUT + reference JPEGs + BoQ bank
 
 The bundle is self-contained: it carries the reference images (EDM needs to SEE them at
 flight time), so deployment no longer depends on an external image directory.
@@ -419,9 +419,9 @@ def pack_bundle(
     meta = {
         "feature": "edm",
         "matcher": "edm",
-        "vpr": "MegaLoc",
-        "bundle_vpr": "megaloc",
-        "vpr_input": xb["meta"].get("vpr_input", 322),
+        "vpr": "BoQ",
+        "bundle_vpr": "boq",
+        "vpr_input": 384,
         "edm_input_w": EDM_W, "edm_input_h": EDM_H,
         "edm_grid_w": GRID_W, "edm_grid_h": GRID_H,
         "keypoint_identity": KEYPOINT_IDENTITY,
@@ -446,7 +446,7 @@ def pack_bundle(
     bundle = {
         "meta": meta,
         "ref_names": list(ref_names),
-        "ref_global": np.asarray(xb["ref_global"], np.float32)[keep],   # MegaLoc unchanged
+        "ref_global": np.asarray(xb["ref_global"], np.float32)[keep],   # BoQ bank unchanged
         "refs": refs,
     }
     for k in ("ref_centers", "ref_yaws", "ref_stability"):
@@ -477,7 +477,7 @@ def main():
     ap.add_argument(
         "--in-bundle",
         required=True,
-        help="seed bundle: MegaLoc + covis + tracking metadata are inherited from it",
+        help="seed bundle: BoQ bank + covis + tracking metadata are inherited from it",
     )
     ap.add_argument("--work-dir", default=str(DEF_WORK))
     ap.add_argument("--out", default=str(DEF_OUT))
@@ -514,9 +514,14 @@ def main():
     work = Path(args.work_dir)
     work.mkdir(parents=True, exist_ok=True)
 
-    log(f"load seed bundle (MegaLoc + covis) {args.in_bundle}")
+    log(f"load seed bundle (BoQ bank + covis) {args.in_bundle}")
     xb = torch.load(args.in_bundle, map_location="cpu", weights_only=False)
     ref_names = list(xb["ref_names"])
+    seed_dim = int(np.asarray(xb["ref_global"]).shape[1])
+    if seed_dim != 16384:
+        raise SystemExit(
+            f"seed bundle ref_global dim {seed_dim} != 16384 (BoQ-ResNet50)"
+        )
     if not xb.get("covis"):
         raise SystemExit("input bundle lacks covis metadata")
 

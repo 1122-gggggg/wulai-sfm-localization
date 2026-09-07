@@ -18,6 +18,7 @@ DEPLOY = Path(__file__).resolve().parents[2] / "deploy_code" / "sfm_glomap_deplo
 if str(DEPLOY) not in sys.path:
     sys.path.insert(0, str(DEPLOY))
 
+import boq_query as boq_query_module  # noqa: E402
 import production_edm_tracker as tracker_module  # noqa: E402
 import reloc_localizer_edm as edm_localizer_module  # noqa: E402
 import edm_matcher as edm_matcher_module  # noqa: E402
@@ -40,124 +41,92 @@ from production_edm_tracker import (  # noqa: E402
 )
 from reloc_localizer_edm import (  # noqa: E402
     EDMLocalizer,
-    MEGALOC_TENSORRT_GPU_IDENTITY,
     _validate_edm_bundle_schema,
-    _resolve_cuda_device,
-    _validate_megaloc_engine_file,
-    _validate_megaloc_plan_size,
-    _validate_megaloc_tensorrt_compatibility,
-    deserialize_megaloc_cuda_engine,
-    normalize_gpu_identity,
 )
 
 
-def test_edm_megaloc_loads_only_from_verified_local_assets(monkeypatch) -> None:
-    monkeypatch.delenv("SFM_MEGALOC_TENSORRT", raising=False)
-    verified = []
-    loaded = {}
+class _FakeBoQModel:
+    def to(self, _device):
+        return self
 
-    class FakeModel:
-        def eval(self):
-            return self
 
-        def to(self, _device):
-            return self
-
+def _stub_boq_weight_loading(monkeypatch) -> None:
+    """Keep BoQQuery construction on its policy path without touching the real weights."""
+    monkeypatch.setattr(boq_query_module, "verify_sha256", lambda _path, _digest: None)
     monkeypatch.setattr(
-        edm_localizer_module,
+        boq_query_module, "load_boq_model", lambda _path: _FakeBoQModel()
+    )
+
+
+def test_edm_vpr_loads_only_from_sanctioned_verified_weights(monkeypatch) -> None:
+    events = []
+    monkeypatch.delenv("SFM_BOQ_WEIGHTS", raising=False)
+    monkeypatch.delenv("SFM_BOQ_WEIGHTS_SHA256", raising=False)
+    monkeypatch.setattr(
+        boq_query_module,
         "verify_sha256",
-        lambda path, digest: verified.append((Path(path), digest)),
+        lambda path, digest: events.append(("verify", Path(path), digest)),
     )
-    monkeypatch.setattr(edm_localizer_module.torch.hub, "set_dir", lambda path: None)
-
-    def fake_load(*args, **kwargs):
-        loaded["args"] = args
-        loaded["kwargs"] = kwargs
-        return FakeModel()
-
-    monkeypatch.setattr(edm_localizer_module.torch.hub, "load", fake_load)
-
-    query = edm_localizer_module.MegaLocQuery(device="cpu")
-
-    assert loaded["args"] == (
-        str(edm_localizer_module.MEGALOC_REPO_DIR),
-        "get_trained_model",
+    monkeypatch.setattr(
+        boq_query_module,
+        "load_boq_model",
+        lambda path: events.append(("load", Path(path), None)) or _FakeBoQModel(),
     )
-    assert loaded["kwargs"] == {
-        "source": "local",
-        "weights_path": str(edm_localizer_module.MEGALOC_WEIGHTS),
-    }
-    assert verified == [
-        (
-            edm_localizer_module.MEGALOC_REPO_DIR / "hubconf.py",
-            edm_localizer_module.MEGALOC_HUBCONF_SHA256,
-        ),
-        (
-            edm_localizer_module.MEGALOC_REPO_DIR / "megaloc_model.py",
-            edm_localizer_module.MEGALOC_MODEL_SOURCE_SHA256,
-        ),
-        (
-            edm_localizer_module.MEGALOC_WEIGHTS,
-            edm_localizer_module.MEGALOC_WEIGHTS_SHA256,
-        ),
+    monkeypatch.setattr(
+        boq_query_module.torch.hub,
+        "load",
+        lambda *_args, **_kwargs: pytest.fail("BoQ must never load through torch.hub"),
+    )
+
+    query = boq_query_module.BoQQuery(device="cpu")
+
+    assert events == [
+        ("verify", boq_query_module.BOQ_WEIGHTS, boq_query_module.BOQ_WEIGHTS_SHA256),
+        ("load", boq_query_module.BOQ_WEIGHTS, None),
     ]
+    assert boq_query_module.BOQ_WEIGHTS.parent.name == "boq"
+    assert query.input_size == boq_query_module.BOQ_INPUT
     assert query.fp16 is False
-    assert query.tensorrt is False
-    assert query.backend == "pytorch"
-
-    monkeypatch.setenv("SFM_MEGALOC_FP16", "1")
-    assert edm_localizer_module.MegaLocQuery(device="cuda").fp16 is True
-    assert edm_localizer_module.MegaLocQuery(device="cpu").fp16 is False
-
-    explicit = edm_localizer_module.MegaLocQuery(
-        device="cuda", backend="pytorch"
-    )
-    assert explicit.fp16 is False
-    assert explicit.backend == "pytorch"
 
 
-def test_edm_megaloc_tensorrt_is_cuda_default_and_hash_verified(
+def test_edm_vpr_weights_with_a_wrong_digest_never_reach_the_loader(
     monkeypatch, tmp_path: Path
 ) -> None:
-    engine_path = tmp_path / "megaloc.engine"
-    engine_sha256 = "a" * 64
-    verified = []
-    created = []
-
-    class FakeEngine:
-        def __init__(self, path, device, *, require_sanctioned_size):
-            created.append((path, device, require_sanctioned_size))
-
-    monkeypatch.delenv("SFM_MEGALOC_BACKEND", raising=False)
-    monkeypatch.delenv("SFM_MEGALOC_TENSORRT", raising=False)
-    monkeypatch.delenv("SFM_MEGALOC_FP16", raising=False)
-    monkeypatch.setenv("SFM_MEGALOC_TENSORRT_ENGINE", str(engine_path))
-    monkeypatch.setenv("SFM_MEGALOC_TENSORRT_ENGINE_SHA256", engine_sha256)
+    weights = tmp_path / "resnet50_16384.pth"
+    weights.write_bytes(b"tampered-boq-weights")
     monkeypatch.setattr(
-        edm_localizer_module,
-        "verify_sha256",
-        lambda path, digest: verified.append((Path(path), digest)),
-    )
-    monkeypatch.setattr(edm_localizer_module, "_MegaLocTensorRTEngine", FakeEngine)
-    monkeypatch.setattr(
-        edm_localizer_module.torch.hub,
-        "load",
-        lambda *_args, **_kwargs: pytest.fail("PyTorch model must not load"),
+        boq_query_module,
+        "load_boq_model",
+        lambda _path: pytest.fail("weights must be verified before the model loads"),
     )
 
-    query = edm_localizer_module.MegaLocQuery(device="cuda")
+    with pytest.raises(ValueError, match="SHA-256 mismatch"):
+        boq_query_module.BoQQuery(
+            device="cpu",
+            weights_path=weights,
+            weights_sha256=boq_query_module.BOQ_WEIGHTS_SHA256,
+        )
 
-    assert query.tensorrt is True
-    assert query.fp16 is False
-    assert query.model is None
-    assert verified == [(engine_path, engine_sha256)]
-    assert created == [(engine_path, "cuda", False)]
+
+def test_edm_vpr_fp16_is_cuda_only_and_env_gated(monkeypatch) -> None:
+    _stub_boq_weight_loading(monkeypatch)
+    monkeypatch.delenv("SFM_BOQ_FP16", raising=False)
+
+    assert boq_query_module.BoQQuery(device="cuda").fp16 is True
+    assert boq_query_module.BoQQuery(device="cpu").fp16 is False
+    monkeypatch.setenv("SFM_BOQ_FP16", "0")
+    assert boq_query_module.BoQQuery(device="cuda").fp16 is False
+    monkeypatch.setenv("SFM_BOQ_FP16", "1")
+    assert boq_query_module.BoQQuery(device="cuda").fp16 is True
+    assert boq_query_module.BoQQuery(device="cpu", fp16=True).fp16 is False
+    assert boq_query_module.BoQQuery(device="cuda", fp16=False).fp16 is False
 
 
-def test_edm_megaloc_tensorrt_requires_cuda(monkeypatch) -> None:
-    monkeypatch.setenv("SFM_MEGALOC_TENSORRT", "1")
-    with pytest.raises(ValueError, match="requires a CUDA device"):
-        edm_localizer_module.MegaLocQuery(device="cpu")
+def test_edm_vpr_identity_and_descriptor_dimension_are_pinned() -> None:
+    assert boq_query_module.BOQ_INPUT == 384
+    assert boq_query_module.BOQ_DIM == 16384
+    assert boq_query_module.BOQ_MODEL_IDENTITY == "boq:resnet50-16384"
+    assert edm_localizer_module.EDM_GLOBAL_DESCRIPTOR_DIM == boq_query_module.BOQ_DIM
 
 
 def test_edm_retrieval_can_rank_only_nearby_candidates() -> None:
@@ -168,14 +137,14 @@ def test_edm_retrieval_can_rank_only_nearby_candidates() -> None:
             dtype=np.float32,
         ),
     )
-    megaloc = SimpleNamespace(
+    vpr_stub = SimpleNamespace(
         extract_one=lambda _frame: np.asarray([1.0, 0.0], dtype=np.float32)
     )
     localizer = EDMLocalizer(
         reloc_map,
         SimpleNamespace(width=1280, height=720),
         matcher=object(),
-        vpr=megaloc,
+        vpr=vpr_stub,
     )
 
     refs = localizer.retrieve(
@@ -187,13 +156,9 @@ def test_edm_retrieval_can_rank_only_nearby_candidates() -> None:
     assert refs == ["near_good"]
 
 
-def test_edm_megaloc_fp16_autocast_keeps_fp32_output(monkeypatch) -> None:
+def test_edm_vpr_fp16_autocast_keeps_a_normalised_fp32_descriptor(monkeypatch) -> None:
+    torch = boq_query_module.torch
     autocast_calls = []
-
-    class FakeImage:
-        @staticmethod
-        def fromarray(_array):
-            return SimpleNamespace(convert=lambda _mode: object())
 
     class FakeAutocast:
         def __enter__(self):
@@ -206,55 +171,31 @@ def test_edm_megaloc_fp16_autocast_keeps_fp32_output(monkeypatch) -> None:
         autocast_calls.append((device_type, dtype, enabled))
         return FakeAutocast()
 
-    query = edm_localizer_module.MegaLocQuery.__new__(
-        edm_localizer_module.MegaLocQuery
-    )
-    query._Image = FakeImage
+    query = boq_query_module.BoQQuery.__new__(boq_query_module.BoQQuery)
     query.device = "cpu"
+    query.input_size = boq_query_module.BOQ_INPUT
     query.fp16 = True
-    query._trt_engine = None
-    query.tf = lambda _image: edm_localizer_module.torch.ones((3, 2, 2))
-    query.model = lambda _tensor: edm_localizer_module.torch.ones(
-        (1, 4), dtype=edm_localizer_module.torch.float16
+    query._input_staging = None
+    query._normalization_tensors = None
+    query.model = lambda _tensor: torch.full(
+        (1, boq_query_module.BOQ_DIM), 2.0, dtype=torch.float16
     )
-    monkeypatch.setattr(edm_localizer_module.torch, "autocast", fake_autocast)
+    monkeypatch.setattr(torch, "autocast", fake_autocast)
 
-    descriptor = query.extract_one(np.zeros((2, 2, 3), dtype=np.uint8))
+    descriptor = query.extract_one(np.zeros((8, 8, 3), dtype=np.uint8))
 
-    assert autocast_calls == [
-        ("cuda", edm_localizer_module.torch.float16, True)
-    ]
+    assert autocast_calls == [("cuda", torch.float16, True)]
     assert descriptor.dtype == np.float32
-    np.testing.assert_allclose(descriptor, np.full(4, 0.5, dtype=np.float32))
-
-
-def test_edm_megaloc_tensorrt_keeps_fp32_output(monkeypatch) -> None:
-    class FakeImage:
-        @staticmethod
-        def fromarray(_array):
-            return SimpleNamespace(convert=lambda _mode: object())
-
-    query = edm_localizer_module.MegaLocQuery.__new__(
-        edm_localizer_module.MegaLocQuery
+    assert descriptor.shape == (boq_query_module.BOQ_DIM,)
+    np.testing.assert_allclose(
+        descriptor,
+        np.full(
+            boq_query_module.BOQ_DIM,
+            1.0 / np.sqrt(boq_query_module.BOQ_DIM),
+            dtype=np.float32,
+        ),
+        rtol=1e-6,
     )
-    query._Image = FakeImage
-    query.device = "cpu"
-    query.fp16 = False
-    query.tf = lambda _image: edm_localizer_module.torch.ones((3, 2, 2))
-    query.model = None
-    query._trt_engine = lambda _tensor: edm_localizer_module.torch.tensor(
-        [[3.0, 4.0]], dtype=edm_localizer_module.torch.float16
-    )
-    monkeypatch.setattr(
-        edm_localizer_module.torch,
-        "autocast",
-        lambda **_kwargs: pytest.fail("TensorRT must not enter torch.autocast"),
-    )
-
-    descriptor = query.extract_one(np.zeros((2, 2, 3), dtype=np.uint8))
-
-    assert descriptor.dtype == np.float32
-    np.testing.assert_allclose(descriptor, np.array([0.6, 0.8], dtype=np.float32))
 
 
 def test_edm_localizer_keeps_configured_vpr_lazy() -> None:
@@ -377,7 +318,7 @@ def test_lost_global_retrieval_interval_zero_keeps_one_shot_behavior() -> None:
     assert not tracker._should_run_global_retrieval()
 
 
-def test_lost_megaloc_progresses_through_local_rings_before_global(
+def test_lost_vpr_progresses_through_local_rings_before_global(
     monkeypatch,
 ) -> None:
     import cv2
@@ -748,7 +689,7 @@ def test_correspondence_chunks_reuse_one_prepared_query() -> None:
 
 
 def test_edm_retrieval_keeps_similarity_and_topk_on_the_tensor_device() -> None:
-    class FakeMegaLoc:
+    class FakeVPR:
         device = edm_localizer_module.torch.device("cpu")
 
         def __init__(self):
@@ -767,12 +708,12 @@ def test_edm_retrieval_keeps_similarity_and_topk_on_the_tensor_device() -> None:
             [[0.5, 0.5], [1.0, 0.0], [0.25, 0.75]], dtype=np.float32
         ),
     )
-    megaloc = FakeMegaLoc()
+    vpr_stub = FakeVPR()
     localizer = EDMLocalizer(
         reloc_map,
         SimpleNamespace(width=1280, height=720),
         matcher=object(),
-        vpr=megaloc,
+        vpr=vpr_stub,
     )
 
     scored = localizer.retrieve_scored(
@@ -780,7 +721,7 @@ def test_edm_retrieval_keeps_similarity_and_topk_on_the_tensor_device() -> None:
     )
 
     assert [name for name, _score in scored] == ["best", "second"]
-    assert megaloc.tensor_calls == 1
+    assert vpr_stub.tensor_calls == 1
     assert localizer._ref_global_tensor.device.type == "cpu"
 
 
@@ -2219,7 +2160,7 @@ def _acquire_candidate(center: list[float], inliers: int, reproj: float = 1.0):
     )
 
 
-def test_acquire_keeps_strong_megaloc_top1() -> None:
+def test_acquire_keeps_strong_vpr_top1() -> None:
     tracker = object.__new__(ProductionEDMTracker)
     tracker.cfg = EDMConfig()
     selection = _CandidateSelection(True, ["top", "other"], "megaloc_boot", 80, 0.0)
@@ -2234,7 +2175,7 @@ def test_acquire_keeps_strong_megaloc_top1() -> None:
     assert chosen[0] == "top"
 
 
-def test_acquire_reranks_when_megaloc_top1_is_weak() -> None:
+def test_acquire_reranks_when_vpr_top1_is_weak() -> None:
     tracker = object.__new__(ProductionEDMTracker)
     tracker.cfg = EDMConfig()
     selection = _CandidateSelection(True, ["top", "other"], "megaloc_lost", 80, 0.0)
@@ -2754,7 +2695,7 @@ def test_acquire_stage_single_strong_skips_stages_and_obeys_env(monkeypatch) -> 
     info = tracker.localize(np.zeros((720, 1280, 3), np.uint8), capture_stamp=1.0)
     assert calls == [names[:2], names[2:]]
 
-def test_full_global_lost_prior_does_not_restrict_megaloc(monkeypatch) -> None:
+def test_full_global_lost_prior_does_not_restrict_vpr(monkeypatch) -> None:
     import cv2
 
     monkeypatch.setattr(cv2, "cvtColor", lambda frame, _code: frame)
@@ -2841,77 +2782,6 @@ def test_accepted_frame_stores_bgr_cache_when_motion_validation_is_active(
     assert tracker._last_accepted_cam_from_world is not None
 
 
-def test_megaloc_engine_rejects_oversized_plan(tmp_path: Path, monkeypatch) -> None:
-    engine_path = tmp_path / "megaloc.engine"
-    engine_path.write_bytes(b"x" * 64)
-    monkeypatch.setattr(
-        edm_localizer_module, "MEGALOC_TENSORRT_MAX_ENGINE_BYTES", 16
-    )
-    with pytest.raises(ValueError, match="exceeds"):
-        _validate_megaloc_engine_file(engine_path)
-
-
-def test_megaloc_engine_stream_never_slurps_plan_bytes(
-    tmp_path: Path, monkeypatch
-) -> None:
-    trt = sys.modules.get("tensorrt")
-    if trt is None or not hasattr(trt, "IStreamReaderV2"):
-        class _IStreamReaderV2:
-            def __init__(self) -> None:
-                pass
-
-        trt = SimpleNamespace(IStreamReaderV2=_IStreamReaderV2)
-        monkeypatch.setitem(sys.modules, "tensorrt", trt)
-    import tensorrt as trt
-
-    engine_path = tmp_path / "megaloc.engine"
-    payload = b"engine-bytes-0123456789abcd"
-    engine_path.write_bytes(payload)
-    slurps = []
-
-    def forbidden(self):
-        slurps.append(str(self))
-        raise AssertionError("TensorRT loading must not slurp the plan")
-
-    monkeypatch.setattr(Path, "read_bytes", forbidden)
-
-    class FakeRuntime:
-        def deserialize_cuda_engine(self, stream):
-            chunks = []
-            while True:
-                data = stream.read(8, 0)
-                if not data:
-                    break
-                chunks.append(data)
-            assert b"".join(chunks) == payload
-            return "ok"
-
-    result = deserialize_megaloc_cuda_engine(FakeRuntime(), engine_path, trt)
-    assert result == "ok"
-    assert slurps == []
-
-
-def test_megaloc_tensorrt_device_and_sm_fail_closed(monkeypatch) -> None:
-    monkeypatch.setattr(
-        edm_localizer_module.torch.cuda, "is_available", lambda: True
-    )
-    monkeypatch.setattr(
-        edm_localizer_module.torch.cuda, "device_count", lambda: 1
-    )
-    with pytest.raises(ValueError, match="out of range"):
-        _resolve_cuda_device("cuda:3")
-    monkeypatch.setattr(
-        edm_localizer_module.torch.cuda,
-        "get_device_capability",
-        lambda _index: (7, 0),
-    )
-    with pytest.raises(ValueError, match="compute capability"):
-        _validate_megaloc_tensorrt_compatibility(
-            0, SimpleNamespace(__version__="11.2.1")
-        )
-
-
-
 def test_reference_stability_reaches_ranking_when_weight_enabled() -> None:
     tracker = object.__new__(ProductionEDMTracker)
     tracker.cfg = EDMConfig(reference_quality_weight=2.0, reference_quality_floor=0.0)
@@ -2993,44 +2863,6 @@ def test_profile_optional_knobs_apply_to_config_and_reposed(tmp_path: Path) -> N
     assert validator.min_spatial_support == 3
 
 
-def test_megaloc_plan_identity_is_artifact_specific_and_fail_closed(
-    monkeypatch, tmp_path: Path
-) -> None:
-    monkeypatch.setattr(
-        edm_localizer_module.torch.cuda, "get_device_capability", lambda _index: (12, 0)
-    )
-    monkeypatch.setattr(
-        edm_localizer_module.torch.cuda,
-        "get_device_name",
-        lambda _index: "NVIDIA GeForce RTX 5060 Laptop GPU",
-    )
-    assert normalize_gpu_identity("  NVIDIA   GeForce RTX 5060 Laptop GPU ") == (
-        MEGALOC_TENSORRT_GPU_IDENTITY
-    )
-    capability = _validate_megaloc_tensorrt_compatibility(
-        0, SimpleNamespace(__version__="11.2.1")
-    )
-    assert capability == (12, 0)
-    with pytest.raises(ValueError, match="sanctioned MegaLoc plan"):
-        _validate_megaloc_tensorrt_compatibility(
-            0, SimpleNamespace(__version__="10.0.1")
-        )
-    monkeypatch.setattr(
-        edm_localizer_module.torch.cuda,
-        "get_device_name",
-        lambda _index: "NVIDIA GeForce RTX 4090",
-    )
-    with pytest.raises(ValueError, match="GPU identity"):
-        _validate_megaloc_tensorrt_compatibility(
-            0, SimpleNamespace(__version__="11.2.1")
-        )
-    engine_path = tmp_path / "megaloc.engine"
-    engine_path.write_bytes(b"x" * 64)
-    with pytest.raises(ValueError, match="sanctioned"):
-        _validate_megaloc_plan_size(engine_path)
-
-
-
 # ---------------------------------------------------------------------------
 # Flight-disjoint LOO helpers (eval_edm_loo.py)
 
@@ -3070,7 +2902,7 @@ def test_flight_group_keeps_p116_p120_folds_separate_for_flat_and_nested_names()
     assert loo.flight_group("P1670167_0001.jpg") == "P167"
 
 
-def test_same_flight_candidates_are_dropped_before_megaloc_ranking() -> None:
+def test_same_flight_candidates_are_dropped_before_vpr_ranking() -> None:
     loo = _eval_edm_loo()
     names = [
         "P1160116/q.jpg",
@@ -3750,7 +3582,7 @@ def test_starvation_counter_resets_on_dense_matches_and_leaving_lost() -> None:
 
 
 def test_retrieval_frames_do_not_clip_a_starved_run() -> None:
-    # The interleaved MegaLoc cadence puts a retrieval frame between every two
+    # The interleaved VPR cadence puts a retrieval frame between every two
     # local frames, so resetting on retrieval frames would cap the counter at
     # two and a k>=3 escape hatch could never arm.
     tracker = _starvation_tracker(lost_starved_global_frames=3, lost_starved_corr_max=5)

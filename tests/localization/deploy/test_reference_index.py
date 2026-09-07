@@ -228,7 +228,7 @@ def test_default_seed_index_can_be_reopened(tmp_path: Path) -> None:
     assert index.names == tuple(_names(8))
 
 
-def test_megaloc_layer_queries_index_and_maps_names_to_bundle_order(
+def test_boq_layer_queries_index_and_maps_names_to_bundle_order(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -237,22 +237,22 @@ def test_megaloc_layer_queries_index_and_maps_names_to_bundle_order(
         dtype=np.float32,
     )
     bundle_names = ["z-ref.jpg", "a-ref.jpg", "m-ref.jpg"]
-    path = tmp_path / "megaloc-index"
+    path = tmp_path / "boq-index"
     IVFReferenceIndex.build(
         path,
         descriptors,
         bundle_names,
-        model_identity="megaloc:test:v1",
+        model_identity="boq:test:v1",
         nlist=1,
         max_query_probes=1,
         max_query_candidates=3,
     )
-    from production_xfeat_tracker import MegaLocLayer
+    from production_xfeat_tracker import BoQLayer
 
-    layer = MegaLocLayer.load_index(
+    layer = BoQLayer.load_index(
         path,
         bundle_names,
-        expected_model_identity="megaloc:test:v1",
+        expected_model_identity="boq:test:v1",
         device="cpu",
     )
     monkeypatch.setattr(layer, "extract_one", lambda _rgb: descriptors[0])
@@ -276,7 +276,7 @@ def test_edm_retrieval_uses_index_and_honors_exclusions(tmp_path: Path) -> None:
         path,
         descriptors,
         names,
-        model_identity="megaloc:test:v1",
+        model_identity="boq:test:v1",
         nlist=1,
         max_query_probes=1,
         max_query_candidates=3,
@@ -315,7 +315,7 @@ def test_factory_opens_profile_pinned_index_manifest(tmp_path: Path) -> None:
         path,
         descriptors,
         _names(8),
-        model_identity="megaloc:test:v1",
+        model_identity="boq:test:v1",
     )
     from production_localizer_factory import _load_bound_reference_index
 
@@ -336,6 +336,28 @@ def test_factory_opens_profile_pinned_index_manifest(tmp_path: Path) -> None:
         _load_bound_reference_index(
             path / "SHA256SUMS.json",
             ref_names=[*_names(7), "wrong.jpg"],
+            dimension=4,
+            expected_sha256=manifest_sha256,
+        )
+
+
+def test_factory_rejects_a_legacy_megaloc_reference_index(tmp_path: Path) -> None:
+    path = tmp_path / "legacy-index"
+    IVFReferenceIndex.build(
+        path,
+        _descriptors(8, dimension=4),
+        _names(8),
+        model_identity="megaloc:test:v1",
+    )
+    from production_localizer_factory import _load_bound_reference_index
+
+    manifest = path / "SHA256SUMS.json"
+    manifest_sha256 = hashlib.sha256(manifest.read_bytes()).hexdigest()
+
+    with pytest.raises(ValueError, match="boq"):
+        _load_bound_reference_index(
+            manifest,
+            ref_names=_names(8),
             dimension=4,
             expected_sha256=manifest_sha256,
         )

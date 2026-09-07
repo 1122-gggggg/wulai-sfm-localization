@@ -668,7 +668,7 @@ def _ood_knob_receipt() -> dict[str, object]:
         mode = "hard"
     return {
         "ood_mode": mode,
-        "ood_vpr_top1": _f("SFM_EDM_OOD_VPR_TOP1", 0.45),
+        "ood_vpr_top1": _f("SFM_EDM_OOD_VPR_TOP1", 0.32),
         "ood_vpr_margin": _f("SFM_EDM_OOD_VPR_MARGIN", math.inf),
         "ood_vpr_entropy": _f("SFM_EDM_OOD_VPR_ENTROPY", 0.95),
         "ood_match_corr": _receipt_env_int("SFM_EDM_OOD_MATCH_CORR", 200),

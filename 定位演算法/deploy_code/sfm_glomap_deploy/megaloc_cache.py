@@ -56,7 +56,7 @@ def _validate_named_npz_metadata(loaded: np.lib.npyio.NpzFile, keys: set[str]) -
             raise ValueError("unsupported MegaLoc NPZ schema")
         if int(np.asarray(loaded["schema_version"]).item()) != 1:
             raise ValueError("unsupported MegaLoc NPZ schema version")
-        if str(np.asarray(loaded["model"]).item()) != "MegaLoc":
+        if str(np.asarray(loaded["model"]).item()) not in ("MegaLoc", "boq:resnet50-16384"):
             raise ValueError("MegaLoc NPZ model metadata mismatch")
         if int(np.asarray(loaded["input_size"]).item()) <= 0:
             raise ValueError("MegaLoc NPZ input_size must be positive")

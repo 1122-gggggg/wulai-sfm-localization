@@ -12,10 +12,8 @@ import subprocess
 import sys
 from pathlib import Path
 
-MEGALOC_REVISION = "7cb9f7970d366fdf059963d04d372e503e8e9df9"
-MEGALOC_SHA256 = "d4f9f2bcb60018f91eb6a8e061ed054fd55654e10c2569cf13841ea986ffb4f8"
-MEGALOC_HUBCONF_SHA256 = "2b75be965414adec2330de9bff4279a86b1a0fea814de2078c831d70eb54367a"
-MEGALOC_MODEL_SOURCE_SHA256 = "3cbf1d20515b1da423998a8edab787031eaa7bb273c5a86a5c41c4f6d84e2a6d"
+BOQ_WEIGHTS_SHA256 = "4691d1545db847da2c0ba911f34e6c520a5da63f8b94c6415fe87d0d8800ebaa"
+BOQ_WEIGHTS_RELATIVE = "執行環境/torch_hub_cache/checkpoints/boq/resnet50_16384.pth"
 EDM_CHECKPOINT_SHA256 = "f686bebdd9705bf6918621a1a83695f83d698cbd8c3eed932847fe3678d13a97"
 SCALE_FREE_CORE = "模擬器/parrot_stimulate/src/anafi_pcmd_sim/scale_free_control.py"
 REQUIRED_GPU_SUBSTRING = "rtx 5060"
@@ -139,26 +137,12 @@ def _check_required_python_modules(runtime: dict[str, object], failures: list[st
 def _check_runtime_artifacts(root: Path, failures: list[str]) -> None:
     edm_checkpoint = root / "定位演算法/deploy_code/runtime/EDM/weights/edm_outdoor.ckpt"
     _check_sha(edm_checkpoint, EDM_CHECKPOINT_SHA256, "EDM checkpoint", failures)
-    megaloc_root = root / "執行環境/torch_hub_cache/gmberton_MegaLoc_main"
     _check_sha(
-        megaloc_root / "hubconf.py",
-        MEGALOC_HUBCONF_SHA256,
-        "MegaLoc hubconf",
+        root / BOQ_WEIGHTS_RELATIVE,
+        BOQ_WEIGHTS_SHA256,
+        "BoQ weights",
         failures,
     )
-    _check_sha(
-        megaloc_root / "megaloc_model.py",
-        MEGALOC_MODEL_SOURCE_SHA256,
-        "MegaLoc model source",
-        failures,
-    )
-    megaloc_weights = (
-        root
-        / "執行環境/torch_hub_cache/checkpoints/megaloc"
-        / MEGALOC_REVISION
-        / "model.safetensors"
-    )
-    _check_sha(megaloc_weights, MEGALOC_SHA256, "MegaLoc weights", failures)
     edm_config = root / "定位演算法/deploy_code/runtime/EDM/configs/edm/outdoor/edm_base.py"
     if not edm_config.is_file():
         failures.append(f"missing EDM config: {edm_config}")
@@ -400,19 +384,21 @@ def _check_edm_cuda_runtime(failures: list[str], runtime: dict[str, object]) -> 
         failures.append(f"EDM CUDA matcher load failed: {exc}")
 
 
-def _check_megaloc_runtime(failures: list[str], runtime: dict[str, object]) -> None:
+def _check_boq_runtime(failures: list[str], runtime: dict[str, object]) -> None:
     try:
         import numpy as np
-        from reloc_localizer_edm import MegaLocQuery
+        from boq_query import BOQ_DIM, BoQQuery
 
-        extractor = MegaLocQuery(device="cuda")
-        descriptor = extractor.extract_one(np.zeros((322, 322, 3), dtype=np.uint8))
-        if descriptor.shape != (8448,) or not np.isfinite(descriptor).all():
-            raise ValueError(f"unexpected MegaLoc descriptor: {descriptor.shape}")
-        runtime["megaloc_model"] = "loaded_and_inferred"
+        extractor = BoQQuery(device="cuda")
+        descriptor = extractor.extract_one(np.zeros((384, 384, 3), dtype=np.uint8))
+        if descriptor.shape != (BOQ_DIM,) or not np.isfinite(descriptor).all():
+            raise ValueError(f"unexpected BoQ descriptor: {descriptor.shape}")
+        if BOQ_DIM != 16384:
+            raise ValueError(f"unexpected BoQ descriptor dim: {BOQ_DIM}")
+        runtime["boq_model"] = "loaded_and_inferred"
         del extractor, descriptor
     except Exception as exc:  # noqa: BLE001 - report model/runtime failures
-        failures.append(f"MegaLoc CUDA load/inference failed: {exc}")
+        failures.append(f"BoQ CUDA load/inference failed: {exc}")
 
 
 def _check_operator_imports(root: Path, failures: list[str], runtime: dict[str, object]) -> None:
@@ -443,7 +429,7 @@ def _check_full_runtime(
     _check_camera_runtime(profile, failures, runtime)
     _check_edm_bundle_runtime(profile, failures, runtime)
     _check_edm_cuda_runtime(failures, runtime)
-    _check_megaloc_runtime(failures, runtime)
+    _check_boq_runtime(failures, runtime)
     _check_operator_imports(root, failures, runtime)
 
 
@@ -534,7 +520,7 @@ def main() -> None:
     parser.add_argument(
         "--full-runtime",
         action="store_true",
-        help="load the selected bundle, EDM CUDA model, MegaLoc model, GUI and worker",
+        help="load the selected bundle, EDM CUDA model, BoQ model, GUI and worker",
     )
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()

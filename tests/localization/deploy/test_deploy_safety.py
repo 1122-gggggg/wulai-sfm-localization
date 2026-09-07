@@ -269,15 +269,16 @@ def test_edm_scales_query_points_on_x_and_y_axes_independently() -> None:
     [
         {"bundle_vpr": "xfeat"},
         {"vpr": "other-vpr"},
-        {"bundle_vpr": "megaloc", "vpr": "xfeat"},
+        {"bundle_vpr": "megaloc", "vpr": "MegaLoc-8448"},
+        {"bundle_vpr": "boq", "vpr": "xfeat"},
     ],
 )
 def test_xfeat_factory_rejects_incompatible_vpr_metadata(meta) -> None:
-    with pytest.raises(ValueError, match="MegaLoc"):
+    with pytest.raises(ValueError, match="BoQ"):
         factory._validate_xfeat_vpr_metadata(meta)
 
 
-def test_xfeat_factory_accepts_declared_megaloc_family() -> None:
+def test_xfeat_factory_accepts_declared_boq_family() -> None:
     assert factory._validate_xfeat_vpr_metadata(
-        {"bundle_vpr": "megaloc", "vpr": "MegaLoc-8448"}
-    ) == "megaloc"
+        {"bundle_vpr": "boq", "vpr": "BoQ-resnet50-16384"}
+    ) == "boq"

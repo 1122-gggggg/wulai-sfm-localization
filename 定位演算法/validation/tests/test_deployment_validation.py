@@ -321,7 +321,7 @@ def test_site_replay_quality_gate_accepts_equal_or_better_result():
     assert benchmark.evaluate_quality(summary, baseline) == []
 
 
-def test_megaloc_cache_binds_descriptors_to_exact_names_and_hash(tmp_path, monkeypatch):
+def test_vpr_cache_binds_descriptors_to_exact_names_and_hash(tmp_path, monkeypatch):
     deploy = VALIDATION.parent / "deploy_code" / "sfm_glomap_deploy"
     monkeypatch.syspath_prepend(str(deploy))
     cache_io = load_module("megaloc_cache", deploy / "megaloc_cache.py")
@@ -332,7 +332,23 @@ def test_megaloc_cache_binds_descriptors_to_exact_names_and_hash(tmp_path, monke
     cache_io.write_megaloc_cache(npz, desc, names)
     np.testing.assert_array_equal(cache_io.load_megaloc_cache(npz, names), desc)
     production = load_module("production_tracker_cache_test", deploy / "production_xfeat_tracker.py")
-    np.testing.assert_array_equal(production.MegaLocLayer.load_cache(npz, names).ref_desc, desc)
+
+    legacy = tmp_path / "legacy_megaloc.npz"
+    cache_io.write_megaloc_cache(legacy, np.eye(3, 8448, dtype=np.float32), names)
+    try:
+        production.BoQLayer.load_cache(legacy, names)
+    except ValueError as exc:
+        assert "BoQ descriptor mismatch" in str(exc)
+    else:
+        raise AssertionError("an 8448-wide legacy bank was accepted as a BoQ bank")
+
+    boq_npz = tmp_path / "boq_cache.npz"
+    boq_desc = np.zeros((3, production.BOQ_DIM), np.float32)
+    boq_desc[:, 0] = 1.0
+    cache_io.write_megaloc_cache(boq_npz, boq_desc, names)
+    np.testing.assert_array_equal(
+        production.BoQLayer.load_cache(boq_npz, names).ref_desc, boq_desc
+    )
     try:
         cache_io.load_megaloc_cache(npz, list(reversed(names)))
     except ValueError as exc:
@@ -595,7 +611,7 @@ def test_verified_bundle_uses_restricted_schema(tmp_path, monkeypatch):
     reloc = load_module("reloc_localizer_schema_test", deploy / "reloc_localizer_xfeat.py")
     name = "ref.jpg"
     payload = {
-        "meta": {"bundle_vpr": "megaloc"},
+        "meta": {"bundle_vpr": "boq"},
         "ref_names": [name],
         "ref_global": np.ones((1, 4), dtype=np.float32),
         "refs": {
@@ -634,7 +650,7 @@ def test_bundle_schema_rejects_nonfinite_features_bad_dtype_and_covis(tmp_path, 
 
     def payload():
         return {
-            "meta": {"bundle_vpr": "megaloc"},
+            "meta": {"bundle_vpr": "boq"},
             "ref_names": [name],
             "ref_global": np.ones((1, 4), dtype=np.float32),
             "refs": {

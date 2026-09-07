@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""EDM relocalizer: MegaLoc retrieval -> EDM matching -> PnP.
+"""EDM relocalizer: BoQ-ResNet50 retrieval -> EDM matching -> PnP.
 
 Drop-in replacement for the XFeat + LighterGlue + mutual-NN local matcher. Retrieval is
-untouched: the bundle carries the same MegaLoc global descriptors, so only the local
+separate: the bundle carries BoQ-ResNet50 global descriptors, so only the local
 matching and the 2D->3D lookup change.
 
 WHY THERE IS NO KD-TREE / DEPTH MAP / SNAP RADIUS HERE:
@@ -30,28 +30,13 @@ from pathlib import Path
 import cv2
 import numpy as np
 import torch
-import torch.nn.functional as F
 
 from artifact_integrity import verify_sha256
+from boq_query import BOQ_DIM, BoQQuery
 from edm_matcher import EDM_H, EDM_W, EDMMatcher
-from megaloc_token_reduction import (
-    TokenReductionConfig,
-    install_token_reduction,
-)
 from reference_index import ReferenceIndex
 
-MEGALOC_INPUT = 322
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-MEGALOC_REVISION = "7cb9f7970d366fdf059963d04d372e503e8e9df9"
-MEGALOC_WEIGHTS_SHA256 = "d4f9f2bcb60018f91eb6a8e061ed054fd55654e10c2569cf13841ea986ffb4f8"
-# NOTE 2026-09-05: the pre-09-05 workspace hubconf (a weights_path-tolerant
-# fork of upstream e31e8e0, pin 0ebf9fc9…) was deleted with torch_hub_cache
-# and is unrecoverable byte-exact (no copy in git/bundle/caches). This pin
-# now covers the clean-room equivalent above: identical entrypoint contract
-# (get_trained_model(weights_path=None) → MegaLoc + safetensors load).
-# megaloc_model.py is unchanged and still byte-exact at 4a23a2b.
-MEGALOC_HUBCONF_SHA256 = "2b75be965414adec2330de9bff4279a86b1a0fea814de2078c831d70eb54367a"
-MEGALOC_MODEL_SOURCE_SHA256 = "3cbf1d20515b1da423998a8edab787031eaa7bb273c5a86a5c41c4f6d84e2a6d"
 
 # The river bundle currently has 454 references.  Keep a fixed load-time budget
 # safely above that map while rejecting 100k-reference retrieval, which this
@@ -62,7 +47,7 @@ EDM_MAX_IMAGE_ENCODED_BYTES = 4 * 1024 * 1024
 EDM_MAX_TOTAL_ENCODED_IMAGE_BYTES = 512 * 1024 * 1024
 EDM_MAX_TOTAL_DECODED_IMAGE_BYTES = 1024 * 1024 * 1024
 EDM_MAX_XYZ_BYTES = 512 * 1024 * 1024
-EDM_GLOBAL_DESCRIPTOR_DIM = 8448
+EDM_GLOBAL_DESCRIPTOR_DIM = BOQ_DIM
 EDM_MAX_GLOBAL_DESCRIPTOR_BYTES = 256 * 1024 * 1024
 EDM_MAX_COVIS_EDGES = EDM_MAX_REFERENCE_COUNT * 128
 
@@ -133,177 +118,6 @@ def _jpeg_dimensions(encoded: np.ndarray) -> tuple[int, int]:
     raise ValueError("embedded EDM reference JPEG has no supported SOF marker")
 
 
-def _torch_hub_cache() -> Path:
-    configured = os.environ.get("SFM_TORCH_HUB_CACHE", "").strip()
-    if configured:
-        return Path(configured).expanduser().resolve()
-    for parent in Path(__file__).resolve().parents:
-        direct = parent / "torch_hub_cache"
-        if direct.is_dir():
-            return direct
-        runtime = parent / "執行環境" / "torch_hub_cache"
-        if runtime.is_dir():
-            return runtime
-    return Path(__file__).resolve().parents[3] / "執行環境" / "torch_hub_cache"
-
-
-TORCH_HUB_DIR = _torch_hub_cache()
-MEGALOC_REPO_DIR = TORCH_HUB_DIR / "gmberton_MegaLoc_main"
-MEGALOC_WEIGHTS = TORCH_HUB_DIR / "checkpoints" / "megaloc" / MEGALOC_REVISION / "model.safetensors"
-MEGALOC_TENSORRT_ENGINE = (
-    Path(__file__).resolve().parents[1]
-    / "runtime"
-    / "EDM"
-    / "weights"
-    / "megaloc_322_autocast_fp16.engine"
-)
-MEGALOC_TENSORRT_ENGINE_SHA256 = "07a849aa9085574a5537332bf9a5023c1fc17f2022086047a7f910d87d5d6dfe"
-MEGALOC_TENSORRT_ENGINE_SIZE_BYTES = 464285892
-MEGALOC_TENSORRT_GPU_IDENTITY = "nvidia geforce rtx 5060 laptop gpu"
-MEGALOC_TENSORRT_VERSION = (11, 2)
-MEGALOC_TENSORRT_COMPUTE_CAPABILITY = (12, 0)
-MEGALOC_TENSORRT_MAX_ENGINE_BYTES = 512 * 1024 * 1024
-MEGALOC_TENSORRT_STREAM_CHUNK_BYTES = 8 * 1024 * 1024
-MEGALOC_TENSORRT_HEADER_BYTES = 16
-
-
-def normalize_gpu_identity(name: object) -> str:
-    return " ".join(str(name).strip().lower().split())
-
-
-def _parse_tensorrt_version(trt_module) -> tuple[int, int]:
-    version = str(getattr(trt_module, "__version__", "")).strip()
-    parts = version.split(".")
-    if len(parts) < 2:
-        raise ValueError(f"unrecognized TensorRT version: {version!r}")
-    try:
-        major = int(parts[0])
-        minor = int(parts[1])
-    except ValueError as exc:
-        raise ValueError(f"unrecognized TensorRT version: {version!r}") from exc
-    return major, minor
-
-
-def _validate_megaloc_tensorrt_compatibility(device_index: int, trt_module) -> tuple[int, int]:
-    major, minor = _parse_tensorrt_version(trt_module)
-    if (major, minor) != MEGALOC_TENSORRT_VERSION:
-        raise ValueError(
-            f"TensorRT {major}.{minor} is not the sanctioned MegaLoc plan "
-            f"{MEGALOC_TENSORRT_VERSION[0]}.{MEGALOC_TENSORRT_VERSION[1]}"
-        )
-    capability = torch.cuda.get_device_capability(device_index)
-    if capability != MEGALOC_TENSORRT_COMPUTE_CAPABILITY:
-        expected = MEGALOC_TENSORRT_COMPUTE_CAPABILITY
-        raise ValueError(
-            f"GPU compute capability {capability[0]}.{capability[1]} is not the "
-            f"sanctioned MegaLoc TensorRT sm_{expected[0]}{expected[1]}"
-        )
-    identity = normalize_gpu_identity(torch.cuda.get_device_name(device_index))
-    if identity != MEGALOC_TENSORRT_GPU_IDENTITY:
-        raise ValueError(
-            f"GPU identity {identity!r} is not the sanctioned MegaLoc plan "
-            f"{MEGALOC_TENSORRT_GPU_IDENTITY!r}"
-        )
-    return capability
-
-
-def _resolve_cuda_device(device: str | torch.device) -> torch.device:
-    requested = torch.device(device)
-    if requested.type != "cuda":
-        raise ValueError("SFM_MEGALOC_TENSORRT requires a CUDA device")
-    if not torch.cuda.is_available() or torch.cuda.device_count() <= 0:
-        raise ValueError("SFM_MEGALOC_TENSORRT requires a CUDA device")
-    index = torch.cuda.current_device() if requested.index is None else int(requested.index)
-    if index < 0 or index >= torch.cuda.device_count():
-        raise ValueError(f"CUDA device index out of range: {index}")
-    return torch.device("cuda", index)
-
-
-def _validate_megaloc_engine_file(engine_path: Path) -> int:
-    try:
-        size = engine_path.stat().st_size
-    except OSError as exc:
-        raise ValueError(f"cannot read TensorRT MegaLoc engine: {engine_path}") from exc
-    if size <= MEGALOC_TENSORRT_HEADER_BYTES:
-        raise ValueError(f"TensorRT MegaLoc engine is truncated: {engine_path}")
-    if size > MEGALOC_TENSORRT_MAX_ENGINE_BYTES:
-        raise ValueError(
-            f"TensorRT MegaLoc engine exceeds "
-            f"{MEGALOC_TENSORRT_MAX_ENGINE_BYTES} bytes: {engine_path}"
-        )
-    with engine_path.open("rb") as handle:
-        header = handle.read(MEGALOC_TENSORRT_HEADER_BYTES)
-    if len(header) < MEGALOC_TENSORRT_HEADER_BYTES:
-        raise ValueError(f"TensorRT MegaLoc engine is truncated: {engine_path}")
-    return int(size)
-
-
-def _validate_megaloc_plan_size(engine_path: Path) -> int:
-    size = _validate_megaloc_engine_file(engine_path)
-    if size != MEGALOC_TENSORRT_ENGINE_SIZE_BYTES:
-        raise ValueError(
-            f"TensorRT MegaLoc engine size {size} is not the sanctioned "
-            f"{MEGALOC_TENSORRT_ENGINE_SIZE_BYTES} bytes: {engine_path}"
-        )
-    return size
-
-
-def _make_megaloc_engine_stream(trt_module, engine_path: Path, max_bytes: int, chunk_bytes: int):
-    if not hasattr(trt_module, "IStreamReaderV2"):
-        raise RuntimeError("TensorRT IStreamReaderV2 is required to stream MegaLoc engines")
-
-    class _BoundedEngineStream(trt_module.IStreamReaderV2):
-        def __init__(self) -> None:
-            trt_module.IStreamReaderV2.__init__(self)
-            self._fh = engine_path.open("rb")
-            self._max_bytes = int(max_bytes)
-            self._chunk_bytes = int(chunk_bytes)
-            self._size = int(max_bytes)
-
-        def read(self, num_bytes: int, stream: int) -> bytes:
-            del stream
-            if num_bytes <= 0:
-                return b""
-            position = self._fh.tell()
-            if position >= self._max_bytes:
-                return b""
-            count = min(int(num_bytes), self._chunk_bytes, self._max_bytes - position)
-            return self._fh.read(count)
-
-        def seek(self, offset: int, where) -> bool:
-            whence = {
-                trt_module.SeekPosition.SET: os.SEEK_SET,
-                trt_module.SeekPosition.CUR: os.SEEK_CUR,
-                trt_module.SeekPosition.END: os.SEEK_END,
-            }.get(where)
-            if whence is None:
-                return False
-            try:
-                position = self._fh.seek(int(offset), whence)
-            except OSError:
-                return False
-            return 0 <= position <= self._size
-
-        def close(self) -> None:
-            self._fh.close()
-
-    return _BoundedEngineStream()
-
-
-def deserialize_megaloc_cuda_engine(runtime, engine_path: Path, trt_module):
-    size = _validate_megaloc_engine_file(engine_path)
-    stream = _make_megaloc_engine_stream(
-        trt_module,
-        engine_path,
-        max_bytes=size,
-        chunk_bytes=MEGALOC_TENSORRT_STREAM_CHUNK_BYTES,
-    )
-    try:
-        return runtime.deserialize_cuda_engine(stream)
-    finally:
-        stream.close()
-
-
 def _decode_reference_image(item: tuple[str, object]) -> tuple[str, np.ndarray]:
     name, encoded = item
     decoded = cv2.imdecode(
@@ -318,7 +132,7 @@ def _decode_reference_image(item: tuple[str, object]) -> tuple[str, np.ndarray]:
 @dataclass
 class EDMRelocMap:
     ref_names: list
-    ref_global: np.ndarray  # (N, 8448) L2-normalised MegaLoc
+    ref_global: np.ndarray  # (N, BOQ_DIM) L2-normalised BoQ
     xyz_by_cell: dict  # name -> (N_CELLS, 3) float32, NaN = unanchored
     images: dict  # name -> (576, 1024) uint8 grayscale
     meta: dict
@@ -588,285 +402,6 @@ def _validate_edm_bundle_schema(bundle: object) -> dict:
     return bundle
 
 
-class _MegaLocTensorRTEngine:
-    """Fixed-shape TensorRT runner for the experimental MegaLoc backend."""
-
-    def __init__(
-        self,
-        engine_path: Path,
-        device: str,
-        *,
-        require_sanctioned_size: bool = True,
-    ):
-        try:
-            import tensorrt as trt
-        except ImportError as exc:
-            try:
-                import tensorrt_bindings as trt
-            except ImportError:
-                raise RuntimeError(
-                    "TensorRT Python bindings are required for the MegaLoc TensorRT backend"
-                ) from exc
-
-        self.device = _resolve_cuda_device(device)
-        if require_sanctioned_size:
-            _validate_megaloc_plan_size(Path(engine_path))
-        else:
-            _validate_megaloc_engine_file(Path(engine_path))
-
-        capability = _validate_megaloc_tensorrt_compatibility(self.device.index, trt)
-        self._logger = trt.Logger(trt.Logger.ERROR)
-        with torch.cuda.device(self.device):
-            if torch.cuda.current_device() != self.device.index:
-                raise RuntimeError(
-                    f"failed to bind TensorRT MegaLoc to CUDA device {self.device.index}"
-                )
-            self._runtime = trt.Runtime(self._logger)
-            self._engine = deserialize_megaloc_cuda_engine(self._runtime, Path(engine_path), trt)
-            if self._engine is None:
-                raise RuntimeError(
-                    f"failed to deserialize TensorRT engine on {self.device} "
-                    f"sm_{capability[0]}{capability[1]} TensorRT {trt.__version__}: "
-                    f"{engine_path}"
-                )
-
-            expected = {
-                "images": (
-                    trt.TensorIOMode.INPUT,
-                    (1, 3, MEGALOC_INPUT, MEGALOC_INPUT),
-                ),
-                "descriptors": (
-                    trt.TensorIOMode.OUTPUT,
-                    (1, EDM_GLOBAL_DESCRIPTOR_DIM),
-                ),
-            }
-            actual_names = {
-                self._engine.get_tensor_name(index) for index in range(self._engine.num_io_tensors)
-            }
-            if actual_names != set(expected):
-                raise ValueError(f"unexpected TensorRT MegaLoc tensors: {actual_names}")
-            for name, (mode, shape) in expected.items():
-                if (
-                    self._engine.get_tensor_mode(name) != mode
-                    or tuple(self._engine.get_tensor_shape(name)) != shape
-                    or self._engine.get_tensor_dtype(name) != trt.float32
-                ):
-                    raise ValueError(f"unexpected TensorRT MegaLoc tensor contract: {name}")
-
-            self._context = self._engine.create_execution_context()
-            if self._context is None:
-                raise RuntimeError("failed to create TensorRT MegaLoc execution context")
-            self._output = torch.empty(
-                (1, EDM_GLOBAL_DESCRIPTOR_DIM),
-                dtype=torch.float32,
-                device=self.device,
-            )
-            self._context.set_tensor_address("descriptors", self._output.data_ptr())
-
-    def __call__(self, images: torch.Tensor) -> torch.Tensor:
-        if (
-            images.device != self.device
-            or images.dtype != torch.float32
-            or tuple(images.shape) != (1, 3, MEGALOC_INPUT, MEGALOC_INPUT)
-        ):
-            raise ValueError("unexpected TensorRT MegaLoc input tensor")
-        with torch.cuda.device(self.device):
-            images = images.contiguous()
-            self._context.set_tensor_address("images", images.data_ptr())
-            stream = torch.cuda.current_stream(device=self.device).cuda_stream
-            if not self._context.execute_async_v3(stream_handle=stream):
-                raise RuntimeError("TensorRT MegaLoc inference failed")
-            return self._output
-
-
-class MegaLocQuery:
-    """Same retrieval front-end as the XFeat localizer -- the bundle's ref_global is MegaLoc."""
-
-    def __init__(
-        self,
-        device: str = DEVICE,
-        input_size: int = MEGALOC_INPUT,
-        *,
-        backend: str | None = None,
-        engine_path: str | Path | None = None,
-        engine_sha256: str | None = None,
-        token_reduction_method: str | None = None,
-        token_reduction_keep_ratio: float | None = None,
-        token_reduction_layer: int | None = None,
-        token_reduction_fuse: bool | None = None,
-    ):
-        from PIL import Image
-        from torchvision import transforms as T
-
-        self._Image = Image
-        self.device = device
-        self.input_size = int(input_size)
-        if backend is None:
-            backend = os.environ.get("SFM_MEGALOC_BACKEND", "").strip() or (
-                "tensorrt"
-                if os.environ.get("SFM_MEGALOC_TENSORRT", "0") == "1"
-                else "pytorch_fp16"
-                if os.environ.get("SFM_MEGALOC_FP16", "0") == "1"
-                else "tensorrt"
-                if device.startswith("cuda")
-                else "pytorch"
-            )
-        self.backend = backend.strip().lower()
-        if self.backend not in {"pytorch", "pytorch_fp16", "tensorrt"}:
-            raise ValueError(f"unsupported MegaLoc backend: {backend!r}")
-        reduction_method = (
-            str(token_reduction_method).strip().lower()
-            if token_reduction_method is not None
-            else os.environ.get("SFM_MEGALOC_TOKEN_REDUCTION", "none").strip().lower()
-        )
-        reduction_ratio = (
-            float(token_reduction_keep_ratio)
-            if token_reduction_keep_ratio is not None
-            else float(
-                os.environ.get(
-                    "SFM_MEGALOC_TOKEN_KEEP_RATIO",
-                    "1.0" if reduction_method == "none" else "0.5",
-                )
-            )
-        )
-        reduction_layer = (
-            int(token_reduction_layer)
-            if token_reduction_layer is not None
-            else int(os.environ.get("SFM_MEGALOC_TOKEN_LAYER", "6"))
-        )
-        reduction_fuse = (
-            bool(token_reduction_fuse)
-            if token_reduction_fuse is not None
-            else os.environ.get("SFM_MEGALOC_TOKEN_FUSE", "1").strip().lower()
-            not in {"0", "false", "no", "off"}
-        )
-        self.token_reduction = TokenReductionConfig(
-            method=reduction_method,
-            keep_ratio=reduction_ratio,
-            layer=reduction_layer,
-            fuse_inattentive=reduction_fuse,
-        )
-        self.token_reduction.validate()
-        self.tensorrt = self.backend == "tensorrt"
-        if self.tensorrt and self.token_reduction.method != "none":
-            raise ValueError(
-                "MegaLoc token reduction requires a PyTorch backend or a separately "
-                "validated token-reduced TensorRT engine"
-            )
-        self.fp16 = self.backend == "pytorch_fp16" and device.startswith("cuda")
-        self._trt_engine = None
-        if self.tensorrt:
-            if not device.startswith("cuda"):
-                raise ValueError("SFM_MEGALOC_TENSORRT requires a CUDA device")
-            if input_size != MEGALOC_INPUT:
-                raise ValueError(f"TensorRT MegaLoc requires input_size={MEGALOC_INPUT}")
-            engine_path = str(
-                engine_path
-                or os.environ.get("SFM_MEGALOC_TENSORRT_ENGINE", "")
-                or MEGALOC_TENSORRT_ENGINE
-            ).strip()
-            engine_sha256 = str(
-                engine_sha256
-                or os.environ.get("SFM_MEGALOC_TENSORRT_ENGINE_SHA256", "")
-                or MEGALOC_TENSORRT_ENGINE_SHA256
-            ).strip()
-            if not engine_path:
-                raise ValueError("SFM_MEGALOC_TENSORRT_ENGINE is required")
-            verify_sha256(engine_path, engine_sha256)
-            sanctioned_engine = (
-                Path(engine_path).resolve() == MEGALOC_TENSORRT_ENGINE.resolve()
-                and engine_sha256 == MEGALOC_TENSORRT_ENGINE_SHA256
-            )
-            self._trt_engine = _MegaLocTensorRTEngine(
-                Path(engine_path),
-                device,
-                require_sanctioned_size=sanctioned_engine,
-            )
-            engine_device = getattr(self._trt_engine, "device", None)
-            if engine_device is not None:
-                self.device = engine_device
-            self.model = None
-        else:
-            verify_sha256(MEGALOC_REPO_DIR / "hubconf.py", MEGALOC_HUBCONF_SHA256)
-            verify_sha256(MEGALOC_REPO_DIR / "megaloc_model.py", MEGALOC_MODEL_SOURCE_SHA256)
-            verify_sha256(MEGALOC_WEIGHTS, MEGALOC_WEIGHTS_SHA256)
-            torch.hub.set_dir(str(TORCH_HUB_DIR))
-            self.model = (
-                torch.hub.load(
-                    str(MEGALOC_REPO_DIR),
-                    "get_trained_model",
-                    source="local",
-                    weights_path=str(MEGALOC_WEIGHTS),
-                )
-                .eval()
-                .to(device)
-            )
-            install_token_reduction(self.model, self.token_reduction)
-        self.tf = T.Compose(
-            [
-                T.Resize((input_size, input_size), interpolation=T.InterpolationMode.BICUBIC),
-                T.ToTensor(),
-                T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-            ]
-        )
-        self._input_staging = None
-        self._normalization_tensors = None
-
-    def _preprocess_device(self, rgb: np.ndarray) -> torch.Tensor:
-        """Transfer uint8 once, then resize and normalize on the target device."""
-        source = torch.from_numpy(np.ascontiguousarray(rgb[..., :3])).permute(2, 0, 1)
-        device = torch.device(self.device)
-        if device.type == "cuda":
-            staging = self._input_staging
-            if staging is None or tuple(staging.shape) != tuple(source.shape):
-                staging = torch.empty(tuple(source.shape), dtype=torch.uint8, pin_memory=True)
-                self._input_staging = staging
-            staging.copy_(source)
-            x = staging.to(device, non_blocking=True)
-        else:
-            x = source.to(device)
-        x = x.unsqueeze(0).to(dtype=torch.float32).div_(255.0)
-        x = F.interpolate(
-            x,
-            size=(self.input_size, self.input_size),
-            mode="bicubic",
-            align_corners=False,
-            antialias=True,
-        )
-        normalization = self._normalization_tensors
-        if normalization is None or normalization[0].device != device:
-            mean = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32, device=device).view(
-                1, 3, 1, 1
-            )
-            std = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32, device=device).view(
-                1, 3, 1, 1
-            )
-            normalization = (mean, std)
-            self._normalization_tensors = normalization
-        return ((x - normalization[0]) / normalization[1]).contiguous()
-
-    def _preprocess(self, rgb: np.ndarray) -> torch.Tensor:
-        if torch.device(self.device).type == "cuda":
-            return self._preprocess_device(rgb)
-        return (
-            self.tf(self._Image.fromarray(rgb[..., :3]).convert("RGB")).unsqueeze(0).to(self.device)
-        )
-
-    @torch.inference_mode()
-    def extract_one_tensor(self, rgb: np.ndarray) -> torch.Tensor:
-        x = self._preprocess(rgb)
-        if self._trt_engine is not None:
-            output = self._trt_engine(x)
-        else:
-            with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=self.fp16):
-                output = self.model(x)
-        return F.normalize(output.float(), dim=1, eps=1e-12)[0]
-
-    @torch.inference_mode()
-    def extract_one(self, rgb: np.ndarray) -> np.ndarray:
-        return self.extract_one_tensor(rgb).cpu().numpy().astype(np.float32, copy=False)
-
-
 @dataclass
 class Camera:
     model: str
@@ -881,7 +416,7 @@ class EDMLocalizer:
         reloc_map: EDMRelocMap,
         camera: Camera,
         matcher: EDMMatcher | None = None,
-        vpr: MegaLocQuery | None = None,
+        vpr: BoQQuery | None = None,
         topk: int = 5,
         min_conf: float = 0.2,
         pnp_max_error: float = 5.0,
@@ -962,11 +497,9 @@ class EDMLocalizer:
         return out
 
     @property
-    def vpr(self) -> MegaLocQuery:
+    def vpr(self) -> BoQQuery:
         if self._vpr is None:
-            self._vpr = (
-                self._vpr_factory() if self._vpr_factory is not None else MegaLocQuery()
-            )
+            self._vpr = self._vpr_factory() if self._vpr_factory is not None else BoQQuery()
         return self._vpr
 
     def retrieve_scored(
