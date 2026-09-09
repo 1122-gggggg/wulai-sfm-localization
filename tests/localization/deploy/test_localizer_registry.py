@@ -13,17 +13,12 @@ from pose_types import LocalizerCapabilities, LocalizerProvider
 
 
 def test_named_providers_expose_backend_capabilities() -> None:
-    assert registered_localizer_names() == ("edm", "xfeat")
+    assert registered_localizer_names() == ("direct",)
 
-    edm = get_localizer_provider("edm")
-    assert edm.name == "edm"
-    assert edm.capabilities.required_assets == ("localizer_profile",)
-    assert edm.capabilities.supports_production_profile is True
-
-    xfeat = get_localizer_capabilities("xfeat")
-    assert xfeat.name == "xfeat"
-    assert xfeat.required_assets == ()
-    assert xfeat.supports_production_profile is False
+    direct = get_localizer_capabilities("direct")
+    assert direct.name == "direct"
+    assert direct.required_assets == ("localizer_profile",)
+    assert direct.supports_production_profile is True
 
 
 def test_unknown_backend_fails_closed() -> None:
@@ -34,8 +29,7 @@ def test_unknown_backend_fails_closed() -> None:
 def test_factory_attaches_named_provider_builders() -> None:
     import production_localizer_factory  # noqa: F401
 
-    assert get_localizer_provider("edm").builder is not None
-    assert get_localizer_provider("xfeat").builder is not None
+    assert get_localizer_provider("direct").builder is not None
 
 
 def test_provider_with_incompatible_contract_version_is_rejected() -> None:

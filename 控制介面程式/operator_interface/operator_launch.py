@@ -95,32 +95,23 @@ def build_argument_parser() -> argparse.ArgumentParser:
     ap.add_argument(
         "--localizer-backend",
         default=None,
-        choices=("auto", "edm", "xfeat"),
+        choices=("auto", "direct"),
         help=(
-            "Local matcher family (edm|xfeat). Default auto from bundle name; "
-            "site profiles set this atomically with the map/bundle."
+            "Localizer backend (direct only; auto resolves to direct). "
+            "Site profiles set this atomically with the map/bundle."
         ),
     )
     ap.add_argument(
         "--localizer-deploy-dir",
         default=None,
-        help="EDM deployment directory selected directly or by --site-profile",
+        help="Direct deployment directory selected directly or by --site-profile",
     )
     ap.add_argument(
         "--localizer-profile",
         default=None,
-        help="EDM deployment profile selected directly or by --site-profile",
+        help="Direct deployment profile selected directly or by --site-profile",
     )
     ap.add_argument("--localizer-profile-sha256", default=None)
-    ap.add_argument(
-        "--edm-matcher",
-        default="torch",
-        choices=("torch",),
-        help=(
-            "EDM matching engine: verified PyTorch CUDA FP16 production path. "
-            "Rejected ONNX/TensorRT experiments are not selectable in flight UI."
-        ),
-    )
     ap.add_argument("--megaloc-cache", default=None)
     ap.add_argument(
         "--reference-index",
@@ -128,11 +119,6 @@ def build_argument_parser() -> argparse.ArgumentParser:
         help="Profile-pinned IVF index SHA256SUMS.json for large reference maps",
     )
     ap.add_argument("--reference-index-sha256", default=None)
-    ap.add_argument(
-        "--track-landmarks",
-        default=None,
-        help="XFeat TRACK landmark sidecar selected directly or by site profile",
-    )
     ap.add_argument(
         "--live-detect",
         action=argparse.BooleanOptionalAction,
@@ -203,15 +189,15 @@ def build_argument_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=os.environ.get("SFM_HOLD_ON_LOW_CONF", "1").strip() in {"1", "true", "TRUE", "yes"},
         help=(
-            "after consecutive low-confidence EDM results, hover/hold and run "
-            "staged MegaLoc/EDM recovery (enabled by default)"
+            "after consecutive low-confidence results, hover/hold and run "
+            "staged reloc recovery (enabled by default)"
         ),
     )
     ap.add_argument(
         "--low-confidence-hold-results",
         type=int,
         default=int(os.environ.get("SFM_LOW_CONF_HOLD_RESULTS", "2")),
-        help="consecutive low-confidence EDM results before staged MegaLoc recovery",
+        help="consecutive low-confidence results before staged reloc recovery",
     )
     ap.add_argument(
         "--lost-hold-timeout-ms",
@@ -240,11 +226,6 @@ def build_argument_parser() -> argparse.ArgumentParser:
         help="Map ref index for track bench seed (-1=middle)",
     )
     ap.add_argument(
-        "--neuflow-track",
-        action="store_true",
-        help="Use NeuFlow-v2 refresh=3 hybrid in TRACK; deep matcher remains fallback.",
-    )
-    ap.add_argument(
         "--pose-stabilize",
         action="store_true",
         help=(
@@ -253,26 +234,10 @@ def build_argument_parser() -> argparse.ArgumentParser:
         ),
     )
     ap.add_argument(
-        "--projection-track",
-        action="store_true",
-        help="Use projection-guided TRACK fast path; unchanged deep matcher remains fallback.",
-    )
-    ap.add_argument(
-        "--nn-fast-path",
-        action="store_true",
-        help=(
-            "BENCHMARK ONLY: restore the mutual-NN fast pass that was removed from "
-            "production on 2026-07-14 (accuracy). Production runs LighterGlue every frame."
-        ),
-    )
-    ap.add_argument(
         "--local-topk",
         type=int,
         default=0,
-        help=(
-            "Override TRACK local_topk for the live worker (0 = production default). "
-            "XFeat: also clamps adaptive_first_topk. EDM: overrides production_edm_config."
-        ),
+        help="Kept for CLI compatibility; must stay 0 (direct has no local_topk override).",
     )
     ap.add_argument(
         "--route-json",
@@ -481,10 +446,6 @@ def _parse_operator_arguments(ap: argparse.ArgumentParser) -> argparse.Namespace
             "operator HUD must never be driven from a recording while a live aircraft "
             "is connected. Use --live-localize, or drop --live."
         )
-    if args.neuflow_track and args.projection_track:
-        ap.error("--neuflow-track and --projection-track are separate alternatives")
-    if args.projection_track and not args.track_landmarks:
-        ap.error("--projection-track requires --track-landmarks or a profile sidecar")
     return args
 
 
@@ -627,7 +588,7 @@ def _announce_site_assets(
         f"[operator] map={Path(args.map_ply).resolve()} "
         f"bundle={Path(args.bundle).resolve()} "
         f"localizer={args.localizer_backend} "
-        f"megaloc={Path(args.megaloc_cache).resolve() if args.megaloc_cache else 'bundle:ref_global'}",
+        f"megaloc={Path(args.megaloc_cache).resolve() if args.megaloc_cache else 'bundle:bank'}",
         flush=True,
     )
     if route_path is None:
@@ -689,8 +650,6 @@ def _run_operator_selftest(args: argparse.Namespace, points: np.ndarray) -> bool
         print(f"loaded replay rows={len(replay.get('rows', []))} from {args.replay_json}")
     print(
         f"live localize={args.live_localize} worker={args.localizer_worker} "
-        f"neuflow_track={args.neuflow_track} projection_track={args.projection_track} "
-        f"track_landmarks={args.track_landmarks or None} "
         f"pose_stabilize={args.pose_stabilize}"
     )
     print(
@@ -1002,39 +961,14 @@ def _start_operator_backend(
 
 
 def _announce_localizer_mode(args: argparse.Namespace) -> None:
-    if args.localizer_backend == "edm":
-        edm_m = str(getattr(args, "edm_matcher", "torch") or "torch")
-        topk = int(getattr(args, "local_topk", 0) or 0) or 1
-        profile_txt = str(getattr(args, "localizer_profile", "") or "defaults")
-        print(
-            "[operator] TRACK/WEAK matcher = EDM (detector-free), "
-            f"{topk} ref/frame (local_topk={topk}), engine={edm_m}; "
-            "BOOT MegaLoc staged 2 then 10; LOST first nearby EDM, then profile-scheduled MegaLoc; "
-            f"profile={profile_txt}",
-            flush=True,
-        )
-    else:
-        topk = int(getattr(args, "local_topk", 0) or 0)
-        topk_txt = str(topk) if topk > 0 else "production"
-        override = "; nn_then_lg OVERRIDE" if args.nn_fast_path else ""
-        print(
-            "[operator] TRACK/WEAK matcher = XFeat + LighterGlue ONLY "
-            f"(no MNN; local_topk={topk_txt}{override}); "
-            "BOOT/LOST acquisition = MegaLoc top-30 -> LighterGlue",
-            flush=True,
-        )
-    if args.neuflow_track:
-        print(
-            "[operator] TRACK=NeuFlow-v2 refresh3; deep XFeat/NN/LighterGlue "
-            "retained for refresh/fallback and BOOT/LOST",
-            flush=True,
-        )
-    if args.projection_track:
-        print(
-            "[operator] TRACK=projection-guided 15/25/40px; original "
-            "XFeat/NN/LighterGlue retained as same-frame fallback",
-            flush=True,
-        )
+    profile_txt = str(getattr(args, "localizer_profile", "") or "")
+    print(
+        "[operator] localizer = direct two-rate: CPU KLT + pycolmap PnP fast loop, "
+        "background MegaLoc top-k retrieval -> EDM match -> PnP reloc handover, "
+        "delayed VO triangulation and bounded dead reckoning; "
+        f"profile={profile_txt}",
+        flush=True,
+    )
     if args.loc_force_track_bench:
         print(
             "[operator] loc FORCE_TRACK_BENCH: fixed-prior cold-cache TRACK "
@@ -1052,13 +986,6 @@ def _build_operator_localizer(
     want_loc = args.live_localize and (video_stream is not None or not args.live)
     if not want_loc:
         return None
-    if args.localizer_backend == "edm" and (
-        args.neuflow_track or args.projection_track or args.nn_fast_path
-    ):
-        raise SystemExit(
-            "NeuFlow / projection-track / --nn-fast-path are XFeat-only; "
-            "use --localizer-backend xfeat or an XFeat site profile"
-        )
     localizer = LiveLocalizerClient(
         Path(args.localizer_worker),
         args.localizer_python,
@@ -1070,14 +997,6 @@ def _build_operator_localizer(
         reference_index_sha256=str(getattr(args, "reference_index_sha256", "") or ""),
         force_track_bench=bool(args.loc_force_track_bench),
         force_track_ref=int(args.loc_force_track_ref),
-        neuflow_track=bool(args.neuflow_track),
-        projection_track=bool(args.projection_track),
-        track_landmarks=args.track_landmarks,
-        matcher_mode=(
-            "nn_then_lg"
-            if args.nn_fast_path
-            else ("lighterglue" if str(args.localizer_backend) == "xfeat" else "")
-        ),
         localizer_backend=str(args.localizer_backend),
         localizer_deploy_dir=str(getattr(args, "localizer_deploy_dir", "") or ""),
         localizer_profile=str(getattr(args, "localizer_profile", "") or ""),
@@ -1134,7 +1053,7 @@ def _build_lost_hold_policy(
     print(
         f"[operator] localization recovery ON: action={recovery_action}; "
         f"low-confidence threshold={lost_hold.low_confidence_results}; "
-        "LOST first uses nearby EDM, then profile-scheduled MegaLoc; retry EDM "
+        "LOST first retries nearby reloc, then profile-scheduled retrieval; retry "
         f"on the held frame up to {lost_hold.max_attempts}x "
         f"(timeout {lost_hold.timeout_s:.1f}s), then release",
         flush=True,

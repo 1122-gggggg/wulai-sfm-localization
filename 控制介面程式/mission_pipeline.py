@@ -50,7 +50,7 @@ if str(FLIGHT) not in sys.path:
 
 from safety_command import safety_file_from_environment, write_safety_command  # noqa: E402
 
-DEFAULT_FLIGHT_BUNDLE = _WS.bundles / "your_site_reloc_map_edm.pt"
+DEFAULT_FLIGHT_BUNDLE = _WS.bundles / "your_site_direct_bundle.json"
 DEFAULT_MEGALOC_CACHE = ""
 DEFAULT_MAP_PLY = _WS.map_ply_dir / "your_site.ply"
 DEFAULT_PATH_JSON = _WS.mission_routes / "your_site" / "flight_path.json"
@@ -309,8 +309,8 @@ def _shadow_required_errors(profile: SiteProfile) -> list[str]:
         errors.append("missing map_align")
     if profile.query_camera is None:
         errors.append("missing query_camera")
-    if profile.localizer != "edm" or profile.localizer_profile is None:
-        errors.append("missing EDM localizer_profile")
+    if profile.localizer != "direct" or profile.localizer_profile is None:
+        errors.append("missing direct localizer_profile")
     return errors
 
 

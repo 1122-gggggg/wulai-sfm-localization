@@ -460,12 +460,15 @@ def test_bundled_anafi_selection_is_blocked_until_new_map_is_validated() -> None
     assert "localizer_quality calibration is failed" in " ".join(
         mission.readiness.localization_errors
     )
-    # The operator's drawn route is pinned into the selection, so the route is no
-    # longer what blocks flight. The unvalidated map is the only blocker left,
-    # and it must stay one until the map has an independent holdout.
+    # 航線仍是舊座標系（尚未重畫），配上新地圖本來就該擋：flight 除了未驗收的
+    # quality 那條，還多一條 route frame mismatch。航線重畫、frame 對上後，
+    # 把 route 那條期望拿掉；quality 未驗收前仍必須 blocked（不許飛）。
     assert mission.route is not None
     assert "no route package selected" not in mission.readiness.flight_errors
-    assert mission.readiness.flight_errors == mission.readiness.localization_errors
+    assert mission.readiness.flight_errors == (
+        *mission.readiness.localization_errors,
+        "route map frame does not match selected map",
+    )
 
 
 def test_evaluation_only_waives_an_unvalidated_map_but_never_flight(

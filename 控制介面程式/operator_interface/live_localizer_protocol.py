@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import math
-import os
 import struct
 import time
 
@@ -384,15 +383,3 @@ def decode_control_header(
     return mode, stamp, fused
 
 
-def pose_guided_live_enabled() -> bool:
-    override = os.environ.get("SFM_POSE_GUIDED", "").strip()
-    if override == "1":
-        return True
-    if override == "0":
-        return False
-    try:
-        from pose_guided.config import load_pose_guided_config
-
-        return bool(load_pose_guided_config().enabled)
-    except Exception:
-        return False

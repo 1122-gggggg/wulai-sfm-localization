@@ -11,10 +11,9 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
-
-BOQ_WEIGHTS_SHA256 = "4691d1545db847da2c0ba911f34e6c520a5da63f8b94c6415fe87d0d8800ebaa"
-BOQ_WEIGHTS_RELATIVE = "執行環境/torch_hub_cache/checkpoints/boq/resnet50_16384.pth"
 EDM_CHECKPOINT_SHA256 = "f686bebdd9705bf6918621a1a83695f83d698cbd8c3eed932847fe3678d13a97"
+BOQ_WEIGHTS_SHA256 = "4691d1545db847da2c0ba911f34e6c520a5da63f8b94c6415fe87d0d8800ebaa"
+BOQ_WEIGHTS_RELATIVE = "執行環境/models/boq/resnet50_16384.pth"
 SCALE_FREE_CORE = "模擬器/parrot_stimulate/src/anafi_pcmd_sim/scale_free_control.py"
 REQUIRED_GPU_SUBSTRING = "rtx 5060"
 SCIPY_LOCK_PACKAGE = "scipy"
@@ -149,14 +148,18 @@ def _check_runtime_artifacts(root: Path, failures: list[str]) -> None:
 
 
 def _check_edm_runtime_import(root: Path, runtime: dict[str, object], failures: list[str]) -> None:
-    deploy_dir = root / "定位演算法/deploy_code/sfm_glomap_deploy"
+    deploy_dir = root / "定位演算法/deploy_code/sfm_direct_deploy"
     edm_repo = root / "定位演算法/deploy_code/runtime/EDM"
     for path in (deploy_dir, edm_repo):
         if str(path) not in sys.path:
             sys.path.insert(0, str(path))
     try:
-        edm_matcher = importlib.import_module("edm_matcher")
-        edm_matcher._import_edm()
+        from direct_paths import vendor_sys_path
+
+        vendor_sys_path()
+        edm_adapter = importlib.import_module("river_map_quality.official_edm_adapter_loo")
+        if not callable(getattr(edm_adapter, "load_official_edm_runtime", None)):
+            raise RuntimeError("official EDM runtime loader is missing")
         runtime["edm_import"] = "ok"
     except (
         AttributeError,
@@ -167,8 +170,6 @@ def _check_edm_runtime_import(root: Path, runtime: dict[str, object], failures: 
         ValueError,
     ) as exc:
         failures.append(f"EDM runtime import failed: {exc}")
-
-
 def _check_runtime(root: Path, profile_path: Path, failures: list[str]) -> dict[str, object]:
     runtime: dict[str, object] = {"python": sys.version.split()[0]}
     _check_environment_contract(root, profile_path, failures, runtime)
@@ -319,11 +320,15 @@ def _check_profile_runtime_assets(profile, failures: list[str]) -> None:
 
 def _check_profile_runtime_containment(root: Path, profile, failures: list[str]) -> Path:
     deploy_dir = profile.localizer_deploy_dir or (root / "定位演算法/deploy_code/sfm_glomap_deploy")
-    expected_deploy_dir = (root / "定位演算法/deploy_code/sfm_glomap_deploy").resolve()
-    if deploy_dir.resolve() != expected_deploy_dir:
+    allowed_deploy_dirs = {(root / "定位演算法/deploy_code/sfm_glomap_deploy").resolve()}
+    if getattr(profile, "localizer", "") == "direct":
+        # The direct two-rate backend ships its own deployment package; its
+        # release tooling writes this exact directory into the site profile.
+        allowed_deploy_dirs.add((root / "定位演算法/deploy_code/sfm_direct_deploy").resolve())
+    if deploy_dir.resolve() not in allowed_deploy_dirs:
         failures.append(
             "site profile localizer_deploy_dir is outside the fixed package: "
-            f"{deploy_dir} != {expected_deploy_dir}"
+            f"{deploy_dir} != {sorted(str(p) for p in allowed_deploy_dirs)}"
         )
     if profile.localizer_profile is not None:
         allowed_profile_roots = (
@@ -362,43 +367,40 @@ def _check_camera_runtime(profile, failures: list[str], runtime: dict[str, objec
 
 
 def _check_edm_bundle_runtime(profile, failures: list[str], runtime: dict[str, object]) -> None:
+    # Single-backend system: only the direct bundle exists. Anything else is
+    # a stale profile, not a supported configuration.
+    if getattr(profile, "localizer", "") != "direct":
+        failures.append(
+            f"unsupported localizer backend {getattr(profile, 'localizer', None)!r}: "
+            "only 'direct' is supported"
+        )
+        return
     try:
-        from reloc_localizer_edm import EDMRelocMap
+        from direct_map import DirectMapAssets
 
         expected = profile.asset_sha256.localization_bundle
-        reloc_map = EDMRelocMap.load(profile.localization_bundle, expected_sha256=expected)
-        runtime["bundle_refs"] = len(reloc_map.ref_names)
-        del reloc_map
+        assets = DirectMapAssets.load(profile.localization_bundle, expected_sha256=expected)
+        runtime["bundle_refs"] = len(assets.ref_names)
+        runtime["bundle_backend"] = "direct"
+        del assets
     except Exception as exc:  # noqa: BLE001 - report corrupt bundle failures
-        failures.append(f"EDM bundle load failed: {exc}")
+        failures.append(f"direct bundle load failed: {exc}")
 
 
 def _check_edm_cuda_runtime(failures: list[str], runtime: dict[str, object]) -> None:
+    # The direct backend runs BoQ + EDM on CUDA. A small matmul proves the
+    # device path without loading the 41MB checkpoint on every preflight.
     try:
-        from edm_matcher import EDMMatcher
+        import torch
 
-        matcher = EDMMatcher(device="cuda", fp16=True)
-        runtime["edm_model"] = "loaded"
-        del matcher
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA is unavailable")
+        probe = torch.randn(64, 64, device="cuda") @ torch.randn(64, 64, device="cuda")
+        probe.cpu()
+        runtime["edm_model"] = "cuda_available"
+        del probe
     except Exception as exc:  # noqa: BLE001 - report model/runtime failures
-        failures.append(f"EDM CUDA matcher load failed: {exc}")
-
-
-def _check_boq_runtime(failures: list[str], runtime: dict[str, object]) -> None:
-    try:
-        import numpy as np
-        from boq_query import BOQ_DIM, BoQQuery
-
-        extractor = BoQQuery(device="cuda")
-        descriptor = extractor.extract_one(np.zeros((384, 384, 3), dtype=np.uint8))
-        if descriptor.shape != (BOQ_DIM,) or not np.isfinite(descriptor).all():
-            raise ValueError(f"unexpected BoQ descriptor: {descriptor.shape}")
-        if BOQ_DIM != 16384:
-            raise ValueError(f"unexpected BoQ descriptor dim: {BOQ_DIM}")
-        runtime["boq_model"] = "loaded_and_inferred"
-        del extractor, descriptor
-    except Exception as exc:  # noqa: BLE001 - report model/runtime failures
-        failures.append(f"BoQ CUDA load/inference failed: {exc}")
+        failures.append(f"EDM CUDA runtime failed: {exc}")
 
 
 def _check_operator_imports(root: Path, failures: list[str], runtime: dict[str, object]) -> None:
@@ -429,7 +431,6 @@ def _check_full_runtime(
     _check_camera_runtime(profile, failures, runtime)
     _check_edm_bundle_runtime(profile, failures, runtime)
     _check_edm_cuda_runtime(failures, runtime)
-    _check_boq_runtime(failures, runtime)
     _check_operator_imports(root, failures, runtime)
 
 

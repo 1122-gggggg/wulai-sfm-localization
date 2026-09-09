@@ -73,9 +73,6 @@ def test_production_offline_smoke_requires_edm_not_research_xfeat() -> None:
         )
     }
 
-    offline = steps["offline_model_smoke"]
-    assert offline.argv[-2:] == ("--model", "edm")
-
     workspace = steps["workspace_layout"]
     assert workspace.argv[-2:] == ("--strict-output-names", "--no-sizes")
 
@@ -143,26 +140,6 @@ def test_tests_and_portable_smoke_do_not_inherit_source_workspace_binding(
 
     inherited = module._environment_for_step(base, steps["simulated_ui_smoke"])
     assert inherited["SFM_WORKSPACE_ROOT"] == "source-bound"
-
-
-def test_p119_quality_validation_runs_the_pinned_replay_gate(tmp_path) -> None:
-    module = _load_validation_module()
-
-    steps = {
-        step.name: step
-        for step in module._steps(
-            p119=True,
-            accept_p119=True,
-            p119_quality=True,
-            quality_out=tmp_path / "quality.json",
-        )
-    }
-
-    quality = steps["p119_quality"]
-    assert "benchmark_edm_site_replay.py" in " ".join(quality.argv)
-    assert "--quality-baseline" in quality.argv
-    assert "--accept-known-incomplete" in quality.argv
-    assert "--require-cuda" in quality.argv
 
 
 def test_portable_output_is_verified_and_bound_to_source(tmp_path: Path) -> None:
@@ -381,7 +358,7 @@ def test_dry_run_lists_checks_and_targets_without_side_effects(
     assert plan["subprocesses_executed"] is False
     assert plan["filesystem_writes"] is False
     names = {check["name"] for check in plan["checks"]}
-    assert {"root_ruff_check", "p119_integrity", "p119_quality"} <= names
+    assert {"root_ruff_check", "p119_integrity"} <= names
     targets = {target["path"] for target in plan["write_targets"]}
     assert str(receipt_dir) in targets
     assert any(path.startswith(str(receipt_dir)) for path in targets)

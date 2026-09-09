@@ -16,8 +16,8 @@ from local_site_assets import (
     LocalSitePackageProvider,
     LocalTargetProvider,
     discover_ply_files,
-    inspect_edm_bundle,
-    load_edm_runtime_profile,
+    inspect_direct_bundle,
+    load_direct_runtime_profile,
     match_managed_site_profile_for_map,
 )
 from operator_actions import replace_site_profile_argument, require_safe_site_switch
@@ -31,7 +31,7 @@ CAMERA = {
 }
 
 
-def test_edm_asset_inspection_does_not_mutate_ui_import_path(
+def test_direct_asset_inspection_does_not_mutate_ui_import_path(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     calls = []
@@ -40,8 +40,8 @@ def test_edm_asset_inspection_does_not_mutate_ui_import_path(
         calls.append((args, kwargs))
         payload = (
             '["ref-a.jpg"]'
-            if "EDMRelocMap" in args[3]
-            else '{"schema":"edm-deployment-profile/v1"}'
+            if "DirectMapAssets" in args[3]
+            else '{"name": "test-direct", "map_scale": 1.0, "reloc_top_k": 2}'
         )
         return subprocess.CompletedProcess(
             args, 0, stdout=f"noise\nSFM_ASSET_RESULT:{payload}\n", stderr=""
@@ -50,12 +50,12 @@ def test_edm_asset_inspection_does_not_mutate_ui_import_path(
     monkeypatch.setattr(local_assets.subprocess, "run", fake_run)
     before = list(sys.path)
 
-    assert inspect_edm_bundle(tmp_path / "bundle.pt", "a" * 64) == ("ref-a.jpg",)
-    assert load_edm_runtime_profile(tmp_path / "profile.json")["schema"].endswith("/v1")
+    assert inspect_direct_bundle(tmp_path / "bundle.json", "a" * 64) == ("ref-a.jpg",)
+    assert load_direct_runtime_profile(tmp_path / "profile.json")["reloc_top_k"] == 2
     assert sys.path == before
     assert len(calls) == 2
     assert calls[0][0][-1] == "a" * 64
-    assert all(call[1]["cwd"].name == "sfm_glomap_deploy" for call in calls)
+    assert all(call[1]["cwd"].name == "sfm_direct_deploy" for call in calls)
 
 
 def _sha(path: Path) -> str:
@@ -67,6 +67,9 @@ def _write_site_package(root: Path) -> Path:
     # folder; mirror the production marker directories in this fixture.
     for name in ("控制介面程式", "定位演算法", "地圖檔"):
         (root / name).mkdir(parents=True, exist_ok=True)
+    (root / "定位演算法" / "deploy_code" / "sfm_direct_deploy").mkdir(
+        parents=True, exist_ok=True
+    )
     package = root / "builder-output"
     package.mkdir()
     (package / "map.ply").write_text(
@@ -76,9 +79,11 @@ def _write_site_package(root: Path) -> Path:
         "end_header\n0 0 0 255 255 255\n",
         encoding="ascii",
     )
-    (package / "localization_bundle.pt").write_bytes(b"test-edm-bundle")
-    (package / "edm_runtime_profile.json").write_text(
-        json.dumps({"schema": "edm-deployment-profile/v1"}), encoding="utf-8"
+    (package / "direct_bundle.json").write_text(
+        json.dumps({"schema": "direct-localization-bundle/v1"}), encoding="utf-8"
+    )
+    (package / "direct_runtime_profile.json").write_text(
+        json.dumps({"schema": "direct-deployment-profile/v1"}), encoding="utf-8"
     )
     (package / "reference_poses.json").write_text(
         json.dumps(
@@ -98,8 +103,9 @@ def _write_site_package(root: Path) -> Path:
         "schema_version": 2,
         "site_id": "test-yard",
         "display_name": "Test Yard",
-        "localizer": "edm",
-        "localizer_profile": "edm_runtime_profile.json",
+        "localizer": "direct",
+        "localizer_deploy_dir": "../定位演算法/deploy_code/sfm_direct_deploy",
+        "localizer_profile": "direct_runtime_profile.json",
         "map_reference_poses": "reference_poses.json",
         "map_align": "T_align_gravity.json",
         "query_camera": CAMERA,
@@ -114,7 +120,7 @@ def _write_site_package(root: Path) -> Path:
         "assets": {
             "map_ply": "map.ply",
             "route_json": None,
-            "localization_bundle": "localization_bundle.pt",
+            "localization_bundle": "direct_bundle.json",
             "megaloc_cache": None,
             "track_landmarks": None,
             "poles_json": None,
@@ -133,8 +139,8 @@ def _write_site_package(root: Path) -> Path:
     profile["asset_sha256"] = {
         "map_align": _sha(package / "T_align_gravity.json"),
         "map_ply": _sha(package / "map.ply"),
-        "localization_bundle": _sha(package / "localization_bundle.pt"),
-        "localizer_profile": _sha(package / "edm_runtime_profile.json"),
+        "localization_bundle": _sha(package / "direct_bundle.json"),
+        "localizer_profile": _sha(package / "direct_runtime_profile.json"),
         "map_reference_poses": _sha(package / "reference_poses.json"),
     }
     (package / "site_profile.json").write_text(json.dumps(profile), encoding="utf-8")
@@ -143,7 +149,7 @@ def _write_site_package(root: Path) -> Path:
 
 def _profile_loader(path: Path) -> dict:
     raw = json.loads(path.read_text(encoding="utf-8"))
-    assert raw["schema"] == "edm-deployment-profile/v1"
+    assert raw["schema"] == "direct-deployment-profile/v1"
     return raw
 
 
@@ -171,14 +177,14 @@ def test_site_package_is_validated_and_imported_atomically(tmp_path: Path) -> No
     managed = tmp_path / "managed"
 
     def inspect_bundle(path: Path, expected_sha256: str) -> tuple[str, ...]:
-        assert path == package / "localization_bundle.pt"
+        assert path == package / "direct_bundle.json"
         assert expected_sha256 == _sha(path)
         return ("ref-a.jpg",)
 
     provider = LocalSitePackageProvider(
         managed,
         bundle_inspector=inspect_bundle,
-        edm_profile_loader=_profile_loader,
+        profile_loader=_profile_loader,
     )
 
     report = provider.validate_folder(package)
@@ -200,7 +206,7 @@ def test_ply_digest_uniquely_matches_an_imported_site(tmp_path: Path) -> None:
     provider = LocalSitePackageProvider(
         managed,
         bundle_inspector=lambda _path, _sha256: ("ref-a.jpg",),
-        edm_profile_loader=_profile_loader,
+        profile_loader=_profile_loader,
     )
     provider.import_folder(package)
 
@@ -272,7 +278,7 @@ def test_unmatched_ply_stays_unbound(tmp_path: Path) -> None:
     provider = LocalSitePackageProvider(
         managed,
         bundle_inspector=lambda _path, _sha256: ("ref-a.jpg",),
-        edm_profile_loader=_profile_loader,
+        profile_loader=_profile_loader,
     )
     provider.import_folder(package)
     other = tmp_path / "other.ply"
@@ -293,7 +299,7 @@ def test_ambiguous_ply_match_is_rejected(tmp_path: Path) -> None:
     provider = LocalSitePackageProvider(
         managed,
         bundle_inspector=lambda _path, _sha256: ("ref-a.jpg",),
-        edm_profile_loader=_profile_loader,
+        profile_loader=_profile_loader,
     )
     imported = provider.import_folder(package)
     shutil.copytree(imported.profile_path.parent, managed / "duplicate")
@@ -307,7 +313,7 @@ def test_site_package_rejects_reference_names_not_in_bundle(tmp_path: Path) -> N
     provider = LocalSitePackageProvider(
         tmp_path / "managed",
         bundle_inspector=lambda _path, _sha256: ("different.jpg",),
-        edm_profile_loader=_profile_loader,
+        profile_loader=_profile_loader,
     )
 
     # The bundle offers a reference the poses file cannot place. That direction is
@@ -330,7 +336,7 @@ def test_site_package_rejects_asset_path_outside_selected_folder(
     provider = LocalSitePackageProvider(
         tmp_path / "managed",
         bundle_inspector=lambda _path, _sha256: ("ref-a.jpg",),
-        edm_profile_loader=_profile_loader,
+        profile_loader=_profile_loader,
     )
 
     with pytest.raises(ValueError, match="inside the selected folder"):
@@ -343,7 +349,7 @@ def test_route_and_target_are_independent_profile_ports(tmp_path: Path) -> None:
     site_provider = LocalSitePackageProvider(
         managed,
         bundle_inspector=lambda _path, _sha256: ("ref-a.jpg",),
-        edm_profile_loader=_profile_loader,
+        profile_loader=_profile_loader,
     )
     profile_path = site_provider.import_folder(package).profile_path
     route = tmp_path / "route.json"
@@ -404,7 +410,7 @@ def test_editor_authored_route_can_be_approved_for_auto(tmp_path: Path) -> None:
     site_provider = LocalSitePackageProvider(
         managed,
         bundle_inspector=lambda _path, _sha256: ("ref-a.jpg",),
-        edm_profile_loader=_profile_loader,
+        profile_loader=_profile_loader,
     )
     profile_path = site_provider.import_folder(package).profile_path
     route = _write_valid_route(tmp_path / "route.json")
@@ -433,7 +439,7 @@ def test_route_import_updates_linked_component_and_selection_sha(tmp_path: Path)
     profile_path = LocalSitePackageProvider(
         managed,
         bundle_inspector=lambda _path, _sha256: ("ref-a.jpg",),
-        edm_profile_loader=_profile_loader,
+        profile_loader=_profile_loader,
     ).import_folder(package).profile_path
     component_path = (
         tmp_path
@@ -498,7 +504,7 @@ def test_auto_approval_rejects_a_route_not_authored_by_the_editor(
     site_provider = LocalSitePackageProvider(
         managed,
         bundle_inspector=lambda _path, _sha256: ("ref-a.jpg",),
-        edm_profile_loader=_profile_loader,
+        profile_loader=_profile_loader,
     )
     profile_path = site_provider.import_folder(package).profile_path
     route = _write_valid_route(tmp_path / "external-route.json")
@@ -519,7 +525,7 @@ def test_route_commit_rolls_back_asset_when_profile_replace_fails(
     site_provider = LocalSitePackageProvider(
         managed,
         bundle_inspector=lambda _path, _sha256: ("ref-a.jpg",),
-        edm_profile_loader=_profile_loader,
+        profile_loader=_profile_loader,
     )
     profile_path = site_provider.import_folder(package).profile_path
     profile_before = profile_path.read_bytes()
@@ -549,7 +555,7 @@ def test_concurrent_route_imports_commit_without_temp_collision(tmp_path: Path,
     site_provider = LocalSitePackageProvider(
         managed,
         bundle_inspector=lambda _path, _sha256: ("ref-a.jpg",),
-        edm_profile_loader=_profile_loader,
+        profile_loader=_profile_loader,
     )
     profile_path = site_provider.import_folder(package).profile_path
     route = _write_valid_route(tmp_path / "route.json")
@@ -587,7 +593,7 @@ def test_adding_route_preserves_existing_route_files(
     site_provider = LocalSitePackageProvider(
         managed,
         bundle_inspector=lambda _path, _sha256: ("ref-a.jpg",),
-        edm_profile_loader=_profile_loader,
+        profile_loader=_profile_loader,
     )
     profile_path = site_provider.import_folder(package).profile_path
     site_root = profile_path.parent
@@ -613,7 +619,7 @@ def test_editing_route_replaces_only_the_selected_route(tmp_path: Path) -> None:
     profile_path = LocalSitePackageProvider(
         managed,
         bundle_inspector=lambda _path, _sha256: ("ref-a.jpg",),
-        edm_profile_loader=_profile_loader,
+        profile_loader=_profile_loader,
     ).import_folder(package).profile_path
     provider = LocalRouteProvider(managed)
     first = provider.import_file(_write_valid_route(tmp_path / "first.json"), profile_path)
@@ -654,7 +660,7 @@ def test_concurrent_site_package_imports_have_one_winner(tmp_path: Path,
     provider = LocalSitePackageProvider(
         managed,
         bundle_inspector=lambda _path, _sha256: ("ref-a.jpg",),
-        edm_profile_loader=_profile_loader,
+        profile_loader=_profile_loader,
     )
     validated = threading.Barrier(2)
     real_validate = provider.validate_folder
@@ -687,7 +693,7 @@ def test_route_import_resolves_system_profile_to_its_managed_site(
     site_provider = LocalSitePackageProvider(
         managed,
         bundle_inspector=lambda _path, _sha256: ("ref-a.jpg",),
-        edm_profile_loader=_profile_loader,
+        profile_loader=_profile_loader,
     )
     imported_profile_path = site_provider.import_folder(package).profile_path
     site_folder = managed / "operator-folder"
@@ -705,7 +711,7 @@ def test_route_import_resolves_system_profile_to_its_managed_site(
     )
     system_profiles = tmp_path / "control" / "site_profiles"
     system_profiles.mkdir(parents=True)
-    system_profile_path = system_profiles / "test_yard_edm.json"
+    system_profile_path = system_profiles / "test_yard_direct.json"
     system_profile_path.write_text(json.dumps(raw), encoding="utf-8")
 
     route = tmp_path / "route.json"
@@ -775,7 +781,7 @@ def test_site_package_requires_and_carries_its_gravity_alignment(tmp_path: Path)
     provider = LocalSitePackageProvider(
         tmp_path / "managed",
         bundle_inspector=lambda _path, _sha256: ("ref-a.jpg",),
-        edm_profile_loader=_profile_loader,
+        profile_loader=_profile_loader,
     )
 
     report = provider.validate_folder(package)
@@ -798,8 +804,35 @@ def test_site_package_without_a_gravity_alignment_is_refused(tmp_path: Path) -> 
     provider = LocalSitePackageProvider(
         tmp_path / "managed",
         bundle_inspector=lambda _path, _sha256: ("ref-a.jpg",),
-        edm_profile_loader=_profile_loader,
+        profile_loader=_profile_loader,
     )
 
     with pytest.raises(ValueError, match="map_align"):
         provider.validate_folder(package)
+
+
+def test_site_package_rejects_bundle_sha_mismatch(tmp_path: Path) -> None:
+    package = _write_site_package(tmp_path)
+    profile_path = package / "site_profile.json"
+    raw = json.loads(profile_path.read_text(encoding="utf-8"))
+    raw["asset_sha256"]["localization_bundle"] = "0" * 64
+    profile_path.write_text(json.dumps(raw), encoding="utf-8")
+    provider = LocalSitePackageProvider(
+        tmp_path / "managed",
+        bundle_inspector=lambda _path, _sha256: ("ref-a.jpg",),
+        profile_loader=_profile_loader,
+    )
+
+    with pytest.raises(ValueError, match="SHA-256 mismatch"):
+        provider.validate_folder(package)
+
+
+def test_site_package_validate_rejects_non_directory(tmp_path: Path) -> None:
+    provider = LocalSitePackageProvider(
+        tmp_path / "managed",
+        bundle_inspector=lambda _path, _sha256: ("ref-a.jpg",),
+        profile_loader=_profile_loader,
+    )
+
+    with pytest.raises(ValueError, match="not a folder"):
+        provider.validate_folder(tmp_path / "missing")

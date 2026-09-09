@@ -27,7 +27,7 @@ SUPPORTED_SCHEMA_VERSIONS = (1, SCHEMA_VERSION)
 ROUTE_EDITOR_AUTO_APPROVAL_NOTE = "In-app operator route editor approval for AUTO."
 
 
-PRODUCTION_LOCALIZER_BACKEND = "edm"
+PRODUCTION_LOCALIZER_BACKEND = "direct"
 SHA256_KEYS = (
     "map_ply",
     "localization_bundle",
@@ -1068,10 +1068,21 @@ def _localizer_asset_errors(profile: SiteProfile) -> list[str]:
     if capabilities is not None:
         for key in capabilities.required_assets:
             if getattr(profile, key, None) is None:
-                if key == "localizer_profile" and profile.localizer == "edm":
-                    errors.append("missing EDM localizer_profile")
+                if key == "localizer_profile" and profile.localizer == "direct":
+                    errors.append(
+                        "missing direct localizer_profile "
+                        "(direct-deployment-profile/v1 JSON: map scale, reloc and PnP gates)"
+                    )
                 else:
                     errors.append(f"missing {profile.localizer} {key}")
+    if profile.localizer == "direct" and profile.localizer_deploy_dir is None:
+        # The direct runtime lives in sfm_direct_deploy, not the default
+        # sfm_glomap_deploy directory the worker falls back to, so an unset
+        # deploy dir would silently launch the wrong backend implementation.
+        errors.append(
+            "missing localizer_deploy_dir (direct runtime lives in "
+            "定位演算法/deploy_code/sfm_direct_deploy)"
+        )
     return errors
 
 

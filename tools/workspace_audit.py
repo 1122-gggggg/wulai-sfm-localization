@@ -62,8 +62,8 @@ CANONICAL_ENTRYPOINTS = (
     "控制介面程式/影片模擬串流/啟動.sh",
     "控制介面程式/真機串流/啟動.sh",
     "控制介面程式/mission_pipeline.py",
-    "定位演算法/deploy_code/sfm_glomap_deploy/production_edm_tracker.py",
-    "定位演算法/configs/edm_production_profile.json",
+    "定位演算法/deploy_code/sfm_direct_deploy/two_rate_tracker.py",
+    "定位演算法/deploy_code/sfm_direct_deploy/live_provider.py",
     "定位演算法/validation/check_runtime_mirrors.py",
 )
 GENERATED_TOP_LEVEL = {

@@ -1,7 +1,24 @@
-# 定位 runtime
+# 定位 runtime（direct 後端）
 
-本目錄擁有可部署的定位 runtime：EDM/XFeat tracker、bundle loader、artifact integrity、
-MegaLoc cache 與共用 pose 型別。UI worker 與離線 replay 直接從這裡匯入。
+本目錄是可部署定位 runtime 的唯一入口，只剩 `direct` 後端：
+
+- `production_localizer_factory.py`：唯一的生產 builder。`build_production_localizer`
+  簽章不變，`backend` 只接受 `"direct"`（其他值直接 `ValueError`）；`Camera`
+  改從 `pose_types` 匯入；`validate_camera_tuple` 保留給 worker/preflight 用。
+  direct 沒有內建閾值：SHA 驗證過的 `direct-deployment-profile/v1` 就是全部
+  gate 設定，`production_profile` 必填，BoQ cache / IVF index / matcher 覆寫一律拒絕。
+- `localizer_registry.py`：只註冊 `direct`。capabilities：
+  `required_assets=("localizer_profile",)`、
+  `unsupported_assets=("megaloc_cache", "track_landmarks", "reference_index")`、
+  `supports_production_profile=True`。
+- `pose_types.py`：中立型別（`Pose`、`Localizer`、`BuiltLocalizer`、
+  `LocalizerCapabilities`、`LocalizerProvider`）外加 `Camera`
+ （`model`/`width`/`height`/`params`，由舊 `reloc_localizer_edm.py` 搬入，語意不變）。
+- `artifact_integrity.py`：bundle / profile 的 SHA-256 驗證，direct builder 照用。
+
+實際的 direct 部署實作（map 資產、profile loader、tracker adapter、live provider）
+住在 `定位演算法/deploy_code/sfm_direct_deploy/`，本目錄只負責組裝與驗證，
+不碰該目錄下任何檔案。
 
 飛控、安全監控、Olympe frame source 與人工控制工具的唯一 owner 是
 `定位演算法/flight_control/`。本目錄不再保存 `path_follow_flight.py`、
@@ -11,21 +28,6 @@ MegaLoc cache 與共用 pose 型別。UI worker 與離線 replay 直接從這裡
 ```bash
 python 定位演算法/validation/check_runtime_mirrors.py
 ```
-
-EDM 模型的離線檢查與短重播：
-
-```bash
-python 定位演算法/validation/offline_model_smoke.py --model edm
-python 定位演算法/validation/benchmark_edm_site_replay.py \
-  --require-cuda --max-frames 3 \
-  --site-profile 地圖檔/場域/river_site/site_profile.json \
-  --video /path/to/P1190119.MP4 --out /tmp/edm_gpu_smoke.json
-```
-
-完整重播與 PnP correspondence cap A/B 使用同一支
-`benchmark_edm_site_replay.py`，分別傳入 `--max-corr-total 450`、`600`、`750`、
-`900`。結果保存影片、site profile、bundle 與 localizer profile 的 SHA-256，
-以及逐幀拒絕原因、跳躍確認、品質與延遲資料。
 
 自主航線入口永久鎖定；起飛只能由現場操作員在桌面 UI 親自執行。
 

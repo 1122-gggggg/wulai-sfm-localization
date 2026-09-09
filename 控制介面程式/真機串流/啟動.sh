@@ -119,5 +119,9 @@ echo "[真機串流] mission-selection: $SFM_MISSION_SELECTION"
 echo "[真機串流] $MISSION_REPORT"
 
 echo "[真機串流] IP=$IP CTRL=$CTRL LOCAL_TOPK=$LOCAL_TOPK"
+# direct 後端 worker 暖機約 25–60 秒（模型載入），預設 20 秒會誤殺重啟。
+if grep -q '"localizer"[[:space:]]*:[[:space:]]*"direct"' "$SFM_SITE_PROFILE" 2>/dev/null; then
+  export SFM_WORKER_WARMUP_S="${SFM_WORKER_WARMUP_S:-180}"
+fi
 echo "[真機串流] 起飛僅 UI 人工按鍵；動搖桿強制交回搖桿"
 exec "$OI/start_anafi_live.sh" "$@"

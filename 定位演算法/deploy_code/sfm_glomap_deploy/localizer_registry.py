@@ -71,23 +71,17 @@ def get_localizer_capabilities(name: str) -> LocalizerCapabilities:
 
 register_localizer_provider(
     LocalizerProvider(
-        name="edm",
+        name="direct",
         capabilities=LocalizerCapabilities(
-            name="edm",
+            name="direct",
+            # The direct backend has no built-in threshold defaults at all: the
+            # SHA-pinned deployment profile IS the gate configuration, so it is
+            # required rather than optional.
             required_assets=("localizer_profile",),
-            optional_assets=("reference_index",),
+            # Retrieval is the bundle's own MegaLoc bank; there is no BoQ cache,
+            # no landmark sidecar and no IVF index to bind.
+            unsupported_assets=("megaloc_cache", "track_landmarks", "reference_index"),
             supports_production_profile=True,
-        ),
-    )
-)
-register_localizer_provider(
-    LocalizerProvider(
-        name="xfeat",
-        capabilities=LocalizerCapabilities(
-            name="xfeat",
-            optional_assets=("megaloc_cache", "track_landmarks", "reference_index"),
-            unsupported_assets=("localizer_profile",),
-            supports_production_profile=False,
         ),
     )
 )

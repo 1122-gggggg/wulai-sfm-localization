@@ -19,7 +19,6 @@ import os
 import sys
 import threading
 import time
-from collections import OrderedDict
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -201,7 +200,7 @@ def test_fly_is_not_an_arming_entrypoint():
     assert takeoffs == []
 
 
-def test_flight_localizer_uses_site_selected_edm_factory(monkeypatch):
+def test_flight_localizer_uses_site_selected_direct_factory(monkeypatch):
     captured = {}
     tracker = object()
 
@@ -209,7 +208,7 @@ def test_flight_localizer_uses_site_selected_edm_factory(monkeypatch):
         captured.update(kwargs)
         return SimpleNamespace(
             tracker=tracker,
-            backend="edm",
+            backend="direct",
             variant="fixture",
             camera=SimpleNamespace(model="PINHOLE", width=1280, height=720),
         )
@@ -219,9 +218,9 @@ def test_flight_localizer_uses_site_selected_edm_factory(monkeypatch):
         "production_localizer_factory",
         SimpleNamespace(build_production_localizer=fake_build),
     )
-    monkeypatch.setattr(pff, "LOCALIZER_BACKEND", "edm")
-    monkeypatch.setattr(pff, "LOCALIZER_PROFILE", "/tmp/edm-profile.json")
+    monkeypatch.setattr(pff, "LOCALIZER_PROFILE", "/tmp/direct-profile.json")
     monkeypatch.setattr(pff, "BUNDLE_SHA256", "a" * 64)
+    monkeypatch.setattr(pff, "XBUN", "/tmp/bundle.pt")
     measured_frame = object()
     monkeypatch.setattr(pff, "MAP_ALIGN", "/tmp/measured-align.json")
     monkeypatch.setattr(rpf, "load_map_frame", lambda path: (
@@ -238,9 +237,10 @@ def test_flight_localizer_uses_site_selected_edm_factory(monkeypatch):
     }))
 
     assert pff.build_localizer(lambda: None) is tracker
-    assert captured["backend"] == "edm"
+    assert captured["backend"] == "direct"
     assert captured["camera_tuple"][0] == "PINHOLE"
     assert captured["bundle_sha256"] == "a" * 64
+    assert captured["bundle"] == "/tmp/bundle.pt"
     assert captured["production_profile_sha256"] == "b" * 64
     assert captured["map_frame"] is measured_frame
 
@@ -509,30 +509,6 @@ def test_inspection_source_drain_rejects_preconfirm_pipeline_frames():
              receipt_stamp=101.1)
     assert g.inspection_sample_after(
         baseline, min_source_advance_s=1.0, receipt_after=101.0) is not None
-
-
-def test_tracker_pose_uses_capture_not_inference_completion_stamp(monkeypatch):
-    import production_xfeat_tracker as pxt
-
-    class _Rotation:
-        @staticmethod
-        def matrix():
-            return np.eye(3)
-
-    class _Transform:
-        rotation = _Rotation()
-        translation = np.zeros(3)
-
-    tracker = pxt.ProductionXFeatTracker.__new__(pxt.ProductionXFeatTracker)
-    tracker.cfg = pxt.ProductionConfig()
-    tracker.state = pxt.RuntimeState()
-    tracker._flow_enabled = False
-    ret = {"cam_from_world": _Transform()}
-    info = {"inliers": tracker.cfg.acquire_min_inliers, "reproj_rms": 0.5}
-    tracker._localize_frame_deep = lambda _frame: tracker._gate(ret, info, "BOOT_INIT")[2]
-
-    pose = tracker.localize_frame(np.zeros((4, 6, 3), np.uint8), capture_stamp=12.5)
-    assert pose is not None and pose.stamp == pytest.approx(12.5)
 
 
 @pytest.mark.parametrize("new_mode, expected", [("HOVER", "zero"), ("MANUAL", "silent")])
@@ -3357,112 +3333,6 @@ def test_non_finite_command_fails_closed_to_zero(field):
     assert rpf.command_to_body_percent(cmd, pose) == ZERO
 
 
-def test_lost_reacquire_clears_motion_and_flow_history():
-    import production_xfeat_tracker as pxt
-
-    tracker = pxt.ProductionXFeatTracker.__new__(pxt.ProductionXFeatTracker)
-    tracker.state = pxt.RuntimeState(
-        mode="LOST", last_pose=pxt.Pose(8, 0, 0, 0, 1), prev_pose=pxt.Pose(7, 0, 0, 0, 0),
-        last_center=np.array([8, 0, 0], np.float32), prev_center=np.array([7, 0, 0], np.float32),
-        last_yaw=0.2, prev_yaw=0.1, last_refs=[1, 2])
-    tracker.temporal_cache = pxt.TemporalAnchorCache(
-        descriptors=np.ones((2, 2)), xyz=np.ones((2, 3)), ref_ids=np.array([1, 2]))
-    tracker._flow_2d = np.ones((2, 2)); tracker._flow_3d = np.ones((2, 3))
-    tracker._flow_gray = np.ones((2, 2)); tracker._flow_age = 3
-    tracker._last_inl_2d = np.ones((2, 2)); tracker._last_inl_3d = np.ones((2, 3))
-    tracker._last_seed_refs = (1, 2)
-    pose = pxt.Pose(20, 0, 0, 0.3, 2)
-    tracker._publish_success(pose, {"used_refs": [3]}, False, source_mode="LOST")
-    assert tracker.state.prev_center is None and tracker.state.prev_pose is None
-    assert tracker.state.last_center.tolist() == [20.0, 0.0, 0.0]
-    assert tracker._flow_2d is None and tracker._flow_3d is None and tracker._flow_gray is None
-    assert len(tracker.temporal_cache) == 0 and tracker._last_seed_refs == ()
-
-
-def test_flow_failure_retries_same_frame_with_deep_path():
-    import production_xfeat_tracker as pxt
-
-    tracker = pxt.ProductionXFeatTracker.__new__(pxt.ProductionXFeatTracker)
-    tracker._flow_2d = np.ones((2, 2)); tracker._flow_3d = np.ones((2, 3))
-    tracker._flow_gray = np.ones((2, 2)); tracker._flow_age = 3
-    expected = pxt.Pose(1, 2, 3, 0.2, 4)
-
-    def deep(_frame):
-        tracker._last_info = {"accepted": True, "inliers": 120}
-        return expected
-
-    tracker._localize_frame_deep = deep
-    tracker._seed_flow_from_deep = lambda *_args: True
-    actual = tracker._flow_fallback_deep(
-        np.zeros((2, 2, 3), np.uint8), "track_lowconf", inliers=42)
-    assert actual is expected
-    assert tracker._flow_2d is None and tracker._flow_3d is None
-    assert tracker._flow_gray is None and tracker._flow_age == 0
-    assert tracker._last_info["flow_stage"] == "track_lowconf"
-    assert tracker._last_info["flow_fallback"] is True
-    assert tracker._last_info["flow_inliers"] == 42
-
-
-def test_flow_cache_is_not_used_outside_track_state():
-    import production_xfeat_tracker as pxt
-
-    tracker = pxt.ProductionXFeatTracker.__new__(pxt.ProductionXFeatTracker)
-    tracker.state = pxt.RuntimeState(mode="LOST")
-    tracker._flow_2d = np.ones((2, 2)); tracker._flow_3d = np.ones((2, 3))
-    tracker._flow_gray = np.ones((2, 2), np.uint8); tracker._flow_age = 1
-    tracker._flow_refresh_every = 6; tracker._flow_min_seed = 100
-    tracker._last_inl_2d = None; tracker._last_inl_3d = None
-    deep_calls = []
-
-    def deep(_frame):
-        deep_calls.append(True)
-        tracker._last_info = {"accepted": False, "inliers": 0}
-        return None
-
-    tracker._localize_frame_deep = deep
-    assert tracker._localize_frame_flow(np.zeros((2, 2, 3), np.uint8)) is None
-    assert deep_calls == [True]
-    assert tracker._flow_2d is None and tracker._flow_3d is None
-    assert tracker._last_info["flow_stage"] == "refresh"
-
-
-def test_vpr_fp16_is_explicit_and_cuda_only(monkeypatch):
-    import production_xfeat_tracker as pxt
-
-    descriptors = np.ones((1, pxt.BOQ_DIM), np.float32)
-    monkeypatch.setenv("SFM_BOQ_FP16", "1")
-    assert pxt.BoQLayer(descriptors, device="cuda").fp16 is True
-    assert pxt.BoQLayer(descriptors, device="cpu").fp16 is False
-    monkeypatch.setenv("SFM_BOQ_FP16", "0")
-    assert pxt.BoQLayer(descriptors, device="cuda").fp16 is False
-
-
-def test_cuda_oom_releases_live_gpu_caches(monkeypatch):
-    import production_xfeat_tracker as pxt
-
-    tracker = pxt.ProductionXFeatTracker.__new__(pxt.ProductionXFeatTracker)
-    tracker.state = pxt.RuntimeState(mode="TRACK")
-    tracker._ref_dev_cache = OrderedDict([(1, {"descriptors": object()})])
-    tracker.temporal_cache = pxt.TemporalAnchorCache(
-        descriptors=np.ones((2, 2)), xyz=np.ones((2, 3)), ref_ids=np.array([1, 2]))
-    tracker._flow_2d = np.ones((2, 2)); tracker._flow_3d = np.ones((2, 3))
-    tracker._flow_gray = np.ones((2, 2)); tracker._flow_age = 1
-    tracker._last_inl_2d = np.ones((2, 2)); tracker._last_inl_3d = np.ones((2, 3))
-    tracker._last_seed_refs = (1,)
-    tracker._localize_frame_impl = lambda _frame: (_ for _ in ()).throw(
-        RuntimeError("CUDA out of memory"))
-    cleanup = []
-    monkeypatch.setattr(pxt.gc, "collect", lambda: cleanup.append(("gc", sys.exc_info()[0])))
-    monkeypatch.setattr(
-        pxt.torch.cuda, "empty_cache",
-        lambda: cleanup.append(("empty", sys.exc_info()[0])))
-    assert tracker._localize_frame_deep(np.zeros((2, 2, 3), np.uint8)) is None
-    assert not tracker._ref_dev_cache and len(tracker.temporal_cache) == 0
-    assert tracker._flow_2d is None and tracker._last_seed_refs == ()
-    assert cleanup == [("gc", None), ("empty", None)], \
-        "traceback refs must be gone before gc.collect()/empty_cache()"
-
-
 def test_command_log_has_final_pcmd_and_reason():
     sent, _, records = run_ticks(10, fresh_pose)
     driven = [r for r in records if not r["blocked"]]
@@ -3884,12 +3754,10 @@ def test_no_developer_specific_site_probe_selects_flight_assets():
                    "FOOTBALL_FIELD_MEGALOC"):
         assert marker not in source, f"{marker} reintroduces a per-developer site probe"
     assert not hasattr(pff, "FOOTBALL_FIELD_BUNDLE")
-    # Defaults must resolve inside the workspace, not to whatever site directory
-    # happens to exist on the machine running the flight.
-    workspace = str(pff.LOC_ROOT.parent)
-    for name in ("DEFAULT_BUNDLE", "DEFAULT_MEGALOC_CACHE"):
-        resolved = str(getattr(pff, name))
-        assert resolved.startswith(workspace), f"{name} points outside the workspace: {resolved}"
+    # No bundle default may exist: the direct localizer only runs on the
+    # site-selected bundle passed through SFM_RELOC_BUNDLE.
+    assert not hasattr(pff, "DEFAULT_BUNDLE")
+    assert not hasattr(pff, "DEFAULT_MEGALOC_CACHE")
 
 
 def test_pcmd_capture_is_bounded_in_real_flight():

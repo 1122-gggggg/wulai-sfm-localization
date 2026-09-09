@@ -519,41 +519,6 @@ def test_worker_exception_payload_carries_localization_contract_fields() -> None
     assert result.pose is None
 
 
-def test_edm_cuda_oom_is_structured_fatal_and_cleans_cache() -> None:
-    class FakeCudaOOM(RuntimeError):
-        pass
-
-    cleanup_calls = []
-    fake_torch = SimpleNamespace(
-        OutOfMemoryError=FakeCudaOOM,
-        cuda=SimpleNamespace(
-            OutOfMemoryError=FakeCudaOOM,
-            empty_cache=lambda: cleanup_calls.append("empty_cache"),
-            ipc_collect=lambda: cleanup_calls.append("ipc_collect"),
-        ),
-    )
-    error = FakeCudaOOM("CUDA out of memory")
-
-    assert localizer_worker.edm_cuda_oom_requires_restart("edm", error, fake_torch)
-    assert not localizer_worker.edm_cuda_oom_requires_restart("xfeat", error, fake_torch)
-
-    payload = localizer_worker.localization_exception_payload(seq=4, error=error)
-    payload.update(localizer_worker.cuda_oom_failure_fields(error))
-    payload["cuda_cache_cleanup"] = localizer_worker.cleanup_cuda_cache(fake_torch)
-
-    assert payload["success"] is False
-    assert payload["validity"] is False
-    assert payload["error"] == "cuda_oom"
-    assert payload["failure_kind"] == "cuda_oom"
-    assert payload["worker_fatal"] is True
-    assert payload["restart_required"] is True
-    assert payload["cuda_cache_cleanup"] == {
-        "empty_cache": "ok",
-        "ipc_collect": "ok",
-    }
-    assert cleanup_calls == ["empty_cache", "ipc_collect"]
-
-
 def test_localization_exception_result_triggers_live_fail_safe() -> None:
     payload = localizer_worker.localization_exception_payload(
         seq=5, error=RuntimeError("tracker failed")
@@ -797,6 +762,8 @@ def test_install_site_runtime_allows_localization_exception_seq_zero(monkeypatch
     operator.site_asset_actions = SimpleNamespace(current_profile=None)
     operator.history = []
     operator.history_health = []
+    operator.history_weak = []
+    operator.history_weak_health = []
     operator.no_loc_markers = []
     operator.write_log = lambda _message: None
     operator.destroy = lambda: None
@@ -1106,15 +1073,6 @@ def test_live_localizer_mode_header_rejects_invalid_input() -> None:
         localizer_protocol.encode_mode("fly")
 
 
-def test_edm_worker_fails_clearly_when_cuda_is_unavailable() -> None:
-    fake_torch = SimpleNamespace(
-        cuda=SimpleNamespace(is_available=lambda: False),
-    )
-
-    with pytest.raises(RuntimeError, match="requires a working CUDA device"):
-        localizer_worker.require_edm_cuda(fake_torch)
-
-
 def test_timed_localizer_header_round_trip() -> None:
     header = localizer_protocol.encode_request("auto", 123.456)
 
@@ -1201,56 +1159,6 @@ def test_live_localizer_sends_gnss_with_its_independent_stamp() -> None:
     assert fused is not None and fused.has_gnss
     assert fused.gps_stamp == pytest.approx(9.5)
     assert fused.latitude == pytest.approx(25.033)
-
-
-@pytest.mark.parametrize("enabled", [False, True])
-def test_live_localizer_client_passes_neuflow_flag_only_when_enabled(
-    monkeypatch: pytest.MonkeyPatch,
-    enabled: bool,
-) -> None:
-    captured = {}
-
-    def fake_worker_init(_self, cmd, *_args, **_kwargs) -> None:
-        captured["cmd"] = cmd
-        captured["kwargs"] = _kwargs
-
-    monkeypatch.setattr(app.LiveWorkerClient, "__init__", fake_worker_init)
-
-    app.LiveLocalizerClient(
-        Path("worker.py"),
-        sys.executable,
-        1280,
-        720,
-        Path("bundle.pt"),
-        neuflow_track=enabled,
-    )
-
-    assert ("--neuflow-track" in captured["cmd"]) is enabled
-    assert "--startup-handshake" in captured["cmd"]
-    assert captured["kwargs"]["expect_ready_event"] is True
-
-
-def test_live_localizer_client_passes_projection_sidecar(monkeypatch) -> None:
-    captured = {}
-
-    def fake_worker_init(_self, cmd, *_args, **_kwargs) -> None:
-        captured["cmd"] = cmd
-
-    monkeypatch.setattr(app.LiveWorkerClient, "__init__", fake_worker_init)
-
-    app.LiveLocalizerClient(
-        Path("worker.py"),
-        sys.executable,
-        1280,
-        720,
-        Path("bundle.pt"),
-        projection_track=True,
-        track_landmarks=Path("track_landmarks_v1.npz"),
-    )
-
-    index = captured["cmd"].index("--track-landmarks")
-    assert "--projection-track" in captured["cmd"]
-    assert captured["cmd"][index + 1] == "track_landmarks_v1.npz"
 
 
 def test_live_localizer_client_passes_profile_query_camera(monkeypatch) -> None:
@@ -1353,55 +1261,6 @@ def test_live_localizer_client_no_longer_spawns_legacy_vpr_backend_flags(monkeyp
                 Path("bundle.pt"),
                 **{flag.lstrip("-").replace("-", "_"): "tensorrt"},
             )
-
-
-def test_shipped_edm_production_profile_pins_validated_parameters() -> None:
-    profile_path = (
-        Path(__file__).resolve().parents[3]
-        / "定位演算法"
-        / "configs"
-        / "edm_production_profile.json"
-    )
-
-    profile = localizer_worker.load_edm_production_profile(profile_path)
-
-    assert profile["matcher"] == {
-        "coarse_topk": 3225,
-        "mconf_thr": 0.2,
-        "fp16": True,
-        "input_size": [1024, 576],
-        "reference_cache_size": 32,
-    }
-    assert profile["tracker"]["acquire_initial_topk"] == 2
-    assert profile["tracker"]["max_reproj_error_acquire"] == 5.0
-    assert profile["tracker"]["max_reproj_error_track"] == 6.0
-    assert profile["tracker"]["prediction_max_dt"] == 0.25
-    assert profile["tracker"]["local_topk"] == 1
-    assert profile["tracker"]["weak_local_topk"] == 3
-    assert profile["tracker"]["lost_local_topk"] == 5
-    assert profile["tracker"]["lost_local_grace_frames"] == 2
-    assert profile["tracker"]["recovery_bank_size"] == 192
-    assert profile["tracker"]["recovery_scan_topk"] == 2
-
-
-def test_xfeat_topk_override_keeps_validated_three_then_four_retry() -> None:
-    cfg = SimpleNamespace(
-        matcher_mode="lighterglue",
-        acquire_matcher_mode="lighterglue",
-        local_topk=5,
-        weak_local_topk=8,
-        adaptive_first_topk=3,
-    )
-
-    localizer_worker.apply_xfeat_runtime_overrides(
-        cfg,
-        matcher_mode="",
-        local_topk=4,
-    )
-
-    assert cfg.local_topk == 4
-    assert cfg.weak_local_topk == 8
-    assert cfg.adaptive_first_topk == 3
 
 
 def test_live_localizer_switches_mode_without_restarting_worker(tmp_path: Path) -> None:
@@ -1933,7 +1792,7 @@ def test_confidence_hold_engages_only_after_tracker_is_lost() -> None:
     assert policy.active
 
 
-def test_real_low_confidence_escalation_hovers_and_requests_megaloc_once() -> None:
+def test_real_low_confidence_escalation_hovers_and_requests_relocalize_once() -> None:
     clears = []
     pcmds = []
     relocalize_calls = []
@@ -2028,7 +1887,6 @@ def test_operator_and_worker_parsers_are_side_effect_free() -> None:
     assert operator_args.video == "sample.mp4"
     assert operator_args.live is False
     assert worker_args.width == 1280
-    assert worker_args.localizer_backend in {"auto", "edm", "xfeat"}
 
 
 def test_temporal_pose_stabilizer_suppresses_single_frame_flip() -> None:
@@ -2370,7 +2228,7 @@ def test_worker_loop_emits_one_json_result_for_one_mock_frame(monkeypatch) -> No
     localizer_worker._run_worker_loop(
         args,
         output,
-        "xfeat",
+        "direct",
         fake_torch,
         FakeTracker(),
         "mock-tracker",
@@ -3406,181 +3264,7 @@ sys.stdin.buffer.read()
     assert oom_rows[0]["oom_transition"] is True
 
 
-def test_worker_fused_odometry_uses_telemetry_stamp_not_capture() -> None:
-    fused = localizer_protocol.FusedTelemetry(
-        stamp=10.05,
-        roll=0.1,
-        pitch=-0.2,
-        yaw=1.3,
-        speed_north=0.4,
-        speed_east=-0.1,
-        speed_down=0.0,
-    )
-    sample = localizer_worker._fused_odometry_sample_from_request(
-        fused,
-        capture_stamp=10.0,
-        now_mono=10.1,
-    )
-    assert sample is not None
-    assert sample.timestamp == pytest.approx(10.05)
-
-
-def test_worker_fused_odometry_keeps_independent_gnss_stamp() -> None:
-    fused = localizer_protocol.FusedTelemetry(
-        stamp=10.05,
-        roll=0.1,
-        pitch=-0.2,
-        yaw=1.3,
-        gps_stamp=9.5,
-        latitude=25.033,
-        longitude=121.5654,
-        altitude=18.2,
-        latitude_accuracy=0.8,
-        longitude_accuracy=0.9,
-        altitude_accuracy=1.4,
-    )
-
-    sample = localizer_worker._fused_odometry_sample_from_request(
-        fused,
-        capture_stamp=10.0,
-        now_mono=10.1,
-    )
-
-    assert sample is not None and sample.has_gnss
-    assert sample.timestamp == pytest.approx(10.05)
-    assert sample.geodetic_timestamp == pytest.approx(9.5)
-    assert sample.geodetic_lla == pytest.approx((25.033, 121.5654, 18.2))
-
-
-def test_worker_fused_odometry_does_not_backdate_unstamped_telemetry() -> None:
-    fused = localizer_protocol.FusedTelemetry(
-        stamp=None,
-        roll=0.1,
-        pitch=-0.2,
-        yaw=1.3,
-    )
-    assert (
-        localizer_worker._fused_odometry_sample_from_request(
-            fused,
-            capture_stamp=10.0,
-            now_mono=10.1,
-        )
-        is None
-    )
-    assert (
-        localizer_worker._fused_odometry_sample_from_request(
-            None,
-            capture_stamp=10.0,
-            now_mono=10.1,
-        )
-        is None
-    )
-
-
-def test_worker_fused_odometry_rejects_future_and_stale_stamps() -> None:
-    future = localizer_protocol.FusedTelemetry(
-        stamp=10.2,
-        roll=0.0,
-        pitch=0.0,
-        yaw=0.0,
-    )
-    assert (
-        localizer_worker._fused_odometry_sample_from_request(
-            future,
-            capture_stamp=10.0,
-            now_mono=10.1,
-        )
-        is None
-    )
-    stale = localizer_protocol.FusedTelemetry(
-        stamp=10.0 + localizer_protocol.MAX_FUSED_SYNC_ERROR_S + 0.01,
-        roll=0.0,
-        pitch=0.0,
-        yaw=0.0,
-    )
-    assert (
-        localizer_worker._fused_odometry_sample_from_request(
-            stale,
-            capture_stamp=10.0,
-            now_mono=stale.stamp + 1.0,
-        )
-        is None
-    )
-
-
-def test_worker_publishes_sampled_cuda_and_per_class_edm_cache_metrics() -> None:
-    class FakeCuda:
-        def is_available(self) -> bool:
-            return True
-
-        def memory_allocated(self) -> int:
-            return 10
-
-        def memory_reserved(self) -> int:
-            return 20
-
-        def max_memory_allocated(self) -> int:
-            return 30
-
-        def synchronize(self) -> None:
-            raise AssertionError("must not force CUDA synchronization")
-
-    tracker = SimpleNamespace(
-        loc=SimpleNamespace(
-            matcher=SimpleNamespace(
-                feature_cache_stats_by_class=lambda: {
-                    "map": {"hits": 8, "misses": 1, "evictions": 0},
-                    "temporal": {"hits": 2, "misses": 1, "evictions": 3},
-                }
-            )
-        ),
-        last_info={},
-    )
-    payload = {}
-    last_mono, last_stats = localizer_worker._attach_sampled_runtime_metrics(
-        payload,
-        SimpleNamespace(cuda=FakeCuda()),
-        tracker,
-        None,
-        None,
-    )
-    assert last_mono is not None
-    assert last_stats == {
-        "cuda_allocated_bytes": 10,
-        "cuda_reserved_bytes": 20,
-        "cuda_peak_allocated_bytes": 30,
-    }
-    assert payload["cuda_allocated_bytes"] == 10
-    assert payload["cuda_reserved_bytes"] == 20
-    assert payload["cuda_peak_allocated_bytes"] == 30
-    assert payload["edm_cache_hits"] == 10
-    assert payload["edm_cache_misses"] == 2
-    assert payload["edm_cache_evictions"] == 3
-
-
-def test_worker_reads_edm_cache_metrics_through_adapter_tracker() -> None:
-    tracker = SimpleNamespace(
-        trk=SimpleNamespace(
-            loc=SimpleNamespace(
-                matcher=SimpleNamespace(
-                    feature_cache_stats_by_class=lambda: {
-                        "map": {"hits": 9, "misses": 2, "evictions": 1},
-                        "temporal": {"hits": 3, "misses": 1, "evictions": 0},
-                    }
-                )
-            )
-        ),
-        last_info={},
-    )
-
-    assert localizer_worker._edm_cache_stats_from_tracker(tracker) == {
-        "edm_cache_hits": 12,
-        "edm_cache_misses": 3,
-        "edm_cache_evictions": 1,
-    }
-
-
-def test_worker_loop_observes_independent_fused_stamp(monkeypatch) -> None:
+def test_worker_loop_ignores_fused_telemetry_for_direct_backend(monkeypatch) -> None:
     observed = []
 
     class FakeTracker:
@@ -3633,7 +3317,7 @@ def test_worker_loop_observes_independent_fused_stamp(monkeypatch) -> None:
     localizer_worker._run_worker_loop(
         args,
         output,
-        "xfeat",
+        "direct",
         SimpleNamespace(cuda=SimpleNamespace(is_available=lambda: False)),
         FakeTracker(),
         "mock-tracker",
@@ -3642,11 +3326,10 @@ def test_worker_loop_observes_independent_fused_stamp(monkeypatch) -> None:
         lambda *_args, **_kwargs: None,
     )
     payload = json.loads(output.getvalue())
-    assert observed == [pytest.approx(fused_stamp)]
+    # Direct-backend semantics: fused telemetry is decoded but the worker does
+    # not feed it to the tracker.
+    assert observed == []
     assert payload["success"] is True
-    assert payload["edm_cache_hits"] == 5
-    assert payload["edm_cache_misses"] == 1
-    assert payload["edm_cache_evictions"] == 2
 
 
 def test_client_lifecycle_metrics_follow_outage_and_ready_transitions() -> None:

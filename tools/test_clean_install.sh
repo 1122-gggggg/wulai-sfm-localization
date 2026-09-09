@@ -30,4 +30,4 @@ SFM_TORCH_HUB_CACHE="$ROOT/執行環境/torch_hub_cache" \
     --json
 "$VENV_DIR/bin/python" -m pytest -q --timeout=300 --cov \
   --cov-config="$ROOT/pyproject.toml" --cov-report=term-missing \
-  --cov-fail-under=0 "$ROOT/tools" "$ROOT/定位演算法/validation/tests"
+  --cov-fail-under=0 "$ROOT/tools" "$ROOT/tests"

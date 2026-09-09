@@ -1,5 +1,12 @@
 # 定位演算法優化 Runbook
 
+> **適用範圍：`sfm_glomap_deploy`（EDM `.pt` bundle）路徑，該路徑已從 worktree 移除。**
+> `localizer_registry` 現在只註冊 `direct` 一個 backend，本檔的旗標與閾值
+> （KLT bridge、async tracker、`acquire_relaxed_min_inliers`、CUDA graphs、
+> `match_batch_size`、兩個否決器…）在現行程式碼中都不存在。現行後端見
+> [`docs/direct_backend_ledger.md`](direct_backend_ledger.md)。保留本檔是為了
+> 記錄已花掉的實驗成本，不要當成現行系統的描述。
+
 最後更新：2026-09-05
 分支：`agent/localization-runtime-optimizations`
 硬體基準：NVIDIA GeForce RTX 5060 Laptop GPU（8151 MiB，sm_120）

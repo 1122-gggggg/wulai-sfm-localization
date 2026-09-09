@@ -51,8 +51,6 @@ def discover_profiles(root: Path) -> list[tuple[Path, object]]:
             profile = load_profile(path)
         except SelectionError:
             continue
-        if profile.site_id == "your_site_edm":
-            continue
         profiles.append((path.resolve(), profile))
     return profiles
 

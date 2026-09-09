@@ -996,25 +996,19 @@ class LiveWorkerClient:
 def _append_localizer_backend_args(
     command: list[str],
     *,
-    backend: str,
     bundle_sha256: str,
     deploy_dir: str | Path,
     profile: str | Path,
     profile_sha256: str,
-    matcher_mode: str,
 ) -> None:
     if bundle_sha256:
         command.extend(["--bundle-sha256", str(bundle_sha256)])
-    if backend == "edm":
-        command.extend(["--edm-matcher", "torch"])
-        if deploy_dir:
-            command.extend(["--deploy-dir", str(deploy_dir)])
-        if profile:
-            command.extend(["--production-profile", str(profile)])
-        if profile_sha256:
-            command.extend(["--production-profile-sha256", str(profile_sha256)])
-    elif matcher_mode:
-        command.extend(["--matcher-mode", str(matcher_mode)])
+    if deploy_dir:
+        command.extend(["--deploy-dir", str(deploy_dir)])
+    if profile:
+        command.extend(["--production-profile", str(profile)])
+    if profile_sha256:
+        command.extend(["--production-profile-sha256", str(profile_sha256)])
 
 
 def _append_localizer_query_args(
@@ -1058,16 +1052,9 @@ def _append_localizer_reference_args(
 def _append_localizer_tracking_args(
     command: list[str],
     *,
-    neuflow_track: bool,
-    projection_track: bool,
-    track_landmarks: str | Path,
     force_track_bench: bool,
     force_track_ref: int,
 ) -> None:
-    if neuflow_track:
-        command.append("--neuflow-track")
-    if projection_track:
-        command.extend(["--projection-track", "--track-landmarks", str(track_landmarks)])
     if force_track_bench:
         command.append("--force-track-bench")
     else:
@@ -1088,10 +1075,6 @@ class LiveLocalizerClient(LiveWorkerClient):
         reference_index_sha256: str = "",
         force_track_bench: bool = False,
         force_track_ref: int = -1,
-        neuflow_track: bool = False,
-        projection_track: bool = False,
-        track_landmarks: str | Path = "",
-        matcher_mode: str = "",
         localizer_backend: str = "auto",
         localizer_deploy_dir: str | Path = "",
         localizer_profile: str | Path = "",
@@ -1116,7 +1099,6 @@ class LiveLocalizerClient(LiveWorkerClient):
         import flight_operator_app as _app
 
         self.localizer_backend = _app.resolve_localizer_backend(localizer_backend, Path(bundle))
-        self.edm_matcher = "torch"
         cmd = [
             str(python_bin),
             str(worker_py),
@@ -1131,12 +1113,10 @@ class LiveLocalizerClient(LiveWorkerClient):
         ]
         _append_localizer_backend_args(
             cmd,
-            backend=self.localizer_backend,
             bundle_sha256=bundle_sha256,
             deploy_dir=localizer_deploy_dir,
             profile=localizer_profile,
             profile_sha256=localizer_profile_sha256,
-            matcher_mode=matcher_mode,
         )
         _append_localizer_query_args(
             cmd,
@@ -1152,9 +1132,6 @@ class LiveLocalizerClient(LiveWorkerClient):
         )
         _append_localizer_tracking_args(
             cmd,
-            neuflow_track=neuflow_track,
-            projection_track=projection_track,
-            track_landmarks=track_landmarks,
             force_track_bench=force_track_bench,
             force_track_ref=force_track_ref,
         )

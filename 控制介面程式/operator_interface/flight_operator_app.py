@@ -341,7 +341,7 @@ DEFAULT_DETECTOR_WORKER = _WS.operator_interface / "object_detector_worker.py"
 DEFAULT_BUNDLE = Path(
     os.environ.get(
         "SFM_RELOC_BUNDLE",
-        str(_WS.bundles / "your_site_reloc_map_edm.pt"),
+        str(_WS.bundles / "your_site_direct_bundle.json"),
     )
 )
 DEFAULT_LOCALIZER_BACKEND = os.environ.get("SFM_LOCALIZER_BACKEND", "auto")
@@ -916,13 +916,11 @@ _SITE_ASSET_ENV_VARS = (
 
 
 def resolve_localizer_backend(requested: str, bundle: Path) -> str:
-    """Resolve edm|xfeat from an explicit request or the bundle file name."""
+    """Return the direct backend; auto also resolves to direct."""
     req = (requested or "auto").strip().lower()
-    if req in {"edm", "xfeat"}:
-        return req
-    if req not in {"", "auto"}:
-        raise ValueError(f"unsupported localizer backend: {requested!r}")
-    return "edm" if "edm" in bundle.name.lower() else "xfeat"
+    if req in {"", "auto", "direct"}:
+        return "direct"
+    raise ValueError(f"unsupported localizer backend: {requested!r}")
 
 
 def resolve_operator_site_assets(args, parser: argparse.ArgumentParser) -> SiteProfile | None:
@@ -1889,6 +1887,13 @@ class OperatorApp(tk.Tk):
         self.loc_health_inliers = 0
         self.loc_health_reproj = None
         self.history_health: list[str] = []  # per-history-point health, for map markers
+        # Display-only weak trail (VO_ONLY / DEAD_RECKON / WEAK_TRACK /
+        # PREDICTED_ONLY mirrors from operator_tick). Parallel lists, same
+        # 300 cap as history. Never read by any flight-control gate.
+        self.history_weak: list = []
+        self.history_weak_health: list[str] = []
+        # Consecutive weak-with-pose frames, for the HUD direct status line.
+        self.loc_weak_run = 0
         # Localization gate: the 720p stream is fed to the localizer only after
         # 開始定位 is pressed. This does not start an autonomous route.
         self.inspecting = False
@@ -5471,6 +5476,8 @@ class OperatorApp(tk.Tk):
         self._video_resized_cache = None
         self.history.clear()
         self.history_health.clear()
+        self.history_weak.clear()
+        self.history_weak_health.clear()
         self.no_loc_markers.clear()
 
         self.route_pts = list(prepared.route_points)
@@ -5520,6 +5527,7 @@ class OperatorApp(tk.Tk):
         self.loc_health = "OK"
         self.loc_health_inliers = 0
         self.loc_health_reproj = None
+        self.loc_weak_run = 0
         self._reset_localization_benchmark_metrics()
         self.inspect_start = None
         self.loc_benchmark_requested = (
@@ -6227,6 +6235,9 @@ class OperatorApp(tk.Tk):
         )
         self.loc_stage = str(
             result.get("composite_stage")
+            # direct backend: FAST_TRACK / RELOC_SEED / VO_ONLY / DEAD_RECKON.
+            # WEAK_TRACK alone cannot tell VO-only drift from dead reckoning.
+            or result.get("direct_status")
             or result.get("next_mode")
             or result.get("mode")
             or ("FAIL" if not result.get("success") else "-")
@@ -6289,6 +6300,16 @@ class OperatorApp(tk.Tk):
             self.loc_hold_engage_count += 1
         elif hold_event == "RELEASE_FIX":
             self.loc_recovery_fix_count += 1
+        # Consecutive weak-with-pose frames, for the direct status line. A
+        # weak frame still computed a pose (it is shown on the map); any
+        # trustworthy fix or failure resets the run. Display-only: no gate
+        # reads this counter.
+        try:
+            weak_frame = bool(result.get("success")) and bool(
+                localization_result_is_weak(result))
+        except (AttributeError, KeyError, TypeError, ValueError):
+            weak_frame = False
+        self.loc_weak_run = int(getattr(self, "loc_weak_run", 0) or 0) + 1 if weak_frame else 0
         hold_attempts = int(result.get("confidence_hold_attempts", 0) or 0)
         hold_state = " 重定位中" if result.get("confidence_hold_active") else ""
         event_state = f" {hold_event}" if hold_event else ""
@@ -6297,11 +6318,24 @@ class OperatorApp(tk.Tk):
         reference_text = "-" if reference_count is None else str(int(reference_count))
         global_calls = result.get("global_retrieval_calls")
         megaloc_text = "-" if global_calls is None else str(int(global_calls))
+        direct_text = ""
+        direct_status = result.get("direct_status")
+        if direct_status:
+            direct_text = (
+                f" | direct {direct_status}"
+                f" map={result.get('map_inliers')}"
+                f" vo={result.get('vo_inliers')}"
+                f" live={result.get('live_points')}"
+                f" dr={result.get('dead_reckon_age')}"
+                f" reloc={result.get('reloc_status') or '-'}"
+                f" weak_run={int(getattr(self, 'loc_weak_run', 0) or 0)}"
+            )
         self.loc_recovery_text = (
             f"狀態 {mode}→{next_mode} | hold {hold_attempts} "
             f"(累計 {self.loc_hold_engage_count}) | recovery fix "
             f"{self.loc_recovery_fix_count}{event_state}{hold_state} | "
             f"{candidate_mode} refs={reference_text} MegaLoc={megaloc_text}"
+            f"{direct_text}"
         )
 
     def _render_localization_metrics(self, inliers: int) -> None:
@@ -7224,6 +7258,8 @@ class OperatorApp(tk.Tk):
                 route_pts=route_pts,
                 history=self.history,
                 history_health=self.history_health,
+                history_weak=self.history_weak,
+                history_weak_health=self.history_weak_health,
                 pose=render_pose,
                 camera_axes=camera_axes,
                 camera_forward=camera_forward,

@@ -226,6 +226,21 @@ class ResolvedMission:
                 "reference_index": (None if reference_index is None else str(reference_index.path)),
             },
         }
+        # A backend whose runtime does not live in the default deployment
+        # directory (the direct two-rate localizer lives in sfm_direct_deploy)
+        # declares it in the variant manifest; the launchers read it from the
+        # compatibility profile.
+        deploy_dir = self.localizer.runtime.get("deploy_dir")
+        if deploy_dir is not None:
+            declared = Path(str(deploy_dir)).expanduser()
+            if not declared.is_absolute():
+                declared = self.workspace_root / declared
+            resolved = declared.resolve()
+            if not resolved.is_dir():
+                raise ManifestError(
+                    f"localizer.runtime.deploy_dir is not a directory: {resolved}"
+                )
+            document["localizer_deploy_dir"] = str(resolved)
         if pose_chain is not None:
             document["pose_chain"] = {
                 "site_frame_id": pose_chain.site_frame_id,

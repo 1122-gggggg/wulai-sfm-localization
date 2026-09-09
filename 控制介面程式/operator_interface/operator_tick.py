@@ -25,6 +25,7 @@ from operator_localization_config import (
 )
 from localization_result_ui import (
     annotate_ui_arrival_timing,
+    localization_result_is_weak,
     normalize_live_localization_result,
     validate_live_localization_result,
 )
@@ -513,6 +514,8 @@ def _map_dirty_key(app: Any, state: Any, *, width: int, height: int) -> tuple:
         len(app.history),
         id(app.history[-1]) if app.history else 0,
         id(app.history[0]) if app.history else 0,
+        len(getattr(app, "history_weak", ()) or ()),
+        id(app.history_weak[-1]) if getattr(app, "history_weak", None) else 0,
         len(app.route_pts),
         len(app.no_loc_markers),
         pose_key,
@@ -962,6 +965,54 @@ def _accept_predicted_pose(app: Any, result: dict, xyz: np.ndarray) -> None:
     app.live_new_pose = True
 
 
+#: Cap for the display-only weak trail. Same bound as the main history so one
+#: long degraded stretch cannot grow either list without bound.
+_WEAK_HISTORY_MAX = 300
+#: Health label stored alongside every weak display point. This is the pure
+#: classify_localization_health vocabulary (HEALTH_COLOR maps it to amber);
+#: the internal live_pose health ("LOW") is a separate flight-control concern.
+_WEAK_DISPLAY_HEALTH = "DEGRADED"
+
+
+def _record_weak_display_pose(
+    app: Any, result: dict, xyz: np.ndarray | None, *, require_success: bool = True,
+) -> bool:
+    """Mirror one weak pose into the display-only weak trail.
+
+    Flight-control state (live_pose / live_last_xyz / live_heading) is never
+    touched: the confidence hold keeps holding the last trustworthy pose for
+    the controller while the map still shows every computed weak fix,
+    including ones the hold gate swallows. Returns True when a point was
+    recorded. A separate list (instead of releasing weak poses into history
+    via _accept_live_pose) is what keeps the flight semantics bit-for-bit
+    identical: _accept_live_pose writes the pose the autonomy gates consume.
+    """
+    if xyz is None:
+        return False
+    try:
+        if require_success and not result.get("success"):
+            return False
+        if require_success and not localization_result_is_weak(result):
+            return False
+        point = np.asarray(xyz, dtype=float).reshape(-1)[:3]
+    except (TypeError, ValueError, AttributeError, KeyError) as exc:
+        app.write_log(f"WEAK_DISPLAY_SHAPE_FAILED: {exc!r}")
+        return False
+    if point.shape != (3,) or not np.all(np.isfinite(point)):
+        return False
+    trail = getattr(app, "history_weak", None)
+    trail_health = getattr(app, "history_weak_health", None)
+    if not isinstance(trail, list) or not isinstance(trail_health, list):
+        return False
+    trail.append(point.copy())
+    trail_health.append(_WEAK_DISPLAY_HEALTH)
+    while len(trail) > _WEAK_HISTORY_MAX:
+        trail.pop(0)
+        if trail_health:
+            trail_health.pop(0)
+    return True
+
+
 def update_live_results(
     app: Any,
     *,
@@ -1017,6 +1068,9 @@ def update_live_results(
         ):
             # Keep low-confidence and recovery-only poses in telemetry, but
             # hold the last trustworthy public pose until recovery releases.
+            # Display still gets the weak fix: the mirror never touches the
+            # flight pose, so the hold semantics stay exactly as they were.
+            _record_weak_display_pose(app, result, xyz)
             continue
         if _live_result_failed(
                 app, result, invalid_success_pose=invalid_success_pose,
@@ -1030,9 +1084,18 @@ def update_live_results(
                 app.write_log(f"LOCALIZATION_POSE_STATUS_FAILED: {exc!r}")
                 pose_status = None
             if pose_status == "PREDICTED_ONLY" and xyz is not None:
+                # An IMU guess is degraded display by definition: mirror it for
+                # the map even though the worker reports no visual success.
+                _record_weak_display_pose(
+                    app, result, xyz, require_success=False)
                 _accept_predicted_pose(app, result, xyz)
             continue
         assert xyz is not None
+        # Mirror weak fixes for the map before the jump gate: a rejected jump
+        # still answered "where does the estimator think we are", and the weak
+        # trail draws markers without a connecting line, so no false segment
+        # is implied. Trustworthy poses are a no-op here.
+        _record_weak_display_pose(app, result, xyz)
         if not _live_pose_is_continuous(app, xyz):
             continue
         _accept_live_pose(app, result, xyz)

@@ -61,6 +61,14 @@ check_fixed_environment() {
 check_fixed_environment
 P119_SHA256="600bbf70227311cab079d77fcb896f97e6d3e55f6bc40b5bef01d74b65f7826c"
 LOCAL_TOPK="${LOCAL_TOPK:-2}"
+# direct 後端不接受 --local-topk（reloc.top_k 由 SHA 綁定的 profile 決定）：
+# 用 direct site profile 時強制歸零，操作員顯式傳的 LOCAL_TOPK 也不放行 worker。
+if grep -q '"localizer"[[:space:]]*:[[:space:]]*"direct"' "$SITE_PROFILE" 2>/dev/null; then
+  LOCAL_TOPK=0
+  # direct worker 暖機要載 COLMAP 模型（545MB）+ MegaLoc（914MB）+ EDM，
+  # 實測約 25–60 秒；預設 20 秒 handshake 會誤殺成重啟迴圈。
+  export SFM_WORKER_WARMUP_S="${SFM_WORKER_WARMUP_S:-180}"
+fi
 STREAM_FPS="${STREAM_FPS:-30}"
 VIDEO_STRIDE="${VIDEO_STRIDE:-1}"
 # BOOT_INIT hold budget (ms). Released early on first successful MegaLoc lock.

@@ -8,18 +8,18 @@
       "size_bytes": 41417503
     },
     {
-      "fetch_hint": "Seed the sanctioned BoQ-ResNet50 weights at this repository-relative path.",
-      "name": "boq-weights",
-      "path": "執行環境/torch_hub_cache/checkpoints/boq/resnet50_16384.pth",
-      "sha256": "4691d1545db847da2c0ba911f34e6c520a5da63f8b94c6415fe87d0d8800ebaa",
-      "size_bytes": 95610672
-    },
-    {
       "fetch_hint": "Seed the approved MoGe-2 ViT-S normal checkpoint at this repository-relative path.",
       "name": "moge-2-vits-normal",
       "path": "執行環境/models/moge-2-vits-normal/model.pt",
       "sha256": "79a16621928c2bf0ed04659218c55c01075e950507f40bb3332fb4c873d3e1dc",
       "size_bytes": 140550416
+    },
+    {
+      "fetch_hint": "Seed the approved BoQ-ResNet50 retrieval weights at this repository-relative path.",
+      "name": "boq-weights",
+      "path": "執行環境/models/boq/resnet50_16384.pth",
+      "sha256": "4691d1545db847da2c0ba911f34e6c520a5da63f8b94c6415fe87d0d8800ebaa",
+      "size_bytes": 95610672
     }
   ],
   "schema": "sfm-runtime-artifacts/v1",

@@ -33,7 +33,11 @@ from live_localizer_protocol import (
     TIMED_MAGIC,
     decode_control_header,
 )
-from localization_metrics import edm_cache_metric_fields, sample_cuda_memory_stats
+from localization_metrics import (
+    DIRECT_INFO_FIELDS,
+    edm_cache_metric_fields,
+    sample_cuda_memory_stats,
+)
 
 
 # Workspace layout (physical dirs beneath the repository root).
@@ -67,43 +71,21 @@ PACKAGE_ROOT = _WS.runtime
 DEFAULT_BUNDLE = Path(
     os.environ.get(
         "SFM_RELOC_BUNDLE",
-        str(_WS.bundles / "your_site_reloc_map_edm.pt"),
+        str(_WS.bundles / "your_site_direct_bundle.json"),
     )
 )
 DEFAULT_MEGALOC = os.environ.get(
     "SFM_MEGALOC_CACHE",
     "",
 )
-DEFAULT_NEUFLOW_REPO = Path(
-    os.environ.get(
-        "SFM_NEUFLOW_REPO",
-        str(_WS.root / ".experiment_deps" / "neuflow_v2"),
-    )
-)
-DEFAULT_NEUFLOW_WEIGHTS = Path(
-    os.environ.get(
-        "SFM_NEUFLOW_WEIGHTS",
-        str(DEFAULT_NEUFLOW_REPO / "neuflow_mixed.pth"),
-    )
-)
-
-from edm_profile import (  # noqa: E402
-    apply_edm_tracker_profile as apply_edm_tracker_profile,  # noqa: F401 - compatibility export
-    load_edm_production_profile as load_edm_production_profile,  # noqa: F401 - compatibility export
-)
 
 
 def resolve_localizer_backend(requested: str, bundle: Path) -> str:
-    """Pick edm|xfeat from an explicit flag, else from the bundle file name."""
+    """Return the direct backend; auto also resolves to direct."""
     req = (requested or "auto").strip().lower()
-    if req in {"edm", "xfeat"}:
-        return req
-    if req not in {"", "auto"}:
-        raise ValueError(f"unsupported localizer backend: {requested!r}")
-    name = bundle.name.lower()
-    if "edm" in name:
-        return "edm"
-    return "xfeat"
+    if req in {"", "auto", "direct"}:
+        return "direct"
+    raise ValueError(f"unsupported localizer backend: {requested!r}")
 
 
 def require_edm_cuda(torch_module) -> None:
@@ -224,25 +206,6 @@ def resolve_query_camera_override(
 
     return validate_camera_tuple((model, width, height, params))
 
-
-def apply_xfeat_runtime_overrides(cfg, *, matcher_mode: str, local_topk: int) -> None:
-    if matcher_mode:
-        cfg.matcher_mode = str(matcher_mode)
-    else:
-        cfg.matcher_mode = "lighterglue"
-        cfg.acquire_matcher_mode = "lighterglue"
-    if local_topk > 0:
-        cfg.local_topk = int(local_topk)
-        cfg.weak_local_topk = max(
-            int(cfg.weak_local_topk),
-            int(local_topk) + 1,
-            int(cfg.local_topk) + 1,
-        )
-        # Keep the validated adaptive first pass. local_topk is the candidate
-        # budget; the fourth ref is added only when the first three are weak.
-        cfg.adaptive_first_topk = min(int(cfg.adaptive_first_topk), cfg.local_topk)
-
-
 def apply_runtime_benchmark_mode(tracker, mode: str, previous_mode: str, seed_local_prior) -> bool:
     """Prepare one forced benchmark branch at a frame boundary.
 
@@ -330,8 +293,8 @@ def edm_cuda_oom_requires_restart(
     error: BaseException,
     torch_module,
 ) -> bool:
-    """Only EDM OOMs are fatal; XFeat keeps its existing missed-fix behavior."""
-    return str(backend).lower() == "edm" and is_cuda_oom_error(error, torch_module)
+    """Only direct-backend OOMs are fatal; anything else keeps missed-fix behavior."""
+    return str(backend).lower() == "direct" and is_cuda_oom_error(error, torch_module)
 
 
 def cuda_oom_failure_fields(error: BaseException) -> dict[str, object]:
@@ -413,41 +376,18 @@ def build_argument_parser() -> argparse.ArgumentParser:
     )
     ap.add_argument(
         "--localizer-backend",
-        choices=("auto", "edm", "xfeat"),
+        choices=("auto", "direct"),
         default=os.environ.get("SFM_LOCALIZER_BACKEND", "auto"),
         help=(
-            "Local matcher family: edm (ProductionEDMTracker) or xfeat "
-            "(ProductionXFeatTracker). auto picks from the bundle file name."
-        ),
-    )
-    ap.add_argument(
-        "--neuflow-track",
-        action="store_true",
-        help="XFeat only: NeuFlow-v2 refresh=3 hybrid for TRACK; keep deep fallback.",
-    )
-    ap.add_argument(
-        "--projection-track",
-        action="store_true",
-        help="XFeat only: projection-guided TRACK fast path with deep fallback.",
-    )
-    ap.add_argument("--track-landmarks", default="")
-    ap.add_argument(
-        "--matcher-mode",
-        choices=("", "nn_then_lg", "lighterglue"),
-        default="",
-        help=(
-            "XFeat only: override TRACK/WEAK matcher. Empty follows production_config() "
-            "(LighterGlue). 'nn_then_lg' restores the mutual-NN fast pass for benches only."
+            "Localizer backend: direct (two-rate MegaLoc+EDM reloc with a "
+            "KLT/PnP fast loop). auto resolves to direct."
         ),
     )
     ap.add_argument(
         "--local-topk",
         type=int,
         default=0,
-        help=(
-            "Override TRACK local_topk (0 = production default). "
-            "For XFeat also clamps adaptive_first_topk. For EDM overrides production_edm_config."
-        ),
+        help="Kept for CLI compatibility; must stay 0 (direct has no local_topk override).",
     )
     ap.add_argument(
         "--runtime-benchmark-control",
@@ -471,18 +411,9 @@ def build_argument_parser() -> argparse.ArgumentParser:
         help="Ref index for --force-track-bench seed (-1 = middle ref).",
     )
     ap.add_argument(
-        "--edm-matcher",
-        choices=("torch",),
-        default="torch",
-        help=(
-            "Verified EDM production backend: PyTorch CUDA FP16. Rejected "
-            "ONNX/TensorRT experiments are intentionally unavailable here."
-        ),
-    )
-    ap.add_argument(
         "--production-profile",
         default="",
-        help="Validated edm-deployment-profile/v1 JSON applied to matcher and tracker.",
+        help="Validated direct-deployment-profile/v1 JSON for the direct localizer.",
     )
     ap.add_argument(
         "--production-profile-sha256",
@@ -493,20 +424,26 @@ def build_argument_parser() -> argparse.ArgumentParser:
 
 
 def _validate_backend_options(ap, args, backend: str) -> None:
-    if backend == "edm":
-        for enabled, flag in (
-            (args.neuflow_track, "--neuflow-track"),
-            (args.projection_track, "--projection-track"),
-            (args.matcher_mode, "--matcher-mode"),
-        ):
-            if enabled:
-                ap.error(f"{flag} is XFeat-only; use --localizer-backend xfeat")
-        if args.production_profile_sha256 and not args.production_profile:
-            ap.error("--production-profile-sha256 requires --production-profile")
-    elif args.production_profile:
-        ap.error("--production-profile is EDM-only")
-    elif args.production_profile_sha256:
-        ap.error("--production-profile-sha256 is EDM-only")
+    if backend != "direct":
+        ap.error(f"unsupported localizer backend: {backend!r} (only direct remains)")
+    if args.production_profile_sha256 and not args.production_profile:
+        ap.error("--production-profile-sha256 requires --production-profile")
+    # The direct backend has no built-in thresholds: the SHA-pinned
+    # direct-deployment-profile IS its gate configuration.
+    if not args.production_profile:
+        ap.error(
+            "--production-profile is required for --localizer-backend direct "
+            "(direct-deployment-profile/v1 JSON)"
+        )
+    for value, flag in (
+        (args.megaloc_cache, "--megaloc-cache"),
+        (args.reference_index, "--reference-index"),
+        (args.reference_index_sha256, "--reference-index-sha256"),
+    ):
+        if value:
+            ap.error(f"{flag} is not supported by --localizer-backend direct")
+    if int(args.local_topk) > 0:
+        ap.error("--local-topk is not supported by --localizer-backend direct")
 
 
 def _parse_worker_args():
@@ -527,10 +464,6 @@ def _parse_worker_args():
         )
     except ValueError as exc:
         ap.error(str(exc))
-    if args.neuflow_track and args.projection_track:
-        ap.error("--neuflow-track and --projection-track are separate alternatives")
-    if args.projection_track and not args.track_landmarks:
-        ap.error("--projection-track requires --track-landmarks")
     try:
         backend = resolve_localizer_backend(args.localizer_backend, Path(args.bundle))
     except ValueError as exc:
@@ -546,14 +479,12 @@ def _prepare_worker_runtime(args, backend: str):
     sys.stdout = sys.stderr
     selected_deploy_dir = Path(args.deploy_dir).resolve()
     sys.path.insert(0, str(selected_deploy_dir))
-    # A transferred EDM package contains its matcher/tracker implementation but
+    # A transferred deployment package contains its localizer implementation but
     # deliberately omits the UI adapter. Keep the UI adapter from the workspace
     # available after the selected deployment so its imports resolve to the
-    # package's EDM modules first.
+    # package's modules first.
     if selected_deploy_dir != DEPLOY_DIR.resolve():
         sys.path.insert(1, str(DEPLOY_DIR))
-    if backend == "xfeat" and (args.neuflow_track or args.projection_track):
-        sys.path.insert(0, str(VALIDATION_DIR))
     map_frame = None
     if args.map_align:
         from real_path_follow_controller import load_map_frame
@@ -633,153 +564,57 @@ def _build_worker_backend(args, backend: str, query_camera_override, map_frame):
     with redirect_native_stdout_to_stderr(), contextlib.redirect_stdout(sys.stderr):
         import torch
 
-        if backend == "edm":
-            require_edm_cuda(torch)
-            from edm_localizer_adapter import CAM_720_EDM
-            from production_localizer_factory import build_production_localizer
+        if backend != "direct":
+            raise ValueError(f"unsupported localizer backend: {backend!r} (only direct remains)")
+        # MegaLoc retrieval and the EDM matcher both run on the GPU; without
+        # CUDA the reloc worker would fail deep inside model loading.
+        require_edm_cuda(torch)
+        from production_localizer_factory import build_production_localizer
 
-            if args.megaloc_cache:
-                print(
-                    f"[live_worker] ignoring --megaloc-cache {args.megaloc_cache}: "
-                    "EDM retrieval reads the bundle's own BoQ ref_global",
-                    file=sys.stderr,
-                    flush=True,
-                )
-            built = build_production_localizer(
-                backend="edm",
-                bundle=args.bundle,
-                bundle_sha256=args.bundle_sha256 or None,
-                reference_index=args.reference_index or None,
-                reference_index_sha256=args.reference_index_sha256 or None,
-                frame_source=lambda: None,
-                camera_tuple=query_camera_override or CAM_720_EDM,
-                production_profile=args.production_profile or None,
-                production_profile_sha256=(args.production_profile_sha256 or None),
-                local_topk=int(args.local_topk),
-                map_frame=map_frame,
+        if query_camera_override is None:
+            raise RuntimeError(
+                "the direct localizer backend needs the site profile query_camera "
+                "(--query-camera-model/--query-camera-width/--query-camera-height/"
+                "--query-camera-params); it has no built-in camera default"
             )
-            tracker = built.tracker
-            xmap = built.reloc_map
-            cam = built.camera
-            cfg = built.config
-            tracker_variant = built.variant
-            DEVICE = built.device
-            edm_matcher = tracker.trk.loc.matcher
-            print(
-                f"[live_worker] EDM tracker={tracker_variant} "
-                f"vpr=boq_resnet50_fp16 "
-                f"mconf={getattr(edm_matcher, 'mconf_thr', 0.2)} "
-                f"track/weak/lost={cfg.local_topk}/{cfg.weak_local_topk}/"
-                f"{getattr(cfg, 'lost_local_topk', 'n/a')} "
-                f"boot_topk={cfg.boot_global_topk} "
-                f"staged_first={getattr(cfg, 'acquire_initial_topk', 'n/a')} "
-                f"batch={getattr(cfg, 'match_batch_size', 'n/a')} "
-                f"pnp_workers/early={getattr(cfg, 'pnp_workers', 'n/a')}/"
-                f"{getattr(cfg, 'pnp_early_stop', 'n/a')} "
-                f"lost_grace={getattr(cfg, 'lost_local_grace_frames', 'n/a')} "
-                f"recovery_bank/scan={getattr(cfg, 'recovery_bank_size', 'n/a')}/"
-                f"{getattr(cfg, 'recovery_scan_topk', 'n/a')} "
-                f"max_corr={cfg.max_corr_total} "
-                f"reproj_gate={getattr(cfg, 'max_reproj_error_acquire', 'n/a')}/"
-                f"{getattr(cfg, 'max_reproj_error_track', 'n/a')} "
-                f"min_inliers={cfg.acquire_min_inliers}/{cfg.track_min_inliers}/{cfg.weak_min_inliers}",
-                file=sys.stderr,
-                flush=True,
-            )
-        else:
-            from path_follow_flight import CAM_720
-            from production_localizer_factory import build_production_localizer
-
-            built = build_production_localizer(
-                backend="xfeat",
-                bundle=args.bundle,
-                bundle_sha256=args.bundle_sha256 or None,
-                frame_source=lambda: None,
-                camera_tuple=query_camera_override or CAM_720,
-                megaloc_cache=args.megaloc_cache or None,
-                reference_index=args.reference_index or None,
-                reference_index_sha256=args.reference_index_sha256 or None,
-                matcher_mode=str(args.matcher_mode),
-                local_topk=int(args.local_topk),
-                map_frame=map_frame,
-            )
-            tracker = built.tracker
-            xmap = built.reloc_map
-            cam = built.camera
-            cfg = built.config
-            tracker_variant = built.variant
-            DEVICE = built.device
-            megaloc = tracker.vpr
-            tracker_variant = (
-                f"matcher_{cfg.matcher_mode}_topk{cfg.local_topk}_adapt{cfg.adaptive_first_topk}"
-            )
-            print(
-                f"[live_worker] XFeat TRACK matcher={cfg.matcher_mode} "
-                f"local_topk={cfg.local_topk} weak_local_topk={cfg.weak_local_topk} "
-                f"adaptive_first={cfg.adaptive_first_topk} "
-                f"track_min_inliers={cfg.track_min_inliers} "
-                f"max_reproj_track={cfg.max_reproj_error_track} "
-                f"max_jump={cfg.max_jump} weak_after={cfg.weak_after} "
-                f"lost_after={cfg.lost_after} xfeat_track={cfg.xfeat_topk_track}",
-                file=sys.stderr,
-                flush=True,
-            )
-            if args.neuflow_track:
-                from neuflow_refresh_experiment import NeuFlowRefreshTracker, NeuFlowV2Backend
-
-                neuflow_backend = NeuFlowV2Backend(
-                    repo=DEFAULT_NEUFLOW_REPO,
-                    weights=DEFAULT_NEUFLOW_WEIGHTS,
-                    width=520,
-                    height=320,
-                )
-                tracker = NeuFlowRefreshTracker(
-                    xmap,
-                    megaloc,
-                    frame_source=lambda: None,
-                    query_cam=cam,
-                    cfg=cfg,
-                    neuflow_backend=neuflow_backend,
-                    refresh_interval=3,
-                    min_seed=80,
-                    min_track=60,
-                    min_inliers=50,
-                    min_inlier_ratio=0.35,
-                    max_reproj=6.0,
-                )
-                tracker_variant = "neuflow_v2_r3_s80_t60"
-            elif args.projection_track:
-                from projection_guided_tracker import (
-                    ProjectionGuidedTracker,
-                    TrackLandmarkSidecar,
-                )
-
-                landmark_sidecar = TrackLandmarkSidecar.load(
-                    Path(args.track_landmarks), xmap.ref_names
-                )
-                tracker = ProjectionGuidedTracker(
-                    xmap,
-                    megaloc,
-                    frame_source=lambda: None,
-                    query_cam=cam,
-                    cfg=cfg,
-                    landmark_sidecar=landmark_sidecar,
-                    search_radii=(15.0, 25.0, 40.0),
-                    min_score=0.60,
-                    ratio=0.95,
-                )
-                tracker_variant = "projection_guided_r15_25_40_s060_ratio095"
-
-        # Experimental XFeat wrappers inherit the production pose gate but have
-        # older constructor signatures. Apply the same verified frame uniformly.
+        built = build_production_localizer(
+            backend="direct",
+            bundle=args.bundle,
+            bundle_sha256=args.bundle_sha256 or None,
+            frame_source=lambda: None,
+            camera_tuple=query_camera_override,
+            production_profile=args.production_profile or None,
+            production_profile_sha256=(args.production_profile_sha256 or None),
+            map_frame=map_frame,
+        )
+        tracker = built.tracker
+        xmap = built.reloc_map
+        cam = built.camera
+        cfg = built.config
+        tracker_variant = built.variant
+        DEVICE = built.device
+        print(
+            f"[live_worker] DIRECT tracker={tracker_variant} "
+            f"map_revision={xmap.map_revision_id} "
+            f"frame={xmap.coordinate_frame_id} "
+            f"bank={xmap.bank_name} "
+            f"map_scale={cfg.map_scale} "
+            f"reloc_topk={cfg.reloc.top_k} reloc_period_s={cfg.reloc.period_s} "
+            f"reloc_min_points={cfg.reloc.min_points} "
+            f"fast_loop={cfg.fast_loop.resolution[0]}x{cfg.fast_loop.resolution[1]} "
+            f"tracker={cfg.fast_loop.tracker} "
+            f"pnp_min_inliers={cfg.fast_loop.pnp.min_inliers} "
+            f"vo={cfg.vo.enabled} dead_reckon_max={cfg.dead_reckon.max_frames}",
+            file=sys.stderr,
+            flush=True,
+        )
+        # Apply the verified map frame uniformly before any benchmark seeding.
         tracker.map_frame = map_frame
 
         if args.force_track_bench:
             # Hard lock: never MegaLoc / never leave TRACK for the whole session.
             if hasattr(tracker, "lock_track_only"):
                 tracker.lock_track_only = True
-            elif hasattr(tracker, "trk") and hasattr(tracker.trk, "lock_track_only"):
-                tracker.trk.lock_track_only = True  # EDM adapter
             print(
                 "[live_worker] lock_track_only=1: MegaLoc disabled; mode pinned to TRACK "
                 "(success/fail does not escalate to WEAK/LOST)",
@@ -795,14 +630,7 @@ def _build_worker_backend(args, backend: str, query_camera_override, map_frame):
             file=sys.stderr,
             flush=True,
         )
-        if args.force_track_bench:
-            # Forced TRACK microbench never takes BOOT/LOST VPR; keep MegaLoc off GPU
-            # so its cost is not attributed to the matching path being measured.
-            ensure = getattr(tracker, "ensure_xfeat", None) or getattr(tracker, "ensure_edm", None)
-            if callable(ensure):
-                ensure()
-        else:
-            tracker.ensure_models()
+        tracker.ensure_models()
 
         benchmark_seed = _prepare_benchmark_seed(args, tracker, xmap)
     return (
@@ -1125,7 +953,7 @@ def _build_success_payload(
         if capture_stamp is not None
         else worker_read_done_mono_ns
     )
-    return {
+    payload = {
         "seq": seq,
         "frame_id": f"worker-{seq}",
         "capture_mono_ns": capture_mono_ns,
@@ -1230,20 +1058,6 @@ def _build_success_payload(
         "pnp_skipped": info.get("pnp_skipped"),
         "pnp_workers": info.get("pnp_workers"),
         "edm_host_feature_cache": info.get("host_feature_cache"),
-        "neuflow_stage": info.get("neuflow_stage"),
-        "neuflow_anchor_count": info.get("neuflow_anchor_count"),
-        "neuflow_flow_ms": info.get("neuflow_flow_ms"),
-        "neuflow_gpu_ms": info.get("neuflow_gpu_ms"),
-        "projection_fallback": info.get("projection_fallback"),
-        "projection_reason": info.get("projection_reason"),
-        "projection_radius_px": info.get("projection_radius_px"),
-        "projection_anchor_count": info.get("projection_anchor_count"),
-        "projection_visible_count": info.get("projection_visible_count"),
-        "projection_match_count": info.get("projection_match_count"),
-        "projection_best_inliers": info.get("projection_best_inliers"),
-        "projection_project_ms": info.get("projection_project_ms"),
-        "projection_feature_ms": info.get("projection_feature_ms"),
-        "projection_match_ms": info.get("projection_match_ms"),
         # Async fast/slow accounting. A starved fast path, a slow thread that
         # died, and a slow path that simply never matched all look like a wall
         # of NO_ANCHOR from outside; without these the only way to tell them
@@ -1257,6 +1071,11 @@ def _build_success_payload(
         "async_anchor_rejects": info.get("slow_anchor_rejects"),
         "async_inline_runs": info.get("slow_inline_runs"),
     }
+    # Direct-backend two-rate diagnostics. Copied only when the tracker sets them.
+    for key in DIRECT_INFO_FIELDS:
+        if key in info:
+            payload[key] = info[key]
+    return payload
 
 
 def _build_exception_payload(
@@ -1451,47 +1270,6 @@ def _process_worker_frame(
     return payload, worker_fatal, previous_runtime_mode
 
 
-def _fused_odometry_sample_from_request(fused, capture_stamp, *, now_mono=None):
-    """Build pose-guided IMU/GNSS from independent acquisition stamps."""
-    if fused is None:
-        return None
-    stamp = getattr(fused, "stamp", None)
-    if stamp is None:
-        return None
-    try:
-        stamp = float(stamp)
-    except (TypeError, ValueError, OverflowError):
-        return None
-    now = time.monotonic() if now_mono is None else float(now_mono)
-    if not math.isfinite(now) or not math.isfinite(stamp) or stamp <= 0.0 or stamp > now:
-        return None
-    if capture_stamp is not None:
-        try:
-            capture = float(capture_stamp)
-        except (TypeError, ValueError, OverflowError):
-            return None
-        if not math.isfinite(capture) or abs(stamp - capture) > MAX_FUSED_SYNC_ERROR_S:
-            return None
-    try:
-        from pose_guided.types import FusedOdometrySample
-    except ImportError:
-        return None
-    return FusedOdometrySample.from_anafi(
-        timestamp=stamp,
-        roll=fused.roll,
-        pitch=fused.pitch,
-        yaw=fused.yaw,
-        speed_north=fused.speed_north,
-        speed_east=fused.speed_east,
-        speed_down=fused.speed_down,
-        gps_timestamp=fused.gps_stamp,
-        latitude=fused.latitude,
-        longitude=fused.longitude,
-        altitude=fused.altitude,
-        latitude_accuracy=fused.latitude_accuracy,
-        longitude_accuracy=fused.longitude_accuracy,
-        altitude_accuracy=fused.altitude_accuracy,
-    )
 
 
 def _tracker_matcher(tracker):
@@ -1603,12 +1381,7 @@ def _run_worker_loop(
         request = _read_benchmark_request(args)
         if request is None:
             break
-        benchmark_mode_requested, capture_stamp, fused = request
-        sample = _fused_odometry_sample_from_request(fused, capture_stamp)
-        if sample is not None:
-            observe = getattr(tracker, "observe_fused_state", None)
-            if callable(observe):
-                observe(sample)
+        benchmark_mode_requested, capture_stamp, _fused = request
 
         frame = _read_worker_frame(args, frame_buffer, frame_shm, frame_size)
         if frame is None:

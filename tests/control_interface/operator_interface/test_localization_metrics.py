@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 from localization_metrics import (
     CIRCUIT_BREAKER_STATES,
+    DIRECT_INFO_FIELDS,
     CUDA_SAMPLE_MIN_INTERVAL_S,
     RESULT_FIELDS,
     RESTART_REASONS,
@@ -289,6 +290,67 @@ def test_stage_breakdown_reaches_the_session_log() -> None:
         + record["pnp_ms"]
     )
     assert named <= record["total_ms"] <= record["core_wall_ms"]
+
+
+def test_relocalizer_timing_reaches_the_session_log() -> None:
+    # `reloc.period_s` only bites while the background relocalizer is idle, so
+    # tuning it on a machine needs that worker's own latency. Without these
+    # fields the cycle could only be inferred from the spacing of RELOC_SEED
+    # frames, which measures handovers rather than jobs and goes silent exactly
+    # when a handover is dropped.
+    reloc = {
+        "reloc_ms": 174.1,
+        "reloc_busy": True,
+        "reloc_delivered": True,
+        "reloc_submitted": False,
+        "handover_points": 480,
+        "handover_dropped": 0,
+        "reloc_status": "LOCALIZED_STRONG",
+    }
+    assert set(reloc) <= set(RESULT_FIELDS)
+
+    record = build_localization_metric_record(
+        {"success": True, "wall_ms": 7.7, "core_wall_ms": 7.7, **reloc},
+        metric_mono_ns=1_000_000_000,
+        loc_fps=16.6,
+        submit_ok=1,
+        submit_skip_busy=0,
+        submit_busy_attempts=0,
+    )
+    for key, value in reloc.items():
+        assert record[key] == value
+
+
+def test_direct_fast_loop_stage_split_closes() -> None:
+    """track/pnp/vo must account for the tracker total, which fits the worker span."""
+
+    stages = {"track_ms": 2.4, "pnp_ms": 1.8, "vo_ms": 0.3, "total_ms": 5.1}
+    assert set(stages) <= set(RESULT_FIELDS)
+
+    record = build_localization_metric_record(
+        {"success": True, "wall_ms": 7.7, "core_wall_ms": 7.7, **stages},
+        metric_mono_ns=1_000_000_000,
+        loc_fps=16.6,
+        submit_ok=1,
+        submit_skip_busy=0,
+        submit_busy_attempts=0,
+    )
+    named = record["track_ms"] + record["pnp_ms"] + record["vo_ms"]
+    assert named <= record["total_ms"] <= record["core_wall_ms"]
+
+
+def test_a_non_direct_result_gains_no_direct_field() -> None:
+    """The direct fields are opt-in: an edm/xfeat record must not grow them."""
+
+    record = build_localization_metric_record(
+        {"success": True, "wall_ms": 26.3, "core_wall_ms": 26.3, "match_ms": 17.0},
+        metric_mono_ns=1_000_000_000,
+        loc_fps=8.0,
+        submit_ok=1,
+        submit_skip_busy=0,
+        submit_busy_attempts=0,
+    )
+    assert not set(DIRECT_INFO_FIELDS) & set(record)
 
 
 def test_live_status_is_written_for_a_typed_result(tmp_path, monkeypatch) -> None:

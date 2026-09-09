@@ -37,8 +37,8 @@ from site_profile import (
 
 _REQUIRED_ASSETS = (
     ("map_ply", "點雲地圖"),
-    ("localization_bundle", "EDM 定位 bundle"),
-    ("localizer_profile", "EDM runtime profile"),
+    ("localization_bundle", "定位 bundle"),
+    ("localizer_profile", "定位 runtime profile"),
     ("map_reference_poses", "參考影像位姿"),
     # Dropping this on import made every managed site fall back to the legacy
     # "GLOMAP -Y is up" guess, which is 22.51 deg wrong on target_site_v1.
@@ -683,7 +683,8 @@ def _validate_reference_poses(
     orphans = sorted(set(names) - set(poses))
     if orphans:
         raise ValueError(
-            f"{len(orphans)} EDM bundle reference(s) have no pose, first: {orphans[0]}"
+            f"{len(orphans)} localization bundle reference(s) have no pose, "
+            f"first: {orphans[0]}"
         )
     for name, pose in poses.items():
         if not isinstance(pose, dict):
@@ -715,16 +716,18 @@ def _validate_reference_poses(
 _DEPLOY_RESULT_PREFIX = "SFM_ASSET_RESULT:"
 
 
+_DEPLOY_CODE_ROOT = Path(__file__).resolve().parents[2] / "定位演算法" / "deploy_code"
+
+
 def _run_deploy_inspector(
-    path: Path, expression: str, arguments: tuple[str, ...] = ()
+    path: Path,
+    expression: str,
+    arguments: tuple[str, ...] = (),
+    *,
+    deploy_package: str = "sfm_glomap_deploy",
 ) -> object:
     """Run production asset code without mutating the UI process import path."""
-    deploy = (
-        Path(__file__).resolve().parents[2]
-        / "定位演算法"
-        / "deploy_code"
-        / "sfm_glomap_deploy"
-    )
+    deploy = _DEPLOY_CODE_ROOT / deploy_package
     try:
         completed = subprocess.run(
             [
@@ -743,11 +746,11 @@ def _run_deploy_inspector(
             check=False,
         )
     except (OSError, subprocess.SubprocessError) as exc:
-        raise ValueError(f"EDM asset inspector failed for {path}: {exc}") from exc
+        raise ValueError(f"deploy asset inspector failed for {path}: {exc}") from exc
     if completed.returncode != 0:
         detail = (completed.stderr or completed.stdout).strip()[-2000:]
         raise ValueError(
-            f"EDM asset inspector rejected {path} (exit {completed.returncode}): {detail}"
+            f"deploy asset inspector rejected {path} (exit {completed.returncode}): {detail}"
         )
     payload = next(
         (
@@ -758,44 +761,59 @@ def _run_deploy_inspector(
         None,
     )
     if payload is None:
-        raise ValueError(f"EDM asset inspector returned no result for {path}")
+        raise ValueError(f"deploy asset inspector returned no result for {path}")
     try:
         return json.loads(payload)
     except json.JSONDecodeError as exc:
-        raise ValueError(f"EDM asset inspector returned invalid JSON for {path}") from exc
+        raise ValueError(
+            f"deploy asset inspector returned invalid JSON for {path}"
+        ) from exc
 
 
-def inspect_edm_bundle(
+
+def inspect_direct_bundle(
     path: Path, expected_sha256: str | None = None
 ) -> tuple[str, ...]:
-    """Use the production EDM loader so import and runtime accept the same artifact."""
+    """Structurally validate a direct-localization-bundle/v1 with its own loader."""
     expression = (
-        "import json,sys; from reloc_localizer_edm import EDMRelocMap; "
-        "bundle=EDMRelocMap.load(sys.argv[1], sys.argv[2] or None); "
-        f"print({_DEPLOY_RESULT_PREFIX!r}+json.dumps(bundle.ref_names))"
+        "import json,sys; from direct_paths import vendor_sys_path; vendor_sys_path(); "
+        "from direct_map import DirectMapAssets; "
+        "assets=DirectMapAssets.load(sys.argv[1], expected_sha256=sys.argv[2] or None); "
+        f"print({_DEPLOY_RESULT_PREFIX!r}+json.dumps(list(assets.ref_names)))"
     )
     try:
-        names = _run_deploy_inspector(path, expression, (expected_sha256 or "",))
+        names = _run_deploy_inspector(
+            path,
+            expression,
+            (expected_sha256 or "",),
+            deploy_package="sfm_direct_deploy",
+        )
         if not isinstance(names, list) or not all(isinstance(name, str) for name in names):
             raise ValueError("production loader returned invalid reference names")
         return tuple(names)
     except Exception as exc:
-        raise ValueError(f"invalid EDM localization bundle {path}: {exc}") from exc
+        raise ValueError(f"invalid direct localization bundle {path}: {exc}") from exc
 
 
-def load_edm_runtime_profile(path: Path) -> dict:
+def load_direct_runtime_profile(path: Path) -> dict:
+    """Validate a direct-deployment-profile/v1 through the production loader."""
     expression = (
-        "import json,sys; from edm_profile import load_edm_production_profile; "
-        "profile=load_edm_production_profile(sys.argv[1]); "
-        f"print({_DEPLOY_RESULT_PREFIX!r}+json.dumps(profile))"
+        "import json,sys; from direct_paths import vendor_sys_path; vendor_sys_path(); "
+        "from direct_profile import load_direct_profile; "
+        "profile=load_direct_profile(sys.argv[1]); "
+        f"print({_DEPLOY_RESULT_PREFIX!r}+json.dumps("
+        "{'name': str(profile.name), 'map_scale': float(profile.map_scale), "
+        "'reloc_top_k': int(profile.reloc.top_k)}))"
     )
     try:
-        profile = _run_deploy_inspector(path, expression)
+        profile = _run_deploy_inspector(
+            path, expression, deploy_package="sfm_direct_deploy"
+        )
         if not isinstance(profile, dict):
             raise ValueError("production loader returned a non-object profile")
         return profile
     except Exception as exc:
-        raise ValueError(f"invalid EDM runtime profile {path}: {exc}") from exc
+        raise ValueError(f"invalid direct runtime profile {path}: {exc}") from exc
 
 
 def _validate_site_package_profile(profile: SiteProfile) -> None:
@@ -810,8 +828,12 @@ def _validate_site_package_profile(profile: SiteProfile) -> None:
         "poles_json": profile.poles_json,
         "megaloc_cache": profile.megaloc_cache,
         "track_landmarks": profile.track_landmarks,
-        "localizer_deploy_dir": profile.localizer_deploy_dir,
     }
+    if profile.localizer != "direct":
+        # The direct runtime lives outside every site folder (sfm_direct_deploy),
+        # so its deploy dir is part of the package contract rather than a
+        # separately managed asset the importer must reject.
+        separate_assets["localizer_deploy_dir"] = profile.localizer_deploy_dir
     configured_separately = sorted(
         key for key, value in separate_assets.items() if value is not None
     )
@@ -849,12 +871,12 @@ class LocalSitePackageProvider:
         self,
         managed_root: str | Path,
         *,
-        bundle_inspector: Callable[[Path, str], tuple[str, ...]] = inspect_edm_bundle,
-        edm_profile_loader: Callable[[Path], dict] = load_edm_runtime_profile,
+        bundle_inspector: Callable[[Path, str], tuple[str, ...]] = inspect_direct_bundle,
+        profile_loader: Callable[[Path], dict] = load_direct_runtime_profile,
     ):
         self.managed_root = Path(managed_root).expanduser().resolve()
         self.bundle_inspector = bundle_inspector
-        self.edm_profile_loader = edm_profile_loader
+        self.profile_loader = profile_loader
 
     def validate_folder(self, folder: str | Path) -> ValidatedSitePackage:
         root = Path(folder).expanduser().resolve()
@@ -867,7 +889,7 @@ class LocalSitePackageProvider:
         _validate_site_package_profile(profile)
         checks = _validate_site_package_assets(profile, root)
         _validate_ply(profile.map_ply)
-        self.edm_profile_loader(profile.localizer_profile)
+        self.profile_loader(profile.localizer_profile)
         bundle_sha256 = profile.asset_sha256.localization_bundle
         assert bundle_sha256 is not None
         names = self.bundle_inspector(profile.localization_bundle, bundle_sha256)
@@ -916,15 +938,20 @@ class LocalSitePackageProvider:
             tempfile.mkdtemp(prefix=f".{report.site_id}-", dir=self.managed_root)
         )
         try:
+            if source_profile.localizer != "direct":
+                raise ValueError(
+                    "only direct site packages can be imported; "
+                    f"got localizer {source_profile.localizer!r}"
+                )
             copies = {
                 "map_ply": (source_profile.map_ply, Path("map/map.ply")),
                 "localization_bundle": (
                     source_profile.localization_bundle,
-                    Path("localization/localization_bundle.pt"),
+                    Path("localization/direct_bundle.json"),
                 ),
                 "localizer_profile": (
                     source_profile.localizer_profile,
-                    Path("localization/edm_runtime_profile.json"),
+                    Path("localization/direct_localizer_profile.json"),
                 ),
                 "map_reference_poses": (
                     source_profile.map_reference_poses,
@@ -950,13 +977,16 @@ class LocalSitePackageProvider:
             coordinate = source_profile.coordinate_frame
             camera = source_profile.query_camera
             assert coordinate is not None and camera is not None
+            deploy_dir = source_profile.localizer_deploy_dir
+            if deploy_dir is None:
+                raise ValueError("direct site package must declare localizer_deploy_dir")
             profile_json = {
                 "schema_version": 2,
                 "site_id": report.site_id,
                 "display_name": report.display_name,
-                "localizer": "edm",
-                "localizer_deploy_dir": None,
-                "localizer_profile": "localization/edm_runtime_profile.json",
+                "localizer": "direct",
+                "localizer_deploy_dir": os.path.relpath(deploy_dir.resolve(), destination),
+                "localizer_profile": "localization/direct_localizer_profile.json",
                 "map_reference_poses": "localization/reference_poses.json",
                 "map_align": "localization/T_align_gravity.json",
                 "query_camera": _camera_dict(camera),
@@ -983,7 +1013,7 @@ class LocalSitePackageProvider:
                 "assets": {
                     "map_ply": "map/map.ply",
                     "route_json": None,
-                    "localization_bundle": "localization/localization_bundle.pt",
+                    "localization_bundle": "localization/direct_bundle.json",
                     "megaloc_cache": None,
                     "track_landmarks": None,
                     "poles_json": None,

@@ -6,8 +6,8 @@ sim-validated separately; this file joins them into a single runnable real-fligh
 entrypoint on ONE Olympe connection:
 
     OlympePdrawGrabber (720p live stream)              [olympe_frame_source.py]
-      -> site-selected EDM or XFeat production tracker
-             MegaLoc retrieval -> local matching -> PnP, BOOT_INIT -> TRACK
+      -> site-selected direct production tracker
+             KLT fast loop with MegaLoc/EDM reloc handover
       -> map-frame heading fusion  (visual camera ray <-> Olympe yaw)
       -> RouteAutoController.step(pose) -> Command      [real_path_follow_controller.py]
              FOLLOW / REJOIN-nearest-point / LAND  (keeps drone ON the drawn route)
@@ -15,7 +15,7 @@ entrypoint on ONE Olympe connection:
       -> drone(PCMD(...))            same single connection used for the video
 
 SDK      : Parrot Olympe (Ground SDK).  https://developer.parrot.com/docs/olympe/
-Map      : fused forward+reverse GLOMAP; reloc bundle reloc_map_xfeat_tri.pt (1920 refs).
+Map      : river direct release; reloc manifest localization/direct_bundle.json.
 Path     : pre-drawn polyline  safezone/flight_path.json  (Blender Z-up waypoints).
 Frame    : raw GLOMAP  horizontal = X/Z, gravity-up = -Y   (matches RouteAutoController).
 
@@ -110,16 +110,12 @@ from safety_command import (  # noqa: E402
 )
 # 2026-08-06 audit: a hard-coded external-site probe used to sit here and,
 # whenever that developer-specific directory happened to exist, silently swapped
-# DEFAULT_BUNDLE and DEFAULT_MEGALOC_CACHE to the football-field site regardless of
+# bundle/cache defaults to the football-field site regardless of
 # which site the operator had chosen. The live launcher refuses to start without an
 # explicit --site-profile for exactly this reason ("field assets must never fall
 # back to a different site map/route/bundle"); this module must not contradict it.
-DEFAULT_BUNDLE = (
-    LOC_ROOT / "bundles" / "current_reloc_map_updated_v3.pt"
-    if (LOC_ROOT / "bundles" / "current_reloc_map_updated_v3.pt").exists()
-    else LOC_ROOT / "bundles" / "base_reloc_map_xfeat_tri.pt"
-)
-DEFAULT_MEGALOC_CACHE = DEPLOY_ROOT / "megaloc_ref_desc_glomap_fused_322.npy"
+# There are no bundle defaults left: the direct localizer only runs on the
+# site-selected bundle passed through SFM_RELOC_BUNDLE.
 DEFAULT_PATH_JSON = (
     MISSION_ROOT / "outputs" / "current_safezone" / "flight_path.json"
     if (MISSION_ROOT / "outputs" / "current_safezone" / "flight_path.json").exists()
@@ -132,16 +128,10 @@ DEFAULT_POLES_JSON = (
 )
 
 # artifact paths (same ones sim_dashboard_real.py loads)
-XBUN = os.environ.get("SFM_RELOC_BUNDLE", str(DEFAULT_BUNDLE))
-MEG = os.environ.get("SFM_MEGALOC_CACHE", str(DEFAULT_MEGALOC_CACHE))
-REFERENCE_INDEX = os.environ.get("SFM_REFERENCE_INDEX", "").strip()
-REFERENCE_INDEX_SHA256 = os.environ.get(
-    "SFM_REFERENCE_INDEX_SHA256", ""
-).strip()
+XBUN = os.environ.get("SFM_RELOC_BUNDLE", "").strip()
 PATH_JSON = os.environ.get("SFM_FLIGHT_PATH_JSON", str(DEFAULT_PATH_JSON))
 POLES_JSON = os.environ.get("SFM_POLES_JSON", str(DEFAULT_POLES_JSON))
 MAP_ALIGN = os.environ.get("SFM_MAP_ALIGN", "").strip()
-LOCALIZER_BACKEND = os.environ.get("SFM_LOCALIZER_BACKEND", "xfeat").strip().lower()
 LOCALIZER_PROFILE = os.environ.get("SFM_LOCALIZER_PROFILE", "").strip()
 BUNDLE_SHA256 = os.environ.get("SFM_BUNDLE_SHA256", "").strip()
 FLIGHT_CONTRACT_JSON = os.environ.get("SFM_FLIGHT_CONTRACT_JSON", "").strip()
@@ -150,28 +140,15 @@ DRONE_IP_REAL = "192.168.42.1"
 DRONE_IP_SKYCTRL = "192.168.53.1"
 DRONE_IP_SIM = "10.202.0.1"                     # Parrot Sphinx simulator
 
-# Same physical camera as the football-field map, calibrated at 1280x720.
-# FULL_OPENCV params: fx,fy,cx,cy,k1,k2,p1,p2,k3,k4,k5,k6.
-CAM_720 = (
-    "FULL_OPENCV", 1280, 720,
-    [
-        960.4853099760471, 958.1961747147875,
-        670.8167651412149, 358.7191813450141,
-        -0.016359355216362784, 0.256336300878371,
-        -0.006099082030819077, 0.019509803298460405,
-        -0.1198628127364991, 0.0, 0.0, 0.0,
-    ],
-)
-
 
 def _reject_json_constant(value: str):
     raise ValueError(f"non-finite JSON number is not allowed: {value}")
 
 
-def query_camera_from_environment(default=CAM_720, *, required: bool = False):
+def query_camera_from_environment(default=None, *, required: bool = False):
     raw = os.environ.get("SFM_QUERY_CAMERA_JSON", "").strip()
     if not raw:
-        if required:
+        if required or default is None:
             raise ValueError("flight contract requires an explicit query camera")
         return default
     try:
@@ -2792,24 +2769,6 @@ def run_loop(hooks: LoopHooks, ctrl, waypoints, yaw_sign: int = 1, verbose: bool
 # ---------------------------------------------------------------------------
 # Builders
 
-def production_config():
-    """The LOCKED production sweep (user's final decision). These
-    match ProductionConfig() defaults; pinned here so the deployment entrypoint is
-    self-documenting and a future default change can't silently alter real flights.
-        BOOT_INIT/LOST : MegaLoc top30 -> XFeat -> LighterGlue -> PnP
-        TRACK/WEAK     : XFeat -> LighterGlue adaptive 3->5 -> PnP
-
-    2026-07-14: the mutual-NN fast pass was REMOVED from production on accuracy
-    grounds (operator decision). LighterGlue now runs on every frame, which is the
-    path the 20260714 reference trajectories were measured against. The temporal
-    anchor cache is only consulted by the NN fast pass, so it is now inert; its
-    settings are kept so matcher_mode="nn_then_lg" stays reproducible for benchmarks.
-    """
-    from production_localizer_factory import production_xfeat_config
-
-    return production_xfeat_config()
-
-
 def build_localizer(frame_source, cam_tuple=None):
     from production_localizer_factory import build_production_localizer
     import real_path_follow_controller as rpf
@@ -2824,12 +2783,6 @@ def build_localizer(frame_source, cam_tuple=None):
             contract_camera.get("params"),
         )
     bundle_sha256 = contract.get("localization_bundle_sha256") or BUNDLE_SHA256
-    reference_index = contract.get("reference_index") or REFERENCE_INDEX or None
-    reference_index_sha256 = (
-        contract.get("reference_index_sha256")
-        or REFERENCE_INDEX_SHA256
-        or None
-    )
     if (
         contract.get("approved") is True
         and BUNDLE_SHA256
@@ -2838,15 +2791,17 @@ def build_localizer(frame_source, cam_tuple=None):
         raise ValueError(
             "SFM_BUNDLE_SHA256 does not match the approved flight contract"
         )
+    if not XBUN:
+        raise ValueError(
+            "flight localization requires SFM_RELOC_BUNDLE "
+            "(the site-selected direct_bundle.json); no bundle fallback exists"
+        )
     built = build_production_localizer(
-        backend=LOCALIZER_BACKEND,
+        backend="direct",
         bundle=XBUN,
         frame_source=frame_source,
-        camera_tuple=cam_tuple or query_camera_from_environment(),
+        camera_tuple=cam_tuple or query_camera_from_environment(required=True),
         bundle_sha256=bundle_sha256 or None,
-        megaloc_cache=MEG or None,
-        reference_index=reference_index,
-        reference_index_sha256=reference_index_sha256,
         production_profile=LOCALIZER_PROFILE or None,
         production_profile_sha256=contract.get("localizer_profile_sha256"),
         map_frame=(rpf.load_map_frame(MAP_ALIGN) if MAP_ALIGN else None),

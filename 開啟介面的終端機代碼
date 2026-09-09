@@ -1,8 +1,8 @@
   河濱串流模擬：
 
   cd /home/allen/localization
-  SFM_SITE_PROFILE="/home/allen/localization/地圖檔/場域/river_site/site_profile.json" \
-  VIDEO="/home/allen/localization/模擬器/測試影片/P1680168.MP4" \
+  SFM_SITE_PROFILE="/home/allen/localization/地圖檔/場域/river_site/releases/river_gluemap_all8_direct_20260908/site_profile.json" \
+  VIDEO="/home/allen/localization/模擬器/測試影片/720p/P1670167_720p.MP4" \
   ./控制介面程式/影片模擬串流/啟動.sh
 
   IMU 飛行測試（手動搖桿飛行 + 開定位，全程錄 IMU / 搖桿 / 畫面）：

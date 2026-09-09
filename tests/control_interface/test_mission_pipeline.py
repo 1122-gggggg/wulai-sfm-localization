@@ -137,7 +137,9 @@ def test_selftest_remains_profile_free():
         )
         is None
     )
-    assert args.bundle.endswith("your_site_reloc_map_edm.pt")
+    # 舊 edm/xfeat 後端已刪除，只剩 direct：selftest 仍保持 profile-free，
+    # 只是預設 bundle 換成 direct bundle。
+    assert args.bundle.endswith("your_site_direct_bundle.json")
 
 
 def test_main_dispatches_profile_free_selftest_without_external_process(monkeypatch):
@@ -394,10 +396,13 @@ def test_scale_free_flight_contract_exports_no_map_scale_and_verifies_hashes(tmp
     map_ply = tmp_path / "map.ply"
     bundle = tmp_path / "bundle.pt"
     reference_poses = tmp_path / "reference_poses.json"
-    localizer_profile = tmp_path / "edm.json"
+    localizer_profile = tmp_path / "direct.json"
     map_align = tmp_path / "T_align_gravity.json"
     for path in (map_ply, bundle, reference_poses, localizer_profile, map_align):
         path.write_bytes(b"x")
+    # direct 後端把 localizer_deploy_dir 列為 flight readiness 必要項；
+    # 本測試只關心 contract 與 hash，用 tmp 空目錄佔位即可（只檢查 is_dir）。
+    (tmp_path / "deploy").mkdir()
     control_points = [
         [0.0, 0.0, 0.0],
         [2.0, 0.0, 0.0],
@@ -455,8 +460,9 @@ def test_scale_free_flight_contract_exports_no_map_scale_and_verifies_hashes(tmp
         "schema_version": 2,
         "site_id": "alpha",
         "display_name": "Alpha",
-        "localizer": "edm",
-        "localizer_profile": "edm.json",
+        "localizer": "direct",
+        "localizer_deploy_dir": "deploy",
+        "localizer_profile": "direct.json",
         "map_reference_poses": "reference_poses.json",
         "map_align": "T_align_gravity.json",
         "coordinate_frame": {
@@ -593,7 +599,7 @@ def test_scale_free_flight_contract_exports_no_map_scale_and_verifies_hashes(tmp
     env = mission_pipeline.env_with_mission(args, profile)
 
     assert profile is not None
-    assert env["SFM_LOCALIZER_BACKEND"] == "edm"
+    assert env["SFM_LOCALIZER_BACKEND"] == "direct"
     assert env["SFM_BUNDLE_SHA256"] == digest(bundle)
     contract = json.loads(env["SFM_FLIGHT_CONTRACT_JSON"])
     assert "map_units_per_meter" not in contract
@@ -628,10 +634,14 @@ def test_shadow_readiness_verifies_pinned_assets_without_granting_flight_approva
         "localization_bundle": tmp_path / "bundle.pt",
         "map_reference_poses": tmp_path / "reference_poses.json",
         "map_align": tmp_path / "T_align_gravity.json",
-        "localizer_profile": tmp_path / "edm.json",
+        "localizer_profile": tmp_path / "direct.json",
     }
     for path in paths.values():
         path.write_bytes(path.name.encode("utf-8"))
+    # flight_readiness_errors（經 shadow_authorization_blockers 呼叫）會直接讀
+    # profile.localizer_deploy_dir；direct 語意下用 tmp 空目錄佔位。
+    deploy_dir = tmp_path / "deploy"
+    deploy_dir.mkdir()
     route = tmp_path / "route.json"
     route.write_text(json.dumps({
         "schema": "sfm-flight-route/v1",
@@ -650,7 +660,8 @@ def test_shadow_readiness_verifies_pinned_assets_without_granting_flight_approva
     profile = SimpleNamespace(
         schema_version=2,
         site_id="alpha",
-        localizer="edm",
+        localizer="direct",
+        localizer_deploy_dir=deploy_dir,
         map_ply=paths["map_ply"],
         localization_bundle=paths["localization_bundle"],
         route_json=route,

@@ -21,7 +21,7 @@ ROOT = SCRIPT.parents[2]
 RIVER_MAP = (
     ROOT
     / "地圖檔/場域/river_site/releases"
-    / "river_gluemap_all8_direct_20260831/map/map.ply"
+    / "river_gluemap_all8_direct_20260908/map/map.ply"
 )
 RIVER_PROFILE = ROOT / "地圖檔/場域/river_site/site_profile.json"
 

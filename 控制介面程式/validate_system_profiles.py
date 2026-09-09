@@ -18,7 +18,7 @@ ROOT = Path(__file__).resolve().parent
 WORKSPACE_ROOT = ROOT.parent
 PROFILES = ROOT / "site_profiles"
 CANONICAL_PROFILE_DIR = WORKSPACE_ROOT / "地圖檔" / "場域"
-TEMPLATE_NAMES = {"example_site_edm.json"}
+TEMPLATE_NAMES: set[str] = set()
 # A profile may be AUTO-approved only once a route has been redrawn on the
 # current map. Operator decision 2026-09-05: rather than hand-editing a list of
 # sites for every route, accept the approval the route editor itself recorded --

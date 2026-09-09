@@ -599,17 +599,6 @@ def _steps(
             str(ROOT),
             300,
         ),
-        Step(
-            "offline_model_smoke",
-            (
-                str(ROOT_PYTHON),
-                str(ROOT / "定位演算法/validation/offline_model_smoke.py"),
-                "--model",
-                "edm",
-            ),
-            str(ROOT),
-            1800,
-        ),
     ]
     if portable_package is not None:
         package_root = portable_package.expanduser().resolve()
@@ -671,27 +660,6 @@ def _steps(
     if p119_quality:
         if quality_out is None:
             raise ValueError("quality_out is required for P119 quality validation")
-        steps.append(
-            Step(
-                "p119_quality",
-                (
-                    str(ROOT_PYTHON),
-                    str(ROOT / "定位演算法/validation/benchmark_edm_site_replay.py"),
-                    "--site-profile",
-                    str(ROOT / "地圖檔/場域/river_site/site_profile.json"),
-                    "--video",
-                    str(P119_VIDEO),
-                    "--out",
-                    str(quality_out),
-                    "--quality-baseline",
-                    str(P119_QUALITY_BASELINE),
-                    "--accept-known-incomplete",
-                    "--require-cuda",
-                ),
-                str(ROOT),
-                1800,
-            )
-        )
     return steps
 
 

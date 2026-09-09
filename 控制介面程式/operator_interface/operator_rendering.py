@@ -56,6 +56,11 @@ class MapRenderContext:
     #: Telemetry gimbal pitch in degrees, positive up, for the yaw-only
     #: fallback. Measured camera axes carry their own attitude and ignore it.
     gimbal_pitch_deg: Any = None
+    #: Display-only weak trail (VO_ONLY / DEAD_RECKON / WEAK_TRACK /
+    #: PREDICTED_ONLY mirrors). Parallel lists, same cap as history. Defaults
+    #: keep every existing constructor working.
+    history_weak: Sequence[object] = ()
+    history_weak_health: Sequence[str] = ()
 
 
 #: Camera picture rectangle: a real plane in map space, oriented by the full
@@ -220,7 +225,10 @@ def camera_view_plane_corners(
 def _draw_route_and_history(draw: Any, context: MapRenderContext) -> None:
     route_n = len(context.route_pts)
     history_n = len(context.history)
-    if not route_n and not history_n:
+    weak_trail = list(getattr(context, "history_weak", None) or ())
+    weak_health = list(getattr(context, "history_weak_health", None) or ())
+    weak_n = len(weak_trail)
+    if not route_n and not history_n and not weak_n:
         return
 
     parts = []
@@ -230,6 +238,14 @@ def _draw_route_and_history(draw: Any, context: MapRenderContext) -> None:
         parts.append(
             np.array(
                 [np.asarray(point, dtype=float)[:3] for point in context.history],
+                dtype=float,
+            )
+            .reshape(-1, 3)
+        )
+    if weak_n:
+        parts.append(
+            np.array(
+                [np.asarray(point, dtype=float)[:3] for point in weak_trail],
                 dtype=float,
             )
             .reshape(-1, 3)
@@ -255,14 +271,39 @@ def _draw_route_and_history(draw: Any, context: MapRenderContext) -> None:
             draw.ellipse((x - 3, y - 3, x + 3, y + 3), fill=context.route_color)
 
     if history_n > 1:
-        history_screen = list(zip(screen_x[route_n:], screen_y[route_n:]))
+        history_screen = list(zip(screen_x[route_n:route_n + history_n],
+                                  screen_y[route_n:route_n + history_n]))
         draw.line(history_screen, fill="#5aa7e8", width=3)
-        for (x, y), health in zip(history_screen, context.history_health):
+        # Explicit alignment: history and history_health are parallel lists,
+        # but a dropped append would make zip() silently swallow the tail.
+        # Draw markers only over the explicitly shared prefix.
+        dot_n = min(history_n, len(context.history_health))
+        for index in range(dot_n):
+            x, y = history_screen[index]
+            health = context.history_health[index]
             if health and health != "OK":
                 draw.ellipse(
                     (x - 4, y - 4, x + 4, y + 4),
                     fill=context.health_color.get(health, "#e0a92e"),
                 )
+
+    if weak_n:
+        # Weak fixes (VO_ONLY / DEAD_RECKON / WEAK_TRACK / PREDICTED_ONLY):
+        # hollow diamonds in the health colour (DEGRADED amber). A solid dot
+        # is already the non-OK symbol, so weak reusing it would collide;
+        # markers only, no connecting line, so a jump-rejected fix cannot
+        # imply a flown segment that never happened.
+        weak_screen = list(zip(screen_x[route_n + history_n:],
+                               screen_y[route_n + history_n:]))
+        mark_n = min(weak_n, len(weak_health))
+        for index in range(mark_n):
+            colour = context.health_color.get(weak_health[index], "#e0a92e")
+            size = 6
+            draw.polygon(
+                [(x, y - size), (x + size, y), (x, y + size), (x - size, y)],
+                outline=colour,
+                width=2,
+            )
 
 
 def _draw_collision_guard(draw: Any, context: MapRenderContext) -> None:

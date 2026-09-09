@@ -15,12 +15,11 @@
 profile、route、bundle 綁定並解析記錄。
 
 Site profile 原子化綁定地圖、定位 bundle、參考位姿、相機與 runtime profile。
-`localizer` 必須是 deployment registry 已註冊的 backend。正式隨附場域與 portable
-只使用 `edm`；registry 內的 `xfeat` 僅保留研究／舊包遷移，不在 production artifact
-allowlist。schema 會拒絕未知 backend，並依 provider capabilities 驗證
-backend-specific assets。EDM 需要場域 `localizer_profile`；XFeat 不接受 EDM
-profile，且兩者都以 bundle SHA 綁定。切換 backend 會形成新 snapshot，當次 preflight
-必須重新完成。
+`localizer` 必須是 deployment registry 已註冊的 backend，目前只有 `direct`。
+schema 會拒絕未知 backend，並依 provider capabilities 驗證 backend-specific
+assets。direct 需要場域 `localizer_profile`（direct-deployment-profile/v1）與
+`localizer_deploy_dir`（sfm_direct_deploy），並以 bundle SHA 綁定。切換 backend
+會形成新 snapshot，當次 preflight 必須重新完成。
 
 ## Raw-map 6DoF 導航契約（AUTO）
 
@@ -45,8 +44,8 @@ symlink 的檔案或父目錄，一律拒絕。若要選擇不同 workspace，�
 `SFM_WORKSPACE_ROOT`，不要依賴隱含的開發環境路徑。
 地面定位可在 `flight.approved=false` 下使用；自主飛行只有在所有必要欄位與檔案
 完整、驗證通過，且 resolver 判定 mission selection `flight_ready=true` 時才可進入。
-目前河濱預設是 B0+P116/P117 fringe 地圖，舊 official69 航線已刪除，尚未重畫
-新座標系 route，因此不是 flight-ready。ANAFI 羅盤改由真機韌體即時回讀，校正
+目前河濱預設是全八段 direct 地圖（20260908 release），新座標系、尚無 route，
+因此不是 flight-ready。ANAFI 羅盤改由真機韌體即時回讀，校正
 完成且狀態有效後自動通過 preflight 第一步；其餘步驟仍由操作員當次確認。
 
 ## 換場域資產分界
@@ -54,7 +53,7 @@ symlink 的檔案或父目錄，一律拒絕。若要選擇不同 workspace，�
 | 資產 / 欄位 | 地面定位與介面需求 | 換場域動作 |
 |---|---|---|
 | site profile JSON | 啟動契約必要 | 新增或替換 |
-| `assets.localization_bundle` | EDM 定位核心必要 | 替換為新場域 bundle |
+| `assets.localization_bundle` | direct 定位核心必要 | 替換為新場域 bundle manifest |
 | `query_camera` | portable full-runtime 必要 | 填入與影片解析度/裁切流程一致的內參 |
 | `assets.map_ply` | schema、selector 與 UI 必要；不參與 EDM 姿態估計 | 替換顯示點雲 |
 | `localizer_profile` | 可使用固定共用預設 | 只有場域特調且重新驗證時替換 |
@@ -63,14 +62,14 @@ symlink 的檔案或父目錄，一律拒絕。若要選擇不同 workspace，�
 | `poles_json` | 純定位可為 `null` | 有 `inspect_waypoints` 才需要 |
 | legacy `pose_chain.*` | 可保留歷史檔案；raw-map AUTO 不讀取 | 不需建立或更新 |
 | calibration receipt | 只有 vehicle manifest 明確要求時才是 AUTO gate；目前 ANAFI 不要求 | 換 vehicle revision 時依新 manifest 處理 |
-| `megaloc_cache` | EDM 不使用 | 保持 `null`；BoQ descriptors 已在 bundle `ref_global` |
-| `reference_index` | backend-neutral 的大型 reference retrieval index，可選 | EDM/XFeat 可指向 index 的 `SHA256SUMS.json`；同時更新 `asset_sha256.reference_index` |
-| `track_landmarks` | XFeat/projection legacy | 正式 EDM 保持 `null` |
+| `megaloc_cache` | direct 不使用 | 保持 `null`；全域檢索 descriptors 在 release 的 MegaLoc bank |
+| `reference_index` | backend-neutral 的大型 reference retrieval index，可選 | direct 場域保持 `null`；同時更新 `asset_sha256.reference_index` 才可指向 index 的 `SHA256SUMS.json` |
+| `track_landmarks` | 已移除的舊後端遺留欄位 | 保持 `null` |
 | `flight` | 真機自主飛行核准 | route/map 契約與淨空確認後更新 |
 | `hardware_approval` | 綁定場域與硬體身份的 signed v2 收據 | 可選；若存在則保留 receipt、簽章與 trust store 的解析／記錄 |
 
 每個有提供的場域資產都要同步更新 profile 內路徑與 SHA-256。
-換場域不要替換固定 EDM checkpoint、BoQ weights、deploy code、UI 或
+換場域不要替換固定 checkpoint、deploy code、UI 或
 Parrot 模擬器。
 
 ### 現場 raw-map 起航流程
@@ -101,8 +100,8 @@ Parrot 模擬器。
 - `coordinate_frame_id` 唯一識別這一次 SfM 重建；route 必須使用同一 ID。
 - schema v2 永久不接受 `map_units_per_meter`，也不從相機或路徑猜測公尺尺度。
 - `route_clearance_approved=true` 表示整條航線已由現場安全審查確認淨空。
-- `asset_sha256` 必須包含 localization bundle、route、reference poses，
-  EDM 場域另包含 localizer profile；啟用巡檢時也必須包含 `poles_json`。
+`asset_sha256` 必須包含 localization bundle、route、reference poses，
+另包含 direct localizer profile；啟用巡檢時也必須包含 `poles_json`。
   若 profile 提供 `assets.reference_index`，必須指向 index 目錄內的
   `SHA256SUMS.json`，並提供 `asset_sha256.reference_index`。runtime 會再驗證
   manifest 內所有 index 檔案；它是 retrieval 加速資產，不取代 bundle identity
@@ -133,6 +132,6 @@ route JSON 必須是開放 polyline，至少兩個互異且有限的三維 waypo
 `frame` 也可為 `aligned`，但必須明確填寫。範例座標只說明結構，不是可飛航線。
 任何 route 或資產內容更動後，都必須重新計算 profile 中的 SHA-256 並重新審核。
 
-目前河濱 profile 已啟用新地圖定位、唯一的新繪 route 與 raw-map 6DoF 導航；不需
-七點座標校正。到現場仍必須通過四步檢查、確認相機水平朝向等同機頭朝向並逐段低速
+目前河濱 profile 指向全八段 direct 新地圖（未獨立驗證、無 route、未核准飛行）；
+到現場仍必須通過四步檢查、確認相機水平朝向等同機頭朝向並逐段低速
 試飛。烏來與其他場域仍維持 `approved=false`。

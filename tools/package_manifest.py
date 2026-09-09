@@ -36,6 +36,8 @@ EXCLUDED_PARTS = {
     "EDM工具包",
     "inductor_cache",
     "mission_snapshots",
+    # direct 後端的執行期 scratch (see .gitignore); regenerated on every run.
+    "direct_reloc_cache",
     "outputs",
     "package_git",
     # Large binary artifacts kept local only (see .gitignore); not shipped in the manifest.
@@ -57,6 +59,8 @@ EXCLUDED_PREFIXES = (
     # Large source bundle kept local only (see .gitignore); not shipped in the manifest.
     "river-localization-bundle-20260831/",
     "river-localization-bundle-20260831.tar.zst",
+    "river-deploy-5060-20260908/",
+    "river-deploy-5060-20260908.tar.zst",
 )
 SOURCE_EXTERNAL_PARTS = {"offline_wheelhouse", "torch_hub_cache"}
 SOURCE_EXTERNAL_PREFIXES = ("定位演算法/deploy_code/runtime/EDM/weights/",)

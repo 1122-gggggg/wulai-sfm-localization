@@ -14,12 +14,7 @@ from Cryptodome.Signature import eddsa
 
 import flight_operator_app as app
 import mission_pipeline
-from live_localizer_worker import (
-    apply_edm_tracker_profile,
-    load_edm_production_profile,
-    resolve_query_camera_override,
-)
-from edm_localizer_adapter import production_edm_config
+from live_localizer_worker import resolve_query_camera_override
 from production_localizer_factory import validate_camera_tuple
 from hardware_approval_trust import (
     TRUST_STORE_SCHEMA,
@@ -91,24 +86,13 @@ def test_site_profile_resolves_all_paths_relative_to_profile(tmp_path: Path) -> 
     profile = load_site_profile(_write_profile(tmp_path))
 
     assert profile.site_id == "test_site"
-    assert profile.localizer == "edm"
+    assert profile.localizer == "direct"
     assert profile.map_ply == (tmp_path / "assets/map.ply").resolve()
     assert profile.route_json == (tmp_path / "assets/route.json").resolve()
     assert profile.localization_bundle == (tmp_path / "assets/bundle.pt").resolve()
     assert profile.megaloc_cache == (tmp_path / "assets/cache.npy").resolve()
     assert profile.track_landmarks == (tmp_path / "assets/landmarks.npz").resolve()
     assert profile.poles_json == (tmp_path / "assets/poles.json").resolve()
-
-
-def test_site_profile_accepts_registered_xfeat_localizer(tmp_path: Path) -> None:
-    profile_path = _write_profile(tmp_path)
-    raw = json.loads(profile_path.read_text(encoding="utf-8"))
-    raw["localizer"] = "xfeat"
-    profile_path.write_text(json.dumps(raw), encoding="utf-8")
-
-    profile = load_site_profile(profile_path)
-    assert profile.localizer == "xfeat"
-    assert all("localizer_profile" not in error for error in flight_readiness_errors(profile))
 
 
 def test_site_profile_rejects_cache_and_reference_index_together(
@@ -119,7 +103,7 @@ def test_site_profile_rejects_cache_and_reference_index_together(
     index_dir.mkdir()
     (index_dir / "SHA256SUMS.json").write_text("{}", encoding="utf-8")
     raw = json.loads(profile_path.read_text(encoding="utf-8"))
-    raw["localizer"] = "xfeat"
+    raw["localizer"] = "direct"
     raw["assets"]["reference_index"] = "assets/index/SHA256SUMS.json"
     profile_path.write_text(json.dumps(raw), encoding="utf-8")
 
@@ -132,7 +116,7 @@ def test_site_profile_reference_index_must_name_its_manifest(
 ) -> None:
     profile_path = _write_profile(tmp_path)
     raw = json.loads(profile_path.read_text(encoding="utf-8"))
-    raw["localizer"] = "xfeat"
+    raw["localizer"] = "direct"
     raw["assets"].pop("megaloc_cache")
     raw["assets"]["reference_index"] = "assets/index.json"
     profile_path.write_text(json.dumps(raw), encoding="utf-8")
@@ -141,11 +125,11 @@ def test_site_profile_reference_index_must_name_its_manifest(
         load_site_profile(profile_path, validate_files=False)
 
 
-def test_site_profile_requires_backend_specific_edm_profile(tmp_path: Path) -> None:
+def test_site_profile_requires_backend_specific_direct_profile(tmp_path: Path) -> None:
     profile_path = _write_profile(tmp_path)
     raw = json.loads(profile_path.read_text(encoding="utf-8"))
     raw["schema_version"] = 2
-    raw["localizer"] = "edm"
+    raw["localizer"] = "direct"
     raw["flight"] = {
         "approved": False,
         "coordinate_frame_id": "test-frame-v1",
@@ -156,20 +140,7 @@ def test_site_profile_requires_backend_specific_edm_profile(tmp_path: Path) -> N
     profile_path.write_text(json.dumps(raw), encoding="utf-8")
 
     profile = load_site_profile(profile_path)
-    assert "missing EDM localizer_profile" in flight_readiness_errors(profile)
-
-
-def test_xfeat_profile_rejects_edm_only_profile_asset(tmp_path: Path) -> None:
-    profile_path = _write_profile(tmp_path)
-    runtime_profile = tmp_path / "edm.json"
-    runtime_profile.write_text("{}", encoding="utf-8")
-    raw = json.loads(profile_path.read_text(encoding="utf-8"))
-    raw["localizer"] = "xfeat"
-    raw["localizer_profile"] = runtime_profile.name
-    profile_path.write_text(json.dumps(raw), encoding="utf-8")
-
-    with pytest.raises(ValueError, match="does not support localizer_profile"):
-        load_site_profile(profile_path)
+    assert "missing direct localizer_profile (direct-deployment-profile/v1 JSON: map scale, reloc and PnP gates)" in flight_readiness_errors(profile)
 
 
 def test_site_profile_rejects_unknown_localizer(tmp_path: Path) -> None:
@@ -588,7 +559,7 @@ def test_current_river_map_route_and_approval_are_consistent() -> None:
             assert profile.flight.route_clearance_approved is True
     assert profile.coordinate_frame is not None
     assert profile.coordinate_frame.id == (
-        "river_gluemap_all8_direct_20260831_d2b8a5304eff"
+        "river_gluemap_all8_direct_20260908_0bc1fd174740"
     )
     assert not any("pose_chain" in error for error in flight_readiness_errors(profile))
     assert not any("hardware approval" in error for error in flight_readiness_errors(profile))
@@ -654,24 +625,6 @@ def test_site_profile_rejects_ambiguous_coordinate_frame(tmp_path: Path) -> None
 
     with pytest.raises(ValueError, match="raw GLOMAP"):
         load_site_profile(profile_path)
-
-
-def test_site_profile_loads_edm_deployment_directory(tmp_path: Path) -> None:
-    profile_path = _write_profile(tmp_path)
-    deploy_dir = tmp_path / "edm-deploy"
-    deploy_dir.mkdir()
-    runtime_profile = deploy_dir / "production.json"
-    runtime_profile.write_text("{}", encoding="utf-8")
-    raw = json.loads(profile_path.read_text(encoding="utf-8"))
-    raw["localizer"] = "edm"
-    raw["localizer_deploy_dir"] = "edm-deploy"
-    raw["localizer_profile"] = "edm-deploy/production.json"
-    profile_path.write_text(json.dumps(raw), encoding="utf-8")
-
-    profile = load_site_profile(profile_path)
-
-    assert profile.localizer_deploy_dir == deploy_dir.resolve()
-    assert profile.localizer_profile == runtime_profile.resolve()
 
 
 def test_site_profile_rejects_asset_path_traversal(tmp_path: Path) -> None:
@@ -979,59 +932,6 @@ def test_mission_pipeline_uses_the_same_profile_route_and_bundle(
     assert args.bundle == str((tmp_path / "assets/bundle.pt").resolve())
 
 
-def test_example_edm_profile_uses_portable_relative_paths() -> None:
-    path = (
-        Path(__file__).resolve().parents[3]
-        / "控制介面程式"
-        / "site_profiles"
-        / "example_site_edm.json"
-    )
-    profile = load_site_profile(path, validate_files=False)
-
-    assert profile.site_id == "your_site_edm"
-    assert profile.localizer == "edm"
-    assert profile.route_json is None
-    assert profile.map_ply.name == "your_site.ply"
-    assert profile.localization_bundle.name == "your_site_reloc_map_edm.pt"
-    assert profile.localizer_deploy_dir is not None
-    assert profile.localizer_profile is not None
-
-
-def test_final_edm_profile_pins_the_validated_runtime_parameters() -> None:
-    profile = load_edm_production_profile(
-        Path(__file__).resolve().parents[3]
-        / "定位演算法/configs/edm_production_profile.json"
-    )
-
-    assert profile["matcher"] == {
-        "coarse_topk": 3225,
-        "mconf_thr": 0.2,
-        "fp16": True,
-        "input_size": [1024, 576],
-        "reference_cache_size": 32,
-    }
-    tracker = profile["tracker"]
-    assert (tracker["local_topk"], tracker["weak_local_topk"], tracker["lost_local_topk"]) == (1, 3, 5)
-    assert (tracker["boot_global_topk"], tracker["match_batch_size"]) == (10, 2)
-    assert tracker["acquire_initial_topk"] == 2
-    assert (tracker["lost_local_grace_frames"], tracker["recovery_bank_size"], tracker["recovery_scan_topk"]) == (2, 192, 2)
-    assert tracker["use_temporal_reference"] is False
-    assert (tracker["max_reproj_error_acquire"], tracker["max_reproj_error_track"], tracker["pnp_ransac_max_error"]) == (5.0, 6.0, 5.0)
-    assert tracker["prediction_max_dt"] == 0.25
-    assert "reposed" not in profile
-
-
-
-def test_edm_tracker_profile_rejects_non_finite_values() -> None:
-    profile = load_edm_production_profile(
-        Path(__file__).resolve().parents[3]
-        / "定位演算法/configs/edm_production_profile.json"
-    )
-    profile["tracker"]["max_jump"] = float("nan")
-    with pytest.raises(ValueError, match="max_jump"):
-        apply_edm_tracker_profile(production_edm_config(), profile)
-
-
 def test_query_camera_is_constructed_before_model_startup() -> None:
     with pytest.raises(ValueError, match="pycolmap"):
         resolve_query_camera_override(
@@ -1091,76 +991,14 @@ def test_safety_command_bypasses_invalid_site_profile(
     assert safety_file.read_text(encoding="utf-8") == "hover\n"
 
 
-def test_localizer_explicitly_disables_inherited_megaloc_cache(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    captured = {}
-
-    def fake_worker_init(self, cmd, *_args, **_kwargs):
-        captured["cmd"] = cmd
-
-    monkeypatch.setattr(app.LiveWorkerClient, "__init__", fake_worker_init)
-    app.LiveLocalizerClient(
-        Path("worker.py"),
-        sys.executable,
-        1280,
-        720,
-        Path("bundle.pt"),
-        megaloc_cache="",
-        localizer_backend="xfeat",
-    )
-
-    index = captured["cmd"].index("--megaloc-cache")
-    assert captured["cmd"][index + 1] == ""
-    assert captured["cmd"][captured["cmd"].index("--localizer-backend") + 1] == "xfeat"
-
-
-def test_edm_localizer_passes_profile_deployment_directory(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    captured = {}
-
-    def fake_worker_init(self, cmd, *_args, **_kwargs):
-        captured["cmd"] = cmd
-
-    monkeypatch.setattr(app.LiveWorkerClient, "__init__", fake_worker_init)
-    app.LiveLocalizerClient(
-        Path("worker.py"), sys.executable, 1280, 720, Path("bundle_edm.pt"),
-        localizer_backend="edm", localizer_deploy_dir="/tmp/edm-deploy",
-        localizer_profile="/tmp/edm-production.json",
-        bundle_sha256="a" * 64,
-        localizer_profile_sha256="b" * 64,
-    )
-
-    index = captured["cmd"].index("--deploy-dir")
-    assert captured["cmd"][index + 1] == "/tmp/edm-deploy"
-    matcher_index = captured["cmd"].index("--edm-matcher")
-    assert captured["cmd"][matcher_index + 1] == "torch"
-    profile_index = captured["cmd"].index("--production-profile")
-    assert captured["cmd"][profile_index + 1] == "/tmp/edm-production.json"
-    assert captured["cmd"][captured["cmd"].index("--bundle-sha256") + 1] == "a" * 64
-    assert (
-        captured["cmd"][
-            captured["cmd"].index("--production-profile-sha256") + 1
-        ]
-        == "b" * 64
-    )
-    assert "--edm-onnx" not in captured["cmd"]
-
-
-def test_localizer_backend_auto_detects_edm_bundle_name() -> None:
-    assert app.resolve_localizer_backend("auto", Path("your_site_reloc_map_edm.pt")) == "edm"
-    assert app.resolve_localizer_backend("auto", Path("current_reloc_map_updated_v3.pt")) == "xfeat"
-    assert app.resolve_localizer_backend("edm", Path("anything.pt")) == "edm"
-
-
 def _approved_profile(root: Path) -> Path:
     """A complete flight contract; receipt helpers add the hardware trust gate."""
     profile_path = _write_profile(root)
     assets = root / "assets"
     (assets / "refs.json").write_bytes(b"x")
-    (assets / "edm.json").write_bytes(b"x")
+    (assets / "direct.json").write_bytes(b"x")
     (assets / "T_align_gravity.json").write_bytes(b"x")
+    (assets / "deploy").mkdir()
     control_points = [
         [0.0, 0.0, 0.0],
         [2.0, 0.0, 0.0],
@@ -1196,8 +1034,9 @@ def _approved_profile(root: Path) -> Path:
     )
     raw = json.loads(profile_path.read_text(encoding="utf-8"))
     raw["schema_version"] = 2
-    raw["localizer"] = "edm"
-    raw["localizer_profile"] = "assets/edm.json"
+    raw["localizer"] = "direct"
+    raw["localizer_profile"] = "assets/direct.json"
+    raw["localizer_deploy_dir"] = "assets/deploy"
     raw["map_reference_poses"] = "assets/refs.json"
     raw["map_align"] = "assets/T_align_gravity.json"
     raw["coordinate_frame"] = {

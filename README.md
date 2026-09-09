@@ -70,7 +70,15 @@ EDM runtime profile `.json` 與參考影像位姿 `.json`；缺少任何一項�
 
 預畫航線與電桿／目標物不屬於基本定位包，分別由另外兩個接口選配匯入。匯入完成
 後，模擬模式可切換 site profile；真機模式必須切換 mission selection，演算法與 UI
-不需修改：
+不需修改。
+
+第三個定位後端 `direct`（河濱 EDM fixed-pose retriangulate 地圖專用）：建圖端輸出
+的是 COLMAP 模型目錄 + MegaLoc bank + 磁碟上的 keyframe JPEG（`tools/build_direct_site_release.py`
+打包，規格見 `控制介面程式/site_profiles/建圖端輸出規格.md`），而不是 `.pt` bundle。
+線上跑 two-rate：CPU 上 KLT + PnP 快迴路（960×540），GPU 背景做 MegaLoc top-2 檢索 →
+EDM 匹配 → PnP reloc，另有 VO 延遲三角化與有界 dead reckoning。換上 `direct` 地圖等於換了
+座標系：航線必須重畫、`flight.approved` 從 false 開始；新地圖上線前，先拿一條全新航線跑一次
+驗收，quality receipt 轉 passed 才能飛 AUTO：
 
 ```bash
 # 影片目錄中只有一部影片時自動選用它（P119 會先驗證 SHA）
@@ -231,6 +239,12 @@ frame，不建立 `map→site` 對齊、不使用 `map_units_per_meter`，相機
 逐張距離應在 1e-7 量級。
 
 ## 固定的 EDM 正式參數
+
+> **這一節描述的是 `sfm_glomap_deploy`（EDM `.pt` bundle）後端，該後端已從 worktree
+> 移除，`定位演算法/configs/edm_production_profile.json` 也不再存在。**
+> `localizer_registry` 現在只註冊 `direct`，其凍結參數在 release 內的
+> `localization/direct_localizer_profile.json`，實測與已落地的優化見
+> [`docs/direct_backend_ledger.md`](docs/direct_backend_ledger.md)。以下保留為歷史紀錄。
 
 `定位演算法/configs/edm_production_profile.json` 是共用的正式設定：1024×576、
 PyTorch CUDA FP16、coarse top-k 3225、confidence 0.2、reference tensor cache 32、

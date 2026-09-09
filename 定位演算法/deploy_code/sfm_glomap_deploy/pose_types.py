@@ -7,7 +7,7 @@ re-exports these names for backward compatibility.
 """
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 LOCALIZER_PROVIDER_API_VERSION = 1
@@ -42,6 +42,13 @@ class Pose:
 class Localizer:
     def get_pose(self) -> "Pose | None":
         raise NotImplementedError("plug visual relocalizer (map-frame pose)")
+
+@dataclass
+class Camera:
+    model: str
+    width: int
+    height: int
+    params: list = field(default_factory=list)
 
 
 @dataclass(frozen=True)

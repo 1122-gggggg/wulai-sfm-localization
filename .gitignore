@@ -27,9 +27,21 @@ outputs/*
 !定位演算法/deploy_code/runtime/EDM/weights/.gitignore
 # 大型二進位資產：留在本機，不進 git 歷史（feature bank ~8.9GB、bundle ~2.6GB）。
 執行環境/models/edm_reference_features/
+執行環境/models/edm_reference_features_candidates/
+# BoQ-ResNet50 檢索權重（92 MB）。RUNTIME_ARTIFACTS.json 以 SHA-256 綁定它並在
+# 離線種入，不進 git 歷史。
+執行環境/models/boq/
+# direct 後端的執行期 scratch（placeholder manifest、EDM runtime config）。
+執行環境/direct_reloc_cache/
 river-localization-bundle-20260831/
 river-localization-bundle-20260831.tar.zst
 river-localization-bundle-20260831.tar.zst.sha256
+# direct 建圖／定位交付包（tar 2.8 GB、解開後 3.1 GB）。vendor 來源與逐檔 SHA-256
+# 記在 定位演算法/deploy_code/sfm_direct_deploy/VENDOR_PROVENANCE.json，
+# 交付包本身留在本機。
+river-deploy-5060-20260908/
+river-deploy-5060-20260908.tar.zst
+river-deploy-5060-20260908.tar.zst*.sha256
 定位演算法/validation/report_*/
 模擬器/測試影片/*
 !模擬器/測試影片/README.md

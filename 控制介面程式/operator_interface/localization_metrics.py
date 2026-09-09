@@ -23,6 +23,40 @@ RESTART_REASONS = (
 CIRCUIT_BREAKER_STATES = ("closed", "open")
 
 
+#: Direct-backend two-rate diagnostics. The worker forwards these only when the
+#: direct tracker sets them, so an edm/xfeat record never gains a field; here
+#: they are appended to RESULT_FIELDS so a direct session logs its own state
+#: (which sub-state produced the pose, how many inliers were map points vs VO
+#: points, and how long dead reckoning has been running) into
+#: session_logs/localization.jsonl.
+#:
+#: The relocalizer group is what makes `reloc.period_s` tunable on a given
+#: machine. `period_s` only does anything while the background worker is idle,
+#: so setting it needs the worker's own latency and duty cycle; without
+#: `reloc_ms` the only way to recover the cycle was to difference the timestamps
+#: of successive RELOC_SEED frames, which measures handover spacing rather than
+#: the job, and says nothing at all when a handover is dropped. `track_ms` and
+#: `vo_ms` complete the fast-loop split (`total_ms` and `pnp_ms` were already
+#: logged), which is what shows the CPU loop being starved while the relocalizer
+#: holds the GIL.
+DIRECT_INFO_FIELDS = (
+    "direct_status",
+    "map_inliers",
+    "vo_inliers",
+    "live_points",
+    "vo_candidates",
+    "dead_reckon_age",
+    "reloc_status",
+    "handover_points",
+    "handover_dropped",
+    "reloc_ms",
+    "reloc_busy",
+    "reloc_delivered",
+    "reloc_submitted",
+    "track_ms",
+    "vo_ms",
+)
+
 RESULT_FIELDS = (
     "timing_clock",
     "client_submit_mono",
@@ -188,7 +222,7 @@ RESULT_FIELDS = (
     "fused_gps_latitude_accuracy",
     "fused_gps_longitude_accuracy",
     "fused_gps_altitude_accuracy",
-)
+) + DIRECT_INFO_FIELDS
 
 
 def _json_safe(value: Any) -> Any:

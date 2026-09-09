@@ -24,14 +24,11 @@ CANONICAL_MODULES = {
     "artifact_integrity.py": DEPLOY_PREFIX / "artifact_integrity.py",
     "autoflight.py": FLIGHT_PREFIX / "autoflight.py",
     "manual_nudge_pilot.py": FLIGHT_PREFIX / "manual_nudge_pilot.py",
-    "megaloc_cache.py": DEPLOY_PREFIX / "megaloc_cache.py",
     "olympe_frame_source.py": FLIGHT_PREFIX / "olympe_frame_source.py",
     "path_follow_flight.py": FLIGHT_PREFIX / "path_follow_flight.py",
     "plan_path.py": FLIGHT_PREFIX / "plan_path.py",
     "pose_types.py": DEPLOY_PREFIX / "pose_types.py",
-    "production_xfeat_tracker.py": DEPLOY_PREFIX / "production_xfeat_tracker.py",
     "real_path_follow_controller.py": FLIGHT_PREFIX / "real_path_follow_controller.py",
-    "reloc_localizer_xfeat.py": DEPLOY_PREFIX / "reloc_localizer_xfeat.py",
 }
 
 # Documentation describes different directory responsibilities, so the two

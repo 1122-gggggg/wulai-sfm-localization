@@ -22,19 +22,18 @@
 MP4 或 ANAFI Pdraw RGB frame
         │
         ▼
-live_localizer_worker
+live_localizer_worker（direct 唯一後端）
         │
-        ├─ BOOT / LOST：MegaLoc 全域檢索
-        ├─ TRACK / WEAK：EDM 或 XFeat 局部匹配
-        ├─ 2D–3D correspondences
-        └─ pycolmap absolute-pose PnP
+        ├─ 快迴路（CPU）：KLT 追蹤 → pycolmap PnP → FAST_TRACK / VO_ONLY / DEAD_RECKON
+        ├─ 慢迴路（GPU 背景）：MegaLoc top-2 檢索 → EDM 匹配 → lift 2D–3D → PnP reloc
+        └─ handover：catch-up 追蹤後 REPLACE 活點集
         │
         ▼
-Pose + BOOT_INIT / TRACK / WEAK_TRACK / LOST
+Pose + FAST_TRACK / RELOC_SEED / VO_ONLY / DEAD_RECKON / NO_POSE
         │
-        ├─ operator desktop UI
+        ├─ operator desktop UI（含 weak 軌跡顯示）
         ├─ validation / replay quality gate
-        └─ flight controller safety gates
+        └─ flight controller safety gates（weak 不得飛 AUTO）
 ```
 
 ## 目錄所有權
@@ -71,13 +70,10 @@ Pose + BOOT_INIT / TRACK / WEAK_TRACK / LOST
 symlink、容量與未分類 output。
 
 ## 共用 runtime 模組的唯一所有權
-
-部署與飛控入口都可能把兩個 runtime 目錄加入 `sys.path`，因此同名 Python 檔會使
-匯入結果依路徑順序而變。每個共用模組只保留一份權威實作：
-
 | owner 目錄 | 權威模組 |
 |---|---|
-| `deploy_code/sfm_glomap_deploy/` | `artifact_integrity.py`、`localizer_registry.py`、`megaloc_cache.py`、`pose_types.py`、`reference_index.py`、`production_xfeat_tracker.py`、`reloc_localizer_xfeat.py` |
+| `deploy_code/sfm_glomap_deploy/` | `artifact_integrity.py`、`localizer_registry.py`、`pose_types.py`、`production_localizer_factory.py`（direct 唯一後端接線） |
+| `deploy_code/sfm_direct_deploy/` | `direct_map.py`、`direct_profile.py`、`live_provider.py`、`two_rate_tracker.py`、`direct_localizer_adapter.py`、`vendor/` |
 | `flight_control/` | `autoflight.py`、`manual_nudge_pilot.py`、`olympe_frame_source.py`、`path_follow_flight.py`、`plan_path.py`、`real_path_follow_controller.py`、`route_domain.py` |
 
 呼叫端直接從 owner 匯入，另一個目錄不得再放相容副本。CI 由下列命令驗證 owner
@@ -115,12 +111,8 @@ selection 在元件、定位品質與 route 契約通過後即為 flight-ready�
 
 `flight_control/route_domain.py` 是 route JSON 的唯一解析、驗證與 controller
 conversion 邊界。profile 的 `site_id`、`coordinate_frame_id` 與 route 必須完全
-一致。localizer 由 `localizer_registry.py` 依 profile 建立，EDM 與 XFeat 都實作相同
-pose provider contract；呼叫端不得直接綁定某個 tracker。
-
-大量 reference 透過 `reference_index.py` 的磁碟式、可驗證 IVF index 讀取，descriptor
-與 posting array 使用 memory map，避免把 100k reference 全部載入 RAM。index
-metadata、陣列與模型 identity 都由 `SHA256SUMS.json` 固定。
+一致。localizer 由 `localizer_registry.py` 依 profile 建立，唯一後端 `direct`
+實作 pose provider contract；呼叫端不得直接綁定某個 tracker。
 
 ## Portable artifact 與信任邊界
 
