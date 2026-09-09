@@ -174,7 +174,7 @@ class RelocWorker:
     def __init__(self, provider: Any) -> None:
         self._provider = provider
         self._cv = threading.Condition()
-        self._job: tuple[np.ndarray, np.ndarray | None, int] | None = None
+        self._job: tuple[np.ndarray, int] | None = None
         self._busy = False
         self._closed = False
         self._out: "queue.Queue[tuple[RelocFix, int]]" = queue.Queue()
@@ -209,20 +209,11 @@ class RelocWorker:
         with self._cv:
             return self._busy
 
-    def submit(
-        self, gray: np.ndarray, color_bgr: np.ndarray | None, ordinal: int
-    ) -> bool:
+    def submit(self, gray: np.ndarray, ordinal: int) -> bool:
         with self._cv:
             if self._closed or self._thread is None or self._busy:
                 return False
-            # `gray` is always a fresh cv2.cvtColor output, but the colour frame
-            # is the caller's array whenever no resize was needed, so it can be
-            # overwritten while the worker is still reading it. Snapshot it.
-            self._job = (
-                gray,
-                None if color_bgr is None else color_bgr.copy(),
-                int(ordinal),
-            )
+            self._job = (gray, int(ordinal))
             self._busy = True
             self._cv.notify()
         return True
@@ -242,11 +233,11 @@ class RelocWorker:
                 if self._closed:
                     self._busy = False
                     return
-                gray, color_bgr, ordinal = self._job
+                gray, ordinal = self._job
                 self._job = None
             started = time.perf_counter()
             try:
-                fix = self._provider.localize_array(gray, color_bgr=color_bgr)
+                fix = self._provider.localize_array(gray)
             except BaseException as error:  # noqa: BLE001 - must never kill the thread
                 fix = _failed_fix(
                     (time.perf_counter() - started) * 1000.0,
@@ -558,11 +549,15 @@ class TwoRateTracker:
                 or (stamp - self._last_reloc_stamp) >= float(reloc.period_s)
             )
             if len(self._live_ids) < int(reloc.min_points) or status == "NO_POSE" or due:
-                # The frozen BoQ reference bank was extracted from colour
-                # keyframes; feeding the relocalizer a grey frame replicated
-                # across three channels puts retrieval off the distribution the
-                # bank was built on. The colour frame is already in hand here.
-                if self._worker.submit(gray, frame, ordinal):
+                # Retrieval gets the grey frame, replicated to three channels
+                # by the provider. The frozen BoQ bank was built from *colour*
+                # keyframes, so this is a real distribution mismatch and the
+                # colour frame is in hand right here -- but handing it over was
+                # measured on the P173 holdout and is NOT an improvement:
+                # coverage 96.23% vs 97.68% over five paired repeats (4 of 5
+                # pairs negative, p~0.18), map-confirmed frames flat. See
+                # docs/direct_backend_ledger.md; do not re-apply without a gate.
+                if self._worker.submit(gray, ordinal):
                     self._pending_ordinal = ordinal
                     self._last_reloc_stamp = stamp
                     submitted = True

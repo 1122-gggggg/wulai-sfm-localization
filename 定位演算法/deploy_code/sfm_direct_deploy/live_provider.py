@@ -306,12 +306,7 @@ class LiveMapEDMProvider(FinalMapEDMProvider):
         width, height = self.profile.fast_loop.resolution
         # A real forward pass through both networks; an exception here is a
         # broken deployment and must not be hidden behind the first stream frame.
-        # The colour argument is warmed too, because that is the deployed path:
-        # the fast loop hands its BGR frame over with every relocalization.
-        self._localize_array(
-            np.zeros((height, width), dtype=np.uint8),
-            np.zeros((height, width, 3), dtype=np.uint8),
-        )
+        self._localize_array(np.zeros((height, width), dtype=np.uint8), None)
         self._models_ready = True
 
     @property
