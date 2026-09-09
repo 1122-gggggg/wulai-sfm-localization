@@ -28,7 +28,6 @@ from live_localizer_protocol import (
     GNSS_FUSED_HEADER_SIZE,
     GNSS_FUSED_MAGIC,
     HEADER_SIZE,
-    MAX_FUSED_SYNC_ERROR_S,
     TIMED_HEADER_SIZE,
     TIMED_MAGIC,
     decode_control_header,

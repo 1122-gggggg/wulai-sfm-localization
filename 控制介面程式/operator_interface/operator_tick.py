@@ -555,26 +555,28 @@ def _video_dirty_key(app: Any, state: Any, *, width: int, height: int) -> tuple:
 
 def _render_if_dirty(app: Any, state: Any, *, profile: Any = None) -> None:
     detail = None if profile is None else profile.detail
-    mark = time.perf_counter if detail is not None else None
+    # `started` stays a plain float rather than tracking `detail`: one
+    # perf_counter per render is free next to a panel repaint, and the parallel
+    # Optional made every stage read as possibly-None to a type checker.
     width_map = max(300, app.map_label.winfo_width())
     height_map = max(220, app.map_label.winfo_height())
     width_video = max(300, app.video_label.winfo_width())
     height_video = max(220, app.video_label.winfo_height())
     # Map: re-render only when the view, flown history, drawn route or pose/quality
     # readouts changed. Between live fixes these are all static, so reuse the PhotoImage.
-    started = None if mark is None else mark()
+    started = time.perf_counter()
     map_key = _map_dirty_key(
         app, state, width=width_map, height=height_map
     )
     if detail is not None:
-        now = mark()
+        now = time.perf_counter()
         detail("render_if_dirty.map_key", (now - started) * 1000.0)
         started = now
     video_key = _video_dirty_key(
         app, state, width=width_video, height=height_video
     )
     if detail is not None:
-        now = mark()
+        now = time.perf_counter()
         detail("render_if_dirty.video_key", (now - started) * 1000.0)
         started = now
     map_dirty = map_key != app._map_dirty_key
@@ -596,7 +598,7 @@ def _render_if_dirty(app: Any, state: Any, *, profile: Any = None) -> None:
             app.map_label, "map_photo", app.render_map(width_map, height_map, state)
         )
         if detail is not None:
-            now = mark()
+            now = time.perf_counter()
             detail("render_if_dirty.map", (now - started) * 1000.0)
             started = now
     # Video: re-render only when the source frame, panel size, the localization
@@ -612,7 +614,7 @@ def _render_if_dirty(app: Any, state: Any, *, profile: Any = None) -> None:
             app.render_video(width_video, height_video, state),
         )
         if detail is not None:
-            detail("render_if_dirty.video", (mark() - started) * 1000.0)
+            detail("render_if_dirty.video", (time.perf_counter() - started) * 1000.0)
 
 
 def _schedule_next_tick(app: Any, *, next_tick_deadline: NextTickDeadline) -> None:

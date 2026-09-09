@@ -40,11 +40,7 @@ def _payload(
     pose_status: str = "VISUALLY_CONFIRMED",
     success: bool | None = None,
 ) -> dict:
-    pose = (
-        None
-        if xyz is None
-        else {"x": xyz[0], "y": xyz[1], "z": xyz[2], "yaw_raw": 0.1}
-    )
+    pose = None if xyz is None else {"x": xyz[0], "y": xyz[1], "z": xyz[2], "yaw_raw": 0.1}
     return {
         "seq": seq,
         "display_seq": seq,
@@ -68,31 +64,47 @@ def _payload(
 
 def _fast(seq: int, x: float) -> dict:
     return _payload(
-        seq, (x, 2.0, 3.0), mode="TRACK", next_mode="TRACK",
-        inliers=400, direct_status="FAST_TRACK",
+        seq,
+        (x, 2.0, 3.0),
+        mode="TRACK",
+        next_mode="TRACK",
+        inliers=400,
+        direct_status="FAST_TRACK",
     )
 
 
 def _vo(seq: int, x: float) -> dict:
     return _payload(
-        seq, (x, 2.0, 3.0), mode="WEAK_TRACK", next_mode="WEAK_TRACK",
-        inliers=45, direct_status="VO_ONLY",
+        seq,
+        (x, 2.0, 3.0),
+        mode="WEAK_TRACK",
+        next_mode="WEAK_TRACK",
+        inliers=45,
+        direct_status="VO_ONLY",
         pose_status="NONE",
     )
 
 
 def _dead_reckon_zero(seq: int, x: float) -> dict:
     return _payload(
-        seq, (x, 2.0, 3.0), mode="WEAK_TRACK", next_mode="WEAK_TRACK",
-        inliers=0, direct_status="DEAD_RECKON",
+        seq,
+        (x, 2.0, 3.0),
+        mode="WEAK_TRACK",
+        next_mode="WEAK_TRACK",
+        inliers=0,
+        direct_status="DEAD_RECKON",
         pose_status="NONE",
     )
 
 
 def _no_pose(seq: int) -> dict:
     return _payload(
-        seq, None, mode="LOST", next_mode="LOST",
-        inliers=0, direct_status="NO_POSE",
+        seq,
+        None,
+        mode="LOST",
+        next_mode="LOST",
+        inliers=0,
+        direct_status="NO_POSE",
         pose_status="NONE",
     )
 
@@ -162,12 +174,8 @@ def _make_operator(batches: list, policy) -> SimpleNamespace:
         _record_no_loc=None,  # bound below (needs operator)
         write_log=lambda _message: None,
     )
-    operator.update_localization_metrics = (
-        lambda result: _classify_stub(operator, result)
-    )
-    operator._record_no_loc = lambda: setattr(
-        operator, "no_loc_count", operator.no_loc_count + 1
-    )
+    operator.update_localization_metrics = lambda result: _classify_stub(operator, result)
+    operator._record_no_loc = lambda: setattr(operator, "no_loc_count", operator.no_loc_count + 1)
     operator.recovery_calls = recovery_calls
     return operator
 
@@ -176,6 +184,8 @@ def _drain(operator: SimpleNamespace, payloads: list[dict]) -> None:
     for _payload in payloads:
         operator.live_new_pose = False
         app.OperatorApp.update_live_results(operator)
+
+
 # --------------------------------------------------------------------------
 # acceptance: weak poses reach the map-draw input
 
@@ -229,9 +239,7 @@ def test_drained_weak_points_reach_map_draw_input() -> None:
 
 def test_hold_swallowed_weak_still_displays_while_flight_holds() -> None:
     # Production-like policy: hold engages on the 2nd consecutive weak frame.
-    policy = app.LostHoldPolicy(
-        low_confidence_results=2, hold_on_low_confidence=True
-    )
+    policy = app.LostHoldPolicy(low_confidence_results=2, hold_on_low_confidence=True)
     anchor = _fast(1, 1.0)
     weak_run = [_vo(2, 1.01), _vo(3, 1.02), _vo(4, 1.03)]
     lost = _no_pose(5)
@@ -254,8 +262,13 @@ def test_hold_swallowed_weak_still_displays_while_flight_holds() -> None:
 
 def test_predicted_only_mirrors_into_weak_trail() -> None:
     predicted = _payload(
-        1, (7.0, 8.0, 9.0), mode="WEAK_TRACK", next_mode="WEAK_TRACK",
-        inliers=0, pose_status="PREDICTED_ONLY", success=False,
+        1,
+        (7.0, 8.0, 9.0),
+        mode="WEAK_TRACK",
+        next_mode="WEAK_TRACK",
+        inliers=0,
+        pose_status="PREDICTED_ONLY",
+        success=False,
     )
     operator = _make_operator([[predicted]], app.LostHoldPolicy())
 
@@ -388,6 +401,48 @@ def test_weak_points_draw_hollow_diamonds_in_health_colour() -> None:
         assert kwargs.get("fill") is None
 
 
+def test_weak_diamonds_are_centred_on_their_own_points() -> None:
+    """Position, not just count: the diamonds used to stack on a leaked x/y."""
+
+    draw = _RecordingDraw()
+    context = _map_context(
+        history=[(0.0, 0.0, 0.0), (1.0, 0.0, 0.0)],
+        history_health=["OK", "OK"],
+        # Far apart on purpose, so identical centres cannot be a coincidence.
+        history_weak=[(5.0, 0.0, 0.0), (-5.0, 0.0, 0.0)],
+        history_weak_health=["DEGRADED", "DEGRADED"],
+    )
+
+    _draw_route_and_history(draw, context)
+
+    assert len(draw.polygons) == 2
+    centres = [
+        (sum(p[0] for p in poly) / 4.0, sum(p[1] for p in poly) / 4.0) for poly, _ in draw.polygons
+    ]
+    assert centres[0] != centres[1]
+    # +5 is right of -5 on screen, and neither sits on the history tail.
+    assert centres[0][0] > centres[1][0]
+    history_tail = (draw.lines[0][0][-1][0], draw.lines[0][0][-1][1])
+    assert all(centre != history_tail for centre in centres)
+
+
+def test_weak_fixes_render_without_a_route_or_history() -> None:
+    """The first weak fix of a flight arrives before any OK history exists."""
+
+    draw = _RecordingDraw()
+    context = _map_context(
+        route_pts=[],
+        history=[],
+        history_health=[],
+        history_weak=[(1.0, 0.0, 0.0)],
+        history_weak_health=["DEGRADED"],
+    )
+
+    _draw_route_and_history(draw, context)
+
+    assert len(draw.polygons) == 1
+
+
 def test_mismatched_history_health_aligns_explicitly() -> None:
     draw = _RecordingDraw()
     context = _map_context(
@@ -439,8 +494,12 @@ def test_hud_direct_line_reports_consecutive_weak_frames() -> None:
 def test_hud_without_direct_status_has_no_weak_run_fragment() -> None:
     operator = _hud_operator()
     edm_weak = _payload(
-        1, (1.0, 2.0, 3.0), mode="WEAK_TRACK", next_mode="WEAK_TRACK",
-        inliers=20, direct_status=None,
+        1,
+        (1.0, 2.0, 3.0),
+        mode="WEAK_TRACK",
+        next_mode="WEAK_TRACK",
+        inliers=20,
+        direct_status=None,
     )
     app.OperatorApp._update_localization_recovery(operator, edm_weak)
     assert operator.loc_weak_run == 1

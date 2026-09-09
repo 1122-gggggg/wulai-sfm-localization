@@ -54,10 +54,13 @@ ROOT_FORMAT_SCOPE = (
     "tests/tools/test_install_runtime_contract.py",
     "定位演算法/flight_control/safety_command.py",
     "定位演算法/validation/check_runtime_mirrors.py",
-    "定位演算法/validation/tests/test_runtime_mirrors.py",
-    "定位演算法/validation/tests/test_edm_cpp_resource_safety.py",
     "控制介面程式/operator_interface/localization_metrics.py",
+    "控制介面程式/operator_interface/operator_rendering.py",
     "tests/control_interface/operator_interface/test_localization_metrics.py",
+    "tests/control_interface/operator_interface/test_weak_display.py",
+    "tests/localization/deploy/test_lift_reference_matches.py",
+    "tests/localization/deploy/test_reloc_worker_handover.py",
+    "tests/localization/deploy/test_dead_reckon_yaw_guard.py",
 )
 RELEASE_FILES = (
     "requirements/README.md",
@@ -425,6 +428,14 @@ def _steps(
                 "**/tests/**",
                 "--exclude",
                 "定位演算法/deploy_code/runtime/**",
+                # Same rule as runtime/: vendored third-party source, pinned per
+                # file in VENDOR_PROVENANCE.json. Its three findings are the
+                # mapping/diagnosis tooling that ships inside the package and is
+                # imported by nothing under sfm_direct_deploy/ -- two S608 that
+                # interpolate hard-coded table/column literals with bound
+                # parameters, and an S105 on a status-string comparison.
+                "--exclude",
+                "定位演算法/deploy_code/sfm_direct_deploy/vendor/**",
             ),
             str(ROOT),
             300,

@@ -255,10 +255,12 @@ handover 門檻的結論，**不得只用 P157 這類全程高覆蓋的影片得
 
 ## 已知缺口（不是優化，是護欄沒蓋到）
 
-- `tools/check_maintainability.py` 的 `SCAN_PATHS` 只有
-  `定位演算法/deploy_code/sfm_glomap_deploy`，**沒有 `sfm_direct_deploy`**。整條現行
-  production 樹（fast loop、provider、vendor）不在複雜度 ratchet 之內，而 ratchet
-  守的是已經被刪掉的那棵樹。納入需要先重新定基準。
+- ~~`check_maintainability.py` 沒有涵蓋 `sfm_direct_deploy`~~ **已修（2026-09-09）**。
+  `SCAN_PATHS` 加入現行 localizer，vendor 子樹由 pyproject 的 ruff `exclude` 擋掉。
+  重新定基準後 `deploy` 從舊的 26/57 收緊到實測 **2/23**，`validation` 從 8/19 收緊到
+  **0/0**（唯一的違規者是凍結的 P174 replay harness，改用 per-file-ignores 具名豁免，
+  而不是把整組天花板拉到它的 115）。`tools` 與 `control` 則因遷移帶進來的發布工具而
+  放寬，那是待還的債。
 - `river_gluemap_all8_direct_20260908` 的 quality receipt 是 `passed: false`、
   `validation: NONE`、`absolute_ground_truth: NONE`。本檔所有數字都是**相對**比較
   （同輸入前後對照），沒有一項是絕對精度。

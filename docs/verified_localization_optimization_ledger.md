@@ -7,6 +7,10 @@
 > [`docs/direct_backend_ledger.md`](direct_backend_ledger.md)。保留本檔是為了
 > 記錄已花掉的實驗成本，不要當成現行系統的描述。
 
+> 這些實驗的原始證據目錄（`outputs/gates_*`、`klt_*`、`veto_gates_*`、`corpus_*` 等，
+> 共約 1.19 GB）已於 2026-09-09 刪除：結論與數字留在本檔，程式碼已不存在，
+> 重跑不可能。文中的 `outputs/...` 路徑因此是歷史指涉，不是可開啟的檔案。
+
 最後更新：2026-09-01  
 適用硬體：NVIDIA GeForce RTX 5060 Laptop GPU，8151 MiB VRAM，sm_120
 

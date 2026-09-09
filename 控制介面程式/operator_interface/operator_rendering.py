@@ -100,12 +100,7 @@ CAMERA_VIEW_ARROW_HEAD_PX = 7.0
 
 
 def _map_scale(context: MapRenderContext) -> float:
-    return (
-        min(context.width, context.height)
-        * 0.46
-        * context.map_zoom
-        / context.map_radius
-    )
+    return min(context.width, context.height) * 0.46 * context.map_zoom / context.map_radius
 
 
 def _basis_from_forward(
@@ -181,13 +176,11 @@ def _camera_picture_basis(
     if not math.isfinite(pitch_value):
         pitch_value = 0.0
     pitch_value = max(-math.pi / 2 + 1e-6, min(math.pi / 2 - 1e-6, pitch_value))
-    horizontal = (
-        math.cos(yaw_value) * np.asarray(context.map_east, dtype=float)
-        + math.sin(yaw_value) * np.asarray(context.map_north, dtype=float)
-    )
-    forward = (
-        math.cos(pitch_value) * horizontal
-        + math.sin(pitch_value) * np.asarray(context.map_up, dtype=float)
+    horizontal = math.cos(yaw_value) * np.asarray(context.map_east, dtype=float) + math.sin(
+        yaw_value
+    ) * np.asarray(context.map_north, dtype=float)
+    forward = math.cos(pitch_value) * horizontal + math.sin(pitch_value) * np.asarray(
+        context.map_up, dtype=float
     )
     built = _basis_from_forward(context, forward)
     return (*built, True) if built is not None else None
@@ -213,12 +206,14 @@ def camera_view_plane_corners(
     half_width = CAMERA_VIEW_RECT_PX * 0.5 / scale
     half_height = half_width / float(aspect_ratio)
     center = np.asarray(drone, dtype=float) + np.asarray(forward, dtype=float) * gap
-    corners: np.ndarray = np.stack([
-        center - right * half_width + image_up * half_height,
-        center + right * half_width + image_up * half_height,
-        center + right * half_width - image_up * half_height,
-        center - right * half_width - image_up * half_height,
-    ])
+    corners: np.ndarray = np.stack(
+        [
+            center - right * half_width + image_up * half_height,
+            center + right * half_width + image_up * half_height,
+            center + right * half_width - image_up * half_height,
+            center - right * half_width - image_up * half_height,
+        ]
+    )
     return corners
 
 
@@ -239,29 +234,19 @@ def _draw_route_and_history(draw: Any, context: MapRenderContext) -> None:
             np.array(
                 [np.asarray(point, dtype=float)[:3] for point in context.history],
                 dtype=float,
-            )
-            .reshape(-1, 3)
+            ).reshape(-1, 3)
         )
     if weak_n:
         parts.append(
             np.array(
                 [np.asarray(point, dtype=float)[:3] for point in weak_trail],
                 dtype=float,
-            )
-            .reshape(-1, 3)
+            ).reshape(-1, 3)
         )
     view = context.transform_xyz(np.concatenate(parts, axis=0))
     scale = _map_scale(context)
-    screen_x = (
-        context.width * 0.5
-        + context.map_pan[0]
-        + view[:, 0] * scale
-    ).astype(int).tolist()
-    screen_y = (
-        context.height * 0.5
-        + context.map_pan[1]
-        - view[:, 1] * scale
-    ).astype(int).tolist()
+    screen_x = (context.width * 0.5 + context.map_pan[0] + view[:, 0] * scale).astype(int).tolist()
+    screen_y = (context.height * 0.5 + context.map_pan[1] - view[:, 1] * scale).astype(int).tolist()
 
     if route_n > 1:
         route_screen = list(zip(screen_x[:route_n], screen_y[:route_n]))
@@ -271,8 +256,9 @@ def _draw_route_and_history(draw: Any, context: MapRenderContext) -> None:
             draw.ellipse((x - 3, y - 3, x + 3, y + 3), fill=context.route_color)
 
     if history_n > 1:
-        history_screen = list(zip(screen_x[route_n:route_n + history_n],
-                                  screen_y[route_n:route_n + history_n]))
+        history_screen = list(
+            zip(screen_x[route_n : route_n + history_n], screen_y[route_n : route_n + history_n])
+        )
         draw.line(history_screen, fill="#5aa7e8", width=3)
         # Explicit alignment: history and history_health are parallel lists,
         # but a dropped append would make zip() silently swallow the tail.
@@ -293,10 +279,15 @@ def _draw_route_and_history(draw: Any, context: MapRenderContext) -> None:
         # is already the non-OK symbol, so weak reusing it would collide;
         # markers only, no connecting line, so a jump-rejected fix cannot
         # imply a flown segment that never happened.
-        weak_screen = list(zip(screen_x[route_n + history_n:],
-                               screen_y[route_n + history_n:]))
-        mark_n = min(weak_n, len(weak_health))
+        weak_screen = list(zip(screen_x[route_n + history_n :], screen_y[route_n + history_n :]))
+        # Same explicit alignment as the history markers above, and the
+        # position has to come from weak_screen: reading a bare x/y here picked
+        # up whatever the route or history loop happened to leave bound, which
+        # stacked every weak diamond on one wrong point -- and raised
+        # UnboundLocalError outright when neither of those loops had run.
+        mark_n = min(weak_n, len(weak_health), len(weak_screen))
         for index in range(mark_n):
+            x, y = weak_screen[index]
             colour = context.health_color.get(weak_health[index], "#e0a92e")
             size = 6
             draw.polygon(
@@ -312,9 +303,7 @@ def _draw_collision_guard(draw: Any, context: MapRenderContext) -> None:
     center = np.asarray(context.collision_center, dtype=float)
     if center.shape != (3,) or not np.all(np.isfinite(center)):
         return
-    screen_x, screen_y = context.project_world(
-        center, context.width, context.height
-    )
+    screen_x, screen_y = context.project_world(center, context.width, context.height)
     radius_px = max(1, int(round(context.collision_radius * _map_scale(context))))
     status = str(context.collision_status)
     color = {
@@ -345,9 +334,7 @@ def _draw_collision_guard(draw: Any, context: MapRenderContext) -> None:
     if status in {"COLLISION", "PREVIEW_HIT"} and context.collision_point is not None:
         point = np.asarray(context.collision_point, dtype=float)
         if point.shape == (3,) and np.all(np.isfinite(point)):
-            hit_x, hit_y = context.project_world(
-                point, context.width, context.height
-            )
+            hit_x, hit_y = context.project_world(point, context.width, context.height)
             hit_color = "#ff4d4d" if status == "COLLISION" else "#e6b94f"
             draw.line((screen_x, screen_y, hit_x, hit_y), fill=hit_color, width=2)
             draw.ellipse(
@@ -359,7 +346,9 @@ def _draw_collision_guard(draw: Any, context: MapRenderContext) -> None:
     label = (
         "模擬相機"
         if context.collision_preview
-        else "近接命中" if status == "COLLISION" else "相機近接圈"
+        else "近接命中"
+        if status == "COLLISION"
+        else "相機近接圈"
     )
     draw.text(
         (screen_x + radius_px + 6, screen_y - 8),
@@ -395,18 +384,22 @@ def _draw_camera_overlay(draw: Any, context: MapRenderContext) -> None:
         aspect = 16.0 / 9.0
     drone = np.asarray(context.pose[:3], dtype=float)
     corners = camera_view_plane_corners(drone, right, image_up, forward, scale, aspect)
-    tip = drone + forward * (
-        (CAMERA_VIEW_RECT_GAP_PX + CAMERA_VIEW_ARROW_PX) / scale
-    )
+    tip = drone + forward * ((CAMERA_VIEW_RECT_GAP_PX + CAMERA_VIEW_ARROW_PX) / scale)
     head_base = tip - forward * (CAMERA_VIEW_ARROW_HEAD_PX / scale)
     head_half = CAMERA_VIEW_ARROW_HEAD_PX * 0.6 / scale
     # One batched transform for everything: drone, quad corners, arrow tip and
     # arrowhead base -- the same projection the cloud and the route use.
-    view = context.transform_xyz(np.stack([
-        drone, *corners, tip,
-        head_base + right * head_half,
-        head_base - right * head_half,
-    ]))
+    view = context.transform_xyz(
+        np.stack(
+            [
+                drone,
+                *corners,
+                tip,
+                head_base + right * head_half,
+                head_base - right * head_half,
+            ]
+        )
+    )
     screen_x = context.width * 0.5 + context.map_pan[0] + view[:, 0] * scale
     screen_y = context.height * 0.5 + context.map_pan[1] - view[:, 1] * scale
     border_color = "#3fbf7f" if from_yaw else "#00d4ff"
@@ -559,11 +552,7 @@ def draw_video_hud(
     if age is None and live_backend:
         age = getattr(state, "link_latency_ms", None)
     if age is None:
-        age_text = (
-            f"~{stream_latency_ms:.0f} ms (profile)"
-            if not live_backend
-            else "-"
-        )
+        age_text = f"~{stream_latency_ms:.0f} ms (profile)" if not live_backend else "-"
     else:
         age_text = f"{float(age):.0f} ms"
     fps = float(getattr(state, "stream_fps", 0.0) or 0.0)
@@ -649,13 +638,8 @@ def draw_video_banner(
         elif health == "PAUSED_ZOOM":
             message = "LOCALIZATION PAUSED — 相機縮放未校正，回到 1.0x 恢復"
         else:
-            reprojection = (
-                "-" if health_reproj is None else f"{health_reproj:.1f}"
-            )
-            message = (
-                f"LOW CONFIDENCE  inliers={health_inliers} "
-                f"reproj={reprojection}"
-            )
+            reprojection = "-" if health_reproj is None else f"{health_reproj:.1f}"
+            message = f"LOW CONFIDENCE  inliers={health_inliers} reproj={reprojection}"
         draw.rectangle((18, 20, width - 18, 60), fill=color)
         draw.text(
             (width // 2, 40),
@@ -677,65 +661,137 @@ def draw_gravity_phase_icon(canvas: Any, phase: str | None) -> None:
     body, accent, arrow = "#39424b", "#f0f3f5", "#4ea1ff"
     tag = f"gravity-phase-{phase}" if phase else "gravity-phase-ready"
     if phase is None:
-        canvas.create_text(
-            cx, cy, text="準備", fill="#7a828a", font=("Sans", 9), tags=(tag,)
-        )
+        canvas.create_text(cx, cy, text="準備", fill="#7a828a", font=("Sans", 9), tags=(tag,))
         return
 
     if phase == "yaw":
         canvas.create_oval(
-            cx - 9, cy - 18, cx + 9, cy + 18,
-            fill=body, outline=accent, tags=(tag, "airframe"),
+            cx - 9,
+            cy - 18,
+            cx + 9,
+            cy + 18,
+            fill=body,
+            outline=accent,
+            tags=(tag, "airframe"),
         )
         canvas.create_polygon(
-            cx, cy - 23, cx - 5, cy - 14, cx + 5, cy - 14,
-            fill=accent, outline=accent, tags=(tag, "airframe"),
+            cx,
+            cy - 23,
+            cx - 5,
+            cy - 14,
+            cx + 5,
+            cy - 14,
+            fill=accent,
+            outline=accent,
+            tags=(tag, "airframe"),
         )
         canvas.create_arc(
-            cx - 27, cy - 27, cx + 27, cy + 27,
-            start=35, extent=285, style="arc", outline=arrow, width=2,
+            cx - 27,
+            cy - 27,
+            cx + 27,
+            cy + 27,
+            start=35,
+            extent=285,
+            style="arc",
+            outline=arrow,
+            width=2,
             tags=(tag, "motion-yaw"),
         )
         canvas.create_polygon(
-            cx + 21, cy - 18, cx + 28, cy - 10, cx + 16, cy - 11,
-            fill=arrow, outline=arrow, tags=(tag, "motion-yaw"),
+            cx + 21,
+            cy - 18,
+            cx + 28,
+            cy - 10,
+            cx + 16,
+            cy - 11,
+            fill=arrow,
+            outline=arrow,
+            tags=(tag, "motion-yaw"),
         )
         return
 
     if phase == "pitch":
         canvas.create_oval(
-            cx - 22, cy - 7, cx + 17, cy + 7,
-            fill=body, outline=accent, tags=(tag, "airframe"),
+            cx - 22,
+            cy - 7,
+            cx + 17,
+            cy + 7,
+            fill=body,
+            outline=accent,
+            tags=(tag, "airframe"),
         )
         canvas.create_polygon(
-            cx + 16, cy, cx + 25, cy - 5, cx + 25, cy + 5,
-            fill=accent, outline=accent, tags=(tag, "airframe"),
+            cx + 16,
+            cy,
+            cx + 25,
+            cy - 5,
+            cx + 25,
+            cy + 5,
+            fill=accent,
+            outline=accent,
+            tags=(tag, "airframe"),
         )
         canvas.create_line(
-            cx, cy - 26, cx, cy + 26,
-            fill=arrow, width=2, arrow="both", tags=(tag, "motion-pitch"),
+            cx,
+            cy - 26,
+            cx,
+            cy + 26,
+            fill=arrow,
+            width=2,
+            arrow="both",
+            tags=(tag, "motion-pitch"),
         )
         canvas.create_arc(
-            cx - 27, cy - 22, cx + 27, cy + 22,
-            start=205, extent=130, style="arc", outline=arrow, width=2,
+            cx - 27,
+            cy - 22,
+            cx + 27,
+            cy + 22,
+            start=205,
+            extent=130,
+            style="arc",
+            outline=arrow,
+            width=2,
             tags=(tag, "motion-pitch"),
         )
         return
 
     canvas.create_oval(
-        cx - 7, cy - 18, cx + 7, cy + 18,
-        fill=body, outline=accent, tags=(tag, "airframe"),
+        cx - 7,
+        cy - 18,
+        cx + 7,
+        cy + 18,
+        fill=body,
+        outline=accent,
+        tags=(tag, "airframe"),
     )
     canvas.create_line(
-        cx - 24, cy, cx + 24, cy,
-        fill=accent, width=3, tags=(tag, "airframe"),
+        cx - 24,
+        cy,
+        cx + 24,
+        cy,
+        fill=accent,
+        width=3,
+        tags=(tag, "airframe"),
     )
     canvas.create_line(
-        cx - 27, cy, cx + 27, cy,
-        fill=arrow, width=2, arrow="both", tags=(tag, "motion-roll"),
+        cx - 27,
+        cy,
+        cx + 27,
+        cy,
+        fill=arrow,
+        width=2,
+        arrow="both",
+        tags=(tag, "motion-roll"),
     )
     canvas.create_arc(
-        cx - 27, cy - 27, cx + 27, cy + 27,
-        start=140, extent=80, style="arc", outline=arrow, width=2,
+        cx - 27,
+        cy - 27,
+        cx + 27,
+        cy + 27,
+        start=140,
+        extent=80,
+        style="arc",
+        outline=arrow,
+        width=2,
         tags=(tag, "motion-roll"),
     )

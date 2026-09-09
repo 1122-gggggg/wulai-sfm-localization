@@ -13,12 +13,23 @@ exclude = [
   # Imported upstream source. It is pinned and smoke-tested, but not restyled.
   "定位演算法/deploy_code/runtime",
   "定位演算法/EDM工具包",
+  # Vendored river_map_quality / sfm_diagnosis. Same rule: pinned per-file in
+  # VENDOR_PROVENANCE.json, never restyled. Local patches are linted through
+  # their own tests, not by reformatting a third-party tree.
+  "定位演算法/deploy_code/sfm_direct_deploy/vendor",
 ]
 
 [tool.ruff.lint]
 # Full Pyflakes catches dead imports, name shadowing, undefined names, and other
 # correctness issues in first-party code. Syntax errors remain an explicit gate.
 select = ["E9", "F"]
+
+[tool.ruff.lint.per-file-ignores]
+# Frozen P174 replay harness: experiment scaffolding, kept byte-stable as the
+# reference the deployed two-rate loop was derived from, deliberately not
+# refactored. Exempt from the complexity ratchet so that one frozen file does
+# not set the ceiling for every other module in 定位演算法/validation/.
+"定位演算法/validation/replay_two_rate_reference.py" = ["C901"]
 
 [tool.mypy]
 # This is an intentionally bounded boundary gate, not a claim that the whole

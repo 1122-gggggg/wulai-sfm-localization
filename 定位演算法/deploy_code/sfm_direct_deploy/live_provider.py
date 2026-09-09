@@ -43,7 +43,6 @@ from sfm_diagnosis.edm_risk.edm_loo import EDMQuery  # noqa: E402
 from sfm_diagnosis.site_pipeline.deployment_localizer import (  # noqa: E402
     FinalMapEDMProvider,
     _configure_audited_runtime_site_packages,
-    _resolve_audited_site_packages,
     rank_reference_indices,
 )
 
