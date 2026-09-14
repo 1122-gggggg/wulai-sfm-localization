@@ -127,70 +127,6 @@ def test_route_arrival_radius_is_preserved_by_controller_conversion(tmp_path):
     assert config.progress_jump_slack >= 0.42
 
 
-@pytest.mark.parametrize(
-    "radius",
-    [True, False, -0.1, float("nan"), float("inf"), float("-inf"), "0.5"],
-)
-def test_route_domain_rejects_invalid_route_deviation_radius(radius):
-    with pytest.raises(ValueError, match="max_route_deviation_map_units"):
-        RouteDocument.from_data(_route(max_route_deviation_map_units=radius))
-
-
-def test_route_deviation_radius_is_preserved_and_cannot_loosen_the_base_limit(
-    tmp_path,
-):
-    path = tmp_path / "route.json"
-    path.write_text(
-        json.dumps(_route(max_route_deviation_map_units=0.075)),
-        encoding="utf-8",
-    )
-
-    route = RouteDocument.from_path(path)
-    tightened = rpf.config_for_route(
-        path,
-        rpf.ControlConfig(max_route_deviation=0.1),
-    )
-    capped = rpf.config_for_route(
-        path,
-        rpf.ControlConfig(max_route_deviation=0.05),
-    )
-
-    assert route.max_route_deviation_map_units == pytest.approx(0.075)
-    assert tightened.max_route_deviation == pytest.approx(0.075)
-    assert capped.max_route_deviation == pytest.approx(0.05)
-
-
-def test_zero_route_deviation_means_centerline_only(tmp_path):
-    path = tmp_path / "route.json"
-    path.write_text(
-        json.dumps(_route(max_route_deviation_map_units=0.0)),
-        encoding="utf-8",
-    )
-
-    route = RouteDocument.from_path(path)
-    config = rpf.config_for_route(path)
-
-    assert route.max_route_deviation_map_units == pytest.approx(0.0)
-    assert config.max_route_deviation == pytest.approx(0.0)
-
-
-def test_mission_snapshot_carries_the_approved_route_deviation_radius(tmp_path):
-    path = tmp_path / "route.json"
-    path.write_text(
-        json.dumps(_route(max_route_deviation_map_units=0.065)),
-        encoding="utf-8",
-    )
-
-    snapshot = rpf.capture_mission_route_snapshot(
-        path,
-        expected_sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
-        expected_site_id="field-a",
-        expected_coordinate_frame_id="glomap-a",
-    )
-
-    assert snapshot.max_route_deviation_map_units == pytest.approx(0.065)
-
-
 def test_aligned_conversion_uses_the_declared_legacy_or_measured_authoring_frame():
     frame = rpf.MapFrame.from_gravity(MEASURED_GRAVITY)
     aligned = [[0.0, 0.0, 0.0], [1.0, 2.0, 3.0]]
@@ -249,3 +185,58 @@ def test_controller_loader_delegates_to_the_same_domain_conversion(tmp_path):
         require_flight_contract=True,
     )
     assert np.allclose(loaded[1], domain.controller_waypoints()[1])
+
+
+def test_route_domain_preserves_per_waypoint_radii(tmp_path):
+    path = tmp_path / "route.json"
+    path.write_text(
+        json.dumps(_route(waypoint_arrive_radii=[0.05, 0.3])),
+        encoding="utf-8",
+    )
+
+    route = RouteDocument.from_path(path)
+    config = rpf.config_for_route(path)
+
+    assert route.waypoint_arrive_radii == pytest.approx((0.05, 0.3))
+    assert config.waypoint_arrive_radii == pytest.approx((0.05, 0.3))
+    assert config.progress_jump_slack >= 0.3
+
+
+@pytest.mark.parametrize(
+    "radii",
+    [[0.05], [0.05, 0.05, 0.05], [0.05, 0.0], [0.05, -0.1], [0.05, "0.3"], [0.05, True]],
+)
+def test_route_domain_rejects_bad_per_waypoint_radii(radii):
+    with pytest.raises(ValueError, match="waypoint_arrive_radii"):
+        RouteDocument.from_data(_route(waypoint_arrive_radii=radii))
+
+
+def test_route_domain_without_per_waypoint_radii_stays_global(tmp_path):
+    path = tmp_path / "route.json"
+    path.write_text(json.dumps(_route(arrive_radius_map_units=0.42)), encoding="utf-8")
+
+    route = RouteDocument.from_path(path)
+    config = rpf.config_for_route(path)
+
+    assert route.waypoint_arrive_radii is None
+    assert config.waypoint_arrive_radii is None
+    assert config.waypoint_arrive_radius == pytest.approx(0.42)
+
+
+def test_mission_snapshot_carries_per_waypoint_radii(tmp_path):
+    path = tmp_path / "route.json"
+    path.write_text(
+        json.dumps(_route(waypoint_arrive_radii=[0.05, 0.3])),
+        encoding="utf-8",
+    )
+
+    snapshot = rpf.capture_mission_route_snapshot(
+        path,
+        expected_sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+        expected_site_id="field-a",
+        expected_coordinate_frame_id="glomap-a",
+    )
+    config = rpf.config_for_route(snapshot)
+
+    assert snapshot.waypoint_arrive_radii == pytest.approx((0.05, 0.3))
+    assert config.waypoint_arrive_radii == pytest.approx((0.05, 0.3))

@@ -110,6 +110,7 @@ class DroneState:
     link_latency_ms: float = ANAFI.stream_latency_ms
     frame_age_ms: float | None = None
     telemetry_read_mono_ns: int | None = None
+    attitude_mono_ns: int | None = None
     gps_read_mono_ns: int | None = None
     last_pcmd_call_mono_ns: int | None = None
     pcmd_to_telemetry_poll_ms: float | None = None
@@ -125,6 +126,7 @@ class DroneState:
     max_tilt_deg: float | None = None
     max_vertical_speed_mps: float | None = None
     max_rotation_speed_dps: float | None = None
+    max_pitch_roll_rotation_speed_dps: float | None = None
     preflight_ok: bool | None = None
     preflight_reason: str = "not checked"
     control_owner: str = "SIM"
@@ -170,7 +172,7 @@ class DroneState:
     disk_free_percent: float | None = None
     disk_warning: bool = False
     autonomous_speed_limit_enabled: bool = True
-    autonomous_speed_limit_mps: float = 0.30
+    autonomous_speed_limit_mps: float = 0.60
     autonomous_speed_guard_status: str = "SPEED_WAITING"
     autonomous_approval_valid: bool = False
     drone_magnetometer_required: int | None = None

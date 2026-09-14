@@ -1,21 +1,19 @@
 #!/usr/bin/env python3
 """Autonomous pole-inspection flight for Parrot ANAFI 4K (Olympe).
 
-Two layers (agreed design):
-  GLOBAL  : plan_path.plan_tour -> a clearance-preferring path visiting the pole
-            STANDOFF points (safe zone + pole no-go baked into the SDF).
-  LOCAL   : this reactive controller follows the path while adjusting live to
-            SDF clearance (geofence repulsion), YOLO pole bearing+area (final
-            approach to standoff), and localization. Hard safety override =
-            stop / hover / recover-toward-open-space.
+Legacy reactive controller (TakeOff permanently locked; dry-run only):
+it follows a carrot point along a pre-drawn polyline through NAV ->
+APPROACH -> INSPECT -> ... -> DONE, using YOLO pole bearing+area for the
+final approach to standoff. Stale/lost localization hovers, then lands.
 
-State machine:  NAV -> APPROACH -> INSPECT -> (next target) -> ... -> DONE
-                any state -> RECOVER (clearance <= STOP_MARGIN) -> back
-                any state -> HOVER (pose stale) -> LAND (lost too long)
+There is no safety tube or boundary slowdown in this module: no SDF
+clearance, no geofence repulsion, no slow band. Every tick flies the
+planned line directly; drift is corrected by re-drawing from the current
+pose. Production AUTO uses real_path_follow_controller, not this file.
 
 Frames: map XY horizontal, Z up; yaw = heading of forward axis, CCW from +X.
-All geofence/path lengths are in MAP UNITS (scale-free). Only the YOLO standoff
-(bbox area target) is a metric-ish proxy and is *backed up* by the SDF no-go.
+All path lengths are in MAP UNITS (scale-free). Only the YOLO standoff
+(bbox area target) is a metric-ish proxy.
 
 !!! SAFETY: validate with --dry-run (built-in sim), then PROPS-OFF, then open
 area with manual-override pilot. VERIFY PCMD signs (YAW_SIGN/pitch/gaz) first.
@@ -38,7 +36,7 @@ DEPLOY_ROOT = Path(__file__).resolve().parents[1] / "deploy_code" / "sfm_glomap_
 if DEPLOY_ROOT.is_dir() and str(DEPLOY_ROOT) not in sys.path:
     sys.path.append(str(DEPLOY_ROOT))
 
-from plan_path import SDFGrid, plan_tour
+from pose_types import Pose, Localizer  # noqa: F401  (re-export for old callers)
 
 # ----------------------------- CONFIG --------------------------------------
 DRONE_IP = "192.168.42.1"  # ANAFI WiFi; SkyController -> 192.168.53.1
@@ -51,11 +49,8 @@ K_YAW = 1.4  # heading P-gain
 K_VERT = 1.0  # vertical P-gain (map-units -> gaz scale)
 YAW_SIGN = +1  # matches the built-in sim; VERIFY on real ANAFI!
 
-# SDF geofence thresholds (MAP UNITS)
-SLOW_BAND = 1.0  # start slowing + repelling below this clearance
-STOP_MARGIN = 0.35  # <= this -> stop/hover/recover (touched boundary)
-RESUME_MARGIN = 0.8  # recover until clearance >= this (hysteresis)
-REPULSE_W = 1.5  # weight of SDF-gradient repulsion vs path direction
+# No SDF, no slow band, no boundary repulsion: volume proximity never steers
+# this controller. Every tick flies the planned line directly.
 
 # path following / mission (MAP UNITS unless noted)
 LOOKAHEAD = 1.5  # carrot distance along the global path
@@ -71,10 +66,6 @@ LOST_LAND_S = 4.0
 
 
 # ----------------------------- interfaces ----------------------------------
-from pose_types import (
-    Pose,
-    Localizer,
-)  # re-export; types moved to pose_types (decouples localizer from plan_path)
 
 
 @dataclass
@@ -118,8 +109,16 @@ class PathFollower:
 
 # ----------------------------- controller ----------------------------------
 class AutoFlight:
-    def __init__(self, sdf: SDFGrid, follower: PathFollower, targets):
-        self.sdf = sdf
+    def __init__(self, *args, sdf=None, follower=None, targets=None):
+        # Old callers passed (sdf, follower, targets); the tube is gone so the
+        # SDF is accepted and ignored, never used for steering or slowdown.
+        positional = list(args)
+        if len(positional) == 3 and follower is None and targets is None:
+            positional.pop(0)
+        if follower is None and positional:
+            follower = positional.pop(0)
+        if targets is None and positional:
+            targets = positional.pop(0)
         self.follower = follower
         self.targets = [np.asarray(t, float) for t in targets]  # pole standoff pts
         self.cur = 0
@@ -128,18 +127,11 @@ class AutoFlight:
         self._t_inspect = None
         self._t_detect_seen = None
 
-    def _horizontal_dir(self, P, base_dir_xy, clearance):
-        """Blend path/goal direction with SDF repulsion (toward open space)."""
+    def _horizontal_dir(self, base_dir_xy):
+        """Planned-line direction only: no clearance steering of any kind."""
         d = np.asarray(base_dir_xy, float)
         n = np.linalg.norm(d)
-        d = d / n if n > 1e-9 else d
-        if clearance < SLOW_BAND:
-            g = self.sdf.gradient([P.x, P.y, P.z])[:2]  # toward higher clearance
-            w = REPULSE_W * (1.0 - max(clearance, 0.0) / SLOW_BAND)
-            d = d + w * g
-            n = np.linalg.norm(d)
-            d = d / n if n > 1e-9 else d
-        return d
+        return d / n if n > 1e-9 else d
 
     def _to_pcmd(self, P, dir_xy, target_z, speed):
         """world horizontal dir + target altitude + speed -> (roll,pitch,yaw,gaz)."""
@@ -150,13 +142,10 @@ class AutoFlight:
         gaz_cmd = _clamp(K_VERT * (target_z - P.z), -1, 1) * ALT_GAZ
         return (0, int(round(pitch_cmd)), int(round(yaw_cmd)), int(round(gaz_cmd)))
 
-    def _recover_command(self, clearance: float):
-        if clearance >= RESUME_MARGIN:
-            self.state = self.prev_state
-            return None
-        # On a clearance breach, hover for the operator. Autonomous gradient
-        # motion would be an uncommanded move inside an uncertain obstacle region.
-        return (0, 0, 0, 0, f"RECOVER hover c={clearance:.2f}")
+    def _recover_hover(self):
+        # Kept so a RECOVER state set by an old pickle/log replays as a hover
+        # instead of crashing; nothing in the live code sets RECOVER anymore.
+        return (0, 0, 0, 0, "RECOVER hover")
 
     def _inspect_command(self, det: PoleDetection | None, now: float):
         self._t_inspect = self._t_inspect or now
@@ -175,7 +164,6 @@ class AutoFlight:
         self,
         det: PoleDetection | None,
         now: float,
-        clearance: float,
     ):
         if det and det.score > 0.0:
             self._t_detect_seen = now
@@ -187,20 +175,19 @@ class AutoFlight:
             speed = _clamp(1.0 - det.area_frac / AREA_TARGET, 0.1, 1.0)
             facing = max(0.0, 1.0 - abs(det.u_off))
             pitch = CRUISE_PITCH * speed * facing
-            pitch *= _clamp(clearance / SLOW_BAND, 0.0, 1.0)
             gaz = _clamp(1.2 * det.v_off, -1, 1) * ALT_GAZ
             return (
                 0,
                 int(round(pitch)),
                 int(round(yaw_cmd)),
                 int(round(gaz)),
-                f"APPROACH area={det.area_frac:.2f} c={clearance:.2f}",
+                f"APPROACH area={det.area_frac:.2f}",
             )
         if self._t_detect_seen and now - self._t_detect_seen > DETECT_LOST_S:
             self.state = "NAV"
         return (0, 0, 0, 0, "APPROACH wait-detect")
 
-    def _nav_command(self, pose: Pose, now: float, clearance: float):
+    def _nav_command(self, pose: Pose, now: float):
         target = self.targets[self.cur]
         position = np.array([pose.x, pose.y, pose.z])
         if np.linalg.norm(position - target) < ARRIVAL_R:
@@ -209,24 +196,16 @@ class AutoFlight:
             return (0, 0, 0, 0, "NAV arrived -> APPROACH")
         carrot = self.follower.carrot(position)
         base = (carrot - position)[:2]
-        direction = self._horizontal_dir(pose, base, clearance)
-        speed = _clamp(clearance / SLOW_BAND, 0.0, 1.0)
-        command = self._to_pcmd(pose, direction, carrot[2], speed)
-        return (*command, f"NAV->t{self.cur} c={clearance:.2f}")
+        direction = self._horizontal_dir(base)
+        command = self._to_pcmd(pose, direction, carrot[2], 1.0)
+        return (*command, f"NAV->t{self.cur}")
 
     def step(self, P: Pose, det: PoleDetection | None, now: float):
         """Return (roll,pitch,yaw,gaz, info)."""
-        clearance = self.sdf.clearance([P.x, P.y, P.z])
-
-        # ---- hard safety override: clearance breached -> RECOVER ----
-        if clearance <= STOP_MARGIN and self.state != "RECOVER":
-            self.prev_state = self.state
-            self.state = "RECOVER"
-
         if self.state == "RECOVER":
-            command = self._recover_command(clearance)
-            if command is not None:
-                return command
+            # No clearance input exists anymore, so a latched RECOVER can only
+            # clear by an explicit reset, never by drifting back into a band.
+            self.state = self.prev_state
 
         if self.state == "DONE":
             return (0, 0, 0, 0, "DONE hover")
@@ -235,8 +214,9 @@ class AutoFlight:
             return self._inspect_command(det, now)
 
         if self.state == "APPROACH":
-            return self._approach_command(det, now, clearance)
-        return self._nav_command(P, now, clearance)
+            return self._approach_command(det, now)
+        return self._nav_command(P, now)
+
 
 
 # ----------------------------- run loop ------------------------------------
@@ -399,31 +379,16 @@ if __name__ == "__main__":
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 
-    # synthetic SDF: 30x30x10 box, pole no-go cylinder (r+buffer=3) at (15,15)
-    vox, L, H = 0.5, 30.0, 10.0
-    nx, ny, nz = int(L / vox), int(L / vox), int(H / vox)
-    sdf = np.empty((nx, ny, nz), np.float32)
-    for i in range(nx):
-        x = i * vox
-        for j in range(ny):
-            y = j * vox
-            dpole = math.hypot(x - 15, y - 15) - 3.0
-            for k in range(nz):
-                z = k * vox
-                sdf[i, j, k] = min(min(x, L - x, y, L - y, z, H - z), dpole)
-    grid = SDFGrid(sdf, np.zeros(3), vox)
-
     start = (4, 4, 5)
-    # pole standoff points = ring around the pole at the box, here just two probe spots
-    targets = [(11.5, 15, 5), (15, 11.5, 5)]  # standoff points near the pole no-go
-    path, order = plan_tour(grid, start, targets, standoff_min=0.0, pref_clear=2.0, risk_w=3.0)
-    # NOTE: plan_tour already smooths each leg; do NOT smooth the full tour again
-    # (a global shortcut could skip a mandatory target).
-    print(f"[plan] tour pts={len(path)} order={[tuple(map(float, o)) for o in order]}")
+    # Direct hand-drawn style polyline: start -> two probe standoff points.
+    # No SDF, no planner, no clearance scoring; the dry-run exercises only
+    # the NAV/APPROACH/INSPECT state machine along the drawn line.
+    targets = [(11.5, 15, 5), (15, 11.5, 5)]  # standoff points near the pole
+    path = [np.asarray(start, float), *[np.asarray(t, float) for t in targets]]
+    print(f"[plan] direct pts={len(path)} (no SDF planner)")
 
     follower = PathFollower(path)
-    ctrl = AutoFlight(grid, follower, targets)
-
+    ctrl = AutoFlight(follower, targets)
     if args.dry_run:
         sim = _Sim(start[0], start[1], start[2], 0.0)
         run(_SimLocalizer(sim), _SimPoleDetector(sim, (15, 15)), ctrl, dry_run=True, sim=sim)

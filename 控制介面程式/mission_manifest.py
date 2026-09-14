@@ -38,13 +38,51 @@ class ManifestError(ValueError):
     """A component manifest is malformed, unsafe or has lost its identity."""
 
 
+_SHA256_CACHE: dict[tuple[Any, ...], str] = {}
+
+
+def clear_sha256_cache() -> None:
+    """Clear the in-process SHA-256 memoization cache."""
+    _SHA256_CACHE.clear()
+
+
 def sha256_file(path: str | Path) -> str:
+    """Compute SHA-256 of a file, with in-process memoization key=(path,mtime,size,ino)."""
+    p = Path(path)
+    try:
+        resolved = p.resolve()
+        st = resolved.stat()
+        canonical_key = (str(resolved), st.st_mtime_ns, st.st_size, st.st_ino)
+        cached = _SHA256_CACHE.get(canonical_key)
+        if cached is not None:
+            return cached
+        for candidate in (
+            (resolved, st.st_mtime_ns, st.st_size, st.st_ino),
+            (str(p), st.st_mtime_ns, st.st_size, st.st_ino),
+            (p, st.st_mtime_ns, st.st_size, st.st_ino),
+            (str(resolved), st.st_mtime, st.st_size, st.st_ino),
+            (resolved, st.st_mtime, st.st_size, st.st_ino),
+            (str(p), st.st_mtime, st.st_size, st.st_ino),
+            (p, st.st_mtime, st.st_size, st.st_ino),
+        ):
+            if candidate in _SHA256_CACHE:
+                return _SHA256_CACHE[candidate]
+    except OSError:
+        resolved = p
+        st = None
+
     digest = hashlib.sha256()
-    with Path(path).open("rb") as handle:
+    with resolved.open("rb") as handle:
         for block in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(block)
-    return digest.hexdigest()
+    result = digest.hexdigest()
 
+    if st is not None:
+        for path_key in (str(resolved), resolved, str(p), p):
+            for mtime_key in (st.st_mtime_ns, st.st_mtime):
+                _SHA256_CACHE[(path_key, mtime_key, st.st_size, st.st_ino)] = result
+
+    return result
 
 def _reject_json_constant(value: str) -> NoReturn:
     raise ManifestError(f"non-finite JSON number is not allowed: {value}")
@@ -950,5 +988,6 @@ __all__ = [
     "load_route_manifest",
     "load_site_manifest",
     "load_vehicle_manifest",
+    "clear_sha256_cache",
     "sha256_file",
 ]

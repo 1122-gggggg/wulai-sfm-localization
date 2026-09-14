@@ -93,7 +93,6 @@ def _scale_free_controller() -> dict:
         "inspect_radius_map_units": 0.5,
         "inspect_resume_margin_map_units": 0.2,
         "max_pose_jump_map_units": 1.0,
-        "max_route_deviation_map_units": 1.5,
         "progress_jump_slack_map_units": 0.5,
         "max_progress_regression_map_units": 0.1,
         "segment_window": 2,
@@ -108,7 +107,6 @@ def _scale_free_controller() -> dict:
         ("speed_limit_mps", 2.01),
         ("lookahead_map_units", 5.01),
         ("max_pose_jump_map_units", 5.01),
-        ("max_route_deviation_map_units", 10.01),
     ],
 )
 def test_site_controller_rejects_values_outside_the_safety_envelope(

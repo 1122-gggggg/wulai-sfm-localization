@@ -629,7 +629,7 @@ class SessionConfig:
     source: str
     offline: bool
     site_profile_schema_version: int = 0
-    autonomous_speed_limit_mps: float = 0.30
+    autonomous_speed_limit_mps: float = 0.60
     autonomous_locked: bool = True
     firmware_limits: Mapping[str, Any] = field(default_factory=dict)
 

@@ -15,15 +15,11 @@ sys.path.insert(0, str(FLIGHT_CONTROL_ROOT))
 import autoflight
 
 
-class FakeSDF:
-    def __init__(self, clearance: float):
+class _LegacySDF:
+    """Placeholder accepted-and-ignored SDF for the retired tube interface."""
+
+    def __init__(self, clearance: float = 2.0):
         self.value = clearance
-
-    def clearance(self, _point) -> float:
-        return self.value
-
-    def gradient(self, _point) -> np.ndarray:
-        return np.array([1.0, 0.0, 0.0])
 
 
 class StaticFollower:
@@ -34,8 +30,8 @@ class StaticFollower:
         return self.target.copy()
 
 
-def _controller(clearance: float = 2.0) -> tuple[autoflight.AutoFlight, FakeSDF]:
-    sdf = FakeSDF(clearance)
+def _controller(clearance: float = 2.0) -> tuple[autoflight.AutoFlight, _LegacySDF]:
+    sdf = _LegacySDF(clearance)
     target = np.array([10.0, 0.0, 1.0])
     return autoflight.AutoFlight(sdf, StaticFollower(target), [target]), sdf
 
@@ -44,18 +40,13 @@ def _pose() -> autoflight.Pose:
     return autoflight.Pose(0.0, 0.0, 1.0, 0.0, 1.0)
 
 
-def test_clearance_breach_hovers_until_hysteresis_clears() -> None:
-    controller, sdf = _controller(autoflight.STOP_MARGIN)
-
+def test_no_tube_steering_or_boundary_slowdown() -> None:
+    controller, _sdf = _controller()
     command = controller.step(_pose(), None, now=1.0)
-    assert command[:4] == (0, 0, 0, 0)
-    assert command[4].startswith("RECOVER hover")
-    assert controller.state == "RECOVER"
-
-    sdf.value = autoflight.RESUME_MARGIN
-    resumed = controller.step(_pose(), None, now=1.1)
+    assert command[:4] == (0, 8, 0, 0)
+    assert command[4] == "NAV->t0"
     assert controller.state == "NAV"
-    assert resumed[4].startswith("NAV->")
+    assert autoflight.AutoFlight(StaticFollower([10.0, 0.0, 1.0]), [[10.0, 0.0, 1.0]]).state == "NAV"
 
 
 def test_inspection_completion_advances_to_done() -> None:

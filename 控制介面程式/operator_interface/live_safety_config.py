@@ -11,6 +11,11 @@ from dataclasses import asdict, dataclass
 DEFAULT_MAX_TILT_DEG = 20.0
 DEFAULT_MAX_VERTICAL_SPEED_MS = 2.0
 DEFAULT_MAX_ROTATION_SPEED_DEGS = 20.0
+# Operator decision 2026-09-12: roll/pitch rotation speed was the one axis the
+# firmware envelope never pinned, so it sat at the aircraft default and the
+# measured flight reached 154 deg/s.  60 deg/s is both the default and the
+# ceiling here, like the other three limits -- it can be lowered, never raised.
+DEFAULT_MAX_PITCH_ROLL_ROTATION_SPEED_DEGS = 60.0
 DEFAULT_RTH_MIN_ALTITUDE_M = 20.0
 DEFAULT_STREAM_LOSS_GRACE_S = 10.0
 CRITICAL_BATTERY_PCT = 10.0
@@ -41,6 +46,29 @@ def _optional_positive(name: str, value: object | None) -> float | None:
     return parsed
 
 
+def takeoff_battery_blocker(battery: object, battery_floor: object) -> str | None:
+    """Whether battery state blocks takeoff; None when it does not.
+
+    The live backend enforces this at the command boundary and the preflight
+    screen reports it to the operator, so both read the same decision here: a
+    preflight that said "advisory only" while the backend refused the takeoff
+    sent the operator to the field with the wrong expectation.
+    """
+    try:
+        percent = _finite("battery", battery)
+    except (TypeError, ValueError):
+        return "battery state unavailable or invalid"
+    if not 0.0 <= percent <= 100.0:
+        return "battery state unavailable or invalid"
+    try:
+        floor = _finite("battery floor", battery_floor)
+    except (TypeError, ValueError):
+        return "takeoff battery floor is unavailable or invalid"
+    if percent < floor:
+        return f"battery {percent:.0f}% is below the {floor:.0f}% takeoff floor"
+    return None
+
+
 @dataclass(frozen=True)
 class LiveSafetyConfig:
     """Effective, normalized live-flight settings used by UI and backend."""
@@ -52,6 +80,7 @@ class LiveSafetyConfig:
     max_tilt_deg: float
     max_vertical_speed_ms: float
     max_rotation_speed_degs: float
+    max_pitch_roll_rotation_speed_degs: float
     rth_min_altitude_m: float
     stream_loss_grace_s: float
     min_takeoff_battery_pct: float
@@ -69,6 +98,7 @@ class LiveSafetyConfig:
         max_tilt_deg: object,
         max_vertical_speed_ms: object,
         max_rotation_speed_degs: object,
+        max_pitch_roll_rotation_speed_degs: object,
         rth_min_altitude_m: object,
         stream_loss_grace_s: object,
         min_takeoff_battery_pct: object,
@@ -91,6 +121,9 @@ class LiveSafetyConfig:
         tilt = _finite("max_tilt_deg", max_tilt_deg)
         vertical = _finite("max_vertical_speed_ms", max_vertical_speed_ms)
         rotation = _finite("max_rotation_speed_degs", max_rotation_speed_degs)
+        pitch_roll_rotation = _finite(
+            "max_pitch_roll_rotation_speed_degs", max_pitch_roll_rotation_speed_degs
+        )
         rth = _finite("rth_min_altitude_m", rth_min_altitude_m)
         grace = _finite("stream_loss_grace_s", stream_loss_grace_s)
         battery = _finite("min_takeoff_battery_pct", min_takeoff_battery_pct)
@@ -98,6 +131,11 @@ class LiveSafetyConfig:
             ("max_tilt_deg", tilt, DEFAULT_MAX_TILT_DEG),
             ("max_vertical_speed_ms", vertical, DEFAULT_MAX_VERTICAL_SPEED_MS),
             ("max_rotation_speed_degs", rotation, DEFAULT_MAX_ROTATION_SPEED_DEGS),
+            (
+                "max_pitch_roll_rotation_speed_degs",
+                pitch_roll_rotation,
+                DEFAULT_MAX_PITCH_ROLL_ROTATION_SPEED_DEGS,
+            ),
             ("rth_min_altitude_m", rth, DEFAULT_RTH_MIN_ALTITUDE_M),
         ):
             if not 0.0 < value <= maximum:
@@ -119,6 +157,7 @@ class LiveSafetyConfig:
             max_tilt_deg=tilt,
             max_vertical_speed_ms=vertical,
             max_rotation_speed_degs=rotation,
+            max_pitch_roll_rotation_speed_degs=pitch_roll_rotation,
             rth_min_altitude_m=rth,
             stream_loss_grace_s=grace,
             min_takeoff_battery_pct=battery,

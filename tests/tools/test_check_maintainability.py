@@ -4,6 +4,8 @@ from pathlib import Path
 
 import pytest
 
+pytestmark = pytest.mark.smoke
+
 from check_maintainability import (
     BUDGETS,
     budget_failures,

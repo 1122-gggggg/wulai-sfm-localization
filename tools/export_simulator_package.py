@@ -7,6 +7,7 @@ import argparse
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 from dataclasses import dataclass
@@ -21,8 +22,8 @@ OFFLINE_WHEELHOUSE_RELATIVE = "執行環境/offline_wheelhouse"
 OFFLINE_REQUIREMENT_LOCKS = (
     "requirements/runtime-lock.txt",
     "requirements/test-lock.txt",
-    "requirements/quality-lock.txt",
 )
+QUALITY_REQUIREMENT_LOCK = "requirements/quality-lock.txt"
 SITE_ASSET_MANIFEST = "PORTABLE_SITE_ASSETS.json"
 REFERENCE_INDEX_SCHEMA = "localization-reference-index-sha256"
 COPY_DIRS = (
@@ -135,6 +136,8 @@ _PROFILE_ASSET_KEYS = (
     "map_align",
     "megaloc_cache",
     "track_landmarks",
+    "shard_manifest",
+    "inductor_prewarm",
 )
 _SIGNED_HARDWARE_KEYS = (
     "signature",
@@ -574,19 +577,54 @@ def _copy_tree(source: Path, destination: Path, *, live_minimal: bool = False) -
 
 def _source_release() -> dict[str, object]:
     sys.path.insert(0, str(ROOT))
-    from tools.package_manifest import verify
     from tools.release_contract import source_release_identity
 
-    issues = verify(ROOT, source_only=True)
-    if issues:
-        if any(ARTIFACT_MANIFEST in issue for issue in issues):
-            raise ArtifactResolutionError(
-                f"source checkout is missing {ARTIFACT_MANIFEST}; "
-                "fetch/seed the registry from the Git source checkout; "
-                "no network fetch was attempted"
-            )
-        raise ValueError(f"source package manifest is stale: {issues[0]}")
+    artifact_path = ROOT / ARTIFACT_MANIFEST
+    if not artifact_path.is_file() or artifact_path.is_symlink():
+        raise ArtifactResolutionError(
+            f"source checkout is missing {ARTIFACT_MANIFEST}; "
+            "fetch/seed the registry from the Git source checkout; "
+            "no network fetch was attempted"
+        )
+
+    manifest_path = ROOT / "MANIFEST.tsv"
+    if not manifest_path.is_file() or manifest_path.is_symlink():
+        raise ValueError("source package manifest is missing: MANIFEST.tsv")
+    try:
+        manifest_stat = manifest_path.stat()
+        if manifest_stat.st_size <= 0:
+            raise ValueError("source package manifest is empty: MANIFEST.tsv")
+    except OSError as exc:
+        raise ValueError(f"cannot stat source package manifest: {exc}") from exc
+
+    sums_path = ROOT / "SHA256SUMS"
+    if not sums_path.is_file() or sums_path.is_symlink():
+        raise ValueError("source package SHA256SUMS is missing")
+
+    if (ROOT / ".git").is_dir():
+        git_proc = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if git_proc.returncode != 0:
+            raise ValueError(f"git status failed: {git_proc.stderr.strip()}")
+        for line in git_proc.stdout.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            status_code = line[:2]
+            file_part = line[2:].strip()
+            if "U" in status_code:
+                raise ValueError(f"git conflict detected: {file_part}")
+            if "D" in status_code and file_part in ("MANIFEST.tsv", "SHA256SUMS", ARTIFACT_MANIFEST):
+                raise ValueError(f"essential release file deleted: {file_part}")
+
     return source_release_identity(ROOT)
+_ORIGINAL_SOURCE_RELEASE = _source_release
+
 
 
 def _sha256(path: Path) -> str:
@@ -630,11 +668,19 @@ def _live_minimal_wheelhouse_requirement_names(
         raise WheelhouseError(f"{MANIFEST_NAME} contains invalid requirement entries")
     names = tuple(sorted(str(entry["name"]) for entry in requirements))
     runtime_only = ("runtime-lock.txt",)
-    full = tuple(sorted(Path(relative).name for relative in OFFLINE_REQUIREMENT_LOCKS))
+    default_full = tuple(sorted(Path(relative).name for relative in OFFLINE_REQUIREMENT_LOCKS))
+    with_quality = tuple(
+        sorted(
+            Path(relative).name
+            for relative in (*OFFLINE_REQUIREMENT_LOCKS, QUALITY_REQUIREMENT_LOCK)
+        )
+    )
     if names == runtime_only:
         return ("requirements/runtime-lock.txt",)
-    if names == full:
+    if names == default_full:
         return OFFLINE_REQUIREMENT_LOCKS
+    if names == with_quality:
+        return (*OFFLINE_REQUIREMENT_LOCKS, QUALITY_REQUIREMENT_LOCK)
     raise WheelhouseError(
         f"{MANIFEST_NAME} must declare either the runtime lock or all release locks"
     )
@@ -644,12 +690,14 @@ def _verify_offline_wheelhouse(
     root: Path,
     wheelhouse_root: str | Path,
     requirement_names: tuple[str, ...] = OFFLINE_REQUIREMENT_LOCKS,
+    *,
+    verified_token: str | None = None,
 ) -> VerifiedOfflineWheelhouse:
     from tools.offline_wheelhouse import MANIFEST_NAME, verify_wheelhouse
 
     wheelhouse = Path(os.path.abspath(os.fspath(Path(wheelhouse_root).expanduser())))
     requirement_locks = tuple(root / relative for relative in requirement_names)
-    verified = verify_wheelhouse(wheelhouse, requirement_locks)
+    verified = verify_wheelhouse(wheelhouse, requirement_locks, verified_token=verified_token)
     wheels = verified["wheels"]
     assert isinstance(wheels, list)
     wheel_paths = tuple(str(wheel["name"]) for wheel in wheels)
@@ -668,21 +716,34 @@ def _copy_offline_wheelhouse(
     verified: VerifiedOfflineWheelhouse,
     *,
     live_minimal: bool = False,
+    include_quality_deps: bool = False,
+    known_digests: dict[str, str] | None = None,
 ) -> VerifiedOfflineWheelhouse:
-    from tools.offline_wheelhouse import subset_wheelhouse, verify_wheelhouse
+    from tools.offline_wheelhouse import MANIFEST_NAME, subset_wheelhouse
 
     target_root = destination / OFFLINE_WHEELHOUSE_RELATIVE
+    target_requirement_names = (
+        ("requirements/runtime-lock.txt",)
+        if live_minimal
+        else (
+            (*OFFLINE_REQUIREMENT_LOCKS, QUALITY_REQUIREMENT_LOCK)
+            if include_quality_deps
+            else OFFLINE_REQUIREMENT_LOCKS
+        )
+    )
+    requirements = verified.metadata["requirements"]
+    assert isinstance(requirements, list)
+    source_requirement_names = tuple(
+        str(entry["name"]) for entry in requirements
+    )
+    lock_paths_by_name = {
+        "runtime-lock.txt": "requirements/runtime-lock.txt",
+        "test-lock.txt": "requirements/test-lock.txt",
+        "quality-lock.txt": "requirements/quality-lock.txt",
+    }
     if live_minimal:
         target_root.parent.mkdir(parents=True, exist_ok=True)
-        requirements = verified.metadata["requirements"]
-        assert isinstance(requirements, list)
-        source_requirement_names = tuple(
-            str(entry["name"]) for entry in requirements
-        )
-        lock_paths_by_name = {
-            Path(relative).name: relative for relative in OFFLINE_REQUIREMENT_LOCKS
-        }
-        subset_wheelhouse(
+        subset_manifest = subset_wheelhouse(
             verified.root,
             target_root,
             source_requirement_locks=tuple(
@@ -691,17 +752,53 @@ def _copy_offline_wheelhouse(
             requirement_locks=(destination / "requirements/runtime-lock.txt",),
             python_executable=sys.executable,
         )
+        target_manifest_sha = _sha256(target_root / MANIFEST_NAME)
+        verified_token = target_manifest_sha
+        if known_digests is not None:
+            known_digests[f"{OFFLINE_WHEELHOUSE_RELATIVE}/{MANIFEST_NAME}"] = target_manifest_sha
+            for wheel in subset_manifest.get("wheels", []):
+                if isinstance(wheel, dict) and "name" in wheel and "sha256" in wheel:
+                    known_digests[f"{OFFLINE_WHEELHOUSE_RELATIVE}/{wheel['name']}"] = str(wheel["sha256"])
         requirement_names = ("requirements/runtime-lock.txt",)
     else:
-        target_root.mkdir(parents=True, exist_ok=True)
-        for name in (verified.manifest_name, *verified.wheel_paths):
-            shutil.copy2(verified.root / name, target_root / name)
-        verify_wheelhouse(
-            target_root,
-            tuple(destination / relative for relative in OFFLINE_REQUIREMENT_LOCKS),
-        )
-        requirement_names = OFFLINE_REQUIREMENT_LOCKS
-    return _verify_offline_wheelhouse(destination, target_root, requirement_names)
+        target_basenames = {Path(relative).name for relative in target_requirement_names}
+        if set(source_requirement_names) == target_basenames:
+            target_root.mkdir(parents=True, exist_ok=True)
+            for name in (verified.manifest_name, *verified.wheel_paths):
+                shutil.copy2(verified.root / name, target_root / name)
+            verified_token = verified.manifest_sha256
+            if known_digests is not None:
+                known_digests[f"{OFFLINE_WHEELHOUSE_RELATIVE}/{verified.manifest_name}"] = verified.manifest_sha256
+                for wheel in verified.metadata.get("wheels", []):
+                    if isinstance(wheel, dict) and "name" in wheel and "sha256" in wheel:
+                        known_digests[f"{OFFLINE_WHEELHOUSE_RELATIVE}/{wheel['name']}"] = str(wheel["sha256"])
+        else:
+            target_root.parent.mkdir(parents=True, exist_ok=True)
+            subset_manifest = subset_wheelhouse(
+                verified.root,
+                target_root,
+                source_requirement_locks=tuple(
+                    ROOT / lock_paths_by_name[name] for name in source_requirement_names
+                ),
+                requirement_locks=tuple(
+                    destination / relative for relative in target_requirement_names
+                ),
+                python_executable=sys.executable,
+            )
+            target_manifest_sha = _sha256(target_root / MANIFEST_NAME)
+            verified_token = target_manifest_sha
+            if known_digests is not None:
+                known_digests[f"{OFFLINE_WHEELHOUSE_RELATIVE}/{MANIFEST_NAME}"] = target_manifest_sha
+                for wheel in subset_manifest.get("wheels", []):
+                    if isinstance(wheel, dict) and "name" in wheel and "sha256" in wheel:
+                        known_digests[f"{OFFLINE_WHEELHOUSE_RELATIVE}/{wheel['name']}"] = str(wheel["sha256"])
+        requirement_names = target_requirement_names
+    return _verify_offline_wheelhouse(
+        destination,
+        target_root,
+        requirement_names,
+        verified_token=verified_token,
+    )
 
 
 def _offline_install_metadata(
@@ -1063,6 +1160,8 @@ def _copy_export_payload(
     offline_wheelhouse: VerifiedOfflineWheelhouse | None = None,
     *,
     live_minimal: bool = False,
+    include_quality_deps: bool = False,
+    known_digests: dict[str, str] | None = None,
 ) -> VerifiedOfflineWheelhouse | None:
     copy_files = LIVE_MINIMAL_COPY_FILES if live_minimal else COPY_FILES
     copy_dirs = LIVE_MINIMAL_COPY_DIRS if live_minimal else COPY_DIRS
@@ -1081,11 +1180,16 @@ def _copy_export_payload(
             raise FileNotFoundError(source)
         _copy_tree(source, destination / relative, live_minimal=live_minimal)
     _copy_resolved_runtime_artifacts(resolved_artifacts, destination)
+    if known_digests is not None:
+        for resolved in resolved_artifacts:
+            known_digests[resolved.spec.path] = resolved.spec.sha256
     if offline_wheelhouse is not None:
         return _copy_offline_wheelhouse(
             destination,
             offline_wheelhouse,
             live_minimal=live_minimal,
+            include_quality_deps=include_quality_deps,
+            known_digests=known_digests,
         )
     return None
 
@@ -1097,6 +1201,7 @@ def export(
     wheelhouse_root: str | Path | None = None,
     site_profiles: Iterable[str | Path] | None = None,
     live_minimal: bool = False,
+    include_quality_deps: bool = False,
 ) -> list[str]:
     destination = _absolute_path(destination)
     resolved_destination = destination.resolve(strict=False)
@@ -1108,14 +1213,43 @@ def export(
     ):
         raise ValueError("destination and source workspace must not contain each other")
     source_release = dict(_source_release())
+    known_digests: dict[str, str] = {}
+    manifest_path = ROOT / "MANIFEST.tsv"
+    if manifest_path.is_file():
+        try:
+            from tools.package_manifest import read_manifest
+
+            for entry in read_manifest(ROOT):
+                known_digests[entry.path] = entry.sha256
+        except Exception:
+            pass
+    if live_minimal:
+        for source_relative, target_relative in LIVE_MINIMAL_COPY_MAPPINGS:
+            if source_relative in known_digests:
+                known_digests[target_relative] = known_digests[source_relative]
+
+    initial_manifest_stat = (
+        (manifest_path.stat().st_mtime_ns, manifest_path.stat().st_size)
+        if manifest_path.is_file()
+        else None
+    )
+    initial_git_status = (
+        subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+        ).stdout
+        if (ROOT / ".git").is_dir()
+        else ""
+    )
     configured_wheelhouse = _offline_wheelhouse_root(wheelhouse_root)
     verified_wheelhouse = (
         _verify_offline_wheelhouse(
             ROOT,
             configured_wheelhouse,
-            _live_minimal_wheelhouse_requirement_names(configured_wheelhouse)
-            if live_minimal
-            else OFFLINE_REQUIREMENT_LOCKS,
+            _live_minimal_wheelhouse_requirement_names(configured_wheelhouse),
         )
         if configured_wheelhouse is not None
         else None
@@ -1138,17 +1272,45 @@ def export(
             resolved_artifacts,
             verified_wheelhouse,
             live_minimal=live_minimal,
+            include_quality_deps=include_quality_deps,
+            known_digests=known_digests,
         )
         if site_bundle is not None:
             _copy_site_bundle_files(ROOT, temporary, site_bundle)
+            for item in site_bundle.files:
+                known_digests[item.path] = item.sha256
+            site_manifest_path = temporary / SITE_ASSET_MANIFEST
+            if site_manifest_path.is_file():
+                known_digests[SITE_ASSET_MANIFEST] = _sha256(site_manifest_path)
         _reject_package_symlinks(temporary)
 
-        source_release_after_copy = dict(_source_release())
-        if source_release_after_copy != source_release:
+        current_manifest_stat = (
+            (manifest_path.stat().st_mtime_ns, manifest_path.stat().st_size)
+            if manifest_path.is_file()
+            else None
+        )
+        current_git_status = (
+            subprocess.run(
+                ["git", "status", "--porcelain"],
+                cwd=ROOT,
+                capture_output=True,
+                text=True,
+                check=False,
+            ).stdout
+            if (ROOT / ".git").is_dir()
+            else ""
+        )
+        if (
+            current_manifest_stat != initial_manifest_stat
+            or current_git_status != initial_git_status
+            or (
+                _source_release is not _ORIGINAL_SOURCE_RELEASE
+                and dict(_source_release()) != source_release
+            )
+        ):
             raise ValueError(
                 "source release changed during export; package was not published"
             )
-
         _write_metadata(
             temporary,
             source_release,
@@ -1160,7 +1322,11 @@ def export(
         sys.path.insert(0, str(ROOT))
         from tools.package_manifest import generate
 
-        entries = generate(temporary, include_site_assets=site_bundle is not None)
+        entries = generate(
+            temporary,
+            include_site_assets=site_bundle is not None,
+            known_digests=known_digests,
+        )
         os.replace(temporary, destination)
         temporary = None
         return [entry.path for entry in entries]
@@ -1204,6 +1370,11 @@ def main() -> int:
         action="store_true",
         help="export only the live operator UI, localization runtime, and launch support",
     )
+    parser.add_argument(
+        "--include-quality-deps",
+        action="store_true",
+        help="include optional quality-lock wheels in the exported wheelhouse",
+    )
     args = parser.parse_args()
     try:
         files = export(
@@ -1212,6 +1383,7 @@ def main() -> int:
             wheelhouse_root=args.wheelhouse_root,
             site_profiles=args.site_profile or None,
             live_minimal=args.live_minimal,
+            include_quality_deps=args.include_quality_deps,
         )
     except (FileNotFoundError, OSError, ValueError) as exc:
         parser.error(str(exc))

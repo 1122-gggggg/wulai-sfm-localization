@@ -131,6 +131,7 @@ def rank_reference_indices(
     occupied_bins: Sequence[int] | None = None,
     min_occupied_bins: int = 0,
     retrieve_pool: int | None = None,
+    reference_norms: np.ndarray | None = None,
 ) -> tuple[tuple[int, ...], bool]:
     """Apply session exclusion before cosine ranking, then drop empty-side views."""
 
@@ -143,7 +144,10 @@ def rank_reference_indices(
     if top_k <= 0:
         raise ValueError("top_k must be positive")
     query_norm = float(np.linalg.norm(query))
-    reference_norms = np.linalg.norm(references, axis=1)
+    if reference_norms is None:
+        reference_norms = np.linalg.norm(references, axis=1)
+    elif np.asarray(reference_norms).shape != (len(references),):
+        raise ValueError("reference norms must align with descriptor rows")
     if query_norm <= 0 or np.any(reference_norms <= 0):
         raise ValueError("retrieval descriptors must have non-zero norm")
     scores = (references @ query) / (reference_norms * query_norm)
@@ -1204,12 +1208,12 @@ class FinalMapEDMProvider:
         # reduction order differences across different batch sizes on GPU.
         batch_enabled = os.environ.get("EDM_BATCH_REFS", "0") == "1"
         if batch_enabled and len(ref_items) > 1:
-            matched_list = _match_official_prepared_batch(
+            matched_list = getattr(self, "_match_prepared_batch", _match_official_prepared_batch)(
                 matcher, prepared_query, [item[2] for item in ref_items]
             )
         else:
             matched_list = [
-                _match_official_prepared(matcher, prepared_query, item[2])
+                getattr(self, "_match_prepared", _match_official_prepared)(matcher, prepared_query, item[2])
                 for item in ref_items
             ]
 

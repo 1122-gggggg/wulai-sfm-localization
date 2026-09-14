@@ -73,18 +73,25 @@ def _arrive_radius(raw: object) -> float | None:
     return value
 
 
-def _route_deviation_radius(raw: object) -> float | None:
-    """Validate the operator-confirmed safe tube carried by a route file."""
+def _waypoint_radii(raw: object, count: int) -> list[float] | None:
+    """Validate per-waypoint arrival spheres; None means all-global."""
     if raw is None:
         return None
-    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
-        raise ValueError("route max_route_deviation_map_units must be a number")
-    value = float(raw)
-    if not math.isfinite(value) or value < 0.0:
+    if not isinstance(raw, list) or len(raw) != count:
         raise ValueError(
-            "route max_route_deviation_map_units must be finite and >= 0"
+            "route waypoint_arrive_radii must be a list with one radius per waypoint"
         )
-    return value
+    radii = []
+    for index, value in enumerate(raw):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"route waypoint_arrive_radii[{index}] must be a number")
+        radius = float(value)
+        if not math.isfinite(radius) or radius <= 0.0:
+            raise ValueError(
+                f"route waypoint_arrive_radii[{index}] must be finite and > 0"
+            )
+        radii.append(radius)
+    return radii
 
 
 def _editor_points_from_route(
@@ -132,8 +139,8 @@ class RouteDocument:
     align_source: str = "legacy"
     #: Arrival sphere the operator confirmed, in map units.
     arrive_radius_map_units: float | None = None
-    #: Radius of the safe tube around the route centerline, in map units.
-    max_route_deviation_map_units: float | None = None
+    #: Per-waypoint arrival spheres drawn by the operator; None = all-global.
+    waypoint_arrive_radii: list[float] | None = None
 
     @classmethod
     def load(
@@ -190,8 +197,8 @@ class RouteDocument:
             source_path=source,
             align_source=align_source,
             arrive_radius_map_units=_arrive_radius(raw.get("arrive_radius_map_units")),
-            max_route_deviation_map_units=_route_deviation_radius(
-                raw.get("max_route_deviation_map_units")
+            waypoint_arrive_radii=_waypoint_radii(
+                raw.get("waypoint_arrive_radii"), len(editor_points)
             ),
         )
 
@@ -212,7 +219,7 @@ class RouteDocument:
             "closed": False,
             "waypoints": points,
             "arrive_radius_map_units": self.arrive_radius_map_units,
-            "max_route_deviation_map_units": self.max_route_deviation_map_units,
+            "waypoint_arrive_radii": self.aligned_point_radii(len(points)),
             "source": "operator_route_editor",
             "note": (
                 "unbound PLY preview; cannot be imported as a flight route"
@@ -221,6 +228,23 @@ class RouteDocument:
             ),
         }
         return payload
+
+    def aligned_point_radii(self, count: int) -> list[float] | None:
+        """Per-point spheres padded/truncated to the current point list.
+
+        The editor window keeps this aligned on add/delete; this backstop
+        covers undo/redo, which restores points without touching radii.
+        """
+        radii = self.waypoint_arrive_radii
+        if radii is None:
+            return None
+        fallback = self.arrive_radius_map_units
+        if fallback is None or not isinstance(fallback, (int, float)):
+            raise ValueError("route needs a global arrival radius to align per-point radii")
+        aligned = list(radii[:count])
+        while len(aligned) < count:
+            aligned.append(float(fallback))
+        return aligned
 
     def save(self, path: str | Path, *, preview_only: bool = False) -> Path:
         target = Path(path).expanduser().resolve()

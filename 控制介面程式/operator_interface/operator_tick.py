@@ -25,10 +25,12 @@ from operator_localization_config import (
 )
 from localization_result_ui import (
     annotate_ui_arrival_timing,
+    localization_pose_timestamp,
     localization_result_is_weak,
     normalize_live_localization_result,
     validate_live_localization_result,
 )
+from operator_rendering import weak_pose_source_kind
 
 
 RollingEventFps = Callable[[list[float], float], tuple[list[float], float]]
@@ -197,6 +199,11 @@ def _read_next_stream_frame(
     if not can_read:
         return None
     frame = app.video_stream.next_frame()
+    if frame is None:
+        # The file decoder issues its next decode request and reports empty;
+        # keep this source slot so the 5 ms pump retries it instead of
+        # skipping a whole frame period.
+        return None
     if app.next_stream_frame_time <= 0.0:
         app.next_stream_frame_time = now
     while app.next_stream_frame_time <= now:
@@ -204,15 +211,15 @@ def _read_next_stream_frame(
     return frame
 
 
-def _accept_stream_frame(
+def _accept_stream_frame_data(
     app: Any,
-    state: Any,
     frame: Any,
     *,
     now: float,
     hold_boot: bool,
     rolling_event_fps: RollingEventFps,
-) -> Any:
+) -> str:
+    """Record one accepted frame and return the stream label it implies."""
     app.video_frame = frame
     app.video_display_index = max(0, app.video_stream.output_index - 1)
     app.video_display_frame_name = app.video_stream.last_frame_name
@@ -225,9 +232,8 @@ def _accept_stream_frame(
     app.video_frame_fresh = not hold_boot
     app.stream_lost_since = None
     if hold_boot:
-        state.stream = "HOLD_720P"
+        return "HOLD_720P"
     elif app.inspecting:
-        state.stream = "OK"
         # Rolling 5s stream FPS (truth for "is the pipe real-time now?")
         # plus lifetime average for long-run stats.
         app.processed_frames += 1
@@ -240,8 +246,27 @@ def _accept_stream_frame(
             elapsed = now - app.inspect_start
             if elapsed > 0:
                 app._lifetime_stream_fps = app.processed_frames / elapsed
+        return "OK"
     else:
-        state.stream = "PREVIEW"   # live preview, not yet in inspection
+        return "PREVIEW"   # live preview, not yet in inspection
+
+
+def _accept_stream_frame(
+    app: Any,
+    state: Any,
+    frame: Any,
+    *,
+    now: float,
+    hold_boot: bool,
+    rolling_event_fps: RollingEventFps,
+) -> Any:
+    state.stream = _accept_stream_frame_data(
+        app,
+        frame,
+        now=now,
+        hold_boot=hold_boot,
+        rolling_event_fps=rolling_event_fps,
+    )
     return state
 
 
@@ -325,7 +350,8 @@ def _update_stream(
     app: Any, state: Any, *, rolling_event_fps: RollingEventFps,
 ) -> Any:
     """Pull and classify the right-hand stream without changing flight state."""
-    app.video_frame_fresh = False
+    if getattr(app, "localizer", None) is None:
+        app.video_frame_fresh = False
     if app.video_stream is None:
         if app.video_frame is None:
             state.stream = "NO_SOURCE"
@@ -352,6 +378,22 @@ def _update_stream(
     )
 
 
+def pump_localization_frame(app: Any) -> None:
+    """Accept at most one new frame and submit it between render ticks."""
+    if app.localizer is None or app.video_stream is None or not app.inspecting:
+        return
+    if app.boot_holding() or app.lost_holding():
+        return
+    now = time.monotonic()
+    frame = _read_next_stream_frame(app, now=now, hold_boot=False, hold_lost=False)
+    if frame is None:
+        return
+    _accept_stream_frame_data(
+        app, frame, now=now, hold_boot=False, rolling_event_fps=_rolling_event_fps
+    )
+    app.submit_current_frame_for_localization()
+
+
 def _update_state_and_history(app: Any, state: Any) -> Any:
     app.submit_current_frame_for_localization()
     app.submit_current_frame_for_detection()
@@ -371,7 +413,11 @@ def _update_state_and_history(app: Any, state: Any) -> Any:
     if app.localizer is not None:
         # A result may have arrived on the independent 5 ms poll callback.
         # Consume its one-shot history notification only after this render tick.
+        # The fresh-frame latch is consumed here too: pump_localization_frame
+        # may accept frames between render ticks, and the video panel must not
+        # lose its one-shot refresh notice before this tick renders it.
         app.live_new_pose = False
+        app.video_frame_fresh = False
     app._update_age_readout(state)
     return state
 
@@ -425,14 +471,24 @@ def _update_hud_active(
     app.live_result_times, app.loc_fps = rolling_event_fps(
         app.live_result_times, now_hud
     )
+    last_hud_t = float(getattr(app, "_hud_text_last_update_t", 0.0) or 0.0)
+    terminal_text = (
+        None if app._is_live_backend() else stream_terminal_text(state.stream)
+    )
+    if terminal_text is None and (now_hud - last_hud_t) < 0.2:
+        return
+    app._hud_text_last_update_t = now_hud
+
     age_ms = (
         (now_hud - float(app._video_frame_stamp)) * 1000.0
         if app._video_frame_stamp > 0 else -1.0
     )
-    age_txt = f"{age_ms:.0f}" if age_ms >= 0 else "-"
-    terminal_text = (
-        None if app._is_live_backend() else stream_terminal_text(state.stream)
-    )
+    if age_ms >= 0:
+        quantized_age = int(round(age_ms / 50.0) * 50)
+        age_txt = f"{quantized_age}"
+    else:
+        age_txt = "-"
+
     if terminal_text is not None:
         app.overall_fps_var.set(
             f"整體/串流 FPS 0.0 | {terminal_text} | 幀 {app.processed_frames}"
@@ -497,18 +553,6 @@ def _map_dirty_key(app: Any, state: Any, *, width: int, height: int) -> tuple:
         tuple(round(float(value), 4) for value in app.camera_axes_world.reshape(-1))
         if app.camera_axes_world is not None else None
     )
-    guard = getattr(app, "collision_guard_snapshot", {}) or {}
-    guard_center = guard.get("center")
-    guard_point = guard.get("point")
-    guard_key = (
-        str(guard.get("status", "")),
-        round(float(guard.get("radius", 0.0) or 0.0), 4),
-        tuple(round(float(value), 4) for value in guard_center)
-        if guard_center is not None else None,
-        tuple(round(float(value), 4) for value in guard_point)
-        if guard_point is not None else None,
-        bool(guard.get("preview", False)),
-    )
     return (
         app.map_base_key(width, height),
         len(app.history),
@@ -523,11 +567,11 @@ def _map_dirty_key(app: Any, state: Any, *, width: int, height: int) -> tuple:
         camera_forward_key,
         int(state.inliers),
         None if state.reproj is None else round(float(state.reproj), 4),
-        guard_key,
     )
 
 
 def _video_dirty_key(app: Any, state: Any, *, width: int, height: int) -> tuple:
+    flight_state = getattr(state, "flight_state", None) or getattr(state, "mode", None)
     return (
         # stamp changes only on new grabber frame (avoids work on idle ticks)
         round(float(getattr(app, "_video_frame_stamp", 0.0)), 4),
@@ -542,14 +586,11 @@ def _video_dirty_key(app: Any, state: Any, *, width: int, height: int) -> tuple:
         # Held frames stop changing the stamp; repaint the retry counter anyway.
         app.lost_holding(),
         0 if app.lost_hold is None else app.lost_hold.attempts,
-        # Re-render when link/GPS/age band changes (LINK LOST banner + HUD).
+        # Major status: link / GPS / flight state / battery
         bool(getattr(state, "link_ok", True)),
         getattr(state, "gps_fixed", None),
-        None if getattr(state, "frame_age_ms", None) is None
-        else int(float(state.frame_age_ms) // 50),  # ~50 ms buckets
-        int(float(getattr(state, "stream_fps", 0.0) or 0.0)),
-        round(float(state.battery_pct), 0),
-        app._video_diagnostic_lines(),
+        flight_state,
+        round(float(getattr(state, "battery_pct", 100.0) or 0.0), 0),
     )
 
 
@@ -583,15 +624,18 @@ def _render_if_dirty(app: Any, state: Any, *, profile: Any = None) -> None:
     video_dirty = video_key != app._video_dirty_key
     if map_dirty and video_dirty:
         # Both panels dirty = the 44-64 ms worst case that ate the event loop
-        # (runbook 0b-1). One panel per tick caps the body near a single render
-        # so the 33 ms tick survives; the deferred panel stays dirty and paints
-        # next tick (<=1 tick / ~33 ms staleness either side).
-        turn = int(getattr(app, "_render_turn", 0) or 0)
-        app._render_turn = turn + 1
-        if turn % 2 == 0:
-            video_dirty = False
-        else:
+        # (runbook 0b-1). Video streams at 30 Hz (dirty nearly every tick)
+        # while the map pose dot moves slowly, so the map paints every 3rd
+        # contested tick (~10 Hz) and video takes the others: the tick stays
+        # near 40 ms and localization submissions (one per tick) clear 20 Hz.
+        # Display-only; the pose trail still lands every result, only its
+        # paint is decimated. Either side goes stale by <=3 ticks worst case.
+        contested = int(getattr(app, "_render_contested", 0) or 0) + 1
+        app._render_contested = contested
+        if contested % 3:
             map_dirty = False
+        else:
+            video_dirty = False
     if map_dirty:
         app._map_dirty_key = map_key
         app._present_frame(
@@ -944,6 +988,73 @@ def _accept_live_pose(app: Any, result: dict, xyz: np.ndarray) -> None:
         app.write_log(
             f"BOOT_INIT: live MegaLoc/PnP locked on {app.live_result_frame_name}"
         )
+    heading = getattr(app, "live_heading", None)
+    try:
+        heading_value = float(heading)
+    except (TypeError, ValueError, OverflowError):
+        heading_value = float("nan")
+    stamp = localization_pose_timestamp(result, arrival_mono=time.monotonic())
+    if (
+        stamp is not None
+        and math.isfinite(heading_value)
+        and all(math.isfinite(float(value)) for value in xyz[:3])
+    ):
+        app._autonomy_pose_snapshot = (
+            float(xyz[0]),
+            float(xyz[1]),
+            float(xyz[2]),
+            heading_value,
+            float(stamp),
+        )
+
+
+def _snapshot_weak_pose_for_autonomy(app: Any, result: dict, xyz: np.ndarray | None) -> None:
+    """Mirror a held weak fix into the AUTO pose snapshot only.
+
+    The confidence hold keeps protecting live_pose / loc_health / boot state;
+    this writes nothing but ``_autonomy_pose_snapshot``, and only while an
+    autonomy coordinator with ``accept_weak_poses`` is attached. Lets the
+    route loop keep flying toward the waypoints on VO-only fixes.
+    """
+    coordinator = getattr(app, "_integrated_autonomy", None)
+    if not bool(getattr(coordinator, "accept_weak_poses", False)):
+        return
+    try:
+        ok = bool(result.get("success"))
+    except (ValueError, KeyError, TypeError, AttributeError):
+        return
+    if not ok or xyz is None:
+        return
+    try:
+        point = [float(value) for value in np.asarray(xyz, dtype=float).reshape(-1)[:3]]
+    except (TypeError, ValueError):
+        return
+    if not all(math.isfinite(value) for value in point):
+        return
+    heading_value = float("nan")
+    try:
+        pose_value = result.get("pose")
+        pose = pose_value if isinstance(pose_value, dict) else {}
+        heading_value = float(pose.get("yaw_raw"))
+    except (TypeError, ValueError, OverflowError):
+        heading_value = float("nan")
+    if not math.isfinite(heading_value):
+        try:
+            heading_value = float(getattr(app, "live_heading", float("nan")))
+        except (TypeError, ValueError, OverflowError):
+            return
+        if not math.isfinite(heading_value):
+            return
+    stamp = localization_pose_timestamp(result, arrival_mono=time.monotonic())
+    if stamp is None:
+        return
+    try:
+        stamp_value = float(stamp)
+    except (TypeError, ValueError, OverflowError):
+        return
+    if not math.isfinite(stamp_value):
+        return
+    app._autonomy_pose_snapshot = (point[0], point[1], point[2], heading_value, stamp_value)
 
 
 def _accept_predicted_pose(app: Any, result: dict, xyz: np.ndarray) -> None:
@@ -1008,6 +1119,11 @@ def _record_weak_display_pose(
         return False
     trail.append(point.copy())
     trail_health.append(_WEAK_DISPLAY_HEALTH)
+    trail_kind = getattr(app, "history_weak_kind", None)
+    if isinstance(trail_kind, list):
+        trail_kind.append(weak_pose_source_kind(result))
+        while len(trail_kind) > _WEAK_HISTORY_MAX:
+            trail_kind.pop(0)
     while len(trail) > _WEAK_HISTORY_MAX:
         trail.pop(0)
         if trail_health:
@@ -1073,6 +1189,9 @@ def update_live_results(
             # Display still gets the weak fix: the mirror never touches the
             # flight pose, so the hold semantics stay exactly as they were.
             _record_weak_display_pose(app, result, xyz)
+            # VO-flight opt-in: the AUTO snapshot still advances on weak fixes
+            # so the route loop keeps flying toward the waypoints.
+            _snapshot_weak_pose_for_autonomy(app, result, xyz)
             continue
         if _live_result_failed(
                 app, result, invalid_success_pose=invalid_success_pose,
@@ -1111,6 +1230,7 @@ def run_tick(
     stream_terminal_text: StreamTerminalText = stream_terminal_text,
 ) -> None:
     """Run one UI cycle in the same order as the legacy callback."""
+    app._preflight_tick_memo = {}
     stage = "drain_flight_command_results"
     # profile.next() closes the stage just run and returns the next stage name,
     # so `stage` still holds exactly what it did before at every point -- the
@@ -1124,15 +1244,21 @@ def run_tick(
         _refresh_held_controls(app)
         stage = profile.next("poll_backend")
         state = _poll_backend(app)
+        if state is None:
+            # Poll failed: _poll_backend already paused AUTO and held zero PCMD
+            # without changing the control owner. Every stage below reads
+            # ``state``, so abandon the tick rather than run them on a stale or
+            # absent one. No profile sample is filed -- a tick that ran four of
+            # the stages is not a tick, and counting it would skew the very
+            # per-stage statistics the profiler exists to produce. The ``finally``
+            # below still schedules the next tick.
+            return
         stage = profile.next("fail_safe_dead_localizer")
         _fail_safe_dead_localizer(app)
         stage = profile.next("handle_stick_override")
-        if state is None:
-            return
         _handle_stick_override(app, state)
-        stage = profile.next("gravity_tick")
-        app._gravity_tick(state)
-        app.video_frame_fresh = False
+        if getattr(app, "localizer", None) is None:
+            app.video_frame_fresh = False
         stage = profile.next("update_boot_lock")
         app.update_boot_lock()
         stage = profile.next("update_live_results")
@@ -1145,12 +1271,6 @@ def run_tick(
         state = _update_stream(app, state, rolling_event_fps=rolling_event_fps)
         stage = profile.next("update_state_and_history")
         state = _update_state_and_history(app, state)
-        stage = profile.next("update_sparse_cloud_collision_interlock")
-        update_collision_interlock = getattr(
-            app, "update_sparse_cloud_collision_interlock", None
-        )
-        if callable(update_collision_interlock):
-            update_collision_interlock(state)
         stage = profile.next("update_hud_metrics")
         _update_hud_metrics(
             app,
@@ -1165,4 +1285,5 @@ def run_tick(
         _handle_tick_failure(app, stage=stage, exc=exc)
         raise
     finally:
+        app._preflight_tick_memo = {}
         _schedule_next_tick(app, next_tick_deadline=next_tick_deadline)

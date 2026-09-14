@@ -86,30 +86,50 @@ OUTPUT_EVIDENCE_PREFIXES = (
     "augment_",
     "baseline_",
     "benchmark_",
+    "benchmarks",
     "boq_",
     "corpus_",
-    "edm_",
-    "gates_",
+    "direct_",
     "empirical_",
     "exact_latency_",
+    "gates_",
     "localization_fps_",
-    "megaloc_",
-    "onnx_flow_",
     "optimization_",
     "p117_",
+    "p157_",
+    "p167_",
     "p168_",
+    "p173_",
+    "p174_",
     "regression_",
+    "replay_",
     "reverse_topk_",
     "river_",
     "video720_",
 )
+HISTORIC_EVIDENCE_PREFIXES = (
+    "edm_",
+    "flight_review_",
+    "megaloc_",
+    "onnx_flow_",
+)
 WORKSPACE_SIZE_WARNING_BYTES = 20 * 1024**3
 FREE_SPACE_WARNING_PERCENT = 15.0
 AUDIT_OUTPUT_RE = re.compile(r"audit_\d{8}$")
+EVIDENCE_DATE_RE = re.compile(r"_\d{8}(?:[_\-].*)?$")
+PRUNED_DIRECTORIES = {
+    ".git",
+    ".codegraph",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".venv",
+    "__pycache__",
+}
 
 
 def _walk_without_following_links(root: Path) -> Iterable[tuple[Path, os.stat_result]]:
     for current, directories, files in os.walk(root, followlinks=False):
+        directories[:] = [d for d in directories if d not in PRUNED_DIRECTORIES]
         current_path = Path(current)
         for name in [*directories, *files]:
             path = current_path / name
@@ -117,7 +137,6 @@ def _walk_without_following_links(root: Path) -> Iterable[tuple[Path, os.stat_re
                 yield path, path.lstat()
             except FileNotFoundError:
                 continue
-
 
 def directory_size(path: Path) -> int:
     if path.is_symlink():
@@ -147,6 +166,10 @@ def classify_output(name: str) -> str:
     if AUDIT_OUTPUT_RE.fullmatch(name):
         return "governance"
     if name.startswith(OUTPUT_EVIDENCE_PREFIXES):
+        return "experiment_evidence"
+    if name.startswith(HISTORIC_EVIDENCE_PREFIXES) and EVIDENCE_DATE_RE.search(name):
+        return "experiment_evidence"
+    if any(name.startswith(p.rstrip("_")) for p in OUTPUT_EVIDENCE_PREFIXES) and EVIDENCE_DATE_RE.search(name):
         return "experiment_evidence"
     return "unclassified"
 

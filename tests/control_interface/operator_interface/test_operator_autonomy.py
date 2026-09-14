@@ -10,11 +10,24 @@ from unittest.mock import Mock
 import pytest
 import numpy as np
 
-from operator_autonomy import AUTO_PCMD_FAILURE_LIMIT, DesktopRouteAutonomy
+from operator_autonomy import (
+    AUTO_BATTERY_RESERVE_PCT,
+    AUTO_MAX_DURATION_S,
+    AUTO_PCMD_FAILURE_LIMIT,
+    AUTO_WAIT_BUDGET_S,
+    DesktopRouteAutonomy,
+)
 from operator_localization_search import YawSearchConfig
 import path_follow_flight as pff
 import real_path_follow_controller as rpf
-from real_path_follow_controller import LEGACY_MAP_FRAME, MissionRouteSnapshot, Pose
+from real_path_follow_controller import (
+    DESKTOP_AUTO_MAX_TRANSLATION_PCMD,
+    DESKTOP_AUTO_MAX_YAW_PCMD,
+    DESKTOP_AUTO_YAW_ALIGNMENT_TIMEOUT_S,
+    LEGACY_MAP_FRAME,
+    MissionRouteSnapshot,
+    Pose,
+)
 
 
 class _Clock:
@@ -64,7 +77,6 @@ class _Backend:
 def _snapshot(
     tmp_path,
     *,
-    max_route_deviation_map_units: float | None = None,
     waypoints=None,
 ) -> MissionRouteSnapshot:
     route_waypoints = (
@@ -74,11 +86,13 @@ def _snapshot(
     )
     route = tmp_path / "route.json"
     route.write_text(
-        json.dumps({
-            "waypoints": route_waypoints,
-            "frame": "glomap",
-            "units": "map",
-        }),
+        json.dumps(
+            {
+                "waypoints": route_waypoints,
+                "frame": "glomap",
+                "units": "map",
+            }
+        ),
         encoding="utf-8",
     )
     digest = hashlib.sha256(route.read_bytes()).hexdigest()
@@ -88,44 +102,12 @@ def _snapshot(
         site_id="field-a",
         coordinate_frame_id="glomap-a",
         waypoints=route_waypoints,
-        max_route_deviation_map_units=max_route_deviation_map_units,
     )
 
 
-@pytest.mark.parametrize(
-    ("route_limit", "site_limit", "expected"),
-    [(0.08, 0.1, 0.08), (0.08, 0.05, 0.05)],
-)
-def test_desktop_auto_uses_the_tighter_route_or_site_deviation_limit(
-    tmp_path,
-    route_limit,
-    site_limit,
-    expected,
-) -> None:
-    autonomy = DesktopRouteAutonomy(
-        backend=_Backend(),
-        snapshot=_snapshot(
-            tmp_path,
-            max_route_deviation_map_units=route_limit,
-        ),
-        map_frame=LEGACY_MAP_FRAME,
-        get_pose=lambda: None,
-        pose_is_weak=lambda: False,
-        pose_confidence=lambda: 100,
-        force_relocalize=lambda: None,
-        stream_healthy=lambda: True,
-        takeoff=lambda: True,
-        land=lambda: True,
-        max_route_deviation_map_units=site_limit,
-    )
-
-    assert autonomy.controller.cfg.max_route_deviation == pytest.approx(expected)
-
-
-def test_desktop_auto_keeps_route_and_limits_in_raw_map_frame(tmp_path) -> None:
+def test_desktop_auto_keeps_route_in_raw_map_frame(tmp_path) -> None:
     snapshot = _snapshot(
         tmp_path,
-        max_route_deviation_map_units=0.08,
         waypoints=((0, 0, 0), (1, 2, 3)),
     )
     autonomy = DesktopRouteAutonomy(
@@ -144,13 +126,11 @@ def test_desktop_auto_keeps_route_and_limits_in_raw_map_frame(tmp_path) -> None:
         stream_healthy=lambda: True,
         takeoff=lambda: True,
         land=lambda: True,
-        max_route_deviation_map_units=0.1,
     )
 
     assert np.asarray(autonomy.waypoints) == pytest.approx(
         np.array([[0.0, 0.0, 0.0], [1.0, 2.0, 3.0]])
     )
-    assert autonomy.controller.cfg.max_route_deviation == pytest.approx(0.08)
 
 
 def test_cancel_join_tracks_the_async_manual_handoff(tmp_path) -> None:
@@ -401,10 +381,7 @@ def test_initial_localization_timeout_does_not_land_when_handoff_is_unavailable(
 
     assert commands == ["takeoff"]
     assert all(entry[:4] == (0, 0, 0, 0) for entry in backend.zeros)
-    assert any(
-        event.kind == "boot_hover_waiting"
-        for event in autonomy.drain_events()
-    )
+    assert any(event.kind == "boot_hover_waiting" for event in autonomy.drain_events())
 
 
 def test_initial_localization_search_uses_yaw_only_then_stops_on_pose(
@@ -455,6 +432,7 @@ def test_initial_localization_search_uses_yaw_only_then_stops_on_pose(
 def test_boot_search_yaw_uses_vector_deadman_authority_not_raw_pcmd(
     tmp_path,
 ) -> None:
+    clock = _Clock()
     backend = _Backend()
     autonomy = DesktopRouteAutonomy(
         backend=backend,
@@ -467,17 +445,21 @@ def test_boot_search_yaw_uses_vector_deadman_authority_not_raw_pcmd(
         stream_healthy=lambda: True,
         takeoff=lambda: True,
         land=lambda: True,
+        now=clock.now,
     )
 
     assert autonomy._send_boot_search_yaw(6)
     assert autonomy._send_boot_search_yaw(-6)
 
-    moving = [
-        entry
-        for entry in backend.vectors
-        if any(abs(value) > 0.0 for value in entry)
+    moving = [entry for entry in backend.vectors if any(abs(value) > 0.0 for value in entry)]
+    # Unit axes are scaled by AUTO's authority, and the backend scales them
+    # back, so what reaches the aircraft is still the +/-6% that was asked for.
+    authority = autonomy._pcmd_authority_pct()
+    assert moving == [
+        (0.0, 0.0, 6 / authority, 0.0),
+        (0.0, 0.0, -6 / authority, 0.0),
     ]
-    assert moving == [(0.0, 0.0, 0.6, 0.0), (0.0, 0.0, -0.6, 0.0)]
+    assert [round(entry[2] * authority) for entry in moving] == [6, -6]
     assert not any(entry[2] for entry in backend.zeros)
 
 
@@ -515,8 +497,7 @@ def test_position_without_same_frame_orientation_commands_nothing_then_recovers(
         ),
         now=clock.now,
         sleep=clock.sleep,
-        run_loop=lambda *_args, **_kwargs: route_calls.append(True)
-        or "route complete",
+        run_loop=lambda *_args, **_kwargs: route_calls.append(True) or "route complete",
     )
 
     autonomy._run()
@@ -541,7 +522,7 @@ def test_desktop_route_localization_loss_never_auto_lands(tmp_path) -> None:
 
     hooks = autonomy._route_hooks()
     assert hooks.land_on_localization_loss is False
-    assert hooks.localization_yaw_search_pcmd == 8
+    assert hooks.localization_yaw_search_pcmd == 0
     assert hooks.localization_yaw_search_event is not None
 
 
@@ -583,7 +564,7 @@ def test_stable_localization_starts_route_only_after_hover_lock(tmp_path) -> Non
     assert kinds.index("boot_hover") < kinds.index("route_started")
 
 
-def test_stable_localization_starts_after_nearest_takeoff_waypoint(tmp_path) -> None:
+def test_stable_localization_starts_at_waypoint_one_even_near_a_later_point(tmp_path) -> None:
     clock = _Clock()
     commands = []
     route_starts = []
@@ -621,11 +602,214 @@ def test_stable_localization_starts_after_nearest_takeoff_waypoint(tmp_path) -> 
     autonomy._run()
 
     assert commands == ["takeoff", "land"]
-    assert route_starts == [3]
+    assert route_starts == [0]
     assert any(
-        event.kind == "route_start_selected" and "waypoint 3" in event.detail
+        event.kind == "route_start_selected" and "starts at waypoint 1" in event.detail
         for event in autonomy.drain_events()
     )
+
+
+def test_takeoff_far_off_the_route_still_starts_at_waypoint_one(tmp_path) -> None:
+    # There is no corridor policing the opening leg or the route, so a takeoff
+    # far off the drawn polyline must still start at waypoint 1 rather than refuse.
+    clock = _Clock()
+    commands = []
+    route_starts = []
+    route = (
+        (0.0, 0.0, 0.0),
+        (5.0, 0.0, 0.0),
+        (10.0, 0.0, 0.0),
+        (15.0, 0.0, 0.0),
+    )
+
+    def pose():
+        return Pose(9.9, 6.0, 0.0, 0.0, stamp=clock.now())
+
+    def run_loop(_hooks, controller, _waypoints, **_kwargs):
+        route_starts.append(controller.target_index)
+        return "route complete -> land"
+
+    autonomy = DesktopRouteAutonomy(
+        backend=_Backend(),
+        snapshot=_snapshot(tmp_path, waypoints=route),
+        map_frame=LEGACY_MAP_FRAME,
+        get_pose=pose,
+        pose_is_weak=lambda: False,
+        pose_confidence=lambda: 100,
+        force_relocalize=lambda: None,
+        stream_healthy=lambda: True,
+        takeoff=lambda: commands.append("takeoff") or True,
+        land=lambda: commands.append("land") or True,
+        boot_timeout_s=1.0,
+        now=clock.now,
+        sleep=clock.sleep,
+        run_loop=run_loop,
+    )
+
+    autonomy._run()
+
+    assert commands == ["takeoff", "land"]
+    assert route_starts == [0]
+    assert autonomy.phase != "AUTO_FAILED"
+    kinds = [event.kind for event in autonomy.drain_events()]
+    assert "auto_failed" not in kinds
+    assert "route_start_selected" in kinds
+
+
+def test_auto_yaw_authority_is_not_tied_to_the_manual_nudge_size(tmp_path) -> None:
+    # A small --nudge-pct used to shrink AUTO's yaw command with it: at 8 the
+    # alignment turned at 8% of the firmware MaxRotationSpeed while translation
+    # was held at zero, so AUTO never reached the route (measured 2026-09-12).
+    backend = _Backend()
+    backend.nudge_pct = 8
+    autonomy = DesktopRouteAutonomy(
+        backend=backend,
+        snapshot=_snapshot(tmp_path),
+        map_frame=LEGACY_MAP_FRAME,
+        get_pose=lambda: None,
+        pose_is_weak=lambda: False,
+        pose_confidence=lambda: 100,
+        force_relocalize=lambda: None,
+        stream_healthy=lambda: True,
+        takeoff=lambda: True,
+        land=lambda: True,
+    )
+
+    cfg = autonomy.controller.cfg
+    assert cfg.max_yaw_pcmd == DESKTOP_AUTO_MAX_YAW_PCMD
+    assert cfg.max_yaw_pcmd > backend.nudge_pct
+    assert cfg.yaw_alignment_timeout_s == pytest.approx(DESKTOP_AUTO_YAW_ALIGNMENT_TIMEOUT_S)
+    assert cfg.max_translation_pcmd == DESKTOP_AUTO_MAX_TRANSLATION_PCMD
+    # Translation authority (3% tilt ≈ 0.45 m/s nominal, balanced against the
+    # 0.60 m/s speed guard, 2026-09-13) is intentionally BELOW the manual
+    # nudge size: the two envelopes are unrelated. What must hold is that the
+    # dispatch seam scales by AUTO's own authority, verified below.
+
+    # And the dispatch seam carries those caps through: it used to divide by
+    # nudge_pct while the backend multiplied by nudge_pct, so the whole chain
+    # collapsed to clamp(pcmd, +/-nudge_pct) and a commanded 50% yaw left as 8%.
+    authority = autonomy._pcmd_authority_pct()
+    assert authority == DESKTOP_AUTO_MAX_YAW_PCMD
+    for pcmd in (
+        (0, 0, DESKTOP_AUTO_MAX_YAW_PCMD, 0),
+        (DESKTOP_AUTO_MAX_TRANSLATION_PCMD, 0, 0, 0),
+    ):
+        autonomy._dispatch_route_pcmd(pcmd, speed_guard_active=False)
+        vector = backend.vectors[-1]
+        assert [round(value * authority) for value in vector] == list(pcmd)
+
+    # Lost-pose default is hover-in-place, never blind rotation (operator
+    # decision 2026-09-13): the search only spins on explicit opt-in.
+    assert autonomy.spin_to_search is False
+    assert autonomy._route_hooks().localization_yaw_search_pcmd == 0
+
+
+def test_desktop_auto_matches_path_follow_production_config(tmp_path, monkeypatch) -> None:
+    snapshot = _snapshot(tmp_path)
+    monkeypatch.setattr(pff, "PATH_JSON", str(snapshot.path))
+    monkeypatch.setattr(pff, "MAP_ALIGN", "")
+    monkeypatch.setattr(pff, "FLIGHT_CONTRACT_JSON", "")
+    autonomy = DesktopRouteAutonomy(
+        backend=_Backend(),
+        snapshot=snapshot,
+        map_frame=LEGACY_MAP_FRAME,
+        get_pose=lambda: None,
+        pose_is_weak=lambda: False,
+        pose_confidence=lambda: 100,
+        force_relocalize=lambda: None,
+        stream_healthy=lambda: True,
+        takeoff=lambda: True,
+        land=lambda: True,
+    )
+    controller, _waypoints = pff.build_controller(require_approved=False)
+    desktop = autonomy.controller.cfg
+    production = controller.cfg
+    assert desktop.max_yaw_pcmd == production.max_yaw_pcmd
+    assert desktop.yaw_alignment_timeout_s == pytest.approx(production.yaw_alignment_timeout_s)
+    assert desktop.max_translation_pcmd == production.max_translation_pcmd
+    assert desktop.return_to_start == production.return_to_start
+    assert desktop.return_to_start is True
+    assert desktop.max_yaw_pcmd == DESKTOP_AUTO_MAX_YAW_PCMD
+    assert desktop.max_translation_pcmd == DESKTOP_AUTO_MAX_TRANSLATION_PCMD
+    assert desktop.yaw_alignment_timeout_s == pytest.approx(DESKTOP_AUTO_YAW_ALIGNMENT_TIMEOUT_S)
+
+
+class _SessionLogs:
+    """Minimal stand-in for the localization stream the AUTO worker writes to."""
+
+    def __init__(self):
+        self.records = []
+
+    def localization(self, event, **fields):
+        self.records.append((event, fields))
+        return True
+
+
+def test_route_loop_logs_the_plan_and_each_tick_against_it(tmp_path) -> None:
+    # The per-frame pose already reaches localization.jsonl; what was missing is
+    # what the route loop made of it, which is what an AUTO debrief needs.
+    clock = _Clock()
+    backend = _Backend()
+    backend.session_logs = _SessionLogs()
+    route = (
+        (0.0, 0.0, 0.0),
+        (5.0, 0.0, 0.0),
+        (10.0, 0.0, 0.0),
+    )
+
+    def pose():
+        return Pose(0.0, 0.0, 0.0, 0.0, stamp=clock.now())
+
+    def run_loop(hooks, _controller, _waypoints, **_kwargs):
+        hooks.log_tick({"route_distance_u": 0.25, "pose_u": [0.0, 0.0, 0.0]})
+        return "route complete -> land"
+
+    autonomy = DesktopRouteAutonomy(
+        backend=backend,
+        snapshot=_snapshot(tmp_path, waypoints=route),
+        map_frame=LEGACY_MAP_FRAME,
+        get_pose=pose,
+        pose_is_weak=lambda: False,
+        pose_confidence=lambda: 100,
+        force_relocalize=lambda: None,
+        stream_healthy=lambda: True,
+        takeoff=lambda: True,
+        land=lambda: True,
+        boot_timeout_s=1.0,
+        now=clock.now,
+        sleep=clock.sleep,
+        run_loop=run_loop,
+    )
+
+    autonomy._run()
+
+    events = dict(backend.session_logs.records)
+    assert "auto_route_plan" in events
+    plan = events["auto_route_plan"]
+    assert plan["drawn_waypoint_count"] == 3
+    assert plan["waypoints_u"][0] == [0.0, 0.0, 0.0]
+    assert events["auto_route_tick"]["route_distance_u"] == pytest.approx(0.25)
+
+
+def test_route_tick_logging_survives_a_backend_without_session_logs(tmp_path) -> None:
+    clock = _Clock()
+    autonomy = DesktopRouteAutonomy(
+        backend=_Backend(),
+        snapshot=_snapshot(tmp_path),
+        map_frame=LEGACY_MAP_FRAME,
+        get_pose=lambda: None,
+        pose_is_weak=lambda: False,
+        pose_confidence=lambda: 100,
+        force_relocalize=lambda: None,
+        stream_healthy=lambda: True,
+        takeoff=lambda: True,
+        land=lambda: True,
+        now=clock.now,
+        sleep=clock.sleep,
+    )
+
+    autonomy._log_route_plan()
+    autonomy._log_route_tick({"route_distance_u": 1.0})
 
 
 def test_boot_pose_failure_resets_consecutive_lock(tmp_path) -> None:
@@ -707,10 +891,7 @@ def test_airborne_manual_start_claims_pc_without_sending_takeoff(tmp_path) -> No
     assert route_calls == [True]
     assert backend.zeros
     assert backend.zeros[0][:4] == (0, 0, 0, 0)
-    command_events = [
-        event for event in autonomy.drain_events()
-        if event.kind == "command_result"
-    ]
+    command_events = [event for event in autonomy.drain_events() if event.kind == "command_result"]
     assert command_events[0].command == "pc_control"
     assert command_events[0].result is True
 
@@ -745,8 +926,7 @@ def test_failed_airborne_pc_handoff_stays_manual_without_takeoff_or_land(
     run_loop.assert_not_called()
     events = autonomy.drain_events()
     assert any(
-        event.kind == "finished" and "PC control handoff failed" in event.detail
-        for event in events
+        event.kind == "finished" and "PC control handoff failed" in event.detail for event in events
     )
 
 
@@ -851,14 +1031,10 @@ def test_run_route_exception_enters_auto_failed_and_hovers_without_landing(
 
     run_loop.assert_called_once()
     land.assert_not_called()
-    assert any(
-        entry == (0, 0, 0, 0, "auto_worker_failure_hover")
-        for entry in backend.zeros
-    )
+    assert any(entry == (0, 0, 0, 0, "auto_worker_failure_hover") for entry in backend.zeros)
     events = autonomy.drain_events()
     assert any(
-        event.kind == "auto_failed" and "AUTO worker failed" in event.detail
-        for event in events
+        event.kind == "auto_failed" and "AUTO worker failed" in event.detail for event in events
     )
     assert not any(event.kind == "finished" for event in events)
     assert backend.pilot_sticks is False
@@ -962,17 +1138,19 @@ def test_auto_controller_config_stays_bound_to_verified_route_snapshot(
 
     def write_route(radius: float) -> None:
         route.write_text(
-            json.dumps({
-                "schema": "sfm-flight-route/v1",
-                "site_id": "field-a",
-                "coordinate_frame_id": "glomap-a",
-                "frame": "glomap",
-                "units": "map",
-                "purpose": "flight",
-                "closed": False,
-                "arrive_radius_map_units": radius,
-                "waypoints": [[0, 0, 0], [1, 0, 0]],
-            }),
+            json.dumps(
+                {
+                    "schema": "sfm-flight-route/v1",
+                    "site_id": "field-a",
+                    "coordinate_frame_id": "glomap-a",
+                    "frame": "glomap",
+                    "units": "map",
+                    "purpose": "flight",
+                    "closed": False,
+                    "arrive_radius_map_units": radius,
+                    "waypoints": [[0, 0, 0], [1, 0, 0]],
+                }
+            ),
             encoding="utf-8",
         )
 
@@ -1096,8 +1274,9 @@ def test_pose_jump_pause_emits_event_and_requires_resume(tmp_path) -> None:
     autonomy._pause_for_pose_jump(2.75)
 
     assert autonomy.paused
-    event = autonomy.drain_events()[0]
-    assert event.kind == "pose_jump_paused"
+    events = autonomy.drain_events()
+    assert "paused" in [event.kind for event in events]
+    event = next(event for event in events if event.kind == "pose_jump_paused")
     assert "2.75" in event.detail
     assert backend.zeros[-1][:4] == (0, 0, 0, 0)
     assert autonomy.resume()
@@ -1191,7 +1370,6 @@ def test_cancel_hands_control_to_manual_without_resuming_auto(tmp_path) -> None:
     assert backend.handoffs == ["auto_cancel:manual_takeover"]
 
 
-
 @pytest.mark.parametrize("measured_speed", [0.30, 0.31])
 def test_fresh_speed_at_or_above_limit_hovers_before_route_command(
     tmp_path,
@@ -1231,7 +1409,7 @@ def test_fresh_speed_below_limit_keeps_guard_active_and_sends_route_command(
 ) -> None:
     clock = _Clock()
     backend = _Backend()
-    backend.state.ground_speed_mps = 0.29
+    backend.state.ground_speed_mps = 0.15
     autonomy = DesktopRouteAutonomy(
         backend=backend,
         snapshot=_snapshot(tmp_path),
@@ -1252,7 +1430,8 @@ def test_fresh_speed_below_limit_keeps_guard_active_and_sends_route_command(
     assert accepted
     assert "fresh-speed guard" in reason
     assert applied == (5, 0, 0, 0)
-    assert backend.vectors == [(0.5, 0.0, 0.0, 0.0)]
+    authority = autonomy._pcmd_authority_pct()
+    assert backend.vectors == [(5 / authority, 0.0, 0.0, 0.0)]
     assert backend.state.autonomous_speed_guard_status == "FRESH_SPEED_GUARD"
 
 
@@ -1340,10 +1519,7 @@ def test_missing_or_stale_speed_blocks_horizontal_auto_command(
     assert not accepted
     assert "ground speed" in reason
     assert applied == (0, 0, 0, 0)
-    assert all(
-        not any(abs(value) > 0.0 for value in vector)
-        for vector in backend.vectors
-    )
+    assert all(not any(abs(value) > 0.0 for value in vector) for vector in backend.vectors)
     assert backend.state.autonomous_speed_guard_status == "SPEED_UNAVAILABLE_HOVER"
 
 
@@ -1448,8 +1624,338 @@ def test_takeoff_must_return_literal_true_before_boot_hover(tmp_path) -> None:
     assert not any(event.kind == "boot_hover" for event in autonomy.drain_events())
 
 
+def _budget_autonomy(tmp_path, backend, clock) -> DesktopRouteAutonomy:
+    return DesktopRouteAutonomy(
+        backend=backend,
+        snapshot=_snapshot(tmp_path),
+        map_frame=LEGACY_MAP_FRAME,
+        get_pose=lambda: Pose(0.0, 0.0, 0.0, 0.0, stamp=clock.now()),
+        pose_is_weak=lambda: False,
+        pose_confidence=lambda: 100,
+        force_relocalize=lambda: None,
+        stream_healthy=lambda: True,
+        takeoff=lambda: True,
+        land=lambda: True,
+        now=clock.now,
+        sleep=clock.sleep,
+        run_loop=lambda *_args, **_kwargs: "route complete",
+    )
+
+
+@pytest.mark.parametrize("speed, age", [
+    (0.317, 0.0), (0.0, 0.6), (float("nan"), 0.0), (0.0, -1.0),
+])
+def test_auto_turn_waits_for_measured_horizontal_stop(tmp_path, speed, age):
+    clock = _Clock()
+    backend = _Backend()
+    backend.state.autonomous_speed_limit_mps = 0.6
+    backend.state.ground_speed_mps = speed
+    backend.state.ground_speed_mono_ns = int((clock.now() - age) * 1e9)
+    autonomy = _budget_autonomy(tmp_path, backend, clock)
+
+    accepted, _, applied = autonomy._send_authorized((0, 0, 50, 2))
+    assert accepted
+    assert applied == (0, 0, 0, 2)  # Height correction continues while braking.
+    record = {"pcmd": list(applied), "pcmd_phase": "turn"}
+    autonomy._log_route_tick(record)
+    assert record["pcmd_phase"] == "turn_brake"
+
+    backend.state.ground_speed_mps = 0.05
+    backend.state.ground_speed_mono_ns = int(clock.now() * 1e9)
+    assert autonomy._send_authorized((0, 0, 50, 2))[2] == (0, 0, 50, 2)
+
+
+def test_desktop_bounds_weak_pose_continuation_even_when_enabled(tmp_path):
+    autonomy = _budget_autonomy(tmp_path, _Backend(), _Clock())
+    autonomy.accept_weak_poses = True
+    assert autonomy._route_hooks().max_weak_pose_age_s == pff.POSE_STALE_S
+
+
+def test_turn_brake_log_preserves_a_later_manual_handoff(tmp_path):
+    autonomy = _budget_autonomy(tmp_path, _Backend(), _Clock())
+    autonomy._turn_wait_reason = "waiting for horizontal stop"
+    record = {"pcmd": None, "pcmd_phase": "turn", "blocked": True, "reason": "MANUAL"}
+    autonomy._log_route_tick(record)
+    assert record["reason"] == "MANUAL"
+
+
+def test_boot_pose_lock_rejects_vo_only_even_with_high_inliers(tmp_path):
+    clock = _Clock()
+    autonomy = _budget_autonomy(tmp_path, _Backend(), clock)
+    autonomy.accept_weak_poses = True
+    autonomy.pose_is_weak = lambda: True
+    autonomy.pose_confidence = lambda: 300
+    lock = Mock()
+    assert autonomy._observe_boot_pose(lock, None) == (False, None, False)
+    lock.observe.assert_not_called()
+    lock.reset.assert_called_once()
+
+
+@pytest.mark.parametrize("speed, expected", [(0.20, 10), (0.24, 10), (0.27, 5), (0.29, 2)])
+def test_speed_taper_reduces_only_horizontal_axes(tmp_path, speed, expected):
+    clock = _Clock()
+    backend = _Backend()
+    backend.state.ground_speed_mps = speed
+    autonomy = _budget_autonomy(tmp_path, backend, clock)
+    accepted, _, applied = autonomy._send_authorized((10, -10, 7, 3))
+    assert accepted
+    assert applied == (expected, -expected, 7, 3)
+    authority = autonomy._pcmd_authority_pct()
+    assert backend.vectors[-1] == pytest.approx(tuple(value / authority for value in applied))
+
+
+def test_speed_taper_reduces_guard_chopping_in_a_lagged_velocity_plant(tmp_path):
+    def simulate(taper):
+        clock = _Clock()
+        backend = _Backend()
+        autonomy = _budget_autonomy(tmp_path, backend, clock)
+        if not taper:
+            original = autonomy._apply_speed_guard
+
+            def hard_guard_only(pcmd):
+                result = original(pcmd)
+                autonomy._speed_command_scale = 1.0
+                return result
+
+            autonomy._apply_speed_guard = hard_guard_only
+        speed = 0.0
+        blocked = 0
+        samples = []
+        for _ in range(400):
+            backend.state.ground_speed_mps = speed
+            backend.state.ground_speed_mono_ns = int((clock.now() - 0.001) * 1e9)
+            accepted, _, applied = autonomy._send_authorized((0, 3, 0, 0))
+            blocked += not accepted
+            # A first-order response with 0.4 s lag; no aircraft connection.
+            target_speed = 0.15 * applied[1]
+            speed += (target_speed - speed) * (1.0 - np.exp(-0.05 / 0.4))
+            samples.append(speed)
+            clock.sleep(0.05)
+        return blocked, max(samples), float(np.mean(samples[-100:]))
+
+    hard = simulate(False)
+    soft = simulate(True)
+    assert hard[0] > 0 and soft[0] < hard[0]
+    assert soft[1] < hard[1]
+    assert soft[2] > 0.20
+
+
+def _progress_tick(clock, *, x=0.0, target=1, **overrides):
+    tick = {
+        "t": clock.now(), "pose_stamp": clock.now(), "pose_u": [x, 0.0, 0.0],
+        "target_index": target, "pcmd_phase": "translate", "action": "FOLLOW",
+        "pcmd": [0, 3, 0, 0], "blocked": False, "reason": "FOLLOW",
+    }
+    tick.update(overrides)
+    return tick
+
+
+def test_stalled_waypoint_stops_motion_and_reports_failure_without_landing(tmp_path):
+    clock = _Clock()
+    backend = _Backend()
+    autonomy = _budget_autonomy(tmp_path, backend, clock)
+    autonomy.phase = "ROUTE"
+    autonomy.land = Mock()
+    last = None
+    for _ in range(301):
+        # Bounded localization jitter must not masquerade as sustained progress.
+        last = _progress_tick(clock, x=0.002 if int(clock.now() * 10) % 2 else 0.0)
+        autonomy._log_route_tick(last)
+        clock.sleep(0.1)
+    assert autonomy._auto_failed
+    assert "waypoint 2" in autonomy._auto_failure_detail
+    assert "progress" in autonomy._auto_failure_detail
+    assert backend.zeros[-1][:4] == (0, 0, 0, 0)
+    assert any(event.kind == "auto_failed" for event in autonomy.drain_events())
+    autonomy.land.assert_not_called()
+    accepted, _, applied = autonomy._send_authorized((0, 3, 0, 0))
+    assert not accepted and applied == (0, 0, 0, 0)
+
+
+def test_slow_but_steady_waypoint_progress_does_not_time_out(tmp_path):
+    clock = _Clock()
+    autonomy = _budget_autonomy(tmp_path, _Backend(), clock)
+    autonomy.phase = "ROUTE"
+    for index in range(700):
+        autonomy._log_route_tick(_progress_tick(clock, x=index * 0.0001))
+        clock.sleep(0.1)
+    assert not autonomy._auto_failed
+
+
+@pytest.mark.parametrize("interruption", ["turn", "blocked", "missing_pose", "stale_pose", "target", "paused"])
+def test_waypoint_stall_history_survives_interruptions_until_target_changes(tmp_path, interruption):
+    clock = _Clock()
+    autonomy = _budget_autonomy(tmp_path, _Backend(), clock)
+    autonomy.phase = "ROUTE"
+    for _ in range(200):
+        autonomy._log_route_tick(_progress_tick(clock))
+        clock.sleep(0.1)
+    changes = {
+        "turn": {"pcmd_phase": "turn", "pcmd": [0, 0, 20, 0]},
+        "blocked": {"blocked": True, "pcmd": [0, 0, 0, 0]},
+        "missing_pose": {"pose_u": None},
+        "stale_pose": {"pose_stamp": clock.now() - 1.0},
+        "target": {"target_index": 2},
+        "paused": {},
+    }[interruption]
+    if interruption == "paused":
+        autonomy._paused.set()
+    autonomy._log_route_tick(_progress_tick(clock, **changes))
+    autonomy._paused.clear()
+    clock.sleep(0.1)
+    for _ in range(200):
+        autonomy._log_route_tick(_progress_tick(clock))
+        clock.sleep(0.1)
+    assert autonomy._auto_failed is (interruption != "target")
+
+
+def test_repeated_pose_cannot_refresh_progress_or_trigger_a_false_stall(tmp_path):
+    clock = _Clock()
+    autonomy = _budget_autonomy(tmp_path, _Backend(), clock)
+    autonomy.phase = "ROUTE"
+    captured = clock.now()
+    for _ in range(400):
+        autonomy._log_route_tick(_progress_tick(clock, pose_stamp=captured))
+        clock.sleep(0.05)
+    assert not autonomy._auto_failed
+    assert not autonomy._waypoint_progress.counting
+    assert autonomy._waypoint_progress.no_progress_s <= autonomy.controller.cfg.max_pose_age_s
+
+
+def test_real_route_loop_stops_stalled_translation_without_landing(tmp_path, monkeypatch):
+    clock = _Clock()
+    backend = _Backend()
+    autonomy = _budget_autonomy(tmp_path, backend, clock)
+    autonomy.phase = "ROUTE"
+    autonomy.controller.target_index = 1
+    autonomy.land = Mock()
+    hooks = autonomy._route_hooks()
+
+    def pose():
+        assert clock.now() < 50.0, "stalled route failed to stop within its budget"
+        backend.state.ground_speed_mono_ns = int((clock.now() - 0.001) * 1e9)
+        return Pose(0.0, 0.0, 0.0, 0.0, stamp=clock.now())
+
+    hooks.get_pose = pose
+    monkeypatch.setattr(pff.time, "sleep", clock.sleep)
+    pff.run_loop(hooks, autonomy.controller, autonomy.waypoints, verbose=False)
+    assert autonomy._auto_failed
+    assert "progress" in autonomy._auto_failure_detail
+    assert backend.zeros[-1][:4] == (0, 0, 0, 0)
+    autonomy.land.assert_not_called()
+
+
+def test_auto_wait_budget_latches_failure_instead_of_hovering_forever(tmp_path) -> None:
+    """A wait AUTO cannot end by itself is bounded, not held indefinitely."""
+    clock = _Clock()
+    autonomy = _budget_autonomy(tmp_path, _Backend(), clock)
+
+    assert autonomy._check_wait_budget("localization unavailable", 1.0) is False
+    assert autonomy._auto_failed is False
+
+    assert autonomy._check_wait_budget("localization unavailable", AUTO_WAIT_BUDGET_S) is True
+    assert autonomy._auto_failed is True
+    assert autonomy.phase == "AUTO_FAILED"
+    events = autonomy.drain_events()
+    assert any(event.kind == "auto_failed" for event in events)
+    # The failure stops autonomous motion; it must not hand the sticks to a
+    # pilot who may not be holding the controller.
+    assert autonomy.backend.pilot_sticks is False
+
+
+@pytest.mark.parametrize(
+    ("battery", "expected"),
+    [
+        (80.0, False),
+        (AUTO_BATTERY_RESERVE_PCT, True),
+        (float("nan"), True),
+    ],
+    ids=["healthy", "at-reserve", "unreadable"],
+)
+def test_auto_runtime_budget_latches_on_battery_reserve(tmp_path, battery, expected) -> None:
+    """In-flight AUTO stops on its own battery reserve, not only on firmware RTH."""
+    clock = _Clock()
+    backend = _Backend()
+    backend.is_live = True
+    backend.state.battery_pct = battery
+    backend.state.telemetry_read_mono_ns = int(clock.now() * 1_000_000_000)
+    autonomy = _budget_autonomy(tmp_path, backend, clock)
+    autonomy._mission_started = clock.now()
+    autonomy.phase = "ROUTE"
+
+    assert autonomy._check_runtime_budget() is expected
+    assert autonomy._auto_failed is expected
+
+
+def test_auto_runtime_budget_latches_on_mission_duration(tmp_path) -> None:
+    clock = _Clock()
+    autonomy = _budget_autonomy(tmp_path, _Backend(), clock)
+    autonomy._mission_started = clock.now()
+    autonomy.phase = "ROUTE"
+
+    assert autonomy._check_runtime_budget() is False
+    clock.sleep(AUTO_MAX_DURATION_S)
+    assert autonomy._check_runtime_budget() is True
+    assert autonomy.phase == "AUTO_FAILED"
+
+
 @pytest.mark.parametrize("landing_result", [False, RuntimeError("landing failed")])
-def test_unconfirmed_landing_retries_and_completes_worker(tmp_path, landing_result) -> None:
+def test_manual_takeover_during_failed_landing_retires_the_auto_retry(
+    tmp_path, landing_result
+) -> None:
+    """Takeover while the first land() is in flight: no second autonomous land.
+
+    ``land_cmd`` re-claims PC control on the real backend, so a retry fired after
+    the operator already has the sticks would take the aircraft back mid-recovery.
+    The retry must re-check authority, not just the result of the previous call.
+    """
+    clock = _Clock()
+    backend = _Backend()
+    autonomy = None
+
+    def take_over_then_fail():
+        # The operator grabs the sticks while this first land() is still running.
+        autonomy._cancel.set()
+        backend.pilot_sticks = True
+        if isinstance(landing_result, Exception):
+            raise landing_result
+        return landing_result
+
+    land = Mock(side_effect=take_over_then_fail)
+    autonomy = DesktopRouteAutonomy(
+        backend=backend,
+        snapshot=_snapshot(tmp_path),
+        map_frame=LEGACY_MAP_FRAME,
+        get_pose=lambda: Pose(0.0, 0.0, 0.0, 0.0, stamp=clock.now()),
+        pose_is_weak=lambda: False,
+        pose_confidence=lambda: 100,
+        force_relocalize=lambda: None,
+        stream_healthy=lambda: True,
+        takeoff=lambda: True,
+        land=land,
+        boot_timeout_s=1.0,
+        now=clock.now,
+        sleep=clock.sleep,
+        run_loop=lambda *_args, **_kwargs: "route complete",
+    )
+
+    autonomy._land_after_failure("route complete -> land")
+
+    assert land.call_count == 1
+    assert autonomy._landing_confirmed is False
+    events = autonomy.drain_events()
+    assert not any(event.kind == "landing_unresolved" for event in events)
+
+
+@pytest.mark.parametrize("landing_result", [False, RuntimeError("landing failed")])
+def test_unconfirmed_landing_retries_and_stays_unresolved(tmp_path, landing_result) -> None:
+    """Both land() attempts unconfirmed: the worker ends, the mission does not.
+
+    ``finished``/``DONE`` is the operator's evidence that the aircraft is on the
+    ground, so an unconfirmed landing must not claim it.  The worker thread still
+    exits; the phase stays ``LANDING_UNRESOLVED`` so the unresolved landing keeps
+    its supervision owner.
+    """
     clock = _Clock()
     backend = _Backend()
     commands = []
@@ -1478,6 +1984,89 @@ def test_unconfirmed_landing_retries_and_completes_worker(tmp_path, landing_resu
     assert land.call_count == 2
     events = autonomy.drain_events()
     assert sum(event.kind == "landing_unresolved" for event in events) == 1
-    assert sum(event.kind == "finished" for event in events) == 1
+    assert not any(event.kind == "finished" for event in events)
     assert autonomy._landing_confirmed is False
+    assert autonomy.phase == "LANDING_UNRESOLVED"
+
+
+def test_cancelled_run_releases_for_a_fresh_start_after_join(tmp_path) -> None:
+    """Manual takeover during ROUTE, then AUTO again: the old run must join to DONE."""
+    backend = _Backend()
+    autonomy = DesktopRouteAutonomy(
+        backend=backend,
+        snapshot=_snapshot(tmp_path),
+        map_frame=LEGACY_MAP_FRAME,
+        get_pose=lambda: None,
+        pose_is_weak=lambda: False,
+        pose_confidence=lambda: 100,
+        force_relocalize=lambda: None,
+        stream_healthy=lambda: True,
+        takeoff=lambda: True,
+        land=lambda: True,
+        run_loop=lambda *_args, **_kwargs: "route done",
+    )
+
+    assert autonomy.start() is True
+    autonomy.cancel("manual_takeover")
+    assert autonomy.join(timeout=2.0) is True
     assert autonomy.phase == "DONE"
+    assert any(event.kind == "finished" for event in autonomy.drain_events())
+
+    assert autonomy.start() is True
+    autonomy.cancel("manual_takeover")
+    assert autonomy.join(timeout=2.0) is True
+    assert autonomy.phase == "DONE"
+
+
+def test_send_authorized_race_with_failure_clears_nudge_and_zeros_pcmd(
+    tmp_path,
+) -> None:
+    class RacingBackend(_Backend):
+        def __init__(self):
+            super().__init__()
+            self._nudge_vector = ("unset",)
+            self._entered = threading.Event()
+            self._release = threading.Event()
+            self.state.autonomous_speed_limit_enabled = False
+
+        def set_nudge_vector(self, roll, pitch, yaw, gaz, authority_pct=10):
+            self._entered.set()
+            assert self._release.wait(timeout=2.0)
+            self._nudge_vector = (roll, pitch, yaw, gaz)
+            self.vectors.append((roll, pitch, yaw, gaz))
+            return True
+
+        def clear_nudge_vector(self):
+            self._nudge_vector = None
+            self.vectors.append((0.0, 0.0, 0.0, 0.0))
+
+        def send_pcmd(self, roll, pitch, yaw, gaz, *, reason):
+            self.zeros.append((roll, pitch, yaw, gaz, reason))
+            return True
+
+    backend = RacingBackend()
+    autonomy = DesktopRouteAutonomy(
+        backend=backend,
+        snapshot=_snapshot(tmp_path),
+        map_frame=LEGACY_MAP_FRAME,
+        get_pose=lambda: None,
+        pose_is_weak=lambda: False,
+        pose_confidence=lambda: 100,
+        force_relocalize=lambda: None,
+        stream_healthy=lambda: True,
+        takeoff=lambda: True,
+        land=lambda: True,
+    )
+    worker = threading.Thread(
+        target=autonomy._send_authorized,
+        args=((10, 0, 0, 0),),
+        daemon=True,
+    )
+    worker.start()
+    assert backend._entered.wait(timeout=2.0)
+    autonomy._latch_auto_failure("race")
+    backend._release.set()
+    worker.join(timeout=2.0)
+    assert not worker.is_alive()
+    assert backend._nudge_vector is None
+    assert backend.zeros[-1][:4] == (0, 0, 0, 0)

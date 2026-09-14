@@ -1,0 +1,30 @@
+{
+  "calibrations": [
+    {
+      "path": "../../地圖檔/場域/river_site/releases/river_gluemap_all8_direct_20260908/compat/localizer_quality_receipt.json",
+      "sha256": "2a57d3332c44a66ded5530387c6662dd1b857157620361be1f9ecb6b87ba73fd"
+    }
+  ],
+  "localizer": {
+    "path": "../../地圖檔/場域/river_site/releases/river_gluemap_all8_direct_20260908/compat/localizer_direct_manifest.json",
+    "sha256": "3e6f601e28f6d7aef1cad2728e91ab78f97176c8427d726e358f266ed4d29c5a"
+  },
+  "map": {
+    "path": "../../地圖檔/場域/river_site/releases/river_gluemap_all8_direct_20260908/compat/map_manifest.json",
+    "sha256": "7e20e047ba6448a5270a70a25be26c3a87c8c683db0559663c6729298f8d5b0d"
+  },
+  "route": {
+    "path": "../mission_components/routes/river_site_route_3wp_20260913.json",
+    "sha256": "d63cbefba073769866ffde837147f4c8e4eb5c71e53ccaee46d2a18aabbf68f3"
+  },
+  "schema": "sfm-mission-selection/v1",
+  "selection_id": "river_gluemap_all8_direct_3wp",
+  "site": {
+    "path": "../../地圖檔/場域/river_site/manifests/site.json",
+    "sha256": "02c2c1a00099e0ada0b69676b7c69313c95b459717fe6a7afaf2ca51282dea13"
+  },
+  "vehicle": {
+    "path": "../mission_components/vehicles/parrot_anafi_720p_river_direct.json",
+    "sha256": "ccf4849fb6cb0a1ad381910c6de4b0ec597feece97dc41c0af1b0f0b9a680d6b"
+  }
+}

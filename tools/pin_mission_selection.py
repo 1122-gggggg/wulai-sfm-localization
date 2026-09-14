@@ -23,7 +23,7 @@ from mission_resolver import resolve_mission  # noqa: E402
 def _digest(path: Path) -> str:
     value = hashlib.sha256()
     with path.open("rb") as stream:
-        for block in iter(lambda: stream.read(1024 * 1024), b""):
+        for block in iter(lambda: stream.read(8 * 1024 * 1024), b""):
             value.update(block)
     return value.hexdigest()
 

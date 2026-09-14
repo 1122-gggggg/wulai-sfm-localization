@@ -331,53 +331,6 @@ def magnetometer_axis_guide(axis_raw: object) -> tuple[str, str, str] | None:
     return MAGNETOMETER_AXIS_GUIDE.get(key)
 
 
-def gravity_phase_guidance(
-    phase: str | None,
-    *,
-    sample_count: int = 0,
-    span_deg: float = 0.0,
-    phases: tuple[str, ...] = ("yaw", "pitch", "roll"),
-    min_samples_per_phase: int = 15,
-    min_yaw_span_deg: float = 90.0,
-    min_pitch_span_deg: float = 25.0,
-    min_roll_span_deg: float = 25.0,
-) -> str:
-    """Operator-facing instruction and live progress for one passive phase."""
-    if phase not in phases:
-        return (
-            "準備：拆除螺旋槳、確認飛機 landed，雙手托住機身。\n"
-            "按「開始檢查」後依序做：水平旋轉 → 前後俯仰 → 左右側傾。"
-        )
-    guide = {
-        "yaw": (
-            "1/3 YAW 水平旋轉",
-            "機身保持水平，繞垂直軸慢慢轉一整圈",
-            float(min_yaw_span_deg),
-            "下一階段",
-        ),
-        "pitch": (
-            "2/3 PITCH 前後俯仰",
-            "機頭先抬高再壓低，做出明顯的前後俯仰",
-            float(min_pitch_span_deg),
-            "下一階段",
-        ),
-        "roll": (
-            "3/3 ROLL 左右側傾",
-            "機身先向左再向右側傾，做出明顯的左右滾轉",
-            float(min_roll_span_deg),
-            "完成並分析",
-        ),
-    }
-    title, motion, target_deg, next_button = guide[phase]
-    return (
-        f"{title}：{motion}。\n"
-        f"進度：樣本 {max(0, int(sample_count))}/{min_samples_per_phase}；"
-        f"角度變化 {max(0.0, float(span_deg)):.0f}°/{target_deg:.0f}°。"
-        f"樣本與角度達標後可按「{next_button}」；"
-        "穩定度警告會保留到最後分析。"
-    )
-
-
 def format_magnetometer_calibration(state: object) -> dict[str, str]:
     """Format aircraft/controller firmware calibration without guessing state."""
     required = getattr(state, "drone_magnetometer_required", None)

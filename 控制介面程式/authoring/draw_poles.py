@@ -5,10 +5,9 @@ For pole inspection: each pole becomes an axis-aligned vertical CUBOID in the
 ALIGNED map frame (ground z=0, +Z up) -- same frame as map_aligned.ply /
 true_polygon.json / wires.ply / flight_path.json. The boxes feed two consumers:
 
-  1. OBSTACLE / no-go  -> baked into the planner SDF WITH a buffer, so
-     deploy/plan_path.py keeps standoff from each pole by construction.
-  2. INSPECTION targets -> deploy/load_poles.py turns each box into standoff
-     waypoints (a ring at a chosen distance) for plan_tour / autoflight.
+  1. OBSTACLE / no-go  -> recorded alongside the route for operator review.
+  2. INSPECTION targets -> pole boxes resolved through route_domain at flight
+     time; no SDF planner or clearance steering consumes them.
 
 A pole is tall and thin, so you mark it with TWO clicks:
   click 1 = the pole BASE (snaps to nearest visible cloud vertex -> XY + z_base)

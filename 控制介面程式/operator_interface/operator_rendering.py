@@ -11,11 +11,33 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
+import os
 from typing import Any, Callable, Mapping, Sequence
 
 import numpy as np
 from PIL import Image
 
+from localization_result_ui import localization_result_is_weak
+
+
+def _positive_env_int(key: str, default: int) -> int:
+    try:
+        val = int(os.environ.get(key, default))
+        return val if val > 0 else default
+    except (ValueError, TypeError):
+        return default
+
+
+def _positive_env_float(key: str, default: float) -> float:
+    try:
+        val = float(os.environ.get(key, default))
+        return val if val > 0.0 else default
+    except (ValueError, TypeError):
+        return default
+
+
+LOC_LOW_INLIERS = _positive_env_int("SFM_LOW_CONF_INLIERS", 60)
+LOC_HIGH_REPROJ = _positive_env_float("SFM_LOC_HIGH_REPROJ", 4.0)
 
 @dataclass(frozen=True)
 class MapRenderContext:
@@ -33,11 +55,6 @@ class MapRenderContext:
     pose: Sequence[float]
     camera_axes: np.ndarray | None
     camera_forward: np.ndarray | None
-    collision_center: Sequence[float] | None
-    collision_radius: float
-    collision_status: str
-    collision_point: Sequence[float] | None
-    collision_preview: bool
     transform_xyz: Callable[[np.ndarray], np.ndarray]
     project_world: Callable[[np.ndarray, int, int], tuple[int, int]]
     route_color: str
@@ -61,7 +78,14 @@ class MapRenderContext:
     #: keep every existing constructor working.
     history_weak: Sequence[object] = ()
     history_weak_health: Sequence[str] = ()
-
+    map_rotation: tuple[float, float, float] | np.ndarray | None = None
+    map_yaw: float = 0.0
+    map_pitch: float = 0.0
+    map_roll: float = 0.0
+    #: Estimate source per weak-trail point (KLT / IMU / OTHER), parallel to
+    #: history_weak. Appended last so existing positional constructors keep
+    #: working; missing entries fall back to the health colour.
+    history_weak_kind: Sequence[str] = ()
 
 #: Camera picture rectangle: a real plane in map space, oriented by the full
 #: camera attitude, drawn ahead of the drone like the screen the stream looks
@@ -216,6 +240,21 @@ def camera_view_plane_corners(
     )
     return corners
 
+_PROJECTION_CACHE: dict[tuple, tuple[list[int], list[int]]] = {}
+_PROJECTION_CACHE_MAX = 64
+
+
+def _pts_sig(seq: Sequence[Any] | None) -> tuple | int:
+    if not seq:
+        return 0
+    n = len(seq)
+    if n <= 32:
+        return tuple(tuple(round(float(x), 4) for x in p[:3]) for p in seq)
+    step = max(1, n // 16)
+    sampled = tuple(tuple(round(float(x), 4) for x in seq[i][:3]) for i in range(0, n, step))
+    if (n - 1) % step != 0:
+        sampled = sampled + (tuple(round(float(x), 4) for x in seq[-1][:3]),)
+    return (n, sampled)
 
 def _draw_route_and_history(draw: Any, context: MapRenderContext) -> None:
     route_n = len(context.route_pts)
@@ -226,28 +265,65 @@ def _draw_route_and_history(draw: Any, context: MapRenderContext) -> None:
     if not route_n and not history_n and not weak_n:
         return
 
-    parts = []
-    if route_n:
-        parts.append(np.asarray(context.route_pts, dtype=float).reshape(-1, 3))
-    if history_n:
-        parts.append(
-            np.array(
-                [np.asarray(point, dtype=float)[:3] for point in context.history],
-                dtype=float,
-            ).reshape(-1, 3)
+    pan_arr = np.asarray(context.map_pan, dtype=float).reshape(-1)
+    pan_key = (
+        round(float(pan_arr[0]), 4),
+        round(float(pan_arr[1]), 4),
+    ) if len(pan_arr) >= 2 else (0.0, 0.0)
+    zoom_key = round(float(context.map_zoom), 6)
+    size_key = (int(context.width), int(context.height))
+    rot_val = getattr(context, "map_rotation", None)
+    if rot_val is not None and len(rot_val) >= 3:
+        rotation_key = (
+            round(float(rot_val[0]), 4),
+            round(float(rot_val[1]), 4),
+            round(float(rot_val[2]), 4),
         )
-    if weak_n:
-        parts.append(
-            np.array(
-                [np.asarray(point, dtype=float)[:3] for point in weak_trail],
-                dtype=float,
-            ).reshape(-1, 3)
+    else:
+        rotation_key = (
+            round(float(getattr(context, "map_yaw", 0.0)), 4),
+            round(float(getattr(context, "map_pitch", 0.0)), 4),
+            round(float(getattr(context, "map_roll", 0.0)), 4),
         )
-    view = context.transform_xyz(np.concatenate(parts, axis=0))
-    scale = _map_scale(context)
-    screen_x = (context.width * 0.5 + context.map_pan[0] + view[:, 0] * scale).astype(int).tolist()
-    screen_y = (context.height * 0.5 + context.map_pan[1] - view[:, 1] * scale).astype(int).tolist()
 
+    proj_cache_key = (
+        pan_key,
+        zoom_key,
+        size_key,
+        rotation_key,
+        round(float(getattr(context, "map_radius", 1.0)), 4),
+        _pts_sig(context.route_pts),
+        _pts_sig(context.history),
+        _pts_sig(weak_trail),
+    )
+    cached = _PROJECTION_CACHE.get(proj_cache_key)
+    if cached is not None:
+        screen_x, screen_y = cached
+    else:
+        parts = []
+        if route_n:
+            parts.append(np.asarray(context.route_pts, dtype=float).reshape(-1, 3))
+        if history_n:
+            parts.append(
+                np.array(
+                    [np.asarray(point, dtype=float)[:3] for point in context.history],
+                    dtype=float,
+                ).reshape(-1, 3)
+            )
+        if weak_n:
+            parts.append(
+                np.array(
+                    [np.asarray(point, dtype=float)[:3] for point in weak_trail],
+                    dtype=float,
+                ).reshape(-1, 3)
+            )
+        view = context.transform_xyz(np.concatenate(parts, axis=0))
+        scale = _map_scale(context)
+        screen_x = (context.width * 0.5 + context.map_pan[0] + view[:, 0] * scale).astype(int).tolist()
+        screen_y = (context.height * 0.5 + context.map_pan[1] - view[:, 1] * scale).astype(int).tolist()
+        if len(_PROJECTION_CACHE) >= _PROJECTION_CACHE_MAX:
+            _PROJECTION_CACHE.clear()
+        _PROJECTION_CACHE[proj_cache_key] = (screen_x, screen_y)
     if route_n > 1:
         route_screen = list(zip(screen_x[:route_n], screen_y[:route_n]))
         draw.line(route_screen, fill=context.route_color, width=2, joint="curve")
@@ -275,89 +351,31 @@ def _draw_route_and_history(draw: Any, context: MapRenderContext) -> None:
 
     if weak_n:
         # Weak fixes (VO_ONLY / DEAD_RECKON / WEAK_TRACK / PREDICTED_ONLY):
-        # hollow diamonds in the health colour (DEGRADED amber). A solid dot
-        # is already the non-OK symbol, so weak reusing it would collide;
-        # markers only, no connecting line, so a jump-rejected fix cannot
-        # imply a flown segment that never happened.
+        # hollow diamonds coloured by estimate source (KLT green, IMU yellow,
+        # anything else the health amber). A solid dot is already the non-OK
+        # symbol, so weak reusing it would collide; markers only, no
+        # connecting line, so a jump-rejected fix cannot imply a flown
+        # segment that never happened.
         weak_screen = list(zip(screen_x[route_n + history_n :], screen_y[route_n + history_n :]))
         # Same explicit alignment as the history markers above, and the
         # position has to come from weak_screen: reading a bare x/y here picked
         # up whatever the route or history loop happened to leave bound, which
         # stacked every weak diamond on one wrong point -- and raised
         # UnboundLocalError outright when neither of those loops had run.
+        weak_kind = list(getattr(context, "history_weak_kind", None) or ())
         mark_n = min(weak_n, len(weak_health), len(weak_screen))
         for index in range(mark_n):
             x, y = weak_screen[index]
-            colour = context.health_color.get(weak_health[index], "#e0a92e")
+            kind = weak_kind[index] if index < len(weak_kind) else "OTHER"
+            colour = WEAK_KIND_COLOR.get(kind)
+            if colour is None:
+                colour = context.health_color.get(weak_health[index], WEAK_KIND_FALLBACK_COLOR)
             size = 6
             draw.polygon(
                 [(x, y - size), (x + size, y), (x, y + size), (x - size, y)],
                 outline=colour,
                 width=2,
             )
-
-
-def _draw_collision_guard(draw: Any, context: MapRenderContext) -> None:
-    if context.collision_center is None or context.collision_radius <= 0.0:
-        return
-    center = np.asarray(context.collision_center, dtype=float)
-    if center.shape != (3,) or not np.all(np.isfinite(center)):
-        return
-    screen_x, screen_y = context.project_world(center, context.width, context.height)
-    radius_px = max(1, int(round(context.collision_radius * _map_scale(context))))
-    status = str(context.collision_status)
-    color = {
-        "CLEAR": "#3fbf7f",
-        "COLLISION": "#ff4d4d",
-        "PREVIEW_HIT": "#00d4ff",
-        "PREVIEW_CLEAR": "#00d4ff",
-        "WAITING": "#e0a92e",
-        "UNAVAILABLE": "#e0a92e",
-        "DISABLED": "#7f8a94",
-    }.get(status, "#7f8a94")
-    draw.ellipse(
-        (
-            screen_x - radius_px,
-            screen_y - radius_px,
-            screen_x + radius_px,
-            screen_y + radius_px,
-        ),
-        outline=color,
-        width=3,
-    )
-    draw.ellipse(
-        (screen_x - 5, screen_y - 5, screen_x + 5, screen_y + 5),
-        fill=color,
-        outline="#ffffff",
-        width=1,
-    )
-    if status in {"COLLISION", "PREVIEW_HIT"} and context.collision_point is not None:
-        point = np.asarray(context.collision_point, dtype=float)
-        if point.shape == (3,) and np.all(np.isfinite(point)):
-            hit_x, hit_y = context.project_world(point, context.width, context.height)
-            hit_color = "#ff4d4d" if status == "COLLISION" else "#e6b94f"
-            draw.line((screen_x, screen_y, hit_x, hit_y), fill=hit_color, width=2)
-            draw.ellipse(
-                (hit_x - 5, hit_y - 5, hit_x + 5, hit_y + 5),
-                fill=hit_color,
-                outline="#ffffff",
-                width=1,
-            )
-    label = (
-        "模擬相機"
-        if context.collision_preview
-        else "近接命中"
-        if status == "COLLISION"
-        else "相機近接圈"
-    )
-    draw.text(
-        (screen_x + radius_px + 6, screen_y - 8),
-        f"{label}  r={context.collision_radius:.3g} u",
-        fill=color,
-        font=context.overlay_font,
-        stroke_width=2,
-        stroke_fill="#0b0c0e",
-    )
 
 
 def _draw_no_orientation_marker(draw: Any, context: MapRenderContext) -> None:
@@ -426,7 +444,6 @@ def _draw_camera_overlay(draw: Any, context: MapRenderContext) -> None:
 def draw_map_overlays(draw: Any, context: MapRenderContext) -> None:
     """Paint dynamic map overlays over an already-rendered map base."""
     _draw_route_and_history(draw, context)
-    _draw_collision_guard(draw, context)
     _draw_camera_overlay(draw, context)
 
 
@@ -528,6 +545,260 @@ def draw_video_empty_state(
         )
 
 
+def format_latency_text(latency_ms: float | None) -> str:
+    """Format a latency value for HUD display. Pure, no Tk dependency."""
+    if latency_ms is None:
+        return "-"
+    try:
+        value = float(latency_ms)
+    except (TypeError, ValueError):
+        return "-"
+    if not math.isfinite(value):
+        return "-"
+    return f"{value:.1f}ms"
+
+
+def classify_localization_health(loc: dict) -> str:
+    """Pure health classification for a localization result. Returns OK/DEGRADED/LOST.
+
+    * OK       – high-confidence fix (enough inliers, low reproj, not weak).
+    * DEGRADED – low inliers / high reproj / weak (still a pose but not trusted).
+    * LOST     – no pose / success==False.
+    No Tk, no self, no mutation — safe to import headless.
+    """
+    if not hasattr(loc, "get"):
+        return "LOST"
+    if not loc.get("success"):
+        return "LOST"
+    try:
+        inliers = int(loc.get("inliers", 0) or 0)
+    except (TypeError, ValueError):
+        inliers = 0
+    reproj = loc.get("reproj_rms")
+    try:
+        weak = localization_result_is_weak(loc)
+    except (AttributeError, KeyError, TypeError, ValueError):
+        weak = bool(loc.get("weak"))
+    if inliers < LOC_LOW_INLIERS:
+        return "DEGRADED"
+    if reproj is not None:
+        try:
+            if float(reproj) > LOC_HIGH_REPROJ:
+                return "DEGRADED"
+        except (TypeError, ValueError):
+            pass
+    if weak:
+        return "DEGRADED"
+    return "OK"
+
+#: Map-trail colours by estimate source. Strong fixes keep the blue history
+#: line; weak fixes draw hollow diamonds so shape already says "estimate":
+#: KLT (optical-flow bridge) green, IMU (fused-yaw bridge) yellow, anything
+#: else falls back to the health amber.
+WEAK_KIND_COLOR = {
+    "KLT": "#3fbf7f",
+    "IMU": "#ffd60a",
+}
+WEAK_KIND_FALLBACK_COLOR = "#e0a92e"
+
+
+def weak_pose_source_kind(result: Any) -> str:
+    """Classify a weak localization result as KLT / IMU / OTHER.
+
+    Pure, no Tk dependency — safe to import headless. Anything unrecognized
+    is OTHER so a new estimator can never break the map draw.
+    """
+    try:
+        get = result.get
+    except AttributeError:
+        return "OTHER"
+    try:
+        if get("candidate_mode") in ("klt_bridge", "klt_fast"):
+            return "KLT"
+        if get("pose_status") == "KLT_BRIDGED":
+            return "KLT"
+        if get("direct_status") == "IMU_BRIDGE" or bool(get("imu_bridge")):
+            return "IMU"
+    except (AttributeError, KeyError, TypeError, ValueError):
+        return "OTHER"
+    return "OTHER"
+
+
+def build_hud_overlay_data(state: Any, loc: Any, telemetry: Any) -> dict:
+    """Pure HUD overlay builder. Inputs are not mutated. Returns HUD data dict."""
+    # Normalize loc to dict copy
+    if isinstance(loc, dict):
+        loc_dict = dict(loc)
+    elif loc is None:
+        loc_dict = {}
+    else:
+        try:
+            loc_dict = {
+                k: getattr(loc, k)
+                for k in ("success", "inliers", "reproj_rms", "mode", "next_mode", "weak", "health", "loc_health")
+                if hasattr(loc, k)
+            }
+        except (AttributeError, KeyError, TypeError, ValueError):
+            loc_dict = {}
+    # Normalize state
+    if isinstance(state, dict):
+        state_dict = dict(state)
+    elif state is None:
+        state_dict = {}
+    else:
+        state_dict = {}
+        for key in (
+            "mode", "stream", "loc", "tracker_state", "pose", "inliers",
+            "reproj", "link_ok", "gps_fixed", "frame_age_ms", "flight_state", "is_live"
+        ):
+            try:
+                if hasattr(state, key):
+                    state_dict[key] = getattr(state, key)
+            except (AttributeError, KeyError, TypeError, ValueError):
+                continue
+    # Normalize telemetry
+    if isinstance(telemetry, dict):
+        tele_dict = dict(telemetry)
+    elif telemetry is None:
+        tele_dict = {}
+    else:
+        for key in (
+            "rth", "gps", "attitude", "velocity", "altitude_agl", "link_quality",
+            "current_auto_speed", "olympe_state", "olympe_attitude", "olympe_altitude"
+        ):
+            try:
+                if hasattr(telemetry, key):
+                    tele_dict[key] = getattr(telemetry, key)
+            except (AttributeError, KeyError, TypeError, ValueError):
+                continue
+    # Health
+    health = None
+    if isinstance(loc, dict) and "health" in loc:
+        health = str(loc["health"])
+    elif isinstance(loc, dict) and "loc_health" in loc:
+        health = str(loc["loc_health"])
+    elif loc_dict:
+        if "success" in loc_dict or "inliers" in loc_dict:
+            health = classify_localization_health(loc_dict)
+        else:
+            health = str(loc_dict.get("health", loc_dict.get("loc_health", "OK")))
+    else:
+        health = "OK"
+    # Inliers / reproj
+    try:
+        inliers = int(loc_dict.get("inliers", loc_dict.get("loc_health_inliers", 0)) or 0)
+    except (TypeError, ValueError):
+        inliers = 0
+    reproj = loc_dict.get("reproj_rms", loc_dict.get("loc_health_reproj"))
+    # FPS
+    fps_raw = loc_dict.get("fps", loc_dict.get("loc_fps", loc_dict.get("localization_fps")))
+    try:
+        fps_text = f"{float(fps_raw):.1f}" if fps_raw is not None and math.isfinite(float(fps_raw)) else "-"
+    except (TypeError, ValueError):
+        fps_text = "-"
+    # Latencies
+    latency_raw = loc_dict.get("latency_ms", loc_dict.get("loc_latency_ms", loc_dict.get("core_wall_ms", loc_dict.get("wall_ms"))))
+    wall_raw = loc_dict.get("wall_ms", loc_dict.get("loc_wall_ms"))
+    e2e_raw = loc_dict.get("e2e_ms", loc_dict.get("loc_e2e_ms", loc_dict.get("e2e_submit_to_ui_ms")))
+    latency_text = format_latency_text(latency_raw)
+    wall_text = format_latency_text(wall_raw)
+    e2e_text = format_latency_text(e2e_raw)
+    # Telemetry fallbacks
+    auto_speed = tele_dict.get("current_auto_speed", tele_dict.get("auto_speed", tele_dict.get("current_auto_speed_var", "AUTO 地速安全閘門 -")))
+    rth = tele_dict.get("rth", tele_dict.get("olympe_state", "RTH ?/?"))
+    gps = tele_dict.get("gps", "")
+    attitude = tele_dict.get("attitude", tele_dict.get("olympe_attitude", "飛控融合姿態 -"))
+    velocity = tele_dict.get("velocity", tele_dict.get("olympe_velocity", "三軸速度 -"))
+    altitude_agl = tele_dict.get("altitude_agl", tele_dict.get("olympe_altitude", "飛控高度 - | AGL -"))
+    link_quality = tele_dict.get("link_quality", "")
+    olympe_state_val = tele_dict.get("olympe_state", None)
+    olympe_attitude_val = tele_dict.get("olympe_attitude", None)
+    olympe_altitude_val = tele_dict.get("olympe_altitude", None)
+    if olympe_state_val is not None or olympe_attitude_val is not None:
+        line1 = " | ".join(part for part in (str(auto_speed), f"定位 FPS {fps_text}", f"inliers {inliers}") if part)
+        line2 = f"wall_ms {wall_text} | core {latency_text} | e2e {e2e_text}"
+        line3 = str(olympe_state_val) if olympe_state_val is not None else (f"{rth} | {gps}".strip(" |") if gps else str(rth))
+        line4 = str(olympe_altitude_val) if olympe_altitude_val is not None else (f"{altitude_agl} | {link_quality}".strip(" |") if link_quality else str(altitude_agl))
+        att = str(olympe_attitude_val) if olympe_attitude_val is not None else str(attitude)
+        if " | 三軸速度 " in att:
+            att_part, sep, vel_part = att.partition(" | 三軸速度 ")
+            attitude_line = att_part
+            velocity_line = f"三軸速度 {vel_part}" if sep else str(velocity)
+        else:
+            attitude_line = att
+            velocity_line = str(velocity) if str(velocity).startswith("三軸") else f"三軸速度 {velocity}"
+        diagnostic_lines = (line1, line2, line3, line4, attitude_line, velocity_line)
+    else:
+        diagnostic_lines = (
+            " | ".join((str(auto_speed), f"定位 FPS {fps_text}", f"inliers {inliers}")),
+            f"wall_ms {wall_text} | core {latency_text} | e2e {e2e_text}",
+            f"{rth} | {gps}".strip(" |") if gps else str(rth),
+            f"{altitude_agl} | {link_quality}".strip(" |") if link_quality else str(altitude_agl),
+            str(attitude),
+            str(velocity) if str(velocity).startswith("三軸") else f"三軸速度 {velocity}",
+        )
+    health_text_map = {
+        "OK": "定位正常",
+        "LOW": f"定位信心低 inliers={inliers}",
+        "DEGRADED": f"定位信心低 inliers={inliers}",
+        "FAIL": "定位失敗",
+        "LOST": "定位失敗",
+        "PAUSED_ZOOM": "定位暫停：相機縮放未校正",
+    }
+    health_text = health_text_map.get(str(health), str(health))
+    ok_count = loc_dict.get("ok_count", loc_dict.get("_loc_ok_count", loc_dict.get("loc_ok_count")))
+    fail_count = loc_dict.get("fail_count", loc_dict.get("_loc_fail_count", loc_dict.get("loc_fail_count")))
+    if ok_count is not None or fail_count is not None:
+        try:
+            oc = int(ok_count or 0)
+            fc = int(fail_count or 0)
+            if oc or fc:
+                health_text += f" | ok={oc} fail={fc}"
+        except (TypeError, ValueError):
+            pass
+    return {
+        "health": str(health),
+        "health_text": health_text,
+        "inliers": inliers,
+        "reproj_rms": reproj,
+        "fps": fps_text,
+        "latency_text": latency_text,
+        "wall_text": wall_text,
+        "e2e_text": e2e_text,
+        "diagnostic_lines": diagnostic_lines,
+        "state": dict(state_dict),
+        "telemetry": dict(tele_dict),
+    }
+
+
+def heading_arrow_polygon(
+    sx: float,
+    sy: float,
+    hx: float,
+    hy: float,
+    *,
+    length: float = 18.0,
+    head_width: float = 8.0,
+    tail_length: float = 7.0,
+) -> list[tuple[float, float]] | None:
+    """Return a screen-space arrow whose tip points from current pose to heading."""
+    dx, dy = float(hx - sx), float(hy - sy)
+    norm = math.hypot(dx, dy)
+    if norm < 1e-3:
+        return None
+    ux, uy = dx / norm, dy / norm
+    px, py = -uy, ux
+    tip = (sx + ux * length, sy + uy * length)
+    head_base = (sx + ux * 2.0, sy + uy * 2.0)
+    tail = (sx - ux * tail_length, sy - uy * tail_length)
+    tail_half_width = head_width * 0.42
+    return [
+        tip,
+        (head_base[0] + px * head_width, head_base[1] + py * head_width),
+        (tail[0] + px * tail_half_width, tail[1] + py * tail_half_width),
+        (tail[0] - px * tail_half_width, tail[1] - py * tail_half_width),
+        (head_base[0] - px * head_width, head_base[1] - py * head_width),
+    ]
 def draw_video_hud(
     draw: Any,
     width: int,
@@ -567,14 +838,18 @@ def draw_video_hud(
         17,
         (height - 26 - hud_top) // len(hud_lines),
     )
+    # One solid strip behind plain (stroke-free) text: stroked truetype at
+    # 13-15px cost ~44 ms per 960x540 frame on the Tk thread and capped the
+    # whole UI tick near 12 Hz; the strip keeps contrast over bright video
+    # for ~10 ms total. Display-only; localization input is untouched.
+    strip_bottom = min(height - 18, hud_top + 5 + len(hud_lines) * line_spacing)
+    draw.rectangle((18, hud_top, width - 18, strip_bottom), fill="#0b0c0e")
     for index, line in enumerate(hud_lines):
         draw.text(
             (28, hud_top + 5 + index * line_spacing),
             line,
-            fill="#000000",
+            fill="#f4f4f4",
             font=main_hud_font if index == 0 else hud_font,
-            stroke_width=1,
-            stroke_fill="#f4f4f4",
         )
     return link_ok
 
@@ -648,150 +923,3 @@ def draw_video_banner(
             anchor="mm",
             font=banner_font,
         )
-
-
-def draw_gravity_phase_icon(canvas: Any, phase: str | None) -> None:
-    """Draw the yaw, pitch, or roll calibration cue on a Tk-like canvas."""
-    phase = phase if phase in {"yaw", "pitch", "roll"} else None
-    if getattr(canvas, "_gravity_phase_icon", object()) == phase and canvas.find_all():
-        return
-    canvas.delete("all")
-    canvas._gravity_phase_icon = phase
-    cx, cy = 36, 32
-    body, accent, arrow = "#39424b", "#f0f3f5", "#4ea1ff"
-    tag = f"gravity-phase-{phase}" if phase else "gravity-phase-ready"
-    if phase is None:
-        canvas.create_text(cx, cy, text="準備", fill="#7a828a", font=("Sans", 9), tags=(tag,))
-        return
-
-    if phase == "yaw":
-        canvas.create_oval(
-            cx - 9,
-            cy - 18,
-            cx + 9,
-            cy + 18,
-            fill=body,
-            outline=accent,
-            tags=(tag, "airframe"),
-        )
-        canvas.create_polygon(
-            cx,
-            cy - 23,
-            cx - 5,
-            cy - 14,
-            cx + 5,
-            cy - 14,
-            fill=accent,
-            outline=accent,
-            tags=(tag, "airframe"),
-        )
-        canvas.create_arc(
-            cx - 27,
-            cy - 27,
-            cx + 27,
-            cy + 27,
-            start=35,
-            extent=285,
-            style="arc",
-            outline=arrow,
-            width=2,
-            tags=(tag, "motion-yaw"),
-        )
-        canvas.create_polygon(
-            cx + 21,
-            cy - 18,
-            cx + 28,
-            cy - 10,
-            cx + 16,
-            cy - 11,
-            fill=arrow,
-            outline=arrow,
-            tags=(tag, "motion-yaw"),
-        )
-        return
-
-    if phase == "pitch":
-        canvas.create_oval(
-            cx - 22,
-            cy - 7,
-            cx + 17,
-            cy + 7,
-            fill=body,
-            outline=accent,
-            tags=(tag, "airframe"),
-        )
-        canvas.create_polygon(
-            cx + 16,
-            cy,
-            cx + 25,
-            cy - 5,
-            cx + 25,
-            cy + 5,
-            fill=accent,
-            outline=accent,
-            tags=(tag, "airframe"),
-        )
-        canvas.create_line(
-            cx,
-            cy - 26,
-            cx,
-            cy + 26,
-            fill=arrow,
-            width=2,
-            arrow="both",
-            tags=(tag, "motion-pitch"),
-        )
-        canvas.create_arc(
-            cx - 27,
-            cy - 22,
-            cx + 27,
-            cy + 22,
-            start=205,
-            extent=130,
-            style="arc",
-            outline=arrow,
-            width=2,
-            tags=(tag, "motion-pitch"),
-        )
-        return
-
-    canvas.create_oval(
-        cx - 7,
-        cy - 18,
-        cx + 7,
-        cy + 18,
-        fill=body,
-        outline=accent,
-        tags=(tag, "airframe"),
-    )
-    canvas.create_line(
-        cx - 24,
-        cy,
-        cx + 24,
-        cy,
-        fill=accent,
-        width=3,
-        tags=(tag, "airframe"),
-    )
-    canvas.create_line(
-        cx - 27,
-        cy,
-        cx + 27,
-        cy,
-        fill=arrow,
-        width=2,
-        arrow="both",
-        tags=(tag, "motion-roll"),
-    )
-    canvas.create_arc(
-        cx - 27,
-        cy - 27,
-        cx + 27,
-        cy + 27,
-        start=140,
-        extent=80,
-        style="arc",
-        outline=arrow,
-        width=2,
-        tags=(tag, "motion-roll"),
-    )

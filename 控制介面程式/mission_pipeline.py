@@ -74,14 +74,12 @@ _ROUTE_MUST_EXIST_MODES = {
     "label-route",
     "edit-height",
     "sync-path",
-    "plan-path",
     "dry-run",
     "fly",
 }
 _POLES_MUST_EXIST_MODES = {
     "draw-wires",
     "sync-poles",
-    "plan-path",
 }
 _SITE_ASSET_ENV_VARS = (
     "SFM_MAP_PLY",
@@ -662,8 +660,10 @@ def _run_mission_mode(args, passthrough, env) -> None:
         return
 
     if args.mode == "plan-path":
-        run([args.python, str(FLIGHT / "plan_path.py"), *passthrough], env)
-        return
+        raise SystemExit(
+            "[mission_pipeline] --mode plan-path is retired: routes are drawn "
+            "by hand in the route editor and flown direct; no SDF planner runs."
+        )
 
     flight_script = FLIGHT / "path_follow_flight.py"
     if args.mode == "flight-selftest":

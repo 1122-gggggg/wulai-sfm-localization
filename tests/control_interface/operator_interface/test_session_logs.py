@@ -35,6 +35,52 @@ def test_session_logs_create_required_files_and_dual_timestamps(tmp_path) -> Non
     assert summary["reason"] == "test_complete"
 
 
+def test_dispatch_buffer_is_flushed_on_close_without_disk_io_at_enqueue(tmp_path, monkeypatch):
+    session = SessionLogs.create(tmp_path, mode=InterfaceMode.SIMULATED_STREAM, manifest={})
+    written = []
+    original = session.telemetry
+    monkeypatch.setattr(session, "telemetry", lambda *a, **kw: (written.append(kw), original(*a, **kw))[1])
+    assert session.defer_telemetry("pcmd_dispatch", command_mono_ns=123, pcmd=[1, 2, 0, 3])
+    assert not written
+    session.close(reason="done")
+    row = json.loads((session.directory / "telemetry.jsonl").read_text())
+    assert row["command_mono_ns"] == 123 and row["pcmd"] == [1, 2, 0, 3]
+    summary = json.loads((session.directory / "session_summary.json").read_text())
+    assert summary["event_counts"]["telemetry"] == 1
+    assert summary["debug_deferred_dropped"] == 0
+
+
+def test_debug_log_uses_null_for_unavailable_numbers(tmp_path):
+    session = SessionLogs.create(tmp_path, mode=InterfaceMode.SIMULATED_STREAM, manifest={})
+    assert session.telemetry("test", sample=[float("nan"), float("inf")])
+    session.close(reason="done")
+    row = json.loads((session.directory / "telemetry.jsonl").read_text())
+    assert row["sample"] == [None, None]
+
+
+def test_concurrent_producers_leave_complete_json_lines(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+
+    session = SessionLogs.create(tmp_path, mode=InterfaceMode.SIMULATED_STREAM, manifest={})
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        results = list(pool.map(lambda seq: session.localization("pose", seq=seq), range(100)))
+    session.close(reason="done")
+    assert all(results)
+    rows = [json.loads(line) for line in (session.directory / "localization.jsonl").read_text().splitlines()]
+    assert sorted(row["seq"] for row in rows) == list(range(100))
+
+
+def test_debug_queue_overflow_is_reported(tmp_path):
+    session = SessionLogs.create(tmp_path, mode=InterfaceMode.SIMULATED_STREAM, manifest={})
+    for seq in range(512):
+        assert session.defer_telemetry("pcmd_dispatch", dispatch_seq=seq)
+    assert not session.defer_telemetry("pcmd_dispatch", dispatch_seq=512)
+    session.close(reason="done")
+    summary = json.loads((session.directory / "session_summary.json").read_text())
+    assert summary["debug_deferred_dropped"] == 1
+    assert summary["event_counts"]["telemetry"] == 512
+
+
 def test_session_summary_reports_latency_extrema_and_unresolved_incidents(
     tmp_path,
 ) -> None:

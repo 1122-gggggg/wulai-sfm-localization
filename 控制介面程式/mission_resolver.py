@@ -11,6 +11,7 @@ from __future__ import annotations
 import hmac
 import json
 import os
+import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -20,6 +21,7 @@ from navigation_pose_runtime import load_pose_calibrations
 from mission_manifest import (
     ArtifactRef,
     CalibrationReceipt,
+    CoordinateFrameContract,
     LocalizerVariantManifest,
     ManifestError,
     MapRevisionManifest,
@@ -36,8 +38,21 @@ from mission_manifest import (
     load_route_manifest,
     load_site_manifest,
     load_vehicle_manifest,
+    clear_sha256_cache,
     sha256_file,
 )
+
+_FLIGHT_CONTROL = Path(__file__).resolve().parents[1] / "定位演算法" / "flight_control"
+if str(_FLIGHT_CONTROL) not in sys.path:
+    sys.path.insert(0, str(_FLIGHT_CONTROL))
+try:
+    from route_domain import validate_flight_route_fields  # noqa: E402
+except ImportError:
+    # Portable live packages ship no 定位演算法/flight_control. Route geometry
+    # is only validated when a selection actually carries a route (below), so
+    # keep the import optional and fail closed at that use-site instead of at
+    # module import, which every launcher pays even for routeless missions.
+    validate_flight_route_fields = None
 
 
 SUPPORTED_PROVIDER_API_VERSION = 1
@@ -76,8 +91,7 @@ class MissionReadiness:
         autonomous-flight contract still rejects the mission.
         """
         return bool(self.localization_errors) and all(
-            error.startswith(EVALUATION_WAIVABLE_PREFIX)
-            for error in self.localization_errors
+            error.startswith(EVALUATION_WAIVABLE_PREFIX) for error in self.localization_errors
         )
 
 
@@ -89,6 +103,39 @@ class PoseChainSelection:
     camera_frame_id: str
     site_alignment: ArtifactRef
     camera_body_extrinsic: ArtifactRef
+
+
+def _standard_flight_controller(frame: CoordinateFrameContract) -> dict[str, object]:
+    axis_map = {"x": 0, "y": 1, "z": 2}
+    h_axes = [axis_map.get(str(ax).lstrip("+-").lower(), 0) for ax in frame.horizontal_axes]
+    v_axis = axis_map.get(str(frame.up_axis).lstrip("+-").lower(), 1)
+    if len(h_axes) != 2 or sorted([*h_axes, v_axis]) != [0, 1, 2]:
+        h_axes = [0, 2]
+        v_axis = 1
+    body_right_sign = 1 if v_axis == 1 else -1
+    return {
+        "model": "scale_free_direction_speed_guard_v1",
+        "speed_limit_mps": 0.60,
+        "pose_max_age_ms": 500.0,
+        "speed_max_age_ms": 500.0,
+        "command_ttl_ms": 150.0,
+        "yaw_tolerance_deg": 3.0,
+        "horizontal_axes": list(h_axes),
+        "vertical_axis": int(v_axis),
+        "camera_to_body_yaw_deg": 0.0,
+        "body_right_sign": int(body_right_sign),
+        "lookahead_map_units": 0.8,
+        "rejoin_tolerance_map_units": 0.4,
+        "arrival_tolerance_map_units": 0.2,
+        "inspect_radius_map_units": 0.5,
+        "inspect_resume_margin_map_units": 0.2,
+        "max_pose_jump_map_units": 1.0,
+        "progress_jump_slack_map_units": 0.5,
+        "max_progress_regression_map_units": 0.1,
+        "segment_window": 2,
+        "progress_speed_factor": 2.0,
+        "inspect_waypoints": [],
+    }
 
 
 @dataclass(frozen=True, slots=True)
@@ -129,9 +176,7 @@ class ResolvedMission:
         if self.route is not None:
             references.append(self.route.route)
         references.extend(
-            receipt.artifact
-            for receipt in self.calibrations
-            if receipt.artifact is not None
+            receipt.artifact for receipt in self.calibrations if receipt.artifact is not None
         )
         return tuple(references)
 
@@ -204,17 +249,20 @@ class ResolvedMission:
                     None if pose_chain is None else pose_chain.site_alignment.sha256
                 ),
                 "camera_body_extrinsic": (
-                    None
-                    if pose_chain is None
-                    else pose_chain.camera_body_extrinsic.sha256
+                    None if pose_chain is None else pose_chain.camera_body_extrinsic.sha256
                 ),
             },
             "flight": {
-                "approved": self.readiness.flight_ready,
+                "approved": self.readiness.flight_ready and not evaluation_only_requested(),
                 "coordinate_frame_id": frame.frame_id,
-                "route_clearance_approved": self.readiness.flight_ready,
+                "route_clearance_approved": self.readiness.flight_ready
+                and not evaluation_only_requested(),
                 "approval_note": approval_note,
-                "controller": None,
+                "controller": (
+                    _standard_flight_controller(frame)
+                    if self.readiness.flight_ready and not evaluation_only_requested()
+                    else None
+                ),
             },
             "assets": {
                 "map_ply": str(map_assets["map_ply"].path),
@@ -237,9 +285,7 @@ class ResolvedMission:
                 declared = self.workspace_root / declared
             resolved = declared.resolve()
             if not resolved.is_dir():
-                raise ManifestError(
-                    f"localizer.runtime.deploy_dir is not a directory: {resolved}"
-                )
+                raise ManifestError(f"localizer.runtime.deploy_dir is not a directory: {resolved}")
             document["localizer_deploy_dir"] = str(resolved)
         if pose_chain is not None:
             document["pose_chain"] = {
@@ -259,7 +305,13 @@ class ResolvedMission:
         if not directory.is_relative_to(self.workspace_root):
             raise ManifestError("compatibility profile output must stay in workspace")
         directory.mkdir(parents=True, exist_ok=True)
-        output = directory / f"{self.identity}.site_profile.json"
+        # The document embeds the SFM_EVALUATION_ONLY flavor (flight.approved /
+        # route_clearance_approved / controller), so the two flavors must not
+        # share one filename: a production run materializing first used to make
+        # every later evaluation-only launch fail closed with "disagrees with
+        # snapshot" before it reached its own checks, and vice versa.
+        flavor = ".eval" if evaluation_only_requested() else ""
+        output = directory / f"{self.identity}{flavor}.site_profile.json"
         content = (
             json.dumps(
                 self.legacy_site_profile_document(),
@@ -306,6 +358,7 @@ def _receipt_error(
     kind: str,
     subject: str,
     now: datetime,
+    localizer: LocalizerVariantManifest | None = None,
 ) -> str | None:
     if receipt is None:
         return f"missing current {kind} calibration for {subject}"
@@ -313,6 +366,22 @@ def _receipt_error(
         return f"{kind} calibration subject mismatch: expected {subject}, got {receipt.subject}"
     if not receipt.current(now):
         return f"{kind} calibration is failed or expired for {subject}"
+    if localizer is not None:
+        details = receipt.details
+        bundle_sha = details.get("bundle_sha256")
+        if isinstance(bundle_sha, str) and bundle_sha.strip():
+            expected = localizer.artifacts.get("bundle")
+            if expected is None or bundle_sha.strip().lower() != expected.sha256.lower():
+                return (
+                    f"{kind} calibration digests do not match the selected artifacts for {subject}"
+                )
+        profile_sha = details.get("profile_sha256")
+        if isinstance(profile_sha, str) and profile_sha.strip():
+            expected = localizer.artifacts.get("profile")
+            if expected is None or profile_sha.strip().lower() != expected.sha256.lower():
+                return (
+                    f"{kind} calibration digests do not match the selected artifacts for {subject}"
+                )
     return None
 
 
@@ -427,25 +496,26 @@ def resolve_mission(
     *,
     workspace_root: str | Path,
     now: datetime | None = None,
+    verify_files: bool = True,
 ) -> ResolvedMission:
     """Load, hash-check and compatibility-check one mission selection."""
     root = Path(workspace_root).expanduser().resolve()
     selection = load_mission_selection(
         selection_path,
         workspace_root=root,
-        verify_files=True,
+        verify_files=verify_files,
     )
     vehicle = load_vehicle_manifest(selection.vehicle.path, workspace_root=root)
     site = load_site_manifest(selection.site.path, workspace_root=root)
     map_revision = load_map_manifest(
         selection.map_revision.path,
         workspace_root=root,
-        verify_files=True,
+        verify_files=verify_files,
     )
     localizer = load_localizer_manifest(
         selection.localizer.path,
         workspace_root=root,
-        verify_files=True,
+        verify_files=verify_files,
     )
     route = (
         None
@@ -453,9 +523,26 @@ def resolve_mission(
         else load_route_manifest(
             selection.route.path,
             workspace_root=root,
-            verify_files=True,
+            verify_files=verify_files,
         )
     )
+    route_geometry_error: str | None = None
+    if route is not None:
+        if validate_flight_route_fields is None:
+            route_geometry_error = (
+                "flight route validation is unavailable: "
+                "this package ships no flight_control/route_domain"
+            )
+        else:
+            try:
+                payload = json.loads(Path(route.route.path).read_text(encoding="utf-8"))
+                validate_flight_route_fields(
+                    payload,
+                    expected_site_id=route.site_id,
+                    expected_coordinate_frame_id=route.frame_id,
+                )
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+                route_geometry_error = str(exc)
     calibrations = tuple(
         load_calibration_receipt(reference.path, workspace_root=root)
         for reference in selection.calibrations
@@ -477,6 +564,18 @@ def resolve_mission(
         localizer,
         route,
     )
+    if route_geometry_error is not None:
+        route_errors.append(route_geometry_error)
+    deploy_dir = localizer.runtime.get("deploy_dir")
+    if localizer.algorithm_id == "direct" and not deploy_dir:
+        localization_errors.append("direct localizer requires runtime.deploy_dir")
+    elif deploy_dir is not None:
+        declared = Path(str(deploy_dir)).expanduser()
+        resolved = (declared if declared.is_absolute() else root / declared).resolve()
+        if not resolved.is_relative_to(root) or not resolved.is_dir():
+            localization_errors.append(
+                "localizer runtime.deploy_dir must be an existing workspace directory"
+            )
     calibration_by_kind, duplicate_errors = _calibration_by_kind(calibrations)
     localization_errors.extend(duplicate_errors)
     quality_error = _receipt_error(
@@ -484,6 +583,7 @@ def resolve_mission(
         kind="localizer_quality",
         subject=localizer.quality_gate_id,
         now=checked_at,
+        localizer=localizer,
     )
     if quality_error is not None:
         localization_errors.append(quality_error)
@@ -556,4 +656,6 @@ __all__ = [
     "evaluation_only_admission",
     "evaluation_only_requested",
     "resolve_mission",
+    "clear_sha256_cache",
+    "sha256_file",
 ]

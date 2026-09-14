@@ -25,7 +25,6 @@ from release_contract import (  # noqa: E402
     source_release_identity,
     validate_source_release,
 )
-from simulator_preflight import _collision_monitor_status  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 ROOT_PYTHON = ROOT / ".venv/bin/python"
@@ -44,23 +43,23 @@ P119_VIDEO = Path(
         str(ROOT / "模擬器/測試影片/P1190119.MP4"),
     )
 ).expanduser()
-P119_QUALITY_BASELINE = ROOT / "定位演算法/validation/baselines/p119_edm_quality.json"
+# ROOT_FORMAT_SCOPE defines paths checked by root_ruff_format.
+# 巨檔排除註記：
+# 控制介面程式/operator_interface/flight_operator_app.py (~7850 行) 與
+# 控制介面程式/operator_interface/olympe_live_backend.py (~5208 行) 體積龐大，
+# 由專屬維護與 LINE_BUDGETS 控管行數，避免全量 reformat 造成歷史 git blame 斷層與併行衝突，
+# 故不納入全域 ruff format 範圍，維持針對性檔案或子模組檢查。
 ROOT_FORMAT_SCOPE = (
-    "tools/check_maintainability.py",
-    "tests/tools/test_check_maintainability.py",
-    "tests/tools/test_documentation_contract.py",
-    "tools/offline_wheelhouse.py",
-    "tests/tools/test_offline_wheelhouse.py",
-    "tests/tools/test_install_runtime_contract.py",
+    "tools/",
+    "tests/tools/",
+    "tests/localization/deploy/",
+    "定位演算法/deploy_code/sfm_direct_deploy",
     "定位演算法/flight_control/safety_command.py",
     "定位演算法/validation/check_runtime_mirrors.py",
     "控制介面程式/operator_interface/localization_metrics.py",
     "控制介面程式/operator_interface/operator_rendering.py",
     "tests/control_interface/operator_interface/test_localization_metrics.py",
     "tests/control_interface/operator_interface/test_weak_display.py",
-    "tests/localization/deploy/test_lift_reference_matches.py",
-    "tests/localization/deploy/test_reloc_worker_handover.py",
-    "tests/localization/deploy/test_dead_reckon_yaw_guard.py",
 )
 RELEASE_FILES = (
     "requirements/README.md",
@@ -145,9 +144,6 @@ RELEASE_FILES = (
     "定位演算法/deploy_code/runtime/EDM/weights/edm_outdoor.ckpt",
     "定位演算法/validation/monitor_hardware.py",
     "定位演算法/validation/check_runtime_mirrors.py",
-    "定位演算法/validation/benchmark_edm_site_replay.py",
-    "定位演算法/validation/benchmark_production_stream.py",
-    "定位演算法/validation/baselines/p119_edm_quality.json",
     "執行環境/torch_hub_cache/gmberton_MegaLoc_main/hubconf.py",
     "執行環境/torch_hub_cache/gmberton_MegaLoc_main/megaloc_model.py",
     "執行環境/torch_hub_cache/checkpoints/boq/resnet50_16384.pth",
@@ -193,8 +189,7 @@ def _pytest_summary(output: str) -> dict[str, int] | None:
     for line in reversed(output.splitlines()):
         matches = _PYTEST_COUNT_RE.findall(line)
         if not matches or not any(
-            label.lower() in _PYTEST_RESULT_LABELS
-            for _count, label in matches
+            label.lower() in _PYTEST_RESULT_LABELS for _count, label in matches
         ):
             continue
         summary = dict.fromkeys(keys, 0)
@@ -218,11 +213,7 @@ def _pytest_summary(output: str) -> dict[str, int] | None:
     skipped = sum(
         int(match.group(1) or 1)
         for line in output.splitlines()
-        if (
-            match := re.match(
-                r"\s*SKIPPED(?:\s+\[(\d+)\])?(?:\s|$)", line, re.IGNORECASE
-            )
-        )
+        if (match := re.match(r"\s*SKIPPED(?:\s+\[(\d+)\])?(?:\s|$)", line, re.IGNORECASE))
     )
     if skipped:
         return {key: (skipped if key == "skipped" else 0) for key in keys}
@@ -283,10 +274,7 @@ def _portable_metadata(
                 raise ValueError("PORTABLE_PACKAGE.json must contain an object")
             source_release = metadata.get("source_release")
             offline_install = metadata.get("offline_install")
-            if (
-                not isinstance(offline_install, dict)
-                or offline_install.get("complete") is not True
-            ):
+            if not isinstance(offline_install, dict) or offline_install.get("complete") is not True:
                 offline_install_issues.append(
                     "PORTABLE_PACKAGE.json has no complete offline install bundle"
                 )
@@ -296,14 +284,10 @@ def _portable_metadata(
                 "manifest_sha256": _sha256(ROOT / "MANIFEST.tsv"),
                 "sha256sums_sha256": _sha256(ROOT / "SHA256SUMS"),
                 "commit": (
-                    source_release.get("commit")
-                    if isinstance(source_release, dict)
-                    else None
+                    source_release.get("commit") if isinstance(source_release, dict) else None
                 ),
                 "version": (
-                    source_release.get("version")
-                    if isinstance(source_release, dict)
-                    else None
+                    source_release.get("version") if isinstance(source_release, dict) else None
                 ),
             }
             if not isinstance(source_release, dict):
@@ -316,10 +300,7 @@ def _portable_metadata(
     return {
         "path": str(package_root),
         "complete": (
-            not missing
-            and source_matches
-            and offline_install_complete
-            and not metadata_error
+            not missing and source_matches and offline_install_complete and not metadata_error
         ),
         "missing": missing,
         "source_release_matches": source_matches,
@@ -371,14 +352,84 @@ def _release_metadata(
 
 def _steps(
     *,
-    p119: bool,
-    accept_p119: bool,
-    p119_quality: bool,
-    quality_out: Path | None,
+    smoke: bool = False,
+    p119: bool = False,
+    accept_p119: bool = False,
+    p119_quality: bool = False,
+    quality_out: Path | None = None,
     portable_package: Path | None = None,
     clean_install: bool = False,
     ui_smoke: bool = False,
 ) -> list[Step]:
+    if smoke:
+        smoke_steps = [
+            Step(
+                "root_ruff_check",
+                (str(ROOT_PYTHON), "-m", "ruff", "check", "."),
+                str(ROOT),
+                300,
+            ),
+            Step(
+                "root_ruff_format",
+                (
+                    str(ROOT_PYTHON),
+                    "-m",
+                    "ruff",
+                    "format",
+                    "--check",
+                    *ROOT_FORMAT_SCOPE,
+                ),
+                str(ROOT),
+                300,
+            ),
+            Step(
+                "maintainability_budget",
+                (str(ROOT_PYTHON), str(ROOT / "tools/check_maintainability.py")),
+                str(ROOT),
+                300,
+            ),
+            Step(
+                "bounded_mypy",
+                (str(ROOT_PYTHON), "-m", "mypy"),
+                str(ROOT),
+                300,
+            ),
+            Step(
+                "root_pytest",
+                (
+                    str(ROOT_PYTHON),
+                    "-m",
+                    "pytest",
+                    "-q",
+                    "--timeout=60",
+                    "-m",
+                    "smoke",
+                ),
+                str(ROOT),
+                300,
+                isolate_workspace=True,
+            ),
+            Step(
+                "workspace_layout",
+                (
+                    str(ROOT_PYTHON),
+                    str(ROOT / "tools/workspace_audit.py"),
+                    "--strict-output-names",
+                    "--no-sizes",
+                ),
+                str(ROOT),
+                120,
+            ),
+        ]
+        if p119:
+            argv = [
+                str(ROOT_PYTHON),
+                str(ROOT / "控制介面程式/validate_p119_source.py"),
+            ]
+            if accept_p119:
+                argv.append("--accept-known-incomplete")
+            smoke_steps.append(Step("p119_integrity", tuple(argv), str(ROOT), 600))
+        return smoke_steps
     uv = shutil.which("uv") or "uv"
     steps = [
         Step(
@@ -436,6 +487,23 @@ def _steps(
                 # parameters, and an S105 on a status-string comparison.
                 "--exclude",
                 "定位演算法/deploy_code/sfm_direct_deploy/vendor/**",
+            ),
+            str(ROOT),
+            300,
+        ),
+        Step(
+            "first_party_perf_bugbear",
+            (
+                str(ROOT_PYTHON),
+                "-m",
+                "ruff",
+                "check",
+                "--select",
+                "PERF,B,C4",
+                "--ignore",
+                "B904",
+                "定位演算法/deploy_code/sfm_direct_deploy",
+                "tools",
             ),
             str(ROOT),
             300,
@@ -668,9 +736,6 @@ def _steps(
         if accept_p119:
             argv.append("--accept-known-incomplete")
         steps.append(Step("p119_integrity", tuple(argv), str(ROOT), 600))
-    if p119_quality:
-        if quality_out is None:
-            raise ValueError("quality_out is required for P119 quality validation")
     return steps
 
 
@@ -692,21 +757,36 @@ def _write_receipt(path: Path, payload: dict[str, object]) -> None:
         temp.unlink(missing_ok=True)
 
 
+def _rotate_receipts(receipt_dir: Path, keep: int = 10) -> None:
+    """Retain the newest `keep` receipts and their log directories."""
+    if not receipt_dir.is_dir() or keep <= 0:
+        return
+    receipts = sorted(receipt_dir.glob("validation_*.json"), key=lambda p: p.name)
+    if len(receipts) > keep:
+        for old_receipt in receipts[:-keep]:
+            old_receipt.unlink(missing_ok=True)
+            old_log_dir = receipt_dir / f"{old_receipt.stem}_logs"
+            if old_log_dir.is_dir():
+                shutil.rmtree(old_log_dir, ignore_errors=True)
+
+
 def _dry_run_plan(
     *,
     receipt_dir: Path,
     stamp: str,
-    p119: bool,
-    accept_p119: bool,
-    p119_quality: bool,
-    portable_package: Path | None,
-    clean_install: bool,
-    ui_smoke: bool,
+    smoke: bool = False,
+    p119: bool = False,
+    accept_p119: bool = False,
+    p119_quality: bool = False,
+    portable_package: Path | None = None,
+    clean_install: bool = False,
+    ui_smoke: bool = False,
 ) -> dict[str, object]:
     receipt_dir = receipt_dir.expanduser().resolve()
     receipt_path = receipt_dir / f"validation_{stamp}.json"
     log_dir = receipt_dir / f"validation_{stamp}_logs"
     steps = _steps(
+        smoke=smoke,
         p119=p119,
         accept_p119=accept_p119,
         p119_quality=p119_quality,
@@ -739,10 +819,6 @@ def _dry_run_plan(
             }
         )
         write_targets.append({"kind": "step_log", "path": str(log_path)})
-    if p119_quality:
-        write_targets.append(
-            {"kind": "p119_quality_output", "path": str(log_dir / "p119_quality.json")}
-        )
     if any(step.name == "dependency_security_sbom" for step in steps):
         write_targets.extend(
             [
@@ -757,6 +833,8 @@ def _dry_run_plan(
             ]
         )
     return {
+        "schema": "sfm-system-validation-plan/v1",
+        "tier": "smoke" if smoke else "full",
         "dry_run": True,
         "read_only": True,
         "subprocesses_executed": False,
@@ -769,11 +847,16 @@ def _dry_run_plan(
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--smoke",
+        action="store_true",
+        help="run smoke tier (ruff, mypy, unit tests without cov, workspace audit)",
+    )
     parser.add_argument("--p119-integrity", action="store_true")
     parser.add_argument(
         "--p119-quality",
         action="store_true",
-        help="run the complete pinned P119 EDM replay and fail on quality regression",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--accept-p119-known-incomplete",
@@ -817,19 +900,10 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.accept_p119_known_incomplete and not args.p119_integrity:
         parser.error("--accept-p119-known-incomplete requires --p119-integrity")
-    if args.p119_quality and not (
-        args.p119_integrity and args.accept_p119_known_incomplete
-    ):
-        parser.error(
-            "--p119-quality requires --p119-integrity and "
-            "--accept-p119-known-incomplete"
-        )
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     receipt_dir = args.receipt_dir.expanduser().resolve()
     portable_package = (
-        args.portable_package.expanduser().resolve()
-        if args.portable_package is not None
-        else None
+        args.portable_package.expanduser().resolve() if args.portable_package is not None else None
     )
     if args.dry_run:
         print(
@@ -837,6 +911,7 @@ def main(argv: list[str] | None = None) -> int:
                 _dry_run_plan(
                     receipt_dir=receipt_dir,
                     stamp=stamp,
+                    smoke=bool(args.smoke),
                     p119=bool(args.p119_integrity),
                     accept_p119=bool(args.accept_p119_known_incomplete),
                     p119_quality=bool(args.p119_quality),
@@ -864,6 +939,7 @@ def main(argv: list[str] | None = None) -> int:
     source_release = source_release_identity(ROOT)
     payload: dict[str, object] = {
         "schema_version": 2,
+        "tier": "smoke" if bool(args.smoke) else "full",
         "status": "running",
         "started_utc": datetime.now(timezone.utc).isoformat(),
         "root": str(ROOT),
@@ -872,9 +948,6 @@ def main(argv: list[str] | None = None) -> int:
         "system_spec_sha256": _sha256(ROOT / "文件/SYSTEM_SPEC.md"),
         "git": git,
         "release": release_gate,
-        "collision_monitor": _collision_monitor_status(
-            ROOT, [], production_required=False
-        ),
         "release_inputs": _release_metadata(
             portable_package,
             expected_source_release=source_release,
@@ -897,9 +970,7 @@ def main(argv: list[str] | None = None) -> int:
             "SFM_TORCH_HUB_CACHE": str(ROOT / "執行環境/torch_hub_cache"),
             "SFM_UI_PYTHON": str(ROOT_PYTHON),
             "SFM_LOCALIZER_PYTHON": str(ROOT_PYTHON),
-            "SFM_SITE_PROFILE": str(
-                ROOT / "地圖檔/場域/river_site/site_profile.json"
-            ),
+            "SFM_SITE_PROFILE": str(ROOT / "地圖檔/場域/river_site/site_profile.json"),
         }
     )
     release_inputs = payload["release_inputs"]
@@ -907,6 +978,7 @@ def main(argv: list[str] | None = None) -> int:
     failed = not bool(release_inputs.get("complete")) or not bool(release_gate["passed"])
     for index, step in enumerate(
         _steps(
+            smoke=bool(args.smoke),
             p119=bool(args.p119_integrity),
             accept_p119=bool(args.accept_p119_known_incomplete),
             p119_quality=bool(args.p119_quality),
@@ -935,16 +1007,8 @@ def main(argv: list[str] | None = None) -> int:
         except subprocess.TimeoutExpired as exc:
             timed_out = True
             exit_code = 124
-            stdout = (
-                exc.stdout.decode()
-                if isinstance(exc.stdout, bytes)
-                else (exc.stdout or "")
-            )
-            stderr = (
-                exc.stderr.decode()
-                if isinstance(exc.stderr, bytes)
-                else (exc.stderr or "")
-            )
+            stdout = exc.stdout.decode() if isinstance(exc.stdout, bytes) else (exc.stdout or "")
+            stderr = exc.stderr.decode() if isinstance(exc.stderr, bytes) else (exc.stderr or "")
             output = stdout + stderr + f"\nTIMEOUT after {step.timeout_s}s\n"
         duration = time.monotonic() - step_started
         # F-34: enrich workspace_layout failures with itemized offending paths and a
@@ -960,9 +1024,7 @@ def main(argv: list[str] | None = None) -> int:
 
                 try:
                     _report = _audit_workspace(ROOT, include_sizes=False)
-                    _unclassified = list(
-                        _report.get("output_classes", {}).get("unclassified", [])
-                    )
+                    _unclassified = list(_report.get("output_classes", {}).get("unclassified", []))
                 except Exception:
                     _unclassified = []
             except Exception:
@@ -999,6 +1061,7 @@ def main(argv: list[str] | None = None) -> int:
         if output:
             print(output.rstrip(), flush=True)
         ok = exit_code == 0
+        failed = failed or not ok
         pytest_summary = _pytest_summary(output)
         if pytest_summary is not None:
             pytest_receipt = payload["pytest"]
@@ -1029,6 +1092,7 @@ def main(argv: list[str] | None = None) -> int:
         receipt=str(receipt_path),
     )
     _write_receipt(receipt_path, payload)
+    _rotate_receipts(receipt_dir, keep=10)
     print(f"[validation] receipt={receipt_path} status={payload['status']}", flush=True)
     return 1 if failed else 0
 

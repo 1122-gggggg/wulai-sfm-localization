@@ -599,7 +599,7 @@ WEAK、LOST、stale pose 或 worker error 都不可沿用上一筆非零 autonom
 | SkyController stick movement | 立即停止 PC PCMD並交回 sticks | SkyController manual | 否 |
 | PC 與 SkyController/aircraft 完全斷線 | 主機停止假設可控；機載懸停／重連 | GPS+Home 有效逾時 RTH；否則經驗證的受控降落 | 否 |
 | battery 低於 30% 或核心安全讀回不合格 | 起飛前拒絕；空中依 firmware 與操作員處置 | 手動／安全降落 | 否 |
-| GPS／Home／distance geofence／高度或距離限制未就緒 | 文字提示；無 GPS 時 distance geofence 可關閉或僅提示，不阻擋手動起飛；AUTO 先懸停等待定位，不自動降落 | 手動可飛／AUTO 等待 | 定位恢復後可續行 |
+| GPS／Home／distance geofence／高度或距離限制未就緒 | **未設定**高度／距離限制：文字提示，不阻擋手動起飛（等於不受限，非有保護）；**已設定**者寫入或回讀失敗：起飛前拒絕。distance geofence 關閉時無 GPS 不阻擋；已設定且要求 GPS 時無 fix 則拒絕。AUTO 先懸停等待定位，不自動降落 | 手動可飛／AUTO 等待 | 定位恢復後可續行 |
 | logging 或磁碟無法保證 safety log | 起飛前拒絕；空中發出 incident 並交人工 | 手動 | 否 |
 | 關窗／Ctrl+C／SIGTERM／SIGHUP | 先以 backend shutdown latch 永久拒絕晚到 PCMD，再取消 AUTO 並獨立原地 Landing；AUTO worker 卡死也不得阻止降落 | 僅 touchdown 已確認才關 UI／斷線；否則保留介面與連線重試 | 不適用 |
 
@@ -795,11 +795,9 @@ stateDiagram-v2
 - model/checkpoint/bundle/profile/route/reference poses/map manifest 在載入前驗 SHA-256。
 - Python 安裝資產由 `WHEELHOUSE.json` 綁定 runtime/test/quality 三份 lockfile
   與每個 wheel 的 size/SHA-256；正式 portable 安裝強制 `--no-index`。
-- `SparseCloudCollisionMonitor` 目前不是 production safety。scipy 已在 runtime hash
-  lock 中，preflight／validation receipt 的正常狀態為
-  `available_non_production`，且固定 `collision_protection_claim=false`。若產品需求
-  改為依賴此 monitor，必須先完成 safety wiring 審查，再以
-  `--require-collision-monitor` fail closed。
+- 稀疏點雲近接互鎖（`SparseCloudCollisionMonitor`）已於 2026-09-12 依操作員指示移除，
+  不再有點雲碰撞懸停、半徑設定或 `--require-collision-monitor`。障礙物迴避回到操作員
+  目視與手動接管。
 - PyTorch artifact 優先使用 `weights_only=True`、受限 safe globals 及 schema validation。任何仍使用 unrestricted pickle 的維護工具必須先驗 SHA，且不得進 production startup path。
 - command log 不記錄 secret；工作區不可要求 Internet token 才能飛行。
 - 操作員核准 artifact 更新時，receipt 必須包含舊／新 SHA、變更理由、測試結果、人工視覺判定與日期。

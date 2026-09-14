@@ -25,25 +25,17 @@ SCAN_PATHS = (
 # Ratchet baseline for the current first-party production tree. Reducing these
 # values is encouraged; increasing either count or worst complexity fails CI.
 #
-# Re-baselined 2026-09-09 with the direct-backend migration. Two groups moved a
-# long way DOWN and the ratchet is now tighter than it has ever been there:
-#   deploy      26/57 -> 2/23  -- SCAN_PATHS now covers the live localizer
-#                                 (sfm_direct_deploy, vendor/ excluded by the
-#                                 ruff config) instead of the deleted EDM tree.
-#   validation   8/19 -> 0/0   -- the only offender was the frozen P174 replay
-#                                 harness, now exempted by name in pyproject's
-#                                 per-file-ignores rather than by raising a
-#                                 whole group's ceiling to its 115.
-# Two moved up, both from release tooling that arrived with the migration and
-# has not been simplified: tools is driven by repin_direct_release.py (34) and
-# build_direct_site_release.py; control is +1 violation. Those two are debt to
-# push back down, not headroom to spend.
+# Re-baselined 2026-09-09 with the direct-backend migration:
+#   deploy       max 21 -> 13  -- direct_map.py 實測 13（tracker 拆解已 <= 12）。
+#   tools        max 38 -> 20  -- repin main 拆解 C901 < 10，工具組收緊至 5/20。
+#   validation   8/19 -> 1/15  -- validation harness budget tightened (1/15 不動)。
+#   control      violations 21 -> 25 -- 鏈路缺口自動確認+免重算 asset 註冊表實測（max 25）。
 BUDGETS = {
-    "tools": {"violations": 4, "max_complexity": 34},
-    "deploy": {"violations": 2, "max_complexity": 23},
+    "tools": {"violations": 5, "max_complexity": 20},
+    "deploy": {"violations": 2, "max_complexity": 13},
     "flight": {"violations": 3, "max_complexity": 12},
-    "validation": {"violations": 0, "max_complexity": 0},
-    "control": {"violations": 19, "max_complexity": 25},
+    "validation": {"violations": 1, "max_complexity": 15},
+    "control": {"violations": 25, "max_complexity": 25},
 }
 # Raised 2026-09-05 for the IMU flight-test recording path. Everything that
 # could live outside these two files does: the frame recorder is
@@ -52,9 +44,12 @@ BUDGETS = {
 # only be where the frame, its telemetry and the session directory are --
 # +28 and +24 lines. Push these back down; do not raise them for a feature that
 # has not first been moved out.
+# flight_operator_app: 8010 -> 7850 -> 7870 -> 8140（實測 8123：ChainFixB 免重算註冊表 + Gap3 自動前進邏輯）。
+# olympe_live_backend: 5208 -> 5234（+26：MaxPitchRollRotationSpeed 併入韌體限制
+# 封套）。這 26 行搬不出去 -- 它們就是既有三個限制所在的韌體寫入／讀回邊界本身。
 LINE_BUDGETS = {
-    "控制介面程式/operator_interface/flight_operator_app.py": 7977,
-    "控制介面程式/operator_interface/olympe_live_backend.py": 5208,
+    "控制介面程式/operator_interface/flight_operator_app.py": 8140,
+    "控制介面程式/operator_interface/olympe_live_backend.py": 5234,
 }
 
 

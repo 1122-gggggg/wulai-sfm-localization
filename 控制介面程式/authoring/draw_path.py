@@ -1,14 +1,11 @@
 #!/usr/bin/env python3
 """Hand-draw a drone FLIGHT PATH on the aligned map cloud, in Blender, by clicking.
 
-This is the manual counterpart to deploy/plan_path.py's automatic A* planner:
-instead of letting the planner route between targets, you click the waypoints
-yourself. The result is a single connected polyline of 3D waypoints in the SAME
-aligned frame as map_aligned.ply / true_polygon.json / wires.ply (ground = z=0,
-up = +Z), so it drops straight into the executor:
-
-    from load_path import load_waypoints          # deploy/load_path.py
-    follower = PathFollower(load_waypoints())      # cruise_geofence.PathFollower
+Routes are hand-drawn: you click the waypoints yourself. The result is a
+single connected polyline of 3D waypoints in the SAME aligned frame as
+map_aligned.ply / true_polygon.json / wires.ply (ground = z=0, up = +Z),
+parsed at flight time through route_domain.RouteDocument. No planner, tube,
+or boundary slowdown is involved.
 
 Why waypoints live in free space (not snapped to a surface like the wires):
 a cruise path flies ABOVE the structures. Each click fixes the waypoint's XY

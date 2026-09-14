@@ -10,18 +10,24 @@
   控制介面程式/mission_selections/river_gluemap_all8_direct_localization.json
 ```
 
-此全八段地圖尚未通過獨立定位品質與 ANAFI camera-pipeline 驗證，上述入口目前會
-fail closed；這是預期的安全狀態，不得繞過 receipt 守門。
+此全八段地圖尚無獨立定位品質驗證與 ANAFI camera-pipeline 品質證據
+（validation: NONE）。2026-09-09 操作員以有人監督試飛接受風險，receipt 以
+OPERATOR_ACCEPTANCE（2026-10-09 到期）放行定位；flight 仍因 route frame 不符而阻擋。
 
 或 `控制介面程式/真機串流/啟動.sh`。此專案的 agent 不得執行 `--fly` 或代為授權 AUTO。
 
 ## Firmware 高度／距離上限
 
-`--max-altitude-m` 與 `--max-distance-m` 現在是選用的盡力設定；未提供、數值不符、
-firmware 設定／回讀失敗，或電量低於 30%，程式都只記錄警告並繼續，不會以此
-阻擋飛行。距離圍欄預設關閉，因此沒有 GPS 或尚未 fix 也可以繼續。操作員若明確
-加上 `--distance-geofence`，程式會嘗試設定 GPS 距離圍欄，但失敗同樣只會警告。
-飛機 firmware 本身若拒絕起飛，程式不會繞過該機載決定。
+`configure_flight_preflight()` 是 fail-closed，不是盡力設定。下列任一情況都會
+丟出 `RuntimeError` 並中止，不會只記錄警告：`--max-altitude-m` 或
+`--max-distance-m` 未提供、非有限值或 <= 0；電量讀不到或不在 0-100；電量低於
+30%；`MaxAltitude`／`MaxDistance` 寫入後回讀與要求值不符。距離圍欄預設關閉，
+關閉時沒有 GPS 或尚未 fix 可以繼續；但操作員若明確加上 `--distance-geofence`，
+就必須有已確認的 GPS fix，否則同樣中止。
+
+注意這裡的上限只有在**有提供**時才成為保護：完全不設定會在此中止，所以本路徑
+不存在「沒有上限仍然起飛」的情況。飛機 firmware 本身若拒絕起飛，程式不會繞過
+該機載決定。
 
 距離圍欄只阻止飛越上限，不會自動返航。`NavigateHome` 是獨立的 RTH
 操作；本程式不會因碰到 geofence 而自行呼叫它。

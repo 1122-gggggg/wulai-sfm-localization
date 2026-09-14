@@ -37,6 +37,7 @@ from flight_operator_app import (
 from backend_contract import InterfaceMode, LegacyFrameSourceAdapter, SessionConfig
 from ffmpeg_frame_stream import FFmpegFrameStream
 from live_safety_config import (
+    DEFAULT_MAX_PITCH_ROLL_ROTATION_SPEED_DEGS,
     DEFAULT_MAX_ROTATION_SPEED_DEGS,
     DEFAULT_MAX_TILT_DEG,
     DEFAULT_MAX_VERTICAL_SPEED_MS,
@@ -46,7 +47,7 @@ from live_safety_config import (
 from live_worker_clients import LiveDetectorClient, LiveLocalizerClient
 from lost_hold_policy import LostHoldPolicy
 from mission_manifest import ManifestError
-from mission_resolver import evaluation_only_admission
+from mission_resolver import evaluation_only_admission, evaluation_only_requested
 from operator_shutdown import OperatorShutdownCoordinator
 from operator_site_runtime import (
     ActiveSiteRuntime,
@@ -322,6 +323,20 @@ def build_argument_parser() -> argparse.ArgumentParser:
         help="firmware MaxRotationSpeed pinned at connect",
     )
     ap.add_argument(
+        "--max-pitch-roll-rotation-speed-degs",
+        type=float,
+        default=float(
+            os.environ.get(
+                "SFM_MAX_PITCH_ROLL_ROTATION_SPEED_DEGS",
+                DEFAULT_MAX_PITCH_ROLL_ROTATION_SPEED_DEGS,
+            )
+        ),
+        help=(
+            "firmware MaxPitchRollRotationSpeed pinned at connect; how fast the "
+            "aircraft may change bank angle, for both sticks and AUTO"
+        ),
+    )
+    ap.add_argument(
         "--stream-loss-grace-s",
         type=float,
         default=float(os.environ.get("SFM_STREAM_LOSS_GRACE_S", 10.0)),
@@ -453,7 +468,76 @@ def _resolve_startup_site(
     args: argparse.Namespace,
     ap: argparse.ArgumentParser,
 ) -> tuple[SiteProfile | None, object | None]:
-    site_profile = app.resolve_operator_site_assets(args, ap)
+    profile_arg = str(getattr(args, "site_profile", "") or "").strip()
+    is_snapshot = False
+    snapshots_dir = (app._WS.runtime / "mission_snapshots").resolve()
+    if profile_arg:
+        candidate = Path(profile_arg).expanduser()
+        if not candidate.is_absolute():
+            candidate = (app._WS.root / candidate).resolve()
+        else:
+            candidate = candidate.resolve()
+        snapshots_dirs = [snapshots_dir]
+        alt_runtime = (app._WS.root / "runtime" / "mission_snapshots").resolve()
+        if alt_runtime != snapshots_dir:
+            snapshots_dirs.append(alt_runtime)
+        try:
+            is_snapshot = any(candidate == d or candidate.is_relative_to(d) for d in snapshots_dirs)
+        except (AttributeError, ValueError):
+            is_snapshot = False
+
+    if is_snapshot:
+        cli_overrides = [
+            flag
+            for flag, value in (
+                ("--map-ply", getattr(args, "map_ply", None)),
+                ("--route-json", getattr(args, "route_json", None)),
+                ("--bundle", getattr(args, "bundle", None)),
+                ("--megaloc-cache", getattr(args, "megaloc_cache", None)),
+                ("--reference-index", getattr(args, "reference_index", None)),
+                (
+                    "--reference-index-sha256",
+                    getattr(args, "reference_index_sha256", None),
+                ),
+                ("--track-landmarks", getattr(args, "track_landmarks", None)),
+                ("--localizer-backend", getattr(args, "localizer_backend", None)),
+                ("--localizer-deploy-dir", getattr(args, "localizer_deploy_dir", None)),
+                ("--localizer-profile", getattr(args, "localizer_profile", None)),
+                ("--bundle-sha256", getattr(args, "bundle_sha256", None)),
+                (
+                    "--localizer-profile-sha256",
+                    getattr(args, "localizer_profile_sha256", None),
+                ),
+            )
+            if value is not None
+        ]
+        env_overrides = [name for name in app._SITE_ASSET_ENV_VARS if os.environ.get(name)]
+        conflicts = cli_overrides + env_overrides
+        if conflicts:
+            ap.error(
+                "--site-profile atomically selects map/route/bundle/localizer/MegaLoc; "
+                f"remove these per-asset overrides: {', '.join(conflicts)}"
+            )
+        try:
+            site_profile = app.load_site_profile(candidate)
+        except ValueError as exc:
+            ap.error(str(exc))
+        args.site_profile = str(site_profile.source)
+        args.map_ply = str(site_profile.map_ply)
+        args.route_json = str(site_profile.route_json or "")
+        args.bundle = str(site_profile.localization_bundle)
+        args.megaloc_cache = str(site_profile.megaloc_cache or "")
+        args.reference_index = str(site_profile.reference_index or "")
+        args.reference_index_sha256 = str(site_profile.asset_sha256.reference_index or "")
+        args.track_landmarks = str(site_profile.track_landmarks or "")
+        args.localizer_backend = str(site_profile.localizer)
+        args.localizer_deploy_dir = str(site_profile.localizer_deploy_dir or "")
+        args.localizer_profile = str(site_profile.localizer_profile or "")
+        args.bundle_sha256 = str(site_profile.asset_sha256.localization_bundle or "")
+        args.localizer_profile_sha256 = str(site_profile.asset_sha256.localizer_profile or "")
+    else:
+        site_profile = app.resolve_operator_site_assets(args, ap)
+
     if args.live and site_profile is None:
         raise SystemExit(
             "--live requires an explicit --site-profile; field assets must never "
@@ -467,16 +551,33 @@ def _resolve_startup_site(
                 "is not an independent flight authorization source"
             )
         try:
-            mission = app.resolve_mission(selection_arg, workspace_root=app._WS.root)
+            try:
+                mission = app.resolve_mission(
+                    selection_arg,
+                    workspace_root=app._WS.root,
+                    verify_files=not is_snapshot,
+                )
+            except TypeError:
+                mission = app.resolve_mission(
+                    selection_arg,
+                    workspace_root=app._WS.root,
+                )
             evaluation_only, waived = evaluation_only_admission(mission.readiness)
             if not mission.readiness.localization_ready and not evaluation_only:
                 raise ManifestError(
                     "mission is not localization-ready: "
                     + "; ".join(mission.readiness.localization_errors)
                 )
-            expected_profile = mission.materialize_legacy_site_profile(
-                app._WS.runtime / "mission_snapshots"
-            ).resolve()
+            if is_snapshot:
+                expected_profile = (
+                    snapshots_dir / f"{mission.identity}.site_profile.json"
+                ).resolve()
+                if not expected_profile.is_file():
+                    raise ManifestError(f"mission snapshot not found: {expected_profile}")
+            else:
+                expected_profile = mission.materialize_legacy_site_profile(
+                    app._WS.runtime / "mission_snapshots"
+                ).resolve()
         except (ManifestError, OSError, ValueError) as exc:
             raise SystemExit(f"mission selection rejected: {exc}") from exc
         assert site_profile is not None
@@ -492,9 +593,17 @@ def _resolve_startup_site(
         # flight_ready is already False (the waived quality error also sits in
         # flight_errors) -- pin it anyway so no later edit can widen the waiver
         # from "localization may start" into "this mission may fly itself".
-        args.mission_flight_ready = bool(mission.readiness.flight_ready) and not evaluation_only
+        # An explicit SFM_EVALUATION_ONLY=1 on an otherwise ready mission must
+        # also block flight; otherwise the flag is a no-op on the live path.
+        reported_evaluation_only = bool(
+            evaluation_only
+            or (evaluation_only_requested() and mission.readiness.localization_ready)
+        )
+        args.mission_flight_ready = (
+            bool(mission.readiness.flight_ready) and not reported_evaluation_only
+        )
         args.mission_flight_errors = tuple(mission.readiness.flight_errors)
-        args.mission_evaluation_only = evaluation_only
+        args.mission_evaluation_only = reported_evaluation_only
         args.mission_evaluation_waived_errors = tuple(waived)
     hardware_approval = None
     if site_profile is not None and site_profile.hardware_approval is not None:
@@ -518,6 +627,7 @@ def _resolve_live_safety(
             max_tilt_deg=args.max_tilt_deg,
             max_vertical_speed_ms=args.max_vertical_speed_ms,
             max_rotation_speed_degs=args.max_rotation_speed_degs,
+            max_pitch_roll_rotation_speed_degs=(args.max_pitch_roll_rotation_speed_degs),
             rth_min_altitude_m=args.rth_min_altitude_m,
             stream_loss_grace_s=args.stream_loss_grace_s,
             min_takeoff_battery_pct=args.min_takeoff_battery_pct,
@@ -729,7 +839,7 @@ def _operator_session_identity(
     runtime_profile_sha256 = ""
     if site_profile is not None and site_profile.localizer_profile is not None:
         runtime_profile_sha256 = app.file_sha256(site_profile.localizer_profile)
-    autonomous_speed_limit_mps = 0.30
+    autonomous_speed_limit_mps = 0.60
     if (
         site_profile is not None
         and site_profile.flight is not None
@@ -921,6 +1031,7 @@ def _build_operator_backend(
         max_tilt_deg=float(args.max_tilt_deg),
         max_vertical_speed_ms=float(args.max_vertical_speed_ms),
         max_rotation_speed_degs=float(args.max_rotation_speed_degs),
+        max_pitch_roll_rotation_speed_degs=float(args.max_pitch_roll_rotation_speed_degs),
         rth_min_altitude_m=float(args.rth_min_altitude_m),
         auto_pc_control=bool(args.auto_pc_control),
         stream_loss_grace_s=float(args.stream_loss_grace_s),

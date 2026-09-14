@@ -12,7 +12,7 @@
 # (ANAFI is single-controller).
 
 set -euo pipefail
-OI="$(cd "$(dirname "$0")" && pwd)"
+OI="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Workspace root: .../localization (contains 控制介面程式 / 定位演算法 / 地圖檔)
 WORKSPACE_ROOT="$(cd "$OI/../.." && pwd)"
 export SFM_WORKSPACE_ROOT="${SFM_WORKSPACE_ROOT:-$WORKSPACE_ROOT}"
@@ -24,9 +24,11 @@ if [[ "$DRY_RUN" != "0" && "$DRY_RUN" != "1" ]]; then
 fi
 
 verify_portable_package() {
-  if [[ ! -f "$PACKAGE_ROOT/PORTABLE_PACKAGE.json" ]]; then
-    if [[ ! -d "$PACKAGE_ROOT/.git" ]]; then
-      echo "[start] ERROR: non-Git runtime is missing PORTABLE_PACKAGE.json" >&2
+  local tag="${1:-[start]}"
+  local pkg_root="${2:-${PACKAGE_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}}"
+  if [[ ! -f "$pkg_root/PORTABLE_PACKAGE.json" ]]; then
+    if [[ ! -d "$pkg_root/.git" ]]; then
+      echo "$tag ERROR: non-Git runtime is missing PORTABLE_PACKAGE.json" >&2
       exit 2
     fi
     return 0
@@ -34,22 +36,58 @@ verify_portable_package() {
   local verifier
   verifier="$(command -v python3.10 || command -v python3 || true)"
   if [[ -z "$verifier" ]]; then
-    echo "[start] ERROR: no Python interpreter available for portable manifest verification" >&2
+    echo "$tag ERROR: no Python interpreter available for portable manifest verification" >&2
     exit 2
   fi
-  if [[ ! -f "$PACKAGE_ROOT/tools/package_manifest.py" ]]; then
-    echo "[start] ERROR: portable package is missing tools/package_manifest.py" >&2
+  if [[ ! -f "$pkg_root/tools/package_manifest.py" ]]; then
+    echo "$tag ERROR: portable package is missing tools/package_manifest.py" >&2
     exit 2
   fi
-  echo "[start] verifying portable package manifest ..."
-  if ! "$verifier" "$PACKAGE_ROOT/tools/package_manifest.py" verify --root "$PACKAGE_ROOT"; then
-    echo "[start] ERROR: portable package manifest verification failed" >&2
+  echo "$tag verifying portable package manifest ..."
+  if ! "$verifier" "$pkg_root/tools/package_manifest.py" verify --root "$pkg_root"; then
+    echo "$tag ERROR: portable package manifest verification failed" >&2
     exit 1
   fi
 }
 
-verify_portable_package
+enforce_stream_interface_exclusion() {
+  local mode="$1"
+  shift
+  case "$mode" in
+    sim|simulated)
+      local prefix="${1:-[影片模擬串流]}"
+      shift || true
+      for arg in "$@"; do
+        case "$arg" in
+          --live|--interface|--interface=*|--video|--video=*|--site-profile|--site-profile=*)
+            echo "$prefix 拒絕跨接口參數: $arg" >&2
+            echo "$prefix 此入口固定為 simulated-stream，不會連接實機" >&2
+            exit 2
+            ;;
+        esac
+      done
+      ;;
+    real|live)
+      local prefix="${1:-[start]}"
+      shift || true
+      for arg in "$@"; do
+        case "$arg" in
+          --interface|--interface=*|--video|--video=*)
+            echo "$prefix ERROR: real-flight launcher rejects cross-interface argument: $arg" >&2
+            echo "$prefix Use 控制介面程式/影片模擬串流/啟動.sh for video files" >&2
+            exit 2
+            ;;
+        esac
+      done
+      ;;
+  esac
+}
 
+if [[ "${BASH_SOURCE[0]}" != "${0}" ]]; then
+  return 0 2>/dev/null || exit 0
+fi
+
+verify_portable_package "[start]"
 if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
   cat <<'EOF'
 用法: ./start_anafi_live.sh [flight_operator_app.py 的真機選項]
@@ -63,15 +101,7 @@ fi
 export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
 source "$OI/resolve_display.sh"
 configure_operator_display "$DRY_RUN"
-for arg in "$@"; do
-  case "$arg" in
-    --interface|--interface=*|--video|--video=*)
-      echo "[start] ERROR: real-flight launcher rejects cross-interface argument: $arg" >&2
-      echo "[start] Use 控制介面程式/影片模擬串流/啟動.sh for video files" >&2
-      exit 2
-      ;;
-  esac
-done
+enforce_stream_interface_exclusion real "[start]" "$@"
 MAX_PERFORMANCE="${SFM_MAX_PERFORMANCE:-1}"
 if [[ "$MAX_PERFORMANCE" != "0" && "$MAX_PERFORMANCE" != "1" ]]; then
   echo "[start] ERROR: SFM_MAX_PERFORMANCE must be 0 or 1" >&2

@@ -1,23 +1,12 @@
 #!/usr/bin/env python3
 """Treat the safe zone as a hand-modelled 3D VOLUME (a closed mesh).
 
-If you model the flyable region as a watertight mesh in the ALIGNED map frame
-(Blender / CloudCompare / the in-house box composer), this wraps it in an Open3D
-RaycastingScene so the geofence can ask, fully in 3D and scale-free:
+RETIRED: no production or legacy flight code reads a safety tube, slow band,
+or clearance field. This module is kept only so old analysis scripts that
+import SafeVolume keep importing; nothing steers, slows, or repels off it.
 
-    sv = SafeVolume("safezone/safe_volume.ply")
-    sv.inside(x, y, z)        -> bool   (drone inside the flyable volume?)
-    sv.clearance(x, y, z)     -> float  (>0 inside = distance to the nearest wall)
-    sv.inward_dir(x, y, z)    -> (ux,uy,uz) unit vector toward the interior
-
-This replaces SafeZone2p5D (polygon + altitude band) AND any height profile with
-one 3D test. In cruise_geofence.CruiseController.compute() use clearance() for the
-slow band and inward_dir() for steer-back, exactly like signed_distance_inward.
-
-Requires a WATERTIGHT (closed, outward-normal) mesh for correct inside/outside
-sign -- verify with mesh.is_watertight() (the composer guarantees it).
+NOTE: not wired into the production flight path (path_follow_flight).
 """
-# NOTE: not wired into the production flight path (path_follow_flight). Experimental/unused as of this package.
 from __future__ import annotations
 
 import numpy as np

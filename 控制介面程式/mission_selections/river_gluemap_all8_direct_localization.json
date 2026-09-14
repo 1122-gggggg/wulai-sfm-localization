@@ -2,12 +2,12 @@
   "calibrations": [
     {
       "path": "../../地圖檔/場域/river_site/releases/river_gluemap_all8_direct_20260908/compat/localizer_quality_receipt.json",
-      "sha256": "7b71a4fb9053739ca48a6ea33aae50b451d786f85184de92458c1abcabaf49e2"
+      "sha256": "2a57d3332c44a66ded5530387c6662dd1b857157620361be1f9ecb6b87ba73fd"
     }
   ],
   "localizer": {
     "path": "../../地圖檔/場域/river_site/releases/river_gluemap_all8_direct_20260908/compat/localizer_direct_manifest.json",
-    "sha256": "99f9c1ddd793f7d19ced0e06b1570d83caf205f5179f4d56e865738e7362a6be"
+    "sha256": "3e6f601e28f6d7aef1cad2728e91ab78f97176c8427d726e358f266ed4d29c5a"
   },
   "map": {
     "path": "../../地圖檔/場域/river_site/releases/river_gluemap_all8_direct_20260908/compat/map_manifest.json",
@@ -15,7 +15,7 @@
   },
   "route": {
     "path": "../mission_components/routes/river_site_operator_route.json",
-    "sha256": "e04d9e7901ae30dc3ffb61323fa7c2cfdc56a65903a117f14716e05d79e1402f"
+    "sha256": "86880b648dcd8dae170a72e4b945c96334c5207603251173dc6dde262c07f205"
   },
   "schema": "sfm-mission-selection/v1",
   "selection_id": "river_gluemap_all8_direct_localization",

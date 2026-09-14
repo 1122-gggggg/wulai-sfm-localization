@@ -5,6 +5,7 @@ install_test_deps=0
 install_quality_deps=0
 offline_install=0
 offline_lock_dir=""
+verified_token="${SFM_VERIFIED_TOKEN:-}"
 portable_identity=""
 portable_marker_tmp=""
 cleanup() {
@@ -31,6 +32,10 @@ while [[ "$#" -gt 0 ]]; do
       offline_install=1
       shift
       ;;
+    --verified-token)
+      verified_token="$2"
+      shift 2
+      ;;
     --help|-h)
       break
       ;;
@@ -50,11 +55,13 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
   SFM_INSTALL_TEST_DEPS=1     additionally install requirements/test-lock.txt
   SFM_INSTALL_QUALITY_DEPS=1  additionally install requirements/quality-lock.txt
   SFM_INSTALL_OFFLINE=1       install only from 執行環境/offline_wheelhouse
+  SFM_VERIFIED_TOKEN=token    skip wheel re-hash if token/marker is verified
 
 選項:
   --test-deps                  同上，安裝 hash-locked pytest/ruff/coverage tools
   --quality-deps               安裝 hash-locked mypy/pip-audit/SBOM tools
   --offline                    僅使用已驗證的離線 wheelhouse 安裝
+  --verified-token TOKEN       略過已驗證 wheelhouse 的重複 hash 檢查
 EOF
   exit 0
 fi
@@ -108,6 +115,22 @@ for name in ("PORTABLE_PACKAGE.json", "MANIFEST.tsv"):
 print(digest.hexdigest())
 PY
 )"
+  if [[ -z "$verified_token" ]]; then
+    verified_token="$("$python_bin" - "$portable_metadata" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+try:
+    data = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+    token = data.get("offline_install", {}).get("manifest_sha256")
+    if token:
+        print(token)
+except Exception:
+    pass
+PY
+)"
+  fi
   if [[ -L "$venv_dir" ]]; then
     echo "[runtime] 拒絕 symlink venv: $venv_dir" >&2
     exit 1
@@ -135,11 +158,14 @@ if [[ "$offline_install" == "1" ]]; then
     exit 1
   fi
   offline_requirement_locks=("$requirements_lock")
-  for optional_lock in "$requirements_test_lock" "$requirements_quality_lock"; do
-    if [[ -f "$optional_lock" ]]; then
-      offline_requirement_locks+=("$optional_lock")
+  if [[ -f "$requirements_test_lock" ]]; then
+    offline_requirement_locks+=("$requirements_test_lock")
+  fi
+  if [[ "$install_quality_deps" == "1" ]] || grep -q 'quality-lock.txt' "$offline_wheelhouse_manifest" 2>/dev/null; then
+    if [[ -f "$requirements_quality_lock" ]]; then
+      offline_requirement_locks+=("$requirements_quality_lock")
     fi
-  done
+  fi
   for lock_path in "${offline_requirement_locks[@]}"; do
     if [[ ! -f "$lock_path" ]]; then
       echo "[runtime] 缺少固定相依鎖檔: $lock_path" >&2
@@ -150,6 +176,9 @@ if [[ "$offline_install" == "1" ]]; then
   for lock_path in "${offline_requirement_locks[@]}"; do
     offline_verify_args+=(--requirements "$lock_path")
   done
+  if [[ -n "$verified_token" ]]; then
+    offline_verify_args+=(--verified-token "$verified_token")
+  fi
   "$python_bin" "$offline_wheelhouse_tool" verify \
     --wheelhouse "$offline_wheelhouse" \
     "${offline_verify_args[@]}" >/dev/null

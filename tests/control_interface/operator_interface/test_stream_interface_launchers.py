@@ -245,23 +245,28 @@ def test_simulated_launcher_rejects_runtime_overrides(
     assert "portable 入口不接受額外" in result.stderr
 
 
-def test_real_launcher_blocks_unvalidated_default_map_before_connecting() -> None:
+def test_real_launcher_admits_operator_accepted_map_for_localization_and_flight() -> None:
+    """Admit on a reissued receipt (2026-09-13).
+
+    The acceptance receipt
+    (river_gluemap_all8_direct_20260908_operator_accepted_20260913) now carries
+    the selected artifacts' digests (5377857e…/316319ac…), so the launcher
+    admits the dry run. Digest-mismatch fail-closed stays covered by the
+    fixture-level tests in test_mission_resolver.
+    """
     result = launch(REAL_LAUNCHER)
 
-    assert result.returncode == 2
-    assert "mission is not localization-ready" in result.stderr
-    assert "localizer_quality calibration is failed" in result.stderr
-    assert "dry-run command:" not in result.stdout
+    assert result.returncode == 0, result.stderr
+    assert "dry-run command" in result.stdout
 
 
-def test_real_launcher_admits_the_unvalidated_map_only_for_evaluation() -> None:
+def test_real_launcher_needs_no_evaluation_waiver_once_operator_accepted() -> None:
+    """Evaluation-only session admits without a waiver on a current receipt."""
     result = launch(REAL_LAUNCHER, SFM_EVALUATION_ONLY="1")
 
-    assert result.returncode != 2
+    assert result.returncode == 0, result.stderr
     assert "EVALUATION-ONLY session" in result.stderr
-    assert "localizer_quality calibration is failed" in result.stderr
-    # The waiver never turns into flight authorization.
-    assert '"flight_ready": false' in result.stdout
+    assert ".eval.site_profile.json" in result.stdout
 
 
 def test_real_launcher_requires_mission_selection() -> None:

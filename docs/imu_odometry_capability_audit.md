@@ -4,6 +4,13 @@ Date: 2026-08-17
 Scope: production live localization (GlueMap/EDM/PnP) and ANAFI Olympe telemetry.
 Rule: only quantities that exist in code or sampled logs. No assumed sensors.
 
+> **2026-09-14 direct backend update:** fixed world-to-camera IMU yaw composition,
+> retained source attitude timestamps instead of refreshing cached samples, and
+> added KLT quality, bounded PnP correspondences, independent telemetry timestamps,
+> and control/dispatch diagnostics. See [next-flight debug runbook](next_flight_debug_runbook.md).
+> This remains an orientation bridge; no new direct-path Kalman filter, raw
+> accelerometer/gyroscope, or calibrated NED-to-map translation is claimed.
+
 > **2026-09-05 update — the transport landed; the capability verdict did not.**
 > "Localization worker currently receives IMU? **No**" below is now stale as a
 > statement about wiring: `live_localizer_protocol` has SFM3/SFM4 fused headers,
@@ -17,6 +24,15 @@ Rule: only quantities that exist in code or sampled logs. No assumed sensors.
 > `esekf.prediction_allowed()` is what decides whether any of it is used.
 > To see whether it ever armed on a real flight: `./IMU飛行測試.sh` then
 > `tools/imu_flight_test_report.py` (`docs/esekf_live_eval_runbook.md`).
+> **2026-09-12 update — direct backend now consumes fused yaw (Level D).**
+> The worker forwards each frame's SFM3/SFM4 sample to
+> `DirectTrackerAdapter.observe_fused_state`, and `TwoRateTracker` bridges
+> frames where visual PnP *and* visual dead reckoning fail by rotating the
+> last pose about the map up axis by the fused yaw increment (center held,
+> status `IMU_BRIDGE` → WEAK, shares the dead-reckon age budget). Log
+> grounding: pose success 0.86 → 0.64 once yaw rate passes ~5 deg/s, and AUTO
+> now aligns at 10 deg/s. No translation source is claimed; rows carry
+> `imu_bridge` / `imu_sample_age_s` / `imu_yaw_delta_deg`.
 
 ## Verdict
 

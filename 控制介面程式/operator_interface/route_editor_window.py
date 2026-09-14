@@ -22,7 +22,6 @@ from x11_pinch_zoom import install_x11_pinch_zoom
 _BG = (18, 21, 25)
 _ARRIVE = "#3fbf7f"
 _ARRIVE_FILL = (63, 191, 127, 52)
-_SAFE_TUBE = (0, 229, 255, 128)
 #: Matches ControlConfig.waypoint_arrive_radius; the exported route carries the
 #: value the operator actually confirmed, so the two cannot drift apart.
 #: Operator decision 2026-08-06: the arrival sphere is 0.005 to 0.05 map units.
@@ -31,23 +30,9 @@ _SAFE_TUBE = (0, 229, 255, 128)
 DEFAULT_ARRIVE_RADIUS_U = 0.02
 ARRIVE_RADIUS_MIN_U = 0.005
 ARRIVE_RADIUS_MAX_U = 0.05
-DEFAULT_ROUTE_DEVIATION_U = 0.1
-ROUTE_DEVIATION_MIN_U = 0.0
-ROUTE_DEVIATION_MAX_U = 0.1
 _ROUTE = "#ff3ea5"
 _SELECTED = "#ffe169"
 _AXIS = ("#ff6b5f", "#55d187", "#5aa7e8")
-
-
-def _profile_route_deviation_cap(profile) -> float:
-    controller = getattr(getattr(profile, "flight", None), "controller", None)
-    raw = getattr(controller, "max_route_deviation_map_units", None)
-    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
-        return DEFAULT_ROUTE_DEVIATION_U
-    value = float(raw)
-    if not np.isfinite(value) or value < 0.0:
-        return DEFAULT_ROUTE_DEVIATION_U
-    return min(ROUTE_DEVIATION_MAX_U, max(ROUTE_DEVIATION_MIN_U, value))
 
 
 def _resolve_map_frame(profile):
@@ -71,6 +56,22 @@ def _resolve_map_frame(profile):
             f"場域宣告了重力對齊 ({align})，但無法載入讀取它的模組：{exc}"
         ) from exc
     return load_map_frame(align), "measured"
+
+
+def _save_failure_hint(exc: Exception) -> str | None:
+    """Actionable text for save failures whose fix is outside the editor.
+
+    A session started directly from a release/system profile has no managed
+    site pack, so every route import is refused at the trust boundary. The
+    raw error names the boundary; the operator needs the next click instead.
+    """
+    text = str(exc)
+    if "managed site profile" in text or "尚未對應" in text:
+        return (
+            "目前場域尚未匯入為場域資料夾；請先在場域面板「匯入場域資料夾」並套用，"
+            "再重新開啟編輯器畫路線儲存"
+        )
+    return None
 
 
 class RouteEditorWindow(tk.Toplevel):
@@ -126,21 +127,10 @@ class RouteEditorWindow(tk.Toplevel):
         self.arrive_radius_var = tk.DoubleVar(
             value=DEFAULT_ARRIVE_RADIUS_U if saved_radius is None
             else min(ARRIVE_RADIUS_MAX_U, max(ARRIVE_RADIUS_MIN_U, saved_radius)))
-        self.route_deviation_max_u = _profile_route_deviation_cap(profile)
-        saved_deviation = document.max_route_deviation_map_units
-        route_deviation = (
-            self.route_deviation_max_u
-            if saved_deviation is None
-            else min(
-                self.route_deviation_max_u,
-                max(ROUTE_DEVIATION_MIN_U, saved_deviation),
-            )
-        )
-        self.route_deviation_var = tk.DoubleVar(value=route_deviation)
+        self.point_radius_var = tk.StringVar(value=f"{float(self.arrive_radius_var.get()):.3f}")
         self.discovery_var = tk.StringVar(value="尚未導入資料夾")
         self._discovered = None
         self.show_arrive_var = tk.BooleanVar(value=False)
-        self.show_route_deviation_var = tk.BooleanVar(value=False)
         self.document = document
         self.import_route = import_route
         self.discover_map_ply = discover_map_ply
@@ -325,31 +315,21 @@ class RouteEditorWindow(tk.Toplevel):
             arrive, from_=ARRIVE_RADIUS_MIN_U, to=ARRIVE_RADIUS_MAX_U,
             variable=self.arrive_radius_var, command=self._on_arrive_radius,
         ).pack(fill="x", padx=6, pady=(0, 6))
-        self._on_arrive_radius(None)
-        safe_tube = ttk.LabelFrame(side, text="航線安全管確認")
-        safe_tube.pack(fill="x", padx=12, pady=(0, 10))
-        ttk.Checkbutton(
-            safe_tube,
-            text="顯示航線安全管",
-            variable=self.show_route_deviation_var,
-            command=self.request_redraw,
-        ).pack(anchor="w", padx=6, pady=(4, 0))
-        self.route_deviation_label_var = tk.StringVar()
-        ttk.Label(
-            safe_tube,
-            textvariable=self.route_deviation_label_var,
-            style="RouteEditor.TLabel",
-            wraplength=260,
-        ).pack(anchor="w", padx=6)
-        self.route_deviation_scale = ttk.Scale(
-            safe_tube,
-            from_=ROUTE_DEVIATION_MIN_U,
-            to=self.route_deviation_max_u,
-            variable=self.route_deviation_var,
-            command=self._on_route_deviation,
+        point_row = ttk.Frame(arrive)
+        point_row.pack(fill="x", padx=6, pady=(0, 6))
+        ttk.Label(point_row, text="選取點半徑", style="RouteEditor.TLabel").pack(side="left")
+        self.point_radius_box = ttk.Spinbox(
+            point_row, from_=ARRIVE_RADIUS_MIN_U, to=ARRIVE_RADIUS_MAX_U,
+            increment=0.001, textvariable=self.point_radius_var, width=7,
+            command=self._on_point_radius,
         )
-        self.route_deviation_scale.pack(fill="x", padx=6, pady=(0, 6))
-        self._on_route_deviation(None)
+        self.point_radius_box.pack(side="left", padx=6)
+        self.point_radius_box.bind("<Return>", self._on_point_radius)
+        self.point_radius_box.bind("<FocusOut>", self._on_point_radius)
+        self.point_radius_note_var = tk.StringVar()
+        ttk.Label(arrive, textvariable=self.point_radius_note_var,
+                  style="RouteEditor.TLabel").pack(anchor="w", padx=6)
+        self._on_arrive_radius(None)
         ttk.Label(
             side,
             textvariable=self.selection_var,
@@ -428,7 +408,7 @@ class RouteEditorWindow(tk.Toplevel):
         return (
             points,
             float(self.arrive_radius_var.get()),
-            float(self.route_deviation_var.get()),
+            tuple(self.document.waypoint_arrive_radii or ()),
         )
 
     def _refresh_labels(self) -> None:
@@ -453,6 +433,7 @@ class RouteEditorWindow(tk.Toplevel):
             self.selection_var.set(
                 f"選取：航點 {selected + 1}\nX {x:.3f}  Y {y:.3f}  高度 Z {z:.3f}"
             )
+        self._sync_point_radius_box()
         self.finish_button.configure(
             state="normal" if self.controller.phase == "layout" else "disabled"
         )
@@ -527,44 +508,23 @@ class RouteEditorWindow(tk.Toplevel):
         sx, sy, _ = self.view.project(self.controller.points, width, height)
         projected = list(zip(sx.tolist(), sy.tolist()))
         if len(projected) > 1:
-            if self.show_route_deviation_var.get():
-                tube_pixels = float(self.route_deviation_var.get()) * self.view.scale(
-                    width, height
-                )
-                if tube_pixels >= 1.0:
-                    tube_width = max(2, int(round(tube_pixels * 2.0)))
-                    draw.line(
-                        projected,
-                        fill=_SAFE_TUBE,
-                        width=tube_width,
-                        joint="curve",
-                    )
-                    for x, y in projected:
-                        draw.ellipse(
-                            (
-                                x - tube_pixels,
-                                y - tube_pixels,
-                                x + tube_pixels,
-                                y + tube_pixels,
-                            ),
-                            fill=_SAFE_TUBE,
-                        )
             draw.line(projected, fill=_ROUTE, width=3, joint="curve")
         if self.show_arrive_var.get():
             # The arrival sphere in MAP units, drawn at the view's own scale so
             # what the operator confirms here is what the controller will use.
+            # Per-point drawn values win where the operator set them.
             width_px, height_px = width, height
-            pixels = float(self.arrive_radius_var.get()) * self.view.scale(
-                width_px, height_px
-            )
-            if pixels >= 1.0:
-                for x, y in projected:
-                    draw.ellipse(
-                        (x - pixels, y - pixels, x + pixels, y + pixels),
-                        fill=_ARRIVE_FILL,
-                        outline=_ARRIVE,
-                        width=2,
-                    )
+            unit = self.view.scale(width_px, height_px)
+            for index, (x, y) in enumerate(projected):
+                pixels = self._point_radius_for(index) * unit
+                if pixels < 1.0:
+                    continue
+                draw.ellipse(
+                    (x - pixels, y - pixels, x + pixels, y + pixels),
+                    fill=_ARRIVE_FILL,
+                    outline=_ARRIVE,
+                    width=2,
+                )
         for index, (x, y) in enumerate(projected):
             selected = index == self.controller.selected
             radius = 8 if selected else 6
@@ -701,6 +661,10 @@ class RouteEditorWindow(tk.Toplevel):
                 self.status_var.set("游標附近沒有點雲，未新增航點；請放大或重新點選")
                 return
             self.controller.add(point)
+            if self.document.waypoint_arrive_radii is not None:
+                self.document.waypoint_arrive_radii.append(
+                    float(self.arrive_radius_var.get())
+                )
             self.status_var.set(
                 f"已新增路徑點 {len(self.controller.points)}；可繼續單擊標點"
             )
@@ -822,7 +786,11 @@ class RouteEditorWindow(tk.Toplevel):
             self.status_var.set("Esc 只取消移動；請使用右上角「離開編輯器」")
 
     def _handle_delete(self) -> None:
+        selected = self.controller.selected
         if self.controller.delete_selected():
+            radii = self.document.waypoint_arrive_radii
+            if radii is not None and selected is not None and 0 <= selected < len(radii):
+                del radii[selected]
             self.status_var.set("已刪除選取航點")
             self._refresh_labels()
             self.request_redraw()
@@ -866,26 +834,72 @@ class RouteEditorWindow(tk.Toplevel):
             # translating between them: it settles, advances, settles, advances.
             note = f"　⚠ 半徑 >= 最短段 {shortest:.3f}u 的一半，相鄰球體會重疊"
         self.arrive_label_var.set(f"半徑 {radius:.3f} 地圖單位{note}")
-        if hasattr(self, "route_deviation_label_var"):
-            self._set_route_deviation_label()
         if self.show_arrive_var.get():
             self.request_redraw()
 
-    def _set_route_deviation_label(self) -> None:
-        radius = float(self.route_deviation_var.get())
+    def _point_radius_for(self, index: int | None) -> float:
+        """Arrival sphere for one waypoint: its drawn value or the global."""
+        radii = self.document.waypoint_arrive_radii
+        if (
+            radii is not None
+            and index is not None
+            and 0 <= index < len(radii)
+            and index < len(self.controller.points)
+        ):
+            return float(radii[index])
+        return float(self.arrive_radius_var.get())
+
+    def _sync_point_radius_box(self) -> None:
+        selected = self.controller.selected
+        self.point_radius_var.set(f"{self._point_radius_for(selected):.3f}")
+        self._update_point_radius_note()
+
+    def _update_point_radius_note(self) -> None:
+        selected = self.controller.selected
+        points = self.controller.points
+        if selected is None or not (0 <= selected < len(points)):
+            self.point_radius_note_var.set("")
+            return
+        radius = self._point_radius_for(selected)
+        neighbours = []
+        if selected > 0:
+            neighbours.append(points[selected - 1])
+        if selected + 1 < len(points):
+            neighbours.append(points[selected + 1])
+        import math as _math
+        nearest = min((_math.dist(points[selected], other) for other in neighbours), default=None)
         note = ""
-        if radius < float(self.arrive_radius_var.get()):
-            note = "；⚠ 小於到達半徑"
-        self.route_deviation_label_var.set(
-            f"半徑 {radius:.3f} 地圖單位{note}\n超出後立即結束 AUTO 並原地降落"
+        if nearest is not None and radius >= nearest * 0.5:
+            note = f"　⚠ 半徑 >= 相鄰段 {nearest:.3f}u 的一半，相鄰球體會重疊"
+        custom = self.document.waypoint_arrive_radii is not None and (
+            0 <= selected < len(self.document.waypoint_arrive_radii or [])
+        )
+        self.point_radius_note_var.set(
+            f"航點 {selected + 1} 到達球 {radius:.3f}u{note}"
+            + ("" if custom else "（全域值）")
         )
 
-    def _on_route_deviation(self, _value) -> None:
-        if _value is not None:
-            self.show_route_deviation_var.set(True)
-        self._set_route_deviation_label()
-        if self.show_route_deviation_var.get():
-            self.request_redraw()
+    def _on_point_radius(self, _event=None) -> None:
+        selected = self.controller.selected
+        if selected is None or not (0 <= selected < len(self.controller.points)):
+            self.status_var.set("先選取一個航點再設單點半徑")
+            return
+        try:
+            radius = float(str(self.point_radius_var.get()).strip())
+        except (TypeError, ValueError):
+            radius = float("nan")
+        import math as _math
+        if not _math.isfinite(radius):
+            self._sync_point_radius_box()
+            return
+        radius = min(ARRIVE_RADIUS_MAX_U, max(ARRIVE_RADIUS_MIN_U, radius))
+        radii = self.document.waypoint_arrive_radii
+        if radii is None or len(radii) != len(self.controller.points):
+            radii = [float(self.arrive_radius_var.get())] * len(self.controller.points)
+            self.document.waypoint_arrive_radii = radii
+        radii[selected] = radius
+        self._sync_point_radius_box()
+        self.request_redraw()
 
     def finish_layout(self) -> None:
         try:
@@ -896,11 +910,9 @@ class RouteEditorWindow(tk.Toplevel):
         # Stage two is where the arrival spheres matter, so show them by default:
         # the operator confirms the radius against the real geometry before export.
         self.show_arrive_var.set(True)
-        self.show_route_deviation_var.set(True)
         self._on_arrive_radius(None)
-        self._on_route_deviation(None)
         self.status_var.set(
-            "第二階段：綠圈為到達球體、藍綠管為安全範圍，確認兩個半徑後再匯出；"
+            "第二階段：綠圈為到達球體，確認到達半徑後再匯出；"
             "選取路徑點後按 G，可用 X／Y／Z 調整位置"
         )
         self._refresh_labels()
@@ -1127,12 +1139,6 @@ class RouteEditorWindow(tk.Toplevel):
                 site_id="", coordinate_frame_id="", align_source=self.align_source)
             self._preview_only = True
             display_name = "未綁定 PLY"
-        self.route_deviation_max_u = _profile_route_deviation_cap(profile)
-        self.route_deviation_scale.configure(to=self.route_deviation_max_u)
-        self.route_deviation_var.set(
-            min(float(self.route_deviation_var.get()), self.route_deviation_max_u)
-        )
-        self._on_route_deviation(None)
         self._map_source = source
         self.title(f"航線編輯器 — {display_name}")
         self.title_var.set(f"航線編輯器｜{display_name}")
@@ -1173,9 +1179,16 @@ class RouteEditorWindow(tk.Toplevel):
             self.controller.confirm_move()
         self.document.points = self.controller.points
         self.document.arrive_radius_map_units = float(self.arrive_radius_var.get())
-        self.document.max_route_deviation_map_units = float(
-            self.route_deviation_var.get()
-        )
+        radii = self.document.waypoint_arrive_radii
+        if radii is not None:
+            # Backstop for undo/redo, which restores points without touching
+            # radii: truncate extras, pad additions with the global sphere.
+            global_radius = float(self.arrive_radius_var.get())
+            self.document.waypoint_arrive_radii = (
+                list(radii[: len(self.controller.points)])
+                + [global_radius]
+                * max(0, len(self.controller.points) - len(radii))
+            )
 
     def save_route(self) -> Path | None:
         self._update_document()
@@ -1199,7 +1212,8 @@ class RouteEditorWindow(tk.Toplevel):
                 staged = self.document.save(Path(temporary) / "flight_route.json")
                 result = self.import_route(staged)
         except Exception as exc:
-            self.status_var.set(f"航線儲存失敗：{exc}")
+            hint = _save_failure_hint(exc)
+            self.status_var.set(f"航線儲存失敗：{hint or exc}")
             return None
         saved = Path(getattr(result, "asset_path", None) or self.profile.route_json)
         self.document.source_path = saved

@@ -79,6 +79,7 @@ from operator_flight_safety import (  # noqa: E402
 )
 from scale_free_control_adapter import validate_speed_limit_change  # noqa: E402
 from live_safety_config import (  # noqa: E402
+    DEFAULT_MAX_PITCH_ROLL_ROTATION_SPEED_DEGS,
     DEFAULT_MAX_ROTATION_SPEED_DEGS,
     DEFAULT_MAX_TILT_DEG,
     DEFAULT_MAX_VERTICAL_SPEED_MS,
@@ -86,6 +87,7 @@ from live_safety_config import (  # noqa: E402
     DEFAULT_STREAM_LOSS_GRACE_S,
     LiveSafetyConfig,
     NUDGE_TTL_MAX_S,
+    takeoff_battery_blocker,
 )
 from recording_quality import (  # noqa: E402
     DEFAULT_RECORDING_PROFILE,
@@ -123,17 +125,29 @@ def _clamp_pct(v: int) -> int:
     return max(-100, min(100, int(v)))
 
 
-def takeoff_battery_blocker(battery: float, battery_floor: float | None) -> str | None:
-    """D1: pure fragment of takeoff preflight -- battery-vs-floor decision only.
+def _validate_vector_authority(authority_pct: int | None) -> bool:
+    """Check the per-vector percent-of-envelope for ``set_nudge_vector``."""
+    if authority_pct is None:
+        return True
+    if isinstance(authority_pct, bool) or not isinstance(authority_pct, int):
+        return False
+    return 1 <= authority_pct <= 100
 
-    The caller has already fetched ``battery`` from live telemetry; this makes
-    just the threshold decision testable without a drone.
-    """
-    if battery_floor is None:
-        return "takeoff battery floor is unavailable or invalid"
-    if battery < battery_floor:
-        return f"battery {battery:.0f}% is below the {battery_floor:.0f}% takeoff floor"
-    return None
+
+def _clamp_unit_axes(
+    roll: float, pitch: float, yaw: float, gaz: float
+) -> list[float] | None:
+    """Clamp four stick axes to [-1, 1]; None when any axis is not finite."""
+    axes = []
+    for value in (roll, pitch, yaw, gaz):
+        try:
+            v = float(value)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(v):
+            return None
+        axes.append(max(-1.0, min(1.0, v)))
+    return axes
 
 
 @dataclass(frozen=True)
@@ -323,6 +337,9 @@ class OlympeLiveBackend:
         max_tilt_deg: float = DEFAULT_MAX_TILT_DEG,
         max_vertical_speed_ms: float = DEFAULT_MAX_VERTICAL_SPEED_MS,
         max_rotation_speed_degs: float = DEFAULT_MAX_ROTATION_SPEED_DEGS,
+        max_pitch_roll_rotation_speed_degs: float = (
+            DEFAULT_MAX_PITCH_ROLL_ROTATION_SPEED_DEGS
+        ),
         rth_min_altitude_m: float = DEFAULT_RTH_MIN_ALTITUDE_M,
         auto_pc_control: bool = True,
         stream_loss_grace_s: float = DEFAULT_STREAM_LOSS_GRACE_S,
@@ -347,6 +364,7 @@ class OlympeLiveBackend:
             max_tilt_deg=max_tilt_deg,
             max_vertical_speed_ms=max_vertical_speed_ms,
             max_rotation_speed_degs=max_rotation_speed_degs,
+            max_pitch_roll_rotation_speed_degs=max_pitch_roll_rotation_speed_degs,
             rth_min_altitude_m=rth_min_altitude_m,
             stream_loss_grace_s=stream_loss_grace_s,
             min_takeoff_battery_pct=min_takeoff_battery_pct,
@@ -369,6 +387,9 @@ class OlympeLiveBackend:
         self.desired_max_tilt_deg = safety_config.max_tilt_deg
         self.desired_max_vertical_speed_ms = safety_config.max_vertical_speed_ms
         self.desired_max_rotation_speed_degs = safety_config.max_rotation_speed_degs
+        self.desired_max_pitch_roll_rotation_speed_degs = (
+            safety_config.max_pitch_roll_rotation_speed_degs
+        )
         self.desired_rth_min_altitude_m = safety_config.rth_min_altitude_m
         self.auto_pc_control = bool(auto_pc_control)
         self.stream_loss_grace_s = safety_config.stream_loss_grace_s
@@ -406,7 +427,7 @@ class OlympeLiveBackend:
         self.state.distance_from_home_m = None
         self.state.airspeed_mps = None
         self.state.autonomous_speed_limit_enabled = True
-        self.state.autonomous_speed_limit_mps = 0.30
+        self.state.autonomous_speed_limit_mps = 0.60
         self.state.autonomous_approval_valid = False
         self.state.drone_magnetometer_required = None
         self.state.drone_magnetometer_started = None
@@ -482,6 +503,12 @@ class OlympeLiveBackend:
         self._distance_guard_active: bool | None = None
         self.state.distance_guard_active = None
         self._nudge_vector: tuple[float, float, float, float] | None = None
+        # Percent-of-envelope the current vector's unit axes scale by.  None
+        # means nudge_pct, which is what the on-screen sticks want.  AUTO sets
+        # its own so its command is not silently re-clamped to the manual nudge
+        # size on the way out (measured 2026-09-12: every AUTO axis was pinned
+        # at nudge_pct no matter what the controller asked for).
+        self._nudge_vector_authority: int | None = None
         self.zero_pcmd_failures = 0
         self.last_zero_pcmd_error: str | None = None
         self._disk_low_noted = False
@@ -516,9 +543,6 @@ class OlympeLiveBackend:
         )
         self.record_dir = _DEFAULT_RECORD_DIR
         self.record_dir.mkdir(parents=True, exist_ok=True)
-        # sim-compatible attributes used by gravity UI
-        self.gravity_sim_phase: str | None = None
-        self._gravity_sim_t0 = None
         self.sim_xyz = np.zeros(3, dtype=float)
         self.sim_yaw = 0.0
         self.target_altitude_m = 0.0
@@ -763,6 +787,8 @@ class OlympeLiveBackend:
             observed_mono_ns=max(0, observed_mono_ns),
         )
         setattr(self.state, f"{name}_mono_ns", sample.observed_mono_ns)
+        source = "event" if isinstance(marker, tuple) and marker[0] == "event" else "observed_cache_value"
+        setattr(self.state, f"{name}_stamp_source", source)
         return dict(sample.value)
 
     @staticmethod
@@ -1139,6 +1165,7 @@ class OlympeLiveBackend:
         self.state.max_tilt_deg = None
         self.state.max_vertical_speed_mps = None
         self.state.max_rotation_speed_dps = None
+        self.state.max_pitch_roll_rotation_speed_dps = None
 
     def _read_firmware_safety_state(self) -> dict[str, dict | None]:
         """Refresh UI fields exclusively from Olympe state readback."""
@@ -1151,6 +1178,7 @@ class OlympeLiveBackend:
                 NoFlyOverMaxDistanceChanged,
             )
             from olympe.messages.ardrone3.SpeedSettingsState import (
+                MaxPitchRollRotationSpeedChanged,
                 MaxRotationSpeedChanged,
                 MaxVerticalSpeedChanged,
             )
@@ -1164,6 +1192,9 @@ class OlympeLiveBackend:
                 "tilt": self._state_dict(MaxTiltChanged),
                 "vertical_speed": self._state_dict(MaxVerticalSpeedChanged),
                 "rotation_speed": self._state_dict(MaxRotationSpeedChanged),
+                "pitch_roll_rotation_speed": self._state_dict(
+                    MaxPitchRollRotationSpeedChanged
+                ),
             }
 
         def current(name: str) -> float | None:
@@ -1187,6 +1218,9 @@ class OlympeLiveBackend:
         self.state.max_tilt_deg = current("tilt")
         self.state.max_vertical_speed_mps = current("vertical_speed")
         self.state.max_rotation_speed_dps = current("rotation_speed")
+        self.state.max_pitch_roll_rotation_speed_dps = current(
+            "pitch_roll_rotation_speed"
+        )
         return states
 
     def _flight_state_name(self) -> str:
@@ -1665,6 +1699,10 @@ class OlympeLiveBackend:
             ("max tilt", self.desired_max_tilt_deg),
             ("max vertical speed", self.desired_max_vertical_speed_ms),
             ("max rotation speed", self.desired_max_rotation_speed_degs),
+            (
+                "max pitch/roll rotation speed",
+                self.desired_max_pitch_roll_rotation_speed_degs,
+            ),
         ):
             if self._finite_float(value) is None or float(value) <= 0.0:
                 return f"desired {label} must be finite and > 0"
@@ -1723,10 +1761,12 @@ class OlympeLiveBackend:
                 NoFlyOverMaxDistanceChanged,
             )
             from olympe.messages.ardrone3.SpeedSettings import (
+                MaxPitchRollRotationSpeed,
                 MaxRotationSpeed,
                 MaxVerticalSpeed,
             )
             from olympe.messages.ardrone3.SpeedSettingsState import (
+                MaxPitchRollRotationSpeedChanged,
                 MaxRotationSpeedChanged,
                 MaxVerticalSpeedChanged,
             )
@@ -1738,6 +1778,10 @@ class OlympeLiveBackend:
             "tilt": (MaxTilt, MaxTiltChanged),
             "vertical_speed": (MaxVerticalSpeed, MaxVerticalSpeedChanged),
             "rotation_speed": (MaxRotationSpeed, MaxRotationSpeedChanged),
+            "pitch_roll_rotation_speed": (
+                MaxPitchRollRotationSpeed,
+                MaxPitchRollRotationSpeedChanged,
+            ),
             "geofence": (NoFlyOverMaxDistance, NoFlyOverMaxDistanceChanged),
         }, None
 
@@ -1802,6 +1846,7 @@ class OlympeLiveBackend:
         tilt: float,
         vspeed: float,
         rspeed: float,
+        pr_rspeed: float,
     ) -> bool:
         if not self._apply_firmware_setting(
             messages["altitude"][0](current=altitude),
@@ -1833,11 +1878,18 @@ class OlympeLiveBackend:
             "MaxVerticalSpeed",
         ):
             return False
-        return self._apply_firmware_setting(
+        if not self._apply_firmware_setting(
             messages["rotation_speed"][0](current=rspeed),
             messages["rotation_speed"][1],
             rspeed,
             "MaxRotationSpeed",
+        ):
+            return False
+        return self._apply_firmware_setting(
+            messages["pitch_roll_rotation_speed"][0](current=pr_rspeed),
+            messages["pitch_roll_rotation_speed"][1],
+            pr_rspeed,
+            "MaxPitchRollRotationSpeed",
         )
 
     def _configure_firmware_limits_locked(self) -> bool:
@@ -1862,6 +1914,7 @@ class OlympeLiveBackend:
         tilt = float(self.desired_max_tilt_deg)
         vspeed = float(self.desired_max_vertical_speed_ms)
         rspeed = float(self.desired_max_rotation_speed_degs)
+        pr_rspeed = float(self.desired_max_pitch_roll_rotation_speed_degs)
         states = self._read_firmware_safety_state()
         for bounds_error in (
             self._limit_bounds_error(states.get("altitude"), altitude, "MaxAltitude"),
@@ -1871,12 +1924,17 @@ class OlympeLiveBackend:
                 states.get("vertical_speed"), vspeed, "MaxVerticalSpeed"),
             self._limit_bounds_error(
                 states.get("rotation_speed"), rspeed, "MaxRotationSpeed"),
+            self._limit_bounds_error(
+                states.get("pitch_roll_rotation_speed"),
+                pr_rspeed,
+                "MaxPitchRollRotationSpeed",
+            ),
         ):
             if bounds_error is not None:
                 return self._firmware_limits_fail(bounds_error)
 
         if not self._apply_firmware_settings(
-            messages, altitude, distance, tilt, vspeed, rspeed
+            messages, altitude, distance, tilt, vspeed, rspeed, pr_rspeed
         ):
             return False
 
@@ -1897,6 +1955,7 @@ class OlympeLiveBackend:
             distance_m=distance, distance_geofence=bool(geofence_value),
             max_tilt_deg=tilt, max_vertical_speed_ms=vspeed,
             max_rotation_speed_degs=rspeed,
+            max_pitch_roll_rotation_speed_degs=pr_rspeed,
         )
         return True
 
@@ -2079,11 +2138,8 @@ class OlympeLiveBackend:
             battery = self._finite_float(
                 battery_state.get("percent") if battery_state is not None else None
             )
-            if battery is None or not 0.0 <= battery <= 100.0:
-                return self._takeoff_preflight_fail(
-                    "battery state unavailable or invalid"
-                )
-            self.state.battery_pct = battery
+            if battery is not None:
+                self.state.battery_pct = battery
             battery_blocker = takeoff_battery_blocker(battery, battery_floor)
             if battery_blocker is not None:
                 return self._takeoff_preflight_fail(battery_blocker)
@@ -2277,10 +2333,18 @@ class OlympeLiveBackend:
             return None
         from olympe.messages.ardrone3.Piloting import PCMD
         call_mono_ns = time.monotonic_ns()
-        self.drone(PCMD(1, r, p, y, g, 0))
+        # Match Olympe's piloting sender, including yaw/gaz-only commands.
+        flag = int(bool(r or p))
+        self.drone(PCMD(flag, r, p, y, g, 0))
+        self._last_pcmd_flag = flag
         self._last_pcmd = (r, p, y, g)
         self._last_pcmd_mono_ns = call_mono_ns
         self.state.last_pcmd_call_mono_ns = call_mono_ns
+        defer = getattr(getattr(self, "session_logs", None), "defer_telemetry", None)
+        if callable(defer):
+            self._pcmd_debug_seq = getattr(self, "_pcmd_debug_seq", 0) + 1
+            defer("pcmd_dispatch", command_mono_ns=call_mono_ns,
+                  dispatch_seq=self._pcmd_debug_seq, pcmd=[r, p, y, g], flag=flag)
         return call_mono_ns
 
     def send_pcmd(
@@ -2328,6 +2392,7 @@ class OlympeLiveBackend:
                 self._last_hold_log_t = now
             self.log.event(
                 "pcmd", reason=reason, pcmd=(roll, pitch, yaw, gaz),
+                pcmd_flag=getattr(self, "_last_pcmd_flag", None),
                 pcmd_call_mono_ns=pcmd_call_mono_ns,
             )
             return True
@@ -3138,14 +3203,19 @@ class OlympeLiveBackend:
         return ""
 
     def set_nudge_vector(self, roll: float, pitch: float, yaw: float,
-                         gaz: float) -> bool:
+                         gaz: float, *, authority_pct: int | None = None) -> bool:
         """Continuous stick input, on the SAME path as the discrete nudges.
 
         Deliberately reuses the hold loop, its deadman, the pilot_sticks block and
         the manoeuvre guard: a second command path would have bypassed every
         safety fix those carry. Axes are unit values in [-1, 1]; releasing the
         on-screen stick calls this with zeros (or clear_nudge_vector).
+
+        ``authority_pct`` is the percent-of-envelope the unit axes scale by.
+        Omit it for the on-screen sticks, which must stay inside nudge_pct.
         """
+        if not _validate_vector_authority(authority_pct):
+            return False
         if self.pilot_sticks:
             self.log.event("nudge_blocked_manual", reason="vector")
             return False
@@ -3160,15 +3230,9 @@ class OlympeLiveBackend:
         if maneuver is not None:
             self.log.event("nudge_blocked", name="vector", note=f"maneuver:{maneuver}")
             return False
-        axes = []
-        for value in (roll, pitch, yaw, gaz):
-            try:
-                v = float(value)
-            except (TypeError, ValueError):
-                return False
-            if not math.isfinite(v):
-                return False
-            axes.append(max(-1.0, min(1.0, v)))
+        axes = _clamp_unit_axes(roll, pitch, yaw, gaz)
+        if axes is None:
+            return False
         if not any(abs(v) > 1e-3 for v in axes):
             self.clear_nudge_vector()
             return True
@@ -3191,6 +3255,7 @@ class OlympeLiveBackend:
                 return False
             self._nudge_loop_stop.clear()
             self._nudge_vector = tuple(axes)
+            self._nudge_vector_authority = authority_pct
             self._nudge_deadline = time.monotonic() + self.nudge_pulse_s
             self._nudge_held.add(_VECTOR_HOLD)
         self._set_tracker_state(TrackerState.NUDGE, reason="set_nudge_vector")
@@ -3245,6 +3310,7 @@ class OlympeLiveBackend:
     def clear_nudge_vector(self) -> None:
         with self._lock:
             self._nudge_vector = None
+            self._nudge_vector_authority = None
             self._nudge_held.discard(_VECTOR_HOLD)
             self._motion_epoch += 1
             empty = not self._nudge_held
@@ -3279,7 +3345,9 @@ class OlympeLiveBackend:
             # being non-None stops an EXPIRED stick from re-entering the PCMD on the
             # operator's next button press.
             vector = self._nudge_vector if _VECTOR_HOLD in held else None
+            vector_pct = self._nudge_vector_authority
         pct = int(self.nudge_pct)
+        vector_pct = pct if vector_pct is None else int(vector_pct)
         acc = [0, 0, 0, 0]
         units = [0, 0, 0, 0]
         for name in held:
@@ -3294,11 +3362,13 @@ class OlympeLiveBackend:
             for i in range(4):
                 acc[i] += int(scaled[i])
         if vector is not None:
-            # Continuous stick: scaled by the same authority envelope, so the
-            # on-screen sticks can never exceed what a button press could.
+            # Continuous stick: scaled by its own authority, which defaults to
+            # nudge_pct so the on-screen sticks can never exceed what a button
+            # press could.  Only a caller that passed authority_pct differs.
             for i, value in enumerate(vector):
-                acc[i] += int(round(float(value) * pct))
-        return tuple(max(-pct, min(pct, v)) for v in acc)  # type: ignore[return-value]
+                acc[i] += int(round(float(value) * vector_pct))
+        limit = max(pct, vector_pct)
+        return tuple(max(-limit, min(limit, v)) for v in acc)  # type: ignore[return-value]
 
     def _nudge_loop_step(self) -> tuple[bool, bool]:
         if (
@@ -3537,6 +3607,7 @@ class OlympeLiveBackend:
         """
         with self._lock:
             self._nudge_vector = None
+            self._nudge_vector_authority = None
             self._nudge_held.clear()
             self._nudge_deadline = 0.0
             self._motion_epoch += 1
@@ -4424,11 +4495,28 @@ class OlympeLiveBackend:
             auto_resume=False,
         )
 
-    def set_gravity_sim_phase(self, phase: str | None) -> None:
-        # Live: never synthesize attitude; real IMU is polled in poll().
-        self.gravity_sim_phase = None
-        self._gravity_sim_t0 = None
-        self.log.event("gravity_phase", phase=phase, mode="live_real_attitude")
+    def _recover_from_link_loss(self) -> None:
+        """Release a latched total-link-loss into manual ownership on recovery.
+
+        The poll loop calls this on the first healthy poll after a confirmed
+        loss. Recovery hands the aircraft to the sticks (or a frozen PC hover
+        without sticks), never back to PC: the operator re-takes computer
+        control explicitly. Only clears our own latch; a newer incident is
+        left alone.
+        """
+        if self.state.active_incident != FailureReason.CONTROL_LINK_LOST.value:
+            return
+        self.pilot_sticks = True
+        self.state.mode = "MANUAL"
+        if self.via_skycontroller():
+            self.state.control_owner = "SKYCONTROLLER"
+            self._set_tracker_state(TrackerState.STICKS, reason="_link_recovered_to_sticks")
+        else:
+            self.state.control_owner = "PC_MANUAL_ZERO"
+            self._set_tracker_state(TrackerState.PC_FROZEN, reason="_link_recovered_to_sticks")
+        self.state.last_command = "host_commands_flowing:link_recovered_to_manual"
+        self.state.active_incident = ""
+        self.log.event("link_recovered", handoff="manual_sticks")
 
     def _probe_host_link_ok(self) -> bool:
         if self.drone is None:
@@ -4498,6 +4586,8 @@ class OlympeLiveBackend:
         self.state.link_status = link_status
         if prev and not link_ok:
             self._latch_total_link_loss()
+        elif link_ok and not prev:
+            self._recover_from_link_loss()
         return link_ok
 
     def _poll_mandatory_messages(self):
@@ -4535,6 +4625,8 @@ class OlympeLiveBackend:
     def _poll_mandatory_telemetry(self, messages, poll_mono_ns: int) -> None:
         AttitudeChanged, AltitudeChanged, FlyingStateChanged, SpeedChanged, BatteryStateChanged = messages
         att = self._poll_get_state(AttitudeChanged)
+        if att:
+            att = self._observe_telemetry("attitude", AttitudeChanged, att, now_mono_ns=poll_mono_ns)
         if att:
             self.state.att_roll = float(att.get("roll", 0.0) or 0.0)
             self.state.att_pitch = float(att.get("pitch", 0.0) or 0.0)
@@ -4781,6 +4873,9 @@ class OlympeLiveBackend:
     def _poll_session_telemetry(self, now: float) -> None:
         if self.session_logs is None:
             return
+        flush = getattr(self.session_logs, "flush_deferred", None)
+        if callable(flush):
+            flush()
         self._poll_stick_axes(now)
         # High-rate NED velocity + attitude for offline ESEKF/KLT-3D A/B replay
         # (定位演算法/validation/benchmark_esekf_live_replay.py). The 1 Hz
@@ -4791,6 +4886,23 @@ class OlympeLiveBackend:
             self.session_logs.telemetry(
                 "fused_odometry",
                 t_mono_ns=time.monotonic_ns(),
+                poll_mono_ns=getattr(self.state, "telemetry_read_mono_ns", None),
+                attitude_mono_ns=getattr(self.state, "attitude_mono_ns", None),
+                attitude_stamp_source=getattr(self.state, "attitude_stamp_source", None),
+                speed_stamp_source=getattr(self.state, "ground_speed_stamp_source", None),
+                speed_mono_ns=getattr(self.state, "ground_speed_mono_ns", None),
+                altitude_mono_ns=getattr(self.state, "altitude_mono_ns", None),
+                gps_mono_ns=getattr(self.state, "gps_location_mono_ns", None),
+                velocity_frame="NED", attitude_kind="firmware_fused_euler",
+                flight_state=getattr(self.state, "flight_state", None),
+                control_owner=getattr(self.state, "control_owner", None),
+                wind_state=getattr(self.state, "wind_state", None),
+                gimbal_pitch_deg=getattr(self.state, "gimbal_pitch_deg", None),
+                zoom=getattr(self.state, "zoom", None),
+                gps_fixed=getattr(self.state, "gps_fixed", None),
+                gps_latitude_accuracy_m=getattr(self.state, "gps_latitude_accuracy_m", None),
+                gps_longitude_accuracy_m=getattr(self.state, "gps_longitude_accuracy_m", None),
+                gps_altitude_accuracy_m=getattr(self.state, "gps_altitude_accuracy_m", None),
                 speed_north_mps=getattr(self.state, "speed_north_mps", None),
                 speed_east_mps=getattr(self.state, "speed_east_mps", None),
                 speed_down_mps=getattr(self.state, "speed_down_mps", None),
@@ -4798,6 +4910,7 @@ class OlympeLiveBackend:
                 att_pitch=getattr(self.state, "att_pitch", None),
                 att_yaw=getattr(self.state, "att_yaw", None),
                 drone_altitude_m=getattr(self.state, "drone_altitude_m", None),
+                agl_altitude_m=getattr(self.state, "agl_altitude_m", None),
                 gps_latitude_deg=getattr(self.state, "gps_latitude_deg", None),
                 gps_longitude_deg=getattr(self.state, "gps_longitude_deg", None),
                 gps_altitude_m=getattr(self.state, "gps_altitude_m", None),
@@ -5019,6 +5132,7 @@ class OlympeLiveBackend:
             self._pulse_token += 1
             self._motion_epoch += 1
             self._nudge_vector = None
+            self._nudge_vector_authority = None
             self._nudge_held.clear()
             self._nudge_deadline = 0.0
             self._nudge_loop_stop.set()

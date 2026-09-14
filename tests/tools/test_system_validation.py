@@ -5,6 +5,10 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
+
+pytestmark = pytest.mark.smoke
+
 ROOT = Path(__file__).resolve().parents[2] / "tools"
 
 
@@ -79,11 +83,29 @@ def test_production_offline_smoke_requires_edm_not_research_xfeat() -> None:
     assert steps["root_ruff_check"].argv[-3:] == ("ruff", "check", ".")
     assert steps["root_ruff_format"].argv[2:5] == ("ruff", "format", "--check")
     assert "mission_selection_validation" in steps
-    assert steps["maintainability_budget"].argv[-1].endswith(
-        "tools/check_maintainability.py"
-    )
+    assert steps["maintainability_budget"].argv[-1].endswith("tools/check_maintainability.py")
     assert "--cov" in steps["root_pytest"].argv
     assert "--timeout=300" in steps["root_pytest"].argv
+
+
+def test_smoke_tier_steps_contract() -> None:
+    module = _load_validation_module()
+    steps = {
+        step.name: step
+        for step in module._steps(
+            smoke=True,
+            p119=False,
+            accept_p119=False,
+            p119_quality=False,
+            quality_out=None,
+        )
+    }
+
+    assert "maintainability_budget" in steps
+    assert "root_ruff_format" in steps
+    assert steps["root_ruff_format"].argv[2:5] == ("ruff", "format", "--check")
+    assert steps["maintainability_budget"].argv[-1].endswith("tools/check_maintainability.py")
+    assert ("-m", "smoke") in zip(steps["root_pytest"].argv, steps["root_pytest"].argv[1:])
 
 
 def test_parrot_simulator_validation_stays_in_its_python311_environment() -> None:
@@ -150,9 +172,7 @@ def test_portable_output_is_verified_and_bound_to_source(tmp_path: Path) -> None
         "manifest_sha256": module._sha256(module.ROOT / "MANIFEST.tsv"),
         "sha256sums_sha256": module._sha256(module.ROOT / "SHA256SUMS"),
     }
-    source_release.update(
-        {"commit": "deadbeef", "version": "release-deadbeef", "dirty": False}
-    )
+    source_release.update({"commit": "deadbeef", "version": "release-deadbeef", "dirty": False})
     (package / "PORTABLE_PACKAGE.json").write_text(
         json.dumps(
             {
@@ -273,7 +293,7 @@ def test_system_validation_has_a_read_only_hardware_receipt_step() -> None:
     assert hardware.timeout_s <= 120
 
 
-def test_simulator_preflight_receipt_includes_collision_monitor_policy() -> None:
+def test_simulator_preflight_receipt_passes_video_and_json() -> None:
     module = _load_validation_module()
     steps = {
         step.name: step
@@ -364,3 +384,26 @@ def test_dry_run_lists_checks_and_targets_without_side_effects(
     assert any(path.startswith(str(receipt_dir)) for path in targets)
     assert str(module.ROOT / "outputs/security/pip-audit.json") in targets
     assert not receipt_dir.exists()
+
+
+def test_a_failing_step_fails_the_receipt_and_exit_code(tmp_path, monkeypatch) -> None:
+    module = _load_validation_module()
+    monkeypatch.setattr(
+        module,
+        "_steps",
+        lambda **_: [
+            module.Step(
+                name="forced_failure",
+                argv=(sys.executable, "-c", "raise SystemExit(3)"),
+                cwd=str(module.ROOT),
+                timeout_s=30,
+            )
+        ],
+    )
+    code = module.main(["--smoke", "--allow-dirty", "--receipt-dir", str(tmp_path)])
+    assert code == 1
+    receipts = list(tmp_path.glob("validation_*.json"))
+    assert receipts, "expected a validation receipt"
+    payload = json.loads(receipts[0].read_text(encoding="utf-8"))
+    assert payload["status"] == "failed"
+    assert payload["steps"][0]["ok"] is False

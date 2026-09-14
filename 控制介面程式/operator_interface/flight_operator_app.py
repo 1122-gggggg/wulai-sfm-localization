@@ -182,7 +182,6 @@ from operator_hud_text import (
     format_magnetometer_calibration,
     format_olympe_telemetry,
     gps_operator_message,
-    gravity_phase_guidance as _format_gravity_phase_guidance,
     inventory_block_summary,
     inventory_ui_status,
     magnetometer_axis_guide,
@@ -207,26 +206,49 @@ from site_profile import (
 from mission_resolver import resolve_mission as resolve_mission
 from mission_pipeline import validate_profile_flight_assets
 from workspace_layout import workspace_from_file
+_ORIGINAL_VALIDATE_PROFILE_FLIGHT_ASSETS = validate_profile_flight_assets
 
 _WS = workspace_from_file(__file__)
+_SESSION_VERIFIED_ASSETS: set[tuple[Path, str]] = set()
+
+
+def _is_mission_snapshot_profile(profile_path: Path | str | None) -> bool:
+    if profile_path in (None, ""):
+        return False
+    try:
+        resolved = Path(profile_path).expanduser().resolve()
+        snapshot_dir = (_WS.runtime / "mission_snapshots").resolve()
+        return resolved.is_relative_to(snapshot_dir)
+    except Exception:
+        return False
+
+
+def _register_session_verified_asset(
+    path: Path | str | None, expected_sha256: str | None
+) -> None:
+    if path is None or not expected_sha256:
+        return
+    try:
+        _SESSION_VERIFIED_ASSETS.add(
+            (Path(path).expanduser().resolve(), expected_sha256.strip().lower())
+        )
+    except Exception:
+        pass
+
 _MISSION_ROOT = _CTRL_ROOT  # site_profiles + site_profile live here now
-# Gravity calibration lives with the real flight stack.
+# Flight-control types are shared with the operator interface.
 _FLIGHT_CONTROL = _WS.flight_control
 if str(_FLIGHT_CONTROL) not in sys.path:
     sys.path.insert(0, str(_FLIGHT_CONTROL))
 from real_path_follow_controller import (  # type: ignore
-    CAMERA_COLLISION_RADIUS_MAX,
-    CAMERA_COLLISION_RADIUS_MIN,
     LEGACY_MAP_FRAME,
     MapFrame,
     MissionRouteLock,
     MissionRouteSnapshot,
     Pose,
-    SparseCloudCollisionMonitor,
     camera_heading_from_forward,
     capture_mission_route_snapshot,
 )
-from real_path_follow_controller import cKDTree as rpf_cKDTree  # type: ignore
 from route_domain import RouteDocument  # type: ignore
 from simulated_route_test import SimulatedRoutePlant
 from operator_autonomy import DesktopRouteAutonomy
@@ -239,15 +261,19 @@ from operator_preflight import (
 )
 from operator_rendering import (
     MapRenderContext,
-    draw_gravity_phase_icon,
+    build_hud_overlay_data as build_hud_overlay_data,
+    classify_localization_health as classify_localization_health,
     draw_map_overlays,
     draw_video_banner,
     draw_video_empty_state,
     draw_video_hud,
+    format_latency_text as format_latency_text,
+    heading_arrow_polygon as heading_arrow_polygon,
     prepare_video_frame,
 )
 import operator_tick
 from operator_tick import (
+    pump_localization_frame,
     run_tick,
     next_tick_deadline as next_tick_deadline,
     stream_terminal_text,
@@ -255,46 +281,6 @@ from operator_tick import (
 )
 from operator_command_coordinator import OperatorCommandCoordinator
 from operator_shutdown import OperatorShutdownCoordinator
-
-try:
-    from gravity_calibration import (  # type: ignore
-        MIN_PITCH_SPAN_DEG,
-        MIN_ROLL_SPAN_DEG,
-        MIN_SAMPLES_PER_PHASE,
-        MIN_YAW_SPAN_DEG,
-        PHASE_LABELS,
-        PHASES,
-        GravityCalibrator,
-        attitude_to_body_gravity,
-    )
-except Exception:  # pragma: no cover - import path issues should not block the UI
-    PHASE_LABELS = {
-        "yaw": "水平旋轉",
-        "pitch": "前後俯仰",
-        "roll": "左右側傾",
-    }
-    PHASES = ("yaw", "pitch", "roll")
-    MIN_SAMPLES_PER_PHASE = 15
-    MIN_YAW_SPAN_DEG = 90.0
-    MIN_PITCH_SPAN_DEG = 25.0
-    MIN_ROLL_SPAN_DEG = 25.0
-    GravityCalibrator = None  # type: ignore
-    attitude_to_body_gravity = None  # type: ignore
-
-
-def gravity_phase_guidance(
-    phase: str | None, *, sample_count: int = 0, span_deg: float = 0.0
-) -> str:
-    return _format_gravity_phase_guidance(
-        phase,
-        sample_count=sample_count,
-        span_deg=span_deg,
-        phases=tuple(PHASES),
-        min_samples_per_phase=int(MIN_SAMPLES_PER_PHASE),
-        min_yaw_span_deg=float(MIN_YAW_SPAN_DEG),
-        min_pitch_span_deg=float(MIN_PITCH_SPAN_DEG),
-        min_roll_span_deg=float(MIN_ROLL_SPAN_DEG),
-    )
 
 
 def find_system_root(start: Path) -> Path:
@@ -360,9 +346,6 @@ DEFAULT_DETECTOR_MODEL = (
 LIVE_DETECTION_STATUS_PATH = Path("/tmp/sfm_flight_operator_detection_status.json")
 SIMULATED_STREAM_INTERFACE = "simulated-stream"
 REAL_FLIGHT_INTERFACE = "real-flight"
-# Fixed gravity-cal path: re-open loads this; re-calibrate overwrites it.
-GRAVITY_CAL_DIR = _WS.flight_logs
-GRAVITY_CAL_LATEST = GRAVITY_CAL_DIR / "gravity_cal_latest.json"
 
 _PIL_UI_FONT_CANDIDATES = {
     False: (
@@ -651,201 +634,8 @@ ROUTE_DOT_MAX = _positive_env_int("SFM_ROUTE_DOT_MAX", 200)
 # TrackerState now lives in operator_state.py (imported above) so both this
 # module and olympe_live_backend.py can use it without a circular import.
 
-
-def format_latency_text(latency_ms: float | None) -> str:
-    """Format a latency value for HUD display. Pure, no Tk dependency."""
-    if latency_ms is None:
-        return "-"
-    try:
-        value = float(latency_ms)
-    except (TypeError, ValueError):
-        return "-"
-    if not math.isfinite(value):
-        return "-"
-    return f"{value:.1f}ms"
-
-
-def classify_localization_health(loc: dict) -> str:
-    """Pure health classification for a localization result. Returns OK/DEGRADED/LOST.
-
-    * OK       – high-confidence fix (enough inliers, low reproj, not weak).
-    * DEGRADED – low inliers / high reproj / weak (still a pose but not trusted).
-    * LOST     – no pose / success==False.
-    No Tk, no self, no mutation — safe to import headless.
-    Legacy aliases LOW==DEGRADED and FAIL==LOST are accepted on input but never
-    returned; callers normalise via HEALTH_COLOR which contains both spellings.
-    """
-    if not hasattr(loc, "get"):
-        # Accept a plain dict or the typed LocalizationResult (dict-like via
-        # .get/__getitem__); only a non-result object is treated as lost.
-        return "LOST"
-    if not loc.get("success"):
-        return "LOST"
-    try:
-        inliers = int(loc.get("inliers", 0) or 0)
-    except (TypeError, ValueError):
-        inliers = 0
-    reproj = loc.get("reproj_rms")
-    try:
-        weak = localization_result_is_weak(loc)
-    except (AttributeError, KeyError, TypeError, ValueError):  # Tier1 narrow: only weak-check failures; don't swallow flight-critical errors
-        weak = bool(loc.get("weak"))
-    if inliers < LOC_LOW_INLIERS:
-        return "DEGRADED"
-    if reproj is not None:
-        try:
-            if float(reproj) > LOC_HIGH_REPROJ:
-                return "DEGRADED"
-        except (TypeError, ValueError):
-            pass
-    if weak:
-        return "DEGRADED"
-    return "OK"
-
-
-def build_hud_overlay_data(state, loc, telemetry) -> dict:
-    """Pure HUD overlay builder. Inputs are not mutated. Returns HUD data dict."""
-    # Normalize loc to dict copy
-    if isinstance(loc, dict):
-        loc_dict = dict(loc)
-    elif loc is None:
-        loc_dict = {}
-    else:
-        try:
-            loc_dict = {k: getattr(loc, k) for k in ("success", "inliers", "reproj_rms", "mode", "next_mode", "weak", "health", "loc_health") if hasattr(loc, k)}
-        except (AttributeError, KeyError, TypeError, ValueError):  # Tier1 narrow: getattr mapping only
-            loc_dict = {}
-    # Normalize state
-    if isinstance(state, dict):
-        state_dict = dict(state)
-    elif state is None:
-        state_dict = {}
-    else:
-        state_dict = {}
-        for key in ("mode", "stream", "loc", "tracker_state", "pose", "inliers", "reproj", "link_ok", "gps_fixed", "frame_age_ms", "flight_state", "is_live"):
-            try:
-                if hasattr(state, key):
-                    state_dict[key] = getattr(state, key)
-            except (AttributeError, KeyError, TypeError, ValueError):  # Tier1 narrow: state getattr only
-                continue
-    # Normalize telemetry
-    if isinstance(telemetry, dict):
-        tele_dict = dict(telemetry)
-    elif telemetry is None:
-        tele_dict = {}
-    else:
-        for key in ("rth", "gps", "attitude", "velocity", "altitude_agl", "link_quality", "current_auto_speed", "olympe_state", "olympe_attitude", "olympe_altitude"):
-            try:
-                if hasattr(telemetry, key):
-                    tele_dict[key] = getattr(telemetry, key)
-            except (AttributeError, KeyError, TypeError, ValueError):  # Tier1 narrow: telemetry getattr only
-                continue
-    # Health
-    health = None
-    if isinstance(loc, dict) and "health" in loc:
-        health = str(loc["health"])
-    elif isinstance(loc, dict) and "loc_health" in loc:
-        health = str(loc["loc_health"])
-    elif loc_dict:
-        # if loc looks like a result dict, classify
-        if "success" in loc_dict or "inliers" in loc_dict:
-            health = classify_localization_health(loc_dict)
-        else:
-            health = str(loc_dict.get("health", loc_dict.get("loc_health", "OK")))
-    else:
-        health = "OK"
-    # Inliers / reproj
-    try:
-        inliers = int(loc_dict.get("inliers", loc_dict.get("loc_health_inliers", 0)) or 0)
-    except (TypeError, ValueError):
-        inliers = 0
-    reproj = loc_dict.get("reproj_rms", loc_dict.get("loc_health_reproj"))
-    # FPS
-    fps_raw = loc_dict.get("fps", loc_dict.get("loc_fps", loc_dict.get("localization_fps")))
-    try:
-        fps_text = f"{float(fps_raw):.1f}" if fps_raw is not None and math.isfinite(float(fps_raw)) else "-"
-    except (TypeError, ValueError):
-        fps_text = "-"
-    # Latencies (try multiple key aliases)
-    latency_raw = loc_dict.get("latency_ms", loc_dict.get("loc_latency_ms", loc_dict.get("core_wall_ms", loc_dict.get("wall_ms"))))
-    wall_raw = loc_dict.get("wall_ms", loc_dict.get("loc_wall_ms"))
-    e2e_raw = loc_dict.get("e2e_ms", loc_dict.get("loc_e2e_ms", loc_dict.get("e2e_submit_to_ui_ms")))
-    latency_text = format_latency_text(latency_raw)
-    wall_text = format_latency_text(wall_raw)
-    e2e_text = format_latency_text(e2e_raw)
-    # Telemetry fallbacks
-    auto_speed = tele_dict.get("current_auto_speed", tele_dict.get("auto_speed", tele_dict.get("current_auto_speed_var", "AUTO 地速安全閘門 -")))
-    rth = tele_dict.get("rth", tele_dict.get("olympe_state", "RTH ?/?"))
-    # rth/gps split handling: if olympe_state contains rth + gps, keep as is
-    gps = tele_dict.get("gps", "")
-    attitude = tele_dict.get("attitude", tele_dict.get("olympe_attitude", "飛控融合姿態 -"))
-    velocity = tele_dict.get("velocity", tele_dict.get("olympe_velocity", "三軸速度 -"))
-    altitude_agl = tele_dict.get("altitude_agl", tele_dict.get("olympe_altitude", "飛控高度 - | AGL -"))
-    link_quality = tele_dict.get("link_quality", "")
-    # Handle case where caller passed already split strings via telemetry dict
-    olympe_state_val = tele_dict.get("olympe_state", None)
-    olympe_attitude_val = tele_dict.get("olympe_attitude", None)
-    olympe_altitude_val = tele_dict.get("olympe_altitude", None)
-    # Build diagnostic lines mirroring _video_diagnostic_lines
-    # When telemetry is provided as formatted strings, prefer those.
-    if olympe_state_val is not None or olympe_attitude_val is not None:
-        # Use explicit HUD var values if supplied
-        line1 = " | ".join(part for part in (str(auto_speed), f"定位 FPS {fps_text}", f"inliers {inliers}") if part)
-        line2 = f"wall_ms {wall_text} | core {latency_text} | e2e {e2e_text}"
-        line3 = str(olympe_state_val) if olympe_state_val is not None else (f"{rth} | {gps}".strip(" |") if gps else str(rth))
-        line4 = str(olympe_altitude_val) if olympe_altitude_val is not None else (f"{altitude_agl} | {link_quality}".strip(" |") if link_quality else str(altitude_agl))
-        att = str(olympe_attitude_val) if olympe_attitude_val is not None else str(attitude)
-        # attitude may contain separator " | 三軸速度 "
-        if " | 三軸速度 " in att:
-            att_part, sep, vel_part = att.partition(" | 三軸速度 ")
-            attitude_line = att_part
-            velocity_line = f"三軸速度 {vel_part}" if sep else str(velocity)
-        else:
-            attitude_line = att
-            velocity_line = str(velocity) if str(velocity).startswith("三軸") else f"三軸速度 {velocity}"
-        diagnostic_lines = (line1, line2, line3, line4, attitude_line, velocity_line)
-    else:
-        diagnostic_lines = (
-            " | ".join((str(auto_speed), f"定位 FPS {fps_text}", f"inliers {inliers}")),
-            f"wall_ms {wall_text} | core {latency_text} | e2e {e2e_text}",
-            f"{rth} | {gps}".strip(" |") if gps else str(rth),
-            f"{altitude_agl} | {link_quality}".strip(" |") if link_quality else str(altitude_agl),
-            str(attitude),
-            str(velocity) if str(velocity).startswith("三軸") else f"三軸速度 {velocity}",
-        )
-    health_text_map = {
-        "OK": "定位正常",
-        "LOW": f"定位信心低 inliers={inliers}",
-        "DEGRADED": f"定位信心低 inliers={inliers}",
-        "FAIL": "定位失敗",
-        "LOST": "定位失敗",
-        "PAUSED_ZOOM": "定位暫停：相機縮放未校正",
-    }
-    health_text = health_text_map.get(str(health), str(health))
-    ok_count = loc_dict.get("ok_count", loc_dict.get("_loc_ok_count", loc_dict.get("loc_ok_count")))
-    fail_count = loc_dict.get("fail_count", loc_dict.get("_loc_fail_count", loc_dict.get("loc_fail_count")))
-    if ok_count is not None or fail_count is not None:
-        try:
-            oc = int(ok_count or 0)
-            fc = int(fail_count or 0)
-            if oc or fc:
-                health_text += f" | ok={oc} fail={fc}"
-        except (TypeError, ValueError):
-            pass
-    return {
-        "health": str(health),
-        "health_text": health_text,
-        "inliers": inliers,
-        "reproj_rms": reproj,
-        "fps": fps_text,
-        "latency_text": latency_text,
-        "wall_text": wall_text,
-        "e2e_text": e2e_text,
-        "diagnostic_lines": diagnostic_lines,
-        "state": dict(state_dict),
-        "telemetry": dict(tele_dict),
-    }
-
+# format_latency_text, classify_localization_health, build_hud_overlay_data
+# are defined in operator_rendering.py and re-exported above.
 
 class DedupStringVar(tk.StringVar):
     """A StringVar that drops writes of the value it already holds.
@@ -868,35 +658,7 @@ class DedupStringVar(tk.StringVar):
         super().set(text)
 
 
-def heading_arrow_polygon(
-    sx: float,
-    sy: float,
-    hx: float,
-    hy: float,
-    *,
-    length: float = 18.0,
-    head_width: float = 8.0,
-    tail_length: float = 7.0,
-) -> list[tuple[float, float]] | None:
-    """Return a screen-space arrow whose tip points from current pose to heading."""
-    dx, dy = float(hx - sx), float(hy - sy)
-    norm = math.hypot(dx, dy)
-    if norm < 1e-3:
-        return None
-    ux, uy = dx / norm, dy / norm
-    px, py = -uy, ux
-    tip = (sx + ux * length, sy + uy * length)
-    head_base = (sx + ux * 2.0, sy + uy * 2.0)
-    tail = (sx - ux * tail_length, sy - uy * tail_length)
-    tail_half_width = head_width * 0.42
-    return [
-        tip,
-        (head_base[0] + px * head_width, head_base[1] + py * head_width),
-        (tail[0] + px * tail_half_width, tail[1] + py * tail_half_width),
-        (tail[0] - px * tail_half_width, tail[1] - py * tail_half_width),
-        (head_base[0] - px * head_width, head_base[1] - py * head_width),
-    ]
-
+# heading_arrow_polygon is defined in operator_rendering.py and re-exported above.
 
 _SITE_ASSET_ENV_VARS = (
     "SFM_MAP_PLY",
@@ -985,6 +747,21 @@ def resolve_operator_site_assets(args, parser: argparse.ArgumentParser) -> SiteP
                     parser.error(
                         f"site profile {label} SHA-256 mismatch: expected {expected}, got {actual}"
                     )
+                _register_session_verified_asset(asset, expected)
+        if _is_mission_snapshot_profile(profile.source):
+            for path_attr, digest_attr in (
+                ("localization_bundle", "localization_bundle"),
+                ("map_ply", "map_ply"),
+                ("route_json", "route_json"),
+                ("map_reference_poses", "map_reference_poses"),
+                ("map_align", "map_align"),
+                ("reference_index", "reference_index"),
+                ("track_landmarks", "track_landmarks"),
+            ):
+                asset_val = getattr(profile, path_attr, None)
+                digest_val = getattr(profile.asset_sha256, digest_attr, None)
+                if asset_val is not None and digest_val is not None:
+                    _register_session_verified_asset(asset_val, digest_val)
         args.site_profile = str(profile.source)
         args.map_ply = str(profile.map_ply)
         args.route_json = str(profile.route_json or "")
@@ -1163,9 +940,6 @@ class DroneBackend:
         self.target_altitude_m = 0.0
         self.flight_start: float | None = None
         self.route_test_plant = SimulatedRoutePlant(self)
-        # Gravity-cal demo: when set to yaw|pitch|roll, synthesize that motion.
-        self.gravity_sim_phase: str | None = None
-        self._gravity_sim_t0: float | None = None
         self.record_on_takeoff = False
         self.recording_active = False
         self.recording_profile = DEFAULT_RECORDING_PROFILE
@@ -1628,33 +1402,9 @@ class DroneBackend:
             self.sim_xyz[1] = 0.0
             self.target_altitude_m = 0.0
             self.state.tracker_state = TrackerState.HOVER
-        elif self.state.tracker_state not in {"LAND", "TAKEOFF", "BOOT_INIT", "GRAVITY_CAL"}:
+        elif self.state.tracker_state not in {"LAND", "TAKEOFF", "BOOT_INIT"}:
             self.state.tracker_state = TrackerState.HOVER
         return False
-
-    def _update_gravity_sim_telemetry(self, now: float) -> None:
-        # Synthetic attitude for gravity-cal demo (or hold last live values).
-        if self.gravity_sim_phase:
-            if self._gravity_sim_t0 is None:
-                self._gravity_sim_t0 = now
-            u = now - self._gravity_sim_t0
-            if self.gravity_sim_phase == "yaw":
-                self.state.att_roll = math.radians(1.0)
-                self.state.att_pitch = math.radians(-1.5)
-                self.state.att_yaw = (u * 1.6) % (2 * math.pi)  # full spin ~4s
-            elif self.gravity_sim_phase == "pitch":
-                self.state.att_roll = 0.0
-                # Sweep -40..+40 deg over ~2s then hold pattern
-                self.state.att_pitch = math.radians(40.0 * math.sin(u * 2.0))
-                self.state.att_yaw = 0.3
-            elif self.gravity_sim_phase == "roll":
-                self.state.att_roll = math.radians(45.0 * math.sin(u * 2.0))
-                self.state.att_pitch = 0.0
-                self.state.att_yaw = 0.3
-            self.state.tracker_state = TrackerState.GRAVITY_CAL
-        else:
-            # Keep sim yaw aligned with pose heading when not calibrating.
-            self.state.att_yaw = float(self.sim_yaw)
 
     def _update_sim_telemetry(self, now: float, t: float) -> None:
         self.state.inliers = 180 + int(40 * math.sin(t))
@@ -1668,7 +1418,7 @@ class DroneBackend:
         self.state.stream_fps = ANAFI.stream_fps
         self.state.stream_mbps = ANAFI.stream_mbps
 
-        self._update_gravity_sim_telemetry(now)
+        self.state.att_yaw = float(self.sim_yaw)
 
     def poll(self, now_mono_ns: int | None = None) -> DroneState:
         now = time.monotonic()
@@ -1681,11 +1431,6 @@ class DroneBackend:
             return self.state
         self._update_sim_telemetry(now, t)
         return self.state
-
-    def set_gravity_sim_phase(self, phase: str | None) -> None:
-        self.gravity_sim_phase = phase
-        self._gravity_sim_t0 = None if phase is None else time.monotonic()
-
 
 def _first_present_pose(poses: list[dict | None], indices: range) -> dict | None:
     for index in indices:
@@ -1801,6 +1546,40 @@ class OperatorApp(tk.Tk):
             if site_profile_path in (None, "")
             else Path(site_profile_path).expanduser().resolve()
         )
+        if self.site_profile_path and _is_mission_snapshot_profile(self.site_profile_path):
+            try:
+                p = load_site_profile(self.site_profile_path)
+                for path_attr, digest_attr in (
+                    ("localization_bundle", "localization_bundle"),
+                    ("map_ply", "map_ply"),
+                    ("route_json", "route_json"),
+                    ("map_reference_poses", "map_reference_poses"),
+                    ("map_align", "map_align"),
+                    ("reference_index", "reference_index"),
+                    ("track_landmarks", "track_landmarks"),
+                ):
+                    asset_val = getattr(p, path_attr, None)
+                    digest_val = getattr(p.asset_sha256, digest_attr, None)
+                    if asset_val is not None and digest_val is not None:
+                        _register_session_verified_asset(asset_val, digest_val)
+            except Exception:
+                pass
+        if self._site_runtime is not None:
+            prepared_p = getattr(getattr(self._site_runtime, "prepared", None), "profile", None)
+            if prepared_p is not None:
+                for path_attr, digest_attr in (
+                    ("localization_bundle", "localization_bundle"),
+                    ("map_ply", "map_ply"),
+                    ("route_json", "route_json"),
+                    ("map_reference_poses", "map_reference_poses"),
+                    ("map_align", "map_align"),
+                    ("reference_index", "reference_index"),
+                    ("track_landmarks", "track_landmarks"),
+                ):
+                    asset_val = getattr(prepared_p, path_attr, None)
+                    digest_val = getattr(getattr(prepared_p, "asset_sha256", None), digest_attr, None)
+                    if asset_val is not None and digest_val is not None:
+                        _register_session_verified_asset(asset_val, digest_val)
         self.site_asset_actions = SiteAssetActions(
             LocalSitePackageProvider(_WS.site_packages),
             LocalRouteProvider(_WS.site_packages),
@@ -1892,6 +1671,7 @@ class OperatorApp(tk.Tk):
         # 300 cap as history. Never read by any flight-control gate.
         self.history_weak: list = []
         self.history_weak_health: list[str] = []
+        self.history_weak_kind: list[str] = []
         # Consecutive weak-with-pose frames, for the HUD direct status line.
         self.loc_weak_run = 0
         # Localization gate: the 720p stream is fed to the localizer only after
@@ -1929,6 +1709,7 @@ class OperatorApp(tk.Tk):
         self.camera_forward_world: np.ndarray | None = None
         self.live_pose = np.array([0.0, 0.0, 0.0, np.nan], dtype=float)
         self.live_locked = False
+        self._autonomy_pose_snapshot: tuple[float, float, float, float, float] | None = None
         self.live_new_pose = False
         self.last_submitted_index = -1
         self.last_detect_submitted_index = -1
@@ -1978,6 +1759,7 @@ class OperatorApp(tk.Tk):
         self._integrated_auto_map_frame = None
         self._auto_paused = False
         self.preflight_guide = SequentialPreflightGuide()
+        self._preflight_tick_memo: dict[tuple, tuple[object | None, str]] = {}
         self.current_state = self.backend.state
         self.base_map_image = None
         self.map_photo = None
@@ -2014,12 +1796,6 @@ class OperatorApp(tk.Tk):
         self._loc_health_colour: str | None = None
         self._incident_banner_state: tuple | None = ("__unset__", None)
         self.default_map_center, self.map_radius = self._map_view_bounds(map_points)
-        self.collision_guard_enabled = True
-        self._collision_interlock_latched = False
-        self._collision_guard_monitor: SparseCloudCollisionMonitor | None = None
-        self.collision_guard_radius: float | None = None
-        self.collision_guard_snapshot: dict[str, object] = {}
-        self._configure_sparse_cloud_collision_guard(map_points)
         if len(map_points):
             map_lo = map_points[:, :3].min(axis=0)
             map_hi = map_points[:, :3].max(axis=0)
@@ -2043,8 +1819,6 @@ class OperatorApp(tk.Tk):
         self.map_pan = np.zeros(2, dtype=float)
         self._drag_button: int | None = None
         self._drag_last: tuple[int, int] | None = None
-        self.gravity_cal = GravityCalibrator() if GravityCalibrator is not None else None
-        self.gravity_result_path: Path | None = None
         live = bool(getattr(backend, "is_live", False))
         self._autonomy_profile_verified = False
         self._autonomy_profile_errors: tuple[str, ...] = ()
@@ -2121,6 +1895,9 @@ class OperatorApp(tk.Tk):
             if callable(drain):
                 drain()
             self.update_live_results()
+            # Drain first so busy()/hold state is fresh, then feed one new
+            # frame: this loop now owns inter-tick submit pacing at 5 ms.
+            pump_localization_frame(self)
         except Exception as exc:
             incident = getattr(getattr(self, "session_logs", None), "incident", None)
             if callable(incident):
@@ -2171,7 +1948,6 @@ class OperatorApp(tk.Tk):
                 self._on_localizer_result_ready,
             )
             self._loc_file_handler_registered = True
-            self._loc_result_poll_ms = 100
         except (AttributeError, OSError, tk.TclError):
             self._loc_file_handler_registered = False
             self._loc_result_poll_ms = 5
@@ -2180,7 +1956,21 @@ class OperatorApp(tk.Tk):
         if self.localizer is None:
             return
         self.localizer.drain_result_notifications()
-        self.update_live_results()
+        if not getattr(self, "_loc_result_idle_pending", False):
+            self._loc_result_idle_pending = True
+
+            def _dispatch() -> None:
+                self._loc_result_idle_pending = False
+                self.update_live_results()
+
+            after_idle = getattr(self, "after_idle", None)
+            if callable(after_idle):
+                try:
+                    after_idle(_dispatch)
+                    return
+                except (tk.TclError, RuntimeError):
+                    self._loc_result_idle_pending = False
+            self.update_live_results()
 
     def boot_holding(self) -> bool:
         localizer = getattr(self, "localizer", None)
@@ -2463,7 +2253,13 @@ class OperatorApp(tk.Tk):
     def toggle_preflight_details(self) -> None:
         self._set_preflight_expanded(not bool(getattr(self, "_preflight_details_expanded", True)))
 
-    def _update_preflight_cards(self, st: "DroneState") -> None:
+    def _update_preflight_cards(
+        self,
+        st: "DroneState",
+        current_evidence: object = None,
+        *,
+        evidence_known: bool = False,
+    ) -> None:
         guide = getattr(self, "preflight_guide", None)
         labels = getattr(self, "preflight_step_labels", {})
         if guide is None or not labels:
@@ -2473,7 +2269,17 @@ class OperatorApp(tk.Tk):
             if step in guide.confirmed_steps:
                 state, symbol, state_text = "good", "✓", "通過"
             elif step == current:
-                evidence, _reason = self._preflight_step_evidence(step, st)
+                if evidence_known:
+                    evidence = current_evidence
+                elif current_evidence is not None:
+                    evidence = current_evidence
+                else:
+                    memo = self.__dict__.get("_preflight_tick_memo")
+                    memo_key = (step, id(st), False)
+                    if memo is not None and memo_key in memo:
+                        evidence, _reason = memo[memo_key]
+                    else:
+                        evidence, _reason = self._preflight_step_evidence(step, st)
                 if evidence is None:
                     state, symbol, state_text = "blocked", "!", "待處理"
                 else:
@@ -2488,7 +2294,6 @@ class OperatorApp(tk.Tk):
                 bg=bg,
                 fg=fg,
             )
-
     def _select_flight_tab(self) -> None:
         notebook = getattr(self, "controls_notebook", None)
         tab = getattr(self, "_flight_tab", None)
@@ -2847,6 +2652,7 @@ class OperatorApp(tk.Tk):
         # Aircraft identity and safety state live in the always-visible header;
         # engineering readouts are composed into the video HUD below.
 
+        self._build_auto_status_panel(self)
         controls = ttk.Frame(self, style="Panel.TFrame", width=920, height=CONTROL_PANE_MIN_H)
         controls.pack(fill="x", padx=10, pady=(4, 6))
         controls.pack_propagate(False)
@@ -2883,7 +2689,6 @@ class OperatorApp(tk.Tk):
         aircraft_tab.columnconfigure(1, minsize=300)
         aircraft_tab.rowconfigure(1, weight=1)
         calibration_tab.columnconfigure(0, weight=1)
-        calibration_tab.columnconfigure(1, weight=1)
         site_tab.columnconfigure(0, weight=1)
         site_tab.rowconfigure(0, weight=1)
         # Parent is flight_bar (always visible), not the tabbed control pane.
@@ -3044,46 +2849,11 @@ class OperatorApp(tk.Tk):
         # to change what the map shows.
         map_tool_stack = ttk.Frame(self.map_label, style="Panel.TFrame")
         map_tool_stack.place(relx=0.0, rely=1.0, x=8, y=-8, anchor="sw")
-        collision_tools = ttk.Frame(map_tool_stack, style="Panel.TFrame")
-        collision_tools.pack(anchor="w", fill="x", padx=4, pady=(3, 0))
-        self.collision_guard_enabled_var = tk.BooleanVar(value=self.collision_guard_enabled)
-        ttk.Checkbutton(
-            collision_tools,
-            text="◎ 點雲近接懸停",
-            variable=self.collision_guard_enabled_var,
-            command=self._on_collision_guard_enabled_change,
-        ).pack(side="left", padx=(0, 4))
-        self.collision_guard_radius_var = tk.DoubleVar(value=self.collision_guard_radius)
-        self.collision_guard_scale = ttk.Scale(
-            collision_tools,
-            from_=self.collision_guard_radius_min,
-            to=self.collision_guard_radius_max,
-            variable=self.collision_guard_radius_var,
-            length=120,
-            command=self._on_collision_guard_radius_change,
-        )
-        self.collision_guard_scale.pack(side="left", padx=2)
-        self.collision_guard_radius_text = DedupStringVar(
-            value=f"{self.collision_guard_radius:.3g} u"
-        )
-        ttk.Label(
-            collision_tools,
-            textvariable=self.collision_guard_radius_text,
-            width=8,
-        ).pack(side="left", padx=(3, 0))
-        self.collision_guard_status_var = DedupStringVar(value="中心預覽：等待點雲檢查（不觸發）")
-        ttk.Label(
-            map_tool_stack,
-            textvariable=self.collision_guard_status_var,
-            font=("Sans", 8),
-        ).pack(anchor="w", padx=6, pady=(0, 1))
         map_tools = ttk.Frame(map_tool_stack, style="Panel.TFrame")
         map_tools.pack(anchor="w", fill="x")
         ttk.Button(map_tools, text="重設地圖", command=self.reset_map_view).pack(
             side="left", padx=(4, 2), pady=3
         )
-        self.update_sparse_cloud_collision_interlock(self.current_state)
-
         # Localization health is one of the always-visible status chips. Detailed
         # performance and estimator fields live in the diagnostics tab below, not
         # over the camera image.
@@ -3185,7 +2955,7 @@ class OperatorApp(tk.Tk):
             1,
             min(100, int(getattr(self.backend, "nudge_pct", 10) or 10)),
         )
-        current_auto_speed = float(getattr(self.backend.state, "autonomous_speed_limit_mps", 0.30))
+        current_auto_speed = float(getattr(self.backend.state, "autonomous_speed_limit_mps", 0.60))
         current_auto_speed_enabled = bool(
             getattr(self.backend.state, "autonomous_speed_limit_enabled", True)
         )
@@ -3282,108 +3052,6 @@ class OperatorApp(tk.Tk):
             wraplength=620,
             font=("Sans", 8),
         ).pack(anchor="w", padx=6, pady=(3, 4))
-        # ---- Passive gravity / attitude check (does not calibrate firmware) ----
-        grav = ttk.LabelFrame(
-            calibration_tab,
-            text="姿態／重力檢查（只讀；不寫入飛機）",
-        )
-        grav.grid(row=0, column=1, sticky="nsew", padx=6, pady=(4, 5))
-        self.gravity_status_var = DedupStringVar(
-            value="待命：依序旋轉機身，僅記錄姿態並分析重力一致性"
-        )
-        self.gravity_guide_var = DedupStringVar(value=gravity_phase_guidance(None))
-        self.gravity_att_var = DedupStringVar(value="att roll/pitch/yaw = -")
-        self.gravity_g_var = DedupStringVar(value="g_body = -")
-        ttk.Label(
-            grav,
-            textvariable=self.gravity_guide_var,
-            wraplength=520,
-            justify="left",
-            font=("Sans", 10, "bold"),
-        ).pack(anchor="w", fill="x", padx=6, pady=(2, 4))
-        ttk.Label(
-            grav,
-            textvariable=self.gravity_status_var,
-            wraplength=520,
-            justify="left",
-            font=("Sans", 9),
-        ).pack(anchor="w", fill="x", padx=6, pady=(0, 3))
-        self.gravity_session_var = DedupStringVar(value="本次重新檢查進度：尚未開始")
-        ttk.Label(
-            grav,
-            textvariable=self.gravity_session_var,
-            font=("Sans", 9, "bold"),
-        ).pack(anchor="w", padx=6, pady=(0, 2))
-        progress_panel = ttk.Frame(grav)
-        progress_panel.pack(fill="x", padx=6, pady=(0, 3))
-        self.gravity_progress_panel = progress_panel
-        self.gravity_progress_phase_var = DedupStringVar(value="等待開始")
-        ttk.Label(
-            progress_panel,
-            textvariable=self.gravity_progress_phase_var,
-            width=14,
-        ).grid(row=0, column=0, sticky="w", pady=1)
-        self.gravity_progress_bar = ttk.Progressbar(progress_panel, maximum=100, length=175)
-        self.gravity_progress_bar.grid(row=0, column=1, sticky="ew", padx=(4, 6), pady=1)
-        self.gravity_progress_var = DedupStringVar(value=f"0/{MIN_SAMPLES_PER_PHASE} · 0°")
-        ttk.Label(
-            progress_panel,
-            textvariable=self.gravity_progress_var,
-            width=18,
-        ).grid(row=0, column=2, sticky="w", pady=1)
-        self.gravity_phase_canvas = tk.Canvas(
-            progress_panel,
-            width=72,
-            height=64,
-            highlightthickness=0,
-            bg="#111316",  # matches the existing calibration guide canvas
-        )
-        self.gravity_phase_canvas.grid(
-            row=0,
-            column=3,
-            sticky="nsew",
-            padx=(2, 0),
-            pady=1,
-        )
-        progress_panel.columnconfigure(1, weight=1)
-        self._draw_gravity_phase(None)
-
-        # Live attitude remains visible, but secondary to the guided progress.
-        attitude_row = ttk.Frame(grav)
-        attitude_row.pack(anchor="w", fill="x", padx=6)
-        ttk.Label(attitude_row, textvariable=self.gravity_att_var).pack(side="left")
-        ttk.Label(attitude_row, text=" | ").pack(side="left")
-        ttk.Label(attitude_row, textvariable=self.gravity_g_var).pack(side="left")
-        row = ttk.Frame(grav)
-        row.pack(fill="x", padx=4, pady=4)
-        self.gravity_start_button = ttk.Button(row, text="開始檢查", command=self.gravity_start)
-        self.gravity_start_button.pack(side="left", padx=2)
-        self.gravity_next_button = ttk.Button(
-            row, text="下一階段", command=self.gravity_next, state="disabled"
-        )
-        self.gravity_next_button.pack(side="left", padx=2)
-        self.gravity_finish_button = ttk.Button(
-            row, text="完成並分析", command=self.gravity_finish, state="disabled"
-        )
-        self.gravity_finish_button.pack(side="left", padx=2)
-        self.gravity_retry_button = ttk.Button(
-            row, text="重做本階段", command=self.gravity_retry_phase, state="disabled"
-        )
-        self.gravity_retry_button.pack(side="left", padx=2)
-        self.gravity_cancel_button = ttk.Button(
-            row, text="取消", command=self.gravity_cancel, state="disabled"
-        )
-        self.gravity_cancel_button.pack(side="left", padx=2)
-        ttk.Label(
-            grav,
-            text=(
-                "LIVE：手持拆槳旋轉，僅採樣姿態；這不是 FreeFlight 羅盤校正。"
-                "SIM：自動產生本階段姿態。"
-            ),
-            wraplength=520,
-            font=("Sans", 9),
-        ).pack(anchor="w", padx=6, pady=(0, 4))
-
         # Read-only engineering telemetry is composed into the bottom-left video
         # HUD. These variables keep the existing telemetry update paths intact.
         self.olympe_state_var = DedupStringVar(value="RTH ?/? | GPS ?")
@@ -3412,21 +3080,14 @@ class OperatorApp(tk.Tk):
         self._backend_command("record_arm", {"enabled": True})
         self._sync_record_status_label()
         self.write_log("ready")
-        if GravityCalibrator is None:
-            self.gravity_status_var.set("姿態／重力檢查模組載入失敗（gravity_calibration.py）")
-            self.gravity_guide_var.set("姿態／重力檢查不可用，請勿繼續操作。")
-        else:
-            self._load_gravity_cal_into_ui()
-            self._refresh_gravity_controls()
         self._update_preflight_guide(self.backend.state)
+        self._preflight_tick_memo = {}
 
     def _on_nudge_key_press(self, key: str, direction: str, _event=None) -> None:
         """Hold-to-move: first KeyPress only (ignore OS auto-repeat)."""
         widget = getattr(_event, "widget", None)
         widget_class = getattr(widget, "winfo_class", lambda: "")()
         if widget_class in _NUDGE_KEY_BLOCKED_WIDGET_CLASSES:
-            return
-        if self._collision_motion_blocked("鍵盤微移"):
             return
         if key in self._nudge_keys_held:
             return
@@ -3461,8 +3122,6 @@ class OperatorApp(tk.Tk):
                 show_keyboard(x, y)
 
     def _on_nudge_btn_press(self, direction: str, event=None) -> None:
-        if self._collision_motion_blocked("畫面微移按鈕"):
-            return
         self._cancel_integrated_auto("nudge_button")
         if event is not None:
             event.widget._nudge_down = True  # type: ignore[attr-defined]
@@ -3507,9 +3166,6 @@ class OperatorApp(tk.Tk):
                     )
                 except Exception as exc:
                     self.write_log(f"虛擬搖桿歸零失敗: {exc!r}")
-            return
-        if self._collision_motion_blocked("虛擬搖桿"):
-            self._reset_virtual_sticks()
             return
         self._cancel_integrated_auto("virtual_stick")
         try:
@@ -3739,6 +3395,7 @@ class OperatorApp(tk.Tk):
         self.inspecting = False
         self.inspect_start = None
         self.live_locked = False
+        self._autonomy_pose_snapshot = None
         self.live_new_pose = False
         self.live_result = None
         self.live_result_frame_name = ""
@@ -3881,8 +3538,6 @@ class OperatorApp(tk.Tk):
         return True
 
     def _resume_integrated_auto(self) -> bool:
-        if self._collision_motion_blocked("繼續自動飛行"):
-            return False
         coordinator = self.__dict__.get("_integrated_autonomy")
         if coordinator is None or not bool(getattr(coordinator, "paused", False)):
             return False
@@ -3891,65 +3546,37 @@ class OperatorApp(tk.Tk):
         self._set_auto_paused(False)
         self.write_log("AUTO 已繼續：沿原路線恢復，不重複起飛")
         return True
+
     def _autonomy_pose(self) -> Pose | None:
-        """Return only the latest strong, fresh pose accepted by the UI gates."""
-        if (
-            not bool(getattr(self, "live_locked", False))
-            or str(getattr(self, "loc_health", "FAIL")) != "OK"
-        ):
+        """Latest fresh pose for the AUTO loop, strong or (opt-in) weak."""
+        if not bool(getattr(self, "live_locked", False)):
             return None
-        # Typed path: unpack from LocalizationResult where possible, keep fallback for dict.
-        typed = getattr(self, "live_result", None)
-        xyz_from_typed: tuple[float, float, float] | None = None
-        stamp_from_typed: float | None = None
-        if isinstance(typed, LocalizationResult):
-            pose_tuple = typed.pose
-            if pose_tuple is not None:
-                try:
-                    x, y, z, _yaw = pose_tuple  # type: ignore[misc]
-                    xyz_from_typed = (float(x), float(y), float(z))
-                    # Prefer the UI's accepted timestamp, fall back to typed pose_mono_ns.
-                    raw_stamp = getattr(self, "loc_pose_updated_mono", None)
-                    if raw_stamp is None:
-                        raw_stamp = typed.pose_mono_ns * 1e-9
-                    stamp_from_typed = float(raw_stamp)
-                    if not all(math.isfinite(v) for v in (*xyz_from_typed, stamp_from_typed)):
-                        xyz_from_typed = None
-                        stamp_from_typed = None
-                except (TypeError, ValueError, OverflowError):
-                    xyz_from_typed = None
-                    stamp_from_typed = None
-        stamp = getattr(self, "loc_pose_updated_mono", None)
-        if xyz_from_typed is not None and stamp_from_typed is not None:
-            values: tuple[float, ...] = (*xyz_from_typed, float("nan"))
-            stamp_value = stamp_from_typed
-            # Validate length/finite as legacy path does.
-            if len(values) != 4 or not all(math.isfinite(v) for v in (*values[:3], stamp_value)):
-                return None
-        else:
-            try:
-                values = tuple(float(value) for value in self.live_pose)  # type: ignore[arg-type]
-                stamp_value = float(stamp)  # type: ignore[arg-type]
-            except (TypeError, ValueError, OverflowError):
-                return None
-            if len(values) != 4 or not all(
-                math.isfinite(value) for value in (*values[:3], stamp_value)
-            ):
-                return None
+        coordinator = self.__dict__.get("_integrated_autonomy")
+        weak_accepted = bool(getattr(coordinator, "accept_weak_poses", False))
+        if str(getattr(self, "loc_health", "FAIL")) != "OK" and not weak_accepted:
+            return None
+        # __dict__.get, not getattr-with-default: on a bare (uninitialised Tk)
+        # double the tkinter __getattr__ delegate recurses via a missing
+        # self.tk instead of raising AttributeError.
+        snapshot = self.__dict__.get("_autonomy_pose_snapshot")
+        if snapshot is None:
+            return None
+        try:
+            x, y, z, heading, stamp_value = (
+                float(snapshot[0]),
+                float(snapshot[1]),
+                float(snapshot[2]),
+                float(snapshot[3]),
+                float(snapshot[4]),
+            )
+        except (TypeError, ValueError, OverflowError, IndexError):
+            return None
+        if not all(math.isfinite(value) for value in (x, y, z, heading, stamp_value)):
+            return None
         age = time.monotonic() - stamp_value
         if age < -0.05 or age > AUTONOMY_POSE_MAX_AGE_S:
             return None
-        map_frame = self.__dict__.get("_autonomy_map_frame")
-        camera_forward = normalize_camera_forward(getattr(self, "camera_forward_world", None))
-        if map_frame is None or camera_forward is None:
-            return None
-        try:
-            heading = camera_heading_from_forward(camera_forward, map_frame)
-        except (TypeError, ValueError):
-            return None
-        if heading is None:
-            return None
-        return Pose(*values[:3], yaw=heading, stamp=stamp_value)
+        return Pose(x, y, z, yaw=heading, stamp=stamp_value)
 
     def _autonomy_stream_healthy(self) -> bool:
         state = self.backend.state
@@ -3963,6 +3590,126 @@ class OperatorApp(tk.Tk):
         except (TypeError, ValueError, OverflowError):
             return False
         return stamp > 0.0 and 0.0 <= time.monotonic() - stamp <= 1.0
+
+    def _validate_auto_flight_assets(
+        self, profile: SiteProfile, snapshot: MissionRouteSnapshot
+    ) -> None:
+        if callable(getattr(snapshot, "verify_file_unchanged", None)):
+            snapshot.verify_file_unchanged()
+
+        current_validator = globals().get("validate_profile_flight_assets")
+        if (
+            current_validator is not None
+            and current_validator is not _ORIGINAL_VALIDATE_PROFILE_FLIGHT_ASSETS
+        ):
+            current_validator(profile)
+            return
+
+        errors = flight_readiness_errors(profile)
+        if errors:
+            note = "" if getattr(profile, "flight", None) is None else getattr(profile.flight, "approval_note", "")
+            suffix = f"; note: {note}" if note else ""
+            raise ValueError(
+                "site is not approved for autonomous flight: " + "; ".join(errors) + suffix
+            )
+
+        if getattr(profile, "flight", None) is None:
+            raise ValueError("site profile has no flight section")
+
+        camera = getattr(profile, "query_camera", None)
+        if camera is not None:
+            deploy_path = str(_WS.deploy_code)
+            if deploy_path not in sys.path:
+                sys.path.append(deploy_path)
+            from production_localizer_factory import validate_camera_tuple
+
+            validate_camera_tuple(
+                (camera.model, camera.width, camera.height, list(camera.params))
+            )
+
+        profile_site_id = getattr(profile, "site_id", None)
+        snapshot_site_id = getattr(snapshot, "site_id", None)
+        if profile_site_id and snapshot_site_id and snapshot_site_id != profile_site_id:
+            raise ValueError(
+                f"route site_id mismatch: expected {profile_site_id!r}, got {snapshot_site_id!r}"
+            )
+
+        flight_obj = getattr(profile, "flight", None)
+        coord_frame = getattr(profile, "coordinate_frame", None)
+        expected_frame_id = (
+            getattr(flight_obj, "coordinate_frame_id", None)
+            if flight_obj and getattr(flight_obj, "coordinate_frame_id", None)
+            else (getattr(coord_frame, "id", None) if coord_frame else None)
+        )
+        snapshot_frame_id = getattr(snapshot, "coordinate_frame_id", None)
+        if expected_frame_id and snapshot_frame_id and snapshot_frame_id != expected_frame_id:
+            raise ValueError(
+                f"route coordinate_frame_id mismatch: expected {expected_frame_id!r}, got {snapshot_frame_id!r}"
+            )
+
+        asset_sha256 = getattr(profile, "asset_sha256", None)
+        route_json = getattr(profile, "route_json", None)
+        snapshot_path = getattr(snapshot, "path", None)
+        snapshot_sha256 = getattr(snapshot, "sha256", None)
+        if (
+            asset_sha256 is not None
+            and route_json is not None
+            and getattr(asset_sha256, "route_json", None) is not None
+            and snapshot_path is not None
+            and Path(route_json).resolve() == Path(snapshot_path).resolve()
+            and snapshot_sha256 != asset_sha256.route_json
+        ):
+            raise ValueError(
+                f"route_json SHA-256 mismatch: expected {asset_sha256.route_json}, got {snapshot_sha256}"
+            )
+
+        if asset_sha256 is not None:
+            is_snapshot_profile = _is_mission_snapshot_profile(self.site_profile_path)
+            checks = (
+                (
+                    getattr(profile, "localization_bundle", None),
+                    getattr(asset_sha256, "localization_bundle", None),
+                    "localization_bundle",
+                ),
+                (
+                    getattr(profile, "map_reference_poses", None),
+                    getattr(asset_sha256, "map_reference_poses", None),
+                    "map_reference_poses",
+                ),
+                (
+                    getattr(profile, "map_align", None),
+                    getattr(asset_sha256, "map_align", None),
+                    "map_align",
+                ),
+                (
+                    getattr(profile, "reference_index", None),
+                    getattr(asset_sha256, "reference_index", None),
+                    "reference_index",
+                ),
+                (
+                    getattr(profile, "track_landmarks", None),
+                    getattr(asset_sha256, "track_landmarks", None),
+                    "track_landmarks",
+                ),
+            )
+            for path, expected, label in checks:
+                if expected is None:
+                    continue
+                if path is None:
+                    raise ValueError(f"missing asset for {label} (expected {expected})")
+                resolved_path = Path(path).resolve()
+                if not resolved_path.is_file():
+                    raise ValueError(f"asset file does not exist for {label}: {path}")
+                expected_lower = str(expected).strip().lower()
+                if is_snapshot_profile or (resolved_path, expected_lower) in _SESSION_VERIFIED_ASSETS:
+                    _register_session_verified_asset(resolved_path, expected_lower)
+                    continue
+                actual = file_sha256(resolved_path)
+                if actual != expected_lower:
+                    raise ValueError(
+                        f"{label} ({path}) has sha256 {actual}, expected {expected_lower}"
+                    )
+                _register_session_verified_asset(resolved_path, expected_lower)
 
     def _start_integrated_auto(self, snapshot: MissionRouteSnapshot) -> bool:
         if self._integrated_auto_active():
@@ -3989,17 +3736,11 @@ class OperatorApp(tk.Tk):
             return False
         try:
             profile = load_site_profile(self.site_profile_path)
-            validate_profile_flight_assets(profile)
+            self._validate_auto_flight_assets(profile, snapshot)
             map_frame = resolve_site_map_frame(profile)
             if map_frame is None:
                 raise ValueError("AUTO requires the site's measured gravity frame")
             self._autonomy_map_frame = map_frame
-            profile_controller = getattr(profile.flight, "controller", None)
-            route_deviation_options = {}
-            if profile_controller is not None:
-                route_deviation_options["max_route_deviation_map_units"] = (
-                    profile_controller.max_route_deviation_map_units
-                )
             coordinator = DesktopRouteAutonomy(
                 backend=self.backend,
                 snapshot=snapshot,
@@ -4014,7 +3755,11 @@ class OperatorApp(tk.Tk):
                 start_airborne=start_airborne,
                 land=lambda: self._backend_command("land", {}),
                 arming_blockers=lambda: autonomous_arming_blockers(self._autonomy_gate_snapshot()),
-                **route_deviation_options,
+                # Operator decision 2026-09-13: VO-only / WEAK_TRACK keeps
+                # flying toward the waypoints instead of hovering for a map
+                # fix. Inlier floor, jump gate, heading veto, speed guard and
+                # stick override stay armed; VLOS + finger on sticks required.
+                accept_weak_poses=True,
             )
         except Exception as exc:
             self.write_log(f"AUTO 已拒絕：{exc}")
@@ -4029,7 +3774,7 @@ class OperatorApp(tk.Tk):
         if start_airborne:
             self.write_log(
                 "AUTO 已接受：請放開並置中搖桿；確認交接電腦控制後原地懸停；"
-                "定位穩定且位於路線起點附近才開始移動"
+                "定位穩定後從第 1 航點依序開始移動"
             )
         else:
             self.write_log(
@@ -4052,12 +3797,6 @@ class OperatorApp(tk.Tk):
             map_frame = resolve_site_map_frame(profile)
             if not isinstance(map_frame, MapFrame):
                 raise ValueError("模擬航線需要場域的實測重力座標")
-            profile_controller = getattr(profile.flight, "controller", None)
-            route_options = {}
-            if profile_controller is not None:
-                route_options["max_route_deviation_map_units"] = (
-                    profile_controller.max_route_deviation_map_units
-                )
             if not plant.begin(snapshot, map_frame):
                 raise ValueError("無法載入剛儲存的航線")
             coordinator = DesktopRouteAutonomy(
@@ -4073,7 +3812,6 @@ class OperatorApp(tk.Tk):
                 take_pc_control=lambda: True,
                 start_airborne=True,
                 land=plant.finish,
-                **route_options,
             )
         except Exception as exc:
             self.write_log(f"模擬航線已拒絕：{exc}")
@@ -4136,7 +3874,20 @@ class OperatorApp(tk.Tk):
     def _log_integrated_auto_route_started(self, _event) -> None:
         self.write_log("AUTO 定位已穩定：開始路線飛行")
 
+    def _log_integrated_auto_leg_stage(self, event) -> None:
+        self.write_log(f"AUTO {event.detail}")
+
+    def _log_integrated_auto_waypoint_arrived(self, event) -> None:
+        self.write_log(f"AUTO {event.detail}")
+
     def _log_integrated_auto_landing_unresolved(self, event) -> None:
+        # No "finished" follows an unresolved landing, so this is the last event
+        # of the run: drop the pending activation and the paused flag here.
+        # ``_integrated_autonomy`` is deliberately kept -- the route lock must
+        # not release until a landing is confirmed or the operator resolves it.
+        if getattr(self, "_pending_auto_route_activation", False):
+            self._cancel_pending_auto_route_activation()
+        self._set_auto_paused(False)
         self.write_log(f"AUTO 降落尚未確認：{event.detail}；保持連線並確認落地後再關閉介面")
 
     def _log_integrated_auto_failed(self, event) -> None:
@@ -4165,6 +3916,9 @@ class OperatorApp(tk.Tk):
         if getattr(self, "_pending_auto_route_activation", False):
             self._cancel_pending_auto_route_activation()
         self.write_log(f"AUTO 結束：{event.detail}")
+        coordinator = self.__dict__.get("_integrated_autonomy")
+        if coordinator is not None:
+            self._last_auto_status = coordinator.auto_leg_status()
         self._set_auto_paused(False)
         self._integrated_autonomy = None
         self._integrated_auto_map_frame = None
@@ -4180,11 +3934,22 @@ class OperatorApp(tk.Tk):
             "localization_yaw_search": (self._log_integrated_auto_localization_yaw_search),
             "pose_jump_paused": self._log_integrated_auto_pose_jump_paused,
             "route_started": self._log_integrated_auto_route_started,
+            "waypoint_arrived": self._log_integrated_auto_waypoint_arrived,
+            "leg_stage": self._log_integrated_auto_leg_stage,
             "landing_unresolved": self._log_integrated_auto_landing_unresolved,
             "auto_failed": self._log_integrated_auto_failed,
             "finished": self._finish_integrated_auto_event,
+            "route_start_selected": self._log_integrated_auto_leg_stage,
         }
         for event in coordinator.drain_events():
+            if event.kind != "command_result":
+                detail = {
+                    "boot_hover": "等待穩定地圖定位",
+                    "route_started": "定位已穩定，開始沿路線飛行",
+                    "finished": f"自動飛行結束：{event.detail}",
+                    "auto_failed": f"自動飛行失敗：{event.detail}",
+                }.get(event.kind, str(event.detail))
+                OperatorApp._append_auto_status_event(self, detail)
             handler = handlers.get(event.kind)
             if handler is not None:
                 handler(event)
@@ -4300,9 +4065,14 @@ class OperatorApp(tk.Tk):
         *,
         now: float | None = None,
         verify_route_hash: bool = False,
+        force: bool = False,
     ) -> tuple[object | None, str]:
         """Collect UI/backend facts and run the read-only evidence check."""
         now_value = time.monotonic() if now is None else float(now)
+        memo = self.__dict__.get("_preflight_tick_memo")
+        memo_key = (step, id(st), verify_route_hash)
+        if memo is not None and not force and memo_key in memo:
+            return memo[memo_key]
         safety_log = getattr(self.backend, "log", None)
         route_lock = self.__dict__.get("mission_route_lock")
         displayed_route_snapshot = self.__dict__.get("_displayed_route_snapshot")
@@ -4333,13 +4103,17 @@ class OperatorApp(tk.Tk):
             inventory_takeoff_ready=getattr(self.backend, "_inventory_takeoff_ready", None),
             inventory_block_reason=inventory_block_summary(self.backend),
         )
-        return evaluate_preflight_step(
+        result = evaluate_preflight_step(
             step,
             st,
             context,
             now=now_value,
             verify_route_hash=verify_route_hash,
+            memo=memo,
         )
+        if memo is not None:
+            memo[memo_key] = result
+        return result
 
     def confirm_current_preflight_step(self) -> bool:
         step = self.preflight_guide.current_step
@@ -4347,10 +4121,14 @@ class OperatorApp(tk.Tk):
             self.write_log("起飛前人工確認已全部完成")
             return True
         state = getattr(self, "current_state", self.backend.state)
+        memo = self.__dict__.get("_preflight_tick_memo")
+        if memo is not None:
+            memo.clear()
         evidence, reason = self._preflight_step_evidence(
             step,
             state,
             verify_route_hash=(step == "route"),
+            force=True,
         )
         if evidence is None:
             self.write_log(f"起飛前步驟「{PREFLIGHT_GUIDE_LABELS[step]}」不能確認：{reason}")
@@ -4366,7 +4144,19 @@ class OperatorApp(tk.Tk):
                 return False
         confirmed = self.preflight_guide.confirm_current(evidence)
         self.write_log(f"起飛前步驟已由使用者確認：{PREFLIGHT_GUIDE_LABELS[confirmed]}（{reason}）")
-        self._update_preflight_guide(state)
+        now_t = time.monotonic()
+        self._last_preflight_tick_update_t = now_t
+        self._last_preflight_guide_status = (
+            self.preflight_guide.current_step,
+            self.preflight_guide.confirmed_steps,
+        )
+        if memo is not None:
+            memo[(confirmed, id(state), False)] = (evidence, reason)
+            memo[(confirmed, id(state), True)] = (evidence, reason)
+        try:
+            self._update_preflight_guide(state, eval_current=False)
+        except TypeError:
+            self._update_preflight_guide(state)
         self._select_preflight_tab(self.preflight_guide.current_step)
         return True
 
@@ -4394,8 +4184,24 @@ class OperatorApp(tk.Tk):
         self._select_preflight_tab(guide.current_step)
         return True
 
-    def _update_preflight_guide(self, st: DroneState) -> None:
-        guide = getattr(self, "preflight_guide", None)
+    def _sync_preflight_cards(
+        self,
+        st: DroneState,
+        current_evidence: object = None,
+        *,
+        evidence_known: bool = False,
+    ) -> None:
+        try:
+            self._update_preflight_cards(
+                st, current_evidence=current_evidence, evidence_known=evidence_known
+            )
+        except TypeError:
+            self._update_preflight_cards(st)
+
+    def _update_preflight_guide(
+        self, st: DroneState, *, force: bool = False, eval_current: bool = True
+    ) -> None:
+        guide = self.__dict__.get("preflight_guide")
         if guide is None:
             return
         live = self._is_live_backend()
@@ -4404,6 +4210,7 @@ class OperatorApp(tk.Tk):
         landed = flight_state_name == "landed"
         if live and not landed:
             can_confirm_system = False
+            evidence = None
             if guide.current_step == "system":
                 evidence, _reason = self._preflight_step_evidence("system", st)
                 can_confirm_system = evidence is not None
@@ -4425,17 +4232,29 @@ class OperatorApp(tk.Tk):
                 getattr(self, "start_auto_button", None),
                 can_start_auto,
             )
-            self._update_preflight_cards(st)
+            self._sync_preflight_cards(st, current_evidence=evidence, evidence_known=True)
             self._update_flight_action_guidance(st)
             return
         evidence_by_step = {}
         reasons = {}
         for confirmed in guide.confirmed_steps:
-            evidence, reason = self._preflight_step_evidence(confirmed, st)
+            memo = self.__dict__.get("_preflight_tick_memo")
+            memo_key = (confirmed, id(st), False)
+            if memo is not None and not force and memo_key in memo:
+                evidence, reason = memo[memo_key]
+            else:
+                evidence, reason = self._preflight_step_evidence(
+                    confirmed, st, force=force
+                )
             evidence_by_step[confirmed] = evidence
             reasons[confirmed] = reason
         invalidated = guide.sync(evidence_by_step)
         if invalidated is not None:
+            self._last_preflight_guide_status = None
+            self._last_preflight_tick_update_t = 0.0
+            memo = self.__dict__.get("_preflight_tick_memo")
+            if memo is not None:
+                memo.clear()
             self.write_log(
                 f"起飛前確認已失效，請從「{PREFLIGHT_GUIDE_LABELS[invalidated]}」重新確認："
                 f"{reasons.get(invalidated, '狀態已改變')}"
@@ -4444,8 +4263,64 @@ class OperatorApp(tk.Tk):
             self._set_preflight_visible(True)
             self._set_preflight_expanded(True)
         self._auto_confirm_valid_compass_preflight(st, live=live)
+        is_landed_stable = bool(
+            landed and (live or bool(self.__dict__.get("_auto_advance_preflight", False)))
+        )
+        if is_landed_stable:
+            while guide.current_step in {"map", "route", "system"}:
+                step = guide.current_step
+                evidence, reason = self._preflight_step_evidence(
+                    step,
+                    st,
+                    verify_route_hash=(step == "route"),
+                    force=force,
+                )
+                if evidence is None:
+                    break
+                if step == "route":
+                    snapshot = self.__dict__.get("_displayed_route_snapshot")
+                    if snapshot is not None:
+                        try:
+                            self._bind_route_snapshot_for_auto(snapshot)
+                        except ValueError as exc:
+                            try:
+                                self.write_log(
+                                    f"起飛前步驟「{PREFLIGHT_GUIDE_LABELS[step]}」不能確認：{exc}"
+                                )
+                            except Exception:
+                                pass
+                            break
+                        except Exception:
+                            pass
+                confirmed = guide.confirm_current(evidence)
+                memo = self.__dict__.get("_preflight_tick_memo")
+                if memo is not None:
+                    memo[(confirmed, id(st), False)] = (evidence, reason)
+                    memo[(confirmed, id(st), True)] = (evidence, reason)
+                try:
+                    self.write_log(
+                        f"起飛前步驟已自動確認：{PREFLIGHT_GUIDE_LABELS[confirmed]}（{reason}）"
+                    )
+                except Exception:
+                    pass
+                session_logs = self.__dict__.get("session_logs")
+                if session_logs is not None:
+                    try:
+                        session_logs.command(
+                            "preflight_auto_confirmed",
+                            step=confirmed,
+                            reason=reason,
+                        )
+                    except Exception:
+                        pass
+                try:
+                    self._select_preflight_tab(guide.current_step)
+                except Exception:
+                    pass
         step = guide.current_step
         if step is None:
+            self._last_preflight_guide_status = (None, guide.confirmed_steps)
+            self._last_preflight_tick_update_t = time.monotonic()
             self.preflight_guide_var.set(
                 "✓ 起飛前確認完成，當前串流／遙測正常；可以由使用者按「起飛」或"
                 "「自動飛行」"
@@ -4454,14 +4329,26 @@ class OperatorApp(tk.Tk):
             self._set_widget_enabled(self.preflight_confirm_button, False)
             self._set_widget_enabled(getattr(self, "takeoff_button", None), True)
             self._set_widget_enabled(getattr(self, "start_auto_button", None), True)
-            self._update_preflight_cards(st)
+            self._sync_preflight_cards(st, current_evidence=None, evidence_known=True)
             self._update_flight_action_guidance(st)
-            if not bool(getattr(self, "_preflight_auto_collapsed", False)):
+            if not bool(self.__dict__.get("_preflight_auto_collapsed", False)):
                 self._preflight_auto_collapsed = True
                 self._set_preflight_visible(False)
                 self._select_flight_tab()
             return
-        evidence, reason = self._preflight_step_evidence(step, st)
+        if not eval_current:
+            index = PREFLIGHT_GUIDE_STEPS.index(step) + 1
+            self.preflight_guide_var.set(f"{index}/4 {PREFLIGHT_GUIDE_LABELS[step]}：待確認")
+            self._set_widget_enabled(
+                self.preflight_confirm_button,
+                False,
+            )
+            self._set_widget_enabled(getattr(self, "takeoff_button", None), False)
+            self._set_widget_enabled(getattr(self, "start_auto_button", None), False)
+            self._sync_preflight_cards(st, current_evidence=None, evidence_known=True)
+            self._update_flight_action_guidance(st)
+            return
+        evidence, reason = self._preflight_step_evidence(step, st, force=force)
         index = PREFLIGHT_GUIDE_STEPS.index(step) + 1
         self.preflight_guide_var.set(f"{index}/4 {PREFLIGHT_GUIDE_LABELS[step]}：{reason}")
         self._set_widget_enabled(
@@ -4470,9 +4357,8 @@ class OperatorApp(tk.Tk):
         )
         self._set_widget_enabled(getattr(self, "takeoff_button", None), False)
         self._set_widget_enabled(getattr(self, "start_auto_button", None), False)
-        self._update_preflight_cards(st)
+        self._sync_preflight_cards(st, current_evidence=evidence, evidence_known=True)
         self._update_flight_action_guidance(st)
-
     def _make_command_coordinator(self) -> OperatorCommandCoordinator:
         normal_results = self.__dict__.get("_flight_results")
         if normal_results is None:
@@ -4699,10 +4585,6 @@ class OperatorApp(tk.Tk):
         if not self.__dict__.get("_runtime_available", True):
             self.write_log(f"{command}: 定位／飛控 runtime 未連線，已拒絕指令")
             return True
-        if command in {"auto", "start_auto"} and OperatorApp._collision_motion_blocked(
-            self, "AUTO"
-        ):
-            return True
         if command in {"auto", "start_auto"} and self._resume_integrated_auto():
             return True
         if self._preflight_blocks_flight_command(command):
@@ -4893,359 +4775,8 @@ class OperatorApp(tk.Tk):
         # output for development; SessionLogs remains the persistent audit trail.
         print(f"{time.strftime('%H:%M:%S')} {text}", flush=True)
 
-    # ---- gravity calibration UI ----
     def _is_live_backend(self) -> bool:
         return bool(getattr(self.backend, "is_live", False))
-
-    def _set_gravity_phase(self, phase: str | None) -> None:
-        """Sim: synthesize attitude for the phase. Live: only sample real IMU."""
-        if self._is_live_backend():
-            if hasattr(self.backend, "set_gravity_sim_phase"):
-                self.backend.set_gravity_sim_phase(phase)  # no-op synth
-            return
-        if hasattr(self.backend, "set_gravity_sim_phase"):
-            self.backend.set_gravity_sim_phase(phase)
-
-    @staticmethod
-    def _gravity_phase_target(phase: str) -> float:
-        return {
-            "yaw": float(MIN_YAW_SPAN_DEG),
-            "pitch": float(MIN_PITCH_SPAN_DEG),
-            "roll": float(MIN_ROLL_SPAN_DEG),
-        }.get(phase, 1.0)
-
-    def _gravity_phase_assessment(self, phase: str) -> tuple[bool, int, float, float, str]:
-        """Return phase-navigation readiness plus operator-facing quality notes."""
-        if self.gravity_cal is None or phase not in PHASES:
-            return False, 0, 0.0, self._gravity_phase_target(phase), "檢查不可用"
-        result = self.gravity_cal.analyze_phase(phase)
-        span = {
-            "yaw": float(result.yaw_span_deg),
-            "pitch": float(result.pitch_span_deg),
-            "roll": float(result.roll_span_deg),
-        }[phase]
-        target = self._gravity_phase_target(phase)
-        count = int(result.n)
-        ready = count >= MIN_SAMPLES_PER_PHASE and span >= target
-        reasons = []
-        if count < MIN_SAMPLES_PER_PHASE:
-            reasons.append(f"樣本 {count}/{MIN_SAMPLES_PER_PHASE}")
-        if span < target:
-            reasons.append(f"角度 {span:.0f}°/{target:.0f}°")
-        notes = " ".join(str(note).lower() for note in result.notes)
-        warnings = []
-        if "level tilt" in notes:
-            warnings.append("水平旋轉時機身傾斜過大")
-        if "gravity scatter" in notes:
-            warnings.append("旋轉過程不穩定")
-        if ready:
-            detail = "樣本與角度已達標"
-            if warnings:
-                detail += f"；警告：{'、'.join(warnings)}（納入最後分析）"
-            elif not result.ok:
-                detail += "；警告：品質檢查未通過（納入最後分析）"
-            return True, count, span, target, detail
-        reasons.extend(warnings)
-        return False, count, span, target, "、".join(reasons)
-
-    def _refresh_gravity_controls(self) -> None:
-        calibrator = self.gravity_cal
-        active = bool(
-            calibrator is not None
-            and calibrator.started
-            and not calibrator.finished
-            and calibrator.phase in PHASES
-        )
-        phase = calibrator.phase if active else None
-        self._draw_gravity_phase(phase)
-        current_ready = False
-        if phase in PHASES:
-            ready, count, span, target, _reason = self._gravity_phase_assessment(phase)
-            progress = min(
-                1.0,
-                count / max(1, MIN_SAMPLES_PER_PHASE),
-                span / max(1.0, target),
-            )
-            if ready:
-                progress = 1.0
-            index = PHASES.index(phase) + 1
-            self.gravity_progress_phase_var.set(f"{index}/3 {PHASE_LABELS.get(phase, phase)}")
-            self.gravity_progress_bar.configure(value=progress * 100.0)
-            mark = "✓ " if ready else ""
-            self.gravity_progress_var.set(
-                f"{mark}{count}/{MIN_SAMPLES_PER_PHASE} · {span:.0f}°/{target:.0f}°"
-            )
-            current_ready = ready
-        elif calibrator is not None and calibrator.finished:
-            self.gravity_progress_phase_var.set("3/3 檢查完成")
-            self.gravity_progress_bar.configure(value=100.0)
-            self.gravity_progress_var.set("✓ 三階段完成")
-        else:
-            self.gravity_progress_phase_var.set("等待開始")
-            self.gravity_progress_bar.configure(value=0.0)
-            self.gravity_progress_var.set(f"0/{MIN_SAMPLES_PER_PHASE} · 0°")
-
-        start = getattr(self, "gravity_start_button", None)
-        if start is not None:
-            start.configure(text="重新開始（會清除全部樣本）" if active else "開始檢查")
-        self._set_widget_enabled(
-            getattr(self, "gravity_next_button", None),
-            active and phase in {"yaw", "pitch"} and current_ready,
-        )
-        self._set_widget_enabled(
-            getattr(self, "gravity_finish_button", None),
-            active and phase == "roll" and current_ready,
-        )
-        self._set_widget_enabled(getattr(self, "gravity_retry_button", None), active)
-        self._set_widget_enabled(getattr(self, "gravity_cancel_button", None), active)
-
-    def _draw_gravity_phase(self, phase: str | None) -> None:
-        """Draw a compact vector cue for the active attitude-check motion."""
-        canvas = getattr(self, "gravity_phase_canvas", None)
-        if canvas is not None:
-            draw_gravity_phase_icon(canvas, phase)
-
-    @staticmethod
-    def _gravity_payload_summary(payload: dict) -> str:
-        phases = payload.get("phases") or {}
-        parts = []
-        for phase in PHASES:
-            result = phases.get(phase) or {}
-            count = int(result.get("n", 0) or 0)
-            span_key = {
-                "yaw": "yaw_span_deg",
-                "pitch": "pitch_span_deg",
-                "roll": "roll_span_deg",
-            }[phase]
-            span = float(result.get(span_key, 0.0) or 0.0)
-            target = OperatorApp._gravity_phase_target(phase)
-            state = "PASS" if bool(result.get("ok")) else "FAIL"
-            parts.append(
-                f"{PHASE_LABELS.get(phase, phase)} {state}："
-                f"樣本 {count}/{MIN_SAMPLES_PER_PHASE}，"
-                f"角度 {span:.0f}°/{target:.0f}°"
-            )
-        return "｜".join(parts)
-
-    def gravity_start(self) -> None:
-        if self.gravity_cal is None:
-            self.write_log("gravity cal unavailable")
-            return
-        if self.gravity_cal.started and not self.gravity_cal.finished:
-            if not messagebox.askyesno(
-                "重新開始姿態／重力檢查",
-                "重新開始會清除 Yaw、Pitch、Roll 全部已收集樣本。\n確定要清除並重新開始嗎？",
-                parent=self,
-            ):
-                self.write_log("gravity_cal: restart cancelled; samples preserved")
-                return
-        self.gravity_cal.start()
-        self.gravity_session_var.set("本次重新檢查進度：進行中")
-        self._set_gravity_phase("yaw")
-        self.gravity_guide_var.set(gravity_phase_guidance("yaw"))
-        label = PHASE_LABELS.get("yaw", "yaw")
-        mode = "真機姿態" if self._is_live_backend() else "模擬姿態"
-        self.gravity_status_var.set(
-            f"階段 1/3 yaw：{label}（{mode}）\n手持機身水平轉一圈，完成後按「下一階段」"
-        )
-        self.write_log("gravity_cal: start phase=yaw")
-        self._refresh_gravity_controls()
-
-    def gravity_next(self) -> None:
-        if self.gravity_cal is None or not self.gravity_cal.started:
-            self.write_log("gravity_cal: not started")
-            return
-        cur = self.gravity_cal.phase
-        if cur not in PHASES:
-            self.write_log("gravity_cal: no active phase")
-            return
-        ready, _n, _span, _target, reason = self._gravity_phase_assessment(cur)
-        if not ready:
-            self.gravity_status_var.set(
-                f"「{PHASE_LABELS.get(cur, cur)}」尚未達標：{reason}\n"
-                "達標後「下一階段」會自動可用。"
-            )
-            self.write_log(f"gravity_cal: phase={cur} blocked: {reason}")
-            self._refresh_gravity_controls()
-            return
-        n = len(self.gravity_cal.samples_for(cur)) if cur else 0
-        self.write_log(f"gravity_cal: end phase={cur} samples={n}")
-        if cur == "roll":
-            self.gravity_finish()
-            return
-        nxt = self.gravity_cal.next_phase()
-        if nxt is None:
-            self.gravity_finish()
-            return
-        self._set_gravity_phase(nxt)
-        self.gravity_guide_var.set(gravity_phase_guidance(nxt))
-        idx = PHASES.index(nxt) + 1
-        mode = "真機姿態" if self._is_live_backend() else "模擬姿態"
-        self.gravity_status_var.set(
-            f"階段 {idx}/3 {nxt}：{PHASE_LABELS.get(nxt, nxt)}（{mode}）\n完成後按「下一階段」"
-        )
-        self.write_log(f"gravity_cal: start phase={nxt}")
-        self._refresh_gravity_controls()
-
-    def gravity_retry_phase(self) -> None:
-        calibrator = self.gravity_cal
-        phase = None if calibrator is None else calibrator.phase
-        if (
-            calibrator is None
-            or not calibrator.started
-            or calibrator.finished
-            or phase not in PHASES
-        ):
-            self.write_log("gravity_cal: no active phase to retry")
-            return
-        count = len(calibrator.samples_for(phase))
-        if not messagebox.askyesno(
-            "重做本階段",
-            f"只會清除「{PHASE_LABELS.get(phase, phase)}」的 {count} 筆樣本，"
-            "已通過的前序階段會保留。\n確定重做嗎？",
-            parent=self,
-        ):
-            return
-        calibrator.samples = [sample for sample in calibrator.samples if sample.phase != phase]
-        calibrator.begin_phase(phase)
-        self._set_gravity_phase(phase)
-        self.gravity_status_var.set(
-            f"已清除「{PHASE_LABELS.get(phase, phase)}」的樣本，請重新操作。"
-        )
-        self.gravity_session_var.set(f"本次重新檢查進度：正在重做{PHASE_LABELS.get(phase, phase)}")
-        self.write_log(f"gravity_cal: retry phase={phase}; cleared={count}")
-        self._refresh_gravity_controls()
-
-    def gravity_finish(self) -> None:
-        if self.gravity_cal is None or not self.gravity_cal.started:
-            self.write_log("gravity_cal: finish refused; not started")
-            return
-        phase = self.gravity_cal.phase
-        if phase != "roll":
-            self.gravity_status_var.set("請先依序完成水平旋轉與前後俯仰。")
-            self.write_log(f"gravity_cal: finish refused; phase={phase}")
-            return
-        ready, _n, _span, _target, reason = self._gravity_phase_assessment("roll")
-        if not ready:
-            self.gravity_status_var.set(f"「{PHASE_LABELS.get('roll', 'roll')}」尚未達標：{reason}")
-            self.write_log(f"gravity_cal: finish blocked: {reason}")
-            self._refresh_gravity_controls()
-            return
-        self._set_gravity_phase(None)
-        self.gravity_cal.finished = True
-        self.gravity_cal.phase = None
-        payload = self.gravity_cal.to_jsonable()
-        payload["saved_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
-        GRAVITY_CAL_DIR.mkdir(parents=True, exist_ok=True)
-        # Always overwrite the single canonical file used on next UI open.
-        out = GRAVITY_CAL_LATEST
-        out.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-        self.gravity_result_path = out
-        self._apply_gravity_display(payload, source_path=out, note="已覆寫")
-        if payload.get("ok"):
-            self.gravity_guide_var.set("檢查完成：PASS。三階段動作與姿態覆蓋皆達標。")
-            self.gravity_session_var.set("本次重新檢查進度：PASS")
-        else:
-            self.gravity_guide_var.set("檢查完成：FAIL。" + self._gravity_payload_summary(payload))
-            self.gravity_session_var.set("本次重新檢查進度：FAIL")
-        self.write_log(
-            f"gravity_cal: {'PASS' if payload.get('ok') else 'FAIL'} -> {out} (overwrite)"
-        )
-        self.write_log(payload.get("map_up_hint", "") or "")
-        self._refresh_gravity_controls()
-
-    def gravity_cancel(self) -> None:
-        if self.gravity_cal is not None:
-            self.gravity_cal.reset()
-        self._set_gravity_phase(None)
-        self.gravity_session_var.set("本次重新檢查進度：已取消")
-        # After cancel, restore last saved result on disk (if any).
-        if not self._load_gravity_cal_into_ui():
-            self.gravity_status_var.set("已取消。待命：開始後依序旋轉機身")
-            self.gravity_guide_var.set(gravity_phase_guidance(None))
-            self.gravity_att_var.set("att roll/pitch/yaw = -")
-            self.gravity_g_var.set("g_body = -")
-        self.write_log("gravity_cal: cancelled")
-        self._refresh_gravity_controls()
-
-    @staticmethod
-    def _resolve_gravity_cal_file() -> Path | None:
-        """Prefer gravity_cal_latest.json; else newest gravity_cal_*.json."""
-        if GRAVITY_CAL_LATEST.is_file():
-            return GRAVITY_CAL_LATEST
-        if not GRAVITY_CAL_DIR.is_dir():
-            return None
-        candidates = sorted(
-            GRAVITY_CAL_DIR.glob("gravity_cal_*.json"),
-            key=lambda p: p.stat().st_mtime,
-            reverse=True,
-        )
-        return candidates[0] if candidates else None
-
-    def _apply_gravity_display(
-        self, payload: dict, *, source_path: Path | None = None, note: str = ""
-    ) -> None:
-        ok = "PASS" if payload.get("ok") else "FAIL"
-        summary = str(payload.get("summary", "") or "")
-        saved = str(payload.get("saved_at") or payload.get("t_iso") or "")
-        head = f"{ok}（已載入）" if note == "已載入" else f"{ok}（{note}）" if note else ok
-        if saved:
-            head = f"{head} @ {saved}"
-        body = self._gravity_payload_summary(payload)
-        if not body:
-            body = summary.strip()
-        self.gravity_status_var.set(f"{head}\n{body}" if body else head)
-        g = payload.get("body_g_level")
-        if isinstance(g, (list, tuple)) and len(g) >= 3:
-            self.gravity_g_var.set(
-                f"g_body(level)=({float(g[0]):+.3f},{float(g[1]):+.3f},{float(g[2]):+.3f})"
-            )
-        hint = payload.get("map_up_hint")
-        if hint and note == "已載入":
-            # Keep att line as loaded marker; live att overwrites while flying.
-            self.gravity_att_var.set(f"已載入 {source_path.name if source_path else ''}".strip())
-        self.gravity_result_path = source_path
-
-    def _load_gravity_cal_into_ui(self) -> bool:
-        """Load latest gravity result for display after UI restart. Returns True if loaded."""
-        if not hasattr(self, "gravity_status_var"):
-            return False
-        path = self._resolve_gravity_cal_file()
-        if path is None:
-            return False
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-            if not isinstance(payload, dict):
-                return False
-        except Exception as exc:
-            self.write_log(f"gravity_cal: load failed {path.name}: {exc!r}")
-            return False
-        # Migrate timestamped legacy file into the canonical overwrite path.
-        if path.resolve() != GRAVITY_CAL_LATEST.resolve():
-            try:
-                GRAVITY_CAL_DIR.mkdir(parents=True, exist_ok=True)
-                if "saved_at" not in payload:
-                    payload["saved_at"] = time.strftime(
-                        "%Y-%m-%d %H:%M:%S", time.localtime(path.stat().st_mtime)
-                    )
-                GRAVITY_CAL_LATEST.write_text(
-                    json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
-                )
-                path = GRAVITY_CAL_LATEST
-                self.write_log(f"gravity_cal: migrated -> {path.name}")
-            except Exception as exc:
-                self.write_log(f"gravity_cal: migrate failed: {exc!r}")
-        self._apply_gravity_display(payload, source_path=path, note="已載入")
-        if hasattr(self, "gravity_guide_var"):
-            state = "PASS" if payload.get("ok") else "FAIL"
-            action = (
-                "三階段皆已達標。"
-                if payload.get("ok")
-                else "請按「開始檢查」並依三階段指引重新操作。"
-            )
-            self.gravity_guide_var.set(f"已載入上次結果：{state}。{action}")
-        self.write_log(f"gravity_cal: loaded {path}")
-        return True
 
     def _check_active_site_route(self) -> None:
         """On startup, send the operator to draw a route when this site has none."""
@@ -5431,6 +4962,20 @@ class OperatorApp(tk.Tk):
         self.site_id = profile.site_id
         self.site_profile_path = profile.source
         self.site_asset_actions.current_profile = profile.source
+        if profile is not None:
+            for path_attr, digest_attr in (
+                ("localization_bundle", "localization_bundle"),
+                ("map_ply", "map_ply"),
+                ("route_json", "route_json"),
+                ("map_reference_poses", "map_reference_poses"),
+                ("map_align", "map_align"),
+                ("reference_index", "reference_index"),
+                ("track_landmarks", "track_landmarks"),
+            ):
+                asset_val = getattr(profile, path_attr, None)
+                digest_val = getattr(getattr(profile, "asset_sha256", None), digest_attr, None)
+                if asset_val is not None and digest_val is not None:
+                    _register_session_verified_asset(asset_val, digest_val)
 
         self._flight_results = queue.Queue(maxsize=FLIGHT_RESULT_QUEUE_MAX)
         self._flight_safety_results = queue.Queue()
@@ -5450,7 +4995,6 @@ class OperatorApp(tk.Tk):
 
         self.map_points = prepared.map_points
         self.default_map_center, self.map_radius = self._map_view_bounds(self.map_points)
-        self._configure_sparse_cloud_collision_guard(self.map_points)
         if len(self.map_points):
             map_lo = self.map_points[:, :3].min(axis=0)
             map_hi = self.map_points[:, :3].max(axis=0)
@@ -5478,6 +5022,8 @@ class OperatorApp(tk.Tk):
         self.history_health.clear()
         self.history_weak.clear()
         self.history_weak_health.clear()
+        if isinstance(self.__dict__.get("history_weak_kind"), list):
+            self.history_weak_kind.clear()
         self.no_loc_markers.clear()
 
         self.route_pts = list(prepared.route_points)
@@ -5513,13 +5059,13 @@ class OperatorApp(tk.Tk):
         self.live_last_xyz = None
         self.live_pose = np.array([0.0, 0.0, 0.0, np.nan], dtype=float)
         self.live_locked = False
+        self._autonomy_pose_snapshot = None
         self.live_new_pose = False
         self.camera_axes_world = None
         self.camera_forward_world = None
         self.last_submitted_index = -1
         self.last_detect_submitted_index = -1
         self.inspecting = False
-        self.update_sparse_cloud_collision_interlock(self.current_state)
         OperatorApp._sync_localization_button(self)
         self.inspect_start = None
         self.boot_lock_start = None
@@ -6032,39 +5578,6 @@ class OperatorApp(tk.Tk):
             self._shutdown_in_progress = False
             self.write_log(f"關窗清理無法啟動（{exc!r}）；請重試。")
 
-    def _gravity_tick(self, st: DroneState) -> None:
-        """Feed current attitude into the calibrator and refresh HUD lines."""
-        roll = float(getattr(st, "att_roll", 0.0))
-        pitch = float(getattr(st, "att_pitch", 0.0))
-        yaw = float(getattr(st, "att_yaw", 0.0))
-        self.gravity_att_var.set(
-            f"att r/p/y = {math.degrees(roll):+.1f}° / "
-            f"{math.degrees(pitch):+.1f}° / {math.degrees(yaw):+.1f}°"
-        )
-        if attitude_to_body_gravity is not None:
-            gx, gy, gz = attitude_to_body_gravity(roll, pitch)
-            self.gravity_g_var.set(f"g_body = ({gx:+.3f},{gy:+.3f},{gz:+.3f})")
-        if (
-            self.gravity_cal is not None
-            and self.gravity_cal.started
-            and not self.gravity_cal.finished
-        ):
-            self.gravity_cal.add_sample(roll, pitch, yaw)
-            phase = self.gravity_cal.phase or "?"
-            n = len(self.gravity_cal.samples_for(phase))
-            phase_result = self.gravity_cal.analyze_phase(phase)
-            span = {
-                "yaw": phase_result.yaw_span_deg,
-                "pitch": phase_result.pitch_span_deg,
-                "roll": phase_result.roll_span_deg,
-            }.get(phase, 0.0)
-            self.gravity_guide_var.set(gravity_phase_guidance(phase, sample_count=n, span_deg=span))
-            # lightweight live status (phase label kept; append sample count)
-            base = self.gravity_status_var.get().split("\n")[0]
-            _ready, _count, _span, _target, reason = self._gravity_phase_assessment(phase)
-            self.gravity_status_var.set(f"{base}\n本階段：{reason}")
-            self._refresh_gravity_controls()
-
     def _record_no_loc(self) -> None:
         """Record one bounded, spatially deduplicated no-localization marker."""
         p = self.live_last_xyz
@@ -6132,6 +5645,7 @@ class OperatorApp(tk.Tk):
                 pass
 
     def _append_loc_metrics(self, result: dict) -> None:
+        self._latest_tracking_mode = str(result.get("direct_status") or result.get("mode") or "未知")
         self._ensure_loc_metrics_log()
         if not self._loc_metrics_f:
             return
@@ -6575,7 +6089,7 @@ class OperatorApp(tk.Tk):
                 1,
                 min(100, int(getattr(self.backend, "nudge_pct", 10) or 10)),
             )
-            speed_limit = float(getattr(st, "autonomous_speed_limit_mps", 0.30))
+            speed_limit = float(getattr(st, "autonomous_speed_limit_mps", 0.60))
             speed_limit_enabled = bool(getattr(st, "autonomous_speed_limit_enabled", True))
             guard_status = str(getattr(st, "autonomous_speed_guard_status", "SPEED_WAITING"))
             self.current_auto_speed_var.set(
@@ -6584,6 +6098,64 @@ class OperatorApp(tk.Tk):
                 f"PCMD ±{auto_pcmd_cap_pct}% | {guard_status}"
             )
         return link_ok
+
+    def _build_auto_status_panel(self, parent) -> None:
+        panel = ttk.LabelFrame(parent, text="飛行狀態與航點事件")
+        panel.pack(fill="x", padx=8, pady=(0, 6))
+        self.auto_leg_var = DedupStringVar(master=panel, value="AUTO 未啟動")
+        label = ttk.Label(panel, textvariable=self.auto_leg_var, font=("Sans", 10, "bold"),
+                          justify="left", anchor="w")
+        label.pack(fill="x", padx=5, pady=4)
+        panel.bind("<Configure>", lambda event: label.configure(wraplength=max(120, event.width - 20)))
+        history = ttk.Frame(panel)
+        history.pack(fill="x", padx=5, pady=(0, 5))
+        self.auto_status_events = tk.Text(history, height=5, wrap="word", state="disabled",
+                                         font=("Sans", 10), takefocus=False)
+        scrollbar = ttk.Scrollbar(history, command=self.auto_status_events.yview)
+        self.auto_status_events.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side="right", fill="y")
+        self.auto_status_events.pack(side="left", fill="x", expand=True)
+
+    def _append_auto_status_event(self, text: str) -> None:
+        widget = self.__dict__.get("auto_status_events")
+        if widget is None:
+            return
+        widget.configure(state="normal")
+        widget.insert("end", f"{time.strftime('%H:%M:%S')}  {text}\n")
+        if int(widget.index("end-1c").split(".")[0]) > 2000:
+            widget.delete("1.0", "2.0")
+        widget.configure(state="disabled")
+        widget.see("end")
+
+    def _update_auto_leg_readout(self) -> None:
+        """Live AUTO leg/arrival/action line, refreshed on every UI tick."""
+        if "auto_leg_var" not in self.__dict__:
+            return
+        coordinator = self.__dict__.get("_integrated_autonomy")
+        state = getattr(self.__dict__.get("backend"), "state", None)
+        flight = str(getattr(state, "flight_state", "未知") or "未知")
+        flight = {"landed": "已落地", "takingoff": "起飛中", "hovering": "懸停",
+                  "flying": "飛行中", "landing": "降落中", "emergency": "緊急狀態"}.get(flight, flight)
+        if flight != self.__dict__.get("_last_displayed_flight_state"):
+            self._last_displayed_flight_state = flight
+            OperatorApp._append_auto_status_event(self, f"飛行狀態：{flight}")
+        owner = str(getattr(state, "control_owner", "未知") or "未知")
+        tracking = self.__dict__.get("_latest_tracking_mode", "尚無定位")
+        health = self.__dict__.get("loc_health", "UNKNOWN")
+        if health != "OK":
+            tracking = {"LOW": "定位品質低", "FAIL": "定位失效", "LOST": "定位遺失",
+                        "PAUSED_ZOOM": "變焦中，定位暫停"}.get(health, "尚無可靠定位")
+        header = f"飛行：{flight}｜控制：{owner}｜定位：{tracking}"
+        try:
+            status = (
+                coordinator.auto_leg_status() if coordinator is not None
+                else self.__dict__.get("_last_auto_status", {"line": "AUTO 未啟動"})
+            )
+        except Exception:
+            return
+        line = status.get("line") if isinstance(status, dict) else None
+        if isinstance(line, str) and line:
+            self.auto_leg_var.set(f"{header}\n{line}")
 
     def _update_anafi_limit_readout(self, st: DroneState) -> None:
         geofence_txt = _distance_geofence_text(st)
@@ -6601,7 +6173,7 @@ class OperatorApp(tk.Tk):
             "AUTO 地速安全閘門 "
             f"{'ON' if bool(getattr(st, 'autonomous_speed_limit_enabled', True)) else 'OFF'} "
             "（非硬上限） "
-            f"{float(getattr(st, 'autonomous_speed_limit_mps', 0.30)):g}m/s "
+            f"{float(getattr(st, 'autonomous_speed_limit_mps', 0.60)):g}m/s "
             f"({getattr(st, 'autonomous_speed_guard_status', 'SPEED_WAITING')})"
         )
 
@@ -6638,259 +6210,25 @@ class OperatorApp(tk.Tk):
         # Map coordinate only. Other repeated values live in the header/video HUD.
         self.anafi_flight_var.set(f"map Y {-float(st.pose[1]):+.2f}u")
         link_ok = self._update_anafi_stream_readouts(st)
+        self._update_auto_leg_readout()
         self.update_magnetometer_metrics(st)
         self._update_readiness_cards(st)
-        self._update_preflight_guide(st)
+        now_t = time.monotonic()
+        guide = self.__dict__.get("preflight_guide")
+        guide_status = (
+            None if guide is None else getattr(guide, "current_step", None),
+            () if guide is None else getattr(guide, "confirmed_steps", ()),
+        )
+        last_status = self.__dict__.get("_last_preflight_guide_status")
+        last_tick_t = float(self.__dict__.get("_last_preflight_tick_update_t", 0.0) or 0.0)
+        if guide_status != last_status or (now_t - last_tick_t) >= 1.0:
+            self._last_preflight_tick_update_t = now_t
+            self._last_preflight_guide_status = guide_status
+            self._update_preflight_guide(st)
         self._update_anafi_limit_readout(st)
         self._update_anafi_incident_banner(st, link_ok=link_ok)
         self._update_link_loss_log(link_ok=link_ok)
         self._sync_record_status_label()
-
-    @staticmethod
-    def _collision_guard_radius_limits(map_radius: float) -> tuple[float, float, float]:
-        radius = max(0.0, float(map_radius))
-        minimum = CAMERA_COLLISION_RADIUS_MIN
-        maximum = CAMERA_COLLISION_RADIUS_MAX
-        default = float(np.clip(radius * 0.05, minimum, maximum))
-        return minimum, maximum, default
-
-    def _configure_sparse_cloud_collision_guard(self, points: np.ndarray) -> None:
-        minimum, maximum, default = self._collision_guard_radius_limits(self.map_radius)
-        try:
-            previous = float(self.__dict__.get("collision_guard_radius"))
-        except (TypeError, ValueError, OverflowError):
-            previous = math.nan
-        selected = previous if math.isfinite(previous) and previous >= 0.0 else default
-        self.collision_guard_radius_min = minimum
-        self.collision_guard_radius_max = maximum
-        self.collision_guard_radius = float(np.clip(selected, minimum, maximum))
-        try:
-            cloud = np.empty((0, 3), dtype=np.float32) if len(points) == 0 else np.asarray(points)
-            self._collision_guard_monitor = SparseCloudCollisionMonitor(
-                cloud,
-                collision_radius=self.collision_guard_radius,
-                warning_radius=self.collision_guard_radius,
-            )
-        except (TypeError, ValueError):
-            self._collision_guard_monitor = None
-        if (
-            self._collision_guard_monitor is not None
-            and self._collision_guard_monitor.tree is None
-            and rpf_cKDTree is None
-        ):
-            self.write_log(
-                "碰撞監控 UNAVAILABLE：scipy cKDTree 無法載入，"
-                "點雲鄰近查詢停用（非「附近無障礙物」）"
-            )
-        self.collision_guard_snapshot = {
-            "center": self.default_map_center.copy(),
-            "radius": self.collision_guard_radius,
-            "status": "PREVIEW",
-            "distance": None,
-            "point": None,
-            "preview": True,
-        }
-        radius_var = self.__dict__.get("collision_guard_radius_var")
-        if radius_var is not None:
-            radius_var.set(self.collision_guard_radius)
-        scale = self.__dict__.get("collision_guard_scale")
-        if scale is not None:
-            scale.configure(from_=minimum, to=maximum)
-
-    def _collision_guard_center(self, state: DroneState) -> tuple[np.ndarray, bool, bool]:
-        """Return center, preview flag, and whether the pose may drive an interlock."""
-        if not bool(self.__dict__.get("inspecting", False)):
-            return self.default_map_center.copy(), True, False
-        # Simulated-stream used the plant pose here. That pose sits on the map
-        # centre during worker warmup, so a dense SfM cloud latched on every
-        # auto-inspect start. Live and sim both require a fresh locked fix.
-        # Read from __dict__: a partial Tk test double has no instance attrs,
-        # and tk.Misc.__getattr__ recurses on missing names.
-        stamp = self.__dict__.get("loc_pose_updated_mono")
-        try:
-            pose = np.asarray(self.__dict__.get("live_pose"), dtype=float)[:3]
-            age_s = time.monotonic() - float(stamp)
-        except (TypeError, ValueError, OverflowError, IndexError):
-            pose = np.asarray(self.default_map_center, dtype=float)
-            age_s = math.inf
-        valid = bool(
-            bool(self.__dict__.get("live_locked", False))
-            and str(self.__dict__.get("loc_health", "FAIL")) == "OK"
-            and pose.shape == (3,)
-            and np.all(np.isfinite(pose))
-            and -0.05 <= age_s <= AUTONOMY_POSE_MAX_AGE_S
-        )
-        center = pose if np.all(np.isfinite(pose)) else self.default_map_center.copy()
-        return center, False, valid
-
-    @staticmethod
-    def _collision_guard_status_text(snapshot: dict[str, object]) -> str:
-        status = str(snapshot.get("status", "UNAVAILABLE"))
-        distance = snapshot.get("distance")
-        distance_text = "" if distance is None else f"，最近 {float(distance):.3g} u"
-        return {
-            "PREVIEW_HIT": f"中心預覽：圈內有點雲{distance_text}（不觸發）",
-            "PREVIEW_CLEAR": f"中心預覽：圈內無點雲{distance_text}（不觸發）",
-            "CLEAR": f"近接互鎖運作中{distance_text}",
-            "COLLISION": f"命中點雲：已停止並懸停{distance_text}",
-            "WAITING": "近接互鎖等待新鮮定位",
-            "DISABLED": "近接互鎖已關閉",
-            "UNAVAILABLE": "近接互鎖不可用：點雲索引未建立",
-        }.get(status, "近接互鎖狀態未知")
-
-    def _record_sparse_cloud_collision(
-        self, snapshot: dict[str, object], *, resolved: bool
-    ) -> None:
-        incident = getattr(getattr(self, "session_logs", None), "incident", None)
-        if callable(incident):
-            try:
-                incident(
-                    "sparse_cloud_collision_hover",
-                    radius_map_units=float(snapshot["radius"]),
-                    distance_map_units=snapshot.get("distance"),
-                    nearest_point=snapshot.get("point"),
-                    resolved=resolved,
-                )
-            except Exception as exc:
-                self.write_log(f"點雲近接事件紀錄失敗：{exc!r}")
-
-    def _stop_motion_for_sparse_cloud_collision(self, snapshot: dict[str, object]) -> bool:
-        try:
-            self._nudge_keys_held.clear()
-            self._nudge_buttons_held.clear()
-            self._sync_keyboard_sticks()
-            self._reset_virtual_sticks()
-        except Exception as exc:
-            self.write_log(f"點雲近接 UI 輸入清除失敗：{exc!r}")
-        try:
-            self._pause_integrated_auto("sparse_cloud_collision")
-        except Exception as exc:
-            self.write_log(f"點雲近接 AUTO 暫停失敗：{exc!r}")
-
-        backend = self.backend
-        hover = getattr(backend, "hover_cmd", None)
-        hovered = False
-        try:
-            if callable(hover):
-                hovered = bool(hover("sparse_cloud_collision"))
-            else:
-                clear = getattr(backend, "nudge_clear", None)
-                if callable(clear):
-                    clear(reason="sparse_cloud_collision")
-                send_zero = getattr(backend, "send_pcmd", None)
-                if callable(send_zero):
-                    hovered = bool(
-                        send_zero(
-                            0,
-                            0,
-                            0,
-                            0,
-                            reason="sparse_cloud_collision_hover",
-                        )
-                    )
-                else:
-                    hovered = self._backend_command("hover", {}) is not False
-        except Exception as exc:
-            self.write_log(f"點雲近接懸停失敗：{exc!r}")
-        state = getattr(backend, "state", None)
-        if hovered and state is not None:
-            state.tracker_state = TrackerState.HOVER
-            state.last_command = "sparse_cloud_collision_hover"
-        self._record_sparse_cloud_collision(snapshot, resolved=False)
-        if hovered:
-            self.write_log(
-                "點雲近接互鎖：相機半徑內偵測到稀疏點，已清除目前動作並懸停；"
-                "縮小半徑或移除命中後，需由操作者重新下令"
-            )
-        else:
-            self.write_log("點雲近接互鎖已觸發，但零 PCMD／懸停未獲確認")
-        return hovered
-
-    def update_sparse_cloud_collision_interlock(self, state: DroneState) -> None:
-        center, preview, pose_valid = self._collision_guard_center(state)
-        enabled_var = self.__dict__.get("collision_guard_enabled_var")
-        enabled = (
-            bool(enabled_var.get())
-            if enabled_var is not None
-            else bool(self.__dict__.get("collision_guard_enabled", True))
-        )
-        self.collision_guard_enabled = enabled
-        monitor = self._collision_guard_monitor
-        status = "DISABLED"
-        result: dict[str, object] = {
-            "distance": None,
-            "point": None,
-        }
-        if enabled:
-            if monitor is None or monitor.tree is None:
-                status = "UNAVAILABLE"
-            elif not preview and not pose_valid:
-                status = "WAITING"
-            else:
-                monitor.set_radii(
-                    self.collision_guard_radius,
-                    self.collision_guard_radius,
-                )
-                result = monitor.update(center)
-                hit = result.get("status") == "COLLISION"
-                status = (
-                    ("PREVIEW_HIT" if hit else "PREVIEW_CLEAR")
-                    if preview
-                    else ("COLLISION" if hit else "CLEAR")
-                )
-        snapshot = {
-            "center": np.asarray(center, dtype=float).copy(),
-            "radius": float(self.collision_guard_radius),
-            "status": status,
-            "distance": result.get("distance"),
-            "point": result.get("point"),
-            "preview": preview,
-        }
-        self.collision_guard_snapshot = snapshot
-        status_var = self.__dict__.get("collision_guard_status_var")
-        if status_var is not None:
-            status_var.set(self._collision_guard_status_text(snapshot))
-
-        if status == "COLLISION" and not self._collision_interlock_latched:
-            self._collision_interlock_latched = True
-            self._stop_motion_for_sparse_cloud_collision(snapshot)
-        elif status in {"CLEAR", "DISABLED"} and self._collision_interlock_latched:
-            self._collision_interlock_latched = False
-            self._record_sparse_cloud_collision(snapshot, resolved=True)
-            self.write_log("點雲近接互鎖已解除；AUTO 仍保持暫停，必須由操作者重新下令")
-
-    def _collision_motion_blocked(self, source: str) -> bool:
-        if not bool(self.__dict__.get("_collision_interlock_latched", False)):
-            return False
-        self.write_log(f"{source} 已拒絕：相機近接圈仍命中點雲，請先調整半徑或位置")
-        return True
-
-    def _on_collision_guard_radius_change(self, raw_value: object) -> None:
-        try:
-            selected = float(raw_value)
-        except (TypeError, ValueError, OverflowError):
-            return
-        self.collision_guard_radius = float(
-            np.clip(
-                selected,
-                self.collision_guard_radius_min,
-                self.collision_guard_radius_max,
-            )
-        )
-        radius_text = self.__dict__.get("collision_guard_radius_text")
-        if radius_text is not None:
-            radius_text.set(f"{self.collision_guard_radius:.3g} u")
-        self.update_sparse_cloud_collision_interlock(self.current_state)
-        self._map_dirty_key = None
-        self.redraw_map_only()
-
-    def _on_collision_guard_enabled_change(self) -> None:
-        enabled_var = self.__dict__.get("collision_guard_enabled_var")
-        if enabled_var is not None:
-            self.collision_guard_enabled = bool(enabled_var.get())
-        self.update_sparse_cloud_collision_interlock(self.current_state)
-        self._map_dirty_key = None
-        self.redraw_map_only()
 
     @staticmethod
     def _map_view_bounds(points: np.ndarray) -> tuple[np.ndarray, float]:
@@ -7231,19 +6569,9 @@ class OperatorApp(tk.Tk):
         img = self.map_base_image(width, height).copy()
         draw = ImageDraw.Draw(img)
         overlay_font = pil_ui_font(13)
-        guard = getattr(self, "collision_guard_snapshot", {}) or {}
-        guard_center = guard.get("center")
-        guard_preview = bool(guard.get("preview", False))
         render_pose = st.pose
-        if guard_preview and guard_center is not None:
-            center = np.asarray(guard_center, dtype=float)
-            if center.shape == (3,) and np.all(np.isfinite(center)):
-                render_pose = np.array([*center, np.nan], dtype=float)
         camera_axes = normalize_camera_axes(getattr(self, "camera_axes_world", None))
         camera_forward = normalize_camera_forward(getattr(self, "camera_forward_world", None))
-        if guard_preview:
-            camera_axes = None
-            camera_forward = None
         route_pts = self.route_pts if getattr(self, "route_pts", None) else []
         map_east, map_north, map_up, _measured = self._map_axis_basis()
         draw_map_overlays(
@@ -7260,14 +6588,10 @@ class OperatorApp(tk.Tk):
                 history_health=self.history_health,
                 history_weak=self.history_weak,
                 history_weak_health=self.history_weak_health,
+                history_weak_kind=self.__dict__.get("history_weak_kind") or (),
                 pose=render_pose,
                 camera_axes=camera_axes,
                 camera_forward=camera_forward,
-                collision_center=guard_center,
-                collision_radius=float(guard.get("radius", 0.0) or 0.0),
-                collision_status=str(guard.get("status", "UNAVAILABLE")),
-                collision_point=guard.get("point"),
-                collision_preview=guard_preview,
                 transform_xyz=self.transform_xyz,
                 project_world=self.project_world,
                 route_color=ROUTE_COLOR,
@@ -7280,6 +6604,10 @@ class OperatorApp(tk.Tk):
                 map_north=map_north,
                 map_up=map_up,
                 gimbal_pitch_deg=getattr(st, "gimbal_pitch_deg", None),
+                map_rotation=(float(self.map_yaw), float(self.map_pitch), float(self.map_roll)),
+                map_yaw=float(self.map_yaw),
+                map_pitch=float(self.map_pitch),
+                map_roll=float(self.map_roll),
             ),
         )
         return img
@@ -7377,33 +6705,19 @@ class OperatorApp(tk.Tk):
                 return tuple(str(x) for x in lines)
         except (OSError, ValueError, AttributeError, TypeError, RuntimeError):  # Tier3: fallback best-effort — narrow, keep pass
             pass
-
-        def value(name: str, fallback: str) -> str:
-            variable = getattr(self, name, None)
-            getter = getattr(variable, "get", None)
-            if not callable(getter):
-                return fallback
-            try:
-                return str(getter())
-            except tk.TclError:
-                return fallback
-
-        attitude_and_velocity = value("olympe_attitude_var", "飛控融合姿態 - | 三軸速度 -")
+        attitude_and_velocity = _val("olympe_attitude_var", "飛控融合姿態 - | 三軸速度 -")
         attitude, separator, velocity = attitude_and_velocity.partition(" | 三軸速度 ")
         return (
             " | ".join(
                 (
-                    value("current_auto_speed_var", "AUTO 地速安全閘門 -"),
-                    value("loc_fps_var", "定位 FPS -"),
-                    value("loc_quality_var", "inliers -"),
+                    _val("current_auto_speed_var", "AUTO 地速安全閘門 -"),
+                    _val("loc_fps_var", "定位 FPS -"),
+                    _val("loc_quality_var", "inliers -"),
                 )
             ),
-            value("loc_latency_var", "wall_ms - | core - | e2e -"),
-            value("olympe_state_var", "RTH ?/? | GPS ?"),
-            value(
-                "olympe_altitude_var",
-                "飛控高度 - | AGL - | 連接品質 -",
-            ),
+            _val("loc_latency_var", "wall_ms - | core - | e2e -"),
+            _val("olympe_state_var", "RTH ?/? | GPS ?"),
+            _val("olympe_altitude_var", "飛控高度 - | AGL - | 連接品質 -"),
             attitude,
             f"三軸速度 {velocity}" if separator else "三軸速度 -",
         )

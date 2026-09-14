@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import io
 import json
 import math
 from multiprocessing import resource_tracker, shared_memory
@@ -47,7 +48,6 @@ if str(_CTRL) not in _sys.path:
     _sys.path.insert(0, str(_CTRL))
 from workspace_layout import workspace_from_file  # noqa: E402
 from backend_contract import InterfaceMode  # noqa: E402
-from localization_contract import InvalidLocalizationResult, LocalizationResult  # noqa: E402
 from runtime_safety import (  # noqa: E402
     configure_offline_environment,
     install_network_guard,
@@ -473,8 +473,14 @@ def _parse_worker_args():
 
 def _prepare_worker_runtime(args, backend: str):
     startup_started = time.perf_counter()
-    json_fd = os.dup(sys.stdout.fileno())
-    json_out = os.fdopen(json_fd, "w", encoding="utf-8", buffering=1)
+    try:
+        stdout_fd = sys.stdout.fileno()
+        stderr_fd = sys.stderr.fileno()
+        json_fd = os.dup(stdout_fd)
+        os.dup2(stderr_fd, stdout_fd)
+        json_out = os.fdopen(json_fd, "w", encoding="utf-8", buffering=1)
+    except (AttributeError, io.UnsupportedOperation, OSError):
+        json_out = sys.stdout
     sys.stdout = sys.stderr
     selected_deploy_dir = Path(args.deploy_dir).resolve()
     sys.path.insert(0, str(selected_deploy_dir))
@@ -831,6 +837,24 @@ def _prepare_benchmark_frame(
     )
 
 
+def _offer_fused_sample(tracker, fused) -> None:
+    """Hand this frame's fused IMU sample to the tracker, if it takes one.
+
+    Backends without inertial aiding (or older adapters) simply lack
+    ``observe_fused_state``; a bad sample must degrade to unaided tracking,
+    never to a dead worker.
+    """
+    if fused is None:
+        return
+    offer = getattr(tracker, "observe_fused_state", None)
+    if not callable(offer):
+        return
+    try:
+        offer(fused)
+    except Exception as exc:
+        print(f"[live_worker] fused sample dropped: {exc!r}", file=sys.stderr, flush=True)
+
+
 def _run_tracker_localization(
     tracker,
     frame,
@@ -840,8 +864,7 @@ def _run_tracker_localization(
 ):
     if gpu_start_event is not None:
         gpu_start_event.record()
-    with redirect_native_stdout_to_stderr(), contextlib.redirect_stdout(sys.stderr):
-        pose = tracker.localize_frame(frame, capture_stamp=capture_stamp)
+    pose = tracker.localize_frame(frame, capture_stamp=capture_stamp)
     gpu_span_ms = None
     if gpu_end_event is not None:
         gpu_end_event.record()
@@ -1074,7 +1097,7 @@ def _build_success_payload(
     for key in DIRECT_INFO_FIELDS:
         if key in info:
             payload[key] = info[key]
-    return payload
+    return {k: v for k, v in payload.items() if v is not None}
 
 
 def _build_exception_payload(
@@ -1154,7 +1177,7 @@ def _build_exception_payload(
     if worker_fatal:
         payload.update(cuda_oom_failure_fields(error))
     print(f"[live_worker] localization error: {error!r}", file=sys.stderr, flush=True)
-    return payload, worker_fatal
+    return {k: v for k, v in payload.items() if v is not None}, worker_fatal
 
 
 def _process_worker_frame(
@@ -1176,6 +1199,7 @@ def _process_worker_frame(
     force_track_ref_resolved,
     force_track_label,
     seed_local_prior,
+    fused,
     previous_runtime_mode: str,
 ):
     wall_t0 = time.perf_counter()
@@ -1205,6 +1229,7 @@ def _process_worker_frame(
         worker_core_start_mono_ns = time.monotonic_ns()
         worker_core_start_mono = worker_core_start_mono_ns * 1e-9
         core_t0 = time.perf_counter()
+        _offer_fused_sample(tracker, fused)
         pose, gpu_span_ms = _run_tracker_localization(
             tracker, frame, capture_stamp, gpu_start_event, gpu_end_event
         )
@@ -1380,7 +1405,7 @@ def _run_worker_loop(
         request = _read_benchmark_request(args)
         if request is None:
             break
-        benchmark_mode_requested, capture_stamp, _fused = request
+        benchmark_mode_requested, capture_stamp, fused = request
 
         frame = _read_worker_frame(args, frame_buffer, frame_shm, frame_size)
         if frame is None:
@@ -1405,6 +1430,7 @@ def _run_worker_loop(
             force_track_ref_resolved=force_track_ref_resolved,
             force_track_label=force_track_label,
             seed_local_prior=seed_local_prior,
+            fused=fused,
             previous_runtime_mode=previous_runtime_mode,
         )
         last_cuda_sample_mono, last_cuda_stats = _attach_sampled_runtime_metrics(
@@ -1414,10 +1440,7 @@ def _run_worker_loop(
             last_cuda_sample_mono,
             last_cuda_stats,
         )
-        try:
-            LocalizationResult.from_dict(payload)
-        except InvalidLocalizationResult as exc:
-            print(f"[live_worker] payload failed contract validation: {exc}", file=sys.stderr, flush=True)
+        payload = {k: v for k, v in payload.items() if v is not None}
         json_out.write(json.dumps(payload, ensure_ascii=False) + "\n")
         json_out.flush()
         seq += 1

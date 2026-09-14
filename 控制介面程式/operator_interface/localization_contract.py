@@ -306,6 +306,8 @@ class LocalizationResult:
         payload.setdefault("pose_mono_ns", self.pose_mono_ns)
         payload.setdefault("validity", self.validity)
         payload.setdefault("confidence", self.confidence)
+        payload.setdefault("pose", self.pose)
+        payload.setdefault("success", self.validity)
         return payload
 
     def __getitem__(self, key: str) -> Any:

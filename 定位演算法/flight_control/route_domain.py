@@ -218,19 +218,51 @@ def _arrival_radius(data: dict[str, Any]) -> float | None:
         raise ValueError("route arrive_radius_map_units must be finite and > 0")
     return arrive_radius
 
-
-def _route_deviation_radius(data: dict[str, Any]) -> float | None:
-    raw_radius = data.get("max_route_deviation_map_units")
-    if raw_radius is None:
+def _waypoint_arrive_radii(data: dict[str, Any], count: int) -> tuple[float, ...] | None:
+    raw = data.get("waypoint_arrive_radii")
+    if raw is None:
         return None
-    if isinstance(raw_radius, bool) or not isinstance(raw_radius, (int, float)):
-        raise ValueError("route max_route_deviation_map_units must be a number")
-    radius = float(raw_radius)
-    if not math.isfinite(radius) or radius < 0.0:
+    if not isinstance(raw, list) or len(raw) != count:
         raise ValueError(
-            "route max_route_deviation_map_units must be finite and >= 0"
+            "route waypoint_arrive_radii must be a list with one radius per waypoint"
         )
-    return radius
+    radii = []
+    for index, value in enumerate(raw):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(
+                f"route waypoint_arrive_radii[{index}] must be a number"
+            )
+        radius = float(value)
+        if not math.isfinite(radius) or radius <= 0.0:
+            raise ValueError(
+                f"route waypoint_arrive_radii[{index}] must be finite and > 0"
+            )
+        radii.append(radius)
+    return tuple(radii)
+
+
+def validate_flight_route_fields(
+    data: object,
+    *,
+    expected_site_id: str | None,
+    expected_coordinate_frame_id: str | None,
+) -> None:
+    """Reject illegal flight-route geometry without converting coordinates."""
+    if not isinstance(data, dict) or not isinstance(data.get("waypoints"), list):
+        raise ValueError("route JSON must contain a waypoints list")
+    source_points, frame, _units, closed = _route_core_fields(
+        data,
+        require_map_units=True,
+    )
+    _validate_flight_contract(
+        data,
+        expected_site_id=expected_site_id,
+        expected_coordinate_frame_id=expected_coordinate_frame_id,
+        frame=frame,
+        closed=closed,
+    )
+    _arrival_radius(data)
+    _waypoint_arrive_radii(data, len(source_points))
 
 
 @dataclass(frozen=True)
@@ -254,7 +286,7 @@ class RouteDocument:
     purpose: str | None = None
     align_source: str | None = None
     arrive_radius_map_units: float | None = None
-    max_route_deviation_map_units: float | None = None
+    waypoint_arrive_radii: tuple[float, ...] | None = None
 
     @classmethod
     def from_data(
@@ -282,12 +314,10 @@ class RouteDocument:
         align_source = _optional_text(data, "align_source")
 
         if require_flight_contract:
-            _validate_flight_contract(
+            validate_flight_route_fields(
                 data,
                 expected_site_id=expected_site_id,
                 expected_coordinate_frame_id=expected_coordinate_frame_id,
-                frame=frame,
-                closed=closed,
             )
         controller_points, align_source = _controller_coordinates(
             source_points,
@@ -296,8 +326,7 @@ class RouteDocument:
             map_frame=map_frame,
         )
         arrive_radius = _arrival_radius(data)
-        route_deviation_radius = _route_deviation_radius(data)
-
+        point_radii = _waypoint_arrive_radii(data, len(source_points))
         return cls(
             waypoints=source_points,
             controller_points=controller_points,
@@ -310,7 +339,7 @@ class RouteDocument:
             purpose=purpose,
             align_source=align_source,
             arrive_radius_map_units=arrive_radius,
-            max_route_deviation_map_units=route_deviation_radius,
+            waypoint_arrive_radii=point_radii,
         )
 
     @classmethod
@@ -392,7 +421,7 @@ class MissionRouteSnapshot:
     coordinate_frame_id: str
     waypoints: tuple[tuple[float, float, float], ...]
     arrive_radius_map_units: float | None = None
-    max_route_deviation_map_units: float | None = None
+    waypoint_arrive_radii: tuple[float, ...] | None = None
 
     def controller_waypoints(self) -> list[np.ndarray]:
         return [np.array(point, dtype=float, copy=True) for point in self.waypoints]
@@ -451,7 +480,7 @@ def capture_mission_route_snapshot(
         coordinate_frame_id=coordinate_frame_id,
         waypoints=tuple((point[0], point[1], point[2]) for point in route.controller_points),
         arrive_radius_map_units=route.arrive_radius_map_units,
-        max_route_deviation_map_units=route.max_route_deviation_map_units,
+        waypoint_arrive_radii=route.waypoint_arrive_radii,
     )
 
 

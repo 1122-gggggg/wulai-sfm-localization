@@ -50,11 +50,43 @@ DIRECT_INFO_FIELDS = (
     "handover_points",
     "handover_dropped",
     "reloc_ms",
+    "reloc_retrieval_ms",
+    "reloc_match_lift_ms",
+    "reloc_pnp_ms",
+    "reloc_reference_count",
     "reloc_busy",
     "reloc_delivered",
     "reloc_submitted",
     "track_ms",
     "vo_ms",
+    "handover_ms",
+    "bookkeeping_ms",
+    "map_constraint_age_s",
+    "reproj_p90",
+    "inlier_hull_coverage",
+    "positive_depth_ratio",
+    "fused_state_seen",
+    "imu_bridge",
+    "imu_sample_age_s",
+    "imu_yaw_delta_deg",
+    "imu_bridge_reason",
+    "imu_reference_stamp_mono",
+    "imu_sample_stamp_mono",
+    "frame_stamp_mono",
+    "frame_dt_s",
+    "klt_reseeded",
+    "klt_input_points",
+    "klt_forward_valid",
+    "klt_backward_valid",
+    "klt_kept_points",
+    "klt_inside_kept",
+    "klt_fb_p50_px",
+    "klt_fb_p95_px",
+    "klt_displacement_p50_px",
+    "pnp_image_size_px",
+    "step_norm",
+    "reloc_reference_names",
+    "pnp_observation_sample",
 )
 
 RESULT_FIELDS = (
@@ -113,6 +145,8 @@ RESULT_FIELDS = (
     "pose",
     "pose_raw",
     "pose_filter",
+    "camera_axes_world",
+    "camera_forward_world",
     "vpr_ms",
     "feature_ms",
     "match_ms",
@@ -209,6 +243,10 @@ RESULT_FIELDS = (
     "esekf_update_accepted",
     "esekf_update_exceptions",
     "fused_telemetry_mono",
+    "fused_stamp_source",
+    "fused_attitude_mono",
+    "fused_speed_mono",
+    "fused_altitude_mono",
     "fused_roll",
     "fused_pitch",
     "fused_yaw",
@@ -413,13 +451,27 @@ def attach_fused_localization_telemetry(
             "fused_gps_altitude_accuracy": getattr(state, "gps_altitude_accuracy_m", None),
         }
     )
+    attitude_stamp = getattr(state, "attitude_mono_ns", None)
+    has_source_stamp = hasattr(state, "attitude_mono_ns")
     fused_mono = _fused_telemetry_mono_s(
-        getattr(state, "telemetry_read_mono_ns", None),
+        attitude_stamp if has_source_stamp else getattr(state, "telemetry_read_mono_ns", None)
     )
+    timing["fused_stamp_source"] = (
+        getattr(state, "attitude_stamp_source", "attitude_event") if attitude_stamp is not None
+        else "unavailable" if has_source_stamp else "poll_fallback"
+    )
+    if has_source_stamp and fused_mono is None:
+        timing.update(fused_roll=None, fused_pitch=None, fused_yaw=None)
+    for field, attribute in (
+        ("fused_attitude_mono", "attitude_mono_ns"),
+        ("fused_speed_mono", "ground_speed_mono_ns"),
+        ("fused_altitude_mono", "altitude_mono_ns"),
+    ):
+        timing[field] = _fused_telemetry_mono_s(getattr(state, attribute, None))
     if fused_mono is not None:
         timing["fused_telemetry_mono"] = fused_mono
     gps_mono = _fused_telemetry_mono_s(
-        getattr(state, "gps_read_mono_ns", None),
+        getattr(state, "gps_location_mono_ns", None) or getattr(state, "gps_read_mono_ns", None),
     )
     if gps_mono is not None:
         timing["fused_gps_mono"] = gps_mono

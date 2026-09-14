@@ -25,7 +25,7 @@ import json
 import os
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -35,6 +35,7 @@ from boq_extractor import BOQ_DIM, BoQExtractor
 from direct_map import DirectMapAssets
 from direct_paths import vendor_sys_path
 from direct_profile import DirectProfile
+from edm_inference import CachedEDM
 
 
 vendor_sys_path()
@@ -99,6 +100,7 @@ class RelocFix:
     reference_names: tuple[str, ...]
     runtime_ms: float
     reason: str = ""
+    stage_ms: dict[str, float] | None = None
 
     @classmethod
     def abstained(cls, reason: str, runtime_ms: float) -> "RelocFix":
@@ -118,16 +120,48 @@ class RelocFix:
         )
 
 
-def boq_descriptor_from_array(extractor: BoQExtractor, rgb: np.ndarray) -> np.ndarray:
-    """Extract one 16,384-D BoQ descriptor from an in-memory RGB array.
+def boq_descriptor_from_array(extractor: BoQExtractor, image: np.ndarray) -> np.ndarray:
+    """Extract one 16,384-D BoQ descriptor from an in-memory RGB or grayscale array."""
+    if image.ndim == 2:
+        import torch
+        import torch.nn.functional as F
+        from boq_extractor import _IMAGENET_MEAN, _IMAGENET_STD
 
-    Thin wrapper over ``BoQExtractor.extract_from_array`` (bicubic
-    ``antialias=True`` resize to the ``BOQ_INPUT`` square, 384; ImageNet
-    mean/std; model; L2 normalise).  The frozen reference bank was produced
-    by that exact transform; any deviation silently re-ranks retrieval.
-    """
+        device = torch.device(extractor.device)
+        arr = image if image.flags.c_contiguous else np.ascontiguousarray(image)
+        source = torch.from_numpy(arr)
+        if device.type == "cuda":
+            source = source.pin_memory()
+        x = source.to(device, non_blocking=True)
+        x = x.unsqueeze(0).unsqueeze(0).to(dtype=torch.float32).div_(255.0)
+        x = F.interpolate(
+            x,
+            size=(extractor.input_size, extractor.input_size),
+            mode="bicubic",
+            align_corners=False,
+            antialias=True,
+        ).repeat(1, 3, 1, 1)
+        normalization = extractor._normalization_tensors
+        if normalization is None or normalization[0].device != device:
+            mean = torch.tensor(
+                list(_IMAGENET_MEAN), dtype=torch.float32, device=device
+            ).view(1, 3, 1, 1)
+            std = torch.tensor(
+                list(_IMAGENET_STD), dtype=torch.float32, device=device
+            ).view(1, 3, 1, 1)
+            normalization = (mean, std)
+            extractor._normalization_tensors = normalization
+        x = ((x - normalization[0]) / normalization[1]).contiguous()
+        with torch.inference_mode():
+            with torch.autocast(
+                device_type="cuda", dtype=torch.float16, enabled=extractor.fp16
+            ):
+                output = extractor.model(x)
+            desc = F.normalize(output.float(), dim=1, eps=1e-12)[0]
+            descriptor = desc.cpu().numpy().astype(np.float32, copy=False)
+    else:
+        descriptor = extractor.extract_from_array(image)
 
-    descriptor = extractor.extract_from_array(rgb)
     if descriptor.shape != (BOQ_DIM,):
         raise RuntimeError(
             f"BoQ descriptor shape {descriptor.shape!r} violates the "
@@ -135,10 +169,7 @@ def boq_descriptor_from_array(extractor: BoQExtractor, rgb: np.ndarray) -> np.nd
         )
     if not np.isfinite(descriptor).all():
         raise RuntimeError("BoQ emitted a non-finite descriptor")
-    norm = float(np.linalg.norm(descriptor))
-    if not np.isfinite(norm) or norm <= 1e-12:
-        raise RuntimeError("BoQ emitted a zero-norm descriptor")
-    return np.ascontiguousarray(descriptor / norm, dtype=np.float32)
+    return descriptor
 
 
 class LiveMapEDMProvider(FinalMapEDMProvider):
@@ -203,6 +234,11 @@ class LiveMapEDMProvider(FinalMapEDMProvider):
         self._index: Any | None = None
         self._models_ready = False
         self._lock = threading.Lock()
+        self._gpu_matcher: CachedEDM | None = None
+        self._query_matches: dict[int, dict] = {}
+        self._last_strong_refs: tuple[int, ...] = ()
+        self.last_stage_ms: dict[str, float] = {}
+        self._reference_norms: np.ndarray | None = None
 
     # -- construction helpers ---------------------------------------------
 
@@ -302,6 +338,7 @@ class LiveMapEDMProvider(FinalMapEDMProvider):
         self._index = self.build_reference_index(
             excluded_sessions=frozenset(), strict=False
         )
+        self._reference_norms = np.linalg.norm(self._reference_descriptors, axis=1)
         width, height = self.profile.fast_loop.resolution
         # A real forward pass through both networks; an exception here is a
         # broken deployment and must not be hidden behind the first stream frame.
@@ -313,6 +350,44 @@ class LiveMapEDMProvider(FinalMapEDMProvider):
         return tuple(self._reference_names)
 
     # -- localization ------------------------------------------------------
+
+    def _match_prepared(self, runtime, query, reference):
+        from river_map_quality.official_edm_adapter import match_official_prepared
+
+        key = id(reference)
+        if key not in self._query_matches:
+            capacity = self.profile.optimizations.gpu_cache_size
+            if capacity:
+                if self._gpu_matcher is None:
+                    self._gpu_matcher = CachedEDM(runtime, capacity)
+                matched = self._gpu_matcher.match(query, reference)
+            else:
+                matched = match_official_prepared(runtime, query, reference)
+            self._query_matches[key] = (reference, matched)
+        return self._query_matches[key][1]
+
+    def _match_prepared_batch(self, runtime, query, references):
+        from river_map_quality.official_edm_adapter import match_official_prepared_batch
+
+        missing = [reference for reference in references if id(reference) not in self._query_matches]
+        if missing:
+            matched = match_official_prepared_batch(runtime, query, missing)
+            self._query_matches.update((id(ref), (ref, result)) for ref, result in zip(missing, matched, strict=True))
+        return [self._query_matches[id(reference)][1] for reference in references]
+
+    def _recovery_references(self, ranked: tuple[int, ...]) -> tuple[int, ...]:
+        """Keep the global winner; add a covisible alternative when available."""
+        extra = list(ranked[self.top_k:])
+        if len(extra) < 2 or not self._last_strong_refs:
+            return tuple(extra[:self.top_k])
+        seeds = np.unique(np.concatenate([
+            self._observations[self._reference_names[index]][1]
+            for index in self._last_strong_refs
+        ]))
+        # Only rank the bounded global shortlist, never lock recovery to a prior.
+        overlap = [len(np.intersect1d(seeds, self._observations[self._reference_names[index]][1])) for index in extra[1:]]
+        neighbor = extra[1 + int(np.argmax(overlap))]
+        return tuple(dict.fromkeys([extra[0], neighbor, *extra]))[:self.top_k]
 
     def localize_array(self, gray: np.ndarray, *, color_bgr: np.ndarray | None = None) -> RelocFix:
         """Relocalize one live frame.  Never raises; failures become ABSTAINED.
@@ -340,36 +415,69 @@ class LiveMapEDMProvider(FinalMapEDMProvider):
         if self._index is None:
             raise RuntimeError("ensure_models() must run before localize_array()")
         started = time.perf_counter()
+        self._query_matches.clear()
+        self.last_stage_ms = {}
         image = np.ascontiguousarray(gray)
         if image.ndim == 3:
             image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         if image.ndim != 2 or image.dtype != np.uint8:
             raise ValueError("live query must be an HxW uint8 grayscale array")
         if color_bgr is None:
-            rgb = np.repeat(image[:, :, None], 3, axis=2)
+            descriptor = boq_descriptor_from_array(self._vpr(), image)
         else:
             rgb = cv2.cvtColor(np.ascontiguousarray(color_bgr), cv2.COLOR_BGR2RGB)
-
-        descriptor = boq_descriptor_from_array(self._vpr(), rgb)
+            descriptor = boq_descriptor_from_array(self._vpr(), rgb)
         subset = self._subsets[self._index.index_id]
         ranked, viewpoint_pool_fallback = rank_reference_indices(
             self._reference_descriptors,
             descriptor,
             reference_sessions=self._reference_sessions,
             excluded_sessions=subset.excluded_sessions,
-            top_k=self.top_k,
+            top_k=self.top_k * (3 if self.profile.optimizations.adaptive_retrieval else 1),
             occupied_bins=self._reference_occupied_bins,
             min_occupied_bins=self.min_reference_occupied_bins,
             retrieve_pool=None,
+            reference_norms=self._reference_norms,
         )
         allowed = set(subset.indices)
         ranked = tuple(index for index in ranked if index in allowed)
+        self.last_stage_ms["retrieval_ms"] = (time.perf_counter() - started) * 1000.0
         if not ranked:
             return RelocFix.abstained(
                 "retrieval returned no admissible reference",
                 (time.perf_counter() - started) * 1000.0,
             )
 
+        base = ranked[:self.top_k]
+        from river_map_quality.official_edm_adapter import prepare_official_megadepth_image_from_array
+
+        prepared = prepare_official_megadepth_image_from_array(image, self._matcher_runtime())
+        fix = self._solve_references(image, prepared, base, started, viewpoint_pool_fallback)
+        self.last_stage_ms["matched_references"] = float(len(base))
+        # Preserve every strong baseline decision. Expansion only rescues failures,
+        # and only while this attempt still has budget within its normal period.
+        if (
+            not fix.ok and self.profile.optimizations.adaptive_retrieval
+            and time.perf_counter() - started < self.profile.reloc.period_s
+        ):
+            extra = self._recovery_references(ranked)
+            if extra:
+                refs = base + extra
+                expanded = self._solve_references(image, prepared, refs, started, viewpoint_pool_fallback)
+                self.last_stage_ms["matched_references"] = float(len(refs))
+                if expanded.ok:
+                    fix = expanded
+                    base = refs
+        if fix.ok:
+            self._last_strong_refs = base
+        else:
+            self._last_strong_refs = ()
+        return replace(
+            fix, runtime_ms=(time.perf_counter() - started) * 1000.0,
+            stage_ms=dict(self.last_stage_ms),
+        )
+
+    def _solve_references(self, image, prepared, ranked, started, viewpoint_pool_fallback):
         self.last_retrieval_source = "boq"
         self.last_n_transferred = 0
         self.last_track_anchor = None
@@ -378,11 +486,13 @@ class LiveMapEDMProvider(FinalMapEDMProvider):
 
         query_path = Path(self._queries[_PLACEHOLDER_QUERY_ID]["image_path"])
         match_started = time.perf_counter()
-        lifted, raw_matches = self._match_and_lift(query_path, ranked, query_image=image)
+        lifted, raw_matches = self._match_and_lift(query_path, ranked, query_image=image, prepared_query=prepared)
         runtime_edm = time.perf_counter() - match_started
         pnp_started = time.perf_counter()
         solved, metrics, decision_status = self._solve(query_path, lifted, query_image=image)
         runtime_pnp = time.perf_counter() - pnp_started
+        self.last_stage_ms["match_lift_ms"] = self.last_stage_ms.get("match_lift_ms", 0.0) + runtime_edm * 1000.0
+        self.last_stage_ms["reloc_pnp_ms"] = self.last_stage_ms.get("reloc_pnp_ms", 0.0) + runtime_pnp * 1000.0
         result = self._pack_query_result(
             query=EDMQuery(
                 query_id=_PLACEHOLDER_QUERY_ID,
@@ -450,6 +560,8 @@ class LiveMapEDMProvider(FinalMapEDMProvider):
         """Release both GPU runtimes."""
 
         self._matcher = None
+        self._gpu_matcher = None
+        self._query_matches.clear()
         self._vpr_runtime = None
         self._models_ready = False
         self._empty_cuda_cache()

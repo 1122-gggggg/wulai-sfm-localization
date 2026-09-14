@@ -225,3 +225,47 @@ def test_tick_profile_is_absent_rather_than_wrong_when_nothing_was_logged() -> N
     summary = summarize_tick_profile([])
     assert summary["ticks"] == 0
     assert summary["worst"] is None
+
+
+def test_flown_session_reports_converged_map_scale(tmp_path) -> None:
+    # Metric circle radius 8 m at 10 Hz + visual poses at 1/2 scale.
+    telemetry = []
+    for index in range(1000):
+        t = 1000.0 + index * 0.1
+        angle = 2.0 * math.pi * (t - 1000.0) / 40.0
+        telemetry.append(
+            {
+                "event": "fused_odometry",
+                "t_mono_ns": int(t * 1e9),
+                "speed_north_mps": -8.0 * math.sin(angle) * 2.0 * math.pi / 40.0,
+                "speed_east_mps": 8.0 * math.cos(angle) * 2.0 * math.pi / 40.0,
+                "speed_down_mps": 0.0,
+                "att_roll": 0.02,
+                "att_pitch": -0.03,
+                "att_yaw": angle,
+            }
+        )
+    localization = []
+    for index in range(2400):
+        t = 1000.0 + index / 24.0
+        angle = 2.0 * math.pi * (t - 1000.0) / 40.0
+        localization.append(
+            {
+                "event": "pose_result",
+                "t_mono": t,
+                "ui_arrival_mono": t,
+                "success": True,
+                "pose": {
+                    "x": 4.0 * (math.cos(angle) - 1.0),
+                    "y": 4.0 * math.sin(angle),
+                    "z": 0.0,
+                },
+            }
+        )
+    session = _write_session(tmp_path, telemetry, localization, frames=0)
+    built = report.build_report(session)
+    scale = built["map_scale"]
+    assert scale["available"] is True
+    assert scale["converged"] is True, scale["reason"]
+    assert scale["scale_m_per_unit"] == pytest.approx(2.0, rel=0.05)
+    assert "地圖尺度" in report.render(built)

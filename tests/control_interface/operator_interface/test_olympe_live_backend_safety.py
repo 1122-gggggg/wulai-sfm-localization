@@ -96,6 +96,7 @@ class _FakeDrone:
             "MaxTilt": True,
             "MaxVerticalSpeed": True,
             "MaxRotationSpeed": True,
+            "MaxPitchRollRotationSpeed": True,
         }
         self.apply_setting = True
         self.setting_states = {
@@ -105,6 +106,9 @@ class _FakeDrone:
             "MaxTiltChanged": {"current": 10.0, "min": 1.0, "max": 40.0},
             "MaxVerticalSpeedChanged": {"current": 0.5, "min": 0.1, "max": 4.0},
             "MaxRotationSpeedChanged": {"current": 10.0, "min": 3.0, "max": 200.0},
+            "MaxPitchRollRotationSpeedChanged": {
+                "current": 200.0, "min": 40.0, "max": 300.0,
+            },
         }
         self.landing_success = True
         self.takeoff_success = True
@@ -155,7 +159,8 @@ class _FakeDrone:
 
             return _Expectation(self.source_ack, confirm_source)
         if first.name in {"MaxAltitude", "MaxDistance", "NoFlyOverMaxDistance",
-                          "MaxTilt", "MaxVerticalSpeed", "MaxRotationSpeed"}:
+                          "MaxTilt", "MaxVerticalSpeed", "MaxRotationSpeed",
+                          "MaxPitchRollRotationSpeed"}:
             state_name = first.name + "Changed"
             field = {
                 "MaxAltitude": "current",
@@ -164,6 +169,7 @@ class _FakeDrone:
                 "MaxTilt": "current",
                 "MaxVerticalSpeed": "current",
                 "MaxRotationSpeed": "current",
+                "MaxPitchRollRotationSpeed": "current",
             }[first.name]
             argument = {
                 "MaxAltitude": "current",
@@ -172,6 +178,7 @@ class _FakeDrone:
                 "MaxTilt": "current",
                 "MaxVerticalSpeed": "current",
                 "MaxRotationSpeed": "current",
+                "MaxPitchRollRotationSpeed": "current",
             }[first.name]
             ok = self.setting_ack[first.name]
 
@@ -542,6 +549,9 @@ def _install_fake_olympe(monkeypatch: pytest.MonkeyPatch) -> None:
         "olympe.messages.ardrone3.SpeedSettings": {
             "MaxVerticalSpeed": _message_factory("MaxVerticalSpeed"),
             "MaxRotationSpeed": _message_factory("MaxRotationSpeed"),
+            "MaxPitchRollRotationSpeed": _message_factory(
+                "MaxPitchRollRotationSpeed"
+            ),
         },
         "olympe.messages.ardrone3.PilotingSettingsState": {
             name: _message_factory(name) for name in (
@@ -554,6 +564,9 @@ def _install_fake_olympe(monkeypatch: pytest.MonkeyPatch) -> None:
         "olympe.messages.ardrone3.SpeedSettingsState": {
             "MaxVerticalSpeedChanged": _message_factory("MaxVerticalSpeedChanged"),
             "MaxRotationSpeedChanged": _message_factory("MaxRotationSpeedChanged"),
+            "MaxPitchRollRotationSpeedChanged": _message_factory(
+                "MaxPitchRollRotationSpeedChanged"
+            ),
         },
         "olympe.messages.ardrone3.GPSSettingsState": {
             "GPSFixStateChanged": _message_factory("GPSFixStateChanged"),
@@ -755,6 +768,23 @@ def test_inventory_reads_and_logs_actual_connected_hardware(make_backend):
     assert backend.state.home_valid is True
     assert backend.state.rth_policy_valid is True
     assert any(event == "hardware_inventory" for event, _ in backend.log.records)
+
+
+@pytest.mark.parametrize("axes, flag", [
+    ((0, 0, 50, 2), 0),
+    ((0, 0, -50, -2), 0),
+    ((0, 0, 0, 0), 0),
+    ((1, 0, 0, 0), 1),
+    ((0, -3, 0, 2), 1),
+])
+def test_zero_horizontal_pcmd_uses_sdk_hover_flag(make_backend, axes, flag):
+    # 18:03 flight: [0, 0, 50, gaz] still moved horizontally. Match Olympe
+    # ControllerBase._send_piloting_command, including yaw-only/vertical-only.
+    backend = make_backend()
+    backend.pilot_sticks = False
+    assert backend.send_pcmd(*axes, reason="desktop_auto_route")
+    assert backend.drone.pcmds[-1] == (flag, *axes, 0)
+    assert backend.log.records[-1][1]["pcmd_flag"] == flag
 
 
 def test_real_backend_typed_session_start_is_not_shadowed(make_backend):
@@ -1068,11 +1098,12 @@ def test_firmware_limits_write_only_when_landed_and_confirm_readback(make_backen
     backend.drone.flight_state = "landed"
     assert backend._configure_firmware_limits_if_safe()
 
-    # The speed envelope (tilt / vertical / rotation) is pinned and read back too:
-    # every operator command is a percentage of those three.
-    assert backend.drone.events[-6:] == [
+    # The speed envelope (tilt / vertical / rotation / pitch-roll rotation) is
+    # pinned and read back too: every operator command is a percentage of those.
+    assert backend.drone.events[-7:] == [
         "MaxAltitude", "MaxDistance", "MaxTilt",
-        "MaxVerticalSpeed", "MaxRotationSpeed", "NoFlyOverMaxDistance",
+        "MaxVerticalSpeed", "MaxRotationSpeed", "MaxPitchRollRotationSpeed",
+        "NoFlyOverMaxDistance",
     ]
     assert backend.state.max_altitude_m == pytest.approx(20.0)
     assert backend.state.max_distance_m == pytest.approx(80.0)
@@ -1100,9 +1131,10 @@ def test_ui_firmware_limit_apply_updates_desired_values_and_readback(make_backen
     assert backend.state.max_altitude_m == pytest.approx(30.0)
     assert backend.state.max_distance_m == pytest.approx(100.0)
     assert backend.state.distance_geofence_enabled is True
-    assert backend.drone.events[-6:] == [
+    assert backend.drone.events[-7:] == [
         "MaxAltitude", "MaxDistance", "MaxTilt",
-        "MaxVerticalSpeed", "MaxRotationSpeed", "NoFlyOverMaxDistance",
+        "MaxVerticalSpeed", "MaxRotationSpeed", "MaxPitchRollRotationSpeed",
+        "NoFlyOverMaxDistance",
     ]
 
 
@@ -1318,6 +1350,8 @@ def test_geofence_readback_mismatch_is_fail_closed(make_backend):
         backend_module.DEFAULT_MAX_VERTICAL_SPEED_MS)
     states["MaxRotationSpeedChanged"]["current"] = (
         backend_module.DEFAULT_MAX_ROTATION_SPEED_DEGS)
+    states["MaxPitchRollRotationSpeedChanged"]["current"] = (
+        backend_module.DEFAULT_MAX_PITCH_ROLL_ROTATION_SPEED_DEGS)
     backend.drone.apply_setting = False
 
     assert not backend._configure_firmware_limits_if_safe()
@@ -1333,6 +1367,8 @@ def test_poll_displays_all_current_firmware_readbacks(make_backend):
     backend.drone.setting_states["MaxTiltChanged"]["current"] = 12.0
     backend.drone.setting_states["MaxVerticalSpeedChanged"]["current"] = 0.7
     backend.drone.setting_states["MaxRotationSpeedChanged"]["current"] = 15.0
+    backend.drone.setting_states[
+        "MaxPitchRollRotationSpeedChanged"]["current"] = 55.0
 
     state = backend.poll()
 
@@ -1342,6 +1378,7 @@ def test_poll_displays_all_current_firmware_readbacks(make_backend):
     assert state.max_tilt_deg == pytest.approx(12.0)
     assert state.max_vertical_speed_mps == pytest.approx(0.7)
     assert state.max_rotation_speed_dps == pytest.approx(15.0)
+    assert state.max_pitch_roll_rotation_speed_dps == pytest.approx(55.0)
     assert state.airspeed_mps == pytest.approx(0.3)
     assert state.ground_speed_mps == pytest.approx(0.3)
     assert state.speed_north_mps == pytest.approx(0.18)
@@ -1387,6 +1424,35 @@ def test_poll_does_not_refresh_speed_age_without_a_new_olympe_event(
     backend.poll(now_mono_ns=first_ns + 2_000_000_000)
 
     assert backend.state.ground_speed_mono_ns > first_stamp
+
+
+def test_poll_does_not_refresh_attitude_age_without_a_new_event(make_backend):
+    backend = make_backend()
+    first_ns = time.monotonic_ns()
+    backend.poll(now_mono_ns=first_ns)
+    original = backend.state.attitude_mono_ns
+    backend._last_telemetry_t = 0.0
+    backend.poll(now_mono_ns=first_ns + 1_000_000_000)
+    assert backend.state.attitude_mono_ns == original
+    backend.drone.event_markers["AttitudeChanged"] = 2
+    backend._last_telemetry_t = 0.0
+    backend.poll(now_mono_ns=first_ns + 2_000_000_000)
+    assert backend.state.attitude_mono_ns > original
+
+
+def test_every_sdk_dispatch_is_deferred_without_changing_the_command(make_backend):
+    backend = make_backend()
+    recorder = Mock()
+    backend.session_logs = SimpleNamespace(defer_telemetry=recorder)
+    stamp = backend._raw_pcmd(2, -3, 40, 10)
+    assert stamp is not None
+    event, = recorder.call_args.args
+    assert event == "pcmd_dispatch"
+    assert recorder.call_args.kwargs["pcmd"] == [2, -3, 40, 10]
+    assert recorder.call_args.kwargs["command_mono_ns"] == stamp
+    assert recorder.call_args.kwargs["flag"] == 1
+    backend._raw_pcmd(0, 0, 40, 10)
+    assert recorder.call_args.kwargs["flag"] == 0
 
 
 def test_future_telemetry_event_does_not_replace_last_valid_state(make_backend):
@@ -2263,9 +2329,12 @@ def test_distance_geofence_reports_itself_inactive_without_gps(make_backend):
 
 
 def test_speed_envelope_is_pinned_and_read_back_not_inherited(make_backend):
-    """MaxTilt / MaxVerticalSpeed / MaxRotationSpeed decide how fast every operator
-    command actually moves the aircraft. They used to be READ but never WRITTEN, so
-    the real speed was whatever the last FreeFlight session left behind."""
+    """MaxTilt / MaxVerticalSpeed / MaxRotationSpeed / MaxPitchRollRotationSpeed
+    decide how fast every operator command actually moves the aircraft. They used
+    to be READ but never WRITTEN, so the real speed was whatever the last
+    FreeFlight session left behind. MaxPitchRollRotationSpeed was still inherited
+    after the other three were pinned, and a measured flight reached 154 deg/s of
+    roll rate through it (operator decision 2026-09-12)."""
     backend = make_backend(max_altitude_m=10.0, max_distance_m=50.0)
     backend.drone.flight_state = "landed"
     # Aircraft arrives with a completely different (much faster) envelope.
@@ -2273,6 +2342,7 @@ def test_speed_envelope_is_pinned_and_read_back_not_inherited(make_backend):
     states["MaxTiltChanged"]["current"] = 40.0
     states["MaxVerticalSpeedChanged"]["current"] = 4.0
     states["MaxRotationSpeedChanged"]["current"] = 200.0
+    states["MaxPitchRollRotationSpeedChanged"]["current"] = 300.0
 
     assert backend._configure_firmware_limits_if_safe()
 
@@ -2282,6 +2352,8 @@ def test_speed_envelope_is_pinned_and_read_back_not_inherited(make_backend):
         backend_module.DEFAULT_MAX_VERTICAL_SPEED_MS)
     assert states["MaxRotationSpeedChanged"]["current"] == pytest.approx(
         backend_module.DEFAULT_MAX_ROTATION_SPEED_DEGS)
+    assert states["MaxPitchRollRotationSpeedChanged"]["current"] == pytest.approx(
+        backend_module.DEFAULT_MAX_PITCH_ROLL_ROTATION_SPEED_DEGS)
     assert any(
         event == "firmware_limits" and fields.get("ok")
         and fields.get("max_tilt_deg") == pytest.approx(
@@ -2306,6 +2378,8 @@ def test_speed_envelope_readback_mismatch_is_fail_closed(make_backend):
     ("max_tilt_deg", float("nan")),
     ("max_vertical_speed_ms", -1.0),
     ("max_rotation_speed_degs", 0.0),
+    ("max_pitch_roll_rotation_speed_degs", 0.0),
+    ("max_pitch_roll_rotation_speed_degs", float("nan")),
 ])
 def test_invalid_speed_envelope_is_rejected(make_backend, field, bad):
     backend = make_backend(max_altitude_m=10.0, max_distance_m=50.0)
@@ -2314,6 +2388,9 @@ def test_invalid_speed_envelope_is_rejected(make_backend, field, bad):
         "max_tilt_deg": "desired_max_tilt_deg",
         "max_vertical_speed_ms": "desired_max_vertical_speed_ms",
         "max_rotation_speed_degs": "desired_max_rotation_speed_degs",
+        "max_pitch_roll_rotation_speed_degs": (
+            "desired_max_pitch_roll_rotation_speed_degs"
+        ),
     }[field], bad)
 
     assert not backend._configure_firmware_limits_if_safe()
@@ -4534,3 +4611,44 @@ def test_rth_is_refused_when_the_climb_was_never_read_back(make_backend):
         event == "runtime_safety_rth_skipped" and "never read back" in fields["detail"]
         for event, fields in backend.log.records
     ), "RTH was skipped with no record of why"
+
+
+def test_link_recovery_releases_latch_into_manual_sticks(make_backend):
+    backend = make_backend()
+    backend.pilot_sticks = False
+    backend._link_was_ok = True
+    backend.drone.connected = False
+    base_ns = time.monotonic_ns()
+    for index in range(3):
+        backend.poll(base_ns + index * 200_000_000)
+    assert backend.state.active_incident == "control_link_lost"
+    assert backend.state.tracker_state == "LINK_LOST_ONBOARD"
+
+    backend.drone.connected = True
+    state = backend.poll(base_ns + 600_000_000)
+
+    assert state.link_status == "OK"
+    assert state.active_incident == ""
+    assert state.tracker_state == "STICKS"
+    assert state.control_owner == "SKYCONTROLLER"
+    assert state.mode == "MANUAL"
+    assert backend.pilot_sticks is True
+    assert any(event == "link_recovered" for event, _fields in backend.log.records)
+
+
+def test_link_recovery_leaves_newer_incident_alone(make_backend):
+    backend = make_backend()
+    backend.pilot_sticks = False
+    backend._link_was_ok = True
+    backend.drone.connected = False
+    base_ns = time.monotonic_ns()
+    for index in range(3):
+        backend.poll(base_ns + index * 200_000_000)
+    assert backend.state.active_incident == "control_link_lost"
+
+    backend.drone.connected = True
+    backend.state.active_incident = "something_newer"
+    backend.poll(base_ns + 600_000_000)
+
+    assert backend.state.active_incident == "something_newer"
+    assert not any(event == "link_recovered" for event, _fields in backend.log.records)

@@ -215,52 +215,6 @@ def test_map_detail_drops_while_interacting_and_settles_after(operator) -> None:
     assert operator._map_dirty_key is None
 
 
-def test_sparse_cloud_guard_has_adjustable_center_preview(operator) -> None:
-    snapshot = operator.collision_guard_snapshot
-    assert snapshot["preview"] is True
-    assert snapshot["center"] == pytest.approx(operator.default_map_center)
-    assert operator.collision_guard_radius_min == pytest.approx(0.0)
-    assert operator.collision_guard_radius_max == pytest.approx(0.06)
-    assert operator.collision_guard_scale.cget("from") == pytest.approx(
-        operator.collision_guard_radius_min
-    )
-    assert operator.collision_guard_scale.cget("to") == pytest.approx(
-        operator.collision_guard_radius_max
-    )
-    assert "中心預覽" in operator.collision_guard_status_var.get()
-
-    image = operator.render_map(400, 300, operator.backend.poll())
-    center_x, center_y = operator.project_world(
-        operator.default_map_center, 400, 300
-    )
-    assert image.getpixel((center_x, center_y)) == (0, 212, 255)
-
-    requested = 0.03
-    operator._on_collision_guard_radius_change(requested)
-    assert operator.collision_guard_radius == pytest.approx(requested)
-    assert operator.collision_guard_snapshot["radius"] == pytest.approx(requested)
-
-    operator._on_collision_guard_radius_change(0.5)
-    assert operator.collision_guard_radius == pytest.approx(0.06)
-    operator._on_collision_guard_radius_change(-0.5)
-    assert operator.collision_guard_radius == pytest.approx(0.0)
-
-
-def test_sparse_cloud_guard_state_is_part_of_the_map_dirty_key(operator) -> None:
-    state = operator.backend.poll()
-    before = operator_tick._map_dirty_key(
-        operator, state, width=400, height=300
-    )
-    operator.collision_guard_snapshot = {
-        **operator.collision_guard_snapshot,
-        "status": "COLLISION",
-    }
-    after = operator_tick._map_dirty_key(
-        operator, state, width=400, height=300
-    )
-    assert after != before
-
-
 def test_incident_banner_only_occupies_a_row_when_something_is_wrong(operator) -> None:
     """2026-08-03 operator decision: no idle 「安全狀態：正常」 row.
 
@@ -499,45 +453,6 @@ def test_magnetometer_axis_diagram_draws_and_clears(operator) -> None:
     assert not any("現在請轉" in t for t in texts), "stale rotation still shown"
 
 
-def test_gravity_phase_diagram_uses_the_active_motion_and_clears(operator) -> None:
-    """The passive attitude check must show the requested axis motion, not stale art."""
-    canvas = operator.gravity_phase_canvas
-
-    operator._draw_gravity_phase(None)
-    assert canvas.find_withtag("gravity-phase-ready")
-
-    for phase in app.PHASES:
-        operator._draw_gravity_phase(phase)
-        operator.update_idletasks()
-        assert canvas.find_withtag(f"gravity-phase-{phase}"), phase
-        assert canvas.find_withtag(f"motion-{phase}"), phase
-        assert "arc" in {canvas.type(item) for item in canvas.find_all()}
-
-    operator._draw_gravity_phase(None)
-    assert canvas.find_withtag("gravity-phase-ready")
-    assert not canvas.find_withtag("motion-yaw")
-    assert not canvas.find_withtag("motion-pitch")
-    assert not canvas.find_withtag("motion-roll")
-
-
-def test_gravity_uses_one_progress_bar_and_relabels_it_for_the_active_phase(
-    operator,
-) -> None:
-    bars = [
-        child
-        for child in operator.gravity_progress_panel.winfo_children()
-        if isinstance(child, ttk.Progressbar)
-    ]
-    assert bars == [operator.gravity_progress_bar]
-
-    operator.gravity_start()
-    assert operator.gravity_progress_phase_var.get().startswith("1/3 水平旋轉")
-
-    operator.gravity_cal.begin_phase("pitch")
-    operator._refresh_gravity_controls()
-    assert operator.gravity_progress_phase_var.get().startswith("2/3 前後俯仰")
-
-
 def test_virtual_stick_drag_clamps_to_the_circle_and_self_centres(operator) -> None:
     """The knob is a circle: a corner drag must not exceed unit magnitude."""
     import types
@@ -602,7 +517,7 @@ def test_no_control_tab_is_clipped_by_the_fixed_control_pane(operator) -> None:
                     )
 
 
-def test_calibration_results_and_each_gravity_phase_fit_the_control_pane(operator) -> None:
+def test_firmware_calibration_results_fit_the_control_pane(operator) -> None:
     notebook = operator.controls_notebook
     pane = notebook.master
     calibration_tab = operator._preflight_tabs["compass"]
@@ -623,63 +538,27 @@ def test_calibration_results_and_each_gravity_phase_fit_the_control_pane(operato
         _window_geometry(app.UI_MIN_SIZE),
     ):
         operator.geometry(geometry)
-        for phase in app.PHASES:
-            operator.gravity_guide_var.set(
-                app.gravity_phase_guidance(phase, sample_count=15, span_deg=90.0)
-            )
-            operator._fit_control_pane()
-            operator.update_idletasks()
-            pane_bottom = pane.winfo_rooty() + pane.winfo_height()
-            stack = [calibration_tab]
-            while stack:
-                parent = stack.pop()
-                children = parent.winfo_children()
-                stack.extend(children)
-                for child in children:
-                    if child.winfo_ismapped():
-                        bottom = child.winfo_rooty() + child.winfo_height()
-                        assert bottom <= pane_bottom, (
-                            f"{geometry} {phase}: gravity guide clips by "
-                            f"{bottom - pane_bottom}px"
-                        )
-
-
-def test_gravity_workflow_preserves_samples_and_gates_phase_advance(
-    operator, monkeypatch,
-) -> None:
-    operator.gravity_start()
-    assert operator.gravity_cal.phase == "yaw"
-    assert operator.gravity_phase_canvas.find_withtag("gravity-phase-yaw")
-    assert operator.gravity_next_button.instate(["disabled"])
-
-    operator.gravity_next()
-    assert operator.gravity_cal.phase == "yaw", "an incomplete phase must not advance"
-
-    for index in range(24):
-        operator.gravity_cal.add_sample(
-            roll=math.radians(7.0),
-            pitch=0.0,
-            yaw=index / 24.0 * math.tau,
-            t_mono=index * 0.05,
-        )
-    phase_result = operator.gravity_cal.analyze_phase("yaw")
-    assert phase_result.ok is False, "tilt must remain a final quality failure"
-    assert any("level tilt" in note for note in phase_result.notes)
-    operator._refresh_gravity_controls()
-    assert operator.gravity_next_button.instate(["!disabled"])
-    operator.gravity_next()
-    assert operator.gravity_cal.phase == "pitch"
-    assert operator.gravity_phase_canvas.find_withtag("gravity-phase-pitch")
-
-    count_before = len(operator.gravity_cal.samples)
-    monkeypatch.setattr(app.messagebox, "askyesno", lambda *_args, **_kwargs: False)
-    operator.gravity_start()
-    assert len(operator.gravity_cal.samples) == count_before
-    assert operator.gravity_cal.phase == "pitch"
+        operator._fit_control_pane()
+        operator.update_idletasks()
+        pane_bottom = pane.winfo_rooty() + pane.winfo_height()
+        stack = [calibration_tab]
+        while stack:
+            parent = stack.pop()
+            children = parent.winfo_children()
+            stack.extend(children)
+            for child in children:
+                if child.winfo_ismapped():
+                    bottom = child.winfo_rooty() + child.winfo_height()
+                    assert bottom <= pane_bottom, (
+                        f"{geometry}: compass panel clips by "
+                        f"{bottom - pane_bottom}px"
+                    )
 
 
 def test_yaw_gravity_check_accepts_stable_real_airframe_offset() -> None:
-    calibrator = app.GravityCalibrator()
+    from gravity_calibration import GravityCalibrator
+
+    calibrator = GravityCalibrator()
     calibrator.start()
     for index in range(24):
         calibrator.add_sample(

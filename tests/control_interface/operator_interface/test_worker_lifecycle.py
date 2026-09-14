@@ -163,8 +163,7 @@ def test_autonomy_pose_rejects_source_pose_older_than_half_second(monkeypatch) -
     operator = SimpleNamespace(
         live_locked=True,
         loc_health="OK",
-        loc_pose_updated_mono=99.0,
-        live_pose=np.array([1.0, 2.0, 3.0, 0.0], dtype=float),
+        _autonomy_pose_snapshot=(1.0, 2.0, 3.0, 0.0, 99.0),
     )
 
     assert app.OperatorApp._autonomy_pose(operator) is None
@@ -176,11 +175,8 @@ def test_autonomy_pose_uses_raw_camera_center_and_6dof_heading(monkeypatch) -> N
     operator = SimpleNamespace(
         live_locked=True,
         loc_health="OK",
-        loc_pose_updated_mono=99.8,
-        live_pose=np.array([1.0, 2.0, 3.0, np.nan], dtype=float),
-        camera_forward_world=np.array([0.0, 0.0, 1.0]),
-        _autonomy_map_frame=app.LEGACY_MAP_FRAME,
-        backend=SimpleNamespace(is_live=True),
+        _autonomy_pose_snapshot=(1.0, 2.0, 3.0, math.pi / 2.0, 99.8),
+        live_result={"pose": [9.0, 9.0, 9.0]},
     )
 
     pose = app.OperatorApp._autonomy_pose(operator)
@@ -196,7 +192,7 @@ def test_autonomy_pose_rejects_camera_looking_nearly_vertical(monkeypatch) -> No
     operator = SimpleNamespace(
         live_locked=True,
         loc_health="OK",
-        loc_pose_updated_mono=99.8,
+        _autonomy_pose_snapshot=None,
         live_pose=np.array([1.0, 2.0, 3.0, 0.0], dtype=float),
         camera_forward_world=np.array([0.0, -1.0, 0.01]),
         _autonomy_map_frame=app.LEGACY_MAP_FRAME,
@@ -214,7 +210,7 @@ def test_autonomy_pose_requires_same_frame_orientation_even_when_not_live(
         operator = SimpleNamespace(
             live_locked=True,
             loc_health="OK",
-            loc_pose_updated_mono=99.8,
+            _autonomy_pose_snapshot=None,
             live_pose=np.array([1.0, 2.0, 3.0, 0.0], dtype=float),
             camera_forward_world=None,
             _autonomy_map_frame=app.LEGACY_MAP_FRAME,
@@ -258,7 +254,12 @@ def test_autonomy_pose_rejects_invalid_current_orientation_then_recovers(
         camera_axes_world=np.eye(3),
         _integrated_auto_map_frame=app.LEGACY_MAP_FRAME,
         _autonomy_map_frame=app.LEGACY_MAP_FRAME,
+        _autonomy_pose_snapshot=None,
         live_heading=0.5,
+        loc_bridge_run=0,
+        live_result_frame_name="",
+        boot_holding=lambda: False,
+        write_log=lambda *_a, **_k: None,
     )
 
     for result in (
@@ -274,9 +275,12 @@ def test_autonomy_pose_rejects_invalid_current_orientation_then_recovers(
         assert app.OperatorApp._autonomy_pose(operator) is None
 
     new_forward = np.array([1.0, 0.0, 0.0], dtype=float)
-    app.OperatorApp._update_live_camera_orientation(
+    operator_tick._accept_live_pose(
         operator,
-        {"camera_forward_world": new_forward.tolist()},
+        {
+            "camera_forward_world": new_forward.tolist(),
+            "source_frame_stamp_mono": 99.8,
+        },
         np.array([1.1, 2.0, 3.0], dtype=float),
     )
 
@@ -288,6 +292,45 @@ def test_autonomy_pose_rejects_invalid_current_orientation_then_recovers(
     )
     assert expected_heading is not None
     assert pose.yaw == pytest.approx(expected_heading)
+    assert (pose.x, pose.y, pose.z) == pytest.approx((1.1, 2.0, 3.0))
+
+
+def test_autonomy_pose_ignores_unaccepted_jump_candidate(monkeypatch) -> None:
+    monkeypatch.setattr(app.time, "monotonic", lambda: 100.0)
+    operator = SimpleNamespace(
+        live_locked=True,
+        loc_health="OK",
+        live_last_xyz=np.array([0.0, 0.0, 0.0], dtype=float),
+        live_pose=np.array([0.0, 0.0, 0.0, 0.0], dtype=float),
+        live_heading=0.0,
+        live_result={"pose": [2.0, 0.0, 0.0], "success": True},
+        camera_forward_world=np.array([1.0, 0.0, 0.0], dtype=float),
+        camera_axes_world=np.eye(3),
+        _integrated_auto_map_frame=app.LEGACY_MAP_FRAME,
+        _autonomy_map_frame=app.LEGACY_MAP_FRAME,
+        _autonomy_pose_snapshot=None,
+        loc_bridge_run=0,
+        live_result_frame_name="",
+        boot_holding=lambda: False,
+        write_log=lambda *_a, **_k: None,
+    )
+
+    assert app.OperatorApp._autonomy_pose(operator) is None
+
+    accepted = np.array([0.25, 0.0, 0.0], dtype=float)
+    for xyz in (np.array([0.20, 0.0, 0.0], dtype=float), accepted):
+        operator_tick._accept_live_pose(
+            operator,
+            {
+                "camera_forward_world": [1.0, 0.0, 0.0],
+                "source_frame_stamp_mono": 99.8,
+            },
+            xyz,
+        )
+    pose = app.OperatorApp._autonomy_pose(operator)
+    assert pose is not None
+    assert (pose.x, pose.y, pose.z) == pytest.approx((0.25, 0.0, 0.0))
+    assert pose.x != pytest.approx(2.0)
 
 
 def test_state_from_replay_clears_camera_orientation_when_row_lacks_it(
@@ -1486,25 +1529,6 @@ def test_empty_result_poll_preserves_pose_until_render_tick() -> None:
     assert operator.live_new_pose is True
 
 
-def test_localization_result_poll_reschedules_independently() -> None:
-    calls = []
-
-    class FakeOperator:
-        _loc_result_poll_ms = 5
-        poll_localization_results = app.OperatorApp.poll_localization_results
-
-        def update_live_results(self) -> None:
-            calls.append("poll")
-
-        def after(self, delay, callback) -> None:
-            calls.append((delay, callback))
-
-    operator = FakeOperator()
-    operator.poll_localization_results()
-    assert calls[0] == "poll"
-    assert calls[1] == (5, operator.poll_localization_results)
-
-
 def test_localization_result_poll_logs_failure_and_reschedules_in_finally() -> None:
     logs = []
     scheduled = []
@@ -1578,9 +1602,6 @@ def test_tick_stage_failure_is_logged_paused_and_rescheduled_once(monkeypatch) -
 
         def _is_live_backend(self):
             return False
-
-        def _gravity_tick(self, _state):
-            return None
 
         def update_boot_lock(self):
             return None
@@ -3264,7 +3285,7 @@ sys.stdin.buffer.read()
     assert oom_rows[0]["oom_transition"] is True
 
 
-def test_worker_loop_ignores_fused_telemetry_for_direct_backend(monkeypatch) -> None:
+def test_worker_loop_forwards_fused_telemetry_to_the_tracker(monkeypatch) -> None:
     observed = []
 
     class FakeTracker:
@@ -3279,7 +3300,7 @@ def test_worker_loop_ignores_fused_telemetry_for_direct_backend(monkeypatch) -> 
         )
 
         def observe_fused_state(self, sample) -> None:
-            observed.append(sample.timestamp)
+            observed.append(sample)
 
         def localize_frame(self, frame, *, capture_stamp=None):
             return SimpleNamespace(x=1.0, y=2.0, z=3.0, yaw=0.4)
@@ -3326,9 +3347,13 @@ def test_worker_loop_ignores_fused_telemetry_for_direct_backend(monkeypatch) -> 
         lambda *_args, **_kwargs: None,
     )
     payload = json.loads(output.getvalue())
-    # Direct-backend semantics: fused telemetry is decoded but the worker does
-    # not feed it to the tracker.
-    assert observed == []
+    # The fused sample decoded from this frame's header reaches the tracker,
+    # which decides (yaw bridge or nothing) -- the worker never interprets it.
+    assert len(observed) == 1
+    assert observed[0].stamp == pytest.approx(fused_stamp)
+    assert (observed[0].roll, observed[0].pitch, observed[0].yaw) == pytest.approx(
+        (0.1, 0.0, 0.2)
+    )
     assert payload["success"] is True
 
 
@@ -3400,3 +3425,24 @@ def test_live_heading_falls_back_to_travel_only_without_a_camera_axis() -> None:
     )
 
     assert operator.live_heading == pytest.approx(0.0)
+
+
+def test_autonomy_pose_gates_weak_snapshot_on_opt_in_flag(monkeypatch) -> None:
+    monkeypatch.setattr(app.time, "monotonic", lambda: 100.0)
+    base = dict(
+        live_locked=True,
+        loc_health="LOW",
+        _autonomy_pose_snapshot=(1.0, 2.0, 3.0, 0.0, 99.8),
+    )
+
+    assert app.OperatorApp._autonomy_pose(SimpleNamespace(**base)) is None
+
+    opted_in = SimpleNamespace(
+        _integrated_autonomy=SimpleNamespace(accept_weak_poses=True),
+        **base,
+    )
+    pose = app.OperatorApp._autonomy_pose(opted_in)
+    assert pose is not None
+    assert (pose.x, pose.y, pose.z, pose.yaw, pose.stamp) == pytest.approx(
+        (1.0, 2.0, 3.0, 0.0, 99.8)
+    )

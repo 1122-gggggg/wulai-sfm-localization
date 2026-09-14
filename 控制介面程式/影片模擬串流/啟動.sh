@@ -177,15 +177,8 @@ if [[ $# -gt 0 && "${1:-}" != -* ]]; then
   shift
 fi
 EXTRA+=("$@")
-for arg in "${EXTRA[@]}"; do
-  case "$arg" in
-    --live|--interface|--interface=*|--video|--video=*|--site-profile|--site-profile=*)
-      echo "[影片模擬串流] 拒絕跨接口參數: $arg" >&2
-      echo "[影片模擬串流] 此入口固定為 simulated-stream，不會連接實機" >&2
-      exit 2
-      ;;
-  esac
-done
+source "$OI/start_anafi_live.sh"
+enforce_stream_interface_exclusion sim "[影片模擬串流]" "${EXTRA[@]}"
 if [[ "${#EXTRA[@]}" -gt 0 ]]; then
   echo "[影片模擬串流] portable 入口不接受額外 flight_operator_app 參數" >&2
   echo "[影片模擬串流] 請使用已驗證的選擇介面與啟動器環境變數" >&2

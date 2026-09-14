@@ -15,32 +15,9 @@ export LOCAL_TOPK="${LOCAL_TOPK:-0}"
 export IP="${IP:-192.168.53.1}"
 export CTRL="${CTRL:-skycontroller3}"
 
-verify_portable_package() {
-  if [[ ! -f "$PACKAGE_ROOT/PORTABLE_PACKAGE.json" ]]; then
-    if [[ ! -d "$PACKAGE_ROOT/.git" ]]; then
-      echo "[真機串流] ERROR: non-Git runtime is missing PORTABLE_PACKAGE.json" >&2
-      exit 2
-    fi
-    return 0
-  fi
-  local verifier
-  verifier="$(command -v python3.10 || command -v python3 || true)"
-  if [[ -z "$verifier" ]]; then
-    echo "[真機串流] ERROR: no Python interpreter available for portable manifest verification" >&2
-    exit 2
-  fi
-  if [[ ! -f "$PACKAGE_ROOT/tools/package_manifest.py" ]]; then
-    echo "[真機串流] ERROR: portable package is missing tools/package_manifest.py" >&2
-    exit 2
-  fi
-  echo "[真機串流] verifying portable package manifest ..."
-  if ! "$verifier" "$PACKAGE_ROOT/tools/package_manifest.py" verify --root "$PACKAGE_ROOT"; then
-    echo "[真機串流] ERROR: portable package manifest verification failed" >&2
-    exit 1
-  fi
-}
-
-verify_portable_package
+source "$OI/start_anafi_live.sh"
+verify_portable_package "[真機串流]"
+enforce_stream_interface_exclusion real "[真機串流]" "$@"
 
 source "$OI/resolve_display.sh"
 configure_operator_display "${SFM_LAUNCH_DRY_RUN:-0}"

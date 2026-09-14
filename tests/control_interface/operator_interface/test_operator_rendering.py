@@ -34,7 +34,7 @@ class _RecordingDraw:
         self.texts.append((tuple(xy), text, kwargs))
 
 
-def test_video_hud_draws_black_text_directly_on_stream_without_bottom_panel() -> None:
+def test_video_hud_draws_plain_text_on_a_contrast_strip() -> None:
     draw = _RecordingDraw()
     state = SimpleNamespace(
         frame_age_ms=12.4,
@@ -61,6 +61,7 @@ def test_video_hud_draws_black_text_directly_on_stream_without_bottom_panel() ->
     assert link_ok is False
     assert draw.rectangles == [
         ((18, 18, 302, 222), {"outline": "#363c44", "width": 2}),
+        ((18, 180, 302, 222), {"fill": "#0b0c0e"}),
     ]
     assert [text for _, text, _ in draw.texts] == [
         "影像 30.0 FPS · 影格新鮮度 12 ms · 鏡頭 -20° / 1.0x",
@@ -68,9 +69,8 @@ def test_video_hud_draws_black_text_directly_on_stream_without_bottom_panel() ->
         "diagnostic two",
     ]
     assert [xy for xy, _, _ in draw.texts] == [(28, 185), (28, 202), (28, 219)]
-    assert all(kwargs["fill"] == "#000000" for _, _, kwargs in draw.texts)
-    assert all(kwargs["stroke_width"] == 1 for _, _, kwargs in draw.texts)
-    assert all(kwargs["stroke_fill"] == "#f4f4f4" for _, _, kwargs in draw.texts)
+    assert all(kwargs["fill"] == "#f4f4f4" for _, _, kwargs in draw.texts)
+    assert all("stroke_width" not in kwargs for _, _, kwargs in draw.texts)
 
 
 def _map_context(**overrides):
@@ -106,11 +106,6 @@ def _map_context(**overrides):
         # is seen edge-on: the honest 3D baseline.
         camera_axes=np.array([[0.0, 0.0, -1.0], [0.0, -1.0, 0.0], [1.0, 0.0, 0.0]]),
         camera_forward=None,
-        collision_center=None,
-        collision_radius=0.0,
-        collision_status="DISABLED",
-        collision_point=None,
-        collision_preview=False,
         transform_xyz=transform_xyz,
         project_world=project_world,
         route_color="#ff3ea5",
@@ -508,3 +503,39 @@ def test_yaw_picture_tilts_with_the_telemetry_gimbal_pitch() -> None:
     junk_basis = _camera_picture_basis(junk)
     assert junk_basis is not None
     assert np.allclose(junk_basis[2], horizontal, atol=1e-12)
+
+
+def test_weak_pose_source_kind_splits_klt_imu_other() -> None:
+    from operator_rendering import weak_pose_source_kind
+
+    assert weak_pose_source_kind({"candidate_mode": "klt_bridge"}) == "KLT"
+    assert weak_pose_source_kind({"candidate_mode": "klt_fast"}) == "KLT"
+    assert weak_pose_source_kind({"pose_status": "KLT_BRIDGED"}) == "KLT"
+    assert weak_pose_source_kind({"direct_status": "IMU_BRIDGE"}) == "IMU"
+    assert weak_pose_source_kind({"imu_bridge": True}) == "IMU"
+    assert weak_pose_source_kind({"direct_status": "VO_ONLY"}) == "OTHER"
+    assert weak_pose_source_kind({}) == "OTHER"
+    assert weak_pose_source_kind(None) == "OTHER"
+
+
+def test_weak_diamonds_take_kind_colors() -> None:
+    from operator_rendering import (
+        WEAK_KIND_COLOR,
+        WEAK_KIND_FALLBACK_COLOR,
+        _draw_route_and_history,
+    )
+
+    context = _map_context(
+        history_weak=[(0.0, 0.0, 0.0), (2.0, 0.0, 0.0), (4.0, 0.0, 0.0)],
+        history_weak_health=["DEGRADED", "DEGRADED", "DEGRADED"],
+        history_weak_kind=["KLT", "IMU", "OTHER"],
+    )
+    draw = _RecordingMapDraw()
+    _draw_route_and_history(draw, context)
+
+    outlines = [call[1]["outline"] for call in draw.polygons]
+    assert outlines == [
+        WEAK_KIND_COLOR["KLT"],
+        WEAK_KIND_COLOR["IMU"],
+        WEAK_KIND_FALLBACK_COLOR,
+    ]

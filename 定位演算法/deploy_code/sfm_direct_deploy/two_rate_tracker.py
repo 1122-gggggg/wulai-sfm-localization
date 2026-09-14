@@ -49,6 +49,8 @@ from typing import TYPE_CHECKING, Any
 import cv2
 import numpy as np
 
+from point_quality import pose_quality, spatial_indices
+
 if TYPE_CHECKING:  # pragma: no cover - typing only, keeps import graph light
     from direct_map import DirectMapAssets
     from direct_profile import DirectProfile
@@ -64,6 +66,20 @@ HANDOVER_MAX_FRAMES = 48
 
 #: Single-frame azimuth change above which a dead-reckoned step is halved.
 DEAD_RECKON_MAX_TURN_DEG = 5.0
+
+#: Inertial bridge (fused-attitude aiding) bounds. Level D only: the fused
+#: sample carries Euler angles, not gyro/accel, so the bridge rotates the last
+#: visual pose about the map up axis and holds its center -- it never invents
+#: translation. attitude ~8 Hz, frames ~30 Hz: 0.5 s covers a few missed polls.
+IMU_FUSED_HISTORY = 64
+IMU_BRIDGE_MAX_SAMPLE_AGE_S = 0.5
+#: Near-level flight only: the yaw axis is approximated by the map up axis.
+#: Log p95 roll/pitch rates hit 27/19 deg/s with peaks past 150 (2026-09-12),
+#: but sustained tilt past 35 deg means the approximation is dishonest.
+IMU_BRIDGE_MAX_TILT_DEG = 35.0
+#: Glitch gate: the airframe cannot sustain this yaw rate (MaxRotationSpeed
+#: caps at 200 deg/s and AUTO flies 10); a bigger implied rate is a bad sample.
+IMU_BRIDGE_MAX_YAW_RATE_DEG_S = 180.0
 
 
 def azimuth_turn_exceeds(
@@ -117,12 +133,15 @@ class KLTTracker:
         self.levels = int(levels)
         self.criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 20, 0.03)
         self._prev_gray: np.ndarray | None = None
+        self.last_diagnostics: dict = {}
 
     def set_frame(self, gray: np.ndarray) -> None:
         self._prev_gray = gray
+        self.last_diagnostics = {"klt_input_points": 0, "klt_kept_points": 0}
 
     def reset(self) -> None:
         self._prev_gray = None
+        self.last_diagnostics = {}
 
     def track_pair(
         self, prev_gray: np.ndarray, cur_gray: np.ndarray, xy: np.ndarray
@@ -133,6 +152,7 @@ class KLTTracker:
         previous = self._prev_gray
         self._prev_gray = gray
         if previous is None:
+            self.last_diagnostics = {"klt_input_points": len(xy), "klt_kept_points": 0}
             return xy, np.zeros(len(xy), dtype=bool)
         return self._lk(previous, gray, xy)
 
@@ -142,6 +162,7 @@ class KLTTracker:
     def _lk(
         self, previous: np.ndarray, current: np.ndarray, xy: np.ndarray
     ) -> tuple[np.ndarray, np.ndarray]:
+        self.last_diagnostics = {"klt_input_points": len(xy), "klt_kept_points": 0}
         if xy.size == 0:
             return xy, np.zeros(len(xy), dtype=bool)
         p0 = xy.astype(np.float32).reshape(-1, 1, 2)
@@ -149,16 +170,32 @@ class KLTTracker:
             previous, current, p0, None, winSize=(self.win, self.win),
             maxLevel=self.levels, criteria=self.criteria,
         )
+        if p1 is None or st is None:
+            return xy, np.zeros(len(xy), dtype=bool)
         p0b, stb, _ = cv2.calcOpticalFlowPyrLK(
             current, previous, p1, None, winSize=(self.win, self.win),
             maxLevel=self.levels, criteria=self.criteria,
         )
+        if p0b is None or stb is None:
+            return xy, np.zeros(len(xy), dtype=bool)
         fwd = p1.reshape(-1, 2)
         back = p0b.reshape(-1, 2)
         fb = np.linalg.norm(back - xy, axis=1)
         keep = (
             (st.reshape(-1) == 1) & (stb.reshape(-1) == 1)
             & np.isfinite(fwd).all(axis=1) & (fb <= self.fb_max_px)
+        )
+        valid_fb = fb[(st.reshape(-1) == 1) & (stb.reshape(-1) == 1) & np.isfinite(fb)]
+        self.last_diagnostics.update(
+            klt_forward_valid=int(np.count_nonzero(st)),
+            klt_backward_valid=int(np.count_nonzero(stb)),
+            klt_kept_points=int(np.count_nonzero(keep)),
+            klt_fb_p50_px=float(np.median(valid_fb)) if valid_fb.size else None,
+            klt_fb_p95_px=float(np.percentile(valid_fb, 95)) if valid_fb.size else None,
+        )
+        displacement = np.linalg.norm(fwd[keep] - xy[keep], axis=1)
+        self.last_diagnostics["klt_displacement_p50_px"] = (
+            float(np.median(displacement)) if displacement.size else None
         )
         return fwd, keep
 
@@ -223,6 +260,15 @@ class RelocWorker:
             return self._out.get_nowait()
         except queue.Empty:
             return None
+    def reset(self) -> None:
+        """Drop a queued-but-unstarted job and any undelivered fixes."""
+        with self._cv:
+            self._job = None
+            while True:
+                try:
+                    self._out.get_nowait()
+                except queue.Empty:
+                    break
 
     # ---------- worker thread ----------
     def _run(self) -> None:
@@ -342,6 +388,13 @@ class TwoRateTracker:
         estimation.ransac.min_num_trials = int(pnp.min_trials)
         estimation.ransac.max_num_trials = int(pnp.max_trials)
         estimation.ransac.confidence = float(pnp.confidence)
+        # Deterministic coverage: pycolmap defaults random_seed=-1
+        # (nondeterministic), which alone swings P173 coverage 3-4pp
+        # run-to-run. Vendor reloc (_solve via _estimate_pnp) already uses
+        # seed=0; the fast loop must match so paired A/B actually measures
+        # the change, not RNG noise. Not an accuracy knob (P174 ban unaffected).
+        estimation.ransac.random_seed = 0
+        cv2.setRNGSeed(0)
         refinement = pycolmap.AbsolutePoseRefinementOptions()
         refinement.max_num_iterations = int(pnp.refine_iters)
         self._pnp_estimation = estimation
@@ -371,12 +424,13 @@ class TwoRateTracker:
     def reset(self) -> None:
         """Drop every tracking prior. The map assets and models are untouched."""
         self._tracker.reset()
+        self._worker.reset()
         self._reset_tracking_state()
 
     def _reset_tracking_state(self) -> None:
-        self._live_xy = np.zeros((0, 2), dtype=float)
+        self._live_xy = np.zeros((0, 2), dtype=np.float64)
         self._live_ids = np.zeros((0,), dtype=np.int64)
-        self._live_xyz = np.zeros((0, 3), dtype=float)
+        self._live_xyz = np.zeros((0, 3), dtype=np.float64)
         self._vo_xy = np.zeros((0, 2), dtype=float)
         self._vo_seed_xy = np.zeros((0, 2), dtype=float)
         self._vo_bid = np.zeros((0,), dtype=np.int64)
@@ -389,33 +443,35 @@ class TwoRateTracker:
         self._last_pose: np.ndarray | None = None
         self._last_gray: np.ndarray | None = None
         self._last_pose_ordinal = -10**9
+        self._last_pose_stamp: float | None = None
+        self._last_visual_stamp: float | None = None
+        self._last_pose_status: str | None = None
         self._prev_center: np.ndarray | None = None
         self._step_history: list[float] = []
+        self._speed_history: list[float] = []
         self._dead_reckon_age = 0
         self._last_reloc_status: str | None = None
         self._last_reloc_ms: float | None = None
+        self._last_reloc_stages: dict = {}
+        self._last_map_stamp: float | None = None
         self._handover_dropped = 0
         # Cumulative DR-guard hits (hover rejects + yaw downweights). Internal
         # only: direct_localizer_adapter builds last_info from an explicit
         # key whitelist, so a new info-dict key would be silently dropped --
         # per spec the bool key is omitted and only this counter is kept.
         self._dead_reckon_guarded = 0
+        # Fused-attitude samples for the inertial bridge: (stamp, yaw, roll,
+        # pitch), host-monotonic seconds, yaw NED clockwise-from-north radians.
+        self._fused_yaw: deque = deque(maxlen=IMU_FUSED_HISTORY)
+        self._klt_diagnostics: dict = {}
+        self._previous_capture_stamp: float | None = None
+        self._last_observation_sample_stamp = float("-inf")
 
     # ---------- one frame ----------
-    def step(self, bgr_native: np.ndarray, capture_stamp: float) -> dict:
-        t0 = time.perf_counter()
-        self._ordinal += 1
-        ordinal = self._ordinal
-        stamp = float(capture_stamp)
-
-        frame = np.asarray(bgr_native)
-        if (frame.shape[1], frame.shape[0]) != (self._w, self._h):
-            frame = cv2.resize(frame, (self._w, self._h), interpolation=cv2.INTER_AREA)
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        self._ring.append((ordinal, gray))
-
-        # 1. fast loop: carry the live map-point set and the un-triangulated VO
-        #    candidates one frame forward in a single tracker call
+    def _step_fast_loop(
+        self, gray: np.ndarray
+    ) -> tuple[np.ndarray | None, np.ndarray | None, float]:
+        """Fast loop: carry live map points and un-triangulated VO candidates forward."""
         n_live = len(self._live_xy)
         combined = (
             np.concatenate([self._live_xy, self._vo_xy])
@@ -423,37 +479,468 @@ class TwoRateTracker:
             else self._live_xy
         )
         fwd_all, keep_all = self._tracker.track(gray, combined)
+        self._klt_diagnostics = dict(getattr(self._tracker, "last_diagnostics", {}))
         dr_prev = dr_curr = None
         if combined.size:
             ok_all = keep_all & self._inside(fwd_all)
+            self._klt_diagnostics["klt_inside_kept"] = int(np.count_nonzero(ok_all))
             inside, ok_vo = ok_all[:n_live], ok_all[n_live:]
             if self.profile.dead_reckon.enabled:
                 dr_prev = combined[ok_all]
                 dr_curr = fwd_all[ok_all]
-            self._live_xy = fwd_all[:n_live][inside]
+            self._live_xy = np.ascontiguousarray(fwd_all[:n_live][inside], dtype=np.float64)
             self._live_ids = self._live_ids[inside]
             self._live_xyz = self._live_xyz[inside]
             self._vo_xy = fwd_all[n_live:][ok_vo]
             self._vo_seed_xy = self._vo_seed_xy[ok_vo]
             self._vo_bid = self._vo_bid[ok_vo]
         t_track = time.perf_counter()
+        return dr_prev, dr_curr, t_track
 
-        # 2. worker handover: chain the anchor through the frames the worker
-        #    spent relocalizing, then REPLACE (strong) or MERGE (weak).
-        reseeded = False
-        handover_points = 0
+    def _step_handover(
+        self, gray: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, str | None, tuple[str, ...], Any]:
+        """Poll the worker and walk the fix to this frame without writing _live_*."""
+        empty_ids = np.zeros((0,), dtype=np.int64)
+        empty_xy = np.zeros((0, 2), dtype=np.float64)
+        empty_xyz = np.zeros((0, 3), dtype=np.float64)
         reloc_status: str | None = None
         reference_names: tuple[str, ...] = ()
         delivered = self._worker.poll()
-        if delivered is not None:
-            fix, trigger_ordinal = delivered
-            self._pending_ordinal = None
-            self._last_reloc_status = reloc_status = str(fix.status)
-            self._last_reloc_ms = float(fix.runtime_ms)
-            reference_names = tuple(str(name) for name in (fix.reference_names or ()))
-            handover_points, reseeded = self._apply_handover(fix, trigger_ordinal, gray)
+        if delivered is None:
+            return empty_ids, empty_xy, empty_xyz, reloc_status, reference_names, None
+        fix, trigger_ordinal = delivered
+        self._pending_ordinal = None
+        self._last_reloc_status = reloc_status = str(fix.status)
+        self._last_reloc_ms = float(fix.runtime_ms)
+        self._last_reloc_stages = dict(fix.stage_ms or {})
+        reference_names = tuple(str(name) for name in (fix.reference_names or ()))
+        ids, xy, xyz = self._walk_handover(fix, trigger_ordinal)
+        return ids, xy, xyz, reloc_status, reference_names, delivered
 
+    def _step_dead_reckon(
+        self,
+        gray: np.ndarray,
+        ordinal: int,
+        dr_prev: np.ndarray | None,
+        dr_curr: np.ndarray | None,
+        stamp: float,
+    ) -> tuple[np.ndarray | None, np.ndarray | None, str | None, int]:
+        dead = self.profile.dead_reckon
+        if not (
+            dead.enabled
+            and self._last_pose is not None
+            and self._last_gray is not None
+            and self._dead_reckon_age < int(dead.max_frames)
+            and self._last_pose_stamp is not None
+            and stamp > self._last_pose_stamp
+            and self._last_visual_stamp is not None
+            and stamp - self._last_visual_stamp <= float(dead.max_age_s)
+        ):
+            return None, None, None, 0
+        prev_xy, curr_xy = dr_prev, dr_curr
+        if (
+            self._last_pose_ordinal != ordinal - 1
+            or prev_xy is None
+            or len(prev_xy) < 8
+        ):
+            extra = self._detect_features(
+                self._last_gray, np.zeros((0, 2), dtype=float)
+            )
+            if extra.size:
+                fwd, keep = self._tracker.track_pair(
+                    self._last_gray, gray, extra
+                )
+                ok = keep & self._inside(fwd)
+                prev_xy, curr_xy = extra[ok], fwd[ok]
+        step_len = (
+            float(np.median(self._speed_history[-5:])) * (stamp - self._last_pose_stamp)
+            if self._speed_history
+            else 0.0
+        )
+        pose, n_inl = self._recover_relative(
+            prev_xy, curr_xy, self._last_pose, step_len
+        )
+        if pose is not None:
+            self._dead_reckon_age += 1
+            return pose, _center(pose), "DEAD_RECKON", n_inl
+        return None, None, None, 0
+
+    def observe_fused_state(self, sample) -> None:
+        """Keep one fused-attitude sample for the inertial bridge.
+
+        Duck-typed: the worker hands over ``FusedTelemetry`` (stamp/yaw/roll/
+        pitch in host-monotonic seconds and NED radians); tests hand over
+        anything with the same attributes. Samples without a finite yaw and
+        stamp are not attitude aiding and are dropped. A stamp older than the
+        newest kept sample is out of order and is dropped, so
+        ``_fused_attitude_at`` can keep taking the last entry at or before
+        ``when``.
+        """
+        try:
+            stamp = float(getattr(sample, "stamp", None))
+            yaw = float(getattr(sample, "yaw", None))
+        except (TypeError, ValueError, OverflowError):
+            return
+        if not math.isfinite(stamp) or not math.isfinite(yaw):
+            return
+        if self._fused_yaw and stamp <= self._fused_yaw[-1][0]:
+            return
+        try:
+            roll = float(getattr(sample, "roll", None))
+            pitch = float(getattr(sample, "pitch", None))
+        except (TypeError, ValueError, OverflowError):
+            roll = pitch = float("nan")
+        self._fused_yaw.append((stamp, yaw, roll, pitch))
+
+    def _fused_attitude_at(self, when: float):
+        """Latest fused sample at or before ``when``, else None."""
+        best = None
+        for entry in self._fused_yaw:
+            if entry[0] <= when:
+                best = entry
+            else:
+                break
+        return best
+
+    @staticmethod
+    def _rot_about_axis(axis: np.ndarray, angle: float) -> np.ndarray:
+        axis = np.asarray(axis, dtype=float)
+        norm = float(np.linalg.norm(axis))
+        if not math.isfinite(norm) or norm <= 1e-12:
+            return np.eye(3)
+        x, y, z = axis / norm
+        c, s = math.cos(angle), math.sin(angle)
+        return np.array([
+            [c + x * x * (1 - c), x * y * (1 - c) - z * s, x * z * (1 - c) + y * s],
+            [y * x * (1 - c) + z * s, c + y * y * (1 - c), y * z * (1 - c) - x * s],
+            [z * x * (1 - c) - y * s, z * y * (1 - c) + x * s, c + z * z * (1 - c)],
+        ])
+
+    def _step_imu_bridge(
+        self, stamp: float
+    ) -> tuple[np.ndarray | None, np.ndarray | None, str | None, int, dict]:
+        """Rotate the last visual pose by the fused yaw increment.
+
+        Runs only when visual PnP and visual dead reckoning both failed. Holds
+        the last center (no translation source exists: NED velocity is unscaled
+        on a scale-free map) and reports WEAK so the flight loop never treats
+        it as a confirmed fix. Shares the dead-reckon age budget.
+        """
+        blank: dict = {"imu_bridge": False, "imu_sample_age_s": None, "imu_yaw_delta_deg": None,
+                       "imu_bridge_reason": "no_recent_visual_pose"}
+        if not self._imu_bridge_armed(stamp):
+            return None, None, None, 0, blank
+        bridged = self._imu_bridge_delta(stamp)
+        blank.update(self._imu_bridge_debug)
+        if bridged is None:
+            return None, None, None, 0, blank
+        delta_ned, sample_age = bridged
+        up = getattr(self.map_frame, "up", None)
+        if up is None:
+            blank["imu_bridge_reason"] = "map_frame_missing"
+            return None, None, None, 0, blank
+        # Map headings run counter-clockwise-from-East while fused yaw runs
+        # clockwise-from-North: a clockwise turn shrinks the map heading.
+        rot = self._rot_about_axis(np.asarray(up, dtype=float), -delta_ned)
+        last = np.asarray(self._last_pose, dtype=float)
+        if last.shape != (3, 4) or not np.isfinite(last).all():
+            blank["imu_bridge_reason"] = "pose_invalid"
+            return None, None, None, 0, blank
+        # R is world-to-camera. A world-frame camera rotation Q transforms
+        # camera-to-world as Q @ R.T, hence the new R is R @ Q.T.
+        center = _center(last)
+        rotation = last[:, :3] @ rot.T
+        pose = np.column_stack((rotation, -rotation @ center))
+        self._dead_reckon_age += 1
+        return (
+            pose,
+            _center(pose),
+            "IMU_BRIDGE",
+            0,
+            {
+                **self._imu_bridge_debug,
+                "imu_bridge_reason": "applied",
+                "imu_bridge": True,
+                "imu_sample_age_s": sample_age,
+                "imu_yaw_delta_deg": math.degrees(-delta_ned),
+            },
+        )
+
+    def _imu_bridge_armed(self, stamp: float) -> bool:
+        """Is there a recent visual pose the bridge may extend?"""
+        dead = self.profile.dead_reckon
+        return bool(
+            dead.enabled
+            and self._last_pose is not None
+            and self._last_pose_stamp is not None
+            and self._dead_reckon_age < int(dead.max_frames)
+            and stamp > self._last_pose_stamp
+            and self._last_visual_stamp is not None
+            and stamp - self._last_visual_stamp <= float(dead.max_age_s)
+        )
+
+    def _imu_bridge_delta(self, stamp: float) -> tuple[float, float] | None:
+        """Fused yaw increment since the last visual pose, else None.
+
+        Returns (delta_ned_radians, sample_age_seconds). Every reject is a
+        sample the bridge must not steer by: missing, stale, tilted, or a yaw
+        rate no airframe sustains.
+        """
+        now_sample = self._fused_attitude_at(stamp)
+        ref_sample = self._fused_attitude_at(float(self._last_pose_stamp))
+        self._imu_bridge_debug = {
+            "imu_bridge_reason": "sample_unavailable",
+            "imu_sample_stamp_mono": None if now_sample is None else now_sample[0],
+            "imu_reference_stamp_mono": None if ref_sample is None else ref_sample[0],
+            "imu_sample_age_s": None if now_sample is None else stamp - now_sample[0],
+        }
+        if now_sample is None or ref_sample is None:
+            return None
+        sample_age = stamp - now_sample[0]
+        if sample_age < 0.0 or sample_age > IMU_BRIDGE_MAX_SAMPLE_AGE_S:
+            self._imu_bridge_debug["imu_bridge_reason"] = "sample_stale"
+            return None
+        if self._last_pose_stamp - ref_sample[0] > IMU_BRIDGE_MAX_SAMPLE_AGE_S:
+            self._imu_bridge_debug["imu_bridge_reason"] = "reference_stale"
+            return None
+        tilt_limit = math.radians(IMU_BRIDGE_MAX_TILT_DEG)
+        for entry in (now_sample, ref_sample):
+            roll, pitch = float(entry[2]), float(entry[3])
+            if (
+                not math.isfinite(roll)
+                or not math.isfinite(pitch)
+                or abs(roll) > tilt_limit
+                or abs(pitch) > tilt_limit
+            ):
+                self._imu_bridge_debug["imu_bridge_reason"] = "tilt_invalid_or_excessive"
+                return None
+        yaw_now, yaw_ref = now_sample[1], ref_sample[1]
+        if not math.isfinite(yaw_now) or not math.isfinite(yaw_ref):
+            self._imu_bridge_debug["imu_bridge_reason"] = "yaw_invalid"
+            return None
+        delta_ned = (yaw_now - yaw_ref + math.pi) % (2.0 * math.pi) - math.pi
+        dt = stamp - float(self._last_pose_stamp)
+        if dt <= 0.0 or abs(delta_ned) / dt > math.radians(IMU_BRIDGE_MAX_YAW_RATE_DEG_S):
+            self._imu_bridge_debug["imu_bridge_reason"] = "yaw_rate_excessive"
+            return None
+        return delta_ned, sample_age
+
+    def _step_reloc_trigger(
+        self, gray: np.ndarray, ordinal: int, stamp: float, status: str
+    ) -> bool:
+        reloc = self.profile.reloc
+        if self._pending_ordinal is not None or self._worker.busy:
+            return False
+        due = (
+            self._last_reloc_stamp is None
+            or (stamp - self._last_reloc_stamp) >= float(reloc.period_s)
+        )
+        # VO tracks can be numerous while none constrain the pose to the map.
+        # Request a map fix as soon as the one-job worker is available, without
+        # waiting for the normal refresh period or clearing the usable tracks.
+        unconfirmed = status in {"VO_ONLY", "DEAD_RECKON", "IMU_BRIDGE", "NO_POSE"}
+        if len(self._live_ids) < int(reloc.min_points) or unconfirmed or due:
+            if self._worker.submit(gray, ordinal):
+                self._pending_ordinal = ordinal
+                self._last_reloc_stamp = stamp
+                return True
+        return False
+
+    def _step_bookkeeping(
+        self,
+        center: np.ndarray | None,
+        cam_from_world: np.ndarray | None,
+        ordinal: int,
+        gray: np.ndarray,
+        stamp: float,
+        status: str,
+    ) -> float | None:
+        step = None
+        if center is not None and self._prev_center is not None:
+            step = float(np.linalg.norm(center - self._prev_center))
+        if center is not None:
+            self._prev_center = center
+        if step is not None:
+            self._step_history.append(step)
+            if len(self._step_history) > 15:
+                del self._step_history[:-15]
+        if status == "RELOC_SEED":
+            # A map correction is not physical motion.
+            self._speed_history.clear()
+        elif (
+            step is not None
+            and status in {"FAST_TRACK", "VO_ONLY"}
+            and self._last_pose_status in {"FAST_TRACK", "VO_ONLY", "RELOC_SEED"}
+            and self._last_pose_ordinal == ordinal - 1
+            and self._last_pose_stamp is not None
+            and stamp > self._last_pose_stamp
+        ):
+            self._speed_history.append(step / (stamp - self._last_pose_stamp))
+            del self._speed_history[:-5]
+        if cam_from_world is not None:
+            self._last_pose = np.asarray(cam_from_world, dtype=float).copy()
+            self._last_pose_ordinal = ordinal
+            self._last_pose_stamp = stamp
+            self._last_pose_status = status
+            # Keep the exposure paired with the pose through NO_POSE gaps.
+            self._last_gray = gray
+            if status not in {"DEAD_RECKON", "IMU_BRIDGE"}:
+                self._last_visual_stamp = stamp
+        return step
+
+    def step(self, gray_native: np.ndarray, capture_stamp: float) -> dict:
+        t0 = time.perf_counter()
+        self._ordinal += 1
+        ordinal = self._ordinal
+        stamp = float(capture_stamp)
+        frame_dt = None if self._previous_capture_stamp is None else stamp - self._previous_capture_stamp
+        self._previous_capture_stamp = stamp
+        self._klt_diagnostics = {}
+
+        frame = np.asarray(gray_native)
+        if (frame.shape[1], frame.shape[0]) != (self._w, self._h):
+            frame = cv2.resize(frame, (self._w, self._h), interpolation=cv2.INTER_AREA)
+        if frame.ndim == 2:
+            gray = frame
+        else:
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        gray = np.ascontiguousarray(gray, dtype=np.uint8)
+        self._ring.append((ordinal, gray))
+        t_gray = time.perf_counter()
+
+        # 1. worker handover: poll and catch-up walk, do not write _live_* yet
+        (
+            walked_ids,
+            walked_xy,
+            walked_xyz,
+            reloc_status,
+            reference_names,
+            delivered,
+        ) = self._step_handover(gray)
+        t_handover = time.perf_counter()
+
+        # 2. REPLACE when the walked set meets strong_inliers; otherwise KLT
+        # the old live set, then MERGE current-frame handover ids (no KLT).
+        strong_inliers = int(self.profile.reloc.frozen_pnp_thresholds["strong_inliers"])
+        reseeded = int(walked_ids.size) >= strong_inliers
+        handover_points = int(walked_ids.size)
+        if reseeded:
+            self._live_xy = np.ascontiguousarray(walked_xy, dtype=np.float64)
+            self._live_ids = walked_ids
+            self._live_xyz = walked_xyz
+            self._tracker.set_frame(gray)
+            dr_prev = dr_curr = None
+            t_track = time.perf_counter()
+        else:
+            dr_prev, dr_curr, t_track = self._step_fast_loop(gray)
+            if walked_ids.size:
+                handover_points = self._merge_handover_points(
+                    walked_ids, walked_xy, walked_xyz
+                )
         # 3. absolute pose
+        status, cam_from_world, center, inliers, map_inliers, vo_inliers, n_corr, quality = (
+            self._step_absolute_pose(reseeded, stamp)
+        )
+        t_pnp = time.perf_counter()
+
+
+        # 4. dead reckoning
+        imu_info: dict = {"imu_bridge": False, "imu_sample_age_s": None, "imu_yaw_delta_deg": None,
+                          "imu_bridge_reason": "visual_pose_available"}
+        if cam_from_world is None:
+            dr_pose, dr_center, dr_status, dr_inl = self._step_dead_reckon(
+                gray, ordinal, dr_prev, dr_curr, stamp
+            )
+            if dr_pose is not None:
+                cam_from_world = dr_pose
+                center = dr_center
+                status = dr_status
+                inliers = dr_inl
+            else:
+                # 4b. inertial bridge: visual tracking is gone but the fused
+                # yaw still says which way the camera turned. Holds the last
+                # center, shares the dead-reckon age budget, stays WEAK.
+                imu_pose, imu_center, imu_status, imu_inl, imu_info = self._step_imu_bridge(stamp)
+                if imu_pose is not None:
+                    cam_from_world = imu_pose
+                    center = imu_center
+                    status = imu_status
+                    inliers = imu_inl
+        else:
+            self._dead_reckon_age = 0
+
+        # 5. VO keyframes
+        vo = self.profile.vo
+        if vo.enabled and cam_from_world is not None and ordinal % int(vo.keyframe_stride) == 0:
+            self._vo_keyframe(gray, cam_from_world)
+        t_vo = time.perf_counter()
+
+        # 6. relocalizer trigger
+        submitted = self._step_reloc_trigger(gray, ordinal, stamp, status)
+
+        # 7. bookkeeping
+        step = self._step_bookkeeping(center, cam_from_world, ordinal, gray, stamp, status)
+        t_end = time.perf_counter()
+
+        rotation = None if cam_from_world is None else cam_from_world[:3, :3]
+        return {
+            **quality,
+            "ok": cam_from_world is not None,
+            "status": status,
+            "ordinal": ordinal,
+            "capture_stamp": stamp,
+            "center": center,
+            "R": rotation,
+            "cam_from_world": cam_from_world,
+            "yaw": None if rotation is None else _yaw_from_rotation(rotation),
+            "inliers": int(inliers),
+            "map_inliers": int(map_inliers),
+            "vo_inliers": int(vo_inliers),
+            "live_points": int(len(self._live_ids)),
+            "vo_candidates": int(len(self._vo_xy)),
+            "dead_reckon_age": int(self._dead_reckon_age),
+            "imu_bridge": bool(imu_info["imu_bridge"]),
+            "imu_sample_age_s": imu_info["imu_sample_age_s"],
+            "imu_yaw_delta_deg": imu_info["imu_yaw_delta_deg"],
+            "imu_bridge_reason": imu_info.get("imu_bridge_reason"),
+            "imu_sample_stamp_mono": imu_info.get("imu_sample_stamp_mono"),
+            "imu_reference_stamp_mono": imu_info.get("imu_reference_stamp_mono"),
+            "map_constraint_age_s": (
+                None if self._last_map_stamp is None else max(0.0, stamp - self._last_map_stamp)
+            ),
+            "frame_stamp_mono": stamp,
+            "frame_dt_s": frame_dt,
+            "klt_reseeded": reseeded,
+            "pnp_image_size_px": [self._w, self._h],
+            **self._klt_diagnostics,
+            "handover_points": int(handover_points),
+            "handover_dropped": int(self._handover_dropped),
+            "reloc_status": reloc_status if reloc_status is not None else self._last_reloc_status,
+            "reloc_delivered": delivered is not None,
+            "reloc_submitted": submitted,
+            "reloc_busy": self._worker.busy,
+            "reference_names": reference_names,
+            "step": step,
+            "n_corr": n_corr,
+            "loop_ms": (t_end - t0) * 1000.0,
+            "gray_ms": (t_gray - t0) * 1000.0,
+            "handover_ms": (t_handover - t_gray) * 1000.0,
+            "track_ms": (t_track - t_handover) * 1000.0,
+            "pnp_ms": (t_pnp - t_track) * 1000.0,
+            "vo_ms": (t_vo - t_pnp) * 1000.0,
+            "bookkeeping_ms": (t_end - t_vo) * 1000.0,
+            "reloc_ms": self._last_reloc_ms,
+            "reloc_retrieval_ms": self._last_reloc_stages.get("retrieval_ms"),
+            "reloc_match_lift_ms": self._last_reloc_stages.get("match_lift_ms"),
+            "reloc_pnp_ms": self._last_reloc_stages.get("reloc_pnp_ms"),
+            "reloc_reference_count": self._last_reloc_stages.get("matched_references"),
+        }
+
+    def _step_absolute_pose(
+        self, reseeded: bool, stamp: float
+    ) -> tuple[str, np.ndarray | None, np.ndarray | None, int, int, int, int, dict]:
+        """PnP the live set; keep only geometric inliers for the next frame."""
         n_corr = int(len(self._live_xy))
         status = "NO_POSE"
         inliers = 0
@@ -461,6 +948,7 @@ class TwoRateTracker:
         vo_inliers = 0
         center = None
         cam_from_world = None
+        quality: dict = {}
         pnp = self.profile.fast_loop.pnp
         if n_corr >= int(pnp.min_points):
             answer = self._pycolmap.estimate_and_refine_absolute_pose(
@@ -478,148 +966,51 @@ class TwoRateTracker:
                     vo_inliers = inliers - map_inliers
                     if reseeded:
                         status = "RELOC_SEED"
+                    elif map_inliers >= int(pnp.min_inliers):
+                        status = "FAST_TRACK"
                     else:
-                        status = (
-                            "FAST_TRACK"
-                            if map_inliers >= int(pnp.min_inliers)
-                            else "VO_ONLY"
-                        )
-                    # keep only the geometric inliers
-                    self._live_xy = self._live_xy[mask]
+                        status = "VO_ONLY"
+                    self._live_xy = np.ascontiguousarray(self._live_xy[mask], dtype=np.float64)
                     self._live_ids = self._live_ids[mask]
                     self._live_xyz = self._live_xyz[mask]
-        t_pnp = time.perf_counter()
-
-        # 4. dead reckoning: calibrated essential-matrix step from the last pose
-        if cam_from_world is None:
-            dead = self.profile.dead_reckon
-            if (
-                dead.enabled
-                and self._last_pose is not None
-                and self._last_gray is not None
-                and self._dead_reckon_age < int(dead.max_frames)
-            ):
-                prev_xy, curr_xy = dr_prev, dr_curr
-                if (
-                    self._last_pose_ordinal != ordinal - 1
-                    or prev_xy is None
-                    or len(prev_xy) < 8
-                ):
-                    extra = self._detect_features(
-                        self._last_gray, np.zeros((0, 2), dtype=float)
+                    quality = pose_quality(
+                        self._live_xy, self._live_xyz, cam_from_world, self._K, self._w, self._h
                     )
-                    if extra.size:
-                        fwd, keep = self._tracker.track_pair(
-                            self._last_gray, gray, extra
-                        )
-                        ok = keep & self._inside(fwd)
-                        prev_xy, curr_xy = extra[ok], fwd[ok]
-                step_len = (
-                    float(np.median(self._step_history[-5:]))
-                    if self._step_history
-                    else 0.0
-                )
-                pose, n_inl = self._recover_relative(
-                    prev_xy, curr_xy, self._last_pose, step_len
-                )
-                if pose is not None:
-                    cam_from_world = pose
-                    center = _center(pose)
-                    status = "DEAD_RECKON"
-                    inliers = n_inl
-                    self._dead_reckon_age += 1
-        else:
-            self._dead_reckon_age = 0
-
-        # 5. VO keyframes: candidates are seeded every keyframe and triangulated
-        #    `batch_lag` keyframes later, because one keyframe of drone motion is
-        #    not enough parallax. Scale comes from the poses, so a VO point is in
-        #    map units. Nothing here writes to the map.
-        vo = self.profile.vo
-        if vo.enabled and cam_from_world is not None and ordinal % int(vo.keyframe_stride) == 0:
-            self._vo_keyframe(gray, cam_from_world)
-        t_end = time.perf_counter()
-
-        # 6. relocalizer trigger
-        reloc = self.profile.reloc
-        submitted = False
-        if self._pending_ordinal is None and not self._worker.busy:
-            due = (
-                self._last_reloc_stamp is None
-                or (stamp - self._last_reloc_stamp) >= float(reloc.period_s)
-            )
-            if len(self._live_ids) < int(reloc.min_points) or status == "NO_POSE" or due:
-                # Retrieval gets the grey frame, replicated to three channels
-                # by the provider. The frozen BoQ bank was built from *colour*
-                # keyframes, so this is a real distribution mismatch and the
-                # colour frame is in hand right here -- but handing it over was
-                # measured on the P173 holdout and is NOT an improvement:
-                # coverage 96.23% vs 97.68% over five paired repeats (4 of 5
-                # pairs negative, p~0.18), map-confirmed frames flat. See
-                # docs/direct_backend_ledger.md; do not re-apply without a gate.
-                if self._worker.submit(gray, ordinal):
-                    self._pending_ordinal = ordinal
-                    self._last_reloc_stamp = stamp
-                    submitted = True
-
-        # 7. bookkeeping
-        step = None
-        if center is not None and self._prev_center is not None:
-            step = float(np.linalg.norm(center - self._prev_center))
-        if center is not None:
-            self._prev_center = center
-        if step is not None:
-            self._step_history.append(step)
-            if len(self._step_history) > 15:
-                del self._step_history[:-15]
-        if cam_from_world is not None:
-            self._last_pose = np.asarray(cam_from_world, dtype=float).copy()
-            self._last_pose_ordinal = ordinal
-        self._last_gray = gray
-
-        rotation = None if cam_from_world is None else cam_from_world[:3, :3]
-        return {
-            "ok": cam_from_world is not None,
-            "status": status,
-            "ordinal": ordinal,
-            "capture_stamp": stamp,
-            "center": center,
-            "R": rotation,
-            "cam_from_world": cam_from_world,
-            "yaw": None if rotation is None else _yaw_from_rotation(rotation),
-            "inliers": int(inliers),
-            "map_inliers": int(map_inliers),
-            "vo_inliers": int(vo_inliers),
-            "live_points": int(len(self._live_ids)),
-            "vo_candidates": int(len(self._vo_xy)),
-            "dead_reckon_age": int(self._dead_reckon_age),
-            "handover_points": int(handover_points),
-            "handover_dropped": int(self._handover_dropped),
-            "reloc_status": reloc_status if reloc_status is not None else self._last_reloc_status,
-            "reloc_delivered": delivered is not None,
-            "reloc_submitted": submitted,
-            "reloc_busy": self._worker.busy,
-            "reference_names": reference_names,
-            "step": step,
-            "n_corr": n_corr,
-            "loop_ms": (t_end - t0) * 1000.0,
-            "track_ms": (t_track - t0) * 1000.0,
-            "pnp_ms": (t_pnp - t_track) * 1000.0,
-            "vo_ms": (t_end - t_pnp) * 1000.0,
-            "reloc_ms": self._last_reloc_ms,
-        }
+                    elapsed = stamp - self._last_observation_sample_stamp
+                    if elapsed >= 1.0 or (reseeded and elapsed >= 0.5):
+                        # Bounded samples for offline residual/covariance analysis.
+                        # Positive IDs are map anchors; negative IDs are VO points.
+                        selected = np.linspace(0, len(self._live_ids) - 1,
+                                               min(128, len(self._live_ids)), dtype=int)
+                        quality["pnp_observation_sample"] = {
+                            "capture_stamp_mono": stamp,
+                            "total_inliers": int(inliers), "sample_count": len(selected),
+                            "ids": self._live_ids[selected].tolist(),
+                            "image_xy_px": self._live_xy[selected].tolist(),
+                            "world_xyz_u": self._live_xyz[selected].tolist(),
+                            "K": self._K.tolist(), "image_size_px": [self._w, self._h],
+                            "cam_from_world": cam_from_world.tolist(),
+                            "sampling": "uniform_index; at most 128 inliers",
+                        }
+                        self._last_observation_sample_stamp = stamp
+                    if map_inliers >= int(pnp.min_inliers):
+                        self._last_map_stamp = stamp
+        return status, cam_from_world, center, inliers, map_inliers, vo_inliers, n_corr, quality
 
     # ---------- handover ----------
-    def _apply_handover(
-        self, fix: "RelocFix", trigger_ordinal: int, gray: np.ndarray
-    ) -> tuple[int, bool]:
+    def _walk_handover(
+        self, fix: "RelocFix", trigger_ordinal: int
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        empty_ids = np.zeros((0,), dtype=np.int64)
+        empty_xy = np.zeros((0, 2), dtype=np.float64)
+        empty_xyz = np.zeros((0, 3), dtype=np.float64)
         if not fix.ok or fix.cam_from_world is None:
-            return 0, False
+            return empty_ids, empty_xy, empty_xyz
         ids = np.asarray(fix.point3d_ids, dtype=np.int64)
         xy = np.asarray(fix.query_xy, dtype=float)
         xyz = np.asarray(fix.point_xyz, dtype=float)
         if ids.size < int(self.profile.fast_loop.pnp.min_points):
-            return 0, False
+            return empty_ids, empty_xy, empty_xyz
 
         chain = [frame for ordinal, frame in self._ring if ordinal >= trigger_ordinal]
         first = next(
@@ -629,12 +1020,9 @@ class TwoRateTracker:
             # the worker outran the ring buffer: the anchor's 2D can no longer
             # be walked to this frame, so the whole handover is discarded
             self._handover_dropped += 1
-            return 0, False
+            return empty_ids, empty_xy, empty_xyz
 
-        cap = int(self.profile.fast_loop.track_cap)
-        if len(ids) > cap:
-            take = np.linspace(0, len(ids) - 1, cap).astype(int)
-            ids, xy, xyz = ids[take], xy[take], xyz[take]
+        ids, xy, xyz = self._cap_handover_points(ids, xy, xyz)
         n = len(chain)
         # Stride-2 catch-up: one track_pair per two frames instead of one per
         # frame. Pairs fall from (n-1) to ceil((n-1)/2) -- about half the KLT
@@ -657,29 +1045,49 @@ class TwoRateTracker:
             inside = keep & self._inside(fwd)
             xy, ids, xyz = fwd[inside], ids[inside], xyz[inside]
         if ids.size == 0:
-            return 0, True
+            return empty_ids, empty_xy, empty_xyz
+        return ids, xy, xyz
 
-        if ids.size >= int(self.profile.fast_loop.reseed_min_points):
-            # Strong handover: REPLACE. Merging lets an old drifted majority
-            # outvote the fresh map-derived 2D, so relocalization stops
-            # correcting anything -- measured, not hypothetical.
-            self._live_xy, self._live_ids, self._live_xyz = xy, ids, xyz
-        else:
-            fresh = ~np.isin(ids, self._live_ids)
-            xy, ids, xyz = xy[fresh], ids[fresh], xyz[fresh]
-            self._live_xy = np.concatenate([self._live_xy, xy]) if self._live_xy.size else xy
-            self._live_ids = (
-                np.concatenate([self._live_ids, ids]) if self._live_ids.size else ids
-            )
-            self._live_xyz = (
-                np.concatenate([self._live_xyz, xyz]) if self._live_xyz.size else xyz
-            )
-        return int(ids.size), True
+    def _merge_handover_points(
+        self, ids: np.ndarray, xy: np.ndarray, xyz: np.ndarray
+    ) -> int:
+        """Append current-frame reloc ids after the old live set has been KLT'd."""
+        fresh = ~np.isin(ids, self._live_ids)
+        xy, ids, xyz = xy[fresh], ids[fresh], xyz[fresh]
+        self._live_xy = (
+            np.ascontiguousarray(np.concatenate([self._live_xy, xy]), dtype=np.float64)
+            if self._live_xy.size
+            else np.ascontiguousarray(xy, dtype=np.float64)
+        )
+        self._live_ids = (
+            np.concatenate([self._live_ids, ids]) if self._live_ids.size else ids
+        )
+        self._live_xyz = (
+            np.concatenate([self._live_xyz, xyz]) if self._live_xyz.size else xyz
+        )
+        return int(ids.size)
+
+
+    def _cap_handover_points(
+        self, ids: np.ndarray, xy: np.ndarray, xyz: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Bound the catch-up set; spread survivors across the image when enabled."""
+        cap = int(self.profile.fast_loop.track_cap)
+        if len(ids) > cap:
+            if self.profile.optimizations.spatial_selection:
+                take = spatial_indices(xy, cap, self._w, self._h)
+            else:
+                take = np.linspace(0, len(ids) - 1, cap).astype(int)
+            ids, xy, xyz = ids[take], xy[take], xyz[take]
+        return ids, xy, xyz
 
     # ---------- VO ----------
     def _vo_keyframe(self, gray: np.ndarray, cam_from_world: np.ndarray) -> None:
         vo = self.profile.vo
         mature = self._vo_bid <= self._vo_bid_next - int(vo.batch_lag)
+        new_xy: list[np.ndarray] = []
+        new_ids: list[np.ndarray] = []
+        new_xyz: list[np.ndarray] = []
         for bid in np.unique(self._vo_bid[mature]) if mature.any() else ():
             rows = self._vo_bid == bid
             world, good = self._triangulate_batch(
@@ -694,20 +1102,33 @@ class TwoRateTracker:
                     self._vo_next_id, self._vo_next_id - count, -1, dtype=np.int64
                 )
                 self._vo_next_id -= count
-                self._live_xy = (
-                    np.concatenate([self._live_xy, add_xy]) if self._live_xy.size else add_xy
-                )
-                self._live_ids = (
-                    np.concatenate([self._live_ids, add_ids])
-                    if self._live_ids.size
-                    else add_ids
-                )
-                self._live_xyz = (
-                    np.concatenate([self._live_xyz, add_xyz])
-                    if self._live_xyz.size
-                    else add_xyz
-                )
+                new_xy.append(add_xy)
+                new_ids.append(add_ids)
+                new_xyz.append(add_xyz)
             self._vo_pose_by_bid.pop(int(bid), None)
+
+        if new_xy:
+            all_add_xy = np.concatenate(new_xy, axis=0)
+            all_add_ids = np.concatenate(new_ids, axis=0)
+            all_add_xyz = np.concatenate(new_xyz, axis=0)
+            self._live_xy = (
+                np.ascontiguousarray(
+                    np.concatenate([self._live_xy, all_add_xy], axis=0)
+                    if self._live_xy.size
+                    else all_add_xy,
+                    dtype=np.float64,
+                )
+            )
+            self._live_ids = (
+                np.concatenate([self._live_ids, all_add_ids], axis=0)
+                if self._live_ids.size
+                else all_add_ids
+            )
+            self._live_xyz = (
+                np.concatenate([self._live_xyz, all_add_xyz], axis=0)
+                if self._live_xyz.size
+                else all_add_xyz
+            )
         keep_vo = ~mature
         self._vo_xy = self._vo_xy[keep_vo]
         self._vo_seed_xy = self._vo_seed_xy[keep_vo]
@@ -743,7 +1164,7 @@ class TwoRateTracker:
             # PnP and the tracker are both linear in point count, so the cap is
             # the throughput knob. Map points outrank VO points.
             order = np.argsort(-self._live_ids, kind="stable")[:cap]
-            self._live_xy = self._live_xy[order]
+            self._live_xy = np.ascontiguousarray(self._live_xy[order], dtype=np.float64)
             self._live_ids = self._live_ids[order]
             self._live_xyz = self._live_xyz[order]
 
@@ -794,8 +1215,21 @@ class TwoRateTracker:
         vo = self.profile.vo
         min_distance = int(vo.min_distance)
         mask = np.full(gray.shape, 255, dtype=np.uint8)
-        for point in occupied:
-            cv2.circle(mask, (int(point[0]), int(point[1])), min_distance, 0, -1)
+        if occupied.size:
+            pts = np.asarray(occupied, dtype=int)
+            valid = (
+                (pts[:, 0] >= 0)
+                & (pts[:, 0] < gray.shape[1])
+                & (pts[:, 1] >= 0)
+                & (pts[:, 1] < gray.shape[0])
+            )
+            pts = pts[valid]
+            if len(pts):
+                mask[pts[:, 1], pts[:, 0]] = 0
+                kernel = cv2.getStructuringElement(
+                    cv2.MORPH_ELLIPSE, (2 * min_distance + 1, 2 * min_distance + 1)
+                )
+                mask = cv2.erode(mask, kernel)
         corners = cv2.goodFeaturesToTrack(
             gray, maxCorners=int(vo.detect_cap), qualityLevel=0.01,
             minDistance=min_distance, mask=mask,
@@ -812,6 +1246,7 @@ class TwoRateTracker:
         step_len: float,
     ) -> tuple[np.ndarray | None, int]:
         """Calibrated essential-matrix step. Translation magnitude from recent motion."""
+        cv2.setRNGSeed(0)
         if prev_xy is None or curr_xy is None:
             return None, 0
         prev_xy = np.asarray(prev_xy, dtype=float).reshape(-1, 2)

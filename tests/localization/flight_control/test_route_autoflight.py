@@ -1,4 +1,5 @@
 """Acceptance tests for tools/test_route_autoflight.py (drawn-route dry-run gate)."""
+
 from __future__ import annotations
 
 import json
@@ -65,8 +66,32 @@ def test_drawn_format_route_passes_dry_run(tmp_path: Path) -> None:
     assert log.exists()
 
 
-def test_impossible_progress_threshold_fails(tmp_path: Path) -> None:
+def test_incomplete_run_is_rejected(tmp_path: Path) -> None:
+    """A run that never reaches the landing branch must not report success.
+
+    A completed route now reports progress exactly 1.0 (the controller's own
+    monotonic arclength), so the gate is exercised by starving the run of steps
+    rather than by asking for an unreachable threshold.
+    """
     route = tmp_path / "drawn.json"
     route.write_text(json.dumps(DRAWN_ROUTE), encoding="utf-8")
-    proc = _run("--route", str(route), "--min-progress", "1.0")
+    proc = _run("--route", str(route), "--steps", "500")
     assert proc.returncode == 2
+    assert "state=LANDING" not in proc.stdout
+
+
+def test_height_summary_uses_the_measured_up_axis(tmp_path: Path) -> None:
+    route = tmp_path / "glomap.json"
+    route.write_text(
+        json.dumps(
+            {
+                "waypoints": [[0, 0, 0], [0, -1, 0]],
+                "frame": "glomap",
+                "units": "map",
+                "closed": False,
+            }
+        ),
+        encoding="utf-8",
+    )
+    proc = _run("--route", str(route))
+    assert "alt_max=1.00" in proc.stdout

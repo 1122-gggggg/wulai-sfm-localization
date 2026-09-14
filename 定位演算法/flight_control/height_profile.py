@@ -1,27 +1,9 @@
 #!/usr/bin/env python3
 """Per-(x,y) altitude band from a hand-drawn height profile.
 
-Two profile formats (both produced by the safezone pickers) are supported:
-
-  * single  : one (s,z) floor + ceiling along the corridor centreline
-              (scripts/13_pick_profile.py, scripts/15_pick_3d_height.py)
-  * two_rail : separate LEFT and RIGHT elevations; the band is interpolated
-              across the corridor width between them
-              (scripts/16_pick_views.py)
-
-s is distance along the corridor long-axis, w is the signed perpendicular
-offset. floor/ceiling are linearly interpolated in s (and, for two_rail, across
-w), then a clearance is added above the floor and a margin left below the ceiling.
-
-Usage in cruise_geofence.py:
-
-    from height_profile import HeightProfile
-    hp = HeightProfile("safezone/height_profile.json", clearance=0.4, margin=0.3)
-    # in CruiseController.compute(), replace the fixed band with:
-    z_lo, z_hi = hp.band(pose.x, pose.y)
-    z_target = _clamp(self.alt_hold, z_lo, z_hi)
-
-All map units (scale-free); clearance/margin tuned empirically.
+RETIRED: the altitude slow band is removed. Nothing reads this band to scale
+speed near the edges; altitude holds clamp directly to [z_min, z_max].
+Kept only so old scripts importing HeightProfile keep importing.
 """
 from __future__ import annotations
 

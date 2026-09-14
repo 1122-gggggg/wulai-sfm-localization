@@ -22,13 +22,15 @@ exclude = [
 [tool.ruff.lint]
 # Full Pyflakes catches dead imports, name shadowing, undefined names, and other
 # correctness issues in first-party code. Syntax errors remain an explicit gate.
+# PERF/B/C4 規則改為手動審查指令：
+# .venv/bin/python -m ruff check --select PERF,B,C4 定位演算法/deploy_code/sfm_direct_deploy tools
 select = ["E9", "F"]
 
 [tool.ruff.lint.per-file-ignores]
 # Frozen P174 replay harness: experiment scaffolding, kept byte-stable as the
 # reference the deployed two-rate loop was derived from, deliberately not
 # refactored. Exempt from the complexity ratchet so that one frozen file does
-# not set the ceiling for every other module in 定位演算法/validation/.
+# not set the ceiling for every other module in 定位演算法/validation/ (分階段重構保留).
 "定位演算法/validation/replay_two_rate_reference.py" = ["C901"]
 
 [tool.mypy]
@@ -138,7 +140,7 @@ source = [
   "控制介面程式",
   "定位演算法/validation",
   "定位演算法/flight_control",
-  "定位演算法/deploy_code/sfm_glomap_deploy",
+  "定位演算法/deploy_code/sfm_direct_deploy",
 ]
 omit = [
   "*/tests/*",

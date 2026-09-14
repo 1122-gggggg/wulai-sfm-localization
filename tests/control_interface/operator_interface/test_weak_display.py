@@ -20,6 +20,8 @@ from types import SimpleNamespace
 
 import numpy as np
 
+import pytest
+
 import flight_operator_app as app
 import operator_tick
 from operator_rendering import MapRenderContext, _draw_route_and_history
@@ -343,11 +345,6 @@ def _map_context(**overrides):
         pose=(0.0, 0.0, 0.0, float("nan")),
         camera_axes=None,
         camera_forward=None,
-        collision_center=None,
-        collision_radius=0.0,
-        collision_status="DISABLED",
-        collision_point=None,
-        collision_preview=False,
         transform_xyz=transform_xyz,
         project_world=project_world,
         route_color="#ff3ea5",
@@ -504,3 +501,41 @@ def test_hud_without_direct_status_has_no_weak_run_fragment() -> None:
     app.OperatorApp._update_localization_recovery(operator, edm_weak)
     assert operator.loc_weak_run == 1
     assert "weak_run" not in operator.loc_recovery_text
+
+
+def test_held_weak_feeds_autonomy_snapshot_only_when_opted_in() -> None:
+    for flag, expected_x in ((False, 1.0), (True, 1.03)):
+        policy = app.LostHoldPolicy(low_confidence_results=2, hold_on_low_confidence=True)
+        anchor = _fast(1, 1.0)
+        weak = [_vo(2, 1.01), _vo(3, 1.02), _vo(4, 1.03)]
+        for payload in weak:
+            payload["confidence_hold_active"] = True
+        operator = _make_operator([[payload] for payload in [anchor] + weak], policy)
+        operator._integrated_autonomy = SimpleNamespace(accept_weak_poses=flag)
+
+        _drain(operator, [anchor])
+        frozen_live = operator.live_pose.copy()
+        _drain(operator, weak)
+
+        assert operator.lost_hold.active
+        assert np.allclose(operator.live_pose, frozen_live)
+        assert operator._autonomy_pose_snapshot[0] == pytest.approx(expected_x)
+
+
+def test_weak_trail_records_estimate_source_kind() -> None:
+    import operator_tick
+
+    operator = _make_operator([], app.LostHoldPolicy())
+    operator.history_weak_kind = []
+    klt = _vo(1, 1.0)
+    klt["candidate_mode"] = "klt_fast"
+    imu = _vo(2, 2.0)
+    imu["direct_status"] = "IMU_BRIDGE"
+    vo = _vo(3, 3.0)
+
+    assert operator_tick._record_weak_display_pose(operator, klt, np.array([1.0, 2.0, 3.0]))
+    assert operator_tick._record_weak_display_pose(operator, imu, np.array([2.0, 2.0, 3.0]))
+    assert operator_tick._record_weak_display_pose(operator, vo, np.array([3.0, 2.0, 3.0]))
+
+    assert operator.history_weak_kind == ["KLT", "IMU", "OTHER"]
+    assert len(operator.history_weak) == 3

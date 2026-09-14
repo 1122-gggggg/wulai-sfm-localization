@@ -112,7 +112,6 @@ REFERENCE_CONTROLLER = {
     "inspect_radius_map_units": 0.7938627034411776,
     "inspect_resume_margin_map_units": 0.3175450813764711,
     "max_pose_jump_map_units": 0.9338766098022462,
-    "max_route_deviation_map_units": 2.3815881103235327,
     "progress_jump_slack_map_units": 0.7938627034411776,
     "max_progress_regression_map_units": 0.15877254068823553,
     "segment_window": 2,
@@ -202,12 +201,37 @@ class BuildError(RuntimeError):
 # --------------------------------------------------------------------------- io
 
 
+_SHA256_CACHE: dict[tuple[int, int, int, int], str] = {}
+_COPY_SOURCE_TARGET: dict[tuple[int, int, int, int], tuple[int, int, int, int]] = {}
+
+
 def sha256_file(path: Path) -> str:
+    resolved = Path(path).resolve()
+    try:
+        st = resolved.stat()
+        key = (int(st.st_dev), int(st.st_ino), int(st.st_mtime_ns), int(st.st_size))
+    except OSError:
+        key = None
+    if key is not None:
+        if key in _SHA256_CACHE:
+            return _SHA256_CACHE[key]
+        alt_key = _COPY_SOURCE_TARGET.get(key)
+        if alt_key is not None and alt_key in _SHA256_CACHE:
+            val = _SHA256_CACHE[alt_key]
+            _SHA256_CACHE[key] = val
+            return val
+
     digest = hashlib.sha256()
-    with path.open("rb") as stream:
+    with resolved.open("rb") as stream:
         for block in iter(lambda: stream.read(8 * 1024 * 1024), b""):
             digest.update(block)
-    return digest.hexdigest()
+    val = digest.hexdigest()
+    if key is not None:
+        _SHA256_CACHE[key] = val
+        alt_key = _COPY_SOURCE_TARGET.get(key)
+        if alt_key is not None:
+            _SHA256_CACHE[alt_key] = val
+    return val
 
 
 def frame_digest(model_dir: Path) -> str:
@@ -245,6 +269,17 @@ def transfer(source: Path, target: Path, mode: str) -> None:
             ) from exc
     elif mode == "copy":
         shutil.copyfile(source, target)
+        try:
+            st_s = Path(source).resolve().stat()
+            st_t = Path(target).resolve().stat()
+            src_k = (int(st_s.st_dev), int(st_s.st_ino), int(st_s.st_mtime_ns), int(st_s.st_size))
+            tgt_k = (int(st_t.st_dev), int(st_t.st_ino), int(st_t.st_mtime_ns), int(st_t.st_size))
+            if src_k in _SHA256_CACHE:
+                _SHA256_CACHE[tgt_k] = _SHA256_CACHE[src_k]
+            _COPY_SOURCE_TARGET[tgt_k] = src_k
+            _COPY_SOURCE_TARGET[src_k] = tgt_k
+        except OSError:
+            pass
     elif mode == "move":
         shutil.move(str(source), str(target))
     else:
@@ -418,6 +453,114 @@ def controller_for_scale(map_scale: float) -> tuple[dict, dict]:
         controller[key] = coefficient * map_scale
     return controller, coefficients
 
+def write_shard_manifest(
+    localization: Path,
+    keyframes_root: Path,
+    image_relatives: Iterable[Path],
+    *,
+    shard_size: int = 64,
+    depth_root: Path | None = None,
+    depth_relatives: Iterable[Path] | None = None,
+) -> tuple[Path, str]:
+    """Write a deterministic per-shard manifest of bulk keyframe images and optional depth."""
+    relatives = sorted(image_relatives)
+    shards = []
+    for idx, start in enumerate(range(0, len(relatives), shard_size)):
+        chunk = relatives[start : start + shard_size]
+        entries = []
+        for rel in chunk:
+            full = keyframes_root / rel
+            entries.append({
+                "path": rel.as_posix(),
+                "sha256": sha256_file(full),
+                "size_bytes": full.stat().st_size,
+            })
+        shard_root_sha256 = hashlib.sha256(
+            "".join(f"{e['path']} {e['sha256']}\n" for e in entries).encode("utf-8")
+        ).hexdigest()
+        shards.append({
+            "shard_id": f"shard_{idx:04d}",
+            "shard_root_sha256": shard_root_sha256,
+            "file_count": len(entries),
+            "total_bytes": sum(e["size_bytes"] for e in entries),
+            "files": entries,
+        })
+    manifest_payload: dict[str, object] = {
+        "schema": "direct-shard-manifest/v1",
+        "shard_size": shard_size,
+        "num_shards": len(shards),
+        "total_files": len(relatives),
+        "shards": shards,
+    }
+    if depth_root is not None and depth_relatives is not None:
+        depth_list = sorted(depth_relatives)
+        depth_shards = []
+        for idx, start in enumerate(range(0, len(depth_list), shard_size)):
+            chunk = depth_list[start : start + shard_size]
+            entries = []
+            for rel in chunk:
+                full = depth_root / rel
+                entries.append({
+                    "path": rel.as_posix(),
+                    "sha256": sha256_file(full),
+                    "size_bytes": full.stat().st_size,
+                })
+            d_root_sha = hashlib.sha256(
+                "".join(f"{e['path']} {e['sha256']}\n" for e in entries).encode("utf-8")
+            ).hexdigest()
+            depth_shards.append({
+                "shard_id": f"depth_shard_{idx:04d}",
+                "shard_root_sha256": d_root_sha,
+                "file_count": len(entries),
+                "total_bytes": sum(e["size_bytes"] for e in entries),
+                "files": entries,
+            })
+        manifest_payload["depth_shards"] = depth_shards
+        manifest_payload["total_depth_files"] = len(depth_list)
+    manifest_path = localization / "shard_manifest.json"
+    manifest_sha = write_json(manifest_path, manifest_payload)
+    return manifest_path, manifest_sha
+
+
+def write_inductor_prewarm(
+    staging: Path,
+    *,
+    batch_sizes: tuple[int, ...] = (1, 2),
+) -> tuple[Path, str]:
+    """Generate hardware-matched inductor prewarm metadata.
+
+    Target sm_ capability is detected from torch.cuda if available.
+    On hardware mismatch or absent GPU, runtime safely falls back
+    to JIT compilation (SFM_EDM_FUSED_COARSE=0 / eager JIT).
+    Note for PackExport: exporter excludes inductor_cache per package_manifest policy.
+    """
+    sm_arch = "none"
+    has_cuda = False
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            major, minor = torch.cuda.get_device_capability()
+            sm_arch = f"sm_{major}{minor}"
+            has_cuda = True
+    except Exception:
+        pass
+
+    prewarm_payload = {
+        "schema": "direct-inductor-prewarm/v1",
+        "target_sm": sm_arch,
+        "has_cuda": has_cuda,
+        "warmup_batches": list(batch_sizes),
+        "fallback_policy": "fail-safe-jit",
+        "note": (
+            "Hardware-matched Inductor prewarm package. Runtime falls back to JIT "
+            "compilation whenever hardware SM capability does not match."
+        ),
+    }
+    prewarm_path = staging / "compat" / "inductor_prewarm.json"
+    prewarm_sha = write_json(prewarm_path, prewarm_payload)
+    return prewarm_path, prewarm_sha
+
 
 # ------------------------------------------------------------------------ build
 
@@ -584,6 +727,15 @@ def populate(
         "dead_reckon": FROZEN_DEAD_RECKON,
     })
 
+    shard_manifest_path, shard_manifest_sha = write_shard_manifest(
+        localization,
+        staging / "keyframes/images",
+        image_relatives,
+        depth_root=staging / "depth_moge3",
+        depth_relatives=depth_relatives,
+    )
+    prewarm_path, prewarm_sha = write_inductor_prewarm(staging)
+
     # --- bundle -------------------------------------------------------------
     bundle_files = [
         *(f"../model/{name}" for name in sorted(MODEL_BINS)),
@@ -592,6 +744,8 @@ def populate(
         "boq_references_sideview.names.json",
         "fim_lwtl_intersection_cells.json",
         "../keyframes/keyframes.jsonl",
+        "shard_manifest.json",
+        "../compat/inductor_prewarm.json",
     ]
     bundle_path = localization / "direct_bundle.json"
     bundle_sha = write_json(bundle_path, {
@@ -643,6 +797,8 @@ def populate(
             "localizer_profile": profile_sha,
             "map_reference_poses": poses_sha,
             "map_align": gravity_sha,
+            "shard_manifest": shard_manifest_sha,
+            "inductor_prewarm": prewarm_sha,
         },
         "hardware_approval": None,
         "flight": {
@@ -662,6 +818,8 @@ def populate(
             "megaloc_cache": None,
             "track_landmarks": None,
             "poles_json": None,
+            "shard_manifest": "localization/shard_manifest.json",
+            "inductor_prewarm": "compat/inductor_prewarm.json",
         },
     })
     site_profile_sha = sha256_file(site_profile_path)
@@ -707,7 +865,10 @@ def populate(
                 "sha256": profile_sha,
             },
         },
-        "runtime": {"device": "cuda", "matcher": "edm", "retrieval": "megaloc"},
+        "runtime": {
+            "device": "cuda", "matcher": "edm", "retrieval": "megaloc",
+            "deploy_dir": "定位演算法/deploy_code/sfm_direct_deploy",
+        },
     })
     write_json(compat / "localizer_quality_receipt.json", {
         "schema": "sfm-calibration-receipt/v1",
@@ -822,6 +983,8 @@ def populate(
             "localization/direct_bundle.json": bundle_sha,
             "localization/direct_localizer_profile.json": profile_sha,
             "site_profile.json": site_profile_sha,
+            "localization/shard_manifest.json": shard_manifest_sha,
+            "compat/inductor_prewarm.json": prewarm_sha,
         },
         "reference_counts": {
             "reference_manifest": len(ref_names),
@@ -832,34 +995,46 @@ def populate(
     return report
 
 
-def verify_staging(staging: Path, pycolmap) -> None:
-    """Re-hash every published digest and re-open the model before promoting."""
-    bundle = json.loads(
-        (staging / "localization/direct_bundle.json").read_text(encoding="utf-8")
+def _verify_shard_entries(
+    shards: list[dict], root: Path, label: str,
+) -> None:
+    for shard in shards:
+        files = shard.get("files", [])
+        if "shard_root_sha256" in shard:
+            expected_root = hashlib.sha256(
+                "".join(f"{e['path']} {e['sha256']}\n" for e in files).encode("utf-8")
+            ).hexdigest()
+            if shard["shard_root_sha256"] != expected_root:
+                raise BuildError(f"{label} shard {shard.get('shard_id')} root hash mismatch")
+        for entry in files:
+            full = root / entry["path"]
+            if not full.is_file():
+                raise BuildError(f"{label} file missing: {entry['path']}")
+            if sha256_file(full) != entry["sha256"]:
+                raise BuildError(f"{label} hash mismatch: {entry['path']}")
+
+
+def _verify_shard_manifest(staging: Path, digests: dict[str, str]) -> None:
+    shard_manifest = staging / "localization/shard_manifest.json"
+    if not shard_manifest.is_file():
+        return
+    actual = sha256_file(shard_manifest)
+    if "shard_manifest" in digests and actual != digests["shard_manifest"]:
+        raise BuildError(f"site_profile asset_sha256.shard_manifest mismatch: {actual} != {digests['shard_manifest']}")
+    manifest_obj = json.loads(shard_manifest.read_text(encoding="utf-8"))
+    _verify_shard_entries(
+        manifest_obj.get("shards", []),
+        staging / "keyframes/images",
+        label="keyframe",
     )
-    localization = staging / "localization"
-    for entry in bundle["files"]:
-        path = (localization / entry["path"]).resolve()
-        actual = sha256_file(path)
-        if actual != entry["sha256"] or path.stat().st_size != entry["size_bytes"]:
-            raise BuildError(f"bundle file digest mismatch: {entry['path']}")
-    for name, expected in bundle["model_sha256"].items():
-        if sha256_file(staging / "model" / name) != expected:
-            raise BuildError(f"model digest mismatch: {name}")
+    _verify_shard_entries(
+        manifest_obj.get("depth_shards", []),
+        staging / "depth_moge3",
+        label="depth",
+    )
 
-    profile = json.loads((staging / "site_profile.json").read_text(encoding="utf-8"))
-    digests = profile["asset_sha256"]
-    targets = {
-        "map_ply": profile["assets"]["map_ply"],
-        "localization_bundle": profile["assets"]["localization_bundle"],
-        "localizer_profile": profile["localizer_profile"],
-        "map_reference_poses": profile["map_reference_poses"],
-        "map_align": profile["map_align"],
-    }
-    for key, relative in targets.items():
-        if sha256_file(staging / relative) != digests[key]:
-            raise BuildError(f"site_profile asset_sha256.{key} mismatch")
 
+def _verify_colmap_and_keyframes(staging: Path, pycolmap) -> None:
     reconstruction = pycolmap.Reconstruction(str(staging / "model"))
     occupancy = json.loads(
         (staging / "model/occupancy.json").read_text(encoding="utf-8")
@@ -882,6 +1057,53 @@ def verify_staging(staging: Path, pycolmap) -> None:
         if not image.is_file():
             raise BuildError(f"keyframe listed in the manifest is missing: {image}")
 
+
+def _verify_bundle(staging: Path) -> None:
+    bundle = json.loads(
+        (staging / "localization/direct_bundle.json").read_text(encoding="utf-8")
+    )
+    localization = staging / "localization"
+    for entry in bundle["files"]:
+        path = (localization / entry["path"]).resolve()
+        actual = sha256_file(path)
+        if actual != entry["sha256"] or path.stat().st_size != entry["size_bytes"]:
+            raise BuildError(f"bundle file digest mismatch: {entry['path']}")
+    for name, expected in bundle["model_sha256"].items():
+        if sha256_file(staging / "model" / name) != expected:
+            raise BuildError(f"model digest mismatch: {name}")
+
+
+def verify_staging(staging: Path, pycolmap) -> None:
+    """Re-hash every published digest and re-open the model before promoting."""
+    _verify_bundle(staging)
+    profile = json.loads((staging / "site_profile.json").read_text(encoding="utf-8"))
+    digests = profile["asset_sha256"]
+    targets = {
+        "map_ply": profile["assets"]["map_ply"],
+        "localization_bundle": profile["assets"]["localization_bundle"],
+        "localizer_profile": profile["localizer_profile"],
+        "map_reference_poses": profile["map_reference_poses"],
+        "map_align": profile["map_align"],
+    }
+    if profile.get("assets", {}).get("shard_manifest"):
+        targets["shard_manifest"] = profile["assets"]["shard_manifest"]
+    if profile.get("assets", {}).get("inductor_prewarm"):
+        targets["inductor_prewarm"] = profile["assets"]["inductor_prewarm"]
+    for key, relative in targets.items():
+        if relative is None:
+            continue
+        if sha256_file(staging / relative) != digests[key]:
+            raise BuildError(f"site_profile asset_sha256.{key} mismatch")
+
+    _verify_shard_manifest(staging, digests)
+
+    prewarm_file = staging / "compat/inductor_prewarm.json"
+    if prewarm_file.is_file():
+        actual_prewarm = sha256_file(prewarm_file)
+        if "inductor_prewarm" in digests and actual_prewarm != digests["inductor_prewarm"]:
+            raise BuildError("site_profile asset_sha256.inductor_prewarm mismatch")
+
+    _verify_colmap_and_keyframes(staging, pycolmap)
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])

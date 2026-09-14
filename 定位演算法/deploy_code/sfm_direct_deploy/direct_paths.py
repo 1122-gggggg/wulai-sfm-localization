@@ -24,16 +24,28 @@ from pathlib import Path
 
 
 _SHA256_CHUNK = 8 * 1024 * 1024
+_SHA256_CACHE: dict[tuple[int, int, int], str] = {}
 
 
 def sha256_file(path: str | Path) -> str:
     """Stream one file through SHA-256 without holding it in memory."""
+    resolved = Path(path).resolve()
+    try:
+        st = resolved.stat()
+        key = (st.st_ino, int(st.st_mtime_ns), st.st_size)
+    except OSError:
+        key = None
+    if key is not None and key in _SHA256_CACHE:
+        return _SHA256_CACHE[key]
 
     digest = hashlib.sha256()
-    with Path(path).open("rb") as stream:
+    with resolved.open("rb") as stream:
         for chunk in iter(lambda: stream.read(_SHA256_CHUNK), b""):
             digest.update(chunk)
-    return digest.hexdigest()
+    val = digest.hexdigest()
+    if key is not None:
+        _SHA256_CACHE[key] = val
+    return val
 
 
 def verify_file_sha256(path: str | Path, expected: str | None) -> str:
@@ -60,10 +72,24 @@ BOQ_WEIGHTS_ENV = "SFM_BOQ_WEIGHTS"
 
 _DEFAULT_EDM_REPO = WORKSPACE_ROOT / "定位演算法" / "deploy_code" / "runtime" / "EDM"
 _DEFAULT_EDM_CHECKPOINT = _DEFAULT_EDM_REPO / "weights" / "edm_outdoor.ckpt"
-# Mirrors ``boq_extractor.BOQ_WEIGHTS`` (kept local so this module stays free of
-# the torch import; ``BoQExtractor`` SHA-pins the file at load).
-_DEFAULT_BOQ_WEIGHTS = Path("/home/allen/.cache/torch/hub/checkpoints/resnet50_16384.pth")
+# Authoritative BoQ weights live under 執行環境/models/boq/ (RUNTIME_ARTIFACTS.json).
+# Three-way exists chain: authoritative -> repo torch_hub_cache -> user cache.
+_BOQ_WEIGHTS_CANDIDATES = (
+    WORKSPACE_ROOT / "執行環境" / "models" / "boq" / "resnet50_16384.pth",
+    WORKSPACE_ROOT / "執行環境" / "torch_hub_cache" / "checkpoints" / "boq" / "resnet50_16384.pth",
+    Path.home() / ".cache" / "torch" / "hub" / "checkpoints" / "resnet50_16384.pth",
+)
+_DEFAULT_BOQ_WEIGHTS = _BOQ_WEIGHTS_CANDIDATES[0]
 _DEFAULT_CACHE_DIR = WORKSPACE_ROOT / "執行環境" / "direct_reloc_cache"
+
+
+def resolve_boq_weights_path() -> Path:
+    """Resolve BoQ weights via 3-way exists chain (authoritative -> repo cache -> home cache)."""
+    for candidate in _BOQ_WEIGHTS_CANDIDATES:
+        resolved = candidate.expanduser()
+        if resolved.is_file():
+            return resolved.resolve()
+    return _DEFAULT_BOQ_WEIGHTS
 
 
 def vendor_sys_path() -> None:
@@ -116,7 +142,7 @@ def default_runtime_paths() -> DirectRuntimePaths:
         _DEFAULT_EDM_CHECKPOINT, directory=False, what="EDM checkpoint"
     )
     boq_weights = _from_env(BOQ_WEIGHTS_ENV, directory=False) or _require(
-        _DEFAULT_BOQ_WEIGHTS, directory=False, what="BoQ weights"
+        resolve_boq_weights_path(), directory=False, what="BoQ weights"
     )
     return DirectRuntimePaths(
         edm_repo=edm_repo,

@@ -24,7 +24,6 @@ from flight_operator_app import (
     format_magnetometer_calibration,
     format_olympe_telemetry,
     gps_operator_message,
-    gravity_phase_guidance,
     inventory_ui_status,
     next_tick_deadline,
     video_hud_identity,
@@ -57,47 +56,6 @@ def _bare_app(backend=None):
     app.control_owner_var = SimpleNamespace(set=lambda _value: None)
     app.write_log = lambda _message: None
     return app
-
-
-class _CollisionBackend:
-    is_live = False
-
-    def __init__(self):
-        self.state = SimpleNamespace(
-            pose=np.zeros(4, dtype=float),
-            tracker_state="CRUISE",
-            last_command="",
-        )
-        self.calls = []
-
-    def nudge_clear(self, *, reason):
-        self.calls.append(("nudge_clear", reason))
-
-    def send_pcmd(self, *pcmd, reason):
-        self.calls.append(("send_pcmd", pcmd, reason))
-        return True
-
-
-def _collision_guard_app() -> OperatorApp:
-    operator = _bare_app(_CollisionBackend())
-    operator.map_radius = 10.0
-    operator.default_map_center = np.zeros(3, dtype=float)
-    operator.collision_guard_enabled = True
-    operator.collision_guard_radius = None
-    operator._collision_interlock_latched = False
-    operator._collision_guard_monitor = None
-    operator.collision_guard_snapshot = {}
-    operator.inspecting = False
-    operator.current_state = operator.backend.state
-    operator._is_live_backend = lambda: False
-    operator._pause_integrated_auto = lambda _reason: False
-    operator.session_logs = None
-    operator._configure_sparse_cloud_collision_guard(
-        np.array([[0.0, 0.0, 0.0]], dtype=float)
-    )
-    if operator._collision_guard_monitor.tree is None:
-        pytest.skip("scipy cKDTree is unavailable")
-    return operator
 
 
 class _RouteLock:
@@ -183,124 +141,6 @@ def test_keyboard_keys_match_the_two_virtual_sticks() -> None:
         "i": "前",
         "k": "後",
     }
-
-
-def test_sparse_cloud_center_camera_is_preview_only() -> None:
-    operator = _collision_guard_app()
-
-    operator.update_sparse_cloud_collision_interlock(operator.backend.state)
-
-    assert operator.collision_guard_snapshot["status"] == "PREVIEW_HIT"
-    assert operator.collision_guard_snapshot["preview"] is True
-    assert operator.collision_guard_snapshot["center"] == pytest.approx(
-        operator.default_map_center
-    )
-    assert operator._collision_interlock_latched is False
-    assert operator.backend.calls == []
-
-
-def test_sparse_cloud_hit_clears_motion_hovers_once_and_requires_clearance() -> None:
-    operator = _collision_guard_app()
-    operator.inspecting = True
-    operator.live_locked = True
-    operator.loc_health = "OK"
-    operator.live_pose = np.array([0.02, 0.0, 0.0], dtype=float)
-    operator.loc_pose_updated_mono = time.monotonic()
-    pauses = []
-    incidents = []
-    operator._pause_integrated_auto = lambda reason: pauses.append(reason) or True
-    operator.session_logs = SimpleNamespace(
-        incident=lambda event, **fields: incidents.append((event, fields))
-    )
-
-    operator.update_sparse_cloud_collision_interlock(operator.backend.state)
-    operator.update_sparse_cloud_collision_interlock(operator.backend.state)
-
-    assert operator.collision_guard_snapshot["status"] == "COLLISION"
-    assert operator._collision_interlock_latched is True
-    assert pauses == ["sparse_cloud_collision"]
-    assert operator.backend.calls == [
-        ("nudge_clear", "sparse_cloud_collision"),
-        (
-            "send_pcmd",
-            (0, 0, 0, 0),
-            "sparse_cloud_collision_hover",
-        ),
-    ]
-    assert operator.backend.state.tracker_state == "HOVER"
-    assert operator._collision_motion_blocked("test motion") is True
-    assert incidents[0][0] == "sparse_cloud_collision_hover"
-    assert incidents[0][1]["resolved"] is False
-    calls_at_latch = list(operator.backend.calls)
-    operator._on_nudge_btn_press("前")
-    assert operator.backend.calls == calls_at_latch
-    assert operator._nudge_buttons_held == set()
-
-    operator.inspecting = False
-    operator.update_sparse_cloud_collision_interlock(operator.backend.state)
-    assert operator.collision_guard_snapshot["status"] == "PREVIEW_HIT"
-    assert operator._collision_interlock_latched is True
-
-    operator.inspecting = True
-    operator.live_pose = np.array([2.0, 0.0, 0.0], dtype=float)
-    operator.loc_pose_updated_mono = time.monotonic()
-    operator.update_sparse_cloud_collision_interlock(operator.backend.state)
-    assert operator.collision_guard_snapshot["status"] == "CLEAR"
-    assert operator._collision_interlock_latched is False
-    assert incidents[-1][1]["resolved"] is True
-
-
-def test_sparse_cloud_inspect_without_lock_does_not_latch() -> None:
-    operator = _collision_guard_app()
-    operator.inspecting = True
-    operator.live_locked = False
-    operator.loc_health = "FAIL"
-    operator.backend.state.pose = np.array([0.0, 0.0, 0.0, 0.0])
-
-    operator.update_sparse_cloud_collision_interlock(operator.backend.state)
-
-    assert operator.collision_guard_snapshot["status"] == "WAITING"
-    assert operator._collision_interlock_latched is False
-    assert operator.backend.calls == []
-
-
-def test_sparse_cloud_radius_change_controls_the_collision_boundary() -> None:
-    operator = _collision_guard_app()
-    operator.inspecting = True
-    operator.live_locked = True
-    operator.loc_health = "OK"
-    operator.live_pose = np.array([0.04, 0.0, 0.0], dtype=float)
-    operator.loc_pose_updated_mono = time.monotonic()
-    operator.collision_guard_radius = 0.025
-
-    operator.update_sparse_cloud_collision_interlock(operator.backend.state)
-    assert operator.collision_guard_snapshot["status"] == "CLEAR"
-
-    operator.collision_guard_radius = 0.05
-    operator.update_sparse_cloud_collision_interlock(operator.backend.state)
-    assert operator.collision_guard_snapshot["status"] == "COLLISION"
-
-
-def test_sparse_cloud_collision_still_hovers_when_auto_pause_raises() -> None:
-    operator = _collision_guard_app()
-    operator.inspecting = True
-    operator.live_locked = True
-    operator.loc_health = "OK"
-    operator.live_pose = np.array([0.01, 0.0, 0.0], dtype=float)
-    operator.loc_pose_updated_mono = time.monotonic()
-
-    def fail_pause(_reason):
-        raise RuntimeError("coordinator failed")
-
-    operator._pause_integrated_auto = fail_pause
-    operator.update_sparse_cloud_collision_interlock(operator.backend.state)
-
-    assert operator._collision_interlock_latched is True
-    assert operator.backend.calls[-1] == (
-        "send_pcmd",
-        (0, 0, 0, 0),
-        "sparse_cloud_collision_hover",
-    )
 
 
 def test_keyboard_indicator_moves_without_emitting_a_stick_command() -> None:
@@ -560,15 +400,20 @@ def test_preflight_system_step_requires_fresh_stream_and_telemetry(
     )
     assert evidence == ("system", "live"), reason
 
-    for advisory_battery in (1.0, float("nan")):
-        state.battery_pct = advisory_battery
+    # The live backend refuses takeoff below the floor and on an unreadable
+    # battery, so the preflight step must withhold evidence for the same states
+    # rather than tell the operator they are advisory.
+    for blocking_battery in (1.0, float("nan")):
+        state.battery_pct = blocking_battery
         evidence, reason = operator._preflight_step_evidence(
             "system", state, now=now
         )
-        assert evidence is not None, reason
-        assert "電量" in reason and "不阻擋起飛" in reason
+        assert evidence is None, reason
+        assert "電量" in reason and "會阻擋起飛" in reason
     state.battery_pct = 80.0
 
+    # An unset altitude/distance limit really is unconstrained, and GPS only
+    # blocks behind a configured distance geofence: those stay non-blocking.
     state.gps_fixed = False
     state.max_altitude_m = None
     state.max_distance_m = None
@@ -578,7 +423,7 @@ def test_preflight_system_step_requires_fresh_stream_and_telemetry(
         "system", state, now=now
     )
     assert evidence is not None, reason
-    assert "不阻擋起飛" in reason
+    assert "未設定則不限制" in reason
 
     for unavailable_stream in ("WAIT", "LOST", "LOST_HOLD"):
         state.stream = unavailable_stream
@@ -656,7 +501,7 @@ def test_missing_gps_with_disabled_geofence_is_not_a_preflight_blocker(gps_fixed
     )
 
     assert evidence is not None, reason
-    assert "不阻擋起飛" in reason
+    assert "GPS 僅在已設定距離圍欄" in reason
 
 
 @pytest.mark.parametrize("gps_fixed", [False, None], ids=["no-fix", "unknown"])
@@ -1268,7 +1113,7 @@ def test_integrated_auto_starts_without_a_separate_live_release_flag(
             approved=True,
             route_clearance_approved=True,
             coordinate_frame_id="glomap-a",
-            controller=SimpleNamespace(max_route_deviation_map_units=0.9),
+            controller=SimpleNamespace(),
         ),
     )
     operator = _bare_app()
@@ -1298,7 +1143,7 @@ def test_integrated_auto_starts_without_a_separate_live_release_flag(
 
     assert len(created) == 1
     assert operator.__dict__.get("_integrated_autonomy") is created[0]
-    assert created[0].kwargs["max_route_deviation_map_units"] == pytest.approx(0.9)
+    assert "max_route_deviation_map_units" not in created[0].kwargs
     assert operator.mission_route_lock.active
     assert not any("發布阻擋" in message for message in operator.logs)
 
@@ -1827,11 +1672,11 @@ def test_ui_exposes_read_only_olympe_flight_telemetry() -> None:
     assert "cache age 25 ms" in telemetry["sensors"]
 
 
-def test_ui_separates_firmware_magnetometer_calibration_from_passive_gravity_check() -> None:
+def test_ui_keeps_firmware_magnetometer_calibration_without_passive_gravity_check() -> None:
     source = inspect.getsource(OperatorApp._build_ui)
 
     assert "飛機羅盤校正（只允許 landed；使用者手持旋轉）" in source
-    assert "姿態／重力檢查（只讀；不寫入飛機）" in source
+    assert "姿態／重力檢查" not in source
     assert "drone_magnetometer_start" in source
     assert "不會啟動馬達" in source
     # Operator decision 2026-08-06: the SkyController compass panel was removed.
@@ -1885,25 +1730,6 @@ def test_magnetometer_status_shows_reusable_and_latest_firmware_result() -> None
     ))["drone"]
     assert "最新讀回校正結果：FAIL" in failed
     assert "不可沿用" in failed
-
-
-def test_gravity_guide_tells_the_operator_each_motion_and_next_action() -> None:
-    ready = gravity_phase_guidance(None)
-    assert "拆除螺旋槳" in ready and "landed" in ready
-    assert "水平旋轉 → 前後俯仰 → 左右側傾" in ready
-
-    yaw = gravity_phase_guidance("yaw", sample_count=12, span_deg=46.4)
-    assert "1/3 YAW" in yaw and "保持水平" in yaw and "轉一整圈" in yaw
-    assert "樣本 12/15" in yaw and "角度變化 46°/90°" in yaw
-    assert "下一階段" in yaw
-
-    pitch = gravity_phase_guidance("pitch", sample_count=18, span_deg=31.0)
-    assert "2/3 PITCH" in pitch and "機頭先抬高再壓低" in pitch
-    assert "角度變化 31°/25°" in pitch and "下一階段" in pitch
-
-    roll = gravity_phase_guidance("roll", sample_count=20, span_deg=28.0)
-    assert "3/3 ROLL" in roll and "先向左再向右側傾" in roll
-    assert "角度變化 28°/25°" in roll and "完成並分析" in roll
 
 
 def test_focus_loss_clears_all_holds_and_backend_nudges():

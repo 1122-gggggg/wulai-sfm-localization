@@ -17,6 +17,8 @@ import math
 # Source modules are supplied by the repository's pytest pythonpath.
 import numpy as np
 import pytest
+
+pytestmark = pytest.mark.smoke
 from real_path_follow_controller import MapFrame
 
 from two_rate_tracker import DEAD_RECKON_MAX_TURN_DEG, azimuth_turn_exceeds

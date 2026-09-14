@@ -1,32 +1,8 @@
 #!/usr/bin/env python3
-"""Pole-inspection cruise: fly the hand-drawn path, but turn the CAMERA to face
-each boxed pole while passing it, then snap back to looking straight ahead.
+"""Pole-inspection cruise reference (not flown by production AUTO).
 
-Inputs (both ALIGNED map frame, scale-free, from the Blender tools):
-  safezone/flight_path.json  -> the route waypoints (load_path)
-  safezone/poles.json        -> the marked pole boxes (load_poles)
-
-Behaviour, as a function of the live pose:
-  * a carrot point LOOKAHEAD ahead on the path gives the travel direction +
-    target altitude (this is what actually moves the drone).
-  * HEADING schedule:
-      - far from every pole         -> face the path forward tangent.
-      - within RELEASE_R of a pole   -> start blending toward "look at pole".
-      - within ENGAGE_R of a pole    -> fully locked on the pole bearing.
-    The blend is distance-based with hysteresis, so as the drone approaches a
-    pole it locks on, and once it has passed (distance grows again) it eases
-    back to forward -- exactly "face the pole, recover to straight ahead after".
-  * the ANAFI gimbal only pitches, so horizontal aim = drone YAW (body turns);
-    the gimbal PITCH tilts up/down to the pole mid-height while engaged.
-  * because the drone is yawed at the pole but must still track the path, the
-    world travel direction is split into body forward (pitch) + lateral (roll)
-    using the current yaw, so it strafes along the route while looking sideways.
-
-PCMD percents + sign conventions mirror cruise_geofence.py. VERIFY YAW_SIGN /
-ROLL_SIGN / gimbal sign on YOUR airframe before flying (they match the built-in
-sim here, noted the same way the existing controllers are).
-
-Standalone self-check:  python3 deploy/pole_cruise.py
+RETIRED from flight: no tube, no clearance steering, no boundary slowdown.
+Kept only as a controller-only reference; not wired into production flight.
 """
 # NOTE: not wired into the production flight path (path_follow_flight). Experimental/unused as of this package.
 from __future__ import annotations

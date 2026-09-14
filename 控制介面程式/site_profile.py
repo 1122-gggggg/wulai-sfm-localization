@@ -144,7 +144,6 @@ class FlightControlProfile:
     inspect_radius_map_units: float
     inspect_resume_margin_map_units: float
     max_pose_jump_map_units: float
-    max_route_deviation_map_units: float
     progress_jump_slack_map_units: float
     max_progress_regression_map_units: float
     segment_window: int
@@ -566,7 +565,6 @@ def _load_flight_controller_values(
         "speed_limit_mps": 2.0,
         "lookahead_map_units": 5.0,
         "max_pose_jump_map_units": 5.0,
-        "max_route_deviation_map_units": 10.0,
     }
     for key, maximum in ceilings.items():
         if values[key] > maximum:
@@ -605,7 +603,6 @@ def _load_flight_controller(raw: object, source: Path) -> FlightControlProfile |
         "inspect_radius_map_units",
         "inspect_resume_margin_map_units",
         "max_pose_jump_map_units",
-        "max_route_deviation_map_units",
         "progress_jump_slack_map_units",
         "max_progress_regression_map_units",
         "progress_speed_factor",

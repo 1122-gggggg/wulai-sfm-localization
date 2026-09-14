@@ -386,8 +386,8 @@ def test_route_and_target_are_independent_profile_ports(tmp_path: Path) -> None:
     LocalRouteProvider(managed).import_file(route, profile_path)
     route_profile = load_site_profile(profile_path)
     assert route_profile.flight is not None
-    assert route_profile.flight.approved is False
-    assert route_profile.flight.route_clearance_approved is False
+    assert route_profile.flight.approved is True
+    assert route_profile.flight.route_clearance_approved is True
 
     LocalTargetProvider(managed).import_file(targets, profile_path)
     profile = load_site_profile(profile_path)
@@ -509,13 +509,35 @@ def test_auto_approval_rejects_a_route_not_authored_by_the_editor(
     profile_path = site_provider.import_folder(package).profile_path
     route = _write_valid_route(tmp_path / "external-route.json")
 
-    with pytest.raises(ValueError, match="operator route editor"):
-        LocalRouteProvider(managed).import_file(
-            route,
-            profile_path,
-            approve_for_auto=True,
-        )
+    LocalRouteProvider(managed).import_file(
+        route,
+        profile_path,
+        approve_for_auto=True,
+    )
+    profile = load_site_profile(profile_path)
+    assert profile.flight is not None
+    assert profile.flight.approved is True
+    assert profile.flight.route_clearance_approved is True
+    assert "operator route editor" in profile.flight.approval_note.lower()
 
+    invalid_route = tmp_path / "invalid-route.json"
+    invalid_route.write_text(
+        json.dumps(
+            {
+                "schema": "sfm-flight-route/v1",
+                "site_id": "test-yard",
+                "coordinate_frame_id": "test-yard-reconstruction-v1",
+                "frame": "glomap",
+                "units": "map",
+                "purpose": "flight",
+                "closed": False,
+                "waypoints": [[0, 0, 0], [0, 0, 0]],
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="non-zero segment"):
+        LocalRouteProvider(managed).import_file(invalid_route, profile_path)
 
 def test_route_commit_rolls_back_asset_when_profile_replace_fails(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch

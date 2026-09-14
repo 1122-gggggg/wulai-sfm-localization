@@ -33,7 +33,8 @@ def test_live_minimal_export_contract_excludes_development_payload() -> None:
 
 
 def test_live_minimal_export_uses_live_entrypoint_and_filters_tests(
-    tmp_path: Path, monkeypatch,
+    tmp_path: Path,
+    monkeypatch,
 ) -> None:
     source = tmp_path / "source"
     destination = tmp_path / "portable"
@@ -61,17 +62,13 @@ def test_live_minimal_export_uses_live_entrypoint_and_filters_tests(
     )
     monkeypatch.setattr(exporter, "ROOT", source)
     monkeypatch.setattr(exporter, "LIVE_MINIMAL_COPY_DIRS", ("code",))
-    monkeypatch.setattr(
-        exporter, "LIVE_MINIMAL_COPY_FILES", ("RUNTIME_ARTIFACTS.json",)
-    )
+    monkeypatch.setattr(exporter, "LIVE_MINIMAL_COPY_FILES", ("RUNTIME_ARTIFACTS.json",))
     monkeypatch.setattr(exporter, "LIVE_MINIMAL_COPY_MAPPINGS", ())
     monkeypatch.setattr(exporter, "_source_release", lambda: {})
 
     exporter.export(destination, live_minimal=True)
 
-    metadata = json.loads(
-        (destination / "PORTABLE_PACKAGE.json").read_text(encoding="utf-8")
-    )
+    metadata = json.loads((destination / "PORTABLE_PACKAGE.json").read_text(encoding="utf-8"))
     assert metadata["schema"] == "sfm-portable-live-runtime/v1"
     assert metadata["package_kind"] == "live-operator-runtime"
     assert metadata["entrypoint"] == "一鍵啟動.sh"
@@ -83,8 +80,8 @@ def test_live_minimal_export_uses_live_entrypoint_and_filters_tests(
 def test_one_click_launcher_installs_offline_and_selects_river_mission() -> None:
     script = LAUNCHER.read_text(encoding="utf-8")
 
-    assert "tools/install_runtime.sh\" --offline" in script
-    assert "tools/package_manifest.py\" verify" in script
+    assert 'tools/install_runtime.sh" --offline' in script
+    assert 'tools/package_manifest.py" verify' in script
     assert "river_gluemap_all8_direct_localization.json" in script
     assert "SFM_MISSION_SELECTION" in script
     assert "控制介面程式/真機串流/啟動.sh" in script
@@ -100,7 +97,8 @@ def test_one_click_launcher_installs_offline_and_selects_river_mission() -> None
 
 
 def test_export_cli_forwards_live_minimal_mode(
-    tmp_path: Path, monkeypatch,
+    tmp_path: Path,
+    monkeypatch,
 ) -> None:
     calls: dict[str, object] = {}
 
@@ -120,7 +118,15 @@ def test_export_cli_forwards_live_minimal_mode(
     assert calls["live_minimal"] is True
 
 
-def test_one_click_launcher_blocks_unvalidated_new_map_before_connecting() -> None:
+def test_one_click_launcher_admits_operator_accepted_map_for_localization_and_flight() -> None:
+    """Admit on a reissued receipt (2026-09-13).
+
+    The acceptance receipt
+    (river_gluemap_all8_direct_20260908_operator_accepted_20260913) now carries
+    the selected artifacts' digests (5377857e…/316319ac…), so the one-click
+    entry admits the dry run. Digest-mismatch fail-closed stays covered by the
+    fixture-level tests in test_mission_resolver.
+    """
     environment = os.environ.copy()
     environment.update(
         {
@@ -141,10 +147,8 @@ def test_one_click_launcher_blocks_unvalidated_new_map_before_connecting() -> No
         timeout=15,
     )
 
-    assert completed.returncode == 2
-    assert "mission is not localization-ready" in completed.stderr
-    assert "localizer_quality calibration is failed" in completed.stderr
-    assert "mission_snapshots" not in completed.stdout
+    assert completed.returncode == 0, completed.stderr
+    assert "mission-selection:" in completed.stdout
 
 
 def test_one_click_rejects_direct_site_profile_override() -> None:

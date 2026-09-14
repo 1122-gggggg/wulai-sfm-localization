@@ -13,7 +13,7 @@ is an unknown key.  A knob nobody validates is a knob nobody controls.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Mapping
@@ -28,6 +28,7 @@ DIRECT_PROFILE_SCHEMA = "direct-deployment-profile/v1"
 _TOP_KEYS = frozenset(
     {"schema", "name", "map_scale", "intrinsics", "reloc", "fast_loop", "vo", "dead_reckon"}
 )
+_OPTIMIZATION_KEYS = frozenset({"adaptive_retrieval", "spatial_selection", "gpu_cache_size"})
 _INTRINSICS_KEYS = frozenset(
     {"schema_version", "image_width", "image_height", "K", "images_are_undistorted"}
 )
@@ -85,7 +86,7 @@ _VO_KEYS = frozenset(
         "window_ba",
     }
 )
-_DEAD_RECKON_KEYS = frozenset({"enabled", "max_frames"})
+_DEAD_RECKON_KEYS = frozenset({"enabled", "max_frames", "max_age_s"})
 
 SUPPORTED_TRACKERS = frozenset({"klt"})
 
@@ -98,11 +99,14 @@ def _reject_json_constant(value: str):
     raise DirectProfileError(f"non-finite JSON number is not allowed: {value}")
 
 
-def _section(raw: Mapping[str, Any], name: str, allowed: frozenset[str], source: Path) -> dict:
+def _section(
+    raw: Mapping[str, Any], name: str, allowed: frozenset[str], source: Path,
+    *, optional: frozenset[str] = frozenset(),
+) -> dict:
     value = raw.get(name)
     if not isinstance(value, dict):
         raise DirectProfileError(f"direct profile section {name!r} must be an object: {source}")
-    missing = sorted(allowed - value.keys())
+    missing = sorted(allowed - optional - value.keys())
     unknown = sorted(value.keys() - allowed)
     if missing:
         raise DirectProfileError(f"direct profile {name} is missing {missing}: {source}")
@@ -233,6 +237,16 @@ class DirectVO:
 class DirectDeadReckon:
     enabled: bool
     max_frames: int
+    max_age_s: float = 10.0
+
+
+@dataclass(frozen=True)
+class DirectOptimizations:
+    """Optional, SHA-bound experiments; legacy releases retain their policy."""
+
+    adaptive_retrieval: bool = False
+    spatial_selection: bool = False
+    gpu_cache_size: int = 0
 
 
 @dataclass(frozen=True)
@@ -249,6 +263,7 @@ class DirectProfile:
     raw: Mapping[str, Any]
     sha256: str
     source: Path
+    optimizations: DirectOptimizations = field(default_factory=DirectOptimizations)
 
 
 def _parse_intrinsics(raw: Mapping[str, Any], source: Path) -> DirectIntrinsics:
@@ -380,10 +395,14 @@ def _parse_vo(raw: Mapping[str, Any], source: Path) -> DirectVO:
 
 
 def _parse_dead_reckon(raw: Mapping[str, Any], source: Path) -> DirectDeadReckon:
-    section = _section(raw, "dead_reckon", _DEAD_RECKON_KEYS, source)
+    section = _section(
+        raw, "dead_reckon", _DEAD_RECKON_KEYS, source, optional=frozenset({"max_age_s"})
+    )
     return DirectDeadReckon(
         enabled=_boolean("dead_reckon", "enabled", section["enabled"], source),
         max_frames=_positive_int("dead_reckon", "max_frames", section["max_frames"], source),
+        # Legacy releases allowed 300 successful DR steps on the 30 Hz stream.
+        max_age_s=_positive_float("dead_reckon", "max_age_s", section.get("max_age_s", 10.0), source),
     )
 
 
@@ -402,7 +421,7 @@ def load_direct_profile(
             f"direct profile schema must be {DIRECT_PROFILE_SCHEMA!r}: {source}"
         )
     missing = sorted(_TOP_KEYS - raw.keys())
-    unknown = sorted(raw.keys() - _TOP_KEYS)
+    unknown = sorted(raw.keys() - _TOP_KEYS - {"optimizations"})
     if missing:
         raise DirectProfileError(f"direct profile is missing {missing}: {source}")
     if unknown:
@@ -410,6 +429,14 @@ def load_direct_profile(
     name = raw["name"]
     if not isinstance(name, str) or not name:
         raise DirectProfileError(f"direct profile name must be a non-empty string: {source}")
+    optimizations = DirectOptimizations()
+    if "optimizations" in raw:
+        section = _section(raw, "optimizations", _OPTIMIZATION_KEYS, source)
+        optimizations = DirectOptimizations(
+            adaptive_retrieval=_boolean("optimizations", "adaptive_retrieval", section["adaptive_retrieval"], source),
+            spatial_selection=_boolean("optimizations", "spatial_selection", section["spatial_selection"], source),
+            gpu_cache_size=_nonnegative_int("optimizations", "gpu_cache_size", section["gpu_cache_size"], source),
+        )
     return DirectProfile(
         name=name,
         map_scale=_positive_float("profile", "map_scale", raw["map_scale"], source),
@@ -421,4 +448,5 @@ def load_direct_profile(
         raw=MappingProxyType(raw),
         sha256=digest,
         source=source,
+        optimizations=optimizations,
     )

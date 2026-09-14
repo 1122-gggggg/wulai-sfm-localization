@@ -4,6 +4,7 @@
 Validates an authored flight route and executes a dry-run closed-loop flight
 using RouteAutoController and kinematic toy-dynamics without hardware.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -30,8 +31,8 @@ if str(FLIGHT_CONTROL_ROOT) not in sys.path:
 # Ensure ambient flight contract environment does not enforce SHA-256 verification
 os.environ.pop("SFM_FLIGHT_CONTRACT_JSON", None)
 
-from route_domain import RouteDocument, LEGACY_MAP_FRAME  # noqa: E402
-from real_path_follow_controller import load_map_frame  # noqa: E402
+from route_domain import RouteDocument  # noqa: E402
+from real_path_follow_controller import LEGACY_MAP_FRAME, load_map_frame  # noqa: E402
 import path_follow_flight as pff  # noqa: E402
 
 
@@ -114,20 +115,23 @@ def _filter_stdout():
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    parser = RouteTestArgumentParser(
-        description="Route autoflight dry-run acceptance tool."
-    )
+    parser = RouteTestArgumentParser(description="Route autoflight dry-run acceptance tool.")
     parser.add_argument(
         "--route",
         required=True,
         type=str,
         help="Path to route JSON (e.g. flight_path.json)",
     )
+    # AUTO flies every route out and back (return_to_start), so the simulated
+    # path is twice the drawn length and needs twice the old budget. Desktop
+    # translation authority is 3% tilt (balanced against the 0.60 m/s speed
+    # guard, 2026-09-13), roughly a third of the old 10%, so double again.
+    # The cap counts hook now() calls, roughly four per control tick.
     parser.add_argument(
         "--steps",
         type=int,
-        default=12000,
-        help="Max simulation steps (default: 12000)",
+        default=48000,
+        help="Max simulation steps (default: 48000)",
     )
     parser.add_argument(
         "--min-progress",
@@ -174,9 +178,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         map_align = _site_map_align(route_path, args.site_profile)
         map_frame = LEGACY_MAP_FRAME if map_align is None else load_map_frame(map_align)
-        doc = RouteDocument.from_path(
-            route_path, require_map_units=True, map_frame=map_frame
-        )
+        doc = RouteDocument.from_path(route_path, require_map_units=True, map_frame=map_frame)
     except Exception as exc:
         print(f"[route-test] error={exc}")
         return 1
@@ -190,7 +192,7 @@ def main(argv: list[str] | None = None) -> int:
     if closed and calc_pts[-1] != calc_pts[0]:
         calc_pts.append(calc_pts[0])
     total_len = sum(math.dist(a, b) for a, b in zip(calc_pts[:-1], calc_pts[1:]))
-    zs = [p[2] for p in wps]
+    zs = [map_frame.vertical(point) for point in doc.controller_waypoints()]
     z_min, z_max = min(zs), max(zs)
 
     # Print route verification line
@@ -262,8 +264,8 @@ def main(argv: list[str] | None = None) -> int:
         f"state={state} cmdlog={cmdlog}"
     )
 
-    # 4. progress>=min-progress 則 exit 0 否則 exit 2
-    if progress >= args.min_progress:
+    # Progress alone must not accept a timed-out, hovering, or aborted run.
+    if progress >= args.min_progress and state == "LANDING" and reason == "route complete -> land":
         return 0
     return 2
 

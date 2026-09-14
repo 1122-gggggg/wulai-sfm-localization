@@ -150,16 +150,25 @@ def digest(path: Path) -> str:
 
 
 def entries(
-    root: Path, *, source_only: bool = False, include_site_assets: bool = False
+    root: Path,
+    *,
+    source_only: bool = False,
+    include_site_assets: bool = False,
+    known_digests: Mapping[str, str] | None = None,
 ) -> list[Entry]:
-    return [
-        Entry(path.stat().st_size, digest(path), path.relative_to(root).as_posix())
-        for path in package_files(
-            root,
-            source_only=source_only,
-            include_site_assets=include_site_assets,
-        )
-    ]
+    result: list[Entry] = []
+    digests = known_digests or {}
+    for path in package_files(
+        root,
+        source_only=source_only,
+        include_site_assets=include_site_assets,
+    ):
+        rel = path.relative_to(root).as_posix()
+        file_sha256 = digests.get(rel)
+        if file_sha256 is None:
+            file_sha256 = digest(path)
+        result.append(Entry(path.stat().st_size, file_sha256, rel))
+    return result
 
 
 def generate(
@@ -167,6 +176,7 @@ def generate(
     *,
     source_only: bool = False,
     include_site_assets: bool | None = None,
+    known_digests: Mapping[str, str] | None = None,
 ) -> list[Entry]:
     root_path = Path(root)
     if issue := _control_file_issue(root_path):
@@ -178,6 +188,7 @@ def generate(
         root,
         source_only=source_only,
         include_site_assets=include_site_assets,
+        known_digests=known_digests,
     )
     manifest = ["size_bytes\tsha256\tpath"]
     manifest.extend(f"{entry.size}\t{entry.sha256}\t./{entry.path}" for entry in result)
@@ -345,9 +356,11 @@ def _offline_wheelhouse_issues(root: Path) -> list[str]:
     try:
         from offline_wheelhouse import WheelhouseError, verify_wheelhouse
 
+        token = str(offline_install.get("manifest_sha256") or "")
         metadata = verify_wheelhouse(
             root / OFFLINE_WHEELHOUSE_RELATIVE,
             tuple(root / OFFLINE_REQUIREMENTS_RELATIVE / name for name in lock_names),
+            verified_token=token if token else None,
         )
         return _offline_install_metadata_issues(root, offline_install, metadata)
     except (OSError, WheelhouseError) as exc:

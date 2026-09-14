@@ -24,6 +24,7 @@ from mission_resolver import (  # noqa: E402
     evaluation_only_admission,
     resolve_mission,
 )
+from route_domain import validate_flight_route_fields  # noqa: E402
 from pose_frame_chain import CameraBodyExtrinsic, save_camera_body_extrinsic  # noqa: E402
 from site_alignment import (  # noqa: E402
     SiteAlignment,
@@ -69,6 +70,7 @@ def _build_selection(
     include_pose_chain: bool = False,
     include_approval: bool = False,
     localizer_map_revision: str = "map_v1",
+    quality_passed: bool = True,
 ) -> Path:
     assets = root / "assets"
     map_ply = _write_asset(assets / "map.ply")
@@ -157,7 +159,7 @@ def _build_selection(
             "receipt_id": "quality_v1",
             "kind": "localizer_quality",
             "subject": "quality_gate_v1",
-            "passed": True,
+            "passed": quality_passed,
             "issued_at": "2026-08-01T00:00:00Z",
             "expires_at": None,
             "details": {},
@@ -445,42 +447,51 @@ def test_not_localization_ready_selection_is_explicitly_blocked(tmp_path: Path) 
     )
 
 
-def test_bundled_anafi_selection_is_blocked_until_new_map_is_validated() -> None:
-    selection = (
-        CONTROL
-        / "mission_selections"
-        / "river_gluemap_all8_direct_localization.json"
-    )
+def test_bundled_anafi_selection_flies_only_on_an_operator_accepted_receipt() -> None:
+    """The shipped default carries an *acceptance*, not a validation.
+
+    2026-09-09: the operator accepted this map for a supervised, pilot-in-the-
+    loop campaign (SkyController stick override, 0.3 m/s). What it must never
+    claim is that the map was validated -- there is still no absolute ground
+    truth and no acceptance flight -- and the receipt expires, so this test
+    starts failing again when the acceptance lapses. 2026-09-13: the receipt
+    digests were reissued to match the selected artifacts.
+    """
+
+    selection = CONTROL / "mission_selections" / "river_gluemap_all8_direct_localization.json"
 
     mission = resolve_mission(selection, workspace_root=ROOT, now=NOW)
 
     assert "imu" not in mission.vehicle.required_calibrations
-    assert not mission.readiness.localization_ready
-    assert not mission.readiness.flight_ready
-    assert "localizer_quality calibration is failed" in " ".join(
-        mission.readiness.localization_errors
-    )
-    # 航線仍是舊座標系（尚未重畫），配上新地圖本來就該擋：flight 除了未驗收的
-    # quality 那條，還多一條 route frame mismatch。航線重畫、frame 對上後，
-    # 把 route 那條期望拿掉；quality 未驗收前仍必須 blocked（不許飛）。
+    assert mission.readiness.localization_ready
+    assert mission.readiness.flight_ready
+    details = mission.calibrations[0].details
+    assert details["basis"] == "OPERATOR_ACCEPTANCE_PILOT_IN_THE_LOOP"
+    assert details["validation"] == "NONE"
+    assert details["absolute_ground_truth"] == "NONE"
+    assert mission.calibrations[0].expires_at is not None
+    bundle_sha = mission.localizer.artifacts["bundle"].sha256
+    profile_sha = mission.localizer.artifacts["profile"].sha256
+    assert details["bundle_sha256"] == bundle_sha
+    assert details["profile_sha256"] == profile_sha
     assert mission.route is not None
-    assert "no route package selected" not in mission.readiness.flight_errors
-    assert mission.readiness.flight_errors == (
-        *mission.readiness.localization_errors,
-        "route map frame does not match selected map",
-    )
+    assert mission.route.frame_id == mission.map_revision.coordinate_frame.frame_id
+    assert mission.readiness.flight_errors == ()
 
 
 def test_evaluation_only_waives_an_unvalidated_map_but_never_flight(
+    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    selection = (
-        CONTROL
-        / "mission_selections"
-        / "river_gluemap_all8_direct_localization.json"
-    )
-    mission = resolve_mission(selection, workspace_root=ROOT, now=NOW)
+    """Structural invariant, on a fixture so no shipped receipt can mask it."""
 
+    selection = _build_selection(tmp_path, include_route=True, quality_passed=False)
+    mission = resolve_mission(selection, workspace_root=tmp_path, now=NOW)
+
+    assert not mission.readiness.localization_ready
+    assert "localizer_quality calibration is failed" in " ".join(
+        mission.readiness.localization_errors
+    )
     assert mission.readiness.evaluation_only_ready
 
     monkeypatch.delenv("SFM_EVALUATION_ONLY", raising=False)
@@ -490,8 +501,7 @@ def test_evaluation_only_waives_an_unvalidated_map_but_never_flight(
     admitted, waived = evaluation_only_admission(mission.readiness)
     assert admitted
     assert waived == mission.readiness.localization_errors
-    # The waiver buys localization only. Flight stays blocked, and the profile
-    # the launcher hands the UI must keep saying so.
+    # Waiving localization must never open flight.
     assert not mission.readiness.flight_ready
 
 
@@ -515,3 +525,86 @@ def test_evaluation_only_is_not_ready_when_nothing_needs_waiving() -> None:
 
     assert clean.localization_ready
     assert not clean.evaluation_only_ready
+
+
+def test_localizer_quality_digests_must_match_selected_artifacts(tmp_path: Path) -> None:
+    expected_error = "localizer_quality calibration digests do not match the selected artifacts"
+    match_root = tmp_path / "match"
+    selection_path = _build_selection(match_root)
+    localizer_raw = json.loads(
+        (match_root / "components" / "localizer.json").read_text(encoding="utf-8")
+    )
+    bundle_sha = localizer_raw["artifacts"]["bundle"]["sha256"]
+    profile_sha = localizer_raw["artifacts"]["profile"]["sha256"]
+    quality_path = match_root / "receipts" / "quality.json"
+    raw = json.loads(quality_path.read_text(encoding="utf-8"))
+    raw["details"] = {"bundle_sha256": bundle_sha, "profile_sha256": profile_sha}
+    quality_path.write_text(json.dumps(raw), encoding="utf-8")
+    selection_raw = json.loads(selection_path.read_text(encoding="utf-8"))
+    selection_raw["calibrations"][0]["sha256"] = _digest(quality_path)
+    selection_path.write_text(json.dumps(selection_raw), encoding="utf-8")
+    mission = resolve_mission(selection_path, workspace_root=match_root, now=NOW)
+    assert expected_error not in " ".join(mission.readiness.localization_errors)
+
+    mismatch_root = tmp_path / "mismatch"
+    selection_path = _build_selection(mismatch_root)
+    quality_path = mismatch_root / "receipts" / "quality.json"
+    raw = json.loads(quality_path.read_text(encoding="utf-8"))
+    raw["details"] = {"bundle_sha256": "0" * 64, "profile_sha256": "0" * 64}
+    quality_path.write_text(json.dumps(raw), encoding="utf-8")
+    selection_raw = json.loads(selection_path.read_text(encoding="utf-8"))
+    selection_raw["calibrations"][0]["sha256"] = _digest(quality_path)
+    selection_path.write_text(json.dumps(selection_raw), encoding="utf-8")
+    mission = resolve_mission(selection_path, workspace_root=mismatch_root, now=NOW)
+    assert expected_error in " ".join(mission.readiness.localization_errors)
+
+
+def _selection_with_mutated_route(root: Path, mutator) -> Path:
+    selection = _build_selection(root, include_route=True)
+    route_asset = root / "routes" / "flight_route.json"
+    data = json.loads(route_asset.read_text(encoding="utf-8"))
+    mutator(data)
+    _write_json(route_asset, data)
+    route_pkg = root / "components" / "route.json"
+    pkg = json.loads(route_pkg.read_text(encoding="utf-8"))
+    pkg["route"]["sha256"] = _digest(route_asset)
+    _write_json(route_pkg, pkg)
+    selection_raw = json.loads(selection.read_text(encoding="utf-8"))
+    selection_raw["route"]["sha256"] = _digest(route_pkg)
+    _write_json(selection, selection_raw)
+    return selection
+
+
+def _assert_route_geometry_blocks_flight(root: Path, mutator) -> None:
+    selection = _selection_with_mutated_route(root, mutator)
+    data = json.loads((root / "routes" / "flight_route.json").read_text(encoding="utf-8"))
+    with pytest.raises(ValueError) as excinfo:
+        validate_flight_route_fields(
+            data,
+            expected_site_id="site_a",
+            expected_coordinate_frame_id="map_v1_frame",
+        )
+    mission = resolve_mission(selection, workspace_root=root, now=NOW)
+    assert not mission.readiness.flight_ready
+    assert str(excinfo.value) in mission.readiness.flight_errors
+
+
+def test_duplicate_route_points_block_flight_ready(tmp_path: Path) -> None:
+    _assert_route_geometry_blocks_flight(
+        tmp_path,
+        lambda data: data.__setitem__("waypoints", [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0]]),
+    )
+
+
+def test_closed_route_blocks_flight_ready(tmp_path: Path) -> None:
+    _assert_route_geometry_blocks_flight(
+        tmp_path,
+        lambda data: data.__setitem__("closed", True),
+    )
+
+
+def test_negative_arrive_radius_blocks_flight_ready(tmp_path: Path) -> None:
+    _assert_route_geometry_blocks_flight(
+        tmp_path,
+        lambda data: data.__setitem__("arrive_radius_map_units", -1),
+    )

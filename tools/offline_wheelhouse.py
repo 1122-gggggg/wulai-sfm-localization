@@ -51,7 +51,7 @@ def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
     try:
         with path.open("rb") as stream:
-            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            for chunk in iter(lambda: stream.read(8 * 1024 * 1024), b""):
                 digest.update(chunk)
     except OSError as exc:
         raise WheelhouseError(f"cannot hash {path}: {exc}") from exc
@@ -185,6 +185,8 @@ def _validate_manifest(
 def verify_wheelhouse(
     wheelhouse: str | os.PathLike[str],
     requirement_locks: Iterable[str | os.PathLike[str]],
+    *,
+    verified_token: str | None = None,
 ) -> WheelhouseManifest:
     """Verify a wheelhouse and return its validated manifest metadata."""
     root = Path(wheelhouse)
@@ -198,6 +200,13 @@ def verify_wheelhouse(
         data = json.loads(manifest_path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise WheelhouseError(f"cannot read {MANIFEST_NAME}: {exc}") from exc
+
+    manifest_sha256 = _sha256(manifest_path)
+    if verified_token is not None and verified_token != manifest_sha256:
+        raise WheelhouseError(
+            f"verified token mismatch for {MANIFEST_NAME}: "
+            f"expected={manifest_sha256} actual={verified_token}"
+        )
 
     locks = _lock_paths(requirement_locks)
     expected_requirements = _requirement_records(locks)
@@ -225,12 +234,13 @@ def verify_wheelhouse(
                 f"wheel size mismatch for {name}: "
                 f"expected={entry['size_bytes']} actual={actual_size}"
             )
-        actual_sha256 = _sha256(path)
-        if actual_sha256 != entry["sha256"]:
-            raise WheelhouseError(
-                f"wheel SHA-256 mismatch for {name}: "
-                f"expected={entry['sha256']} actual={actual_sha256}"
-            )
+        if verified_token is None:
+            actual_sha256 = _sha256(path)
+            if actual_sha256 != entry["sha256"]:
+                raise WheelhouseError(
+                    f"wheel SHA-256 mismatch for {name}: "
+                    f"expected={entry['sha256']} actual={actual_sha256}"
+                )
     return manifest
 
 
@@ -489,6 +499,11 @@ def _parser() -> argparse.ArgumentParser:
     verify = commands.add_parser("verify", help="verify an existing wheelhouse")
     verify.add_argument("--wheelhouse", required=True, type=Path)
     verify.add_argument("--requirements", action="append", default=[], type=Path)
+    verify.add_argument(
+        "--verified-token",
+        default=None,
+        help="skip wheel SHA-256 calculation if already verified by caller token",
+    )
 
     prepare = commands.add_parser(
         "prepare-lock", help="remove only package-index declarations from a verified lock"
@@ -504,7 +519,11 @@ def main(argv: Iterable[str] | None = None) -> int:
         if args.command == "build":
             metadata = build_wheelhouse(args.output, args.requirements, sys.executable)
         elif args.command == "verify":
-            metadata = verify_wheelhouse(args.wheelhouse, args.requirements)
+            metadata = verify_wheelhouse(
+                args.wheelhouse,
+                args.requirements,
+                verified_token=args.verified_token,
+            )
         else:
             output = write_offline_requirements(args.source, args.output)
             print(output)

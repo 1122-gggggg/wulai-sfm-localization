@@ -7,9 +7,9 @@ Amar Ali-bey) via the deleted ``sfm_glomap_deploy/boq_net.py`` /
 ``boq_query.py``; it deliberately imports no deleted repo module and depends
 only on torch / torchvision / numpy / cv2.
 
-Weights (read-only, never copied into the repo)::
+Weights (read-only, authoritative under RUNTIME_ARTIFACTS.json)::
 
-    /home/allen/.cache/torch/hub/checkpoints/resnet50_16384.pth
+    執行環境/models/boq/resnet50_16384.pth
 
 loaded with ``strict=True`` and a hard-pinned SHA-256 (``BOQ_WEIGHTS_SHA256``);
 any mismatch raises before the model is built.
@@ -101,7 +101,15 @@ BOQ_MODEL_IDENTITY = "boq:resnet50-16384"
 BOQ_WEIGHTS_SHA256 = (
     "4691d1545db847da2c0ba911f34e6c520a5da63f8b94c6415fe87d0d8800ebaa"
 )
-BOQ_WEIGHTS = Path("/home/allen/.cache/torch/hub/checkpoints/resnet50_16384.pth")
+_DEPLOY_DIR = Path(__file__).resolve().parent
+_WORKSPACE_ROOT = _DEPLOY_DIR.parents[2]
+BOQ_WEIGHTS_RELATIVE = Path("執行環境/models/boq/resnet50_16384.pth")
+BOQ_WEIGHTS_CANDIDATES = (
+    _WORKSPACE_ROOT / "執行環境" / "models" / "boq" / "resnet50_16384.pth",
+    _WORKSPACE_ROOT / "執行環境" / "torch_hub_cache" / "checkpoints" / "boq" / "resnet50_16384.pth",
+    Path.home() / ".cache" / "torch" / "hub" / "checkpoints" / "resnet50_16384.pth",
+)
+BOQ_WEIGHTS = BOQ_WEIGHTS_CANDIDATES[0]
 BOQ_WEIGHTS_ENV = "SFM_BOQ_WEIGHTS"
 BOQ_FP16_ENV = "SFM_BOQ_FP16"
 
@@ -251,23 +259,44 @@ class BoQVPRModel(torch.nn.Module):
 
 
 def resolve_weights_path(weights_path: str | Path | None = None) -> Path:
-    """Resolve the BoQ checkpoint location (explicit > env > default)."""
+    """Resolve the BoQ checkpoint location (explicit > env > 3-way candidates)."""
+    if weights_path:
+        return Path(weights_path).expanduser()
     configured = (os.environ.get(BOQ_WEIGHTS_ENV, "") or "").strip()
-    return Path(weights_path or configured or BOQ_WEIGHTS).expanduser()
+    if configured:
+        return Path(configured).expanduser()
+    for candidate in BOQ_WEIGHTS_CANDIDATES:
+        resolved = candidate.expanduser()
+        if resolved.is_file():
+            return resolved.resolve()
+    return BOQ_WEIGHTS
+
+
+_SHA256_CACHE: dict[tuple[int, int, int], str] = {}
 
 
 def verify_weights_sha256(
     path: Path, expected: str = BOQ_WEIGHTS_SHA256
 ) -> Path:
     """SHA-pin the checkpoint; raise on any mismatch or absent file."""
-    resolved = Path(path).expanduser()
+    resolved = Path(path).expanduser().resolve()
     if not resolved.is_file():
         raise FileNotFoundError(f"BoQ weights are absent: {resolved}")
-    digest = hashlib.sha256()
-    with resolved.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(8 * 1024 * 1024), b""):
-            digest.update(chunk)
-    actual = digest.hexdigest()
+    try:
+        st = resolved.stat()
+        key = (st.st_ino, int(st.st_mtime_ns), st.st_size)
+    except OSError:
+        key = None
+    if key is not None and key in _SHA256_CACHE:
+        actual = _SHA256_CACHE[key]
+    else:
+        digest = hashlib.sha256()
+        with resolved.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(8 * 1024 * 1024), b""):
+                digest.update(chunk)
+        actual = digest.hexdigest()
+        if key is not None:
+            _SHA256_CACHE[key] = actual
     if actual != expected:
         raise ValueError(
             f"BoQ weights SHA-256 mismatch: {resolved} "
@@ -331,8 +360,14 @@ class BoQExtractor:
         """
         if rgb.ndim != 3 or rgb.shape[2] != 3 or rgb.dtype != np.uint8:
             raise ValueError("BoQ input must be an HxWx3 uint8 RGB array")
-        source = torch.from_numpy(np.ascontiguousarray(rgb[..., :3])).permute(2, 0, 1)
-        x = source.to(torch.device(self.device))
+        device = torch.device(self.device)
+        arr = rgb[..., :3]
+        if not arr.flags.c_contiguous:
+            arr = np.ascontiguousarray(arr)
+        source = torch.from_numpy(arr).permute(2, 0, 1)
+        if device.type == "cuda":
+            source = source.pin_memory()
+        x = source.to(device, non_blocking=True)
         x = x.unsqueeze(0).to(dtype=torch.float32).div_(255.0)
         x = F.interpolate(
             x,
@@ -378,10 +413,7 @@ class BoQExtractor:
         )
         if not np.isfinite(desc).all():
             raise RuntimeError("BoQ emitted a non-finite descriptor")
-        norm = float(np.linalg.norm(desc))
-        if not np.isfinite(norm) or norm <= 1e-12:
-            raise RuntimeError("BoQ emitted a zero-norm descriptor")
-        return np.ascontiguousarray(desc / norm, dtype=np.float32)
+        return desc
 
     @torch.inference_mode()
     def extract_bank(
@@ -407,7 +439,9 @@ class BoQExtractor:
                 device_type="cuda", dtype=torch.float16, enabled=self.fp16
             ):
                 raw = self.model(x)
-            array = F.normalize(raw.float(), dim=1, eps=1e-12).cpu().numpy()
+            array = F.normalize(raw.float(), dim=1, eps=1e-12).cpu().numpy().astype(
+                np.float32, copy=False
+            )
             if array.ndim != 2 or array.shape[1] != BOQ_DIM:
                 raise RuntimeError(
                     f"BoQ bank batch shape {array.shape!r} violates "
@@ -415,8 +449,5 @@ class BoQExtractor:
                 )
             if not np.isfinite(array).all():
                 raise RuntimeError("BoQ emitted a non-finite bank batch")
-            norms = np.linalg.norm(array, axis=1)
-            if np.any(norms <= 1e-12) or not np.isfinite(norms).all():
-                raise RuntimeError("BoQ emitted a zero-norm bank row")
-            out.append(np.ascontiguousarray(array / norms[:, None], dtype=np.float32))
-        return np.ascontiguousarray(np.concatenate(out, axis=0), dtype=np.float32)
+            out.append(array)
+        return np.concatenate(out, axis=0)

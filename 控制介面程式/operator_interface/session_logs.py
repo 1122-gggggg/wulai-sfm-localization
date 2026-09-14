@@ -9,12 +9,15 @@ gate in arming_gate.py -- each independently readable and testable.
 from __future__ import annotations
 
 import importlib.metadata
+import hashlib
 import json
 import math
 import os
 import platform
+import queue
 import sys
 import time
+import threading
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -126,11 +129,47 @@ def collect_runtime_identity() -> dict[str, Any]:
 
 
 def _record(event: str, fields: dict[str, Any]) -> dict[str, Any]:
-    return {
+    return _finite_json({
         "t_utc": _utc_now(),
         "t_mono_ns": time.monotonic_ns(),
         "event": event,
         **fields,
+    })
+
+
+def _finite_json(value):
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    if isinstance(value, dict):
+        return {key: _finite_json(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_finite_json(item) for item in value]
+    return value
+
+
+def flight_debug_contract() -> dict[str, Any]:
+    root = Path(__file__).resolve().parents[2]
+    paths = (
+        "定位演算法/flight_control/real_path_follow_controller.py",
+        "定位演算法/flight_control/path_follow_flight.py",
+        "定位演算法/deploy_code/sfm_direct_deploy/two_rate_tracker.py",
+        "控制介面程式/operator_interface/operator_autonomy.py",
+        "控制介面程式/operator_interface/olympe_live_backend.py",
+    )
+    return {
+        "version": 2,
+        "clock": "host_monotonic; *_mono_ns nanoseconds, *_mono seconds",
+        "map_position_units": "map units; not metres without measured scale",
+        "velocity": "firmware-fused NED, metres/second",
+        "attitude": "firmware-fused Euler radians; yaw clockwise from North",
+        "raw_accelerometer_available": False, "raw_gyroscope_available": False,
+        "sensor_covariance_available": False,
+        "pcmd_order": ["roll", "pitch", "yaw", "gaz"],
+        "pcmd_dispatch_semantics": "SDK call; not firmware execution acknowledgement",
+        "source_files_at_session_start": {
+            name: hashlib.sha256((root / name).read_bytes()).hexdigest()
+            for name in paths if (root / name).is_file()
+        },
     }
 
 
@@ -140,6 +179,7 @@ class _JsonlSink:
         self._handle = path.open("a", encoding="utf-8", buffering=1)
         self._sync_every = max(1, int(sync_every))
         self._pending_writes = 0
+        self._lock = threading.Lock()
         self.healthy = True
         self.last_error = ""
         self.durable = False
@@ -167,10 +207,11 @@ class _JsonlSink:
         if not self.healthy:
             return False
         try:
-            self._handle.write(json.dumps(value, ensure_ascii=False) + "\n")
-            self._pending_writes += 1
-            if self._pending_writes >= self._sync_every:
-                self._sync()
+            with self._lock:
+                self._handle.write(json.dumps(value, ensure_ascii=False, allow_nan=False) + "\n")
+                self._pending_writes += 1
+                if self._pending_writes >= self._sync_every:
+                    self._sync()
             return True
         except Exception as exc:
             self.healthy = False
@@ -185,9 +226,10 @@ class _JsonlSink:
 
     def close(self) -> None:
         try:
-            if self.healthy and self._pending_writes:
-                self._sync()
-            self._handle.close()
+            with self._lock:
+                if self.healthy and self._pending_writes:
+                    self._sync()
+                self._handle.close()
         except Exception as exc:
             self.healthy = False
             self.durable = False
@@ -230,6 +272,8 @@ class SessionLogs:
         self._counts = {name: 0 for name in self.REQUIRED_STREAMS}
         self._latency_samples_ms: list[float] = []
         self._unresolved_incidents: set[str] = set()
+        self._deferred_telemetry = queue.Queue(maxsize=512)
+        self._deferred_dropped = 0
         self._sinks = {
             name: _JsonlSink(
                 directory / f"{name}.jsonl",
@@ -260,6 +304,7 @@ class SessionLogs:
             "mode": mode.value,
             "created_utc": _utc_now(),
             "created_mono_ns": time.monotonic_ns(),
+            "debug_contract": flight_debug_contract(),
             **manifest,
         }
         temp = directory / ".session_manifest.json.tmp"
@@ -346,6 +391,25 @@ class SessionLogs:
     def telemetry(self, event: str, **fields: Any) -> bool:
         return self._write("telemetry", event, fields)
 
+    def defer_telemetry(self, event: str, **fields: Any) -> bool:
+        """Keep SDK dispatch logging off the piloting thread's disk path."""
+        if self._closed:
+            return False
+        try:
+            self._deferred_telemetry.put_nowait((event, fields))
+            return True
+        except queue.Full:
+            self._deferred_dropped += 1
+            return False
+
+    def flush_deferred(self) -> None:
+        for _ in range(self._deferred_telemetry.maxsize):
+            try:
+                event, fields = self._deferred_telemetry.get_nowait()
+            except queue.Empty:
+                break
+            self.telemetry(event, **fields)
+
     def incident(self, event: str, **fields: Any) -> bool:
         if fields.get("resolved") is True:
             self._unresolved_incidents.discard(str(event))
@@ -356,6 +420,7 @@ class SessionLogs:
     def close(self, *, reason: str, extra: dict[str, Any] | None = None) -> None:
         if self._closed:
             return
+        self.flush_deferred()
         samples = sorted(self._latency_samples_ms)
         p95 = None
         maximum = None
@@ -370,6 +435,7 @@ class SessionLogs:
             "closed_utc": _utc_now(),
             "closed_mono_ns": time.monotonic_ns(),
             "event_counts": dict(self._counts),
+            "debug_deferred_dropped": self._deferred_dropped,
             "metrics": {
                 "p95_ms": p95,
                 "max_ms": maximum,

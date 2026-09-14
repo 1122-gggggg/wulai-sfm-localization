@@ -10,7 +10,7 @@ import subprocess
 import sys
 
 from mission_manifest import ManifestError
-from mission_resolver import evaluation_only_admission, resolve_mission
+from mission_resolver import evaluation_only_admission, evaluation_only_requested, resolve_mission
 from workspace_layout import workspace_from_file
 
 
@@ -48,8 +48,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     if os.environ.get("SFM_SITE_PROFILE", "").strip():
         print(
-            "mission launcher rejects existing SFM_SITE_PROFILE; "
-            "pass SFM_MISSION_SELECTION",
+            "mission launcher rejects existing SFM_SITE_PROFILE; pass SFM_MISSION_SELECTION",
             file=sys.stderr,
         )
         return 2
@@ -61,12 +60,16 @@ def main(argv: list[str] | None = None) -> int:
                 "mission is not localization-ready: "
                 + "; ".join(mission.readiness.localization_errors)
             )
+        forced_evaluation_only = (
+            evaluation_only_requested() and mission.readiness.localization_ready
+        )
+        reported_evaluation_only = bool(evaluation_only or forced_evaluation_only)
         profile = mission.materialize_legacy_site_profile(WORKSPACE.runtime / "mission_snapshots")
     except (ManifestError, OSError, ValueError) as exc:
         print(f"mission launch rejected: {exc}", file=sys.stderr)
         return 2
 
-    if evaluation_only:
+    if reported_evaluation_only:
         print(
             "EVALUATION-ONLY session: localization runs for measurement only. "
             "Waived: " + "; ".join(waived),
@@ -76,10 +79,10 @@ def main(argv: list[str] | None = None) -> int:
     report = {
         "snapshot_id": mission.identity,
         "site_profile": str(profile),
-        "localization_ready": not evaluation_only,
-        "evaluation_only": evaluation_only,
+        "localization_ready": not reported_evaluation_only,
+        "evaluation_only": reported_evaluation_only,
         "evaluation_waived_errors": list(waived),
-        "flight_ready": mission.readiness.flight_ready,
+        "flight_ready": bool(mission.readiness.flight_ready and not reported_evaluation_only),
         "flight_errors": list(mission.readiness.flight_errors),
     }
     print(json.dumps(report, ensure_ascii=False, sort_keys=True), flush=True)

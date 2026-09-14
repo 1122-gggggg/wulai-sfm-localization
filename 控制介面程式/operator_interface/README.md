@@ -62,12 +62,9 @@ JSON，正式航線匯入按鈕會鎖住。
 Z-up 顯示座標並輸出 `frame: aligned`；匯入端再轉回 GLOMAP 的 X/Z 水平、-Y
 向上座標。
 
-第二階段會同時顯示可拖曳調整的半透明綠色到達球與半透明藍綠色航線安全管；拖曳
-任一滑桿會自動開啟對應圖形並即時縮放。安全管半徑可在 `0.000–0.100` map units
-內調整，`0` 表示只允許中心線。航線 JSON
-分別以 `arrive_radius_map_units` 與 `max_route_deviation_map_units` 保存兩個半徑；
-真機 AUTO 超出安全管時會先懸停，再平移回完整路徑折線上的最近點。航線值只能收緊場域或
-全域核准上限，不能用單一路線放寬既有安全限制。
+第二階段會顯示可拖曳調整的半透明綠色到達球；拖曳滑桿會自動開啟對應圖形並即時縮放。
+航線 JSON 以 `arrive_radius_map_units` 保存到達半徑。每一拍都從目前定位位置重畫往
+目前航點的直線，偏航由機身平移持續修正，沒有安全管／重返執法。
 
 真機模式只有明確回讀為 `landed` 且沒有飛行命令處理中才可開啟；狀態改變時
 編輯器會自動關閉。「儲存路線」會
@@ -86,9 +83,7 @@ SHA 驗證與航線綁定，再用 production `RouteAutoController` 和記憶體
 閉迴路測試；到達最後一點並通過地速確認後結束。這條流程不會連接真機或送出
 Olympe 指令；真機介面不顯示此按鈕，仍須完成四步 preflight 並親自按「自動飛行」。
 
-AUTO 起飛後以連續穩定的定位姿態判定起飛位置，不要求位於第一個航點附近；系統會找
-出距離最近的航點，將它視為銜接點，第一個飛行目標設為下一個航點。開放航線不循環，
-若最近的是最後航點就維持終點，不會跳回第一點。起飛位置仍須在任一航點的
+AUTO 起飛後以連續穩定的定位姿態判定起飛位置，不要求位於第一個航點附近；系統一律先飛往第 1 航點，到了之後依序往第 2、3 點移動，方便除錯。開放航線不循環，最後回到返程起點降落。起飛位置仍須在任一航點的
 `SFM_BOOT_START_MAX_U` 範圍內（預設 `1.5` map units），避免從航線外直接橫切進入。
 
 ## Single-Process Desktop App
@@ -102,8 +97,11 @@ and accepts only ANAFI PDRAW video. It never falls back to a video file. The old
 
 介面進入後會顯示一條不會遮住降落／緊急控制的「起飛前依序確認」導引。操作員必須
 依序親手確認：① 飛機羅盤校正狀態；② 目前匯入的地圖與場域；③ 顯示後逐點檢查的
-航線（包含匯入／修改結果）；④ 新鮮串流、遙測、連線、飛控警示與電量。GPS 與韌體
-高度／距離限制仍顯示並記錄，但不再阻擋起飛。前一步未確認時不能跳到後一步；任何已確認的狀態或資產後來改變，該步驟
+航線（包含匯入／修改結果）；④ 新鮮串流、遙測、連線、飛控警示與電量。第 ④ 步的
+電量判定與 backend 起飛閘門是同一份 `takeoff_battery_blocker`：電量低於門檻或讀
+不到就不會給出 evidence，這一步過不了。高度／距離限制未設定時確實不限制，但**已
+設定**者若寫入或回讀失敗，backend 會拒絕起飛；GPS 只有在已設定距離圍欄且要求
+GPS 時才阻擋。前一步未確認時不能跳到後一步；任何已確認的狀態或資產後來改變，該步驟
 與其後步驟會失效。全部完成且狀態仍正常後，介面才顯示可以由操作員按「起飛」並啟用
 按鈕；這不會自動起飛，按下後後端仍會重新執行完整 fail-closed preflight。
 
@@ -214,7 +212,7 @@ This wires the UI buttons to real Olympe:
 | UI | Real action |
 |---|---|
 | 起飛 | TakeOff → hover；不檢查定位；起飛成功後固定開始機載錄影 |
-| 自動飛行 | TakeOff → 原地零 PCMD 懸停 → 連續可靠定位後找最近航點並以前往下一點開始執行已鎖定路線；定位失敗時持續懸停，等待恢復或操作者手動接管／降落；暫停後按「繼續自動飛行」沿原路線恢復 |
+| 自動飛行 | TakeOff → 原地零 PCMD 懸停 → 連續可靠定位後先飛往第 1 航點再依序執行已鎖定路線；定位失敗時持續懸停，等待恢復或操作者手動接管／降落；暫停後按「繼續自動飛行」沿原路線恢復 |
 | 原地降落 | 停止錄影並盡力下載 → Landing + restore sticks |
 | 關窗 / Ctrl+C | **強制原地降落**（即使曾 Esc；已落地則跳過） |
 | 錄影 | 介面啟動時固定武裝；起飛成功後自動錄機載 SD；降落時存檔。下拉選 FHD 1080p30 或 4K UHD 30（只改 SD 編碼，live stream 仍是 720p） |
@@ -456,10 +454,10 @@ Keyboard safety shortcuts:
 
 ### Firmware magnetometer calibration
 
-Panel **韌體羅盤校正** exposes the ANAFI and SkyController 3 calibration APIs as
-two separate controls. This replaces the need to enter FreeFlight 6 for the same
-firmware operation on the supported hardware, while retaining FreeFlight 6 as a
-manual fallback.
+Panel **飛機羅盤校正** starts the ANAFI's firmware magnetometer calibration and
+displays its requested X/Y/Z rotation and result. It changes the aircraft's
+compass calibration, unlike the removed passive attitude check. FreeFlight 6
+remains a manual fallback; the SkyController compass panel is not exposed here.
 
 - Calibration can start only after the flight state is explicitly read back as
   `landed`, from a local operator button click, with a healthy live link.
@@ -475,31 +473,27 @@ manual fallback.
   directed by the displayed axis. Keep propellers stopped and move away from metal,
   reinforced concrete, vehicles, magnets, and strong current-carrying cables.
 
-The two devices are calibrated independently. Cancelling one does not start or
-cancel the other, and no calibration is started automatically when the application
-opens.
+No calibration is started automatically when the application opens. A valid
+firmware readback can be reused; the operator does not need to repeat calibration
+on every launch.
 
 ### Passive gravity / attitude check
 
-Panel **姿態／重力檢查（只讀；不寫入飛機）** guides three props-off rotations
-while sampling body attitude:
-
-1. **水平旋轉 (yaw)** — spin about gravity, deck level  
-2. **前後俯仰 (pitch)** — tip nose up/down  
-3. **左右側傾 (roll)** — tip sideways  
-
-The UI reports level tilt, per-phase angular coverage, body-frame gravity unit vector, and PASS/FAIL. Results are saved under `outputs/flight_logs/gravity_cal_*.json`. This is a project-side sensor/axis check only; it does not write calibration data to the aircraft and is not a substitute for firmware magnetometer calibration.
-
-- **In this sim app**: starting a phase synthesizes matching attitude so you can practice the flow.
-- **On the real airframe** (props off, passive telemetry only):
+The passive **姿態／重力檢查** panel has been removed from the operator interface.
+It only sampled firmware attitude and saved a PASS/FAIL report; the report never
+changed the aircraft, localization, map frame, PCMD, or preflight decisions.
+The UI no longer loads or writes `gravity_cal_*.json`; existing reports are kept.
+The standalone diagnostic helper remains available, with an offline self-test
+from the workspace root:
 
 ```bash
-cd ../flight_control
-python3 gravity_calibration.py --selftest
-python3 gravity_calibration.py --live --ip 192.168.53.1 --controller skycontroller3
+.venv/bin/python 定位演算法/flight_control/gravity_calibration.py --selftest
 ```
 
-Map note: GLOMAP gravity-up is **-Y**; level-phase `g_body` is NED-down in the body frame (level ≈ `(0,0,1)`).
+This removal does not affect the site's measured `map_align` /
+`T_align_gravity.json`. AUTO uses that map basis to split position errors into
+horizontal and vertical control and to interpret heading. The map's up axis must
+come from the active site's measurement, not a universal GLOMAP `-Y` assumption.
 
 Micro-move buttons / keys use the selected backend:
 

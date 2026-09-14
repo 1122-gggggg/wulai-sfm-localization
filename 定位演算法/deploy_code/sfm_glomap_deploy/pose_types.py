@@ -1,10 +1,4 @@
-"""Neutral pose/localizer types shared by the localizer and the flight controller.
-
-Extracted from autoflight.py so the visual localizer (production_xfeat_tracker,
-reloc_localizer_xfeat) can import Pose/Localizer WITHOUT pulling in autoflight's
-top-level `from plan_path import ...` (the A*/SDF tour planner). autoflight.py
-re-exports these names for backward compatibility.
-"""
+"""Neutral pose/localizer types shared by the localizer and the flight controller."""
 
 from collections.abc import Callable
 from dataclasses import dataclass, field

@@ -1,20 +1,10 @@
 #!/usr/bin/env python3
-"""Global safest-path planner for pole inspection, on an SDF voxel grid.
+"""Offline SDF route planner (RETIRED from flight).
 
-Two-layer architecture (agreed):
-  GLOBAL (this file): at mission start, plan a CLEARANCE-PREFERRING path that
-    visits the inspection targets (poles) while staying inside the safe zone and
-    clear of structures. Poles/wires are baked into the SDF as no-go WITH buffer,
-    so the path keeps standoff by construction.
-  LOCAL (cruise_geofence.py, reactive): follow this path while reacting live to
-    SDF clearance (geofence repulsion), YOLO pole bearing + bbox-area standoff,
-    and localization; stop/hover/recover is the hard safety override.
-
-SDF convention: sdf[i,j,k] = signed distance (MAP UNITS) to the nearest UNSAFE
-surface; POSITIVE inside the flyable & structure-clear region, <=0 outside or
-inside a structure (pole/wire no-go). Built offline from the dense MVS map +
-drawn safe zone + pole/wire buffers. Everything here is scale-free (map units);
-only the YOLO standoff in the LOCAL layer needs a metric notion.
+No production or legacy flight code plans through this module: routes are
+hand-drawn and flown direct, with no clearance scoring, slow band, or tube
+steering. Kept only so old analysis scripts importing SDFGrid/plan_tour
+keep importing.
 """
 
 from __future__ import annotations

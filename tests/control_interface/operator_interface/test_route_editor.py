@@ -98,7 +98,6 @@ def test_successful_route_save_approves_and_closes_the_finished_editor(tmp_path)
         ),
         document=RouteDocument(site_id="yard", coordinate_frame_id="yard-map-v1"),
         arrive_radius_var=SimpleNamespace(get=lambda: 0.025),
-        route_deviation_var=SimpleNamespace(get=lambda: 0.06),
         import_route=import_route,
         profile=SimpleNamespace(route_json=saved),
         _signature=lambda: ("saved",),
@@ -111,7 +110,7 @@ def test_successful_route_save_approves_and_closes_the_finished_editor(tmp_path)
 
     assert result == saved
     assert imported_payloads[0]["arrive_radius_map_units"] == pytest.approx(0.025)
-    assert imported_payloads[0]["max_route_deviation_map_units"] == pytest.approx(0.06)
+    assert "max_route_deviation_map_units" not in imported_payloads[0]
     assert "SHA 已同步" in status[-1]
     assert closed == [True]
 
@@ -269,7 +268,6 @@ def test_saved_route_declares_which_alignment_produced_it(tmp_path):
     document.points = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]]
     document.align_source = "measured"
     document.arrive_radius_map_units = 0.3
-    document.max_route_deviation_map_units = 0.08
 
     saved = document.save(tmp_path / "flight_path.json")
     payload = json.loads(saved.read_text(encoding="utf-8"))
@@ -277,10 +275,10 @@ def test_saved_route_declares_which_alignment_produced_it(tmp_path):
     assert payload["frame"] == "aligned"
     assert payload["align_source"] == "measured"
     assert payload["arrive_radius_map_units"] == 0.3
-    assert payload["max_route_deviation_map_units"] == 0.08
+    assert "max_route_deviation_map_units" not in payload
 
 
-def test_editor_route_limits_round_trip_together(tmp_path):
+def test_editor_arrive_limit_round_trips(tmp_path):
     source = tmp_path / "route.json"
     source.write_text(
         json.dumps(
@@ -291,7 +289,6 @@ def test_editor_route_limits_round_trip_together(tmp_path):
                 "closed": False,
                 "waypoints": [[0, 0, 0], [1, 0, 0]],
                 "arrive_radius_map_units": 0.02,
-                "max_route_deviation_map_units": 0.07,
             }
         ),
         encoding="utf-8",
@@ -304,10 +301,9 @@ def test_editor_route_limits_round_trip_together(tmp_path):
     )
 
     assert document.arrive_radius_map_units == pytest.approx(0.02)
-    assert document.max_route_deviation_map_units == pytest.approx(0.07)
 
 
-def test_save_preview_persists_both_dragged_route_limits(tmp_path):
+def test_save_preview_persists_the_dragged_arrive_limit(tmp_path):
     import route_editor_window as rew
 
     target = tmp_path / "route_preview.json"
@@ -318,7 +314,6 @@ def test_save_preview_persists_both_dragged_route_limits(tmp_path):
         _choose_preview_path=lambda: target,
         document=document,
         arrive_radius_var=SimpleNamespace(get=lambda: 0.025),
-        route_deviation_var=SimpleNamespace(get=lambda: 0.06),
         _preview_only=True,
         _signature=lambda: ("saved",),
         status_var=SimpleNamespace(set=lambda _message: None),
@@ -330,7 +325,7 @@ def test_save_preview_persists_both_dragged_route_limits(tmp_path):
 
     assert payload["purpose"] == "preview_only"
     assert payload["arrive_radius_map_units"] == pytest.approx(0.025)
-    assert payload["max_route_deviation_map_units"] == pytest.approx(0.06)
+    assert "max_route_deviation_map_units" not in payload
 
 
 def test_bound_save_stages_before_atomic_route_import(tmp_path):
@@ -360,7 +355,6 @@ def test_bound_save_stages_before_atomic_route_import(tmp_path):
         controller=SimpleNamespace(moving=False, points=replacement),
         document=document,
         arrive_radius_var=SimpleNamespace(get=lambda: 0.025),
-        route_deviation_var=SimpleNamespace(get=lambda: 0.06),
         _preview_only=False,
         import_route=import_route,
         profile=SimpleNamespace(route_json=target),
@@ -377,10 +371,105 @@ def test_bound_save_stages_before_atomic_route_import(tmp_path):
     assert not (tmp_path / "route_drafts").exists()
 
 
-def test_route_deviation_tube_is_drawn_at_the_dragged_map_radius():
+def test_bound_save_failure_without_managed_site_points_to_import():
     import route_editor_window as rew
 
-    assert rew._SAFE_TUBE == (0, 229, 255, 128)
+    assert rew._save_failure_hint(ValueError("something else")) is None
+    hint = rew._save_failure_hint(
+        ValueError("route and target imports require a managed site profile")
+    )
+    assert hint is not None and "匯入場域資料夾" in hint
+
+    shown = []
+
+    def import_route(_path):
+        raise ValueError("route and target imports require a managed site profile")
+
+    document = RouteDocument(
+        site_id="yard",
+        coordinate_frame_id="yard-map-v1",
+        points=[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
+    )
+    editor = SimpleNamespace(
+        controller=SimpleNamespace(moving=False, points=document.points),
+        document=document,
+        arrive_radius_var=SimpleNamespace(get=lambda: 0.025),
+        _preview_only=False,
+        import_route=import_route,
+        _signature=lambda: ("saved",),
+        status_var=SimpleNamespace(set=shown.append),
+        close_editor=lambda *, force=False: None,
+    )
+    editor._update_document = lambda: rew.RouteEditorWindow._update_document(editor)
+
+    assert rew.RouteEditorWindow.save_route(editor) is None
+    assert len(shown) == 1
+    assert shown[0].startswith("航線儲存失敗：")
+    assert "匯入場域資料夾" in shown[0]
+
+
+def test_bound_save_emits_drawn_per_waypoint_radii(tmp_path):
+    import route_editor_window as rew
+
+    target = tmp_path / "current_route.json"
+    document = rem.RouteDocument(
+        site_id="yard",
+        coordinate_frame_id="yard-map-v1",
+        points=[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [2.0, 0.0, 0.0]],
+        arrive_radius_map_units=0.02,
+        waypoint_arrive_radii=[0.05, 0.02, 0.03],
+    )
+    imported = []
+
+    def import_route(path):
+        imported.append(json.loads(path.read_text(encoding="utf-8")))
+        return SimpleNamespace(message="saved", asset_path=target)
+
+    editor = SimpleNamespace(
+        controller=SimpleNamespace(moving=False, points=document.points),
+        document=document,
+        arrive_radius_var=SimpleNamespace(get=lambda: 0.02),
+        _preview_only=False,
+        import_route=import_route,
+        profile=SimpleNamespace(route_json=target),
+        _signature=lambda: ("saved",),
+        status_var=SimpleNamespace(set=lambda _message: None),
+        close_editor=lambda *, force=False: None,
+    )
+    editor._update_document = lambda: rew.RouteEditorWindow._update_document(editor)
+
+    rew.RouteEditorWindow.save_route(editor)
+    assert imported[0]["waypoint_arrive_radii"] == [0.05, 0.02, 0.03]
+
+
+def test_update_document_realigns_radii_after_undo(tmp_path):
+    import route_editor_window as rew
+
+    document = rem.RouteDocument(
+        site_id="yard",
+        coordinate_frame_id="yard-map-v1",
+        arrive_radius_map_units=0.02,
+        waypoint_arrive_radii=[0.05, 0.02, 0.03, 0.04],
+    )
+    editor = SimpleNamespace(
+        controller=SimpleNamespace(
+            moving=False, points=[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]]
+        ),
+        document=document,
+        arrive_radius_var=SimpleNamespace(get=lambda: 0.02),
+    )
+
+    rew.RouteEditorWindow._update_document(editor)
+    assert document.waypoint_arrive_radii == [0.05, 0.02]
+
+    document.waypoint_arrive_radii = [0.05]
+    editor.controller.points.append([2.0, 0.0, 0.0])
+    rew.RouteEditorWindow._update_document(editor)
+    assert document.waypoint_arrive_radii == [0.05, 0.02, 0.02]
+
+
+def test_per_waypoint_spheres_draw_at_own_sizes():
+    import route_editor_window as rew
 
     class View:
         @staticmethod
@@ -393,13 +482,13 @@ def test_route_deviation_tube_is_drawn_at_the_dragged_map_radius():
 
     class Draw:
         def __init__(self):
-            self.lines = []
+            self.ellipses = []
 
-        def line(self, points, **kwargs):
-            self.lines.append((points, kwargs))
-
-        def ellipse(self, *_args, **_kwargs):
+        def line(self, *_args, **_kwargs):
             return None
+
+        def ellipse(self, bounds, **kwargs):
+            self.ellipses.append((bounds, kwargs))
 
         def text(self, *_args, **_kwargs):
             return None
@@ -407,27 +496,26 @@ def test_route_deviation_tube_is_drawn_at_the_dragged_map_radius():
     draw = Draw()
     editor = SimpleNamespace(
         controller=SimpleNamespace(points=[[0, 0, 0], [1, 0, 0]], selected=None),
+        document=SimpleNamespace(waypoint_arrive_radii=[0.02, 0.05]),
         view=View(),
-        show_route_deviation_var=SimpleNamespace(get=lambda: True),
-        route_deviation_var=SimpleNamespace(get=lambda: 0.04),
-        show_arrive_var=SimpleNamespace(get=lambda: False),
+        show_arrive_var=SimpleNamespace(get=lambda: True),
+        arrive_radius_var=SimpleNamespace(get=lambda: 0.03),
+    )
+    editor._point_radius_for = lambda index: rew.RouteEditorWindow._point_radius_for(
+        editor, index
     )
 
     rew.RouteEditorWindow._draw_route(editor, draw, 800, 600)
 
-    tube = next(kwargs for _points, kwargs in draw.lines if kwargs["fill"] == rew._SAFE_TUBE)
-    assert tube["width"] == 8
+    spheres = [
+        item for item in draw.ellipses if item[1].get("fill") == rew._ARRIVE_FILL
+    ]
+    assert len(spheres) == 2
+    assert spheres[0][0] == pytest.approx((8.0, 18.0, 12.0, 22.0))
+    assert spheres[1][0] == pytest.approx((105.0, 15.0, 115.0, 25.0))
 
 
-def test_route_deviation_slider_range_is_zero_to_point_one():
-    import route_editor_window as rew
-
-    assert rew.ROUTE_DEVIATION_MIN_U == pytest.approx(0.0)
-    assert rew.ROUTE_DEVIATION_MAX_U == pytest.approx(0.1)
-    assert rew.DEFAULT_ROUTE_DEVIATION_U == pytest.approx(0.1)
-
-
-def test_dragging_either_limit_turns_on_its_live_visualization():
+def test_dragging_the_arrive_limit_turns_on_its_live_visualization():
     import route_editor_window as rew
 
     class Variable:
@@ -453,21 +541,8 @@ def test_dragging_either_limit_turns_on_its_live_visualization():
     )
     rew.RouteEditorWindow._on_arrive_radius(arrive, "0.02")
 
-    safe_tube = SimpleNamespace(
-        route_deviation_var=Variable(0.05),
-        arrive_radius_var=Variable(0.02),
-        route_deviation_label_var=Variable(""),
-        show_route_deviation_var=Variable(False),
-        request_redraw=lambda: redraws.append("tube"),
-    )
-    safe_tube._set_route_deviation_label = lambda: (
-        rew.RouteEditorWindow._set_route_deviation_label(safe_tube)
-    )
-    rew.RouteEditorWindow._on_route_deviation(safe_tube, "0.05")
-
     assert arrive.show_arrive_var.get() is True
-    assert safe_tube.show_route_deviation_var.get() is True
-    assert redraws == ["arrive", "tube"]
+    assert redraws == ["arrive"]
 
 
 def test_arrival_sphere_draws_a_scaled_translucent_fill():
@@ -498,11 +573,13 @@ def test_arrival_sphere_draws_a_scaled_translucent_fill():
     draw = Draw()
     editor = SimpleNamespace(
         controller=SimpleNamespace(points=[[0, 0, 0], [1, 0, 0]], selected=None),
+        document=SimpleNamespace(waypoint_arrive_radii=None),
         view=View(),
-        show_route_deviation_var=SimpleNamespace(get=lambda: False),
-        route_deviation_var=SimpleNamespace(get=lambda: 0.05),
         show_arrive_var=SimpleNamespace(get=lambda: True),
         arrive_radius_var=SimpleNamespace(get=lambda: 0.03),
+    )
+    editor._point_radius_for = lambda index: rew.RouteEditorWindow._point_radius_for(
+        editor, index
     )
 
     rew.RouteEditorWindow._draw_route(editor, draw, 800, 600)

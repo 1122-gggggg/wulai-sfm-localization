@@ -6,6 +6,16 @@
 
 ## 目前保留
 
+- `validation_receipts/`
+  - 全地面系統驗證（`tools/system_validation.py`）之 JSON receipt（`validation_<timestamp>.json`）與步驟記錄（`validation_<timestamp>_logs/`）。
+  - 生命週期：支援 `--smoke` 與完整（full）兩層 tier 驗證；內建自動輪替政策，嚴格保留最新 10 份 receipt 與對應 log 目錄，超出者自動清理，防止無界增長。
+- `flight_logs/`
+  - 飛行與操作日誌目錄，新的操作 session 使用該目錄。
+
+## 歷史註記（已清理 1.19 GB 十目錄）
+
+下列十個實驗與驗證目錄（共約 1.19 GB）已自本機磁碟清理，其數值結論、反例與定讞機制已記載於 [`docs/verified_localization_optimization_ledger.md`](../docs/verified_localization_optimization_ledger.md) 與 [`docs/direct_backend_ledger.md`](../docs/direct_backend_ledger.md)，不再留存本機暫存檔案：
+
 | 路徑 | 內容 |
 |---|---|
 | `river_gluemap_all8_direct_20260831_import/` | 現行河濱圖單幀 smoke（1/1 TRACK、120 inliers） |
@@ -18,7 +28,6 @@
 | `baseline_recheck_20260905/` | 上述實驗的 P168 4K seq700 對照基準 |
 | `klt_lost_20260905/` | KLT LOST 預測實驗（見 `docs/klt_lost_prediction_experiment.md`） |
 | `veto_gates_20260906/` | 隨機化配對閘門證據（`定位演算法/validation/randomized_ab_gate.py`）。否決器：`gate_r3c_report.json`（R3 軌跡 21/21 PASS）、`gate_p3_report.json`（P3 重力 21/21 PASS）、`gate_both_report.json`（雙旗標＋另一組 seed）、`injection.json`（故障注入檢出率）、`gate_r3_firstversion_FAIL.json`（**保留反例**：距離語意版 P167 −35、河濱_P117 −30）。profile 旗標定讞：`gate_qgraph_report.json`（query CUDA graph）、`gate_tmf_report.json`（track_map_first）、`gate_asm_report.json`（acquire_stage_mode）、`gate_prb_report.json`（pnp_ranked_batches） |
-
 ## 已濃縮的實驗結論
 
 - 保留：query feature reuse、GPU cache 192、full-token MegaLoc TensorRT、persistent feature bank、packed D2H、bundle mmap。

@@ -28,8 +28,12 @@ wheelhouse，再從包內 wheels 建立 `.venv`。不會連線到 Python package
 預設任務為
 `控制介面程式/mission_selections/river_gluemap_all8_direct_localization.json`。真機入口會先
 驗證所有 component SHA，再產生唯讀 site-profile snapshot；不接受另一份 profile
-直接覆寫解析結果。此全八段地圖只有同資料集單幀煙霧測試，尚無獨立 holdout 與
-ANAFI camera-pipeline 品質證據，因此 resolver 會阻擋真機定位；同時無 route，不能 AUTO。
+直接覆寫解析結果。
+此全八段地圖尚無獨立定位品質驗證與 ANAFI camera-pipeline 品質證據
+（validation: NONE, ground truth: NONE）。2026-09-09 操作員以有人監督試飛
+（pilot-in-the-loop, 0.3 m/s）接受此風險，quality receipt 以
+OPERATOR_ACCEPTANCE（2026-10-09 到期）放行真機定位；flight 仍因 route frame
+不符（20260831 航線 vs 20260908 地圖）而阻擋，重畫航線前不能 AUTO。
 ANAFI 羅盤仍由真機韌體即時回讀；完成場域驗證、補畫航線並
 完成校正且回讀為有效後，preflight 第一步會自動通過。AUTO 仍只會在操作員完成
 其餘步驟並親自按下按鈕後，使用第三步確認時綁定的 immutable route snapshot。

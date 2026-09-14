@@ -1,4 +1,5 @@
 """In-process kinematic plant for testing the production route controller."""
+
 from __future__ import annotations
 
 import math
@@ -8,7 +9,20 @@ from typing import Any
 
 import numpy as np
 
-from real_path_follow_controller import MapFrame, MissionRouteSnapshot, Pose
+from real_path_follow_controller import MapFrame, MissionRouteSnapshot, Pose, production_auto_control_config
+
+
+def _map_heading_to_ned_yaw(map_heading: float) -> float:
+    """Express a map-frame heading the way Olympe reports attitude yaw.
+
+    Visual poses speak counter-clockwise-from-East; Olympe AttitudeChanged.yaw
+    is clockwise-from-North, so a clockwise turn grows one while shrinking the
+    other.  Reporting the same number on both used to stay under the
+    visual/IMU increment gate only because AUTO never yawed above ~10%; at
+    its real 50% authority the doubled increment tripped the gate and latched
+    the route into hover (measured 2026-09-12: 17.19 deg vs a 10 deg limit).
+    """
+    return (math.pi / 2.0 - float(map_heading) + math.pi) % (2.0 * math.pi) - math.pi
 
 
 class SimulatedRoutePlant:
@@ -37,9 +51,16 @@ class SimulatedRoutePlant:
         if points.shape[1:] != (3,) or not np.isfinite(points).all():
             return False
         heading = map_frame.heading(points[1] - points[0])
+        config = production_auto_control_config(map_frame)
+        # This map-unit demo must respect the controller's separate axis caps.
+        # Otherwise the 20% gaz cap moves five times faster than horizontal
+        # flight and oscillates across a small arrival sphere indefinitely.
+        self._vertical_pcmd_gain = 0.06 * config.max_translation_pcmd / config.max_vertical_pcmd
         with self._lock:
             self.backend.sim_xyz = points[0].copy()
             self.backend.sim_yaw = heading
+            self.state.att_yaw = _map_heading_to_ned_yaw(heading)
+            self.state.attitude_mono_ns = time.monotonic_ns()
             self._map_frame = map_frame
             self.finished = False
             self.pilot_sticks = False
@@ -48,9 +69,7 @@ class SimulatedRoutePlant:
             self.state.flight_state = "flying"
             self.state.tracker_state = "ROUTE_TEST"
             self.state.last_command = "start_auto:simulated_route"
-            self._speed_limit_enabled = bool(
-                self.state.autonomous_speed_limit_enabled
-            )
+            self._speed_limit_enabled = bool(self.state.autonomous_speed_limit_enabled)
             # Map units intentionally have no metres conversion. This run tests
             # route geometry and controller decisions, not the physical m/s guard.
             self.state.autonomous_speed_limit_enabled = False
@@ -88,7 +107,7 @@ class SimulatedRoutePlant:
         translation_dt = 4.0 * control_dt
         with self._lock:
             self.backend.sim_yaw = (
-                self.backend.sim_yaw + 0.06 * yaw_value * control_dt + math.pi
+                self.backend.sim_yaw - 0.06 * yaw_value * control_dt + math.pi
             ) % (2.0 * math.pi) - math.pi
             forward = (
                 math.cos(self.backend.sim_yaw) * map_frame.east
@@ -101,17 +120,18 @@ class SimulatedRoutePlant:
             displacement = (
                 0.06 * pitch_value * translation_dt * forward
                 + 0.06 * roll_value * translation_dt * right
-                + 0.05 * gaz_value * translation_dt * map_frame.up
+                + self._vertical_pcmd_gain * gaz_value * translation_dt * map_frame.up
             )
             self.backend.sim_xyz += displacement
             self.state.pose[:] = [*self.backend.sim_xyz, self.backend.sim_yaw]
-            self.state.att_yaw = self.backend.sim_yaw
+            self.state.att_yaw = _map_heading_to_ned_yaw(self.backend.sim_yaw)
             self.state.ground_speed_mps = (
                 map_frame.horizontal_distance(displacement) / translation_dt
             )
             stamp = time.monotonic_ns()
             self.state.ground_speed_mono_ns = stamp
             self.state.telemetry_read_mono_ns = stamp
+            self.state.attitude_mono_ns = stamp
             self.state.last_pcmd_call_mono_ns = stamp
             self.state.last_command = reason
         return True
@@ -122,11 +142,20 @@ class SimulatedRoutePlant:
         pitch: float,
         yaw: float,
         gaz: float,
+        *,
+        authority_pct: int | None = None,
     ) -> bool:
+        # Same contract as the live backend: unit axes scale by the caller's
+        # authority, defaulting to the manual nudge size.  AUTO normalizes
+        # against its own authority, so scaling by nudge_pct here would fly
+        # every AUTO command at a fraction of its intended percent.
+        scale = self.nudge_pct if authority_pct is None else authority_pct
+        if isinstance(scale, bool) or not isinstance(scale, int) or not 1 <= scale <= 100:
+            return False
         axes = np.asarray((roll, pitch, yaw, gaz), dtype=float)
         if not np.isfinite(axes).all():
             return False
-        pcmd = np.rint(np.clip(axes, -1.0, 1.0) * self.nudge_pct).astype(int)
+        pcmd = np.rint(np.clip(axes, -1.0, 1.0) * scale).astype(int)
         return self.send_pcmd(*pcmd, reason="simulated_route_controller")
 
     def clear_nudge_vector(self) -> None:

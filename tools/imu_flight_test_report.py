@@ -16,8 +16,17 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import sys
 from pathlib import Path
 from typing import Any, Iterator
+
+_FLIGHT_CONTROL = Path(__file__).resolve().parents[1] / "定位演算法" / "flight_control"
+if str(_FLIGHT_CONTROL) not in sys.path:
+    sys.path.insert(0, str(_FLIGHT_CONTROL))
+try:
+    from map_scale import estimate_map_scale
+except ImportError:  # estimator unavailable: scale section reports as such
+    estimate_map_scale = None  # type: ignore[assignment]
 
 #: Same bound live_localizer_protocol enforces before a fused sample is allowed
 #: onto the wire. A frame whose telemetry is older than this never reached the
@@ -251,6 +260,61 @@ def summarize_localization(records: list[dict[str, Any]]) -> dict[str, Any]:
         **_esekf_summary(records),
     }
 
+def summarize_map_scale(
+    fused: list[dict[str, Any]], localization: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """Metres-per-map-unit from trajectory + IMU speed (informational).
+
+    Never a verdict gate: a parked session simply reports unconverged. Any
+    unexpected shape degrades to ``available=False`` so the report itself
+    cannot crash on a new recorder version.
+    """
+    if estimate_map_scale is None:
+        return {"available": False, "reason": "map_scale estimator unavailable"}
+    speeds: list[tuple[float, float]] = []
+    for row in fused:
+        stamp = _finite(row.get("t_mono_ns"))
+        velocity = [
+            _finite(row.get(key))
+            for key in ("speed_north_mps", "speed_east_mps", "speed_down_mps")
+        ]
+        if stamp is None or not all(value is not None for value in velocity):
+            continue
+        speeds.append(
+            (stamp * 1e-9, math.sqrt(sum(value * value for value in velocity)))  # type: ignore[operator]
+        )
+    visual: list[tuple[float, float, float, float]] = []
+    for row in localization:
+        pose = row.get("pose")
+        stamp = _finite(row.get("ui_arrival_mono"))
+        if stamp is None:
+            stamp = _finite(row.get("t_mono"))
+        xyz = (
+            [_finite(pose.get(axis)) for axis in ("x", "y", "z")]
+            if isinstance(pose, dict)
+            else [None, None, None]
+        )
+        if stamp is None or not all(value is not None for value in xyz):
+            continue
+        visual.append((stamp, xyz[0], xyz[1], xyz[2]))  # type: ignore[misc]
+    try:
+        estimate = estimate_map_scale(visual, speeds)
+    except Exception as exc:  # defensive: report must not crash on data shape
+        return {"available": False, "reason": f"estimator failed: {exc!r}"}
+    return {
+        "available": True,
+        "converged": estimate.converged,
+        "scale_m_per_unit": estimate.scale_m_per_unit,
+        "q1_m_per_unit": estimate.q1_m_per_unit,
+        "q3_m_per_unit": estimate.q3_m_per_unit,
+        "n_segments": estimate.n_segments,
+        "metric_distance_m": estimate.metric_distance_m,
+        "visual_distance_u": estimate.visual_distance_u,
+        "duration_s": estimate.duration_s,
+        "reason": estimate.reason,
+        "drift_ratio": estimate.drift_ratio,
+    }
+
 
 def summarize_frames(session: Path) -> dict[str, Any]:
     directory = session / "imu_test"
@@ -414,9 +478,12 @@ def summarize_tick_profile(records: list[dict[str, Any]]) -> dict[str, Any]:
 
 def build_report(session: Path) -> dict[str, Any]:
     telemetry = list(read_jsonl(session / "telemetry.jsonl"))
-    imu = summarize_imu([r for r in telemetry if r.get("event") == "fused_odometry"])
+    imu_rows = [r for r in telemetry if r.get("event") == "fused_odometry"]
+    imu = summarize_imu(imu_rows)
     sticks = summarize_sticks([r for r in telemetry if r.get("event") == "stick_axes"])
-    localization = summarize_localization(list(read_jsonl(session / "localization.jsonl")))
+    loc_rows = list(read_jsonl(session / "localization.jsonl"))
+    localization = summarize_localization(loc_rows)
+    map_scale = summarize_map_scale(imu_rows, loc_rows)
     frames = summarize_frames(session)
     tick_profile = summarize_tick_profile(
         [r for r in telemetry if r.get("event") == "ui_tick_profile"]
@@ -428,6 +495,7 @@ def build_report(session: Path) -> dict[str, Any]:
         "sticks": sticks,
         "localization": localization,
         "frames": frames,
+        "map_scale": map_scale,
         "tick_profile": tick_profile,
         "verdict": status,
         "notes": notes,
@@ -490,6 +558,26 @@ def render(report: dict[str, Any]) -> str:
             f"dropped_queue_full={recorder.get('dropped_queue_full')} "
             f"stop_reason={recorder.get('stop_reason') or '-'}"
         )
+    scale = report.get("map_scale") or {}
+    if scale.get("available"):
+        lines += [
+            "",
+            "## 地圖尺度（trajectory × IMU speed，非判定門檻）",
+        ]
+        if scale.get("converged"):
+            lines.append(
+                f"- {scale['n_segments']} 段中位數 {_number(scale.get('scale_m_per_unit'), 3)} m/unit"
+                f"（IQR {_number(scale.get('q1_m_per_unit'), 3)}–{_number(scale.get('q3_m_per_unit'), 3)}），"
+                f"共 {_number(scale.get('metric_distance_m'), 1)} m / "
+                f"{_number(scale.get('visual_distance_u'), 2)} unit"
+            )
+            if scale.get("drift_ratio") is not None:
+                lines.append(
+                    f"- 前後半段比值 {_number(scale.get('drift_ratio'), 3)}"
+                    "（遠離 1 表示視覺尺度在飄，不代表估計錯）"
+                )
+        else:
+            lines.append(f"- 未收斂：{scale.get('reason') or '-'}")
     tick = report.get("tick_profile") or {}
     if tick.get("ticks"):
         total = (tick.get("stages") or {}).get("_total") or {}

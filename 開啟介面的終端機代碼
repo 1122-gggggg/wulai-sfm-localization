@@ -1,17 +1,103 @@
-  河濱串流模擬：
+開啟介面的終端機代碼
+====================
+
+兩個入口互斥，同時只能開一個。開介面本身不會送起飛指令；起飛只有操作員在 UI 按鍵。
+
+
+A. 影片模擬串流（無真機，用測試影片跑定位與 UI）
+------------------------------------------------
 
   cd /home/allen/localization
-  SFM_SITE_PROFILE="/home/allen/localization/地圖檔/場域/river_site/releases/river_gluemap_all8_direct_20260908/site_profile.json" \
+  SFM_SITE_PROFILE="/home/allen/localization/地圖檔/場域/river_site/site_profile.json" \
   VIDEO="/home/allen/localization/模擬器/測試影片/720p/P1670167_720p.MP4" \
   ./控制介面程式/影片模擬串流/啟動.sh
 
-  IMU 飛行測試（手動搖桿飛行 + 開定位，全程錄 IMU / 搖桿 / 畫面）：
+可換的測試影片（模擬器/測試影片/720p/）：
+  P1160116_720p.MP4  P1180118_720p.MP4  P1190119_720p.MP4
+  P1570157_720p.MP4  P1670167_720p.MP4  P1680168_720p.MP4
+  河濱_P1170117_720p.MP4
+
+這個入口吃 SFM_SITE_PROFILE；真機入口不吃（見下）。
+
+註（2026-09-13）：SFM_SITE_PROFILE 指的 release site_profile.json 曾帶著
+已被程式移除的舊鍵 `max_route_deviation_map_units`，啟動會卡在
+`[simulator-preflight] FAIL ... unknown=['max_route_deviation_map_units']`。
+已清掉，可直接跑。先驗證只跑 preflight：
+
+  .venv/bin/python tools/simulator_preflight.py \
+    --site-profile "/home/allen/localization/地圖檔/場域/river_site/site_profile.json" \
+    --video "/home/allen/localization/模擬器/測試影片/720p/P1670167_720p.MP4"
+
+看到 `[simulator-preflight] OK` 再跑上面的啟動.sh。
+
+
+B. 真機串流（SkyController + 無人機，可手動／搖桿／自動飛行）
+--------------------------------------------------------------
+
+先接好 SkyController（USB 接電腦，SkyController 連無人機），然後：
+
+  cd /home/allen/localization
+  ./一鍵啟動.sh
+
+一鍵啟動已預設 SFM_MISSION_SELECTION 為
+控制介面程式/mission_selections/river_gluemap_all8_direct_localization.json。
+正式任務包的 route 經 river_site_operator_route.json 指到目前正式航線；
+編輯器「編輯路線」覆寫同檔、「新增路線」建新檔，被指到的 component 與
+selection SHA 會同步更新（LocalRouteProvider 連動），不需手動改 JSON。
+
+日常換航線不必改這裡、不必手動改 JSON：介面「場域」分頁的「可選航線」會列出
+地圖檔/場域/river_site/routes/ 下所有正式航線（目前 6 點／4 點／3 點共三條），
+點一下就切換顯示並綁定下一次 AUTO（AUTO 進行中鎖住，要等確認 landed 才解鎖）。
+只有「匯入航線 JSON」會新增航線並重置飛行核准；單純切換不碰核准、不改任務包。
+
+預設連線參數（要改就在命令前面加同名環境變數）：
+  IP=192.168.53.1   CTRL=skycontroller3   LOCAL_TOPK=0
+
+真機入口拒絕 SFM_SITE_PROFILE 與 --site-profile：site profile 是 mission
+selection 產生的唯讀 snapshot，不能由另一個入口給出不同的飛行核准答案。
+
+進去之後必須完成四步起飛前確認（羅盤／地圖／航線／系統）才會開放起飛與
+自動飛行。第 ④ 步的電量判定與 backend 起飛閘門是同一份，過不了就是真的
+會被擋。動搖桿一律強制交回搖桿控制。
+
+direct 後端 worker 暖機約 25-60 秒（模型載入），啟動器已把逾時放寬到 180 秒。
+
+
+C. IMU 飛行測試（手動搖桿飛行 + 開定位，全程錄 IMU／搖桿／畫面）
+-----------------------------------------------------------------
 
   cd /home/allen/localization
   ./IMU飛行測試.sh
 
-  落地關窗後會自動印出這次的 session 與判定；細節見腳本開頭與
-  docs/esekf_live_eval_runbook.md。事後單獨重看某一次：
+落地關窗後會自動印出這次的 session 與判定；細節見腳本開頭與
+docs/esekf_live_eval_runbook.md。事後單獨重看某一次：
 
   .venv/bin/python tools/imu_flight_test_report.py \
     --session outputs/flight_logs/session_<UTC>_real-flight_<id>
+
+
+D. 出發前的離線檢查（不接無人機也能跑）
+----------------------------------------
+
+任務是否就緒（要看到 flight ready=true、errors=[]）：
+
+  cd /home/allen/localization
+  .venv/bin/python tools/resolve_mission.py \
+    控制介面程式/mission_selections/river_gluemap_all8_direct_localization.json \
+    --require flight
+
+三條正式航線的離線閉迴路（要看到 route complete -> land、state=LANDING）：
+
+  .venv/bin/python tools/test_route_autoflight.py \
+    --route 地圖檔/場域/river_site/routes/flight_route_20260914_141505_e87a66fb.json
+  .venv/bin/python tools/test_route_autoflight.py \
+    --route 地圖檔/場域/river_site/routes/flight_route_20260913_145051_ec20651d.json
+  .venv/bin/python tools/test_route_autoflight.py \
+    --route 地圖檔/場域/river_site/routes/flight_route_20260913_144924_3f7aedd6.json
+
+只看兩個入口會下什麼指令（不實際啟動）：
+
+  SFM_LAUNCH_DRY_RUN=1 ./控制介面程式/影片模擬串流/啟動.sh
+  SFM_LAUNCH_DRY_RUN=1 ./一鍵啟動.sh
+
+（兩者都只印出完整指令就退出；真機入口會先跑任務解析與 live runtime preflight 才印。）

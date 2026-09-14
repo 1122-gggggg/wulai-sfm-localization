@@ -223,6 +223,38 @@ P167/P173/P174 這類已經反覆量測過的影片來做。要往下調，證�
 P173 190 - 229 ms（皆為 2026-09-09 兩輪交錯的實測）。0.3 對 P173 的上界仍有約 1.3 倍
 餘裕，但沒有 P157 上那麼寬。若日後 reloc 變慢，這裡是第一個要重量的地方。
 
+## 7. `reloc.period_s` 0.3 → 1.0（2026-09-11 落地；§4 的重衡量，機器換了）
+
+§4 留的觸發條件成立了：搬到 RTX 5060 筆電本機後，驗收影片 reloc 變慢到
+**P173 p50 445 ms、P174 p50 182 ms**（live headless，30 fps 步調，
+`outputs/benchmarks/localization_1346/live_cur_defaults`、
+`live_p174_defaults`）。0.3 s 週期 < 0.445 s 中位數，worker 在 P173 上
+100% busy、reloc 永久排隊；排隊的 CPU/GPU 負載經 GIL 反壓快迴路
+（track p95 34 ms）與 Tk tick（ui_poll p95 97 ms），整機定位顯示只剩 ~12 fps。
+`P174_AND_NEXT.md`「准做 #2」(`period >= 1.0 * median_s`) 要求用本機實測重設，
+1.0 s 對兩條驗收路線的中位數都有 2 倍以上餘裕。觸發器（`min_points`、
+`NO_POSE`）不受週期閘門影響，弱段救援速率不變；只放慢健康態的定期 reseed。
+
+| 路線 | `period_s` | decode p50/p95 | loop p95 | reloc p50 | NO_POSE | FAST_TRACK | 地圖約束比 |
+|---|---|---|---|---|---|---|---|
+| P173 live | 0.3 | 28.6 / 73.8 | 49.5 | 445 | 108 | 1704 | 61.5% |
+| P173 live | **1.0** | **10.7 / 32.1** | **19.8** | **243** | **45** | **1977** | **69.1%** |
+| P174 live（holdout） | 0.3 | 7.4 / 44.1 | 35.6 | 182 | 12 | 1504 | 87.2% |
+| P174 live（holdout） | **1.0** | **5.6 / 28.7** | **20.9** | **191** | **15** | **1562** | **87.0%** |
+
+單位 ms；地圖約束比 = (FAST_TRACK + RELOC_SEED) / 全幀。P174 兩臂聯合 ok 幀
+位姿差 p50 0.019、p95 0.093 地圖單位（map_scale 2.34）—— 無回退。
+P173 改善幅度含定時相位運氣（兩臂 reloc 投遞時刻不同），P174 持平才是保守讀法：
+**不退化 + 全幀 < 50 ms**。冷啟動不受影響（`min_points` 觸發不走週期閘門；
+worker 暖機中本來就投不進去）。
+
+GUI 端到端（simulated-stream，P173，正式 release profile）：10 s 窗格
+distinct 定位結果 **20.0–23.2/s**（改前同條件 ~12/s），e2e submit→UI
+p50 22 / p95 45 ms，tick 27.3/s。顯示層另有兩筆不碰精度的修改：
+HUD 描邊文字改純文字加底條（`draw_video_hud` 43.7→8.6 ms/幀），
+雙面板髒汙同 tick 時地圖每 3 幀畫一次（`_render_if_dirty`）。
+無加速（reloc p50 445→446 ms），維持預設關閉，程式與單元測試保留。
+
 ## VO 與 dead reckoning：P157 上惰性，驗收影片上是主力
 
 **先記一次判斷錯誤。** 本檔第一版根據 P157（802 幀）寫下「VO 與 dead-reckon 一次都沒
@@ -253,6 +285,36 @@ handover 門檻的結論，**不得只用 P157 這類全程高覆蓋的影片得
 `DEAD_RECKON` 開火了 19 - 101 次。所以這項改動目前是**正確性修正，不是已證實的改善**。
 要證明它有用，需要一段真的出現急轉彎且同時 PnP 餓死的錄影。
 
+## 5. 快迴路 PnP RANSAC seed 固定為 0（2026-09-09 落地，量測方法）
+
+pycolmap 預設 `RANSACOptions.random_seed = -1`（非確定），vendor reloc
+（`_solve` 經 `_estimate_pnp`）早已用 seed=0，快迴路 `TwoRateTracker` 卻沒設。
+合成場景實測：同一組 80 點（含 25% 粗差）跑 5 次，seed=-1 得 3 種不同
+inlier 集合（59/59/60/60/59），seed=0 五次逐位元相同。這就是 P173 覆蓋率
+同臂擺盪 3-4pp 的機制：邊緣幀在 ≥12 inlier 門檻上被 RNG 翻來翻去。
+改動只是一行 `estimation.ransac.random_seed = 0`，不是準度旋鈕（P174 禁令不適用），
+與 vendor 已有慣例對齊。回歸見
+`tests/localization/deploy/test_pnp_ransac_seed.py`（3 tests：seed=0 確定性、
+seed=-1 非確定性、tracker 原始碼釘住）。
+
+驗證（非調參）：P173 全片單跑（seed 已固定），2899 評分幀覆蓋 **97.03%**
+（FAST_TRACK 1753、RELOC_SEED 173、VO_ONLY 811、DEAD_RECKON 76、NO_POSE 86），
+落在既有 grey 基線 97.68% ± 1.35 的 1σ 內 —— 無退化，但單跑也不能宣稱提升。
+端到端完全確定性尚未驗證：VO 的 cv2 RANSAC（`findEssentialMat`）仍吃全域 RNG，
+沒有釘。要把 A/B 降到單跑可比，還得處理那一處。
+
+## 6. P173 失敗幀空間分佈（2026-09-09，純分析，未動任何旋鈕）
+
+同一單跑的逐幀記錄：86 個 NO_POSE **100% 落在 ordinal 2614–2725**（112 幀窗口，
+即已知 151 幀洞 2614–2764 的子集）。洞內 `map_inliers` p50 = **0**（洞外 176），
+洞內狀態只有 NO_POSE 86 + DEAD_RECKON 26，一個地圖約束幀都沒有；
+洞外 2787 幀 **0 個 NO_POSE**。VO 在洞前扛了最長 514 幀（2090–2603），到洞口才斷。
+括弧定位顯示相機過洞位移僅約 0.01 地圖單位（慢速段）。
+
+結論：這是**地圖覆蓋洞，不是 tracker 調參問題**。槓桿是往該路段補參考影像，
+不是調 `min_live` / handover / PnP（且 P174 禁令本來就禁止拿 P173 調這些）。
+後續精度實驗的准入維持：新航線凍結組態跑一次；P173 只做驗證，不做選擇。
+
 ## 已知缺口（不是優化，是護欄沒蓋到）
 
 - ~~`check_maintainability.py` 沒有涵蓋 `sfm_direct_deploy`~~ **已修（2026-09-09）**。
@@ -261,6 +323,7 @@ handover 門檻的結論，**不得只用 P157 這類全程高覆蓋的影片得
   **0/0**（唯一的違規者是凍結的 P174 replay harness，改用 per-file-ignores 具名豁免，
   而不是把整組天花板拉到它的 115）。`tools` 與 `control` 則因遷移帶進來的發布工具而
   放寬，那是待還的債。
-- `river_gluemap_all8_direct_20260908` 的 quality receipt 是 `passed: false`、
-  `validation: NONE`、`absolute_ground_truth: NONE`。本檔所有數字都是**相對**比較
-  （同輸入前後對照），沒有一項是絕對精度。
+- `river_gluemap_all8_direct_20260908` 的 quality receipt 自 2026-09-09 起是
+  **OPERATOR_ACCEPTANCE（passed=true，2026-10-09 到期），validation: NONE、
+  ground truth: NONE** —— 放行的是有人監督試飛的定位，不是驗證。
+  本檔所有數字仍是**相對**比較（同輸入前後對照），沒有一項是絕對精度。

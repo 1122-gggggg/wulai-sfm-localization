@@ -81,13 +81,18 @@ class _ScenarioBackend:
         return True
 
     def set_nudge_vector(
-        self, roll: float, pitch: float, yaw: float, gaz: float
+        self,
+        roll: float,
+        pitch: float,
+        yaw: float,
+        gaz: float,
+        *,
+        authority_pct: int | None = None,
     ) -> bool:
         self.nudge_vectors.append((roll, pitch, yaw, gaz))
         if yaw:
-            self.state.att_yaw += math.radians(
-                float(yaw) * self.nudge_pct * 2.0
-            )
+            scale = self.nudge_pct if authority_pct is None else authority_pct
+            self.state.att_yaw += math.radians(float(yaw) * scale * 2.0)
         return True
 
     def clear_nudge_vector(self) -> None:
@@ -165,9 +170,7 @@ def test_manual_takeoff_command_lifecycle_is_typed_and_simulated() -> None:
     assert backend.state.tracker_state == "HOVER"
     assert backend.state.altitude_m == pytest.approx(1.0)
 
-    landed = backend.command(
-        ControlRequest.create(ControlAction.LAND_NOW, human_origin=True)
-    )
+    landed = backend.command(ControlRequest.create(ControlAction.LAND_NOW, human_origin=True))
     assert landed.accepted and landed.executed
     assert backend.state.tracker_state == "LAND"
     backend.sim_xyz[1] = 0.0
@@ -202,11 +205,51 @@ def test_simulated_route_test_runs_the_production_controller_on_drawn_waypoints(
     )
 
     assert autonomy.start()
-    assert autonomy.join(timeout=12.0)
+    # The route is flown out and back, so this runs roughly twice the drawn path.
+    assert autonomy.join(timeout=24.0)
     assert autonomy.phase == "DONE"
     assert plant.finished
     assert backend.state.flight_state == "landed"
-    assert backend.sim_xyz == pytest.approx(snapshot.waypoints[-1], abs=0.08)
+    # return_to_start: AUTO lands back at waypoint 1, not at the far end.
+    assert backend.sim_xyz == pytest.approx(snapshot.waypoints[0], abs=0.08)
+
+
+def test_start_near_the_far_endpoint_still_flies_from_waypoint_one(tmp_path) -> None:
+    import numpy as np
+
+    backend = DroneBackend()
+    snapshot = _snapshot(
+        tmp_path,
+        waypoints=((0.0, 0.0, 0.0), (0.5, 0.0, 0.0), (0.5, 0.0, 0.5)),
+    )
+    plant = backend.route_test_plant
+    assert plant.begin(snapshot, LEGACY_MAP_FRAME)
+    backend.sim_xyz = np.array(snapshot.waypoints[-1]) + np.array([0.0, -0.4, 0.0])
+
+    autonomy = DesktopRouteAutonomy(
+        backend=plant,
+        snapshot=snapshot,
+        map_frame=LEGACY_MAP_FRAME,
+        get_pose=plant.pose,
+        pose_is_weak=lambda: False,
+        pose_confidence=lambda: 100,
+        force_relocalize=lambda: None,
+        stream_healthy=lambda: True,
+        takeoff=lambda: False,
+        take_pc_control=lambda: True,
+        start_airborne=True,
+        land=plant.finish,
+    )
+
+    assert autonomy.start()
+    assert autonomy.join(timeout=24.0)
+    details = [
+        event.detail for event in autonomy.drain_events() if event.kind == "route_start_selected"
+    ]
+    assert any("first target is waypoint 1 of 3" in detail for detail in details)
+    assert autonomy.phase == "DONE"
+    assert plant.finished
+    assert backend.sim_xyz == pytest.approx(snapshot.waypoints[0], abs=0.08)
 
 
 def test_simulated_auto_route_is_not_blocked_by_real_flight_preflight() -> None:
@@ -275,8 +318,8 @@ def test_switching_into_auto_clears_manual_nonzero_input_before_activation(
     operator._stick_vector_active = True
     operator.write_log = lambda _message: None
     operator._preflight_blocks_flight_command = lambda _command: False
-    operator._backend_command = (
-        lambda command, payload=None: backend.command(command, **(payload or {}))
+    operator._backend_command = lambda command, payload=None: backend.command(
+        command, **(payload or {})
     )
     started = []
     operator._start_integrated_auto = lambda snapshot: started.append(snapshot) or True
@@ -334,15 +377,12 @@ def test_initial_missing_localization_search_is_bounded_yaw_only_and_stops_on_lo
     autonomy.start()
     assert autonomy.join(timeout=1.0)
     search = [
-        vector
-        for vector in backend.nudge_vectors
-        if any(abs(value) > 0.0 for value in vector)
+        vector for vector in backend.nudge_vectors if any(abs(value) > 0.0 for value in vector)
     ]
     assert any(vector[2] > 0 for vector in search)
     assert any(vector[2] < 0 for vector in search)
     assert all(
-        vector[:2] == (0.0, 0.0) and vector[3] == 0.0 and abs(vector[2]) <= 0.6
-        for vector in search
+        vector[:2] == (0.0, 0.0) and vector[3] == 0.0 and abs(vector[2]) <= 0.6 for vector in search
     )
     assert route_started_at
     assert all(command[:4] == (0, 0, 0, 0) for command in backend.pcmds[route_started_at[0] :])
@@ -394,8 +434,7 @@ def test_missing_localization_without_yaw_telemetry_never_rotates_while_hovering
     assert backend.pcmds
     assert all(command[:4] == (0, 0, 0, 0) for command in backend.pcmds)
     assert any(
-        event.kind == "boot_hover_search_waiting"
-        and "without blind rotation" in event.detail
+        event.kind == "boot_hover_search_waiting" and "without blind rotation" in event.detail
         for event in autonomy.drain_events()
     )
     assert commands == ["takeoff"]
@@ -435,9 +474,7 @@ def test_airborne_auto_handoff_never_repeats_takeoff(tmp_path) -> None:
     autonomy._run()
 
     assert commands == ["pc_control", "land"]
-    command_events = [
-        event for event in autonomy.drain_events() if event.kind == "command_result"
-    ]
+    command_events = [event for event in autonomy.drain_events() if event.kind == "command_result"]
     assert [(event.command, event.result) for event in command_events] == [
         ("pc_control", True),
         ("land", True),
@@ -468,9 +505,7 @@ def test_auto_localization_loss_hovers_without_timer_handoff_or_land(
 
     def record_nudge(roll, pitch, yaw, gaz):
         result = set_nudge_vector(roll, pitch, yaw, gaz)
-        if loss_started.is_set() and not any(
-            abs(value) > 0.0 for value in (roll, pitch, yaw, gaz)
-        ):
+        if loss_started.is_set() and not any(abs(value) > 0.0 for value in (roll, pitch, yaw, gaz)):
             hover_seen.set()
         return result
 
@@ -523,15 +558,10 @@ def test_auto_localization_loss_hovers_without_timer_handoff_or_land(
     )
 
     assert backend.pcmds
-    assert all(
-        command[0] == 0 and command[1] == 0 and command[3] == 0
-        for command in backend.pcmds
-    )
+    assert all(command[0] == 0 and command[1] == 0 and command[3] == 0 for command in backend.pcmds)
     assert commands == ["takeoff"]
     assert backend.handoffs == []
-    assert not any(
-        event.kind == "landing_unresolved" for event in autonomy.drain_events()
-    )
+    assert not any(event.kind == "landing_unresolved" for event in autonomy.drain_events())
 
     autonomy.cancel("test complete")
     assert autonomy.join(timeout=1.0)

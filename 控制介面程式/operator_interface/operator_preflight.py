@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
 
+from live_safety_config import takeoff_battery_blocker
+
 
 PREFLIGHT_GUIDE_STEPS = ("compass", "map", "route", "system")
 PREFLIGHT_GUIDE_LABELS = {
@@ -49,16 +51,29 @@ class SequentialPreflightGuide:
         self._evidence[step] = evidence
         return step
 
+    def invalidate(self, step: str | None = None) -> str | None:
+        """Drop one invalidated step and everything confirmed after it."""
+        if step is None:
+            if not self._evidence:
+                return None
+            step = next((s for s in PREFLIGHT_GUIDE_STEPS if s in self._evidence), None)
+            if step is None:
+                return None
+        elif step not in self._evidence:
+            return None
+        index = PREFLIGHT_GUIDE_STEPS.index(step)
+        for invalid in PREFLIGHT_GUIDE_STEPS[index:]:
+            self._evidence.pop(invalid, None)
+        return step
+
     def sync(self, current_evidence: dict[str, object | None]) -> str | None:
         """Drop one changed step and everything confirmed after it."""
-        for index, step in enumerate(PREFLIGHT_GUIDE_STEPS):
+        for step in PREFLIGHT_GUIDE_STEPS:
             if step not in self._evidence:
                 break
             if current_evidence.get(step) == self._evidence[step]:
                 continue
-            for invalid in PREFLIGHT_GUIDE_STEPS[index:]:
-                self._evidence.pop(invalid, None)
-            return step
+            return self.invalidate(step)
         return None
 
 
@@ -244,25 +259,22 @@ def _system_evidence(
     problem = _system_readiness_problem(state, context)
     if problem is not None:
         return None, problem
-    try:
-        battery = _evidence_float(getattr(state, "battery_pct", -1.0))
-        battery_floor = _evidence_float(context.min_takeoff_battery_pct)
-    except (TypeError, ValueError):
-        battery_note = "電量讀回不可用（不阻擋起飛）"
-    else:
-        if not math.isfinite(battery) or not 0.0 <= battery <= 100.0:
-            battery_note = "電量讀回不可用（不阻擋起飛）"
-        elif math.isfinite(battery_floor) and battery < battery_floor:
-            battery_note = (
-                f"電量 {battery:.0f}% 低於建議 {battery_floor:.0f}%"
-                "（不阻擋起飛）"
-            )
-        else:
-            battery_note = f"電量 {battery:.0f}%（不阻擋起飛）"
+    # Same decision object the live backend enforces at the takeoff boundary, so
+    # this screen cannot promise a takeoff the backend will refuse.
+    battery_blocker = takeoff_battery_blocker(
+        getattr(state, "battery_pct", None), context.min_takeoff_battery_pct
+    )
+    if battery_blocker is not None:
+        return None, f"電量未達起飛條件（會阻擋起飛）：{battery_blocker}"
+    battery = _evidence_float(getattr(state, "battery_pct", -1.0))
     return (
         "system",
         "live",
-    ), f"串流、遙測與連線正常；{battery_note}；GPS／高度／距離限制僅提示"
+    ), (
+        f"串流、遙測與連線正常；電量 {battery:.0f}% 已過起飛門檻；"
+        "高度／距離限制：已設定者寫入或回讀失敗會阻擋起飛，未設定則不限制；"
+        "GPS 僅在已設定距離圍欄且要求 GPS 時才阻擋"
+    )
 
 
 def evaluate_preflight_step(
@@ -272,14 +284,22 @@ def evaluate_preflight_step(
     *,
     now: float,
     verify_route_hash: bool = False,
+    memo: dict[tuple, tuple[object | None, str]] | None = None,
 ) -> tuple[object | None, str]:
     """Return immutable evidence for one human preflight confirmation."""
+    memo_key = (step, id(state), id(context), verify_route_hash)
+    if memo is not None and memo_key in memo:
+        return memo[memo_key]
     if step == "compass":
-        return _compass_evidence(state, context.live)
-    if step == "map":
-        return _map_evidence(context)
-    if step == "route":
-        return _route_evidence(context, verify_route_hash)
-    if step == "system":
-        return _system_evidence(state, context, now)
-    return None, f"未知的起飛前步驟：{step}"
+        result = _compass_evidence(state, context.live)
+    elif step == "map":
+        result = _map_evidence(context)
+    elif step == "route":
+        result = _route_evidence(context, verify_route_hash)
+    elif step == "system":
+        result = _system_evidence(state, context, now)
+    else:
+        result = None, f"未知的起飛前步驟：{step}"
+    if memo is not None:
+        memo[memo_key] = result
+    return result

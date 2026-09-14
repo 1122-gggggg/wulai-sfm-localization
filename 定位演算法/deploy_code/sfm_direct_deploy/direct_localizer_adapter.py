@@ -13,12 +13,13 @@ Status mapping (safety contract, never widened):
     RELOC_SEED   -> TRACK       weak=False   handover landed on this frame
     VO_ONLY      -> WEAK_TRACK  weak=True    inliers are self-built VO points
     DEAD_RECKON  -> WEAK_TRACK  weak=True    essential-matrix dead reckoning
+    IMU_BRIDGE   -> WEAK_TRACK  weak=True    fused-yaw rotation of last pose
     NO_POSE      -> LOST        weak=True    localize_frame returns None
 """
 
 from __future__ import annotations
 
-import time
+import math
 from dataclasses import dataclass, field
 
 import cv2
@@ -28,12 +29,12 @@ from pose_types import Localizer, Pose
 
 from two_rate_tracker import TwoRateTracker
 
-#: status -> (worker mode, weak flag). See the module docstring.
 _STATUS_MODE: dict[str, tuple[str, bool]] = {
     "FAST_TRACK": ("TRACK", False),
     "RELOC_SEED": ("TRACK", False),
     "VO_ONLY": ("WEAK_TRACK", True),
     "DEAD_RECKON": ("WEAK_TRACK", True),
+    "IMU_BRIDGE": ("WEAK_TRACK", True),
     "NO_POSE": ("LOST", True),
 }
 
@@ -138,14 +139,17 @@ class DirectTrackerAdapter(Localizer):
 
     # ---------- fusion / retrieval hooks ----------
     def observe_fused_state(self, sample) -> None:
-        """Record the fused navigation sample for diagnostics only.
+        """Offer this frame's fused IMU sample to the fast loop.
 
-        The frozen P174 configuration has no ESEKF and no IMU/NED coupling: the
-        fast loop's prior is the tracked 2D point set, not a filtered state.
-        Storing the sample without consuming it is deliberate -- pretending to
-        fuse would make `last_info` claim an inertial aid that does not exist.
+        The tracker keeps the sample's yaw for its inertial bridge: when both
+        visual PnP and visual dead reckoning fail, a fresh fused yaw rotates
+        the last pose instead of reporting LOST. The bridge never confirms a
+        fix -- it reports WEAK_TRACK, and `last_info` says whether it ran.
         """
         self._fused_sample = sample
+        offer = getattr(self.trk, "observe_fused_state", None)
+        if callable(offer):
+            offer(sample)
 
     def attach_pose_guided(self, controller) -> None:
         """No-op. Pose-guided retrieval reorders the EDM tracker's *reference*
@@ -158,10 +162,29 @@ class DirectTrackerAdapter(Localizer):
     def localize_frame(
         self, frame: np.ndarray, capture_stamp: float | None = None
     ) -> Pose | None:
-        # The worker hands us RGB; OpenCV and the whole direct stack are BGR-in.
-        bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-        stamp = time.monotonic() if capture_stamp is None else float(capture_stamp)
-        info = self.trk.step(bgr, stamp)
+        try:
+            stamp = float(capture_stamp)
+        except (TypeError, ValueError, OverflowError):
+            stamp = float("nan")
+        if not math.isfinite(stamp):
+            self._last_info = {
+                "mode": "LOST",
+                "next_mode": "LOST",
+                "weak": True,
+                "direct_status": "NO_POSE",
+                "inliers": 0,
+                "pose_status": "NONE",
+            }
+            return None
+        if frame.ndim == 3:
+            gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
+        else:
+            gray = np.asarray(frame)
+        target_w, target_h = (int(v) for v in self.profile.fast_loop.resolution)
+        if (gray.shape[1], gray.shape[0]) != (target_w, target_h):
+            gray = cv2.resize(gray, (target_w, target_h), interpolation=cv2.INTER_AREA)
+        gray = np.ascontiguousarray(gray, dtype=np.uint8)
+        info = self.trk.step(gray, stamp)
 
         status = str(info["status"])
         mode, weak = _STATUS_MODE[status]
@@ -203,20 +226,26 @@ class DirectTrackerAdapter(Localizer):
             # constraint and must never be treated as a confirmed fix.
             "weak": weak,
             "inliers": int(info["inliers"]),
-            "reproj_rms": None,          # fast-loop PnP reports no residual RMS
+            "reproj_rms": info.get("reproj_rms"),
+            "reproj_p90": info.get("reproj_p90"),
+            "inlier_hull_coverage": info.get("inlier_hull_coverage"),
+            "positive_depth_ratio": info.get("positive_depth_ratio"),
             "inlier_ratio": (
                 None if not info["n_corr"] else float(info["inliers"]) / float(info["n_corr"])
             ),
-            "inlier_grid_cells": None,
+            "inlier_grid_cells": info.get("inlier_grid_cells"),
             "vpr_ms": None,              # retrieval runs off the fast loop
             "feature_ms": None,          # detector-free fast loop
             "match_ms": None,
             "total_ms": float(info["loop_ms"]),
-            "stage_gray_ms": None,
+            "stage_gray_ms": info.get("gray_ms"),
             "stage_bridge_ms": None,
             "stage_query_ms": None,
             "stage_select_ms": None,
             "track_ms": float(info["track_ms"]),
+            "handover_ms": info.get("handover_ms"),
+            "bookkeeping_ms": info.get("bookkeeping_ms"),
+            "map_constraint_age_s": info.get("map_constraint_age_s"),
             "pnp_ms": float(info["pnp_ms"]),
             "vo_ms": float(info["vo_ms"]),
             "pnp_candidates": int(info["n_corr"]),
@@ -244,13 +273,30 @@ class DirectTrackerAdapter(Localizer):
             "handover_points": int(info["handover_points"]),
             "handover_dropped": int(info["handover_dropped"]),
             "reloc_ms": info["reloc_ms"],
+            "reloc_retrieval_ms": info.get("reloc_retrieval_ms"),
+            "reloc_match_lift_ms": info.get("reloc_match_lift_ms"),
+            "reloc_pnp_ms": info.get("reloc_pnp_ms"),
+            "reloc_reference_count": info.get("reloc_reference_count"),
             "reloc_delivered": bool(info["reloc_delivered"]),
-            "reloc_submitted": bool(info["reloc_submitted"]),
+            "fused_state_seen": self._fused_sample is not None,
+            "imu_bridge": bool(info.get("imu_bridge")),
+            "imu_sample_age_s": info.get("imu_sample_age_s"),
+            "imu_yaw_delta_deg": info.get("imu_yaw_delta_deg"),
             "reloc_busy": bool(info["reloc_busy"]),
             "vo_candidates": int(info["vo_candidates"]),
             "step_norm": info["step"],
-            "fused_state_seen": self._fused_sample is not None,
+            "reloc_reference_names": references,
+            "reloc_submitted": bool(info.get("reloc_submitted")),
         }
+        for key in (
+            "frame_stamp_mono", "frame_dt_s", "klt_reseeded", "klt_input_points",
+            "klt_forward_valid", "klt_backward_valid", "klt_kept_points", "klt_inside_kept",
+            "klt_fb_p50_px", "klt_fb_p95_px", "klt_displacement_p50_px", "pnp_image_size_px",
+            "imu_bridge_reason", "imu_reference_stamp_mono", "imu_sample_stamp_mono",
+            "pnp_observation_sample",
+        ):
+            if key in info:
+                self._last_info[key] = info[key]
         return pose
 
     def _advance_state(self, pose: Pose | None, info: dict, mode: str, status: str) -> None:
@@ -278,16 +324,16 @@ class DirectTrackerAdapter(Localizer):
         sample = self.frame_source()
         if sample is None:
             return None
-        if isinstance(sample, tuple):
-            if len(sample) != 2:
-                self._last_info = {
-                    "mode": self.state.mode,
-                    "next_mode": self.state.mode,
-                    "error": "invalid_frame_sample",
-                    "inliers": 0,
-                }
-                return None
-            frame, capture_stamp = sample
-        else:
-            frame, capture_stamp = sample, time.monotonic()
+        if not isinstance(sample, tuple) or len(sample) != 2:
+            self._last_info = {
+                "mode": "LOST",
+                "next_mode": "LOST",
+                "weak": True,
+                "direct_status": "NO_POSE",
+                "inliers": 0,
+                "pose_status": "NONE",
+                "error": "invalid_frame_sample",
+            }
+            return None
+        frame, capture_stamp = sample
         return self.localize_frame(frame, capture_stamp=capture_stamp)

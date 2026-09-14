@@ -1,16 +1,9 @@
 #!/usr/bin/env python3
 """Load the hand-drawn flight path (scripts/draw_path.py output) for the executor.
 
-The path is a list of 3D waypoints in the ALIGNED map frame (ground z=0, +Z up),
-same frame the geofence / safe zone use and the same frame align_pose.AlignedPose
-maps live localizer poses into. So it feeds straight into cruise_geofence:
-
-    from load_path import load_waypoints
-    from cruise_geofence import PathFollower
-    follower = PathFollower(load_waypoints())
-
-Returns a list of np.ndarray(3,) (what PathFollower expects). If `closed` was set
-in the JSON, the start waypoint is appended so the loop closes.
+Legacy loader kept for old tests/scripts. Production flight parses routes
+through route_domain.RouteDocument; nothing here enforces a tube, corridor
+radius, or boundary slowdown.
 """
 from __future__ import annotations
 

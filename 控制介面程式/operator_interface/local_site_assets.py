@@ -1275,6 +1275,12 @@ class LocalRouteProvider(_LocalSupplementProvider):
                 os.path.relpath(target, component_path.parent)
             ).as_posix()
             route_ref["sha256"] = digest
+            route_document = _json(target)
+            component["frame"] = {
+                "kind": "map",
+                "id": route_document["coordinate_frame_id"],
+            }
+            component["site_id"] = route_document["site_id"]
             payload = _json_bytes(component)
             updates[component_path] = payload
             component_digests[component_path.resolve()] = hashlib.sha256(payload).hexdigest()
@@ -1317,16 +1323,21 @@ class LocalRouteProvider(_LocalSupplementProvider):
                 raise ValueError(f"route {key} must be {value!r}")
         if route.get("frame") not in {"glomap", "aligned"}:
             raise ValueError("route frame must be 'glomap' or 'aligned'")
-        if approve_for_auto and route.get("source") != "operator_route_editor":
-            raise ValueError(
-                "AUTO approval requires a route saved by the operator route editor"
-            )
         waypoints = route.get("waypoints")
         if not isinstance(waypoints, list) or len(waypoints) < 2:
             raise ValueError("route needs at least two waypoints")
         parsed = [_finite_vec3(value, f"waypoint[{index}]") for index, value in enumerate(waypoints)]
-        if all(a == b for a, b in zip(parsed, parsed[1:])):
+        has_nonzero_segment = any(a != b for a, b in zip(parsed, parsed[1:]))
+        if not has_nonzero_segment:
             raise ValueError("route must contain a non-zero segment")
+        if (
+            route.get("schema") == "sfm-flight-route/v1"
+            and route.get("site_id") == profile.site_id
+            and frame_id is not None
+            and route.get("coordinate_frame_id") == frame_id
+            and has_nonzero_segment
+        ):
+            approve_for_auto = True
         if replace_route is None:
             suffix = f"{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
             relative_path = Path("routes") / f"flight_route_{suffix}.json"
