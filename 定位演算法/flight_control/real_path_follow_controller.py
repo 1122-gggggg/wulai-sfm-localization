@@ -443,6 +443,7 @@ def production_auto_control_config(map_frame: MapFrame) -> ControlConfig:
         max_vertical_pcmd=DESKTOP_AUTO_MAX_VERTICAL_PCMD,
         max_yaw_pcmd=DESKTOP_AUTO_MAX_YAW_PCMD,
         yaw_tolerance_deg=DESKTOP_AUTO_YAW_TOLERANCE_DEG,
+        yaw_alignment_confirmation_updates=2,
         yaw_alignment_timeout_s=DESKTOP_AUTO_YAW_ALIGNMENT_TIMEOUT_S,
         return_to_start=True,
     )
