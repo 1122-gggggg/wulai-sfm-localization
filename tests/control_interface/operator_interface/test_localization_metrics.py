@@ -45,10 +45,12 @@ def test_fused_telemetry_includes_independent_gnss_stamp() -> None:
 
 
 def test_cached_attitude_keeps_its_source_stamp_when_polling_advances():
-    state = SimpleNamespace(attitude_mono_ns=10_000_000_000,
-                            ground_speed_mono_ns=10_100_000_000,
-                            gps_location_mono_ns=9_900_000_000,
-                            telemetry_read_mono_ns=10_200_000_000)
+    state = SimpleNamespace(
+        attitude_mono_ns=10_000_000_000,
+        ground_speed_mono_ns=10_100_000_000,
+        gps_location_mono_ns=9_900_000_000,
+        telemetry_read_mono_ns=10_200_000_000,
+    )
     for poll in (10_200_000_000, 10_800_000_000):
         state.telemetry_read_mono_ns = poll
         timing = {}
@@ -61,8 +63,13 @@ def test_cached_attitude_keeps_its_source_stamp_when_polling_advances():
 
 def test_missing_attitude_event_does_not_invent_a_fresh_zero_attitude():
     timing = {}
-    state = SimpleNamespace(attitude_mono_ns=None, telemetry_read_mono_ns=10_000_000_000,
-                            att_roll=0.0, att_pitch=0.0, att_yaw=0.0)
+    state = SimpleNamespace(
+        attitude_mono_ns=None,
+        telemetry_read_mono_ns=10_000_000_000,
+        att_roll=0.0,
+        att_pitch=0.0,
+        att_yaw=0.0,
+    )
     attach_fused_localization_telemetry(timing, state)
     assert "fused_telemetry_mono" not in timing
     assert timing["fused_yaw"] is None
@@ -100,14 +107,26 @@ def test_metric_record_has_unique_bounded_fields_and_compatibility_defaults() ->
 
 
 def test_next_flight_diagnostics_survive_the_metrics_allowlist():
-    fields = {"klt_input_points": 100, "klt_kept_points": 80,
-              "klt_fb_p95_px": 0.45, "imu_bridge_reason": "sample_stale",
-              "imu_sample_stamp_mono": 12.0, "frame_stamp_mono": 12.6,
-              "pnp_observation_sample": {"image_size_px": [512, 384],
-                                         "ids": [42], "image_xy_px": [[20, 30]]}}
+    fields = {
+        "klt_input_points": 100,
+        "klt_kept_points": 80,
+        "klt_fb_p95_px": 0.45,
+        "imu_bridge_reason": "sample_stale",
+        "imu_sample_stamp_mono": 12.0,
+        "frame_stamp_mono": 12.6,
+        "pnp_observation_sample": {
+            "image_size_px": [512, 384],
+            "ids": [42],
+            "image_xy_px": [[20, 30]],
+        },
+    }
     record = build_localization_metric_record(
-        fields, metric_mono_ns=13_000_000_000, loc_fps=10,
-        submit_ok=1, submit_skip_busy=0, submit_busy_attempts=0,
+        fields,
+        metric_mono_ns=13_000_000_000,
+        loc_fps=10,
+        submit_ok=1,
+        submit_skip_busy=0,
+        submit_busy_attempts=0,
     )
     assert {key: record[key] for key in fields} == fields
 

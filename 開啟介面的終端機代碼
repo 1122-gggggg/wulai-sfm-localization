@@ -69,8 +69,8 @@ C. IMU 飛行測試（手動搖桿飛行 + 開定位，全程錄 IMU／搖桿／
   cd /home/allen/localization
   ./IMU飛行測試.sh
 
-落地關窗後會自動印出這次的 session 與判定；細節見腳本開頭與
-docs/esekf_live_eval_runbook.md。事後單獨重看某一次：
+這個腳本會設 SFM_EVALUATION_ONLY=1，定位可開、AUTO 會被擋住；要測自動飛行
+請用上面的 ./一鍵啟動.sh，不要走這條。落地關窗後會印出 session；事後重看：
 
   .venv/bin/python tools/imu_flight_test_report.py \
     --session outputs/flight_logs/session_<UTC>_real-flight_<id>
@@ -79,7 +79,7 @@ docs/esekf_live_eval_runbook.md。事後單獨重看某一次：
 D. 出發前的離線檢查（不接無人機也能跑）
 ----------------------------------------
 
-任務是否就緒（要看到 flight ready=true、errors=[]）：
+任務是否就緒（JSON 裡 flight.ready=true、flight.errors=[]）：
 
   cd /home/allen/localization
   .venv/bin/python tools/resolve_mission.py \
@@ -97,7 +97,10 @@ D. 出發前的離線檢查（不接無人機也能跑）
 
 只看兩個入口會下什麼指令（不實際啟動）：
 
-  SFM_LAUNCH_DRY_RUN=1 ./控制介面程式/影片模擬串流/啟動.sh
+  SFM_LAUNCH_DRY_RUN=1 \
+  VIDEO="/home/allen/localization/模擬器/測試影片/720p/P1670167_720p.MP4" \
+  ./控制介面程式/影片模擬串流/啟動.sh
   SFM_LAUNCH_DRY_RUN=1 ./一鍵啟動.sh
 
-（兩者都只印出完整指令就退出；真機入口會先跑任務解析與 live runtime preflight 才印。）
+（兩者都只印出完整指令就退出。模擬入口必須指定 VIDEO，測試片在 720p/ 子目錄，
+不帶 VIDEO 會失敗。真機入口會先跑任務解析才印指令；dry-run 不會做網路探測。）

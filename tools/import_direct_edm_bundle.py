@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Convert a portable direct BoQ/EDM/COLMAP map into the production EDM bundle."""
+
 from __future__ import annotations
 
 import argparse
@@ -102,11 +103,7 @@ def build_covisibility(
     covis: dict[str, list[int]] = {}
     for index, name in enumerate(names):
         order = np.argsort(-shared[index], kind="stable")
-        covis[name] = [
-            int(other)
-            for other in order
-            if shared[index, other] > 0
-        ][:COVIS_KEEP]
+        covis[name] = [int(other) for other in order if shared[index, other] > 0][:COVIS_KEEP]
     return covis
 
 
@@ -158,9 +155,7 @@ def embedded_reference(image_path: Path) -> np.ndarray:
         raise ValueError(f"cannot decode reference image: {image_path}")
     if image.shape != (EDM_H, EDM_W):
         image = cv2.resize(image, (EDM_W, EDM_H), interpolation=cv2.INTER_AREA)
-    ok, encoded = cv2.imencode(
-        ".jpg", image, [int(cv2.IMWRITE_JPEG_QUALITY), 92]
-    )
+    ok, encoded = cv2.imencode(".jpg", image, [int(cv2.IMWRITE_JPEG_QUALITY), 92])
     if not ok:
         raise ValueError(f"cannot encode reference image: {image_path}")
     return np.frombuffer(encoded.tobytes(), dtype=np.uint8)
@@ -225,16 +220,13 @@ def build(source: Path, out_dir: Path, lift_distance_px: float) -> dict:
         }
         if (index + 1) % 100 == 0 or index + 1 == len(names):
             print(
-                f"packed {index + 1}/{len(names)} "
-                f"anchors={anchored_counts[-1]}",
+                f"packed {index + 1}/{len(names)} anchors={anchored_counts[-1]}",
                 flush=True,
             )
 
     covis = build_covisibility(reconstruction, names, images_by_name)
     scale_center = np.median(centers, axis=0)
-    scale_s = float(
-        2.0 * np.percentile(np.linalg.norm(centers - scale_center, axis=1), 95)
-    )
+    scale_s = float(2.0 * np.percentile(np.linalg.norm(centers - scale_center, axis=1), 95))
     bundle = {
         "meta": {
             "feature": "edm",

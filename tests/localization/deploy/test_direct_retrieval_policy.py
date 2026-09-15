@@ -12,7 +12,9 @@ from river_map_quality import official_edm_adapter
 def provider(monkeypatch):
     provider = object.__new__(LiveMapEDMProvider)
     provider._index = SimpleNamespace(index_id="test")
-    provider._subsets = {"test": SimpleNamespace(excluded_sessions=frozenset(), indices=tuple(range(6)))}
+    provider._subsets = {
+        "test": SimpleNamespace(excluded_sessions=frozenset(), indices=tuple(range(6)))
+    }
     provider._reference_names = tuple(str(i) for i in range(6))
     provider._reference_descriptors = np.eye(6, dtype=np.float32)
     provider._reference_sessions = ("map",) * 6
@@ -28,8 +30,12 @@ def provider(monkeypatch):
     )
     provider._vpr = lambda: None
     provider._matcher_runtime = lambda: None
-    monkeypatch.setattr(live_provider, "boq_descriptor_from_array", lambda *_: np.arange(6, 0, -1, dtype=np.float32))
-    monkeypatch.setattr(official_edm_adapter, "prepare_official_megadepth_image_from_array", lambda *_: object())
+    monkeypatch.setattr(
+        live_provider, "boq_descriptor_from_array", lambda *_: np.arange(6, 0, -1, dtype=np.float32)
+    )
+    monkeypatch.setattr(
+        official_edm_adapter, "prepare_official_megadepth_image_from_array", lambda *_: object()
+    )
     return provider
 
 
@@ -41,6 +47,7 @@ def run(provider, statuses):
         fix = RelocFix.abstained("test", 0.0)
         if statuses[len(attempts) - 1]:
             from dataclasses import replace
+
             fix = replace(fix, ok=True, status="LOCALIZED_STRONG", reference_names=ranked)
         return fix
 

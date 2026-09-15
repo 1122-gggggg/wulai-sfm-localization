@@ -73,9 +73,8 @@ def _phase_bucket(tick: dict[str, Any]) -> str:
         return phase
     return "hover_other"
 
-def _vo_share(
-    post: list[dict[str, Any]], pose_timeline: list[tuple[float, bool]]
-) -> float | None:
+
+def _vo_share(post: list[dict[str, Any]], pose_timeline: list[tuple[float, bool]]) -> float | None:
     """Share of post-join positioned ticks whose nearest pose was VO-only.
 
     Both clocks are host-monotonic seconds, so each tick is attributed to the
@@ -189,9 +188,7 @@ def _analyze_run(
     }
     if join_tick is not None:
         entry["join"]["join_t"] = join_tick.get("t")
-        entry["join"]["time_to_join_s"] = round(
-            join_tick.get("t", 0.0) - ticks[0].get("t", 0.0), 1
-        )
+        entry["join"]["time_to_join_s"] = round(join_tick.get("t", 0.0) - ticks[0].get("t", 0.0), 1)
     arrivals: list[dict[str, Any]] = []
     last_target = initial_target
     for tick in indexed:
@@ -202,30 +199,18 @@ def _analyze_run(
     if join_tick is None:
         entry["verdict"] = "NEVER_JOINED"
         return entry
-    post = [tick for tick in ticks if float(tick.get("t", 0.0) or 0.0) >= float(join_tick.get("t", 0.0) or 0.0)]
+    post = [
+        tick
+        for tick in ticks
+        if float(tick.get("t", 0.0) or 0.0) >= float(join_tick.get("t", 0.0) or 0.0)
+    ]
     post_errors = sorted(
-        distance
-        for tick in post
-        if (distance := _finite(tick.get("route_distance_u"))) is not None
+        distance for tick in post if (distance := _finite(tick.get("route_distance_u"))) is not None
     )
     progs = [
-        _finite(tick.get("progress"))
-        for tick in post
-        if _finite(tick.get("progress")) is not None
+        _finite(tick.get("progress")) for tick in post if _finite(tick.get("progress")) is not None
     ]
-    phase_seconds: dict[str, float] = {}
-    for tick, nxt in zip(post, post[1:]):
-        span = float(nxt.get("t", 0.0) or 0.0) - float(tick.get("t", 0.0) or 0.0)
-        if not math.isfinite(span) or span < 0.0 or span > 5.0:
-            continue
-        bucket = _phase_bucket(tick)
-        phase_seconds[bucket] = phase_seconds.get(bucket, 0.0) + span
-    blocked_s = 0.0
-    for tick, nxt in zip(post, post[1:]):
-        if tick.get("blocked") is True:
-            span = float(nxt.get("t", 0.0) or 0.0) - float(tick.get("t", 0.0) or 0.0)
-            if math.isfinite(span) and 0.0 <= span <= 5.0:
-                blocked_s += span
+    phase_seconds, blocked_s = _post_join_timing(post)
     post_join: dict[str, Any] = {
         "samples": len(post_errors),
         "pose_coverage": round(len(post_errors) / max(1, len(post)), 3),
@@ -256,28 +241,7 @@ def analyze_session(session: Path) -> dict[str, Any]:
     without an id fall back to plan/step boundaries like the debug bundle.
     Manual time between runs never enters join timing or post-join error.
     """
-    events: list[dict[str, Any]] = []
-    pose_modes: dict[str, int] = {}
-    vo_only = 0
-    pose_success = 0
-    pose_timeline: list[tuple[float, bool]] = []
-    for record in read_jsonl(session / "localization.jsonl"):
-        event = record.get("event")
-        if event in ("auto_route_plan", "auto_route_tick"):
-            events.append(record)
-        elif event == "pose_result":
-            mode = str(record.get("mode") or "UNKNOWN")
-            pose_modes[mode] = pose_modes.get(mode, 0) + 1
-            stamp = _finite(record.get("t_mono_ns"))
-            stamp_s = stamp / 1e9 if stamp is not None else None
-            if record.get("success"):
-                pose_success += 1
-                is_vo = record.get("direct_status") == "VO_ONLY"
-                if is_vo:
-                    vo_only += 1
-                if stamp_s is not None:
-                    pose_timeline.append((stamp_s, is_vo))
-    pose_timeline.sort()
+    events, pose_modes, vo_only, pose_success, pose_timeline = _session_pose_timeline(session)
     plans = [row for row in events if row.get("event") == "auto_route_plan"]
     ticks = [row for row in events if row.get("event") == "auto_route_tick"]
     report: dict[str, Any] = {
@@ -298,11 +262,13 @@ def analyze_session(session: Path) -> dict[str, Any]:
             continue
         plan = _run_plan_for(run, plans)
         if plan is None:
-            entries.append({
-                "auto_run_id": run.get("auto_run_id"),
-                "tick_count": len(run["ticks"]),
-                "verdict": "NO_PLAN",
-            })
+            entries.append(
+                {
+                    "auto_run_id": run.get("auto_run_id"),
+                    "tick_count": len(run["ticks"]),
+                    "verdict": "NO_PLAN",
+                }
+            )
             continue
         entries.append(_analyze_run(run, plan, pose_timeline))
     # Legacy single-run shape: the newest/last run stays top-level so old
@@ -348,16 +314,22 @@ def format_report(report: dict[str, Any]) -> str:
             f"mean {cross['mean']}u / p95 {cross['p95']}u / max {cross['max']}u；"
             f"進度 {post['progress_from']} → {post['progress_to']}"
         )
-        phases = ", ".join(f"{name} {secs}s" for name, secs in sorted(post["phase_seconds"].items()))
+        phases = ", ".join(
+            f"{name} {secs}s" for name, secs in sorted(post["phase_seconds"].items())
+        )
         lines.append(f"站後時間分配：{phases}；受阻 {post['blocked_seconds']}s")
         if "within_arrival_sphere_share" in post:
             lines.append(f"站後樣本在到達球內佔比 {post['within_arrival_sphere_share']}")
     arrivals = report.get("arrivals", [])
     if arrivals:
-        lines.append("到站事件：" + ", ".join(f"wp{a['target_index']}@{a['t']:.0f}s" for a in arrivals))
+        lines.append(
+            "到站事件：" + ", ".join(f"wp{a['target_index']}@{a['t']:.0f}s" for a in arrivals)
+        )
     modes = report.get("pose_modes", {})
     if modes:
-        lines.append("定位：" + ", ".join(f"{name} {count}" for name, count in sorted(modes.items())))
+        lines.append(
+            "定位：" + ", ".join(f"{name} {count}" for name, count in sorted(modes.items()))
+        )
     lines.append(f"判定：{report['verdict']}")
     return "\n".join(lines)
 
@@ -370,8 +342,53 @@ def main(argv: list[str] | None = None) -> int:
     report = analyze_session(args.session)
     print(format_report(report))
     if args.out is not None:
-        args.out.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        args.out.write_text(
+            json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+        )
     return 0
+
+
+def _post_join_timing(post):
+    phase_seconds: dict[str, float] = {}
+    for tick, nxt in zip(post, post[1:]):
+        span = float(nxt.get("t", 0.0) or 0.0) - float(tick.get("t", 0.0) or 0.0)
+        if not math.isfinite(span) or span < 0.0 or span > 5.0:
+            continue
+        bucket = _phase_bucket(tick)
+        phase_seconds[bucket] = phase_seconds.get(bucket, 0.0) + span
+    blocked_s = 0.0
+    for tick, nxt in zip(post, post[1:]):
+        if tick.get("blocked") is True:
+            span = float(nxt.get("t", 0.0) or 0.0) - float(tick.get("t", 0.0) or 0.0)
+            if math.isfinite(span) and 0.0 <= span <= 5.0:
+                blocked_s += span
+    return phase_seconds, blocked_s
+
+
+def _session_pose_timeline(session):
+    events: list[dict[str, Any]] = []
+    pose_modes: dict[str, int] = {}
+    vo_only = 0
+    pose_success = 0
+    pose_timeline: list[tuple[float, bool]] = []
+    for record in read_jsonl(session / "localization.jsonl"):
+        event = record.get("event")
+        if event in ("auto_route_plan", "auto_route_tick"):
+            events.append(record)
+        elif event == "pose_result":
+            mode = str(record.get("mode") or "UNKNOWN")
+            pose_modes[mode] = pose_modes.get(mode, 0) + 1
+            stamp = _finite(record.get("t_mono_ns"))
+            stamp_s = stamp / 1e9 if stamp is not None else None
+            if record.get("success"):
+                pose_success += 1
+                is_vo = record.get("direct_status") == "VO_ONLY"
+                if is_vo:
+                    vo_only += 1
+                if stamp_s is not None:
+                    pose_timeline.append((stamp_s, is_vo))
+    pose_timeline.sort()
+    return events, pose_modes, vo_only, pose_success, pose_timeline
 
 
 if __name__ == "__main__":

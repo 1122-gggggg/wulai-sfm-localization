@@ -105,15 +105,8 @@ def included(
         and not relative.name.startswith(".coverage.")
         and not relative.name.endswith("~")
         and relative.suffix not in EXCLUDED_SUFFIXES
-        and not (
-            not include_site_assets
-            and value.startswith("地圖檔/")
-        )
-        and not any(
-            value.startswith(prefix)
-            for prefix in EXCLUDED_PREFIXES
-            if prefix != "地圖檔/"
-        )
+        and not (not include_site_assets and value.startswith("地圖檔/"))
+        and not any(value.startswith(prefix) for prefix in EXCLUDED_PREFIXES if prefix != "地圖檔/")
         and not (
             source_only
             and any(value.startswith(prefix) for prefix in SOURCE_EXTERNAL_PREFIXES)
@@ -298,10 +291,7 @@ def _offline_install_metadata_issues(
         "wheelhouse": OFFLINE_WHEELHOUSE_RELATIVE,
         "manifest": f"{OFFLINE_WHEELHOUSE_RELATIVE}/{MANIFEST_NAME}",
         "manifest_sha256": digest(root / OFFLINE_WHEELHOUSE_RELATIVE / MANIFEST_NAME),
-        "lock_digests": {
-            str(entry["name"]): str(entry["sha256"])
-            for entry in requirements
-        },
+        "lock_digests": {str(entry["name"]): str(entry["sha256"]) for entry in requirements},
         "wheel_count": len(wheels),
     }
     return (
@@ -534,9 +524,7 @@ def _site_profile_files_issues(
         issues.append(f"{SITE_ASSET_MANIFEST} profile has no files list: {profile_relative}")
     else:
         for listed in listed_files:
-            listed_issue, listed_path = _site_asset_path_issue(
-                root, listed, label="profile file"
-            )
+            listed_issue, listed_path = _site_asset_path_issue(root, listed, label="profile file")
             if listed_issue is not None or listed_path is None:
                 issues.append(listed_issue or f"{SITE_ASSET_MANIFEST} profile file is invalid")
                 continue
@@ -570,9 +558,7 @@ def _site_profile_declared_assets(
     declared_assets: dict[str, object] = {}
     profile_assets = profile_data.get("assets", {})
     if not isinstance(profile_assets, dict):
-        issues.append(
-            f"{SITE_ASSET_MANIFEST} profile assets must be an object: {profile_relative}"
-        )
+        issues.append(f"{SITE_ASSET_MANIFEST} profile assets must be an object: {profile_relative}")
     else:
         declared_assets.update(profile_assets)
     for key in _SITE_PROFILE_TOP_LEVEL_ASSET_KEYS:
@@ -658,9 +644,7 @@ def _site_profile_entry_issues(
     if profile_entry is None:
         issues.append(f"{SITE_ASSET_MANIFEST} profile is not bundled: {profile_relative}")
     elif profile_entry.get("role") != "site_profile":
-        issues.append(
-            f"{SITE_ASSET_MANIFEST} profile has an invalid file role: {profile_relative}"
-        )
+        issues.append(f"{SITE_ASSET_MANIFEST} profile has an invalid file role: {profile_relative}")
     if not profile_path.is_file():
         issues.append(f"{SITE_ASSET_MANIFEST} profile missing: {profile_relative}")
         return issues
@@ -737,9 +721,7 @@ def _site_asset_issues(root: Path) -> list[str]:
         if raw.get("role") == "reference_index_manifest":
             issues.extend(_reference_index_issues(root, relative, entries_by_path))
             checked_reference_indexes.add(relative)
-    issues.extend(
-        _site_profile_issues(root, data, entries_by_path, checked_reference_indexes)
-    )
+    issues.extend(_site_profile_issues(root, data, entries_by_path, checked_reference_indexes))
     return issues
 
 
@@ -764,8 +746,7 @@ def _manifest_entries_issues(
         return [str(exc)]
     issues = [f"missing: {name}" for name in sorted(set(expected_by_path) - set(actual_paths))]
     issues.extend(
-        f"unexpected: {name}"
-        for name in sorted(set(actual_paths) - set(expected_by_path))
+        f"unexpected: {name}" for name in sorted(set(actual_paths) - set(expected_by_path))
     )
     for name in sorted(set(expected_by_path) & set(actual_paths)):
         expected_entry = expected_by_path[name]

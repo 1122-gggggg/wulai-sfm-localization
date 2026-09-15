@@ -27,19 +27,7 @@ jobs:
       - name: First-party code quality gates
         run: |
           ruff check .
-          ruff format --check \
-            tools/check_maintainability.py \
-            tests/tools/test_check_maintainability.py \
-            tests/tools/test_documentation_contract.py \
-            tools/offline_wheelhouse.py \
-            tests/tools/test_offline_wheelhouse.py \
-            tests/tools/test_install_runtime_contract.py \
-            定位演算法/flight_control/safety_command.py \
-            定位演算法/validation/check_runtime_mirrors.py \
-            定位演算法/validation/tests/test_runtime_mirrors.py \
-            定位演算法/validation/tests/test_edm_cpp_resource_safety.py \
-            控制介面程式/operator_interface/localization_metrics.py \
-            tests/control_interface/operator_interface/test_localization_metrics.py
+          python -c "import subprocess, sys; from tools.system_validation import ROOT_FORMAT_SCOPE; subprocess.run([sys.executable, '-m', 'ruff', 'format', '--check', *ROOT_FORMAT_SCOPE], check=True)"
           python tools/check_maintainability.py
           python -m mypy
       - name: High-signal Ruff security gate
@@ -51,7 +39,8 @@ jobs:
             --select S102,S105,S106,S107,S602,S604,S605,S608 \
             --exclude '**/test*.py' \
             --exclude '**/tests/**' \
-            --exclude '定位演算法/deploy_code/runtime/**'
+            --exclude '定位演算法/deploy_code/runtime/**' \
+            --exclude '定位演算法/deploy_code/sfm_direct_deploy/vendor/**'
       - name: Dependency vulnerability audit and CycloneDX SBOM
         run: |
           python tools/security_dependency_gate.py \
@@ -95,15 +84,10 @@ jobs:
           python 控制介面程式/mission_pipeline.py --mode flight-selftest
           python -m pip check
       - name: Validate private site profile assets when mounted
-        if: >-
-          ${{
-            hashFiles('地圖檔/場域/river_site/maps/river_site_realrgb_dense_trimmed.ply') != '' &&
-            hashFiles('地圖檔/場域/river_site/maps/river_site_ref_poses.json') != '' &&
-            hashFiles('地圖檔/場域/river_site/maps/T_align_gravity.json') != '' &&
-            hashFiles('地圖檔/場域/river_site/bundles/river_site_reloc_map_edm.pt') != '' &&
-            hashFiles('地圖檔/場域/river_site/routes/authored/route_20260807_013811.json') != ''
-          }}
+        if: ${{ hashFiles('地圖檔/場域/river_site/site_profile.json') != '' }}
         run: python 控制介面程式/validate_system_profiles.py
+      - name: Sphinx controller and telemetry contracts (no aircraft)
+        run: python -m pytest -q --timeout=60 模擬器/sphinx_anafi_path_convergence/tests
       - name: Root tests with expanded first-party coverage
         run: python -m pytest -q --timeout=300 --cov --cov-config="$GITHUB_WORKSPACE/pyproject.toml" --cov-report=term-missing
 
@@ -201,14 +185,13 @@ jobs:
       - name: Require private validation assets
         run: |
           required=(
-            "地圖檔/場域/river_site/maps/river_site_realrgb_dense_trimmed.ply"
-            "地圖檔/場域/river_site/maps/river_site_ref_poses.json"
-            "地圖檔/場域/river_site/maps/T_align_gravity.json"
-            "地圖檔/場域/river_site/bundles/river_site_reloc_map_edm.pt"
-            "地圖檔/場域/river_site/routes/authored/route_20260807_013811.json"
-            "模擬器/測試影片/河濱_P1180118_first_2s.mp4"
+            "地圖檔/場域/river_site/site_profile.json"
+            "地圖檔/場域/river_site/releases/river_gluemap_all8_direct_20260908/map/map.ply"
+            "地圖檔/場域/river_site/releases/river_gluemap_all8_direct_20260908/localization/direct_bundle.json"
+            "地圖檔/場域/river_site/releases/river_gluemap_all8_direct_20260908/localization/direct_localizer_profile.json"
+            "模擬器/測試影片/720p/P1190119_720p.MP4"
             "定位演算法/deploy_code/runtime/EDM/weights/edm_outdoor.ckpt"
-            "執行環境/torch_hub_cache/checkpoints/boq/resnet50_16384.pth"
+            "執行環境/models/boq/resnet50_16384.pth"
           )
           missing=()
           for path in "${required[@]}"; do
@@ -231,7 +214,7 @@ jobs:
         run: |
           SFM_PYTHON="$(command -v python)" \
           SFM_VENV_DIR="$GITHUB_WORKSPACE/.venv" \
-            bash tools/install_runtime.sh --test-deps
+            bash tools/install_runtime.sh --test-deps --quality-deps
           echo "SFM_PYTHON=$GITHUB_WORKSPACE/.venv/bin/python" >> "$GITHUB_ENV"
       - uses: actions/setup-python@v5
         with:
@@ -242,11 +225,25 @@ jobs:
       - name: Install simulator pinned environment
         working-directory: 模擬器/parrot_stimulate
         run: uv sync --locked
+      - name: Prepare the locked offline wheelhouse
+        run: |
+          if [[ ! -f 執行環境/offline_wheelhouse/WHEELHOUSE.json ]]; then
+            .venv/bin/python tools/offline_wheelhouse.py build --output 執行環境/offline_wheelhouse \
+              --requirements requirements/runtime-lock.txt --requirements requirements/test-lock.txt \
+              --requirements requirements/quality-lock.txt
+          fi
+          .venv/bin/python tools/offline_wheelhouse.py verify --wheelhouse 執行環境/offline_wheelhouse \
+            --requirements requirements/runtime-lock.txt --requirements requirements/test-lock.txt \
+            --requirements requirements/quality-lock.txt
       - name: Export portable package for the bound validation receipt
-        run: python tools/export_simulator_package.py "$RUNNER_TEMP/localization_portable"
+        run: |
+          .venv/bin/python tools/export_simulator_package.py "$RUNNER_TEMP/localization_portable" \
+            --wheelhouse-root 執行環境/offline_wheelhouse --include-quality-deps \
+            --site-profile 地圖檔/場域/river_site/site_profile.json
       - name: Run complete no-flight system validation with clean install and UI smoke
         env:
           DISPLAY: :99
+          SFM_INSTALL_OFFLINE: "1"
         run: |
           Xvfb :99 -screen 0 1920x1080x24 -nolisten tcp >/tmp/sfm-xvfb.log 2>&1 &
           xvfb_pid=$!

@@ -10,6 +10,7 @@ Validation is fail-closed in both directions, like
 ``sfm_glomap_deploy/edm_profile.py``: a missing required key is an error, and so
 is an unknown key.  A knob nobody validates is a knob nobody controls.
 """
+
 from __future__ import annotations
 
 import json
@@ -100,8 +101,12 @@ def _reject_json_constant(value: str):
 
 
 def _section(
-    raw: Mapping[str, Any], name: str, allowed: frozenset[str], source: Path,
-    *, optional: frozenset[str] = frozenset(),
+    raw: Mapping[str, Any],
+    name: str,
+    allowed: frozenset[str],
+    source: Path,
+    *,
+    optional: frozenset[str] = frozenset(),
 ) -> dict:
     value = raw.get(name)
     if not isinstance(value, dict):
@@ -264,6 +269,7 @@ class DirectProfile:
     sha256: str
     source: Path
     optimizations: DirectOptimizations = field(default_factory=DirectOptimizations)
+    max_jump_u: float = 1.5
 
 
 def _parse_intrinsics(raw: Mapping[str, Any], source: Path) -> DirectIntrinsics:
@@ -291,7 +297,9 @@ def _parse_intrinsics(raw: Mapping[str, Any], source: Path) -> DirectIntrinsics:
 
 def _parse_thresholds(raw: Mapping[str, Any], source: Path) -> Mapping[str, Any]:
     thresholds = _section(raw, "frozen_pnp_thresholds", _THRESHOLD_KEYS, source)
-    _positive_int("reloc.frozen_pnp_thresholds", "strong_inliers", thresholds["strong_inliers"], source)
+    _positive_int(
+        "reloc.frozen_pnp_thresholds", "strong_inliers", thresholds["strong_inliers"], source
+    )
     _positive_int(
         "reloc.frozen_pnp_thresholds",
         "minimum_occupancy_4x4",
@@ -316,7 +324,9 @@ def _parse_reloc(raw: Mapping[str, Any], source: Path) -> DirectReloc:
         raise DirectProfileError(f"reloc.reference_bank must be a non-empty string: {source}")
     return DirectReloc(
         top_k=_positive_int("reloc", "top_k", section["top_k"], source),
-        lift_distance_px=_positive_float("reloc", "lift_distance_px", section["lift_distance_px"], source),
+        lift_distance_px=_positive_float(
+            "reloc", "lift_distance_px", section["lift_distance_px"], source
+        ),
         period_s=_positive_float("reloc", "period_s", section["period_s"], source),
         min_points=_positive_int("reloc", "min_points", section["min_points"], source),
         reference_bank=bank,
@@ -367,11 +377,15 @@ def _parse_fast_loop(raw: Mapping[str, Any], source: Path) -> DirectFastLoop:
             levels=_positive_int("fast_loop.klt", "levels", klt["levels"], source),
         ),
         pnp=DirectFastPnP(
-            max_error_px=_positive_float("fast_loop.pnp", "max_error_px", pnp["max_error_px"], source),
+            max_error_px=_positive_float(
+                "fast_loop.pnp", "max_error_px", pnp["max_error_px"], source
+            ),
             min_trials=_positive_int("fast_loop.pnp", "min_trials", pnp["min_trials"], source),
             max_trials=_positive_int("fast_loop.pnp", "max_trials", pnp["max_trials"], source),
             confidence=_unit_float("fast_loop.pnp", "confidence", pnp["confidence"], source),
-            refine_iters=_positive_int("fast_loop.pnp", "refine_iters", pnp["refine_iters"], source),
+            refine_iters=_positive_int(
+                "fast_loop.pnp", "refine_iters", pnp["refine_iters"], source
+            ),
             min_points=_positive_int("fast_loop.pnp", "min_points", pnp["min_points"], source),
             min_inliers=_positive_int("fast_loop.pnp", "min_inliers", pnp["min_inliers"], source),
         ),
@@ -387,7 +401,9 @@ def _parse_vo(raw: Mapping[str, Any], source: Path) -> DirectVO:
         min_live=_positive_int("vo", "min_live", section["min_live"], source),
         detect_cap=_positive_int("vo", "detect_cap", section["detect_cap"], source),
         min_distance=_positive_int("vo", "min_distance", section["min_distance"], source),
-        min_parallax_deg=_positive_float("vo", "min_parallax_deg", section["min_parallax_deg"], source),
+        min_parallax_deg=_positive_float(
+            "vo", "min_parallax_deg", section["min_parallax_deg"], source
+        ),
         max_reproj_px=_positive_float("vo", "max_reproj_px", section["max_reproj_px"], source),
         refine=_boolean("vo", "refine", section["refine"], source),
         window_ba=_boolean("vo", "window_ba", section["window_ba"], source),
@@ -402,13 +418,13 @@ def _parse_dead_reckon(raw: Mapping[str, Any], source: Path) -> DirectDeadReckon
         enabled=_boolean("dead_reckon", "enabled", section["enabled"], source),
         max_frames=_positive_int("dead_reckon", "max_frames", section["max_frames"], source),
         # Legacy releases allowed 300 successful DR steps on the 30 Hz stream.
-        max_age_s=_positive_float("dead_reckon", "max_age_s", section.get("max_age_s", 10.0), source),
+        max_age_s=_positive_float(
+            "dead_reckon", "max_age_s", section.get("max_age_s", 10.0), source
+        ),
     )
 
 
-def load_direct_profile(
-    path: str | Path, *, expected_sha256: str | None = None
-) -> DirectProfile:
+def load_direct_profile(path: str | Path, *, expected_sha256: str | None = None) -> DirectProfile:
     """Load, integrity-check and validate one frozen direct deployment profile."""
 
     source = Path(path).expanduser().resolve(strict=True)
@@ -421,7 +437,7 @@ def load_direct_profile(
             f"direct profile schema must be {DIRECT_PROFILE_SCHEMA!r}: {source}"
         )
     missing = sorted(_TOP_KEYS - raw.keys())
-    unknown = sorted(raw.keys() - _TOP_KEYS - {"optimizations"})
+    unknown = sorted(raw.keys() - _TOP_KEYS - {"optimizations", "max_jump_u"})
     if missing:
         raise DirectProfileError(f"direct profile is missing {missing}: {source}")
     if unknown:
@@ -433,9 +449,15 @@ def load_direct_profile(
     if "optimizations" in raw:
         section = _section(raw, "optimizations", _OPTIMIZATION_KEYS, source)
         optimizations = DirectOptimizations(
-            adaptive_retrieval=_boolean("optimizations", "adaptive_retrieval", section["adaptive_retrieval"], source),
-            spatial_selection=_boolean("optimizations", "spatial_selection", section["spatial_selection"], source),
-            gpu_cache_size=_nonnegative_int("optimizations", "gpu_cache_size", section["gpu_cache_size"], source),
+            adaptive_retrieval=_boolean(
+                "optimizations", "adaptive_retrieval", section["adaptive_retrieval"], source
+            ),
+            spatial_selection=_boolean(
+                "optimizations", "spatial_selection", section["spatial_selection"], source
+            ),
+            gpu_cache_size=_nonnegative_int(
+                "optimizations", "gpu_cache_size", section["gpu_cache_size"], source
+            ),
         )
     return DirectProfile(
         name=name,
@@ -449,4 +471,5 @@ def load_direct_profile(
         sha256=digest,
         source=source,
         optimizations=optimizations,
+        max_jump_u=_positive_float("profile", "max_jump_u", raw.get("max_jump_u", 1.5), source),
     )

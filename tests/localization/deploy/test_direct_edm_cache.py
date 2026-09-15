@@ -39,8 +39,11 @@ class Matcher(torch.nn.Module):
 
 
 def prepared(value):
-    return SimpleNamespace(pixels=np.full((4, 4), value, dtype=np.uint8),
-                           coarse_mask=np.ones((1, 1), dtype=bool), scale=(1., 1.))
+    return SimpleNamespace(
+        pixels=np.full((4, 4), value, dtype=np.uint8),
+        coarse_mask=np.ones((1, 1), dtype=bool),
+        scale=(1.0, 1.0),
+    )
 
 
 @pytest.fixture

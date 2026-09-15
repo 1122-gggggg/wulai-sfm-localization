@@ -27,7 +27,6 @@ for extra in (HERE, HERE.parent):
         sys.path.insert(0, str(extra))
 
 import flight_operator_app as app  # noqa: E402
-import operator_tick  # noqa: E402
 
 tk = pytest.importorskip("tkinter")
 
@@ -696,10 +695,20 @@ def test_camera_and_mission_sit_in_the_always_visible_flight_bar(operator) -> No
             except Exception:
                 continue
     assert "起飛" in labels, "takeoff must still live in the always-visible bar"
-    assert "起飛後錄影" not in labels
-    assert not hasattr(operator, "record_on_takeoff_var")
-    assert operator.backend.record_on_takeoff is True
+    assert "起飛後錄影" in labels
+    assert operator.record_on_takeoff_var.get() is False
+    assert operator.backend.record_on_takeoff is False
     assert operator.record_status_var.get().startswith("錄影:")
+
+
+def test_record_on_takeoff_stays_off_until_the_operator_arms_it(operator) -> None:
+    assert operator.backend.record_on_takeoff is False
+    operator.record_on_takeoff_var.set(True)
+    operator._on_record_on_takeoff_toggled()
+    assert operator.backend.record_on_takeoff is True
+    operator.record_on_takeoff_var.set(False)
+    operator._on_record_on_takeoff_toggled()
+    assert operator.backend.record_on_takeoff is False
 
 
 def test_control_pane_follows_the_selected_tab_height(operator) -> None:
@@ -848,7 +857,7 @@ def test_video_hud_contains_only_requested_engineering_metrics(operator) -> None
     }
     joined = "\n".join(operator._video_diagnostic_lines())
     for token in (
-        "AUTO 地速安全閘門", "wall_ms", "core", "e2e", "RTH", "GPS",
+        "AUTO PCMD", "wall_ms", "core", "e2e", "RTH", "GPS",
         "飛控高度", "AGL", "連接品質", "定位 FPS", "inliers",
         "飛控融合姿態", "三軸速度",
     ):
@@ -896,7 +905,7 @@ def test_flight_tab_only_shows_limit_settings_and_has_no_duplicate_hover(
                 continue
     joined = "\n".join(settings_texts)
     for token in (
-        "目前設定", "高度", "距離", "圍欄", "AUTO 地速安全閘門", "啟用速度限制",
+        "目前設定", "高度", "距離", "圍欄", "AUTO PCMD",
     ):
         assert token in joined
     for removed in (

@@ -29,6 +29,10 @@ AUTONOMY_MIN_CONSECUTIVE_FIXES = 2
 def autonomous_approval_blockers(snapshot: dict[str, Any]) -> list[str]:
     """Return profile/external-approval reasons AUTO may not even start."""
     blockers: list[str] = []
+    if snapshot.get("mission_flight_ready") is not True:
+        blockers.append("mission is not flight-ready")
+    if snapshot.get("mission_evaluation_only", False):
+        blockers.append("evaluation-only mission cannot authorize AUTO")
     if snapshot.get("autonomous_locked", True):
         blockers.append("autonomous route flight is locked pending external approval")
     if not snapshot.get("autonomous_approval_valid", False):

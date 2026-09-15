@@ -13,6 +13,7 @@ Modules in this deploy directory import each other flatly (``import
 direct_paths``), matching the ``sfm_glomap_deploy`` convention: callers insert
 the deploy directory itself onto ``sys.path``.
 """
+
 from __future__ import annotations
 
 import hashlib

@@ -22,11 +22,12 @@ import pycolmap
 
 def _synthetic_scene() -> tuple[np.ndarray, np.ndarray, pycolmap.Camera]:
     rng = np.random.default_rng(0)
-    cam = pycolmap.Camera(model="PINHOLE", width=960, height=540,
-                          params=[800.0, 800.0, 480.0, 270.0])
+    cam = pycolmap.Camera(
+        model="PINHOLE", width=960, height=540, params=[800.0, 800.0, 480.0, 270.0]
+    )
     K = np.array([[800.0, 0.0, 480.0], [0.0, 800.0, 270.0], [0.0, 0.0, 1.0]])
     pts3d = rng.uniform([-5.0, -2.0, 5.0], [5.0, 2.0, 20.0], size=(80, 3))
-    proj = (pts3d @ K.T)
+    proj = pts3d @ K.T
     proj = proj[:, :2] / proj[:, 2:3]
     proj += rng.normal(0.0, 1.0, size=proj.shape)
     # 25% gross outliers so RANSAC actually has to choose.
@@ -34,8 +35,7 @@ def _synthetic_scene() -> tuple[np.ndarray, np.ndarray, pycolmap.Camera]:
     return proj, pts3d, cam
 
 
-def _solve(proj: np.ndarray, pts3d: np.ndarray,
-           cam: pycolmap.Camera, seed: int) -> tuple:
+def _solve(proj: np.ndarray, pts3d: np.ndarray, cam: pycolmap.Camera, seed: int) -> tuple:
     opt = pycolmap.AbsolutePoseEstimationOptions()
     opt.ransac.max_error = 4.0
     opt.ransac.min_num_trials = 10
@@ -47,8 +47,12 @@ def _solve(proj: np.ndarray, pts3d: np.ndarray,
     ans = pycolmap.estimate_and_refine_absolute_pose(proj, pts3d, cam, opt, ref)
     assert ans is not None
     cf = ans["cam_from_world"]
-    return (np.asarray(cf.rotation.matrix()), np.asarray(cf.translation),
-            int(ans["num_inliers"]), bytes(np.asarray(ans["inlier_mask"]).tobytes()))
+    return (
+        np.asarray(cf.rotation.matrix()),
+        np.asarray(cf.translation),
+        int(ans["num_inliers"]),
+        bytes(np.asarray(ans["inlier_mask"]).tobytes()),
+    )
 
 
 def test_seed_zero_is_bit_identical_across_runs() -> None:
@@ -60,6 +64,7 @@ def test_seed_zero_is_bit_identical_across_runs() -> None:
         assert np.array_equal(run[0], runs[0][0])
         assert np.array_equal(run[1], runs[0][1])
 
+
 def test_seed_minus_one_is_nondeterministic_on_same_input() -> None:
     """Documents *why* the pin exists: default seed wanders on identical input."""
     proj, pts3d, cam = _synthetic_scene()
@@ -68,7 +73,11 @@ def test_seed_minus_one_is_nondeterministic_on_same_input() -> None:
 
 
 def test_fast_loop_tracker_pins_ransac_seed_zero() -> None:
-    src = (pathlib.Path(__file__).resolve().parents[3]
-           / "定位演算法" / "deploy_code" / "sfm_direct_deploy"
-           / "two_rate_tracker.py").read_text(encoding="utf-8")
+    src = (
+        pathlib.Path(__file__).resolve().parents[3]
+        / "定位演算法"
+        / "deploy_code"
+        / "sfm_direct_deploy"
+        / "two_rate_tracker.py"
+    ).read_text(encoding="utf-8")
     assert "estimation.ransac.random_seed = 0" in src

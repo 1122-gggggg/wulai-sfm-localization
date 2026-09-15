@@ -99,6 +99,7 @@ class Pose:
     yaw: float
     stamp: float = field(default_factory=time.monotonic)
     map_confirmed: bool = True
+    reseed_confirming: bool = False
 
     @property
     def xyz(self) -> np.ndarray:
@@ -414,15 +415,21 @@ class ControlConfig:
         _validate_realign_threshold(self)
 
 
-DESKTOP_AUTO_MAX_TRANSLATION_PCMD = 3
+DESKTOP_AUTO_MAX_TRANSLATION_PCMD = 50
 DESKTOP_AUTO_MAX_VERTICAL_PCMD = 20
 DESKTOP_AUTO_MAX_YAW_PCMD = 50
 DESKTOP_AUTO_YAW_ALIGNMENT_TIMEOUT_S = 30.0
 DESKTOP_AUTO_YAW_TOLERANCE_DEG = 20.0
+# Body-velocity rejection while translating or holding height, in PCMD per m/s.
+# Cross-track only during cruise so the aircraft still closes the waypoint.
+DESKTOP_AUTO_WIND_REJECT_PCMD_PER_MPS = 20.0
+# Floor on the drawn arrival sphere so a wind-held 0.4-1 m offset still arrives.
+# 0.15 map units is about 1.4 m on the river site (0.022 u ≈ 0.2 m).
+DESKTOP_AUTO_MIN_ARRIVE_RADIUS = 0.15
 
-# Horizontal tilt remains capped at 3%; telemetry enforces the physical speed
-# limit. Gaz has its own speed-percentage cap. Turns keep horizontal PCMD at
-# zero while allowing height correction; route recovery holds yaw instead.
+# Horizontal tilt is capped by DESKTOP_AUTO_MAX_TRANSLATION_PCMD (50% of
+# MaxTilt 20° ≈ 10°). Gaz has its own vertical-speed percentage. After each
+# waypoint the nose aligns, then cruise flies with cross-track wind reject.
 
 
 def production_auto_control_config(map_frame: MapFrame) -> ControlConfig:
@@ -438,6 +445,22 @@ def production_auto_control_config(map_frame: MapFrame) -> ControlConfig:
         yaw_tolerance_deg=DESKTOP_AUTO_YAW_TOLERANCE_DEG,
         yaw_alignment_timeout_s=DESKTOP_AUTO_YAW_ALIGNMENT_TIMEOUT_S,
         return_to_start=True,
+    )
+
+
+def apply_desktop_auto_authority(config: ControlConfig) -> ControlConfig:
+    """Widen arrival and keep progress slack valid after route-authored limits."""
+    floor = float(DESKTOP_AUTO_MIN_ARRIVE_RADIUS)
+    radius = max(float(config.waypoint_arrive_radius), floor)
+    radii = config.waypoint_arrive_radii
+    if radii is not None:
+        radii = tuple(max(float(value), floor) for value in radii)
+        radius = max(radius, max(radii) if radii else radius)
+    return replace(
+        config,
+        waypoint_arrive_radius=radius,
+        waypoint_arrive_radii=radii,
+        progress_jump_slack=max(float(config.progress_jump_slack), radius),
     )
 
 
@@ -1150,7 +1173,15 @@ class RouteAutoController:
         self._advance_to_reached(_finite_vec3(pos, "position"))
         return self.wp[self.target_index].copy()
 
-    def _auto_goal(self, pos: np.ndarray, pose_stamp: float, now: float, *, map_confirmed=True):
+    def _auto_goal(
+        self,
+        pos: np.ndarray,
+        pose_stamp: float,
+        now: float,
+        *,
+        map_confirmed=True,
+        reseed_confirming=False,
+    ):
         """Return (goal, target_index, path_error, progress, action).
 
         Arrival always uses the authored waypoint. step() supplies segment
@@ -1164,7 +1195,12 @@ class RouteAutoController:
         path_error, _nearest, _t = point_segment_distance(pos, leg_start, goal)
         progress = float(self.target_index) / float(max(1, last))
         if not map_confirmed:
-            self._reset_final_hold()
+            # A RELOC_SEED's source-confirmation frames recur about once a
+            # second, shorter than final_hold_s. They pause landing evidence
+            # rather than discard it; the next confirmed pose must still be in
+            # tolerance within max_pose_age_s (_final_hold_complete).
+            if not reseed_confirming:
+                self._reset_final_hold()
             if self._waypoint_reached(pos, self.target_index):
                 return goal, self.target_index, path_error, progress, "WAIT_MAP_CONFIRMATION"
         if self.target_index < last and self._arrive_frames > 0 and not self.holding_for_inspection:
@@ -1227,7 +1263,11 @@ class RouteAutoController:
 
         pos = pose.xyz
         goal, seg, path_error, progress, action = self._auto_goal(
-            pos, float(pose.stamp), now, map_confirmed=bool(getattr(pose, "map_confirmed", True))
+            pos,
+            float(pose.stamp),
+            now,
+            map_confirmed=bool(getattr(pose, "map_confirmed", True)),
+            reseed_confirming=bool(getattr(pose, "reseed_confirming", False)),
         )
 
         if action == "WAIT_MAP_CONFIRMATION":
@@ -1340,6 +1380,10 @@ class RouteAutoController:
                 status="final path reached -> LAND",
             )
 
+        return self._guidance_command(pose, goal, path_error, progress, action)
+
+    def _guidance_command(self, pose, goal, path_error, progress, action):
+        pos = pose.xyz
         guidance_goal = None
         if self.target_index > self._join_target_index:
             start = self.wp[self.target_index - 1]
@@ -1515,13 +1559,15 @@ def _translation_percent_command(
     # the deadzone) slows to 1 -> 0. The 6-point route's last legs sit in
     # the 0.06-0.10u band; creeping that whole band at 1 misses the 300 s
     # budget (measured: step cap at 300 s, 10/11 reached, 0.027u short).
-    if speed_distance <= 2.0 * config.waypoint_arrive_radius:
-        strength = 1
-    else:
-        strength = min(
-            config.max_translation_pcmd,
-            max(2, int(math.ceil(ratio * config.max_translation_pcmd - 1e-9))),
-        )
+    cap = int(config.max_translation_pcmd)
+    strength = min(
+        cap,
+        max(2, int(math.ceil(ratio * cap - 1e-9))),
+    )
+    if speed_distance <= config.waypoint_arrive_radius:
+        # Keep enough authority inside the sphere to fight wind; a 1% creep
+        # saturates against a few tenths of a metre of gust offset.
+        strength = max(strength, max(2, cap // 6))
     if recovering and speed_distance > 2.0 * config.waypoint_arrive_radius:
         strength = config.max_translation_pcmd
     clamp = lambda value: int(round(max(-100.0, min(100.0, float(value)))))
@@ -1618,15 +1664,12 @@ def command_to_body_percent(
 
 
 class YawAlignedPcmdController:
-    """Yaw gate shared by dry-run and real flight, with bounded mid-leg repair.
+    """Yaw toward a new waypoint, then translate without mid-leg re-turns.
 
-    Heading is corrected once per waypoint (takeoff counts as the first one)
-    while height correction continues; horizontal cruise follows alignment.
-    Small mid-leg drift is closed by strafing. A large drift (gust-rotated, or a
-    fused heading that walked away) re-opens the turn gate after
-    ``yaw_alignment_confirmation_updates`` consecutive fresh samples past
-    ``mid_leg_realign_deg``. The leg's original window/timeout budget is NOT
-    reset, so a flapping heading ends in hold-for-operator, never chatter.
+    After each target change the nose aligns to the next point while
+    horizontal PCMD holds against measured wind. Cruise then flies toward
+    the goal without parking to realign. Near-waypoint centering and REJOIN
+    still hold yaw and close position.
     """
 
     def __init__(self, config: ControlConfig):
@@ -1646,73 +1689,62 @@ class YawAlignedPcmdController:
         self._realign_strikes = 0
         self.centering = False
         self.vertical_adjusting = False
-        self._reset_turn_recovery()
-
-    def _reset_turn_recovery(self) -> None:
-        self.turn_anchor: np.ndarray | None = None
-        self.turn_recovering = False
         self.turn_anchor_error_u = 0.0
-        self._turn_settle_stamp: float | None = None
-        self._turn_velocity_stamp: float | None = None
+        self._integral_f = 0.0
+        self._integral_r = 0.0
+        self._integral_now: float | None = None
 
-    def _turn_drift_command(self, cmd, pose, now, body_velocity, radius):
-        """Bounded position/velocity feedback before allowing a stationary turn.
-
-        Position feedback uses map units/radius; damping uses body m/s with
-        10 PCMD per m/s. No metric velocity is added to map coordinates.
-        """
+    def _usable_body_velocity(self, body_velocity, now: float):
         if body_velocity is None:
-            if not self.turn_recovering:
-                return None
-            self._turn_settle_stamp = None
-            self.phase = "turn_recovery_wait"
-            return 0, 0, 0, 0
-        forward_v, right_v, stamp = body_velocity
-        if (
-            not all(math.isfinite(v) for v in body_velocity)
-            or not 0.0 <= now - stamp <= self.config.max_pose_age_s
-            or not pose.map_confirmed
-        ):
-            self._turn_settle_stamp = None
-            self.phase = "turn_recovery_wait"
-            return 0, 0, 0, 0
-        if self.turn_anchor is None:
-            self.turn_anchor = pose.xyz.copy()
-        error = self.turn_anchor - pose.xyz
-        forward, right, _up = self.config.map_frame.body_components(error, pose.yaw)
-        distance = math.hypot(forward, right)
-        self.turn_anchor_error_u = distance
-        speed = math.hypot(forward_v, right_v)
-        if speed > 0.10 or distance > 2.0 * radius:
-            self.turn_recovering = True
-        if not self.turn_recovering:
             return None
+        try:
+            forward_v, right_v, stamp = body_velocity
+            forward_v = float(forward_v)
+            right_v = float(right_v)
+            stamp = float(stamp)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if not all(math.isfinite(value) for value in (forward_v, right_v, stamp)):
+            return None
+        if not 0.0 <= now - stamp <= self.config.max_pose_age_s:
+            return None
+        return forward_v, right_v
 
-        fresh = self._turn_velocity_stamp is None or stamp > self._turn_velocity_stamp
-        if fresh:
-            self._turn_velocity_stamp = stamp
-        stable = speed <= 0.08 and distance <= radius
-        if stable and fresh:
-            if self._turn_settle_stamp is None:
-                self._turn_settle_stamp = stamp
-            elif stamp - self._turn_settle_stamp >= 0.3:
-                self.turn_recovering = False
-                self._turn_settle_stamp = None
-        elif not stable:
-            self._turn_settle_stamp = None
-        if stable and not self.turn_recovering:
-            self.phase = "turn_settle"
-            # One zero-horizontal tick separates braking from resumed yaw.
-            gaz = command_to_body_percent(cmd, pose, config=self.config)[3]
-            return 0, 0, 0, gaz
+    def _position_integral(self, forward: float, right: float, now: float, radius: float, cap: int):
+        dt = 0.05
+        if self._integral_now is not None:
+            dt = max(0.0, min(0.2, float(now) - self._integral_now))
+        self._integral_now = float(now)
+        leak = math.exp(-dt / 2.0) if dt > 0.0 else 1.0
+        self._integral_f = leak * self._integral_f + float(forward) * dt
+        self._integral_r = leak * self._integral_r + float(right) * dt
+        imax = 3.0 * max(float(radius), 1e-3)
+        self._integral_f = float(np.clip(self._integral_f, -imax, imax))
+        self._integral_r = float(np.clip(self._integral_r, -imax, imax))
+        ki = 0.35 * float(cap) / max(float(radius), 1e-3)
+        return ki * self._integral_f, ki * self._integral_r
 
-        self.phase = "turn_settle" if stable else "turn_drift_recovery"
-        cap = self.config.max_translation_pcmd
-        # Leave a small position deadband so map noise cannot drive a brake pulse.
-        position_scale = 0.0 if distance <= 0.5 * radius else cap / radius
-        pitch = int(round(np.clip(forward * position_scale - 10.0 * forward_v, -cap, cap)))
-        roll = int(round(np.clip(right * position_scale - 10.0 * right_v, -cap, cap)))
-        return roll, pitch, 0, 0
+    def _wind_corrected_horizontal(self, roll, pitch, body_velocity, now):
+        """Cancel cross-track wind while cruising; hold station if not translating."""
+        velocity = self._usable_body_velocity(body_velocity, now)
+        cap = int(self.config.max_translation_pcmd)
+        kv = DESKTOP_AUTO_WIND_REJECT_PCMD_PER_MPS
+        if velocity is None:
+            return roll, pitch
+        forward_v, right_v = velocity
+        cmd_mag = math.hypot(float(pitch), float(roll))
+        if cmd_mag < 1e-6:
+            hold_pitch = int(np.clip(round(-kv * forward_v), -cap, cap))
+            hold_roll = int(np.clip(round(-kv * right_v), -cap, cap))
+            return hold_roll, hold_pitch
+        dir_f = float(pitch) / cmd_mag
+        dir_r = float(roll) / cmd_mag
+        along = forward_v * dir_f + right_v * dir_r
+        cross_f = forward_v - along * dir_f
+        cross_r = right_v - along * dir_r
+        pitch = int(np.clip(round(float(pitch) - kv * cross_f), -cap, cap))
+        roll = int(np.clip(round(float(roll) - kv * cross_r), -cap, cap))
+        return roll, pitch
 
     def _separate_translation_axes(self, command, cmd: Command, pose: Pose, now, body_velocity):
         """Separate height/horizontal repair, with measured horizontal damping."""
@@ -1738,7 +1770,10 @@ class YawAlignedPcmdController:
                 strength = max(1, round(self.config.max_vertical_pcmd * min(
                     1.0, abs(height_error) / (3.0 * radius)
                 )))
-                return 0, 0, yaw, int(math.copysign(strength, height_error))
+                hold_roll, hold_pitch = self._wind_corrected_horizontal(
+                    0, 0, body_velocity, now,
+                )
+                return hold_roll, hold_pitch, yaw, int(math.copysign(strength, height_error))
             horizontal = _translation_percent_command(
                 delta - height_error * self.config.map_frame.up, pose, self.config,
                 distance_to_waypoint=(horizontal_error if cmd.action == "REJOIN"
@@ -1748,19 +1783,21 @@ class YawAlignedPcmdController:
             command = horizontal[0], horizontal[1], 0, 0
         close_or_recovering = self.phase != "translate" or float(np.linalg.norm(cmd.goal - pose.xyz)) <= 3.0 * radius
         if body_velocity is not None and close_or_recovering and command[2] == command[3] == 0:
-            forward_v, right_v, stamp = body_velocity
-            if (not all(math.isfinite(v) for v in body_velocity)
-                    or not 0.0 <= now - stamp <= self.config.max_pose_age_s
-                    or not pose.map_confirmed):
-                return 0, 0, 0, 0
-            forward, right, _up = self.config.map_frame.body_components(delta, pose.yaw)
-            cap = self.config.max_translation_pcmd
-            # Position/radius is dimensionless; body velocity provides damping
-            # in 10 PCMD per m/s, without integrating metres into the raw map.
-            pitch = int(np.clip(round(cap * forward / (2.0 * radius) - 10.0 * forward_v), -cap, cap))
-            roll = int(np.clip(round(cap * right / (2.0 * radius) - 10.0 * right_v), -cap, cap))
-            return roll, pitch, 0, 0
-        return command
+            velocity = self._usable_body_velocity(body_velocity, now)
+            if velocity is not None:
+                forward_v, right_v = velocity
+                forward, right, _up = self.config.map_frame.body_components(delta, pose.yaw)
+                cap = self.config.max_translation_pcmd
+                i_f, i_r = self._position_integral(forward, right, now, radius, cap)
+                # Position/radius is dimensionless; body velocity provides damping
+                # in 10 PCMD per m/s. Integral closes a steady wind offset the
+                # P term alone cannot.
+                pitch = int(np.clip(round(cap * forward / (2.0 * radius) + i_f - 10.0 * forward_v), -cap, cap))
+                roll = int(np.clip(round(cap * right / (2.0 * radius) + i_r - 10.0 * right_v), -cap, cap))
+                return roll, pitch, 0, 0
+        roll, pitch, yaw, gaz = command
+        roll, pitch = self._wind_corrected_horizontal(roll, pitch, body_velocity, now)
+        return roll, pitch, yaw, gaz
 
     def _normalized_now(self, now: float) -> float | None:
         try:
@@ -1864,6 +1901,7 @@ class YawAlignedPcmdController:
         fresh_sample: bool,
         yaw_rate_deg_s: float | None,
         yaw_sign: int,
+        body_velocity: tuple[float, float, float] | None = None,
     ) -> tuple[int, int, int, int]:
         zero = (0, 0, 0, 0)
         if self.alignment_started is None:
@@ -1892,15 +1930,17 @@ class YawAlignedPcmdController:
             yaw_error=yaw_error,
             fresh_sample=fresh_sample,
         )
+        hold_roll, hold_pitch = self._wind_corrected_horizontal(0, 0, body_velocity, now)
         if abs(math.degrees(yaw_error)) > self.config.yaw_tolerance_deg:
             self.phase = "turn"
-            return command_to_body_percent(
+            yaw_cmd = command_to_body_percent(
                 cmd,
                 pose,
                 config=self.config,
                 yaw_sign=yaw_sign,
                 require_yaw_alignment=True,
             )
+            return hold_roll, hold_pitch, yaw_cmd[2], yaw_cmd[3]
         if stable:
             self.aligned_for_translation = True
             self.phase = "yaw_alignment_confirmed"
@@ -1910,7 +1950,68 @@ class YawAlignedPcmdController:
             cmd, pose, config=self.config, yaw_sign=yaw_sign,
             require_yaw_alignment=False,
         )[3]
-        return 0, 0, 0, vertical
+        return hold_roll, hold_pitch, 0, vertical
+
+    def _final_centering_command(self, cmd, pose, now, yaw_sign, body_velocity):
+        # Terminal centering: the landing point is known and fresh poses
+        # keep arriving, so hold it with the visual servo instead of an
+        # open-loop hover that wind walks off the arrival sphere. Yaw
+        # stays locked; translation stops inside the arrival deadband.
+        # (ARRIVING keeps its deliberate settle-in-place behavior: on a
+        # wide sphere the center can sit behind the drone.)
+        measurement = self._alignment_measurement(cmd, pose)
+        if measurement is None:
+            return 0, 0, 0, 0
+        self._record_alignment_sample(measurement[0], float(pose.yaw))
+        self.centering = True
+        hold_cmd = Command(
+            "FOLLOW",
+            np.zeros(3, dtype=float),
+            float(pose.yaw),
+            np.array(cmd.goal, dtype=float, copy=True),
+            cmd.path_error,
+            cmd.progress,
+            status="final centering",
+        )
+        centered = command_to_body_percent(
+            hold_cmd,
+            pose,
+            config=self.config,
+            yaw_sign=yaw_sign,
+            require_yaw_alignment=False,
+        )
+        self.phase = "final_centering"
+        return self._separate_translation_axes(centered, hold_cmd, pose, now, body_velocity)
+
+
+    def _position_recovery_command(self, cmd, pose, now, radius, yaw_sign, body_velocity):
+        horizontal_distance = self.config.map_frame.horizontal_distance(cmd.goal - pose.xyz)
+        if horizontal_distance <= radius:
+            self.centering = True
+        elif horizontal_distance > 2.0 * radius:
+            self.centering = False
+        if self.centering:
+            # Near a waypoint the target bearing is ill-conditioned. Hold yaw
+            # and close position/height instead of turning around the sphere.
+            # The wider exit boundary prevents localization noise from toggling
+            # this phase on every capture.
+            self.phase = "waypoint_centering"
+            centering_cmd = replace(cmd, guidance_goal=None, action="FOLLOW")
+            return self._separate_translation_axes(command_to_body_percent(
+                centering_cmd, pose,
+                config=self.config, yaw_sign=yaw_sign,
+                require_yaw_alignment=False,
+            ), centering_cmd, pose, now, body_velocity)
+        if cmd.action == "REJOIN" and cmd.guidance_goal is not None:
+            # Position recovery takes priority over nose alignment. Translate
+            # back to the segment with yaw held, then resume the turn gate.
+            self.phase = "route_rejoin"
+            return self._separate_translation_axes(command_to_body_percent(
+                cmd, pose, config=self.config, yaw_sign=yaw_sign,
+                require_yaw_alignment=False,
+            ), cmd, pose, now, body_velocity)
+
+        return None
 
     def update(
         self,
@@ -1930,35 +2031,7 @@ class YawAlignedPcmdController:
         self._prepare_target(now, target_key)
 
         if cmd.action == "FINAL_HOLD" and not cmd.should_land:
-            # Terminal centering: the landing point is known and fresh poses
-            # keep arriving, so hold it with the visual servo instead of an
-            # open-loop hover that wind walks off the arrival sphere. Yaw
-            # stays locked; translation stops inside the arrival deadband.
-            # (ARRIVING keeps its deliberate settle-in-place behavior: on a
-            # wide sphere the center can sit behind the drone.)
-            measurement = self._alignment_measurement(cmd, pose)
-            if measurement is None:
-                return 0, 0, 0, 0
-            self._record_alignment_sample(measurement[0], float(pose.yaw))
-            self.centering = True
-            hold_cmd = Command(
-                "FOLLOW",
-                np.zeros(3, dtype=float),
-                float(pose.yaw),
-                np.array(cmd.goal, dtype=float, copy=True),
-                cmd.path_error,
-                cmd.progress,
-                status="final centering",
-            )
-            centered = command_to_body_percent(
-                hold_cmd,
-                pose,
-                config=self.config,
-                yaw_sign=yaw_sign,
-                require_yaw_alignment=False,
-            )
-            self.phase = "final_centering"
-            return self._separate_translation_axes(centered, hold_cmd, pose, now, body_velocity)
+            return self._final_centering_command(cmd, pose, now, yaw_sign, body_velocity)
 
         if cmd.action not in {"FOLLOW", "REJOIN"} or cmd.should_land:
             self.reset()
@@ -1968,85 +2041,34 @@ class YawAlignedPcmdController:
         if measurement is None:
             return 0, 0, 0, 0
         pose_stamp, projected_error, yaw_error = measurement
-
-        fresh_alignment_sample, yaw_rate_deg_s = self._record_alignment_sample(
-            pose_stamp,
-            float(pose.yaw),
+        fresh_sample, yaw_rate_deg_s = self._record_alignment_sample(
+            pose_stamp, float(pose.yaw),
         )
 
         radius = float(self.config.waypoint_arrive_radius)
         radii = self.config.waypoint_arrive_radii
         if radii is not None and isinstance(target_key, int) and 0 <= target_key < len(radii):
             radius = float(radii[target_key])
-        horizontal_distance = self.config.map_frame.horizontal_distance(cmd.goal - pose.xyz)
-        if horizontal_distance <= radius:
-            self.centering = True
-        elif horizontal_distance > 2.0 * radius:
-            self.centering = False
-        if self.centering:
-            # Near a waypoint the target bearing is ill-conditioned. Hold yaw
-            # and close position/height instead of turning around the sphere.
-            # The wider exit boundary prevents localization noise from toggling
-            # this phase on every capture.
-            self.phase = "waypoint_centering"
-            self._reset_turn_recovery()
-            centering_cmd = replace(cmd, guidance_goal=None, action="FOLLOW")
-            return self._separate_translation_axes(command_to_body_percent(
-                centering_cmd, pose,
-                config=self.config, yaw_sign=yaw_sign,
-                require_yaw_alignment=False,
-            ), centering_cmd, pose, now, body_velocity)
-        if cmd.action == "REJOIN" and cmd.guidance_goal is not None:
-            # Position recovery takes priority over nose alignment. Translate
-            # back to the segment with yaw held, then resume the turn gate.
-            self.phase = "route_rejoin"
-            self._reset_turn_recovery()
-            return self._separate_translation_axes(command_to_body_percent(
-                cmd, pose, config=self.config, yaw_sign=yaw_sign,
-                require_yaw_alignment=False,
-            ), cmd, pose, now, body_velocity)
+        position_command = self._position_recovery_command(cmd, pose, now, radius, yaw_sign, body_velocity)
+        if position_command is not None:
+            return position_command
 
         if projected_error is None:
             self.aligned_for_translation = True
-
-        # Bounded mid-leg repair: small drift keeps strafing correction, but a
-        # large drift would fly a long rotated leg. Strikes need consecutive
-        # FRESH samples so one noisy frame cannot park translation; the leg's
-        # window/timeout budget is deliberately not reset, so a flapping
-        # heading degrades to hold-for-operator instead of chattering.
-        # Repeated captures neither add nor clear strikes when control runs
-        # faster than localization.
-        if (
-            self.aligned_for_translation
-            and projected_error is not None
-            and fresh_alignment_sample
-            and abs(math.degrees(yaw_error)) > float(self.config.mid_leg_realign_deg)
-        ):
-            self._realign_strikes += 1
-        elif fresh_alignment_sample:
-            self._realign_strikes = 0
-        if self._realign_strikes >= int(self.config.yaw_alignment_confirmation_updates):
-            self._realign_strikes = 0
-            self.aligned_for_translation = False
-            self.confirmation_count = 0
-            self._alignment_samples = []
-            self._reset_turn_recovery()
         if not self.aligned_for_translation:
-            if self.turn_recovering or abs(math.degrees(yaw_error)) > self.config.yaw_tolerance_deg:
-                recovery = self._turn_drift_command(cmd, pose, now, body_velocity, radius)
-                if recovery is not None:
-                    return recovery
             return self._alignment_hold_command(
                 cmd,
                 pose,
                 now,
                 yaw_error,
-                fresh_alignment_sample,
+                fresh_sample,
                 yaw_rate_deg_s,
                 yaw_sign,
+                body_velocity,
             )
+
         self.phase = "translate"
-        self._reset_turn_recovery()
+        self.turn_anchor_error_u = 0.0
         return self._separate_translation_axes(command_to_body_percent(
             cmd,
             pose,

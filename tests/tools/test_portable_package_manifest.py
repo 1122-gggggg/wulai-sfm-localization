@@ -59,14 +59,14 @@ def test_portable_export_keeps_output_governance_readme() -> None:
 
     runtime_script = (
         Path(__file__).resolve().parents[2] / "tools" / "test_portable_runtime.sh"
-    ).read_text(
-        encoding="utf-8"
-    )
+    ).read_text(encoding="utf-8")
     assert '"$portable_root/outputs/README.md"' in runtime_script
     assert 'rm -r -- "$staged_output_root/flight_logs"' in runtime_script
     assert 'rm -r -- "$staged_output_root"' not in runtime_script
     assert "routes/flight_route.json" not in runtime_script
-    assert "river_site_b0_p116_p117_20260818/compat/T_align_gravity.json" in runtime_script
+    assert "--require-site-bundle" in runtime_script
+    assert "runtime-only package imported" in runtime_script
+    assert "river_gluemap_all8_direct_20260908" not in runtime_script
     assert "routes/authored/" not in runtime_script
     assert "river_site_realrgb_dense_trimmed.ply" not in runtime_script
     assert '"$portable_root/PORTABLE_SITE_ASSETS.json"' in runtime_script
@@ -89,9 +89,7 @@ def test_manifest_round_trip(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize("control_name", ("MANIFEST.tsv", "SHA256SUMS"))
-def test_manifest_rejects_symlinked_control_files(
-    tmp_path: Path, control_name: str
-) -> None:
+def test_manifest_rejects_symlinked_control_files(tmp_path: Path, control_name: str) -> None:
     root = tmp_path / "package"
     root.mkdir()
     (root / "payload.txt").write_text("payload\n", encoding="utf-8")
@@ -195,9 +193,7 @@ def test_runtime_artifact_copy_uses_only_digest_bound_allowlist(tmp_path: Path) 
     artifact_path = seed / "執行環境/torch_hub_cache/checkpoints/model.bin"
     artifact_path.parent.mkdir(parents=True)
     artifact_path.write_bytes(payload)
-    (seed / "執行環境/torch_hub_cache/checkpoints/unlisted.bin").write_bytes(
-        b"must not be copied"
-    )
+    (seed / "執行環境/torch_hub_cache/checkpoints/unlisted.bin").write_bytes(b"must not be copied")
     _write_runtime_registry(
         source,
         {
@@ -319,9 +315,7 @@ def test_runtime_artifact_copy_rechecks_bytes_after_copy(
     monkeypatch.setattr(export_simulator_package.shutil, "copy2", tampering_copy)
 
     with pytest.raises(export_simulator_package.ArtifactResolutionError, match="changed"):
-        export_simulator_package._copy_resolved_runtime_artifacts(
-            (resolved,), destination
-        )
+        export_simulator_package._copy_resolved_runtime_artifacts((resolved,), destination)
 
     assert not (destination / spec.path).exists()
 
@@ -421,8 +415,7 @@ def test_portable_export_copies_verified_wheelhouse_and_records_metadata(
 
     wheel_relative = "demo-1.0-py3-none-any.whl"
     manifest_relative = (
-        f"{export_simulator_package.OFFLINE_WHEELHOUSE_RELATIVE}/"
-        f"{offline_wheelhouse.MANIFEST_NAME}"
+        f"{export_simulator_package.OFFLINE_WHEELHOUSE_RELATIVE}/{offline_wheelhouse.MANIFEST_NAME}"
     )
     assert (destination / manifest_relative).is_file()
     assert (
@@ -432,9 +425,7 @@ def test_portable_export_copies_verified_wheelhouse_and_records_metadata(
     offline = metadata["offline_install"]
     assert offline == {
         "complete": True,
-        "lock_digests": {
-            Path(name).name: _sha256(source / name) for name in lock_names
-        },
+        "lock_digests": {Path(name).name: _sha256(source / name) for name in lock_names},
         "manifest": manifest_relative,
         "manifest_sha256": _sha256(wheelhouse / offline_wheelhouse.MANIFEST_NAME),
         "mode": "no-index",
@@ -476,9 +467,7 @@ def test_live_minimal_export_reuses_runtime_only_wheelhouse(
         output.mkdir(parents=True)
         for path in Path(source_root).iterdir():
             (output / path.name).write_bytes(path.read_bytes())
-        return json.loads(
-            (output / offline_wheelhouse.MANIFEST_NAME).read_text(encoding="utf-8")
-        )
+        return json.loads((output / offline_wheelhouse.MANIFEST_NAME).read_text(encoding="utf-8"))
 
     monkeypatch.setattr(offline_wheelhouse, "subset_wheelhouse", fake_subset)
 
@@ -489,9 +478,7 @@ def test_live_minimal_export_reuses_runtime_only_wheelhouse(
     )
 
     assert source_lock_names == runtime_lock_names
-    metadata = json.loads(
-        (destination / "PORTABLE_PACKAGE.json").read_text(encoding="utf-8")
-    )
+    metadata = json.loads((destination / "PORTABLE_PACKAGE.json").read_text(encoding="utf-8"))
     assert set(metadata["offline_install"]["lock_digests"]) == set(runtime_lock_names)
     assert verify(destination) == []
 
@@ -512,8 +499,7 @@ def test_portable_manifest_accepts_a_runtime_only_offline_wheelhouse(
     target.parent.mkdir(parents=True)
     wheelhouse.rename(target)
     manifest_relative = (
-        f"{export_simulator_package.OFFLINE_WHEELHOUSE_RELATIVE}/"
-        f"{offline_wheelhouse.MANIFEST_NAME}"
+        f"{export_simulator_package.OFFLINE_WHEELHOUSE_RELATIVE}/{offline_wheelhouse.MANIFEST_NAME}"
     )
     (tmp_path / "PORTABLE_PACKAGE.json").write_text(
         json.dumps(
@@ -685,9 +671,7 @@ def test_site_bundle_copies_and_verifies_all_reference_index_siblings(
         "maps/index/names.json",
     }
     assert verify(destination) == []
-    marker = json.loads(
-        (destination / "PORTABLE_SITE_ASSETS.json").read_text(encoding="utf-8")
-    )
+    marker = json.loads((destination / "PORTABLE_SITE_ASSETS.json").read_text(encoding="utf-8"))
     assert marker["schema"] == "sfm-portable-site-assets/v1"
     assert {item["path"] for item in marker["files"]} == set(copied)
 
@@ -732,13 +716,9 @@ def test_site_bundle_keeps_only_the_profile_bound_route(tmp_path: Path) -> None:
 
     destination = tmp_path / "bundle"
     export_simulator_package.copy_site_bundle(root, destination, [profile])
-    marker = json.loads(
-        (destination / "PORTABLE_SITE_ASSETS.json").read_text(encoding="utf-8")
-    )
+    marker = json.loads((destination / "PORTABLE_SITE_ASSETS.json").read_text(encoding="utf-8"))
     route_entries = {
-        (item["role"], item["path"])
-        for item in marker["files"]
-        if item["role"] == "route_json"
+        (item["role"], item["path"]) for item in marker["files"] if item["role"] == "route_json"
     }
     assert route_entries == {
         ("route_json", "地圖檔/場域/river_site/routes/flight_route.json"),
@@ -771,9 +751,7 @@ def test_portable_manifest_rejects_profile_asset_missing_from_marker(
     generate(destination, include_site_assets=True)
 
     issues = verify(destination)
-    assert any(
-        "reference_index" in issue and "bundled" in issue for issue in issues
-    )
+    assert any("reference_index" in issue and "bundled" in issue for issue in issues)
 
 
 @pytest.mark.parametrize(
@@ -935,27 +913,20 @@ def test_site_bundle_includes_signed_hardware_sidecars_and_checks_pins(
     profile.write_text(json.dumps(raw), encoding="utf-8")
 
     export_simulator_package.copy_site_bundle(root, tmp_path / "bundle", [profile])
-    bundle = json.loads(
-        (tmp_path / "bundle/PORTABLE_SITE_ASSETS.json").read_text(encoding="utf-8")
-    )
+    bundle = json.loads((tmp_path / "bundle/PORTABLE_SITE_ASSETS.json").read_text(encoding="utf-8"))
     profile_record = bundle["profiles"][0]
     assert profile_record["signed_hardware_approval"] is True
     assert {
-        item["path"]
-        for item in bundle["files"]
-        if item["role"].startswith("hardware_approval_")
+        item["path"] for item in bundle["files"] if item["role"].startswith("hardware_approval_")
     } == {
         "maps/reports/receipt.json",
         "maps/reports/receipt.sig",
         "maps/reports/trust.json",
     }
 
-    (tmp_path / "bundle/maps/reports/trust.json").write_text(
-        "tampered\n", encoding="utf-8"
-    )
+    (tmp_path / "bundle/maps/reports/trust.json").write_text("tampered\n", encoding="utf-8")
     assert any(
-        "PORTABLE_SITE_ASSETS.json" in issue
-        and "maps/reports/trust.json" in issue
+        "PORTABLE_SITE_ASSETS.json" in issue and "maps/reports/trust.json" in issue
         for issue in verify(tmp_path / "bundle")
     )
 
@@ -980,8 +951,6 @@ def test_site_bundle_allows_legacy_unsigned_hardware_receipt_without_signing_it(
     profile.write_text(json.dumps(raw), encoding="utf-8")
 
     export_simulator_package.copy_site_bundle(root, tmp_path / "bundle", [profile])
-    bundle = json.loads(
-        (tmp_path / "bundle/PORTABLE_SITE_ASSETS.json").read_text(encoding="utf-8")
-    )
+    bundle = json.loads((tmp_path / "bundle/PORTABLE_SITE_ASSETS.json").read_text(encoding="utf-8"))
     assert bundle["profiles"][0]["signed_hardware_approval"] is False
     assert verify(tmp_path / "bundle") == []

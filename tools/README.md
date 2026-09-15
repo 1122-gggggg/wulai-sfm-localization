@@ -34,12 +34,9 @@ wheelhouse：
 validation 使用 `bash tools/install_runtime.sh --offline --test-deps --quality-deps`。
 offline 模式會先核對 `WHEELHOUSE.json`、三份 lockfile 與所有 wheel，再以
 `--no-index --find-links` 安裝。安裝器會拒絕
-`include-system-site-packages=true` 的既有 venv。`simulator_preflight.py --json` 的
-receipt 會記錄稀疏點雲 collision monitor 是否能在 clean lock-only 環境取得；
-scipy 已固定於 runtime lock，正常狀態為 `available_non_production`。它不是
-production safety，`collision_protection_claim` 永遠為 false。若未來將其納入
-production，先完成 safety wiring 審查，再使用 `--require-collision-monitor`，
-否則 preflight fail closed。
+`include-system-site-packages=true` 的既有 venv。scipy 已固定於 runtime lock，
+供診斷與 deploy 使用；桌面操作介面不再有稀疏點雲近接懸停互鎖，也沒有
+`--require-collision-monitor`。不得宣稱具備 collision protection。
 
 `system_validation.py` 的 receipt 也會在 `pytest.steps` 彙整每個 pytest step 的
 passed/failed/skipped/xfailed/xpassed/errors/warnings，並在 `pytest.skipped` 列出

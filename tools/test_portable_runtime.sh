@@ -3,8 +3,8 @@
 # explicit external replay, require a valid pose, then remove test outputs.
 set -euo pipefail
 
-if [[ "$#" -ne 1 ]]; then
-  echo "usage: bash tools/test_portable_runtime.sh /path/to/portable-package" >&2
+if [[ "$#" -lt 1 || "$#" -gt 2 || ( "$#" -eq 2 && "$2" != "--require-site-bundle" ) ]]; then
+  echo "usage: bash tools/test_portable_runtime.sh /path/to/portable-package [--require-site-bundle]" >&2
   exit 2
 fi
 
@@ -12,7 +12,7 @@ source_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 portable_root="$(realpath -e -- "$1")"
 temporary_root="$(mktemp -d -t sfm-portable-runtime-XXXXXX)"
 staged_output_root="$portable_root/outputs"
-smoke_video="${SFM_SMOKE_VIDEO:-$source_root/模擬器/測試影片/P1190119.MP4}"
+smoke_video="${SFM_SMOKE_VIDEO:-${SFM_P119_VIDEO:-$source_root/模擬器/測試影片/720p/P1190119_720p.MP4}}"
 staging_owned=0
 
 cleanup() {
@@ -39,10 +39,7 @@ if [[ ! -d "$staged_output_root" ]]; then
   echo "[portable-runtime] package outputs directory is missing: $staged_output_root" >&2
   exit 2
 fi
-if [[ ! -s "$smoke_video" ]]; then
-  echo "[portable-runtime] smoke video is missing or empty: $smoke_video" >&2
-  exit 2
-fi
+
 for path in "$portable_root/.venv"; do
   if [[ -e "$path" || -L "$path" ]]; then
     echo "[portable-runtime] refusing to overwrite existing path: $path" >&2
@@ -54,19 +51,26 @@ for path in \
   "$portable_root/一鍵啟動.sh" \
   "$portable_root/tools/install_runtime.sh" \
   "$portable_root/tools/simulated_ui_smoke.sh" \
-  "$portable_root/PORTABLE_SITE_ASSETS.json" \
   "$portable_root/執行環境/offline_wheelhouse/WHEELHOUSE.json" \
-  "$portable_root/outputs/README.md" \
-  "$portable_root/地圖檔/場域/river_site/site_profile.json" \
-  "$portable_root/地圖檔/場域/river_site/releases/river_site_b0_p116_p117_20260818/map/map.ply" \
-  "$portable_root/地圖檔/場域/river_site/releases/river_site_b0_p116_p117_20260818/localization/reference_poses.json" \
-  "$portable_root/地圖檔/場域/river_site/releases/river_site_b0_p116_p117_20260818/compat/T_align_gravity.json" \
-  "$portable_root/地圖檔/場域/river_site/releases/river_site_b0_p116_p117_20260818/localization/localization_bundle.pt"; do
+  "$portable_root/outputs/README.md"; do
   if [[ ! -f "$path" ]]; then
     echo "[portable-runtime] portable package is missing: $path" >&2
     exit 1
   fi
 done
+
+has_site=0
+if [[ -f "$portable_root/PORTABLE_SITE_ASSETS.json" ]]; then
+  has_site=1
+elif [[ "${2:-}" == "--require-site-bundle" ]]; then
+  echo "[portable-runtime] localization verification requires a site bundle; export with --site-profile" >&2
+  exit 2
+fi
+
+if [[ "$has_site" == "1" && ! -s "$smoke_video" ]]; then
+  echo "[portable-runtime] smoke video is missing or empty: $smoke_video" >&2
+  exit 2
+fi
 
 "$source_root/.venv/bin/python" - "$portable_root/PORTABLE_PACKAGE.json" <<'PY'
 import json
@@ -118,6 +122,18 @@ if grep -Eiq 'https?://|looking in indexes:' "$install_log"; then
   echo "[portable-runtime] offline installer attempted a package index or URL" >&2
   exit 1
 fi
+if [[ "$has_site" == "0" ]]; then
+  SFM_WORKSPACE_ROOT="$portable_root" "$portable_venv/bin/python" - "$portable_root" <<'PYTHON'
+import sys
+from pathlib import Path
+root = Path(sys.argv[1])
+sys.path.insert(0, str(root / "控制介面程式/operator_interface"))
+import flight_operator_app
+import live_localizer_worker
+print("[portable-runtime] PASS: runtime-only package imported; no site localization or GUI pose was evaluated")
+PYTHON
+  exit 0
+fi
 staging_owned=1
 SFM_UI_PYTHON="$portable_venv/bin/python" \
 SFM_LOCALIZER_PYTHON="$portable_venv/bin/python" \
@@ -128,6 +144,7 @@ SFM_UI_PYTHON="$portable_venv/bin/python" \
 SFM_LOCALIZER_PYTHON="$portable_venv/bin/python" \
 SFM_PORTABLE_ALLOW_EXTERNAL_PYTHON=1 \
 SFM_LAUNCH_DRY_RUN=1 \
+SFM_EVALUATION_ONLY=1 \
 SFM_MAX_PERFORMANCE=0 \
   bash "$portable_root/一鍵啟動.sh"
 

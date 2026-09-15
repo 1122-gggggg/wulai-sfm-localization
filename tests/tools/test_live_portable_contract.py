@@ -5,6 +5,8 @@ import hashlib
 import json
 import subprocess
 import sys
+
+import pytest
 from pathlib import Path
 
 import export_simulator_package as exporter
@@ -26,6 +28,8 @@ def test_live_minimal_export_contract_excludes_development_payload() -> None:
     assert exporter.LIVE_MINIMAL_COPY_MAPPINGS == ()
     assert "控制介面程式" in exporter.LIVE_MINIMAL_COPY_DIRS
     assert "定位演算法/flight_control" in exporter.LIVE_MINIMAL_COPY_DIRS
+    assert "定位演算法/deploy_code/sfm_direct_deploy" in exporter.LIVE_MINIMAL_COPY_DIRS
+    assert "定位演算法/configs" not in exporter.LIVE_MINIMAL_COPY_DIRS
     assert "模擬器/parrot_stimulate" not in exporter.LIVE_MINIMAL_COPY_DIRS
     assert "文件" not in exporter.LIVE_MINIMAL_COPY_DIRS
     assert "pyproject.toml" not in exporter.LIVE_MINIMAL_COPY_FILES
@@ -91,7 +95,7 @@ def test_one_click_launcher_installs_offline_and_selects_river_mission() -> None
 
     smoke_script = (ROOT / "tools/simulated_ui_smoke.sh").read_text(encoding="utf-8")
     assert "SFM_SMOKE_VIDEO" in smoke_script
-    assert "模擬器/測試影片/P1190119.MP4" in smoke_script
+    assert "模擬器/測試影片/720p/P1190119_720p.MP4" in smoke_script
     assert "河濱_P1180118_first_2s.mp4" not in smoke_script
     assert 'SFM_WORKSPACE_ROOT="$root_dir" setsid' in smoke_script
 
@@ -118,15 +122,11 @@ def test_export_cli_forwards_live_minimal_mode(
     assert calls["live_minimal"] is True
 
 
+@pytest.mark.skipif(
+    not (ROOT / "地圖檔/場域/river_site/site_profile.json").is_file(),
+    reason="requires private river site bundle",
+)
 def test_one_click_launcher_admits_operator_accepted_map_for_localization_and_flight() -> None:
-    """Admit on a reissued receipt (2026-09-13).
-
-    The acceptance receipt
-    (river_gluemap_all8_direct_20260908_operator_accepted_20260913) now carries
-    the selected artifacts' digests (5377857e…/316319ac…), so the one-click
-    entry admits the dry run. Digest-mismatch fail-closed stays covered by the
-    fixture-level tests in test_mission_resolver.
-    """
     environment = os.environ.copy()
     environment.update(
         {
@@ -136,6 +136,7 @@ def test_one_click_launcher_admits_operator_accepted_map_for_localization_and_fl
             "SFM_MAX_PERFORMANCE": "0",
         }
     )
+    environment.pop("SFM_EVALUATION_ONLY", None)
 
     completed = subprocess.run(
         ["bash", str(LAUNCHER)],
@@ -149,6 +150,8 @@ def test_one_click_launcher_admits_operator_accepted_map_for_localization_and_fl
 
     assert completed.returncode == 0, completed.stderr
     assert "mission-selection:" in completed.stdout
+    assert "dry-run command" in completed.stdout
+    assert "EVALUATION-ONLY session" not in completed.stderr
 
 
 def test_one_click_rejects_direct_site_profile_override() -> None:

@@ -19,6 +19,7 @@ opposite shape -- one in-memory frame at a time, arriving from a camera.
 
 Every matching, lifting, PnP and admission decision stays inside vendor code.
 """
+
 from __future__ import annotations
 
 import json
@@ -143,19 +144,17 @@ def boq_descriptor_from_array(extractor: BoQExtractor, image: np.ndarray) -> np.
         ).repeat(1, 3, 1, 1)
         normalization = extractor._normalization_tensors
         if normalization is None or normalization[0].device != device:
-            mean = torch.tensor(
-                list(_IMAGENET_MEAN), dtype=torch.float32, device=device
-            ).view(1, 3, 1, 1)
-            std = torch.tensor(
-                list(_IMAGENET_STD), dtype=torch.float32, device=device
-            ).view(1, 3, 1, 1)
+            mean = torch.tensor(list(_IMAGENET_MEAN), dtype=torch.float32, device=device).view(
+                1, 3, 1, 1
+            )
+            std = torch.tensor(list(_IMAGENET_STD), dtype=torch.float32, device=device).view(
+                1, 3, 1, 1
+            )
             normalization = (mean, std)
             extractor._normalization_tensors = normalization
         x = ((x - normalization[0]) / normalization[1]).contiguous()
         with torch.inference_mode():
-            with torch.autocast(
-                device_type="cuda", dtype=torch.float16, enabled=extractor.fp16
-            ):
+            with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=extractor.fp16):
                 output = extractor.model(x)
             desc = F.normalize(output.float(), dim=1, eps=1e-12)[0]
             descriptor = desc.cpu().numpy().astype(np.float32, copy=False)
@@ -164,8 +163,7 @@ def boq_descriptor_from_array(extractor: BoQExtractor, image: np.ndarray) -> np.
 
     if descriptor.shape != (BOQ_DIM,):
         raise RuntimeError(
-            f"BoQ descriptor shape {descriptor.shape!r} violates the "
-            f"{BOQ_DIM}-D contract"
+            f"BoQ descriptor shape {descriptor.shape!r} violates the {BOQ_DIM}-D contract"
         )
     if not np.isfinite(descriptor).all():
         raise RuntimeError("BoQ emitted a non-finite descriptor")
@@ -288,8 +286,7 @@ class LiveMapEDMProvider(FinalMapEDMProvider):
         """Install the frozen reference bank; never extract a query catalog."""
 
         names = tuple(
-            str(name)
-            for name in json.loads(self.assets.bank_names.read_text(encoding="utf-8"))
+            str(name) for name in json.loads(self.assets.bank_names.read_text(encoding="utf-8"))
         )
         descriptors = np.load(self.assets.bank_descriptors, allow_pickle=False)
         self.apply_reference_bank(names, descriptors)
@@ -312,8 +309,7 @@ class LiveMapEDMProvider(FinalMapEDMProvider):
             )
         if int(runtime.coarse_topk) != EDM_COARSE_TOPK:
             raise RuntimeError(
-                f"EDM COARSE.TOPK did not merge: {runtime.coarse_topk} "
-                f"(expected {EDM_COARSE_TOPK})"
+                f"EDM COARSE.TOPK did not merge: {runtime.coarse_topk} (expected {EDM_COARSE_TOPK})"
             )
         return runtime
 
@@ -335,9 +331,7 @@ class LiveMapEDMProvider(FinalMapEDMProvider):
         self._prepare()
         self._matcher_runtime()
         self._vpr()
-        self._index = self.build_reference_index(
-            excluded_sessions=frozenset(), strict=False
-        )
+        self._index = self.build_reference_index(excluded_sessions=frozenset(), strict=False)
         self._reference_norms = np.linalg.norm(self._reference_descriptors, axis=1)
         width, height = self.profile.fast_loop.resolution
         # A real forward pass through both networks; an exception here is a
@@ -369,25 +363,36 @@ class LiveMapEDMProvider(FinalMapEDMProvider):
     def _match_prepared_batch(self, runtime, query, references):
         from river_map_quality.official_edm_adapter import match_official_prepared_batch
 
-        missing = [reference for reference in references if id(reference) not in self._query_matches]
+        missing = [
+            reference for reference in references if id(reference) not in self._query_matches
+        ]
         if missing:
             matched = match_official_prepared_batch(runtime, query, missing)
-            self._query_matches.update((id(ref), (ref, result)) for ref, result in zip(missing, matched, strict=True))
+            self._query_matches.update(
+                (id(ref), (ref, result)) for ref, result in zip(missing, matched, strict=True)
+            )
         return [self._query_matches[id(reference)][1] for reference in references]
 
     def _recovery_references(self, ranked: tuple[int, ...]) -> tuple[int, ...]:
         """Keep the global winner; add a covisible alternative when available."""
-        extra = list(ranked[self.top_k:])
+        extra = list(ranked[self.top_k :])
         if len(extra) < 2 or not self._last_strong_refs:
-            return tuple(extra[:self.top_k])
-        seeds = np.unique(np.concatenate([
-            self._observations[self._reference_names[index]][1]
-            for index in self._last_strong_refs
-        ]))
+            return tuple(extra[: self.top_k])
+        seeds = np.unique(
+            np.concatenate(
+                [
+                    self._observations[self._reference_names[index]][1]
+                    for index in self._last_strong_refs
+                ]
+            )
+        )
         # Only rank the bounded global shortlist, never lock recovery to a prior.
-        overlap = [len(np.intersect1d(seeds, self._observations[self._reference_names[index]][1])) for index in extra[1:]]
+        overlap = [
+            len(np.intersect1d(seeds, self._observations[self._reference_names[index]][1]))
+            for index in extra[1:]
+        ]
         neighbor = extra[1 + int(np.argmax(overlap))]
-        return tuple(dict.fromkeys([extra[0], neighbor, *extra]))[:self.top_k]
+        return tuple(dict.fromkeys([extra[0], neighbor, *extra]))[: self.top_k]
 
     def localize_array(self, gray: np.ndarray, *, color_bgr: np.ndarray | None = None) -> RelocFix:
         """Relocalize one live frame.  Never raises; failures become ABSTAINED.
@@ -448,8 +453,10 @@ class LiveMapEDMProvider(FinalMapEDMProvider):
                 (time.perf_counter() - started) * 1000.0,
             )
 
-        base = ranked[:self.top_k]
-        from river_map_quality.official_edm_adapter import prepare_official_megadepth_image_from_array
+        base = ranked[: self.top_k]
+        from river_map_quality.official_edm_adapter import (
+            prepare_official_megadepth_image_from_array,
+        )
 
         prepared = prepare_official_megadepth_image_from_array(image, self._matcher_runtime())
         fix = self._solve_references(image, prepared, base, started, viewpoint_pool_fallback)
@@ -457,13 +464,16 @@ class LiveMapEDMProvider(FinalMapEDMProvider):
         # Preserve every strong baseline decision. Expansion only rescues failures,
         # and only while this attempt still has budget within its normal period.
         if (
-            not fix.ok and self.profile.optimizations.adaptive_retrieval
+            not fix.ok
+            and self.profile.optimizations.adaptive_retrieval
             and time.perf_counter() - started < self.profile.reloc.period_s
         ):
             extra = self._recovery_references(ranked)
             if extra:
                 refs = base + extra
-                expanded = self._solve_references(image, prepared, refs, started, viewpoint_pool_fallback)
+                expanded = self._solve_references(
+                    image, prepared, refs, started, viewpoint_pool_fallback
+                )
                 self.last_stage_ms["matched_references"] = float(len(refs))
                 if expanded.ok:
                     fix = expanded
@@ -473,7 +483,8 @@ class LiveMapEDMProvider(FinalMapEDMProvider):
         else:
             self._last_strong_refs = ()
         return replace(
-            fix, runtime_ms=(time.perf_counter() - started) * 1000.0,
+            fix,
+            runtime_ms=(time.perf_counter() - started) * 1000.0,
             stage_ms=dict(self.last_stage_ms),
         )
 
@@ -486,13 +497,19 @@ class LiveMapEDMProvider(FinalMapEDMProvider):
 
         query_path = Path(self._queries[_PLACEHOLDER_QUERY_ID]["image_path"])
         match_started = time.perf_counter()
-        lifted, raw_matches = self._match_and_lift(query_path, ranked, query_image=image, prepared_query=prepared)
+        lifted, raw_matches = self._match_and_lift(
+            query_path, ranked, query_image=image, prepared_query=prepared
+        )
         runtime_edm = time.perf_counter() - match_started
         pnp_started = time.perf_counter()
         solved, metrics, decision_status = self._solve(query_path, lifted, query_image=image)
         runtime_pnp = time.perf_counter() - pnp_started
-        self.last_stage_ms["match_lift_ms"] = self.last_stage_ms.get("match_lift_ms", 0.0) + runtime_edm * 1000.0
-        self.last_stage_ms["reloc_pnp_ms"] = self.last_stage_ms.get("reloc_pnp_ms", 0.0) + runtime_pnp * 1000.0
+        self.last_stage_ms["match_lift_ms"] = (
+            self.last_stage_ms.get("match_lift_ms", 0.0) + runtime_edm * 1000.0
+        )
+        self.last_stage_ms["reloc_pnp_ms"] = (
+            self.last_stage_ms.get("reloc_pnp_ms", 0.0) + runtime_pnp * 1000.0
+        )
         result = self._pack_query_result(
             query=EDMQuery(
                 query_id=_PLACEHOLDER_QUERY_ID,
@@ -532,9 +549,7 @@ class LiveMapEDMProvider(FinalMapEDMProvider):
         else:
             query_xy = np.ascontiguousarray(anchor.xy, dtype=np.float64)
             point_ids = np.ascontiguousarray(anchor.point3d_ids, dtype=np.int64)
-            point_xyz = np.ascontiguousarray(
-                self._point_xyz_for_ids(point_ids), dtype=np.float64
-            )
+            point_xyz = np.ascontiguousarray(self._point_xyz_for_ids(point_ids), dtype=np.float64)
         cam_from_world = (
             None if solved is None else np.asarray(solved.pose, dtype=np.float64)[:3, :4].copy()
         )

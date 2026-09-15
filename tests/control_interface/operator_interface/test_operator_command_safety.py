@@ -91,6 +91,8 @@ def _complete_preflight(operator) -> None:
 
 def _make_autonomy_runtime_ready(operator, monkeypatch=None) -> None:
     operator._autonomy_profile_verified = True
+    operator._mission_flight_ready = True
+    operator._mission_evaluation_only = False
     operator.localizer = SimpleNamespace(
         ready=True, request_relocalize=lambda: None
     )
@@ -1492,11 +1494,12 @@ def test_ui_exposes_integrated_autonomy_and_separate_localization() -> None:
 def test_flight_tab_exposes_truthful_autonomous_speed_guard() -> None:
     source = inspect.getsource(OperatorApp._build_ui)
 
-    assert "autonomous_speed_limit_input_var" in source
-    assert "套用速度限制" in source
-    assert "新鮮遙測達上限即送零 PCMD" in source
-    assert "地速缺失或過期時禁止水平 AUTO" in source
-    assert "非硬上限" in source
+    assert "套用速度限制" not in source
+    assert "啟用速度限制" not in source
+    assert "autonomous_speed_limit_input_var" not in source
+    assert "新鮮遙測達上限即送零 PCMD" not in source
+    assert "地速缺失或過期時禁止水平 AUTO" not in source
+    assert "AUTO PCMD" in source
 
 
 def test_operator_ui_cannot_force_megaloc_outside_boot_or_lost() -> None:

@@ -111,7 +111,6 @@ from localization_result_ui import (
     normalize_live_localization_result as normalize_live_localization_result,
     stabilize_live_result_pose,
 )
-from localization_contract import LocalizationResult
 from imu_flight_test import (
     capture_frame as capture_imu_flight_test_frame,
     close_recorder as close_imu_flight_test_recorder,
@@ -246,7 +245,7 @@ from real_path_follow_controller import (  # type: ignore
     MissionRouteLock,
     MissionRouteSnapshot,
     Pose,
-    camera_heading_from_forward,
+    camera_heading_from_forward as camera_heading_from_forward,
     capture_mission_route_snapshot,
 )
 from route_domain import RouteDocument  # type: ignore
@@ -1665,6 +1664,7 @@ class OperatorApp(tk.Tk):
         self.loc_health = "OK"  # OK / LOW / FAIL — operator localization alert
         self.loc_health_inliers = 0
         self.loc_health_reproj = None
+        self.loc_reseed_confirming = False
         self.history_health: list[str] = []  # per-history-point health, for map markers
         # Display-only weak trail (VO_ONLY / DEAD_RECKON / WEAK_TRACK /
         # PREDICTED_ONLY mirrors from operator_tick). Parallel lists, same
@@ -1710,6 +1710,7 @@ class OperatorApp(tk.Tk):
         self.live_pose = np.array([0.0, 0.0, 0.0, np.nan], dtype=float)
         self.live_locked = False
         self._autonomy_pose_snapshot: tuple[float, float, float, float, float] | None = None
+        self._autonomy_pose_predicted = False
         self.live_new_pose = False
         self.last_submitted_index = -1
         self.last_detect_submitted_index = -1
@@ -2051,18 +2052,31 @@ class OperatorApp(tk.Tk):
             attempts_before if event and event.startswith("RELEASE") else self.lost_hold.attempts
         )
         if event == "ENGAGE_LOW_CONF":
-            self._engage_real_localization_recovery(FailureReason.LOCALIZATION_WEAK)
-            action = (
-                "AUTO 已歸零並維持原地懸停"
-                if self._integrated_auto_active()
-                else "真機已歸零並維持原地懸停"
-                if self._is_live_backend()
-                else "模擬串流已凍幀"
-            )
-            self.write_log(
-                f"低信心升級：連續 {self.lost_hold.low_confidence_results} 筆；"
-                f"{action}，下一幀先 EDM 附近參考，再依定位 profile 排程 MegaLoc"
-            )
+            auto_active = False
+            try:
+                auto_active = bool(self._integrated_auto_active())
+            except Exception:
+                auto_active = False
+            if auto_active:
+                try:
+                    self.localizer.request_relocalize()
+                except Exception as exc:
+                    self.write_log(f"MegaLoc recovery 請求失敗: {exc!r}")
+                self.write_log(
+                    f"低信心升級：連續 {self.lost_hold.low_confidence_results} 筆；"
+                    "AUTO 繼續用弱定位／VO 平移，背景 MegaLoc"
+                )
+            else:
+                self._engage_real_localization_recovery(FailureReason.LOCALIZATION_WEAK)
+                action = (
+                    "真機已歸零並維持原地懸停"
+                    if self._is_live_backend()
+                    else "模擬串流已凍幀"
+                )
+                self.write_log(
+                    f"低信心升級：連續 {self.lost_hold.low_confidence_results} 筆；"
+                    f"{action}，下一幀先 EDM 附近參考，再依定位 profile 排程 MegaLoc"
+                )
         elif event == "ENGAGE_FAIL":
             self._engage_real_localization_recovery(FailureReason.LOCALIZATION_LOST)
             action = (
@@ -2760,16 +2774,23 @@ class OperatorApp(tk.Tk):
             pady=2,
         )
         self.flight_action_hint.pack(fill="x")
-        # Recording is always armed. Takeoff starts onboard SD capture; landing
-        # stops it. Quality selects the SD encoder only; live stream stays 720p.
+        # Recording stays off until the operator arms 起飛後錄影. Quality
+        # selects the SD encoder only; live stream stays 720p.
         initial_profile = getattr(
             self.backend,
             "recording_profile",
             DEFAULT_RECORDING_PROFILE,
         )
         self._recording_quality_syncing = False
+        self.record_on_takeoff_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            flight_actions,
+            text="起飛後錄影",
+            variable=self.record_on_takeoff_var,
+            command=self._on_record_on_takeoff_toggled,
+        ).pack(side="left", padx=(12, 2), pady=6)
         self.record_quality_var = DedupStringVar(value=initial_profile.label)
-        ttk.Label(flight_actions, text="機載錄影").pack(side="left", padx=(12, 2), pady=6)
+        ttk.Label(flight_actions, text="機載錄影").pack(side="left", padx=(8, 2), pady=6)
         self.record_quality_combo = ttk.Combobox(
             flight_actions,
             textvariable=self.record_quality_var,
@@ -2785,7 +2806,7 @@ class OperatorApp(tk.Tk):
         self.record_status_var = DedupStringVar(
             value=format_record_status(
                 active=False,
-                armed=True,
+                armed=False,
                 profile=initial_profile,
             )
         )
@@ -2955,48 +2976,14 @@ class OperatorApp(tk.Tk):
             1,
             min(100, int(getattr(self.backend, "nudge_pct", 10) or 10)),
         )
-        current_auto_speed = float(getattr(self.backend.state, "autonomous_speed_limit_mps", 0.60))
-        current_auto_speed_enabled = bool(
-            getattr(self.backend.state, "autonomous_speed_limit_enabled", True)
-        )
         self.current_auto_speed_var = DedupStringVar(
-            value=(
-                f"AUTO 地速安全閘門 "
-                f"{'ON' if current_auto_speed_enabled else 'OFF'} "
-                f"{current_auto_speed:g} m/s（非硬上限） | "
-                f"PCMD ±{auto_pcmd_cap_pct}% | SPEED_WAITING"
-            )
+            value=f"AUTO PCMD ±{auto_pcmd_cap_pct}%"
         )
-        self.autonomous_speed_limit_input_var = DedupStringVar(value=f"{current_auto_speed:g}")
-        self.autonomous_speed_limit_enabled_var = tk.BooleanVar(value=current_auto_speed_enabled)
-        autonomous_limit = ttk.Frame(anafi_panel)
-        autonomous_limit.pack(fill="x", padx=8, pady=(0, 6))
         ttk.Label(
-            autonomous_limit,
+            anafi_panel,
             textvariable=self.current_auto_speed_var,
             font=("Sans", 9, "bold"),
-        ).pack(side="left", padx=(0, 14))
-        ttk.Checkbutton(
-            autonomous_limit,
-            text="啟用速度限制",
-            variable=self.autonomous_speed_limit_enabled_var,
-        ).pack(side="left", padx=(0, 8))
-        ttk.Entry(
-            autonomous_limit,
-            width=7,
-            textvariable=self.autonomous_speed_limit_input_var,
-        ).pack(side="left", padx=(0, 2))
-        ttk.Label(autonomous_limit, text="m/s").pack(side="left")
-        ttk.Button(
-            autonomous_limit,
-            text="套用速度限制",
-            command=self.apply_autonomous_speed_limit_from_ui,
-        ).pack(side="left", padx=6)
-        ttk.Label(
-            autonomous_limit,
-            text=("landed 才可改；新鮮遙測達上限即送零 PCMD；地速缺失或過期時禁止水平 AUTO"),
-            font=("Sans", 8),
-        ).pack(side="left")
+        ).pack(fill="x", padx=8, pady=(0, 6))
 
         # ---- Firmware magnetometer calibration (human-guided, motors stay off) ----
         magnetometer = ttk.LabelFrame(
@@ -3077,7 +3064,6 @@ class OperatorApp(tk.Tk):
             "<<NotebookTabChanged>>", lambda _event: self._fit_control_pane()
         )
         self._fit_control_pane()
-        self._backend_command("record_arm", {"enabled": True})
         self._sync_record_status_label()
         self.write_log("ready")
         self._update_preflight_guide(self.backend.state)
@@ -3266,6 +3252,11 @@ class OperatorApp(tk.Tk):
         else:
             self.write_log("視窗失焦／縮小：已清除微移並送零 PCMD")
 
+    def _on_record_on_takeoff_toggled(self) -> None:
+        enabled = bool(self.record_on_takeoff_var.get())
+        self._backend_command("record_arm", {"enabled": enabled})
+        self._sync_record_status_label()
+
     def _on_recording_quality_selected(self, _event=None) -> None:
         if getattr(self, "_recording_quality_syncing", False):
             return
@@ -3292,6 +3283,10 @@ class OperatorApp(tk.Tk):
                     self.record_quality_var.set(profile.label)
                 finally:
                     self._recording_quality_syncing = False
+        armed = bool(getattr(b, "record_on_takeoff", False))
+        armed_var = getattr(self, "record_on_takeoff_var", None)
+        if armed_var is not None and bool(armed_var.get()) != armed:
+            armed_var.set(armed)
         status = getattr(b, "record_status", None)
         if status:
             self.record_status_var.set(str(status))
@@ -3299,7 +3294,7 @@ class OperatorApp(tk.Tk):
         self.record_status_var.set(
             format_record_status(
                 active=bool(getattr(b, "recording_active", False)),
-                armed=bool(getattr(b, "record_on_takeoff", False)),
+                armed=armed,
                 profile=profile,
             )
         )
@@ -3396,6 +3391,7 @@ class OperatorApp(tk.Tk):
         self.inspect_start = None
         self.live_locked = False
         self._autonomy_pose_snapshot = None
+        self._autonomy_pose_predicted = False
         self.live_new_pose = False
         self.live_result = None
         self.live_result_frame_name = ""
@@ -3487,6 +3483,11 @@ class OperatorApp(tk.Tk):
             pose_age_s = None
         pose = self._autonomy_pose()
         return {
+            "mission_flight_ready": (
+                not bool(getattr(self.backend, "is_live", False))
+                or self.__dict__.get("_mission_flight_ready", False) is True
+            ),
+            "mission_evaluation_only": self.__dict__.get("_mission_evaluation_only", False),
             "autonomous_locked": bool(getattr(state, "autonomous_locked", True)),
             "autonomous_approval_valid": bool(getattr(state, "autonomous_approval_valid", False)),
             "localizer_ready": bool(
@@ -3747,6 +3748,11 @@ class OperatorApp(tk.Tk):
                 map_frame=map_frame,
                 get_pose=self._autonomy_pose,
                 pose_is_weak=lambda: str(self.loc_health) != "OK",
+                pose_is_predicted=lambda: bool(self.__dict__.get("_autonomy_pose_predicted")),
+                pose_source_pending=lambda: getattr(
+                    self.__dict__.get("_live_source_confirmation"), "pending", None
+                ) is not None,
+                pose_reseed_confirming=lambda: bool(self.__dict__.get("loc_reseed_confirming")),
                 pose_confidence=lambda: int(self.loc_health_inliers or 0),
                 force_relocalize=lambda: self.localizer.request_relocalize(),
                 stream_healthy=self._autonomy_stream_healthy,
@@ -3755,10 +3761,9 @@ class OperatorApp(tk.Tk):
                 start_airborne=start_airborne,
                 land=lambda: self._backend_command("land", {}),
                 arming_blockers=lambda: autonomous_arming_blockers(self._autonomy_gate_snapshot()),
-                # Operator decision 2026-09-13: VO-only / WEAK_TRACK keeps
-                # flying toward the waypoints instead of hovering for a map
-                # fix. Inlier floor, jump gate, heading veto, speed guard and
-                # stick override stay armed; VLOS + finger on sticks required.
+                # After a visual lock, VO / dead-reckon / IMU-bridge /
+                # PREDICTED_ONLY fill in while visual localization is down.
+                # Jump gate and stick override stay armed.
                 accept_weak_poses=True,
             )
         except Exception as exc:
@@ -3999,10 +4004,10 @@ class OperatorApp(tk.Tk):
         try:
             speed_limit_mps = float(self.autonomous_speed_limit_input_var.get())
         except (TypeError, ValueError):
-            self.write_log("AUTO 地速安全閘門格式錯誤：必須是數字")
+            self.write_log("AUTO 地速限制格式錯誤：必須是數字")
             return False
         if not math.isfinite(speed_limit_mps) or speed_limit_mps <= 0.0:
-            self.write_log("AUTO 地速安全閘門格式錯誤：必須是有限正數")
+            self.write_log("AUTO 地速限制格式錯誤：必須是有限正數")
             return False
         enabled_var = self.__dict__.get("autonomous_speed_limit_enabled_var")
         enabled = True if enabled_var is None else bool(enabled_var.get())
@@ -4521,15 +4526,14 @@ class OperatorApp(tk.Tk):
             if result is True:
                 if enabled:
                     self.write_log(
-                        "AUTO 地速安全閘門已開啟並保存；新鮮地速遙測達上限會送零 "
-                        "PCMD 懸停，地速缺失或過期時禁止水平 AUTO；舊核准已失效"
+                        "AUTO 地速限制已保存；不再因達限、地速缺失或過期而送零 PCMD；舊核准已失效"
                     )
                 else:
                     self.write_log(
-                        "AUTO 地速安全閘門已關閉並保存；其他飛行安全機制不受影響；舊核准已失效"
+                        "AUTO 地速限制已關閉並保存；其他飛行安全機制不受影響；舊核准已失效"
                     )
             else:
-                self.write_log("AUTO 地速安全閘門未保存：必須先確認飛機已落地")
+                self.write_log("AUTO 地速限制未保存：必須先確認飛機已落地")
             return True
         return False
 
@@ -5060,6 +5064,7 @@ class OperatorApp(tk.Tk):
         self.live_pose = np.array([0.0, 0.0, 0.0, np.nan], dtype=float)
         self.live_locked = False
         self._autonomy_pose_snapshot = None
+        self._autonomy_pose_predicted = False
         self.live_new_pose = False
         self.camera_axes_world = None
         self.camera_forward_world = None
@@ -5073,6 +5078,7 @@ class OperatorApp(tk.Tk):
         self.loc_health = "OK"
         self.loc_health_inliers = 0
         self.loc_health_reproj = None
+        self.loc_reseed_confirming = False
         self.loc_weak_run = 0
         self._reset_localization_benchmark_metrics()
         self.inspect_start = None
@@ -5785,6 +5791,8 @@ class OperatorApp(tk.Tk):
         else:
             self._loc_consecutive_good_fixes = 0
         self.loc_health_inliers, self.loc_health_reproj = inliers, reproj
+        # Same result as loc_health, which pose_is_weak reads.
+        self.loc_reseed_confirming = bool(result.get("reseed_confirming"))
         return inliers, reproj
 
     # -- Thin wrappers over pure HUD helpers (C1) — keep for headless import/tests.
@@ -6089,14 +6097,7 @@ class OperatorApp(tk.Tk):
                 1,
                 min(100, int(getattr(self.backend, "nudge_pct", 10) or 10)),
             )
-            speed_limit = float(getattr(st, "autonomous_speed_limit_mps", 0.60))
-            speed_limit_enabled = bool(getattr(st, "autonomous_speed_limit_enabled", True))
-            guard_status = str(getattr(st, "autonomous_speed_guard_status", "SPEED_WAITING"))
-            self.current_auto_speed_var.set(
-                f"AUTO 地速安全閘門 {'ON' if speed_limit_enabled else 'OFF'} "
-                f"{speed_limit:g} m/s（非硬上限） | "
-                f"PCMD ±{auto_pcmd_cap_pct}% | {guard_status}"
-            )
+            self.current_auto_speed_var.set(f"AUTO PCMD ±{auto_pcmd_cap_pct}%")
         return link_ok
 
     def _build_auto_status_panel(self, parent) -> None:
@@ -6109,11 +6110,8 @@ class OperatorApp(tk.Tk):
         panel.bind("<Configure>", lambda event: label.configure(wraplength=max(120, event.width - 20)))
         history = ttk.Frame(panel)
         history.pack(fill="x", padx=5, pady=(0, 5))
-        self.auto_status_events = tk.Text(history, height=5, wrap="word", state="disabled",
+        self.auto_status_events = tk.Text(history, height=3, wrap="word", state="disabled",
                                          font=("Sans", 10), takefocus=False)
-        scrollbar = ttk.Scrollbar(history, command=self.auto_status_events.yview)
-        self.auto_status_events.configure(yscrollcommand=scrollbar.set)
-        scrollbar.pack(side="right", fill="y")
         self.auto_status_events.pack(side="left", fill="x", expand=True)
 
     def _append_auto_status_event(self, text: str) -> None:
@@ -6170,11 +6168,7 @@ class OperatorApp(tk.Tk):
             f"場域 {self.site_id} | "
             f"飛機 {getattr(st, 'aircraft_identity', '未讀回')} | "
             f"控制器 {getattr(st, 'controller_identity', '未讀回')} | "
-            "AUTO 地速安全閘門 "
-            f"{'ON' if bool(getattr(st, 'autonomous_speed_limit_enabled', True)) else 'OFF'} "
-            "（非硬上限） "
-            f"{float(getattr(st, 'autonomous_speed_limit_mps', 0.60)):g}m/s "
-            f"({getattr(st, 'autonomous_speed_guard_status', 'SPEED_WAITING')})"
+            f"AUTO PCMD ±{max(1, min(100, int(getattr(self.backend, 'nudge_pct', 10) or 10)))}%"
         )
 
     def _update_anafi_incident_banner(self, st: DroneState, *, link_ok: bool) -> None:
@@ -6693,7 +6687,7 @@ class OperatorApp(tk.Tk):
                 "success": str(getattr(self, "loc_health", "OK")) not in ("FAIL", "LOST"),
             }
             telemetry = {
-                "current_auto_speed": _val("current_auto_speed_var", "AUTO 地速安全閘門 -"),
+                "current_auto_speed": _val("current_auto_speed_var", "AUTO PCMD -"),
                 "olympe_state": _val("olympe_state_var", "RTH ?/? | GPS ?"),
                 "olympe_altitude": _val("olympe_altitude_var", "飛控高度 - | AGL - | 連接品質 -"),
                 "olympe_attitude": _val("olympe_attitude_var", "飛控融合姿態 - | 三軸速度 -"),
@@ -6710,7 +6704,7 @@ class OperatorApp(tk.Tk):
         return (
             " | ".join(
                 (
-                    _val("current_auto_speed_var", "AUTO 地速安全閘門 -"),
+                    _val("current_auto_speed_var", "AUTO PCMD -"),
                     _val("loc_fps_var", "定位 FPS -"),
                     _val("loc_quality_var", "inliers -"),
                 )

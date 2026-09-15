@@ -1,5 +1,7 @@
 # KLT 延伸進 LOST — 實驗記錄
 
+> **HISTORICAL，2026-09-15 封存說明。** 下文為舊後端／環境的紀錄，包含已刪除腳本與舊路徑，不可當作現行操作或驗證指令。現行 DIRECT 只有受限的 fused-yaw bridge，沒有 ESEKF。請參照 [現行離線驗證](../docs/direct_offline_validation.md)。
+
 日期：2026-09-05
 分支：`agent/localization-runtime-optimizations`
 旗標：`SFM_EDM_KLT_LOST_PREDICT`（預設 0）、`SFM_EDM_KLT_MAX_AGE_S` / `SFM_EDM_KLT_MAX_FRAMES`、

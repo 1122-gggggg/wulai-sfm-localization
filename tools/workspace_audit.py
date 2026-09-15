@@ -53,7 +53,6 @@ REQUIRED_FILES = (
     "驗證系統.sh",
     "模擬器/parrot_stimulate/pyproject.toml",
     "模擬器/parrot_stimulate/firmware/manifest.json",
-    "模擬器/parrot_stimulate/firmware/anafi-pc.ext2.zip",
     "模擬器/parrot_stimulate/src/anafi_pcmd_sim/scale_free_control.py",
     "控制介面程式/影片模擬串流/選擇啟動.sh",
     "控制介面程式/影片模擬串流/選擇啟動.py",
@@ -138,6 +137,7 @@ def _walk_without_following_links(root: Path) -> Iterable[tuple[Path, os.stat_re
             except FileNotFoundError:
                 continue
 
+
 def directory_size(path: Path) -> int:
     if path.is_symlink():
         return 0
@@ -157,6 +157,8 @@ def classify_output(name: str) -> str:
     if name == "flight_logs":
         return "operations"
     if name in {
+        "analysis",
+        "sim_autoflight",
         "validation",
         "validation_receipts",
         "production_stream_bench",
@@ -169,7 +171,9 @@ def classify_output(name: str) -> str:
         return "experiment_evidence"
     if name.startswith(HISTORIC_EVIDENCE_PREFIXES) and EVIDENCE_DATE_RE.search(name):
         return "experiment_evidence"
-    if any(name.startswith(p.rstrip("_")) for p in OUTPUT_EVIDENCE_PREFIXES) and EVIDENCE_DATE_RE.search(name):
+    if any(
+        name.startswith(p.rstrip("_")) for p in OUTPUT_EVIDENCE_PREFIXES
+    ) and EVIDENCE_DATE_RE.search(name):
         return "experiment_evidence"
     return "unclassified"
 

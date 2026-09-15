@@ -569,8 +569,9 @@ def _resolve_startup_site(
                     + "; ".join(mission.readiness.localization_errors)
                 )
             if is_snapshot:
+                flavor = ".eval" if evaluation_only_requested() else ""
                 expected_profile = (
-                    snapshots_dir / f"{mission.identity}.site_profile.json"
+                    snapshots_dir / f"{mission.identity}{flavor}.site_profile.json"
                 ).resolve()
                 if not expected_profile.is_file():
                     raise ManifestError(f"mission snapshot not found: {expected_profile}")
@@ -1499,6 +1500,8 @@ def _build_operator_launch(inputs: _OperatorLaunchInputs) -> _OperatorLaunch:
 
 def _configure_operator_launch(launch: _OperatorLaunch, inputs: _OperatorLaunchInputs) -> None:
     app = launch.app
+    app._mission_flight_ready = bool(getattr(inputs.args, "mission_flight_ready", False))
+    app._mission_evaluation_only = bool(getattr(inputs.args, "mission_evaluation_only", False))
     app.route_pts = inputs.route_points
     if app.route_pts:
         print(

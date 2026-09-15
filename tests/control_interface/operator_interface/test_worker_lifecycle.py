@@ -1853,6 +1853,45 @@ def test_real_low_confidence_escalation_hovers_and_requests_relocalize_once() ->
     assert relocalize_calls == [True]
 
 
+def test_auto_low_confidence_keeps_flying_and_only_requests_relocalize() -> None:
+    clears = []
+    pcmds = []
+    relocalize_calls = []
+    operator = app.OperatorApp.__new__(app.OperatorApp)
+    operator.lost_hold = app.LostHoldPolicy(
+        max_attempts=3,
+        timeout_s=10.0,
+        low_confidence_results=2,
+        hold_on_low_confidence=True,
+    )
+    operator.inspecting = True
+    operator.video_display_frame_name = "frame_000011.jpg"
+    operator.video_display_index = 11
+    operator._is_live_backend = lambda: True
+    operator._integrated_auto_active = lambda: True
+    operator.backend = SimpleNamespace(
+        nudge_clear=lambda *, reason: clears.append(reason),
+        send_pcmd=lambda *pcmd, reason: pcmds.append((pcmd, reason)) or True,
+    )
+    operator.localizer = SimpleNamespace(request_relocalize=lambda: relocalize_calls.append(True))
+    operator.write_log = lambda _message: None
+
+    for _ in range(2):
+        operator._apply_lost_hold_result(
+            {
+                "success": True,
+                "inliers": 20,
+                "reproj_rms": 2.0,
+                "next_mode": "WEAK_TRACK",
+                "mode": "WEAK_TRACK",
+            }
+        )
+
+    assert clears == []
+    assert pcmds == []
+    assert relocalize_calls == [True]
+
+
 def test_metrics_keep_wall_compatibility_and_explicit_core_timing() -> None:
     sink = io.StringIO()
     operator = SimpleNamespace(

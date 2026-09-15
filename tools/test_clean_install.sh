@@ -2,7 +2,7 @@
 # Rebuild the Python 3.10 environment in a temporary directory and run preflight.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-SMOKE_VIDEO="${SFM_SMOKE_VIDEO:-$ROOT/模擬器/測試影片/P1190119.MP4}"
+SMOKE_VIDEO="${SFM_SMOKE_VIDEO:-${SFM_P119_VIDEO:-$ROOT/模擬器/測試影片/720p/P1190119_720p.MP4}}"
 TEMP_ROOT="$(mktemp -d -t sfm-clean-install-XXXXXX)"
 cleanup() {
   if [[ -d "$TEMP_ROOT" ]]; then
@@ -30,4 +30,4 @@ SFM_TORCH_HUB_CACHE="$ROOT/執行環境/torch_hub_cache" \
     --json
 "$VENV_DIR/bin/python" -m pytest -q --timeout=300 --cov \
   --cov-config="$ROOT/pyproject.toml" --cov-report=term-missing \
-  --cov-fail-under=0 "$ROOT/tools" "$ROOT/tests"
+  --cov-fail-under=0 "$ROOT/tests" "$ROOT/模擬器/sphinx_anafi_path_convergence/tests"

@@ -19,6 +19,13 @@ MISSION_SELECTION = (
 P119_VALIDATOR = CONTROL_ROOT / "validate_p119_source.py"
 
 
+@pytest.fixture(autouse=True)
+def simulated_profile(tmp_path, monkeypatch):
+    profile = tmp_path / "shell-profile.json"
+    profile.write_text('{"schema_version":2,"site_id":"shell-fixture","localizer":"direct"}')
+    monkeypatch.setitem(globals(), "SITE_PROFILE", profile)
+
+
 def launch(script: Path, *args: str, **extra_env: str) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy()
     env.update(
@@ -127,7 +134,7 @@ def test_simulated_launcher_discovers_the_only_imported_video(tmp_path: Path) ->
     result = launch(SIMULATED_LAUNCHER, VIDEO_DIR=str(video_dir))
 
     assert result.returncode == 0, result.stderr
-    assert "river_site/site_profile.json" in result.stdout
+    assert str(SITE_PROFILE) in result.stdout
     assert str(video) in result.stdout
     assert "H264 main 5000 kbps" in result.stdout
     assert "延遲 280 ms、丟包 0 %" in result.stdout
@@ -245,23 +252,18 @@ def test_simulated_launcher_rejects_runtime_overrides(
     assert "portable 入口不接受額外" in result.stderr
 
 
+@pytest.mark.skipif(not SITE_PROFILE.is_file(), reason="requires private river site bundle")
 def test_real_launcher_admits_operator_accepted_map_for_localization_and_flight() -> None:
-    """Admit on a reissued receipt (2026-09-13).
-
-    The acceptance receipt
-    (river_gluemap_all8_direct_20260908_operator_accepted_20260913) now carries
-    the selected artifacts' digests (5377857e…/316319ac…), so the launcher
-    admits the dry run. Digest-mismatch fail-closed stays covered by the
-    fixture-level tests in test_mission_resolver.
-    """
+    """Unexpired operator acceptance opens the existing AUTO button."""
     result = launch(REAL_LAUNCHER)
-
     assert result.returncode == 0, result.stderr
     assert "dry-run command" in result.stdout
+    assert "EVALUATION-ONLY session" not in result.stderr
 
 
-def test_real_launcher_needs_no_evaluation_waiver_once_operator_accepted() -> None:
-    """Evaluation-only session admits without a waiver on a current receipt."""
+@pytest.mark.skipif(not SITE_PROFILE.is_file(), reason="requires private river site bundle")
+def test_real_launcher_evaluation_only_still_blocks_flight_authority() -> None:
+    """Evaluation-only remains measurement-only even on an accepted map."""
     result = launch(REAL_LAUNCHER, SFM_EVALUATION_ONLY="1")
 
     assert result.returncode == 0, result.stderr

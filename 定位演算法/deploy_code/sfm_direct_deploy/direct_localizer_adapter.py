@@ -9,7 +9,7 @@ changing anything the EDM/XFeat backends already promise.
 
 Status mapping (safety contract, never widened):
 
-    FAST_TRACK   -> TRACK       weak=False   PnP inliers include >=12 map points
+    FAST_TRACK   -> TRACK       weak=False   requires the configured strong map-inlier floor; otherwise WEAK_TRACK
     RELOC_SEED   -> TRACK       weak=False   handover landed on this frame
     VO_ONLY      -> WEAK_TRACK  weak=True    inliers are self-built VO points
     DEAD_RECKON  -> WEAK_TRACK  weak=True    essential-matrix dead reckoning
@@ -25,6 +25,7 @@ from dataclasses import dataclass, field
 import cv2
 import numpy as np
 
+from localization_continuity import PoseSourceConfirmation
 from pose_types import Localizer, Pose
 
 from two_rate_tracker import TwoRateTracker
@@ -37,6 +38,15 @@ _STATUS_MODE: dict[str, tuple[str, bool]] = {
     "IMU_BRIDGE": ("WEAK_TRACK", True),
     "NO_POSE": ("LOST", True),
 }
+
+
+def _map_confidence_mode(status: str, info: dict, profile) -> tuple[str, bool]:
+    mode, weak = _STATUS_MODE[status]
+    if not weak and int(info.get("map_inliers", 0)) < int(
+        profile.reloc.frozen_pnp_thresholds["strong_inliers"]
+    ):
+        return "WEAK_TRACK", True
+    return mode, weak
 
 
 @dataclass
@@ -91,6 +101,9 @@ class DirectTrackerAdapter(Localizer):
         self.temporal_cache = InertTemporalCache()
         self._last_info: dict = {}
         self._fused_sample = None
+        self._pose_continuity = PoseSourceConfirmation()
+        self._pose_centers: list[np.ndarray] = []
+        self._reseed_confirming = False
 
     @property
     def map_frame(self):
@@ -136,6 +149,9 @@ class DirectTrackerAdapter(Localizer):
         s.last_refs = []
         s.fail_count = s.bad_count = 0
         self.trk.reset()
+        self._pose_continuity = PoseSourceConfirmation()
+        self._pose_centers.clear()
+        self._reseed_confirming = False
 
     # ---------- fusion / retrieval hooks ----------
     def observe_fused_state(self, sample) -> None:
@@ -159,9 +175,7 @@ class DirectTrackerAdapter(Localizer):
         controller to steer."""
 
     # ---------- one frame ----------
-    def localize_frame(
-        self, frame: np.ndarray, capture_stamp: float | None = None
-    ) -> Pose | None:
+    def localize_frame(self, frame: np.ndarray, capture_stamp: float | None = None) -> Pose | None:
         try:
             stamp = float(capture_stamp)
         except (TypeError, ValueError, OverflowError):
@@ -187,7 +201,7 @@ class DirectTrackerAdapter(Localizer):
         info = self.trk.step(gray, stamp)
 
         status = str(info["status"])
-        mode, weak = _STATUS_MODE[status]
+        mode, weak = _map_confidence_mode(status, info, self.profile)
 
         pose = None
         pose_yaw = info.get("yaw")
@@ -203,10 +217,14 @@ class DirectTrackerAdapter(Localizer):
         if info["ok"] and info["center"] is not None and pose_yaw is not None:
             center = np.asarray(info["center"], dtype=float)
             pose = Pose(
-                x=float(center[0]), y=float(center[1]), z=float(center[2]),
-                yaw=float(pose_yaw), stamp=stamp,
+                x=float(center[0]),
+                y=float(center[1]),
+                z=float(center[2]),
+                yaw=float(pose_yaw),
+                stamp=stamp,
             )
 
+        pose, mode, weak, confirming = self._confirm_pose(pose, info, mode, weak, status)
         self._advance_state(pose, info, mode, status)
 
         camera_axes_world = None
@@ -234,8 +252,8 @@ class DirectTrackerAdapter(Localizer):
                 None if not info["n_corr"] else float(info["inliers"]) / float(info["n_corr"])
             ),
             "inlier_grid_cells": info.get("inlier_grid_cells"),
-            "vpr_ms": None,              # retrieval runs off the fast loop
-            "feature_ms": None,          # detector-free fast loop
+            "vpr_ms": None,  # retrieval runs off the fast loop
+            "feature_ms": None,  # detector-free fast loop
             "match_ms": None,
             "total_ms": float(info["loop_ms"]),
             "stage_gray_ms": info.get("gray_ms"),
@@ -289,15 +307,67 @@ class DirectTrackerAdapter(Localizer):
             "reloc_submitted": bool(info.get("reloc_submitted")),
         }
         for key in (
-            "frame_stamp_mono", "frame_dt_s", "klt_reseeded", "klt_input_points",
-            "klt_forward_valid", "klt_backward_valid", "klt_kept_points", "klt_inside_kept",
-            "klt_fb_p50_px", "klt_fb_p95_px", "klt_displacement_p50_px", "pnp_image_size_px",
-            "imu_bridge_reason", "imu_reference_stamp_mono", "imu_sample_stamp_mono",
+            "frame_stamp_mono",
+            "frame_dt_s",
+            "klt_reseeded",
+            "klt_input_points",
+            "klt_forward_valid",
+            "klt_backward_valid",
+            "klt_kept_points",
+            "klt_inside_kept",
+            "klt_fb_p50_px",
+            "klt_fb_p95_px",
+            "klt_displacement_p50_px",
+            "pnp_image_size_px",
+            "imu_bridge_reason",
+            "imu_reference_stamp_mono",
+            "imu_sample_stamp_mono",
             "pnp_observation_sample",
         ):
             if key in info:
                 self._last_info[key] = info[key]
+        self._last_info["pose_source_confirming"] = confirming
+        self._last_info["reseed_confirming"] = self._reseed_confirming
+        self._last_info["max_pose_jump_u"] = self.profile.max_jump_u
+        self._last_info["pose_candidate_u"] = (
+            None if info["center"] is None else np.asarray(info["center"]).tolist()
+        )
         return pose
+
+    def _confirm_pose(self, pose, info, mode, weak, status):
+        gate = self._pose_continuity
+        # True only while a strong fix is held to confirm the source a RELOC_SEED
+        # started: the seed frame, then the FAST_TRACK frame whose label differs.
+        reseed_run, self._reseed_confirming = self._reseed_confirming, False
+        if pose is None:
+            gate.interrupt()
+            return pose, mode, weak, False
+        center = np.array([pose.x, pose.y, pose.z], dtype=float)
+        if not np.isfinite([pose.x, pose.y, pose.z, pose.yaw, pose.stamp]).all():
+            gate.interrupt()
+            return None, "LOST", True, False
+        if self._pose_centers:
+            reference = np.median(np.stack(self._pose_centers), axis=0)
+            if np.linalg.norm(center - reference) > self.profile.max_jump_u:
+                gate.needs_confirmation = True
+        pending = gate.needs_confirmation
+        accepted = gate.accept(
+            center,
+            pose.stamp,
+            reliable=not weak,
+            radius=self.profile.max_jump_u / 2.0,
+            source=status,
+        )
+        if not accepted:
+            self._reseed_confirming = not weak and (status == "RELOC_SEED" or reseed_run)
+            self.trk._speed_history.clear()  # An estimator correction is not physical velocity.
+            return self.state.last_pose, "WEAK_TRACK", True, True
+        if not weak:
+            if pending:
+                self._pose_centers.clear()
+            self._pose_centers.append(center)
+            del self._pose_centers[:-5]
+        return pose, mode, weak, False
 
     def _advance_state(self, pose: Pose | None, info: dict, mode: str, status: str) -> None:
         s = self.state
@@ -305,7 +375,7 @@ class DirectTrackerAdapter(Localizer):
         s.mode = mode
         if pose is not None:
             s.last_pose = pose
-            s.last_center = np.asarray(info["center"], dtype=np.float32)
+            s.last_center = np.asarray([pose.x, pose.y, pose.z], dtype=np.float32)
             s.last_yaw = float(pose.yaw)
         references = info.get("reference_names") or ()
         if references:

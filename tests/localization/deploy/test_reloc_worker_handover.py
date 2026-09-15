@@ -6,7 +6,7 @@ real distribution mismatch, and the fast loop is holding the colour frame at
 the moment it submits -- but handing it over was measured on the P173 holdout
 and did not improve anything (see docs/direct_backend_ledger.md).  This file
 pins the grey-only contract so the mismatch is not "fixed" again without a
-gate, together with the one-job capacity rule.
+gate, together with bounded latest-capture queueing.
 """
 
 from __future__ import annotations
@@ -83,22 +83,38 @@ def test_the_relocalizer_is_given_the_grey_frame_only(worker_factory) -> None:
     assert extra == {}
 
 
-def test_submit_refuses_while_the_worker_is_busy(worker_factory) -> None:
-    """Capacity stays exactly one job: a queued reloc would land already stale."""
-
+def test_busy_worker_keeps_only_the_latest_waiting_capture(worker_factory) -> None:
     release = threading.Event()
     provider = RecordingProvider(block=release)
     worker = worker_factory(provider)
     gray = np.zeros((6, 8), dtype=np.uint8)
-
-    assert worker.submit(gray, 0) is True
+    assert worker.submit(gray, 0)
     assert provider.entered.wait(timeout=5.0)
-    assert worker.busy is True
-    assert worker.submit(gray, 1) is False
-
+    for ordinal in range(1, 100):
+        gray.fill(ordinal)
+        assert worker.submit(gray, ordinal)
+    assert worker.busy and worker.queued
+    gray.fill(0)  # Caller reuse must not mutate the queued capture.
     release.set()
-    drain(worker)
-    assert len(provider.calls) == 1
+    delivered = drain(worker)
+    if delivered[1] == 0:
+        delivered = drain(worker)
+    assert delivered[1] == 99
+    assert len(provider.calls) == 2
+    assert np.all(provider.calls[-1][0] == 99)
+
+
+def test_reset_discards_an_inflight_result(worker_factory):
+    release = threading.Event()
+    provider = RecordingProvider(block=release)
+    worker = worker_factory(provider)
+    gray = np.zeros((6, 8), dtype=np.uint8)
+    assert worker.submit(gray, 1)
+    assert provider.entered.wait(timeout=5.0)
+    worker.reset()
+    assert worker.submit(gray, 2)
+    release.set()
+    assert drain(worker)[1] == 2
 
 
 def test_a_closed_worker_refuses_work() -> None:
@@ -124,11 +140,12 @@ def test_map_unconfirmed_pose_relocalizes_without_waiting_for_period(status, occ
     submitted = []
     tracker._worker = SimpleNamespace(
         busy=occupied == "busy",
+        queued=occupied == "pending",
         submit=lambda gray, ordinal: submitted.append(ordinal) or True,
     )
     triggered = tracker._step_reloc_trigger(np.zeros((8, 8), np.uint8), 2, 10.1, status)
-    assert triggered is (occupied is None)
-    assert submitted == ([2] if occupied is None else [])
+    assert triggered
+    assert submitted == [2]
 
 
 @pytest.mark.parametrize("status", ["FAST_TRACK", "RELOC_SEED"])
@@ -140,7 +157,9 @@ def test_map_confirmed_tracking_keeps_the_normal_relocalization_period(status):
     tracker._last_reloc_stamp = 10.0
     submitted = []
     tracker._worker = SimpleNamespace(
-        busy=False, submit=lambda gray, ordinal: submitted.append(ordinal) or True,
+        busy=False,
+        queued=False,
+        submit=lambda gray, ordinal: submitted.append(ordinal) or True,
     )
     gray = np.zeros((8, 8), np.uint8)
     assert not tracker._step_reloc_trigger(gray, 2, 10.1, status)
@@ -218,9 +237,7 @@ def _handover_tracker(fix: RelocFix):
 
     def fake_absolute(reseeded, stamp):
         n = int(len(tracker._live_ids))
-        center = (
-            np.mean(tracker._live_xyz, axis=0) if n else np.zeros(3, dtype=float)
-        )
+        center = np.mean(tracker._live_xyz, axis=0) if n else np.zeros(3, dtype=float)
         pose = np.column_stack((np.eye(3), -center))
         status = "RELOC_SEED" if reseeded else "FAST_TRACK"
         return status, pose, center, n, n, 0, n, {}
@@ -236,7 +253,7 @@ def _handover_tracker(fix: RelocFix):
 
 
 def test_strong_reloc_handover_replaces_and_skips_klt_on_new_ids() -> None:
-    n = 90
+    n = 120
     fix = _reloc_fix(n)
     expected_xy = np.asarray(fix.query_xy, dtype=float).copy()
     expected_ids = np.asarray(fix.point3d_ids, dtype=np.int64).copy()
@@ -274,3 +291,23 @@ def test_weak_reloc_handover_merges_without_klting_new_ids() -> None:
         got = tracker._live_xy[index[int(pid)]]
         np.testing.assert_allclose(got, xy + np.array([10.0, 0.0]))
     assert info["status"] == "FAST_TRACK"
+
+
+@pytest.mark.parametrize("count", [80, 119, 120])
+def test_empty_track_requires_configured_reseed_minimum(count):
+    tracker = _handover_tracker(_reloc_fix(count))
+    tracker._live_ids = np.zeros(0, np.int64)
+    tracker._live_xy = np.zeros((0, 2))
+    tracker._live_xyz = np.zeros((0, 3))
+    info = tracker.step(np.zeros((64, 64), np.uint8), 1.0)
+    assert info["klt_reseeded"] is (count >= 120)
+    assert len(tracker._live_ids) == (count if count >= 120 else 0)
+
+
+@pytest.mark.parametrize("count", [12, 59, 60, 79, 80, 120])
+def test_fast_track_label_does_not_bypass_strong_map_confidence(count):
+    from direct_localizer_adapter import _map_confidence_mode
+
+    profile = SimpleNamespace(reloc=SimpleNamespace(frozen_pnp_thresholds={"strong_inliers": 80}))
+    mode, weak = _map_confidence_mode("FAST_TRACK", {"map_inliers": count}, profile)
+    assert (mode, weak) == (("TRACK", False) if count >= 80 else ("WEAK_TRACK", True))

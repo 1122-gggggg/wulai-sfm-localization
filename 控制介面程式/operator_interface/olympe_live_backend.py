@@ -37,7 +37,7 @@ from __future__ import annotations
 import importlib.metadata
 import json
 import math
-import os
+import os as os
 import sys
 import threading
 import time
@@ -93,6 +93,7 @@ from recording_quality import (  # noqa: E402
     DEFAULT_RECORDING_PROFILE,
     RecordingProfile,
     format_record_status,
+    jsonable_camera_state,
     recording_mode_matches,
     resolve_recording_profile,
 )
@@ -106,6 +107,7 @@ from skycontroller_stick import (  # noqa: E402
     _STICK_DEADZONE,
     _STICK_FLIGHT_AXES,
 )
+from live_command_log import _CmdLog, quiet_olympe_logs as quiet_olympe_logs  # noqa: E402
 from live_anafi_video_stream import LiveAnafiVideoStream  # noqa: E402
 
 
@@ -212,109 +214,8 @@ _LOST_LINK_RTH_DELAY_S = 1
 _EARTH_RADIUS_M = 6_371_000.0
 
 
-def quiet_olympe_logs() -> None:
-    """Cut Olympe/pdraw INFO spam (AVCC unsupported, renderer empty queue, etc.).
-
-    Does not change flight commands — log level only. Call before connect.
-    """
-    import logging
-    # Force WARNING even if handlers already exist (Olympe reconfigures often).
-    logging.basicConfig(level=logging.WARNING)
-    # Olympe creates per-device child loggers after connection and may attach
-    # their own INFO handlers. The global threshold keeps verbose state payloads
-    # out of the operator terminal regardless of later logger reconfiguration.
-    logging.disable(logging.INFO)
-    for name in (
-        "olympe",
-        "ulog",
-        "olympe.pdraw",
-        "olympe.drone",
-        "olympe.video",
-        "olympe.video.renderer",
-        "olympe.backend",
-        "olympe.media",
-        "olympe.module_loader",
-        "olympe.scheduler",
-        "olympe.update",
-        "olympe.flightplan",
-        "olympe.missions",
-        "olympe.arsdkng",
-    ):
-        lg = logging.getLogger(name)
-        lg.setLevel(logging.WARNING)
-        lg.propagate = True
 
 
-class _CmdLog:
-    def __init__(self, path: Path | None):
-        self.path = path
-        self._f = None
-        self.durable = False
-        self.healthy = True
-        self.last_error = ""
-        if path is not None:
-            try:
-                path.parent.mkdir(parents=True, exist_ok=True)
-                self._f = path.open("w", encoding="utf-8", buffering=1)
-                self.event("start", sink="olympe_live_ui")
-            except Exception as exc:
-                self.healthy = False
-                self.last_error = repr(exc)
-                self._f = None
-                print(
-                    f"[live-ui] safety log unavailable path={path}: {exc!r}",
-                    file=sys.stderr,
-                    flush=True,
-                )
-
-    def event(self, event: str, **kw: Any) -> None:
-        mono_ns = time.monotonic_ns()
-        rec = {
-            "t_iso": datetime.now(timezone.utc).isoformat(),
-            "t_mono": mono_ns * 1e-9,
-            "t_mono_ns": mono_ns,
-            "event": event,
-            **kw,
-        }
-        try:
-            line = json.dumps(rec, ensure_ascii=False)
-        except Exception as exc:
-            self.healthy = False
-            self.last_error = repr(exc)
-            print(
-                f"[live-ui] safety event serialization failed: {exc!r}",
-                file=sys.stderr,
-                flush=True,
-            )
-            return
-        print(f"[live-ui] {line}", flush=True)
-        if self._f is not None:
-            try:
-                self._f.write(line + "\n")
-                self._f.flush()
-                os.fsync(self._f.fileno())
-                self.durable = True
-            except Exception as exc:
-                self.durable = False
-                self.healthy = False
-                self.last_error = repr(exc)
-                print(
-                    f"[live-ui] safety log write failed: {exc!r}",
-                    file=sys.stderr,
-                    flush=True,
-                )
-
-    def close(self) -> None:
-        if self._f is not None:
-            try:
-                self.event("end")
-            except Exception:  # Tier3: teardown best-effort — event flush optional
-                pass
-            try:
-                self._f.close()
-            except Exception:  # Tier3: teardown best-effort — file close optional
-                pass
-            self._f = None
 
 
 class OlympeLiveBackend:
@@ -3019,17 +2920,18 @@ class OlympeLiveBackend:
             except Exception:
                 state = None
             matched = recording_mode_matches(state, profile)
+            readback = jsonable_camera_state(state)
             if matched is False or (matched is None and not acked):
                 self._refresh_record_status(detail="畫質未確認")
                 self.log.event(
                     "record_quality", ok=False, reason="readback_mismatch",
-                    profile=profile.profile_id, acked=acked, readback=state,
+                    profile=profile.profile_id, acked=acked, readback=readback,
                 )
                 return False
             self._refresh_record_status()
             self.log.event(
                 "record_quality", ok=True, profile=profile.profile_id,
-                acked=acked, confirmed=matched is True, readback=state,
+                acked=acked, confirmed=matched is True, readback=readback,
             )
             return True
         except Exception as exc:

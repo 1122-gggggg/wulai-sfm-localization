@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+import json
 import struct
 import sys
 import threading
@@ -1961,6 +1962,32 @@ def test_takeoff_preflight_success_checks_video_battery_gps_source_and_limits(
     assert backend.state.preflight_ok is True
     assert backend.state.preflight_reason == "ready"
     assert backend.drone.source_state == "Controller"
+
+
+def test_mock_takeoff_does_not_record_unless_armed(make_backend, monkeypatch):
+    backend = make_backend(max_altitude_m=10.0, max_distance_m=50.0)
+    backend.drone.flight_state = "landed"
+    recording_starts: list[str] = []
+    monkeypatch.setattr(
+        backend,
+        "start_flight_recording",
+        lambda reason: recording_starts.append(reason) or True,
+    )
+
+    assert backend.record_on_takeoff is False
+    assert backend.takeoff_cmd()
+    assert recording_starts == []
+
+
+def test_recording_quality_log_is_json_serializable(make_backend):
+    backend = make_backend()
+    backend.drone.flight_state = "landed"
+
+    assert backend.set_recording_quality("uhd_4k_30") is True
+    fields = [payload for event, payload in backend.log.records if event == "record_quality"]
+    assert fields
+    json.dumps(fields[-1], allow_nan=False)
+    assert fields[-1]["readback"]["resolution"] == "res_uhd_4k"
 
 
 def test_mock_takeoff_success_records_only_after_hover_confirmation(

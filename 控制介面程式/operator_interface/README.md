@@ -157,16 +157,16 @@ with the state shown and logged. Override these conservative startup values with
 ANAFI panel while the aircraft is confirmed landed. The panel always shows the
 aircraft readback separately; applying limits while airborne is rejected.
 Crossing either firmware limit prevents continued flight outward; it does not
-automatically invoke RTH. AUTO translation has two independent guards: the
-backend `nudge_pct` PCMD command-strength cap, and a fail-closed ground-speed
-interlock. Horizontal AUTO PCMD is blocked when ground-speed telemetry is
-missing or older than 0.5 s. At or above the configured threshold it sends zero
-PCMD and latches until a fresh sample is strictly below 80% of that threshold.
-The landed-only UI editor changes this interlock and invalidates the prior AUTO
-approval. It is not closed-loop speed control or a physical hard-speed
-guarantee; PCMD response, telemetry latency, wind, and braking distance still
-require field validation. Route completion likewise waits for fresh ground
-speed at or below 0.10 m/s before requesting Landing.
+automatically invoke RTH. AUTO translation is capped by the AUTO PCMD-strength
+limit, and a proportional ground-speed limit shrinks horizontal PCMD that adds
+speed along the current motion, from the full cap at standstill to zero at
+`autonomous_speed_limit_mps` (site profile `speed_limit_mps`). It never latches
+or sends a zero-PCMD hover, and braking commands pass untouched. The fail-closed
+interlock and yaw-only turn brake are gone: missing or stale ground speed leaves
+PCMD unlimited. This is not a physical
+hard-speed guarantee; PCMD response, telemetry latency, wind, and braking
+distance still require field validation. Route completion still waits for
+fresh ground speed at or below 0.10 m/s before requesting Landing.
 
 On connection the backend records the actual ANAFI model/serial/firmware,
 SkyController 3 model/serial/software, Olympe version, transport, Home Point,

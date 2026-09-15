@@ -18,6 +18,7 @@ from two_rate_tracker import (
     TwoRateTracker,
 )
 
+
 def _pose():
     # Camera center C=(1,2,3): cam_from_world stores t = -R @ C.
     return np.column_stack((np.eye(3), [-1.0, -2.0, -3.0]))
@@ -75,9 +76,8 @@ def test_bridge_rotates_camera_axes_in_the_measured_world_frame(tracker):
     frame = MapFrame.from_gravity([0.15, 0.98, -0.12])
     tracker.map_frame = frame
     center = np.array([1.0, 2.0, 3.0])
-    rotation = (
-        tracker._rot_about_axis(np.array([1., 0., 0.]), 0.6)
-        @ tracker._rot_about_axis(np.array([0., 1., 0.]), 1.0)
+    rotation = tracker._rot_about_axis(np.array([1.0, 0.0, 0.0]), 0.6) @ tracker._rot_about_axis(
+        np.array([0.0, 1.0, 0.0]), 1.0
     )
     original = np.column_stack((rotation, -rotation @ center))
     tracker._step_bookkeeping(center, original, 1, np.zeros((8, 8), np.uint8), 10.0, "FAST_TRACK")
@@ -86,7 +86,9 @@ def test_bridge_rotates_camera_axes_in_the_measured_world_frame(tracker):
     pose, moved_center, *_ = tracker._step_imu_bridge(10.1)
     expected_forward = tracker._rot_about_axis(frame.up, math.radians(-10)) @ rotation[2]
     np.testing.assert_allclose(pose[2, :3], expected_forward, atol=1e-12)
-    assert math.degrees(wrap_angle(frame.heading(pose[2, :3]) - frame.heading(rotation[2]))) == pytest.approx(-10)
+    assert math.degrees(
+        wrap_angle(frame.heading(pose[2, :3]) - frame.heading(rotation[2]))
+    ) == pytest.approx(-10)
     np.testing.assert_allclose(moved_center, center, atol=1e-12)
     np.testing.assert_allclose(pose[:, :3] @ pose[:, :3].T, np.eye(3), atol=1e-12)
 

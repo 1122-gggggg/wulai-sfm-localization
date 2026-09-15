@@ -41,9 +41,10 @@ def _payload(
     direct_status: str | None = None,
     pose_status: str = "VISUALLY_CONFIRMED",
     success: bool | None = None,
+    source_frame_stamp_mono: float | None = None,
 ) -> dict:
     pose = None if xyz is None else {"x": xyz[0], "y": xyz[1], "z": xyz[2], "yaw_raw": 0.1}
-    return {
+    payload = {
         "seq": seq,
         "display_seq": seq,
         "frame_id": f"frame-{seq}",
@@ -62,6 +63,9 @@ def _payload(
         "dead_reckon_age": 0,
         "reloc_status": None,
     }
+    if source_frame_stamp_mono is not None:
+        payload["source_frame_stamp_mono"] = source_frame_stamp_mono
+    return payload
 
 
 def _fast(seq: int, x: float) -> dict:
@@ -165,6 +169,9 @@ def _make_operator(batches: list, policy) -> SimpleNamespace:
         live_pose=np.array([0.0, 0.0, 0.0, 0.0], dtype=float),
         live_locked=False,
         live_new_pose=False,
+        _autonomy_pose_snapshot=None,
+        _autonomy_pose_predicted=False,
+        _integrated_autonomy=None,
         loc_bridge_run=0,
         boot_holding=lambda: False,
         boot_lock_done=True,
@@ -282,6 +289,30 @@ def test_predicted_only_mirrors_into_weak_trail() -> None:
     assert len(operator.history_weak) == 1
     assert operator.history_weak_health == ["DEGRADED"]
     assert np.allclose(operator.history_weak[0], [7.0, 8.0, 9.0])
+    assert operator._autonomy_pose_snapshot is None
+    assert not operator._autonomy_pose_predicted
+
+
+def test_predicted_only_feeds_auto_snapshot_after_visual_lock() -> None:
+    predicted = _payload(
+        2,
+        (7.0, 8.0, 9.0),
+        mode="WEAK_TRACK",
+        next_mode="WEAK_TRACK",
+        inliers=0,
+        pose_status="PREDICTED_ONLY",
+        success=False,
+        source_frame_stamp_mono=12.0,
+    )
+    predicted["pose"]["yaw_raw"] = 0.4
+    operator = _make_operator([[predicted]], app.LostHoldPolicy())
+    operator.live_locked = True
+    operator._integrated_autonomy = SimpleNamespace(accept_weak_poses=True)
+
+    app.OperatorApp.update_live_results(operator)
+
+    assert operator._autonomy_pose_predicted is True
+    assert operator._autonomy_pose_snapshot == pytest.approx((7.0, 8.0, 9.0, 0.4, 12.0))
 
 
 def test_weak_trail_is_capped_like_history() -> None:

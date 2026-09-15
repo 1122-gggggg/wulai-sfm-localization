@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+
 EDM_CHECKPOINT_SHA256 = "f686bebdd9705bf6918621a1a83695f83d698cbd8c3eed932847fe3678d13a97"
 BOQ_WEIGHTS_SHA256 = "4691d1545db847da2c0ba911f34e6c520a5da63f8b94c6415fe87d0d8800ebaa"
 BOQ_WEIGHTS_RELATIVE = "執行環境/models/boq/resnet50_16384.pth"
@@ -169,6 +170,8 @@ def _check_edm_runtime_import(root: Path, runtime: dict[str, object], failures: 
         ValueError,
     ) as exc:
         failures.append(f"EDM runtime import failed: {exc}")
+
+
 def _check_runtime(root: Path, profile_path: Path, failures: list[str]) -> dict[str, object]:
     runtime: dict[str, object] = {"python": sys.version.split()[0]}
     _check_environment_contract(root, profile_path, failures, runtime)
@@ -230,8 +233,7 @@ def _check_profile_runtime_containment(root: Path, profile, failures: list[str])
         )
         resolved_profile = profile.localizer_profile.resolve()
         if not any(
-            resolved_profile.is_relative_to(allowed_root)
-            for allowed_root in allowed_profile_roots
+            resolved_profile.is_relative_to(allowed_root) for allowed_root in allowed_profile_roots
         ):
             failures.append(
                 "site profile localizer_profile is outside approved config roots: "
@@ -392,13 +394,13 @@ def run_preflight(
     }
 
 
-
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--workspace-root", default=str(_workspace_root()))
     parser.add_argument("--site-profile", required=True)
-    parser.add_argument("--video", default="",
-                        help="required for simulated-stream; omit for live runtime checks")
+    parser.add_argument(
+        "--video", default="", help="required for simulated-stream; omit for live runtime checks"
+    )
     parser.add_argument("--check-runtime", action="store_true")
     parser.add_argument(
         "--full-runtime",
@@ -407,9 +409,7 @@ def main() -> None:
     )
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
-    video_path = (
-        Path(args.video).expanduser().resolve() if str(args.video).strip() else None
-    )
+    video_path = Path(args.video).expanduser().resolve() if str(args.video).strip() else None
     report = run_preflight(
         root=Path(args.workspace_root).expanduser().resolve(),
         profile_path=Path(args.site_profile).expanduser().resolve(),

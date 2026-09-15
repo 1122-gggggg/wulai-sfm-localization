@@ -26,8 +26,9 @@ if str(_FLIGHT_CONTROL) not in sys.path:
     sys.path.insert(0, str(_FLIGHT_CONTROL))
 
 import path_follow_flight as pff
+from operator_autonomy_status import leg_stage
 import real_path_follow_controller as rpf
-from landing_transition import GROUND_SPEED_MAX_AGE_S, landing_speed_allows_land
+from landing_transition import GROUND_SPEED_MAX_AGE_S
 from operator_localization_search import BoundedYawSearch, YawSearchConfig
 
 
@@ -35,8 +36,6 @@ LAND_ATTEMPTS = 2
 AUTO_PCMD_FAILURE_LIMIT = 3
 AUTO_WORKER_STALL_TIMEOUT_S = 2.0
 AUTO_WATCHDOG_POLL_S = 0.05
-AUTO_SPEED_GUARD_RELEASE_RATIO = 0.80
-AUTO_TURN_MAX_SPEED_MPS = 0.10
 AUTO_MAX_DURATION_S = 300.0
 AUTO_BATTERY_RESERVE_PCT = 20.0
 AUTO_TELEMETRY_MAX_AGE_S = 2.0
@@ -96,6 +95,7 @@ class DesktopRouteAutonomy:
         map_frame: rpf.MapFrame,
         get_pose: Callable[[], rpf.Pose | None],
         pose_is_weak: Callable[[], bool],
+        pose_is_predicted: Callable[[], bool] | None = None,
         pose_confidence: Callable[[], int],
         force_relocalize: Callable[[], None],
         stream_healthy: Callable[[], bool],
@@ -107,6 +107,8 @@ class DesktopRouteAutonomy:
         boot_timeout_s: float = pff.FIRST_FIX_TIMEOUT_S,
         boot_search_config: YawSearchConfig | None = None,
         accept_weak_poses: bool = False,
+        pose_source_pending: Callable[[], bool] | None = None,
+        pose_reseed_confirming: Callable[[], bool] | None = None,
         worker_stall_timeout_s: float | None = None,
         now: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
@@ -138,8 +140,10 @@ class DesktopRouteAutonomy:
             spin_to_search = False
         else:
             spin_to_search = True
-        config = rpf.config_for_route(
-            snapshot, rpf.production_auto_control_config(map_frame)
+        config = rpf.apply_desktop_auto_authority(
+            rpf.config_for_route(
+                snapshot, rpf.production_auto_control_config(map_frame)
+            )
         )
 
         self.backend = backend
@@ -149,6 +153,9 @@ class DesktopRouteAutonomy:
         self.controller = rpf.RouteAutoController(waypoints, poles=[], config=config)
         self.get_pose = get_pose
         self.pose_is_weak = pose_is_weak
+        self.pose_is_predicted = pose_is_predicted or (lambda: False)
+        self.pose_source_pending = pose_source_pending
+        self.pose_reseed_confirming = pose_reseed_confirming
         self.pose_confidence = pose_confidence
         self.force_relocalize = force_relocalize
         self.stream_healthy = stream_healthy
@@ -160,12 +167,9 @@ class DesktopRouteAutonomy:
         self.boot_timeout_s = timeout
         self.boot_search_config = boot_search_config
         self.spin_to_search = bool(spin_to_search)
-        # Operator decision 2026-09-13: keep flying the route on VO-only /
-        # WEAK_TRACK poses may bridge a brief map outage. The desktop bounds
-        # this bridge by POSE_STALE_S since the last accepted strong capture;
-        # fresh VO frames cannot renew that map constraint.
-        # VO drifts unanchored: post-flight error numbers on VO stretches are
-        # self-referential (localizer frame), not ground truth.
+        # After a visual lock, VO / dead-reckon / IMU-bridge / PREDICTED_ONLY
+        # may keep translating while visual localization is down. They do not
+        # renew the map anchor and cannot unlock BOOT.
         self.accept_weak_poses = bool(accept_weak_poses)
         self.worker_stall_timeout_s = stall_timeout
         self.now = now
@@ -189,9 +193,6 @@ class DesktopRouteAutonomy:
         self._auto_failure_detail = ""
         self._failure_lock = threading.Lock()
         self._command_epoch = 0
-        self._speed_guard_latched = False
-        self._speed_command_scale = 1.0
-        self._turn_wait_reason = ""
         self._waypoint_progress: _WaypointProgress | None = None
         self._mission_started: float | None = None
         self._route_progress: dict = _fresh_route_progress()
@@ -241,8 +242,6 @@ class DesktopRouteAutonomy:
         self._pcmd_failure_streak = 0
         self._auto_failed = False
         self._auto_failure_detail = ""
-        self._speed_guard_latched = False
-        self._speed_command_scale = 1.0
         self._waypoint_progress = None
         self._mission_started = None
         self._route_progress = _fresh_route_progress()
@@ -296,6 +295,8 @@ class DesktopRouteAutonomy:
         if self.phase not in {"TAKEOFF", "HANDOFF", "BOOT_HOVER", "ROUTE"}:
             return False
         self._paused.set()
+        if reason == "auto_localization_source_change":
+            self.controller.reset_arrival_confirmation()
         self._clear_motion()
         self._send_zero(reason)
         self._emit("paused", "自動飛行已暫停")
@@ -535,7 +536,6 @@ class DesktopRouteAutonomy:
             return False
 
     def _send_authorized(self, pcmd: Pcmd) -> AuthorizedPcmdResult:
-        self._turn_wait_reason = ""
         self._touch_heartbeat()
         self._check_runtime_budget()
         if self._auto_failed:
@@ -568,21 +568,9 @@ class DesktopRouteAutonomy:
             self._send_zero("auto_stream_unhealthy")
             return False, "AUTO stream unhealthy", (0, 0, 0, 0)
 
-        speed_guard_active, rejection = self._apply_speed_guard(pcmd)
-        if rejection is not None:
-            return rejection
-        pcmd = (
-            round(pcmd[0] * self._speed_command_scale),
-            round(pcmd[1] * self._speed_command_scale),
-            pcmd[2],
-            pcmd[3],
-        )
-        pcmd = self._apply_turn_speed_guard(pcmd)
         epoch = int(self._command_epoch)
-        result = self._dispatch_route_pcmd(
-            pcmd,
-            speed_guard_active=speed_guard_active,
-        )
+        pcmd = self._apply_speed_limit(pcmd)
+        result = self._dispatch_route_pcmd(pcmd)
         if (
             int(self._command_epoch) != epoch
             or self._auto_failed
@@ -598,157 +586,48 @@ class DesktopRouteAutonomy:
             return False, reason, (0, 0, 0, 0)
         return result
 
-    def _apply_turn_speed_guard(self, pcmd: Pcmd) -> Pcmd:
-        """Let firmware arrest horizontal motion before rotating the nose."""
-        self._turn_wait_reason = ""
-        if pcmd[0] or pcmd[1] or not pcmd[2]:
+    def _apply_speed_limit(self, pcmd: Pcmd) -> Pcmd:
+        """Shrink horizontal PCMD that would push ground speed past the limit.
+
+        Proportional, never latched: the allowed tilt falls linearly from the
+        full cap at standstill to zero at the limit. Commands that do not add
+        speed along the current motion (braking, wind hold) pass untouched, as
+        does everything when fresh body velocity is unavailable.
+        """
+        roll, pitch = int(pcmd[0]), int(pcmd[1])
+        state = self.backend.state
+        if not (roll or pitch):
             return pcmd
-        stopped, reason, _speed = landing_speed_allows_land(
-            self._ground_speed(), self.now(), threshold_mps=AUTO_TURN_MAX_SPEED_MPS
-        )
-        if stopped:
+        if not bool(getattr(state, "autonomous_speed_limit_enabled", True)):
+            state.autonomous_speed_guard_status = "SPEED_LIMIT_DISABLED"
             return pcmd
-        self._turn_wait_reason = f"AUTO turn waiting for horizontal stop: {reason}"
-        return 0, 0, 0, pcmd[3]
-
-    def _apply_speed_guard(
-        self,
-        pcmd: Pcmd,
-    ) -> tuple[bool, AuthorizedPcmdResult | None]:
-        """Fail closed on horizontal motion when speed telemetry is not fresh."""
-
-        self._speed_command_scale = 1.0
-        if not bool(getattr(self.backend.state, "autonomous_speed_limit_enabled", True)):
-            self._speed_guard_latched = False
-            self.backend.state.autonomous_speed_guard_status = "SPEED_LIMIT_DISABLED"
-            return False, None
-
-        horizontal_motion = int(pcmd[0]) != 0 or int(pcmd[1]) != 0
-        speed_limit = self._speed_guard_limit()
-        if not math.isfinite(speed_limit) or speed_limit <= 0.0:
-            return self._speed_guard_limit_unavailable(horizontal_motion)
-
-        telemetry, rejection = self._speed_guard_telemetry(horizontal_motion)
-        if rejection is not None:
-            return False, rejection
-        if telemetry is None:
-            return False, None
-        speed_mps, speed_guard_active = telemetry
-
-        release_limit = speed_limit * AUTO_SPEED_GUARD_RELEASE_RATIO
-        if self._speed_guard_latched:
-            latched_result = self._speed_guard_latched_result(
-                speed_mps,
-                release_limit,
-                horizontal_motion,
-            )
-            if latched_result is not None:
-                return latched_result
-
-        if speed_mps >= speed_limit:
-            self._speed_guard_latched = True
-            self.backend.state.autonomous_speed_guard_status = "OVERSPEED_HOVER"
-            if horizontal_motion:
-                return self._speed_guard_hover(
-                    "OVERSPEED_HOVER",
-                    f"AUTO speed limit {speed_limit:g} m/s reached ({speed_mps:g} m/s) -> HOVER",
-                )
-            return True, None
-
-        # Reduce horizontal authority from the existing 80% release line to
-        # the hard limit. Quantization may produce zero (coasting); never round
-        # back up to a minimum command that would defeat the taper.
-        if speed_guard_active and horizontal_motion and speed_mps > release_limit:
-            self._speed_command_scale = max(
-                0.0, min(1.0, (speed_limit - speed_mps) / (speed_limit - release_limit))
-            )
-        self.backend.state.autonomous_speed_guard_status = "FRESH_SPEED_GUARD"
-        return speed_guard_active, None
-
-    def _speed_guard_limit(self) -> float:
         try:
-            raw_limit = self.backend.state.autonomous_speed_limit_mps
-            if isinstance(raw_limit, bool):
-                raise ValueError
-            return float(raw_limit)
+            limit = float(state.autonomous_speed_limit_mps)
         except (AttributeError, TypeError, ValueError, OverflowError):
-            return float("nan")
-
-    def _speed_guard_limit_unavailable(
-        self,
-        horizontal_motion: bool,
-    ) -> tuple[bool, AuthorizedPcmdResult | None]:
-        if horizontal_motion:
-            return self._speed_guard_hover(
-                "SPEED_UNAVAILABLE_HOVER",
-                "AUTO speed limit unavailable -> HOVER",
-            )
-        self.backend.state.autonomous_speed_guard_status = "SPEED_LIMIT_UNAVAILABLE"
-        return False, None
-
-    def _speed_guard_telemetry(
-        self,
-        horizontal_motion: bool,
-    ) -> tuple[tuple[float, bool] | None, AuthorizedPcmdResult | None]:
-        speed_sample = self._ground_speed()
-        if speed_sample is None:
-            if horizontal_motion:
-                _, rejection = self._speed_guard_hover(
-                    "SPEED_UNAVAILABLE_HOVER",
-                    "AUTO ground speed unavailable or stale -> HOVER",
-                )
-                return None, rejection
-            self.backend.state.autonomous_speed_guard_status = "SPEED_UNAVAILABLE"
-            return None, None
-
-        speed_mps, speed_stamp = speed_sample
-        speed_guard_active = 0.0 <= self.now() - speed_stamp <= GROUND_SPEED_MAX_AGE_S
-        if not speed_guard_active:
-            if horizontal_motion:
-                _, rejection = self._speed_guard_hover(
-                    "SPEED_UNAVAILABLE_HOVER",
-                    "AUTO ground speed unavailable or stale -> HOVER",
-                )
-                return None, rejection
-            self.backend.state.autonomous_speed_guard_status = "SPEED_STALE"
-            return None, None
-        return (speed_mps, speed_guard_active), None
-
-    def _speed_guard_latched_result(
-        self,
-        speed_mps: float,
-        release_limit: float,
-        horizontal_motion: bool,
-    ) -> tuple[bool, AuthorizedPcmdResult | None] | None:
-        if speed_mps < release_limit:
-            self._speed_guard_latched = False
-            self.backend.state.autonomous_speed_guard_status = "FRESH_SPEED_GUARD_RELEASED"
-            return None
-        self.backend.state.autonomous_speed_guard_status = "OVERSPEED_LATCHED"
-        if horizontal_motion:
-            return self._speed_guard_hover(
-                "OVERSPEED_LATCHED",
-                f"AUTO speed guard latched until ground speed < {release_limit:g} m/s -> HOVER",
-            )
-        return True, None
-
-    def _speed_guard_hover(
-        self,
-        status: str,
-        detail: str,
-    ) -> tuple[bool, AuthorizedPcmdResult | None]:
-        self.backend.state.autonomous_speed_guard_status = status
-        self._clear_motion()
-        self._send_zero(f"auto_speed_guard_hover:{status.lower()}")
-        return False, (False, detail, (0, 0, 0, 0))
+            limit = float("nan")
+        velocity = self._body_velocity()
+        if not math.isfinite(limit) or limit <= 0.0 or velocity is None:
+            state.autonomous_speed_guard_status = "SPEED_UNAVAILABLE"
+            return pcmd
+        forward_v, right_v, _stamp = velocity
+        if pitch * forward_v + roll * right_v <= 0.0:
+            state.autonomous_speed_guard_status = "FRESH_SPEED_LIMIT"
+            return pcmd
+        speed = math.hypot(forward_v, right_v)
+        ceiling = self.controller.cfg.max_translation_pcmd * max(0.0, 1.0 - speed / limit)
+        magnitude = max(abs(roll), abs(pitch))
+        if magnitude <= ceiling:
+            state.autonomous_speed_guard_status = "FRESH_SPEED_LIMIT"
+            return pcmd
+        scale = ceiling / magnitude
+        state.autonomous_speed_guard_status = "SPEED_LIMITED"
+        return round(roll * scale), round(pitch * scale), pcmd[2], pcmd[3]
 
     @staticmethod
-    def _route_pcmd_reason(accepted: bool, speed_guard_active: bool) -> str:
+    def _route_pcmd_reason(accepted: bool) -> str:
         if not accepted:
             return "AUTO PCMD rejected"
-        if speed_guard_active:
-            return "desktop AUTO fresh-speed guard + command cap"
-        return "desktop AUTO command cap only (fresh speed unavailable)"
+        return "desktop AUTO command cap"
 
     def _pcmd_authority_pct(self) -> int:
         """Percent-of-envelope AUTO's unit vector scales by.
@@ -764,8 +643,6 @@ class DesktopRouteAutonomy:
     def _dispatch_route_pcmd(
         self,
         pcmd: Pcmd,
-        *,
-        speed_guard_active: bool,
     ) -> AuthorizedPcmdResult:
         """Send through the backend's normalized vector seam or direct PCMD."""
 
@@ -795,7 +672,7 @@ class DesktopRouteAutonomy:
                 self._record_pcmd_failure("AUTO PCMD rejected")
             return (
                 accepted,
-                self._route_pcmd_reason(accepted, speed_guard_active),
+                self._route_pcmd_reason(accepted),
                 pcmd if accepted else None,
             )
 
@@ -813,7 +690,7 @@ class DesktopRouteAutonomy:
             self._pcmd_failure_streak = 0
         else:
             self._record_pcmd_failure("AUTO PCMD rejected")
-        reason = self._route_pcmd_reason(accepted, speed_guard_active)
+        reason = self._route_pcmd_reason(accepted)
         return accepted, reason, pcmd if accepted else None
 
     def _olympe_yaw(self) -> float | None:
@@ -876,6 +753,9 @@ class DesktopRouteAutonomy:
             ),
             send_authorized_pcmd=self._send_authorized,
             pose_is_weak=self.pose_is_weak,
+            pose_is_predicted=self.pose_is_predicted,
+            pose_source_pending=self.pose_source_pending,
+            pose_reseed_confirming=self.pose_reseed_confirming,
             pose_confidence=self.pose_confidence,
             max_weak_pose_age_s=pff.POSE_STALE_S,
             force_relocalize=self.force_relocalize,
@@ -900,7 +780,7 @@ class DesktopRouteAutonomy:
             now=self.now,
         )
 
-    def _session_logs(self):
+    def _session_logs(self) -> Any:
         return getattr(self.backend, "session_logs", None)
 
     def _log_route_tick(self, record: dict) -> None:
@@ -912,7 +792,6 @@ class DesktopRouteAutonomy:
         "where was the drone" but not "how far off the plan was it", which is the
         question every AUTO debrief actually asks.
         """
-        record["speed_command_scale"] = self._speed_command_scale
         record["auto_run_id"] = self.run_id
         now = self.now()
         state = self.backend.state
@@ -927,10 +806,6 @@ class DesktopRouteAutonomy:
             record[f"{name}_mono_ns"] = stamp
             record[f"{name}_age_s"] = None if stamp is None else now - int(stamp) / 1e9
         record["auto_elapsed_s"] = None if self._mission_started is None else now - self._mission_started
-        if self._turn_wait_reason and record.get("pcmd_phase") == "turn" and not record.get("blocked"):
-            record["pcmd_phase"] = "turn_brake"
-            record["reason"] = self._turn_wait_reason
-            record["blocked"] = True
         self._check_waypoint_progress(record)
         self._track_route_progress(record)
         logs = self._session_logs()
@@ -973,8 +848,7 @@ class DesktopRouteAutonomy:
             )
         except (TypeError, ValueError, OverflowError):
             valid = False
-        motion_block = (record.get("pcmd_phase") == "turn_brake"
-                        or "speed" in str(record.get("reason", "")).lower())
+        motion_block = "speed" in str(record.get("reason", "")).lower()
         if not valid or self._paused.is_set() or (record.get("blocked") and not motion_block):
             if state is not None:
                 state.counting = False
@@ -1008,7 +882,7 @@ class DesktopRouteAutonomy:
                 metrics.append(("turn_anchor_error_u", threshold))
             for key, required in metrics:
                 try:
-                    error = abs(float(record.get(key)))
+                    error = abs(float(record.get(key, float("nan"))))
                 except (TypeError, ValueError, OverflowError):
                     continue
                 if not math.isfinite(error):
@@ -1114,98 +988,7 @@ class DesktopRouteAutonomy:
             self._emit("leg_stage", stage_text)
 
     def _leg_stage(self, target: int, last: dict) -> tuple[str, str]:
-        """Derive one stable stage key plus operator text for a route tick."""
-        label = self._drawn_waypoint_label(int(target))
-        phase = last.get("phase")
-        action = str(last.get("action") or "")
-        reason = str(last.get("reason") or "")
-        lowered = reason.lower()
-        if "arrival confirm" in action:
-            return "arriving", f"到達{label}確認中"
-        if action == "WAIT_MAP_CONFIRMATION":
-            return "map_confirmation", f"等待地圖定位確認（{label}）"
-        if last.get("blocked"):
-            if "waiting for horizontal stop" in lowered:
-                return "turn_brake", f"水平減速後修正朝向（{label}）"
-            if "speed" in lowered:
-                return "speed_guard", f"限速懸停中（{label}）"
-            if "paused" in lowered:
-                return "paused", f"已暫停（{label}）"
-            if "no fresh pose" in lowered or "low confidence" in lowered or "localization recovery" in lowered:
-                return "wait_pose", f"等待可靠定位（{label}）"
-            if "map constraint" in lowered:
-                return "wait_pose", f"地圖定位中斷，重新定位中（{label}）"
-            if "localization recovered" in lowered:
-                return "pose_recovered", f"定位已恢復，準備繼續{label}"
-            return "blocked", f"受阻懸停中（{label}）"
-        if not last.get("has_pose", True):
-            return "searching_pose", f"找尋{label}中"
-        if "final hold" in action:
-            return "final_hold", f"終點{label}到達確認中"
-        if "pending inspection" in action or action.startswith("ABORT"):
-            return "abort", f"巡檢缺失中止降落（{label}）"
-        if action.startswith("LAND") or "final path reached" in action:
-            return "landing", f"終點到達・降落中（{label}）"
-        if "INSPECT" in action:
-            return "inspect", f"巡檢對準／擷取中（{label}）"
-        if "yaw localization search" in reason:
-            deg = last.get("search_deg")
-            try:
-                suffix = (
-                    f"（已旋轉{float(deg):.0f}°）"
-                    if deg is not None and math.isfinite(float(deg))
-                    else ""
-                )
-            except (TypeError, ValueError):
-                suffix = ""
-            return "yaw_search", f"找定位旋轉中（{label}）{suffix}"
-        if phase == "turn":
-            return "turn", f"旋轉機頭朝向{label}"
-        if phase == "turn_drift_recovery":
-            return "turn_drift_recovery", f"修正風漂移後轉向（{label}）"
-        if phase == "turn_settle":
-            return "turn_settle", f"確認水平穩定後轉向（{label}）"
-        if phase == "turn_recovery_wait":
-            return "turn_recovery_wait", f"等待可靠定位與速度以修正漂移（{label}）"
-        if phase == "turn_brake" and not last.get("blocked"):
-            return "turn_brake", f"水平減速後轉向（{label}）"
-        if phase == "yaw_alignment_hold":
-            return "align_hold", f"機頭對準保持確認中（{label}）"
-        if phase == "yaw_alignment_confirmed":
-            return "aligned", f"已朝向{label}"
-        if phase == "translate":
-            return "enroute", f"前往{label}"
-        if phase == "height_adjust":
-            return "height_adjust", f"修正高度中（{label}）"
-        if phase == "route_rejoin" and not last.get("blocked"):
-            return "route_rejoin", f"回到航段中（{label}）"
-        if phase == "waypoint_centering" and not last.get("blocked"):
-            return "waypoint_centering", f"位置與高度調整中（{label}）"
-        if phase == "yaw_alignment_timeout":
-            return "align_timeout", f"對頭逾時保持（{label}）"
-        if phase == "final_centering":
-            return "final_centering", f"終點置中（{label}）"
-        if "pose jump" in lowered:
-            return "jump_pause", f"定位跳變暫停（{label}）・需人工繼續"
-        if "stick override" in lowered:
-            return "stick", f"搖桿接管懸停（{label}）"
-        if "stream" in lowered and ("stale" in lowered or "lost" in lowered):
-            return "stream", f"串流中斷懸停中（{label}）"
-        if (
-            "no fresh pose" in lowered
-            or "localization recovery" in lowered
-            or "heading unavailable" in lowered
-        ):
-            return "wait_pose", f"等定位懸停中（{label}）"
-        if "speed" in lowered:
-            return "speed_guard", f"限速懸停中（{label}）"
-        if "safety" in lowered:
-            return "safety", f"安全懸停中（{label}）"
-        if last.get("blocked"):
-            return "blocked", f"受阻懸停中（{label}）"
-        if phase == "idle":
-            return "idle_hold", f"待命中（{label}）"
-        return "hover", f"懸停中（{label}）"
+        return leg_stage(self._drawn_waypoint_label(int(target)), last)
 
     #: Coordinator phase text shown ahead of the leg stage when not on route.
     _COORDINATOR_PHASE_TEXT = {
@@ -1243,7 +1026,7 @@ class DesktopRouteAutonomy:
         if self.paused:
             action, stage_key = "自動飛行已暫停", "paused"
         try:
-            error = float(last.get("path_error_u"))
+            error = float(last.get("path_error_u", float("nan")))
             error_text = f"｜誤差{error:.2f}u" if math.isfinite(error) else ""
         except (TypeError, ValueError):
             error_text = ""

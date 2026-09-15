@@ -40,7 +40,7 @@ WORKSPACE_BINDING_ENV_KEYS = (
 P119_VIDEO = Path(
     os.environ.get(
         "SFM_P119_VIDEO",
-        str(ROOT / "模擬器/測試影片/P1190119.MP4"),
+        str(ROOT / "模擬器/測試影片/720p/P1190119_720p.MP4"),
     )
 ).expanduser()
 # ROOT_FORMAT_SCOPE defines paths checked by root_ruff_format.
@@ -94,7 +94,6 @@ RELEASE_FILES = (
     "tools/check_maintainability.py",
     "tools/export_simulator_package.py",
     "tools/package_manifest.py",
-    "tools/build_reference_index.py",
     "tools/hardware_approval_receipt.py",
     "tools/security_dependency_gate.py",
     "tools/release_contract.py",
@@ -123,20 +122,30 @@ RELEASE_FILES = (
     "控制介面程式/operator_interface/scale_free_control_adapter.py",
     "控制介面程式/site_profile.py",
     "控制介面程式/mission_manifest.py",
+    "控制介面程式/mission_pipeline.py",
+    "控制介面程式/SAFETY.md",
+    "控制介面程式/operator_interface/arming_gate.py",
+    "控制介面程式/operator_interface/operator_launch.py",
+    "控制介面程式/operator_interface/start_anafi_live.sh",
     "控制介面程式/mission_resolver.py",
     "控制介面程式/launch_mission.py",
     "控制介面程式/validate_mission_selections.py",
     "控制介面程式/validate_system_profiles.py",
     "地圖檔/場域/river_site/site_profile.json",
     "模擬器/parrot_stimulate/src/anafi_pcmd_sim/scale_free_control.py",
-    "定位演算法/deploy_code/sfm_glomap_deploy/edm_matcher.py",
-    "定位演算法/deploy_code/sfm_glomap_deploy/export_edm_onnx_flight.py",
-    "定位演算法/deploy_code/sfm_glomap_deploy/reloc_localizer_edm.py",
+    "定位演算法/deploy_code/sfm_direct_deploy/two_rate_tracker.py",
+    "定位演算法/deploy_code/sfm_direct_deploy/live_provider.py",
+    "定位演算法/deploy_code/sfm_direct_deploy/direct_localizer_adapter.py",
     "定位演算法/deploy_code/sfm_glomap_deploy/localizer_registry.py",
     "定位演算法/deploy_code/sfm_glomap_deploy/production_localizer_factory.py",
-    "定位演算法/deploy_code/sfm_glomap_deploy/reference_index.py",
+    "定位演算法/deploy_code/sfm_direct_deploy/direct_profile.py",
+    "定位演算法/deploy_code/sfm_direct_deploy/direct_map.py",
     "定位演算法/flight_control/landing_transition.py",
     "定位演算法/flight_control/localization_uncertainty.py",
+    "定位演算法/flight_control/pose_source_confirmation.py",
+    "定位演算法/deploy_code/sfm_glomap_deploy/localization_continuity.py",
+    "控制介面程式/operator_interface/operator_autonomy_status.py",
+    "控制介面程式/operator_interface/live_command_log.py",
     "定位演算法/flight_control/path_follow_flight.py",
     "定位演算法/flight_control/route_domain.py",
     "定位演算法/flight_control/real_path_follow_controller.py",
@@ -146,7 +155,7 @@ RELEASE_FILES = (
     "定位演算法/validation/check_runtime_mirrors.py",
     "執行環境/torch_hub_cache/gmberton_MegaLoc_main/hubconf.py",
     "執行環境/torch_hub_cache/gmberton_MegaLoc_main/megaloc_model.py",
-    "執行環境/torch_hub_cache/checkpoints/boq/resnet50_16384.pth",
+    "執行環境/models/boq/resnet50_16384.pth",
 )
 
 
@@ -540,6 +549,20 @@ def _steps(
             isolate_workspace=True,
         ),
         Step(
+            "sphinx_contracts",
+            (
+                str(ROOT_PYTHON),
+                "-m",
+                "pytest",
+                "-q",
+                "--timeout=60",
+                "模擬器/sphinx_anafi_path_convergence/tests",
+            ),
+            str(ROOT),
+            300,
+            isolate_workspace=True,
+        ),
+        Step(
             "parrot_pytest",
             (str(PARROT_PYTHON), "-m", "pytest", "-q"),
             str(PARROT_ROOT),
@@ -722,6 +745,7 @@ def _steps(
                     "bash",
                     str(ROOT / "tools/test_portable_runtime.sh"),
                     str(portable_package.expanduser().resolve()),
+                    "--require-site-bundle",
                 ),
                 str(ROOT),
                 3600,
@@ -926,8 +950,8 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 0
 
-    if not ROOT_PYTHON.is_file() or not PARROT_PYTHON.is_file():
-        parser.error("both pinned Python environments must exist")
+    if not ROOT_PYTHON.is_file() or (not args.smoke and not PARROT_PYTHON.is_file()):
+        parser.error("the pinned Python environments required by this tier must exist")
 
     receipt_dir.mkdir(parents=True, exist_ok=True)
     receipt_path = receipt_dir / f"validation_{stamp}.json"

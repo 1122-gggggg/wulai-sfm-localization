@@ -50,11 +50,11 @@ python tools/workspace_audit.py --strict-output-names
 route 契約後產生唯讀 site-profile snapshot。AUTO 仍須由操作員在當次 UI 完成四步
 preflight 並親自按下按鈕。
 
-AUTO 的水平輸出同時受短 TTL、`nudge_pct` 指令強度上限與 fail-closed 地速安全
-閘門保護：地速缺失／超過 0.5 秒或達閾值時只送零 PCMD；超速後降到閾值 80%
-以下才解除。這是遙測 interlock，不是物理硬速度保證。路線結束也要在新鮮地速
-不高於 0.10 m/s 才要求 Landing。AUTO worker 若 2 秒沒有 heartbeat、發生例外或
-連續三次發送失敗，會進入 `AUTO_FAILED` 並保持零輸出，不會自動續行。
+AUTO 巡航水平輸出受短 TTL 與 PCMD 百分比上限（`nudge_pct`／AUTO 自身 cap）
+保護；fail-closed 地速閘門與轉向守門已拿掉，地速缺失、過期或達閾值不再送零。
+這不是物理硬速度保證。路線完成降落仍要求新鮮地速不高於 0.10 m/s。AUTO
+worker 若 2 秒沒有 heartbeat、發生例外或連續三次發送失敗，會進入
+`AUTO_FAILED` 並保持零輸出，不會自動續行。
 
 ## 換地圖
 
@@ -172,19 +172,10 @@ Python wheelhouse 內，必須由目標電腦的離線 OS 安裝媒體預先供�
 內已收錄 PyTorch/CUDA 及所有固定 Python wheels；目標電腦的
 `install_runtime.sh --offline` 不需要 Internet。
 
-`scipy` 已固定在 runtime hash lock，讓桌面操作介面的
-`SparseCloudCollisionMonitor` 提供可調整 3D 半徑的稀疏點雲近接懸停互鎖。
-未開始定位時，地圖中心的模擬相機與半徑圈只做預覽；取得新鮮有效位姿後，
-半徑內命中點雲會清除手動微移、暫停桌面 AUTO 並送零 PCMD 懸停，且不會自動恢復。
-這條 UI 輔助互鎖未接入獨立的 `RouteAutoController` 飛行入口，也不構成 production
-碰撞保護：稀疏 SfM 點雲會漏掉動態、細小、無紋理及未建圖障礙物。
-`tools/simulator_preflight.py --json` 會在
-`runtime.collision_monitor` 明確記錄 `status=available_non_production`、
-`production_safety=false` 與
-`collision_protection_claim=false`。需要此 monitor 作為 production safety 時，必須
-先完成 production safety wiring 的審查，
-再以 `--require-collision-monitor` 執行 fail-closed preflight；沒有這些證據不得
-宣稱具備 collision protection。
+`scipy` 已固定在 runtime hash lock，供診斷與 deploy 程式使用，不是碰撞保護。
+桌面操作介面不再有稀疏點雲近接懸停互鎖；路徑淨空由操作員目視與搖桿接管。
+稀疏 SfM 點雲會漏掉動態、細小、無紋理及未建圖障礙物，不得宣稱具備
+collision protection。
 
 ## 現有場域
 

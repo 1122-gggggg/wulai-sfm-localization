@@ -24,7 +24,7 @@
 6. 模擬介面的起飛、降落、懸停與微移只更新模擬狀態，永不載入 Olympe、連接真機或送出真機命令。
 7. 真機接口涵蓋連線與影像、即時定位、人工起飛／降落、人工微移、懸停、手動接管、緊急停止及人類按鈕啟動的自主路徑飛行。自主按鈕先起飛懸停，可靠定位後才移動；定位失敗時保持懸停，執行一次 MegaLoc／右轉搜尋並等待恢復或搖桿接管，不會自動降落。
 8. 地圖及路徑不建立公尺尺度，也不要求 `map_units_per_meter`。地圖座標只作定位、方向、相對路徑進度與畫面顯示。
-9. 自主路徑同時使用 backend `nudge_pct` PCMD 百分比指令上限與 fail-closed 地速安全閘門。水平 AUTO 在地速缺失／超過 0.5 s、或達設定閾值時送零並懸停；超速 latch 只在新鮮地速嚴格低於閾值 80% 後解除。這不是閉迴路速度控制或物理硬上限；真機 PCMD 響應、遙測延遲、煞停距離與風況仍須現場驗證。
+9. 自主路徑使用 backend `nudge_pct`／AUTO 自身 PCMD 百分比上限。fail-closed 地速閘門與轉向守門（達限／地速缺失／超速鎖存送零、只轉 yaw 時水平速度 >0.10 m/s 歸零）已依操作員指示拿掉。這不是閉迴路速度控制或物理硬上限；真機 PCMD 響應、遙測延遲、煞停距離與風況仍須現場驗證。
 10. 路徑由操作員避開已知障礙物。系統不宣稱具備動態避障或可靠碰撞偵測；稀疏點雲碰撞監控不是正式安全層。每條真機路徑仍須做人工現場淨空審查。
 11. 規劃路徑線預設隱藏，操作員可勾選顯示；即時定位軌跡、相機視錐及 XYZ 軸持續顯示。
 12. 河濱不是唯一場域。任何具備完整原子化 site profile 的場域都可使用。
@@ -287,13 +287,13 @@ flowchart LR
 
 1. 用 pose 到下一 waypoint／lookahead 的 map-space 向量決定方向，送出前只取單位方向。
 2. 以已校正的 map-to-body 軸向與機體 yaw 將方向轉成 body forward/right，不把 map 距離換成公尺。
-3. 平移輸出由 backend `nudge_pct` 限制 PCMD 百分比；另以新鮮機體地速作 fail-closed 上限閘門。兩者都不等於可保證的實際硬地速上限。
+3. 平移輸出由 backend `nudge_pct`／AUTO 自身 PCMD 百分比上限限制；fail-closed 地速閘門已拿掉。PCMD 百分比不等於可保證的實際硬地速上限。
 4. 每筆 autonomous desired PCMD 的有效期不得超過 0.25 s；沒有更新即歸零。
-5. 飛機地速遙測會作為上限 interlock 與降落前 gate，但不回授調節 PCMD 大小，故不宣稱形成 m/s 閉迴路；缺失或超過 0.5 s 時不得發水平非零 AUTO PCMD。
+5. 飛機地速遙測不回授調節巡航 PCMD 大小，也不再因地速缺失／過期／達閾而禁止水平 AUTO；路線完成降落仍用新鮮地速 ≤0.10 m/s 當 gate。不宣稱形成 m/s 閉迴路。
 6. waypoint arrival、route deviation、pose jump 等幾何門檻以場域 profile 的 map unit 欄位保存，不能跨場域複製。
 7. PCMD 百分比由 backend 啟動設定提供；變更後必須重新做 PCMD 響應、煞停與低高度驗證，不會暗中改寫 site profile。
 
-真機 PCMD 不是直接的 m/s 命令；production route controller 只把地速當 fail-closed interlock，不用它閉迴路調節速度。因此 UI 必須標示「地速安全閘門（非硬上限）」，不得推算或顯示成固定 m/s 保證。硬體 receipt 可選擇性留作稽核證據，不是 AUTO readiness gate。
+真機 PCMD 不是直接的 m/s 命令；fail-closed 地速閘門已依操作員指示拿掉，不用它閉迴路調節速度。UI 不得推算或顯示成固定 m/s 保證。硬體 receipt 可選擇性留作稽核證據，不是 AUTO readiness gate。
 
 ### 5.3 建圖與換圖流程
 
@@ -581,10 +581,10 @@ WEAK、LOST、stale pose 或 worker error 都不可沿用上一筆非零 autonom
 
 - 真機自主 route 實作不得繼續使用目前依賴 `map_units_per_meter` 的 continuous-polyline conversion。
 - 正式 route controller 必須和 `parrot_stimulate` 的逐點控制邏輯共用單一實作或單一權威核心，不得維護兩套 PCMD 公式。
-- map-space target vector 只提供方向；airframe ground-speed telemetry 構成 fail-closed 上限 interlock 與降落 gate，但不構成閉迴路速度調節或物理硬上限。
-- 先轉向、確認穩定、再以短時限 PCMD 平移；每次取得新 pose 後重算。
-- pose 過期、WEAK/LOST、route deviation 或 command TTL 過期都立即歸零並懸停；不因這些事件自動降落或強制切換人工。
-- 地速閾值只可在 confirmed landed 狀態修改，修改會使當次 AUTO preflight 失效；`nudge_pct` 變更同樣必須重新做 PCMD response、braking、low-altitude 與 worst-case 測試。兩者都不得標示成物理硬 m/s 上限。
+- map-space target vector 只提供方向；巡航不再以機體地速作 fail-closed 上限 interlock。路線完成降落仍可用新鮮地速當 gate，但不構成閉迴路速度調節或物理硬上限。
+- 巡航朝航點平移（可不轉機頭）；每次取得新 pose 後重算。
+- pose 過期或無新鮮估算、route deviation 或 command TTL 過期都立即歸零並懸停；視覺失敗時可用 VO／IMU 補位繼續平移。不因這些事件自動降落或強制切換人工。
+- `nudge_pct` 變更必須重新做 PCMD response、braking、low-altitude 與 worst-case 測試。不得標示成物理硬 m/s 上限。
 - 路線完成後只有新鮮地速 ≤0.10 m/s 才要求 Landing；地速缺失、過期或較高時維持零 PCMD 懸停並於下一控制 tick 重試。
 
 ### 10.4 故障策略
@@ -592,9 +592,9 @@ WEAK、LOST、stale pose 或 worker error 都不可沿用上一筆非零 autonom
 | 故障 | 立即動作 | 後續狀態 | 自動恢復 AUTO |
 |---|---|---|---|
 | 影像 stale／中斷 | 清除 desired PCMD、送零、懸停並暫停 AUTO | 等待恢復、操作員繼續 AUTO 或搖桿接管 | 僅由操作員繼續 |
-| 定位 WEAK／LOST／pose stale | 同上；停止使用舊 pose，執行一次 MegaLoc／右轉搜尋 | AUTO 保持懸停等待定位恢復或搖桿接管 | 定位恢復後可續行 |
+| 定位 WEAK／LOST／pose stale | 無新鮮估算則送零懸停；已鎖過後 VO／IMU 補位可繼續平移 | 跳變 >1.5 u 須操作員繼續；搖桿可接管 | 有新鮮估算即可續行 |
 | AUTO worker 例外／stall（2 s 無 heartbeat）／連續三次 PCMD 失敗 | 獨立 watchdog 先歸零並鎖存 `AUTO_FAILED` | 路線終止；保留連線供操作員停止電腦動作、降落或接管 | 否，須人工處置／重啟 |
-| 地速缺失／超過 0.5 s／達安全閘門 | 清除水平 desired PCMD、送零並懸停；超速狀態 latch | 新鮮地速嚴格低於閾值 80% 後才解除 latch | 控制迴圈可續行，但不宣稱硬限速 |
+| 地速缺失／過期／達舊安全閘門閾值 | 巡航不因此送零；PCMD 百分比上限仍在 | 路線完成降落仍等新鮮地速 ≤0.10 m/s | 不適用 |
 | UI freeze／focus loss | nudge heartbeat/desired PCMD TTL 到期歸零 | 手動或 hover | 否 |
 | SkyController stick movement | 立即停止 PC PCMD並交回 sticks | SkyController manual | 否 |
 | PC 與 SkyController/aircraft 完全斷線 | 主機停止假設可控；機載懸停／重連 | GPS+Home 有效逾時 RTH；否則經驗證的受控降落 | 否 |
@@ -725,7 +725,7 @@ stateDiagram-v2
 | safety command observation-to-zero | ≤100 ms | 由獨立 safety log 驗證；不含故障偵測門檻 |
 | pose freshness cutoff | ≤500 ms | 過期即不得控制 |
 | stream stale cutoff | ≤750 ms | 過期即送零並 hover；不自動降落或強制切人工 |
-| AUTO ground-speed freshness | ≤500 ms | 缺失或過期即禁止水平非零 AUTO PCMD |
+| AUTO ground-speed freshness | ≤500 ms | 巡航不因地速缺失／過期送零；路線完成降落仍要求新鮮地速 ≤0.10 m/s |
 | AUTO worker heartbeat timeout | 2.0 s | 超時即 `AUTO_FAILED`、送零且不可自動續行 |
 | nudge deadman | ≤250 ms | UI freeze/release 後必須歸零 |
 
@@ -795,7 +795,7 @@ stateDiagram-v2
 - model/checkpoint/bundle/profile/route/reference poses/map manifest 在載入前驗 SHA-256。
 - Python 安裝資產由 `WHEELHOUSE.json` 綁定 runtime/test/quality 三份 lockfile
   與每個 wheel 的 size/SHA-256；正式 portable 安裝強制 `--no-index`。
-- 稀疏點雲近接互鎖（`SparseCloudCollisionMonitor`）已於 2026-09-12 依操作員指示移除，
+- 稀疏點雲近接互鎖（`SparseCloudCollisionMonitor`）已於 2026-09-15 依操作員指示移除，
   不再有點雲碰撞懸停、半徑設定或 `--require-collision-monitor`。障礙物迴避回到操作員
   目視與手動接管。
 - PyTorch artifact 優先使用 `weights_only=True`、受限 safe globals 及 schema validation。任何仍使用 unrestricted pickle 的維護工具必須先驗 SHA，且不得進 production startup path。

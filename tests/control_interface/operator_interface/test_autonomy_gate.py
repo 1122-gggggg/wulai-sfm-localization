@@ -14,6 +14,8 @@ import arming_gate as rs
 def _good() -> dict:
     """A snapshot in which autonomy may legitimately be armed."""
     return {
+        "mission_flight_ready": True,
+        "mission_evaluation_only": False,
         "autonomous_locked": False,
         "autonomous_approval_valid": True,
         "localizer_ready": True,
@@ -35,6 +37,8 @@ def test_all_localization_conditions_good_allows_arming():
 
 
 @pytest.mark.parametrize("field,bad,expect", [
+    ("mission_flight_ready", False, "mission"),
+    ("mission_evaluation_only", True, "evaluation-only"),
     ("autonomous_locked", True, "locked"),
     ("autonomous_approval_valid", False, "approval"),
     ("localizer_ready", False, "localizer worker"),
@@ -59,7 +63,7 @@ def test_each_localization_condition_blocks_autonomy(field, bad, expect):
 @pytest.mark.parametrize("missing", [
     "pose_age_s", "inliers", "reproj_rms", "consecutive_good_fixes",
     "loc_state", "localizer_ready", "profile_verified",
-    "autonomous_locked", "autonomous_approval_valid",
+    "autonomous_locked", "autonomous_approval_valid", "mission_flight_ready",
 ])
 def test_unknown_evidence_fails_closed(missing):
     """A gate that cannot see the evidence must not conclude the evidence is good."""

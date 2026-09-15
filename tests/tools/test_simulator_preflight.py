@@ -8,11 +8,11 @@ import pytest
 import simulator_preflight
 
 
-def test_preflight_accepts_a_complete_profile_and_video(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_preflight_accepts_a_complete_profile_and_video(tmp_path: Path, monkeypatch) -> None:
     root = Path(__file__).resolve().parents[2]
     profile = root / "地圖檔/場域/river_site/site_profile.json"
+    if not profile.is_file():
+        pytest.skip("requires private river site bundle")
     video = tmp_path / "replay.mp4"
     video.write_bytes(b"not-a-real-video")
     monkeypatch.setattr(
@@ -57,9 +57,7 @@ def test_preflight_reports_missing_profile_and_video(tmp_path: Path) -> None:
     assert any("scale-free control core" in item for item in report["failures"])
 
 
-def test_preflight_rejects_route_digest_mismatch(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_preflight_rejects_route_digest_mismatch(tmp_path: Path, monkeypatch) -> None:
     root = Path(__file__).resolve().parents[2]
     route = tmp_path / "route.json"
     route.write_text("{}", encoding="utf-8")
@@ -78,9 +76,7 @@ def test_preflight_rejects_route_digest_mismatch(
         "_check_video",
         lambda _video, _failures: {"duration_s": "1"},
     )
-    monkeypatch.setattr(
-        "site_profile.load_site_profile", lambda _path: profile
-    )
+    monkeypatch.setattr("site_profile.load_site_profile", lambda _path: profile)
 
     report = simulator_preflight.run_preflight(
         root=root,
@@ -90,20 +86,12 @@ def test_preflight_rejects_route_digest_mismatch(
     )
 
     assert not report["ok"]
-    assert any(
-        "route_json SHA-256 mismatch" in item
-        for item in report["failures"]
-    )
+    assert any("route_json SHA-256 mismatch" in item for item in report["failures"])
 
 
-def test_preflight_requires_authoritative_scale_free_core(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_preflight_requires_authoritative_scale_free_core(tmp_path: Path, monkeypatch) -> None:
     root = tmp_path
-    profile = (
-        Path(__file__).resolve().parents[2]
-        / "地圖檔/場域/river_site/site_profile.json"
-    )
+    profile = Path(__file__).resolve().parents[2] / "地圖檔/場域/river_site/site_profile.json"
     video = tmp_path / "replay.mp4"
     video.write_bytes(b"not-a-real-video")
     monkeypatch.setattr(
@@ -117,9 +105,7 @@ def test_preflight_requires_authoritative_scale_free_core(
     assert any("scale-free control core" in item for item in report["failures"])
 
 
-def test_preflight_rejects_runtime_environment_mismatch(
-    monkeypatch, tmp_path: Path
-) -> None:
+def test_preflight_rejects_runtime_environment_mismatch(monkeypatch, tmp_path: Path) -> None:
     root = Path(__file__).resolve().parents[2]
     profile = root / "地圖檔/場域/river_site/site_profile.json"
     monkeypatch.setenv("SFM_WORKSPACE_ROOT", str(tmp_path))
@@ -129,9 +115,7 @@ def test_preflight_rejects_runtime_environment_mismatch(
     assert any("SFM_WORKSPACE_ROOT" in item for item in failures)
 
 
-def test_preflight_does_not_treat_system_python_as_the_venv(
-    monkeypatch, tmp_path: Path
-) -> None:
+def test_preflight_does_not_treat_system_python_as_the_venv(monkeypatch, tmp_path: Path) -> None:
     root = Path(__file__).resolve().parents[2]
     profile = root / "地圖檔/場域/river_site/site_profile.json"
     venv_python = tmp_path / ".venv/bin/python"
@@ -147,21 +131,15 @@ def test_preflight_does_not_treat_system_python_as_the_venv(
     assert any("SFM_UI_PYTHON" in item for item in failures)
 
 
-def test_preflight_rejects_system_site_packages_venv(
-    monkeypatch, tmp_path: Path
-) -> None:
+def test_preflight_rejects_system_site_packages_venv(monkeypatch, tmp_path: Path) -> None:
     root = Path(__file__).resolve().parents[2]
     profile = root / "地圖檔/場域/river_site/site_profile.json"
-    (tmp_path / "pyvenv.cfg").write_text(
-        "include-system-site-packages = true\n"
-    )
+    (tmp_path / "pyvenv.cfg").write_text("include-system-site-packages = true\n")
     monkeypatch.setattr(simulator_preflight.sys, "prefix", str(tmp_path))
     failures: list[str] = []
     runtime: dict[str, object] = {}
 
-    simulator_preflight._check_environment_contract(
-        root, profile, failures, runtime
-    )
+    simulator_preflight._check_environment_contract(root, profile, failures, runtime)
 
     assert runtime["system_site_packages"] is True
     assert any("include-system-site-packages=true" in item for item in failures)

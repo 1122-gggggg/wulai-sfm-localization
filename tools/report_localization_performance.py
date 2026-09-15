@@ -276,30 +276,7 @@ def build_session_report(
         if row.get("event") == "ui_tick_profile"
     ]
 
-    missing_identity = 0
-    hold_retry = 0
-    duplicate = 0
-    missing_clock = 0
-    seen: set[tuple[Any, Any]] = set()
-    counted: list[tuple[float, dict[str, Any]]] = []
-    for row in loc_rows:
-        if row.get("display_seq") is None:
-            missing_identity += 1
-            continue
-        if row.get("hold_retry") is True:
-            hold_retry += 1
-            continue
-        key = (row.get("display_seq"), row.get("frame_name"))
-        if key in seen:
-            duplicate += 1
-            continue
-        seen.add(key)
-        stamp = _row_clock(row)
-        if stamp is None:
-            missing_clock += 1
-            continue
-        counted.append((stamp, row))
-    counted.sort(key=lambda item: item[0])
+    counted, missing_identity, hold_retry, duplicate, missing_clock = _count_pose_rows(loc_rows)
 
     source = _resolve_source(manifest)
     nominal = nominal_override
@@ -333,18 +310,7 @@ def build_session_report(
 
     # Thin data: still return a report, but mark it insufficient so the
     # caller exits 3 and never reports a pass.
-    insufficient: str | None = None
-    if nominal is None:
-        insufficient = "no nominal fps (unknown source, pass --nominal-fps)"
-    elif not counted:
-        insufficient = "no counted rows after warmup-independent filtering"
-    else:
-        first_t = counted[0][0]
-        full_windows = int((counted[-1][0] - first_t - warmup_s) // window_s)
-        if full_windows < 1:
-            insufficient = "fewer than 1 full window after warmup"
-        elif len(counted) > 0 and missing_clock > MAX_MISSING_CLOCK_RATIO * len(counted):
-            insufficient = "missing_clock_rows exceed 5% of counted rows"
+    insufficient = _insufficient_samples(nominal, counted, warmup_s, window_s, missing_clock)
 
     if insufficient is not None or not counted:
         return {
@@ -414,9 +380,11 @@ def build_session_report(
     # reloc_ms persists in last_info between deliveries. Count each completed
     # job once, rather than weighting its runtime by the following frame count.
     reloc_times = [
-        value for _, row in counted
+        value
+        for _, row in counted
         if row.get("reloc_delivered") is True
-        and (value := _finite(row.get("reloc_ms"))) is not None and value >= 0.0
+        and (value := _finite(row.get("reloc_ms"))) is not None
+        and value >= 0.0
     ]
     latency["reloc_ms"] = {
         "samples": len(reloc_times),
@@ -430,7 +398,8 @@ def build_session_report(
         status = row.get("direct_status") or "UNKNOWN"
         status_counts[str(status)] = status_counts.get(str(status), 0) + 1
     map_ages = [
-        value for _, row in counted
+        value
+        for _, row in counted
         if (value := _finite(row.get("map_constraint_age_s"))) is not None and value >= 0.0
     ]
     reproj = [v for _, r in counted if (v := _finite(r.get("reproj_rms"))) is not None]
@@ -545,6 +514,52 @@ def main(argv: list[str] | None = None) -> int:
     if all(rep["acceptance"]["pass"] for rep in reports):
         return 0
     return 1
+
+
+def _count_pose_rows(loc_rows):
+    missing_identity = 0
+    hold_retry = 0
+    duplicate = 0
+    missing_clock = 0
+    seen: set[tuple[Any, Any]] = set()
+    counted: list[tuple[float, dict[str, Any]]] = []
+    for row in loc_rows:
+        if row.get("display_seq") is None:
+            missing_identity += 1
+            continue
+        if row.get("hold_retry") is True:
+            hold_retry += 1
+            continue
+        key = (row.get("display_seq"), row.get("frame_name"))
+        if key in seen:
+            duplicate += 1
+            continue
+        seen.add(key)
+        stamp = _row_clock(row)
+        if stamp is None:
+            missing_clock += 1
+            continue
+        counted.append((stamp, row))
+    counted.sort(key=lambda item: item[0])
+
+    return counted, missing_identity, hold_retry, duplicate, missing_clock
+
+
+def _insufficient_samples(nominal, counted, warmup_s, window_s, missing_clock):
+    insufficient: str | None = None
+    if nominal is None:
+        insufficient = "no nominal fps (unknown source, pass --nominal-fps)"
+    elif not counted:
+        insufficient = "no counted rows after warmup-independent filtering"
+    else:
+        first_t = counted[0][0]
+        full_windows = int((counted[-1][0] - first_t - warmup_s) // window_s)
+        if full_windows < 1:
+            insufficient = "fewer than 1 full window after warmup"
+        elif len(counted) > 0 and missing_clock > MAX_MISSING_CLOCK_RATIO * len(counted):
+            insufficient = "missing_clock_rows exceed 5% of counted rows"
+
+    return insufficient
 
 
 if __name__ == "__main__":

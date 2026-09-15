@@ -65,8 +65,15 @@ def test_logged_error_needs_no_recomputation(tmp_path: Path) -> None:
         _tick(1, yaw_error_deg=11.0, pcmd_phase="translate"),
     ]
     report = bundle.analyze_session(
-        _write(tmp_path, {"localization.jsonl": ticks, "commands.jsonl": [],
-                           "telemetry.jsonl": [], "incidents.jsonl": []})
+        _write(
+            tmp_path,
+            {
+                "localization.jsonl": ticks,
+                "commands.jsonl": [],
+                "telemetry.jsonl": [],
+                "incidents.jsonl": [],
+            },
+        )
     )
     assert report["turn_gate"]["logged_error_ticks"] == 2
     assert report["turn_gate"]["recomputed_error_ticks"] == 0
@@ -91,18 +98,27 @@ def test_crossing_angle_wrap_is_not_a_large_fusion_jump():
 
 
 def test_planned_target_change_is_separated_from_position_drift():
-    rows = [_tick(0, target_index=0, yaw_target_deg=0),
-            _tick(1, target_index=1, yaw_target_deg=90)]
-    assert bundle.analyze_heading_reconciliation(rows)["verdict"] == "multiple_targets_review_per_leg"
-    assert [target["target_index"] for target in bundle.analyze_auto_runs(rows)[0]["targets"]] == [0, 1]
+    rows = [_tick(0, target_index=0, yaw_target_deg=0), _tick(1, target_index=1, yaw_target_deg=90)]
+    assert (
+        bundle.analyze_heading_reconciliation(rows)["verdict"] == "multiple_targets_review_per_leg"
+    )
+    assert [target["target_index"] for target in bundle.analyze_auto_runs(rows)[0]["targets"]] == [
+        0,
+        1,
+    ]
 
 
-@pytest.mark.parametrize("action,phase,verdict", [
-    ("final path reached -> LAND", "idle", "ROUTE_FINAL_REACHED"),
-    ("REJOIN", "route_rejoin", "POSITION_CORRECTION_ACTIVE"),
-    ("FOLLOW", "height_adjust", "POSITION_CORRECTION_ACTIVE"),
-])
-def test_arrival_and_position_repair_are_not_reported_as_failed_turns(tmp_path, action, phase, verdict):
+@pytest.mark.parametrize(
+    "action,phase,verdict",
+    [
+        ("final path reached -> LAND", "idle", "ROUTE_FINAL_REACHED"),
+        ("REJOIN", "route_rejoin", "POSITION_CORRECTION_ACTIVE"),
+        ("FOLLOW", "height_adjust", "POSITION_CORRECTION_ACTIVE"),
+    ],
+)
+def test_arrival_and_position_repair_are_not_reported_as_failed_turns(
+    tmp_path, action, phase, verdict
+):
     session = _write(tmp_path, {"localization.jsonl": [_tick(0, action=action, pcmd_phase=phase)]})
     assert bundle.analyze_session(session)["verdict"] == verdict
 
@@ -128,12 +144,18 @@ def test_error_only_in_band_is_not_convergence(tmp_path: Path) -> None:
     ticks = [
         _tick(0, pcmd_phase="turn", pcmd=[0, 0, -16, 0]),
         _tick(1, pcmd_phase="turn", pcmd=[0, 0, -16, 0]),
-        _tick(2, pcmd_phase="translate", pcmd=[0, 3, 0, 1],
-              yaw_error_deg=12.0),
+        _tick(2, pcmd_phase="translate", pcmd=[0, 3, 0, 1], yaw_error_deg=12.0),
     ]
     report = bundle.analyze_session(
-        _write(tmp_path, {"localization.jsonl": ticks, "commands.jsonl": [],
-                           "telemetry.jsonl": [], "incidents.jsonl": []})
+        _write(
+            tmp_path,
+            {
+                "localization.jsonl": ticks,
+                "commands.jsonl": [],
+                "telemetry.jsonl": [],
+                "incidents.jsonl": [],
+            },
+        )
     )
     assert report["turn_gate"]["convergence"]["tick"] == 2
     assert report["turn_gate"]["final_phase"] == "translate"
@@ -145,8 +167,15 @@ def test_regressed_leg_is_not_converged(tmp_path: Path) -> None:
         _tick(1, pcmd_phase="turn", pcmd=[0, 0, -50, 0]),
     ]
     report = bundle.analyze_session(
-        _write(tmp_path, {"localization.jsonl": ticks, "commands.jsonl": [],
-                           "telemetry.jsonl": [], "incidents.jsonl": []})
+        _write(
+            tmp_path,
+            {
+                "localization.jsonl": ticks,
+                "commands.jsonl": [],
+                "telemetry.jsonl": [],
+                "incidents.jsonl": [],
+            },
+        )
     )
     assert report["turn_gate"]["convergence"]["tick"] == 0
     assert report["turn_gate"]["final_phase"] == "turn"
@@ -162,8 +191,15 @@ def test_drift_splits_auto_from_manual_by_piloting_source(tmp_path: Path) -> Non
     ]
     commands = [_source(99.0, "Controller"), _source(101.5, "SkyController")]
     report = bundle.analyze_session(
-        _write(tmp_path, {"localization.jsonl": [], "commands.jsonl": commands,
-                           "telemetry.jsonl": telemetry, "incidents.jsonl": []})
+        _write(
+            tmp_path,
+            {
+                "localization.jsonl": [],
+                "commands.jsonl": commands,
+                "telemetry.jsonl": telemetry,
+                "incidents.jsonl": [],
+            },
+        )
     )
     assert report["verdict"] == "NO_AUTO"
     assert report["drift"]["gps_excursion_auto_m"] == 0.0
@@ -175,13 +211,19 @@ def test_heading_reconciliation_names_bearing_walk(tmp_path: Path) -> None:
     # Hold the nose fixed while the position walks sideways past the target:
     # the target bearing sweeps >10 deg while the fusion offset holds.
     ticks = [
-        _tick(s, pose_u=[0.0, 0.0, s * 0.05],
-              heading_deg=0.0, imu_yaw_ned_rad=math.pi / 2.0)
+        _tick(s, pose_u=[0.0, 0.0, s * 0.05], heading_deg=0.0, imu_yaw_ned_rad=math.pi / 2.0)
         for s in range(10)
     ]
     report = bundle.analyze_session(
-        _write(tmp_path, {"localization.jsonl": ticks, "commands.jsonl": [],
-                           "telemetry.jsonl": [], "incidents.jsonl": []})
+        _write(
+            tmp_path,
+            {
+                "localization.jsonl": ticks,
+                "commands.jsonl": [],
+                "telemetry.jsonl": [],
+                "incidents.jsonl": [],
+            },
+        )
     )
     assert report["heading"]["verdict"] == "target_bearing_walk_position_drift"
     assert report["heading"]["offset_walk_deg"] < 2.0

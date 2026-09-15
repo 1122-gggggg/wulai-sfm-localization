@@ -1,5 +1,7 @@
 # Sphinx / ANAFI Smoke Test - 2026-07-02
 
+> **HISTORICAL，2026-09-15 封存說明。** 下文為舊後端／環境的紀錄，包含已刪除腳本與舊路徑，不可當作現行操作或驗證指令。現行 DIRECT 只有受限的 fused-yaw bridge，沒有 ESEKF。請參照 [現行離線驗證](../docs/direct_offline_validation.md)。
+
 ## Installed Components
 
 - `parrot-sphinx`: 2.25.2-1+ubuntu+noble

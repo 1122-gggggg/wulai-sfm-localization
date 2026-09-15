@@ -83,6 +83,7 @@ if str(FLIGHT_ROOT) not in sys.path:
 if DEPLOY_ROOT.is_dir() and str(DEPLOY_ROOT) not in sys.path:
     sys.path.append(str(DEPLOY_ROOT))
 
+from pose_source_confirmation import PoseSourceConfirmation
 from localization_uncertainty import (  # noqa: E402
     LocalizationState,
     decide_localization_transition,
@@ -256,7 +257,6 @@ LOW_CONF_JUMP_HOVER_COUNT = _env_int("SFM_LOW_CONF_JUMP_HOVER_COUNT", 3, minimum
 # for one extra consecutive strong fix when the step exceeds this multiple of
 # the active arrival sphere. The fix still updates the pose continuity
 # reference; only motion waits one tick.
-RELOCALIZE_SETTLE_SPHERES = _env_float("SFM_RELOCALIZE_SETTLE_SPHERES", 2.0, minimum=1.0, maximum=100.0)
 # If the control loop stalls longer than this (model/GPU hang), a helper thread
 # forces zero PCMD so the drone hovers instead of holding the last command.
 WATCHDOG_LAND_S = _env_float("SFM_WATCHDOG_LAND_S", 5.0, minimum=0.5, maximum=120.0)
@@ -907,6 +907,9 @@ class LoopHooks:
         None  # atomic ((r,p,y,g)) -> (sent, reason, actual_pcmd)
     )
     pose_is_weak: callable | None = None  # () -> bool; True if the last fix was a WEAK track
+    pose_is_predicted: callable | None = None  # () -> bool; IMU guess with no visual success
+    pose_source_pending: callable | None = None  # UI-held candidate; never use holdover.
+    pose_reseed_confirming: callable | None = None  # () -> bool; weak only to confirm a RELOC_SEED
     pose_confidence: callable | None = (
         None  # () -> int; last-fix PnP inliers (low -> hover + relocalize)
     )
@@ -1792,7 +1795,7 @@ class _FlightLoopRunner:
         self.pose_jump_pause_latched = False
         self.pose_jump_pause_observed = False
         self.pose_jump_resume_authorized = False
-        self.relocalize_settle_pending = False
+        self.source_confirmation = PoseSourceConfirmation()
         self.steps = 0
         search_pcmd = hooks.localization_yaw_search_pcmd
         if (
@@ -2248,7 +2251,8 @@ class _FlightLoopRunner:
             and float(pose.stamp) > float(self.pending_jump_stamp)
         )
         confirmed = (
-            independent and float(np.linalg.norm(candidate - self.pending_jump)) <= MAX_POSE_JUMP_U
+            independent and float(np.linalg.norm(candidate - self.pending_jump))
+            <= (self._settle_radius() or MAX_POSE_JUMP_U)
         )
         if (
             confirmed
@@ -2258,6 +2262,7 @@ class _FlightLoopRunner:
             self.pending_jump = None
             self.pending_jump_stamp = None
             self.accepted_pose_history.clear()
+            record["jump_confirmed"] = True
             self.pose_jump_resume_authorized = False
             self.pose_jump_pause_observed = False
             if self.verbose:
@@ -2299,35 +2304,8 @@ class _FlightLoopRunner:
             return None
         return radius
 
-    def _arm_relocalize_settle(self, *, pose, fresh: bool, low_confidence: bool,
-                               was_uncertain: bool, previous_good, record: dict) -> None:
-        if not (fresh and was_uncertain and not low_confidence):
-            return
-        if previous_good is None:
-            return
-        try:
-            step = float(np.linalg.norm(
-                np.array([pose.x, pose.y, pose.z], float)
-                - np.array([previous_good.x, previous_good.y, previous_good.z], float)
-            ))
-        except (AttributeError, TypeError, ValueError):
-            return
-        radius = self._settle_radius()
-        if radius is None:
-            return
-        if step > RELOCALIZE_SETTLE_SPHERES * radius:
-            self.relocalize_settle_pending = True
-            record["relocalize_settle_armed"] = True
-            record["relocalize_step_u"] = round(step, 3)
-
-    def _consume_relocalize_settle(self, record: dict) -> bool:
-        if not self.relocalize_settle_pending:
-            return False
-        self.relocalize_settle_pending = False
-        self._reset_pcmd_controller()
-        _sent, _why, actual = self._send_command((0, 0, 0, 0))
-        self._emit(record, actual, True, "relocalized step pending confirmation -> hover")
-        record["relocalize_settle_hold"] = True
+    def _confirm_pose_source(self, pose, fresh: bool, low_confidence: bool,
+                             record: dict) -> bool:
         return True
 
     def _accepted_pose(self, pose, now: float, record: dict):
@@ -2339,6 +2317,8 @@ class _FlightLoopRunner:
             )
         self._record_pose(pose, now, finite, record)
         fresh = bool(finite and -0.05 <= now - pose.stamp <= POSE_STALE_S)
+        if not fresh:
+            self.source_confirmation.interrupt()
         if (
             fresh
             and self.last_good is not None
@@ -2352,20 +2332,16 @@ class _FlightLoopRunner:
         candidate_low_confidence = self._is_low_confidence(fresh, fresh)
         if fresh and self.hooks.max_weak_pose_age_s is not None:
             candidate_low_confidence |= self._map_constraint_expired(now, record)
-        was_uncertain = self.uncertainty.uncertain_since is not None
-        pre_update_good = self.last_good
         fresh, jump_rejected = self._apply_jump_gate(
-            pose,
-            fresh,
-            candidate_low_confidence,
-            now,
-            record,
+            pose, fresh, candidate_low_confidence, now, record,
         )
-        self._arm_relocalize_settle(
-            pose=pose, fresh=fresh, low_confidence=candidate_low_confidence,
-            was_uncertain=was_uncertain, previous_good=pre_update_good,
-            record=record,
-        )
+        if record.get("jump_confirmed"):
+            self.source_confirmation = PoseSourceConfirmation()
+        if fresh and not self._confirm_pose_source(
+            pose, fresh, candidate_low_confidence, record
+        ):
+            fresh = False
+            jump_rejected = True  # No holdover while a new source is pending.
         new_visual_fix = fresh
         low_confidence = bool(fresh and candidate_low_confidence)
         if not fresh and (
@@ -2389,13 +2365,33 @@ class _FlightLoopRunner:
                 low_confidence |= self._map_constraint_expired(now, record, from_holdover=True)
         return pose, fresh, new_visual_fix, low_confidence
 
+    def _pose_is_predicted(self) -> bool:
+        hook = self.hooks.pose_is_predicted
+        if hook is None:
+            return False
+        try:
+            return bool(hook())
+        except Exception:
+            return False
+
     def _map_constraint_expired(self, now: float, record: dict, *, from_holdover=False) -> bool:
         assert self.hooks.max_weak_pose_age_s is not None
+        predicted = self._pose_is_predicted()
         weak = from_holdover or (self.hooks.pose_is_weak is not None and self.hooks.pose_is_weak())
-        record["map_pose_confirmed"] = not weak
+        record["map_pose_confirmed"] = not weak and not predicted
+        if predicted:
+            record["pose_source_predicted"] = True
         age = None if self.last_map_pose_stamp is None else now - self.last_map_pose_stamp
         record["map_constraint_age_s"] = age
-        if not weak:
+        if not weak and not predicted:
+            return False
+        # Desktop AUTO (weak gate off): after a visual lock, VO / dead-reckon /
+        # IMU fill-in may keep translating. They still cannot start the route
+        # with no map stamp, and a stale pose stamp is rejected elsewhere.
+        if predicted or not self.enforce_weak_pose_gate:
+            if self.last_map_pose_stamp is None:
+                record["map_constraint_expired"] = True
+                return True
             return False
         expired = age is None or age > self.hooks.max_weak_pose_age_s
         record["map_constraint_expired"] = expired
@@ -2403,11 +2399,9 @@ class _FlightLoopRunner:
         return expired or self.uncertainty.uncertain_since is not None
 
     def _is_low_confidence(self, fresh: bool, new_visual_fix: bool) -> bool:
-        weak = (
-            self.enforce_weak_pose_gate
-            and self.hooks.pose_is_weak is not None
-            and self.hooks.pose_is_weak()
-        )
+        if self._pose_is_predicted() or not self.enforce_weak_pose_gate:
+            return False
+        weak = self.hooks.pose_is_weak is not None and self.hooks.pose_is_weak()
         few_inliers = (
             self.hooks.pose_confidence is not None
             and self.hooks.pose_confidence() < LOW_CONF_INLIERS
@@ -2416,6 +2410,8 @@ class _FlightLoopRunner:
 
     @staticmethod
     def _uncertainty_reason(low_confidence: bool, record: dict) -> str:
+        if record.get("pose_source_confirming"):
+            return "pose source pending confirmation"
         if record.get("map_constraint_expired"):
             return "map constraint expired"
         if low_confidence:
@@ -2468,29 +2464,13 @@ class _FlightLoopRunner:
             return None
         return yaw if math.isfinite(yaw) else None
 
-    def _localization_yaw_search_outcome(
-        self,
-        *,
-        now: float,
-        waited: float,
-        olympe_yaw,
-        fresh: bool,
-        record: dict,
-    ) -> _LoopOutcome | None:
-        if self.localization_yaw_search_pcmd <= 0:
-            return None
-        if self.localization_yaw_search_completed:
-            return None
-        if fresh and not self.localization_yaw_search_active:
-            return None
-
-        yaw = self._finite_yaw(olympe_yaw)
+    def _update_localization_search_yaw(self, yaw, now, waited, record) -> bool:
         if not self.localization_yaw_search_active:
             if waited < LOST_YAW_SEARCH_DELAY_S:
-                return None
+                return False
             if yaw is None:
                 record["localization_yaw_search"] = "yaw_telemetry_unavailable"
-                return None
+                return False
             self.localization_yaw_search_active = True
             self.localization_yaw_search_started_at = now
             self.localization_yaw_search_last_yaw = yaw
@@ -2502,7 +2482,7 @@ class _FlightLoopRunner:
             progress_deg = math.degrees(self.localization_yaw_search_accumulated_rad)
             record["localization_yaw_search"] = "yaw_telemetry_lost"
             self._notify_localization_yaw_search("yaw_telemetry_lost", progress_deg)
-            return None
+            return False
         else:
             previous = self.localization_yaw_search_last_yaw
             if previous is not None:
@@ -2512,6 +2492,30 @@ class _FlightLoopRunner:
                     self.localization_yaw_search_accumulated_rad + delta,
                 )
             self.localization_yaw_search_last_yaw = yaw
+
+        return True
+
+    def _localization_yaw_search_outcome(
+        self,
+        *,
+        now: float,
+        waited: float,
+        olympe_yaw,
+        fresh: bool,
+        record: dict,
+    ) -> _LoopOutcome | None:
+        if self.source_confirmation.needs_confirmation or record.get("pose_source_confirming"):
+            return None
+        if self.localization_yaw_search_pcmd <= 0:
+            return None
+        if self.localization_yaw_search_completed:
+            return None
+        if fresh and not self.localization_yaw_search_active:
+            return None
+
+        yaw = self._finite_yaw(olympe_yaw)
+        if not self._update_localization_search_yaw(yaw, now, waited, record):
+            return None
 
         progress_deg = math.degrees(self.localization_yaw_search_accumulated_rad)
         if self.localization_yaw_search_accumulated_rad >= LOST_YAW_SEARCH_TARGET_RAD:
@@ -2562,7 +2566,6 @@ class _FlightLoopRunner:
             self._reset_pcmd_controller()
             if self._recovery_target is None and self.ctrl is not None:
                 self._recovery_target = int(self.ctrl.target_index)
-                self.ctrl.reset_arrival_confirmation()
             record["target_index"] = self._recovery_target
             record["localization_recovery_state"] = "waiting"
             waited = float(transition.waited_s)
@@ -2615,17 +2618,12 @@ class _FlightLoopRunner:
             target = self._recovery_target
             self._recovery_target = None
             self._last_relocalize_request = None
-            self.ctrl.reset_arrival_confirmation()
             self._reset_pcmd_controller()
             self._reset_localization_yaw_search("recovered")
             record.update(target_index=target, localization_recovery_state="recovered")
             _sent, _why, actual = self._send_command((0, 0, 0, 0))
             self._emit(record, actual, True,
                        f"localization recovered; holding before resuming waypoint {target + 1}")
-            # A VO bridge's drift arrives as one step on this same fix; the
-            # recovery hover above already held, so this extra settle tick only
-            # fires when the step is large relative to the arrival sphere.
-            self._consume_relocalize_settle(record)
             return _LoopOutcome()
         if transition.action != "recovery_hover":
             return None
@@ -2924,6 +2922,10 @@ class _FlightLoopRunner:
             map_confirmed=(
                 self.hooks.pose_is_weak is None or not self.hooks.pose_is_weak()
             ),
+            reseed_confirming=(
+                self.hooks.pose_reseed_confirming is not None
+                and bool(self.hooks.pose_reseed_confirming())
+            ),
         )
         record["pose_u"] = [
             round(float(pose.x), 4),
@@ -2950,6 +2952,7 @@ class _FlightLoopRunner:
         pcmd = self._compute_route_pcmd(command, pose, now)
         record["pcmd_phase"] = self.pcmd_controller.phase
         record["map_confirmed"] = pose.map_confirmed
+        record["reseed_confirming"] = pose.reseed_confirming
         record["yaw_confirmation_count"] = self.pcmd_controller.confirmation_count
         record["yaw_alignment_windows"] = self.pcmd_controller.alignment_windows
         record["yaw_alignment_age_s"] = (
@@ -3070,9 +3073,11 @@ def build_controller(*, require_approved: bool = True):
         )
         waypoints = snapshot.controller_waypoints()
         route_source = snapshot
-    config = rpf.config_for_route(
-        route_source,
-        rpf.production_auto_control_config(map_frame),
+    config = rpf.apply_desktop_auto_authority(
+        rpf.config_for_route(
+            route_source,
+            rpf.production_auto_control_config(map_frame),
+        )
     )
     return rpf.RouteAutoController(waypoints, poles=[], config=config), waypoints
 
@@ -3282,6 +3287,9 @@ def _make_live_loop_hooks(
     return LoopHooks(
         get_pose=localizer.get_pose,
         pose_is_weak=lambda: bool(dict(localizer.last_info).get("weak", False)),
+        pose_reseed_confirming=lambda: bool(
+            dict(localizer.last_info).get("reseed_confirming", False)
+        ),
         pose_confidence=lambda: int(dict(localizer.last_info).get("inliers", 0) or 0),
         force_relocalize=lambda: setattr(localizer.state, "mode", "LOST"),
         request_manual=request_manual,

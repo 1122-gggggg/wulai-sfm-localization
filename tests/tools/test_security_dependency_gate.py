@@ -183,11 +183,14 @@ expires = "2027-02-09"
     )
 
     exceptions = load_skip_exceptions(config)
-    assert evaluate_skipped_dependencies(
-        [SkippedDependency("torch", "2.11.0+cu128", reason)],
-        exceptions,
-        today=date(2026, 8, 9),
-    ) == []
+    assert (
+        evaluate_skipped_dependencies(
+            [SkippedDependency("torch", "2.11.0+cu128", reason)],
+            exceptions,
+            today=date(2026, 8, 9),
+        )
+        == []
+    )
     assert evaluate_skipped_dependencies(
         [SkippedDependency("torch", "2.11.0+cu129", reason)],
         exceptions,

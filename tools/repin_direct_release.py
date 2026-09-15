@@ -78,12 +78,7 @@ def dump_builder(payload: object) -> str:
 
 def dump_selection(payload: object) -> str:
     """與 pin_mission_selection 的寫入格式一致（sort_keys）。"""
-    return (
-        json.dumps(
-            payload, ensure_ascii=False, indent=2, allow_nan=False, sort_keys=True
-        )
-        + "\n"
-    )
+    return json.dumps(payload, ensure_ascii=False, indent=2, allow_nan=False, sort_keys=True) + "\n"
 
 
 def load_json(path: Path) -> object:
@@ -157,9 +152,7 @@ def find_selections(release: Path) -> list[Path]:
         pinned = localizer.get("path")
         if not isinstance(pinned, str):
             continue
-        target = Path(
-            os.path.normpath(os.path.join(str(selection.parent), pinned))
-        )
+        target = Path(os.path.normpath(os.path.join(str(selection.parent), pinned)))
         try:
             if target.resolve().is_relative_to(release):
                 found.append(selection)
@@ -174,12 +167,16 @@ def check_bank_consistency(release: Path, localization: Path, bundle: dict) -> N
     if not isinstance(bank, dict):
         raise RepinError("bundle reference_bank 不是 object")
     descriptors = resolve_inside(
-        localization, bank.get("descriptors"),
-        label="bundle reference_bank.descriptors", root=release,
+        localization,
+        bank.get("descriptors"),
+        label="bundle reference_bank.descriptors",
+        root=release,
     )
     names_path = resolve_inside(
-        localization, bank.get("names"),
-        label="bundle reference_bank.names", root=release,
+        localization,
+        bank.get("names"),
+        label="bundle reference_bank.names",
+        root=release,
     )
     for path in (descriptors, names_path):
         if not path.is_file() or path.is_symlink():
@@ -199,16 +196,12 @@ def check_bank_consistency(release: Path, localization: Path, bundle: dict) -> N
     except (OSError, ValueError) as exc:
         raise RepinError(f"讀不到 bank npy: {descriptors}: {exc}") from exc
     if len(shape) != 2 or shape[0] != len(names):
-        raise RepinError(
-            f"bank {descriptors} 形狀 {shape} 與 names 列數 {len(names)} 不符"
-        )
+        raise RepinError(f"bank {descriptors} 形狀 {shape} 與 names 列數 {len(names)} 不符")
 
     _check_bank_subsets(names, localization, bundle, release)
 
 
-def _check_bank_subsets(
-    names: list[str], localization: Path, bundle: dict, release: Path
-) -> None:
+def _check_bank_subsets(names: list[str], localization: Path, bundle: dict, release: Path) -> None:
     def _key(uri: object) -> str:
         text = str(uri)
         marker = "keyframes/images/"
@@ -217,8 +210,10 @@ def _check_bank_subsets(
         return "/".join(parts[-2:]) if len(parts) >= 2 else tail
 
     keyframes_path = resolve_inside(
-        localization, bundle.get("keyframes_manifest"),
-        label="bundle keyframes_manifest", root=release,
+        localization,
+        bundle.get("keyframes_manifest"),
+        label="bundle keyframes_manifest",
+        root=release,
     )
     try:
         keyframes_keys = {
@@ -234,8 +229,10 @@ def _check_bank_subsets(
             f"bank names 有 {len(missing)} 筆不在 keyframes.jsonl，例如: {missing[:3]}"
         )
     manifest_path = resolve_inside(
-        localization, bundle.get("reference_manifest"),
-        label="bundle reference_manifest", root=release,
+        localization,
+        bundle.get("reference_manifest"),
+        label="bundle reference_manifest",
+        root=release,
     )
     try:
         manifest_names = {
@@ -248,8 +245,7 @@ def _check_bank_subsets(
     missing = [name for name in names if name not in manifest_names]
     if missing:
         raise RepinError(
-            f"bank names 有 {len(missing)} 筆不在 reference_manifest.jsonl"
-            f"，例如: {missing[:3]}"
+            f"bank names 有 {len(missing)} 筆不在 reference_manifest.jsonl，例如: {missing[:3]}"
         )
     poses_path = localization / "reference_poses.json"
     if poses_path.is_file():
@@ -277,9 +273,7 @@ def _verify_shard_list_consistency(shards: list, label: str) -> None:
                 "".join(f"{e['path']} {e['sha256']}\n" for e in files).encode("utf-8")
             ).hexdigest()
             if shard["shard_root_sha256"] != expected_root:
-                raise RepinError(
-                    f"{label} {shard.get('shard_id')} shard_root_sha256 不符"
-                )
+                raise RepinError(f"{label} {shard.get('shard_id')} shard_root_sha256 不符")
 
 
 def check_shard_consistency(release: Path, localization: Path) -> None:
@@ -298,9 +292,7 @@ def check_shard_consistency(release: Path, localization: Path) -> None:
         _verify_shard_list_consistency(depth_shards, "depth shard")
 
 
-def recompute_bundle_files(
-    release: Path, localization: Path, bundle: dict
-) -> list[dict]:
+def recompute_bundle_files(release: Path, localization: Path, bundle: dict) -> list[dict]:
     """重算 files[] 每條 path 的 sha256 + size_bytes（順序、其他欄位不動）。"""
     entries = bundle.get("files")
     if not isinstance(entries, list) or not entries:
@@ -317,10 +309,7 @@ def recompute_bundle_files(
         if not target.is_file() or target.is_symlink():
             raise RepinError(f"bundle files[] 路徑缺檔或為 symlink: {entry['path']}")
         actual_size = target.stat().st_size
-        if (
-            not isinstance(entry["size_bytes"], int)
-            or isinstance(entry["size_bytes"], bool)
-        ):
+        if not isinstance(entry["size_bytes"], int) or isinstance(entry["size_bytes"], bool):
             raise RepinError(f"bundle files[] size_bytes 非整數: {entry['path']}")
         fresh.append(
             {
@@ -344,9 +333,7 @@ def verify_model_digests(release: Path, bundle: dict) -> None:
             raise RepinError(f"model 檔缺失: {target}")
         actual = sha256_file(target)
         if actual != expected:
-            raise RepinError(
-                f"bundle model_sha256.{name} 與實際不符（model 變更超出本工具範圍）"
-            )
+            raise RepinError(f"bundle model_sha256.{name} 與實際不符（model 變更超出本工具範圍）")
 
 
 def site_pin_targets(profile_path: Path, profile: dict) -> dict[str, Path]:
@@ -411,14 +398,17 @@ def check_pin_file(base: Path, entry: object, *, label: str) -> str:
     actual = sha256_file(target)
     if actual != expected:
         raise RepinError(
-            f"{label} 與實際不符（只驗證不重寫，停住不寫）: "
-            f"pinned={expected} actual={actual}"
+            f"{label} 與實際不符（只驗證不重寫，停住不寫）: pinned={expected} actual={actual}"
         )
     return actual
 
 
 def verify_with_loaders(
-    *, bundle_path: Path, bundle_sha: str, profile_path: Path, profile_sha: str,
+    *,
+    bundle_path: Path,
+    bundle_sha: str,
+    profile_path: Path,
+    profile_sha: str,
     selections: list[Path],
 ) -> list[str]:
     """唯讀驗證：DirectMapAssets.load、load_direct_profile、mission 六 pin 全對。"""
@@ -443,9 +433,7 @@ def verify_with_loaders(
         f"map_scale={profile.map_scale}, sha={profile.sha256[:12]}…"
     )
     for selection in selections:
-        mission = load_mission_selection(
-            selection, workspace_root=REPO_ROOT, verify_files=True
-        )
+        mission = load_mission_selection(selection, workspace_root=REPO_ROOT, verify_files=True)
         pins = dict(mission.component_sha256)
         order = (
             ["localizer", "map", "vehicle", "route", "site"]
@@ -517,7 +505,8 @@ def _audit_site_profiles(
     ):
         targets = site_pin_targets(path, document)
         verify_stable_pins(
-            targets, document["asset_sha256"],
+            targets,
+            document["asset_sha256"],
             skip={"localization_bundle", "localizer_profile", "shard_manifest", "inductor_prewarm"},
         )
         document["asset_sha256"]["localization_bundle"] = bundle_sha
@@ -546,8 +535,10 @@ def _audit_localizer_manifest(
         if not isinstance(entry, dict) or not isinstance(entry.get("path"), str):
             raise RepinError(f"localizer manifest artifacts.{key} 異常")
         target = resolve_inside(
-            paths["localizer_manifest"].parent, entry["path"],
-            label=f"localizer manifest artifacts.{key}.path", root=release,
+            paths["localizer_manifest"].parent,
+            entry["path"],
+            label=f"localizer manifest artifacts.{key}.path",
+            root=release,
         )
         if not target.is_file():
             raise RepinError(f"localizer manifest 指到的檔缺失: {target}")
@@ -606,6 +597,7 @@ def _audit_update_manifests(paths: dict[str, Path]) -> dict:
         "manifest_sha": manifest_sha,
     }
 
+
 def _update_selections(release: Path, manifest_sha: str) -> tuple[list[Path], dict[Path, str]]:
     selections = find_selections(release)
     if not selections:
@@ -629,9 +621,7 @@ def _update_selections(release: Path, manifest_sha: str) -> tuple[list[Path], di
     return selections, selection_texts
 
 
-def _check_disk_profiles_and_manifests(
-    paths: dict[str, Path], state: dict, show: object
-) -> None:
+def _check_disk_profiles_and_manifests(paths: dict[str, Path], state: dict, show: object) -> None:
     site_disk = load_json(paths["site"])
     root_disk = load_json(paths["root_site"])
     source_disk = load_json(paths["source"])
@@ -642,11 +632,13 @@ def _check_disk_profiles_and_manifests(
     assert isinstance(manifest_disk, dict)
     show(
         "release site_profile asset_sha256.localization_bundle",
-        site_disk["asset_sha256"]["localization_bundle"], state["bundle_sha"],
+        site_disk["asset_sha256"]["localization_bundle"],
+        state["bundle_sha"],
     )
     show(
         "release site_profile asset_sha256.localizer_profile",
-        site_disk["asset_sha256"]["localizer_profile"], state["profile_sha"],
+        site_disk["asset_sha256"]["localizer_profile"],
+        state["profile_sha"],
     )
     if "shard_manifest" in site_disk.get("asset_sha256", {}):
         shard_path = paths["release"] / "localization/shard_manifest.json"
@@ -664,15 +656,18 @@ def _check_disk_profiles_and_manifests(
         )
     show(
         "root site_profile asset_sha256.localization_bundle",
-        root_disk["asset_sha256"]["localization_bundle"], state["bundle_sha"],
+        root_disk["asset_sha256"]["localization_bundle"],
+        state["bundle_sha"],
     )
     show(
         "root site_profile asset_sha256.localizer_profile",
-        root_disk["asset_sha256"]["localizer_profile"], state["profile_sha"],
+        root_disk["asset_sha256"]["localizer_profile"],
+        state["profile_sha"],
     )
     show(
         "source_manifest generated bundle",
-        source_disk["generated"]["localization/direct_bundle.json"], state["bundle_sha"],
+        source_disk["generated"]["localization/direct_bundle.json"],
+        state["bundle_sha"],
     )
     show(
         "source_manifest generated profile",
@@ -681,7 +676,8 @@ def _check_disk_profiles_and_manifests(
     )
     show(
         "source_manifest generated site",
-        source_disk["generated"]["site_profile.json"], state["site_sha"],
+        source_disk["generated"]["site_profile.json"],
+        state["site_sha"],
     )
     if "localization/shard_manifest.json" in source_disk.get("generated", {}):
         shard_path = paths["release"] / "localization/shard_manifest.json"
@@ -699,11 +695,13 @@ def _check_disk_profiles_and_manifests(
         )
     show(
         "localizer manifest artifacts.bundle",
-        manifest_disk["artifacts"]["bundle"]["sha256"], state["bundle_sha"],
+        manifest_disk["artifacts"]["bundle"]["sha256"],
+        state["bundle_sha"],
     )
     show(
         "localizer manifest artifacts.profile",
-        manifest_disk["artifacts"]["profile"]["sha256"], state["profile_sha"],
+        manifest_disk["artifacts"]["profile"]["sha256"],
+        state["profile_sha"],
     )
 
 
@@ -733,7 +731,8 @@ def _check_only_diff(
         assert isinstance(on_disk, dict)
         _show(
             f"mission {selection.name} localizer pin",
-            on_disk["localizer"]["sha256"], state["manifest_sha"],
+            on_disk["localizer"]["sha256"],
+            state["manifest_sha"],
         )
     if problems:
         print(
@@ -742,8 +741,10 @@ def _check_only_diff(
         )
         return 1
     for line in verify_with_loaders(
-        bundle_path=paths["bundle"], bundle_sha=state["bundle_sha"],
-        profile_path=paths["profile"], profile_sha=state["profile_sha"],
+        bundle_path=paths["bundle"],
+        bundle_sha=state["bundle_sha"],
+        profile_path=paths["profile"],
+        profile_sha=state["profile_sha"],
         selections=selections,
     ):
         print(f"[verify] {line}")
@@ -776,8 +777,10 @@ def _apply_writes(
     print(f"[repin] site_profile={state['site_sha']}")
     print(f"[repin] localizer_manifest={state['manifest_sha']}")
     for line in verify_with_loaders(
-        bundle_path=paths["bundle"], bundle_sha=state["bundle_sha"],
-        profile_path=paths["profile"], profile_sha=state["profile_sha"],
+        bundle_path=paths["bundle"],
+        bundle_sha=state["bundle_sha"],
+        profile_path=paths["profile"],
+        profile_sha=state["profile_sha"],
         selections=selections,
     ):
         print(f"[verify] {line}")
@@ -787,9 +790,7 @@ def _apply_writes(
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--release", required=True, help="<site>/releases/<id> 目錄")
-    parser.add_argument(
-        "--check-only", action="store_true", help="只驗證不寫入；SHA 不符就列出來"
-    )
+    parser.add_argument("--check-only", action="store_true", help="只驗證不寫入；SHA 不符就列出來")
     return parser.parse_args(argv)
 
 
@@ -806,6 +807,7 @@ def main(argv: list[str] | None = None) -> int:
     except RepinError as exc:
         print(f"[repin] FAIL: {exc}", file=sys.stderr)
         return 1
+
 
 if __name__ == "__main__":
     raise SystemExit(main())

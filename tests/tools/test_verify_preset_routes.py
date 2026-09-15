@@ -14,7 +14,10 @@ from verify_preset_routes import evaluate, evaluate_gust_recovery
 
 ROOT = Path(__file__).resolve().parents[2]
 ROUTES = ROOT / "地圖檔/場域/river_site/routes"
-ALIGN = ROOT / "地圖檔/場域/river_site/releases/river_gluemap_all8_direct_20260908/localization/T_align_gravity.json"
+ALIGN = (
+    ROOT
+    / "地圖檔/場域/river_site/releases/river_gluemap_all8_direct_20260908/localization/T_align_gravity.json"
+)
 
 
 @pytest.mark.skipif(not ALIGN.is_file(), reason="requires the operator's river site assets")
@@ -23,8 +26,19 @@ def test_every_preset_route_from_every_nearest_waypoint(tmp_path):
     assert routes, "preset routes must be present for route acceptance"
     expected_count = sum(len(json.loads(path.read_text())["waypoints"]) for path in routes)
     result = subprocess.run(
-        [sys.executable, str(ROOT / "tools/verify_preset_routes.py"), "--quick", "--out", str(tmp_path)],
-        cwd=ROOT, capture_output=True, text=True, timeout=60,
+        [
+            sys.executable,
+            str(ROOT / "tools/verify_preset_routes.py"),
+            "--quick",
+            "--localization-wait-s",
+            "0",
+            "--out",
+            str(tmp_path),
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        timeout=60,
     )
     assert result.returncode == 0, result.stdout + result.stderr
     rows = json.loads((tmp_path / "results.json").read_text())
@@ -42,8 +56,9 @@ def test_every_preset_route_from_every_nearest_waypoint(tmp_path):
 @pytest.mark.skipif(not ALIGN.is_file(), reason="requires the operator's river site assets")
 def test_gust_parameter_applies_the_requested_physical_displacement():
     route = next(ROUTES.glob("*.json"))
-    params = sim.SimParams(route=route, align=ALIGN, duration_s=0.05,
-                           gust_every_s=0.05, gust_m=0.3, wind_sigma_mps=0)
+    params = sim.SimParams(
+        route=route, align=ALIGN, duration_s=0.05, gust_every_s=0.05, gust_m=0.3, wind_sigma_mps=0
+    )
     result, _ = sim.run_sim(params)
     assert np.linalg.norm(result.trace[0]["gust_displacement_m"]) == pytest.approx(0.3)
 
@@ -52,10 +67,17 @@ def test_gust_parameter_applies_the_requested_physical_displacement():
 @pytest.mark.parametrize("gust_m", [0.2, 0.5])
 @pytest.mark.skipif(not ALIGN.is_file(), reason="requires the operator's river site assets")
 def test_every_route_recovers_from_repeated_wind_displacement(route, gust_m):
-    result = evaluate_gust_recovery(sim.SimParams(
-        route=route, align=ALIGN, duration_s=300, meters_per_unit=5,
-        seed=53, gust_m=gust_m, gust_every_s=20,
-    ))
+    result = evaluate_gust_recovery(
+        sim.SimParams(
+            route=route,
+            align=ALIGN,
+            duration_s=300,
+            meters_per_unit=5,
+            seed=53,
+            gust_m=gust_m,
+            gust_every_s=20,
+        )
+    )
     assert result["accepted"], result
     assert all(item["displacement_m"] == pytest.approx(gust_m) for item in result["gusts"])
 
@@ -68,16 +90,50 @@ def test_six_point_route_converges_in_previously_failing_delayed_noisy_cases(joi
     controller, _config, frame, _doc = sim.build_production_controller(
         route, ALIGN, return_to_start=True
     )
-    offset = controller.wp[join_index] - controller.wp[0] - .08 * frame.east
-    result = evaluate(sim.SimParams(
-        route=route, align=ALIGN, meters_per_unit=5., duration_s=300., seed=41,
-        start_offset_frame="raw", start_offset_u=tuple(offset),
-        initial_yaw_error_deg=170., latency_ms=300., pos_noise_u=.006,
-        yaw_noise_deg=2., drop_rate=.05, wind_sigma_mps=.08,
-        outage_every_s=60., outage_dur_s=.7,
-    ), start_label=f"delayed_noisy_waypoint_{join_index + 1}")
+    offset = controller.wp[join_index] - controller.wp[0] - 0.08 * frame.east
+    result = evaluate(
+        sim.SimParams(
+            route=route,
+            align=ALIGN,
+            meters_per_unit=5.0,
+            duration_s=300.0,
+            seed=41,
+            start_offset_frame="raw",
+            start_offset_u=tuple(offset),
+            initial_yaw_error_deg=170.0,
+            latency_ms=300.0,
+            pos_noise_u=0.006,
+            yaw_noise_deg=2.0,
+            drop_rate=0.05,
+            wind_sigma_mps=0.08,
+            outage_every_s=60.0,
+            outage_dur_s=0.7,
+        ),
+        start_label=f"delayed_noisy_waypoint_{join_index + 1}",
+    )
     # Waypoint-1 start policy (start_after_nearest_waypoint always targets
     # index 0): the start label records the takeoff neighborhood, the join
     # target stays waypoint 1.
     assert result["join_waypoint"] == 1
     assert result["accepted"], result
+
+
+@pytest.mark.skipif(not ALIGN.is_file(), reason="requires the operator's river site assets")
+def test_initial_localization_wait_consumes_the_total_mission_budget():
+    route = next(ROUTES.glob("*.json"))
+    result, info = sim.run_sim(
+        sim.SimParams(route=route, align=ALIGN, duration_s=10, localization_wait_s=20)
+    )
+    assert not result.success
+    assert result.steps == 0 and result.time_s == 10
+    assert result.dist_flown_m == 0
+    assert info["route_time_s"] == 0
+    assert "localization wait" in result.reason
+
+
+@pytest.mark.parametrize("wait", [-1, float("nan"), float("inf")])
+def test_invalid_localization_wait_is_rejected(wait):
+    with pytest.raises(ValueError, match="localization_wait_s"):
+        sim._simulation_budget(
+            sim.SimParams(route=Path("unused"), align=None, localization_wait_s=wait)
+        )

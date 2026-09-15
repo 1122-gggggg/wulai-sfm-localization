@@ -89,9 +89,7 @@ def _resolve_within(root: Path, path: Path, *, label: str) -> Path:
     try:
         resolved_path.relative_to(resolved_root)
     except ValueError as exc:
-        raise ValueError(
-            f"{label} resolves outside activation root: {resolved_path}"
-        ) from exc
+        raise ValueError(f"{label} resolves outside activation root: {resolved_path}") from exc
     return resolved_path
 
 
@@ -127,10 +125,7 @@ def validate_release(
     if issues:
         raise ValueError(f"release manifest is invalid: {issues[0]}")
     offline_install = metadata.get("offline_install")
-    if (
-        not isinstance(offline_install, dict)
-        or offline_install.get("complete") is not True
-    ):
+    if not isinstance(offline_install, dict) or offline_install.get("complete") is not True:
         raise ValueError("release has no complete offline install bundle")
     source = metadata["source_release"]
     expected = _expected_source_release(expected_source_release, release=release)
@@ -178,7 +173,9 @@ def stage(
             for name in (*directories, *files):
                 candidate = Path(current) / name
                 if candidate.is_symlink():
-                    raise ValueError(f"release contains a symlink: {candidate.relative_to(temporary)}")
+                    raise ValueError(
+                        f"release contains a symlink: {candidate.relative_to(temporary)}"
+                    )
         validate_release(
             temporary,
             allow_dirty=allow_dirty,

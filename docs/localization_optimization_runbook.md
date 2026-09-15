@@ -1,5 +1,7 @@
 # 定位演算法優化 Runbook
 
+> 2026-09-15：本文涉及 ProductionEDMTracker／ESEKF 的段落屬歷史資料，相關程式已退役。現行 DIRECT 的能力與離線檢查以 [direct_offline_validation.md](direct_offline_validation.md) 為準。
+
 > **適用範圍：`sfm_glomap_deploy`（EDM `.pt` bundle）路徑，該路徑已從 worktree 移除。**
 > `localizer_registry` 現在只註冊 `direct` 一個 backend，本檔的旗標與閾值
 > （KLT bridge、async tracker、`acquire_relaxed_min_inliers`、CUDA graphs、

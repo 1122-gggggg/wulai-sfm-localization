@@ -36,7 +36,8 @@ class CachedEDM:
         return CachedImage(
             image,
             torch.from_numpy(np.ascontiguousarray(image.pixels))[None, None]
-            .to(device, dtype=torch.float32).div_(255.0),
+            .to(device, dtype=torch.float32)
+            .div_(255.0),
             torch.from_numpy(image.coarse_mask)[None].to(device),
             torch.tensor([image.scale], dtype=torch.float32, device=device),
         )
@@ -56,9 +57,12 @@ class CachedEDM:
         self.references.move_to_end(key)
         q = self.query
         batch = {
-            "image0": q.pixels, "image1": ref.pixels,
-            "mask0": q.mask, "mask1": ref.mask,
-            "scale0": q.scale, "scale1": ref.scale,
+            "image0": q.pixels,
+            "image1": ref.pixels,
+            "mask0": q.mask,
+            "mask1": ref.mask,
+            "scale0": q.scale,
+            "scale1": ref.scale,
         }
         matcher = runtime.matcher
         hook = None
@@ -72,9 +76,11 @@ class CachedEDM:
                 )
                 self.backbone_hits += 1
             else:
+
                 def remember(_module, _inputs, outputs):
                     q.features = tuple(value[:1].clone() for value in outputs)
                     ref.features = tuple(value[1:].clone() for value in outputs)
+
                 hook = matcher.backbone.register_forward_hook(remember)
             try:
                 matcher(batch)
@@ -85,6 +91,5 @@ class CachedEDM:
                 matcher._cache_fully_hit = False
                 matcher._cached_pyramid = None
         return {
-            name: batch[name].detach().cpu().numpy()
-            for name in ("mkpts0_f", "mkpts1_f", "mconf")
+            name: batch[name].detach().cpu().numpy() for name in ("mkpts0_f", "mkpts1_f", "mconf")
         }

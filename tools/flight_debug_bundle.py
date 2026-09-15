@@ -143,53 +143,7 @@ def analyze_turn_gate(ticks: list[dict[str, Any]]) -> dict[str, Any]:
         }
     if max_err is not None:
         out["max_abs_yaw_error_deg"] = round(max_err, 2)
-    ordered = sorted(ticks, key=lambda t: float(t.get("t", 0.0) or 0.0))
-    for tick, nxt in zip(ordered, ordered[1:]):
-        span = float(nxt.get("t", 0.0) or 0.0) - float(tick.get("t", 0.0) or 0.0)
-        if not math.isfinite(span) or span < 0.0 or span > 5.0:
-            continue
-        phase = tick.get("pcmd_phase")
-        if phase == "turn":
-            out["turn_seconds"] += span
-        elif phase == "translate":
-            out["translate_seconds"] += span
-    out["turn_seconds"] = round(out["turn_seconds"], 3)
-    out["translate_seconds"] = round(out["translate_seconds"], 3)
-    # Convergence: first tick where the gate actually released translation
-    # (phase translate / yaw_alignment_confirmed) with the error inside the
-    # 20 deg band. An error-only check false-positives: a 12 deg starting
-    # error is "in band" at tick 0 while the gate still spins (measured
-    # 2026-09-14: 21 s of pure-yaw PCMD before the first translate tick).
-    translated = False
-    for tick in ordered:
-        phase = tick.get("pcmd_phase")
-        if phase not in ("translate", "yaw_alignment_confirmed"):
-            continue
-        value = _finite(tick.get("yaw_error_deg"))
-        if value is None:
-            value = _finite(tick.get("yaw_error_recomputed_deg"))
-        if value is not None and abs(value) <= 20.0:
-            out["convergence"] = {
-                "tick": tick.get("step"),
-                "t": tick.get("t"),
-                "time_to_converge_s": round(
-                    float(tick.get("t", 0.0) or 0.0)
-                    - float(ordered[0].get("t", 0.0) or 0.0),
-                    3,
-                ),
-            }
-            # A single translate burst is not a converged leg: the gate can
-            # re-open mid-leg (mid_leg_realign). Only a translate-held ending
-            # counts; otherwise the report names the ending phase.
-            translated = True
-            break
-    motion_phases = [
-        tick.get("pcmd_phase")
-        for tick in ordered
-        if tick.get("pcmd_phase") in ("turn", "translate")
-    ]
-    out["final_phase"] = motion_phases[-1] if motion_phases else None
-    out["ever_translated"] = translated
+    _turn_timing(ticks, out)
     return out
 
 
@@ -222,17 +176,7 @@ def analyze_heading_reconciliation(ticks: list[dict[str, Any]]) -> dict[str, Any
         heading = math.radians(float(tick["heading_deg"]))
         attitude = math.pi / 2.0 - float(tick["imu_yaw_ned_rad"])
         offsets.append(math.degrees(_wrap(heading - attitude)))
-    bearings: list[float] = []
-    for tick in visuals:
-        pose = tick.get("pose_u")
-        target = tick.get("target_u")
-        heading = _finite(tick.get("heading_deg"))
-        if isinstance(pose, list) and isinstance(target, list) and heading is not None:
-            bearing = _finite(tick.get("yaw_target_deg"))
-            if bearing is None:
-                bearing = _legacy_target_bearing_deg(pose, target)
-            if bearing is not None:
-                bearings.append(bearing)
+    bearings = _heading_bearings(visuals)
     imus = [math.degrees(math.pi / 2.0 - float(t["imu_yaw_ned_rad"])) for t in visuals]
     out["offset_walk_deg"] = round(_angle_span_deg(offsets), 2)
     if bearings:
@@ -241,8 +185,7 @@ def analyze_heading_reconciliation(ticks: list[dict[str, Any]]) -> dict[str, Any
     mismatches: list[float] = []
     for first, second in zip(visuals, visuals[1:]):
         visual_delta = _wrap(
-            math.radians(float(second["heading_deg"]))
-            - math.radians(float(first["heading_deg"]))
+            math.radians(float(second["heading_deg"])) - math.radians(float(first["heading_deg"]))
         )
         imu_delta = _wrap(
             (math.pi / 2.0 - float(second["imu_yaw_ned_rad"]))
@@ -373,9 +316,7 @@ def analyze_drift(
     out["gps_excursion_auto_m"] = _excursion_in_windows(gps, auto_windows)
     out["gps_excursion_manual_m"] = _excursion_in_windows(gps, manual_windows)
     poses: list[list[float]] = [
-        t["pose_u"]
-        for t in ticks
-        if isinstance(t.get("pose_u"), list) and len(t["pose_u"]) == 3
+        t["pose_u"] for t in ticks if isinstance(t.get("pose_u"), list) and len(t["pose_u"]) == 3
     ]
     if len(poses) >= 2:
         origin = poses[0]
@@ -390,12 +331,9 @@ def analyze_drift(
             3,
         )
     # Manual pure-yaw segments: bounded by stick_override pairs in commands.
-    overrides = [
-        c for c in commands if c.get("event") in ("stick_override", "manual")
-    ]
+    overrides = [c for c in commands if c.get("event") in ("stick_override", "manual")]
     out["manual_yaw_segments"] = [
-        {"t_utc": c.get("t_utc"), "event": c.get("event")}
-        for c in overrides[:20]
+        {"t_utc": c.get("t_utc"), "event": c.get("event")} for c in overrides[:20]
     ]
     return out
 
@@ -420,25 +358,7 @@ def analyze_auto_runs(localization: list[dict]) -> list[dict]:
                 if run_id:
                     by_id[run_id] = selected
             selected["ticks"].append(row)
-    result = []
-    for run in runs:
-        if not run["ticks"]:
-            continue
-        targets = {}
-        for tick in run["ticks"]:
-            if tick.get("target_index") is not None:
-                targets.setdefault(tick["target_index"], []).append(tick)
-        result.append({
-            "auto_run_id": run["auto_run_id"], "plan": run["plan"],
-            "tick_count": len(run["ticks"]),
-            "turn_gate": analyze_turn_gate(run["ticks"]),
-            "last_action": run["ticks"][-1].get("action"),
-            "target_indices": list(targets),
-            "targets": [{"target_index": target, "turn_gate": analyze_turn_gate(ticks),
-                         "heading": analyze_heading_reconciliation(ticks)}
-                        for target, ticks in targets.items()],
-        })
-    return result
+    return _summarize_auto_runs(runs)
 
 
 def debug_input_inventory(poses: list[dict], telemetry: list[dict], session: Path) -> dict:
@@ -458,8 +378,9 @@ def debug_input_inventory(poses: list[dict], telemetry: list[dict], session: Pat
         },
         "klt_diagnostic_samples": sum(row.get("klt_input_points") is not None for row in poses),
         "pnp_observation_samples": sum(bool(row.get("pnp_observation_sample")) for row in poses),
-        "imu_bridge_reasons": dict(Counter(str(row["imu_bridge_reason"]) for row in poses
-                                           if row.get("imu_bridge_reason"))),
+        "imu_bridge_reasons": dict(
+            Counter(str(row["imu_bridge_reason"]) for row in poses if row.get("imu_bridge_reason"))
+        ),
         "covariance_note": "FC covariance unavailable; PnP samples permit offline visual-noise analysis",
         "scale_note": "Map units and NED metres must not be fused without measured scale/frame calibration",
     }
@@ -472,14 +393,10 @@ def analyze_session(session: Path) -> dict[str, Any]:
     incidents = read_jsonl(session / "incidents.jsonl")
     ticks = [r for r in localization if r.get("event") == "auto_route_tick"]
     poses = [r for r in localization if r.get("event") == "pose_result"]
-    plan = next(
-        (r for r in localization if r.get("event") == "auto_route_plan"), None
-    )
+    plan = next((r for r in localization if r.get("event") == "auto_route_plan"), None)
     pose_modes = Counter(str(r.get("mode") or "UNKNOWN") for r in poses)
     successes = sum(1 for r in poses if r.get("success"))
-    magnetometer = [
-        c for c in commands if c.get("event") == "magnetometer_state"
-    ]
+    magnetometer = [c for c in commands if c.get("event") == "magnetometer_state"]
     pcmds = [row for row in telemetry if row.get("event") == "pcmd_dispatch"]
     pcmd_source = "sdk_dispatch" if pcmds else "legacy_sampled_commands"
     if not pcmds:
@@ -505,9 +422,7 @@ def analyze_session(session: Path) -> dict[str, Any]:
         "pcmd_count": len(pcmds),
         "pcmd_source": pcmd_source,
         "autonomy_events": [row for row in telemetry if row.get("event") == "autonomy_event"],
-        "incidents": dict(
-            Counter(str(r.get("event")) for r in incidents).most_common(10)
-        ),
+        "incidents": dict(Counter(str(r.get("event")) for r in incidents).most_common(10)),
     }
     if plan is not None:
         report["plan"] = {
@@ -522,40 +437,25 @@ def analyze_session(session: Path) -> dict[str, Any]:
     report["drift"] = analyze_drift(telemetry, ticks, commands)
     report["auto_runs"] = analyze_auto_runs(localization)
     report["debug_inputs"] = debug_input_inventory(poses, telemetry, session)
-    if not ticks:
-        report["verdict"] = "NO_AUTO"
-    elif any(row.get("kind") == "auto_failed" for row in report["autonomy_events"]):
-        report["verdict"] = "AUTO_FAILED"
-    elif ticks[-1].get("action") in {"LAND", "final path reached -> LAND"}:
-        report["verdict"] = "ROUTE_FINAL_REACHED"
-    elif ticks[-1].get("pcmd_phase") in {
-        "height_adjust", "route_rejoin", "waypoint_centering", "final_centering",
-    }:
-        report["verdict"] = "POSITION_CORRECTION_ACTIVE"
-    elif report["turn_gate"].get("final_phase") == "translate":
-        report["verdict"] = "TURN_CONVERGED"
-    elif report["turn_gate"].get("convergence") is None:
-        report["verdict"] = "TURN_NEVER_CONVERGED"
-    else:
-        report["verdict"] = "TURN_REGRESSED"
-    if len(report["auto_runs"]) > 1:
-        report["verdict"] = "MULTIPLE_AUTO_RUNS_SEE_DETAILS"
+    _session_verdict(report, ticks)
     return report
 
 
 def format_report(report: dict[str, Any]) -> str:
     lines = [f"轉向除錯：{report['session']}"]
     inventory = report.get("debug_inputs", {})
-    lines.append(f"資料：SDK dispatch {inventory.get('sdk_dispatches', 0)} 筆，"
-                 f"KLT 品質 {inventory.get('klt_diagnostic_samples', 0)} 筆，"
-                 f"PnP 樣本 {inventory.get('pnp_observation_samples', 0)} 筆；"
-                 f"debug 丟棄 {inventory.get('debug_deferred_dropped')}。")
+    lines.append(
+        f"資料：SDK dispatch {inventory.get('sdk_dispatches', 0)} 筆，"
+        f"KLT 品質 {inventory.get('klt_diagnostic_samples', 0)} 筆，"
+        f"PnP 樣本 {inventory.get('pnp_observation_samples', 0)} 筆；"
+        f"debug 丟棄 {inventory.get('debug_deferred_dropped')}。"
+    )
     if len(report.get("auto_runs", [])) > 1:
-        lines.append("本 session 有多段 AUTO；分段起點與參數請看 auto_runs，勿把人工操作間隔當成巡航時間。")
-    if report.get("verdict") == "NO_AUTO":
-        return "\n".join(
-            lines + ["此班沒有 AUTO（無 auto_route_plan/tick），只看漂移與羅盤。"]
+        lines.append(
+            "本 session 有多段 AUTO；分段起點與參數請看 auto_runs，勿把人工操作間隔當成巡航時間。"
         )
+    if report.get("verdict") == "NO_AUTO":
+        return "\n".join(lines + ["此班沒有 AUTO（無 auto_route_plan/tick），只看漂移與羅盤。"])
     lines.append(
         f"AUTO {report['tick_count']} tick，定位 {report['pose_success']}/{report['pose_results']}，"
         f"純 yaw PCMD {report['pure_yaw_pcmd_count']}/{report['pcmd_count']}。"
@@ -604,18 +504,132 @@ def format_report(report: dict[str, Any]) -> str:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("session", type=Path, help="flight session directory")
-    parser.add_argument(
-        "--out", type=Path, default=None, help="write debug_bundle.json here"
-    )
+    parser.add_argument("--out", type=Path, default=None, help="write debug_bundle.json here")
     args = parser.parse_args(argv)
     report = analyze_session(args.session)
     print(format_report(report))
     out = args.out or (args.session / "debug_bundle.json")
-    out.write_text(
-        json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-    )
+    out.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     print(f"bundle -> {out}")
     return 0
+
+
+def _turn_timing(ticks, out):
+    ordered = sorted(ticks, key=lambda t: float(t.get("t", 0.0) or 0.0))
+    for tick, nxt in zip(ordered, ordered[1:]):
+        span = float(nxt.get("t", 0.0) or 0.0) - float(tick.get("t", 0.0) or 0.0)
+        if not math.isfinite(span) or span < 0.0 or span > 5.0:
+            continue
+        phase = tick.get("pcmd_phase")
+        if phase == "turn":
+            out["turn_seconds"] += span
+        elif phase == "translate":
+            out["translate_seconds"] += span
+    out["turn_seconds"] = round(out["turn_seconds"], 3)
+    out["translate_seconds"] = round(out["translate_seconds"], 3)
+    # Convergence: first tick where the gate actually released translation
+    # (phase translate / yaw_alignment_confirmed) with the error inside the
+    # 20 deg band. An error-only check false-positives: a 12 deg starting
+    # error is "in band" at tick 0 while the gate still spins (measured
+    # 2026-09-14: 21 s of pure-yaw PCMD before the first translate tick).
+    translated = False
+    for tick in ordered:
+        phase = tick.get("pcmd_phase")
+        if phase not in ("translate", "yaw_alignment_confirmed"):
+            continue
+        value = _finite(tick.get("yaw_error_deg"))
+        if value is None:
+            value = _finite(tick.get("yaw_error_recomputed_deg"))
+        if value is not None and abs(value) <= 20.0:
+            out["convergence"] = {
+                "tick": tick.get("step"),
+                "t": tick.get("t"),
+                "time_to_converge_s": round(
+                    float(tick.get("t", 0.0) or 0.0) - float(ordered[0].get("t", 0.0) or 0.0),
+                    3,
+                ),
+            }
+            # A single translate burst is not a converged leg: the gate can
+            # re-open mid-leg (mid_leg_realign). Only a translate-held ending
+            # counts; otherwise the report names the ending phase.
+            translated = True
+            break
+    motion_phases = [
+        tick.get("pcmd_phase")
+        for tick in ordered
+        if tick.get("pcmd_phase") in ("turn", "translate")
+    ]
+    out["final_phase"] = motion_phases[-1] if motion_phases else None
+    out["ever_translated"] = translated
+
+
+def _heading_bearings(visuals):
+    bearings: list[float] = []
+    for tick in visuals:
+        pose = tick.get("pose_u")
+        target = tick.get("target_u")
+        heading = _finite(tick.get("heading_deg"))
+        if isinstance(pose, list) and isinstance(target, list) and heading is not None:
+            bearing = _finite(tick.get("yaw_target_deg"))
+            if bearing is None:
+                bearing = _legacy_target_bearing_deg(pose, target)
+            if bearing is not None:
+                bearings.append(bearing)
+    return bearings
+
+
+def _summarize_auto_runs(runs):
+    result = []
+    for run in runs:
+        if not run["ticks"]:
+            continue
+        targets = {}
+        for tick in run["ticks"]:
+            if tick.get("target_index") is not None:
+                targets.setdefault(tick["target_index"], []).append(tick)
+        result.append(
+            {
+                "auto_run_id": run["auto_run_id"],
+                "plan": run["plan"],
+                "tick_count": len(run["ticks"]),
+                "turn_gate": analyze_turn_gate(run["ticks"]),
+                "last_action": run["ticks"][-1].get("action"),
+                "target_indices": list(targets),
+                "targets": [
+                    {
+                        "target_index": target,
+                        "turn_gate": analyze_turn_gate(ticks),
+                        "heading": analyze_heading_reconciliation(ticks),
+                    }
+                    for target, ticks in targets.items()
+                ],
+            }
+        )
+    return result
+
+
+def _session_verdict(report, ticks):
+    if not ticks:
+        report["verdict"] = "NO_AUTO"
+    elif any(row.get("kind") == "auto_failed" for row in report["autonomy_events"]):
+        report["verdict"] = "AUTO_FAILED"
+    elif ticks[-1].get("action") in {"LAND", "final path reached -> LAND"}:
+        report["verdict"] = "ROUTE_FINAL_REACHED"
+    elif ticks[-1].get("pcmd_phase") in {
+        "height_adjust",
+        "route_rejoin",
+        "waypoint_centering",
+        "final_centering",
+    }:
+        report["verdict"] = "POSITION_CORRECTION_ACTIVE"
+    elif report["turn_gate"].get("final_phase") == "translate":
+        report["verdict"] = "TURN_CONVERGED"
+    elif report["turn_gate"].get("convergence") is None:
+        report["verdict"] = "TURN_NEVER_CONVERGED"
+    else:
+        report["verdict"] = "TURN_REGRESSED"
+    if len(report["auto_runs"]) > 1:
+        report["verdict"] = "MULTIPLE_AUTO_RUNS_SEE_DETAILS"
 
 
 if __name__ == "__main__":

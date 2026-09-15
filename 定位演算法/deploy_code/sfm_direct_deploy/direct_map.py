@@ -14,6 +14,7 @@ Two integrity tiers:
   against ``keyframes.jsonl``'s ``image_sha256`` the first time the relocalizer
   actually prepares it (:meth:`DirectMapAssets.verify_reference_image`).
 """
+
 from __future__ import annotations
 
 import json
@@ -142,9 +143,7 @@ def _verify_model_binaries(declared: object, *, model_dir: Path, source: Path) -
     missing = sorted(set(_MODEL_BINARIES) - declared.keys())
     unknown = sorted(declared.keys() - set(_MODEL_BINARIES))
     if missing or unknown:
-        raise DirectMapError(
-            f"bundle model_sha256 missing={missing} unknown={unknown}: {source}"
-        )
+        raise DirectMapError(f"bundle model_sha256 missing={missing} unknown={unknown}: {source}")
     for name in _MODEL_BINARIES:
         binary = model_dir / name
         if not binary.is_file():
@@ -286,7 +285,9 @@ class DirectMapAssets:
         if not model_dir.is_dir():
             raise DirectMapError(f"model_dir must be a directory: {model_dir}")
         if not keyframes_images_root.is_dir():
-            raise DirectMapError(f"keyframes_images_root must be a directory: {keyframes_images_root}")
+            raise DirectMapError(
+                f"keyframes_images_root must be a directory: {keyframes_images_root}"
+            )
         if reference_depth_dir is not None and not reference_depth_dir.is_dir():
             raise DirectMapError(f"reference_depth_dir must be a directory: {reference_depth_dir}")
 

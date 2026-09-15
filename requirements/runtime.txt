@@ -27,6 +27,5 @@ yacs==0.1.8
 scipy==1.15.3
 # System-level (not pip): ffmpeg, tkinter (python3-tk)
 # XFeat / LighterGlue / BoQ: package-local weights in torch_hub_cache/
-# Policy: scipy is hash-locked so SparseCloudCollisionMonitor is reproducibly
-# available for diagnostics.  The monitor remains a warning-only research aid;
-# it is not wired into autonomous safety and must never claim collision protection.
+# Policy: scipy is hash-locked for deploy/diagnosis imports. It is not a
+# collision-protection claim; the desktop sparse-cloud hover interlock is gone.

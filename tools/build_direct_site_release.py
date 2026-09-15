@@ -37,6 +37,7 @@ Usage
         --site river_site \
         --release-id river_gluemap_all8_direct_20260908
 """
+
 from __future__ import annotations
 
 import argparse
@@ -118,9 +119,7 @@ REFERENCE_CONTROLLER = {
     "progress_speed_factor": 2.0,
     "inspect_waypoints": [],
 }
-SCALED_CONTROLLER_KEYS = tuple(
-    key for key in REFERENCE_CONTROLLER if key.endswith("_map_units")
-)
+SCALED_CONTROLLER_KEYS = tuple(key for key in REFERENCE_CONTROLLER if key.endswith("_map_units"))
 
 #: P174 frozen knobs (P174_AND_NEXT.md).  Production reads these from the
 #: SHA-bound profile; there is no environment-variable override path.
@@ -132,7 +131,7 @@ SCALED_CONTROLLER_KEYS = tuple(
 FROZEN_RELOC = {
     "top_k": 2,
     "lift_distance_px": 2.0,
-    "period_s": 0.3,
+    "period_s": 1.0,
     "min_points": 60,
     "reference_bank": "sideview-boq",
     "min_reference_occupied_bins": 1,
@@ -184,7 +183,7 @@ FROZEN_VO = {
     "refine": False,
     "window_ba": False,
 }
-FROZEN_DEAD_RECKON = {"enabled": True, "max_frames": 300}
+FROZEN_DEAD_RECKON = {"enabled": True, "max_frames": 300, "max_age_s": 10.0}
 
 QUALITY_NOTE = (
     "P174 reports in-sample pose coverage 99.40% over the mapping keyframes only. "
@@ -262,11 +261,10 @@ def transfer(source: Path, target: Path, mode: str) -> None:
             hint = (
                 " The pack and the release directory are on different filesystems; "
                 "rerun with --mode copy (needs the full payload size in free space)."
-                if exc.errno == errno.EXDEV else ""
+                if exc.errno == errno.EXDEV
+                else ""
             )
-            raise BuildError(
-                f"cannot hard-link {source} -> {target}: {exc}.{hint}"
-            ) from exc
+            raise BuildError(f"cannot hard-link {source} -> {target}: {exc}.{hint}") from exc
     elif mode == "copy":
         shutil.copyfile(source, target)
         try:
@@ -350,8 +348,12 @@ def write_map_ply(reconstruction, path: Path, target_points: int) -> dict:
             xyz = point.xyz
             color = point.color
             chunk += record.pack(
-                float(xyz[0]), float(xyz[1]), float(xyz[2]),
-                int(color[0]), int(color[1]), int(color[2]),
+                float(xyz[0]),
+                float(xyz[1]),
+                float(xyz[2]),
+                int(color[0]),
+                int(color[1]),
+                int(color[2]),
             )
             if len(chunk) >= 1 << 20:
                 stream.write(chunk)
@@ -392,8 +394,7 @@ def write_reference_poses(
     missing = [name for name in ref_names if name not in poses]
     if missing:
         raise BuildError(
-            f"{len(missing)} reference images are not registered in the model, "
-            f"first: {missing[0]}"
+            f"{len(missing)} reference images are not registered in the model, first: {missing[0]}"
         )
     document = {
         "schema": "reference-poses/v2",
@@ -407,9 +408,7 @@ def write_reference_poses(
     }
     digest = write_json(path, document)
     scale_center = np.median(centers, axis=0)
-    map_scale = float(
-        2.0 * np.percentile(np.linalg.norm(centers - scale_center, axis=1), 95)
-    )
+    map_scale = float(2.0 * np.percentile(np.linalg.norm(centers - scale_center, axis=1), 95))
     return digest, {
         "pose_count": len(poses),
         "ref_name_count": len(ref_names),
@@ -426,19 +425,19 @@ def derive_gravity(poses_path: Path, out_path: Path, frame_name: str) -> dict:
         [
             sys.executable,
             str(GRAVITY_TOOL),
-            "--poses", str(poses_path),
-            "--out", str(out_path),
-            "--frame-name", frame_name,
+            "--poses",
+            str(poses_path),
+            "--out",
+            str(out_path),
+            "--frame-name",
+            frame_name,
         ],
         capture_output=True,
         text=True,
         check=False,
     )
     if result.returncode != 0 or not out_path.is_file():
-        raise BuildError(
-            "derive_map_gravity.py failed:\n"
-            f"{result.stdout}\n{result.stderr}"
-        )
+        raise BuildError(f"derive_map_gravity.py failed:\n{result.stdout}\n{result.stderr}")
     print(result.stdout.strip())
     return json.loads(out_path.read_text(encoding="utf-8"))
 
@@ -452,6 +451,7 @@ def controller_for_scale(map_scale: float) -> tuple[dict, dict]:
     for key, coefficient in coefficients.items():
         controller[key] = coefficient * map_scale
     return controller, coefficients
+
 
 def write_shard_manifest(
     localization: Path,
@@ -470,21 +470,25 @@ def write_shard_manifest(
         entries = []
         for rel in chunk:
             full = keyframes_root / rel
-            entries.append({
-                "path": rel.as_posix(),
-                "sha256": sha256_file(full),
-                "size_bytes": full.stat().st_size,
-            })
+            entries.append(
+                {
+                    "path": rel.as_posix(),
+                    "sha256": sha256_file(full),
+                    "size_bytes": full.stat().st_size,
+                }
+            )
         shard_root_sha256 = hashlib.sha256(
             "".join(f"{e['path']} {e['sha256']}\n" for e in entries).encode("utf-8")
         ).hexdigest()
-        shards.append({
-            "shard_id": f"shard_{idx:04d}",
-            "shard_root_sha256": shard_root_sha256,
-            "file_count": len(entries),
-            "total_bytes": sum(e["size_bytes"] for e in entries),
-            "files": entries,
-        })
+        shards.append(
+            {
+                "shard_id": f"shard_{idx:04d}",
+                "shard_root_sha256": shard_root_sha256,
+                "file_count": len(entries),
+                "total_bytes": sum(e["size_bytes"] for e in entries),
+                "files": entries,
+            }
+        )
     manifest_payload: dict[str, object] = {
         "schema": "direct-shard-manifest/v1",
         "shard_size": shard_size,
@@ -500,21 +504,25 @@ def write_shard_manifest(
             entries = []
             for rel in chunk:
                 full = depth_root / rel
-                entries.append({
-                    "path": rel.as_posix(),
-                    "sha256": sha256_file(full),
-                    "size_bytes": full.stat().st_size,
-                })
+                entries.append(
+                    {
+                        "path": rel.as_posix(),
+                        "sha256": sha256_file(full),
+                        "size_bytes": full.stat().st_size,
+                    }
+                )
             d_root_sha = hashlib.sha256(
                 "".join(f"{e['path']} {e['sha256']}\n" for e in entries).encode("utf-8")
             ).hexdigest()
-            depth_shards.append({
-                "shard_id": f"depth_shard_{idx:04d}",
-                "shard_root_sha256": d_root_sha,
-                "file_count": len(entries),
-                "total_bytes": sum(e["size_bytes"] for e in entries),
-                "files": entries,
-            })
+            depth_shards.append(
+                {
+                    "shard_id": f"depth_shard_{idx:04d}",
+                    "shard_root_sha256": d_root_sha,
+                    "file_count": len(entries),
+                    "total_bytes": sum(e["size_bytes"] for e in entries),
+                    "files": entries,
+                }
+            )
         manifest_payload["depth_shards"] = depth_shards
         manifest_payload["total_depth_files"] = len(depth_list)
     manifest_path = localization / "shard_manifest.json"
@@ -595,9 +603,7 @@ def build(args: argparse.Namespace) -> int:
     source_keyframes = map_dir / "keyframes"
     source_localization = map_dir / "localization"
 
-    releases = (
-        REPO_ROOT / "地圖檔" / "場域" / args.site / "releases"
-    ).resolve()
+    releases = (REPO_ROOT / "地圖檔" / "場域" / args.site / "releases").resolve()
     if not releases.is_dir():
         raise BuildError(f"site releases directory does not exist: {releases}")
     final = releases / args.release_id
@@ -652,13 +658,9 @@ def populate(
     for name in MODEL_BINS:
         transfer(source_model / name, model_dir / name, mode)
     shutil.copyfile(source_model / "occupancy.json", model_dir / "occupancy.json")
-    image_relatives = transfer_tree(
-        source_keyframes / "images", staging / "keyframes/images", mode
-    )
+    image_relatives = transfer_tree(source_keyframes / "images", staging / "keyframes/images", mode)
     depth_relatives = transfer_tree(source_depth, staging / "depth_moge3", mode)
-    shutil.copyfile(
-        source_keyframes / "keyframes.jsonl", staging / "keyframes/keyframes.jsonl"
-    )
+    shutil.copyfile(source_keyframes / "keyframes.jsonl", staging / "keyframes/keyframes.jsonl")
 
     # --- small localization assets -----------------------------------------
     localization = staging / "localization"
@@ -684,8 +686,10 @@ def populate(
 
     reconstruction = pycolmap.Reconstruction(str(model_dir))
     occupancy = json.loads((model_dir / "occupancy.json").read_text(encoding="utf-8"))
-    if (reconstruction.num_images() != occupancy["n_images"]
-            or reconstruction.num_points3D() != occupancy["n_points3D"]):
+    if (
+        reconstruction.num_images() != occupancy["n_images"]
+        or reconstruction.num_points3D() != occupancy["n_points3D"]
+    ):
         raise BuildError(
             "model disagrees with occupancy.json: "
             f"{reconstruction.num_images()}/{reconstruction.num_points3D()} vs "
@@ -697,7 +701,8 @@ def populate(
     ref_names = [
         json.loads(line)["image_name"]
         for line in (localization / "reference_manifest.jsonl")
-        .read_text(encoding="utf-8").splitlines()
+        .read_text(encoding="utf-8")
+        .splitlines()
         if line.strip()
     ]
     poses_path = localization / "reference_poses.json"
@@ -716,16 +721,20 @@ def populate(
     controller, coefficients = controller_for_scale(map_scale)
 
     profile_path = localization / "direct_localizer_profile.json"
-    profile_sha = write_json(profile_path, {
-        "schema": "direct-deployment-profile/v1",
-        "name": "river_p174_frozen",
-        "map_scale": map_scale,
-        "intrinsics": QUERY_INTRINSICS,
-        "reloc": FROZEN_RELOC,
-        "fast_loop": FROZEN_FAST_LOOP,
-        "vo": FROZEN_VO,
-        "dead_reckon": FROZEN_DEAD_RECKON,
-    })
+    profile_sha = write_json(
+        profile_path,
+        {
+            "schema": "direct-deployment-profile/v1",
+            "name": "river_p174_frozen",
+            "map_scale": map_scale,
+            "intrinsics": QUERY_INTRINSICS,
+            "reloc": FROZEN_RELOC,
+            "fast_loop": FROZEN_FAST_LOOP,
+            "vo": FROZEN_VO,
+            "dead_reckon": FROZEN_DEAD_RECKON,
+            "max_jump_u": 1.5,
+        },
+    )
 
     shard_manifest_path, shard_manifest_sha = write_shard_manifest(
         localization,
@@ -748,149 +757,164 @@ def populate(
         "../compat/inductor_prewarm.json",
     ]
     bundle_path = localization / "direct_bundle.json"
-    bundle_sha = write_json(bundle_path, {
-        "schema": "direct-localization-bundle/v1",
-        "map_revision_id": release_id,
-        "coordinate_frame_id": coordinate_frame_id,
-        "model_dir": "../model",
-        "keyframes_manifest": "../keyframes/keyframes.jsonl",
-        "keyframes_images_root": "../keyframes/images",
-        "reference_manifest": "reference_manifest.jsonl",
-        "reference_bank": {
-            "name": "sideview-boq",
-            "descriptors": "boq_references_sideview.npy",
-            "names": "boq_references_sideview.names.json",
+    bundle_sha = write_json(
+        bundle_path,
+        {
+            "schema": "direct-localization-bundle/v1",
+            "map_revision_id": release_id,
+            "coordinate_frame_id": coordinate_frame_id,
+            "model_dir": "../model",
+            "keyframes_manifest": "../keyframes/keyframes.jsonl",
+            "keyframes_images_root": "../keyframes/images",
+            "reference_manifest": "reference_manifest.jsonl",
+            "reference_bank": {
+                "name": "sideview-boq",
+                "descriptors": "boq_references_sideview.npy",
+                "names": "boq_references_sideview.names.json",
+            },
+            "intersection_cells": "fim_lwtl_intersection_cells.json",
+            "reference_depth_dir": "../depth_moge3",
+            "model_sha256": {name: sha256_file(model_dir / name) for name in FRAME_DIGEST_BINS},
+            "files": [
+                {
+                    "path": relative,
+                    "sha256": sha256_file(localization / relative),
+                    "size_bytes": (localization / relative).stat().st_size,
+                }
+                for relative in bundle_files
+            ],
         },
-        "intersection_cells": "fim_lwtl_intersection_cells.json",
-        "reference_depth_dir": "../depth_moge3",
-        "model_sha256": {
-            name: sha256_file(model_dir / name) for name in FRAME_DIGEST_BINS
-        },
-        "files": [
-            {
-                "path": relative,
-                "sha256": sha256_file(localization / relative),
-                "size_bytes": (localization / relative).stat().st_size,
-            }
-            for relative in bundle_files
-        ],
-    })
+    )
 
     # --- site profile -------------------------------------------------------
     site_profile_path = staging / "site_profile.json"
     ply_sha = sha256_file(staging / "map/map.ply")
-    write_json(site_profile_path, {
-        "schema_version": 2,
-        "site_id": release_id,
-        "display_name": "河濱全八段 DIRECT（未獨立驗證）",
-        "localizer": "direct",
-        "localizer_deploy_dir": DEPLOY_DIR_RELATIVE,
-        "localizer_profile": "localization/direct_localizer_profile.json",
-        "map_reference_poses": "localization/reference_poses.json",
-        "map_align": "localization/T_align_gravity.json",
-        "query_camera": QUERY_CAMERA,
-        "coordinate_frame": coordinate_frame,
-        "asset_sha256": {
-            "map_ply": ply_sha,
-            "localization_bundle": bundle_sha,
-            "route_json": None,
-            "localizer_profile": profile_sha,
-            "map_reference_poses": poses_sha,
-            "map_align": gravity_sha,
-            "shard_manifest": shard_manifest_sha,
-            "inductor_prewarm": prewarm_sha,
+    write_json(
+        site_profile_path,
+        {
+            "schema_version": 2,
+            "site_id": release_id,
+            "display_name": "河濱全八段 DIRECT（未獨立驗證）",
+            "localizer": "direct",
+            "localizer_deploy_dir": DEPLOY_DIR_RELATIVE,
+            "localizer_profile": "localization/direct_localizer_profile.json",
+            "map_reference_poses": "localization/reference_poses.json",
+            "map_align": "localization/T_align_gravity.json",
+            "query_camera": QUERY_CAMERA,
+            "coordinate_frame": coordinate_frame,
+            "asset_sha256": {
+                "map_ply": ply_sha,
+                "localization_bundle": bundle_sha,
+                "route_json": None,
+                "localizer_profile": profile_sha,
+                "map_reference_poses": poses_sha,
+                "map_align": gravity_sha,
+                "shard_manifest": shard_manifest_sha,
+                "inductor_prewarm": prewarm_sha,
+            },
+            "hardware_approval": None,
+            "flight": {
+                "approved": False,
+                "coordinate_frame_id": coordinate_frame_id,
+                "route_clearance_approved": False,
+                "approval_note": (
+                    "新座標系、無航線、未做現場驗收；P174 只有 in-sample pose coverage，"
+                    "禁止 AUTO/真機核准。"
+                ),
+                "controller": controller,
+            },
+            "assets": {
+                "map_ply": "map/map.ply",
+                "route_json": None,
+                "localization_bundle": "localization/direct_bundle.json",
+                "megaloc_cache": None,
+                "track_landmarks": None,
+                "poles_json": None,
+                "shard_manifest": "localization/shard_manifest.json",
+                "inductor_prewarm": "compat/inductor_prewarm.json",
+            },
         },
-        "hardware_approval": None,
-        "flight": {
-            "approved": False,
-            "coordinate_frame_id": coordinate_frame_id,
-            "route_clearance_approved": False,
-            "approval_note": (
-                "新座標系、無航線、未做現場驗收；P174 只有 in-sample pose coverage，"
-                "禁止 AUTO/真機核准。"
-            ),
-            "controller": controller,
-        },
-        "assets": {
-            "map_ply": "map/map.ply",
-            "route_json": None,
-            "localization_bundle": "localization/direct_bundle.json",
-            "megaloc_cache": None,
-            "track_landmarks": None,
-            "poles_json": None,
-            "shard_manifest": "localization/shard_manifest.json",
-            "inductor_prewarm": "compat/inductor_prewarm.json",
-        },
-    })
+    )
     site_profile_sha = sha256_file(site_profile_path)
 
     # --- compat -------------------------------------------------------------
     compat = staging / "compat"
     quality_gate_id = f"{release_id}_direct_unvalidated"
-    write_json(compat / "map_manifest.json", {
-        "schema": "sfm-map-revision/v1",
-        "site_id": f"{args.site}_direct",
-        "map_revision_id": release_id,
-        "coordinate_frame": coordinate_frame,
-        "assets": {
-            "map_ply": {"path": "../map/map.ply", "sha256": ply_sha},
-            "reference_poses": {
-                "path": "../localization/reference_poses.json",
-                "sha256": poses_sha,
-            },
-            "map_align": {
-                "path": "../localization/T_align_gravity.json",
-                "sha256": gravity_sha,
-            },
-        },
-    })
-    write_json(compat / "localizer_direct_manifest.json", {
-        "schema": "sfm-localizer-variant/v1",
-        "algorithm_id": "direct",
-        "variant_id": f"{release_id}_direct",
-        "provider_api_version": 1,
-        "pose_contract_version": 1,
-        "map_revision_id": release_id,
-        "coordinate_frame_id": coordinate_frame_id,
-        "camera_profiles": ["river_b0_p116_p117_map_scaled_1280x720_pinhole_v1"],
-        "required_vehicle_capabilities": ["rgb_stream_1280x720"],
-        "quality_gate_id": quality_gate_id,
-        "artifacts": {
-            "bundle": {
-                "path": "../localization/direct_bundle.json",
-                "sha256": bundle_sha,
-            },
-            "profile": {
-                "path": "../localization/direct_localizer_profile.json",
-                "sha256": profile_sha,
+    write_json(
+        compat / "map_manifest.json",
+        {
+            "schema": "sfm-map-revision/v1",
+            "site_id": f"{args.site}_direct",
+            "map_revision_id": release_id,
+            "coordinate_frame": coordinate_frame,
+            "assets": {
+                "map_ply": {"path": "../map/map.ply", "sha256": ply_sha},
+                "reference_poses": {
+                    "path": "../localization/reference_poses.json",
+                    "sha256": poses_sha,
+                },
+                "map_align": {
+                    "path": "../localization/T_align_gravity.json",
+                    "sha256": gravity_sha,
+                },
             },
         },
-        "runtime": {
-            "device": "cuda", "matcher": "edm", "retrieval": "megaloc",
-            "deploy_dir": "定位演算法/deploy_code/sfm_direct_deploy",
+    )
+    write_json(
+        compat / "localizer_direct_manifest.json",
+        {
+            "schema": "sfm-localizer-variant/v1",
+            "algorithm_id": "direct",
+            "variant_id": f"{release_id}_direct",
+            "provider_api_version": 1,
+            "pose_contract_version": 1,
+            "map_revision_id": release_id,
+            "coordinate_frame_id": coordinate_frame_id,
+            "camera_profiles": ["river_b0_p116_p117_map_scaled_1280x720_pinhole_v1"],
+            "required_vehicle_capabilities": ["rgb_stream_1280x720"],
+            "quality_gate_id": quality_gate_id,
+            "artifacts": {
+                "bundle": {
+                    "path": "../localization/direct_bundle.json",
+                    "sha256": bundle_sha,
+                },
+                "profile": {
+                    "path": "../localization/direct_localizer_profile.json",
+                    "sha256": profile_sha,
+                },
+            },
+            "runtime": {
+                "device": "cuda",
+                "matcher": "edm",
+                "retrieval": "megaloc",
+                "deploy_dir": "定位演算法/deploy_code/sfm_direct_deploy",
+            },
         },
-    })
-    write_json(compat / "localizer_quality_receipt.json", {
-        "schema": "sfm-calibration-receipt/v1",
-        "receipt_id": quality_gate_id,
-        "kind": "localizer_quality",
-        "subject": quality_gate_id,
-        "passed": False,
-        "issued_at": args.issued_at,
-        "expires_at": None,
-        "details": {
-            "source_status": "MAP_BUILT_UNVALIDATED_ALL_INPUTS",
-            "validation": "NONE",
-            "in_sample_pose_coverage": 0.9940,
-            "absolute_ground_truth": "NONE",
-            "site_acceptance_flight": "NONE",
-            "reference_pose_count": pose_stats["pose_count"],
-            "bundle_sha256": bundle_sha,
-            "profile_sha256": profile_sha,
-            "source_evidence": "../provenance/P174_AND_NEXT.md",
-            "notes": QUALITY_NOTE,
+    )
+    write_json(
+        compat / "localizer_quality_receipt.json",
+        {
+            "schema": "sfm-calibration-receipt/v1",
+            "receipt_id": quality_gate_id,
+            "kind": "localizer_quality",
+            "subject": quality_gate_id,
+            "passed": False,
+            "issued_at": args.issued_at,
+            "expires_at": None,
+            "details": {
+                "source_status": "MAP_BUILT_UNVALIDATED_ALL_INPUTS",
+                "validation": "NONE",
+                "in_sample_pose_coverage": 0.9940,
+                "absolute_ground_truth": "NONE",
+                "site_acceptance_flight": "NONE",
+                "reference_pose_count": pose_stats["pose_count"],
+                "bundle_sha256": bundle_sha,
+                "profile_sha256": profile_sha,
+                "source_evidence": "../provenance/P174_AND_NEXT.md",
+                "notes": QUALITY_NOTE,
+            },
         },
-    })
+    )
 
     # --- provenance ---------------------------------------------------------
     provenance = staging / "provenance"
@@ -901,10 +925,7 @@ def populate(
     small_inputs = [
         ("model/occupancy.json", source_model / "occupancy.json"),
         ("keyframes/keyframes.jsonl", source_keyframes / "keyframes.jsonl"),
-        *(
-            (f"localization/{name}", source_localization / name)
-            for name in copied_localization
-        ),
+        *((f"localization/{name}", source_localization / name) for name in copied_localization),
         ("provenance/README.md", pack / "README.md"),
         ("provenance/P174_AND_NEXT.md", pack / "P174_AND_NEXT.md"),
     ]
@@ -925,9 +946,8 @@ def populate(
         },
         "model": {
             "coordinate_frame_id": coordinate_frame_id,
-            "frame_digest_definition":
-                "sha256 over the concatenated contents of cameras.bin, images.bin, "
-                "points3D.bin in exactly that order",
+            "frame_digest_definition": "sha256 over the concatenated contents of cameras.bin, images.bin, "
+            "points3D.bin in exactly that order",
             "model_sha256": model_digest,
             "n_images": reconstruction.num_images(),
             "n_points3D": reconstruction.num_points3D(),
@@ -972,7 +992,7 @@ def populate(
             "reference_map_scale": REFERENCE_CONTROLLER_SCALE,
             "coefficients": coefficients,
             "derivation": "coefficient = reference_value / reference_map_scale; "
-                          "new_value = coefficient * S",
+            "new_value = coefficient * S",
             "values": {key: controller[key] for key in SCALED_CONTROLLER_KEYS},
         },
         "gravity": gravity["derivation"],
@@ -996,7 +1016,9 @@ def populate(
 
 
 def _verify_shard_entries(
-    shards: list[dict], root: Path, label: str,
+    shards: list[dict],
+    root: Path,
+    label: str,
 ) -> None:
     for shard in shards:
         files = shard.get("files", [])
@@ -1020,7 +1042,9 @@ def _verify_shard_manifest(staging: Path, digests: dict[str, str]) -> None:
         return
     actual = sha256_file(shard_manifest)
     if "shard_manifest" in digests and actual != digests["shard_manifest"]:
-        raise BuildError(f"site_profile asset_sha256.shard_manifest mismatch: {actual} != {digests['shard_manifest']}")
+        raise BuildError(
+            f"site_profile asset_sha256.shard_manifest mismatch: {actual} != {digests['shard_manifest']}"
+        )
     manifest_obj = json.loads(shard_manifest.read_text(encoding="utf-8"))
     _verify_shard_entries(
         manifest_obj.get("shards", []),
@@ -1036,32 +1060,28 @@ def _verify_shard_manifest(staging: Path, digests: dict[str, str]) -> None:
 
 def _verify_colmap_and_keyframes(staging: Path, pycolmap) -> None:
     reconstruction = pycolmap.Reconstruction(str(staging / "model"))
-    occupancy = json.loads(
-        (staging / "model/occupancy.json").read_text(encoding="utf-8")
-    )
-    if (reconstruction.num_images() != occupancy["n_images"]
-            or reconstruction.num_points3D() != occupancy["n_points3D"]):
+    occupancy = json.loads((staging / "model/occupancy.json").read_text(encoding="utf-8"))
+    if (
+        reconstruction.num_images() != occupancy["n_images"]
+        or reconstruction.num_points3D() != occupancy["n_points3D"]
+    ):
         raise BuildError("promoted model does not reload with the expected counts")
 
     keyframes = staging / "keyframes/images"
-    manifest_lines = (staging / "keyframes/keyframes.jsonl").read_text(
-        encoding="utf-8"
-    ).splitlines()
+    manifest_lines = (
+        (staging / "keyframes/keyframes.jsonl").read_text(encoding="utf-8").splitlines()
+    )
     for line in manifest_lines:
         if not line.strip():
             continue
         record = json.loads(line)
-        image = keyframes / Path(record["image_uri"]).parent.name / Path(
-            record["image_uri"]
-        ).name
+        image = keyframes / Path(record["image_uri"]).parent.name / Path(record["image_uri"]).name
         if not image.is_file():
             raise BuildError(f"keyframe listed in the manifest is missing: {image}")
 
 
 def _verify_bundle(staging: Path) -> None:
-    bundle = json.loads(
-        (staging / "localization/direct_bundle.json").read_text(encoding="utf-8")
-    )
+    bundle = json.loads((staging / "localization/direct_bundle.json").read_text(encoding="utf-8"))
     localization = staging / "localization"
     for entry in bundle["files"]:
         path = (localization / entry["path"]).resolve()
@@ -1105,20 +1125,29 @@ def verify_staging(staging: Path, pycolmap) -> None:
 
     _verify_colmap_and_keyframes(staging, pycolmap)
 
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--pack", required=True, help="deploy pack root directory")
     parser.add_argument("--site", required=True, help="site directory under 地圖檔/場域")
     parser.add_argument("--release-id", required=True, help="release directory name")
-    parser.add_argument("--map-dir", default="",
-                        help="map directory inside the pack (default: auto-detected)")
-    parser.add_argument("--mode", default="link", choices=("link", "copy", "move"),
-                        help="how the bulk payload is transferred (default: link)")
-    parser.add_argument("--issued-at", default="",
-                        help="quality receipt timestamp (default: derived from the "
-                             "release id date suffix)")
-    parser.add_argument("--force", action="store_true",
-                        help="replace an existing release directory")
+    parser.add_argument(
+        "--map-dir", default="", help="map directory inside the pack (default: auto-detected)"
+    )
+    parser.add_argument(
+        "--mode",
+        default="link",
+        choices=("link", "copy", "move"),
+        help="how the bulk payload is transferred (default: link)",
+    )
+    parser.add_argument(
+        "--issued-at",
+        default="",
+        help="quality receipt timestamp (default: derived from the release id date suffix)",
+    )
+    parser.add_argument(
+        "--force", action="store_true", help="replace an existing release directory"
+    )
     args = parser.parse_args(argv)
     if not args.issued_at:
         stamp = args.release_id[-8:]

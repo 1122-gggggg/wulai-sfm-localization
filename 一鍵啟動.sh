@@ -9,6 +9,17 @@ runtime_python="$venv_dir/bin/python"
 portable_mode=0
 portable_identity=""
 
+for argument in "$@"; do
+  if [[ "$argument" == "--site-profile" || "$argument" == --site-profile=* ]]; then
+    echo "[一鍵啟動] 真機入口的 site profile 由 mission selection 原子產生；不可直接覆寫 --site-profile" >&2
+    exit 2
+  fi
+done
+if [[ -n "${SFM_SITE_PROFILE:-}" ]]; then
+  echo "[一鍵啟動] 拒絕既有 SFM_SITE_PROFILE；請改用 SFM_MISSION_SELECTION" >&2
+  exit 2
+fi
+
 if [[ -f "$root_dir/PORTABLE_PACKAGE.json" ]]; then
   portable_mode=1
   if ! command -v "$python_bin" >/dev/null 2>&1; then
@@ -58,16 +69,6 @@ if [[ ! -x "$runtime_python" ]]; then
 fi
 
 default_selection="$root_dir/控制介面程式/mission_selections/river_gluemap_all8_direct_localization.json"
-for argument in "$@"; do
-  if [[ "$argument" == "--site-profile" || "$argument" == --site-profile=* ]]; then
-    echo "[一鍵啟動] 真機入口的 site profile 由 mission selection 原子產生；不可直接覆寫 --site-profile" >&2
-    exit 2
-  fi
-done
-if [[ -n "${SFM_SITE_PROFILE:-}" ]]; then
-  echo "[一鍵啟動] 拒絕既有 SFM_SITE_PROFILE；請改用 SFM_MISSION_SELECTION" >&2
-  exit 2
-fi
 export SFM_MISSION_SELECTION="${SFM_MISSION_SELECTION:-$default_selection}"
 
 export SFM_WORKSPACE_ROOT="$root_dir"

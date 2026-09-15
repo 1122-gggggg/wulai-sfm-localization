@@ -370,6 +370,17 @@ def _strict_keys(value: object, expected: set[str], label: str) -> dict[str, obj
     return value
 
 
+def _alignment_control_points(value) -> list[ControlPoint]:
+    if not isinstance(value, list):
+        raise ValueError("site alignment control_points must be a list")
+    controls = []
+    for index, item in enumerate(value):
+        if not isinstance(item, dict) or set(item) not in ({"map", "site"}, {"map", "site", "label"}):
+            raise ValueError(f"control_points[{index}] is malformed")
+        controls.append(ControlPoint(item["map"], item["site"], item.get("label")))
+    return controls
+
+
 def site_alignment_from_dict(
     value: object,
     *,
@@ -391,13 +402,7 @@ def site_alignment_from_dict(
         raise ValueError("site alignment site frame does not match the active site")
     if not isinstance(raw["approved"], bool):
         raise ValueError("site alignment approved must be boolean")
-    if not isinstance(raw["control_points"], list):
-        raise ValueError("site alignment control_points must be a list")
-    controls = []
-    for index, item in enumerate(raw["control_points"]):
-        if not isinstance(item, dict) or set(item) not in ({"map", "site"}, {"map", "site", "label"}):
-            raise ValueError(f"control_points[{index}] is malformed")
-        controls.append(ControlPoint(item["map"], item["site"], item.get("label")))
+    controls = _alignment_control_points(raw["control_points"])
     transform = _strict_keys(
         raw["transform"],
         {"scale", "R_site_from_map", "t_site_from_map"},

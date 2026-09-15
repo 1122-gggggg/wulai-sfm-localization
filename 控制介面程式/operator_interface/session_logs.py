@@ -144,7 +144,14 @@ def _finite_json(value):
         return {key: _finite_json(item) for key, item in value.items()}
     if isinstance(value, (list, tuple)):
         return [_finite_json(item) for item in value]
-    return value
+    if value is None or isinstance(value, (str, int, bool)):
+        return value
+    if isinstance(value, float):
+        return value
+    name = getattr(value, "name", None)
+    if isinstance(name, str) and name.strip():
+        return name.strip().rsplit(".", 1)[-1]
+    return str(value)
 
 
 def flight_debug_contract() -> dict[str, Any]:

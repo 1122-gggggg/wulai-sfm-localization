@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
 """Read-only first look at an IMU flight-test session.
 
-Answers one question before any GPU time is spent: does this recording actually
-contain what an IMU-aided localization evaluation needs? A trip that produced a
-session with no velocity, no stick input, or no LOST episode cannot be rescued
-offline, and the ESEKF A/B (``定位演算法/validation/benchmark_esekf_live_replay.py``)
-would just come back ``INVALID``/``DORMANT`` after a full replay.
+Checks the completeness and timing of fused telemetry and recorded images.
+The current DIRECT backend has a bounded fused-yaw bridge, not ESEKF or raw
+inertial integration. A usable recording is not an accuracy or flight approval.
 
 Reads only ``telemetry.jsonl``, ``localization.jsonl`` and ``imu_test/`` from
 the session directory. Writes nothing unless ``--out`` is given.
@@ -105,10 +103,7 @@ def summarize_imu(records: list[dict[str, Any]]) -> dict[str, Any]:
         stamp = _finite(record.get("t_mono_ns"))
         if stamp is not None:
             stamps.append(stamp * 1e-9)
-        attitude = [
-            _finite(record.get(key))
-            for key in ("att_roll", "att_pitch", "att_yaw")
-        ]
+        attitude = [_finite(record.get(key)) for key in ("att_roll", "att_pitch", "att_yaw")]
         if all(value is not None for value in attitude):
             with_attitude += 1
             roll.append(math.degrees(attitude[0]))  # type: ignore[arg-type]
@@ -160,9 +155,7 @@ def summarize_sticks(records: list[dict[str, Any]]) -> dict[str, Any]:
         "samples": len(records),
         "moved_samples": moved,
         "flight_axis_active_samples": active,
-        "axis_span": {
-            axis: max(values) - min(values) for axis, values in sorted(per_axis.items())
-        },
+        "axis_span": {axis: max(values) - min(values) for axis, values in sorted(per_axis.items())},
     }
 
 
@@ -260,6 +253,7 @@ def summarize_localization(records: list[dict[str, Any]]) -> dict[str, Any]:
         **_esekf_summary(records),
     }
 
+
 def summarize_map_scale(
     fused: list[dict[str, Any]], localization: list[dict[str, Any]]
 ) -> dict[str, Any]:
@@ -275,8 +269,7 @@ def summarize_map_scale(
     for row in fused:
         stamp = _finite(row.get("t_mono_ns"))
         velocity = [
-            _finite(row.get(key))
-            for key in ("speed_north_mps", "speed_east_mps", "speed_down_mps")
+            _finite(row.get(key)) for key in ("speed_north_mps", "speed_east_mps", "speed_down_mps")
         ]
         if stamp is None or not all(value is not None for value in velocity):
             continue
@@ -329,12 +322,11 @@ def summarize_frames(session: Path) -> dict[str, Any]:
         except ValueError:
             pass
     stamps = sorted(
-        stamp for stamp in (_finite(row.get("capture_stamp_mono")) for row in rows)
+        stamp
+        for stamp in (_finite(row.get("capture_stamp_mono")) for row in rows)
         if stamp is not None
     )
-    with_velocity = sum(
-        1 for row in rows if _finite(row.get("fused_speed_north")) is not None
-    )
+    with_velocity = sum(1 for row in rows if _finite(row.get("fused_speed_north")) is not None)
     return {
         "indexed": len(rows),
         "on_disk": (
@@ -378,9 +370,7 @@ def _motion_warnings(imu: dict[str, Any], sticks: dict[str, Any]) -> list[str]:
             "資訊量不足以判斷 IMU 有沒有幫助。"
         )
     if imu["with_velocity"] and imu["ground_speed_max_mps"] < MIN_SPEED_SPAN_MPS:
-        found.append(
-            f"最大地速只有 {imu['ground_speed_max_mps']:.2f} m/s；EKF 大概不會收斂。"
-        )
+        found.append(f"最大地速只有 {imu['ground_speed_max_mps']:.2f} m/s；EKF 大概不會收斂。")
     if not sticks["samples"]:
         found.append(
             "沒有 stick_axes；搖桿監控沒起來（直連無人機 Wi-Fi 就會這樣），"
@@ -391,15 +381,11 @@ def _motion_warnings(imu: dict[str, Any], sticks: dict[str, Any]) -> list[str]:
     return found
 
 
-def _coverage_warnings(
-    localization: dict[str, Any], frames: dict[str, Any]
-) -> list[str]:
+def _coverage_warnings(localization: dict[str, Any], frames: dict[str, Any]) -> list[str]:
     """Gaps that leave part of the comparison unevaluated."""
     found: list[str] = []
     if localization["lost_episodes"] < MIN_LOST_EPISODES:
-        found.append(
-            "整段沒有進過 LOST；recovery 這一半評不到，下次記得掃過難定位區再回來。"
-        )
+        found.append("整段沒有進過 LOST；recovery 這一半評不到，下次記得掃過難定位區再回來。")
     if localization["sync_error_over_bound"]:
         found.append(
             f"{localization['sync_error_over_bound']} 幀的 telemetry 比影像舊超過 "
@@ -411,9 +397,7 @@ def _coverage_warnings(
             "可能是速度沒餵到、EKF 沒收斂，或飛行段太短。"
         )
     if frames["indexed"] and frames["on_disk"] < frames["indexed"]:
-        found.append(
-            f"frames.jsonl 有 {frames['indexed']} 筆但磁碟只有 {frames['on_disk']} 張圖。"
-        )
+        found.append(f"frames.jsonl 有 {frames['indexed']} 筆但磁碟只有 {frames['on_disk']} 張圖。")
     dropped = frames.get("recorder", {}).get("dropped_queue_full")
     if dropped:
         found.append(f"錄製佇列滿而丟掉 {dropped} 張畫面（UI 優先，屬預期）。")

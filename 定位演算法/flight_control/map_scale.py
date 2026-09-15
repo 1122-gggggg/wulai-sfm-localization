@@ -184,6 +184,12 @@ def estimate_map_scale(
     close_chunk(times[-1], xyz[-1])
 
     duration = float(times[-1] - times[0]) if len(times) >= 2 else 0.0
+    return _summarize_scale(ratios, total_metric, total_visual, duration,
+                            n_min_segments, d_min_m, spread_tol)
+
+
+def _summarize_scale(ratios, total_metric, total_visual, duration,
+                     n_min_segments, d_min_m, spread_tol) -> MapScaleEstimate:
     if len(ratios) < n_min_segments:
         return MapScaleEstimate(
             None, None, None, len(ratios), total_metric, total_visual,

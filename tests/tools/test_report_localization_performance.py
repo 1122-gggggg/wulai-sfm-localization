@@ -208,12 +208,26 @@ def test_none_hold_kind_does_not_flag_window(tmp_path) -> None:
 
 
 def test_continuity_and_reloc_latency_count_distinct_results_not_cached_values(tmp_path):
-    statuses = ["NO_POSE", "FAST_TRACK", "VO_ONLY", "VO_ONLY", "DEAD_RECKON",
-                "RELOC_SEED", "NO_POSE", "NO_POSE"]
+    statuses = [
+        "NO_POSE",
+        "FAST_TRACK",
+        "VO_ONLY",
+        "VO_ONLY",
+        "DEAD_RECKON",
+        "RELOC_SEED",
+        "NO_POSE",
+        "NO_POSE",
+    ]
     rows = [
-        _loc_row(i, float(i), direct_status=status, success=status != "NO_POSE",
-                 map_constraint_age_s=[None, 0, 1, 2, 3, 0, 1, 2][i],
-                 reloc_ms=100.0 if i < 5 else 300.0, reloc_delivered=i in (1, 5))
+        _loc_row(
+            i,
+            float(i),
+            direct_status=status,
+            success=status != "NO_POSE",
+            map_constraint_age_s=[None, 0, 1, 2, 3, 0, 1, 2][i],
+            reloc_ms=100.0 if i < 5 else 300.0,
+            reloc_delivered=i in (1, 5),
+        )
         for i, status in enumerate(statuses)
     ]
     rows.append({**rows[3], "ui_arrival_mono": 100.0})

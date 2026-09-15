@@ -21,8 +21,8 @@ def test_small_point_sets_are_not_reordered():
 
 
 def test_quality_measures_known_reprojection_error_and_coverage():
-    xy = np.array([[10., 10.], [90., 10.], [10., 90.], [90., 90.]])
-    xyz = np.column_stack((xy + [3., 4.], np.ones(4)))
+    xy = np.array([[10.0, 10.0], [90.0, 10.0], [10.0, 90.0], [90.0, 90.0]])
+    xyz = np.column_stack((xy + [3.0, 4.0], np.ones(4)))
     pose = np.column_stack((np.eye(3), np.zeros(3)))
     result = pose_quality(xy, xyz, pose, np.eye(3), 100, 100)
     assert result["reproj_rms"] == pytest.approx(5.0)

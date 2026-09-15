@@ -1,5 +1,7 @@
 # ESEKF / KLT-3D-aware live evaluation runbook
 
+> **HISTORICAL，2026-09-15 封存說明。** 下文為舊後端／環境的紀錄，包含已刪除腳本與舊路徑，不可當作現行操作或驗證指令。現行 DIRECT 只有受限的 fused-yaw bridge，沒有 ESEKF。請參照 [現行離線驗證](../docs/direct_offline_validation.md)。
+
 最後更新：2026-09-05
 分支：`agent/localization-runtime-optimizations`
 

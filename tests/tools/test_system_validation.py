@@ -59,6 +59,10 @@ def test_release_receipt_tracks_operator_runtime_seams() -> None:
         "控制介面程式/validate_mission_selections.py",
         "地圖檔/場域/river_site/site_profile.json",
         "定位演算法/flight_control/localization_uncertainty.py",
+        "定位演算法/flight_control/pose_source_confirmation.py",
+        "控制介面程式/operator_interface/arming_gate.py",
+        "控制介面程式/operator_interface/operator_launch.py",
+        "控制介面程式/operator_interface/start_anafi_live.sh",
         "定位演算法/flight_control/real_path_follow_controller.py",
     }
 
@@ -270,7 +274,7 @@ def test_actual_portable_gets_clean_install_and_valid_pose_gate(tmp_path: Path) 
     }
 
     gate = steps["portable_clean_install_ui_pose"]
-    assert gate.argv[-1] == str(package.resolve())
+    assert gate.argv[-2:] == (str(package.resolve()), "--require-site-bundle")
     assert gate.timeout_s == 3600
 
 
@@ -307,7 +311,7 @@ def test_simulator_preflight_receipt_passes_video_and_json() -> None:
     preflight = steps["portable_simulator_preflight"]
     assert "--json" in preflight.argv
     assert preflight.argv[preflight.argv.index("--video") + 1].endswith(
-        "模擬器/測試影片/P1190119.MP4"
+        "模擬器/測試影片/720p/P1190119_720p.MP4"
     )
 
 
@@ -388,6 +392,7 @@ def test_dry_run_lists_checks_and_targets_without_side_effects(
 
 def test_a_failing_step_fails_the_receipt_and_exit_code(tmp_path, monkeypatch) -> None:
     module = _load_validation_module()
+    monkeypatch.setattr(module, "ROOT_PYTHON", Path(sys.executable))
     monkeypatch.setattr(
         module,
         "_steps",

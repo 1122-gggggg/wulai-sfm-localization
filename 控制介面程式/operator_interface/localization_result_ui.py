@@ -78,20 +78,25 @@ def stabilize_live_result_pose(
     return filtered_xyz
 
 
+def _pose_xyz(pose) -> np.ndarray | None:
+    xyz = None
+    try:
+        if isinstance(pose, dict):
+            xyz = np.asarray([float(pose[name]) for name in ("x", "y", "z")], dtype=float)
+            if xyz.shape != (3,) or not np.isfinite(xyz).all():
+                xyz = None
+    except (KeyError, TypeError, ValueError, OverflowError):
+        xyz = None
+    return xyz
+
+
 def normalize_live_localization_result(result: object) -> tuple[Any, np.ndarray | None]:
     """Downgrade a worker success unless it contains a complete finite XYZ pose."""
     # Support typed LocalizationResult via Mapping protocol; keep __getitem__ fallback.
     if isinstance(result, LocalizationResult):
         payload = result.to_payload()
         pose = payload.get("pose")
-        xyz = None
-        try:
-            if isinstance(pose, dict):
-                xyz = np.asarray([float(pose[name]) for name in ("x", "y", "z")], dtype=float)
-                if xyz.shape != (3,) or not np.isfinite(xyz).all():
-                    xyz = None
-        except (KeyError, TypeError, ValueError, OverflowError):
-            xyz = None
+        xyz = _pose_xyz(pose)
         if not payload.get("success"):
             return result, xyz
         if xyz is None:
@@ -110,14 +115,7 @@ def normalize_live_localization_result(result: object) -> tuple[Any, np.ndarray 
         return {"success": False, "error": "invalid localization result: expected object"}, None
     normalized = dict(result)
     pose = normalized.get("pose")
-    xyz = None
-    try:
-        if isinstance(pose, dict):
-            xyz = np.asarray([float(pose[name]) for name in ("x", "y", "z")], dtype=float)
-            if xyz.shape != (3,) or not np.isfinite(xyz).all():
-                xyz = None
-    except (KeyError, TypeError, ValueError, OverflowError):
-        xyz = None
+    xyz = _pose_xyz(pose)
     if not normalized.get("success"):
         return normalized, xyz
     if xyz is None:

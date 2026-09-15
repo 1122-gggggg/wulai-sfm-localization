@@ -105,6 +105,24 @@ def unwrap_camera_state(state: object) -> dict | None:
     return None
 
 
+def jsonable_camera_state(state: object) -> dict[str, object] | None:
+    """JSON-safe recording_mode readback. Olympe enums must not reach dumps."""
+    fields = unwrap_camera_state(state)
+    if fields is None:
+        return None
+    payload: dict[str, object] = {}
+    for key, value in fields.items():
+        name = str(key)
+        if value is None or isinstance(value, (str, int, bool)):
+            payload[name] = value
+        elif isinstance(value, float):
+            payload[name] = value
+        else:
+            token = _enum_token(value)
+            payload[name] = token or str(value)
+    return payload
+
+
 def recording_mode_matches(state: object, profile: RecordingProfile) -> bool | None:
     """None = no usable readback; True/False = confirmed match or mismatch."""
     fields = unwrap_camera_state(state)

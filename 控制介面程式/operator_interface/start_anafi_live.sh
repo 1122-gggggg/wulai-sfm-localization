@@ -210,6 +210,13 @@ fi
 export PYTHONUNBUFFERED=1
 export PYTHONNOUSERSITE=1
 
+# Fail before network probes or any backend startup. Python also verifies
+# the selected mission and its matching snapshot before constructing a backend.
+if [[ ! "${SFM_MISSION_SELECTION:-}" =~ [^[:space:]] ]]; then
+  echo "[start] ERROR: real-flight requires SFM_MISSION_SELECTION" >&2
+  exit 2
+fi
+
 target_reachable() {
   local target="$1"
   if command -v ping >/dev/null 2>&1 \
@@ -310,11 +317,6 @@ SITE_PROFILE="${SFM_SITE_PROFILE:-}"
 if [[ -n "$SITE_PROFILE" ]]; then
   EXTRA+=(--site-profile "$SITE_PROFILE")
   echo "[start] site-profile: $SITE_PROFILE"
-fi
-# Parity with 真機串流/啟動.sh:38-65: warn when site profile is supplied directly
-# without a mission selection. Do not block startup; preflight still runs.
-if [[ -z "${SFM_MISSION_SELECTION:-}" && -n "${SFM_SITE_PROFILE:-}" ]]; then
-  echo "[start] WARNING: SFM_SITE_PROFILE is set directly without SFM_MISSION_SELECTION; prefer mission selection via 控制介面程式/真機串流/啟動.sh (parity with 真機串流/啟動.sh:38-65)" >&2
 fi
 # Parity with 影片模擬串流/啟動.sh:29-60: pin expected runtime env before preflight.
 if [[ -n "${SFM_TORCH_HUB_CACHE:-}" ]]; then

@@ -14,12 +14,12 @@
 #   telemetry.jsonl        fused_odometry：姿態 roll/pitch/yaw + NED 速度 + 高度 + GPS（~8 Hz）
 #                          stick_axes：搖桿各軸原始值，動了就記、沒動 1 Hz 一筆
 #   localization.jsonl     每幀定位結果，並附上「這一幀送出去時掛的那個 IMU 樣本」
-#                          與 pose_status / prediction_mode / esekf_* 診斷
+#                          與 pose_status / imu_bridge / imu_bridge_reason 診斷
 #   imu_test/frames/       定位真正吃到的那幾張畫面（JPEG）
 #   imu_test/frames.jsonl  每張畫面的 capture stamp 與配對的 IMU 樣本
 #
 # 為什麼要另外存 imu_test/frames：機上錄影跟主機 telemetry 是兩個時鐘，
-# docs/esekf_live_eval_runbook.md 得靠手調 --telemetry-offset-s 才對得起來。
+# 舊 ESEKF runbook 的手動影片對齊流程已退役。
 # 這裡存的是定位當下那一張圖，跟 IMU 同一個 monotonic 時鐘，不用再對齊。
 set -euo pipefail
 
@@ -28,12 +28,11 @@ PY="${ROOT}/.venv/bin/python"
 SESSION_ROOT="${ROOT}/outputs/flight_logs"
 
 export SFM_IMU_FLIGHT_TEST=1
-# 這趟是「量測」不是「導航」：地圖的 localizer_quality receipt 是 passed:false
-# （沒有獨立 holdout），正規入口會擋在那裡，定位根本開不起來，也就量不到 IMU。
-# SFM_EVALUATION_ONLY=1 只放行「地圖未驗證」這一條 localization blocker，其餘
-# （digest 不符、camera profile 不符、收據缺漏）照擋。自主飛行不受影響：
-# flight.approved / route_clearance_approved 仍是 false，飛行合約照樣拒絕。
-# 手動搖桿飛行不經過那條合約，所以這趟該做的事都還能做。
+# 這趟是「量測」不是「導航」。預設 operator acceptance 已開放原本 AUTO 按鈕，
+# 所以這裡必須明確設 SFM_EVALUATION_ONLY=1，把本場次鎖成定位量測、拒絕 AUTO。
+# 該旗標只放行「地圖未驗證」這一條 localization blocker；digest 不符、
+# camera profile 不符、收據缺漏照擋。flight.approved 在 evaluation-only
+# 下仍是 false。手動搖桿飛行不經過那條合約。
 export SFM_EVALUATION_ONLY=1
 # 影格上限與品質。用河濱實拍量到的：1280x720 JPEG q90 平均 222 KiB，
 # 2 GiB 約 9400 張；定位實測約 8 Hz，也就是大概 20 分鐘（一顆電池夠用）。
@@ -57,7 +56,7 @@ IMU 飛行測試 — 現場步驟
  2. 按「開始定位」。等它從 BOOT 進到 TRACK。
  3. 用搖桿起飛，手動飛。這段要讓定位走過所有狀態：
       穩定 TRACK → 掃過難定位區觸發 WEAK_TRACK / LOST → 回到已知區域重新定位
-    慢一點、貼著路線飛，轉彎與高度變化都給一些，EKF 才收得起來。
+    這些資料僅用於 fused-yaw 與視覺追蹤分析；目前沒有 ESEKF。
  4. 想要更高解析度的備份，可以另外在介面上開機上錄影；
     離線分析用不到它，imu_test/frames 已經是定位當下吃的那批畫面。
  5. 落地後正常關窗（不要直接 kill），錄製才會收尾寫出 summary.json。
@@ -96,13 +95,11 @@ fi
 
 cat <<EOF
 
-[IMU飛行測試] 下一步（離線 ESEKF on/off A/B，需要 GPU）：
-  export HF_HUB_OFFLINE=1 CUDA_VISIBLE_DEVICES=0
-  .venv/bin/python 定位演算法/validation/benchmark_esekf_live_replay.py \\
-    --session "$SESSION" \\
-    --video <機上錄影.MP4> \\
-    --out outputs/esekf_live_$(date -u +%Y%m%d)/ --stride 3
-  判讀方式見 docs/esekf_live_eval_runbook.md。
+[IMU飛行測試] 離線檢查（不連接飛機）：
+  .venv/bin/python tools/imu_flight_test_report.py --session "$SESSION" --json
+  現行系統只有 fused-yaw bridge，沒有 ESEKF on/off replay。
+  原始 gyro/accel、尺度與外參不足時不能宣稱完成視覺慣性融合驗收。
+  判讀方式見 docs/direct_offline_validation.md。
 EOF
 
 exit "$STATUS"

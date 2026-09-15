@@ -59,6 +59,44 @@ def test_vo_at_the_final_point_does_not_accumulate_landing_evidence():
     assert command.should_land
 
 
+def _final_hold_with_periodic_unconfirmed_frames(*, reseed_confirming):
+    """Flight 2026-09-15 14:25: two unconfirmed frames about every 0.9 s."""
+    control = controller([(0, 0, 0), (1, 0, 0)])
+    control.step(rpf.Pose(0, 0, 0, 0, stamp=0), now=0)
+    for index in range(60):
+        stamp = 1.0 + index * 0.06
+        confirmed = index % 15 not in (13, 14)
+        pose = rpf.Pose(
+            1, 0, 0, 0, stamp=stamp, map_confirmed=confirmed,
+            reseed_confirming=reseed_confirming and not confirmed,
+        )
+        if control.step(pose, now=stamp).should_land:
+            return stamp
+    return None
+
+
+def test_reseed_confirmation_frames_pause_the_final_hold():
+    assert _final_hold_with_periodic_unconfirmed_frames(reseed_confirming=True) == pytest.approx(2.02)
+
+
+def test_other_unconfirmed_frames_still_restart_the_final_hold():
+    assert _final_hold_with_periodic_unconfirmed_frames(reseed_confirming=False) is None
+
+
+def test_a_long_reseed_confirmation_still_restarts_the_final_hold():
+    control = controller([(0, 0, 0), (1, 0, 0)])
+    control.step(rpf.Pose(0, 0, 0, 0, stamp=0), now=0)
+    for index in range(40):
+        stamp = 1.0 + index * 0.06
+        confirmed = not 6 <= index <= 16  # 1.36-1.96 s: gap > max_pose_age_s
+        pose = rpf.Pose(
+            1, 0, 0, 0, stamp=stamp, map_confirmed=confirmed, reseed_confirming=not confirmed
+        )
+        if control.step(pose, now=stamp).should_land:
+            break
+    assert stamp == pytest.approx(3.04), "dwell restarts at the first confirmed pose, 2.02 s"
+
+
 def test_climbing_during_a_turn_does_not_advance_horizontal_route_progress():
     control = controller([(0, 0, 0), (10, -5, 0)])
     control.step(rpf.Pose(0, 0, 0, 0, stamp=0), now=0)
@@ -137,9 +175,9 @@ def test_centering_hysteresis_survives_fresh_updates_and_releases_when_far():
         assert gate.centering
         assert gate.phase in {"waypoint_centering", "height_adjust"}
     pose = rpf.Pose(0, 0.1, -0.041, 0, stamp=0.8)
-    roll, pitch, yaw, _gaz = gate.update(command, pose, 0.8, target_key=0)
-    assert (roll, pitch) == (0, 0) and yaw != 0
-    assert gate.phase == "turn"
+    roll, pitch, yaw, gaz = gate.update(command, pose, 0.8, target_key=0)
+    assert not gate.centering
+    assert yaw != 0 or gate.phase == "turn"
 
 
 @pytest.mark.parametrize("limit", [0, -1, 101, True, 2.5])

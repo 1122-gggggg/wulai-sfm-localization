@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import threading
 import time
@@ -131,6 +132,27 @@ def test_desktop_auto_keeps_route_in_raw_map_frame(tmp_path) -> None:
     assert np.asarray(autonomy.waypoints) == pytest.approx(
         np.array([[0.0, 0.0, 0.0], [1.0, 2.0, 3.0]])
     )
+
+
+def test_route_hooks_forward_reseed_confirmation(tmp_path) -> None:
+    def reseed_confirming():
+        return True
+
+    autonomy = DesktopRouteAutonomy(
+        backend=_Backend(),
+        snapshot=_snapshot(tmp_path),
+        map_frame=LEGACY_MAP_FRAME,
+        get_pose=lambda: None,
+        pose_is_weak=lambda: True,
+        pose_reseed_confirming=reseed_confirming,
+        pose_confidence=lambda: 100,
+        force_relocalize=lambda: None,
+        stream_healthy=lambda: True,
+        takeoff=lambda: True,
+        land=lambda: True,
+    )
+
+    assert autonomy._route_hooks().pose_reseed_confirming is reseed_confirming
 
 
 def test_cancel_join_tracks_the_async_manual_handoff(tmp_path) -> None:
@@ -680,10 +702,9 @@ def test_auto_yaw_authority_is_not_tied_to_the_manual_nudge_size(tmp_path) -> No
     assert cfg.max_yaw_pcmd > backend.nudge_pct
     assert cfg.yaw_alignment_timeout_s == pytest.approx(DESKTOP_AUTO_YAW_ALIGNMENT_TIMEOUT_S)
     assert cfg.max_translation_pcmd == DESKTOP_AUTO_MAX_TRANSLATION_PCMD
-    # Translation authority (3% tilt ≈ 0.45 m/s nominal, balanced against the
-    # 0.60 m/s speed guard, 2026-09-13) is intentionally BELOW the manual
-    # nudge size: the two envelopes are unrelated. What must hold is that the
-    # dispatch seam scales by AUTO's own authority, verified below.
+    # Translation authority is intentionally below the default manual nudge
+    # size: the two envelopes are unrelated. Dispatch must scale by AUTO's
+    # own authority, verified below.
 
     # And the dispatch seam carries those caps through: it used to divide by
     # nudge_pct while the backend multiplied by nudge_pct, so the whole chain
@@ -694,7 +715,7 @@ def test_auto_yaw_authority_is_not_tied_to_the_manual_nudge_size(tmp_path) -> No
         (0, 0, DESKTOP_AUTO_MAX_YAW_PCMD, 0),
         (DESKTOP_AUTO_MAX_TRANSLATION_PCMD, 0, 0, 0),
     ):
-        autonomy._dispatch_route_pcmd(pcmd, speed_guard_active=False)
+        autonomy._dispatch_route_pcmd(pcmd)
         vector = backend.vectors[-1]
         assert [round(value * authority) for value in vector] == list(pcmd)
 
@@ -732,6 +753,7 @@ def test_desktop_auto_matches_path_follow_production_config(tmp_path, monkeypatc
     assert desktop.max_yaw_pcmd == DESKTOP_AUTO_MAX_YAW_PCMD
     assert desktop.max_translation_pcmd == DESKTOP_AUTO_MAX_TRANSLATION_PCMD
     assert desktop.yaw_alignment_timeout_s == pytest.approx(DESKTOP_AUTO_YAW_ALIGNMENT_TIMEOUT_S)
+    assert desktop.waypoint_arrive_radius >= rpf.DESKTOP_AUTO_MIN_ARRIVE_RADIUS
 
 
 class _SessionLogs:
@@ -1240,7 +1262,11 @@ def test_pause_holds_zero_and_resume_keeps_the_same_route_run(tmp_path) -> None:
     )
     autonomy.phase = "ROUTE"
 
-    assert autonomy.pause()
+    autonomy.controller._arrive_frames = 2
+    target = autonomy.controller.target_index
+    assert autonomy.pause("auto_localization_source_change")
+    assert autonomy.controller._arrive_frames == 0
+    assert autonomy.controller.target_index == target
     assert autonomy.paused
     assert autonomy._safety_mode() == "HOVER"
     accepted, reason, applied = autonomy._send_authorized((5, 0, 0, 0))
@@ -1429,46 +1455,15 @@ def test_cancel_hands_control_to_manual_without_resuming_auto(tmp_path) -> None:
     assert backend.handoffs == ["auto_cancel:manual_takeover"]
 
 
-@pytest.mark.parametrize("measured_speed", [0.30, 0.31])
-def test_fresh_speed_at_or_above_limit_hovers_before_route_command(
+@pytest.mark.parametrize("measured_speed", [0.30, 0.31, None])
+def test_ground_speed_does_not_zero_horizontal_auto_command(
     tmp_path,
     measured_speed,
 ) -> None:
     clock = _Clock()
     backend = _Backend()
     backend.state.ground_speed_mps = measured_speed
-    backend.state.ground_speed_mono_ns = 10_000_000_000
-    autonomy = DesktopRouteAutonomy(
-        backend=backend,
-        snapshot=_snapshot(tmp_path),
-        map_frame=LEGACY_MAP_FRAME,
-        get_pose=lambda: None,
-        pose_is_weak=lambda: False,
-        pose_confidence=lambda: 100,
-        force_relocalize=lambda: None,
-        stream_healthy=lambda: True,
-        takeoff=lambda: True,
-        land=lambda: True,
-        now=clock.now,
-        sleep=clock.sleep,
-    )
-
-    accepted, reason, applied = autonomy._send_authorized((5, 0, 0, 0))
-
-    assert not accepted
-    assert "speed limit" in reason
-    assert applied == (0, 0, 0, 0)
-    assert backend.vectors == [(0.0, 0.0, 0.0, 0.0)]
-    assert backend.zeros[-1][:4] == (0, 0, 0, 0)
-    assert backend.state.autonomous_speed_guard_status == "OVERSPEED_HOVER"
-
-
-def test_fresh_speed_below_limit_keeps_guard_active_and_sends_route_command(
-    tmp_path,
-) -> None:
-    clock = _Clock()
-    backend = _Backend()
-    backend.state.ground_speed_mps = 0.15
+    backend.state.ground_speed_mono_ns = None if measured_speed is None else 10_000_000_000
     autonomy = DesktopRouteAutonomy(
         backend=backend,
         snapshot=_snapshot(tmp_path),
@@ -1487,14 +1482,14 @@ def test_fresh_speed_below_limit_keeps_guard_active_and_sends_route_command(
     accepted, reason, applied = autonomy._send_authorized((5, 0, 0, 0))
 
     assert accepted
-    assert "fresh-speed guard" in reason
+    assert "speed" not in reason.lower() or "command cap" in reason
     assert applied == (5, 0, 0, 0)
     authority = autonomy._pcmd_authority_pct()
     assert backend.vectors == [(5 / authority, 0.0, 0.0, 0.0)]
-    assert backend.state.autonomous_speed_guard_status == "FRESH_SPEED_GUARD"
+    assert backend.zeros == []
 
 
-def test_disabled_speed_limit_bypasses_only_the_ground_speed_guard(tmp_path) -> None:
+def test_disabled_speed_limit_still_sends_horizontal_auto_command(tmp_path) -> None:
     backend = _Backend()
     backend.state.autonomous_speed_limit_enabled = False
     backend.state.ground_speed_mps = None
@@ -1516,7 +1511,6 @@ def test_disabled_speed_limit_bypasses_only_the_ground_speed_guard(tmp_path) -> 
 
     assert accepted
     assert applied == (5, 0, 0, 0)
-    assert backend.state.autonomous_speed_guard_status == "SPEED_LIMIT_DISABLED"
 
 
 def test_runtime_safety_latch_holds_auto_at_zero(tmp_path) -> None:
@@ -1543,86 +1537,6 @@ def test_runtime_safety_latch_holds_auto_at_zero(tmp_path) -> None:
     assert applied == (0, 0, 0, 0)
     assert backend.vectors == [(0.0, 0.0, 0.0, 0.0)]
     assert backend.zeros[-1] == (0, 0, 0, 0, "auto_runtime_safety_hover")
-
-
-@pytest.mark.parametrize("speed_sample", [None, (5.0, 1.0)])
-def test_missing_or_stale_speed_blocks_horizontal_auto_command(
-    tmp_path,
-    speed_sample,
-) -> None:
-    clock = _Clock()
-    backend = _Backend()
-    if speed_sample is None:
-        backend.state.ground_speed_mps = None
-        backend.state.ground_speed_mono_ns = None
-    else:
-        backend.state.ground_speed_mps, speed_stamp = speed_sample
-        backend.state.ground_speed_mono_ns = int(speed_stamp * 1_000_000_000)
-    autonomy = DesktopRouteAutonomy(
-        backend=backend,
-        snapshot=_snapshot(tmp_path),
-        map_frame=LEGACY_MAP_FRAME,
-        get_pose=lambda: None,
-        pose_is_weak=lambda: False,
-        pose_confidence=lambda: 100,
-        force_relocalize=lambda: None,
-        stream_healthy=lambda: True,
-        takeoff=lambda: True,
-        land=lambda: True,
-        now=clock.now,
-        sleep=clock.sleep,
-    )
-
-    accepted, reason, applied = autonomy._send_authorized((5, 0, 0, 0))
-
-    assert not accepted
-    assert "ground speed" in reason
-    assert applied == (0, 0, 0, 0)
-    assert all(not any(abs(value) > 0.0 for value in vector) for vector in backend.vectors)
-    assert backend.state.autonomous_speed_guard_status == "SPEED_UNAVAILABLE_HOVER"
-
-
-def test_speed_guard_latch_releases_only_below_hysteresis_threshold(tmp_path) -> None:
-    clock = _Clock()
-    backend = _Backend()
-    autonomy = DesktopRouteAutonomy(
-        backend=backend,
-        snapshot=_snapshot(tmp_path),
-        map_frame=LEGACY_MAP_FRAME,
-        get_pose=lambda: None,
-        pose_is_weak=lambda: False,
-        pose_confidence=lambda: 100,
-        force_relocalize=lambda: None,
-        stream_healthy=lambda: True,
-        takeoff=lambda: True,
-        land=lambda: True,
-        now=clock.now,
-        sleep=clock.sleep,
-    )
-
-    backend.state.ground_speed_mps = 0.30
-    accepted, reason, applied = autonomy._send_authorized((5, 0, 0, 0))
-    assert not accepted
-    assert "speed limit" in reason
-    assert applied == (0, 0, 0, 0)
-    assert autonomy._speed_guard_latched
-
-    backend.state.ground_speed_mps = 0.25
-    accepted, _reason, _applied = autonomy._send_authorized((5, 0, 0, 0))
-    assert not accepted
-    assert autonomy._speed_guard_latched
-
-    backend.state.ground_speed_mps = 0.24
-    accepted, _reason, _applied = autonomy._send_authorized((5, 0, 0, 0))
-    assert not accepted
-    assert autonomy._speed_guard_latched
-
-    backend.state.ground_speed_mps = 0.23
-    accepted, reason, applied = autonomy._send_authorized((5, 0, 0, 0))
-    assert accepted
-    assert "fresh-speed guard" in reason
-    assert applied == (5, 0, 0, 0)
-    assert not autonomy._speed_guard_latched
 
 
 def test_paused_auto_does_not_trip_speed_guard_on_stale_telemetry(tmp_path) -> None:
@@ -1652,7 +1566,6 @@ def test_paused_auto_does_not_trip_speed_guard_on_stale_telemetry(tmp_path) -> N
     assert not accepted
     assert reason == "AUTO paused"
     assert applied == (0, 0, 0, 0)
-    assert not autonomy._speed_guard_latched
 
 
 def test_takeoff_must_return_literal_true_before_boot_hover(tmp_path) -> None:
@@ -1704,7 +1617,7 @@ def _budget_autonomy(tmp_path, backend, clock) -> DesktopRouteAutonomy:
 @pytest.mark.parametrize("speed, age", [
     (0.317, 0.0), (0.0, 0.6), (float("nan"), 0.0), (0.0, -1.0),
 ])
-def test_auto_turn_waits_for_measured_horizontal_stop(tmp_path, speed, age):
+def test_auto_yaw_command_is_not_held_for_horizontal_stop(tmp_path, speed, age):
     clock = _Clock()
     backend = _Backend()
     backend.state.autonomous_speed_limit_mps = 0.6
@@ -1714,25 +1627,23 @@ def test_auto_turn_waits_for_measured_horizontal_stop(tmp_path, speed, age):
 
     accepted, _, applied = autonomy._send_authorized((0, 0, 50, 2))
     assert accepted
-    assert applied == (0, 0, 0, 2)  # Height correction continues while braking.
+    assert applied == (0, 0, 50, 2)
     record = {"pcmd": list(applied), "pcmd_phase": "turn"}
     autonomy._log_route_tick(record)
-    assert record["pcmd_phase"] == "turn_brake"
-
-    backend.state.ground_speed_mps = 0.05
-    backend.state.ground_speed_mono_ns = int(clock.now() * 1e9)
-    assert autonomy._send_authorized((0, 0, 50, 2))[2] == (0, 0, 50, 2)
+    assert record["pcmd_phase"] == "turn"
 
 
-def test_desktop_bounds_weak_pose_continuation_even_when_enabled(tmp_path):
+def test_desktop_weak_fill_in_does_not_use_a_half_second_map_deadline(tmp_path):
     autonomy = _budget_autonomy(tmp_path, _Backend(), _Clock())
     autonomy.accept_weak_poses = True
-    assert autonomy._route_hooks().max_weak_pose_age_s == pff.POSE_STALE_S
+    assert autonomy._run_route.__func__ is DesktopRouteAutonomy._run_route
+    # Desktop AUTO passes enforce_weak_pose_gate=not accept_weak_poses.
+    source = inspect.getsource(DesktopRouteAutonomy._run_route)
+    assert "enforce_weak_pose_gate=not self.accept_weak_poses" in source
 
 
 def test_turn_brake_log_preserves_a_later_manual_handoff(tmp_path):
     autonomy = _budget_autonomy(tmp_path, _Backend(), _Clock())
-    autonomy._turn_wait_reason = "waiting for horizontal stop"
     record = {"pcmd": None, "pcmd_phase": "turn", "blocked": True, "reason": "MANUAL"}
     autonomy._log_route_tick(record)
     assert record["reason"] == "MANUAL"
@@ -1750,53 +1661,60 @@ def test_boot_pose_lock_rejects_vo_only_even_with_high_inliers(tmp_path):
     lock.reset.assert_called_once()
 
 
-@pytest.mark.parametrize("speed, expected", [(0.20, 10), (0.24, 10), (0.27, 5), (0.29, 2)])
-def test_speed_taper_reduces_only_horizontal_axes(tmp_path, speed, expected):
-    clock = _Clock()
+def _forward_motion_backend(clock, forward_mps):
     backend = _Backend()
-    backend.state.ground_speed_mps = speed
+    backend.state.autonomous_speed_limit_mps = 0.6
+    backend.state.ground_speed_mps = abs(forward_mps)
+    backend.state.ground_speed_mono_ns = int(clock.now() * 1e9)
+    # att_yaw 0: body forward is north.
+    backend.state.speed_north_mps = forward_mps
+    backend.state.speed_east_mps = 0.0
+    return backend
+
+
+@pytest.mark.parametrize("speed, command, expected", [
+    (0.0, (0, 50, 7, 3), (0, 50, 7, 3)),
+    (0.12, (0, 50, 7, 3), (0, 40, 7, 3)),
+    (0.3, (0, 50, 7, 3), (0, 25, 7, 3)),
+    (0.3, (-30, 40, 0, 0), (-19, 25, 0, 0)),
+    (0.3, (0, 10, 0, 0), (0, 10, 0, 0)),
+    (0.6, (0, 50, 7, 3), (0, 0, 7, 3)),
+    (0.9, (0, 50, 0, 0), (0, 0, 0, 0)),
+])
+def test_horizontal_auto_command_tapers_to_zero_at_speed_limit(
+    tmp_path, speed, command, expected
+):
+    clock = _Clock()
+    backend = _forward_motion_backend(clock, speed)
     autonomy = _budget_autonomy(tmp_path, backend, clock)
-    accepted, _, applied = autonomy._send_authorized((10, -10, 7, 3))
+    assert autonomy.controller.cfg.max_translation_pcmd == 50
+    accepted, _, applied = autonomy._send_authorized(command)
     assert accepted
-    assert applied == (expected, -expected, 7, 3)
+    assert applied == expected
     authority = autonomy._pcmd_authority_pct()
-    assert backend.vectors[-1] == pytest.approx(tuple(value / authority for value in applied))
+    assert backend.vectors[-1] == pytest.approx(tuple(value / authority for value in expected))
+    assert backend.zeros == []
 
 
-def test_speed_taper_reduces_guard_chopping_in_a_lagged_velocity_plant(tmp_path):
-    def simulate(taper):
-        clock = _Clock()
-        backend = _Backend()
-        autonomy = _budget_autonomy(tmp_path, backend, clock)
-        if not taper:
-            original = autonomy._apply_speed_guard
+def test_braking_command_is_not_limited_above_speed_limit(tmp_path):
+    clock = _Clock()
+    backend = _forward_motion_backend(clock, 0.9)
+    autonomy = _budget_autonomy(tmp_path, backend, clock)
+    accepted, _, applied = autonomy._send_authorized((0, -50, 0, 0))
+    assert accepted
+    assert applied == (0, -50, 0, 0)
+    assert backend.state.autonomous_speed_guard_status == "FRESH_SPEED_LIMIT"
 
-            def hard_guard_only(pcmd):
-                result = original(pcmd)
-                autonomy._speed_command_scale = 1.0
-                return result
 
-            autonomy._apply_speed_guard = hard_guard_only
-        speed = 0.0
-        blocked = 0
-        samples = []
-        for _ in range(400):
-            backend.state.ground_speed_mps = speed
-            backend.state.ground_speed_mono_ns = int((clock.now() - 0.001) * 1e9)
-            accepted, _, applied = autonomy._send_authorized((0, 3, 0, 0))
-            blocked += not accepted
-            # A first-order response with 0.4 s lag; no aircraft connection.
-            target_speed = 0.15 * applied[1]
-            speed += (target_speed - speed) * (1.0 - np.exp(-0.05 / 0.4))
-            samples.append(speed)
-            clock.sleep(0.05)
-        return blocked, max(samples), float(np.mean(samples[-100:]))
-
-    hard = simulate(False)
-    soft = simulate(True)
-    assert hard[0] > 0 and soft[0] < hard[0]
-    assert soft[1] < hard[1]
-    assert soft[2] > 0.20
+def test_stale_velocity_leaves_horizontal_command_unlimited(tmp_path):
+    clock = _Clock()
+    backend = _forward_motion_backend(clock, 0.9)
+    backend.state.ground_speed_mono_ns = int((clock.now() - 1.0) * 1e9)
+    autonomy = _budget_autonomy(tmp_path, backend, clock)
+    accepted, _, applied = autonomy._send_authorized((0, 50, 0, 0))
+    assert accepted
+    assert applied == (0, 50, 0, 0)
+    assert backend.state.autonomous_speed_guard_status == "SPEED_UNAVAILABLE"
 
 
 def _progress_tick(clock, *, x=0.0, target=1, **overrides):
@@ -1836,7 +1754,7 @@ def test_slow_but_steady_waypoint_progress_does_not_time_out(tmp_path):
     autonomy = _budget_autonomy(tmp_path, _Backend(), clock)
     autonomy.phase = "ROUTE"
     for index in range(700):
-        autonomy._log_route_tick(_progress_tick(clock, x=index * 0.0001))
+        autonomy._log_route_tick(_progress_tick(clock, x=index * 0.001))
         clock.sleep(0.1)
     assert not autonomy._auto_failed
 

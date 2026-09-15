@@ -26,6 +26,7 @@ RIVER_MAP = (
 RIVER_PROFILE = ROOT / "地圖檔/場域/river_site/site_profile.json"
 
 
+@pytest.mark.skipif(not RIVER_MAP.is_file(), reason="requires private river site bundle")
 def test_map_selection_resolves_the_matching_profile(tmp_path: Path) -> None:
     video_path = tmp_path / "test.mp4"
     video_path.write_bytes(b"test-video")

@@ -17,51 +17,90 @@ def turn_fixture():
     gate = rpf.YawAlignedPcmdController(cfg)
     cmd = rpf.Command("FOLLOW", np.zeros(3), math.pi / 2,
                       np.array([0., -.3, 1.]), 0., 0.)
+    gate.target_key = 0
+    gate.aligned_for_translation = True
     return gate, cmd
 
 
 @pytest.mark.parametrize("forward,right", [(0.317, 0.), (0., -.317), (.2, .2)])
-def test_turn_recovery_brakes_opposite_velocity_without_yaw_or_gaz(forward, right):
+def test_cruise_translates_toward_the_waypoint_without_yawing_for_drift(forward, right):
     gate, cmd = turn_fixture()
     pose = rpf.Pose(0, 0, 0, 0, stamp=1.)
     roll, pitch, yaw, gaz = gate.update(
         cmd, pose, 1., target_key=0, body_velocity=(forward, right, 1.)
     )
-    assert pitch * forward + roll * right < 0
-    assert yaw == gaz == 0
+    assert yaw == 0
+    assert roll or pitch
     assert max(abs(roll), abs(pitch)) <= gate.config.max_translation_pcmd
-    assert gate.phase == "turn_drift_recovery"
+    assert gate.phase == "translate"
 
 
-def test_turn_recovery_restores_anchor_and_requires_fresh_stable_samples():
+def test_cruise_keeps_translating_after_a_gust_without_turning():
     gate, cmd = turn_fixture()
-    gate.update(cmd, rpf.Pose(0, 0, 0, 0, stamp=1.), 1., target_key=0,
-                body_velocity=(.3, 0., 1.))
-    result = gate.update(cmd, rpf.Pose(.08, 0, 0, 0, stamp=1.1), 1.1,
+    first = gate.update(cmd, rpf.Pose(0, 0, 0, 0, stamp=1.), 1., target_key=0,
+                        body_velocity=(.3, 0., 1.))
+    second = gate.update(cmd, rpf.Pose(.08, 0, 0, 0, stamp=1.1), 1.1,
                          target_key=0, body_velocity=(0., 0., 1.1))
-    assert result[1] < 0 and result[2] == result[3] == 0
-    # Even if position is back, one repeated speed sample cannot finish settling.
-    for index in range(5):
-        now = 1.2 + .1 * index
-        result = gate.update(cmd, rpf.Pose(0, 0, 0, 0, stamp=now), now,
-                             target_key=0, body_velocity=(0., 0., 1.2))
-        assert result[2] == 0
-    for index in range(7):
-        now = 1.7 + .1 * index
-        result = gate.update(cmd, rpf.Pose(0, 0, 0, 0, stamp=now), now,
-                             target_key=0, body_velocity=(0., 0., now))
-    assert result[2] != 0 and result[:2] == (0, 0)
-    assert result[3] != 0  # Climb can run with the eventual turn.
+    assert first[2] == second[2] == 0
+    assert gate.phase == "translate"
+    assert first[:2] != (0, 0) or second[:2] != (0, 0)
 
 
 @pytest.mark.parametrize("velocity,confirmed", [((.3, 0., 0.), True),
                                                ((float("nan"), 0., 1.), True),
                                                ((.3, 0., 1.), False)])
-def test_turn_recovery_never_translates_on_stale_or_weak_inputs(velocity, confirmed):
+def test_cruise_still_translates_when_speed_or_map_confirmation_is_bad(velocity, confirmed):
     gate, cmd = turn_fixture()
     result = gate.update(cmd, rpf.Pose(0, 0, 0, 0, stamp=1., map_confirmed=confirmed),
                          1., target_key=0, body_velocity=velocity)
-    assert result[:2] == (0, 0)
+    assert result[2] == 0
+    assert result[:2] != (0, 0)
+    assert gate.phase == "translate"
+
+
+def test_near_waypoint_integral_grows_against_a_steady_offset():
+    cfg = rpf.production_auto_control_config(rpf.LEGACY_MAP_FRAME)
+    cfg = rpf.apply_desktop_auto_authority(cfg)
+    gate = rpf.YawAlignedPcmdController(cfg)
+    gate.target_key = 0
+    gate.aligned_for_translation = True
+    cmd = rpf.Command("FOLLOW", np.zeros(3), 0.0, np.array([0.08, 0.0, 0.0]), 0.0, 0.0)
+    pose = rpf.Pose(0, 0, 0, 0, stamp=1.0)
+    first = gate.update(cmd, pose, 1.0, target_key=0, body_velocity=(0.0, 0.0, 1.0))
+    later = first
+    for index in range(1, 12):
+        now = 1.0 + 0.05 * index
+        later = gate.update(
+            cmd, rpf.Pose(0, 0, 0, 0, stamp=now), now, target_key=0,
+            body_velocity=(0.0, 0.0, now),
+        )
+    assert later[2] == 0
+    assert abs(later[0]) + abs(later[1]) >= abs(first[0]) + abs(first[1])
+
+
+def test_cruise_cancels_cross_track_wind_without_stopping():
+    gate, cmd = turn_fixture()
+    calm = gate.update(cmd, rpf.Pose(0, 0, 0, 0, stamp=1.), 1., target_key=0,
+                       body_velocity=(0., 0., 1.))
+    blown = gate.update(cmd, rpf.Pose(0, 0, 0, 0, stamp=1.1), 1.1, target_key=0,
+                        body_velocity=(0., 0.3, 1.1))
+    assert calm[2] == blown[2] == 0
+    assert blown[0] * 0.3 < 0 or blown[0] != calm[0]
+    assert blown[1] or blown[0]
+
+
+def test_height_adjust_holds_against_side_wind_instead_of_zeroing_horizontal():
+    cfg = rpf.production_auto_control_config(rpf.LEGACY_MAP_FRAME)
+    gate = rpf.YawAlignedPcmdController(cfg)
+    cmd = rpf.Command("FOLLOW", np.zeros(3), 0.0, np.array([0.0, -1.0, 0.0]), 0.0, 0.0)
+    pose = rpf.Pose(0, 0, 0, 0, stamp=1.)
+    roll, pitch, yaw, gaz = gate.update(
+        cmd, pose, 1., target_key=0, body_velocity=(0.0, 0.3, 1.0),
+    )
+    assert yaw == 0
+    assert gaz != 0 or gate.phase == "height_adjust"
+    if math.hypot(roll, pitch) > 0:
+        assert roll * 0.3 < 0 or pitch != 0
 
 
 def progress_coordinator():
@@ -145,14 +184,16 @@ def test_localization_recovery_retains_target_and_hovers_before_resuming():
     )
     runner = pff._FlightLoopRunner(hooks, ctrl, ctrl.wp, yaw_sign=1, verbose=False,
                                    enforce_weak_pose_gate=True)
-    # A partial arrival must not survive a localization outage.
+    # A partial arrival must survive localization recovery so a brief outage
+    # cannot throw away a near-waypoint count and let wind push the aircraft out.
     ctrl._arrive_frames = 1
     ctrl._final_confirm_frames = 4
     for index in range(41):
         clock[0] = 1. + index * .05
         runner._tick(clock[0], "AUTO", {})
     assert ctrl.target_index == 0
-    assert ctrl._arrive_frames == ctrl._final_confirm_frames == 0
+    assert ctrl._arrive_frames == 1
+    assert ctrl._final_confirm_frames == 4
     assert 1 <= len(requests) <= 3
     # Resume near waypoint 2: never reselect that closer point after recovery.
     for now in (3.1, 3.2):
@@ -186,51 +227,74 @@ def test_firmware_velocity_is_rotated_to_body_axes(yaw, north, east, expected):
 
 
 @pytest.mark.parametrize("wind_speed", [.15, .317])
-def test_turn_completes_with_continuous_drift_and_inertia(wind_speed):
+def test_cruise_keeps_translating_under_continuous_drift(wind_speed):
     gate, _ = turn_fixture()
-    cfg = gate.config
     cmd = rpf.Command("FOLLOW", np.zeros(3), math.pi / 2,
                       np.array([0., 0., 10.]), 0., 0.)
-    position = np.zeros(3)
-    velocity = np.zeros(3)
-    yaw = 0.
-    dt = .05
-    phases = set()
-    for index in range(1200):
-        now = index * dt
-        wind = cfg.map_frame.east * wind_speed
-        forward = math.cos(yaw) * cfg.map_frame.east + math.sin(yaw) * cfg.map_frame.north
-        right = math.sin(yaw) * cfg.map_frame.east - math.cos(yaw) * cfg.map_frame.north
-        ground = velocity + wind
-        pose = rpf.Pose(*(position / 5.), yaw, stamp=now)
-        roll, pitch, turn, gaz = gate.update(
-            cmd, pose, now, target_key=0,
-            body_velocity=(float(ground @ forward), float(ground @ right), now),
-        )
-        assert not ((roll or pitch) and (turn or gaz))
-        phases.add(gate.phase)
-        if gate.aligned_for_translation:
-            break
-        # 0.4 s inertia, 0.15 m/s per PCMD, with no firmware position hold.
-        velocity += (.15 * (pitch * forward + roll * right) - velocity) * (1 - math.exp(-dt / .4))
-        position += (velocity + wind) * dt
-        yaw -= math.radians(turn * .2) * dt
-        assert np.linalg.norm(position) < .2
+    pose = rpf.Pose(0., 0., 0., 0., stamp=0.)
+    roll, pitch, turn, gaz = gate.update(
+        cmd, pose, 0., target_key=0,
+        body_velocity=(wind_speed, 0., 0.),
+    )
+    assert turn == 0
+    assert roll or pitch
+    assert gate.phase == "translate"
     assert gate.aligned_for_translation
-    assert {"turn_drift_recovery", "turn_settle", "turn"} <= phases
 
 
-def test_mid_leg_realign_anchors_at_current_position_not_the_old_turn():
+def test_mid_leg_heading_error_does_not_stop_translation_to_turn():
     gate, cmd = turn_fixture()
-    gate.target_key = 0
-    gate.aligned_for_translation = True
-    gate.turn_anchor = np.zeros(3)
     position = np.array([.5, 0., 0.])
     for now in (1., 1.1, 1.2):
         gate.update(cmd, rpf.Pose(*position, 0., stamp=now), now,
                     target_key=0, body_velocity=(.317, 0., now))
-    assert gate.phase == "turn_drift_recovery"
-    np.testing.assert_allclose(gate.turn_anchor, position)
+    assert gate.phase == "translate"
+    assert gate.aligned_for_translation
+
+
+def test_new_waypoint_yaws_toward_the_next_point_then_translates():
+    cfg = rpf.production_auto_control_config(rpf.LEGACY_MAP_FRAME)
+    gate = rpf.YawAlignedPcmdController(cfg)
+    cmd = rpf.Command(
+        "FOLLOW", np.zeros(3), math.pi / 2, np.array([0.0, 0.0, 1.0]), 0.0, 0.0,
+    )
+    turning = gate.update(
+        cmd, rpf.Pose(0, 0, 0, 0, stamp=1.0), 1.0, target_key=0,
+        body_velocity=(0.0, 0.3, 1.0),
+    )
+    assert turning[2] != 0
+    assert turning[0] * 0.3 <= 0
+    assert gate.phase == "turn"
+    assert not gate.aligned_for_translation
+
+    now = 1.0
+    for index in range(1, 6):
+        now = 1.0 + 0.1 * index
+        pcmd = gate.update(
+            cmd, rpf.Pose(0, 0, 0, math.pi / 2, stamp=now), now, target_key=0,
+        )
+        if gate.aligned_for_translation:
+            assert pcmd[2] == 0
+            break
+    else:
+        raise AssertionError("aligned heading never released translation")
+    flown = gate.update(
+        cmd, rpf.Pose(0, 0, 0, math.pi / 2, stamp=now + 0.1), now + 0.1, target_key=0,
+    )
+    assert flown[2] == 0
+    assert flown[0] or flown[1] or flown[3]
+    assert gate.phase == "translate"
+
+    next_cmd = rpf.Command(
+        "FOLLOW", np.zeros(3), 0.0, np.array([1.0, 0.0, 0.0]), 0.0, 0.0,
+    )
+    next_leg = gate.update(
+        next_cmd, rpf.Pose(0, 0, 0, math.pi / 2, stamp=2.0), 2.0, target_key=1,
+        body_velocity=(0.0, 0.0, 2.0),
+    )
+    assert next_leg[2] != 0
+    assert gate.phase == "turn"
+    assert not gate.aligned_for_translation
 
 
 @pytest.mark.parametrize("phase,text", [
@@ -270,7 +334,7 @@ def test_drift_that_hits_speed_guard_cannot_wait_indefinitely():
     assert obj._latch_auto_failure.called
 
 
-def test_flight_loop_uses_body_velocity_before_authorizing_drift_recovery():
+def test_flight_loop_translates_instead_of_authorizing_drift_recovery():
     obj, clock = progress_coordinator()
     clock[0] = 1.
     sent = []
@@ -285,8 +349,8 @@ def test_flight_loop_uses_body_velocity_before_authorizing_drift_recovery():
     runner = pff._FlightLoopRunner(hooks, obj.controller, obj.controller.wp,
                                    yaw_sign=1, verbose=False, enforce_weak_pose_gate=True)
     runner._tick(1., "AUTO", {})
-    assert records[-1]["pcmd_phase"] == "turn_drift_recovery"
-    assert sent[-1][1] < 0 and sent[-1][2:] == (0, 0)
+    assert records[-1]["pcmd_phase"] != "turn_drift_recovery"
+    assert sent[-1] is not None
     hooks.safety_poll = lambda: "HOVER"
     runner._tick(1., "HOVER", {})
     assert not any(sent[-1])

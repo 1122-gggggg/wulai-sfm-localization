@@ -65,9 +65,7 @@ def _add_offline_bundle(package: Path) -> None:
     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
     metadata["offline_install"] = {
         "complete": True,
-        "lock_digests": {
-            name: _sha256(lock_root / name) for name in sorted(_OFFLINE_LOCKS)
-        },
+        "lock_digests": {name: _sha256(lock_root / name) for name in sorted(_OFFLINE_LOCKS)},
         "manifest": "執行環境/offline_wheelhouse/WHEELHOUSE.json",
         "manifest_sha256": _sha256(manifest),
         "mode": "no-index",
@@ -145,13 +143,9 @@ def test_activation_is_atomic_and_rollback_is_verifiable(tmp_path: Path) -> None
         else:
             shutil.copy2(path, target)
     (second_source / "payload.txt").write_text("two", encoding="utf-8")
-    metadata = json.loads(
-        (second_source / "PORTABLE_PACKAGE.json").read_text(encoding="utf-8")
-    )
+    metadata = json.loads((second_source / "PORTABLE_PACKAGE.json").read_text(encoding="utf-8"))
     metadata["source_release"]["version"] = "release-two"
-    (second_source / "PORTABLE_PACKAGE.json").write_text(
-        json.dumps(metadata), encoding="utf-8"
-    )
+    (second_source / "PORTABLE_PACKAGE.json").write_text(json.dumps(metadata), encoding="utf-8")
     generate(second_source)
     expected_two = metadata["source_release"]
     second = stage(
@@ -190,9 +184,9 @@ def test_stage_rejects_symlinks_even_under_manifest_excluded_paths(
     _add_offline_bundle(source)
     (source / "payload.txt").write_text("one", encoding="utf-8")
     generate(source)
-    expected = json.loads(
-        (source / "PORTABLE_PACKAGE.json").read_text(encoding="utf-8")
-    )["source_release"]
+    expected = json.loads((source / "PORTABLE_PACKAGE.json").read_text(encoding="utf-8"))[
+        "source_release"
+    ]
     outside = tmp_path / "outside"
     outside.mkdir()
     (outside / "secret.txt").write_text("secret", encoding="utf-8")

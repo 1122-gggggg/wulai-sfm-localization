@@ -87,6 +87,7 @@ DIRECT_INFO_FIELDS = (
     "step_norm",
     "reloc_reference_names",
     "pnp_observation_sample",
+    "reseed_confirming",
 )
 
 RESULT_FIELDS = (
@@ -457,8 +458,11 @@ def attach_fused_localization_telemetry(
         attitude_stamp if has_source_stamp else getattr(state, "telemetry_read_mono_ns", None)
     )
     timing["fused_stamp_source"] = (
-        getattr(state, "attitude_stamp_source", "attitude_event") if attitude_stamp is not None
-        else "unavailable" if has_source_stamp else "poll_fallback"
+        getattr(state, "attitude_stamp_source", "attitude_event")
+        if attitude_stamp is not None
+        else "unavailable"
+        if has_source_stamp
+        else "poll_fallback"
     )
     if has_source_stamp and fused_mono is None:
         timing.update(fused_roll=None, fused_pitch=None, fused_yaw=None)

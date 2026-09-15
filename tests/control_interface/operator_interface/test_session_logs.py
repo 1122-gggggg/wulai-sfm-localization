@@ -50,6 +50,25 @@ def test_dispatch_buffer_is_flushed_on_close_without_disk_io_at_enqueue(tmp_path
     assert summary["debug_deferred_dropped"] == 0
 
 
+def test_session_logs_keep_healthy_when_readback_is_an_olympe_enum(tmp_path):
+    from types import SimpleNamespace
+
+    session = SessionLogs.create(tmp_path, mode=InterfaceMode.SIMULATED_STREAM, manifest={})
+    readback = {
+        0: {
+            "resolution": SimpleNamespace(name="resolution.res_1080p"),
+            "framerate": SimpleNamespace(name="framerate.fps_30"),
+        }
+    }
+    assert session.command("record_quality", readback=readback)
+    assert session.healthy is True
+    assert session.durable is True
+    session.close(reason="done")
+    row = json.loads((session.directory / "commands.jsonl").read_text())
+    assert row["event"] == "record_quality"
+    assert row["readback"]["0"]["resolution"] == "res_1080p"
+
+
 def test_debug_log_uses_null_for_unavailable_numbers(tmp_path):
     session = SessionLogs.create(tmp_path, mode=InterfaceMode.SIMULATED_STREAM, manifest={})
     assert session.telemetry("test", sample=[float("nan"), float("inf")])

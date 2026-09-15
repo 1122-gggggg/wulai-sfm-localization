@@ -55,8 +55,7 @@ def test_join_boundary_excludes_approach_wander_from_error(tmp_path: Path) -> No
     rows += [_tick(step, target=1, distance=0.6 - step * 0.05) for step in range(5)]
     # Joined at step 5; post-join error is a known 0.10/0.12 alternating pair.
     rows += [
-        _tick(5 + step, target=2, distance=0.10 if step % 2 == 0 else 0.12)
-        for step in range(6)
+        _tick(5 + step, target=2, distance=0.10 if step % 2 == 0 else 0.12) for step in range(6)
     ]
     result = report.analyze_session(_write_session(tmp_path, rows))
 
@@ -94,8 +93,13 @@ def test_post_join_vo_share_attributes_ticks_to_poses(tmp_path: Path) -> None:
     rows += [_tick(step, target=1, distance=0.5) for step in range(2)]
     rows += [_tick(2 + step, target=2, distance=0.1) for step in range(4)]
     poses = [
-        {"event": "pose_result", "success": True, "mode": "TRACK",
-         "direct_status": status, "t_mono_ns": int(stamp * 1e9)}
+        {
+            "event": "pose_result",
+            "success": True,
+            "mode": "TRACK",
+            "direct_status": status,
+            "t_mono_ns": int(stamp * 1e9),
+        }
         for stamp, status in (
             (100.0, "FAST_TRACK"),
             (100.2, "FAST_TRACK"),
@@ -120,14 +124,17 @@ def test_post_join_vo_share_attributes_ticks_to_poses(tmp_path: Path) -> None:
     ],
 )
 def test_blocked_commands_override_the_planned_phase(reason, expected):
-    tick = {"pcmd_phase": "translate", "pcmd": [0, 0, 0, 0],
-            "blocked": True, "reason": reason}
+    tick = {"pcmd_phase": "translate", "pcmd": [0, 0, 0, 0], "blocked": True, "reason": reason}
     assert report._phase_bucket(tick) == expected
 
 
 def test_accepted_speed_guard_command_is_still_translation():
-    tick = {"pcmd_phase": "translate", "pcmd": [0, 1, 0, 0],
-            "blocked": False, "reason": "desktop AUTO fresh-speed guard + command cap"}
+    tick = {
+        "pcmd_phase": "translate",
+        "pcmd": [0, 1, 0, 0],
+        "blocked": False,
+        "reason": "desktop AUTO fresh-speed guard + command cap",
+    }
     assert report._phase_bucket(tick) == "translate"
 
 
@@ -135,12 +142,17 @@ def test_phase_durations_accumulate_before_rounding_at_20hz(tmp_path):
     rows = [_plan(), _tick(0, target=0, distance=0.5)]
     for index in range(21):
         tick = _tick(index, target=1, distance=0.1)
-        tick.update(t=101.0 + index * 0.05, blocked=True,
-                    reason="AUTO speed limit reached -> HOVER", pcmd=[0, 0, 0, 0])
+        tick.update(
+            t=101.0 + index * 0.05,
+            blocked=True,
+            reason="AUTO speed limit reached -> HOVER",
+            pcmd=[0, 0, 0, 0],
+        )
         rows.append(tick)
     result = report.analyze_session(_write_session(tmp_path, rows))
     assert result["post_join"]["phase_seconds"] == {"guard_hover": 1.0}
     assert result["post_join"]["blocked_seconds"] == 1.0
+
 
 def test_two_auto_runs_do_not_share_join_timing_or_error(tmp_path: Path) -> None:
     first = [_plan()]

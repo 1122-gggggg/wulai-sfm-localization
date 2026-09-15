@@ -16,6 +16,7 @@ import json
 import re
 import subprocess
 import sys
+
 try:
     import tomllib
 except ModuleNotFoundError:  # CPython 3.10 uses the locked tomli backport.
@@ -147,9 +148,7 @@ def load_skip_exceptions(config_path: str | Path) -> tuple[SkippedDependencyExce
         if key in seen:
             raise ValueError(f"duplicate security skip exception: {package}/{version}")
         seen.add(key)
-        parsed.append(
-            SkippedDependencyException(package, version, skip_reason, reason, expires)
-        )
+        parsed.append(SkippedDependencyException(package, version, skip_reason, reason, expires))
     return tuple(parsed)
 
 
@@ -257,9 +256,7 @@ def evaluate_findings(
 ) -> list[str]:
     """Return gate failures for expired or unexcepted advisories."""
     current_date = date.today() if today is None else today
-    exception_by_key = {
-        (_package_key(item.package), item.advisory_id): item for item in exceptions
-    }
+    exception_by_key = {(_package_key(item.package), item.advisory_id): item for item in exceptions}
     errors: list[str] = []
     for item in exceptions:
         if item.expires <= current_date:
@@ -292,8 +289,7 @@ def evaluate_skipped_dependencies(
     """Require every pip-audit skip to match package, version, and reason."""
     current_date = date.today() if today is None else today
     exception_by_key = {
-        (_package_key(item.package), item.version, item.skip_reason): item
-        for item in exceptions
+        (_package_key(item.package), item.version, item.skip_reason): item for item in exceptions
     }
     errors: list[str] = []
     for item in exceptions:
@@ -372,10 +368,7 @@ def _record_skipped_component(
             },
         ]
     )
-    if not any(
-        isinstance(entry, dict) and entry.get("ref") == bom_ref
-        for entry in dependencies
-    ):
+    if not any(isinstance(entry, dict) and entry.get("ref") == bom_ref for entry in dependencies):
         dependencies.append({"ref": bom_ref})
     return None
 
@@ -469,10 +462,7 @@ def _run_pip_audit(
         except (OSError, json.JSONDecodeError) as exc:
             errors.append(f"CycloneDX SBOM is not valid JSON: {exc}")
         else:
-            if (
-                not isinstance(sbom_document, dict)
-                or sbom_document.get("bomFormat") != "CycloneDX"
-            ):
+            if not isinstance(sbom_document, dict) or sbom_document.get("bomFormat") != "CycloneDX":
                 errors.append("pip-audit SBOM is not a CycloneDX JSON document")
     return errors
 

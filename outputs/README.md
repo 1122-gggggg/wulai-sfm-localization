@@ -6,6 +6,8 @@
 
 ## 目前保留
 
+- `analysis/`：飛行紀錄複查、離線反例與修正驗證，保留各次來源雜湊及限制。
+- `sim_autoflight/`：路線控制模擬結果，不代表實飛或定位精度驗收。
 - `validation_receipts/`
   - 全地面系統驗證（`tools/system_validation.py`）之 JSON receipt（`validation_<timestamp>.json`）與步驟記錄（`validation_<timestamp>_logs/`）。
   - 生命週期：支援 `--smoke` 與完整（full）兩層 tier 驗證；內建自動輪替政策，嚴格保留最新 10 份 receipt 與對應 log 目錄，超出者自動清理，防止無界增長。

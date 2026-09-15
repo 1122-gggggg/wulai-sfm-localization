@@ -229,6 +229,7 @@ class SimParams:
     yaw_sign: int = 1
     seed: int = 7
     duration_s: float = 600.0
+    localization_wait_s: float = 0.0  # Included in the total mission budget.
     # takeoff
     start_offset_u: tuple[float, float, float] = (0.25, 0.0, 0.0)
     start_offset_frame: str = "lateral"  # lateral | raw
@@ -246,7 +247,7 @@ class SimParams:
     outage_every_s: float = 0.0
     outage_dur_s: float = 0.0
     # plant
-    cruise_mps: float = 0.45  # horizontal speed at max_translation_pcmd
+    cruise_mps: float = 0.90  # horizontal speed at max_translation_pcmd
     max_vertical_speed_mps: float = 2.0  # configured desktop envelope, not capability maximum
     max_rotation_speed_deg_s: float = 20.0
     speed_limit_mps: float = 0.6
@@ -288,9 +289,12 @@ class _SimulationAutonomyChecks(DesktopRouteAutonomy):
     """Run production speed/stall checks without a flight worker or transport."""
 
     def __init__(self, limit: float, controller):
-        self.backend = SimpleNamespace(state=SimpleNamespace(
-            autonomous_speed_limit_enabled=True, autonomous_speed_limit_mps=limit,
-        ))
+        self.backend = SimpleNamespace(
+            state=SimpleNamespace(
+                autonomous_speed_limit_enabled=True,
+                autonomous_speed_limit_mps=limit,
+            )
+        )
         self.stamp = 0.0
         self.now = lambda: self.stamp
         self._speed_guard_latched = False
@@ -314,13 +318,7 @@ class _SimulationAutonomyChecks(DesktopRouteAutonomy):
         self.stamp = stamp
         self.backend.state.ground_speed_mps = speed
         self.backend.state.ground_speed_mono_ns = int(stamp * 1e9)
-        _active, rejection = self._apply_speed_guard(pcmd)
-        if rejection is not None:
-            return rejection[2]
-        return self._apply_turn_speed_guard((
-            round(pcmd[0] * self._speed_command_scale),
-            round(pcmd[1] * self._speed_command_scale), pcmd[2], pcmd[3],
-        ))
+        return pcmd
 
 
 def _body_axes(yaw: float, map_frame) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -329,19 +327,157 @@ def _body_axes(yaw: float, map_frame) -> tuple[np.ndarray, np.ndarray, np.ndarra
     return (np.asarray(fwd, float), np.asarray(right, float), np.asarray(map_frame.up, float))
 
 
-def run_sim(params: SimParams, *, record_trace: bool = True) -> tuple[SimResult, dict]:
-    rng = np.random.default_rng(params.seed)
-    ctrl, cfg, map_frame, doc = build_production_controller(
-        params.route, params.align, return_to_start=params.return_to_start
-    )
-    s = float(params.meters_per_unit)
-    if not math.isfinite(s) or s <= 0:
-        raise ValueError("meters_per_unit must be finite and > 0")
+def _integrate_plant(
+    state,
+    wind,
+    hover_anchor,
+    params,
+    map_frame,
+    rng,
+    pcmd,
+    vh_per_pct,
+    vv_per_pct,
+    yaw_per_pct,
+    gust_phase,
+):
+    """Advance the physical plant by one control period, including wind."""
+    roll, pitch, yaw_p, gaz = pcmd
+    sub = 4
+    sdt = DT / sub
+    fwd_w, right_w, up_w = _body_axes(state.yaw, map_frame)
+    # vh_per_pct encodes the cruise calibration (max_translation_pcmd ->
+    # cruise_mps); vertical uses the configured firmware speed envelope.
+    v_tgt = fwd_w * (pitch * vh_per_pct) + right_w * (roll * vh_per_pct) + up_w * (gaz * vv_per_pct)
+    yaw_rate_tgt = -math.radians(yaw_p * yaw_per_pct)
+    # hard capability caps (white-paper maxima, never exceeded even by gusts)
+    if hover_anchor is not None and params.hover_hold_mps > 0:
+        hold = (hover_anchor - state.pos_m) * params.hover_hold_gain
+        hn = float(np.linalg.norm(hold))
+        if hn > params.hover_hold_mps:
+            hold = hold / hn * params.hover_hold_mps
+        v_tgt = v_tgt + hold
+    vh_cap = v_tgt - np.dot(v_tgt, up_w) * up_w
+    if float(np.linalg.norm(vh_cap)) > VH_MAX_MPS:
+        v_tgt = vh_cap / float(np.linalg.norm(vh_cap)) * VH_MAX_MPS + np.dot(v_tgt, up_w) * up_w
+    vv_n = float(np.dot(v_tgt, up_w))
+    if abs(vv_n) > VV_MAX_MPS:
+        v_tgt = v_tgt - up_w * (vv_n - math.copysign(VV_MAX_MPS, vv_n))
+    k_h = 1.0 - math.exp(-sdt / params.tau_h_s)
+    k_v = 1.0 - math.exp(-sdt / params.tau_v_s)
+    k_y = 1.0 - math.exp(-sdt / params.tau_yaw_s)
+    gust_displacement = np.zeros(3)
+    for _ in range(sub):
+        # wind OU in world meters
+        wind += (
+            (
+                -wind / params.wind_tau_s * sdt
+                + math.sqrt(2.0 / params.wind_tau_s)
+                * params.wind_sigma_mps
+                * math.sqrt(max(sdt, 1e-9))
+                * rng.normal(0, 1, 3)
+            )
+            if params.wind_tau_s > 0
+            else 0.0
+        )
+        gust = np.zeros(3)
+        if params.gust_every_s > 0 and params.gust_m > 0:
+            gust_phase += sdt
+            if gust_phase >= params.gust_every_s:
+                gust_phase = 0.0
+                gdir = rng.normal(0, 1, 3)
+                gdir /= np.linalg.norm(gdir) or 1.0
+                gust = gdir * (params.gust_m / sdt)  # exact metre displacement per impulse
+                gust_displacement += gust * sdt
+        vh = v_tgt - np.dot(v_tgt, up_w) * up_w  # horizontal part
+        vv = np.dot(v_tgt, up_w) * up_w
+        cur_h = state.vel_m - np.dot(state.vel_m, up_w) * up_w
+        cur_v = np.dot(state.vel_m, up_w) * up_w
+        cur_h += (vh - cur_h) * k_h
+        cur_v += (vv - cur_v) * k_v
+        state.vel_m = cur_h + cur_v
+        state.pos_m += (state.vel_m + wind) * sdt + gust * sdt
+        state.yaw_rate += (yaw_rate_tgt - state.yaw_rate) * k_y
+        state.yaw = rpf.wrap_angle(state.yaw + state.yaw_rate * sdt)
+    return wind, gust_phase, gust_displacement
 
-    wp = [np.array(p, float) for p in ctrl.wp]
-    n_wp = len(wp)
 
-    # --- takeoff state (meters, world frame parallel to map basis) ---
+def _inspection_dwell(ctrl, cmd, pose, cfg, t, land_hold_since):
+    phase = "inspect_hold"
+    if pose is not None and cmd.look_at_pole is not None:
+        err = abs(math.degrees(rpf.wrap_angle(float(cmd.yaw_target) - float(pose.yaw))))
+        if err <= float(cfg.inspect_yaw_tolerance_deg):
+            if land_hold_since is None:
+                land_hold_since = t
+            if t - land_hold_since >= 1.0:
+                ctrl.ack_inspection(cmd.look_at_pole, orientation_confirmed=True)
+                land_hold_since = None
+                phase = "inspect_acked"
+        else:
+            land_hold_since = None
+    return land_hold_since, phase
+
+
+def _update_hover_anchor(state, hover_anchor, map_frame, roll, pitch, gaz):
+    if hover_anchor is None:
+        hover_anchor = state.pos_m.copy()
+    anchor_delta = state.pos_m - hover_anchor
+    anchor_vertical = np.dot(anchor_delta, map_frame.up) * map_frame.up
+    if roll != 0 or pitch != 0:
+        hover_anchor += anchor_delta - anchor_vertical
+    if gaz != 0:
+        hover_anchor += anchor_vertical
+
+    return hover_anchor
+
+
+def _record_sim_arrival(ctrl, pose, prev_target, reached):
+    now_target = int(ctrl.target_index)
+    if prev_target != now_target:
+        reached.add(prev_target)
+    elif now_target not in reached and ctrl.waypoint_reached(
+        np.array([pose.x, pose.y, pose.z]), now_target
+    ):
+        reached.add(now_target)
+
+
+def _route_motion(cmd, pose, yaw_ctl, state, map_frame, wind, ctrl, t, params):
+    hover_ticks = yaw_ticks = 0
+    if pose is None:
+        action_pcmd = (0, 0, 0, 0)
+        phase = "stale_hover"
+    elif cmd.action in {"FOLLOW", "REJOIN", "FINAL_HOLD"}:
+        body_forward, body_right, _body_up = _body_axes(state.yaw, map_frame)
+        ground_velocity = state.vel_m + wind
+        action_pcmd = yaw_ctl.update(
+            cmd,
+            pose,
+            t,
+            target_key=int(ctrl.target_index),
+            yaw_sign=params.yaw_sign,
+            body_velocity=(
+                float(np.dot(ground_velocity, body_forward)),
+                float(np.dot(ground_velocity, body_right)),
+                t,
+            ),
+        )
+        phase = f"fgc:{yaw_ctl.phase}"
+        if yaw_ctl.phase in (
+            "turn",
+            "yaw_alignment_hold",
+            "yaw_alignment_confirmed",
+            "yaw_alignment_timeout",
+            "final_centering",
+        ):
+            yaw_ticks += 1
+    else:  # ARRIVING / HOVER
+        action_pcmd = (0, 0, 0, 0)
+        phase = cmd.action.lower()
+        hover_ticks += 1
+
+    return action_pcmd, phase, hover_ticks, yaw_ticks
+
+
+def _initial_sim_state(params, wp, map_frame, s):
     if params.start_offset_frame == "lateral":
         # offset perpendicular to the first leg's horizontal direction: a real
         # cross-track start, not a slide along the route.
@@ -362,6 +498,34 @@ def run_sim(params: SimParams, *, record_trace: bool = True) -> tuple[SimResult,
         pos_m=start_map * s,
         yaw=float(map_frame.heading(wp[1] - wp[0]) + math.radians(params.initial_yaw_error_deg)),
     )
+
+    return state, start_map
+
+
+def _simulation_budget(params: SimParams) -> tuple[float, int]:
+    duration, wait = float(params.duration_s), float(params.localization_wait_s)
+    if not math.isfinite(duration) or duration <= 0:
+        raise ValueError("duration_s must be finite and positive")
+    if not math.isfinite(wait) or wait < 0:
+        raise ValueError("localization_wait_s must be finite and nonnegative")
+    initial_wait = min(wait, duration)
+    return initial_wait, int((duration - initial_wait) * CTRL_HZ)
+
+
+def run_sim(params: SimParams, *, record_trace: bool = True) -> tuple[SimResult, dict]:
+    rng = np.random.default_rng(params.seed)
+    ctrl, cfg, map_frame, doc = build_production_controller(
+        params.route, params.align, return_to_start=params.return_to_start
+    )
+    s = float(params.meters_per_unit)
+    if not math.isfinite(s) or s <= 0:
+        raise ValueError("meters_per_unit must be finite and > 0")
+
+    wp = [np.array(p, float) for p in ctrl.wp]
+    n_wp = len(wp)
+
+    # --- takeoff state (meters, world frame parallel to map basis) ---
+    state, start_map = _initial_sim_state(params, wp, map_frame, s)
 
     # AUTO start rule: waypoint 1 first, even when takeoff sits nearer a later point.
     ctrl.start_after_nearest_waypoint(np.asarray(start_map, float))
@@ -388,12 +552,10 @@ def run_sim(params: SimParams, *, record_trace: bool = True) -> tuple[SimResult,
     vv_per_pct = params.max_vertical_speed_mps / 100.0
     yaw_per_pct = params.max_rotation_speed_deg_s / 100.0
 
-    loc.push_truth(0.0, state)
+    initial_wait, max_steps = _simulation_budget(params)
+    loc.push_truth(initial_wait, state)
     wind = np.zeros(3)
     hover_anchor: np.ndarray | None = None
-    max_steps = int(params.duration_s * CTRL_HZ)
-    sub = 4
-    sdt = DT / sub
 
     trace: list[dict] = []
     reached: set[int] = set()
@@ -405,10 +567,11 @@ def run_sim(params: SimParams, *, record_trace: bool = True) -> tuple[SimResult,
     max_waypoint_no_progress_s = 0.0
     max_dev = 0.0
     land_hold_since: float | None = None
-    reason = "step cap"
+    reason = "step cap" if max_steps else "localization wait exhausted total budget"
     success = False
     dist_m = 0.0
-    t = 0.0
+    t = initial_wait
+    step = -1
     prev_pos = state.pos_m.copy()
     gust_phase = 0.0
 
@@ -456,13 +619,7 @@ def run_sim(params: SimParams, *, record_trace: bool = True) -> tuple[SimResult,
         prev_target = int(ctrl.target_index)
         cmd = ctrl.step(pose, t)
         if pose is not None and fresh:
-            now_target = int(ctrl.target_index)
-            if prev_target != now_target:
-                reached.add(prev_target)
-            elif now_target not in reached and ctrl.waypoint_reached(
-                np.array([pose.x, pose.y, pose.z]), now_target
-            ):
-                reached.add(now_target)
+            _record_sim_arrival(ctrl, pose, prev_target, reached)
 
         # The controller owns segment recovery; the simulator measures its result.
         action_pcmd: tuple[int, int, int, int] = (0, 0, 0, 0)
@@ -491,17 +648,7 @@ def run_sim(params: SimParams, *, record_trace: bool = True) -> tuple[SimResult,
                 else (0, 0, 0, 0)
             )
             phase = "inspect_hold"
-            if pose is not None and cmd.look_at_pole is not None:
-                err = abs(math.degrees(rpf.wrap_angle(float(cmd.yaw_target) - float(pose.yaw))))
-                if err <= float(cfg.inspect_yaw_tolerance_deg):
-                    if land_hold_since is None:
-                        land_hold_since = t
-                    if t - land_hold_since >= 1.0:
-                        ctrl.ack_inspection(cmd.look_at_pole, orientation_confirmed=True)
-                        land_hold_since = None
-                        phase = "inspect_acked"
-                else:
-                    land_hold_since = None
+            land_hold_since, phase = _inspection_dwell(ctrl, cmd, pose, cfg, t, land_hold_since)
         elif cmd.should_land and cmd.action == "LAND":
             action_pcmd = (0, 0, 0, 0)
             phase = "landing_hold"
@@ -511,56 +658,47 @@ def run_sim(params: SimParams, *, record_trace: bool = True) -> tuple[SimResult,
                 success = True
                 reason = transition.reason
                 if record_trace:
-                    trace.append({
-                        "t": round(t, 3), "step": step,
-                        "true_m": state.pos_m.tolist(),
-                        "true_map_u": (state.pos_m / s).tolist(),
-                        "est_map_u": pose.xyz.tolist(),
-                        "yaw_deg": round(math.degrees(state.yaw), 2),
-                        "action": "LAND", "phase": phase,
-                        "target_idx": int(ctrl.target_index), "progress": 1.0,
-                        "path_err_u": float(cmd.path_error), "dev_u": float(dist),
-                        "ground_speed_mps": speed_mps, "pcmd": list(action_pcmd),
-                    })
+                    trace.append(
+                        {
+                            "t": round(t, 3),
+                            "step": step,
+                            "true_m": state.pos_m.tolist(),
+                            "true_map_u": (state.pos_m / s).tolist(),
+                            "est_map_u": pose.xyz.tolist(),
+                            "yaw_deg": round(math.degrees(state.yaw), 2),
+                            "action": "LAND",
+                            "phase": phase,
+                            "target_idx": int(ctrl.target_index),
+                            "progress": 1.0,
+                            "path_err_u": float(cmd.path_error),
+                            "dev_u": float(dist),
+                            "ground_speed_mps": speed_mps,
+                            "pcmd": list(action_pcmd),
+                        }
+                    )
                 break
         else:
             land_hold_since = None if cmd.action != "INSPECT" else land_hold_since
-            if pose is None:
-                action_pcmd = (0, 0, 0, 0)
-                phase = "stale_hover"
-            elif cmd.action in {"FOLLOW", "REJOIN", "FINAL_HOLD"}:
-                body_forward, body_right, _body_up = _body_axes(state.yaw, map_frame)
-                ground_velocity = state.vel_m + wind
-                action_pcmd = yaw_ctl.update(
-                    cmd, pose, t, target_key=int(ctrl.target_index), yaw_sign=params.yaw_sign,
-                    body_velocity=(float(np.dot(ground_velocity, body_forward)),
-                                   float(np.dot(ground_velocity, body_right)), t),
-                )
-                phase = f"fgc:{yaw_ctl.phase}"
-                if yaw_ctl.phase in (
-                    "turn",
-                    "yaw_alignment_hold",
-                    "yaw_alignment_confirmed",
-                    "yaw_alignment_timeout",
-                    "final_centering",
-                ):
-                    yaw_ticks += 1
-            else:  # ARRIVING / HOVER
-                action_pcmd = (0, 0, 0, 0)
-                phase = cmd.action.lower()
-                hover_ticks += 1
+            action_pcmd, phase, hover_inc, yaw_inc = _route_motion(
+                cmd, pose, yaw_ctl, state, map_frame, wind, ctrl, t, params
+            )
+            hover_ticks += hover_inc
+            yaw_ticks += yaw_inc
 
         guarded = speed_guard.apply(
             action_pcmd, map_frame.horizontal_distance(state.vel_m + wind), t
         )
         speed_guard_interventions += guarded != action_pcmd
         progress_record = {
-            "pcmd": guarded, "pcmd_phase": phase.removeprefix("fgc:"),
+            "pcmd": guarded,
+            "pcmd_phase": phase.removeprefix("fgc:"),
             "target_index": int(ctrl.target_index),
             "pose_u": None if pose is None else pose.xyz,
             "pose_stamp": None if pose is None else float(pose.stamp),
             "path_error_u": float(cmd.path_error),
-            "yaw_error_deg": None if pose is None else math.degrees(rpf.wrap_angle(cmd.yaw_target - pose.yaw)),
+            "yaw_error_deg": None
+            if pose is None
+            else math.degrees(rpf.wrap_angle(cmd.yaw_target - pose.yaw)),
             "turn_anchor_error_u": yaw_ctl.turn_anchor_error_u,
         }
         speed_guard._check_waypoint_progress(progress_record)
@@ -574,72 +712,21 @@ def run_sim(params: SimParams, *, record_trace: bool = True) -> tuple[SimResult,
         if yaw_p and (roll or pitch):
             reason = "invalid simultaneous yaw and horizontal PCMD"
             break
-        if hover_anchor is None:
-            hover_anchor = state.pos_m.copy()
-        anchor_delta = state.pos_m - hover_anchor
-        anchor_vertical = np.dot(anchor_delta, map_frame.up) * map_frame.up
-        if roll != 0 or pitch != 0:
-            hover_anchor += anchor_delta - anchor_vertical
-        if gaz != 0:
-            hover_anchor += anchor_vertical
+        hover_anchor = _update_hover_anchor(state, hover_anchor, map_frame, roll, pitch, gaz)
 
-        # --- plant integration (meters, 80 Hz substeps) ---
-        fwd_w, right_w, up_w = _body_axes(state.yaw, map_frame)
-        # vh_per_pct encodes the cruise calibration (max_translation_pcmd ->
-        # cruise_mps); vertical uses the configured firmware speed envelope.
-        v_tgt = (
-            fwd_w * (pitch * vh_per_pct) + right_w * (roll * vh_per_pct) + up_w * (gaz * vv_per_pct)
+        wind, gust_phase, gust_displacement = _integrate_plant(
+            state,
+            wind,
+            hover_anchor,
+            params,
+            map_frame,
+            rng,
+            (roll, pitch, yaw_p, gaz),
+            vh_per_pct,
+            vv_per_pct,
+            yaw_per_pct,
+            gust_phase,
         )
-        yaw_rate_tgt = -math.radians(yaw_p * yaw_per_pct)
-        # hard capability caps (white-paper maxima, never exceeded even by gusts)
-        if hover_anchor is not None and params.hover_hold_mps > 0:
-            hold = (hover_anchor - state.pos_m) * params.hover_hold_gain
-            hn = float(np.linalg.norm(hold))
-            if hn > params.hover_hold_mps:
-                hold = hold / hn * params.hover_hold_mps
-            v_tgt = v_tgt + hold
-        vh_cap = v_tgt - np.dot(v_tgt, up_w) * up_w
-        if float(np.linalg.norm(vh_cap)) > VH_MAX_MPS:
-            v_tgt = vh_cap / float(np.linalg.norm(vh_cap)) * VH_MAX_MPS + np.dot(v_tgt, up_w) * up_w
-        vv_n = float(np.dot(v_tgt, up_w))
-        if abs(vv_n) > VV_MAX_MPS:
-            v_tgt = v_tgt - up_w * (vv_n - math.copysign(VV_MAX_MPS, vv_n))
-        k_h = 1.0 - math.exp(-sdt / params.tau_h_s)
-        k_v = 1.0 - math.exp(-sdt / params.tau_v_s)
-        k_y = 1.0 - math.exp(-sdt / params.tau_yaw_s)
-        gust_displacement = np.zeros(3)
-        for _ in range(sub):
-            # wind OU in world meters
-            wind += (
-                (
-                    -wind / params.wind_tau_s * sdt
-                    + math.sqrt(2.0 / params.wind_tau_s)
-                    * params.wind_sigma_mps
-                    * math.sqrt(max(sdt, 1e-9))
-                    * rng.normal(0, 1, 3)
-                )
-                if params.wind_tau_s > 0
-                else 0.0
-            )
-            gust = np.zeros(3)
-            if params.gust_every_s > 0 and params.gust_m > 0:
-                gust_phase += sdt
-                if gust_phase >= params.gust_every_s:
-                    gust_phase = 0.0
-                    gdir = rng.normal(0, 1, 3)
-                    gdir /= np.linalg.norm(gdir) or 1.0
-                    gust = gdir * (params.gust_m / sdt)  # exact metre displacement per impulse
-                    gust_displacement += gust * sdt
-            vh = v_tgt - np.dot(v_tgt, up_w) * up_w  # horizontal part
-            vv = np.dot(v_tgt, up_w) * up_w
-            cur_h = state.vel_m - np.dot(state.vel_m, up_w) * up_w
-            cur_v = np.dot(state.vel_m, up_w) * up_w
-            cur_h += (vh - cur_h) * k_h
-            cur_v += (vv - cur_v) * k_v
-            state.vel_m = cur_h + cur_v
-            state.pos_m += (state.vel_m + wind) * sdt + gust * sdt
-            state.yaw_rate += (yaw_rate_tgt - state.yaw_rate) * k_y
-            state.yaw = rpf.wrap_angle(state.yaw + state.yaw_rate * sdt)
         dist_m += float(np.linalg.norm(state.pos_m - prev_pos))
         prev_pos = state.pos_m.copy()
 
@@ -699,6 +786,8 @@ def run_sim(params: SimParams, *, record_trace: bool = True) -> tuple[SimResult,
         "join_target_1based": join_target + 1,
         "final_target_1based": home_label if success else int(ctrl.target_index) + 1,
         "seed": params.seed,
+        "localization_wait_s": initial_wait,
+        "route_time_s": round(t - initial_wait, 2),
     }
     return result, info
 
@@ -860,6 +949,12 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--seed", type=int, default=7)
     ap.add_argument("--duration-s", type=float, default=900.0)
     ap.add_argument(
+        "--localization-wait-s",
+        type=float,
+        default=0.0,
+        help="initial wait charged to the total budget",
+    )
+    ap.add_argument(
         "--start-offset-u",
         type=float,
         nargs=3,
@@ -883,11 +978,8 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument(
         "--cruise-mps",
         type=float,
-        default=0.45,
-        help="horizontal speed at max_translation_pcmd; "
-        "default 0.45 m/s = white-paper linear mapping "
-        "(3%% of 15 m/s firmware maximum, matching "
-        "DESKTOP_AUTO_MAX_TRANSLATION_PCMD=3)",
+        default=0.90,
+        help="horizontal speed at max_translation_pcmd in the plant model",
     )
     ap.add_argument("--wind-sigma-mps", type=float, default=0.05)
     ap.add_argument(

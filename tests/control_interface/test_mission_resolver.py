@@ -447,17 +447,17 @@ def test_not_localization_ready_selection_is_explicitly_blocked(tmp_path: Path) 
     )
 
 
+@pytest.mark.skipif(
+    not (ROOT / "地圖檔/場域/river_site/site_profile.json").is_file(),
+    reason="requires private river site bundle",
+)
 def test_bundled_anafi_selection_flies_only_on_an_operator_accepted_receipt() -> None:
-    """The shipped default carries an *acceptance*, not a validation.
+    """The shipped default carries an acceptance, not independent validation.
 
-    2026-09-09: the operator accepted this map for a supervised, pilot-in-the-
-    loop campaign (SkyController stick override, 0.3 m/s). What it must never
-    claim is that the map was validated -- there is still no absolute ground
-    truth and no acceptance flight -- and the receipt expires, so this test
-    starts failing again when the acceptance lapses. 2026-09-13: the receipt
-    digests were reissued to match the selected artifacts.
+    Unexpired operator acceptance opens the existing AUTO button under stick
+    takeover. The receipt must still say validation is NONE, and this test
+    starts failing again when the acceptance lapses.
     """
-
     selection = CONTROL / "mission_selections" / "river_gluemap_all8_direct_localization.json"
 
     mission = resolve_mission(selection, workspace_root=ROOT, now=NOW)
@@ -469,6 +469,7 @@ def test_bundled_anafi_selection_flies_only_on_an_operator_accepted_receipt() ->
     assert details["basis"] == "OPERATOR_ACCEPTANCE_PILOT_IN_THE_LOOP"
     assert details["validation"] == "NONE"
     assert details["absolute_ground_truth"] == "NONE"
+    assert mission.calibrations[0].passed is True
     assert mission.calibrations[0].expires_at is not None
     bundle_sha = mission.localizer.artifacts["bundle"].sha256
     profile_sha = mission.localizer.artifacts["profile"].sha256
@@ -477,6 +478,7 @@ def test_bundled_anafi_selection_flies_only_on_an_operator_accepted_receipt() ->
     assert mission.route is not None
     assert mission.route.frame_id == mission.map_revision.coordinate_frame.frame_id
     assert mission.readiness.flight_errors == ()
+    assert not mission.readiness.evaluation_only_ready
 
 
 def test_evaluation_only_waives_an_unvalidated_map_but_never_flight(

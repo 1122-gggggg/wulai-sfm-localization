@@ -98,9 +98,7 @@ import torchvision
 BOQ_INPUT = 384
 BOQ_DIM = 16384
 BOQ_MODEL_IDENTITY = "boq:resnet50-16384"
-BOQ_WEIGHTS_SHA256 = (
-    "4691d1545db847da2c0ba911f34e6c520a5da63f8b94c6415fe87d0d8800ebaa"
-)
+BOQ_WEIGHTS_SHA256 = "4691d1545db847da2c0ba911f34e6c520a5da63f8b94c6415fe87d0d8800ebaa"
 _DEPLOY_DIR = Path(__file__).resolve().parent
 _WORKSPACE_ROOT = _DEPLOY_DIR.parents[2]
 BOQ_WEIGHTS_RELATIVE = Path("執行環境/models/boq/resnet50_16384.pth")
@@ -171,14 +169,10 @@ class BoQBlock(torch.nn.Module):
         self.queries = torch.nn.Parameter(torch.randn(1, num_queries, in_dim))
 
         # Training-only stability path (cached in eval, kept for key compat).
-        self.self_attn = torch.nn.MultiheadAttention(
-            in_dim, num_heads=nheads, batch_first=True
-        )
+        self.self_attn = torch.nn.MultiheadAttention(in_dim, num_heads=nheads, batch_first=True)
         self.norm_q = torch.nn.LayerNorm(in_dim)
 
-        self.cross_attn = torch.nn.MultiheadAttention(
-            in_dim, num_heads=nheads, batch_first=True
-        )
+        self.cross_attn = torch.nn.MultiheadAttention(in_dim, num_heads=nheads, batch_first=True)
         self.norm_out = torch.nn.LayerNorm(in_dim)
 
     def forward(self, x: torch.Tensor):
@@ -204,17 +198,12 @@ class BoQAggregator(torch.nn.Module):
         row_dim: int = 32,
     ):
         super().__init__()
-        self.proj_c = torch.nn.Conv2d(
-            in_channels, proj_channels, kernel_size=3, padding=1
-        )
+        self.proj_c = torch.nn.Conv2d(in_channels, proj_channels, kernel_size=3, padding=1)
         self.norm_input = torch.nn.LayerNorm(proj_channels)
 
         in_dim = proj_channels
         self.boqs = torch.nn.ModuleList(
-            [
-                BoQBlock(in_dim, num_queries, nheads=in_dim // 64)
-                for _ in range(num_layers)
-            ]
+            [BoQBlock(in_dim, num_queries, nheads=in_dim // 64) for _ in range(num_layers)]
         )
 
         self.fc = torch.nn.Linear(num_layers * num_queries, row_dim)
@@ -275,9 +264,7 @@ def resolve_weights_path(weights_path: str | Path | None = None) -> Path:
 _SHA256_CACHE: dict[tuple[int, int, int], str] = {}
 
 
-def verify_weights_sha256(
-    path: Path, expected: str = BOQ_WEIGHTS_SHA256
-) -> Path:
+def verify_weights_sha256(path: Path, expected: str = BOQ_WEIGHTS_SHA256) -> Path:
     """SHA-pin the checkpoint; raise on any mismatch or absent file."""
     resolved = Path(path).expanduser().resolve()
     if not resolved.is_file():
@@ -299,8 +286,7 @@ def verify_weights_sha256(
             _SHA256_CACHE[key] = actual
     if actual != expected:
         raise ValueError(
-            f"BoQ weights SHA-256 mismatch: {resolved} "
-            f"has {actual}, expected {expected}"
+            f"BoQ weights SHA-256 mismatch: {resolved} has {actual}, expected {expected}"
         )
     return resolved
 
@@ -379,12 +365,12 @@ class BoQExtractor:
         normalization = self._normalization_tensors
         device = torch.device(self.device)
         if normalization is None or normalization[0].device != device:
-            mean = torch.tensor(
-                list(_IMAGENET_MEAN), dtype=torch.float32, device=device
-            ).view(1, 3, 1, 1)
-            std = torch.tensor(
-                list(_IMAGENET_STD), dtype=torch.float32, device=device
-            ).view(1, 3, 1, 1)
+            mean = torch.tensor(list(_IMAGENET_MEAN), dtype=torch.float32, device=device).view(
+                1, 3, 1, 1
+            )
+            std = torch.tensor(list(_IMAGENET_STD), dtype=torch.float32, device=device).view(
+                1, 3, 1, 1
+            )
             normalization = (mean, std)
             self._normalization_tensors = normalization
         return ((x - normalization[0]) / normalization[1]).contiguous()
@@ -393,32 +379,25 @@ class BoQExtractor:
     def extract_one_tensor(self, rgb: np.ndarray) -> torch.Tensor:
         """One L2-normalised ``(16384,)`` tensor on ``self.device``."""
         x = self._preprocess(rgb)
-        with torch.autocast(
-            device_type="cuda", dtype=torch.float16, enabled=self.fp16
-        ):
+        with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=self.fp16):
             output = self.model(x)
         desc = F.normalize(output.float(), dim=1, eps=1e-12)[0]
         if desc.shape != (BOQ_DIM,):
             raise RuntimeError(
-                f"BoQ descriptor shape {tuple(desc.shape)!r} violates "
-                f"{BOQ_DIM}-D contract"
+                f"BoQ descriptor shape {tuple(desc.shape)!r} violates {BOQ_DIM}-D contract"
             )
         return desc
 
     @torch.inference_mode()
     def extract_from_array(self, rgb: np.ndarray) -> np.ndarray:
         """One L2-normalised ``(16384,)`` float32 descriptor from uint8 RGB."""
-        desc = self.extract_one_tensor(rgb).cpu().numpy().astype(
-            np.float32, copy=False
-        )
+        desc = self.extract_one_tensor(rgb).cpu().numpy().astype(np.float32, copy=False)
         if not np.isfinite(desc).all():
             raise RuntimeError("BoQ emitted a non-finite descriptor")
         return desc
 
     @torch.inference_mode()
-    def extract_bank(
-        self, image_paths: Sequence[str | Path], *, batch_size: int = 8
-    ) -> np.ndarray:
+    def extract_bank(self, image_paths: Sequence[str | Path], *, batch_size: int = 8) -> np.ndarray:
         """Batched ``(N, 16384)`` float32 L2-normalised bank from image files."""
         paths = [Path(p) for p in image_paths]
         if not paths:
@@ -435,17 +414,17 @@ class BoQExtractor:
                     raise FileNotFoundError(f"BoQ bank image is unreadable: {path}")
                 batch.append(self._preprocess(cv2.cvtColor(image, cv2.COLOR_BGR2RGB)))
             x = torch.cat(batch, dim=0).to(device)
-            with torch.autocast(
-                device_type="cuda", dtype=torch.float16, enabled=self.fp16
-            ):
+            with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=self.fp16):
                 raw = self.model(x)
-            array = F.normalize(raw.float(), dim=1, eps=1e-12).cpu().numpy().astype(
-                np.float32, copy=False
+            array = (
+                F.normalize(raw.float(), dim=1, eps=1e-12)
+                .cpu()
+                .numpy()
+                .astype(np.float32, copy=False)
             )
             if array.ndim != 2 or array.shape[1] != BOQ_DIM:
                 raise RuntimeError(
-                    f"BoQ bank batch shape {array.shape!r} violates "
-                    f"{BOQ_DIM}-D contract"
+                    f"BoQ bank batch shape {array.shape!r} violates {BOQ_DIM}-D contract"
                 )
             if not np.isfinite(array).all():
                 raise RuntimeError("BoQ emitted a non-finite bank batch")

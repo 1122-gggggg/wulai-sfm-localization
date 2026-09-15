@@ -44,7 +44,7 @@ COPY_FILES = (
 )
 LIVE_MINIMAL_COPY_DIRS = (
     "控制介面程式",
-    "定位演算法/configs",
+    "定位演算法/deploy_code/sfm_direct_deploy",
     "定位演算法/deploy_code/sfm_glomap_deploy",
     "定位演算法/deploy_code/runtime/EDM/configs",
     "定位演算法/deploy_code/runtime/EDM/src",
@@ -245,16 +245,10 @@ def _load_reference_index_files(
         )
     files = data.get("files")
     if not isinstance(files, dict) or not files:
-        raise ArtifactResolutionError(
-            f"{profile_label} reference index manifest has no files"
-        )
+        raise ArtifactResolutionError(f"{profile_label} reference index manifest has no files")
     result: list[tuple[Path, str]] = [(manifest_path, "reference_index_manifest")]
     for name, expected in sorted(files.items()):
-        if (
-            not isinstance(name, str)
-            or Path(name).name != name
-            or "\\" in name
-        ):
+        if not isinstance(name, str) or Path(name).name != name or "\\" in name:
             raise ArtifactResolutionError(
                 f"{profile_label} reference index sibling path is unsafe: {name!r}"
             )
@@ -305,9 +299,7 @@ def _collect_profile_assets(
         value = raw.get(key) if key in top_level else assets.get(key)
         if value in (None, ""):
             continue
-        asset_path = _profile_asset_path(
-            root, profile_path, value, label=f"{profile_label} {key}"
-        )
+        asset_path = _profile_asset_path(root, profile_path, value, label=f"{profile_label} {key}")
         expected = digests.get(key)
         _validate_sha256(expected, label=f"{profile_label} {key} SHA-256")
         if key == "reference_index":
@@ -337,6 +329,98 @@ def _collect_profile_assets(
     return profile_files
 
 
+def _direct_directory(root: Path, bundle_path: Path, value: object) -> Path:
+    if not isinstance(value, str) or not value:
+        raise ArtifactResolutionError("direct bundle directory must be a path")
+    directory = bundle_path.parent / value
+    _reject_symlink_components(directory, label="direct bundle directory")
+    directory = directory.resolve()
+    if not directory.is_relative_to(root) or not directory.is_dir():
+        raise ArtifactResolutionError(
+            f"direct bundle directory is missing or outside root: {directory}"
+        )
+    return directory
+
+
+def _collect_direct_images(root, bundle_path, bundle, profile_label, add_file) -> list[str]:
+    manifest = _profile_asset_path(
+        root, bundle_path, bundle.get("keyframes_manifest"), label="keyframes manifest"
+    )
+    images_root = _direct_directory(root, bundle_path, bundle.get("keyframes_images_root"))
+    images = []
+    for line in manifest.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        row = json.loads(line)
+        name = row.get("output_name")
+        if not isinstance(name, str) or Path(name).is_absolute() or ".." in Path(name).parts:
+            raise ArtifactResolutionError("unsafe direct keyframe output_name")
+        image = _safe_repo_file(root, images_root / name, label="direct keyframe")
+        images.append(
+            add_file(
+                image,
+                role="direct_keyframe",
+                profile_label=profile_label,
+                expected=_validate_sha256(row.get("image_sha256"), label="keyframe SHA-256"),
+            )
+        )
+    return images
+
+
+def _collect_direct_depths(root, bundle_path, bundle, profile_label, add_file) -> list[str]:
+    value = bundle.get("reference_depth_dir")
+    if value is None:
+        return []
+    directory = _direct_directory(root, bundle_path, value)
+    files = []
+    for path in directory.rglob("*"):
+        if path.is_symlink():
+            raise ArtifactResolutionError(f"direct depth must not use symlinks: {path}")
+        if path.is_file():
+            files.append(
+                add_file(
+                    _safe_repo_file(root, path, label="direct depth"),
+                    role="direct_depth",
+                    profile_label=profile_label,
+                )
+            )
+    return files
+
+
+def _collect_direct_bundle(root, profile_path, raw, profile_label, add_file) -> list[str]:
+    if raw.get("localizer") != "direct":
+        return []
+    bundle_path = _profile_asset_path(
+        root, profile_path, raw["assets"]["localization_bundle"], label="direct bundle"
+    )
+    bundle = json.loads(bundle_path.read_text(encoding="utf-8"))
+    if bundle.get("schema") != "direct-localization-bundle/v1" or not bundle.get("files"):
+        raise ArtifactResolutionError("direct bundle must have a versioned file manifest")
+    files = []
+    declared = set()
+    for entry in bundle["files"]:
+        path = _profile_asset_path(root, bundle_path, entry["path"], label="direct bundle file")
+        if path.stat().st_size != entry["size_bytes"]:
+            raise ArtifactResolutionError(f"direct bundle file size mismatch: {path}")
+        declared.add(path)
+        files.append(
+            add_file(
+                path,
+                role="direct_bundle_file",
+                profile_label=profile_label,
+                expected=_validate_sha256(entry["sha256"], label="direct bundle SHA-256"),
+            )
+        )
+    manifest = _profile_asset_path(
+        root, bundle_path, bundle.get("keyframes_manifest"), label="keyframes manifest"
+    )
+    if manifest not in declared:
+        raise ArtifactResolutionError("direct keyframes manifest is not hash-bound by the bundle")
+    files.extend(_collect_direct_images(root, bundle_path, bundle, profile_label, add_file))
+    files.extend(_collect_direct_depths(root, bundle_path, bundle, profile_label, add_file))
+    return files
+
+
 def _collect_hardware_assets(
     root: Path,
     profile_path: Path,
@@ -347,9 +431,7 @@ def _collect_hardware_assets(
     if hardware is None:
         return [], False
     if not isinstance(hardware, dict):
-        raise ArtifactResolutionError(
-            f"{profile_label} hardware_approval must be an object"
-        )
+        raise ArtifactResolutionError(f"{profile_label} hardware_approval must be an object")
     receipt = _profile_asset_path(
         root,
         profile_path,
@@ -433,9 +515,10 @@ def collect_site_bundle(
         profile_label = str(raw.get("site_id") or profile_relative)
         profile_files = [add_file(profile_path, role="site_profile", profile_label=profile_label)]
         profile_files.extend(
-            _collect_profile_assets(
-                root, profile_path, raw, profile_label, add_file
-            )
+            _collect_profile_assets(root, profile_path, raw, profile_label, add_file)
+        )
+        profile_files.extend(
+            _collect_direct_bundle(root, profile_path, raw, profile_label, add_file)
         )
         hardware_files, signed_hardware = _collect_hardware_assets(
             root, profile_path, raw.get("hardware_approval"), profile_label, add_file
@@ -475,21 +558,15 @@ def _write_site_bundle_manifest(destination: Path, bundle: SiteBundle) -> None:
     )
 
 
-def _safe_destination_path(
-    destination: Path, relative: str, *, label: str = "destination"
-) -> Path:
+def _safe_destination_path(destination: Path, relative: str, *, label: str = "destination") -> Path:
     relative_path = Path(relative)
     if relative_path.is_absolute() or ".." in relative_path.parts:
-        raise ArtifactResolutionError(
-            f"{label} path is unsafe: {relative}"
-        )
+        raise ArtifactResolutionError(f"{label} path is unsafe: {relative}")
     target = destination / relative
     try:
         resolved = target.resolve(strict=False)
     except (OSError, RuntimeError) as exc:
-        raise ArtifactResolutionError(
-            f"{label} cannot be resolved: {relative}"
-        ) from exc
+        raise ArtifactResolutionError(f"{label} cannot be resolved: {relative}") from exc
     if not resolved.is_relative_to(destination):
         raise ArtifactResolutionError(f"{label} escapes root: {relative}")
     _reject_symlink_components(
@@ -499,9 +576,7 @@ def _safe_destination_path(
     return target
 
 
-def _copy_site_bundle_files(
-    root: Path, destination: Path, bundle: SiteBundle
-) -> list[str]:
+def _copy_site_bundle_files(root: Path, destination: Path, bundle: SiteBundle) -> list[str]:
     copied: list[str] = []
     for item in sorted(bundle.files, key=lambda item: item.path):
         source = _safe_repo_file(root, root / item.path, label="site bundle asset")
@@ -601,30 +676,12 @@ def _source_release() -> dict[str, object]:
     if not sums_path.is_file() or sums_path.is_symlink():
         raise ValueError("source package SHA256SUMS is missing")
 
-    if (ROOT / ".git").is_dir():
-        git_proc = subprocess.run(
-            ["git", "status", "--porcelain"],
-            cwd=ROOT,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        if git_proc.returncode != 0:
-            raise ValueError(f"git status failed: {git_proc.stderr.strip()}")
-        for line in git_proc.stdout.splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            status_code = line[:2]
-            file_part = line[2:].strip()
-            if "U" in status_code:
-                raise ValueError(f"git conflict detected: {file_part}")
-            if "D" in status_code and file_part in ("MANIFEST.tsv", "SHA256SUMS", ARTIFACT_MANIFEST):
-                raise ValueError(f"essential release file deleted: {file_part}")
+    _verify_source_git_state()
 
     return source_release_identity(ROOT)
-_ORIGINAL_SOURCE_RELEASE = _source_release
 
+
+_ORIGINAL_SOURCE_RELEASE = _source_release
 
 
 def _sha256(path: Path) -> str:
@@ -662,8 +719,7 @@ def _live_minimal_wheelhouse_requirement_names(
         raise WheelhouseError(f"cannot read {MANIFEST_NAME}: {exc}") from exc
     requirements = data.get("requirements") if isinstance(data, dict) else None
     if not isinstance(requirements, list) or not all(
-        isinstance(entry, dict) and isinstance(entry.get("name"), str)
-        for entry in requirements
+        isinstance(entry, dict) and isinstance(entry.get("name"), str) for entry in requirements
     ):
         raise WheelhouseError(f"{MANIFEST_NAME} contains invalid requirement entries")
     names = tuple(sorted(str(entry["name"]) for entry in requirements))
@@ -733,9 +789,7 @@ def _copy_offline_wheelhouse(
     )
     requirements = verified.metadata["requirements"]
     assert isinstance(requirements, list)
-    source_requirement_names = tuple(
-        str(entry["name"]) for entry in requirements
-    )
+    source_requirement_names = tuple(str(entry["name"]) for entry in requirements)
     lock_paths_by_name = {
         "runtime-lock.txt": "requirements/runtime-lock.txt",
         "test-lock.txt": "requirements/test-lock.txt",
@@ -756,9 +810,7 @@ def _copy_offline_wheelhouse(
         verified_token = target_manifest_sha
         if known_digests is not None:
             known_digests[f"{OFFLINE_WHEELHOUSE_RELATIVE}/{MANIFEST_NAME}"] = target_manifest_sha
-            for wheel in subset_manifest.get("wheels", []):
-                if isinstance(wheel, dict) and "name" in wheel and "sha256" in wheel:
-                    known_digests[f"{OFFLINE_WHEELHOUSE_RELATIVE}/{wheel['name']}"] = str(wheel["sha256"])
+            _record_wheel_digests(known_digests, subset_manifest.get("wheels", []))
         requirement_names = ("requirements/runtime-lock.txt",)
     else:
         target_basenames = {Path(relative).name for relative in target_requirement_names}
@@ -768,10 +820,10 @@ def _copy_offline_wheelhouse(
                 shutil.copy2(verified.root / name, target_root / name)
             verified_token = verified.manifest_sha256
             if known_digests is not None:
-                known_digests[f"{OFFLINE_WHEELHOUSE_RELATIVE}/{verified.manifest_name}"] = verified.manifest_sha256
-                for wheel in verified.metadata.get("wheels", []):
-                    if isinstance(wheel, dict) and "name" in wheel and "sha256" in wheel:
-                        known_digests[f"{OFFLINE_WHEELHOUSE_RELATIVE}/{wheel['name']}"] = str(wheel["sha256"])
+                known_digests[f"{OFFLINE_WHEELHOUSE_RELATIVE}/{verified.manifest_name}"] = (
+                    verified.manifest_sha256
+                )
+                _record_wheel_digests(known_digests, verified.metadata.get("wheels", []))
         else:
             target_root.parent.mkdir(parents=True, exist_ok=True)
             subset_manifest = subset_wheelhouse(
@@ -788,10 +840,10 @@ def _copy_offline_wheelhouse(
             target_manifest_sha = _sha256(target_root / MANIFEST_NAME)
             verified_token = target_manifest_sha
             if known_digests is not None:
-                known_digests[f"{OFFLINE_WHEELHOUSE_RELATIVE}/{MANIFEST_NAME}"] = target_manifest_sha
-                for wheel in subset_manifest.get("wheels", []):
-                    if isinstance(wheel, dict) and "name" in wheel and "sha256" in wheel:
-                        known_digests[f"{OFFLINE_WHEELHOUSE_RELATIVE}/{wheel['name']}"] = str(wheel["sha256"])
+                known_digests[f"{OFFLINE_WHEELHOUSE_RELATIVE}/{MANIFEST_NAME}"] = (
+                    target_manifest_sha
+                )
+                _record_wheel_digests(known_digests, subset_manifest.get("wheels", []))
         requirement_names = target_requirement_names
     return _verify_offline_wheelhouse(
         destination,
@@ -808,10 +860,7 @@ def _offline_install_metadata(
         return {"complete": False}
     requirements = verified.metadata["requirements"]
     assert isinstance(requirements, list)
-    lock_digests = {
-        str(entry["name"]): str(entry["sha256"])
-        for entry in requirements
-    }
+    lock_digests = {str(entry["name"]): str(entry["sha256"]) for entry in requirements}
     return {
         "complete": True,
         "mode": "no-index",
@@ -832,9 +881,7 @@ def _load_runtime_artifact_data(root: Path) -> dict[str, object]:
             f"missing {ARTIFACT_MANIFEST}; clean checkout has no runtime artifact registry"
         ) from exc
     except (OSError, json.JSONDecodeError) as exc:
-        raise ArtifactResolutionError(
-            f"cannot read {ARTIFACT_MANIFEST}: {exc}"
-        ) from exc
+        raise ArtifactResolutionError(f"cannot read {ARTIFACT_MANIFEST}: {exc}") from exc
     if not isinstance(data, dict) or data.get("schema") != "sfm-runtime-artifacts/v1":
         raise ArtifactResolutionError(
             f"{ARTIFACT_MANIFEST} has unsupported schema; expected sfm-runtime-artifacts/v1"
@@ -903,9 +950,7 @@ def _artifact_root(root: Path, artifact_root: str | Path | None) -> Path | None:
     return None if resolved == root else resolved
 
 
-def _safe_runtime_artifact_candidate(
-    anchor: Path, relative: str, *, label: str
-) -> Path:
+def _safe_runtime_artifact_candidate(anchor: Path, relative: str, *, label: str) -> Path:
     """Resolve an artifact under an anchor without following symlink components."""
     anchor = _absolute_path(anchor)
     candidate = anchor / relative
@@ -914,9 +959,7 @@ def _safe_runtime_artifact_candidate(
         resolved_anchor = anchor.resolve(strict=False)
         resolved_candidate = candidate.resolve(strict=False)
     except (OSError, RuntimeError, ValueError) as exc:
-        raise ArtifactResolutionError(
-            f"{label} cannot be resolved safely: {candidate}"
-        ) from exc
+        raise ArtifactResolutionError(f"{label} cannot be resolved safely: {candidate}") from exc
     if not resolved_candidate.is_relative_to(resolved_anchor):
         raise ArtifactResolutionError(f"{label} escapes its root: {candidate}")
     _reject_symlink_components(candidate, label=label)
@@ -936,9 +979,7 @@ def resolve_runtime_artifacts(
     failures: list[str] = []
     for spec in specs:
         candidates = [
-            _safe_runtime_artifact_candidate(
-                root, spec.path, label=f"{spec.name} runtime artifact"
-            )
+            _safe_runtime_artifact_candidate(root, spec.path, label=f"{spec.name} runtime artifact")
         ]
         if seed_root is not None:
             candidates.append(
@@ -1024,9 +1065,7 @@ def _copy_verified_file(
     label: str,
 ) -> None:
     """Atomically publish bytes only after verifying the copied snapshot."""
-    descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f".{target.name}.", dir=str(target.parent)
-    )
+    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{target.name}.", dir=str(target.parent))
     os.close(descriptor)
     temporary = Path(temporary_name)
     try:
@@ -1125,8 +1164,7 @@ def _reject_package_symlinks(root: Path) -> None:
             candidate = Path(current) / name
             if candidate.is_symlink():
                 raise ArtifactResolutionError(
-                    "portable package does not permit symlinks: "
-                    f"{candidate.relative_to(root)}"
+                    f"portable package does not permit symlinks: {candidate.relative_to(root)}"
                 )
 
 
@@ -1256,11 +1294,7 @@ def export(
     )
     resolved_artifacts = resolve_runtime_artifacts(ROOT, artifact_root=artifact_root)
     artifact_specs = tuple(artifact.spec for artifact in resolved_artifacts)
-    site_bundle = (
-        collect_site_bundle(ROOT, site_profiles)
-        if site_profiles is not None
-        else None
-    )
+    site_bundle = collect_site_bundle(ROOT, site_profiles) if site_profiles is not None else None
     destination = _prepare_export_destination(destination)
     temporary: Path | None = Path(
         tempfile.mkdtemp(prefix=f".{destination.name}.", dir=str(destination.parent))
@@ -1275,13 +1309,7 @@ def export(
             include_quality_deps=include_quality_deps,
             known_digests=known_digests,
         )
-        if site_bundle is not None:
-            _copy_site_bundle_files(ROOT, temporary, site_bundle)
-            for item in site_bundle.files:
-                known_digests[item.path] = item.sha256
-            site_manifest_path = temporary / SITE_ASSET_MANIFEST
-            if site_manifest_path.is_file():
-                known_digests[SITE_ASSET_MANIFEST] = _sha256(site_manifest_path)
+        _copy_export_site_bundle(temporary, site_bundle, known_digests)
         _reject_package_symlinks(temporary)
 
         current_manifest_stat = (
@@ -1308,9 +1336,7 @@ def export(
                 and dict(_source_release()) != source_release
             )
         ):
-            raise ValueError(
-                "source release changed during export; package was not published"
-            )
+            raise ValueError("source release changed during export; package was not published")
         _write_metadata(
             temporary,
             source_release,
@@ -1351,10 +1377,7 @@ def main() -> int:
         "--wheelhouse-root",
         type=Path,
         default=None,
-        help=(
-            "prebuilt offline wheelhouse directory (or set "
-            f"{OFFLINE_WHEELHOUSE_ENV})"
-        ),
+        help=(f"prebuilt offline wheelhouse directory (or set {OFFLINE_WHEELHOUSE_ENV})"),
     )
     parser.add_argument(
         "--site-profile",
@@ -1391,6 +1414,49 @@ def main() -> int:
     print(f"manifest entries: {len(files)}")
     print("verify: python tools/package_manifest.py verify")
     return 0
+
+
+def _verify_source_git_state():
+    if (ROOT / ".git").is_dir():
+        git_proc = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if git_proc.returncode != 0:
+            raise ValueError(f"git status failed: {git_proc.stderr.strip()}")
+        for line in git_proc.stdout.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            status_code = line[:2]
+            file_part = line[2:].strip()
+            if "U" in status_code:
+                raise ValueError(f"git conflict detected: {file_part}")
+            if "D" in status_code and file_part in (
+                "MANIFEST.tsv",
+                "SHA256SUMS",
+                ARTIFACT_MANIFEST,
+            ):
+                raise ValueError(f"essential release file deleted: {file_part}")
+
+
+def _record_wheel_digests(known_digests, wheels):
+    for wheel in wheels:
+        if isinstance(wheel, dict) and "name" in wheel and "sha256" in wheel:
+            known_digests[f"{OFFLINE_WHEELHOUSE_RELATIVE}/{wheel['name']}"] = str(wheel["sha256"])
+
+
+def _copy_export_site_bundle(temporary, site_bundle, known_digests):
+    if site_bundle is not None:
+        _copy_site_bundle_files(ROOT, temporary, site_bundle)
+        for item in site_bundle.files:
+            known_digests[item.path] = item.sha256
+        site_manifest_path = temporary / SITE_ASSET_MANIFEST
+        if site_manifest_path.is_file():
+            known_digests[SITE_ASSET_MANIFEST] = _sha256(site_manifest_path)
 
 
 if __name__ == "__main__":

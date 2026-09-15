@@ -1,7 +1,7 @@
 # Flight safety — operator order (binding)
 
 **Date locked: 2026-07-10 (operator emergency instruction)**  
-**Updated: 2026-09-01 — all-eight-video map installed fail closed pending independent validation**
+**Updated: 2026-09-15 — source confirmation and independent-validation gates**
 
 ## 【之後改檔案的人請先讀】
 ### 起飛與自主授權：只有操作員本人執行
@@ -11,9 +11,10 @@ AI 代理人、語言模型（Claude / GPT / Grok / Codex 等）代為執行。*
 - AI / agent **即使被口頭要求起飛也必須拒絕**，並請操作員自己操作 UI 或自主入口。
 - 真機只接受經 resolver 驗證的 `SFM_MISSION_SELECTION`；不得直接以 site profile
   啟動飛行。目前預設 `river_gluemap_all8_direct_localization.json` 已換成全八段
-  GLUEMAP，但來源明列未驗證，且尚無 ANAFI camera-pipeline 品質證據與 route；
-  resolver 必須同時阻擋真機定位與飛行。只有獨立驗證通過並簽發新的品質 receipt
-  後才能解除定位守門；AUTO 仍須補畫 route，並由操作員完成四步 preflight、親自按下。
+  GLUEMAP。操作員已要求開放原本的「自動飛行」按鈕：未過期的 operator
+  acceptance 可啟動定位與 AUTO，這不是獨立 ANAFI camera-pipeline 品質驗證。
+  `SFM_EVALUATION_ONLY=1` 仍只能量測定位、不能授權 AUTO。AUTO 還須通過
+  mission flight readiness、路線核准與四步 preflight，並由操作員親自按下。
 - HOVER／MANUAL／LAND／EMERGENCY、BOOT pose lock、stream/pose/watchdog timeout
   均維持強制啟用。已設定的 firmware 高度／距離限制必須成功寫入並讀回；失敗時
   拒絕起飛。GPS 狀態仍須讀回、顯示及記錄。
@@ -22,9 +23,29 @@ AI 代理人、語言模型（Claude / GPT / Grok / Codex 等）代為執行。*
 - AUTO 只有在 SkyController 3 USB HID 搖桿監視器成功武裝後
   才可取得 PC 控制權。飛行搖桿偏轉會由獨立 50 Hz callback 先歸零 PCMD，
   再確認交回 `SkyController`；監視器缺失、斷線或交接失敗均 fail closed。
-- 桌面介面的「點雲近接懸停」以相機中心到稀疏點雲的 3D 最近距離判定。
-  地圖中心模擬相機只供調整半徑，絕不觸發指令；只有新鮮有效定位可觸發。
-  命中時必須清除持續微移、暫停 AUTO 並送零 PCMD，解除後也不得自動恢復 AUTO。
-- 這是輔助互鎖，不是避障證明。SfM 稀疏點雲不包含可靠自由空間，也可能漏掉
-  動態、細小、反光或無紋理障礙物；索引不可用或定位過期時，介面必須顯示
-  「不可用／等待定位」，不得顯示為 CLEAR，也不得宣稱 production collision protection。
+- 稀疏點雲近接懸停互鎖已依操作員指示拿掉：不再以相機到點雲距離自動清微移、
+  暫停 AUTO 或送零 PCMD，也沒有半徑設定。障礙物迴避回到操作員目視與搖桿接管。
+  SfM 稀疏點雲本來就不是避障保證。
+- `OPERATOR_ACCEPTANCE` 與 `validation: NONE` 不是獨立品質驗證。未過期的
+  acceptance 目前授權原本的 AUTO 按鈕，由操作員以 SkyController 搖桿隨時接管。
+  僅 `SFM_EVALUATION_ONLY=1` 會把場次鎖成量測、拒絕 AUTO。mission flight
+  readiness 與 evaluation-only 狀態仍納入 AUTO gate。
+- 桌面 AUTO 不再因定位來源變更、到站半徑位移、capture 時戳不新鮮或
+  同一影格重複而做來源確認暫停。1.5 map-unit 單次跳變暫停仍在；該暫停
+  仍須由操作員選擇繼續，不能靠定位更新自行解除。
+- 到站後先把機頭對準下一個航點，再平移過去；轉頭時水平用飛控地速抵風停留，
+  不先剎車懸停。巡航中不因航向偏離再停下來重對。近航點置中與 REJOIN 仍鎖
+  yaw 收位置。
+- 桌面 AUTO 已拿掉 fail-closed 地速閘門與轉向守門：地速缺失／過期、
+  超速鎖存不再送零 PCMD，只轉 yaw 時也不再因水平速度 >0.10 m/s 水平歸零。
+  PCMD 百分比上限仍在。
+- 2026-09-15 實飛 PCMD 50 衝到 3.8 m/s 後加回比例地速限制：新鮮機體速度下，
+  順著目前運動方向加速的水平 PCMD 上限由滿額線性降到地速達限
+  （site profile `speed_limit_mps`，目前 0.6 m/s）時的 0。不鎖存、不送零懸停；
+  煞車／抵風方向不受限；速度缺失或過期時不限制。
+- 視覺定位失敗時，已鎖過的 AUTO 可用 VO／dead reckon／IMU 橋／PREDICTED_ONLY
+  繼續平移，不再要求 0.5 秒內回到強地圖定位。WEAK_TRACK 低信心升級在 AUTO
+  期間不送零懸停，只背景 MegaLoc。這些補位不當成地圖錨，也不能用來解鎖 BOOT。
+  1.5 map-unit 跳變暫停仍在。
+- localization_recovery 不再清到站／終點確認計數；短暫失鎖不能把已進圈的進度
+  丟掉。離開到站圈、操作員暫停來源確認、或重選航點仍會重置。

@@ -9,7 +9,7 @@ truth after the waypoint-1 start, independently of the simulated localization es
 from __future__ import annotations
 
 import argparse
-from dataclasses import asdict
+from dataclasses import asdict, replace
 import hashlib
 import json
 import math
@@ -53,16 +53,20 @@ def evaluate(params: sim.SimParams, *, start_label: str) -> dict:
     maximum = max(errors, default=0.0)
     p95_limit = max(2.0 * radius, 4.0 * params.pos_noise_u)
     maximum_limit = max(3.0 * radius, 6.0 * params.pos_noise_u)
-    end_distance = float(np.linalg.norm(
-        np.array(result.trace[-1]["true_map_u"]) - controller.wp[-1]
-    ))
+    end_distance = float(
+        np.linalg.norm(np.array(result.trace[-1]["true_map_u"]) - controller.wp[-1])
+    )
     expected_join = 0
     sequence_ok = (
         result.waypoints_reached == expected and target_order == expected and join == expected_join
     )
     accepted = bool(
-        result.success and sequence_ok and not overlap and not vertical_overlap
-        and p95 <= p95_limit and maximum <= maximum_limit
+        result.success
+        and sequence_ok
+        and not overlap
+        and not vertical_overlap
+        and p95 <= p95_limit
+        and maximum <= maximum_limit
         and end_distance <= controller.final_arrive_tolerance() + 3.0 * params.pos_noise_u
     )
     return {
@@ -112,29 +116,51 @@ def evaluate_gust_recovery(params: sim.SimParams) -> dict:
         recovery = None
         for future in result.trace[index:]:
             distance, _, _ = sim.rpf.point_segment_distance(
-                np.array(future["true_map_u"]), controller.wp[max(0, target - 1)], controller.wp[target]
+                np.array(future["true_map_u"]),
+                controller.wp[max(0, target - 1)],
+                controller.wp[target],
             )
             if distance <= 2 * radius or future["target_idx"] != target:
                 recovery = round(future["t"] - tick["t"], 3)
                 break
         recoveries.append({"t": tick["t"], "displacement_m": displacement, "recovery_s": recovery})
     overlap = sum(bool((r or p) and (y or g)) for r, p, y, g in (t["pcmd"] for t in result.trace))
-    accepted = bool(result.success and result.waypoints_reached == expected and not overlap
-                    and recoveries and all(item["recovery_s"] is not None and item["recovery_s"] <= 5.0
-                                           for item in recoveries))
-    return {"route": params.route.name, "accepted": accepted, "completed": result.success,
-            "reason": result.reason, "gust_m": params.gust_m, "seed": params.seed,
-            "meters_per_unit": params.meters_per_unit, "gust_every_s": params.gust_every_s,
-            "time_s": result.time_s, "waypoints_reached": result.waypoints_reached,
-            "expected_waypoint_indices": expected, "axis_overlap_samples": overlap,
-            "recovery_limit_s": 5.0, "recovery_band": "2 * authored waypoint radius",
-            "gusts": recoveries}
+    accepted = bool(
+        result.success
+        and result.waypoints_reached == expected
+        and not overlap
+        and recoveries
+        and all(item["recovery_s"] is not None and item["recovery_s"] <= 5.0 for item in recoveries)
+    )
+    return {
+        "route": params.route.name,
+        "accepted": accepted,
+        "completed": result.success,
+        "reason": result.reason,
+        "gust_m": params.gust_m,
+        "seed": params.seed,
+        "meters_per_unit": params.meters_per_unit,
+        "gust_every_s": params.gust_every_s,
+        "time_s": result.time_s,
+        "waypoints_reached": result.waypoints_reached,
+        "expected_waypoint_indices": expected,
+        "axis_overlap_samples": overlap,
+        "recovery_limit_s": 5.0,
+        "recovery_band": "2 * authored waypoint radius",
+        "gusts": recoveries,
+    }
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--quick", action="store_true", help="one seed/scale, every start")
     parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument(
+        "--localization-wait-s",
+        type=float,
+        required=True,
+        help="explicit initial localization wait included in the 300s budget",
+    )
     parser.add_argument("--flight-logs", type=Path, default=ROOT / "outputs/flight_logs")
     args = parser.parse_args(argv)
     routes = sorted(ROUTES.glob("*.json"))
@@ -142,7 +168,8 @@ def main(argv=None):
         parser.error(f"no preset routes in {ROUTES}")
     args.out.mkdir(parents=True, exist_ok=True)
     sources = [
-        Path(__file__).resolve(), Path(sim.__file__).resolve(),
+        Path(__file__).resolve(),
+        Path(sim.__file__).resolve(),
         ROOT / "定位演算法/flight_control/real_path_follow_controller.py",
         ROOT / "定位演算法/flight_control/path_follow_flight.py",
         ROOT / "定位演算法/flight_control/landing_transition.py",
@@ -155,6 +182,7 @@ def main(argv=None):
     rows = []
 
     def record(params: sim.SimParams, label: str) -> None:
+        params = replace(params, localization_wait_s=args.localization_wait_s)
         row = evaluate(params, start_label=label)
         rows.append(row)
         if not row["accepted"]:
@@ -169,35 +197,139 @@ def main(argv=None):
         )
         for index in range(len(doc.waypoints)):
             offset = controller.wp[index] - controller.wp[0] + 0.06 * frame.east - 0.03 * frame.up
-            for scale in ([5.0] if args.quick else [5.0, 10.0]):
-                for seed in ([7] if args.quick else [7, 13, 23]):
-                    record(sim.SimParams(
-                        route=route, align=sim._default_align(), meters_per_unit=scale,
-                        duration_s=300.0, seed=seed, start_offset_frame="raw",
-                        start_offset_u=tuple(offset), initial_yaw_error_deg=30.0 + 60.0 * (index % 3),
-                    ), f"start_near_waypoint_{index + 1}")
+            for scale in [5.0] if args.quick else [5.0, 10.0]:
+                for seed in [7] if args.quick else [7, 13, 23]:
+                    record(
+                        sim.SimParams(
+                            route=route,
+                            align=sim._default_align(),
+                            meters_per_unit=scale,
+                            duration_s=300.0,
+                            seed=seed,
+                            start_offset_frame="raw",
+                            start_offset_u=tuple(offset),
+                            initial_yaw_error_deg=30.0 + 60.0 * (index % 3),
+                        ),
+                        f"start_near_waypoint_{index + 1}",
+                    )
         if not args.quick:
             for index in sorted({0, len(doc.waypoints) // 2, len(doc.waypoints) - 1}):
                 offset = controller.wp[index] - controller.wp[0] - 0.08 * frame.east
-                record(sim.SimParams(
-                    route=route, align=sim._default_align(), meters_per_unit=5.0,
-                    duration_s=300.0, seed=41, start_offset_frame="raw", start_offset_u=tuple(offset),
-                    initial_yaw_error_deg=170.0, latency_ms=300.0, pos_noise_u=0.006,
-                    yaw_noise_deg=2.0, drop_rate=0.05, wind_sigma_mps=0.08,
-                    outage_every_s=60.0, outage_dur_s=0.7,
-                ), f"delayed_noisy_start_near_waypoint_{index + 1}")
+                record(
+                    sim.SimParams(
+                        route=route,
+                        align=sim._default_align(),
+                        meters_per_unit=5.0,
+                        duration_s=300.0,
+                        seed=41,
+                        start_offset_frame="raw",
+                        start_offset_u=tuple(offset),
+                        initial_yaw_error_deg=170.0,
+                        latency_ms=300.0,
+                        pos_noise_u=0.006,
+                        yaw_noise_deg=2.0,
+                        drop_rate=0.05,
+                        wind_sigma_mps=0.08,
+                        outage_every_s=60.0,
+                        outage_dur_s=0.7,
+                    ),
+                    f"delayed_noisy_start_near_waypoint_{index + 1}",
+                )
             for index in (0, len(doc.waypoints) - 1):
                 for seed in (101, 137):
-                    offset = controller.wp[index] - controller.wp[0] + 0.09 * frame.east + 0.02 * frame.up
-                    record(sim.SimParams(
-                        route=route, align=sim._default_align(), meters_per_unit=7.5,
-                        duration_s=300.0, seed=seed, start_offset_frame="raw", start_offset_u=tuple(offset),
-                        initial_yaw_error_deg=110.0, latency_ms=200.0, pos_noise_u=0.004,
-                        yaw_bias_deg=5.0, wind_sigma_mps=0.06, drop_rate=0.03,
-                    ), f"held_out_start_near_waypoint_{index + 1}")
-        print(f"{route.name}: {sum(r['accepted'] for r in rows if r['route'] == route.name)}/"
-              f"{sum(r['route'] == route.name for r in rows)} accepted", flush=True)
+                    offset = (
+                        controller.wp[index]
+                        - controller.wp[0]
+                        + 0.09 * frame.east
+                        + 0.02 * frame.up
+                    )
+                    record(
+                        sim.SimParams(
+                            route=route,
+                            align=sim._default_align(),
+                            meters_per_unit=7.5,
+                            duration_s=300.0,
+                            seed=seed,
+                            start_offset_frame="raw",
+                            start_offset_u=tuple(offset),
+                            initial_yaw_error_deg=110.0,
+                            latency_ms=200.0,
+                            pos_noise_u=0.004,
+                            yaw_bias_deg=5.0,
+                            wind_sigma_mps=0.06,
+                            drop_rate=0.03,
+                        ),
+                        f"held_out_start_near_waypoint_{index + 1}",
+                    )
+        print(
+            f"{route.name}: {sum(r['accepted'] for r in rows if r['route'] == route.name)}/"
+            f"{sum(r['route'] == route.name for r in rows)} accepted",
+            flush=True,
+        )
 
+    _record_session_starts(args, routes, record)
+    gust_rows = []
+    if not args.quick:
+        for route in routes:
+            for gust_m in (0.2, 0.5):
+                gust_rows.append(
+                    evaluate_gust_recovery(
+                        sim.SimParams(
+                            route=route,
+                            align=sim._default_align(),
+                            meters_per_unit=5.0,
+                            duration_s=300.0,
+                            seed=53,
+                            gust_m=gust_m,
+                            gust_every_s=20.0,
+                            localization_wait_s=args.localization_wait_s,
+                        )
+                    )
+                )
+        (args.out / "wind_results.json").write_text(
+            json.dumps(gust_rows, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+        )
+        print(
+            f"WIND {sum(row['accepted'] for row in gust_rows)}/{len(gust_rows)} accepted",
+            flush=True,
+        )
+    accepted = sum(row["accepted"] for row in rows)
+    unchanged = all(
+        hashlib.sha256(Path(path).read_bytes()).hexdigest() == digest
+        for path, digest in source_hashes.items()
+    )
+    (args.out / "verification_manifest.json").write_text(
+        json.dumps(
+            {
+                "cases": len(rows),
+                "accepted": accepted,
+                "sources_unchanged_during_run": unchanged,
+                "wind_cases": len(gust_rows),
+                "wind_accepted": sum(row["accepted"] for row in gust_rows),
+                "source_sha256": source_hashes,
+                "flight_logs": str(args.flight_logs.resolve()),
+                "verification": "offline controller and production safety checks; simulated plant",
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    print(f"TOTAL {accepted}/{len(rows)} accepted", flush=True)
+    if not unchanged:
+        print(
+            "Source files changed during verification; rerun before using these results.",
+            flush=True,
+        )
+    return (
+        0
+        if accepted == len(rows) and all(row["accepted"] for row in gust_rows) and unchanged
+        else 1
+    )
+
+
+def _record_session_starts(args, routes, record):
     if not args.quick:
         for session in sorted(args.flight_logs.glob("session_20260914T08*")):
             awaiting = False
@@ -214,7 +346,9 @@ def main(argv=None):
                         )
                         points = np.asarray(candidate_controller.wp)
                         recorded = np.asarray(tick["waypoints_u"])
-                        if points.shape == recorded.shape and np.allclose(points, recorded, atol=5.1e-5):
+                        if points.shape == recorded.shape and np.allclose(
+                            points, recorded, atol=5.1e-5
+                        ):
                             matches.append(candidate)
                     if len(matches) != 1:
                         raise ValueError(f"cannot uniquely match recorded AUTO plan in {session}")
@@ -224,42 +358,22 @@ def main(argv=None):
                     controller, _cfg, frame, _doc = sim.build_production_controller(
                         route, sim._default_align(), return_to_start=True
                     )
-                    yaw_error = tick["heading_deg"] - math.degrees(frame.heading(
-                        controller.wp[1] - controller.wp[0]
-                    ))
-                    record(sim.SimParams(
-                        route=route, align=sim._default_align(), meters_per_unit=5.0,
-                        duration_s=300.0, seed=7, start_offset_frame="raw",
-                        start_offset_u=tuple(np.array(tick["pose_u"]) - controller.wp[0]),
-                        initial_yaw_error_deg=yaw_error,
-                    ), f"{session.name}_auto_{count}")
-    gust_rows = []
-    if not args.quick:
-        for route in routes:
-            for gust_m in (0.2, 0.5):
-                gust_rows.append(evaluate_gust_recovery(sim.SimParams(
-                    route=route, align=sim._default_align(), meters_per_unit=5.0,
-                    duration_s=300.0, seed=53, gust_m=gust_m, gust_every_s=20.0,
-                )))
-        (args.out / "wind_results.json").write_text(
-            json.dumps(gust_rows, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-        )
-        print(f"WIND {sum(row['accepted'] for row in gust_rows)}/{len(gust_rows)} accepted", flush=True)
-    accepted = sum(row["accepted"] for row in rows)
-    unchanged = all(
-        hashlib.sha256(Path(path).read_bytes()).hexdigest() == digest
-        for path, digest in source_hashes.items()
-    )
-    (args.out / "verification_manifest.json").write_text(json.dumps({
-        "cases": len(rows), "accepted": accepted, "sources_unchanged_during_run": unchanged,
-        "wind_cases": len(gust_rows), "wind_accepted": sum(row["accepted"] for row in gust_rows),
-        "source_sha256": source_hashes, "flight_logs": str(args.flight_logs.resolve()),
-        "verification": "offline controller and production safety checks; simulated plant",
-    }, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    print(f"TOTAL {accepted}/{len(rows)} accepted", flush=True)
-    if not unchanged:
-        print("Source files changed during verification; rerun before using these results.", flush=True)
-    return 0 if accepted == len(rows) and all(row["accepted"] for row in gust_rows) and unchanged else 1
+                    yaw_error = tick["heading_deg"] - math.degrees(
+                        frame.heading(controller.wp[1] - controller.wp[0])
+                    )
+                    record(
+                        sim.SimParams(
+                            route=route,
+                            align=sim._default_align(),
+                            meters_per_unit=5.0,
+                            duration_s=300.0,
+                            seed=7,
+                            start_offset_frame="raw",
+                            start_offset_u=tuple(np.array(tick["pose_u"]) - controller.wp[0]),
+                            initial_yaw_error_deg=yaw_error,
+                        ),
+                        f"{session.name}_auto_{count}",
+                    )
 
 
 if __name__ == "__main__":

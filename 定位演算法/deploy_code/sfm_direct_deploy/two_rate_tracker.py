@@ -9,7 +9,7 @@ Relocalizer (`RelocWorker`, one background thread): MegaLoc retrieval + official
 EDM matching + PnP on a single frame through `LiveMapEDMProvider.localize_array`.
 Its anchor 2D points are chained forward through every frame the worker was busy
 for, then handed over to the fast loop. The fast loop NEVER waits for it:
-`RelocWorker.submit` refuses work while the thread is busy instead of queueing.
+`RelocWorker.submit` retains only the newest waiting capture while busy.
 
 Derived from `定位演算法/validation/replay_two_rate_reference.py` (the frozen
 P174 replay harness). Behavioural differences, all deliberate:
@@ -167,14 +167,24 @@ class KLTTracker:
             return xy, np.zeros(len(xy), dtype=bool)
         p0 = xy.astype(np.float32).reshape(-1, 1, 2)
         p1, st, _ = cv2.calcOpticalFlowPyrLK(
-            previous, current, p0, None, winSize=(self.win, self.win),
-            maxLevel=self.levels, criteria=self.criteria,
+            previous,
+            current,
+            p0,
+            None,
+            winSize=(self.win, self.win),
+            maxLevel=self.levels,
+            criteria=self.criteria,
         )
         if p1 is None or st is None:
             return xy, np.zeros(len(xy), dtype=bool)
         p0b, stb, _ = cv2.calcOpticalFlowPyrLK(
-            current, previous, p1, None, winSize=(self.win, self.win),
-            maxLevel=self.levels, criteria=self.criteria,
+            current,
+            previous,
+            p1,
+            None,
+            winSize=(self.win, self.win),
+            maxLevel=self.levels,
+            criteria=self.criteria,
         )
         if p0b is None or stb is None:
             return xy, np.zeros(len(xy), dtype=bool)
@@ -182,8 +192,10 @@ class KLTTracker:
         back = p0b.reshape(-1, 2)
         fb = np.linalg.norm(back - xy, axis=1)
         keep = (
-            (st.reshape(-1) == 1) & (stb.reshape(-1) == 1)
-            & np.isfinite(fwd).all(axis=1) & (fb <= self.fb_max_px)
+            (st.reshape(-1) == 1)
+            & (stb.reshape(-1) == 1)
+            & np.isfinite(fwd).all(axis=1)
+            & (fb <= self.fb_max_px)
         )
         valid_fb = fb[(st.reshape(-1) == 1) & (stb.reshape(-1) == 1) & np.isfinite(fb)]
         self.last_diagnostics.update(
@@ -203,9 +215,8 @@ class KLTTracker:
 class RelocWorker:
     """One background thread running the GPU relocalizer, never blocking.
 
-    Capacity is exactly one job: `submit` returns False while the thread is
-    busy instead of queueing, because a queued relocalization would land with a
-    catch-up chain longer than the ring buffer and be dropped anyway.
+    One job may run and one latest capture may wait. New submissions replace
+    the waiting capture, so triggers are retained without an aging backlog.
     """
 
     def __init__(self, provider: Any) -> None:
@@ -214,7 +225,8 @@ class RelocWorker:
         self._job: tuple[np.ndarray, int] | None = None
         self._busy = False
         self._closed = False
-        self._out: "queue.Queue[tuple[RelocFix, int]]" = queue.Queue()
+        self._out: "queue.Queue[tuple[RelocFix, int]]" = queue.Queue(maxsize=1)
+        self._generation = 0
         self._thread: threading.Thread | None = None
 
     # ---------- lifecycle ----------
@@ -222,9 +234,7 @@ class RelocWorker:
         if self._thread is not None:
             return
         self._closed = False
-        thread = threading.Thread(
-            target=self._run, name="direct-reloc-worker", daemon=True
-        )
+        thread = threading.Thread(target=self._run, name="direct-reloc-worker", daemon=True)
         self._thread = thread
         thread.start()
 
@@ -232,6 +242,7 @@ class RelocWorker:
         thread = self._thread
         with self._cv:
             self._closed = True
+            self._generation += 1
             self._job = None
             self._cv.notify_all()
         if thread is not None:
@@ -244,14 +255,18 @@ class RelocWorker:
     @property
     def busy(self) -> bool:
         with self._cv:
-            return self._busy
+            return self._busy or self._job is not None
+
+    @property
+    def queued(self) -> bool:
+        with self._cv:
+            return self._job is not None
 
     def submit(self, gray: np.ndarray, ordinal: int) -> bool:
         with self._cv:
-            if self._closed or self._thread is None or self._busy:
+            if self._closed or self._thread is None:
                 return False
-            self._job = (gray, int(ordinal))
-            self._busy = True
+            self._job = (gray.copy(), int(ordinal))
             self._cv.notify()
         return True
 
@@ -260,9 +275,11 @@ class RelocWorker:
             return self._out.get_nowait()
         except queue.Empty:
             return None
+
     def reset(self) -> None:
-        """Drop a queued-but-unstarted job and any undelivered fixes."""
+        """Invalidate in-flight work as well as pending and undelivered fixes."""
         with self._cv:
+            self._generation += 1
             self._job = None
             while True:
                 try:
@@ -281,6 +298,8 @@ class RelocWorker:
                     return
                 gray, ordinal = self._job
                 self._job = None
+                generation = self._generation
+                self._busy = True
             started = time.perf_counter()
             try:
                 fix = self._provider.localize_array(gray)
@@ -293,7 +312,17 @@ class RelocWorker:
                 with self._cv:
                     self._busy = False
                     self._cv.notify_all()
-            self._out.put((fix, ordinal))
+            self._publish(fix, ordinal, generation)
+
+    def _publish(self, fix, ordinal: int, generation: int) -> None:
+        with self._cv:
+            if self._closed or generation != self._generation:
+                return
+            try:
+                self._out.get_nowait()
+            except queue.Empty:
+                pass
+            self._out.put_nowait((fix, ordinal))
 
 
 def _failed_fix(runtime_ms: float, reason: str) -> "RelocFix":
@@ -442,7 +471,7 @@ class TwoRateTracker:
         self._last_reloc_stamp: float | None = None
         self._last_pose: np.ndarray | None = None
         self._last_gray: np.ndarray | None = None
-        self._last_pose_ordinal = -10**9
+        self._last_pose_ordinal = -(10**9)
         self._last_pose_stamp: float | None = None
         self._last_visual_stamp: float | None = None
         self._last_pose_status: str | None = None
@@ -474,9 +503,7 @@ class TwoRateTracker:
         """Fast loop: carry live map points and un-triangulated VO candidates forward."""
         n_live = len(self._live_xy)
         combined = (
-            np.concatenate([self._live_xy, self._vo_xy])
-            if self._vo_xy.size
-            else self._live_xy
+            np.concatenate([self._live_xy, self._vo_xy]) if self._vo_xy.size else self._live_xy
         )
         fwd_all, keep_all = self._tracker.track(gray, combined)
         self._klt_diagnostics = dict(getattr(self._tracker, "last_diagnostics", {}))
@@ -539,18 +566,10 @@ class TwoRateTracker:
         ):
             return None, None, None, 0
         prev_xy, curr_xy = dr_prev, dr_curr
-        if (
-            self._last_pose_ordinal != ordinal - 1
-            or prev_xy is None
-            or len(prev_xy) < 8
-        ):
-            extra = self._detect_features(
-                self._last_gray, np.zeros((0, 2), dtype=float)
-            )
+        if self._last_pose_ordinal != ordinal - 1 or prev_xy is None or len(prev_xy) < 8:
+            extra = self._detect_features(self._last_gray, np.zeros((0, 2), dtype=float))
             if extra.size:
-                fwd, keep = self._tracker.track_pair(
-                    self._last_gray, gray, extra
-                )
+                fwd, keep = self._tracker.track_pair(self._last_gray, gray, extra)
                 ok = keep & self._inside(fwd)
                 prev_xy, curr_xy = extra[ok], fwd[ok]
         step_len = (
@@ -558,9 +577,7 @@ class TwoRateTracker:
             if self._speed_history
             else 0.0
         )
-        pose, n_inl = self._recover_relative(
-            prev_xy, curr_xy, self._last_pose, step_len
-        )
+        pose, n_inl = self._recover_relative(prev_xy, curr_xy, self._last_pose, step_len)
         if pose is not None:
             self._dead_reckon_age += 1
             return pose, _center(pose), "DEAD_RECKON", n_inl
@@ -611,11 +628,13 @@ class TwoRateTracker:
             return np.eye(3)
         x, y, z = axis / norm
         c, s = math.cos(angle), math.sin(angle)
-        return np.array([
-            [c + x * x * (1 - c), x * y * (1 - c) - z * s, x * z * (1 - c) + y * s],
-            [y * x * (1 - c) + z * s, c + y * y * (1 - c), y * z * (1 - c) - x * s],
-            [z * x * (1 - c) - y * s, z * y * (1 - c) + x * s, c + z * z * (1 - c)],
-        ])
+        return np.array(
+            [
+                [c + x * x * (1 - c), x * y * (1 - c) - z * s, x * z * (1 - c) + y * s],
+                [y * x * (1 - c) + z * s, c + y * y * (1 - c), y * z * (1 - c) - x * s],
+                [z * x * (1 - c) - y * s, z * y * (1 - c) + x * s, c + z * z * (1 - c)],
+            ]
+        )
 
     def _step_imu_bridge(
         self, stamp: float
@@ -627,8 +646,12 @@ class TwoRateTracker:
         on a scale-free map) and reports WEAK so the flight loop never treats
         it as a confirmed fix. Shares the dead-reckon age budget.
         """
-        blank: dict = {"imu_bridge": False, "imu_sample_age_s": None, "imu_yaw_delta_deg": None,
-                       "imu_bridge_reason": "no_recent_visual_pose"}
+        blank: dict = {
+            "imu_bridge": False,
+            "imu_sample_age_s": None,
+            "imu_yaw_delta_deg": None,
+            "imu_bridge_reason": "no_recent_visual_pose",
+        }
         if not self._imu_bridge_armed(stamp):
             return None, None, None, 0, blank
         bridged = self._imu_bridge_delta(stamp)
@@ -730,17 +753,14 @@ class TwoRateTracker:
         self, gray: np.ndarray, ordinal: int, stamp: float, status: str
     ) -> bool:
         reloc = self.profile.reloc
-        if self._pending_ordinal is not None or self._worker.busy:
-            return False
-        due = (
-            self._last_reloc_stamp is None
-            or (stamp - self._last_reloc_stamp) >= float(reloc.period_s)
+        due = self._last_reloc_stamp is None or (stamp - self._last_reloc_stamp) >= float(
+            reloc.period_s
         )
         # VO tracks can be numerous while none constrain the pose to the map.
         # Request a map fix as soon as the one-job worker is available, without
         # waiting for the normal refresh period or clearing the usable tracks.
         unconfirmed = status in {"VO_ONLY", "DEAD_RECKON", "IMU_BRIDGE", "NO_POSE"}
-        if len(self._live_ids) < int(reloc.min_points) or unconfirmed or due:
+        if len(self._live_ids) < int(reloc.min_points) or unconfirmed or due or self._worker.queued:
             if self._worker.submit(gray, ordinal):
                 self._pending_ordinal = ordinal
                 self._last_reloc_stamp = stamp
@@ -789,12 +809,33 @@ class TwoRateTracker:
                 self._last_visual_stamp = stamp
         return step
 
+    def _apply_handover(self, gray, walked_ids, walked_xy, walked_xyz):
+        strong_inliers = int(self.profile.reloc.frozen_pnp_thresholds["strong_inliers"])
+        reseeded = int(walked_ids.size) >= max(
+            strong_inliers, self.profile.fast_loop.reseed_min_points
+        )
+        handover_points = int(walked_ids.size)
+        if reseeded:
+            self._live_xy = np.ascontiguousarray(walked_xy, dtype=np.float64)
+            self._live_ids = walked_ids
+            self._live_xyz = walked_xyz
+            self._tracker.set_frame(gray)
+            dr_prev = dr_curr = None
+            t_track = time.perf_counter()
+        else:
+            dr_prev, dr_curr, t_track = self._step_fast_loop(gray)
+            if walked_ids.size and len(self._live_ids) >= self.profile.fast_loop.pnp.min_points:
+                handover_points = self._merge_handover_points(walked_ids, walked_xy, walked_xyz)
+        return reseeded, handover_points, dr_prev, dr_curr, t_track
+
     def step(self, gray_native: np.ndarray, capture_stamp: float) -> dict:
         t0 = time.perf_counter()
         self._ordinal += 1
         ordinal = self._ordinal
         stamp = float(capture_stamp)
-        frame_dt = None if self._previous_capture_stamp is None else stamp - self._previous_capture_stamp
+        frame_dt = (
+            None if self._previous_capture_stamp is None else stamp - self._previous_capture_stamp
+        )
         self._previous_capture_stamp = stamp
         self._klt_diagnostics = {}
 
@@ -820,34 +861,23 @@ class TwoRateTracker:
         ) = self._step_handover(gray)
         t_handover = time.perf_counter()
 
-        # 2. REPLACE when the walked set meets strong_inliers; otherwise KLT
-        # the old live set, then MERGE current-frame handover ids (no KLT).
-        strong_inliers = int(self.profile.reloc.frozen_pnp_thresholds["strong_inliers"])
-        reseeded = int(walked_ids.size) >= strong_inliers
-        handover_points = int(walked_ids.size)
-        if reseeded:
-            self._live_xy = np.ascontiguousarray(walked_xy, dtype=np.float64)
-            self._live_ids = walked_ids
-            self._live_xyz = walked_xyz
-            self._tracker.set_frame(gray)
-            dr_prev = dr_curr = None
-            t_track = time.perf_counter()
-        else:
-            dr_prev, dr_curr, t_track = self._step_fast_loop(gray)
-            if walked_ids.size:
-                handover_points = self._merge_handover_points(
-                    walked_ids, walked_xy, walked_xyz
-                )
+        # A partial handover can augment a viable track, but cannot seed an empty one.
+        reseeded, handover_points, dr_prev, dr_curr, t_track = self._apply_handover(
+            gray, walked_ids, walked_xy, walked_xyz
+        )
         # 3. absolute pose
         status, cam_from_world, center, inliers, map_inliers, vo_inliers, n_corr, quality = (
             self._step_absolute_pose(reseeded, stamp)
         )
         t_pnp = time.perf_counter()
 
-
         # 4. dead reckoning
-        imu_info: dict = {"imu_bridge": False, "imu_sample_age_s": None, "imu_yaw_delta_deg": None,
-                          "imu_bridge_reason": "visual_pose_available"}
+        imu_info: dict = {
+            "imu_bridge": False,
+            "imu_sample_age_s": None,
+            "imu_yaw_delta_deg": None,
+            "imu_bridge_reason": "visual_pose_available",
+        }
         if cam_from_world is None:
             dr_pose, dr_center, dr_status, dr_inl = self._step_dead_reckon(
                 gray, ordinal, dr_prev, dr_curr, stamp
@@ -952,8 +982,11 @@ class TwoRateTracker:
         pnp = self.profile.fast_loop.pnp
         if n_corr >= int(pnp.min_points):
             answer = self._pycolmap.estimate_and_refine_absolute_pose(
-                self._live_xy, self._live_xyz, self._camera,
-                self._pnp_estimation, self._pnp_refinement,
+                self._live_xy,
+                self._live_xyz,
+                self._camera,
+                self._pnp_estimation,
+                self._pnp_refinement,
             )
             if answer is not None:
                 mask = np.asarray(answer["inlier_mask"], dtype=bool)
@@ -980,15 +1013,18 @@ class TwoRateTracker:
                     if elapsed >= 1.0 or (reseeded and elapsed >= 0.5):
                         # Bounded samples for offline residual/covariance analysis.
                         # Positive IDs are map anchors; negative IDs are VO points.
-                        selected = np.linspace(0, len(self._live_ids) - 1,
-                                               min(128, len(self._live_ids)), dtype=int)
+                        selected = np.linspace(
+                            0, len(self._live_ids) - 1, min(128, len(self._live_ids)), dtype=int
+                        )
                         quality["pnp_observation_sample"] = {
                             "capture_stamp_mono": stamp,
-                            "total_inliers": int(inliers), "sample_count": len(selected),
+                            "total_inliers": int(inliers),
+                            "sample_count": len(selected),
                             "ids": self._live_ids[selected].tolist(),
                             "image_xy_px": self._live_xy[selected].tolist(),
                             "world_xyz_u": self._live_xyz[selected].tolist(),
-                            "K": self._K.tolist(), "image_size_px": [self._w, self._h],
+                            "K": self._K.tolist(),
+                            "image_size_px": [self._w, self._h],
                             "cam_from_world": cam_from_world.tolist(),
                             "sampling": "uniform_index; at most 128 inliers",
                         }
@@ -1013,9 +1049,7 @@ class TwoRateTracker:
             return empty_ids, empty_xy, empty_xyz
 
         chain = [frame for ordinal, frame in self._ring if ordinal >= trigger_ordinal]
-        first = next(
-            (ordinal for ordinal, _ in self._ring if ordinal >= trigger_ordinal), None
-        )
+        first = next((ordinal for ordinal, _ in self._ring if ordinal >= trigger_ordinal), None)
         if first != trigger_ordinal or len(chain) > HANDOVER_MAX_FRAMES:
             # the worker outran the ring buffer: the anchor's 2D can no longer
             # be walked to this frame, so the whole handover is discarded
@@ -1048,9 +1082,7 @@ class TwoRateTracker:
             return empty_ids, empty_xy, empty_xyz
         return ids, xy, xyz
 
-    def _merge_handover_points(
-        self, ids: np.ndarray, xy: np.ndarray, xyz: np.ndarray
-    ) -> int:
+    def _merge_handover_points(self, ids: np.ndarray, xy: np.ndarray, xyz: np.ndarray) -> int:
         """Append current-frame reloc ids after the old live set has been KLT'd."""
         fresh = ~np.isin(ids, self._live_ids)
         xy, ids, xyz = xy[fresh], ids[fresh], xyz[fresh]
@@ -1059,14 +1091,9 @@ class TwoRateTracker:
             if self._live_xy.size
             else np.ascontiguousarray(xy, dtype=np.float64)
         )
-        self._live_ids = (
-            np.concatenate([self._live_ids, ids]) if self._live_ids.size else ids
-        )
-        self._live_xyz = (
-            np.concatenate([self._live_xyz, xyz]) if self._live_xyz.size else xyz
-        )
+        self._live_ids = np.concatenate([self._live_ids, ids]) if self._live_ids.size else ids
+        self._live_xyz = np.concatenate([self._live_xyz, xyz]) if self._live_xyz.size else xyz
         return int(ids.size)
-
 
     def _cap_handover_points(
         self, ids: np.ndarray, xy: np.ndarray, xyz: np.ndarray
@@ -1091,16 +1118,16 @@ class TwoRateTracker:
         for bid in np.unique(self._vo_bid[mature]) if mature.any() else ():
             rows = self._vo_bid == bid
             world, good = self._triangulate_batch(
-                self._vo_seed_xy[rows], self._vo_pose_by_bid[int(bid)],
-                self._vo_xy[rows], cam_from_world,
+                self._vo_seed_xy[rows],
+                self._vo_pose_by_bid[int(bid)],
+                self._vo_xy[rows],
+                cam_from_world,
             )
             if good.any():
                 add_xy = self._vo_xy[rows][good]
                 add_xyz = world[good]
                 count = int(good.sum())
-                add_ids = np.arange(
-                    self._vo_next_id, self._vo_next_id - count, -1, dtype=np.int64
-                )
+                add_ids = np.arange(self._vo_next_id, self._vo_next_id - count, -1, dtype=np.int64)
                 self._vo_next_id -= count
                 new_xy.append(add_xy)
                 new_ids.append(add_ids)
@@ -1111,13 +1138,11 @@ class TwoRateTracker:
             all_add_xy = np.concatenate(new_xy, axis=0)
             all_add_ids = np.concatenate(new_ids, axis=0)
             all_add_xyz = np.concatenate(new_xyz, axis=0)
-            self._live_xy = (
-                np.ascontiguousarray(
-                    np.concatenate([self._live_xy, all_add_xy], axis=0)
-                    if self._live_xy.size
-                    else all_add_xy,
-                    dtype=np.float64,
-                )
+            self._live_xy = np.ascontiguousarray(
+                np.concatenate([self._live_xy, all_add_xy], axis=0)
+                if self._live_xy.size
+                else all_add_xy,
+                dtype=np.float64,
             )
             self._live_ids = (
                 np.concatenate([self._live_ids, all_add_ids], axis=0)
@@ -1136,18 +1161,14 @@ class TwoRateTracker:
 
         if len(self._live_xy) < int(vo.min_live):
             occupied = (
-                np.concatenate([self._live_xy, self._vo_xy])
-                if self._vo_xy.size
-                else self._live_xy
+                np.concatenate([self._live_xy, self._vo_xy]) if self._vo_xy.size else self._live_xy
             )
             seeded = self._detect_features(gray, occupied)
             if seeded.size:
                 self._vo_pose_by_bid[self._vo_bid_next] = np.asarray(
                     cam_from_world, dtype=float
                 ).copy()
-                self._vo_xy = (
-                    np.concatenate([self._vo_xy, seeded]) if self._vo_xy.size else seeded
-                )
+                self._vo_xy = np.concatenate([self._vo_xy, seeded]) if self._vo_xy.size else seeded
                 self._vo_seed_xy = (
                     np.concatenate([self._vo_seed_xy, seeded.copy()])
                     if self._vo_seed_xy.size
@@ -1231,8 +1252,11 @@ class TwoRateTracker:
                 )
                 mask = cv2.erode(mask, kernel)
         corners = cv2.goodFeaturesToTrack(
-            gray, maxCorners=int(vo.detect_cap), qualityLevel=0.01,
-            minDistance=min_distance, mask=mask,
+            gray,
+            maxCorners=int(vo.detect_cap),
+            qualityLevel=0.01,
+            minDistance=min_distance,
+            mask=mask,
         )
         if corners is None:
             return np.zeros((0, 2), dtype=float)
@@ -1258,8 +1282,12 @@ class TwoRateTracker:
         # recoverPose then assembles a ~90 deg garbage rotation out of noise.
         flow_med = float(np.median(np.linalg.norm(curr_xy - prev_xy, axis=1)))
         matrix, mask = cv2.findEssentialMat(
-            prev_xy, curr_xy, cameraMatrix=self._K,
-            method=cv2.RANSAC, prob=0.999, threshold=1.0,
+            prev_xy,
+            curr_xy,
+            cameraMatrix=self._K,
+            method=cv2.RANSAC,
+            prob=0.999,
+            threshold=1.0,
         )
         if matrix is None:
             return None, 0
@@ -1271,7 +1299,11 @@ class TwoRateTracker:
             self._dead_reckon_guarded += 1
             return None, e_inliers
         n_inliers, rotation, translation, _ = cv2.recoverPose(
-            matrix, prev_xy, curr_xy, cameraMatrix=self._K, mask=mask,
+            matrix,
+            prev_xy,
+            curr_xy,
+            cameraMatrix=self._K,
+            mask=mask,
         )
         n_inliers = int(n_inliers)
         if n_inliers < 8:
@@ -1288,23 +1320,19 @@ class TwoRateTracker:
         if azimuth_turn_exceeds(self.map_frame, prev_r, rotation):
             step_scale = 0.5
             self._dead_reckon_guarded += 1
-        scaled = (
-            np.zeros(3)
-            if norm < 1e-9
-            else translation / norm * (float(step_len) * step_scale)
-        )
+        scaled = np.zeros(3) if norm < 1e-9 else translation / norm * (float(step_len) * step_scale)
         return (
-            np.concatenate(
-                [rotation @ prev_r, (rotation @ prev_t + scaled).reshape(3, 1)], axis=1
-            ),
+            np.concatenate([rotation @ prev_r, (rotation @ prev_t + scaled).reshape(3, 1)], axis=1),
             n_inliers,
         )
 
     def _inside(self, xy: np.ndarray) -> np.ndarray:
         return (
             np.isfinite(xy).all(axis=1)
-            & (xy[:, 0] >= 0) & (xy[:, 0] < self._w)
-            & (xy[:, 1] >= 0) & (xy[:, 1] < self._h)
+            & (xy[:, 0] >= 0)
+            & (xy[:, 0] < self._w)
+            & (xy[:, 1] >= 0)
+            & (xy[:, 1] < self._h)
         )
 
 

@@ -19,7 +19,6 @@ from backend_contract import FailureReason
 from operator_state import TrackerState
 from operator_localization_config import (
     LIVE_STATUS_PATH,
-    POSE_JUMP_U,
     normalize_camera_axes,
     normalize_camera_forward,
 )
@@ -104,6 +103,36 @@ def _fail_safe_dead_localizer(app: Any) -> None:
         write_log("WORKER_EXIT: 定位 worker 已不可用，已 fail-safe")
 
 
+def _hover_after_poll_failure(app: Any, incident: Any) -> None:
+    try:
+        clear_motion = getattr(app.backend, "nudge_clear", None)
+        if callable(clear_motion):
+            clear_motion(reason="backend_poll_failed")
+        send_pcmd = getattr(app.backend, "send_pcmd", None)
+        if callable(send_pcmd):
+            hovered = bool(send_pcmd(
+                0, 0, 0, 0, reason="backend_poll_failed_hover"
+            ))
+        else:
+            state = getattr(app.backend, "state", None)
+            if state is not None:
+                state.tracker_state = TrackerState.HOVER
+                state.last_command = "backend_poll_failed_hover"
+            hovered = True
+        if not hovered:
+            raise RuntimeError("zero PCMD was rejected")
+    except Exception as safe_exc:
+        if callable(incident):
+            try:
+                incident(
+                    "backend_poll_hover_failed",
+                    error=repr(safe_exc),
+                    resolved=False,
+                )
+            except Exception:  # Tier3: incident logging best-effort — keep fallback
+                pass
+
+
 def _poll_backend(app: Any) -> Any | None:
     """Poll telemetry; on failure hold zero without changing control owner."""
     try:
@@ -129,33 +158,7 @@ def _poll_backend(app: Any) -> Any | None:
                 pause_auto("backend_poll_failed")
             except Exception:  # Tier3: pause AUTO best-effort — keep fallback
                 pass
-        try:
-            clear_motion = getattr(app.backend, "nudge_clear", None)
-            if callable(clear_motion):
-                clear_motion(reason="backend_poll_failed")
-            send_pcmd = getattr(app.backend, "send_pcmd", None)
-            if callable(send_pcmd):
-                hovered = bool(send_pcmd(
-                    0, 0, 0, 0, reason="backend_poll_failed_hover"
-                ))
-            else:
-                state = getattr(app.backend, "state", None)
-                if state is not None:
-                    state.tracker_state = TrackerState.HOVER
-                    state.last_command = "backend_poll_failed_hover"
-                hovered = True
-            if not hovered:
-                raise RuntimeError("zero PCMD was rejected")
-        except Exception as safe_exc:
-            if callable(incident):
-                try:
-                    incident(
-                        "backend_poll_hover_failed",
-                        error=repr(safe_exc),
-                        resolved=False,
-                    )
-                except Exception:  # Tier3: incident logging best-effort — keep fallback
-                    pass
+        _hover_after_poll_failure(app, incident)
         return None
 
 
@@ -889,27 +892,9 @@ def _live_result_failed(app: Any, result: dict, *, invalid_success_pose: bool) -
 
 
 def _live_pose_is_continuous(app: Any, xyz: np.ndarray) -> bool:
-    if app.live_last_xyz is None:
-        app._live_pending = None
-        return True
-    jump = float(np.linalg.norm(xyz - app.live_last_xyz))
-    if jump <= POSE_JUMP_U:
-        app._live_pending = None
-        return True
-    if (
-        app._live_pending is not None
-        and float(np.linalg.norm(xyz - app._live_pending)) <= POSE_JUMP_U
-    ):
-        app._live_pending = None
-        return True
-    app._live_pending = xyz
-    app.write_log(
-        f"POSE_JUMP_REJECT {app.live_result_frame_name}: "
-        f"{jump:.2f}u > {POSE_JUMP_U}u; trajectory break, skipped"
-    )
-    app.loc_health = "FAIL"
-    app._record_no_loc()
-    return False
+    """Successful live poses publish without source-confirmation pause."""
+    app._live_pending = None
+    return True
 
 
 def _update_live_camera_orientation(app: Any, result: dict, xyz: np.ndarray) -> None:
@@ -990,7 +975,7 @@ def _accept_live_pose(app: Any, result: dict, xyz: np.ndarray) -> None:
         )
     heading = getattr(app, "live_heading", None)
     try:
-        heading_value = float(heading)
+        heading_value = float(heading) if heading is not None else float("nan")
     except (TypeError, ValueError, OverflowError):
         heading_value = float("nan")
     stamp = localization_pose_timestamp(result, arrival_mono=time.monotonic())
@@ -1006,15 +991,42 @@ def _accept_live_pose(app: Any, result: dict, xyz: np.ndarray) -> None:
             heading_value,
             float(stamp),
         )
+        app._autonomy_pose_predicted = False
 
 
-def _snapshot_weak_pose_for_autonomy(app: Any, result: dict, xyz: np.ndarray | None) -> None:
-    """Mirror a held weak fix into the AUTO pose snapshot only.
+def _weak_pose_heading(app: Any, result: dict) -> float | None:
+    heading_value = float("nan")
+    try:
+        pose_value = result.get("pose")
+        pose = pose_value if isinstance(pose_value, dict) else {}
+        heading_value = float(pose.get("yaw_raw", float("nan")))
+    except (TypeError, ValueError, OverflowError):
+        heading_value = float("nan")
+    if not math.isfinite(heading_value):
+        try:
+            heading_value = float(getattr(app, "live_heading", float("nan")))
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if not math.isfinite(heading_value):
+            return None
+    return heading_value
+
+
+def _snapshot_weak_pose_for_autonomy(
+    app: Any,
+    result: dict,
+    xyz: np.ndarray | None,
+    *,
+    require_success: bool = True,
+    predicted: bool = False,
+) -> None:
+    """Mirror a held weak or IMU-predicted fix into the AUTO pose snapshot only.
 
     The confidence hold keeps protecting live_pose / loc_health / boot state;
     this writes nothing but ``_autonomy_pose_snapshot``, and only while an
     autonomy coordinator with ``accept_weak_poses`` is attached. Lets the
-    route loop keep flying toward the waypoints on VO-only fixes.
+    route loop keep flying toward the waypoints on VO-only or predicted IMU
+    fixes after a visual lock.
     """
     coordinator = getattr(app, "_integrated_autonomy", None)
     if not bool(getattr(coordinator, "accept_weak_poses", False)):
@@ -1023,7 +1035,7 @@ def _snapshot_weak_pose_for_autonomy(app: Any, result: dict, xyz: np.ndarray | N
         ok = bool(result.get("success"))
     except (ValueError, KeyError, TypeError, AttributeError):
         return
-    if not ok or xyz is None:
+    if xyz is None or (require_success and not ok):
         return
     try:
         point = [float(value) for value in np.asarray(xyz, dtype=float).reshape(-1)[:3]]
@@ -1031,20 +1043,9 @@ def _snapshot_weak_pose_for_autonomy(app: Any, result: dict, xyz: np.ndarray | N
         return
     if not all(math.isfinite(value) for value in point):
         return
-    heading_value = float("nan")
-    try:
-        pose_value = result.get("pose")
-        pose = pose_value if isinstance(pose_value, dict) else {}
-        heading_value = float(pose.get("yaw_raw"))
-    except (TypeError, ValueError, OverflowError):
-        heading_value = float("nan")
-    if not math.isfinite(heading_value):
-        try:
-            heading_value = float(getattr(app, "live_heading", float("nan")))
-        except (TypeError, ValueError, OverflowError):
-            return
-        if not math.isfinite(heading_value):
-            return
+    heading_value = _weak_pose_heading(app, result)
+    if heading_value is None:
+        return
     stamp = localization_pose_timestamp(result, arrival_mono=time.monotonic())
     if stamp is None:
         return
@@ -1055,6 +1056,7 @@ def _snapshot_weak_pose_for_autonomy(app: Any, result: dict, xyz: np.ndarray | N
     if not math.isfinite(stamp_value):
         return
     app._autonomy_pose_snapshot = (point[0], point[1], point[2], heading_value, stamp_value)
+    app._autonomy_pose_predicted = bool(predicted)
 
 
 def _accept_predicted_pose(app: Any, result: dict, xyz: np.ndarray) -> None:
@@ -1087,6 +1089,21 @@ _WEAK_HISTORY_MAX = 300
 _WEAK_DISPLAY_HEALTH = "DEGRADED"
 
 
+def _append_weak_history(app: Any, result: dict, point: np.ndarray,
+                         trail: list, trail_health: list) -> None:
+    trail.append(point.copy())
+    trail_health.append(_WEAK_DISPLAY_HEALTH)
+    trail_kind = getattr(app, "history_weak_kind", None)
+    if isinstance(trail_kind, list):
+        trail_kind.append(weak_pose_source_kind(result))
+        while len(trail_kind) > _WEAK_HISTORY_MAX:
+            trail_kind.pop(0)
+    while len(trail) > _WEAK_HISTORY_MAX:
+        trail.pop(0)
+        if trail_health:
+            trail_health.pop(0)
+
+
 def _record_weak_display_pose(
     app: Any, result: dict, xyz: np.ndarray | None, *, require_success: bool = True,
 ) -> bool:
@@ -1117,17 +1134,7 @@ def _record_weak_display_pose(
     trail_health = getattr(app, "history_weak_health", None)
     if not isinstance(trail, list) or not isinstance(trail_health, list):
         return False
-    trail.append(point.copy())
-    trail_health.append(_WEAK_DISPLAY_HEALTH)
-    trail_kind = getattr(app, "history_weak_kind", None)
-    if isinstance(trail_kind, list):
-        trail_kind.append(weak_pose_source_kind(result))
-        while len(trail_kind) > _WEAK_HISTORY_MAX:
-            trail_kind.pop(0)
-    while len(trail) > _WEAK_HISTORY_MAX:
-        trail.pop(0)
-        if trail_health:
-            trail_health.pop(0)
+    _append_weak_history(app, result, point, trail, trail_health)
     return True
 
 
@@ -1175,13 +1182,21 @@ def update_live_results(
             hold_active = False
             low = False
         confidence_hold = getattr(app, "lost_hold", None)
+        auto_flying = False
+        try:
+            auto_flying = bool(app._integrated_auto_active())
+        except Exception:
+            auto_flying = False
         if (
-            hold_active
-            or (
-                low
-                and bool(getattr(
-                    confidence_hold, "hold_on_low_confidence", False
-                ))
+            (not auto_flying)
+            and (
+                hold_active
+                or (
+                    low
+                    and bool(getattr(
+                        confidence_hold, "hold_on_low_confidence", False
+                    ))
+                )
             )
         ):
             # Keep low-confidence and recovery-only poses in telemetry, but
@@ -1205,11 +1220,14 @@ def update_live_results(
                 app.write_log(f"LOCALIZATION_POSE_STATUS_FAILED: {exc!r}")
                 pose_status = None
             if pose_status == "PREDICTED_ONLY" and xyz is not None:
-                # An IMU guess is degraded display by definition: mirror it for
-                # the map even though the worker reports no visual success.
+                # IMU guess: map trail always; AUTO snapshot only after a
+                # visual lock, when accept_weak_poses is on.
                 _record_weak_display_pose(
                     app, result, xyz, require_success=False)
                 _accept_predicted_pose(app, result, xyz)
+                _snapshot_weak_pose_for_autonomy(
+                    app, result, xyz, require_success=False, predicted=True,
+                )
             continue
         assert xyz is not None
         # Mirror weak fixes for the map before the jump gate: a rejected jump

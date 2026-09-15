@@ -67,7 +67,11 @@ def _write_canonical(value: dict[str, Any], output: str) -> None:
 
 def _verify(args: argparse.Namespace) -> int:
     expected = _parse_json_object(Path(args.expected_bindings))
-    now = None if args.now is None else datetime.fromisoformat(_parse_timestamp(args.now)[:-1] + "+00:00")
+    now = (
+        None
+        if args.now is None
+        else datetime.fromisoformat(_parse_timestamp(args.now)[:-1] + "+00:00")
+    )
     verdict = verify_hardware_approval_receipt(
         Path(args.receipt),
         signature=Path(args.signature),
@@ -104,13 +108,17 @@ def _parser() -> argparse.ArgumentParser:
     verify = commands.add_parser("verify", help="verify an existing signed AUTO receipt")
     verify.add_argument("--receipt", required=True, help="existing anafi-hardware-approval/v2 JSON")
     verify.add_argument("--signature", required=True, help="detached signed envelope JSON")
-    verify.add_argument("--trust-store", required=True, help="operator-provisioned trust-store JSON")
+    verify.add_argument(
+        "--trust-store", required=True, help="operator-provisioned trust-store JSON"
+    )
     verify.add_argument(
         "--expected-bindings",
         required=True,
         help="JSON object containing site_id, coordinate_frame_id and asset SHA-256 values",
     )
-    verify.add_argument("--now", help="verification time in UTC Z notation; defaults to current time")
+    verify.add_argument(
+        "--now", help="verification time in UTC Z notation; defaults to current time"
+    )
     verify.set_defaults(handler=_verify)
 
     request = commands.add_parser("create-request", help="create a pending, unsigned request draft")
@@ -122,7 +130,9 @@ def _parser() -> argparse.ArgumentParser:
         "create-payload", help="create unsigned canonical signing input; does not sign or approve"
     )
     payload.add_argument("--receipt", required=True, help="existing approved receipt JSON")
-    payload.add_argument("--key-id", required=True, help="trust-store key_id selected by the operator")
+    payload.add_argument(
+        "--key-id", required=True, help="trust-store key_id selected by the operator"
+    )
     payload.add_argument("--issued-at", required=True, help="validity start in UTC Z notation")
     payload.add_argument("--expires-at", required=True, help="validity end in UTC Z notation")
     payload.add_argument("--output", default="-", help="output path, or - for stdout")

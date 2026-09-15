@@ -39,6 +39,7 @@ def _positive_env_float(key: str, default: float) -> float:
 LOC_LOW_INLIERS = _positive_env_int("SFM_LOW_CONF_INLIERS", 60)
 LOC_HIGH_REPROJ = _positive_env_float("SFM_LOC_HIGH_REPROJ", 4.0)
 
+
 @dataclass(frozen=True)
 class MapRenderContext:
     """All application state needed to paint one map overlay frame."""
@@ -86,6 +87,7 @@ class MapRenderContext:
     #: history_weak. Appended last so existing positional constructors keep
     #: working; missing entries fall back to the health colour.
     history_weak_kind: Sequence[str] = ()
+
 
 #: Camera picture rectangle: a real plane in map space, oriented by the full
 #: camera attitude, drawn ahead of the drone like the screen the stream looks
@@ -240,6 +242,7 @@ def camera_view_plane_corners(
     )
     return corners
 
+
 _PROJECTION_CACHE: dict[tuple, tuple[list[int], list[int]]] = {}
 _PROJECTION_CACHE_MAX = 64
 
@@ -256,6 +259,7 @@ def _pts_sig(seq: Sequence[Any] | None) -> tuple | int:
         sampled = sampled + (tuple(round(float(x), 4) for x in seq[-1][:3]),)
     return (n, sampled)
 
+
 def _draw_route_and_history(draw: Any, context: MapRenderContext) -> None:
     route_n = len(context.route_pts)
     history_n = len(context.history)
@@ -267,9 +271,13 @@ def _draw_route_and_history(draw: Any, context: MapRenderContext) -> None:
 
     pan_arr = np.asarray(context.map_pan, dtype=float).reshape(-1)
     pan_key = (
-        round(float(pan_arr[0]), 4),
-        round(float(pan_arr[1]), 4),
-    ) if len(pan_arr) >= 2 else (0.0, 0.0)
+        (
+            round(float(pan_arr[0]), 4),
+            round(float(pan_arr[1]), 4),
+        )
+        if len(pan_arr) >= 2
+        else (0.0, 0.0)
+    )
     zoom_key = round(float(context.map_zoom), 6)
     size_key = (int(context.width), int(context.height))
     rot_val = getattr(context, "map_rotation", None)
@@ -319,8 +327,12 @@ def _draw_route_and_history(draw: Any, context: MapRenderContext) -> None:
             )
         view = context.transform_xyz(np.concatenate(parts, axis=0))
         scale = _map_scale(context)
-        screen_x = (context.width * 0.5 + context.map_pan[0] + view[:, 0] * scale).astype(int).tolist()
-        screen_y = (context.height * 0.5 + context.map_pan[1] - view[:, 1] * scale).astype(int).tolist()
+        screen_x = (
+            (context.width * 0.5 + context.map_pan[0] + view[:, 0] * scale).astype(int).tolist()
+        )
+        screen_y = (
+            (context.height * 0.5 + context.map_pan[1] - view[:, 1] * scale).astype(int).tolist()
+        )
         if len(_PROJECTION_CACHE) >= _PROJECTION_CACHE_MAX:
             _PROJECTION_CACHE.clear()
         _PROJECTION_CACHE[proj_cache_key] = (screen_x, screen_y)
@@ -591,6 +603,7 @@ def classify_localization_health(loc: dict) -> str:
         return "DEGRADED"
     return "OK"
 
+
 #: Map-trail colours by estimate source. Strong fixes keep the blue history
 #: line; weak fixes draw hollow diamonds so shape already says "estimate":
 #: KLT (optical-flow bridge) green, IMU (fused-yaw bridge) yellow, anything
@@ -635,7 +648,16 @@ def build_hud_overlay_data(state: Any, loc: Any, telemetry: Any) -> dict:
         try:
             loc_dict = {
                 k: getattr(loc, k)
-                for k in ("success", "inliers", "reproj_rms", "mode", "next_mode", "weak", "health", "loc_health")
+                for k in (
+                    "success",
+                    "inliers",
+                    "reproj_rms",
+                    "mode",
+                    "next_mode",
+                    "weak",
+                    "health",
+                    "loc_health",
+                )
                 if hasattr(loc, k)
             }
         except (AttributeError, KeyError, TypeError, ValueError):
@@ -648,8 +670,18 @@ def build_hud_overlay_data(state: Any, loc: Any, telemetry: Any) -> dict:
     else:
         state_dict = {}
         for key in (
-            "mode", "stream", "loc", "tracker_state", "pose", "inliers",
-            "reproj", "link_ok", "gps_fixed", "frame_age_ms", "flight_state", "is_live"
+            "mode",
+            "stream",
+            "loc",
+            "tracker_state",
+            "pose",
+            "inliers",
+            "reproj",
+            "link_ok",
+            "gps_fixed",
+            "frame_age_ms",
+            "flight_state",
+            "is_live",
         ):
             try:
                 if hasattr(state, key):
@@ -663,8 +695,16 @@ def build_hud_overlay_data(state: Any, loc: Any, telemetry: Any) -> dict:
         tele_dict = {}
     else:
         for key in (
-            "rth", "gps", "attitude", "velocity", "altitude_agl", "link_quality",
-            "current_auto_speed", "olympe_state", "olympe_attitude", "olympe_altitude"
+            "rth",
+            "gps",
+            "attitude",
+            "velocity",
+            "altitude_agl",
+            "link_quality",
+            "current_auto_speed",
+            "olympe_state",
+            "olympe_attitude",
+            "olympe_altitude",
         ):
             try:
                 if hasattr(telemetry, key):
@@ -693,32 +733,60 @@ def build_hud_overlay_data(state: Any, loc: Any, telemetry: Any) -> dict:
     # FPS
     fps_raw = loc_dict.get("fps", loc_dict.get("loc_fps", loc_dict.get("localization_fps")))
     try:
-        fps_text = f"{float(fps_raw):.1f}" if fps_raw is not None and math.isfinite(float(fps_raw)) else "-"
+        fps_text = (
+            f"{float(fps_raw):.1f}"
+            if fps_raw is not None and math.isfinite(float(fps_raw))
+            else "-"
+        )
     except (TypeError, ValueError):
         fps_text = "-"
     # Latencies
-    latency_raw = loc_dict.get("latency_ms", loc_dict.get("loc_latency_ms", loc_dict.get("core_wall_ms", loc_dict.get("wall_ms"))))
+    latency_raw = loc_dict.get(
+        "latency_ms",
+        loc_dict.get("loc_latency_ms", loc_dict.get("core_wall_ms", loc_dict.get("wall_ms"))),
+    )
     wall_raw = loc_dict.get("wall_ms", loc_dict.get("loc_wall_ms"))
-    e2e_raw = loc_dict.get("e2e_ms", loc_dict.get("loc_e2e_ms", loc_dict.get("e2e_submit_to_ui_ms")))
+    e2e_raw = loc_dict.get(
+        "e2e_ms", loc_dict.get("loc_e2e_ms", loc_dict.get("e2e_submit_to_ui_ms"))
+    )
     latency_text = format_latency_text(latency_raw)
     wall_text = format_latency_text(wall_raw)
     e2e_text = format_latency_text(e2e_raw)
     # Telemetry fallbacks
-    auto_speed = tele_dict.get("current_auto_speed", tele_dict.get("auto_speed", tele_dict.get("current_auto_speed_var", "AUTO 地速安全閘門 -")))
+    auto_speed = tele_dict.get(
+        "current_auto_speed",
+        tele_dict.get("auto_speed", tele_dict.get("current_auto_speed_var", "AUTO PCMD -")),
+    )
     rth = tele_dict.get("rth", tele_dict.get("olympe_state", "RTH ?/?"))
     gps = tele_dict.get("gps", "")
     attitude = tele_dict.get("attitude", tele_dict.get("olympe_attitude", "飛控融合姿態 -"))
     velocity = tele_dict.get("velocity", tele_dict.get("olympe_velocity", "三軸速度 -"))
-    altitude_agl = tele_dict.get("altitude_agl", tele_dict.get("olympe_altitude", "飛控高度 - | AGL -"))
+    altitude_agl = tele_dict.get(
+        "altitude_agl", tele_dict.get("olympe_altitude", "飛控高度 - | AGL -")
+    )
     link_quality = tele_dict.get("link_quality", "")
     olympe_state_val = tele_dict.get("olympe_state", None)
     olympe_attitude_val = tele_dict.get("olympe_attitude", None)
     olympe_altitude_val = tele_dict.get("olympe_altitude", None)
     if olympe_state_val is not None or olympe_attitude_val is not None:
-        line1 = " | ".join(part for part in (str(auto_speed), f"定位 FPS {fps_text}", f"inliers {inliers}") if part)
+        line1 = " | ".join(
+            part for part in (str(auto_speed), f"定位 FPS {fps_text}", f"inliers {inliers}") if part
+        )
         line2 = f"wall_ms {wall_text} | core {latency_text} | e2e {e2e_text}"
-        line3 = str(olympe_state_val) if olympe_state_val is not None else (f"{rth} | {gps}".strip(" |") if gps else str(rth))
-        line4 = str(olympe_altitude_val) if olympe_altitude_val is not None else (f"{altitude_agl} | {link_quality}".strip(" |") if link_quality else str(altitude_agl))
+        line3 = (
+            str(olympe_state_val)
+            if olympe_state_val is not None
+            else (f"{rth} | {gps}".strip(" |") if gps else str(rth))
+        )
+        line4 = (
+            str(olympe_altitude_val)
+            if olympe_altitude_val is not None
+            else (
+                f"{altitude_agl} | {link_quality}".strip(" |")
+                if link_quality
+                else str(altitude_agl)
+            )
+        )
         att = str(olympe_attitude_val) if olympe_attitude_val is not None else str(attitude)
         if " | 三軸速度 " in att:
             att_part, sep, vel_part = att.partition(" | 三軸速度 ")
@@ -726,7 +794,9 @@ def build_hud_overlay_data(state: Any, loc: Any, telemetry: Any) -> dict:
             velocity_line = f"三軸速度 {vel_part}" if sep else str(velocity)
         else:
             attitude_line = att
-            velocity_line = str(velocity) if str(velocity).startswith("三軸") else f"三軸速度 {velocity}"
+            velocity_line = (
+                str(velocity) if str(velocity).startswith("三軸") else f"三軸速度 {velocity}"
+            )
         diagnostic_lines = (line1, line2, line3, line4, attitude_line, velocity_line)
     else:
         diagnostic_lines = (
@@ -747,7 +817,9 @@ def build_hud_overlay_data(state: Any, loc: Any, telemetry: Any) -> dict:
     }
     health_text = health_text_map.get(str(health), str(health))
     ok_count = loc_dict.get("ok_count", loc_dict.get("_loc_ok_count", loc_dict.get("loc_ok_count")))
-    fail_count = loc_dict.get("fail_count", loc_dict.get("_loc_fail_count", loc_dict.get("loc_fail_count")))
+    fail_count = loc_dict.get(
+        "fail_count", loc_dict.get("_loc_fail_count", loc_dict.get("loc_fail_count"))
+    )
     if ok_count is not None or fail_count is not None:
         try:
             oc = int(ok_count or 0)
@@ -799,6 +871,8 @@ def heading_arrow_polygon(
         (tail[0] - px * tail_half_width, tail[1] - py * tail_half_width),
         (head_base[0] - px * head_width, head_base[1] - py * head_width),
     ]
+
+
 def draw_video_hud(
     draw: Any,
     width: int,

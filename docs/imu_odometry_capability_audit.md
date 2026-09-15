@@ -1,5 +1,7 @@
 # IMU / fused-state capability audit
 
+> 2026-09-15：本文涉及 ProductionEDMTracker／ESEKF 的段落屬歷史資料，相關程式已退役。現行 DIRECT 的能力與離線檢查以 [direct_offline_validation.md](direct_offline_validation.md) 為準。
+
 Date: 2026-08-17
 Scope: production live localization (GlueMap/EDM/PnP) and ANAFI Olympe telemetry.
 Rule: only quantities that exist in code or sampled logs. No assumed sensors.

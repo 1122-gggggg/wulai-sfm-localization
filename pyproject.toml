@@ -50,6 +50,7 @@ files = [
   "控制介面程式/operator_interface/backend_contract.py",
   "控制介面程式/operator_interface/localization_contract.py",
   "控制介面程式/operator_interface/operator_autonomy.py",
+  "控制介面程式/operator_interface/operator_autonomy_status.py",
   "控制介面程式/operator_interface/operator_command_coordinator.py",
   "控制介面程式/operator_interface/operator_flight_safety.py",
   "控制介面程式/operator_interface/operator_preflight.py",

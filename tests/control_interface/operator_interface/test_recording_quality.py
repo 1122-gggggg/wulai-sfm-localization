@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import json
+from types import SimpleNamespace
+
 import pytest
 
 from backend_contract import (
@@ -14,6 +17,7 @@ from recording_quality import (
     FHD_30,
     UHD_4K_30,
     format_record_status,
+    jsonable_camera_state,
     recording_mode_matches,
     recording_profile_by_label,
     resolve_recording_profile,
@@ -58,6 +62,25 @@ def test_recording_mode_readback_accepts_enum_or_short_names() -> None:
         UHD_4K_30,
     ) is False
     assert recording_mode_matches({}, UHD_4K_30) is None
+
+
+def test_jsonable_camera_state_drops_olympe_enum_objects() -> None:
+    raw = {
+        0: {
+            "cam_id": 0,
+            "mode": SimpleNamespace(name="recording_mode.standard"),
+            "resolution": SimpleNamespace(name="resolution.res_1080p"),
+            "framerate": SimpleNamespace(name="framerate.fps_30"),
+        }
+    }
+    payload = jsonable_camera_state(raw)
+    assert payload == {
+        "cam_id": 0,
+        "mode": "standard",
+        "resolution": "res_1080p",
+        "framerate": "fps_30",
+    }
+    json.dumps(payload, allow_nan=False)
 
 
 def test_status_text_includes_selected_profile() -> None:

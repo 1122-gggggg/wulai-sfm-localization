@@ -40,6 +40,7 @@ LAUNCH_ENV = {
     "SFM_MAX_PERFORMANCE",
     "SFM_CPU_THREADS",
     "SFM_SITE_PROFILE",
+    "SFM_MISSION_SELECTION",
     "SFM_UI_PYTHON",
     "VENV",
     "WAYLAND_DISPLAY",
@@ -53,6 +54,7 @@ def run_launcher(*args: str, **overrides: str) -> subprocess.CompletedProcess[st
     env.update({
         "SFM_LAUNCH_DRY_RUN": "1",
         "SFM_UI_PYTHON": sys.executable,
+        "SFM_MISSION_SELECTION": "offline-shell-fixture",
         **overrides,
     })
     return subprocess.run(
@@ -330,6 +332,7 @@ def run_portable_launcher(
     if launcher.parent.name == "真機串流":
         env["SFM_MISSION_SELECTION"] = str(_fake_selection_path(package))
     else:
+        env["SFM_MISSION_SELECTION"] = str(_fake_selection_path(package))
         env["SFM_SITE_PROFILE"] = str(package / "profile.json")
     return subprocess.run(
         [str(launcher)],
@@ -772,6 +775,7 @@ def test_live_max_performance_forwards_signal_before_restoring(
         "PATH": f"{bin_dir}:{os.environ['PATH']}",
         "POWER_STATE": str(power_state),
         "READY": str(ready),
+        "SFM_MISSION_SELECTION": "offline-shell-fixture",
         "SFM_LAUNCH_DRY_RUN": "0",
         "SFM_UI_PYTHON": str(fake_python),
     })
@@ -858,3 +862,11 @@ def test_real_launcher_rejects_cross_interface_arguments(args: tuple[str, ...]):
     assert result.returncode == 2
     assert "rejects cross-interface argument" in result.stderr
     assert "dry-run command" not in result.stdout
+
+
+@pytest.mark.parametrize("selection", ["", "   "])
+def test_missing_selection_fails_before_reachability(selection):
+    result = run_launcher(SFM_MISSION_SELECTION=selection, SFM_LAUNCH_DRY_RUN="0")
+    assert result.returncode == 2
+    assert "requires SFM_MISSION_SELECTION" in result.stderr
+    assert "checking target" not in result.stdout

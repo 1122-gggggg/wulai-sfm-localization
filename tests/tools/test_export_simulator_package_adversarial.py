@@ -49,9 +49,7 @@ def _minimal_source(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 
 
 @pytest.mark.parametrize("link_kind", ("leaf", "parent"))
-def test_runtime_artifacts_reject_symlink_leaf_and_parent(
-    tmp_path: Path, link_kind: str
-) -> None:
+def test_runtime_artifacts_reject_symlink_leaf_and_parent(tmp_path: Path, link_kind: str) -> None:
     source = tmp_path / "source"
     source.mkdir()
     outside = tmp_path / "outside"

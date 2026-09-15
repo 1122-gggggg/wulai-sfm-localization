@@ -220,27 +220,7 @@ def verify_wheelhouse(
             f"expected={sorted(expected_names)} actual={sorted(actual_wheels)}"
         )
 
-    for entry in wheel_entries:
-        name = entry["name"]
-        path = actual_wheels[name]
-        if path.is_symlink():
-            raise WheelhouseError(f"wheelhouse contains a symlink wheel: {name}")
-        try:
-            actual_size = path.stat().st_size
-        except OSError as exc:
-            raise WheelhouseError(f"cannot stat wheel {name}: {exc}") from exc
-        if actual_size != entry["size_bytes"]:
-            raise WheelhouseError(
-                f"wheel size mismatch for {name}: "
-                f"expected={entry['size_bytes']} actual={actual_size}"
-            )
-        if verified_token is None:
-            actual_sha256 = _sha256(path)
-            if actual_sha256 != entry["sha256"]:
-                raise WheelhouseError(
-                    f"wheel SHA-256 mismatch for {name}: "
-                    f"expected={entry['sha256']} actual={actual_sha256}"
-                )
+    _verify_wheel_payloads(wheel_entries, actual_wheels, verified_token)
     return manifest
 
 
@@ -533,6 +513,34 @@ def main(argv: Iterable[str] | None = None) -> int:
         return 1
     print(json.dumps(metadata, ensure_ascii=False, indent=2, sort_keys=True))
     return 0
+
+
+def _verify_wheel_payloads(
+    wheel_entries: list[WheelRecord],
+    actual_wheels: dict[str, Path],
+    verified_token: str | None,
+) -> None:
+    for entry in wheel_entries:
+        name = entry["name"]
+        path = actual_wheels[name]
+        if path.is_symlink():
+            raise WheelhouseError(f"wheelhouse contains a symlink wheel: {name}")
+        try:
+            actual_size = path.stat().st_size
+        except OSError as exc:
+            raise WheelhouseError(f"cannot stat wheel {name}: {exc}") from exc
+        if actual_size != entry["size_bytes"]:
+            raise WheelhouseError(
+                f"wheel size mismatch for {name}: "
+                f"expected={entry['size_bytes']} actual={actual_size}"
+            )
+        if verified_token is None:
+            actual_sha256 = _sha256(path)
+            if actual_sha256 != entry["sha256"]:
+                raise WheelhouseError(
+                    f"wheel SHA-256 mismatch for {name}: "
+                    f"expected={entry['sha256']} actual={actual_sha256}"
+                )
 
 
 if __name__ == "__main__":
