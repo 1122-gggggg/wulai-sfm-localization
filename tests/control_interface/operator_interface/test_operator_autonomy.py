@@ -1309,6 +1309,65 @@ def test_physical_stick_override_stops_authorized_auto_motion(tmp_path) -> None:
     assert backend.vectors[-1] == (0.0, 0.0, 0.0, 0.0)
 
 
+def test_rc_landing_hands_auto_back_to_the_skycontroller(tmp_path) -> None:
+    backend = _Backend()
+    autonomy = DesktopRouteAutonomy(
+        backend=backend,
+        snapshot=_snapshot(tmp_path),
+        map_frame=LEGACY_MAP_FRAME,
+        get_pose=lambda: None,
+        pose_is_weak=lambda: False,
+        pose_confidence=lambda: 100,
+        force_relocalize=lambda: None,
+        stream_healthy=lambda: True,
+        takeoff=lambda: True,
+        land=lambda: True,
+    )
+    autonomy.phase = "ROUTE"
+    backend.state.flight_state = "landing"  # no land_cmd: the SkyController button
+
+    accepted, reason, applied = autonomy._send_authorized((5, 5, 0, 8))
+
+    assert not accepted and applied is None
+    assert reason == "RC landing: AUTO yields"
+    assert autonomy._safety_mode() == "LAND"
+    assert backend.pilot_sticks, "control goes back to the SkyController"
+    assert backend.zeros[-1] == (0, 0, 0, 0, "auto_rc_landing")
+    assert "rc_landing_yield" in [event.kind for event in autonomy.drain_events()]
+
+
+@pytest.mark.parametrize(
+    "phase,flight_state,maneuver",
+    [
+        ("ROUTE", "flying", None),
+        ("ROUTE", "landing", "landing"),  # the backend's own land_cmd
+        ("LANDING", "landing", None),  # AUTO's own end-of-route landing
+    ],
+)
+def test_only_an_uncommanded_landing_during_auto_flight_yields(
+    tmp_path, phase, flight_state, maneuver
+) -> None:
+    backend = _Backend()
+    backend._maneuver_in_progress = maneuver
+    autonomy = DesktopRouteAutonomy(
+        backend=backend,
+        snapshot=_snapshot(tmp_path),
+        map_frame=LEGACY_MAP_FRAME,
+        get_pose=lambda: None,
+        pose_is_weak=lambda: False,
+        pose_confidence=lambda: 100,
+        force_relocalize=lambda: None,
+        stream_healthy=lambda: True,
+        takeoff=lambda: True,
+        land=lambda: True,
+    )
+    autonomy.phase = phase
+    backend.state.flight_state = flight_state
+
+    assert autonomy._safety_mode() == "AUTO"
+    assert not backend.pilot_sticks
+
+
 def test_cancel_hands_control_to_manual_without_resuming_auto(tmp_path) -> None:
     class HandoffBackend(_Backend):
         def __init__(self):

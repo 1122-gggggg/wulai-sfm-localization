@@ -397,12 +397,29 @@ class DesktopRouteAutonomy:
     def _pilot_override(self) -> bool:
         if bool(getattr(self.backend, "pilot_sticks", False)):
             return True
+        if self._uncommanded_landing():
+            return True
         monitor = getattr(self.backend, "_stick_monitor", None)
         is_active = getattr(monitor, "is_active", None)
         try:
             return bool(callable(is_active) and is_active())
         except Exception:
             return True
+
+    def _uncommanded_landing(self) -> bool:
+        """Firmware is landing while AUTO flies, and neither AUTO nor the backend asked.
+
+        The SkyController land button (or a firmware emergency landing) leaves no
+        stick trace. AUTO never lands from these phases, and the backend's own
+        land_cmd marks its maneuver. Flight 2026-09-15 14:25:20: AUTO kept
+        commanding and its gaz +8 cancelled the pilot's landing at 0.17 m.
+        """
+        if self.phase not in {"HANDOFF", "BOOT_HOVER", "ROUTE"}:
+            return False
+        state = getattr(getattr(self.backend, "state", None), "flight_state", "")
+        if str(state or "").lower() not in {"landing", "emergency_landing"}:
+            return False
+        return getattr(self.backend, "_maneuver_in_progress", None) != "landing"
 
     def _safety_mode(self) -> str:
         self._check_runtime_budget()
@@ -492,8 +509,12 @@ class DesktopRouteAutonomy:
             return False
         if not self._manual_handoff_attempted:
             self._manual_handoff_attempted = True
-            self._send_zero("auto_stick_override")
-            self._request_manual()
+            reason = "auto_stick_override"
+            if self._uncommanded_landing():
+                reason = "auto_rc_landing"
+                self._emit("rc_landing_yield", "遙控器降落中：AUTO 停止送命令並交還遙控器")
+            self._send_zero(reason)
+            self._request_manual(reason)
         return True
 
     def _clear_motion(self) -> None:
@@ -531,6 +552,8 @@ class DesktopRouteAutonomy:
             return False, f"AUTO cancelled: {self._cancel_reason}", (0, 0, 0, 0)
         if self._pilot_override():
             self._clear_motion()
+            if self._uncommanded_landing():
+                return False, "RC landing: AUTO yields", None
             return False, "pilot stick override", None
         if self._runtime_safety_latched():
             self._clear_motion()
