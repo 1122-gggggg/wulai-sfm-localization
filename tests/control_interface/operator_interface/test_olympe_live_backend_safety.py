@@ -3689,6 +3689,61 @@ def test_stick_monitor_processes_axis_data_and_notifies_override():
     assert monitor.snapshot_axes() == {0: 2501}
 
 
+def test_stick_monitor_logs_button_presses_but_they_never_take_control():
+    import skycontroller_stick as stick
+
+    observed, logged = [], []
+    monitor = backend_module.SkyControllerStickMonitor(
+        observed.append,
+        log_event=lambda event, **fields: logged.append((event, fields)),
+    )
+    button = stick._JS_EVENT_BUTTON
+    initial = struct.pack(stick._JS_EVENT_FMT, 0, 1, button | stick._JS_EVENT_INIT, 4)
+    press = struct.pack(stick._JS_EVENT_FMT, 0, 1, button, 4)
+    release = struct.pack(stick._JS_EVENT_FMT, 0, 0, button, 4)
+    monitor._process_stick_data(initial + press + release)
+
+    assert logged == [
+        ("stick_button", {"button": 4, "pressed": True}),
+        ("stick_button", {"button": 4, "pressed": False}),
+    ]
+    assert observed == []
+
+
+def test_firmware_landing_without_a_pc_landing_is_logged_as_uncommanded(make_backend):
+    backend = make_backend()
+    backend.log.records.clear()
+
+    backend._log_flight_state_change("flying", "landing")
+    backend._maneuver_in_progress = "landing"
+    backend._log_flight_state_change("flying", "landing")
+
+    assert [event for event, _fields in backend.log.records] == [
+        "flight_state",
+        "uncommanded_landing",
+        "flight_state",
+    ]
+    assert backend.log.records[0][1]["pc_maneuver"] is None
+    assert backend.log.records[2][1]["pc_maneuver"] == "landing"
+
+
+def test_rth_state_change_is_logged_once_with_the_firmware_reason(make_backend):
+    backend = make_backend()
+    backend.log.records.clear()
+    previous = ("available", "finished")
+
+    backend.state.navigate_home_state = "inProgress"
+    backend.state.navigate_home_reason = "userRequest"
+    backend._log_navigate_home_change(previous)
+    backend._log_navigate_home_change(("inProgress", "userRequest"))
+
+    assert [event for event, _fields in backend.log.records] == [
+        "navigate_home_state",
+        "rth_in_progress",
+    ]
+    assert backend.log.records[1][1]["reason"] == "userRequest"
+
+
 def test_stick_monitor_reports_an_unexpected_device_disconnect(monkeypatch):
     disconnected = []
     monitor = backend_module.SkyControllerStickMonitor(

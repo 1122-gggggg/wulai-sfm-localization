@@ -250,13 +250,13 @@ MAX_POSE_JUMP_U = _env_float("SFM_MAX_POSE_JUMP_U", 1.5, minimum=0.01, maximum=1
 POSE_CONTINUITY_HISTORY = _env_int("SFM_POSE_CONTINUITY_HISTORY", 5, minimum=2, maximum=20)
 LOW_CONF_JUMP_WINDOW_S = _env_float("SFM_LOW_CONF_JUMP_WINDOW_S", 2.0, minimum=0.1, maximum=30.0)
 LOW_CONF_JUMP_HOVER_COUNT = _env_int("SFM_LOW_CONF_JUMP_HOVER_COUNT", 3, minimum=2, maximum=20)
-# A strong fix right after a VO bridge can carry the whole bridge drift as one
-# step (recorded 2026-09-14: 0.333u after ~13 s VO, ~15x the 0.0222u arrival
-# sphere; 0.046u even without VO). Steering the route from that single fix
-# swings the target bearing before the correction is confirmed. Hold zero PCMD
-# for one extra consecutive strong fix when the step exceeds this multiple of
-# the active arrival sphere. The fix still updates the pose continuity
-# reference; only motion waits one tick.
+# A fix after a VO bridge or a relocalization can carry the accumulated drift
+# as one step (2026-09-14: 0.333u after ~13 s VO; 2026-09-15 14:23:10: a 0.166u
+# reseed during a turn, under the 1.5u jump gate, switched AUTO to REJOIN at
+# roll 50 on the next tick and the pilot took over). When the position the
+# route controller steers from moves farther than the active arrival radius in
+# one step, horizontal PCMD is capped from zero back to full over this window.
+POSE_CORRECTION_RAMP_S = _env_float("SFM_POSE_CORRECTION_RAMP_S", 1.0, minimum=0.05, maximum=10.0)
 # If the control loop stalls longer than this (model/GPU hang), a helper thread
 # forces zero PCMD so the drone hovers instead of holding the last command.
 WATCHDOG_LAND_S = _env_float("SFM_WATCHDOG_LAND_S", 5.0, minimum=0.5, maximum=120.0)
@@ -1796,6 +1796,8 @@ class _FlightLoopRunner:
         self.pose_jump_pause_observed = False
         self.pose_jump_resume_authorized = False
         self.source_confirmation = PoseSourceConfirmation()
+        self._last_route_xyz: np.ndarray | None = None
+        self.pose_correction_started: float | None = None
         self.steps = 0
         search_pcmd = hooks.localization_yaw_search_pcmd
         if (
@@ -2641,6 +2643,35 @@ class _FlightLoopRunner:
         )
         return _LoopOutcome()
 
+    def _note_pose_correction(self, pose, now: float, record: dict) -> None:
+        previous = self._last_route_xyz
+        self._last_route_xyz = pose.xyz.copy()
+        radius = self._settle_radius()
+        if previous is None or radius is None:
+            return
+        step = float(np.linalg.norm(pose.xyz - previous))
+        if step > radius:
+            self.pose_correction_started = now
+            record["pose_correction_u"] = round(step, 3)
+
+    def _cap_after_pose_correction(self, pcmd, now: float, record: dict):
+        started = self.pose_correction_started
+        if started is None:
+            return pcmd
+        elapsed = max(0.0, now - started)
+        if elapsed >= POSE_CORRECTION_RAMP_S:
+            self.pose_correction_started = None
+            return pcmd
+        cap = float(self.ctrl.cfg.max_translation_pcmd) * elapsed / POSE_CORRECTION_RAMP_S
+        record["pose_correction_cap"] = round(cap, 1)
+        roll, pitch, yaw, gaz = (int(value) for value in pcmd)
+        magnitude = max(abs(roll), abs(pitch))
+        if magnitude <= cap:
+            return pcmd
+        record["pcmd_before_correction_cap"] = [roll, pitch, yaw, gaz]
+        scale = cap / magnitude
+        return int(roll * scale), int(pitch * scale), yaw, gaz
+
     def _compute_route_pcmd(self, command, pose, now: float):
         self._last_body_velocity = None
         if command.look_at_pole is not None:
@@ -2945,11 +2976,13 @@ class _FlightLoopRunner:
         record["heading_offset_deg"] = self._debug_deg(
             getattr(self.heading, "offset", None)
         )
+        self._note_pose_correction(pose, now, record)
         command = self.ctrl.step(pose, now)
         record["yaw_error_deg"] = self._debug_yaw_error_deg(command, heading, pose)
         self._record_route_command(record, command, heading, pose=pose)
         self._record_route_projection(pose, record)
         pcmd = self._compute_route_pcmd(command, pose, now)
+        pcmd = self._cap_after_pose_correction(pcmd, now, record)
         record["pcmd_phase"] = self.pcmd_controller.phase
         record["map_confirmed"] = pose.map_confirmed
         record["reseed_confirming"] = pose.reseed_confirming

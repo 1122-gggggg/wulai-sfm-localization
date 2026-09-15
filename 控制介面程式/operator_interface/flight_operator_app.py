@@ -958,7 +958,7 @@ class DroneBackend:
         self.state.tracker_state = new.value
         if self.session_logs is not None:
             try:
-                self.session_logs.incident(
+                self.session_logs.command(
                     "tracker_state_transition",
                     old=old,
                     new=new.value,
@@ -3388,6 +3388,12 @@ class OperatorApp(tk.Tk):
         if not self.inspecting:
             return False
         self.inspecting = False
+        session_logs = self.__dict__.get("session_logs")
+        if session_logs is not None:
+            try:
+                session_logs.localization("localization_stopped", reason="operator_cancel")
+            except (OSError, ValueError, AttributeError, TypeError, RuntimeError):  # Tier3: fallback best-effort — narrow, keep pass
+                pass
         self.inspect_start = None
         self.live_locked = False
         self._autonomy_pose_snapshot = None
@@ -5651,6 +5657,7 @@ class OperatorApp(tk.Tk):
                 pass
 
     def _append_loc_metrics(self, result: dict) -> None:
+        self._last_loc_result_mono = time.monotonic()
         self._latest_tracking_mode = str(result.get("direct_status") or result.get("mode") or "未知")
         self._ensure_loc_metrics_log()
         if not self._loc_metrics_f:

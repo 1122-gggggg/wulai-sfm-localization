@@ -1674,9 +1674,9 @@ def _forward_motion_backend(clock, forward_mps):
 
 @pytest.mark.parametrize("speed, command, expected", [
     (0.0, (0, 50, 7, 3), (0, 50, 7, 3)),
-    (0.12, (0, 50, 7, 3), (0, 40, 7, 3)),
-    (0.3, (0, 50, 7, 3), (0, 25, 7, 3)),
-    (0.3, (-30, 40, 0, 0), (-19, 25, 0, 0)),
+    (0.12, (0, 50, 7, 3), (0, 32, 7, 3)),
+    (0.3, (0, 50, 7, 3), (0, 12, 7, 3)),
+    (0.3, (-30, 40, 0, 0), (-9, 12, 0, 0)),
     (0.3, (0, 10, 0, 0), (0, 10, 0, 0)),
     (0.6, (0, 50, 7, 3), (0, 0, 7, 3)),
     (0.9, (0, 50, 0, 0), (0, 0, 0, 0)),
@@ -1694,6 +1694,26 @@ def test_horizontal_auto_command_tapers_to_zero_at_speed_limit(
     authority = autonomy._pcmd_authority_pct()
     assert backend.vectors[-1] == pytest.approx(tuple(value / authority for value in expected))
     assert backend.zeros == []
+
+
+def test_speed_limit_extrapolates_measured_acceleration_past_telemetry_delay(tmp_path):
+    """Flight 2026-09-15: speed kept rising ~0.5 s after the limiter cut tilt."""
+    clock = _Clock()
+    backend = _forward_motion_backend(clock, 0.2)
+    autonomy = _budget_autonomy(tmp_path, backend, clock)
+    autonomy._send_authorized((0, 50, 0, 0))
+    clock.sleep(0.2)
+    backend.state.ground_speed_mps = 0.3
+    backend.state.speed_north_mps = 0.3
+    backend.state.ground_speed_mono_ns = int(clock.now() * 1e9)
+    clock.sleep(0.1)
+
+    accepted, _, applied = autonomy._send_authorized((0, 50, 0, 0))
+
+    # 0.3 m/s + 0.5 m/s^2 * (0.1 s age + 0.25 s) = 0.475 m/s -> 50 * (1 - 0.475/0.6)^2
+    assert accepted
+    assert applied == (0, 2, 0, 0)
+    assert backend.state.autonomous_speed_guard_status == "SPEED_LIMITED"
 
 
 def test_braking_command_is_not_limited_above_speed_limit(tmp_path):

@@ -158,9 +158,11 @@ ANAFI panel while the aircraft is confirmed landed. The panel always shows the
 aircraft readback separately; applying limits while airborne is rejected.
 Crossing either firmware limit prevents continued flight outward; it does not
 automatically invoke RTH. AUTO translation is capped by the AUTO PCMD-strength
-limit, and a proportional ground-speed limit shrinks horizontal PCMD that adds
-speed along the current motion, from the full cap at standstill to zero at
-`autonomous_speed_limit_mps` (site profile `speed_limit_mps`). It never latches
+limit, and a ground-speed limit shrinks horizontal PCMD that adds speed along
+the current motion. It acts on speed extrapolated 0.25 s past the telemetry
+sample's age at the measured acceleration, tapering quadratically from the full
+cap at standstill to zero at `autonomous_speed_limit_mps` (site profile
+`speed_limit_mps`). It never latches
 or sends a zero-PCMD hover, and braking commands pass untouched. The fail-closed
 interlock and yaw-only turn brake are gone: missing or stale ground speed leaves
 PCMD unlimited. This is not a physical

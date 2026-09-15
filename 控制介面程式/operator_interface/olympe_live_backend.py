@@ -4576,9 +4576,49 @@ class OlympeLiveBackend:
         fly = self._poll_get_state(FlyingStateChanged)
         if fly and fly.get("state") is not None:
             st = str(self._state_value(fly, "state"))
+            previous = getattr(self.state, "flight_state", None)
             self.state.flight_state = st
+            if st != previous:
+                self._log_flight_state_change(previous, st)
             if self.state.tracker_state not in _TRACKER_STATE_STICKY:
                 self.state.tracker_state = st.upper()
+
+    def _log_flight_state_change(self, old: object, new: str) -> None:
+        """Firmware flight-state change and whether this backend asked for it.
+
+        The SkyController land button reaches the aircraft without passing
+        through here, so a landing with no PC landing maneuver is the only
+        trace it leaves (flight 2026-09-15 14:25:20).
+        """
+        maneuver = self._maneuver_in_progress
+        self.log.event("flight_state", old=old, new=new, pc_maneuver=maneuver)
+        if new.lower() in {"landing", "emergency_landing"} and maneuver != "landing":
+            self.log.event(
+                "uncommanded_landing",
+                old=old,
+                new=new,
+                last_command=getattr(self.state, "last_command", None),
+            )
+
+    def _log_navigate_home_change(self, previous: tuple[object, object]) -> None:
+        current = (
+            getattr(self.state, "navigate_home_state", None),
+            getattr(self.state, "navigate_home_reason", None),
+        )
+        if current == previous:
+            return
+        state, reason = current
+        self.log.event(
+            "navigate_home_state", state=state, reason=reason, old_state=previous[0]
+        )
+        if str(state).rsplit(".", 1)[-1].lower() == "inprogress":
+            # PC RTH also logs "rth"; reason tells an RC button (userRequest)
+            # from a firmware trigger (connectionLost, lowBattery).
+            self.log.event(
+                "rth_in_progress",
+                reason=reason,
+                last_command=getattr(self.state, "last_command", None),
+            )
 
     def _poll_gps_fix(self) -> None:
         try:
@@ -4661,6 +4701,10 @@ class OlympeLiveBackend:
             self.state.alert_state = str(self._state_value(alert, "state"))
         navigate_home = self._poll_get_state(NavigateHomeStateChanged)
         if navigate_home:
+            previous_home = (
+                getattr(self.state, "navigate_home_state", None),
+                getattr(self.state, "navigate_home_reason", None),
+            )
             if navigate_home.get("state") is not None:
                 self.state.navigate_home_state = str(
                     self._state_value(navigate_home, "state")
@@ -4669,6 +4713,7 @@ class OlympeLiveBackend:
                 self.state.navigate_home_reason = str(
                     self._state_value(navigate_home, "reason")
                 )
+            self._log_navigate_home_change(previous_home)
         heading = self._poll_get_state(HeadingLockedStateChanged)
         if heading and heading.get("state") is not None:
             self.state.heading_state = str(self._state_value(heading, "state"))

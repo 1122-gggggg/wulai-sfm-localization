@@ -37,8 +37,11 @@ def evaluate(params: sim.SimParams, *, start_label: str) -> dict:
     vertical_overlap = 0
     for tick in result.trace:
         roll, pitch, yaw, gaz = tick["pcmd"]
-        overlap += bool(yaw and (roll or pitch))
-        vertical_overlap += bool(gaz and (roll or pitch))
+        translating = sim.adds_horizontal_speed(
+            roll, pitch, tick.get("body_velocity_mps", (0.0, 0.0))
+        )
+        overlap += bool(yaw and translating)
+        vertical_overlap += bool(gaz and translating)
         index = tick["target_idx"]
         if not target_order or target_order[-1] != index:
             target_order.append(index)
@@ -57,8 +60,22 @@ def evaluate(params: sim.SimParams, *, start_label: str) -> dict:
         np.linalg.norm(np.array(result.trace[-1]["true_map_u"]) - controller.wp[-1])
     )
     expected_join = 0
+    start_distance = (
+        float(np.linalg.norm(np.array(result.trace[0]["true_map_u"]) - controller.wp[0]))
+        if result.trace
+        else float("inf")
+    )
+    # A takeoff inside waypoint 1's arrival sphere may retire it before the first
+    # logged tick, or a tick later once delayed localization confirms arrival.
+    accepted_orders = (
+        [expected, expected[1:]]
+        if start_distance <= controller._arrive_radius_for(0)
+        else [expected]
+    )
     sequence_ok = (
-        result.waypoints_reached == expected and target_order == expected and join == expected_join
+        result.waypoints_reached == expected
+        and target_order in accepted_orders
+        and join == expected_join
     )
     accepted = bool(
         result.success
@@ -86,6 +103,7 @@ def evaluate(params: sim.SimParams, *, start_label: str) -> dict:
         "max_waypoint_no_progress_s": result.max_waypoint_no_progress_s,
         "sequence_ok": sequence_ok,
         "observed_target_order": target_order,
+        "accepted_target_orders": accepted_orders,
         "waypoint_indices_reached": result.waypoints_reached,
         "expected_waypoint_indices": expected,
         "post_join_error_p95_u": p95,
@@ -93,8 +111,8 @@ def evaluate(params: sim.SimParams, *, start_label: str) -> dict:
         "p95_limit_u": p95_limit,
         "maximum_limit_u": maximum_limit,
         "final_true_distance_u": end_distance,
-        "yaw_horizontal_overlap_samples": overlap,
-        "vertical_horizontal_overlap_samples": vertical_overlap,
+        "yaw_translation_overlap_samples": overlap,
+        "vertical_translation_overlap_samples": vertical_overlap,
         "params": {k: str(v) if isinstance(v, Path) else v for k, v in asdict(params).items()},
     }
 
@@ -124,7 +142,11 @@ def evaluate_gust_recovery(params: sim.SimParams) -> dict:
                 recovery = round(future["t"] - tick["t"], 3)
                 break
         recoveries.append({"t": tick["t"], "displacement_m": displacement, "recovery_s": recovery})
-    overlap = sum(bool((r or p) and (y or g)) for r, p, y, g in (t["pcmd"] for t in result.trace))
+    overlap = 0
+    for tick in result.trace:
+        roll, pitch, yaw, gaz = tick["pcmd"]
+        velocity = tick.get("body_velocity_mps", (0.0, 0.0))
+        overlap += bool((yaw or gaz) and sim.adds_horizontal_speed(roll, pitch, velocity))
     accepted = bool(
         result.success
         and result.waypoints_reached == expected

@@ -46,6 +46,11 @@ AUTO_TELEMETRY_MAX_AGE_S = 2.0
 AUTO_WAIT_BUDGET_S = 60.0
 # Fresh-pose control time persists across motion phases; external waits pause it.
 AUTO_WAYPOINT_STALL_S = 30.0
+# Ground speed arrives at 5 Hz, 0.18-0.30 s old when a tick uses it, and keeps
+# rising for ~0.5 s after tilt is cut (flight 2026-09-15: p95 0.84-0.91 m/s,
+# max 1.22 m/s against 0.6). The limit acts on speed extrapolated this far past
+# the sample's age at its measured acceleration.
+AUTO_SPEED_LIMIT_LOOKAHEAD_S = 0.25
 # Lost-pose yaw search runs at the hook-validated ceiling (20); the 50%
 # route-yaw cap lives in production_auto_control_config and must not be
 # reused here.
@@ -175,6 +180,8 @@ class DesktopRouteAutonomy:
         self.now = now
         self.sleep = sleep
         self.run_loop = run_loop
+        self._speed_sample: tuple[float, float] | None = None
+        self._speed_rate_mps2 = 0.0
         self.events: queue.Queue[AutonomyEvent] = queue.Queue()
         self._cancel = threading.Event()
         self._paused = threading.Event()
@@ -586,13 +593,26 @@ class DesktopRouteAutonomy:
             return False, reason, (0, 0, 0, 0)
         return result
 
+    def _predicted_speed(self, speed: float, stamp: float) -> float:
+        """Speed expected once this tick's tilt takes effect."""
+        previous = self._speed_sample
+        if previous is None or stamp > previous[1]:
+            gap = None if previous is None else stamp - previous[1]
+            self._speed_rate_mps2 = (
+                (speed - previous[0]) / gap if gap is not None and gap <= 0.5 else 0.0
+            )
+            self._speed_sample = (speed, stamp)
+        horizon = max(0.0, self.now() - stamp) + AUTO_SPEED_LIMIT_LOOKAHEAD_S
+        return speed + max(0.0, self._speed_rate_mps2) * horizon
+
     def _apply_speed_limit(self, pcmd: Pcmd) -> Pcmd:
         """Shrink horizontal PCMD that would push ground speed past the limit.
 
-        Proportional, never latched: the allowed tilt falls linearly from the
-        full cap at standstill to zero at the limit. Commands that do not add
-        speed along the current motion (braking, wind hold) pass untouched, as
-        does everything when fresh body velocity is unavailable.
+        Never latched: the allowed tilt falls quadratically from the full cap at
+        standstill to zero at the limit, evaluated on speed predicted past the
+        telemetry delay. Commands that do not add speed along the current motion
+        (braking, wind hold) pass untouched, as does everything when fresh body
+        velocity is unavailable.
         """
         roll, pitch = int(pcmd[0]), int(pcmd[1])
         state = self.backend.state
@@ -609,12 +629,14 @@ class DesktopRouteAutonomy:
         if not math.isfinite(limit) or limit <= 0.0 or velocity is None:
             state.autonomous_speed_guard_status = "SPEED_UNAVAILABLE"
             return pcmd
-        forward_v, right_v, _stamp = velocity
+        forward_v, right_v, stamp = velocity
+        predicted = self._predicted_speed(math.hypot(forward_v, right_v), stamp)
         if pitch * forward_v + roll * right_v <= 0.0:
             state.autonomous_speed_guard_status = "FRESH_SPEED_LIMIT"
             return pcmd
-        speed = math.hypot(forward_v, right_v)
-        ceiling = self.controller.cfg.max_translation_pcmd * max(0.0, 1.0 - speed / limit)
+        ceiling = (
+            self.controller.cfg.max_translation_pcmd * max(0.0, 1.0 - predicted / limit) ** 2
+        )
         magnitude = max(abs(roll), abs(pitch))
         if magnitude <= ceiling:
             state.autonomous_speed_guard_status = "FRESH_SPEED_LIMIT"

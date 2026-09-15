@@ -103,6 +103,64 @@ def _fail_safe_dead_localizer(app: Any) -> None:
         write_log("WORKER_EXIT: 定位 worker 已不可用，已 fail-safe")
 
 
+#: Results normally arrive at ~15 Hz; this long without one while localization
+#: is on is a stop that needs a reason in the log.
+LOCALIZATION_OUTPUT_STALL_S = 2.0
+
+
+def _stall_probe(call: Any) -> object:
+    try:
+        return call() if callable(call) else None
+    except Exception as exc:  # diagnostics only; never break the UI tick
+        return repr(exc)
+
+
+def _log_localization_output_stall(app: Any, now: float | None = None) -> None:
+    """Record, once per stall, which submit gate stopped localization output.
+
+    Flight 2026-09-15 14:25:30: pose_result simply ended and no log said why.
+    The fields mirror the gates in submit_current_frame_for_localization.
+    """
+    incident = getattr(getattr(app, "session_logs", None), "incident", None)
+    last = getattr(app, "_last_loc_result_mono", None)
+    if not callable(incident) or last is None:
+        return
+    current = time.monotonic() if now is None else float(now)
+    since = current - float(last)
+    inspecting = bool(getattr(app, "inspecting", False))
+    stalled = inspecting and since >= LOCALIZATION_OUTPUT_STALL_S
+    if stalled == bool(getattr(app, "_loc_output_stalled", False)):
+        return
+    app._loc_output_stalled = stalled
+    fields: dict[str, Any] = {
+        "resolved": not stalled,
+        "inspecting": inspecting,
+        "since_last_result_s": round(since, 3),
+    }
+    if stalled:
+        localizer = getattr(app, "localizer", None)
+        frame_stamp = float(getattr(app, "_video_frame_stamp", 0.0) or 0.0)
+        fields.update(
+            localizer_present=localizer is not None,
+            localizer_unavailable=bool(getattr(localizer, "unavailable", False)),
+            localizer_busy=_stall_probe(getattr(localizer, "busy", None)),
+            video_frame_present=getattr(app, "video_frame", None) is not None,
+            video_display_index=getattr(app, "video_display_index", None),
+            last_submitted_index=getattr(app, "last_submitted_index", None),
+            video_frame_age_s=round(current - frame_stamp, 3) if frame_stamp > 0 else None,
+            zoom_paused=bool(getattr(app, "_zoom_localization_paused", False)),
+            boot_holding=_stall_probe(getattr(app, "boot_holding", None)),
+            lost_holding=_stall_probe(getattr(app, "lost_holding", None)),
+            submit_ok=getattr(app, "_submit_ok", None),
+            submit_skip_busy=getattr(app, "_submit_skip_busy", None),
+            loc_health=getattr(app, "loc_health", None),
+        )
+    try:
+        incident("localization_output_stalled", **fields)
+    except Exception:  # Tier3: incident logging best-effort — keep fallback
+        pass
+
+
 def _hover_after_poll_failure(app: Any, incident: Any) -> None:
     try:
         clear_motion = getattr(app.backend, "nudge_clear", None)
@@ -1281,6 +1339,7 @@ def run_tick(
         app.update_boot_lock()
         stage = profile.next("update_live_results")
         app.update_live_results()
+        _log_localization_output_stall(app)
         stage = profile.next("update_lost_hold")
         app.update_lost_hold()
         stage = profile.next("update_detection_results")

@@ -2962,6 +2962,37 @@ def test_dead_localizer_triggers_worker_exit_fail_safe() -> None:
     assert calls == [FailureReason.WORKER_EXIT]
 
 
+def test_localization_output_stall_is_logged_once_with_the_submit_gates() -> None:
+    """Flight 2026-09-15 14:25:30: pose results stopped and no log said why."""
+    incidents: list[tuple[str, dict]] = []
+    app = SimpleNamespace(
+        session_logs=SimpleNamespace(
+            incident=lambda event, **fields: incidents.append((event, fields))
+        ),
+        inspecting=True,
+        _last_loc_result_mono=100.0,
+        localizer=SimpleNamespace(unavailable=False, busy=lambda: True),
+        video_frame=object(),
+        video_display_index=42,
+        last_submitted_index=42,
+        _video_frame_stamp=100.2,
+    )
+
+    operator_tick._log_localization_output_stall(app, now=101.0)
+    operator_tick._log_localization_output_stall(app, now=103.0)
+    operator_tick._log_localization_output_stall(app, now=104.0)
+    app._last_loc_result_mono = 104.5
+    operator_tick._log_localization_output_stall(app, now=104.6)
+
+    assert [event for event, _fields in incidents] == ["localization_output_stalled"] * 2
+    assert [fields["resolved"] for _event, fields in incidents] == [False, True]
+    stalled = incidents[0][1]
+    assert stalled["since_last_result_s"] == 3.0
+    assert stalled["localizer_busy"] is True
+    assert stalled["last_submitted_index"] == stalled["video_display_index"] == 42
+    assert stalled["video_frame_age_s"] == 2.8
+
+
 def test_fused_request_keeps_independent_telemetry_stamp() -> None:
     header = localizer_protocol.encode_fused_request(
         "auto",

@@ -114,7 +114,8 @@ def build_production_controller(
     base = rpf.production_auto_control_config(map_frame)
     if not return_to_start:
         base = replace(base, return_to_start=False)
-    cfg = rpf.config_for_route(route_path, base)
+    # DesktopRouteAutonomy widens authored arrival spheres the same way.
+    cfg = rpf.apply_desktop_auto_authority(rpf.config_for_route(route_path, base))
     ctrl = rpf.RouteAutoController(doc.controller_waypoints(), poles=[], config=cfg)
     return ctrl, cfg, map_frame, doc
 
@@ -325,6 +326,17 @@ def _body_axes(yaw: float, map_frame) -> tuple[np.ndarray, np.ndarray, np.ndarra
     fwd = math.cos(yaw) * map_frame.east + math.sin(yaw) * map_frame.north
     right = math.sin(yaw) * map_frame.east - math.cos(yaw) * map_frame.north
     return (np.asarray(fwd, float), np.asarray(right, float), np.asarray(map_frame.up, float))
+
+
+def adds_horizontal_speed(roll: int, pitch: int, body_velocity) -> bool:
+    """True when horizontal PCMD pushes along the current motion.
+
+    The controller may hold horizontal PCMD against measured velocity while it
+    yaws or changes height (wind hold); that only brakes. Translating while
+    yawing or climbing is what the two-phase law forbids.
+    """
+    forward_v, right_v = body_velocity
+    return pitch * forward_v + roll * right_v > 0.0
 
 
 def _integrate_plant(
@@ -709,8 +721,14 @@ def run_sim(params: SimParams, *, record_trace: bool = True) -> tuple[SimResult,
             reason = speed_guard.failure_reason
             break
         roll, pitch, yaw_p, gaz = (int(v) for v in guarded)
-        if yaw_p and (roll or pitch):
-            reason = "invalid simultaneous yaw and horizontal PCMD"
+        body_forward, body_right, _body_up = _body_axes(state.yaw, map_frame)
+        ground_velocity = state.vel_m + wind
+        body_velocity = (
+            float(np.dot(ground_velocity, body_forward)),
+            float(np.dot(ground_velocity, body_right)),
+        )
+        if yaw_p and adds_horizontal_speed(roll, pitch, body_velocity):
+            reason = "horizontal PCMD adds speed while yawing"
             break
         hover_anchor = _update_hover_anchor(state, hover_anchor, map_frame, roll, pitch, gaz)
 
@@ -750,6 +768,7 @@ def run_sim(params: SimParams, *, record_trace: bool = True) -> tuple[SimResult,
                     "path_err_u": round(float(cmd.path_error), 5),
                     "dev_u": round(float(dist), 5) if math.isfinite(dist) else None,
                     "pcmd": [roll, pitch, yaw_p, gaz],
+                    "body_velocity_mps": [round(value, 4) for value in body_velocity],
                     "gust_displacement_m": gust_displacement.tolist(),
                 }
             )

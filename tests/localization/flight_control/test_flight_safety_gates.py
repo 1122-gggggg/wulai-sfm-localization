@@ -1128,6 +1128,42 @@ def test_live_pose_jump_latches_hover_until_operator_resumes_auto():
     assert any(command != ZERO for command in sent[resumed_index:])
 
 
+def test_pose_correction_beyond_arrival_radius_ramps_horizontal_pcmd():
+    """Flight 2026-09-15 14:23:10: a 0.166u reseed, far under the 1.5u jump
+    gate, put AUTO into REJOIN at roll 50 on the very next tick."""
+    wp = [np.zeros(3), np.array([8.0, 0.0, 0.0])]
+    ctrl = rpf.RouteAutoController(wp, poles=[], config=rpf.ControlConfig(inspect_waypoints=()))
+    hooks = pff.LoopHooks(
+        get_pose=lambda: None, olympe_yaw=lambda: None, send_pcmd=lambda *_: None
+    )
+    runner = pff._FlightLoopRunner(
+        hooks, ctrl, wp, yaw_sign=1, verbose=False, enforce_weak_pose_gate=False
+    )
+    cap = int(ctrl.cfg.max_translation_pcmd)
+    request = (cap, -4, 20, 3)
+
+    for now, y in ((0.0, 0.0), (0.05, 0.01)):  # a step inside the 0.02u sphere
+        record = {}
+        runner._note_pose_correction(rpf.Pose(1.0, y, 0.0, 0.0, stamp=now), now, record)
+        assert runner._cap_after_pose_correction(request, now, record) == request
+        assert "pose_correction_u" not in record
+
+    jump = {}
+    runner._note_pose_correction(rpf.Pose(1.0, 0.176, 0.0, 0.0, stamp=0.1), 0.1, jump)
+    assert jump["pose_correction_u"] == pytest.approx(0.166)
+    assert runner._cap_after_pose_correction(request, 0.1, jump) == (0, 0, 20, 3)
+    assert jump["pcmd_before_correction_cap"] == list(request)
+
+    halfway = {}
+    ramped = runner._cap_after_pose_correction(request, 0.1 + 0.5 * pff.POSE_CORRECTION_RAMP_S, halfway)
+    assert ramped == (cap // 2, -2, 20, 3)
+    assert halfway["pose_correction_cap"] == pytest.approx(cap / 2)
+
+    released = {}
+    assert runner._cap_after_pose_correction(request, 0.1 + pff.POSE_CORRECTION_RAMP_S, released) == request
+    assert runner.pose_correction_started is None and not released
+
+
 def test_isolated_low_confidence_jump_is_rejected_without_latching_hover():
     quality = {"inliers": 100}
     pauses = []

@@ -47,10 +47,12 @@ def test_every_preset_route_from_every_nearest_waypoint(tmp_path):
     for row in rows:
         assert row["accepted"] and row["completed"] and row["sequence_ok"]
         assert row["join_waypoint"] == row["expected_join_waypoint"]
-        assert row["observed_target_order"] == row["expected_waypoint_indices"]
+        assert row["observed_target_order"] in row["accepted_target_orders"]
+        assert row["waypoint_indices_reached"] == row["expected_waypoint_indices"]
         assert row["params"]["max_vertical_speed_mps"] == 2.0
         assert row["params"]["max_rotation_speed_deg_s"] == 20.0
-        assert row["yaw_horizontal_overlap_samples"] == 0
+        assert row["yaw_translation_overlap_samples"] == 0
+        assert row["vertical_translation_overlap_samples"] == 0
 
 
 @pytest.mark.skipif(not ALIGN.is_file(), reason="requires the operator's river site assets")

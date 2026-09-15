@@ -216,12 +216,21 @@ class SkyControllerStickMonitor:
             )
             offset += _JS_EVENT_SIZE
             kind = typ & ~_JS_EVENT_INIT
+            if kind == _JS_EVENT_BUTTON and not typ & _JS_EVENT_INIT:
+                self._log_button(int(number), int(value))
             if kind != _JS_EVENT_AXIS:
                 continue
             with self._lock:
                 self._axes[int(number)] = int(value)
         if axes_active(self._axes, deadzone=self.deadzone):
             self._notify_stick_activity()
+
+    def _log_button(self, number: int, value: int) -> None:
+        # Buttons never take control from the PC, but an RC land/RTH press left
+        # no trace (flight 2026-09-15 14:25:20). Which HID button numbers the
+        # SkyController 3 assigns to land/RTH has not been bench-verified.
+        if self._log_event is not None:
+            self._log_event("stick_button", button=number, pressed=bool(value))
 
     def _notify_stick_activity(self) -> None:
         try:

@@ -189,6 +189,26 @@ def test_flight_safety_commands_are_copied_to_permanent_incidents(tmp_path) -> N
     ]
 
 
+def test_tracker_transitions_stay_out_of_incidents(tmp_path) -> None:
+    """Flight 2026-09-15: 3095 of 3101 incidents were NUDGE/HOVER transitions."""
+    session = SessionLogs.create(
+        tmp_path,
+        mode=InterfaceMode.REAL_FLIGHT,
+        manifest={"offline": True},
+    )
+
+    session.command_log.event("tracker_state_transition", old="HOVER", new="NUDGE", reason="nudge")
+    session.command_log.event("uncommanded_landing", old="flying", new="landing")
+    session.close(reason="test_complete")
+
+    def events(name):
+        text = (session.directory / name).read_text()
+        return [json.loads(line)["event"] for line in text.splitlines()]
+
+    assert events("incidents.jsonl") == ["uncommanded_landing"]
+    assert events("commands.jsonl") == ["tracker_state_transition", "uncommanded_landing"]
+
+
 def test_inventory_receipts_are_immutable_and_permanent(tmp_path) -> None:
     session = SessionLogs.create(
         tmp_path,
