@@ -6,7 +6,7 @@
   "revision": "operator_editor_v1",
   "route": {
     "path": "../../../地圖檔/場域/river_site/routes/flight_route_20260914_141505_e87a66fb.json",
-    "sha256": "15fbffef1952022611eb657754e048e53288f55e9d32f7cde2675804d24c5f63"
+    "sha256": "1fae9f7da203ff9bd0b768aba992e758e87136f7ee8ff1048361957cec5267f3"
   },
   "route_id": "river_site_operator_route",
   "schema": "sfm-route-package/v1",
