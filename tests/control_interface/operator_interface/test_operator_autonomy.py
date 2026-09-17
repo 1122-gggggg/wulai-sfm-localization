@@ -1674,9 +1674,10 @@ def _forward_motion_backend(clock, forward_mps):
 
 @pytest.mark.parametrize("speed, command, expected", [
     (0.0, (0, 50, 7, 3), (0, 50, 7, 3)),
-    (0.12, (0, 50, 7, 3), (0, 32, 7, 3)),
-    (0.3, (0, 50, 7, 3), (0, 12, 7, 3)),
-    (0.3, (-30, 40, 0, 0), (-9, 12, 0, 0)),
+    (0.12, (0, 50, 7, 3), (0, 40, 7, 3)),
+    (0.3, (0, 50, 7, 3), (0, 25, 7, 3)),
+    # Orthogonal roll is preserved: only the forward projection is limited.
+    (0.3, (-30, 40, 0, 0), (-30, 25, 0, 0)),
     (0.3, (0, 10, 0, 0), (0, 10, 0, 0)),
     (0.6, (0, 50, 7, 3), (0, 0, 7, 3)),
     (0.9, (0, 50, 0, 0), (0, 0, 0, 0)),
@@ -1710,9 +1711,9 @@ def test_speed_limit_extrapolates_measured_acceleration_past_telemetry_delay(tmp
 
     accepted, _, applied = autonomy._send_authorized((0, 50, 0, 0))
 
-    # 0.3 m/s + 0.5 m/s^2 * (0.1 s age + 0.25 s) = 0.475 m/s -> 50 * (1 - 0.475/0.6)^2
+    # 0.3 m/s + 0.5 m/s^2 * (0.1 s age + 0.25 s) = 0.475 m/s -> 50 * (1 - 0.475/0.6)
     assert accepted
-    assert applied == (0, 2, 0, 0)
+    assert applied == (0, 10, 0, 0)
     assert backend.state.autonomous_speed_guard_status == "SPEED_LIMITED"
 
 

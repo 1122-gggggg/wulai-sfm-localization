@@ -1278,8 +1278,8 @@ def test_route_completion_holds_when_ground_speed_is_unavailable():
     )
 
     assert reason == "tick cap"
-    assert sent[-1] == ZERO
-    assert any("ground speed unavailable" in record.get("reason", "") for record in records)
+    assert sent[-1][0] == 0 and sent[-1][2] == 0 and sent[-1][3] == 0
+    assert any("ground speed unavailable" in str(record.get("landing_speed_reason", "")) for record in records)
 
 
 def test_route_completion_waits_for_fresh_low_ground_speed():
@@ -1295,15 +1295,15 @@ def test_route_completion_waits_for_fresh_low_ground_speed():
         return speed, speed_state["stamp"]
 
     sent, reason, records = run_ticks(
-        80,
+        400,
         pose,
         hooks_extra={"ground_speed": ground_speed},
     )
 
     assert reason == "route complete -> land"
-    assert speed_state["reads"] == 3
     assert sent[-1] == ZERO
-    assert sum("ground speed 0.110 m/s" in record.get("reason", "") for record in records) == 2
+    assert any(record.get("landing_stable_samples", 0) >= 3 for record in records)
+    assert any(record.get("landing_stable_span_s", 0.0) >= 1.0 for record in records)
 
 
 def test_route_completion_holds_when_ground_speed_is_stale():
@@ -1323,8 +1323,8 @@ def test_route_completion_holds_when_ground_speed_is_stale():
     )
 
     assert reason == "tick cap"
-    assert sent[-1] == ZERO
-    assert any("ground speed stale" in record.get("reason", "") for record in records)
+    assert sent[-1][0] == 0 and sent[-1][2] == 0 and sent[-1][3] == 0
+    assert any("ground speed stale" in str(record.get("landing_speed_reason", "")) for record in records)
 
 
 @pytest.mark.parametrize(
@@ -3334,8 +3334,8 @@ def test_yaw_alignment_confirms_at_20hz_control_with_10hz_poses():
     assert output[1] > 0
 
 
-def test_large_mid_leg_drift_reopens_the_turn_gate():
-    """Cruise keeps translating when heading walks away; it does not re-turn."""
+def test_large_mid_leg_drift_blends_yaw_without_stopping_translation():
+    """Cruise keeps translating when heading walks away, blending yaw back in."""
     cfg = rpf.ControlConfig(inspect_waypoints=())
     gate = rpf.YawAlignedPcmdController(cfg)
     goal = np.array([1.0, 0.0, 0.0])
@@ -3366,55 +3366,61 @@ def test_large_mid_leg_drift_reopens_the_turn_gate():
 
     output = drive(math.radians(30.0), 1)
     assert gate.phase == "translate", "one noisy frame must not park translation"
+    assert output[1] > 0
 
     output = drive(math.radians(10.0), 2)
     assert gate.phase == "translate"
 
+    # Three consecutive fresh frames past mid_leg_realign_deg blend limited
+    # yaw in while translation continues (operator scope 2026-09-16).
     output = drive(math.radians(30.0), 3)
     assert gate.phase == "translate"
-    assert output[2] == 0
+    assert output[2] != 0
+    assert abs(output[2]) <= 20
     assert output[1] > 0
 
 
 @pytest.mark.parametrize("ticks_per_pose", [2, 4])
 def test_mid_leg_realign_counts_fresh_poses_at_slower_localization_rates(ticks_per_pose):
-    """At 20 Hz control, 10/5 Hz poses must still trigger and finish a re-turn."""
+    """At 20 Hz control, 10/5 Hz poses must still blend yaw without stopping."""
     cfg = rpf.production_auto_control_config(rpf.LEGACY_MAP_FRAME)
     gate = rpf.YawAlignedPcmdController(cfg)
     goal = np.array([1.0, 0.0, 0.0])
     cmd = rpf.Command("FOLLOW", goal, yaw_target=0.0, goal=goal, path_error=0.0, progress=0.0)
     tick = 0
 
-    def drive_pose(yaw_deg, expected_phase=None):
+    def drive_pose(yaw_deg, expected_yaw_zero=True, expect_translate=True):
         nonlocal tick
-        pose = rpf.Pose(0.0, 0.0, 0.0, yaw=math.radians(yaw_deg), stamp=tick * 0.05)
-        for _ in range(ticks_per_pose):
+        first_output = None
+        for index in range(ticks_per_pose):
+            pose = rpf.Pose(0.0, 0.0, 0.0, yaw=math.radians(yaw_deg), stamp=tick * 0.05)
             output = gate.update(cmd, pose, tick * 0.05, target_key=0)
+            if index == 0:
+                first_output = output
             tick += 1
-            if expected_phase is not None:
-                assert gate.phase == expected_phase
-                if expected_phase == "turn":
-                    assert output[0] == output[1] == output[3] == 0
-                    assert output[2] != 0
-                else:
-                    assert output[1] > 0 and output[2] == 0
+        if expect_translate:
+            assert gate.phase == "translate"
+            assert output[1] > 0
+        assert (first_output[2] == 0) == expected_yaw_zero
 
+    drive_pose(0.0, expect_translate=False)
     for _ in range(4):
         drive_pose(0.0)
-    assert gate.phase == "translate"
-
-    # Repeated captures neither count as additional strikes nor clear them.
-    drive_pose(40.0, "translate")
-    drive_pose(40.0, "translate")
+    # One over-threshold frame is noise; the second consecutive fresh frame
+    # blends capped yaw in (confirmation_updates=2), held while it persists.
+    drive_pose(40.0)
+    drive_pose(40.0, expected_yaw_zero=False)
     # A new in-band capture breaks the sequence of excessive heading errors.
-    drive_pose(0.0, "translate")
-    drive_pose(40.0, "translate")
-    drive_pose(40.0, "translate")
-    drive_pose(40.0, "translate")
+    drive_pose(0.0)
+    drive_pose(40.0)
+    drive_pose(40.0, expected_yaw_zero=False)
+    drive_pose(40.0, expected_yaw_zero=False)
+    # Extra calls hold the blended yaw without new strikes or clearing.
+    drive_pose(40.0, expected_yaw_zero=False)
 
-    for _ in range(4):
+    for _ in range(5):
         drive_pose(0.0)
-    drive_pose(0.0, "translate")
+    drive_pose(0.0)
 
 
 @pytest.mark.parametrize(
@@ -3545,9 +3551,8 @@ def test_translation_keeps_yaw_zero_while_error_stays_within_thirty_degrees():
 
 def test_single_frame_realigns_when_confirmation_updates_is_one():
     # Realign strikes follow yaw_alignment_confirmation_updates: with 1, a
-    # single fresh sample past mid_leg_realign_deg re-opens the turn gate.
-    # (Operator decision 2026-09-13: large mid-leg drift re-turns instead of
-    # strafing on forever.)
+    # single fresh sample past mid_leg_realign_deg blends yaw in while
+    # translation continues (operator scope 2026-09-16).
     cfg = rpf.ControlConfig(
         inspect_waypoints=(),
         yaw_alignment_confirmation_updates=1,
@@ -3570,7 +3575,7 @@ def test_single_frame_realigns_when_confirmation_updates_is_one():
 
     pose = rpf.Pose(0.2, 0.0, 0.0, yaw=math.radians(31.0), stamp=0.3)
     cruising = control.update(cmd, pose, 0.3, target_key=1)
-    assert cruising[2] == 0
+    assert cruising[2] != 0
     assert control.aligned_for_translation
     assert control.phase == "translate"
 
@@ -3842,7 +3847,7 @@ def test_non_finite_command_fails_closed_to_zero(field):
     assert rpf.command_to_body_percent(cmd, pose) == ZERO
 
 
-def test_route_loop_logs_turn_and_climb_on_the_same_tick():
+def test_route_loop_locks_height_while_turning():
     sent, _, records = run_ticks(
         8,
         lambda st: rpf.Pose(0.0, 0.0, 0.0, yaw=0.0, stamp=st["t"]),
@@ -3852,22 +3857,35 @@ def test_route_loop_logs_turn_and_climb_on_the_same_tick():
     assert turning
     for record in turning:
         roll, pitch, yaw, gaz = record["pcmd"]
-        assert (roll, pitch) == (0, 0) and yaw < 0 and gaz > 0
+        assert (roll, pitch, gaz) == (0, 0, 0) and yaw < 0
         assert tuple(record["pcmd"]) in sent
         assert record["pcmd_phase"] == "turn"
 
 
-def test_route_loop_requires_map_confirmation_even_when_weak_motion_is_allowed():
+def test_route_loop_requires_map_confirmation_on_the_final_leg():
+    # run_ticks starts at target 0 with confirm_frames=3 and budget 1: dwell
+    # 3+ ticks inside each sphere (origin-in-sphere reads ARRIVING, not
+    # FOLLOW). Sequenced weak poses retire wp0, then wp1; the final leg then
+    # holds for a map fix (operator scope 2026-09-16).
+    route = ((0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (2.0, 0.0, 0.0))
+    def seq(st):
+        n = st["tick"] - 1
+        if n < 4:
+            return fresh_pose(st, x=0.0)
+        if n < 8:
+            return fresh_pose(st, x=1.0)
+        return fresh_pose(st, x=2.0)
     sent, _, records = run_ticks(
-        15, fresh_pose,
+        60, seq,
+        route=route,
+        control_config=rpf.ControlConfig(
+            inspect_waypoints=(), waypoint_arrive_confirm_frames=1),
         hooks_extra={"pose_is_weak": lambda: True, "pose_confidence": lambda: 100},
         enforce_weak_pose_gate=False,
     )
     waiting = [record for record in records if record.get("action") == "WAIT_MAP_CONFIRMATION"]
     assert waiting
-    assert all(record["target_index"] == 0 for record in waiting)
-    assert all(pcmd == ZERO for pcmd in sent)
-
+    assert all(record["target_index"] == 2 for record in waiting)
 
 def test_command_log_has_final_pcmd_and_reason():
     sent, _, records = run_ticks(10, fresh_pose)

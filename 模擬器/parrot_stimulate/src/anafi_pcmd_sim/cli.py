@@ -15,18 +15,27 @@ from typing import Any
 from .assessment import DiagonalCriteria, DirectionalCriteria
 from .flight import OlympeProbe, write_probe_artifacts
 from .models import PilotingCommand, Scenario, all_direction_scenarios
+from .production_route import PRODUCTION_SUBCOMMAND as _PRODUCTION_SUBCOMMAND
+from .production_route import add_production_route_parser as _add_production_route_parser
+from .production_route import args_from_namespace as _production_args_from_namespace
+from .production_route import run_production_route as _run_production_route
 from .route import (
+    FlightErrorConfig,
     OlympeRouteFollower,
     RouteConfig,
+    custom_enu_route,
     generate_route,
+    parse_enu_waypoints_text,
     route_plan_payload,
     route_stress_scenario,
+    truth_only_error_config,
     worst_case_route_scenarios,
     write_route_artifacts,
     write_route_plan,
 )
 from .simulator import (
     ANAFI_ZERO_YAW_POSE,
+    NullWindDisturbances,
     SphinxFinalApproachDisplacement,
     SphinxInstance,
     SphinxWindDisplacements,
@@ -312,9 +321,73 @@ def _run_response(args: argparse.Namespace) -> int:
     return 2 if summary["status"] == "OPERATIONAL_FAILURE" else 1
 
 
+def _resolve_route_waypoints(args: argparse.Namespace) -> tuple[object, str | None]:
+    if args.waypoints is None:
+        return generate_route(args.seed), None
+    raw = str(args.waypoints)
+    candidate = Path(raw)
+    text = candidate.read_text(encoding="utf-8") if candidate.is_file() else raw
+    points = parse_enu_waypoints_text(text)
+    source = f"file:{candidate}" if candidate.is_file() else "inline"
+    return custom_enu_route(points, seed=args.seed), source
+
+
+def _resolve_route_error_config(args: argparse.Namespace) -> FlightErrorConfig:
+    overrides = {
+        "pos_error_m": args.pos_error_m,
+        "yaw_error_deg": args.yaw_error_deg,
+        "latency_ms": args.latency_ms,
+        "drop_rate": args.drop_rate,
+        "wind_max_m": args.wind_max_m,
+        "wind_interval_s": args.wind_interval_s,
+    }
+    if args.truth_only:
+        if args.stress_scenario is not None:
+            raise ValueError("truth-only cannot be combined with a stress scenario")
+        forbidden = {
+            k: v for k, v in overrides.items() if k not in {"wind_max_m"} and v is not None
+        }
+        if forbidden:
+            keys = sorted(forbidden)
+            raise ValueError(f"truth-only takes no localization overrides: {','.join(keys)}")
+        return truth_only_error_config(wind_maximum_displacement_m=float(args.wind_max_m or 0.0))
+    base = FlightErrorConfig()
+    values = {
+        "wind_maximum_displacement_m": base.wind_maximum_displacement_m
+        if args.wind_max_m is None
+        else float(args.wind_max_m),
+        "wind_displacement_interval_s": base.wind_displacement_interval_s
+        if args.wind_interval_s is None
+        else float(args.wind_interval_s),
+        "maximum_position_error_m": base.maximum_position_error_m
+        if args.pos_error_m is None
+        else float(args.pos_error_m),
+        "maximum_yaw_error_deg": base.maximum_yaw_error_deg
+        if args.yaw_error_deg is None
+        else float(args.yaw_error_deg),
+        "localization_latency_s": base.localization_latency_s
+        if args.latency_ms is None
+        else float(args.latency_ms) / 1000.0,
+        "localization_dropout_probability": base.localization_dropout_probability
+        if args.drop_rate is None
+        else float(args.drop_rate),
+    }
+    return FlightErrorConfig(
+        wind_maximum_displacement_m=values["wind_maximum_displacement_m"],
+        wind_displacement_interval_s=values["wind_displacement_interval_s"],
+        maximum_position_error_m=values["maximum_position_error_m"],
+        maximum_yaw_error_deg=values["maximum_yaw_error_deg"],
+        localization_latency_s=values["localization_latency_s"],
+        localization_dropout_probability=values["localization_dropout_probability"],
+        localization_error_correlation=base.localization_error_correlation,
+        localization_error_basis=base.localization_error_basis,
+    )
+
+
 def _run_route(args: argparse.Namespace) -> int:
-    plan = generate_route(args.seed)
-    config = RouteConfig()
+    error_config = _resolve_route_error_config(args)
+    plan, waypoints_source = _resolve_route_waypoints(args)
+    config = RouteConfig(error_model=error_config)
     stress_scenario = (
         route_stress_scenario(args.stress_scenario, config)
         if args.stress_scenario is not None
@@ -322,7 +395,8 @@ def _run_route(args: argparse.Namespace) -> int:
     )
     output_dir = _output_dir(args.output_dir)
     if args.dry_run:
-        payload = route_plan_payload(plan, config)
+        payload = route_plan_payload(plan, config, truth_only=bool(args.truth_only))
+        payload["waypoints_source"] = waypoints_source or f"seed:{plan.seed}"
         payload["stress_scenario"] = asdict(stress_scenario) if stress_scenario else None
         payload["sphinx_command"] = build_sphinx_command(
             output_dir / "simulator",
@@ -341,15 +415,20 @@ def _run_route(args: argparse.Namespace) -> int:
         print(f"route failed: {error}", file=sys.stderr)
         return 2
 
-    write_route_plan(plan, config, output_dir)
+    write_route_plan(plan, config, output_dir, truth_only=bool(args.truth_only))
     telemetry = TrueTelemetryCollector(stderr_path=output_dir / "true_telemetry.stderr.log")
-    follower = OlympeRouteFollower(config=config, stress_scenario=stress_scenario)
-    if stress_scenario is None:
+    follower = OlympeRouteFollower(
+        config=config, stress_scenario=stress_scenario, truth_only=bool(args.truth_only)
+    )
+    if stress_scenario is None and config.error_model.wind_maximum_displacement_m > 0.0:
         wind_disturbances = SphinxWindDisplacements(
             seed=plan.seed ^ 0x51A7,
             maximum_displacement_m=config.error_model.wind_maximum_displacement_m,
             interval_s=config.error_model.wind_displacement_interval_s,
         )
+        control_disturbance = None
+    elif stress_scenario is None:
+        wind_disturbances = NullWindDisturbances()
         control_disturbance = None
     else:
         wind_disturbances = SphinxFinalApproachDisplacement(
@@ -608,6 +687,22 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="replace random errors with one deterministic bounded worst-case scenario",
     )
+    route.add_argument(
+        "--truth-only",
+        action="store_true",
+        help="ground-truth baseline: feed Sphinx true pose straight to control_decision",
+    )
+    route.add_argument(
+        "--waypoints",
+        default=None,
+        help="explicit ENU metres as `x,y,z` per line (file path or literal text)",
+    )
+    route.add_argument("--pos-error-m", type=float, default=None)
+    route.add_argument("--yaw-error-deg", type=float, default=None)
+    route.add_argument("--latency-ms", type=float, default=None)
+    route.add_argument("--drop-rate", type=float, default=None)
+    route.add_argument("--wind-max-m", type=float, default=None)
+    route.add_argument("--wind-interval-s", type=float, default=None)
     worst_case = subparsers.add_parser(
         "worst-case",
         help="run the deterministic route-error matrix instead of relying on random seeds",
@@ -617,6 +712,7 @@ def build_parser() -> argparse.ArgumentParser:
     worst_case.add_argument("--firmware", default=None)
     worst_case.add_argument("--show-window", action="store_true")
     worst_case.add_argument("--dry-run", action="store_true")
+    _add_production_route_parser(subparsers)
     return parser
 
 
@@ -634,10 +730,20 @@ def main(argv: list[str] | None = None) -> int:
         return _run_response(args)
 
     if args.command == "route":
-        return _run_route(args)
-
+        try:
+            return _run_route(args)
+        except ValueError as error:
+            print(f"route failed: {error}", file=sys.stderr)
+            return 2
     if args.command == "worst-case":
         return _run_worst_case(args)
+
+    if args.command == _PRODUCTION_SUBCOMMAND:
+        try:
+            return _run_production_route(_production_args_from_namespace(args))
+        except ValueError as error:
+            print(f"{_PRODUCTION_SUBCOMMAND} failed: {error}", file=sys.stderr)
+            return 2
 
     output_dir = _output_dir(args.output_dir)
     scenario = _scenario_from_args(args)

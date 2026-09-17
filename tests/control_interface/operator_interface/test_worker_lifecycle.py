@@ -163,7 +163,7 @@ def test_autonomy_pose_rejects_source_pose_older_than_half_second(monkeypatch) -
     operator = SimpleNamespace(
         live_locked=True,
         loc_health="OK",
-        _autonomy_pose_snapshot=(1.0, 2.0, 3.0, 0.0, 99.0),
+        _autonomy_pose_snapshot=app.Pose(1.0, 2.0, 3.0, yaw=0.0, stamp=99.0),
     )
 
     assert app.OperatorApp._autonomy_pose(operator) is None
@@ -175,7 +175,7 @@ def test_autonomy_pose_uses_raw_camera_center_and_6dof_heading(monkeypatch) -> N
     operator = SimpleNamespace(
         live_locked=True,
         loc_health="OK",
-        _autonomy_pose_snapshot=(1.0, 2.0, 3.0, math.pi / 2.0, 99.8),
+        _autonomy_pose_snapshot=app.Pose(1.0, 2.0, 3.0, yaw=math.pi / 2.0, stamp=99.8),
         live_result={"pose": [9.0, 9.0, 9.0]},
     )
 
@@ -185,7 +185,6 @@ def test_autonomy_pose_uses_raw_camera_center_and_6dof_heading(monkeypatch) -> N
     assert (pose.x, pose.y, pose.z, pose.yaw, pose.stamp) == pytest.approx(
         (1.0, 2.0, 3.0, math.pi / 2.0, 99.8)
     )
-
 
 def test_autonomy_pose_rejects_camera_looking_nearly_vertical(monkeypatch) -> None:
     monkeypatch.setattr(app.time, "monotonic", lambda: 100.0)
@@ -3502,7 +3501,7 @@ def test_autonomy_pose_gates_weak_snapshot_on_opt_in_flag(monkeypatch) -> None:
     base = dict(
         live_locked=True,
         loc_health="LOW",
-        _autonomy_pose_snapshot=(1.0, 2.0, 3.0, 0.0, 99.8),
+        _autonomy_pose_snapshot=app.Pose(1.0, 2.0, 3.0, yaw=0.0, stamp=99.8),
     )
 
     assert app.OperatorApp._autonomy_pose(SimpleNamespace(**base)) is None

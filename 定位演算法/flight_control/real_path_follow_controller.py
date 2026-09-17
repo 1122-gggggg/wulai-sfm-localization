@@ -100,6 +100,7 @@ class Pose:
     stamp: float = field(default_factory=time.monotonic)
     map_confirmed: bool = True
     reseed_confirming: bool = False
+    position_observed: bool = True
 
     @property
     def xyz(self) -> np.ndarray:
@@ -129,6 +130,21 @@ class Command:
     # The authored waypoint stays in goal for arrival checks and logging.
     # Segment guidance controls the approach without changing that waypoint.
     guidance_goal: Optional[np.ndarray] = None
+    # Per-tick lateral pull vector (active-leg projection minus position) in
+    # map units. FOLLOW-only; REJOIN already steers at the projection itself.
+    path_pull: Optional[np.ndarray] = None
+    # The arrival radius of the leg this pull was computed on. The PCMD
+    # adapter scales the pull by path_error / this radius; None means the
+    # global waypoint_arrive_radius (hand-built commands in tests).
+    path_pull_radius: Optional[float] = None
+    # Unit tangent of the active authored segment, when the command flies a
+    # real leg (FOLLOW/REJOIN with a valid segment). None for WP1 joining,
+    # past-endpoint, centering and final hold, which steer direct-to-point.
+    path_tangent: Optional[np.ndarray] = None
+    # Scale-free corner-approach weight in [0, 1]: 0 on straight legs, rising
+    # to 1 when the aircraft is inside the lookahead of a sharp authored
+    # turn. Only scales the along-leg PCMD share; correction is untouched.
+    corner_weight: float = 0.0
 
 
 @dataclass(frozen=True, eq=False)
@@ -279,10 +295,10 @@ def load_map_frame(path: str | Path) -> MapFrame:
         raise ValueError(f"map alignment R row 2 disagrees with gravity_glomap: {source}")
     return frame
 
-
 _CONTROL_FLOAT_LIMITS = {
     "lookahead": (0.0, 100.0),
     "rejoin_tol": (0.0, 100.0),
+    "path_pull_gain": (0.0, 2.0),
     "arrive": (0.0, 100.0),
     "arrive_fraction": (0.0, 1.0),
     "min_arrive": (0.0, 100.0),
@@ -327,6 +343,11 @@ class ControlConfig:
     # adapter ignores -- tuning it changed nothing about how the drone flew.
     lookahead: float = 0.8  # map-units ahead on route after rejoin
     rejoin_tol: float = 0.45  # cross-track error before REJOIN
+    #: FOLLOW cross-track pull weight. The steering direction blends the
+    #: waypoint/carrot ray with the lateral part of the projection offset,
+    #: weighted by gain * (path_error / arrive_radius) clamped to full
+    #: correction. 1.0 corrects fully onto the line at one arrival radius.
+    path_pull_gain: float = 1.0
     # Map-unit arrival tolerance. Scale-dependent like radius/max_jump: 0.1 was
     # chosen against urai EDM v1, whose camera track spans 6.07 map units and
     # whose consecutive references sit 0.027 apart. Re-derive it per site.
@@ -450,17 +471,26 @@ def production_auto_control_config(map_frame: MapFrame) -> ControlConfig:
 
 
 def apply_desktop_auto_authority(config: ControlConfig) -> ControlConfig:
-    """Widen arrival and keep progress slack valid after route-authored limits."""
+    """Keep progress slack valid after route-authored limits.
+
+    Drawn per-point spheres are honored as-is: they already encode the map
+    scale (k=0.15 of adjacent segment length) and are verified non-overlapping
+    at route-authoring time. Only the legacy global fallback (no per-point
+    radii) keeps the wind-tolerant floor.
+    """
     floor = float(DESKTOP_AUTO_MIN_ARRIVE_RADIUS)
-    radius = max(float(config.waypoint_arrive_radius), floor)
     radii = config.waypoint_arrive_radii
     if radii is not None:
-        radii = tuple(max(float(value), floor) for value in radii)
-        radius = max(radius, max(radii) if radii else radius)
+        radius = max(float(config.waypoint_arrive_radius), max(float(v) for v in radii))
+        return replace(
+            config,
+            waypoint_arrive_radius=radius,
+            progress_jump_slack=max(float(config.progress_jump_slack), radius),
+        )
+    radius = max(float(config.waypoint_arrive_radius), floor)
     return replace(
         config,
         waypoint_arrive_radius=radius,
-        waypoint_arrive_radii=radii,
         progress_jump_slack=max(float(config.progress_jump_slack), radius),
     )
 
@@ -468,7 +498,9 @@ def apply_desktop_auto_authority(config: ControlConfig) -> ControlConfig:
 def _validate_control_float_limits(config: ControlConfig) -> None:
     for name, (lo, hi) in _CONTROL_FLOAT_LIMITS.items():
         value = float(getattr(config, name))
-        if not math.isfinite(value) or value <= lo or value > hi:
+        # path_pull_gain=0 disables the blend; every other float stays (lo, hi].
+        below = value < lo if name == "path_pull_gain" else value <= lo
+        if not math.isfinite(value) or below or value > hi:
             raise ValueError(f"{name} must be finite and in ({lo}, {hi}], got {value!r}")
 
 
@@ -852,6 +884,31 @@ def nearest_pole(poles: list[dict], ref: np.ndarray, map_frame: MapFrame = LEGAC
 # Main controller
 
 
+def _corner_angle_between(incoming: np.ndarray, outgoing: np.ndarray, map_frame) -> float:
+    """Largest of the 3-D and horizontal turn angles at one waypoint (0-pi)."""
+    incoming = np.asarray(incoming, dtype=float).reshape(3)
+    outgoing = np.asarray(outgoing, dtype=float).reshape(3)
+    norm_in = float(np.linalg.norm(incoming))
+    norm_out = float(np.linalg.norm(outgoing))
+    angle_3d = 0.0
+    if norm_in > 1e-9 and norm_out > 1e-9 and np.all(np.isfinite(incoming)) and np.all(np.isfinite(outgoing)):
+        cos_val = float(np.dot(incoming, outgoing)) / (norm_in * norm_out)
+        cos_val = max(-1.0, min(1.0, cos_val))
+        angle_3d = float(math.acos(cos_val))
+    try:
+        in_e, in_n = map_frame.horizontal(incoming)
+        out_e, out_n = map_frame.horizontal(outgoing)
+    except (AttributeError, TypeError, ValueError, OverflowError):
+        return angle_3d
+    horiz_in = math.hypot(float(in_e), float(in_n))
+    horiz_out = math.hypot(float(out_e), float(out_n))
+    if horiz_in <= 1e-12 or horiz_out <= 1e-12:
+        return angle_3d
+    cos_h = (float(in_e) * float(out_e) + float(in_n) * float(out_n)) / (horiz_in * horiz_out)
+    cos_h = max(-1.0, min(1.0, cos_h))
+    return max(angle_3d, float(math.acos(cos_h)))
+
+
 def _return_to_start_route(
     waypoints: list[np.ndarray], config: ControlConfig
 ) -> tuple[list[np.ndarray], ControlConfig]:
@@ -938,6 +995,7 @@ class RouteAutoController:
         self.progress_s = 0.0
         self._join_target_index = 0
         self._rejoining = False
+        self._corner_incoming = self._precompute_corner_geometry()
 
     def start_after_nearest_waypoint(self, pos: np.ndarray) -> int:
         """Start at waypoint 1, even when the takeoff pose is nearer a later point.
@@ -965,6 +1023,74 @@ class RouteAutoController:
         if radii is not None and 0 <= int(index) < len(radii):
             return float(radii[int(index)])
         return float(self.cfg.waypoint_arrive_radius)
+
+    def _precompute_corner_geometry(self) -> list[dict]:
+        """Per-waypoint incoming leg, length, and turn angle (scale-free)."""
+        table: list[dict] = []
+        count = len(self.wp)
+        for i in range(count):
+            entry = {"incoming": None, "length": 0.0, "theta": 0.0}
+            if i <= 0 or count < 2:
+                table.append(entry)
+                continue
+            incoming = np.asarray(self.wp[i], dtype=float) - np.asarray(self.wp[i - 1], dtype=float)
+            length = float(np.linalg.norm(incoming))
+            if length <= 1e-9 or not np.all(np.isfinite(incoming)):
+                table.append(entry)
+                continue
+            if i >= count - 1:
+                theta = math.pi
+            elif i + 1 < count:
+                outgoing = np.asarray(self.wp[i + 1], dtype=float) - np.asarray(self.wp[i], dtype=float)
+                if float(np.linalg.norm(outgoing)) <= 1e-9 or not np.all(np.isfinite(outgoing)):
+                    table.append({"incoming": incoming / length, "length": length, "theta": 0.0})
+                    continue
+                theta = _corner_angle_between(incoming, outgoing, self.cfg.map_frame)
+            else:
+                theta = 0.0
+            table.append({"incoming": incoming / length, "length": length, "theta": float(theta)})
+        return table
+
+    def _corner_approach_weight(self, pos: np.ndarray) -> float:
+        """Scale-free slowdown weight for the active waypoint turn (0-1)."""
+        try:
+            index = int(self.target_index)
+        except (TypeError, ValueError, OverflowError):
+            return 0.0
+        # Weight the active target's own turn: while flying leg i-1 -> i,
+        # slow for the authored angle at i. Final waypoint is a full stop.
+        if index < 0 or index >= len(self._corner_incoming):
+            return 0.0
+        entry = self._corner_incoming[index]
+        incoming = entry.get("incoming")
+        length = float(entry.get("length", 0.0))
+        theta = float(entry.get("theta", 0.0))
+        if incoming is None or length <= 1e-9 or theta <= 0.0:
+            return 0.0
+        if not math.isfinite(theta) or not math.isfinite(length):
+            return 0.0
+        point = np.asarray(pos, dtype=float).reshape(3)
+        target = np.asarray(self.wp[index], dtype=float).reshape(3)
+        if not np.all(np.isfinite(point)) or not np.all(np.isfinite(target)):
+            return 0.0
+        unit = np.asarray(incoming, dtype=float).reshape(3)
+        remaining = max(0.0, float(np.dot(target - point, unit)))
+        try:
+            radius = float(self._arrive_radius_for(index))
+            slowdown = float(self.cfg.slowdown_distance)
+        except (TypeError, ValueError, OverflowError):
+            return 0.0
+        if not math.isfinite(radius) or not math.isfinite(slowdown):
+            return 0.0
+        lookahead = min(length, max(4.0 * radius, slowdown) * (1.0 + theta / math.pi))
+        denom = max(lookahead - radius, 1e-9)
+        phase = max(0.0, min(1.0, (lookahead - remaining) / denom))
+        smooth = phase * phase * (3.0 - 2.0 * phase)
+        sharp = min(1.0, theta / (math.pi / 2.0))
+        weight = sharp * smooth
+        if not math.isfinite(weight):
+            return 0.0
+        return max(0.0, min(1.0, float(weight)))
 
     def final_arrive_tolerance(self) -> float:
         """End-of-route tolerance for LAND.
@@ -1182,20 +1308,29 @@ class RouteAutoController:
         *,
         map_confirmed=True,
         reseed_confirming=False,
+        position_observed=True,
     ):
         """Return (goal, target_index, path_error, progress, action).
 
         Arrival always uses the authored waypoint. step() supplies segment
         guidance and route recovery separately from waypoint sequencing.
+        Mid-route waypoints may retire on VO/drift poses; the final leg
+        still needs map confirmation (operator scope 2026-09-16).
+        A pose without a fresh position observation keeps steering at the
+        current target but never retires it: IMU-only continuation must not
+        declare arrival.
         """
-        self._advance_to_reached(pos, pose_stamp, allow_arrival=map_confirmed)
         last = len(self.wp) - 1
+        allow_arrival = bool(position_observed) and (
+            bool(map_confirmed) or self.target_index < last
+        )
+        self._advance_to_reached(pos, pose_stamp, allow_arrival=allow_arrival)
         goal = self.wp[self.target_index].copy()
         # Cross-track against the active leg also drives segment recovery.
         leg_start = self.wp[max(0, self.target_index - 1)]
         path_error, _nearest, _t = point_segment_distance(pos, leg_start, goal)
         progress = float(self.target_index) / float(max(1, last))
-        if not map_confirmed:
+        if not map_confirmed and self.target_index >= last:
             # A RELOC_SEED's source-confirmation frames recur about once a
             # second, shorter than final_hold_s. They pause landing evidence
             # rather than discard it; the next confirmed pose must still be in
@@ -1204,7 +1339,12 @@ class RouteAutoController:
                 self._reset_final_hold()
             if self._waypoint_reached(pos, self.target_index):
                 return goal, self.target_index, path_error, progress, "WAIT_MAP_CONFIRMATION"
-        if self.target_index < last and self._arrive_frames > 0 and not self.holding_for_inspection:
+        if (
+            self.target_index < last
+            and position_observed
+            and self._arrive_frames > 0
+            and not self.holding_for_inspection
+        ):
             # Inside the arrival sphere, waiting out the confirmation window. The
             # sphere IS the arrival criterion, so settle here rather than chase the
             # exact centre -- on a sphere this large the centre can be BEHIND the
@@ -1269,8 +1409,8 @@ class RouteAutoController:
             now,
             map_confirmed=bool(getattr(pose, "map_confirmed", True)),
             reseed_confirming=bool(getattr(pose, "reseed_confirming", False)),
+            position_observed=bool(getattr(pose, "position_observed", True)),
         )
-
         if action == "WAIT_MAP_CONFIRMATION":
             self.state = "HOVER"
             return Command(
@@ -1386,11 +1526,16 @@ class RouteAutoController:
     def _guidance_command(self, pose, goal, path_error, progress, action):
         pos = pose.xyz
         guidance_goal = None
+        path_pull = None
+        path_tangent = None
         if self.target_index > self._join_target_index:
             start = self.wp[self.target_index - 1]
             segment = goal - start
             length = float(np.linalg.norm(segment))
-            if length > 1e-9:
+            if length > 1e-9 and np.all(np.isfinite(segment)):
+                raw = float(np.dot(pos - start, np.asarray(segment, dtype=float))) / (length * length)
+                if 0.0 <= raw <= 1.0:
+                    path_tangent = np.asarray(segment, dtype=float) / length
                 _distance, _nearest, fraction = point_segment_distance(pos, start, goal)
                 horizontal_segment = np.array(self.cfg.map_frame.horizontal(segment))
                 horizontal_squared = float(np.dot(horizontal_segment, horizontal_segment))
@@ -1414,13 +1559,22 @@ class RouteAutoController:
                     guidance_goal = _nearest
                     remaining = goal - _nearest
                     remaining_length = float(np.linalg.norm(remaining))
-                    if path_error < 2.0 * radius and remaining_length > 1e-9:
-                        # Keep making bounded along-leg progress during small
-                        # drift repair instead of stalling at a noisy projection.
+                    if remaining_length > 1e-9:
+                        # Bounded along-leg progress at any offset: REJOIN
+                        # repairs with correction priority, never by parking.
                         guidance_goal = _nearest + remaining * min(1.0, radius / remaining_length)
                     action = "REJOIN"
+                    path_pull = np.asarray(_nearest, dtype=float) - pos
+                else:
+                    # Continuous cross-track pull: the PCMD adapter blends this
+                    # lateral offset with the carrot ray every tick, so small
+                    # drift is corrected without waiting for the REJOIN latch.
+                    path_pull = np.asarray(_nearest, dtype=float) - pos
         steering_goal = goal if guidance_goal is None else guidance_goal
-        yaw_delta = steering_goal - pos if guidance_goal is None else goal - start
+        if guidance_goal is None:
+            yaw_delta = goal - pos
+        else:
+            yaw_delta = goal - self.wp[max(0, self.target_index - 1)]
         yaw_target = (
             self.cfg.map_frame.heading(yaw_delta)
             if self.cfg.map_frame.horizontal_distance(yaw_delta) > 1e-9
@@ -1444,6 +1598,14 @@ class RouteAutoController:
             should_land=False,
             status=status,
             guidance_goal=guidance_goal,
+            path_pull=path_pull,
+            path_pull_radius=(
+                float(self._arrive_radius_for(self.target_index))
+                if path_pull is not None
+                else None
+            ),
+            path_tangent=path_tangent,
+            corner_weight=float(self._corner_approach_weight(pos)),
         )
 
 
@@ -1452,6 +1614,20 @@ def _validated_command_goal(cmd: Command, pose: Pose, yaw_sign: int) -> np.ndarr
     goal = _finite_vec3(cmd.goal, "command goal")
     if cmd.guidance_goal is not None:
         _finite_vec3(cmd.guidance_goal, "guidance goal")
+    if cmd.path_pull is not None:
+        _finite_vec3(cmd.path_pull, "path pull")
+    if cmd.path_pull_radius is not None:
+        radius_value = float(cmd.path_pull_radius)
+        if not math.isfinite(radius_value) or radius_value <= 0.0:
+            raise ValueError("path pull radius must be finite and positive")
+    if cmd.path_tangent is not None:
+        tangent = _finite_vec3(cmd.path_tangent, "path tangent")
+        norm = float(np.linalg.norm(tangent))
+        if not math.isfinite(norm) or abs(norm - 1.0) > 1e-6:
+            raise ValueError("path tangent must be a finite unit vector")
+    corner_weight = float(getattr(cmd, "corner_weight", 0.0))
+    if not math.isfinite(corner_weight) or not 0.0 <= corner_weight <= 1.0:
+        raise ValueError("corner weight must be finite and in [0, 1]")
     scalars = [
         cmd.yaw_target,
         cmd.path_error,
@@ -1594,6 +1770,121 @@ def _translation_percent_command(
     )
 
 
+def _route_translation_components(cmd, pose, config):
+    """Split a route command into correction and along-leg PCMD vectors.
+
+    Returns (correction, along, along_scale) in PCMD order (roll, pitch, gaz),
+    or None when the command carries no segment metadata (path_pull_gain=0 or
+    a direct-to-point leg such as WP1 joining, centering, final hold). The
+    correction position term is ``(C, C, V) * path_pull_gain / (2 * r)`` per
+    body axis; the along-leg term reuses ``_translation_percent_command`` with
+    the waypoint-range taper so arrival slowdown still keys on the authored
+    waypoint. Raises through ``_validated_command_goal`` on incomplete or
+    non-finite metadata instead of silently degrading.
+    """
+    cap = int(config.max_translation_pcmd)
+    vert = int(config.max_vertical_pcmd)
+    if float(config.path_pull_gain) == 0.0:
+        return None
+    if cmd.path_tangent is None or cmd.path_pull is None or cmd.path_pull_radius is None:
+        return None
+    tangent = np.asarray(cmd.path_tangent, dtype=float)
+    pull = np.asarray(cmd.path_pull, dtype=float)
+    radius = float(cmd.path_pull_radius)
+    if not np.all(np.isfinite(tangent)) or not np.all(np.isfinite(pull)):
+        raise ValueError("route segment metadata must be finite")
+    norm = float(np.linalg.norm(tangent))
+    if not math.isfinite(norm) or abs(norm - 1.0) > 1e-6:
+        raise ValueError("path tangent must be a finite unit vector")
+    if not math.isfinite(radius) or radius <= 0.0:
+        raise ValueError("path pull radius must be finite and positive")
+    path_error = float(cmd.path_error)
+    if not math.isfinite(path_error):
+        raise ValueError("path error must be finite")
+    rho = max(0.0, float(np.linalg.norm(pull)) / radius)
+    corr_fwd, corr_right, corr_up = config.map_frame.body_components(pull, float(pose.yaw))
+    gain = float(config.path_pull_gain)
+    correction = np.array([
+        cap * corr_right * gain / (2.0 * radius),
+        cap * corr_fwd * gain / (2.0 * radius),
+        vert * corr_up * gain / (2.0 * radius),
+    ], dtype=float)
+    goal = np.asarray(cmd.goal, dtype=float)
+    pos = np.asarray(pose.xyz, dtype=float)
+    remaining = max(0.0, float(np.dot(goal - (pos + pull), tangent)))
+    along_vec = np.asarray(tangent, dtype=float) * remaining
+    along_cmd = _translation_percent_command(
+        along_vec, pose, config,
+        distance_to_waypoint=float(np.linalg.norm(goal - pos)),
+        recovering=False,
+    )
+    along = np.array([float(along_cmd[0]), float(along_cmd[1]), float(along_cmd[3])], dtype=float)
+    along_scale = max(0.10, 1.0 / (1.0 + rho * rho))
+    corner_weight = 0.0
+    try:
+        corner_weight = max(0.0, min(1.0, float(getattr(cmd, "corner_weight", 0.0))))
+    except (TypeError, ValueError, OverflowError):
+        corner_weight = 0.0
+    if not math.isfinite(corner_weight):
+        corner_weight = 0.0
+    along_scale = float(along_scale) * (1.0 - 0.5 * corner_weight)
+    return correction, along, along_scale
+
+
+def _allocate_route_translation(correction, along, along_scale, config):
+    """Combine correction-first PCMD with a bounded along-leg share.
+
+    Correction reserves up to 90% of each axis cap (direction preserved);
+    the shared along-leg factor lambda is the largest value within
+    ``[0, along_scale]`` keeping ``|c + lambda * a|`` inside the per-axis
+    box. Single rounding to (roll, pitch, 0, gaz); no per-axis floor that
+    would rotate the correction.
+    """
+    cap = int(config.max_translation_pcmd)
+    vert = int(config.max_vertical_pcmd)
+    caps = np.array([float(cap), float(cap), float(vert)], dtype=float)
+    correction = np.asarray(correction, dtype=float).reshape(3)
+    along = np.asarray(along, dtype=float).reshape(3)
+    if not np.all(np.isfinite(correction)) or not np.all(np.isfinite(along)):
+        return 0, 0, 0, 0
+    scale = float(along_scale)
+    if not math.isfinite(scale) or scale < 0.0:
+        scale = 0.0
+    peak = np.array([
+        abs(correction[0]) / max(caps[0], 1e-9),
+        abs(correction[1]) / max(caps[1], 1e-9),
+        abs(correction[2]) / max(caps[2], 1e-9),
+    ])
+    worst = float(np.max(peak))
+    saturated = worst > 0.9
+    if saturated and worst > 0.0:
+        # Reserve 10% of the envelope for along-leg progress: scale the
+        # correction to 90% of the box, direction preserved.
+        factor = 0.9 / worst
+        correction = correction * factor
+    upper = max(0.0, min(1.0, float(scale)))
+    for i in range(3):
+        a_i = float(along[i])
+        if abs(a_i) < 1e-12:
+            if abs(float(correction[i])) > caps[i] + 1e-9:
+                return 0, 0, 0, 0
+            continue
+        lo = (-caps[i] - float(correction[i])) / a_i
+        hi = (caps[i] - float(correction[i])) / a_i
+        if lo > hi:
+            lo, hi = hi, lo
+        upper = min(upper, hi)
+        if 0.0 < lo:
+            # No non-negative lambda satisfies this axis; hold correction.
+            upper = min(upper, 0.0)
+    lam = max(0.0, min(float(scale), upper))
+    out = correction + lam * along
+    roll = int(round(max(-caps[0], min(caps[0], float(out[0])))))
+    pitch = int(round(max(-caps[1], min(caps[1], float(out[1])))))
+    gaz = int(round(max(-caps[2], min(caps[2], float(out[2])))))
+    return roll, pitch, 0, gaz
+
+
 def command_to_body_percent(
     cmd: Command,
     pose: Pose,
@@ -1608,8 +1899,8 @@ def command_to_body_percent(
     gravity only to define its horizontal plane and up direction. This adapter
     rotates that 3-D target vector into body forward/right/up,
     normalizes the resultant, and assigns pitch/roll/gaz from one shared bounded
-    strength. When requested, yaw gates horizontal motion while height correction
-    continues during the turn.
+    strength. When requested, yaw gates horizontal motion and locks height:
+    a turn never climbs (overhead-obstacle rule); height waits for translation.
     """
     cfg = config or ControlConfig()
     zero = (0, 0, 0, 0)
@@ -1651,26 +1942,36 @@ def command_to_body_percent(
     )
     if yaw_command is not None:
         if movement:
-            gaz = _translation_percent_command(
-                delta, pose, cfg, distance_to_waypoint=distance_to_waypoint, recovering=recovering
-            )[3]
-            return 0, 0, yaw_command[2], gaz
+            # Turn phase: yaw only. Height stays locked (gaz=0) until the nose
+            # aligns, even on a diagonal leg: climbing blind risks overhead
+            # obstacles, and the slanted move runs as level-turn then translate.
+            return 0, 0, yaw_command[2], 0
         return yaw_command
 
     if not movement:
         return zero
+    if cmd.action in {"FOLLOW", "REJOIN"} and cmd.path_tangent is not None:
+        try:
+            parts = _route_translation_components(cmd, pose, cfg)
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            return zero
+        if parts is not None:
+            correction, along, along_scale = parts
+            return _allocate_route_translation(correction, along, along_scale, cfg)
     return _translation_percent_command(
         delta, pose, cfg, distance_to_waypoint=distance_to_waypoint, recovering=recovering
     )
 
 
 class YawAlignedPcmdController:
-    """Yaw toward a new waypoint, then translate without mid-leg re-turns.
+    """Yaw toward a new waypoint, then translate with mid-leg yaw repair.
 
     After each target change the nose aligns to the next point while
     horizontal PCMD holds against measured wind. Cruise then flies toward
-    the goal without parking to realign. Near-waypoint centering and REJOIN
-    still hold yaw and close position.
+    the goal; a large mid-leg heading error blends limited yaw back in
+    without stopping translation (operator scope 2026-09-16: never park to
+    re-turn). Near-waypoint centering and REJOIN still hold yaw and close
+    position.
     """
 
     def __init__(self, config: ControlConfig):
@@ -1691,9 +1992,11 @@ class YawAlignedPcmdController:
         self.centering = False
         self.vertical_adjusting = False
         self.turn_anchor_error_u = 0.0
-        self._integral_f = 0.0
-        self._integral_r = 0.0
+        self._integral_map = np.zeros(2, dtype=float)
         self._integral_now: float | None = None
+        self._integral_now_pose: float | None = None
+        self._integral_wall: float | None = None
+        self._correction_saturated = False
 
     def _usable_body_velocity(self, body_velocity, now: float):
         if body_velocity is None:
@@ -1711,22 +2014,150 @@ class YawAlignedPcmdController:
             return None
         return forward_v, right_v
 
-    def _position_integral(self, forward: float, right: float, now: float, radius: float, cap: int):
-        dt = 0.05
-        if self._integral_now is not None:
-            dt = max(0.0, min(0.2, float(now) - self._integral_now))
-        self._integral_now = float(now)
-        leak = math.exp(-dt / 2.0) if dt > 0.0 else 1.0
-        self._integral_f = leak * self._integral_f + float(forward) * dt
-        self._integral_r = leak * self._integral_r + float(right) * dt
-        imax = 3.0 * max(float(radius), 1e-3)
-        self._integral_f = float(np.clip(self._integral_f, -imax, imax))
-        self._integral_r = float(np.clip(self._integral_r, -imax, imax))
-        ki = 0.35 * float(cap) / max(float(radius), 1e-3)
-        return ki * self._integral_f, ki * self._integral_r
+    def _position_integral(self, error_map, pose, now, radius, cap, *, saturated=False, integrate=True):
+        """Map-frame position integral, returned as body forward/right PCMD.
+
+        The accumulator lives in map east/north so one world offset keeps one
+        direction when the nose turns; each call projects it into the current
+        body frame. Only strictly newer valid pose stamps integrate, with
+        capture-stamp dt capped at 0.2 s (first sample dt=0, repeats add
+        nothing); wall time only drives the 2 s leak. Accumulates unless the
+        correction already saturates while the error still pushes the same way
+        (opposing errors unload); integrate=False only leaks and advances
+        time, returning no output. Stale/future/non-finite stamps only leak
+        and clear the anchor so the next valid sample restarts with dt=0.
+        The accumulator is capped by vector norm (3*r), direction preserved.
+        """
+        try:
+            now_f = float(now)
+        except (TypeError, ValueError, OverflowError):
+            return 0.0, 0.0
+        if not math.isfinite(now_f):
+            return 0.0, 0.0
+        try:
+            stamp = float(pose.stamp)
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            stamp = float("nan")
+        try:
+            max_age = float(self.config.max_pose_age_s)
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            max_age = 0.5
+        if not math.isfinite(max_age) or max_age < 0.0:
+            max_age = 0.5
+        if self._integral_wall is None:
+            wall_dt = 0.0
+            self._integral_wall = now_f
+        else:
+            try:
+                prev_wall = float(self._integral_wall)
+            except (TypeError, ValueError, OverflowError):
+                prev_wall = now_f
+            if now_f > prev_wall:
+                wall_dt = now_f - prev_wall
+                if wall_dt > 2.0:
+                    wall_dt = 2.0
+                self._integral_wall = now_f
+            else:
+                wall_dt = 0.0
+        leak = math.exp(-wall_dt / 2.0) if wall_dt > 0.0 else 1.0
+        try:
+            radius_f = max(float(radius), 1e-3)
+        except (TypeError, ValueError, OverflowError):
+            radius_f = 1e-3
+        imax = 3.0 * radius_f
+        leaked = np.asarray(self._integral_map, dtype=float).reshape(2) * leak
+        leaked_norm = float(np.linalg.norm(leaked))
+        if leaked_norm > imax and leaked_norm > 0.0:
+            leaked = leaked * (imax / leaked_norm)
+        self._integral_map = leaked
+        age = now_f - stamp if math.isfinite(stamp) else float("nan")
+        valid = bool(math.isfinite(stamp) and math.isfinite(age) and 0.0 <= age <= max_age)
+        if not valid:
+            self._integral_now_pose = None
+            self._integral_now = now_f
+            return 0.0, 0.0
+        if self._integral_now_pose is not None:
+            try:
+                fresh = bool(stamp > float(self._integral_now_pose))
+            except (TypeError, ValueError, OverflowError):
+                fresh = False
+        else:
+            fresh = True
+        if fresh and self._integral_now_pose is not None:
+            try:
+                prev_stamp = float(self._integral_now_pose)
+            except (TypeError, ValueError, OverflowError):
+                prev_stamp = stamp
+            gap = stamp - prev_stamp
+            if gap > max_age:
+                dt = 0.0
+            else:
+                dt = gap
+                if dt < 0.0:
+                    dt = 0.0
+                elif dt > 0.2:
+                    dt = 0.2
+        else:
+            dt = 0.0
+        if fresh:
+            self._integral_now_pose = stamp
+        self._integral_now = now_f
+        try:
+            err = np.asarray(error_map, dtype=float).reshape(2)
+        except (TypeError, ValueError, OverflowError):
+            err = np.zeros(2)
+        if not np.all(np.isfinite(err)):
+            err = np.zeros(2)
+        if integrate and fresh and dt > 0.0:
+            accumulated = np.asarray(self._integral_map, dtype=float).reshape(2)
+            if not saturated or float(np.dot(err, accumulated)) < 0.0:
+                updated = accumulated + err * dt
+                updated_norm = float(np.linalg.norm(updated))
+                if updated_norm > imax and updated_norm > 0.0:
+                    updated = updated * (imax / updated_norm)
+                self._integral_map = updated
+        if not integrate:
+            return 0.0, 0.0
+        try:
+            ki = 0.35 * float(cap) / radius_f
+        except (TypeError, ValueError, OverflowError):
+            return 0.0, 0.0
+        i_e, i_n = (float(v) for v in np.asarray(self._integral_map, dtype=float).reshape(2))
+        cos_y, sin_y = math.cos(float(pose.yaw)), math.sin(float(pose.yaw))
+        return ki * (i_e * cos_y + i_n * sin_y), ki * (i_e * sin_y - i_n * cos_y)
+
+    def _segment_damping(self, tangent_map, pose, body_velocity, now):
+        """Measured-velocity damping in the authored segment frame.
+
+        Returns (damp_forward, damp_right) PCMD: the normal part of the fresh
+        body velocity times -DESKTOP_AUTO_WIND_REJECT_PCMD_PER_MPS. Without a
+        horizontal segment direction (or on a turn hold) damps the full
+        horizontal velocity. None when no fresh velocity is available: the
+        caller adds no D estimate rather than inventing one.
+        """
+        velocity = self._usable_body_velocity(body_velocity, now)
+        if velocity is None:
+            return None
+        forward_v, right_v = velocity
+        kv = float(DESKTOP_AUTO_WIND_REJECT_PCMD_PER_MPS)
+        try:
+            t_online = np.asarray(tangent_map, dtype=float).reshape(3)
+        except (TypeError, ValueError, OverflowError):
+            t_online = None
+        if t_online is not None and np.all(np.isfinite(t_online)):
+            try:
+                t_f, t_r, _ = self.config.map_frame.body_components(t_online, float(pose.yaw))
+            except (TypeError, ValueError, OverflowError):
+                t_f, t_r = 0.0, 0.0
+            norm = math.hypot(float(t_f), float(t_r))
+            if math.isfinite(norm) and norm >= 1e-9:
+                t_f, t_r = float(t_f) / norm, float(t_r) / norm
+                along = forward_v * t_f + right_v * t_r
+                return (-kv * (forward_v - along * t_f), -kv * (right_v - along * t_r))
+        return (-kv * forward_v, -kv * right_v)
 
     def _wind_corrected_horizontal(self, roll, pitch, body_velocity, now):
-        """Cancel cross-track wind while cruising; hold station if not translating."""
+        """Fallback wind hold for direct/turn legs without a segment frame."""
         velocity = self._usable_body_velocity(body_velocity, now)
         cap = int(self.config.max_translation_pcmd)
         kv = DESKTOP_AUTO_WIND_REJECT_PCMD_PER_MPS
@@ -1747,58 +2178,173 @@ class YawAlignedPcmdController:
         roll = int(np.clip(round(float(roll) - kv * cross_r), -cap, cap))
         return roll, pitch
 
-    def _separate_translation_axes(self, command, cmd: Command, pose: Pose, now, body_velocity):
-        """Separate height/horizontal repair, with measured horizontal damping."""
-        roll, pitch, yaw, gaz = command
-        goal = cmd.goal if cmd.guidance_goal is None else cmd.guidance_goal
-        delta = np.asarray(goal) - pose.xyz
-        height_error = self.config.map_frame.vertical(delta)
+    def _target_radius(self):
         radius = float(self.config.waypoint_arrive_radius)
         radii = self.config.waypoint_arrive_radii
         if radii is not None and isinstance(self.target_key, int) and 0 <= self.target_key < len(radii):
             radius = float(radii[self.target_key])
-        if (roll or pitch) and gaz:
-            if abs(height_error) > radius:
-                self.vertical_adjusting = True
-            elif abs(height_error) <= 0.5 * radius:
-                self.vertical_adjusting = False
-            horizontal_error = self.config.map_frame.horizontal_distance(delta)
-            if horizontal_error > max(radius, abs(height_error)):
-                # A smaller height residual must not starve horizontal gust repair.
-                self.vertical_adjusting = False
-            if self.vertical_adjusting:
-                self.phase = "height_adjust"
-                strength = max(1, round(self.config.max_vertical_pcmd * min(
-                    1.0, abs(height_error) / (3.0 * radius)
-                )))
-                hold_roll, hold_pitch = self._wind_corrected_horizontal(
-                    0, 0, body_velocity, now,
-                )
-                return hold_roll, hold_pitch, yaw, int(math.copysign(strength, height_error))
-            horizontal = _translation_percent_command(
-                delta - height_error * self.config.map_frame.up, pose, self.config,
-                distance_to_waypoint=(horizontal_error if cmd.action == "REJOIN"
-                                      else float(np.linalg.norm(cmd.goal - pose.xyz))),
-                recovering=cmd.action == "REJOIN",
-            )
-            command = horizontal[0], horizontal[1], 0, 0
+        return radius
+
+    def _route_translate(self, cmd, pose, now, body_velocity, parts):
+        """One-shot correction-priority allocation for an active-segment leg."""
+        correction, along, along_scale = (
+            np.asarray(parts[0], dtype=float).reshape(3),
+            np.asarray(parts[1], dtype=float).reshape(3),
+            float(parts[2]),
+        )
+        cap = int(self.config.max_translation_pcmd)
+        vert = int(self.config.max_vertical_pcmd)
+        radius = self._target_radius()
+        pull = np.asarray(cmd.path_pull, dtype=float).reshape(3)
+        tangent = np.asarray(cmd.path_tangent, dtype=float).reshape(3)
+        damp = self._segment_damping(cmd.path_tangent, pose, body_velocity, now)
+        fresh_vel = damp is not None
+        if damp is not None:
+            correction = correction + np.array([damp[1], damp[0], 0.0])
+        try:
+            corner_weight = max(0.0, min(1.0, float(getattr(cmd, "corner_weight", 0.0))))
+        except (TypeError, ValueError, OverflowError):
+            corner_weight = 0.0
+        if not math.isfinite(corner_weight):
+            corner_weight = 0.0
+        position_observed = bool(getattr(pose, "position_observed", True))
+        if corner_weight > 0.0 and fresh_vel and body_velocity is not None:
+            velocity = self._usable_body_velocity(body_velocity, now)
+            if velocity is not None:
+                forward_v, right_v = velocity
+                tangent_body = None
+                try:
+                    t_f, t_r, _t_u = self.config.map_frame.body_components(tangent, float(pose.yaw))
+                    norm = math.hypot(float(t_f), float(t_r))
+                    if math.isfinite(norm) and norm >= 1e-9:
+                        tangent_body = (float(t_f) / norm, float(t_r) / norm)
+                except (TypeError, ValueError, OverflowError):
+                    tangent_body = None
+                if tangent_body is not None:
+                    approach = float(forward_v) * tangent_body[0] + float(right_v) * tangent_body[1]
+                    excess = max(0.0, approach - 0.15)
+                    if excess > 0.0:
+                        kv = float(DESKTOP_AUTO_WIND_REJECT_PCMD_PER_MPS)
+                        brake = kv * corner_weight * excess
+                        correction = correction + np.array([
+                            -brake * tangent_body[1],
+                            -brake * tangent_body[0],
+                            0.0,
+                        ])
+        normal = pull - float(np.dot(pull, tangent)) * tangent
+        err_e = float(np.dot(normal, np.asarray(self.config.map_frame.east, dtype=float)))
+        err_n = float(np.dot(normal, np.asarray(self.config.map_frame.north, dtype=float)))
+        i_f, i_r = self._position_integral(
+            np.array([err_e, err_n]), pose, now, radius, cap,
+            saturated=bool(self._correction_saturated),
+            integrate=bool(fresh_vel and position_observed),
+        )
+        correction = correction + np.array([i_r, i_f, 0.0])
+        worst = max(
+            abs(float(correction[0])) / max(float(cap), 1e-9),
+            abs(float(correction[1])) / max(float(cap), 1e-9),
+            abs(float(correction[2])) / max(float(vert), 1e-9),
+        )
+        self._correction_saturated = bool(worst > 0.9)
+        return _allocate_route_translation(correction, along, along_scale, self.config)
+
+    def _separate_translation_axes(self, _command, cmd: Command, pose: Pose, now, body_velocity):
+        """Translate phase: correction-priority allocation on a real segment.
+
+        Active-segment FOLLOW/REJOIN legs compute correction, damping and
+        integral once here and allocate a bounded along-leg share; direct
+        centering legs keep the existing position servo. Turn-phase height
+        lock lives in `command_to_body_percent` and `_alignment_hold_command`,
+        not here. The first slot is an unused placeholder kept so the route
+        allocation cannot be confused with a precomputed stateless command.
+        """
+        if cmd.action in {"FOLLOW", "REJOIN"} and cmd.path_tangent is not None:
+            try:
+                parts = _route_translation_components(cmd, pose, self.config)
+            except (AttributeError, TypeError, ValueError, OverflowError):
+                return 0, 0, 0, 0
+            if parts is not None:
+                self.vertical_adjusting = bool(abs(float(parts[0][2])) > 1e-9 or abs(float(parts[1][2])) > 1e-9)
+                if self.vertical_adjusting and not (abs(float(parts[0][0])) > 1e-9 or abs(float(parts[0][1])) > 1e-9 or abs(float(parts[1][0])) > 1e-9 or abs(float(parts[1][1])) > 1e-9):
+                    self.phase = "height_adjust"
+                return self._route_translate(cmd, pose, now, body_velocity, parts)
+        goal = cmd.goal if cmd.guidance_goal is None else cmd.guidance_goal
+        delta = np.asarray(goal) - pose.xyz
+        radius = self._target_radius()
+        self.vertical_adjusting = False
+        recovering = cmd.action == "REJOIN"
+        command = _translation_percent_command(
+            np.asarray(delta), pose, self.config,
+            distance_to_waypoint=(self.config.map_frame.horizontal_distance(delta)
+                                  if recovering
+                                  else float(np.linalg.norm(cmd.goal - pose.xyz))),
+            recovering=recovering,
+        )
         close_or_recovering = self.phase != "translate" or float(np.linalg.norm(cmd.goal - pose.xyz)) <= 3.0 * radius
-        if body_velocity is not None and close_or_recovering and command[2] == command[3] == 0:
+        if body_velocity is not None and close_or_recovering and command[2] == 0:
             velocity = self._usable_body_velocity(body_velocity, now)
             if velocity is not None:
                 forward_v, right_v = velocity
                 forward, right, _up = self.config.map_frame.body_components(delta, pose.yaw)
                 cap = self.config.max_translation_pcmd
-                i_f, i_r = self._position_integral(forward, right, now, radius, cap)
-                # Position/radius is dimensionless; body velocity provides damping
-                # in 10 PCMD per m/s. Integral closes a steady wind offset the
-                # P term alone cannot.
-                pitch = int(np.clip(round(cap * forward / (2.0 * radius) + i_f - 10.0 * forward_v), -cap, cap))
-                roll = int(np.clip(round(cap * right / (2.0 * radius) + i_r - 10.0 * right_v), -cap, cap))
-                return roll, pitch, 0, 0
+                position_observed = bool(getattr(pose, "position_observed", True))
+                fresh = self._usable_body_velocity(body_velocity, now) is not None
+                i_f, i_r = self._position_integral(
+                    np.array([float(np.dot(delta, np.asarray(self.config.map_frame.east, dtype=float))),
+                              float(np.dot(delta, np.asarray(self.config.map_frame.north, dtype=float)))]),
+                    pose, now, radius, cap,
+                    saturated=bool(self._correction_saturated),
+                    integrate=bool(fresh and position_observed),
+                )
+                kv = float(DESKTOP_AUTO_WIND_REJECT_PCMD_PER_MPS)
+                raw_pitch = cap * forward / (4.0 * radius) + i_f - kv * forward_v
+                raw_roll = cap * right / (4.0 * radius) + i_r - kv * right_v
+                self._correction_saturated = bool(max(abs(raw_pitch), abs(raw_roll)) > cap)
+                pitch = int(np.clip(round(raw_pitch), -cap, cap))
+                roll = int(np.clip(round(raw_roll), -cap, cap))
+                return roll, pitch, 0, command[3]
+        else:
+            # No fresh velocity here: still advance integral time/leak so a
+            # stale-speed interval cannot resume with a pre-gap windup.
+            try:
+                fallback_cap = int(self.config.max_translation_pcmd)
+            except (AttributeError, TypeError, ValueError, OverflowError):
+                fallback_cap = 10
+            try:
+                self._position_integral(np.zeros(2), pose, now, radius, fallback_cap, integrate=False)
+            except (AttributeError, TypeError, ValueError, OverflowError):
+                pass
         roll, pitch, yaw, gaz = command
         roll, pitch = self._wind_corrected_horizontal(roll, pitch, body_velocity, now)
         return roll, pitch, yaw, gaz
+    def _overlay_mid_leg_yaw(self, translated, yaw_error, fresh_sample):
+        """Overlay limited yaw on cruise PCMD when the live ray walks off."""
+        roll, pitch, yaw, gaz = (int(value) for value in translated)
+        if self.phase != "translate":
+            return roll, pitch, yaw, gaz
+        if abs(math.degrees(float(yaw_error))) <= float(self.config.mid_leg_realign_deg):
+            self._realign_strikes = 0
+            return roll, pitch, 0, gaz
+        if gaz:
+            # Diagonal translate climbs blind to heading errors the same way a
+            # turn does: hold the nose, finish the 3-D leg, then re-aim. Yawing
+            # while climbing risks the same overhead strike as turn+climb.
+            self._realign_strikes = 0
+            return roll, pitch, 0, gaz
+        if fresh_sample:
+            self._realign_strikes += 1
+        if self._realign_strikes < int(self.config.yaw_alignment_confirmation_updates):
+            return roll, pitch, 0, gaz
+        yaw_cmd = _yaw_percent_command(
+            float(yaw_error), float(yaw_error), config=self.config,
+            yaw_sign=1, inspection=False, require_yaw_alignment=True,
+        )
+        yaw_out = 0 if yaw_cmd is None else int(yaw_cmd[2])
+        # Cap the overlay so a 95-degree walk cannot demand full-rate spin
+        # while translating; the sign convention (CCW error -> negative PCMD)
+        # matches command_to_body_percent with yaw_sign=+1.
+        yaw_out = int(np.clip(yaw_out, -20, 20))
+        return roll, pitch, yaw_out, gaz
 
     def _normalized_now(self, now: float) -> float | None:
         try:
@@ -1817,8 +2363,13 @@ class YawAlignedPcmdController:
         ):
             self.reset()
         if target_key != self.target_key:
+            was_centering = bool(self.centering)
             self.reset()
             self.target_key = target_key
+            # Recompute the saturation flag in the new mode instead of
+            # carrying the previous mode's stale value into the integral.
+            if was_centering:
+                self._correction_saturated = False
 
     def _alignment_measurement(
         self,
@@ -1941,7 +2492,10 @@ class YawAlignedPcmdController:
                 yaw_sign=yaw_sign,
                 require_yaw_alignment=True,
             )
-            return hold_roll, hold_pitch, yaw_cmd[2], yaw_cmd[3]
+            # Turn holds height as well as position: gaz=0 even though the
+            # adapter already returns 0 here; belt and suspenders so a future
+            # adapter change cannot reintroduce climb-during-turn.
+            return hold_roll, hold_pitch, yaw_cmd[2], 0
         if stable:
             self.aligned_for_translation = True
             self.phase = "yaw_alignment_confirmed"
@@ -1974,15 +2528,8 @@ class YawAlignedPcmdController:
             cmd.progress,
             status="final centering",
         )
-        centered = command_to_body_percent(
-            hold_cmd,
-            pose,
-            config=self.config,
-            yaw_sign=yaw_sign,
-            require_yaw_alignment=False,
-        )
         self.phase = "final_centering"
-        return self._separate_translation_axes(centered, hold_cmd, pose, now, body_velocity)
+        return self._separate_translation_axes((0, 0, 0, 0), hold_cmd, pose, now, body_velocity)
 
 
     def _position_recovery_command(self, cmd, pose, now, radius, yaw_sign, body_velocity):
@@ -1995,22 +2542,17 @@ class YawAlignedPcmdController:
             # Near a waypoint the target bearing is ill-conditioned. Hold yaw
             # and close position/height instead of turning around the sphere.
             # The wider exit boundary prevents localization noise from toggling
-            # this phase on every capture.
+            # this phase on every capture. Direct-to-point: no segment share.
             self.phase = "waypoint_centering"
-            centering_cmd = replace(cmd, guidance_goal=None, action="FOLLOW")
-            return self._separate_translation_axes(command_to_body_percent(
-                centering_cmd, pose,
-                config=self.config, yaw_sign=yaw_sign,
-                require_yaw_alignment=False,
-            ), centering_cmd, pose, now, body_velocity)
+            centering_cmd = replace(cmd, guidance_goal=None, path_pull=None, path_pull_radius=None, path_tangent=None, action="FOLLOW")
+            return self._separate_translation_axes((0, 0, 0, 0), centering_cmd, pose, now, body_velocity)
         if cmd.action == "REJOIN" and cmd.guidance_goal is not None:
             # Position recovery takes priority over nose alignment. Translate
             # back to the segment with yaw held, then resume the turn gate.
+            # Single computation: _separate_translation_axes allocates the
+            # route components itself; no stateless pre-pass.
             self.phase = "route_rejoin"
-            return self._separate_translation_axes(command_to_body_percent(
-                cmd, pose, config=self.config, yaw_sign=yaw_sign,
-                require_yaw_alignment=False,
-            ), cmd, pose, now, body_velocity)
+            return self._separate_translation_axes((0, 0, 0, 0), cmd, pose, now, body_velocity)
 
         return None
 
@@ -2070,13 +2612,8 @@ class YawAlignedPcmdController:
 
         self.phase = "translate"
         self.turn_anchor_error_u = 0.0
-        return self._separate_translation_axes(command_to_body_percent(
-            cmd,
-            pose,
-            config=self.config,
-            yaw_sign=yaw_sign,
-            require_yaw_alignment=False,
-        ), cmd, pose, now, body_velocity)
+        translated = self._separate_translation_axes((0, 0, 0, 0), cmd, pose, now, body_velocity)
+        return self._overlay_mid_leg_yaw(translated, yaw_error, fresh_sample)
 
 
 if __name__ == "__main__":

@@ -486,7 +486,11 @@ class FinalMapEDMProvider:
         self._prepared = False
         self._geometry_locked = False
         self._reference_descriptors_locked = False
-        self.fingerprint = _canonical_sha256(
+        self.fingerprint = self._compute_fingerprint()
+
+    def _compute_fingerprint(self) -> str:
+        """Content identity for the reference index; kept as a method for live override."""
+        return _canonical_sha256(
             {
                 "implementation": "FINAL_MAP_MEGALOC_OFFICIAL_EDM_PNP_V4",
                 "min_reference_occupied_bins": (

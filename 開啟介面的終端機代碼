@@ -30,6 +30,14 @@ A. 影片模擬串流（無真機，用測試影片跑定位與 UI）
 
 看到 `[simulator-preflight] OK` 再跑上面的啟動.sh。
 
+註（2026-09-17）：目前本機這條會先卡住，不要直接跑。preflight / resolve_mission /
+一鍵啟動 dry-run 都停在同一處：
+route_json SHA-256 mismatch: expected 15fbffef...5f63, got 1fae9f7d...267f3。
+原因：地圖檔/場域/river_site/routes/flight_route_20260914_141505_e87a66fb.json
+已在編輯器外被改過，site profile 與 mission component 裡釘的舊 SHA 對不上。
+修法只有一種：用介面「編輯路線」重存該航線並重批（LocalRouteProvider 連動更新
+SHA），不可手改 JSON 裡的 SHA 硬湊。重存後再回到上面的 preflight OK 流程。
+
 
 B. 真機串流（SkyController + 無人機，可手動／搖桿／自動飛行）
 --------------------------------------------------------------

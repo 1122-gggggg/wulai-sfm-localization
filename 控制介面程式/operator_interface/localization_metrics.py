@@ -126,7 +126,7 @@ RESULT_FIELDS = (
     "ui_poll_delay_ms",
     "e2e_submit_to_ui_ms",
     "source_frame_stamp_mono",
-    "source_stamp_semantics",
+    "pose_capture_mono_ns",
     "hold_retry",
     "hold_kind",
     "source_stamp_age_at_submit_ms",

@@ -650,6 +650,28 @@ def _build_worker_backend(args, backend: str, query_camera_override, map_frame):
     )
 
 
+def _provider_startup_stage_ms(tracker) -> dict[str, float] | None:
+    """Read staged warmup timing from the provider without touching models."""
+    seen: list[int] = []
+    candidates = (
+        tracker,
+        getattr(tracker, "trk", None),
+        getattr(tracker, "provider", None),
+        getattr(getattr(tracker, "trk", None), "provider", None),
+    )
+    for candidate in candidates:
+        if candidate is None or id(candidate) in seen:
+            continue
+        seen.append(id(candidate))
+        stages = getattr(candidate, "startup_stage_ms", None)
+        if isinstance(stages, dict) and stages:
+            try:
+                return {str(key): float(value) for key, value in stages.items()}
+            except (TypeError, ValueError, OverflowError):
+                return None
+    return None
+
+
 def main() -> None:
     configure_offline_environment()
     install_network_guard(InterfaceMode.SIMULATED_STREAM)
@@ -675,6 +697,7 @@ def main() -> None:
         file=sys.stderr,
         flush=True,
     )
+    startup_stage_ms = _provider_startup_stage_ms(tracker)
     if args.startup_handshake:
         json_out.write(
             json.dumps(
@@ -684,6 +707,7 @@ def main() -> None:
                     "device": DEVICE,
                     "tracker_variant": tracker_variant,
                     "startup_ms": startup_ms,
+                    "startup_stage_ms": startup_stage_ms,
                 },
                 ensure_ascii=False,
             )
@@ -975,10 +999,25 @@ def _build_success_payload(
         if capture_stamp is not None
         else worker_read_done_mono_ns
     )
+    pose_capture_mono_ns = None
+    if pose_ok and pose is not None:
+        try:
+            pose_stamp = float(getattr(pose, "stamp", float("nan")))
+        except (TypeError, ValueError, OverflowError):
+            pose_stamp = float("nan")
+        if (
+            math.isfinite(pose_stamp)
+            and pose_stamp > 0.0
+            and capture_stamp is not None
+            and math.isfinite(float(capture_stamp))
+            and 0.0 < pose_stamp <= float(capture_stamp)
+        ):
+            pose_capture_mono_ns = int(round(pose_stamp * 1_000_000_000.0))
     payload = {
         "seq": seq,
         "frame_id": f"worker-{seq}",
         "capture_mono_ns": capture_mono_ns,
+        "pose_capture_mono_ns": pose_capture_mono_ns,
         "pose_mono_ns": worker_core_done_mono_ns,
         "localization_contract_version": 1,
         "validity": bool(pose_ok),

@@ -30,9 +30,10 @@ def test_direct_jump_holds_original_pose_until_distinct_confirmation():
     assert offer(2.0, 10.1)[0] is original
     accepted, weak, pending = offer(2.0, 10.2)
     assert accepted.x == 2.0 and not weak and not pending
-    # A source change also needs confirmation even when the displacement is small.
+    # RELOC_SEED and the following FAST_TRACK share one map-fix source: the
+    # second consistent capture releases without waiting for two more.
     assert offer(2.01, 10.3, "RELOC_SEED")[2]
-    assert offer(2.01, 10.4, "RELOC_SEED")[2] is False
+    assert offer(2.01, 10.4)[2] is False
 
 
 def test_only_the_run_a_reseed_starts_is_reseed_confirming():
@@ -50,19 +51,20 @@ def test_only_the_run_a_reseed_starts_is_reseed_confirming():
         accepted, mode, _weak, _pending = adapter._confirm_pose(pose, info, "TRACK", weak, status)
         adapter._advance_state(accepted, info, mode, status)
         return adapter._reseed_confirming
-
     assert offer(0.0, 10.0) is False
-    # Flight 2026-09-15 14:25: the seed frame and the next FAST_TRACK frame are held.
+    # Flight 2026-09-15 14:25: the seed frame is held; the next consistent
+    # FAST_TRACK releases the shared map-fix source and ends the reseed run.
     assert offer(0.01, 10.1, "RELOC_SEED") is True
-    assert offer(0.01, 10.2) is True
+    assert offer(0.01, 10.2) is False
+    assert adapter.state.last_pose is not None and adapter.state.last_pose.x == 0.01
     assert offer(0.01, 10.3) is False
     # A VO-only frame ends the reseed run even though confirmation continues.
     assert offer(0.02, 10.4, "RELOC_SEED") is True
     assert offer(0.02, 10.5, "VO_ONLY", weak=True) is False
-    assert offer(0.02, 10.6) is False
+    assert offer(0.02, 10.6) is True
     assert offer(0.02, 10.7) is False
     # A jump confirmation is not a reseed.
-    assert offer(2.0, 10.8) is False
+    assert offer(2.0, 10.8) is True
 
 
 def test_weak_jump_cannot_bypass_the_shared_continuity_gate():

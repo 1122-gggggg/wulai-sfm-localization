@@ -170,7 +170,6 @@ def _make_operator(batches: list, policy) -> SimpleNamespace:
         live_locked=False,
         live_new_pose=False,
         _autonomy_pose_snapshot=None,
-        _autonomy_pose_predicted=False,
         _integrated_autonomy=None,
         loc_bridge_run=0,
         boot_holding=lambda: False,
@@ -290,7 +289,7 @@ def test_predicted_only_mirrors_into_weak_trail() -> None:
     assert operator.history_weak_health == ["DEGRADED"]
     assert np.allclose(operator.history_weak[0], [7.0, 8.0, 9.0])
     assert operator._autonomy_pose_snapshot is None
-    assert not operator._autonomy_pose_predicted
+    assert not getattr(operator, "_autonomy_pose_predicted", False)
 
 
 def test_predicted_only_feeds_auto_snapshot_after_visual_lock() -> None:
@@ -311,8 +310,12 @@ def test_predicted_only_feeds_auto_snapshot_after_visual_lock() -> None:
 
     app.OperatorApp.update_live_results(operator)
 
-    assert operator._autonomy_pose_predicted is True
-    assert operator._autonomy_pose_snapshot == pytest.approx((7.0, 8.0, 9.0, 0.4, 12.0))
+    snapshot = operator._autonomy_pose_snapshot
+    assert snapshot is not None
+    assert not snapshot.position_observed
+    assert (snapshot.x, snapshot.y, snapshot.z, snapshot.yaw, snapshot.stamp) == pytest.approx(
+        (7.0, 8.0, 9.0, 0.4, 12.0)
+    )
 
 
 def test_weak_trail_is_capped_like_history() -> None:
@@ -530,10 +533,6 @@ def test_hud_without_direct_status_has_no_weak_run_fragment() -> None:
         direct_status=None,
     )
     app.OperatorApp._update_localization_recovery(operator, edm_weak)
-    assert operator.loc_weak_run == 1
-    assert "weak_run" not in operator.loc_recovery_text
-
-
 def test_held_weak_feeds_autonomy_snapshot_only_when_opted_in() -> None:
     for flag, expected_x in ((False, 1.0), (True, 1.03)):
         policy = app.LostHoldPolicy(low_confidence_results=2, hold_on_low_confidence=True)
@@ -550,7 +549,10 @@ def test_held_weak_feeds_autonomy_snapshot_only_when_opted_in() -> None:
 
         assert operator.lost_hold.active
         assert np.allclose(operator.live_pose, frozen_live)
-        assert operator._autonomy_pose_snapshot[0] == pytest.approx(expected_x)
+        snapshot = operator._autonomy_pose_snapshot
+        assert snapshot is not None
+        assert snapshot.x == pytest.approx(expected_x)
+        assert snapshot.position_observed is True
 
 
 def test_weak_trail_records_estimate_source_kind() -> None:

@@ -743,8 +743,11 @@ class TwoRateTracker:
             self._imu_bridge_debug["imu_bridge_reason"] = "yaw_invalid"
             return None
         delta_ned = (yaw_now - yaw_ref + math.pi) % (2.0 * math.pi) - math.pi
-        dt = stamp - float(self._last_pose_stamp)
-        if dt <= 0.0 or abs(delta_ned) / dt > math.radians(IMU_BRIDGE_MAX_YAW_RATE_DEG_S):
+        sample_dt = float(now_sample[0]) - float(ref_sample[0])
+        if sample_dt < 0.0 or (sample_dt == 0.0 and abs(delta_ned) > 0.0):
+            self._imu_bridge_debug["imu_bridge_reason"] = "yaw_rate_excessive"
+            return None
+        if sample_dt > 0.0 and abs(delta_ned) / sample_dt > math.radians(IMU_BRIDGE_MAX_YAW_RATE_DEG_S):
             self._imu_bridge_debug["imu_bridge_reason"] = "yaw_rate_excessive"
             return None
         return delta_ned, sample_age

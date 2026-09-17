@@ -82,21 +82,14 @@ if str(OPERATOR_ROOT) not in sys.path:
 sys.modules.setdefault("olympe", None)
 
 import real_path_follow_controller as rpf  # noqa: E402
-from heading_fusion import HeadingEstimator  # noqa: E402
 from route_domain import RouteDocument  # noqa: E402
-from operator_autonomy import DesktopRouteAutonomy  # noqa: E402
-from landing_transition import decide_route_completion_landing  # noqa: E402
+from operator_autonomy import DesktopRouteAutonomy, _fresh_route_progress  # noqa: E402
 
 CTRL_HZ = 20
 DT = 1.0 / CTRL_HZ
-
-# ANAFI white-paper capability maxima (see module docstring).
 VH_MAX_MPS = 15.0
 VV_MAX_MPS = 4.0
 YAW_MAX_DEG_S = 200.0
-
-MAX_SIM_OUTAGE_S = 4.0  # reject an unrecovered simulation, without a flight command
-
 
 # --------------------------------------------------------------------------
 # Config helpers (mirror path_follow_flight.build_controller, minus Olympe env)
@@ -117,7 +110,7 @@ def build_production_controller(
     # DesktopRouteAutonomy widens authored arrival spheres the same way.
     cfg = rpf.apply_desktop_auto_authority(rpf.config_for_route(route_path, base))
     ctrl = rpf.RouteAutoController(doc.controller_waypoints(), poles=[], config=cfg)
-    return ctrl, cfg, map_frame, doc
+    return ctrl, ctrl.cfg, map_frame, doc
 
 
 # --------------------------------------------------------------------------
@@ -136,84 +129,6 @@ class DroneState:
         d = DroneState(self.pos_m.copy(), float(self.yaw), self.vel_m.copy())
         d.yaw_rate = float(self.yaw_rate)
         return d
-
-
-class Localizer:
-    """True meters -> reported map-units with misalignment residue + defects.
-
-    Truth: p_map_truth = pos_m / s. Report inverts with a wrong scale
-    (1+scale_err), then adds constant yaw/position biases, Gaussian noise,
-    latency (delay line) and dropouts/outages (stale stamp reuse).
-    """
-
-    def __init__(
-        self,
-        s: float,
-        yaw_bias: float,
-        pos_bias_u: np.ndarray,
-        scale_err: float,
-        pos_sigma_u: float,
-        yaw_sigma: float,
-        latency_s: float,
-        drop_rate: float,
-        outage_every_s: float,
-        outage_dur_s: float,
-        rng: np.random.Generator,
-    ):
-        self.s = float(s)
-        self.yaw_bias = float(yaw_bias)
-        self.pos_bias = np.asarray(pos_bias_u, float)
-        self.scale_err = float(scale_err)
-        self.pos_sigma = float(pos_sigma_u)
-        self.yaw_sigma = float(yaw_sigma)
-        self.latency = float(latency_s)
-        self.drop_rate = float(drop_rate)
-        self.outage_every = float(outage_every_s)
-        self.outage_dur = float(outage_dur_s)
-        self.rng = rng
-        self._buf: list[tuple[float, np.ndarray, float]] = []  # (t, pos_m, yaw)
-        self._last_report: rpf.Pose | None = None
-
-    def push_truth(self, t: float, state: DroneState) -> None:
-        self._buf.append((t, state.pos_m.copy(), float(state.yaw)))
-        horizon = t - self.latency - 2.0
-        while len(self._buf) > 2 and self._buf[0][0] < horizon:
-            self._buf.pop(0)
-
-    def _in_outage(self, t: float) -> bool:
-        return (
-            self.outage_every > 0
-            and self.outage_dur > 0
-            and (t % self.outage_every) < self.outage_dur
-        )
-
-    def report(self, t: float) -> rpf.Pose | None:
-        """Pose in the controller's map frame, or None when nothing fresh."""
-        if self._in_outage(t):
-            return None  # total loss: no frame at all this tick
-        # delayed truth sample
-        want = t - self.latency
-        sample = self._buf[0]
-        for entry in self._buf:
-            if entry[0] <= want:
-                sample = entry
-            else:
-                break
-        _, pos_m, yaw = sample
-        if self.rng.random() < self.drop_rate and self._last_report is not None:
-            return self._last_report  # stale reuse: same stamp -> controller HOVERs
-        p_map = pos_m / (self.s * (1.0 + self.scale_err))
-        p_map = p_map + self.pos_bias + self.rng.normal(0.0, self.pos_sigma, 3)
-        yaw_rep = yaw + self.yaw_bias + math.radians(self.rng.normal(0.0, self.yaw_sigma))
-        pose = rpf.Pose(
-            float(p_map[0]),
-            float(p_map[1]),
-            float(p_map[2]),
-            float(yaw_rep),
-            stamp=float(sample[0]),
-        )
-        self._last_report = pose
-        return pose
 
 
 # --------------------------------------------------------------------------
@@ -247,6 +162,25 @@ class SimParams:
     drop_rate: float = 0.02
     outage_every_s: float = 0.0
     outage_dur_s: float = 0.0
+    # Sudden pose jumps (relocalization snaps): teleport up to jump_max_u for one tick.
+    jump_rate: float = 0.0
+    jump_max_u: float = 0.0
+    # Outlier frames: uniform noise over +-outlier_max_u (mismatch proxy).
+    outlier_rate: float = 0.0
+    outlier_max_u: float = 0.0
+    # WEAK_TRACK: low-confidence but reported; noise x weak_noise_gain that tick.
+    weak_rate: float = 0.0
+    weak_noise_gain: float = 3.0
+    # PREDICTED_ONLY: dead-reckoning extrapolation instead of a fresh fix.
+    predicted_rate: float = 0.0
+    # Total visual blackout: no fix at all, IMU-only estimate from the last
+    # visual anchor (production IMU_BRIDGE law: hold center, rotate by fused
+    # yaw, random-walk drift). Periodic: every blackout_every_s for
+    # blackout_dur_s. Defaults off.
+    blackout_every_s: float = 0.0
+    blackout_dur_s: float = 0.0
+    blackout_drift_mps: float = 0.0
+    blackout_yaw_drift_deg_s: float = 0.0
     # plant
     cruise_mps: float = 0.90  # horizontal speed at max_translation_pcmd
     max_vertical_speed_mps: float = 2.0  # configured desktop envelope, not capability maximum
@@ -263,8 +197,75 @@ class SimParams:
     # 0 disables it (pure drift, pessimistic).
     hover_hold_mps: float = 0.2
     hover_hold_gain: float = 0.5
+    # --- plant fidelity (all default to previous behavior) ---
+    # Tilt follows PCMD with its own lag; horizontal accel = tilt * g.
+    tau_tilt_s: float = 1e-3
+    thrust_margin: float = 99.0
+    # Battery sag: linear thrust loss over mission; 0 disables.
+    battery_sag_frac: float = 0.0
+    # Ground effect: lift cushion near takeoff altitude; 0 disables.
+    ground_effect_frac: float = 0.0
+    ground_effect_height_m: float = 1.0
+    # Yaw/translation coupling: yaw rate bleeds tilt authority; 0 disables.
+    yaw_coupling: float = 0.0
     gust_every_s: float = 0.0
     gust_m: float = 0.0
+    ground_altitude_m: float | None = None
+    telemetry_rate_hz: float = 5.0
+    telemetry_latency_ms: float = 200.0
+    telemetry_noise_mps: float = 0.0
+    telemetry_drop_rate: float = 0.0
+    wind_mean_mps: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    pose_rate_hz: float = 20.0
+    latency_jitter_ms: float = 0.0
+    position_correlation_s: float = 0.0
+    yaw_correlation_s: float = 0.0
+    bias_walk_u_sqrt_s: float = 0.0
+    reseed_confirm_frames: int = 0
+    command_latency_ms: float = 0.0
+    command_drop_rate: float = 0.0
+    command_ttl_s: float = 0.2
+    wind_model: str = "residual_ground_drift_proxy"
+    def __post_init__(self):
+        sag = float(self.battery_sag_frac)
+        if not __import__("math").isfinite(sag) or not 0.0 <= sag < 1.0:
+            raise ValueError("battery_sag_frac must be finite and in [0, 1)")
+        if not __import__("math").isfinite(float(self.duration_s)) or float(self.duration_s) <= 0:
+            raise ValueError("duration_s must be finite and positive")
+        if not __import__("math").isfinite(float(self.thrust_margin)) or float(self.thrust_margin) < 1.0:
+            raise ValueError("thrust_margin must be finite and >= 1")
+        yaw_c = float(self.yaw_coupling)
+        if not __import__("math").isfinite(yaw_c) or not 0.0 <= yaw_c <= 1.0:
+            raise ValueError("yaw_coupling must be finite and in [0, 1]")
+        if (sag != 0.0 or yaw_c != 0.0 or float(self.thrust_margin) != 99.0) and float(self.tau_tilt_s) <= 1e-3 + 1e-9:
+            raise ValueError("tilt dynamics require tau_tilt_s > 0.001")
+        for name in ("telemetry_rate_hz", "pose_rate_hz"):
+            rate = float(getattr(self, name))
+            if not __import__("math").isfinite(rate) or rate <= 0.0:
+                raise ValueError(f"{name} must be finite and > 0")
+        for name in ("telemetry_latency_ms", "telemetry_noise_mps", "latency_jitter_ms",
+                     "position_correlation_s", "yaw_correlation_s", "bias_walk_u_sqrt_s",
+                     "command_latency_ms"):
+            value = float(getattr(self, name))
+            if not __import__("math").isfinite(value) or value < 0.0:
+                raise ValueError(f"{name} must be finite and >= 0")
+        drop = float(self.telemetry_drop_rate)
+        if not __import__("math").isfinite(drop) or not 0.0 <= drop <= 1.0:
+            raise ValueError("telemetry_drop_rate must be finite and in [0, 1]")
+        command_drop = float(self.command_drop_rate)
+        if not __import__("math").isfinite(command_drop) or not 0.0 <= command_drop <= 1.0:
+            raise ValueError("command_drop_rate must be finite and in [0, 1]")
+        if not __import__("math").isfinite(float(self.command_ttl_s)) or float(self.command_ttl_s) <= 0.0:
+            raise ValueError("command_ttl_s must be finite and > 0")
+        frames = self.reseed_confirm_frames
+        if isinstance(frames, bool) or not isinstance(frames, int) or frames < 0:
+            raise ValueError("reseed_confirm_frames must be a non-negative int")
+        if str(self.wind_model) != "residual_ground_drift_proxy":
+            raise ValueError("wind_model must be residual_ground_drift_proxy")
+        if float(self.ground_effect_frac) > 0:
+            ground = self.ground_altitude_m
+            if ground is None or not __import__("math").isfinite(float(ground)):
+                raise ValueError("ground_altitude_m must be finite when ground_effect_frac > 0")
 
 
 @dataclass
@@ -283,26 +284,56 @@ class SimResult:
     waypoints_reached: list[int]
     speed_guard_interventions: int = 0
     max_waypoint_no_progress_s: float = 0.0
+    yaw_overlap_ticks: int = 0
     trace: list[dict] = field(default_factory=list)
-
 
 class _SimulationAutonomyChecks(DesktopRouteAutonomy):
     """Run production speed/stall checks without a flight worker or transport."""
 
     def __init__(self, limit: float, controller):
+        import queue as _queue
+        import threading as _threading
+        import time as _time
+        self.events: _queue.Queue = _queue.Queue()
+        self._cancel = _threading.Event()
+        self._paused = _threading.Event()
+        self._cancel_reason = ""
+        self._manual_handoff_attempted = False
+        self._manual_handoff_lock = _threading.Lock()
+        self._manual_handoff_thread = None
+        self._thread = None
+        self._watchdog_thread = None
+        self._watchdog_stop = _threading.Event()
+        self._heartbeat_lock = _threading.Lock()
+        self._heartbeat_mono = _time.monotonic()
+        self._landing_confirmed = None
+        self._pcmd_failure_streak = 0
+        self._auto_failed = False
+        self._auto_failure_detail = ""
+        self._failure_lock = _threading.Lock()
+        self._command_epoch = 0
+        self._mission_started = None
+        self._route_progress = _fresh_route_progress()
         self.backend = SimpleNamespace(
             state=SimpleNamespace(
                 autonomous_speed_limit_enabled=True,
                 autonomous_speed_limit_mps=limit,
+                att_yaw=0.0,
+                attitude_mono_ns=0,
+                speed_north_mps=0.0,
+                speed_east_mps=0.0,
+                ground_speed_mps=0.0,
+                ground_speed_mono_ns=0,
             )
         )
         self.stamp = 0.0
         self.now = lambda: self.stamp
         self._speed_guard_latched = False
         self._speed_command_scale = 1.0
+        self._speed_sample = None
+        self._speed_rate_mps2 = 0.0
         self.controller = controller
         self.phase = "ROUTE"
-        self._paused = SimpleNamespace(is_set=lambda: False)
         self._waypoint_progress = None
         self.failure_reason = None
 
@@ -312,14 +343,33 @@ class _SimulationAutonomyChecks(DesktopRouteAutonomy):
     def _send_zero(self, reason):
         return True
 
-    def _latch_auto_failure(self, detail, *, zero_reason):
-        self.failure_reason = detail
+    def _dispatch_route_pcmd(self, pcmd):
+        limited = tuple(int(v) for v in pcmd)
+        self._pcmd_failure_streak = 0
+        return True, "sim command channel", limited
 
-    def apply(self, pcmd, speed: float, stamp: float):
+    def _latch_auto_failure(self, detail, *, error=None, zero_reason="auto_failure_hover"):
+        super()._latch_auto_failure(detail, error=error, zero_reason=zero_reason)
+        self.failure_reason = self._auto_failure_detail
+
+    def _session_logs(self):
+        return None
+
+    def stream_healthy(self):
+        return True
+
+    def _olympe_yaw(self):
+        # Simulation feeds yaw explicitly per tick; bypass the wall-clock
+        # attitude-age gate used on the live link.
+        try:
+            yaw = float(self.backend.state.att_yaw)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return yaw if math.isfinite(yaw) else None
+
+    def apply(self, pcmd, stamp: float):
         self.stamp = stamp
-        self.backend.state.ground_speed_mps = speed
-        self.backend.state.ground_speed_mono_ns = int(stamp * 1e9)
-        return pcmd
+        return self._apply_speed_limit(pcmd)
 
 
 def _body_axes(yaw: float, map_frame) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -351,24 +401,56 @@ def _integrate_plant(
     vv_per_pct,
     yaw_per_pct,
     gust_phase,
+    *,
+    elapsed_s: float,
 ):
-    """Advance the physical plant by one control period, including wind."""
+    """Advance the physical plant by one control period, including wind.
+
+    Fidelity model: PCMD roll/pitch are tilt percentages. Commanded tilt
+    (rad) = pct/100 * MaxTilt; achieved tilt lags with tau_tilt_s and slews
+    at the firmware pitch/roll rate; horizontal accel = achieved tilt * g *
+    yaw-coupling (tilt approximation, not a 200 Hz firmware PID replica).
+    Total thrust (hover + tilt + climb) saturates at thrust_margin; battery
+    sag scales it down over the mission; ground effect adds a lift cushion
+    near takeoff altitude. The horizontal velocity loop is a speed
+    approximation keyed to cruise_mps, not a calibrated airframe model.
+    """
     roll, pitch, yaw_p, gaz = pcmd
-    sub = 4
+    sub = 10
     sdt = DT / sub
+    sim_now = float(elapsed_s)
+    wind_mean = np.asarray(params.wind_mean_mps, dtype=float).reshape(3)
+    wind_mean_world = (float(wind_mean[0]) * np.asarray(map_frame.east, dtype=float)
+                       + float(wind_mean[1]) * np.asarray(map_frame.north, dtype=float)
+                       + float(wind_mean[2]) * np.asarray(map_frame.up, dtype=float))
+    try:
+        from live_safety_config import (
+            DEFAULT_MAX_PITCH_ROLL_ROTATION_SPEED_DEGS as _MAX_TILT_RATE,
+            DEFAULT_MAX_TILT_DEG as _MAX_TILT,
+        )
+        max_tilt_deg = float(_MAX_TILT)
+        max_tilt_rate_deg_s = float(_MAX_TILT_RATE)
+    except (ImportError, AttributeError, TypeError, ValueError):
+        max_tilt_deg, max_tilt_rate_deg_s = 20.0, 60.0
+    max_tilt_rad = math.radians(max_tilt_deg)
+    max_tilt_rate = math.radians(max_tilt_rate_deg_s)
+    g0 = 9.81
+    tilt_cmd_fwd = pitch / 100.0 * max_tilt_rad
+    tilt_cmd_right = roll / 100.0 * max_tilt_rad
+    k_tilt = 1.0 - math.exp(-sdt / max(float(params.tau_tilt_s), 1e-6))
     fwd_w, right_w, up_w = _body_axes(state.yaw, map_frame)
-    # vh_per_pct encodes the cruise calibration (max_translation_pcmd ->
-    # cruise_mps); vertical uses the configured firmware speed envelope.
     v_tgt = fwd_w * (pitch * vh_per_pct) + right_w * (roll * vh_per_pct) + up_w * (gaz * vv_per_pct)
     yaw_rate_tgt = -math.radians(yaw_p * yaw_per_pct)
-    # hard capability caps (white-paper maxima, never exceeded even by gusts)
     if hover_anchor is not None and params.hover_hold_mps > 0:
         hold = (hover_anchor - state.pos_m) * params.hover_hold_gain
         hn = float(np.linalg.norm(hold))
         if hn > params.hover_hold_mps:
             hold = hold / hn * params.hover_hold_mps
-        v_tgt = v_tgt + hold
-    vh_cap = v_tgt - np.dot(v_tgt, up_w) * up_w
+        # Vertical part only: the horizontal hover correction is added once
+        # per substep after the speed/tilt mode is chosen (see hover_hold
+        # below). Adding the full vector here would apply it twice.
+        v_tgt = v_tgt + np.dot(hold, up_w) * up_w
+    vh_cap = v_tgt - np.dot(v_tgt, up_w) * up_w  # horizontal part
     if float(np.linalg.norm(vh_cap)) > VH_MAX_MPS:
         v_tgt = vh_cap / float(np.linalg.norm(vh_cap)) * VH_MAX_MPS + np.dot(v_tgt, up_w) * up_w
     vv_n = float(np.dot(v_tgt, up_w))
@@ -377,12 +459,14 @@ def _integrate_plant(
     k_h = 1.0 - math.exp(-sdt / params.tau_h_s)
     k_v = 1.0 - math.exp(-sdt / params.tau_v_s)
     k_y = 1.0 - math.exp(-sdt / params.tau_yaw_s)
+    tilt_fwd = float(getattr(state, "tilt_fwd", 0.0))
+    tilt_right = float(getattr(state, "tilt_right", 0.0))
     gust_displacement = np.zeros(3)
     for _ in range(sub):
-        # wind OU in world meters
+        # wind OU drift around the configured mean (ground-drift proxy)
         wind += (
             (
-                -wind / params.wind_tau_s * sdt
+                (wind_mean_world - wind) / params.wind_tau_s * sdt
                 + math.sqrt(2.0 / params.wind_tau_s)
                 * params.wind_sigma_mps
                 * math.sqrt(max(sdt, 1e-9))
@@ -394,14 +478,60 @@ def _integrate_plant(
         gust = np.zeros(3)
         if params.gust_every_s > 0 and params.gust_m > 0:
             gust_phase += sdt
-            if gust_phase >= params.gust_every_s:
+            if gust_phase + 1e-9 >= params.gust_every_s:
                 gust_phase = 0.0
                 gdir = rng.normal(0, 1, 3)
                 gdir /= np.linalg.norm(gdir) or 1.0
                 gust = gdir * (params.gust_m / sdt)  # exact metre displacement per impulse
                 gust_displacement += gust * sdt
-        vh = v_tgt - np.dot(v_tgt, up_w) * up_w  # horizontal part
+        # achieved tilt lags command (first-order) and slews at the firmware
+        # pitch/roll rate limit; horizontal accel = achieved tilt * g.
+        tilt_fwd += (tilt_cmd_fwd - tilt_fwd) * k_tilt
+        tilt_right += (tilt_cmd_right - tilt_right) * k_tilt
+        step_limit = max_tilt_rate * sdt
+        tilt_fwd = max(tilt_cmd_fwd - step_limit, min(tilt_cmd_fwd + step_limit, tilt_fwd))
+        tilt_right = max(tilt_cmd_right - step_limit, min(tilt_cmd_right + step_limit, tilt_right))
+        tilt_mag = math.hypot(float(tilt_fwd), float(tilt_right))
+        if tilt_mag > max_tilt_rad and tilt_mag > 0.0:
+            tilt_fwd *= max_tilt_rad / tilt_mag
+            tilt_right *= max_tilt_rad / tilt_mag
+        fwd_w, right_w, up_w = _body_axes(state.yaw, map_frame)
+        couple = 1.0 - float(params.yaw_coupling) * abs(float(state.yaw_rate)) / math.radians(200.0)
+        couple = max(0.0, min(1.0, couple))
+        a_h = (fwd_w * tilt_fwd + right_w * tilt_right) * g0 * couple
+        # thrust saturation + sag: tilt + climb share the margin over hover
+        climb_demand = abs(float(gaz * vv_per_pct)) / max(VV_MAX_MPS, 1e-6)
+        tilt_demand = float(np.linalg.norm(a_h)) / g0
+        sag_now = float(params.battery_sag_frac) * min(1.0, max(0.0, (sim_now + sdt) / max(float(params.duration_s), 1e-6)))
+        avail = max(0.0, float(params.thrust_margin) * (1.0 - sag_now) - 1.0)
+        if tilt_demand + climb_demand > avail and (tilt_demand + climb_demand) > 0:
+            a_h = a_h * max(0.0, avail / (tilt_demand + climb_demand))
+        # ground effect: lift cushion within ground_effect_height_m above the
+        # takeoff altitude (vertical only, no horizontal effect). Scaled to
+        # 10% of the vertical envelope so frac=1.0 ≈ 0.2 m/s, not a takeoff.
+        vv_lift = 0.0
+        if float(params.ground_effect_frac) > 0 and params.ground_altitude_m is not None:
+            hagl = float(np.dot(state.pos_m, up_w)) - float(params.ground_altitude_m)
+            if 0.0 <= hagl <= float(params.ground_effect_height_m):
+                vv_lift = float(params.ground_effect_frac) * (
+                    1.0 - hagl / max(float(params.ground_effect_height_m), 1e-6)
+                ) * 0.1 * float(params.max_vertical_speed_mps)
+        hover_hold = np.zeros(3)
+        if hover_anchor is not None and params.hover_hold_mps > 0:
+            hold = (hover_anchor - state.pos_m) * params.hover_hold_gain
+            hn = float(np.linalg.norm(hold))
+            if hn > params.hover_hold_mps:
+                hold = hold / hn * params.hover_hold_mps
+            hover_hold = hold - np.dot(hold, up_w) * up_w
+        vh = v_tgt - np.dot(v_tgt, up_w) * up_w  # horizontal part (legacy velocity loop)
         vv = np.dot(v_tgt, up_w) * up_w
+        # tilt path: with tau_tilt_s at default (~0) this is an exact no-op and
+        # the legacy velocity loop above runs unchanged; with tau_tilt_s set,
+        # the horizontal target comes from achieved tilt (tilt * g * tau_h).
+        if float(params.tau_tilt_s) > 1e-3 + 1e-9:
+            vh = a_h * float(params.tau_h_s)
+        vh = vh + hover_hold
+        vv = vv + up_w * vv_lift
         cur_h = state.vel_m - np.dot(state.vel_m, up_w) * up_w
         cur_v = np.dot(state.vel_m, up_w) * up_w
         cur_h += (vh - cur_h) * k_h
@@ -410,6 +540,8 @@ def _integrate_plant(
         state.pos_m += (state.vel_m + wind) * sdt + gust * sdt
         state.yaw_rate += (yaw_rate_tgt - state.yaw_rate) * k_y
         state.yaw = rpf.wrap_angle(state.yaw + state.yaw_rate * sdt)
+    state.tilt_fwd = float(tilt_fwd)
+    state.tilt_right = float(tilt_right)
     return wind, gust_phase, gust_displacement
 
 
@@ -429,6 +561,98 @@ def _inspection_dwell(ctrl, cmd, pose, cfg, t, land_hold_since):
     return land_hold_since, phase
 
 
+def _formal_terminal_success(reason, ctrl, n_wp):
+    """Map the formal loop terminal reason onto the offline result contract."""
+    text = str(reason or "")
+    if "route complete -> land" in text:
+        if int(ctrl.target_index) == int(n_wp) - 1:
+            return True, text
+        return False, text
+    return False, text
+
+
+def _formal_landing_settled(runner_record):
+    try:
+        samples = int(runner_record.get("landing_stable_samples", 0) or 0)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    try:
+        span = float(runner_record.get("landing_stable_span_s", 0.0) or 0.0)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    try:
+        speed = float(runner_record.get("landing_speed_mps"))
+    except (TypeError, ValueError, OverflowError):
+        return False
+    return samples >= 3 and span >= 1.0 and math.isfinite(speed) and speed <= 0.10
+
+
+def _formal_pose_from_record(runner_record, fallback):
+    """Pose the formal loop actually steered from, not the sensor-cell value."""
+    try:
+        pose_u = runner_record.get("pose_u")
+    except AttributeError:
+        return fallback
+    if pose_u is None:
+        return fallback
+    try:
+        xyz = [float(v) for v in pose_u]
+    except (TypeError, ValueError, OverflowError):
+        return fallback
+    if len(xyz) != 3 or not all(math.isfinite(v) for v in xyz):
+        return fallback
+    if fallback is None:
+        return fallback
+    try:
+        yaw = float(runner_record.get("pose_yaw", fallback.yaw))
+    except (TypeError, ValueError, OverflowError):
+        yaw = float(fallback.yaw)
+    if not math.isfinite(yaw):
+        yaw = float(fallback.yaw)
+    try:
+        return replace(
+            fallback,
+            x=float(xyz[0]),
+            y=float(xyz[1]),
+            z=float(xyz[2]),
+            yaw=float(yaw),
+        )
+    except (AttributeError, TypeError, ValueError, OverflowError):
+        return fallback
+
+def _inspection_command_from_record(runner_record, pose):
+    import numpy as _np
+    goal = _np.asarray(runner_record.get("target_u", [0.0, 0.0, 0.0]), dtype=float)
+    yaw_target = float(runner_record.get("yaw_target_deg", 0.0) or 0.0)
+    return rpf.Command(
+        "INSPECT",
+        _np.zeros(3),
+        _np.radians(yaw_target),
+        goal,
+        float(runner_record.get("path_error_u", 0.0) or 0.0),
+        float(runner_record.get("progress", 0.0) or 0.0),
+        look_at_pole={"waypoint": int(runner_record.get("target_index", 0) or 0) + 1},
+        should_land=False,
+        status=str(runner_record.get("action") or "INSPECT"),
+    )
+
+
+def _phase_ticks(phase):
+    text = str(phase or "")
+    base = text.removeprefix("fgc:")
+    if base in (
+        "turn",
+        "yaw_alignment_hold",
+        "yaw_alignment_confirmed",
+        "yaw_alignment_timeout",
+        "final_centering",
+    ):
+        return 0, 1
+    if base in ("translate", "route_rejoin", "waypoint_centering", "height_adjust"):
+        return 0, 0
+    return 1, 0
+
+
 def _update_hover_anchor(state, hover_anchor, map_frame, roll, pitch, gaz):
     if hover_anchor is None:
         hover_anchor = state.pos_m.copy()
@@ -442,51 +666,14 @@ def _update_hover_anchor(state, hover_anchor, map_frame, roll, pitch, gaz):
     return hover_anchor
 
 
-def _record_sim_arrival(ctrl, pose, prev_target, reached):
-    now_target = int(ctrl.target_index)
-    if prev_target != now_target:
-        reached.add(prev_target)
-    elif now_target not in reached and ctrl.waypoint_reached(
-        np.array([pose.x, pose.y, pose.z]), now_target
-    ):
-        reached.add(now_target)
-
-
-def _route_motion(cmd, pose, yaw_ctl, state, map_frame, wind, ctrl, t, params):
-    hover_ticks = yaw_ticks = 0
-    if pose is None:
-        action_pcmd = (0, 0, 0, 0)
-        phase = "stale_hover"
-    elif cmd.action in {"FOLLOW", "REJOIN", "FINAL_HOLD"}:
-        body_forward, body_right, _body_up = _body_axes(state.yaw, map_frame)
-        ground_velocity = state.vel_m + wind
-        action_pcmd = yaw_ctl.update(
-            cmd,
-            pose,
-            t,
-            target_key=int(ctrl.target_index),
-            yaw_sign=params.yaw_sign,
-            body_velocity=(
-                float(np.dot(ground_velocity, body_forward)),
-                float(np.dot(ground_velocity, body_right)),
-                t,
-            ),
-        )
-        phase = f"fgc:{yaw_ctl.phase}"
-        if yaw_ctl.phase in (
-            "turn",
-            "yaw_alignment_hold",
-            "yaw_alignment_confirmed",
-            "yaw_alignment_timeout",
-            "final_centering",
-        ):
-            yaw_ticks += 1
-    else:  # ARRIVING / HOVER
-        action_pcmd = (0, 0, 0, 0)
-        phase = cmd.action.lower()
-        hover_ticks += 1
-
-    return action_pcmd, phase, hover_ticks, yaw_ticks
+def _retired_target_from_record(runner_record, prev_target):
+    try:
+        current = int(runner_record.get("target_index", prev_target))
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if int(current) != int(prev_target):
+        return int(prev_target)
+    return None
 
 
 def _initial_sim_state(params, wp, map_frame, s):
@@ -525,7 +712,11 @@ def _simulation_budget(params: SimParams) -> tuple[float, int]:
 
 
 def run_sim(params: SimParams, *, record_trace: bool = True) -> tuple[SimResult, dict]:
-    rng = np.random.default_rng(params.seed)
+    seed_seq = np.random.SeedSequence(params.seed)
+    rng = np.random.default_rng(seed_seq.spawn(1)[0])
+    tele_rng = np.random.default_rng(seed_seq.spawn(1)[0])
+    loc_rng = np.random.default_rng(seed_seq.spawn(1)[0])
+    cmd_rng = np.random.default_rng(seed_seq.spawn(1)[0])
     ctrl, cfg, map_frame, doc = build_production_controller(
         params.route, params.align, return_to_start=params.return_to_start
     )
@@ -542,43 +733,58 @@ def run_sim(params: SimParams, *, record_trace: bool = True) -> tuple[SimResult,
     # AUTO start rule: waypoint 1 first, even when takeoff sits nearer a later point.
     ctrl.start_after_nearest_waypoint(np.asarray(start_map, float))
     join_target = int(ctrl.target_index)
-
-    loc = Localizer(
-        s,
-        math.radians(params.yaw_bias_deg),
-        np.array(params.pos_bias_u, float),
-        params.scale_error_pct / 100.0,
-        params.pos_noise_u,
-        params.yaw_noise_deg,
-        params.latency_ms / 1000.0,
-        params.drop_rate,
-        params.outage_every_s,
-        params.outage_dur_s,
-        rng,
+    from simulated_localization import CommandChannel, CommandChannelConfig, SimulatedLocalizer, SimulatedLocalizerConfig
+    loc_cfg = SimulatedLocalizerConfig(
+        s=s, yaw_bias_deg=params.yaw_bias_deg, pos_bias_u=tuple(params.pos_bias_u),
+        scale_error_pct=params.scale_error_pct, pos_sigma_u=params.pos_noise_u,
+        yaw_sigma_deg=params.yaw_noise_deg, latency_ms=params.latency_ms,
+        drop_rate=params.drop_rate, outage_every_s=params.outage_every_s,
+        outage_dur_s=params.outage_dur_s, jump_rate=params.jump_rate, jump_max_u=params.jump_max_u,
+        outlier_rate=params.outlier_rate, outlier_max_u=params.outlier_max_u,
+        weak_rate=params.weak_rate, weak_noise_gain=params.weak_noise_gain,
+        predicted_rate=params.predicted_rate, blackout_every_s=params.blackout_every_s,
+        blackout_dur_s=params.blackout_dur_s, blackout_drift_mps=params.blackout_drift_mps,
+        blackout_yaw_drift_deg_s=params.blackout_yaw_drift_deg_s,
+        pose_rate_hz=params.pose_rate_hz, latency_jitter_ms=params.latency_jitter_ms,
+        position_correlation_s=params.position_correlation_s, yaw_correlation_s=params.yaw_correlation_s,
+        bias_walk_u_sqrt_s=params.bias_walk_u_sqrt_s,
+        reseed_confirm_frames=params.reseed_confirm_frames,
     )
-    yaw_ctl = rpf.YawAlignedPcmdController(cfg)
-    heading_est = HeadingEstimator(map_frame)
+    loc = SimulatedLocalizer(loc_cfg, loc_rng)
+    cmd_channel = CommandChannel(CommandChannelConfig(
+        latency_ms=params.command_latency_ms, drop_rate=params.command_drop_rate,
+        ttl_s=params.command_ttl_s), cmd_rng)
+    import path_follow_flight as pff
 
     # per-% speed calibration: max_translation_pcmd flies cruise_mps horizontally.
     vh_per_pct = params.cruise_mps / max(1, int(cfg.max_translation_pcmd))
     vv_per_pct = params.max_vertical_speed_mps / 100.0
     yaw_per_pct = params.max_rotation_speed_deg_s / 100.0
-
     initial_wait, max_steps = _simulation_budget(params)
-    loc.push_truth(initial_wait, state)
-    wind = np.zeros(3)
+    wind_mean = np.asarray(params.wind_mean_mps, dtype=float).reshape(3)
+    if not np.all(np.isfinite(wind_mean)):
+        raise ValueError("wind_mean_mps must be finite")
+    for k in range(8):
+        loc.push_truth(initial_wait - (8 - k) * DT, state.pos_m, state.yaw)
+    loc.push_truth(initial_wait, state.pos_m, state.yaw)
+    wind_mean_world = (float(wind_mean[0]) * np.asarray(map_frame.east, dtype=float)
+                       + float(wind_mean[1]) * np.asarray(map_frame.north, dtype=float)
+                       + float(wind_mean[2]) * np.asarray(map_frame.up, dtype=float))
+    wind = np.array(wind_mean_world, dtype=float)
+    # Sampled, delayed NED telemetry (independent RNG stream).
+    tele_queue: list[tuple[float, float, float]] = []  # (capture_t, north, east)
+    tele_next = initial_wait
+    tele_last: tuple[float, float, float] | None = None  # (north, east, stamp)
     hover_anchor: np.ndarray | None = None
 
-    trace: list[dict] = []
     reached: set[int] = set()
-    last_fresh_stamp: float | None = None
-    lost_since: float | None = None
     hover_ticks = yaw_ticks = 0
+    yaw_overlap_ticks = 0
+    land_hold_since: float | None = None
     speed_guard = _SimulationAutonomyChecks(params.speed_limit_mps, ctrl)
     speed_guard_interventions = 0
     max_waypoint_no_progress_s = 0.0
     max_dev = 0.0
-    land_hold_since: float | None = None
     reason = "step cap" if max_steps else "localization wait exhausted total budget"
     success = False
     dist_m = 0.0
@@ -586,7 +792,73 @@ def run_sim(params: SimParams, *, record_trace: bool = True) -> tuple[SimResult,
     step = -1
     prev_pos = state.pos_m.copy()
     gust_phase = 0.0
+    safety_mode = {"mode": "AUTO"}
+    pose_cell: dict = {"pose": None}
+    oly_cell: dict = {"yaw": 0.0}
+    runner_cell: dict = {"runner": None}
+    sim_clock = {"t": float(initial_wait)}
 
+    def _safety_poll():
+        return str(safety_mode["mode"])
+
+    def _jump_pause(distance):
+        safety_mode["mode"] = "HOVER"
+
+    def _request_manual():
+        safety_mode["mode"] = "MANUAL"
+        return True
+
+    def _wait_expired(wait_reason, elapsed_s):
+        return speed_guard._check_wait_budget(wait_reason, elapsed_s)
+
+    def _send_authorized(pcmd):
+        runner_now = float(sim_clock["t"])
+        speed_guard.stamp = runner_now
+        authorized = speed_guard._send_authorized(tuple(int(v) for v in pcmd))
+        if not authorized[0]:
+            return False, str(authorized[1]), (0, 0, 0, 0)
+        sent = tuple(int(v) for v in (authorized[2] if authorized[2] is not None else (0, 0, 0, 0)))
+        cmd_channel.send(sent, t)
+        return True, "sim authorized", sent
+    logged: list = []
+    sim_trace: list[dict] = []
+
+    def _log_tick(record):
+        logged.append(record)
+
+    hooks = pff.LoopHooks(
+        get_pose=lambda: pose_cell["pose"],
+        olympe_yaw=lambda: float(oly_cell["yaw"]),
+        send_pcmd=lambda r, p, y, g: cmd_channel.send((r, p, y, g), t),
+        send_authorized_pcmd=_send_authorized,
+        pose_is_weak=lambda: bool(pose_cell["pose"] is not None and not bool(getattr(pose_cell["pose"], "map_confirmed", True))),
+        pose_is_predicted=lambda: bool(pose_cell["pose"] is not None and not bool(getattr(pose_cell["pose"], "position_observed", True))),
+        pose_reseed_confirming=lambda: bool(pose_cell["pose"] is not None and bool(getattr(pose_cell["pose"], "reseed_confirming", False))),
+        pose_confidence=lambda: 0 if pose_cell["pose"] is not None and not bool(getattr(pose_cell["pose"], "map_confirmed", True)) else 300,
+        force_relocalize=lambda: loc.note_recovery(),
+        request_manual=_request_manual,
+        stick_active=lambda: False,
+        safety_poll=_safety_poll,
+        stream_healthy=lambda: True,
+        stream_status=lambda: "sim",
+        loop_beat=lambda: None,
+        ground_speed=lambda: speed_guard._ground_speed(),
+        body_velocity=lambda: speed_guard._body_velocity(),
+        max_weak_pose_age_s=pff.POSE_STALE_S,
+        log_tick=_log_tick,
+        land_on_localization_loss=False,
+        wait_expired=_wait_expired,
+        now=lambda: float(sim_clock["t"]),
+    )
+    runner = pff._FlightLoopRunner(
+        hooks, ctrl, [np.array(point, float) for point in ctrl.wp],
+        yaw_sign=int(params.yaw_sign), verbose=False, enforce_weak_pose_gate=False,
+    )
+    runner_cell["runner"] = runner
+    # Offline plant: simulated time advances explicitly via t += DT. Never
+    # wall-clock sleep inside the formal tick or a full route costs minutes.
+    runner.period = 0.0
+    speed_guard._mission_started = initial_wait
     arrive_r = [float(ctrl._arrive_radius_for(i)) for i in range(n_wp)]
 
     def _olympe_report() -> float:
@@ -594,49 +866,140 @@ def run_sim(params: SimParams, *, record_trace: bool = True) -> tuple[SimResult,
         oly = (math.pi / 2.0 - state.yaw + math.pi) % (2.0 * math.pi) - math.pi
         return float(oly + math.radians(rng.normal(0.0, params.oly_noise_deg)))
 
+    def _pump_telemetry(now: float) -> None:
+        nonlocal tele_next, tele_last
+        rate = float(params.telemetry_rate_hz)
+        period = 1.0 / rate
+        while tele_next <= now + 1e-12:
+            capture = tele_next
+            tele_next += period
+            if tele_rng.random() < float(params.telemetry_drop_rate):
+                continue
+            true_ned_n = float(np.dot(state.vel_m + wind, np.asarray(map_frame.north, dtype=float)))
+            true_ned_e = float(np.dot(state.vel_m + wind, np.asarray(map_frame.east, dtype=float)))
+            noise = float(params.telemetry_noise_mps)
+            if noise > 0:
+                true_ned_n += float(tele_rng.normal(0.0, noise))
+                true_ned_e += float(tele_rng.normal(0.0, noise))
+            tele_queue.append((capture, true_ned_n, true_ned_e))
+        latency = float(params.telemetry_latency_ms) / 1000.0
+        while tele_queue and tele_queue[0][0] + latency <= now + 1e-12:
+            capture, north, east = tele_queue.pop(0)
+            tele_last = (north, east, capture)
+
+    def _trace_body_velocity():
+        body = speed_guard._body_velocity()
+        if body is None:
+            return None
+        return (float(body[0]), float(body[1]), float(body[2]))
+
+    def _publish_telemetry(now: float, oly_yaw_now: float) -> tuple[tuple[float, float] | None, float | None]:
+        _pump_telemetry(now)
+        speed_guard.stamp = now
+        speed_guard.backend.state.att_yaw = float(oly_yaw_now)
+        if tele_last is None:
+            speed_guard.backend.state.ground_speed_mps = float("nan")
+            speed_guard.backend.state.ground_speed_mono_ns = 0
+            speed_guard.backend.state.speed_north_mps = float("nan")
+            speed_guard.backend.state.speed_east_mps = float("nan")
+            return None, None
+        north, east, capture = tele_last
+        speed = math.hypot(north, east)
+        speed_guard.backend.state.speed_north_mps = north
+        speed_guard.backend.state.speed_east_mps = east
+        speed_guard.backend.state.ground_speed_mps = speed
+        speed_guard.backend.state.ground_speed_mono_ns = int(capture * 1e9)
+        body = speed_guard._body_velocity()
+        if body is None:
+            return None, None
+        return (body[0], body[1]), body[2]
+
     for step in range(max_steps):
         oly_yaw = _olympe_report()
-        visual = loc.report(t)
-        fresh = visual is not None and (last_fresh_stamp is None or visual.stamp > last_fresh_stamp)
-        if fresh:
-            heading_est.update(float(visual.yaw), oly_yaw)
-        fused = heading_est.heading(oly_yaw)
-        pose = (
-            rpf.Pose(
-                float(visual.x),
-                float(visual.y),
-                float(visual.z),
-                float(fused),
-                stamp=float(visual.stamp),
-            )
-            if visual is not None and fused is not None
-            else None
-        )
-        if fresh:
-            last_fresh_stamp = float(pose.stamp)
-            lost_since = None
-        else:
-            if last_fresh_stamp is None:
-                lost_since = 0.0 if lost_since is None else lost_since
-            else:
-                # age of the newest fix the localizer ever produced
-                lost_since = t - last_fresh_stamp if lost_since is None else lost_since
-                if fresh is False and pose is None:
-                    pass
-            # total-loss timer uses sim time since last fresh stamp
-            if last_fresh_stamp is not None and t - last_fresh_stamp >= MAX_SIM_OUTAGE_S:
-                reason = f"simulation localization outage exceeded {MAX_SIM_OUTAGE_S:.0f}s"
-                break
-
+        sim_clock["t"] = float(t)
+        oly_cell["yaw"] = float(oly_yaw)
         prev_target = int(ctrl.target_index)
-        cmd = ctrl.step(pose, t)
-        if pose is not None and fresh:
-            _record_sim_arrival(ctrl, pose, prev_target, reached)
-
-        # The controller owns segment recovery; the simulator measures its result.
-        action_pcmd: tuple[int, int, int, int] = (0, 0, 0, 0)
-        phase = ""
-        if pose is not None and fresh:
+        logged_before = len(logged)
+        pose_cell["pose"] = loc.report(t)
+        _publish_telemetry(t, oly_yaw)
+        runner_outcome = runner.step()
+        sim_clock["t"] = float(t)
+        runner_record = logged[logged_before] if len(logged) > logged_before else None
+        if runner_record is None:
+            # wait_expired latches AUTO failure and returns a terminal outcome
+            # without emitting a per-tick row (same as the live loop: nothing
+            # is dispatched after the handoff). Surface the latched detail.
+            reason = str(getattr(speed_guard, "failure_reason", None) or getattr(speed_guard, "_auto_failure_detail", None) or runner_outcome.reason or "formal flight loop did not log this tick")
+            success = False
+            break
+        pose = _formal_pose_from_record(runner_record, pose_cell["pose"])
+        if str(safety_mode["mode"]) == "MANUAL":
+            reason = "manual handoff: autonomy sends nothing after pilot takeover"
+            break
+        if runner_outcome.reason is not None:
+            success, reason = _formal_terminal_success(runner_outcome.reason, ctrl, n_wp)
+            if "route complete -> land" in str(runner_outcome.reason or "") and success:
+                reached.add(int(ctrl.target_index))
+                if record_trace:
+                    try:
+                        dist_term, _, _, _ = rpf.project_to_path(
+                            np.array([pose.x, pose.y, pose.z]), list(ctrl.wp), ctrl.cum
+                        )
+                    except (AttributeError, TypeError, ValueError, OverflowError):
+                        dist_term = float("nan")
+                    body_forward, body_right, _up = _body_axes(state.yaw, map_frame)
+                    gv = state.vel_m + wind
+                    tele_term = _trace_body_velocity()
+                    sim_trace.append(
+                        {
+                            "t": round(t, 3),
+                            "step": step,
+                            "true_m": state.pos_m.tolist(),
+                            "true_map_u": (state.pos_m / s).tolist(),
+                            "est_map_u": pose.xyz.tolist() if pose is not None else [float("nan")] * 3,
+                            "yaw_deg": round(math.degrees(state.yaw), 2),
+                            "action": "LAND",
+                            "phase": str(runner_record.get("pcmd_phase") or "final_centering"),
+                            "target_idx": int(ctrl.target_index),
+                            "progress": 1.0,
+                            "path_err_u": float(runner_record.get("path_error_u", 0.0) or 0.0),
+                            "dev_u": float(dist_term),
+                            "ground_speed_mps": float(map_frame.horizontal_distance(gv)),
+                            "body_velocity_mps": [float(np.dot(gv, body_forward)), float(np.dot(gv, body_right))],
+                            "measured_body_velocity_mps": None if tele_term is None else [float(tele_term[0]), float(tele_term[1])],
+                            "telemetry_stamp": None if tele_term is None else float(tele_term[2]),
+                            "pcmd_requested": list(tuple(int(v) for v in runner_record.get("pcmd_requested", (0, 0, 0, 0)))),
+                            "pcmd": list(tuple(int(v) for v in runner_record.get("pcmd_requested", (0, 0, 0, 0)))),
+                            "pcmd_applied": list(tuple(int(v) for v in runner_record.get("pcmd_requested", (0, 0, 0, 0)))),
+                            "speed_guard_status": str(getattr(speed_guard.backend.state, "autonomous_speed_guard_status", "")),
+                            "pose_stamp": float(pose.stamp) if pose is not None else None,
+                            "map_confirmed": bool(getattr(pose, "map_confirmed", True)) if pose is not None else False,
+                            "retired_target_idx": int(ctrl.target_index),
+                            "gust_displacement_m": [0.0, 0.0, 0.0],
+                            "gust_time_s": None,
+                            "loc_fault": loc.fault,
+                            "landing_stable_samples": int(runner_record.get("landing_stable_samples", 0) or 0),
+                            "landing_stable_span_s": round(float(runner_record.get("landing_stable_span_s", 0.0) or 0.0), 3),
+                            "landing_speed_measured_mps": runner_record.get("landing_speed_mps"),
+                            "landing_speed_reason": runner_record.get("landing_speed_reason"),
+                        }
+                    )
+            break
+        cmd_action = str(runner_record.get("command_action") or "")
+        if cmd_action == "ABORT_PENDING_INSPECTION":
+            reason = "ABORT: pending inspection at route end"
+            break
+        if "command_action" not in runner_record:
+            # Formal safety hold (BOOT/recovery/jump/HOVER): apply the logged
+            # zero and integrate the plant without a navigation decision.
+            action_pcmd = tuple(int(v) for v in runner_record.get("pcmd", (0, 0, 0, 0)))
+            phase = str(runner_record.get("localization_recovery_state") or runner_record.get("reason") or "safety_hold")
+        else:
+            # The controller owns segment recovery; the simulator measures its result.
+            action_pcmd = tuple(int(v) for v in runner_record.get("pcmd_requested", (0, 0, 0, 0)))
+            phase = str(runner_record.get("pcmd_phase") or "")
+        tele_body = _trace_body_velocity()
+        if pose is not None:
             dist, _nearest_pt, _seg, _s = rpf.project_to_path(
                 np.array([pose.x, pose.y, pose.z]), list(ctrl.wp), ctrl.cum
             )
@@ -645,92 +1008,94 @@ def run_sim(params: SimParams, *, record_trace: bool = True) -> tuple[SimResult,
         else:
             dist = float("nan")
 
-        if cmd.should_land and cmd.action == "ABORT_PENDING_INSPECTION":
-            reason = "ABORT: pending inspection at route end"
-            break
-
-        if cmd.action == "INSPECT":
-            # patrol routes carry no poles; if they ever do, auto-ack like the
-            # gimbal/capture pipeline would after alignment + drain dwell.
-            action_pcmd = (
-                rpf.command_to_body_percent(
-                    cmd, pose, config=cfg, yaw_sign=params.yaw_sign, require_yaw_alignment=True
-                )
-                if pose is not None
-                else (0, 0, 0, 0)
-            )
-            phase = "inspect_hold"
+        if cmd_action == "INSPECT":
+            cmd = _inspection_command_from_record(runner_record, pose)
             land_hold_since, phase = _inspection_dwell(ctrl, cmd, pose, cfg, t, land_hold_since)
-        elif cmd.should_land and cmd.action == "LAND":
-            action_pcmd = (0, 0, 0, 0)
-            phase = "landing_hold"
-            speed_mps = map_frame.horizontal_distance(state.vel_m + wind)
-            transition = decide_route_completion_landing(cmd.action, (speed_mps, t), t)
-            if transition.outcome == "land":
-                success = True
-                reason = transition.reason
-                if record_trace:
-                    trace.append(
-                        {
-                            "t": round(t, 3),
-                            "step": step,
-                            "true_m": state.pos_m.tolist(),
-                            "true_map_u": (state.pos_m / s).tolist(),
-                            "est_map_u": pose.xyz.tolist(),
-                            "yaw_deg": round(math.degrees(state.yaw), 2),
-                            "action": "LAND",
-                            "phase": phase,
-                            "target_idx": int(ctrl.target_index),
-                            "progress": 1.0,
-                            "path_err_u": float(cmd.path_error),
-                            "dev_u": float(dist),
-                            "ground_speed_mps": speed_mps,
-                            "pcmd": list(action_pcmd),
-                        }
-                    )
-                break
+            action_pcmd = tuple(int(v) for v in runner_record.get("pcmd_requested", (0, 0, 0, 0)))
+            phase = str(runner_record.get("pcmd_phase") or phase)
+        elif cmd_action == "LAND":
+            # The formal loop only emits LAND after the landing confirmation
+            # guard passes, and then it returns the terminal outcome on the
+            # same tick; a bare LAND log without one is a stale snapshot, so
+            # keep integrating instead of ending the offline run early.
+            hover_inc, yaw_inc = _phase_ticks(phase)
+            hover_ticks += hover_inc
+            yaw_ticks += yaw_inc
         else:
-            land_hold_since = None if cmd.action != "INSPECT" else land_hold_since
-            action_pcmd, phase, hover_inc, yaw_inc = _route_motion(
-                cmd, pose, yaw_ctl, state, map_frame, wind, ctrl, t, params
-            )
+            hover_inc, yaw_inc = _phase_ticks(phase)
             hover_ticks += hover_inc
             yaw_ticks += yaw_inc
 
-        guarded = speed_guard.apply(
-            action_pcmd, map_frame.horizontal_distance(state.vel_m + wind), t
-        )
-        speed_guard_interventions += guarded != action_pcmd
-        progress_record = {
-            "pcmd": guarded,
-            "pcmd_phase": phase.removeprefix("fgc:"),
-            "target_index": int(ctrl.target_index),
-            "pose_u": None if pose is None else pose.xyz,
-            "pose_stamp": None if pose is None else float(pose.stamp),
-            "path_error_u": float(cmd.path_error),
-            "yaw_error_deg": None
-            if pose is None
-            else math.degrees(rpf.wrap_angle(cmd.yaw_target - pose.yaw)),
-            "turn_anchor_error_u": yaw_ctl.turn_anchor_error_u,
-        }
-        speed_guard._check_waypoint_progress(progress_record)
         max_waypoint_no_progress_s = max(
-            max_waypoint_no_progress_s, progress_record.get("waypoint_no_progress_s", 0.0)
+            max_waypoint_no_progress_s, float(runner_record.get("waypoint_no_progress_s", 0.0) or 0.0)
         )
         if speed_guard.failure_reason is not None:
             reason = speed_guard.failure_reason
             break
-        roll, pitch, yaw_p, gaz = (int(v) for v in guarded)
+        if speed_guard._auto_failed:
+            reason = str(speed_guard._auto_failure_detail)
+            break
+        applied_now, _age_s, _seq = cmd_channel.applied(t)
+        roll, pitch, yaw_p, gaz = (int(v) for v in applied_now)
+        requested = tuple(int(v) for v in runner_record.get("pcmd_requested", (0, 0, 0, 0)))
+        if (roll, pitch, yaw_p, gaz) != requested and any(v != 0 for v in requested):
+            speed_guard_interventions += 1
         body_forward, body_right, _body_up = _body_axes(state.yaw, map_frame)
         ground_velocity = state.vel_m + wind
         body_velocity = (
             float(np.dot(ground_velocity, body_forward)),
             float(np.dot(ground_velocity, body_right)),
         )
-        if yaw_p and adds_horizontal_speed(roll, pitch, body_velocity):
-            reason = "horizontal PCMD adds speed while yawing"
-            break
+        # Production removed the turn gate (SAFETY.md: no yaw+horizontal FAIL);
+        # the estimator can disagree with truth for a tick and a wind-hold can
+        # read as along-track on the true velocity. Count it for the debrief,
+        # never fail the run on it.
         hover_anchor = _update_hover_anchor(state, hover_anchor, map_frame, roll, pitch, gaz)
+
+        # Record-before-integrate: one row = time t, pre-control state, the
+        # formal loop decision, and the command actually applied. Gust
+        # displacement is backfilled after integration with its own time base.
+        rec: dict | None = None
+        retired_now = _retired_target_from_record(runner_record, prev_target)
+        if retired_now is not None:
+            reached.add(int(retired_now))
+        if record_trace:
+            pre_m = state.pos_m.copy()
+            pre_u = (state.pos_m / s).tolist()
+            est = np.array([pose.x, pose.y, pose.z]) if pose is not None else np.full(3, np.nan)
+            rec = {
+                "t": round(t, 3),
+                "step": step,
+                "true_m": [round(float(v), 4) for v in pre_m],
+                "true_map_u": [float(v) for v in pre_u],
+                "est_map_u": [round(float(v), 5) for v in est],
+                "yaw_deg": round(math.degrees(state.yaw), 2),
+                "action": cmd_action,
+                "phase": phase,
+                "target_idx": int(ctrl.target_index),
+                "progress": round(float(runner_record.get("progress", 0.0) or 0.0), 4),
+                "path_err_u": round(float(runner_record.get("path_error_u", 0.0) or 0.0), 5),
+                "dev_u": round(float(dist), 5) if math.isfinite(dist) else None,
+                "ground_speed_mps": float(map_frame.horizontal_distance(ground_velocity)),
+                "body_velocity_mps": [float(body_velocity[0]), float(body_velocity[1])],
+                "measured_body_velocity_mps": None if tele_body is None else [float(tele_body[0]), float(tele_body[1])],
+                "telemetry_stamp": None if tele_body is None else float(tele_body[2]),
+                "pcmd_requested": list(action_pcmd),
+                "pcmd": [roll, pitch, yaw_p, gaz],
+                "pcmd_applied": [roll, pitch, yaw_p, gaz],
+                "speed_guard_status": str(getattr(speed_guard.backend.state, "autonomous_speed_guard_status", "")),
+                "pose_stamp": None if pose is None else float(pose.stamp),
+                "map_confirmed": bool(getattr(pose, "map_confirmed", True)) if pose is not None else False,
+                "position_observed": bool(getattr(pose, "position_observed", True)) if pose is not None else False,
+                "retired_target_idx": retired_now,
+                "gust_displacement_m": [0.0, 0.0, 0.0],
+                "gust_time_s": None,
+                "loc_fault": loc.fault,
+                "landing_stable_samples": int(runner_record.get("landing_stable_samples", 0) or 0),
+                "landing_stable_span_s": round(float(runner_record.get("landing_stable_span_s", 0.0) or 0.0), 3),
+                "landing_speed_measured_mps": runner_record.get("landing_speed_mps"),
+                "landing_speed_reason": runner_record.get("landing_speed_reason"),
+            }
 
         wind, gust_phase, gust_displacement = _integrate_plant(
             state,
@@ -744,34 +1109,18 @@ def run_sim(params: SimParams, *, record_trace: bool = True) -> tuple[SimResult,
             vv_per_pct,
             yaw_per_pct,
             gust_phase,
+            elapsed_s=t,
         )
         dist_m += float(np.linalg.norm(state.pos_m - prev_pos))
         prev_pos = state.pos_m.copy()
 
         t += DT
-        loc.push_truth(t, state)
+        loc.push_truth(t, state.pos_m, state.yaw)
 
-        if record_trace:
-            est = np.array([pose.x, pose.y, pose.z]) if pose is not None else np.full(3, np.nan)
-            trace.append(
-                {
-                    "t": round(t, 3),
-                    "step": step,
-                    "true_m": [round(float(v), 4) for v in state.pos_m],
-                    "true_map_u": [float(v) for v in state.pos_m / s],
-                    "est_map_u": [round(float(v), 5) for v in est],
-                    "yaw_deg": round(math.degrees(state.yaw), 2),
-                    "action": cmd.action,
-                    "phase": phase,
-                    "target_idx": int(ctrl.target_index),
-                    "progress": round(float(cmd.progress), 4),
-                    "path_err_u": round(float(cmd.path_error), 5),
-                    "dev_u": round(float(dist), 5) if math.isfinite(dist) else None,
-                    "pcmd": [roll, pitch, yaw_p, gaz],
-                    "body_velocity_mps": [round(value, 4) for value in body_velocity],
-                    "gust_displacement_m": gust_displacement.tolist(),
-                }
-            )
+        if rec is not None:
+            rec["gust_displacement_m"] = gust_displacement.tolist()
+            rec["gust_time_s"] = round(t, 3) if float(np.linalg.norm(gust_displacement)) > 1e-12 else None
+            sim_trace.append(rec)
 
     progress_pct = 100.0 * float(ctrl.progress_s) / float(ctrl.path_len)
     # waypoints actually retired by the sequencer (monotonic front), plus sphere hits
@@ -790,7 +1139,8 @@ def run_sim(params: SimParams, *, record_trace: bool = True) -> tuple[SimResult,
         waypoints_reached=sorted(reached),
         speed_guard_interventions=speed_guard_interventions,
         max_waypoint_no_progress_s=max_waypoint_no_progress_s,
-        trace=trace,
+        yaw_overlap_ticks=yaw_overlap_ticks,
+        trace=sim_trace if record_trace else [],
     )
     home_label = 1 if params.return_to_start else (n_wp - 1) // 2 + 1
     info = {
@@ -898,7 +1248,6 @@ def _save_plots(
     fig, axes = plt.subplots(3, 1, figsize=(10, 8), sharex=True)
     axes[0].plot(tt, dev, color="tab:blue", lw=0.8, label="route deviation (telemetry)")
     axes[0].set_ylabel("map units")
-    axes[0].legend(fontsize=8)
     axes[0].grid(alpha=0.3)
     axes[0].set_title(f"tracking + PCMD  ({result.reason})")
     for j, name in enumerate(["roll", "pitch", "yaw", "gaz"]):
@@ -1009,7 +1358,39 @@ def build_parser() -> argparse.ArgumentParser:
     )
     ap.add_argument("--gust-every-s", type=float, default=0.0)
     ap.add_argument("--gust-m", type=float, default=0.0)
-    ap.add_argument("--out", type=Path, default=None)
+    ap.add_argument("--tau-tilt-s", type=float, default=1e-3)
+    ap.add_argument("--thrust-margin", type=float, default=99.0)
+    ap.add_argument("--battery-sag-frac", type=float, default=0.0)
+    ap.add_argument("--ground-effect-frac", type=float, default=0.0)
+    ap.add_argument("--ground-effect-height-m", type=float, default=1.0)
+    ap.add_argument("--yaw-coupling", type=float, default=0.0)
+    ap.add_argument("--jump-rate", type=float, default=0.0)
+    ap.add_argument("--jump-max-u", type=float, default=0.0)
+    ap.add_argument("--outlier-rate", type=float, default=0.0)
+    ap.add_argument("--outlier-max-u", type=float, default=0.0)
+    ap.add_argument("--weak-rate", type=float, default=0.0)
+    ap.add_argument("--weak-noise-gain", type=float, default=3.0)
+    ap.add_argument("--predicted-rate", type=float, default=0.0)
+    ap.add_argument("--blackout-every-s", type=float, default=0.0)
+    ap.add_argument("--blackout-dur-s", type=float, default=0.0)
+    ap.add_argument("--blackout-drift-mps", type=float, default=0.0)
+    ap.add_argument("--blackout-yaw-drift-deg-s", type=float, default=0.0)
+    ap.add_argument("--ground-altitude-m", type=float, default=None)
+    ap.add_argument("--telemetry-rate-hz", type=float, default=5.0)
+    ap.add_argument("--telemetry-latency-ms", type=float, default=200.0)
+    ap.add_argument("--telemetry-noise-mps", type=float, default=0.0)
+    ap.add_argument("--telemetry-drop-rate", type=float, default=0.0)
+    ap.add_argument("--wind-mean-mps", type=float, nargs=3, default=[0.0, 0.0, 0.0],
+                    metavar=("E", "N", "U"))
+    ap.add_argument("--pose-rate-hz", type=float, default=20.0)
+    ap.add_argument("--latency-jitter-ms", type=float, default=0.0)
+    ap.add_argument("--position-correlation-s", type=float, default=0.0)
+    ap.add_argument("--yaw-correlation-s", type=float, default=0.0)
+    ap.add_argument("--bias-walk-u-sqrt-s", type=float, default=0.0)
+    ap.add_argument("--reseed-confirm-frames", type=int, default=0)
+    ap.add_argument("--command-latency-ms", type=float, default=0.0)
+    ap.add_argument("--command-drop-rate", type=float, default=0.0)
+    ap.add_argument("--command-ttl-s", type=float, default=0.2)
     ap.add_argument("--no-plot", action="store_true")
     return ap
 
@@ -1040,6 +1421,38 @@ def _params_from_args(a: argparse.Namespace, *, seed: int, scale: float) -> SimP
         hover_hold_mps=a.hover_hold_mps,
         gust_every_s=a.gust_every_s,
         gust_m=a.gust_m,
+        tau_tilt_s=a.tau_tilt_s,
+        thrust_margin=a.thrust_margin,
+        battery_sag_frac=a.battery_sag_frac,
+        ground_effect_frac=a.ground_effect_frac,
+        ground_effect_height_m=a.ground_effect_height_m,
+        yaw_coupling=a.yaw_coupling,
+        jump_rate=a.jump_rate,
+        jump_max_u=a.jump_max_u,
+        outlier_rate=a.outlier_rate,
+        outlier_max_u=a.outlier_max_u,
+        weak_rate=a.weak_rate,
+        weak_noise_gain=a.weak_noise_gain,
+        predicted_rate=a.predicted_rate,
+        blackout_every_s=a.blackout_every_s,
+        blackout_dur_s=a.blackout_dur_s,
+        blackout_drift_mps=a.blackout_drift_mps,
+        blackout_yaw_drift_deg_s=a.blackout_yaw_drift_deg_s,
+        ground_altitude_m=a.ground_altitude_m,
+        telemetry_rate_hz=a.telemetry_rate_hz,
+        telemetry_latency_ms=a.telemetry_latency_ms,
+        telemetry_noise_mps=a.telemetry_noise_mps,
+        telemetry_drop_rate=a.telemetry_drop_rate,
+        wind_mean_mps=tuple(a.wind_mean_mps),
+        pose_rate_hz=a.pose_rate_hz,
+        latency_jitter_ms=a.latency_jitter_ms,
+        position_correlation_s=a.position_correlation_s,
+        yaw_correlation_s=a.yaw_correlation_s,
+        bias_walk_u_sqrt_s=a.bias_walk_u_sqrt_s,
+        reseed_confirm_frames=a.reseed_confirm_frames,
+        command_latency_ms=a.command_latency_ms,
+        command_drop_rate=a.command_drop_rate,
+        command_ttl_s=a.command_ttl_s,
     )
 
 
@@ -1103,6 +1516,7 @@ def main(argv: list[str] | None = None) -> int:
                 summary = {
                     "result": dict(result.__dict__),
                     "info": info,
+                    "ctrl_waypoints_u": [[float(v) for v in p] for p in ctrl.wp],
                     "params": {
                         k: (
                             str(v)
@@ -1144,9 +1558,31 @@ def main(argv: list[str] | None = None) -> int:
                             "pitch",
                             "yaw",
                             "gaz",
+                            "body_fwd_mps",
+                            "body_right_mps",
+                            "meas_fwd_mps",
+                            "meas_right_mps",
+                            "telemetry_stamp",
+                            "ground_speed_mps",
+                            "req_roll",
+                            "req_pitch",
+                            "req_yaw",
+                            "req_gaz",
+                            "speed_guard_status",
+                            "pose_stamp",
+                            "map_confirmed",
+                            "retired_target_idx",
+                            "gust_time_s",
+                            "gust_dx_m",
+                            "gust_dy_m",
+                            "gust_dz_m",
+                            "loc_fault",
                         ]
                     )
                     for r in result.trace:
+                        body = r.get("body_velocity_mps") or (float("nan"), float("nan"))
+                        meas = r.get("measured_body_velocity_mps") or (float("nan"), float("nan"))
+                        gust = r.get("gust_displacement_m") or (float("nan"), float("nan"), float("nan"))
                         w.writerow(
                             [
                                 r["t"],
@@ -1162,6 +1598,22 @@ def main(argv: list[str] | None = None) -> int:
                                 r["path_err_u"],
                                 r["dev_u"],
                                 *r["pcmd"],
+                                body[0],
+                                body[1],
+                                meas[0],
+                                meas[1],
+                                r.get("telemetry_stamp"),
+                                r.get("ground_speed_mps"),
+                                *(r.get("pcmd_requested") or r["pcmd"]),
+                                r.get("speed_guard_status", ""),
+                                r.get("pose_stamp"),
+                                r.get("map_confirmed"),
+                                r.get("retired_target_idx"),
+                                r.get("gust_time_s"),
+                                gust[0],
+                                gust[1],
+                                gust[2],
+                                r.get("loc_fault", "ok"),
                             ]
                         )
                 if not args.no_plot:

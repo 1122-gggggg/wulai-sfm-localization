@@ -10,6 +10,7 @@ from anafi_pcmd_sim.route import (
     FlightErrorConfig,
     LocalizationErrorState,
     NavigationFrameConfig,
+    OlympeRouteFollower,
     RouteConfig,
     RouteStressScenario,
     Waypoint,
@@ -17,6 +18,7 @@ from anafi_pcmd_sim.route import (
     _arsdk_state_name,
     camera_turn_angles,
     control_decision,
+    custom_enu_route,
     enu_yaw_from_olympe_heading,
     estimate_navigation_state,
     estimate_stress_navigation_state,
@@ -24,9 +26,11 @@ from anafi_pcmd_sim.route import (
     estimated_arrival_tolerance_m,
     generate_route,
     interpolated_yaw_at,
+    parse_enu_waypoints_text,
     pcmd_physical_setpoints,
     route_deviation_m,
     safety_violation,
+    truth_only_error_config,
     worst_case_route_scenarios,
 )
 
@@ -526,3 +530,59 @@ def test_short_nonzero_xy_projection_still_requires_yaw_alignment() -> None:
     assert decision.command.yaw != 0
     assert decision.command.pitch == 0
     assert decision.command.gaz == 0
+
+
+def test_truth_only_error_config_disables_localization_error() -> None:
+    config = truth_only_error_config()
+
+    assert config.maximum_position_error_m == 0.0
+    assert config.maximum_yaw_error_deg == 0.0
+    assert config.localization_latency_s == 0.0
+    assert config.localization_dropout_probability == 0.0
+
+
+def test_zero_error_estimate_returns_true_pose_with_full_confidence() -> None:
+    config = truth_only_error_config()
+    position = TruePosition(timestamp_s=1.0, x_m=2.0, y_m=3.0, z_m=4.0)
+    estimated, yaw, errors = estimate_navigation_state(
+        position, math.radians(30.0), rng=random.Random(42), config=config
+    )
+
+    assert estimated == position
+    assert yaw == pytest.approx(math.radians(30.0))
+    assert errors["position_error_m"] == 0.0
+    assert errors["localization_confidence"] == 1.0
+
+
+def test_truth_only_rejects_stress_scenario() -> None:
+    scenario = RouteStressScenario(name="final-approach-wind", final_approach_wind_m=0.4)
+
+    with pytest.raises(ValueError, match="truth_only"):
+        OlympeRouteFollower(stress_scenario=scenario, truth_only=True)
+
+
+def test_custom_enu_route_keeps_explicit_metres_and_indices() -> None:
+    plan = custom_enu_route([(0.0, 0.0, 1.5), (1.0, 0.5, 2.0)], seed=7)
+
+    assert [point.index for point in plan.waypoints] == [0, 1]
+    assert [(point.x_m, point.y_m, point.z_m) for point in plan.waypoints] == [
+        (0.0, 0.0, 1.5),
+        (1.0, 0.5, 2.0),
+    ]
+    assert plan.seed == 7
+
+
+def test_custom_enu_route_rejects_non_finite_metres() -> None:
+    with pytest.raises(ValueError, match="finite"):
+        custom_enu_route([(0.0, 0.0, float("nan"))])
+
+
+def test_parse_enu_waypoints_text_supports_comments() -> None:
+    points = parse_enu_waypoints_text("# first leg\n0,0,1.5\n1,0,1.5 # hover\n")
+
+    assert points == ((0.0, 0.0, 1.5), (1.0, 0.0, 1.5))
+
+
+def test_parse_enu_waypoints_text_rejects_bad_rows() -> None:
+    with pytest.raises(ValueError, match="expected"):
+        parse_enu_waypoints_text("0,0\n")

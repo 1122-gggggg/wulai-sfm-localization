@@ -34,16 +34,16 @@ import numpy as np
 
 from boq_extractor import BOQ_DIM, BoQExtractor
 from direct_map import DirectMapAssets
-from direct_paths import vendor_sys_path
+from direct_paths import sha256_file, vendor_sys_path
 from direct_profile import DirectProfile
 from edm_inference import CachedEDM
-
 
 vendor_sys_path()
 
 from sfm_diagnosis.edm_risk.edm_loo import EDMQuery  # noqa: E402
 from sfm_diagnosis.site_pipeline.deployment_localizer import (  # noqa: E402
     FinalMapEDMProvider,
+    _canonical_sha256,
     _configure_audited_runtime_site_packages,
     rank_reference_indices,
 )
@@ -237,6 +237,7 @@ class LiveMapEDMProvider(FinalMapEDMProvider):
         self._last_strong_refs: tuple[int, ...] = ()
         self.last_stage_ms: dict[str, float] = {}
         self._reference_norms: np.ndarray | None = None
+        self.startup_stage_ms: dict[str, float] = {}
 
     # -- construction helpers ---------------------------------------------
 
@@ -279,6 +280,25 @@ class LiveMapEDMProvider(FinalMapEDMProvider):
             "input_size": [EDM_TEST_RES, EDM_TEST_RES],
             "confidence_threshold": EDM_CONFIDENCE_THRESHOLD,
         }
+
+    def _compute_fingerprint(self) -> str:
+        """Live identity from verified bundle/profile plus weight/config content."""
+        edm_checkpoint = Path(str(self.edm_config["checkpoint"]))
+        model_config = Path(str(self.edm_config["model_config"]))
+        data_config = Path(str(self.edm_config["data_config"]))
+        return _canonical_sha256(
+            {
+                "implementation": "LIVE_DIRECT_FROZEN_BANK_V1",
+                "bundle": str(self.assets.sha256),
+                "profile": str(self.profile.sha256),
+                "edm_checkpoint": sha256_file(edm_checkpoint),
+                "boq_checkpoint": sha256_file(self.boq_weights),
+                "model_config_sha256": sha256_file(model_config),
+                "data_config_sha256": sha256_file(data_config),
+                "input_size": list(self.edm_config.get("input_size", [])),
+                "confidence_threshold": self.edm_config.get("confidence_threshold"),
+            }
+        )
 
     # -- vendor overrides --------------------------------------------------
 
@@ -324,20 +344,63 @@ class LiveMapEDMProvider(FinalMapEDMProvider):
 
     def ensure_models(self) -> None:
         """Load geometry, bank, EDM and BoQ, then warm the GPU kernels."""
-
         if self._models_ready:
             return
+        stage_ms: dict[str, float] = {}
+        mark = time.perf_counter()
         _configure_audited_runtime_site_packages(self.audited_edm_site_packages)
         self._prepare()
+        stage_ms["geometry_bank_ms"] = (time.perf_counter() - mark) * 1000.0
+        mark = time.perf_counter()
         self._matcher_runtime()
+        stage_ms["edm_load_ms"] = (time.perf_counter() - mark) * 1000.0
+        mark = time.perf_counter()
         self._vpr()
+        stage_ms["boq_load_ms"] = (time.perf_counter() - mark) * 1000.0
+        mark = time.perf_counter()
         self._index = self.build_reference_index(excluded_sessions=frozenset(), strict=False)
         self._reference_norms = np.linalg.norm(self._reference_descriptors, axis=1)
-        width, height = self.profile.fast_loop.resolution
-        # A real forward pass through both networks; an exception here is a
-        # broken deployment and must not be hidden behind the first stream frame.
-        self._localize_array(np.zeros((height, width), dtype=np.uint8), None)
+        stage_ms["reference_index_ms"] = (time.perf_counter() - mark) * 1000.0
+        mark = time.perf_counter()
+        self._warm_models()
+        stage_ms["kernel_warmup_ms"] = (time.perf_counter() - mark) * 1000.0
+        self.startup_stage_ms = dict(stage_ms)
         self._models_ready = True
+
+    def _warm_models(self) -> None:
+        """Run one real forward pass per network without touching the map anchor."""
+        width, height = self.profile.fast_loop.resolution
+        rng = np.random.default_rng(20260916)
+        texture = rng.integers(0, 256, size=(int(height), int(width)), dtype=np.uint8)
+        texture = np.ascontiguousarray(texture)
+        # BoQ sees one real descriptor forward on textured input.
+        boq_descriptor_from_array(self._vpr(), texture)
+        from river_map_quality.official_edm_adapter import (
+            prepare_official_megadepth_image_from_array,
+        )
+        runtime = self._matcher_runtime()
+        prepared = prepare_official_megadepth_image_from_array(texture, runtime)
+        # EDM runs the production matcher branch: batched when the profile
+        # enables it, single-reference otherwise. A temporary GPU cache keeps
+        # the warmup off the production reference cache.
+        saved_matcher = self._gpu_matcher
+        saved_matches = self._query_matches
+        self._query_matches = {}
+        self._gpu_matcher = None
+        try:
+            if bool(self.profile.reloc.batch_refs):
+                self._match_prepared_batch(runtime, prepared, [prepared] * int(self.profile.reloc.top_k))
+            else:
+                self._match_prepared(runtime, prepared, prepared)
+        finally:
+            self._query_matches = saved_matches
+            self._gpu_matcher = saved_matcher
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+        except (AttributeError, RuntimeError, ValueError):
+            pass
 
     @property
     def ref_names(self) -> tuple[str, ...]:

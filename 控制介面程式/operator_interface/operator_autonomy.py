@@ -598,21 +598,28 @@ class DesktopRouteAutonomy:
         previous = self._speed_sample
         if previous is None or stamp > previous[1]:
             gap = None if previous is None else stamp - previous[1]
-            self._speed_rate_mps2 = (
+            raw_rate = (
                 (speed - previous[0]) / gap if gap is not None and gap <= 0.5 else 0.0
             )
+            # 2026-09-16: single-tick telemetry jumps differenced at 20 Hz
+            # produced metre-per-s² spikes that predicted past the limit at
+            # 0.2 m/s and zeroed cruise. Clamp to plausible ANAFI accel.
+            self._speed_rate_mps2 = max(0.0, min(2.0, raw_rate))
             self._speed_sample = (speed, stamp)
         horizon = max(0.0, self.now() - stamp) + AUTO_SPEED_LIMIT_LOOKAHEAD_S
         return speed + max(0.0, self._speed_rate_mps2) * horizon
 
     def _apply_speed_limit(self, pcmd: Pcmd) -> Pcmd:
-        """Shrink horizontal PCMD that would push ground speed past the limit.
+        """Shrink only the along-motion PCMD that would push past the limit.
 
-        Never latched: the allowed tilt falls quadratically from the full cap at
-        standstill to zero at the limit, evaluated on speed predicted past the
-        telemetry delay. Commands that do not add speed along the current motion
-        (braking, wind hold) pass untouched, as does everything when fresh body
-        velocity is unavailable.
+        Never latched: the allowed forward projection falls linearly from the
+        full cap at standstill to zero at the limit, evaluated on speed
+        predicted past the telemetry delay. Decomposed in the body horizontal
+        plane with q=(pitch, roll) and v=(forward_v, right_v): the orthogonal
+        correction c is preserved and only the positive along-motion
+        projection a is limited. Commands that do not add speed along the
+        current motion (braking, wind hold) pass untouched, as does everything
+        when fresh body velocity is unavailable.
         """
         roll, pitch = int(pcmd[0]), int(pcmd[1])
         state = self.backend.state
@@ -630,20 +637,94 @@ class DesktopRouteAutonomy:
             state.autonomous_speed_guard_status = "SPEED_UNAVAILABLE"
             return pcmd
         forward_v, right_v, stamp = velocity
-        predicted = self._predicted_speed(math.hypot(forward_v, right_v), stamp)
-        if pitch * forward_v + roll * right_v <= 0.0:
+        try:
+            forward_v = float(forward_v)
+            right_v = float(right_v)
+        except (TypeError, ValueError, OverflowError):
+            state.autonomous_speed_guard_status = "SPEED_UNAVAILABLE"
+            return pcmd
+        if not math.isfinite(forward_v) or not math.isfinite(right_v):
+            state.autonomous_speed_guard_status = "SPEED_UNAVAILABLE"
+            return pcmd
+        speed = math.hypot(forward_v, right_v)
+        if speed < 1e-9:
             state.autonomous_speed_guard_status = "FRESH_SPEED_LIMIT"
             return pcmd
-        ceiling = (
-            self.controller.cfg.max_translation_pcmd * max(0.0, 1.0 - predicted / limit) ** 2
-        )
-        magnitude = max(abs(roll), abs(pitch))
-        if magnitude <= ceiling:
+        q_pitch, q_roll = float(pitch), float(roll)
+        u_pitch, u_roll = forward_v / speed, right_v / speed
+        along = q_pitch * u_pitch + q_roll * u_roll
+        if along <= 0.0:
             state.autonomous_speed_guard_status = "FRESH_SPEED_LIMIT"
             return pcmd
-        scale = ceiling / magnitude
+        try:
+            cap = int(self.controller.cfg.max_translation_pcmd)
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            state.autonomous_speed_guard_status = "SPEED_UNAVAILABLE"
+            return pcmd
+        cap_f = float(cap)
+        predicted = self._predicted_speed(speed, stamp)
+        full_cap = cap_f / max(abs(u_pitch), abs(u_roll))
+        allowed = full_cap * max(0.0, 1.0 - predicted / limit)
+        if along <= allowed:
+            state.autonomous_speed_guard_status = "FRESH_SPEED_LIMIT"
+            return pcmd
+        c_pitch = q_pitch - along * u_pitch
+        c_roll = q_roll - along * u_roll
+        peak = max(abs(c_pitch), abs(c_roll))
+        if peak > cap_f:
+            scale = cap_f / peak
+            c_pitch *= scale
+            c_roll *= scale
+        upper = min(along, allowed)
+        lower = 0.0
+        for c_i, u_i in ((c_pitch, u_pitch), (c_roll, u_roll)):
+            if abs(u_i) < 1e-12:
+                continue
+            lo = (-cap_f - c_i) / u_i
+            hi = (cap_f - c_i) / u_i
+            if lo > hi:
+                lo, hi = hi, lo
+            lower = max(lower, lo)
+            upper = min(upper, hi)
+        if not math.isfinite(lower) or not math.isfinite(upper):
+            state.autonomous_speed_guard_status = "SPEED_UNAVAILABLE"
+            return pcmd
+        new_along = min(max(upper, 0.0), min(along, allowed))
+        if new_along < 0.0:
+            new_along = 0.0
+        out_pitch = max(-cap, min(cap, int(round(c_pitch + new_along * u_pitch))))
+        out_roll = max(-cap, min(cap, int(round(c_roll + new_along * u_roll))))
+        order = tuple(sorted(
+            ((0, abs(u_pitch), (1 if u_pitch > 0 else -1 if u_pitch < 0 else 0)),
+             (1, abs(u_roll), (1 if u_roll > 0 else -1 if u_roll < 0 else 0))),
+            key=lambda item: (-item[1], item[0]),
+        ))
+        guard = 2 * cap + 4
+        while guard > 0:
+            proj = float(out_pitch) * u_pitch + float(out_roll) * u_roll
+            if proj <= allowed + 1e-9:
+                break
+            stepped = False
+            for axis, magnitude, direction in order:
+                if magnitude < 1e-12 or direction == 0:
+                    continue
+                if axis == 0:
+                    candidate = out_pitch - direction
+                    if -cap <= candidate <= cap:
+                        out_pitch = candidate
+                        stepped = True
+                        break
+                else:
+                    candidate = out_roll - direction
+                    if -cap <= candidate <= cap:
+                        out_roll = candidate
+                        stepped = True
+                        break
+            if not stepped:
+                break
+            guard -= 1
         state.autonomous_speed_guard_status = "SPEED_LIMITED"
-        return round(roll * scale), round(pitch * scale), pcmd[2], pcmd[3]
+        return out_roll, out_pitch, pcmd[2], pcmd[3]
 
     @staticmethod
     def _route_pcmd_reason(accepted: bool) -> str:
@@ -821,6 +902,9 @@ class DesktopRouteAutonomy:
             "ground_speed_mps", "speed_north_mps", "speed_east_mps", "speed_down_mps",
             "drone_altitude_m", "att_roll", "att_pitch", "att_yaw", "wind_state",
             "flight_state", "control_owner", "battery_pct",
+            # Camera extrinsics audit: gimbal/zoom changes move the observation
+            # model, so any future Kalman A/B must be able to gate on them.
+            "gimbal_pitch_deg", "zoom",
         ):
             record[name] = getattr(state, name, None)
         for name in ("ground_speed", "attitude", "altitude"):

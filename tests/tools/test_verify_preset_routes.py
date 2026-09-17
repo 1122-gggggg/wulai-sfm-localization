@@ -48,9 +48,13 @@ def test_every_preset_route_from_every_nearest_waypoint(tmp_path):
         assert row["accepted"] and row["completed"] and row["sequence_ok"]
         assert row["join_waypoint"] == row["expected_join_waypoint"]
         assert row["observed_target_order"] in row["accepted_target_orders"]
+        assert row["retired_target_order"] == row["expected_waypoint_indices"]
         assert row["waypoint_indices_reached"] == row["expected_waypoint_indices"]
+        assert row["arrival_truth_ok"]
+        assert all(item["ok"] for item in row["arrival_truth"])
         assert row["params"]["max_vertical_speed_mps"] == 2.0
         assert row["params"]["max_rotation_speed_deg_s"] == 20.0
+        assert row["phase_contract_violations"] == 0
         assert row["yaw_translation_overlap_samples"] == 0
         assert row["vertical_translation_overlap_samples"] == 0
 
@@ -139,3 +143,41 @@ def test_invalid_localization_wait_is_rejected(wait):
         sim._simulation_budget(
             sim.SimParams(route=Path("unused"), align=None, localization_wait_s=wait)
         )
+
+
+@pytest.mark.skipif(not ALIGN.is_file(), reason="requires the operator's river site assets")
+def test_short_visual_blackout_recovers_on_imu_hold():
+    """Total visual loss rides the production IMU-bridge law, then recovers.
+
+    During the blackout the estimate holds the last visual anchor (it must
+    not track truth motion: scale-free map has no velocity source) and the
+    run still completes once vision returns.
+    """
+    import numpy as np
+    from collections import Counter
+
+    route = next(ROUTES.glob("*.json"))
+    params = sim.SimParams(
+        route=route,
+        align=ALIGN,
+        meters_per_unit=10,
+        seed=7,
+        blackout_every_s=40,
+        blackout_dur_s=3,
+        blackout_drift_mps=0.05,
+        blackout_yaw_drift_deg_s=2.0,
+    )
+    result, _info = sim.run_sim(params, record_trace=True)
+    assert result.success, result.reason
+    faults = Counter(tick.get("loc_fault", "?") for tick in result.trace)
+    assert faults["blackout-imu"] > 0
+    est = np.array([tick["est_map_u"] for tick in result.trace])
+    tru = np.array([tick["true_map_u"] for tick in result.trace])
+    est_step = np.linalg.norm(np.diff(est, axis=0), axis=1)
+    tru_step = np.linalg.norm(np.diff(tru, axis=0), axis=1)
+    bo = [i for i, tick in enumerate(result.trace) if tick.get("loc_fault") == "blackout-imu"]
+    bo = [i for i in bo if i > 0]
+    assert bo
+    assert float(np.mean([est_step[i - 1] for i in bo])) < float(
+        np.mean([tru_step[i - 1] for i in bo])
+    )

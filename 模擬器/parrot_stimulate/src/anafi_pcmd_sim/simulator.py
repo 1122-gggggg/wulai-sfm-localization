@@ -235,6 +235,10 @@ class SphinxWindDisplacements:
         maximum_displacement_m: float,
         interval_s: float,
     ) -> None:
+        if maximum_displacement_m < 0.0:
+            raise ValueError("maximum_displacement_m must not be negative")
+        if interval_s <= 0.0:
+            raise ValueError("interval_s must be positive")
         self._rng = random.Random(seed)
         self._maximum_displacement_m = maximum_displacement_m
         self._interval_s = interval_s
@@ -285,6 +289,22 @@ class SphinxWindDisplacements:
 
     def __enter__(self) -> Self:
         self.start()
+        return self
+
+    def __exit__(self, _type: object, _value: object, _traceback: object) -> None:
+        self.stop()
+
+
+class NullWindDisturbances:
+    """No-op wind interface for the ground-truth baseline without wind."""
+
+    def __init__(self) -> None:
+        self.events: list[dict[str, float]] = []
+
+    def stop(self) -> None:
+        """Match the periodic disturbance cleanup interface."""
+
+    def __enter__(self) -> Self:
         return self
 
     def __exit__(self, _type: object, _value: object, _traceback: object) -> None:

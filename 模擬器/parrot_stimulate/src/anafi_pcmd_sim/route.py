@@ -77,6 +77,37 @@ class FlightErrorConfig:
     localization_error_correlation: float = 0.85
     localization_error_basis: str = "operator-observed GlueMap/EDM position and camera-heading caps"
 
+    def __post_init__(self) -> None:
+        if self.wind_maximum_displacement_m < 0.0:
+            raise ValueError("wind_maximum_displacement_m must not be negative")
+        if self.wind_displacement_interval_s <= 0.0:
+            raise ValueError("wind_displacement_interval_s must be positive")
+        if self.maximum_position_error_m < 0.0:
+            raise ValueError("maximum_position_error_m must not be negative")
+        if self.maximum_yaw_error_deg < 0.0:
+            raise ValueError("maximum_yaw_error_deg must not be negative")
+        if self.localization_latency_s < 0.0:
+            raise ValueError("localization_latency_s must not be negative")
+        if not 0.0 <= self.localization_dropout_probability <= 1.0:
+            raise ValueError("localization_dropout_probability must be in 0..1")
+        if not 0.0 <= self.localization_error_correlation <= 1.0:
+            raise ValueError("localization_error_correlation must be in 0..1")
+
+
+def truth_only_error_config(*, wind_maximum_displacement_m: float = 0.0) -> FlightErrorConfig:
+    """Ground-truth baseline: no localization error; wind stays explicitly opt-in."""
+    if wind_maximum_displacement_m < 0.0:
+        raise ValueError("wind_maximum_displacement_m must not be negative")
+    return FlightErrorConfig(
+        wind_maximum_displacement_m=wind_maximum_displacement_m,
+        maximum_position_error_m=0.0,
+        maximum_yaw_error_deg=0.0,
+        localization_latency_s=0.0,
+        localization_dropout_probability=0.0,
+        localization_error_correlation=0.0,
+        localization_error_basis="ground-truth baseline: simulator true pose, no localization error",
+    )
+
 
 @dataclass(frozen=True)
 class NavigationFrameConfig:
@@ -304,6 +335,14 @@ def estimate_navigation_state(
         state.z_m = error_z
         state.yaw_deg = yaw_error_deg
         state.initialized = True
+    if config.maximum_position_error_m > 0.0:
+        position_penalty = 0.6 * position_error_m / config.maximum_position_error_m
+    else:
+        position_penalty = 0.0
+    if config.maximum_yaw_error_deg > 0.0:
+        yaw_penalty = 0.4 * abs(yaw_error_deg) / config.maximum_yaw_error_deg
+    else:
+        yaw_penalty = 0.0
     estimated_position = TruePosition(
         timestamp_s=position.timestamp_s,
         x_m=position.x_m + error_x,
@@ -320,12 +359,7 @@ def estimate_navigation_state(
             "position_error_z_m": error_z,
             "position_error_m": position_error_m,
             "yaw_error_deg": yaw_error_deg,
-            "localization_confidence": max(
-                0.0,
-                1.0
-                - 0.6 * position_error_m / config.maximum_position_error_m
-                - 0.4 * abs(yaw_error_deg) / config.maximum_yaw_error_deg,
-            ),
+            "localization_confidence": max(0.0, 1.0 - position_penalty - yaw_penalty),
         },
     )
 
@@ -500,6 +534,58 @@ def safety_violation(
     return None
 
 
+def custom_enu_route(
+    points_m: tuple[tuple[float, float, float], ...] | list[tuple[float, float, float]],
+    *,
+    seed: int = 0,
+    spawn: SpawnPose | None = None,
+) -> RoutePlan:
+    """Build an explicit Gazebo-ENU waypoint plan in metres.
+
+    Each point is ``(x_m, y_m, z_m)`` in the Sphinx world frame; yaw stays
+    radians CCW from +X. This is a test/operator input helper only: it does not
+    convert map units, invent a map scale, or accept a non-ENU frame. Callers
+    must hand over metres that already fit the finite `parrot-ue4-empty` floor
+    and the configured altitude/geofence gates.
+    """
+    points = [(float(x), float(y), float(z)) for x, y, z in points_m]
+    if len(points) < 1:
+        raise ValueError("custom_enu_route needs at least one waypoint")
+    for x, y, z in points:
+        if not (math.isfinite(x) and math.isfinite(y) and math.isfinite(z)):
+            raise ValueError("custom ENU waypoints must be finite metres")
+    waypoints = tuple(
+        Waypoint(index=index, x_m=x, y_m=y, z_m=z) for index, (x, y, z) in enumerate(points)
+    )
+    return RoutePlan(
+        seed=int(seed),
+        sphinx_spawn=spawn or SpawnPose(x_m=0.0, y_m=0.0, z_m=0.2, yaw_rad=0.0),
+        waypoints=waypoints,
+    )
+
+
+def parse_enu_waypoints_text(text: str) -> tuple[tuple[float, float, float], ...]:
+    """Parse explicit ENU metres from `x,y,z` lines; `#` starts a comment."""
+    points: list[tuple[float, float, float]] = []
+    for lineno, raw_line in enumerate(text.splitlines(), start=1):
+        line = raw_line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        fields = [field.strip() for field in line.replace(";", ",").split(",")]
+        if len(fields) != 3:
+            raise ValueError(f"line {lineno}: expected `x_m,y_m,z_m`, got {raw_line!r}")
+        try:
+            point = (float(fields[0]), float(fields[1]), float(fields[2]))
+        except ValueError as error:
+            raise ValueError(f"line {lineno}: non-numeric ENU metres: {raw_line!r}") from error
+        if not all(math.isfinite(value) for value in point):
+            raise ValueError(f"line {lineno}: ENU metres must be finite: {raw_line!r}")
+        points.append(point)
+    if not points:
+        raise ValueError("no ENU waypoints found")
+    return tuple(points)
+
+
 def generate_route(seed: int, *, waypoint_count: int = 10) -> RoutePlan:
     """Generate a reproducible forward route that winds left/right and up/down."""
     if waypoint_count <= 0:
@@ -515,8 +601,6 @@ def generate_route(seed: int, *, waypoint_count: int = 10) -> RoutePlan:
     x_m = first.x_m
     while len(waypoints) < waypoint_count:
         index = len(waypoints)
-        # Keep the final point over the finite collision ground in parrot-ue4-empty.
-        # The alternating Y/Z offsets still make each 3D segment about one metre long.
         x_m += rng.uniform(0.35, 0.45)
         side = 1 if index % 2 else -1
         waypoint = Waypoint(
@@ -694,11 +778,15 @@ class OlympeRouteFollower:
         config: RouteConfig | None = None,
         target_ip: str = SPHINX_DRONE_IP,
         stress_scenario: RouteStressScenario | None = None,
+        truth_only: bool = False,
     ) -> None:
         require_sphinx_target(target_ip)
+        if stress_scenario is not None and truth_only:
+            raise ValueError("truth_only cannot be combined with a stress scenario")
         self.config = config or RouteConfig()
         self.target_ip = target_ip
         self.stress_scenario = stress_scenario
+        self.truth_only = bool(truth_only)
         self.records: list[dict[str, object]] = []
         self.arrivals: list[dict[str, object]] = []
         self.initial_position: TruePosition | None = None
@@ -936,30 +1024,38 @@ class OlympeRouteFollower:
                             target.index == plan.waypoints[-1].index,
                         )
                     true_camera_yaw = self._read_camera_yaw_enu_rad(drone, AttitudeChanged)
-                    true_camera_yaw_history.append((true_position.timestamp_s, true_camera_yaw))
-                    localization_source = collector.interpolated_sample_at(
-                        true_position.timestamp_s - self.config.error_model.localization_latency_s
-                    )
-                    delayed_true_camera_yaw = (
-                        interpolated_yaw_at(
-                            true_camera_yaw_history,
-                            localization_source.timestamp_s,
+                    if self.truth_only:
+                        true_camera_yaw_history.append((true_position.timestamp_s, true_camera_yaw))
+                        localization_source = true_position
+                        delayed_true_camera_yaw = true_camera_yaw
+                        forced_loss = False
+                        localization_dropped = False
+                    else:
+                        true_camera_yaw_history.append((true_position.timestamp_s, true_camera_yaw))
+                        localization_source = collector.interpolated_sample_at(
+                            true_position.timestamp_s
+                            - self.config.error_model.localization_latency_s
                         )
-                        if localization_source is not None
-                        else None
-                    )
-                    forced_loss = bool(
-                        self.stress_scenario is not None
-                        and self.stress_scenario.drop_after_nonzero_pcmd
-                        and previous_command_nonzero
-                        and not forced_loss_injected
-                    )
-                    localization_dropped = (
-                        forced_loss
-                        if self.stress_scenario is not None
-                        else estimation_rng.random()
-                        < self.config.error_model.localization_dropout_probability
-                    )
+                        delayed_true_camera_yaw = (
+                            interpolated_yaw_at(
+                                true_camera_yaw_history,
+                                localization_source.timestamp_s,
+                            )
+                            if localization_source is not None
+                            else None
+                        )
+                        forced_loss = bool(
+                            self.stress_scenario is not None
+                            and self.stress_scenario.drop_after_nonzero_pcmd
+                            and previous_command_nonzero
+                            and not forced_loss_injected
+                        )
+                        localization_dropped = (
+                            forced_loss
+                            if self.stress_scenario is not None
+                            else estimation_rng.random()
+                            < self.config.error_model.localization_dropout_probability
+                        )
                     if (
                         localization_source is None
                         or delayed_true_camera_yaw is None
@@ -1021,23 +1117,37 @@ class OlympeRouteFollower:
                         time.sleep(self.config.control_period_s)
                         continue
 
-                    estimated_position, estimated_camera_yaw, estimation_error = (
-                        estimate_stress_navigation_state(
-                            localization_source,
-                            delayed_true_camera_yaw,
-                            target,
-                            config=self.config.error_model,
-                            scenario=self.stress_scenario,
+                    if self.truth_only:
+                        estimated_position, estimated_camera_yaw, estimation_error = (
+                            true_position,
+                            true_camera_yaw,
+                            {
+                                "position_error_x_m": 0.0,
+                                "position_error_y_m": 0.0,
+                                "position_error_z_m": 0.0,
+                                "position_error_m": 0.0,
+                                "yaw_error_deg": 0.0,
+                                "localization_confidence": 1.0,
+                            },
                         )
-                        if self.stress_scenario is not None
-                        else estimate_navigation_state(
-                            localization_source,
-                            delayed_true_camera_yaw,
-                            rng=estimation_rng,
-                            config=self.config.error_model,
-                            state=error_state,
+                    else:
+                        estimated_position, estimated_camera_yaw, estimation_error = (
+                            estimate_stress_navigation_state(
+                                localization_source,
+                                delayed_true_camera_yaw,
+                                target,
+                                config=self.config.error_model,
+                                scenario=self.stress_scenario,
+                            )
+                            if self.stress_scenario is not None
+                            else estimate_navigation_state(
+                                localization_source,
+                                delayed_true_camera_yaw,
+                                rng=estimation_rng,
+                                config=self.config.error_model,
+                                state=error_state,
+                            )
                         )
-                    )
                     pose_age_s = true_position.timestamp_s - estimated_position.timestamp_s
                     confidence = estimation_error["localization_confidence"]
                     velocity_enu = estimate_velocity_enu(
@@ -1219,7 +1329,9 @@ class OlympeRouteFollower:
             raise RuntimeError(f"route completed but landing was not confirmed{details}")
 
 
-def route_plan_payload(plan: RoutePlan, config: RouteConfig) -> dict[str, object]:
+def route_plan_payload(
+    plan: RoutePlan, config: RouteConfig, *, truth_only: bool = False
+) -> dict[str, object]:
     first = plan.waypoints[0]
     first_from_spawn = math.dist(
         (plan.sphinx_spawn.x_m, plan.sphinx_spawn.y_m, plan.sphinx_spawn.z_m),
@@ -1227,6 +1339,7 @@ def route_plan_payload(plan: RoutePlan, config: RouteConfig) -> dict[str, object
     )
     return {
         "seed": plan.seed,
+        "truth_only": bool(truth_only),
         "coordinate_frame": "Gazebo ENU metres; yaw is radians CCW from +X",
         "sphinx_ground_spawn": {
             **asdict(plan.sphinx_spawn),
@@ -1287,10 +1400,17 @@ def route_plan_payload(plan: RoutePlan, config: RouteConfig) -> dict[str, object
     }
 
 
-def write_route_plan(plan: RoutePlan, config: RouteConfig, output_dir: Path) -> None:
+def write_route_plan(
+    plan: RoutePlan, config: RouteConfig, output_dir: Path, *, truth_only: bool = False
+) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     (output_dir / "route_plan.json").write_text(
-        json.dumps(route_plan_payload(plan, config), ensure_ascii=False, indent=2, allow_nan=False)
+        json.dumps(
+            route_plan_payload(plan, config, truth_only=truth_only),
+            ensure_ascii=False,
+            indent=2,
+            allow_nan=False,
+        )
         + "\n",
         encoding="utf-8",
     )
@@ -1312,6 +1432,7 @@ def write_route_artifacts(
     report = {
         "status": status,
         "error": error,
+        "truth_only": bool(getattr(follower, "truth_only", False)),
         "stress_scenario": (
             asdict(follower.stress_scenario) if follower.stress_scenario is not None else None
         ),

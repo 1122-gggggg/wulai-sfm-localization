@@ -70,6 +70,18 @@ def _validate_timestamps(
         raise InvalidLocalizationResult("pose_mono_ns cannot be in the future")
 
 
+def _validate_pose_capture_ns(payload: Mapping[str, Any], capture_mono_ns: int) -> None:
+    if "pose_capture_mono_ns" not in payload or payload["pose_capture_mono_ns"] is None:
+        return
+    value = payload["pose_capture_mono_ns"]
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise InvalidLocalizationResult("pose_capture_mono_ns must be integer nanoseconds")
+    if value <= 0:
+        raise InvalidLocalizationResult("pose_capture_mono_ns must be positive")
+    if value > capture_mono_ns:
+        raise InvalidLocalizationResult("pose_capture_mono_ns cannot be newer than capture_mono_ns")
+
+
 def _pose_tuple(value: object) -> tuple[float, float, float, float] | None:
     if value is None:
         return None
@@ -243,6 +255,7 @@ class LocalizationResult:
             "client_response_mono_ns",
         )
         _validate_timestamps(capture_mono_ns, pose_mono_ns, now_mono_ns)
+        _validate_pose_capture_ns(payload, capture_mono_ns)
 
         validity = payload.get("validity", payload.get("success"))
         if not isinstance(validity, bool):

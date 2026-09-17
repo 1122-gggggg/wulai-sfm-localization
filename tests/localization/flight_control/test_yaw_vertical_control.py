@@ -1,4 +1,4 @@
-"""AUTO may turn and change height together while horizontal motion is gated."""
+"""AUTO locks height during turns; diagonals fly as one 3-D move after yaw aligns."""
 
 from dataclasses import replace
 import math
@@ -21,7 +21,8 @@ def route_command(goal, action="FOLLOW"):
 @pytest.mark.parametrize("action", ["FOLLOW", "REJOIN"])
 @pytest.mark.parametrize("height", [-1.0, 0.0, 1.0])
 @pytest.mark.parametrize("yaw_sign", [-1, 1])
-def test_turn_preserves_vertical_command_without_horizontal_motion(action, height, yaw_sign):
+def test_turn_locks_height_until_yaw_aligns(action, height, yaw_sign):
+    """Turn phase is yaw-only: overhead-obstacle rule forbids climb-during-turn."""
     cfg = rpf.ControlConfig(inspect_waypoints=(), map_frame=FRAME)
     pose = rpf.Pose(0.0, 0.0, 0.0, yaw=0.0, stamp=0.0)
     command = route_command(FRAME.north + height * FRAME.up, action)
@@ -30,22 +31,20 @@ def test_turn_preserves_vertical_command_without_horizontal_motion(action, heigh
         command, pose, config=cfg, yaw_sign=yaw_sign
     )
 
-    assert (roll, pitch) == (0, 0)
+    assert (roll, pitch, gaz) == (0, 0, 0)
     assert yaw * yaw_sign < 0
     assert abs(yaw) <= cfg.max_yaw_pcmd
-    assert np.sign(gaz) == np.sign(height)
-    assert gaz == rpf.command_to_body_percent(
-        command, pose, config=cfg, require_yaw_alignment=False
-    )[3]
 
 
 @pytest.mark.parametrize("height", [-1.0, 1.0])
-def test_cruise_translates_and_climbs_without_yaw_alignment(height):
+def test_turn_holds_height_then_translates_and_climbs_together(height):
+    """Level-turn first, then one 3-D diagonal move after yaw aligns."""
     cfg = rpf.ControlConfig(inspect_waypoints=(), map_frame=FRAME)
     gate = rpf.YawAlignedPcmdController(cfg)
     command = route_command(FRAME.north + height * FRAME.up)
     pose = rpf.Pose(0.0, 0.0, 0.0, yaw=0.0, stamp=0.0)
     pcmd = gate.update(command, pose, 0.0, target_key=0)
+    assert pcmd[3] == 0
     assert pcmd[2] != 0
     assert gate.phase == "turn"
 
@@ -104,14 +103,15 @@ def test_stale_velocity_does_not_zero_rejoin_translation(velocity):
     assert pcmd[0] or pcmd[1] or pcmd[3]
 
 
-def test_height_correction_cannot_starve_larger_horizontal_drift():
+def test_diagonal_translates_and_climbs_together_after_yaw_aligns():
+    """Translate phase flies the slanted leg as one 3-D move, not an L."""
     cfg = rpf.production_auto_control_config(FRAME)
     gate = rpf.YawAlignedPcmdController(cfg)
     pose = rpf.Pose(0, 0, 0, 0, stamp=1.0)
     cmd = rpf.Command("REJOIN", np.zeros(3), 0, FRAME.east, 0.1, 0,
                       guidance_goal=0.07 * FRAME.east + 0.04 * FRAME.up)
     pcmd = gate.update(cmd, pose, 1.0, target_key=0, body_velocity=(0., 0., 1.))
-    assert pcmd[1] > 0 and pcmd[2:] == (0, 0)
+    assert pcmd[1] > 0 and pcmd[2] == 0 and pcmd[3] > 0
 
 
 def test_inspection_turn_does_not_command_a_height_change():
@@ -138,10 +138,9 @@ def test_recorded_near_vertical_target_centers_height_without_chasing_bearing():
     assert pcmd[3] > 0
     assert gate.phase in {"waypoint_centering", "height_adjust"}
 
-
 @pytest.mark.parametrize("height_sign", [-1, 1])
-def test_near_vertical_waypoint_can_be_reached_before_yaw_aligns(height_sign):
-    """Kinematic regression: frozen yaw must not prevent reaching the 3-D sphere."""
+def test_near_vertical_waypoint_locks_yaw_until_height_closes(height_sign):
+    """Overhead-obstacle rule: a frozen yaw holds height too; no blind climb."""
     cfg = replace(
         rpf.production_auto_control_config(FRAME), return_to_start=False,
         slowdown_distance=0.34757225729367,
@@ -159,10 +158,10 @@ def test_near_vertical_waypoint_can_be_reached_before_yaw_aligns(height_sign):
         if controller.target_index == 1:
             break
         roll, pitch, yaw, gaz = gate.update(command, pose, now, target_key=0)
-        assert (roll, pitch, yaw) == (0, 0, 0)
-        position += FRAME.up * gaz * 0.05 * 0.05
-    assert controller.target_index == 1
-    assert np.linalg.norm(goal - position) <= cfg.waypoint_arrive_radius
+        assert yaw == 0
+        assert gate.phase == "waypoint_centering"
+    assert controller.target_index == 0
+    assert float(np.linalg.norm(goal - position)) > cfg.waypoint_arrive_radius
 
 def _horizontal_strength(distance: float) -> int:
     cfg = rpf.ControlConfig(inspect_waypoints=(), map_frame=FRAME)

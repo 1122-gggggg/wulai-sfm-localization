@@ -400,23 +400,40 @@ def localization_pose_timestamp(
     arrival_mono: float | None = None,
 ) -> float | None:
     """Return the conservative monotonic timestamp for a published pose."""
-    candidates: list[float] = []
-
-    def add(value: object, *, nanoseconds: bool = False) -> None:
-        try:
-            number = float(value)  # type: ignore[arg-type]
-        except (TypeError, ValueError, OverflowError):
-            return
-        if nanoseconds:
-            number *= 1e-9
-        if math.isfinite(number) and number > 0.0:
-            candidates.append(number)
-
     def _get(key: str) -> Any:
         try:
             return result.get(key) if hasattr(result, "get") else None  # type: ignore
         except Exception:
             return None
+
+    def _as_seconds(value: object, *, nanoseconds: bool = False) -> float | None:
+        try:
+            number = float(value)  # type: ignore[arg-type]
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if nanoseconds:
+            number *= 1e-9
+        if math.isfinite(number) and number > 0.0:
+            return number
+        return None
+
+    held_ns = _get("pose_capture_mono_ns")
+    if held_ns is not None:
+        if isinstance(held_ns, bool):
+            return None
+        held = _as_seconds(held_ns, nanoseconds=True)
+        if held is None:
+            return None
+        capture = _as_seconds(_get("capture_mono_ns"), nanoseconds=True)
+        if capture is not None and held > capture:
+            return None
+        return held
+    candidates: list[float] = []
+
+    def add(value: object, *, nanoseconds: bool = False) -> None:
+        number = _as_seconds(value, nanoseconds=nanoseconds)
+        if number is not None:
+            candidates.append(number)
 
     for key in (
         "source_frame_stamp_mono",
@@ -440,11 +457,7 @@ def localization_pose_timestamp(
     fallback = _get("ui_arrival_mono")
     if fallback is None:
         fallback = arrival_mono
-    try:
-        value = float(fallback)  # type: ignore[arg-type]
-    except (TypeError, ValueError, OverflowError):
-        return None
-    return value if math.isfinite(value) and value > 0.0 else None
+    return _as_seconds(fallback)
 
 
 def localization_result_is_weak(result: Any) -> bool:

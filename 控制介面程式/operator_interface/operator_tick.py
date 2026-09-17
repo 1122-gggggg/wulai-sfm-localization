@@ -966,13 +966,14 @@ def _update_live_camera_orientation(app: Any, result: dict, xyz: np.ndarray) -> 
 def _update_live_heading(
         app: Any, camera_forward: np.ndarray | None, xyz: np.ndarray) -> None:
     map_frame = getattr(app, "_integrated_auto_map_frame", None)
+    if map_frame is None:
+        map_frame = getattr(app, "_autonomy_map_frame", None)
     if camera_forward is not None:
         # Where the camera looks, whenever the localizer measured it. The
-        # measured gravity frame is only bound while integrated AUTO runs; the
-        # legacy [x, z] azimuth is the same convention the displacement branch
-        # below already falls back to, and it beats reporting the travel
-        # direction as a camera heading (they differ by ~77 deg median on the
-        # river map, where the drone flies along the bank looking sideways).
+        # loaded site frame and the integrated AUTO frame share the same
+        # measured basis; either beats reporting the travel direction as a
+        # camera heading (they differ by ~77 deg median on the river map,
+        # where the drone flies along the bank looking sideways).
         heading = (
             float(map_frame.heading(camera_forward))
             if map_frame is not None
@@ -998,6 +999,83 @@ def _update_live_heading(
     )
 
 
+def _make_autonomy_pose(result: dict, xyz: np.ndarray, heading: float, stamp: float):
+    """Build one control pose carrying its source quality. No Tk, no mutation."""
+    from real_path_follow_controller import Pose
+    from operator_rendering import classify_localization_health
+    try:
+        health = classify_localization_health(result)
+    except (AttributeError, KeyError, TypeError, ValueError):
+        health = "LOST"
+    try:
+        direct_status = result.get("direct_status")
+    except (AttributeError, KeyError, TypeError, ValueError):
+        direct_status = None
+    try:
+        pose_status = result.get("pose_status")
+    except (AttributeError, KeyError, TypeError, ValueError):
+        pose_status = None
+    try:
+        reseed = bool(result.get("reseed_confirming"))
+    except (AttributeError, KeyError, TypeError, ValueError):
+        reseed = False
+    try:
+        confirming = bool(result.get("pose_source_confirming"))
+    except (AttributeError, KeyError, TypeError, ValueError):
+        confirming = False
+    try:
+        imu_bridge = bool(result.get("imu_bridge"))
+    except (AttributeError, KeyError, TypeError, ValueError):
+        imu_bridge = False
+    try:
+        success = bool(result.get("success"))
+    except (AttributeError, KeyError, TypeError, ValueError):
+        success = False
+    predicted_only = pose_status == "PREDICTED_ONLY"
+    unknown_direct = (
+        direct_status is not None
+        and str(direct_status) not in {"FAST_TRACK", "RELOC_SEED", "VO_ONLY", "DEAD_RECKON"}
+    )
+    observed_statuses = {"FAST_TRACK", "RELOC_SEED", "VO_ONLY", "DEAD_RECKON"}
+    if direct_status is None:
+        position_observed = bool(success and not predicted_only and not imu_bridge and not confirming)
+    else:
+        position_observed = bool(
+            success
+            and str(direct_status) in observed_statuses
+            and not predicted_only
+            and not imu_bridge
+            and not confirming
+        )
+    map_confirmed = bool(
+        health == "OK"
+        and success
+        and not predicted_only
+        and not imu_bridge
+        and not confirming
+        and not reseed
+        and not unknown_direct
+    )
+    point = np.asarray(xyz, dtype=float).reshape(-1)[:3]
+    pose = Pose(
+        float(point[0]),
+        float(point[1]),
+        float(point[2]),
+        yaw=float(heading),
+        stamp=float(stamp),
+        map_confirmed=map_confirmed,
+        reseed_confirming=reseed,
+        position_observed=position_observed,
+    )
+    try:
+        held = bool(result.get("confidence_hold_active"))
+    except (AttributeError, KeyError, TypeError, ValueError):
+        held = False
+    if held and (direct_status is None or str(direct_status) in observed_statuses):
+        pose.position_observed = True
+    return pose
+
+
 def _accept_live_pose(app: Any, result: dict, xyz: np.ndarray) -> None:
     _update_live_camera_orientation(app, result, xyz)
     app.live_last_xyz = xyz
@@ -1009,14 +1087,6 @@ def _accept_live_pose(app: Any, result: dict, xyz: np.ndarray) -> None:
     ]
     app.live_locked = True
     app.live_new_pose = True
-    # KLT-bridged frames carry no fresh EDM match: accept for continuity (the
-    # jump gate below still bounds them) but count them so recovery-heavy
-    # segments cannot silently run on optical flow. Counter resets on EDM.
-    # Both spellings matter: the in-tracker bridge reports "klt_bridge", the
-    # async fast path reports "klt_fast" with pose_status KLT_BRIDGED. Counting
-    # only the first meant the async tracker -- which was the code default from
-    # 2026-09-04 to 2026-09-05 -- never incremented this at all, and its
-    # unverified runs reached 710 consecutive frames on the 720p corpus.
     bridged = (
         result.get("candidate_mode") in ("klt_bridge", "klt_fast")
         or result.get("pose_status") == "KLT_BRIDGED"
@@ -1042,15 +1112,7 @@ def _accept_live_pose(app: Any, result: dict, xyz: np.ndarray) -> None:
         and math.isfinite(heading_value)
         and all(math.isfinite(float(value)) for value in xyz[:3])
     ):
-        app._autonomy_pose_snapshot = (
-            float(xyz[0]),
-            float(xyz[1]),
-            float(xyz[2]),
-            heading_value,
-            float(stamp),
-        )
-        app._autonomy_pose_predicted = False
-
+        app._autonomy_pose_snapshot = _make_autonomy_pose(result, xyz, heading_value, float(stamp))
 
 def _weak_pose_heading(app: Any, result: dict) -> float | None:
     heading_value = float("nan")
@@ -1076,7 +1138,6 @@ def _snapshot_weak_pose_for_autonomy(
     xyz: np.ndarray | None,
     *,
     require_success: bool = True,
-    predicted: bool = False,
 ) -> None:
     """Mirror a held weak or IMU-predicted fix into the AUTO pose snapshot only.
 
@@ -1113,9 +1174,9 @@ def _snapshot_weak_pose_for_autonomy(
         return
     if not math.isfinite(stamp_value):
         return
-    app._autonomy_pose_snapshot = (point[0], point[1], point[2], heading_value, stamp_value)
-    app._autonomy_pose_predicted = bool(predicted)
-
+    app._autonomy_pose_snapshot = _make_autonomy_pose(
+        result, np.asarray(point, dtype=float), heading_value, stamp_value
+    )
 
 def _accept_predicted_pose(app: Any, result: dict, xyz: np.ndarray) -> None:
     """Show an IMU guess. Never a visual lock or BOOT fix."""
@@ -1284,7 +1345,7 @@ def update_live_results(
                     app, result, xyz, require_success=False)
                 _accept_predicted_pose(app, result, xyz)
                 _snapshot_weak_pose_for_autonomy(
-                    app, result, xyz, require_success=False, predicted=True,
+                    app, result, xyz, require_success=False,
                 )
             continue
         assert xyz is not None

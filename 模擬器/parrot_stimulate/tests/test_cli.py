@@ -54,6 +54,92 @@ def test_route_dry_run_prints_ten_points_and_a_bounded_spawn(capsys) -> None:
     )
 
 
+def test_route_truth_only_dry_run_reports_no_localization_error(capsys) -> None:
+    exit_code = main(["route", "--dry-run", "--truth-only", "--seed", "42"])
+
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["truth_only"] is True
+    assert payload["controller"]["error_model"]["maximum_position_error_m"] == 0.0
+    assert payload["controller"]["error_model"]["localization_dropout_probability"] == 0.0
+
+
+def test_route_custom_waypoints_dry_run_keeps_explicit_metres(capsys, tmp_path) -> None:
+    points = tmp_path / "points.txt"
+    points.write_text("0,0,1.5\n1,0,1.5\n", encoding="utf-8")
+    exit_code = main(["route", "--dry-run", "--truth-only", "--waypoints", str(points)])
+
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["waypoint_count"] == 2
+    assert [(row["x_m"], row["y_m"], row["z_m"]) for row in payload["waypoints"]] == [
+        (0.0, 0.0, 1.5),
+        (1.0, 0.0, 1.5),
+    ]
+
+
+def test_route_error_knobs_override_defaults_in_dry_run(capsys) -> None:
+    exit_code = main(
+        [
+            "route",
+            "--dry-run",
+            "--pos-error-m",
+            "0.1",
+            "--yaw-error-deg",
+            "5",
+            "--latency-ms",
+            "100",
+            "--drop-rate",
+            "0.01",
+            "--wind-max-m",
+            "0.2",
+            "--wind-interval-s",
+            "10",
+        ]
+    )
+
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    error = payload["controller"]["error_model"]
+    assert error["maximum_position_error_m"] == 0.1
+    assert error["maximum_yaw_error_deg"] == 5.0
+    assert error["localization_latency_s"] == 0.1
+    assert error["localization_dropout_probability"] == 0.01
+    assert error["wind_maximum_displacement_m"] == 0.2
+    assert error["wind_displacement_interval_s"] == 10.0
+
+
+def test_route_truth_only_rejects_stress_and_overrides() -> None:
+    with_stress = main(
+        ["route", "--dry-run", "--truth-only", "--stress-scenario", "combined-bounds"]
+    )
+    with_override = main(["route", "--dry-run", "--truth-only", "--pos-error-m", "0.1"])
+    with_wind_interval = main(["route", "--dry-run", "--truth-only", "--wind-interval-s", "10"])
+
+    assert with_stress == 2
+    assert with_override == 2
+    assert with_wind_interval == 2
+
+
+def test_route_truth_only_accepts_wind_max_only(capsys) -> None:
+    exit_code = main(["route", "--dry-run", "--truth-only", "--wind-max-m", "0.4"])
+
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["truth_only"] is True
+    assert payload["controller"]["error_model"]["maximum_position_error_m"] == 0.0
+    assert payload["controller"]["error_model"]["wind_maximum_displacement_m"] == 0.4
+
+
+def test_production_route_registers_a_sphinx_only_subcommand() -> None:
+    args = build_parser().parse_args(
+        ["production-route", "--route", "r.json", "--meters-per-unit", "5.0", "--output-dir", "out"]
+    )
+
+    assert args.command == "production-route"
+    assert float(args.meters_per_unit) == 5.0
+
+
 def test_response_dry_run_uses_ten_percent_on_all_four_signed_axes(capsys) -> None:
     exit_code = main(["response", "--dry-run"])
 

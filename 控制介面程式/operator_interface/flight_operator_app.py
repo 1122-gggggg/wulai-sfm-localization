@@ -1709,8 +1709,7 @@ class OperatorApp(tk.Tk):
         self.camera_forward_world: np.ndarray | None = None
         self.live_pose = np.array([0.0, 0.0, 0.0, np.nan], dtype=float)
         self.live_locked = False
-        self._autonomy_pose_snapshot: tuple[float, float, float, float, float] | None = None
-        self._autonomy_pose_predicted = False
+        self._autonomy_pose_snapshot = None
         self.live_new_pose = False
         self.last_submitted_index = -1
         self.last_detect_submitted_index = -1
@@ -3397,7 +3396,6 @@ class OperatorApp(tk.Tk):
         self.inspect_start = None
         self.live_locked = False
         self._autonomy_pose_snapshot = None
-        self._autonomy_pose_predicted = False
         self.live_new_pose = False
         self.live_result = None
         self.live_result_frame_name = ""
@@ -3568,23 +3566,24 @@ class OperatorApp(tk.Tk):
         snapshot = self.__dict__.get("_autonomy_pose_snapshot")
         if snapshot is None:
             return None
+        if not isinstance(snapshot, Pose):
+            return None
         try:
-            x, y, z, heading, stamp_value = (
-                float(snapshot[0]),
-                float(snapshot[1]),
-                float(snapshot[2]),
-                float(snapshot[3]),
-                float(snapshot[4]),
-            )
-        except (TypeError, ValueError, OverflowError, IndexError):
+            values = (float(snapshot.x), float(snapshot.y), float(snapshot.z),
+                      float(snapshot.yaw), float(snapshot.stamp))
+        except (TypeError, ValueError, OverflowError, AttributeError):
             return None
-        if not all(math.isfinite(value) for value in (x, y, z, heading, stamp_value)):
+        if not all(math.isfinite(value) for value in values):
             return None
-        age = time.monotonic() - stamp_value
+        age = time.monotonic() - values[4]
         if age < -0.05 or age > AUTONOMY_POSE_MAX_AGE_S:
             return None
-        return Pose(x, y, z, yaw=heading, stamp=stamp_value)
-
+        return Pose(
+            values[0], values[1], values[2], yaw=values[3], stamp=values[4],
+            map_confirmed=bool(getattr(snapshot, "map_confirmed", True)),
+            reseed_confirming=bool(getattr(snapshot, "reseed_confirming", False)),
+            position_observed=bool(getattr(snapshot, "position_observed", True)),
+        )
     def _autonomy_stream_healthy(self) -> bool:
         state = self.backend.state
         if not bool(getattr(state, "link_ok", False)):
@@ -3754,15 +3753,16 @@ class OperatorApp(tk.Tk):
                 map_frame=map_frame,
                 get_pose=self._autonomy_pose,
                 pose_is_weak=lambda: str(self.loc_health) != "OK",
-                pose_is_predicted=lambda: bool(self.__dict__.get("_autonomy_pose_predicted")),
+                pose_is_predicted=lambda: (
+                    (pose := self.__dict__.get("_autonomy_pose_snapshot")) is not None
+                    and isinstance(pose, Pose)
+                    and not bool(getattr(pose, "position_observed", True))
+                ),
                 pose_source_pending=lambda: getattr(
                     self.__dict__.get("_live_source_confirmation"), "pending", None
                 ) is not None,
                 pose_reseed_confirming=lambda: bool(self.__dict__.get("loc_reseed_confirming")),
                 pose_confidence=lambda: int(self.loc_health_inliers or 0),
-                force_relocalize=lambda: self.localizer.request_relocalize(),
-                stream_healthy=self._autonomy_stream_healthy,
-                takeoff=lambda: self._backend_command("takeoff", {}),
                 take_pc_control=lambda: self._backend_command("pc_control", {}),
                 start_airborne=start_airborne,
                 land=lambda: self._backend_command("land", {}),
@@ -5070,7 +5070,6 @@ class OperatorApp(tk.Tk):
         self.live_pose = np.array([0.0, 0.0, 0.0, np.nan], dtype=float)
         self.live_locked = False
         self._autonomy_pose_snapshot = None
-        self._autonomy_pose_predicted = False
         self.live_new_pose = False
         self.camera_axes_world = None
         self.camera_forward_world = None

@@ -31,17 +31,20 @@ def test_waypoint_one_entry_stays_direct_then_follows_the_remaining_segments():
     assert control.target_index == 2
 
 
-def test_vo_pose_cannot_consume_a_waypoint_without_a_fresh_map_fix():
-    control = controller([(0, 0, 0), (1, 0, 0)])
-    for stamp in (0.0, 0.1, 0.2):
-        command = control.step(rpf.Pose(0, 0, 0, 0, stamp=stamp, map_confirmed=False), now=stamp)
-        assert control.target_index == 0
-        assert command.status == "WAIT_MAP_CONFIRMATION"
-        assert command.action == "HOVER" and not command.should_land
-    control.step(rpf.Pose(0, 0, 0, 0, stamp=0.2), now=0.2)
-    assert control.target_index == 0, "the old capture cannot gain new arrival evidence"
-    control.step(rpf.Pose(0, 0, 0, 0, stamp=0.3), now=0.3)
+def test_vo_pose_advances_mid_route_but_not_the_final_leg():
+    control = controller([(0, 0, 0), (1, 0, 0), (2, 0, 0)])
+    control.step(rpf.Pose(0, 0, 0, 0, stamp=0), now=0)
     assert control.target_index == 1
+    # Sequenced VO poses fly the mid-route leg: arriving at wp1 retires it.
+    mid = control.step(rpf.Pose(1, 0, 0, 0, stamp=0.1, map_confirmed=False), now=0.1)
+    assert control.target_index == 2
+    assert mid.action == "FOLLOW"
+    # The final leg still holds for a map fix at the landing waypoint.
+    held = control.step(rpf.Pose(2, 0, 0, 0, stamp=0.2, map_confirmed=False), now=0.2)
+    assert control.target_index == 2
+    assert held.action == "HOVER" and held.status == "WAIT_MAP_CONFIRMATION"
+    control.step(rpf.Pose(2, 0, 0, 0, stamp=0.3), now=0.3)
+    assert control.target_index == 2
 
 
 def test_vo_at_the_final_point_does_not_accumulate_landing_evidence():
@@ -118,7 +121,11 @@ def test_lateral_drift_changes_guidance_but_not_the_segment_heading():
         roll, pitch, yaw, gaz = rpf.command_to_body_percent(command, pose, config=control.cfg)
         assert roll * offset > 0  # Body right points toward map -Z at yaw=0.
         assert command.action == "REJOIN"
-        assert pitch == 0 and yaw == 0 and gaz == 0
+        # Correction-priority allocation keeps a small along-leg share while
+        # repairing: lateral correction dominates, forward progress continues.
+        assert yaw == 0 and gaz == 0
+        assert pitch > 0
+        assert abs(roll) > abs(pitch)
 
 
 def test_route_rejoin_holds_yaw_even_when_the_nose_is_not_aligned():
@@ -237,3 +244,48 @@ def test_nonfinite_guidance_fails_closed():
     command = rpf.Command("FOLLOW", np.ones(3), 0, np.ones(3), 0, 0,
                           guidance_goal=np.array([math.nan, 0, 0]))
     assert rpf.command_to_body_percent(command, rpf.Pose(0, 0, 0, 0)) == (0, 0, 0, 0)
+
+def test_follow_applies_correction_priority_with_along_leg_share():
+    """FOLLOW corrects small drift every tick while keeping forward progress."""
+    control = controller([(0, 0, 0), (10, 0, 0)])
+    control.step(rpf.Pose(0, 0, 0, 0, stamp=0), now=0)
+    pose = rpf.Pose(3, 0, 0.015, 0, stamp=0.1)
+    command = control.step(pose, now=0.1)
+    assert command.action == "FOLLOW"
+    assert command.path_pull is not None
+    np.testing.assert_allclose(command.path_pull, [0, 0, -0.015], atol=1e-9)
+    assert command.path_pull_radius == pytest.approx(
+        control._arrive_radius_for(control.target_index)
+    )
+    assert command.path_tangent is not None
+    parts = rpf._route_translation_components(command, pose, control.cfg)
+    assert parts is not None
+    correction, along, along_scale = parts
+    # Lateral correction points back toward the line; along-leg demand stays
+    # positive so the leg keeps advancing while the drift is repaired.
+    assert correction[0] > 0
+    assert along[1] > 0
+    assert 0.10 <= along_scale <= 1.0
+    roll, pitch, yaw, _gaz = rpf.command_to_body_percent(
+        command, pose, config=control.cfg, require_yaw_alignment=False)
+    assert yaw == 0 and pitch > 0 and roll > 0
+
+
+def test_path_pull_gain_zero_falls_back_to_carrot_guidance():
+    """Gain 0 disables the segment share; steering equals direct-to-point."""
+    control = controller([(0, 0, 0), (10, 0, 0)])
+    control.step(rpf.Pose(0, 0, 0, 0, stamp=0), now=0)
+    pose = rpf.Pose(3, 0, 0.01, 0, stamp=0.1)
+    command = control.step(pose, now=0.1)
+    assert command.path_pull is not None
+    blended = rpf.command_to_body_percent(
+        command, pose, config=control.cfg, require_yaw_alignment=False)
+    flat = replace(control.cfg, path_pull_gain=0.0)
+    unblended = rpf.command_to_body_percent(
+        command, pose, config=flat, require_yaw_alignment=False)
+    carrot = rpf.command_to_body_percent(
+        replace(command, path_pull=None, path_pull_radius=None, path_tangent=None), pose,
+        config=control.cfg, require_yaw_alignment=False)
+    assert unblended == carrot
+    assert rpf._route_translation_components(command, pose, flat) is None
+    assert blended[1] >= unblended[1] or blended[0] >= unblended[0]

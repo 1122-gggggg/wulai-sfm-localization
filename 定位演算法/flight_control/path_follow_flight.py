@@ -91,6 +91,7 @@ from localization_uncertainty import (  # noqa: E402
 from landing_transition import (  # noqa: E402
     GROUND_SPEED_MAX_AGE_S,
     LANDING_SPEED_THRESHOLD_MPS,
+    RouteLandingConfirmation,
     decide_route_completion_landing,
     landing_speed_allows_land,  # noqa: F401 - compatibility API
 )
@@ -1798,6 +1799,7 @@ class _FlightLoopRunner:
         self.source_confirmation = PoseSourceConfirmation()
         self._last_route_xyz: np.ndarray | None = None
         self.pose_correction_started: float | None = None
+        self.landing_confirmation = RouteLandingConfirmation(max_position_age_s=GROUND_SPEED_MAX_AGE_S)
         self.steps = 0
         search_pcmd = hooks.localization_yaw_search_pcmd
         if (
@@ -1815,22 +1817,28 @@ class _FlightLoopRunner:
 
     def run(self) -> str:
         while True:
-            started_at = self.hooks.now()
-            if self.hooks.loop_beat is not None:
-                self.hooks.loop_beat()
-            safety_mode = self.hooks.safety_poll() if self.hooks.safety_poll is not None else "AUTO"
-            record = {
-                "step": self.steps,
-                "t": round(started_at, 3),
-                "t_mono_ns": time.monotonic_ns(),
-                "safety": safety_mode,
-            }
-            outcome = self._tick(started_at, safety_mode, record)
+            outcome = self.step()
             if outcome.reason is not None:
                 return outcome.reason
+
+    def step(self) -> _LoopOutcome:
+        """Advance one 20 Hz control tick without sleeping. Shared by flight and sim."""
+        started_at = self.hooks.now()
+        if self.hooks.loop_beat is not None:
+            self.hooks.loop_beat()
+        safety_mode = self.hooks.safety_poll() if self.hooks.safety_poll is not None else "AUTO"
+        record = {
+            "step": self.steps,
+            "t": round(started_at, 3),
+            "t_mono_ns": time.monotonic_ns(),
+            "safety": safety_mode,
+        }
+        outcome = self._tick(started_at, safety_mode, record)
+        if outcome.reason is None:
             self.steps += 1
             if outcome.sleep:
                 self._sleep_remaining(started_at)
+        return outcome
 
     def _sleep_remaining(self, started_at: float) -> None:
         elapsed = self.hooks.now() - started_at
@@ -1945,11 +1953,17 @@ class _FlightLoopRunner:
         localized_pose, fresh, new_visual_fix, low_confidence = self._accepted_pose(
             localized_pose, now, record
         )
+        map_pose_new = bool(
+            fresh
+            and new_visual_fix
+            and not low_confidence
+            and self._pose_carries_map_confirmation(localized_pose, record)
+        )
         if fresh and new_visual_fix and not low_confidence:
             if self.heading.update(localized_pose.yaw, olympe_yaw):
                 self.last_good = localized_pose
                 self.last_good_accepted_at = now
-                if record.get("map_pose_confirmed"):
+                if map_pose_new:
                     self.last_map_pose_stamp = float(localized_pose.stamp)
                     record["map_constraint_age_s"] = now - self.last_map_pose_stamp
                 self._remember_accepted_pose(localized_pose)
@@ -2376,6 +2390,59 @@ class _FlightLoopRunner:
         except Exception:
             return False
 
+    def _pose_carries_map_confirmation(self, pose, record: dict) -> bool:
+        """Does this fresh fix renew the map anchor? Hooks only demote."""
+        pose_confirmed = self._control_pose_map_confirmed(pose)
+        pose_observed = self._control_pose_position_observed(pose)
+        pose_reseed = self._control_pose_reseed_confirming(pose)
+        hook_confirmed = record.get("map_pose_confirmed", True)
+        if hook_confirmed is None:
+            hook_confirmed = True
+        predicted = bool(record.get("pose_source_predicted"))
+        return bool(
+            pose_confirmed
+            and pose_observed
+            and not pose_reseed
+            and bool(hook_confirmed)
+            and not predicted
+        )
+
+    def _control_pose_map_confirmed(self, pose) -> bool:
+        try:
+            pose_value = bool(getattr(pose, "map_confirmed", True))
+        except (AttributeError, TypeError, ValueError):
+            pose_value = True
+        if self.hooks.pose_is_weak is None:
+            return bool(pose_value)
+        try:
+            weak_value = bool(self.hooks.pose_is_weak())
+        except Exception:
+            return bool(pose_value)
+        if weak_value:
+            return False
+        return bool(pose_value)
+
+    def _control_pose_reseed_confirming(self, pose) -> bool:
+        try:
+            pose_value = bool(getattr(pose, "reseed_confirming", False))
+        except (AttributeError, TypeError, ValueError):
+            pose_value = False
+        if self.hooks.pose_reseed_confirming is None:
+            return pose_value
+        try:
+            return bool(pose_value or bool(self.hooks.pose_reseed_confirming()))
+        except Exception:
+            return pose_value
+
+    def _control_pose_position_observed(self, pose) -> bool:
+        try:
+            pose_value = bool(getattr(pose, "position_observed", True))
+        except (AttributeError, TypeError, ValueError):
+            pose_value = True
+        if self._pose_is_predicted():
+            return False
+        return bool(pose_value)
+
     def _map_constraint_expired(self, now: float, record: dict, *, from_holdover=False) -> bool:
         assert self.hooks.max_weak_pose_age_s is not None
         predicted = self._pose_is_predicted()
@@ -2754,6 +2821,7 @@ class _FlightLoopRunner:
         record["path_error_u"] = round(float(command.path_error), 3)
         record["progress"] = round(float(command.progress), 4)
         record["action"] = command.status
+        record["command_action"] = getattr(command, "action", None)
         # Which waypoint this tick is flying at, and where that waypoint is:
         # without them the pose in the log cannot be read against the plan.
         record["target_index"] = int(self.ctrl.target_index)
@@ -2767,6 +2835,15 @@ class _FlightLoopRunner:
             record["active_segment_index"] = int(self.ctrl.active_segment)
         if command.guidance_goal is not None:
             record["guidance_u"] = [round(float(value), 4) for value in command.guidance_goal]
+        # Continuous path-pull decomposition: blends the carrot ray with the
+        # lateral part of the active-leg projection offset, so the flown
+        # trajectory can be audited against the plan every tick.
+        pull = getattr(command, "path_pull", None)
+        if pull is not None:
+            record["path_pull_u"] = [round(float(value), 4) for value in np.asarray(pull, float)]
+            radius = getattr(command, "path_pull_radius", None)
+            record["path_pull_radius_u"] = None if radius is None else round(float(radius), 4)
+            record["path_pull_gain"] = round(float(self.ctrl.cfg.path_pull_gain), 3)
         # Turn forensics: the exact yaw target and signed error the gate used.
         # The log used to show only the spin (pure-yaw PCMD) while the error
         # had to be recomputed offline under an assumed frame.
@@ -2785,16 +2862,93 @@ class _FlightLoopRunner:
         record["route_nearest_u"] = [round(float(value), 4) for value in nearest]
 
     def _ground_speed_sample(self, command):
-        if command.action != "LAND":
+        if command.action not in ("LAND", "FINAL_HOLD"):
             return None
         try:
             return self.hooks.ground_speed() if self.hooks.ground_speed is not None else None
         except Exception:
             return None
 
+    def _landing_position_ok(self, pose) -> bool:
+        try:
+            last = int(self.ctrl.target_index)
+            total = len(self.ctrl.wp)
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            return False
+        if total <= 0 or last != total - 1:
+            return False
+        if not bool(getattr(pose, "map_confirmed", True)):
+            return False
+        if bool(getattr(pose, "reseed_confirming", False)):
+            return False
+        try:
+            stamp = float(pose.stamp)
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            return False
+        if not math.isfinite(stamp):
+            return False
+        return True
+
+    def _apply_landing_settling(self, command, pose, ground_speed_sample, now: float, record: dict):
+        if getattr(command, "action", None) not in ("FINAL_HOLD", "LAND"):
+            self.landing_confirmation.reset()
+            return command
+        try:
+            last = int(self.ctrl.target_index)
+            total = len(self.ctrl.wp)
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            self.landing_confirmation.reset()
+            return command
+        if total <= 0 or last != total - 1:
+            self.landing_confirmation.reset()
+            return command
+        position_ok = self._landing_position_ok(pose)
+        reseed_pause = bool(getattr(pose, "reseed_confirming", False))
+        if reseed_pause:
+            # A confirming frame is still a final-leg pose; pause the guard
+            # without clearing the in-circle evidence unless it goes stale.
+            position_ok = True
+        try:
+            inside = bool(self.ctrl.waypoint_reached(
+                __import__("numpy").array([pose.x, pose.y, pose.z]), last
+            ))
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            inside = False
+        position_ok = bool(position_ok and inside)
+        stable = self.landing_confirmation.update(
+            ground_speed_sample, now, position_ok=position_ok, reseed_pause=reseed_pause,
+        )
+        record["landing_stable_samples"] = int(self.landing_confirmation.samples)
+        record["landing_stable_span_s"] = round(float(self.landing_confirmation.span_s), 3)
+        try:
+            _ok, speed_reason, speed_value = landing_speed_allows_land(
+                ground_speed_sample, now,
+                threshold_mps=LANDING_SPEED_THRESHOLD_MPS, max_age_s=GROUND_SPEED_MAX_AGE_S,
+            )
+        except (TypeError, ValueError, OverflowError):
+            speed_reason, speed_value = "ground speed invalid", None
+        record["landing_speed_reason"] = str(speed_reason)
+        record["landing_speed_mps"] = None if speed_value is None else float(speed_value)
+        if getattr(command, "action", None) == "LAND" and not stable:
+            import dataclasses as _dc
+            try:
+                settled = _dc.replace(
+                    command, action="FINAL_HOLD", should_land=False,
+                    status=f"final position/speed settling; {speed_reason}",
+                )
+            except (AttributeError, TypeError, ValueError):
+                return command
+            try:
+                self.ctrl.state = "CRUISE"
+            except AttributeError:
+                pass
+            return settled
+        return command
+
     def _route_completion_outcome(
         self,
         command,
+        ground_speed_sample,
         now: float,
         record: dict,
     ) -> _LoopOutcome | None:
@@ -2802,10 +2956,9 @@ class _FlightLoopRunner:
             return None
         if self.landing_wait_started is None:
             self.landing_wait_started = now
-        _sent, _why, actual = self._send_command((0, 0, 0, 0))
         transition = decide_route_completion_landing(
             command.action,
-            self._ground_speed_sample(command),
+            ground_speed_sample,
             now,
             threshold_mps=LANDING_SPEED_THRESHOLD_MPS,
             max_age_s=GROUND_SPEED_MAX_AGE_S,
@@ -2813,12 +2966,14 @@ class _FlightLoopRunner:
         record.update(dict(transition.log_fields))
         if transition.outcome == "hover":
             self._reset_pcmd_controller()
+            _sent, _why, actual = self._send_command((0, 0, 0, 0))
             self._emit(record, actual, True, transition.reason)
             if self.hooks.wait_expired is not None and self.hooks.wait_expired(
                 "landing speed confirmation unavailable", now - self.landing_wait_started
             ):
                 return _LoopOutcome("landing confirmation wait expired -> manual")
             return _LoopOutcome()
+        _sent, _why, actual = self._send_command((0, 0, 0, 0))
         self._emit(record, actual, True, transition.reason)
         return _LoopOutcome(transition.reason)
 
@@ -2950,13 +3105,9 @@ class _FlightLoopRunner:
             z=localized_pose.z,
             yaw=heading,
             stamp=localized_pose.stamp,
-            map_confirmed=(
-                self.hooks.pose_is_weak is None or not self.hooks.pose_is_weak()
-            ),
-            reseed_confirming=(
-                self.hooks.pose_reseed_confirming is not None
-                and bool(self.hooks.pose_reseed_confirming())
-            ),
+            map_confirmed=self._control_pose_map_confirmed(localized_pose),
+            reseed_confirming=self._control_pose_reseed_confirming(localized_pose),
+            position_observed=self._control_pose_position_observed(localized_pose),
         )
         record["pose_u"] = [
             round(float(pose.x), 4),
@@ -2964,6 +3115,7 @@ class _FlightLoopRunner:
             round(float(pose.z), 4),
         ]
         record["pose_stamp"] = float(pose.stamp)
+        record["pose_yaw"] = float(pose.yaw)
         # Heading reconciliation on one tick: visual yaw, IMU-derived map
         # attitude, fused heading (above), and the fusion offset. A turn that
         # never converges is either a walking offset (fusion fault) or a
@@ -2981,13 +3133,15 @@ class _FlightLoopRunner:
         record["yaw_error_deg"] = self._debug_yaw_error_deg(command, heading, pose)
         self._record_route_command(record, command, heading, pose=pose)
         self._record_route_projection(pose, record)
-        pcmd = self._compute_route_pcmd(command, pose, now)
+        ground_speed_sample = self._ground_speed_sample(command)
+        settled_command = self._apply_landing_settling(command, pose, ground_speed_sample, now, record)
+        pcmd = self._compute_route_pcmd(settled_command, pose, now)
         pcmd = self._cap_after_pose_correction(pcmd, now, record)
         record["pcmd_phase"] = self.pcmd_controller.phase
         record["map_confirmed"] = pose.map_confirmed
         record["reseed_confirming"] = pose.reseed_confirming
+        record["position_observed"] = pose.position_observed
         record["yaw_confirmation_count"] = self.pcmd_controller.confirmation_count
-        record["yaw_alignment_windows"] = self.pcmd_controller.alignment_windows
         record["yaw_alignment_age_s"] = (
             None if self.pcmd_controller.alignment_started is None
             else now - self.pcmd_controller.alignment_started
@@ -2998,13 +3152,13 @@ class _FlightLoopRunner:
         record["body_velocity_mps"] = None if velocity is None else list(velocity[:2])
         record["body_velocity_stamp_mono"] = None if velocity is None else velocity[2]
         record["turn_anchor_error_u"] = self.pcmd_controller.turn_anchor_error_u
-        outcome = self._route_completion_outcome(command, now, record)
+        outcome = self._route_completion_outcome(settled_command, ground_speed_sample, now, record)
         if outcome is not None:
             return outcome
-        if command.look_at_pole is not None:
-            return self._inspection_outcome(command, pose, pcmd[2], record)
+        if settled_command.look_at_pole is not None:
+            return self._inspection_outcome(settled_command, pose, pcmd[2], record)
         return self._route_pcmd_outcome(
-            command,
+            settled_command,
             localized_pose,
             heading,
             pcmd,

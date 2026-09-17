@@ -37,9 +37,10 @@ def test_cruise_translates_toward_the_waypoint_without_yawing_for_drift(forward,
 
 def test_cruise_keeps_translating_after_a_gust_without_turning():
     gate, cmd = turn_fixture()
-    first = gate.update(cmd, rpf.Pose(0, 0, 0, 0, stamp=1.), 1., target_key=0,
+    aligned = math.pi / 2
+    first = gate.update(cmd, rpf.Pose(0, 0, 0, aligned, stamp=1.), 1., target_key=0,
                         body_velocity=(.3, 0., 1.))
-    second = gate.update(cmd, rpf.Pose(.08, 0, 0, 0, stamp=1.1), 1.1,
+    second = gate.update(cmd, rpf.Pose(.08, 0, 0, aligned, stamp=1.1), 1.1,
                          target_key=0, body_velocity=(0., 0., 1.1))
     assert first[2] == second[2] == 0
     assert gate.phase == "translate"
@@ -80,9 +81,10 @@ def test_near_waypoint_integral_grows_against_a_steady_offset():
 
 def test_cruise_cancels_cross_track_wind_without_stopping():
     gate, cmd = turn_fixture()
-    calm = gate.update(cmd, rpf.Pose(0, 0, 0, 0, stamp=1.), 1., target_key=0,
+    aligned = math.pi / 2
+    calm = gate.update(cmd, rpf.Pose(0, 0, 0, aligned, stamp=1.), 1., target_key=0,
                        body_velocity=(0., 0., 1.))
-    blown = gate.update(cmd, rpf.Pose(0, 0, 0, 0, stamp=1.1), 1.1, target_key=0,
+    blown = gate.update(cmd, rpf.Pose(0, 0, 0, aligned, stamp=1.1), 1.1, target_key=0,
                         body_velocity=(0., 0.3, 1.1))
     assert calm[2] == blown[2] == 0
     assert blown[0] * 0.3 < 0 or blown[0] != calm[0]

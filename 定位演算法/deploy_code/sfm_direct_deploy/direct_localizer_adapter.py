@@ -339,6 +339,11 @@ class DirectTrackerAdapter(Localizer):
         # True only while a strong fix is held to confirm the source a RELOC_SEED
         # started: the seed frame, then the FAST_TRACK frame whose label differs.
         reseed_run, self._reseed_confirming = self._reseed_confirming, False
+        gate_source = "MAP_FIX" if str(status) in {"RELOC_SEED", "FAST_TRACK"} else status
+        if str(status) == "RELOC_SEED" and not reseed_run:
+            # Non-first RELOC_SEED frames still need two consistent captures;
+            # mark the gate so the next consistent FAST_TRACK can release them.
+            gate.needs_confirmation = True
         if pose is None:
             gate.interrupt()
             return pose, mode, weak, False
@@ -356,10 +361,12 @@ class DirectTrackerAdapter(Localizer):
             pose.stamp,
             reliable=not weak,
             radius=self.profile.max_jump_u / 2.0,
-            source=status,
+            source=gate_source,
         )
         if not accepted:
-            self._reseed_confirming = not weak and (status == "RELOC_SEED" or reseed_run)
+            self._reseed_confirming = not weak and (
+                str(status) in {"RELOC_SEED", "FAST_TRACK"} or reseed_run
+            )
             self.trk._speed_history.clear()  # An estimator correction is not physical velocity.
             return self.state.last_pose, "WEAK_TRACK", True, True
         if not weak:
