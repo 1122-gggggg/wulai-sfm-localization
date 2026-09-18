@@ -821,6 +821,18 @@ class DesktopRouteAutonomy:
             return None
         return speed, stamp
 
+    def _altitude(self) -> tuple[float, float] | None:
+        """Firmware altitude above takeoff and its stamp; freshness is the loop's call."""
+        state = self.backend.state
+        try:
+            altitude = float(state.drone_altitude_m)
+            stamp = int(state.altitude_mono_ns) / 1_000_000_000.0
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            return None
+        if not math.isfinite(altitude) or not math.isfinite(stamp):
+            return None
+        return altitude, stamp
+
     def _body_velocity(self) -> tuple[float, float, float] | None:
         """Fresh firmware NED velocity projected into the aircraft's body axes."""
         sample = self._ground_speed()
@@ -876,6 +888,7 @@ class DesktopRouteAutonomy:
             localization_yaw_search_event=self._on_localization_yaw_search,
             ground_speed=self._ground_speed,
             body_velocity=self._body_velocity,
+            altitude=self._altitude,
             wait_expired=self._check_wait_budget,
             # Localization loss never auto-lands the AUTO route: the loop holds
             # zero PCMD through the bounded yaw search until the pose recovers
@@ -914,6 +927,15 @@ class DesktopRouteAutonomy:
             record[f"{name}_mono_ns"] = stamp
             record[f"{name}_age_s"] = None if stamp is None else now - int(stamp) / 1e9
         record["auto_elapsed_s"] = None if self._mission_started is None else now - self._mission_started
+        if record.get("vertical_waived_now"):
+            check = record.get("vertical_guard") or {}
+            self._emit(
+                "vertical_unobservable",
+                f"{self._drawn_waypoint_label(int(record.get('target_index', 0)))}："
+                f"氣壓計高度已變化 {check.get('baro_moved_m')} m，"
+                f"EDM 高度同向只變化 {check.get('localized_followed_u')} map unit；"
+                "此點改為維持高度、以水平距離判斷到站",
+            )
         self._check_waypoint_progress(record)
         self._track_route_progress(record)
         logs = self._session_logs()

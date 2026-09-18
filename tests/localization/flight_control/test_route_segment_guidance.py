@@ -172,7 +172,8 @@ def test_centering_uses_the_actual_waypoint_instead_of_a_rejoin_projection():
 
 
 def test_centering_hysteresis_survives_fresh_updates_and_releases_when_far():
-    config = rpf.ControlConfig(inspect_waypoints=())
+    # Arrival-sphere hysteresis only: shrink the join-leg yaw-hold zone below it.
+    config = rpf.ControlConfig(inspect_waypoints=(), minimum_yaw_alignment_distance=0.01)
     gate = rpf.YawAlignedPcmdController(config)
     goal = np.zeros(3)
     command = rpf.Command("FOLLOW", np.zeros(3), math.pi / 2, goal, 0, 0)
@@ -357,3 +358,76 @@ def test_large_cross_track_error_retains_bounded_wind_authority():
     assert roll >= 0.9 * cfg.max_translation_pcmd
     assert max(abs(roll), abs(pitch)) <= cfg.max_translation_pcmd == 50
     assert yaw == gaz == 0
+
+
+def test_join_leg_holds_yaw_inside_minimum_yaw_alignment_distance():
+    # 2026-09-18 run 2: 0.03-0.12 u from waypoint 1 the join bearing (goal -
+    # pose) was noise, and a re-alignment swung the nose -52 -> +60 deg.
+    cfg = rpf.ControlConfig(inspect_waypoints=())
+    assert cfg.minimum_yaw_alignment_distance > 0.1
+    gate = rpf.YawAlignedPcmdController(cfg)
+    pose = rpf.Pose(0, 0, -0.1, 0, stamp=0.1)  # goal 0.1 u north, nose east: 90 deg off
+    command = rpf.Command("FOLLOW", np.zeros(3), 0, np.zeros(3), 0.1, 0.0)
+    roll, pitch, yaw, _gaz = gate.update(command, pose, 0.1, target_key=0)
+    assert gate.phase == "waypoint_centering"
+    assert yaw == 0 and (roll, pitch) != (0, 0)
+
+
+def test_join_leg_beyond_minimum_yaw_alignment_distance_still_turns_first():
+    cfg = rpf.ControlConfig(inspect_waypoints=())
+    gate = rpf.YawAlignedPcmdController(cfg)
+    far = cfg.minimum_yaw_alignment_distance + 0.05
+    pose = rpf.Pose(0, 0, -far, 0, stamp=0.1)
+    command = rpf.Command("FOLLOW", np.zeros(3), 0, np.zeros(3), far, 0.0)
+    roll, pitch, yaw, _gaz = gate.update(command, pose, 0.1, target_key=0)
+    assert gate.phase == "turn"
+    assert yaw != 0 and (roll, pitch) == (0, 0)
+
+
+def _feed_guard(guard, samples, *, target=0, radius=0.03):
+    return [guard.observe(target, error, altitude, radius) for altitude, error in samples]
+
+
+_HOLD = [(0.5, 0.20)] * 5  # (barometric altitude m, localized height of target above u)
+
+
+def test_vertical_guard_waives_when_barometer_climbs_but_localized_height_does_not():
+    # Run 2: +1.8 m barometric climb while waypoint 1 went from 0.19 to 0.29 u above.
+    guard = rpf.VerticalConsistencyGuard(rpf.LEGACY_MAP_FRAME)
+    climb = [(0.5 + 0.1 * k, 0.20 + 0.005 * k) for k in range(1, 16)]
+    assert any(_feed_guard(guard, _HOLD + climb))
+    assert guard.waived == {0}
+    assert guard.last_check["baro_moved_m"] >= 1.0
+    assert guard.last_check["localized_followed_u"] < 0.0
+
+
+def test_vertical_guard_keeps_a_localized_height_that_follows():
+    guard = rpf.VerticalConsistencyGuard(rpf.LEGACY_MAP_FRAME)
+    climb = [(0.5 + 0.1 * k, 0.20 - 0.1 * k / 15.0) for k in range(1, 16)]  # 15 m per map unit
+    assert not any(_feed_guard(guard, _HOLD + climb))
+    assert not guard.waived
+
+
+def test_vertical_guard_is_direction_free():
+    # A segment pull can climb toward a lower target; the frozen localized
+    # height is still contradicted by the barometer.
+    guard = rpf.VerticalConsistencyGuard(rpf.LEGACY_MAP_FRAME)
+    samples = [(2.0, -0.09)] * 5 + [(2.0 + 0.1 * k, -0.09) for k in range(1, 16)]
+    assert any(_feed_guard(guard, samples))
+
+
+def test_vertical_guard_needs_a_height_gap_and_an_altitude():
+    inside = rpf.VerticalConsistencyGuard(rpf.LEGACY_MAP_FRAME)
+    samples = [(0.5, 0.02)] * 5 + [(0.5 + 0.2 * k, 0.02) for k in range(1, 10)]
+    assert not any(_feed_guard(inside, samples, radius=0.03))
+    blind = rpf.VerticalConsistencyGuard(rpf.LEGACY_MAP_FRAME)
+    assert not any(blind.observe(0, 0.2, None, 0.03) for _ in range(30))
+    assert blind.last_check is None
+
+
+def test_vertical_guard_judges_each_target_afresh():
+    guard = rpf.VerticalConsistencyGuard(rpf.LEGACY_MAP_FRAME)
+    climb = [(0.5 + 0.1 * k, 0.20) for k in range(1, 16)]
+    assert any(_feed_guard(guard, _HOLD + climb, target=0))
+    assert not any(_feed_guard(guard, [(2.0, 0.2)] * 10, target=1))
+    assert guard.waived == {0}

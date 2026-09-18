@@ -26,9 +26,10 @@ AUTONOMY_OK_LOC_STATES = frozenset({"TRACK"})
 AUTONOMY_MIN_CONSECUTIVE_FIXES = 2
 
 #: The consecutive-fix streak must additionally span this long. Counts alone
-#: pass after ~0.1 s at 20 Hz; the 2026-09-18 flight armed AUTO on ~2 s of
-#: FAST_TRACK and then sat through 24 s with zero strong fixes. Duration forces
-#: the operator to wait for genuinely stable conditions instead of flicker.
+#: pass after ~0.1 s at 20 Hz. Applies only without boot_pose_locked: desktop
+#: AUTO (the path the 2026-09-18 flight used) is armed by BootPoseLock, which
+#: may lock on weak / IMU estimates by operator decision (SAFETY.md), so this
+#: gate does not protect it.
 AUTONOMY_MIN_STABLE_S = 5.0
 
 
@@ -102,7 +103,8 @@ def autonomous_arming_blockers(
     Unknown/missing fields are treated as blocking: a gate that cannot see the
     evidence must not conclude the evidence is good.
     Desktop AUTO may supply boot_pose_locked after BootPoseLock has confirmed
-    consecutive fresh, stable estimates; those do not require PnP metrics.
+    consecutive fresh, stable estimates; those do not require PnP metrics or
+    the AUTONOMY_MIN_STABLE_S strong-fix streak.
     """
     blockers = autonomous_approval_blockers(snapshot)
 

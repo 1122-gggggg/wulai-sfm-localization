@@ -45,7 +45,7 @@ import select
 import sys
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import numpy as np
@@ -233,6 +233,8 @@ POSE_HOLDOVER_S = _env_float("SFM_POSE_HOLDOVER_S", 0.50, minimum=0.0, maximum=P
 # timer; this one decides whether autonomy may run the localizer on the frame.
 STREAM_STALE_S = 0.5
 LOST_LAND_S = 4.0  # no fresh pose for this long -> auto-land
+# Firmware altitude older than this pauses the barometric height cross-check.
+VERTICAL_GUARD_ALTITUDE_MAX_AGE_S = 1.0
 # Give MegaLoc a stationary retry window before moving the camera. The desktop
 # AUTO adapter opts into one slow, telemetry-bounded clockwise turn.
 LOST_YAW_SEARCH_DELAY_S = 10.0
@@ -934,6 +936,9 @@ class LoopHooks:
     pcmd_timing: callable | None = None  # () -> latest desired/wire monotonic_ns markers
     ground_speed: callable | None = None  # () -> (horizontal_mps, monotonic_stamp) | None
     body_velocity: callable | None = None  # () -> (forward_mps, right_mps, source_stamp) | None
+    # () -> (firmware altitude above takeoff in metres, monotonic stamp) | None;
+    # None disables the barometric height cross-check (VerticalConsistencyGuard).
+    altitude: callable | None = None
     max_weak_pose_age_s: float | None = None  # bounded VO bridge from last strong capture
     log_tick: callable | None = None  # (dict) -> None; structured per-tick command log
     land_on_localization_loss: bool = True  # false: zero PCMD and wait for recovery/operator
@@ -1779,6 +1784,10 @@ class _FlightLoopRunner:
         self.enforce_weak_pose_gate = enforce_weak_pose_gate
         self.heading = HeadingEstimator(ctrl.cfg.map_frame if ctrl is not None else None)
         self.pcmd_controller = rpf.YawAlignedPcmdController(ctrl.cfg) if ctrl is not None else None
+        self.vertical_guard = (
+            rpf.VerticalConsistencyGuard(ctrl.cfg.map_frame)
+            if ctrl is not None and hooks.altitude is not None else None
+        )
         self.period = 1.0 / CTRL_HZ
         self.last_good = None
         self.last_good_accepted_at = None
@@ -2722,6 +2731,42 @@ class _FlightLoopRunner:
         )
         return _LoopOutcome()
 
+    def _fresh_altitude(self, now: float) -> float | None:
+        try:
+            sample = self.hooks.altitude()
+            altitude, stamp = float(sample[0]), float(sample[1])
+        except (TypeError, ValueError, OverflowError, IndexError):
+            return None
+        if not math.isfinite(altitude) or not 0.0 <= now - stamp <= VERTICAL_GUARD_ALTITUDE_MAX_AGE_S:
+            return None
+        return altitude
+
+    def _vertical_guarded_pose(self, pose, now: float, record: dict):
+        """Pose the route controller flies by, after the barometric height check.
+
+        Once VerticalConsistencyGuard waives the current target, the controller
+        is given the pose at the target's own localized height: no vertical
+        error, so no climb or descent, and arrival is judged horizontally. The
+        raw pose stays in pose_u; the next target is judged afresh.
+        """
+        guard = self.vertical_guard
+        if guard is None:
+            return pose
+        target = int(self.ctrl.target_index)
+        error = guard.vertical_error(self.ctrl.wp[target], pose.xyz)
+        altitude = self._fresh_altitude(now)
+        record["localized_vertical_error_u"] = round(error, 4)
+        record["baro_altitude_m"] = None if altitude is None else round(altitude, 3)
+        if guard.observe(target, error, altitude, self.ctrl._arrive_radius_for(target)):
+            record["vertical_waived_now"] = True
+        if guard.last_check is not None:
+            record["vertical_guard"] = dict(guard.last_check)
+        if target not in guard.waived:
+            return pose
+        record["vertical_waived"] = True
+        x, y, z = (float(value) for value in pose.xyz + error * guard.up)
+        return replace(pose, x=x, y=y, z=z)
+
     def _note_pose_correction(self, pose, now: float, record: dict) -> None:
         previous = self._last_route_xyz
         self._last_route_xyz = pose.xyz.copy()
@@ -3143,6 +3188,7 @@ class _FlightLoopRunner:
             getattr(self.heading, "offset", None)
         )
         self._note_pose_correction(pose, now, record)
+        pose = self._vertical_guarded_pose(pose, now, record)
         command = self.ctrl.step(pose, now)
         record["yaw_error_deg"] = self._debug_yaw_error_deg(command, heading, pose)
         self._record_route_command(record, command, heading, pose=pose)
@@ -3151,6 +3197,8 @@ class _FlightLoopRunner:
         settled_command = self._apply_landing_settling(command, pose, ground_speed_sample, now, record)
         pcmd = self._compute_route_pcmd(settled_command, pose, now)
         pcmd = self._cap_after_pose_correction(pcmd, now, record)
+        if self.vertical_guard is not None and int(self.ctrl.target_index) in self.vertical_guard.waived:
+            pcmd = (pcmd[0], pcmd[1], pcmd[2], 0)  # hold altitude; see _vertical_guarded_pose
         record["pcmd_phase"] = self.pcmd_controller.phase
         record["map_confirmed"] = pose.map_confirmed
         record["reseed_confirming"] = pose.reseed_confirming

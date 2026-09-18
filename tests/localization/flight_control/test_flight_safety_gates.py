@@ -3695,15 +3695,19 @@ def test_misaligned_per_waypoint_radii_are_rejected():
 
 
 def test_short_horizontal_leg_still_requires_nose_alignment():
+    # A route leg aims along its segment (guidance goal), so even a short one
+    # turns first. Only direct-to-point join legs hold yaw near the goal.
     cfg = rpf.ControlConfig(inspect_waypoints=())
     control = rpf.YawAlignedPcmdController(cfg)
+    goal = np.array([0.0, 0.0, 0.1])
     cmd = rpf.Command(
         "FOLLOW",
         np.array([0.1, 0.0, 0.0]),
-        yaw_target=0.0,
-        goal=np.array([0.0, 0.0, 0.1]),
+        yaw_target=cfg.map_frame.heading(goal),
+        goal=goal,
         path_error=0.0,
         progress=0.0,
+        guidance_goal=goal,
     )
     pose = rpf.Pose(0.0, 0.0, 0.0, yaw=0.0, stamp=1.0)
 

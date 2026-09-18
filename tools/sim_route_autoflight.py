@@ -181,6 +181,20 @@ class SimParams:
     blackout_dur_s: float = 0.0
     blackout_drift_mps: float = 0.0
     blackout_yaw_drift_deg_s: float = 0.0
+    # Localization-failure windows: the aircraft does not know where it is,
+    # but VO / dead reckoning keep reporting a weak estimate that drifts
+    # (drift_gain x true motion + drift_mps). See SimulatedLocalizerConfig.
+    drift_every_s: float = 0.0
+    drift_dur_s: float = 0.0
+    drift_offset_s: float = 0.0
+    drift_gain: float = 1.0
+    drift_mps: float = 0.0
+    # Reported height change = vertical_gain x true height change.
+    vertical_gain: float = 1.0
+    # Firmware altitude fed to the barometric height cross-check: truth plus
+    # white noise and a constant drift (m/s since the start).
+    baro_noise_m: float = 0.0
+    baro_drift_mps: float = 0.0
     # plant
     cruise_mps: float = 0.90  # horizontal speed at max_translation_pcmd
     max_vertical_speed_mps: float = 2.0  # configured desktop envelope, not capability maximum
@@ -245,10 +259,12 @@ class SimParams:
                 raise ValueError(f"{name} must be finite and > 0")
         for name in ("telemetry_latency_ms", "telemetry_noise_mps", "latency_jitter_ms",
                      "position_correlation_s", "yaw_correlation_s", "bias_walk_u_sqrt_s",
-                     "command_latency_ms"):
+                     "command_latency_ms", "baro_noise_m"):
             value = float(getattr(self, name))
             if not __import__("math").isfinite(value) or value < 0.0:
                 raise ValueError(f"{name} must be finite and >= 0")
+        if not __import__("math").isfinite(float(self.baro_drift_mps)):
+            raise ValueError("baro_drift_mps must be finite")
         drop = float(self.telemetry_drop_rate)
         if not __import__("math").isfinite(drop) or not 0.0 <= drop <= 1.0:
             raise ValueError("telemetry_drop_rate must be finite and in [0, 1]")
@@ -276,7 +292,17 @@ class SimParams:
 # with zero strong (FAST_TRACK/RELOC_SEED) fixes while KLT/IMU weak poses keep
 # arriving. R2_weak80 is the milder flicker regime: mostly weak poses with
 # enough strong fixes interleaved that recovery can still confirm.
+#
+# R3/R4 replay the two failure modes of the 2026-09-18 13:01 flight on the
+# route it flew (start offsets are map x/y/z from its waypoint 1; tuned at
+# 15 m/u). R3 (run 1): takeoff 0.68 u from waypoint 1, 0.3 u below it; ~2 s
+# in the aircraft stops knowing where it is for 24 s while VO / dead reckon
+# keep reporting ~5x its real motion plus 0.5 m/s drift. R4 (run 2): the
+# localized height never follows the climb, so waypoint 1 stays above; once
+# over it (40 s here) the position drifts again and a >0.5 s gap forces a
+# re-alignment toward a bearing that is only noise at that range.
 # --------------------------------------------------------------------------
+_FLIGHT_20260918_1301_DELIVERY = {"pose_rate_hz": 16.0, "latency_jitter_ms": 60.0, "drop_rate": 0.08}
 REGRESSION_SCENARIOS: dict[str, dict] = {
     "R1_flight20260918": {
         "localization_wait_s": 23.0,
@@ -287,6 +313,29 @@ REGRESSION_SCENARIOS: dict[str, dict] = {
     "R2_weak80": {
         "start_offset_u": (0.68, 0.0, 0.0),
         "weak_rate": 0.8,
+    },
+    "R3_flight20260918_1301_drift": {
+        **_FLIGHT_20260918_1301_DELIVERY,
+        "start_offset_frame": "raw",
+        "start_offset_u": (-0.0463, 0.2957, -0.6162),
+        "drift_offset_s": 2.0,
+        "drift_every_s": 40.0,
+        "drift_dur_s": 24.0,
+        "drift_gain": 5.0,
+        "drift_mps": 0.5,
+    },
+    "R4_flight20260918_1301_height": {
+        **_FLIGHT_20260918_1301_DELIVERY,
+        "start_offset_frame": "raw",
+        "start_offset_u": (-0.0654, 0.2154, -0.3268),
+        "vertical_gain": 0.0,
+        "drift_offset_s": 40.0,
+        "drift_every_s": 60.0,
+        "drift_dur_s": 14.0,
+        "drift_gain": 5.0,
+        "drift_mps": 0.5,
+        "outage_every_s": 45.0,
+        "outage_dur_s": 1.0,
     },
 }
 
@@ -317,6 +366,18 @@ class SimResult:
     speed_guard_interventions: int = 0
     max_waypoint_no_progress_s: float = 0.0
     yaw_overlap_ticks: int = 0
+    # Truth-side metrics (the estimate-side max_dev cannot see drift).
+    max_true_dev_m: float = 0.0
+    max_est_error_m: float = 0.0
+    max_climb_m: float = 0.0
+    # Longest run of route commands issued on a pose that is not map-confirmed.
+    weak_steer_max_s: float = 0.0
+    # Join-leg yaw-alignment ticks while the target is horizontally inside
+    # minimum_yaw_alignment_distance. That leg aims at goal - pose, so its
+    # bearing is ill-conditioned there; later legs aim along the segment.
+    near_waypoint_turn_ticks: int = 0
+    # Waypoints whose localized height the barometric cross-check waived.
+    vertical_waivers: int = 0
     trace: list[dict] = field(default_factory=list)
 
 class _SimulationAutonomyChecks(DesktopRouteAutonomy):
@@ -669,16 +730,13 @@ def _inspection_command_from_record(runner_record, pose):
     )
 
 
+_TURN_PHASES = ("turn", "yaw_alignment_hold", "yaw_alignment_confirmed", "yaw_alignment_timeout")
+
+
 def _phase_ticks(phase):
     text = str(phase or "")
     base = text.removeprefix("fgc:")
-    if base in (
-        "turn",
-        "yaw_alignment_hold",
-        "yaw_alignment_confirmed",
-        "yaw_alignment_timeout",
-        "final_centering",
-    ):
+    if base in (*_TURN_PHASES, "final_centering"):
         return 0, 1
     if base in ("translate", "route_rejoin", "waypoint_centering", "height_adjust"):
         return 0, 0
@@ -733,6 +791,63 @@ def _initial_sim_state(params, wp, map_frame, s):
     return state, start_map
 
 
+class _TruthDebrief:
+    """Truth-side metrics. run_sim's max_dev is measured on the estimate, which
+    a drifting weak pose can keep on the route while the aircraft is not."""
+
+    def __init__(self, ctrl, cfg, map_frame, s, start_pos_m, join_target):
+        self.ctrl, self.map_frame, self.s = ctrl, map_frame, float(s)
+        self.join_target = int(join_target)
+        self.min_yaw_distance_u = float(cfg.minimum_yaw_alignment_distance)
+        self.up = np.asarray(map_frame.up, dtype=float) / float(np.linalg.norm(map_frame.up))
+        self.start_height_m = float(np.dot(start_pos_m, self.up))
+        self.max_true_dev_u = self.max_est_error_u = self.max_climb_m = 0.0
+        self.weak_steer_s = self.weak_steer_max_s = 0.0
+        self.last_pose_weak = False
+        self.near_waypoint_turn_ticks = 0
+        self.vertical_waivers = 0
+
+    def update(self, pos_m, pose, live_pose, record, phase) -> None:
+        true_u = np.asarray(pos_m, dtype=float) / self.s
+        dist, _nearest, _segment, _s = rpf.project_to_path(true_u, list(self.ctrl.wp), self.ctrl.cum)
+        self.max_true_dev_u = max(self.max_true_dev_u, float(dist))
+        if pose is not None:
+            self.max_est_error_u = max(self.max_est_error_u, float(np.linalg.norm(pose.xyz - true_u)))
+        self.max_climb_m = max(self.max_climb_m, float(np.dot(pos_m, self.up)) - self.start_height_m)
+        # Longest stretch the route controller keeps flying (no localization
+        # hold) while the pose it is given is not map-confirmed.
+        if live_pose is not None:  # None = no delivery this tick (e.g. out-of-order capture)
+            self.last_pose_weak = not bool(getattr(live_pose, "map_confirmed", True))
+        if "command_action" in record and self.last_pose_weak:
+            self.weak_steer_s += DT
+            self.weak_steer_max_s = max(self.weak_steer_max_s, self.weak_steer_s)
+        else:
+            self.weak_steer_s = 0.0
+        if record.get("vertical_waived_now"):
+            self.vertical_waivers += 1
+        error = record.get("target_error_map_u")
+        if (
+            error is not None
+            and record.get("target_index") == self.join_target
+            and str(phase).removeprefix("fgc:") in _TURN_PHASES
+            and self.map_frame.horizontal_distance(np.asarray(error, dtype=float)) < self.min_yaw_distance_u
+        ):
+            self.near_waypoint_turn_ticks += 1
+
+
+def _barometer(params: SimParams, rng, up_axis):
+    """Firmware altitude reader for the height cross-check: truth plus configured error."""
+    noise, drift = float(params.baro_noise_m), float(params.baro_drift_mps)
+
+    def read(pos_m, now) -> float:
+        altitude = float(np.dot(pos_m, up_axis)) + drift * float(now)
+        if noise > 0.0:
+            altitude += float(rng.normal(0.0, noise))
+        return altitude
+
+    return read
+
+
 def _simulation_budget(params: SimParams) -> tuple[float, int]:
     duration, wait = float(params.duration_s), float(params.localization_wait_s)
     if not math.isfinite(duration) or duration <= 0:
@@ -749,6 +864,7 @@ def run_sim(params: SimParams, *, record_trace: bool = True) -> tuple[SimResult,
     tele_rng = np.random.default_rng(seed_seq.spawn(1)[0])
     loc_rng = np.random.default_rng(seed_seq.spawn(1)[0])
     cmd_rng = np.random.default_rng(seed_seq.spawn(1)[0])
+    baro_rng = np.random.default_rng(seed_seq.spawn(1)[0])
     ctrl, cfg, map_frame, doc = build_production_controller(
         params.route, params.align, return_to_start=params.return_to_start
     )
@@ -781,6 +897,10 @@ def run_sim(params: SimParams, *, record_trace: bool = True) -> tuple[SimResult,
         position_correlation_s=params.position_correlation_s, yaw_correlation_s=params.yaw_correlation_s,
         bias_walk_u_sqrt_s=params.bias_walk_u_sqrt_s,
         reseed_confirm_frames=params.reseed_confirm_frames,
+        drift_every_s=params.drift_every_s, drift_dur_s=params.drift_dur_s,
+        drift_offset_s=params.drift_offset_s, drift_gain=params.drift_gain,
+        drift_mps=params.drift_mps, vertical_gain=params.vertical_gain,
+        map_up_u=tuple(float(v) for v in map_frame.up),
     )
     loc = SimulatedLocalizer(loc_cfg, loc_rng)
     cmd_channel = CommandChannel(CommandChannelConfig(
@@ -817,6 +937,8 @@ def run_sim(params: SimParams, *, record_trace: bool = True) -> tuple[SimResult,
     speed_guard_interventions = 0
     max_waypoint_no_progress_s = 0.0
     max_dev = 0.0
+    debrief = _TruthDebrief(ctrl, cfg, map_frame, s, state.pos_m, join_target)
+    barometer = _barometer(params, baro_rng, debrief.up)
     reason = "step cap" if max_steps else "localization wait exhausted total budget"
     success = False
     dist_m = 0.0
@@ -876,6 +998,7 @@ def run_sim(params: SimParams, *, record_trace: bool = True) -> tuple[SimResult,
         loop_beat=lambda: None,
         ground_speed=lambda: speed_guard._ground_speed(),
         body_velocity=lambda: speed_guard._body_velocity(),
+        altitude=lambda: (barometer(state.pos_m, sim_clock["t"]), float(sim_clock["t"])),
         max_weak_pose_age_s=pff.POSE_STALE_S,
         log_tick=_log_tick,
         land_on_localization_loss=False,
@@ -1039,6 +1162,7 @@ def run_sim(params: SimParams, *, record_trace: bool = True) -> tuple[SimResult,
                 max_dev = dist
         else:
             dist = float("nan")
+        debrief.update(state.pos_m, pose, pose_cell["pose"], runner_record, phase)
 
         if cmd_action == "INSPECT":
             cmd = _inspection_command_from_record(runner_record, pose)
@@ -1172,6 +1296,12 @@ def run_sim(params: SimParams, *, record_trace: bool = True) -> tuple[SimResult,
         speed_guard_interventions=speed_guard_interventions,
         max_waypoint_no_progress_s=max_waypoint_no_progress_s,
         yaw_overlap_ticks=yaw_overlap_ticks,
+        max_true_dev_m=round(debrief.max_true_dev_u * s, 3),
+        max_est_error_m=round(debrief.max_est_error_u * s, 3),
+        max_climb_m=round(debrief.max_climb_m, 3),
+        weak_steer_max_s=round(debrief.weak_steer_max_s, 2),
+        near_waypoint_turn_ticks=debrief.near_waypoint_turn_ticks,
+        vertical_waivers=debrief.vertical_waivers,
         trace=sim_trace if record_trace else [],
     )
     home_label = 1 if params.return_to_start else (n_wp - 1) // 2 + 1
@@ -1407,6 +1537,23 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--blackout-dur-s", type=float, default=0.0)
     ap.add_argument("--blackout-drift-mps", type=float, default=0.0)
     ap.add_argument("--blackout-yaw-drift-deg-s", type=float, default=0.0)
+    ap.add_argument("--drift-every-s", type=float, default=0.0,
+                    help="localization-failure window period (0 = off)")
+    ap.add_argument("--drift-dur-s", type=float, default=0.0,
+                    help="seconds per window with no map fix, only a drifting weak estimate")
+    ap.add_argument("--drift-offset-s", type=float, default=0.0, help="start of the first window")
+    ap.add_argument("--drift-gain", type=float, default=1.0,
+                    help="weak-estimate displacement per unit of true displacement")
+    ap.add_argument("--drift-mps", type=float, default=0.0,
+                    help="extra weak-estimate drift speed, random horizontal direction per window")
+    ap.add_argument("--vertical-gain", type=float, default=1.0,
+                    help="reported height change per unit of true height change (0 = frozen)")
+    ap.add_argument("--baro-noise-m", type=float, default=0.0,
+                    help="white noise on the firmware altitude fed to the height cross-check")
+    ap.add_argument("--baro-drift-mps", type=float, default=0.0,
+                    help="constant firmware-altitude drift (m/s) fed to the height cross-check")
+    ap.add_argument("--start-offset-frame", choices=["lateral", "raw"], default="lateral",
+                    help="lateral: --start-offset-u is (lateral, along, up); raw: map x/y/z")
     ap.add_argument("--ground-altitude-m", type=float, default=None)
     ap.add_argument("--telemetry-rate-hz", type=float, default=5.0)
     ap.add_argument("--telemetry-latency-ms", type=float, default=200.0)
@@ -1443,6 +1590,7 @@ def _params_from_args(a: argparse.Namespace, *, seed: int, scale: float) -> SimP
         seed=seed,
         duration_s=a.duration_s,
         start_offset_u=tuple(a.start_offset_u),  # type: ignore[arg-type]
+        start_offset_frame=a.start_offset_frame,
         initial_yaw_error_deg=a.initial_yaw_error_deg,
         yaw_bias_deg=a.yaw_bias_deg,
         pos_bias_u=tuple(a.pos_bias_u),  # type: ignore[arg-type]
@@ -1476,6 +1624,14 @@ def _params_from_args(a: argparse.Namespace, *, seed: int, scale: float) -> SimP
         blackout_dur_s=a.blackout_dur_s,
         blackout_drift_mps=a.blackout_drift_mps,
         blackout_yaw_drift_deg_s=a.blackout_yaw_drift_deg_s,
+        drift_every_s=a.drift_every_s,
+        drift_dur_s=a.drift_dur_s,
+        drift_offset_s=a.drift_offset_s,
+        drift_gain=a.drift_gain,
+        drift_mps=a.drift_mps,
+        vertical_gain=a.vertical_gain,
+        baro_noise_m=a.baro_noise_m,
+        baro_drift_mps=a.baro_drift_mps,
         ground_altitude_m=a.ground_altitude_m,
         telemetry_rate_hz=a.telemetry_rate_hz,
         telemetry_latency_ms=a.telemetry_latency_ms,
@@ -1537,6 +1693,12 @@ def main(argv: list[str] | None = None) -> int:
                 "n_wp_hits": len(result.waypoints_reached),
                 "path_len_m": info["path_len_m"],
                 "arrive_m": info["arrive_radius_m"],
+                "max_true_dev_m": result.max_true_dev_m,
+                "max_est_error_m": result.max_est_error_m,
+                "max_climb_m": result.max_climb_m,
+                "weak_steer_max_s": result.weak_steer_max_s,
+                "near_waypoint_turn_ticks": result.near_waypoint_turn_ticks,
+                "vertical_waivers": result.vertical_waivers,
             }
             rows.append(row)
             flag = "OK " if result.success else "FAIL"
@@ -1544,6 +1706,9 @@ def main(argv: list[str] | None = None) -> int:
                 f"[sim] [{flag}] s={scale:g}m/u seed={seed} "
                 f"t={result.time_s:.0f}s prog={result.progress_pct:.0f}% "
                 f"flown={result.dist_flown_m:.1f}m max_dev={result.max_dev_m:.2f}m "
+                f"true_dev={result.max_true_dev_m:.2f}m est_err={result.max_est_error_m:.2f}m "
+                f"climb={result.max_climb_m:.2f}m weak_steer={result.weak_steer_max_s:.1f}s "
+                f"near_wp_turn={result.near_waypoint_turn_ticks} waivers={result.vertical_waivers} "
                 f"-> {result.reason}",
                 flush=True,
             )

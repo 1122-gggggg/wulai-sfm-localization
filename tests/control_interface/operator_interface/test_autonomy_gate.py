@@ -39,7 +39,9 @@ def test_all_localization_conditions_good_allows_arming():
 
 def test_confirmed_boot_estimates_do_not_require_pnp_metrics():
     snap = _good()
-    snap.update(inliers=0, reproj_rms=None, consecutive_good_fixes=0)
+    # Operator decision (2026-09-18, option B): desktop AUTO BOOT may lock on
+    # weak estimates, so the 5 s strong-fix streak does not apply to it.
+    snap.update(inliers=0, reproj_rms=None, consecutive_good_fixes=0, good_streak_s=1.0)
     assert rs.autonomous_arming_blockers(snap)
     assert rs.autonomous_arming_blockers(snap, boot_pose_locked=True) == []
 

@@ -2271,3 +2271,26 @@ def test_send_authorized_race_with_failure_clears_nudge_and_zeros_pcmd(
     assert not worker.is_alive()
     assert backend._nudge_vector is None
     assert backend.zeros[-1][:4] == (0, 0, 0, 0)
+
+
+def test_route_hooks_feed_firmware_altitude_and_announce_a_height_waiver(tmp_path):
+    clock = _Clock()
+    backend = _Backend()
+    backend.state.drone_altitude_m = 2.5
+    backend.state.altitude_mono_ns = int(clock.now() * 1e9)
+    autonomy = _budget_autonomy(tmp_path, backend, clock)
+    assert autonomy._route_hooks().altitude() == (2.5, pytest.approx(clock.now()))
+    backend.state.drone_altitude_m = float("nan")
+    assert autonomy._altitude() is None
+
+    autonomy._log_route_tick({
+        "target_index": 0,
+        "vertical_waived_now": True,
+        "vertical_guard": {"baro_moved_m": 1.02, "localized_followed_u": -0.09},
+    })
+    events = []
+    while not autonomy.events.empty():
+        events.append(autonomy.events.get_nowait())
+    waiver = [event for event in events if event.kind == "vertical_unobservable"]
+    assert len(waiver) == 1
+    assert "1.02 m" in waiver[0].detail and "-0.09" in waiver[0].detail

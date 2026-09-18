@@ -237,3 +237,102 @@ def test_cli_out_and_scenario_flags_write_artifacts(tmp_path):
     summary = json.loads((outdir / "summary.json").read_text(encoding="utf-8"))
     assert summary["scenario"] == "R2_weak80"
     assert summary["params"]["weak_rate"] == 0.8
+
+
+def _fly_localizer(velocity_mps, t_end, t_start=0.0, **config):
+    """Poll a noise-free, zero-latency SimulatedLocalizer along a straight line."""
+    from simulated_localization import SimulatedLocalizer, SimulatedLocalizerConfig
+    cfg = SimulatedLocalizerConfig(s=10.0, pos_sigma_u=0.0, yaw_sigma_deg=0.0, latency_ms=0.0,
+                                   drop_rate=0.0, map_up_u=(0.0, -1.0, 0.0), **config)
+    loc = SimulatedLocalizer(cfg, np.random.default_rng(0))
+    samples, pos = [], np.zeros(3)
+    for step in range(int(round((t_end - t_start) / sim.DT)) + 1):
+        t = t_start + step * sim.DT
+        loc.push_truth(t, pos, 0.0)
+        samples.append((t, pos / 10.0, loc.report(t)))
+        pos = pos + np.asarray(velocity_mps, dtype=float) * sim.DT
+    return samples
+
+
+def test_drift_window_reports_weak_pose_running_ahead_of_truth():
+    samples = _fly_localizer((1.0, 0.0, 0.0), 4.0, drift_offset_s=1.0, drift_every_s=100.0,
+                             drift_dur_s=2.0, drift_gain=5.0)
+
+    def truth_x(pose):  # 1 m/s at 10 m/u; a capture may sample the previous tick
+        return float(pose.stamp) / 10.0
+
+    tick_u = 0.1 * sim.DT
+    anchor = [pose for t, _truth, pose in samples if t < 1.0][-1]
+    assert anchor.map_confirmed and anchor.x == pytest.approx(truth_x(anchor), abs=tick_u)
+    pose = next(pose for t, _truth, pose in samples if t >= 2.5)
+    assert not pose.map_confirmed and pose.position_observed
+    assert pose.x - anchor.x == pytest.approx(
+        5.0 * (truth_x(pose) - truth_x(anchor)), abs=5.0 * tick_u + 1e-9
+    )
+    pose = next(pose for t, _truth, pose in samples if t >= 3.5)
+    assert pose.map_confirmed and pose.x == pytest.approx(truth_x(pose), abs=tick_u)
+
+
+def test_drift_window_before_any_map_fix_has_no_pose():
+    samples = _fly_localizer((1.0, 0.0, 0.0), 2.0, t_start=1.0, drift_every_s=100.0, drift_dur_s=5.0)
+    assert all(pose is None for _t, _truth, pose in samples)
+
+
+def test_vertical_gain_zero_freezes_reported_height():
+    samples = _fly_localizer((0.0, -1.0, 0.0), 3.0, vertical_gain=0.0)  # climbing: up is -y
+    _t, truth, pose = samples[-1]
+    assert truth[1] == pytest.approx(-0.3)
+    assert pose.y == pytest.approx(0.0, abs=1e-12)
+
+
+def test_drift_and_vertical_gain_need_map_up():
+    from simulated_localization import SimulatedLocalizer, SimulatedLocalizerConfig
+    for kw in ({"drift_mps": 0.5}, {"vertical_gain": 0.0}):
+        with pytest.raises(ValueError, match="map_up_u"):
+            SimulatedLocalizer(SimulatedLocalizerConfig(**kw), np.random.default_rng(0))
+
+
+def test_regression_R3_flies_on_a_drifting_pose_like_flight20260918_1301():
+    params = sim.apply_regression_scenario(_regression_base(), "R3_flight20260918_1301_drift")
+    result, _ = sim.run_sim(params, record_trace=False)
+    # Run 1: route commands kept flowing for the whole 24 s window on VO /
+    # dead-reckon poses metres off; the estimate-side max_dev cannot see it.
+    assert result.weak_steer_max_s > 20.0
+    assert result.max_est_error_m > 5.0
+    base, _ = sim.run_sim(_regression_base(), record_trace=False)
+    assert base.weak_steer_max_s == 0.0
+    assert base.max_est_error_m < 1.0
+
+
+def test_regression_R4_height_guard_arrives_without_runaway_climb_or_yaw_swing():
+    params = sim.apply_regression_scenario(_regression_base(), "R4_flight20260918_1301_height")
+    result, _ = sim.run_sim(params, record_trace=False)
+    # Run 2 before the fix: never reached waypoint 1, climbed 12-14.5 m in
+    # 120 s here and swung the nose over it. The barometric cross-check holds
+    # altitude once the localized height stops following, and the join leg
+    # holds yaw inside minimum_yaw_alignment_distance.
+    assert 0 in result.waypoints_reached
+    assert result.vertical_waivers >= 1
+    assert result.max_climb_m < 4.0
+    assert result.near_waypoint_turn_ticks == 0
+
+
+def test_height_guard_does_not_fire_on_barometer_noise_or_drift():
+    for drift in (0.01, -0.01):
+        params = _regression_base(baro_noise_m=0.1, baro_drift_mps=drift)
+        result, _ = sim.run_sim(params, record_trace=False)
+        assert result.vertical_waivers == 0
+
+
+def test_cli_localization_failure_flags_reach_params():
+    args = sim.build_parser().parse_args([
+        "--drift-every-s", "40", "--drift-dur-s", "24", "--drift-offset-s", "2",
+        "--drift-gain", "5", "--drift-mps", "0.5", "--vertical-gain", "0",
+        "--start-offset-frame", "raw", "--start-offset-u", "0.1", "0.2", "0.3",
+        "--baro-noise-m", "0.1", "--baro-drift-mps", "-0.01",
+    ])
+    params = sim._params_from_args(args, seed=7, scale=15.0)
+    assert (params.drift_every_s, params.drift_dur_s, params.drift_offset_s) == (40.0, 24.0, 2.0)
+    assert (params.drift_gain, params.drift_mps, params.vertical_gain) == (5.0, 0.5, 0.0)
+    assert (params.baro_noise_m, params.baro_drift_mps) == (0.1, -0.01)
+    assert params.start_offset_frame == "raw" and params.start_offset_u == (0.1, 0.2, 0.3)

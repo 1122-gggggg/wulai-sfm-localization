@@ -1967,6 +1967,86 @@ def command_to_body_percent(
     )
 
 
+#: VerticalConsistencyGuard defaults: barometric climb or descent after which
+#: the localized height must have moved the same way, that minimum in map units,
+#: and the median window (ticks) of each reference.
+VERTICAL_GUARD_BARO_M = 1.0
+VERTICAL_GUARD_MIN_FOLLOW_U = 0.02
+VERTICAL_GUARD_WINDOW = 5
+
+
+class VerticalConsistencyGuard:
+    """Waive a waypoint's localized height when the barometer contradicts it.
+
+    Heights stay map heights: AUTO climbs or descends on the localized vertical
+    error. Per target, the first `window` samples fix a reference (median
+    altitude and vertical error). Once the barometer shows the aircraft moved
+    `baro_move_m` up or down while the localized height moved less than
+    `min_follow_u` the same way, that target's height is waived: hold altitude
+    and arrive horizontally. Direction-free, because a segment pull can climb
+    toward a lower target. On 2026-09-18 the barometer climbed 1.8 m while the
+    localized height fell 0.06 u, and AUTO climbed to 4 m. Only engages when
+    height alone keeps the aircraft outside the arrival sphere. Compares
+    directions and a map-unit floor, never metres against map units, so a
+    height that follows only partly is not caught. No altitude, no check.
+    """
+
+    def __init__(
+        self,
+        map_frame,
+        *,
+        baro_move_m: float = VERTICAL_GUARD_BARO_M,
+        min_follow_u: float = VERTICAL_GUARD_MIN_FOLLOW_U,
+        window: int = VERTICAL_GUARD_WINDOW,
+    ) -> None:
+        up = np.asarray(map_frame.up, dtype=float)
+        self.up = up / float(np.linalg.norm(up))
+        self.baro_move_m = float(baro_move_m)
+        self.min_follow_u = float(min_follow_u)
+        self.window = int(window)
+        self.waived: set[int] = set()
+        self.last_check: dict | None = None
+        self._target: int | None = None
+        self._reference: list[tuple[float, float]] = []
+        self._recent: list[tuple[float, float]] = []
+
+    def vertical_error(self, goal, position) -> float:
+        """Localized height of `goal` above `position`, in map units."""
+        delta = np.asarray(goal, dtype=float) - np.asarray(position, dtype=float)
+        return float(np.dot(delta, self.up))
+
+    def observe(self, target: int, vertical_error_u: float, altitude_m: float | None,
+                radius_u: float) -> bool:
+        """Feed one control tick; True only on the tick `target` becomes waived."""
+        target = int(target)
+        if target != self._target:
+            self._target, self._reference, self._recent = target, [], []
+            self.last_check = None
+        if target in self.waived or altitude_m is None:
+            return False
+        sample = (float(altitude_m), float(vertical_error_u))
+        if not (math.isfinite(sample[0]) and math.isfinite(sample[1])):
+            return False
+        if len(self._reference) < self.window:
+            self._reference.append(sample)
+            return False
+        self._recent = (self._recent + [sample])[-self.window:]
+        if len(self._recent) < self.window:
+            return False
+        ref_altitude, ref_error = (float(np.median(values)) for values in zip(*self._reference))
+        altitude, error = (float(np.median(values)) for values in zip(*self._recent))
+        if abs(ref_error) <= float(radius_u):
+            return False
+        moved_m = altitude - ref_altitude
+        # Localized climb since the reference, signed along the barometric move.
+        followed_u = (ref_error - error) * (1.0 if moved_m >= 0.0 else -1.0)
+        self.last_check = {"baro_moved_m": round(moved_m, 3), "localized_followed_u": round(followed_u, 4)}
+        if abs(moved_m) >= self.baro_move_m and followed_u < self.min_follow_u:
+            self.waived.add(target)
+            return True
+        return False
+
+
 class YawAlignedPcmdController:
     """Yaw toward a new waypoint, then translate with mid-leg yaw repair.
 
@@ -2541,9 +2621,15 @@ class YawAlignedPcmdController:
 
     def _position_recovery_command(self, cmd, pose, now, radius, yaw_sign, body_velocity):
         horizontal_distance = self.config.map_frame.horizontal_distance(cmd.goal - pose.xyz)
-        if horizontal_distance <= radius:
+        enter = radius
+        if cmd.guidance_goal is None:
+            # Direct-to-point leg (join / resume): its bearing is goal - pose,
+            # which pose noise dominates this close, so the yaw hold starts at
+            # minimum_yaw_alignment_distance rather than at the sphere.
+            enter = max(radius, float(self.config.minimum_yaw_alignment_distance))
+        if horizontal_distance <= enter:
             self.centering = True
-        elif horizontal_distance > 2.0 * radius:
+        elif horizontal_distance > max(2.0 * radius, enter + radius):
             self.centering = False
         if self.centering:
             # Near a waypoint the target bearing is ill-conditioned. Hold yaw

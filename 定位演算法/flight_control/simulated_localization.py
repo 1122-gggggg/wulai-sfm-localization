@@ -3,7 +3,8 @@
 
 Wraps true meters into reported map-unit poses with misalignment residue,
 capture cadence, latency/jitter delivery, correlated OU noise, bias walk,
-dropouts/outages, and the production IMU-bridge law during blackout. Owns
+dropouts/outages, the production IMU-bridge law during blackout, drifting
+weak estimates during localization-failure windows, and a height gain. Owns
 the capture/receive contract used by the fast simulator and the Sphinx
 production-route adapter so both consume one implementation.
 
@@ -81,6 +82,22 @@ class SimulatedLocalizerConfig:
     reseed_confirm_frames: int = 0
     imu_bridge_max_age_s: float = 10.0
     imu_bridge_max_frames: int = 300
+    # Localization-failure windows: every drift_every_s (first one at
+    # drift_offset_s) for drift_dur_s the aircraft does not know where it is.
+    # Production keeps publishing VO / dead-reckon estimates then, so each
+    # capture is a weak, position-observed pose that drifts from the last map
+    # fix: drift_gain x true displacement plus drift_mps in a random
+    # horizontal direction per window. Before any map fix there is no pose.
+    drift_every_s: float = 0.0
+    drift_dur_s: float = 0.0
+    drift_offset_s: float = 0.0
+    drift_gain: float = 1.0
+    drift_mps: float = 0.0
+    # Reported height change = vertical_gain x true change since the first
+    # capture. 1 is exact; 0 means the localized height never moves.
+    vertical_gain: float = 1.0
+    # Map up axis; required by drift_mps > 0 or vertical_gain != 1.
+    map_up_u: tuple[float, float, float] | None = None
 
 class SimulatedLocalizer:
     """Capture-cadence pose source with bounded jittered delivery."""
@@ -123,6 +140,20 @@ class SimulatedLocalizer:
         self.reseed_confirm_frames = int(self.config.reseed_confirm_frames)
         self.imu_bridge_max_age_s = float(self.config.imu_bridge_max_age_s)
         self.imu_bridge_max_frames = int(self.config.imu_bridge_max_frames)
+        self.drift_every = float(self.config.drift_every_s)
+        self.drift_dur = float(self.config.drift_dur_s)
+        self.drift_offset = float(self.config.drift_offset_s)
+        self.drift_gain = float(self.config.drift_gain)
+        self.drift_mps = float(self.config.drift_mps)
+        self.vertical_gain = float(self.config.vertical_gain)
+        self._up = None
+        if self.config.map_up_u is not None:
+            up = np.asarray(self.config.map_up_u, float)
+            self._up = up / float(np.linalg.norm(up))
+        self._height_ref: float | None = None
+        # Last map fix (reported, observed truth) and the active drift window.
+        self._map_fix: tuple[np.ndarray, np.ndarray] | None = None
+        self._drift: tuple[np.ndarray, np.ndarray, float, np.ndarray] | None = None
         self._truth: list[tuple[float, np.ndarray, float]] = []
         self._pending: list[tuple[float, float, object]] = []
         self._next_capture = 0.0
@@ -176,6 +207,18 @@ class SimulatedLocalizer:
         bridge_frames = cfg.imu_bridge_max_frames
         if isinstance(bridge_frames, bool) or not isinstance(bridge_frames, int) or bridge_frames <= 0:
             raise ValueError("imu_bridge_max_frames must be a positive int")
+        for name in ("drift_every_s", "drift_dur_s", "drift_offset_s", "drift_gain", "drift_mps"):
+            value = float(getattr(cfg, name))
+            if not math.isfinite(value) or value < 0.0:
+                raise ValueError(f"{name} must be finite and >= 0")
+        if not math.isfinite(float(cfg.vertical_gain)):
+            raise ValueError("vertical_gain must be finite")
+        if cfg.map_up_u is not None:
+            up = np.asarray(cfg.map_up_u, float)
+            if up.shape != (3,) or not np.all(np.isfinite(up)) or float(np.linalg.norm(up)) <= 1e-9:
+                raise ValueError("map_up_u must be a finite nonzero 3-vector")
+        elif float(cfg.drift_mps) > 0.0 or float(cfg.vertical_gain) != 1.0:
+            raise ValueError("drift_mps and vertical_gain need map_up_u")
 
     @property
     def dropped_late(self) -> int:
@@ -251,8 +294,19 @@ class SimulatedLocalizer:
             noise_gain = max(1.0, float(self.weak_noise_gain))
             fault = "weak"
             map_confirmed = False
-        p_map = pos_m / (self.s * (1.0 + self.scale_err))
-        p_map = p_map + self.pos_bias + self._bias + pos_noise * noise_gain
+        observed = self._observed_position(pos_m)
+        if self._in_drift(capture_t):
+            if self._map_fix is None:
+                return None, None, "drift-no-fix"
+            noise_gain = max(1.0, float(self.weak_noise_gain))
+            fault = "drift"
+            map_confirmed = False
+            p_map = self._drift_estimate(capture_t, observed) + pos_noise * noise_gain
+        else:
+            self._drift = None
+            p_map = observed + self.pos_bias + self._bias + pos_noise * noise_gain
+            if map_confirmed:
+                self._map_fix = (p_map.copy(), observed.copy())
         yaw_rep = yaw + self.yaw_bias + yaw_noise * noise_gain
         if self.outlier_rate > 0 and self.rng.random() < self.outlier_rate:
             base = np.array(self._last_report.xyz, float) if self._last_report is not None else p_map
@@ -271,6 +325,36 @@ class SimulatedLocalizer:
         self.fault = fault
         self.map_confirmed = bool(map_confirmed)
         return receive, pose, fault
+
+    def _observed_position(self, pos_m) -> np.ndarray:
+        """True map position as the localizer resolves it (height gain applied)."""
+        p_map = np.asarray(pos_m, float) / (self.s * (1.0 + self.scale_err))
+        if self.vertical_gain == 1.0:
+            return p_map
+        height = float(np.dot(p_map, self._up))
+        if self._height_ref is None:
+            self._height_ref = height
+        return p_map + (self.vertical_gain - 1.0) * (height - self._height_ref) * self._up
+
+    def _in_drift(self, t: float) -> bool:
+        if self.drift_every <= 0.0 or self.drift_dur <= 0.0 or float(t) < self.drift_offset:
+            return False
+        return ((float(t) - self.drift_offset) % self.drift_every) < self.drift_dur
+
+    def _drift_estimate(self, capture_t: float, observed: np.ndarray) -> np.ndarray:
+        """Weak estimate carried from the last map fix; the window opens on first use."""
+        if self._drift is None:
+            fix_est, fix_observed = self._map_fix
+            velocity = np.zeros(3)
+            if self.drift_mps > 0.0:
+                direction = self.rng.normal(0.0, 1.0, 3)
+                direction -= float(np.dot(direction, self._up)) * self._up
+                direction /= float(np.linalg.norm(direction)) or 1.0
+                velocity = direction * self.drift_mps / self.s
+            self._drift = (fix_est, fix_observed, float(capture_t), velocity)
+        fix_est, fix_observed, start, velocity = self._drift
+        return (fix_est + self.drift_gain * (observed - fix_observed)
+                + velocity * (float(capture_t) - start))
 
     def report(self, t: float):
         self.fault = "ok"
@@ -291,6 +375,11 @@ class SimulatedLocalizer:
                 capture_tick = float(t)
         if capture_tick is not None and self.rng.random() >= self.drop_rate:
             receive, pose, fault = self._make_capture(float(capture_tick))
+            if pose is None:
+                # No position at all (lost before any map fix): like a dropout.
+                self.fault = fault
+                self.map_confirmed = bool(getattr(self._last_report, "map_confirmed", True))
+                return self._last_report
             # Capture stamp is the cadence tick, not the poll time.
             capture = float(pose.stamp)
             self._pending.append((receive, capture, pose))
