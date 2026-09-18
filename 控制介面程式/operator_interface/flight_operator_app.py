@@ -4019,11 +4019,14 @@ class OperatorApp(tk.Tk):
             if target is None and not getattr(coordinator, "_landing_confirmed", False):
                 # A refused handoff must not discard an earlier manual checkpoint.
                 target = getattr(coordinator, "resume_target_index", None)
-            flight_state = str(getattr(self.backend.state, "flight_state", "")).rsplit(".", 1)[-1].lower()
+            backend = getattr(self, "backend", None)
+            flight_state = str(
+                getattr(getattr(backend, "state", None), "flight_state", "")
+            ).rsplit(".", 1)[-1].lower()
             if target is not None and flight_state in {"hovering", "flying"}:
                 snapshot = coordinator.snapshot
                 self._auto_resume_checkpoint = (
-                    self.backend, snapshot.sha256, snapshot.coordinate_frame_id, target,
+                    backend, snapshot.sha256, snapshot.coordinate_frame_id, target,
                 )
             else:
                 self._auto_resume_checkpoint = None
@@ -4033,7 +4036,10 @@ class OperatorApp(tk.Tk):
 
     def _drain_integrated_autonomy_events(self) -> None:
         coordinator = self.__dict__.get("_integrated_autonomy")
-        flight_state = str(getattr(self.backend.state, "flight_state", "")).rsplit(".", 1)[-1].lower()
+        backend = getattr(self, "backend", None)
+        flight_state = str(
+            getattr(getattr(backend, "state", None), "flight_state", "")
+        ).rsplit(".", 1)[-1].lower()
         if flight_state not in {"hovering", "flying"}:
             self._auto_resume_checkpoint = None
         if coordinator is None:
