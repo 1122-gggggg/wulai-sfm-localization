@@ -268,6 +268,38 @@ class SimParams:
                 raise ValueError("ground_altitude_m must be finite when ground_effect_frac > 0")
 
 
+# --------------------------------------------------------------------------
+# Localization-defect regression scenarios (recorded real-flight regimes).
+#
+# R1_flight20260918 replays the 2026-09-18 real flight that stalled at
+# waypoint 1: ~23 s of NO_POSE after takeoff, then repeating ~24 s stretches
+# with zero strong (FAST_TRACK/RELOC_SEED) fixes while KLT/IMU weak poses keep
+# arriving. R2_weak80 is the milder flicker regime: mostly weak poses with
+# enough strong fixes interleaved that recovery can still confirm.
+# --------------------------------------------------------------------------
+REGRESSION_SCENARIOS: dict[str, dict] = {
+    "R1_flight20260918": {
+        "localization_wait_s": 23.0,
+        "outage_every_s": 40.0,
+        "outage_dur_s": 24.0,
+        "start_offset_u": (0.68, 0.0, 0.0),
+    },
+    "R2_weak80": {
+        "start_offset_u": (0.68, 0.0, 0.0),
+        "weak_rate": 0.8,
+    },
+}
+
+
+def apply_regression_scenario(params: SimParams, name: str) -> SimParams:
+    """Return params with a REGRESSION_SCENARIOS preset applied. Unknown names raise KeyError."""
+    try:
+        overrides = REGRESSION_SCENARIOS[name]
+    except KeyError:
+        raise KeyError(f"unknown regression scenario: {name!r} (have: {sorted(REGRESSION_SCENARIOS)})") from None
+    return replace(params, **overrides)
+
+
 @dataclass
 class SimResult:
     success: bool
@@ -1391,6 +1423,12 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--command-latency-ms", type=float, default=0.0)
     ap.add_argument("--command-drop-rate", type=float, default=0.0)
     ap.add_argument("--command-ttl-s", type=float, default=0.2)
+    ap.add_argument("--out", type=Path, default=None,
+                    help="artifact directory (default: outputs/sim_autoflight/run_<timestamp>)")
+    ap.add_argument("--scenario", type=str, default="",
+                    choices=["", *sorted(REGRESSION_SCENARIOS)],
+                    help="apply a localization-defect regression preset (wins over the "
+                         "matching defect flags for its keys)")
     ap.add_argument("--no-plot", action="store_true")
     return ap
 
@@ -1480,10 +1518,13 @@ def main(argv: list[str] | None = None) -> int:
         for k in range(max(1, int(args.seeds))):
             seed = int(args.seed) + k
             params = _params_from_args(args, seed=seed, scale=scale)
+            if args.scenario:
+                params = apply_regression_scenario(params, args.scenario)
             result, info = run_sim(params, record_trace=not sweep)
             row = {
                 "scale_m_per_u": scale,
                 "seed": seed,
+                "scenario": args.scenario,
                 "success": result.success,
                 "reason": result.reason,
                 "time_s": result.time_s,
@@ -1516,6 +1557,7 @@ def main(argv: list[str] | None = None) -> int:
                 summary = {
                     "result": dict(result.__dict__),
                     "info": info,
+                    "scenario": args.scenario,
                     "ctrl_waypoints_u": [[float(v) for v in p] for p in ctrl.wp],
                     "params": {
                         k: (

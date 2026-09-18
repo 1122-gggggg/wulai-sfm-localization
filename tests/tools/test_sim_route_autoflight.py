@@ -183,3 +183,57 @@ def test_invalid_plant_params_raise():
         sim.SimParams(route=route, align=align, tau_tilt_s=1e-3, battery_sag_frac=0.1)
     with pytest.raises(ValueError, match="ground_altitude_m"):
         sim.SimParams(route=route, align=align, ground_effect_frac=1.0)
+
+
+def _flown_route():
+    """The route actually flown on 2026-09-18 (stalls at waypoint 1)."""
+    from pathlib import Path as _P
+    root = _P(__file__).resolve().parents[2]
+    flown = root / "地圖檔/場域/river_site/routes/flight_route_20260917_222503_e4c4dfe8.json"
+    return flown if flown.is_file() else _route()
+
+
+def _regression_base(**kw):
+    route, align = _flown_route(), _align()
+    base = dict(route=route, align=align, meters_per_unit=15.0, duration_s=120.0,
+                seed=7, wind_sigma_mps=0.0)
+    base.update(kw)
+    return sim.SimParams(**base)
+
+
+def test_regression_R1_contiguous_outage_stalls_like_flight20260918():
+    params = sim.apply_regression_scenario(_regression_base(), "R1_flight20260918")
+    result, _ = sim.run_sim(params, record_trace=False)
+    # Real flight: 0% progress, stuck at waypoint 1, hovering, no flyaway.
+    assert result.progress_pct < 5.0
+    assert len(result.waypoints_reached) <= 1
+    assert result.hover_ticks > 500
+    assert result.max_dev_u < 1.0
+
+
+def test_regression_R2_weak_flicker_degraded_but_moving():
+    base_result, _ = sim.run_sim(_regression_base(), record_trace=False)
+    params = sim.apply_regression_scenario(_regression_base(), "R2_weak80")
+    result, _ = sim.run_sim(params, record_trace=False)
+    assert 0.0 < result.progress_pct < base_result.progress_pct
+    assert result.max_dev_u < 1.0
+
+
+def test_apply_regression_scenario_unknown_raises():
+    with pytest.raises(KeyError):
+        sim.apply_regression_scenario(_regression_base(), "nope")
+
+
+def test_cli_out_and_scenario_flags_write_artifacts(tmp_path):
+    route = _flown_route()
+    outdir = tmp_path / "simR2"
+    rc = sim.main(["--route", str(route), "--meters-per-unit", "15",
+                   "--duration-s", "60", "--seed", "7",
+                   "--scenario", "R2_weak80", "--out", str(outdir), "--no-plot"])
+    assert rc in (0, 1)  # R2 is not expected to fully succeed
+    assert (outdir / "summary.json").is_file()
+    assert (outdir / "trace.csv").is_file()
+    import json
+    summary = json.loads((outdir / "summary.json").read_text(encoding="utf-8"))
+    assert summary["scenario"] == "R2_weak80"
+    assert summary["params"]["weak_rate"] == 0.8
