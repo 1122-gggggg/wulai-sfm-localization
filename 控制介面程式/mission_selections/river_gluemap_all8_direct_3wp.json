@@ -2,12 +2,12 @@
   "calibrations": [
     {
       "path": "../../地圖檔/場域/river_site/releases/river_gluemap_all8_direct_20260908/compat/localizer_quality_receipt.json",
-      "sha256": "ba64d327bdf7228fa92b643922582c8bc249736d8a5f5a4dbd6e485273554e7e"
+      "sha256": "409c6c2c756f21dc1f9fc510d779440ac4b88d423f03f2682631ea686a0af563"
     }
   ],
   "localizer": {
     "path": "../../地圖檔/場域/river_site/releases/river_gluemap_all8_direct_20260908/compat/localizer_direct_manifest.json",
-    "sha256": "6c629f5d6c436e0a988148a0765de998c3731ce0a8cdf8aff4cc7e7f67f3d439"
+    "sha256": "e3b2f716c5f1641bcda96f327d1beb0a4568149595365f4703c660b7d147758a"
   },
   "map": {
     "path": "../../地圖檔/場域/river_site/releases/river_gluemap_all8_direct_20260908/compat/map_manifest.json",

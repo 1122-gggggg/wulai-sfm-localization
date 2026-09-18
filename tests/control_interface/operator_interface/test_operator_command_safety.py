@@ -31,6 +31,85 @@ from flight_operator_app import (
 from operator_shutdown import OperatorShutdownCoordinator
 
 
+@pytest.mark.parametrize("change", [None, "landed", "route", "frame", "backend"])
+def test_auto_resume_checkpoint_only_applies_to_same_airborne_mission(change):
+    backend = SimpleNamespace(state=SimpleNamespace(flight_state="hovering"))
+    snapshot = SimpleNamespace(sha256="route-a", coordinate_frame_id="frame-a")
+    operator = SimpleNamespace(
+        backend=backend,
+        _auto_resume_checkpoint=(backend, "route-a", "frame-a", 4),
+    )
+    if change == "landed":
+        backend.state.flight_state = "landed"
+    elif change == "route":
+        snapshot.sha256 = "route-b"
+    elif change == "frame":
+        snapshot.coordinate_frame_id = "frame-b"
+    elif change == "backend":
+        operator.backend = SimpleNamespace(state=SimpleNamespace(flight_state="hovering"))
+    assert OperatorApp._auto_resume_target(operator, snapshot) == (4 if change is None else None)
+    if change is not None:
+        assert operator._auto_resume_checkpoint is None
+
+
+def test_landing_discards_auto_checkpoint_before_next_takeoff():
+    backend = SimpleNamespace(state=SimpleNamespace(flight_state="landed"))
+    operator = SimpleNamespace(
+        backend=backend,
+        _auto_resume_checkpoint=(backend, "route-a", "frame-a", 2),
+    )
+    OperatorApp._drain_integrated_autonomy_events(operator)
+    backend.state.flight_state = "hovering"
+    snapshot = SimpleNamespace(sha256="route-a", coordinate_frame_id="frame-a")
+    assert OperatorApp._auto_resume_target(operator, snapshot) is None
+
+
+@pytest.mark.parametrize("handoff_failed", [False, True])
+def test_finished_manual_auto_keeps_unfinished_target_for_next_start(handoff_failed):
+    backend = SimpleNamespace(state=SimpleNamespace(flight_state="hovering"))
+    snapshot = SimpleNamespace(sha256="route-a", coordinate_frame_id="frame-a")
+    operator = SimpleNamespace(
+        backend=backend, write_log=lambda _msg: None, _set_auto_paused=lambda _paused: None,
+        _integrated_autonomy=SimpleNamespace(
+            phase="DONE", snapshot=snapshot,
+            interrupted_target_index=None if handoff_failed else 2,
+            resume_target_index=2 if handoff_failed else None,
+            auto_leg_status=lambda: {},
+        ),
+    )
+    OperatorApp._finish_integrated_auto_event(operator, SimpleNamespace(detail="manual takeover"))
+    assert operator._integrated_autonomy is None
+    assert OperatorApp._auto_resume_target(operator, snapshot) == 2
+
+
+def test_auto_start_passes_retained_target_through_existing_gates(monkeypatch):
+    backend = SimpleNamespace(state=SimpleNamespace(flight_state="hovering"))
+    snapshot = SimpleNamespace(sha256="route-a", coordinate_frame_id="frame-a")
+    created = []
+
+    def make_autonomy(**kwargs):
+        created.append(kwargs)
+        return SimpleNamespace(start=lambda: True, _drawn_waypoint_number=lambda index: index + 1)
+
+    monkeypatch.setattr(app, "DesktopRouteAutonomy", make_autonomy)
+    monkeypatch.setattr(app, "load_site_profile", lambda _path: object())
+    monkeypatch.setattr(app, "resolve_site_map_frame", lambda _profile: object())
+    monkeypatch.setattr(app, "autonomous_approval_blockers", lambda _snapshot: [])
+    checked = []
+    operator = SimpleNamespace(
+        backend=backend, site_profile_path="unused", write_log=lambda _msg: None,
+        _integrated_auto_active=lambda: False, _autonomy_gate_snapshot=lambda: {},
+        _validate_auto_flight_assets=lambda _profile, route: checked.append(route),
+        _autonomy_pose=lambda: None, _autonomy_stream_healthy=lambda: True,
+        _auto_resume_checkpoint=(backend, "route-a", "frame-a", 2),
+    )
+    operator._auto_resume_target = lambda route: OperatorApp._auto_resume_target(operator, route)
+    assert OperatorApp._start_integrated_auto(operator, snapshot)
+    assert checked == [snapshot]
+    assert created[0]["start_airborne"] is True
+    assert created[0]["resume_target_index"] == 2
+
+
 class _Backend:
     def __init__(self):
         self.calls = []
@@ -112,6 +191,23 @@ def _make_autonomy_runtime_ready(operator, monkeypatch=None) -> None:
         monkeypatch.setattr(
             app, "resolve_site_map_frame", lambda _profile: app.LEGACY_MAP_FRAME
         )
+
+
+def test_autonomy_gate_uses_estimate_capture_age_not_last_strong_fix():
+    pose = app.Pose(0, 0, 0, 0, stamp=time.monotonic(), map_confirmed=False,
+                    position_observed=False)
+    operator = SimpleNamespace(
+        backend=SimpleNamespace(state=SimpleNamespace()),
+        _autonomy_pose=lambda: pose,
+        loc_pose_updated_mono=time.monotonic() - 30.0,
+        localizer=SimpleNamespace(ready=True),
+        _autonomy_profile_verified=True,
+    )
+    snapshot = OperatorApp._autonomy_gate_snapshot(operator)
+    assert 0 <= snapshot["pose_age_s"] < 0.5
+    operator._autonomy_pose = lambda: None
+    operator.loc_health = "FAIL"
+    assert OperatorApp._autonomy_gate_snapshot(operator)["pose_age_s"] is None
 
 
 def test_draw_detections_renders_a_label_box_without_crashing() -> None:
@@ -1150,14 +1246,17 @@ def test_integrated_auto_starts_without_a_separate_live_release_flag(
     assert not any("發布阻擋" in message for message in operator.logs)
 
 
-def test_integrated_auto_while_airborne_selects_pc_handoff(tmp_path, monkeypatch) -> None:
+@pytest.mark.parametrize("flight_state", ["landed", "hovering", "flying"])
+def test_integrated_auto_wires_required_callbacks(tmp_path, monkeypatch, flight_state) -> None:
     created = []
+    coordinator_signature = inspect.signature(app.DesktopRouteAutonomy)
 
     class Coordinator:
         phase = "IDLE"
         boot_timeout_s = 1.0
 
         def __init__(self, **kwargs):
+            coordinator_signature.bind(**kwargs)
             created.append(kwargs)
 
         def start(self):
@@ -1177,7 +1276,7 @@ def test_integrated_auto_while_airborne_selects_pc_handoff(tmp_path, monkeypatch
     operator.backend.state = SimpleNamespace(
         autonomous_locked=False,
         autonomous_approval_valid=True,
-        flight_state="hovering",
+        flight_state=flight_state,
     )
     operator.backend.pilot_sticks = True
     operator.inspecting = True
@@ -1197,8 +1296,15 @@ def test_integrated_auto_while_airborne_selects_pc_handoff(tmp_path, monkeypatch
     operator.send("start_auto")
 
     assert len(created) == 1
-    assert created[0]["start_airborne"] is True
+    assert created[0]["start_airborne"] is (flight_state != "landed")
     assert callable(created[0]["take_pc_control"])
+    assert callable(created[0]["takeoff"])
+    assert created[0]["stream_healthy"] == operator._autonomy_stream_healthy
+    relocalized = []
+    operator.localizer.request_relocalize = lambda: relocalized.append(True)
+    created[0]["force_relocalize"]()
+    assert relocalized == [True]
+    assert operator.backend.calls == []
 
 
 @pytest.mark.parametrize("command", ["takeoff", "pc_control"])
@@ -1678,7 +1784,8 @@ def test_ui_exposes_read_only_olympe_flight_telemetry() -> None:
 def test_ui_keeps_firmware_magnetometer_calibration_without_passive_gravity_check() -> None:
     source = inspect.getsource(OperatorApp._build_ui)
 
-    assert "飛機羅盤校正（只允許 landed；使用者手持旋轉）" in source
+    assert "飛機羅盤校正" in source
+    assert "僅落地可校正，請手持機身" in source
     assert "姿態／重力檢查" not in source
     assert "drone_magnetometer_start" in source
     assert "不會啟動馬達" in source
@@ -1686,7 +1793,7 @@ def test_ui_keeps_firmware_magnetometer_calibration_without_passive_gravity_chec
     # It only feeds pilot-referenced features this system never uses, and it no
     # longer gates takeoff, so exposing it invited pointless field work.
     assert "skycontroller_magnetometer_start" not in source
-    assert "每一軸請轉滿三圈" in source
+    assert "依 X/Y/Z 指示各轉滿三圈" in source
 
     state = DroneState(
         drone_magnetometer_required=2,
@@ -2750,4 +2857,3 @@ def test_localization_submission_omits_unstamped_fused_telemetry() -> None:
     assert "fused_telemetry_mono" not in timing
     assert timing["fused_roll"] == pytest.approx(0.1)
     assert timing["source_frame_stamp_mono"] == 100.0
-

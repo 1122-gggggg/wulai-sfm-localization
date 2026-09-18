@@ -1,6 +1,6 @@
 # direct 後端總帳
 
-最後更新：2026-09-09。硬體基準：NVIDIA GeForce RTX 5060 Laptop GPU，repo venv
+最後更新：2026-09-17。硬體基準：NVIDIA GeForce RTX 5060 Laptop GPU，repo venv
 （torch 2.11.0+cu128、opencv 4.13.0、pycolmap 4.0.4）。
 
 ## 這份文件為什麼存在
@@ -327,3 +327,42 @@ seed=-1 非確定性、tracker 原始碼釘住）。
   **OPERATOR_ACCEPTANCE（passed=true，2026-10-09 到期），validation: NONE、
   ground truth: NONE** —— 放行的是有人監督試飛的定位，不是驗證。
   本檔所有數字仍是**相對**比較（同輸入前後對照），沒有一項是絕對精度。
+
+## 8. 幾何預計算、載入與 handover 補救（2026-09-17）
+
+目前河濱 release 已加入 `localization/direct_geometry.npz`，由 bundle 的
+`files[]` 綁定大小與 SHA-256，archive 另檢查三份 COLMAP model 的 digest。
+未宣告的 archive 不會被使用；舊 release 繼續走原始解析。建圖發布工具會產生
+這份資料，內容不包含絕對影像路徑，搬機後仍從已驗證的 keyframe index 取路徑。
+幾何計算方式變更時必須更新 archive schema 並重建，不能沿用舊預計算資料。
+
+本機 CPU 量測，證據在 `outputs/benchmarks/direct_1245_20260917/`：
+
+| 項目 | 原本 | 修改後 | 驗證範圍 |
+|---|---:|---:|---|
+| 河濱幾何載入 | 25.207 s | 0.332 / 0.340 / 0.341 s | 原始一次、archive 三次；所有位姿、觀測、ID、XYZ 與統計逐項相同 |
+| 500 萬點 binary PLY 讀取 | 41.2 ms | 13.5 ms | 同一全域 stride，輸出逐位元相同 |
+| 上述 PLY 子行程峰值 RSS | 104524 KiB | 33080 KiB | 暫存讀取限制為 65536 筆，輸出上限 12 萬點 |
+
+archive 約 348 MB。量測未清除 OS page cache；幾何時間不包含 GPU 模型。
+另一次實際 production factory + CUDA 模型載入與預熱為 3.548 s，不含 Python
+行程與前置 import，沒有 GUI 或飛行連線。原始三份 model、profile 參數與品質
+收據的 `validation: NONE` 均維持原意；此次只更新 bundle 相依 digest，額外記錄
+`provenance/geometry_preparation_20260917.json`，不宣稱取得新的品質或實飛驗證。
+
+handover 保留 stride-2。單跳存活點不足既有 reseed 門檻時，使用中間影格重試；
+只有保留更多通過原 FB／邊界檢查的點才採用，成功後該次 handover 改逐幀走完。
+合成 960×540 紋理、500 點、五幀平移測試：每幀 16 px 時存活點 35→433，
+24 px 時 10→269；兩種情境耗時約 17–19→37–38 ms。每幀 2/8 px 的點集不變，
+仍走隔幀快路徑。這是困難 handover 的計算成本與存活率取捨，不能宣稱實飛
+精度提升或每一幀更快。`handover_retry_hops` 記錄自 tracker reset 起的重試跳數。
+
+相關回歸涵蓋真實 CPU KLT 的已知平移誤差、失敗補救不替換較好的隔幀結果、
+預計算／原始幾何等價、搬移路徑與資產竄改拒絕。航向錨點只接受已觀測的地圖
+定位，BOOT 也直接檢查 pose metadata 與 predicted/reseed hooks；弱定位維持
+既有補位移動語意，起降及操作員接管語意未變。
+
+此次相關離線測試 534 passed、1 skipped（烏來 alignment 資產未提供）；Ruff、
+diff whitespace 與兩份 mission selection 的相依驗證通過。全專案 mypy 仍有兩項
+既有錯誤（`_predicted_speed`、`_make_autonomy_pose`），複雜度／檔案長度總閘門也仍
+超標；已確認相關既有程式與 HEAD 相同，未因這次工作修改它們。

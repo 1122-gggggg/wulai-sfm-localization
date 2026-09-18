@@ -9,6 +9,34 @@ from backend_contract import InterfaceMode
 from session_logs import SessionLogs, collect_runtime_identity
 
 
+def test_trajectory_archive_preserves_route_pose_and_lifecycle_after_retention(tmp_path):
+    from disk_policy import enforce_retention
+
+    session = SessionLogs.create(tmp_path, mode=InterfaceMode.SIMULATED_STREAM, manifest={})
+    session.localization("auto_route_plan", auto_run_id="a", waypoints_u=[[0, 0, 0], [1, 2, 3]])
+    session.localization("pose_result", pose={"x": 1, "y": 2, "z": 3}, direct_status="IMU_BRIDGE", wall_ms=10)
+    session.localization("auto_route_tick", auto_run_id="a", pose_u=[1, 2, 3], target_index=1)
+    session.telemetry("autonomy_event", auto_run_id="a", kind="finished")
+    session.close(reason="test")
+    archived = list(map(json.loads, (session.directory / "trajectory.jsonl").read_text().splitlines()))
+    assert [r["event"] for r in archived] == ["auto_route_plan", "pose_result", "auto_route_tick", "autonomy_event"]
+    assert archived[1]["direct_status"] == "IMU_BRIDGE"
+    assert "wall_ms" not in archived[1]
+    original = json.loads((session.directory / "localization.jsonl").read_text().splitlines()[1])
+    assert archived[1]["t_mono_ns"] == original["t_mono_ns"]
+    enforce_retention(tmp_path, current_session=None, max_bytes=0)
+    assert (session.directory / "trajectory.jsonl").exists()
+    assert not (session.directory / "localization.jsonl").exists()
+
+
+def test_trajectory_write_failure_is_visible_in_log_health(tmp_path, monkeypatch):
+    session = SessionLogs.create(tmp_path, mode=InterfaceMode.SIMULATED_STREAM, manifest={})
+    session._sinks["trajectory"].healthy = False
+    assert not session.localization("auto_route_tick", auto_run_id="a")
+    assert not session.healthy
+    session.close(reason="test")
+
+
 def test_session_logs_create_required_files_and_dual_timestamps(tmp_path) -> None:
     session = SessionLogs.create(
         tmp_path,
@@ -138,15 +166,15 @@ def test_high_rate_logs_batch_fsync_but_safety_events_remain_immediate(
     assert len(synced) == startup_syncs
 
     session.localization("pose_result", seq=session_logs._BULK_LOG_SYNC_EVERY)
-    assert len(synced) == startup_syncs + 1
+    assert len(synced) == startup_syncs + 2  # diagnostics plus retained trajectory
 
     session.telemetry("state", seq=0)
     session.command("hover")
     session.incident("stream_stale")
-    assert len(synced) == startup_syncs + 3
+    assert len(synced) == startup_syncs + 4
 
     session.close(reason="test_complete")
-    assert len(synced) == startup_syncs + 4
+    assert len(synced) == startup_syncs + 5
 
 
 def test_session_logs_do_not_claim_durable_when_fsync_fails(

@@ -13,16 +13,18 @@ from __future__ import annotations
 
 import threading
 import time
+from dataclasses import replace
 from types import SimpleNamespace
 
 # Source modules are supplied by the repository's pytest pythonpath.
 import numpy as np
 import pytest
+import cv2
 
 pytestmark = pytest.mark.smoke
 
 from live_provider import RelocFix
-from two_rate_tracker import RelocWorker, TwoRateTracker
+from two_rate_tracker import KLTTracker, RelocWorker, TwoRateTracker
 
 
 class RecordingProvider:
@@ -272,6 +274,63 @@ def test_strong_reloc_handover_replaces_and_skips_klt_on_new_ids() -> None:
     assert info["center"][0] == pytest.approx(0.0)
 
 
+@pytest.mark.parametrize("frames", [3, 4, 7])
+@pytest.mark.parametrize("motion", ["healthy", "retry_better", "retry_worse"])
+def test_handover_retries_only_weak_two_frame_hops(frames, motion):
+    fix = _reloc_fix(120)
+    tracker = _handover_tracker(fix)
+    tracker._ring.extend((i, np.full((64, 64), i, np.uint8)) for i in range(frames))
+    calls = []
+
+    def track(previous, current, xy):
+        a, b = int(previous[0, 0]), int(current[0, 0])
+        calls.append((a, b))
+        keep = np.ones(len(xy), dtype=bool)
+        if (a, b) == (0, 2) and motion != "healthy":
+            keep[80:] = False
+        elif b - a == 1 and motion == "retry_worse":
+            keep[40:] = False
+        return xy + np.array([b - a, 0.0]), keep
+
+    tracker._tracker = SimpleNamespace(track_pair=track)
+    ids, xy, xyz = tracker._walk_handover(fix, 0)
+    count = 120 if motion != "retry_worse" else (40 if frames == 4 else 80)
+    np.testing.assert_array_equal(ids, fix.point3d_ids[:count])
+    np.testing.assert_array_equal(xyz, fix.point_xyz[:count])
+    np.testing.assert_allclose(xy, fix.query_xy[:count] + [frames - 1, 0])
+    if motion == "healthy":
+        assert tracker._handover_retry_hops == 0
+        assert len(calls) == frames // 2
+    else:
+        assert calls[:3] == [(0, 2), (0, 1), (1, 2)]
+        assert tracker._handover_retry_hops >= 1
+    assert len(calls) <= 3 * (frames // 2)
+
+
+def test_handover_recovers_real_klt_points_through_intermediate_exposures():
+    rng = np.random.default_rng(73)
+    texture = cv2.GaussianBlur(rng.integers(0, 256, (540, 960), dtype=np.uint8), (3, 3), 0)
+    xy = cv2.goodFeaturesToTrack(texture, 500, 0.01, 8).reshape(-1, 2).astype(float)
+    chain = [
+        cv2.warpAffine(texture, np.array([[1, 0, 16 * i], [0, 1, 0]], dtype=float), (960, 540))
+        for i in range(5)
+    ]
+    fix = replace(_reloc_fix(len(xy)), query_xy=xy)
+    tracker = _handover_tracker(fix)
+    tracker._w, tracker._h = 960, 540
+    tracker.profile.fast_loop.track_cap = 500
+    tracker._tracker = KLTTracker(fb_max_px=1, win=15, levels=3)
+    tracker._ring.extend(enumerate(chain))
+    old_xy = xy.copy()
+    for a, b in ((0, 2), (2, 4)):
+        fwd, keep = tracker._tracker.track_pair(chain[a], chain[b], old_xy)
+        old_xy = fwd[keep & tracker._inside(fwd)]
+    ids, tracked, _ = tracker._walk_handover(fix, 0)
+    assert len(old_xy) < tracker.profile.fast_loop.reseed_min_points <= len(ids)
+    expected = xy[ids - fix.point3d_ids[0]] + [64, 0]
+    assert np.percentile(np.linalg.norm(tracked - expected, axis=1), 90) < 1.0
+
+
 def test_weak_reloc_handover_merges_without_klting_new_ids() -> None:
     n = 70
     fix = _reloc_fix(n)
@@ -311,3 +370,26 @@ def test_fast_track_label_does_not_bypass_strong_map_confidence(count):
     profile = SimpleNamespace(reloc=SimpleNamespace(frozen_pnp_thresholds={"strong_inliers": 80}))
     mode, weak = _map_confidence_mode("FAST_TRACK", {"map_inliers": count}, profile)
     assert (mode, weak) == (("TRACK", False) if count >= 80 else ("WEAK_TRACK", True))
+
+
+def test_reloc_idle_detects_hover_only():
+    from two_rate_tracker import _reloc_idle
+    assert _reloc_idle([]) is False
+    assert _reloc_idle([0.0001, 0.0003, 0.0002]) is True
+    assert _reloc_idle([0.0001, 0.05, 0.0001, 0.0001, 0.0001, 0.0001]) is True
+    assert _reloc_idle([0.0001, 0.05, 0.05, 0.05, 0.0001, 0.0001]) is False
+    assert _reloc_idle([0.01] * 10) is False
+
+
+def test_reloc_refresh_due_stretches_only_idle_strong():
+    from two_rate_tracker import _reloc_refresh_due as due
+    assert due("FAST_TRACK", 100.0, None, 1.0, False) is True
+    assert due("FAST_TRACK", 102.0, 100.0, 1.0, False) is True
+    assert due("FAST_TRACK", 100.5, 100.0, 1.0, False) is False
+    # Idle strong hover: 1 s period stretches to 4 s.
+    assert due("FAST_TRACK", 102.0, 100.0, 1.0, True) is False
+    assert due("FAST_TRACK", 104.0, 100.0, 1.0, True) is True
+    # Weak statuses keep the aggressive cadence even when still.
+    assert due("VO_ONLY", 100.5, 100.0, 1.0, True) is False
+    assert due("VO_ONLY", 101.0, 100.0, 1.0, True) is True
+    assert due("NO_POSE", 100.1, 100.0, 1.0, True) is False

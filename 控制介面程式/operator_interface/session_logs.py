@@ -29,6 +29,7 @@ from backend_contract import InterfaceMode
 _BULK_LOG_SYNC_EVERY = 16
 
 _PERMANENT_LOG_NAMES = {
+    "trajectory.jsonl",
     "commands.jsonl",
     "hardware_inventory.json",
     "incidents.jsonl",
@@ -270,7 +271,7 @@ class SessionCommandLog:
 
 
 class SessionLogs:
-    REQUIRED_STREAMS = ("commands", "localization", "telemetry", "incidents")
+    REQUIRED_STREAMS = ("commands", "localization", "telemetry", "incidents", "trajectory")
 
     def __init__(self, directory: Path, mode: InterfaceMode):
         self.directory = directory
@@ -369,7 +370,8 @@ class SessionLogs:
     def _write(self, stream: str, event: str, fields: dict[str, Any]) -> bool:
         if self._closed:
             return False
-        ok = self._sinks[stream].write(_record(event, fields))
+        row = _record(event, fields)
+        ok = self._sinks[stream].write(row)
         if ok:
             self._counts[stream] += 1
             for key in (
@@ -388,6 +390,22 @@ class SessionLogs:
                 if math.isfinite(value) and value >= 0.0:
                     self._latency_samples_ms.append(value)
                     break
+        if stream == "localization" and event == "pose_result":
+            # Compact pose evidence survives diagnostic-log retention. Keep
+            # failed fixes too, so reconstruction never silently bridges loss.
+            keys = (
+                "t_utc", "t_mono_ns", "pose", "pose_raw", "success",
+                "source_frame_stamp_mono", "pose_capture_mono_ns", "display_seq",
+                "mode", "direct_status", "pose_status", "confidence_low",
+                "imu_bridge", "map_inliers", "vo_inliers", "inliers",
+                "reproj_rms", "map_constraint_age_s", "reseed_confirming",
+            )
+            saved = self._write("trajectory", event, {key: row[key] for key in keys if key in row})
+            ok = ok and saved
+        elif (stream == "localization" and event in {"auto_route_plan", "auto_route_tick"}
+              or stream == "telemetry" and event == "autonomy_event"):
+            saved = self._write("trajectory", event, {key: value for key, value in row.items() if key != "event"})
+            ok = ok and saved
         return ok
 
     def command(self, event: str, **fields: Any) -> bool:

@@ -13,6 +13,13 @@
       "patched_sha256": "77870b1ca8c93223075a67076ffdee489821bda8aace060c93b1c7f6bf54e051",
       "reason": "The scalar scan was ~40k math.floor calls per lift and the largest GIL-holding block in the relocalizer, which starves the CPU fast loop running in the same process. Measured on RTX 5060 over 26 real P157 frames: localize_array p50 254.1 -> 174.1 ms (-31.5%), with status, inliers, inlier_ratio, reprojection_p90, anchor Point3D IDs and the cam_from_world bytes identical on every frame. Equivalence is pinned by tests/localization/deploy/test_lift_reference_matches.py, which keeps the pre-vectorisation body as a differential oracle. Admitted by README.md 'vendor 來源與搬遷規則' rule 3 as a measured optimisation; still owed upstream before the next re-vendor.",
       "upstream_sha256": "0522ea8cbc81365fd33354d7e7b0bfaab894da2be41a9752647b54a4edb3fc1e"
+    },
+    {
+      "file": "sfm_diagnosis/site_pipeline/deployment_localizer.py",
+      "upstream_sha256": "d70fba6b98faedb6a2c65ab5430ede309f3a0330dbb2f40e47c630fd1955d7de",
+      "patched_sha256": "52aae1f1b686d9aa6f3f3425e613120a5cc801174fb0258aa719fbd1e0748ee2",
+      "change": "Accept an already verified and relocated keyframe_index so live startup does not parse the manifest twice.",
+      "reason": "Reuse DirectMapAssets validation and identities; legacy callers retain the original parser."
     }
   ],
   "origin": "river-deploy-5060-20260908 (河濱 EDM fixed-pose retriangulate 建圖 + two-rate 定位)",

@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="zh-Hant"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>AUTO 軌跡回顧</title>
+<style>
+body{font:16px system-ui,sans-serif;background:#111b25;color:#e4edf4;max-width:1100px;margin:24px auto;padding:0 20px}h1{font-size:26px}p{line-height:1.6;color:#bdcbd7}label{display:inline-block;margin:10px 16px 10px 0}select,button{font:inherit;background:#243443;color:inherit;border:1px solid #607384;border-radius:4px;padding:7px}canvas{width:100%;height:auto;background:#17232e;border:1px solid #34495b}input[type=range]{width:100%}#detail{white-space:pre-wrap;font-variant-numeric:tabular-nums}a{color:#74bfff}.legend span{margin-right:18px}#summary{font-variant-numeric:tabular-nums}
+</style>
+<h1>AUTO 軌跡回顧</h1><p id="session"></p>
+<p>依機載視覺定位、弱定位與 IMU 估計重建；不是獨立量測的真實軌跡。距離以地圖單位表示，沒有換算成公尺。偏差為控制位置到當時目標航段的三維距離，包含首次靠攏段。</p>
+<label>AUTO 場次 <select id="run"></select></label>
+<label>視角 <select id="plane"><option value="0,1">俯視</option><option value="0,2">側視一</option><option value="1,2">側視二</option></select></label>
+<button id="play" type="button">播放</button>
+<p class="legend"><span style="color:#f58bbb">規劃路線</span><span style="color:#74bfff">地圖定位</span><span style="color:#ffc75a">弱定位／未確認</span><span style="color:#dcaaef">IMU／預測</span></p>
+<p id="summary"></p><canvas id="plot" width="1060" height="580" aria-label="規劃路線與估計軌跡比較圖"></canvas>
+<label for="time">時間位置</label><input id="time" type="range" min="0" max="0" value="0" step="1">
+<p id="detail"></p><p>缺少位置或相鄰紀錄間隔超過 0.5 秒時斷線，不補畫未觀測路徑。不同 AUTO 場次分開呈現。</p>
+<p><a href="trajectory.csv" download>下載軌跡 CSV</a> · <a href="trajectory.json" download>下載完整路線與軌跡 JSON</a></p>
+<script>
+const data=__TRAJECTORY_DATA__;
+const $=id=>document.getElementById(id), canvas=$('plot'),ctx=canvas.getContext('2d');
+let timer=null;
+const colors={'地圖定位':'#74bfff','弱定位／未確認':'#ffc75a','IMU／預測':'#dcaaef'};
+const fmt=v=>v==null?'無資料':Number(v).toFixed(3);
+$('session').textContent=data.session;
+data.runs.forEach((r,i)=>{const o=document.createElement('option');o.value=i;o.textContent=`${i+1} · ${r.id}`;$('run').append(o)});
+function stop(){clearInterval(timer);timer=null;$('play').textContent='播放'}
+function draw(){
+ ctx.clearRect(0,0,canvas.width,canvas.height);
+ const run=data.runs[Number($('run').value)];if(!run){$('summary').textContent='此場次沒有可回顧的 AUTO 紀錄';$('play').disabled=true;return}
+ const [a,b]=$('plane').value.split(',').map(Number),end=Number($('time').value),samples=run.samples;
+ const points=[...run.route,...samples.filter(s=>s.view).map(s=>s.view)];
+ const xs=points.map(p=>p[a]),ys=points.map(p=>p[b]);
+ const minx=xs.length?Math.min(...xs):0,maxx=xs.length?Math.max(...xs):1,miny=ys.length?Math.min(...ys):0,maxy=ys.length?Math.max(...ys):1;
+ const scale=Math.min(960/Math.max(maxx-minx,.01),480/Math.max(maxy-miny,.01));
+ const xy=p=>[530+(p[a]-(minx+maxx)/2)*scale,290-(p[b]-(miny+maxy)/2)*scale];
+ ctx.font='15px sans-serif';ctx.fillStyle='#bdcbd7';ctx.fillText(`${run.axes[a]} / ${run.axes[b]} · map units`,20,28);
+ let previous=null;
+ for(const s of samples.slice(0,end+1)){
+  if(!s.view){previous=null;continue}const [x,y]=xy(s.view);ctx.strokeStyle=colors[s.quality];ctx.fillStyle=colors[s.quality];ctx.lineWidth=1;
+  if(previous&&s.t-previous.t<=.5){const [px,py]=xy(previous.view);ctx.beginPath();ctx.moveTo(px,py);ctx.lineTo(x,y);ctx.stroke()}
+  ctx.fillRect(x-1,y-1,2,2);previous=s;
+ }
+ ctx.strokeStyle='#f58bbb';ctx.lineWidth=2;ctx.setLineDash([7,5]);ctx.beginPath();run.route.forEach((p,i)=>{const [x,y]=xy(p);i?ctx.lineTo(x,y):ctx.moveTo(x,y)});ctx.stroke();ctx.setLineDash([]);
+ run.route.slice(0,run.plan.drawn_waypoint_count||run.route.length).forEach((p,i)=>{const [x,y]=xy(p);ctx.fillStyle='#f58bbb';ctx.fillText(String(i+1),x+5,y-5)});
+ const s=samples[end];if(s?.view){const [x,y]=xy(s.view);ctx.strokeStyle='#fff';ctx.lineWidth=2;ctx.beginPath();ctx.arc(x,y,6,0,2*Math.PI);ctx.stroke()}
+ const st=run.stats;$('summary').textContent=`全段三維偏差：平均 ${fmt(st.mean_u)} · P95 ${fmt(st.p95_u)} · 最大 ${fmt(st.max_u)} 地圖單位｜有效偏差樣本 ${st.samples}｜缺失位置 ${st.missing}`;
+ $('detail').textContent=s?`時間 ${fmt(s.t)} s · ${s.utc||''}\n來源：${s.quality}｜階段：${s.phase}｜目標索引：${s.target??'無'}\n偏差 ${fmt(s.error_u)} 地圖單位｜地速 ${fmt(s.speed_mps)} m/s｜電量 ${s.battery_pct??'無資料'}%`:'沒有位置樣本';
+}
+function select(){stop();const n=data.runs[Number($('run').value)]?.samples.length||0;$('time').max=Math.max(0,n-1);$('time').value=Math.max(0,n-1);draw()}
+$('run').onchange=select;$('plane').onchange=draw;$('time').oninput=()=>{stop();draw()};
+$('play').onclick=()=>{if(timer){stop();return}const run=data.runs[Number($('run').value)];if(!run?.samples.length)return;if(Number($('time').value)>=run.samples.length-1)$('time').value=0;let t=run.samples[Number($('time').value)].t,last=performance.now();$('play').textContent='暫停';timer=setInterval(()=>{const now=performance.now();t+=(now-last)/1000;last=now;let i=Number($('time').value);while(i+1<run.samples.length&&run.samples[i+1].t<=t)i++;$('time').value=i;draw();if(i>=run.samples.length-1)stop()},50)};
+select();
+</script></html>

@@ -592,6 +592,37 @@ def resolve_map_dir(pack: Path, explicit: str) -> Path:
     return candidates[0]
 
 
+def prepare_release_geometry(bundle_path: Path) -> str:
+    """Precompute CPU geometry and bind it to the existing bundle manifest."""
+    direct_root = REPO_ROOT / "定位演算法/deploy_code/sfm_direct_deploy"
+    for path in (direct_root, direct_root / "vendor"):
+        if str(path) not in sys.path:
+            sys.path.insert(0, str(path))
+    from direct_geometry import GEOMETRY_ARCHIVE, prepare_geometry_archive
+    from direct_map import DirectMapAssets
+
+    assets = DirectMapAssets.load(bundle_path)
+    if any(entry["path"] == GEOMETRY_ARCHIVE for entry in assets.raw["files"]):
+        return assets.sha256
+    destination = bundle_path.parent / GEOMETRY_ARCHIVE
+    temporary = destination.with_name(f".{destination.name}-{uuid.uuid4().hex}.tmp")
+    try:
+        prepare_geometry_archive(assets, temporary)
+        os.replace(temporary, destination)
+    finally:
+        temporary.unlink(missing_ok=True)
+    raw = dict(assets.raw)
+    raw["files"] = [entry for entry in raw["files"] if entry["path"] != GEOMETRY_ARCHIVE]
+    raw["files"].append(
+        {
+            "path": GEOMETRY_ARCHIVE,
+            "sha256": sha256_file(destination),
+            "size_bytes": destination.stat().st_size,
+        }
+    )
+    return write_json(bundle_path, raw)
+
+
 def build(args: argparse.Namespace) -> int:
     import pycolmap
 
@@ -787,6 +818,7 @@ def populate(
     )
 
     # --- site profile -------------------------------------------------------
+    bundle_sha = prepare_release_geometry(bundle_path)
     site_profile_path = staging / "site_profile.json"
     ply_sha = sha256_file(staging / "map/map.ply")
     write_json(

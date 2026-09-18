@@ -223,7 +223,11 @@ POSE_STALE_S = 0.5  # visual pose older than this -> HOVER
 # Reuse one accepted visual position only across a very short failed-frame run.
 # The source timestamp must still satisfy POSE_STALE_S; this second bound limits
 # how long control may continue after the localizer actually stopped producing fixes.
-POSE_HOLDOVER_S = _env_float("SFM_POSE_HOLDOVER_S", 0.20, minimum=0.0, maximum=POSE_STALE_S)
+# Default 0.50 s (the architecture max): flicker-length dropouts coast through
+# without tripping recovery, while longer outages still hover. 2026-09-18 showed
+# pose-gap p95 at 0.16 s with 0.2-0.3 s spikes -- a 0.2 s holdover tripped
+# recovery on every spike. Still capped by POSE_STALE_S by validation below.
+POSE_HOLDOVER_S = _env_float("SFM_POSE_HOLDOVER_S", 0.50, minimum=0.0, maximum=POSE_STALE_S)
 # 720p live frame older than this -> HOVER before localization. Distinct from the
 # operator interface's _STREAM_STALE_S (0.75 s), which only feeds its stick-handoff
 # timer; this one decides whether autonomy may run the localizer on the frame.
@@ -1960,7 +1964,13 @@ class _FlightLoopRunner:
             and self._pose_carries_map_confirmation(localized_pose, record)
         )
         if fresh and new_visual_fix and not low_confidence:
-            if self.heading.update(localized_pose.yaw, olympe_yaw):
+            # BOOT-approved estimates may initialize heading. Once initialized,
+            # only observed map fixes recalibrate the visual-to-IMU anchor.
+            initialize_heading = (
+                not self.enforce_weak_pose_gate
+                and self.heading.heading(olympe_yaw) is None
+            )
+            if not (map_pose_new or initialize_heading) or self.heading.update(localized_pose.yaw, olympe_yaw):
                 self.last_good = localized_pose
                 self.last_good_accepted_at = now
                 if map_pose_new:
@@ -2454,10 +2464,12 @@ class _FlightLoopRunner:
         record["map_constraint_age_s"] = age
         if not weak and not predicted:
             return False
-        # Desktop AUTO (weak gate off): after a visual lock, VO / dead-reckon /
-        # IMU fill-in may keep translating. They still cannot start the route
-        # with no map stamp, and a stale pose stamp is rejected elsewhere.
-        if predicted or not self.enforce_weak_pose_gate:
+        # Desktop AUTO already confirmed stable estimates in BOOT. Keep their
+        # source labels without requiring or inventing a strong map anchor.
+        # Pose freshness and jump checks remain active independently.
+        if not self.enforce_weak_pose_gate:
+            return False
+        if predicted:
             if self.last_map_pose_stamp is None:
                 record["map_constraint_expired"] = True
                 return True
@@ -2933,11 +2945,13 @@ class _FlightLoopRunner:
             import dataclasses as _dc
             try:
                 settled = _dc.replace(
-                    command, action="FINAL_HOLD", should_land=False,
+                    command, action="HOVER", should_land=False,
                     status=f"final position/speed settling; {speed_reason}",
                 )
             except (AttributeError, TypeError, ValueError):
                 return command
+            # FINAL_HOLD centers on the waypoint. Waiting for low speed must
+            # instead hold still, or its centering PCMD prevents settling.
             try:
                 self.ctrl.state = "CRUISE"
             except AttributeError:

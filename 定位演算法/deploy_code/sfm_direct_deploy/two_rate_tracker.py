@@ -81,6 +81,37 @@ IMU_BRIDGE_MAX_TILT_DEG = 35.0
 #: caps at 200 deg/s and AUTO flies 10); a bigger implied rate is a bad sample.
 IMU_BRIDGE_MAX_YAW_RATE_DEG_S = 180.0
 
+#: Background relocalization while strongly tracked and nearly stationary.
+#: A 5060 relocalization costs ~250 ms of GPU for an anchor refresh the fast
+#: loop does not need every second while hovering: KLT holds the tracks and
+#: the map has not moved. Stretch the refresh period only in this regime --
+#: weak statuses keep the aggressive every-frame trigger below, so recovery
+#: after a real loss is untouched.
+RELOC_STRONG_IDLE_PERIOD_S = 4.0
+#: Median per-frame center step below this counts as hovering (map units).
+#: 0.002 u is ~3 cm/frame at 15 m/u, i.e. ~0.6 m/s drift ceiling -- generous
+#: against a hovering aircraft, tight against real translation.
+RELOC_IDLE_STEP_U = 0.002
+RELOC_IDLE_WINDOW = 5
+
+
+def _reloc_idle(step_history) -> bool:
+    """Is the recent track history a hover? Pure; empty history is not idle."""
+    try:
+        recent = [float(v) for v in list(step_history)[-RELOC_IDLE_WINDOW:]]
+    except (TypeError, ValueError, OverflowError):
+        return False
+    if not recent:
+        return False
+    return float(np.median(recent)) < RELOC_IDLE_STEP_U
+
+
+def _reloc_refresh_due(status: str, stamp: float, last_stamp, period_s: float,
+                       idle: bool) -> bool:
+    """Background-refresh cadence. Pure. Idle strong tracking refreshes slower."""
+    period = RELOC_STRONG_IDLE_PERIOD_S if (status == "FAST_TRACK" and idle) else float(period_s)
+    return last_stamp is None or (float(stamp) - float(last_stamp)) >= period
+
 
 def azimuth_turn_exceeds(
     map_frame: Any,
@@ -484,6 +515,7 @@ class TwoRateTracker:
         self._last_reloc_stages: dict = {}
         self._last_map_stamp: float | None = None
         self._handover_dropped = 0
+        self._handover_retry_hops = 0
         # Cumulative DR-guard hits (hover rejects + yaw downweights). Internal
         # only: direct_localizer_adapter builds last_info from an explicit
         # key whitelist, so a new info-dict key would be silently dropped --
@@ -756,9 +788,9 @@ class TwoRateTracker:
         self, gray: np.ndarray, ordinal: int, stamp: float, status: str
     ) -> bool:
         reloc = self.profile.reloc
-        due = self._last_reloc_stamp is None or (stamp - self._last_reloc_stamp) >= float(
-            reloc.period_s
-        )
+        idle = status == "FAST_TRACK" and _reloc_idle(self._step_history)
+        due = _reloc_refresh_due(status, stamp, self._last_reloc_stamp,
+                                 float(reloc.period_s), idle)
         # VO tracks can be numerous while none constrain the pose to the map.
         # Request a map fix as soon as the one-job worker is available, without
         # waiting for the normal refresh period or clearing the usable tracks.
@@ -949,6 +981,7 @@ class TwoRateTracker:
             **self._klt_diagnostics,
             "handover_points": int(handover_points),
             "handover_dropped": int(self._handover_dropped),
+            "handover_retry_hops": int(self._handover_retry_hops),
             "reloc_status": reloc_status if reloc_status is not None else self._last_reloc_status,
             "reloc_delivered": delivered is not None,
             "reloc_submitted": submitted,
@@ -1061,26 +1094,38 @@ class TwoRateTracker:
 
         ids, xy, xyz = self._cap_handover_points(ids, xy, xyz)
         n = len(chain)
-        # Stride-2 catch-up: one track_pair per two frames instead of one per
-        # frame. Pairs fall from (n-1) to ceil((n-1)/2) -- about half the KLT
-        # calls on the delivery peak. A gap-2 hop tracks frame a straight to
-        # frame b; the skipped frame's 2D is implicitly its linear midpoint
-        # (constant velocity over 2 frames), so no state is stored for it --
-        # the walk only lives on tracked frames. Indexing starts at 0, hence
-        # the anchor frame is always tracked: odd n lands exactly on the last
-        # frame, even n ends with one gap-1 hop onto the current frame.
-        # Risk: a gap-2 hop doubles the per-call displacement, so fast-motion
-        # handovers lose more points to the FB gate and fall through to MERGE
-        # (or empty) -- reseed rate is the validation metric for this trade.
-        idx = list(range(0, n, 2))
-        if idx[-1] != n - 1:
-            idx.append(n - 1)
-        for a, b in zip(idx[:-1], idx[1:]):
-            if xy.size == 0:
-                break
+        # Keep stride-2 while it supplies enough anchors. If a hop drops below
+        # the existing reseed floor, retry through the intervening exposure.
+        # Every retry uses the same FB/bounds gates; retain it only if it keeps
+        # more points. No retry recursively expands the bounded ring walk.
+        a, stride = 0, 2
+        while a < n - 1 and xy.size:
+            b = min(a + stride, n - 1)
             fwd, keep = self._tracker.track_pair(chain[a], chain[b], xy)
             inside = keep & self._inside(fwd)
+            required = min(len(xy), int(self.profile.fast_loop.reseed_min_points))
+            if b - a == 2 and np.count_nonzero(inside) < required:
+                self._handover_retry_hops += 1
+                wide_diagnostics = dict(getattr(self._tracker, "last_diagnostics", {}))
+                midpoint, mid_keep = self._tracker.track_pair(chain[a], chain[a + 1], xy)
+                mid_inside = mid_keep & self._inside(midpoint)
+                mid_indices = np.flatnonzero(mid_inside)
+                if mid_indices.size:
+                    end, end_keep = self._tracker.track_pair(
+                        chain[a + 1], chain[b], midpoint[mid_inside]
+                    )
+                    end_inside = end_keep & self._inside(end)
+                    if np.count_nonzero(end_inside) > np.count_nonzero(inside):
+                        selected = mid_indices[end_inside]
+                        xy, ids, xyz = end[end_inside], ids[selected], xyz[selected]
+                        # The intervening exposure helped. Use consecutive
+                        # frames for the rest of this handover, avoiding
+                        # another failed wide hop during the same motion.
+                        a, stride = b, 1
+                        continue
+                self._tracker.last_diagnostics = wide_diagnostics
             xy, ids, xyz = fwd[inside], ids[inside], xyz[inside]
+            a = b
         if ids.size == 0:
             return empty_ids, empty_xy, empty_xyz
         return ids, xy, xyz

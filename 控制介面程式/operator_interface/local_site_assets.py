@@ -1226,7 +1226,7 @@ class _LocalSupplementProvider:
             _remove_file(backup_asset)
             for path in (*linked_temps.values(), *linked_backups.values()):
                 _remove_file(path)
-        return ImportedAsset(profile_path, target)
+        return ImportedAsset(profile_path, target, approved_for_auto=bool(approve_for_auto))
 
 
 def _finite_vec3(raw: object, label: str) -> tuple[float, float, float]:

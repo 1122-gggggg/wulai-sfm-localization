@@ -343,10 +343,9 @@ class ControlConfig:
     # adapter ignores -- tuning it changed nothing about how the drone flew.
     lookahead: float = 0.8  # map-units ahead on route after rejoin
     rejoin_tol: float = 0.45  # cross-track error before REJOIN
-    #: FOLLOW cross-track pull weight. The steering direction blends the
-    #: waypoint/carrot ray with the lateral part of the projection offset,
-    #: weighted by gain * (path_error / arrive_radius) clamped to full
-    #: correction. 1.0 corrects fully onto the line at one arrival radius.
+    #: Cross-track position feedback weight. Horizontal feedback uses at
+    #: least slowdown_distance as its span, so small arrival spheres do not
+    #: amplify the pull. Output authority remains independently capped.
     path_pull_gain: float = 1.0
     # Map-unit arrival tolerance. Scale-dependent like radius/max_jump: 0.1 was
     # chosen against urai EDM v1, whose camera track spans 6.07 map units and
@@ -444,9 +443,8 @@ DESKTOP_AUTO_YAW_TOLERANCE_DEG = 20.0
 # Body-velocity rejection while translating or holding height, in PCMD per m/s.
 # Cross-track only during cruise so the aircraft still closes the waypoint.
 DESKTOP_AUTO_WIND_REJECT_PCMD_PER_MPS = 20.0
-# Floor on the drawn arrival sphere so a wind-held 0.4-1 m offset still arrives.
-# 0.15 map units is about 1.4 m on the river site (0.022 u ≈ 0.2 m).
-DESKTOP_AUTO_MIN_ARRIVE_RADIUS = 0.15
+# Fallback only for routes without an authored arrival radius.
+DESKTOP_AUTO_DEFAULT_ARRIVE_RADIUS = 0.15
 
 # Horizontal tilt is capped by DESKTOP_AUTO_MAX_TRANSLATION_PCMD (50% of
 # MaxTilt 20° ≈ 10°). Gaz has its own vertical-speed percentage. After each
@@ -473,12 +471,10 @@ def production_auto_control_config(map_frame: MapFrame) -> ControlConfig:
 def apply_desktop_auto_authority(config: ControlConfig) -> ControlConfig:
     """Keep progress slack valid after route-authored limits.
 
-    Drawn per-point spheres are honored as-is: they already encode the map
-    scale (k=0.15 of adjacent segment length) and are verified non-overlapping
-    at route-authoring time. Only the legacy global fallback (no per-point
-    radii) keeps the wind-tolerant floor.
+    Both scalar and per-point authored arrival radii must be honored. Raising
+    a scalar radius can overlap adjacent spheres and retire a waypoint before
+    its vertical error has been corrected.
     """
-    floor = float(DESKTOP_AUTO_MIN_ARRIVE_RADIUS)
     radii = config.waypoint_arrive_radii
     if radii is not None:
         radius = max(float(config.waypoint_arrive_radius), max(float(v) for v in radii))
@@ -487,7 +483,7 @@ def apply_desktop_auto_authority(config: ControlConfig) -> ControlConfig:
             waypoint_arrive_radius=radius,
             progress_jump_slack=max(float(config.progress_jump_slack), radius),
         )
-    radius = max(float(config.waypoint_arrive_radius), floor)
+    radius = float(config.waypoint_arrive_radius)
     return replace(
         config,
         waypoint_arrive_radius=radius,
@@ -794,6 +790,10 @@ def config_for_route(
         drawn_points = list(route.controller_points)
     path_len = _path_length(drawn_points)
     changes = {}
+    if radius is None and point_radii is None:
+        changes["waypoint_arrive_radius"] = max(
+            float(cfg.waypoint_arrive_radius), DESKTOP_AUTO_DEFAULT_ARRIVE_RADIUS,
+        )
     if radius is not None:
         # progress_jump_slack must stay >= the arrival sphere (__post_init__
         # enforces it), so widen the capture bound rather than reject the radius.
@@ -997,25 +997,27 @@ class RouteAutoController:
         self._rejoining = False
         self._corner_incoming = self._precompute_corner_geometry()
 
-    def start_after_nearest_waypoint(self, pos: np.ndarray) -> int:
-        """Start at waypoint 1, even when the takeoff pose is nearer a later point.
+    def start_after_nearest_waypoint(self, pos: np.ndarray, *, target_index: int = 0) -> int:
+        """Start at waypoint 1, or resume an explicitly retained unfinished target.
 
         Kept under the historical name because desktop autonomy, the offline sim,
-        and this repo's tests all call it. The position only validates; the
-        target is always waypoint index 0, so every authored waypoint is flown in
-        order. Only ``_advance_to_reached`` retires a waypoint.
+        and this repo's tests all call it. The position only validates.
+        A new flight starts at index 0. Manual recovery may supply the previous
+        target index; proximity alone never skips an authored waypoint.
         """
         _finite_vec3(pos, "takeoff position")
-        self.target_index = 0
-        self._join_target_index = 0
+        if type(target_index) is not int or not 0 <= target_index < len(self.wp):
+            raise ValueError("route start target is outside the mission")
+        self.target_index = target_index
+        self._join_target_index = target_index
         self._rejoining = False
-        self.active_segment = 0
-        self.progress_s = 0.0
+        self.active_segment = max(0, target_index - 1)
+        self.progress_s = float(self.cum[self.active_segment])
         self.holding_for_inspection = False
         self._arrive_frames = 0
         self._last_sequence_pose_stamp = None
         self._reset_final_hold()
-        return 0
+        return target_index
 
     def _arrive_radius_for(self, index: int) -> float:
         """Arrival sphere for one waypoint: drawn per-point value or global."""
@@ -1776,8 +1778,9 @@ def _route_translation_components(cmd, pose, config):
     Returns (correction, along, along_scale) in PCMD order (roll, pitch, gaz),
     or None when the command carries no segment metadata (path_pull_gain=0 or
     a direct-to-point leg such as WP1 joining, centering, final hold). The
-    correction position term is ``(C, C, V) * path_pull_gain / (2 * r)`` per
-    body axis; the along-leg term reuses ``_translation_percent_command`` with
+    Horizontal correction uses ``C * gain / max(slowdown_distance, 2*r)``;
+    vertical correction keeps ``V * gain / (2*r)``. The along-leg term reuses
+    ``_translation_percent_command`` with
     the waypoint-range taper so arrival slowdown still keys on the authored
     waypoint. Raises through ``_validated_command_goal`` on incomplete or
     non-finite metadata instead of silently degrading.
@@ -1804,9 +1807,10 @@ def _route_translation_components(cmd, pose, config):
     rho = max(0.0, float(np.linalg.norm(pull)) / radius)
     corr_fwd, corr_right, corr_up = config.map_frame.body_components(pull, float(pose.yaw))
     gain = float(config.path_pull_gain)
+    horizontal_span = max(float(config.slowdown_distance), 2.0 * radius)
     correction = np.array([
-        cap * corr_right * gain / (2.0 * radius),
-        cap * corr_fwd * gain / (2.0 * radius),
+        cap * corr_right * gain / horizontal_span,
+        cap * corr_fwd * gain / horizontal_span,
         vert * corr_up * gain / (2.0 * radius),
     ], dtype=float)
     goal = np.asarray(cmd.goal, dtype=float)
@@ -2026,7 +2030,9 @@ class YawAlignedPcmdController:
         (opposing errors unload); integrate=False only leaks and advances
         time, returning no output. Stale/future/non-finite stamps only leak
         and clear the anchor so the next valid sample restarts with dt=0.
-        The accumulator is capped by vector norm (3*r), direction preserved.
+        The feedback radius is at least half the route slowdown distance,
+        keeping small arrival spheres from amplifying integral effort. The
+        accumulator is capped by vector norm (3*r), direction preserved.
         """
         try:
             now_f = float(now)
@@ -2061,7 +2067,7 @@ class YawAlignedPcmdController:
                 wall_dt = 0.0
         leak = math.exp(-wall_dt / 2.0) if wall_dt > 0.0 else 1.0
         try:
-            radius_f = max(float(radius), 1e-3)
+            radius_f = max(float(radius), 0.5 * self.config.slowdown_distance, 1e-3)
         except (TypeError, ValueError, OverflowError):
             radius_f = 1e-3
         imax = 3.0 * radius_f
@@ -2297,8 +2303,9 @@ class YawAlignedPcmdController:
                     integrate=bool(fresh and position_observed),
                 )
                 kv = float(DESKTOP_AUTO_WIND_REJECT_PCMD_PER_MPS)
-                raw_pitch = cap * forward / (4.0 * radius) + i_f - kv * forward_v
-                raw_roll = cap * right / (4.0 * radius) + i_r - kv * right_v
+                horizontal_span = max(float(self.config.slowdown_distance), 4.0 * radius)
+                raw_pitch = cap * forward / horizontal_span + i_f - kv * forward_v
+                raw_roll = cap * right / horizontal_span + i_r - kv * right_v
                 self._correction_saturated = bool(max(abs(raw_pitch), abs(raw_roll)) > cap)
                 pitch = int(np.clip(round(raw_pitch), -cap, cap))
                 roll = int(np.clip(round(raw_roll), -cap, cap))

@@ -246,9 +246,7 @@ def test_approved_route_builds_the_global_scale_free_controller(tmp_path, monkey
 
     assert len(waypoints) == 2
     assert controller.cfg.inspect_waypoints == ()
-    assert controller.cfg.waypoint_arrive_radius == pytest.approx(
-        rpf.DESKTOP_AUTO_MIN_ARRIVE_RADIUS
-    )
+    assert controller.cfg.waypoint_arrive_radius == pytest.approx(0.02)
     assert controller.cfg.waypoint_arrive_confirm_frames == 1
 
 
@@ -849,12 +847,18 @@ def test_real_route_weak_gate_cannot_be_disabled_by_environment(monkeypatch):
 
 def test_offline_runner_can_explicitly_disable_weak_pose_gate(monkeypatch):
     monkeypatch.setattr(pff, "GATE_WEAK", False)
+    weak = {"value": False}
+
+    def pose(st):
+        weak["value"] = st["tick"] > 1
+        return fresh_pose(st, x=-1.0)
+
     sent, _reason, _ = run_ticks(
         8,
-        lambda st: fresh_pose(st, x=-1.0),
+        pose,
         # Exercise weak motion away from a waypoint; weak arrival is separately vetoed.
         route=((1.0, 0.0, 0.0), (8.0, 0.0, 0.0)),
-        hooks_extra={"pose_is_weak": lambda: True},
+        hooks_extra={"pose_is_weak": lambda: weak["value"]},
         enforce_weak_pose_gate=False,
     )
     assert any(c != ZERO for c in sent)
@@ -902,14 +906,21 @@ def test_bounded_vo_cannot_refresh_map_age_and_needs_strong_recovery():
     assert tick(9.8, True).get("map_constraint_expired") is not True
 
 
-def test_bounded_vo_requires_a_strong_anchor_before_any_motion():
+@pytest.mark.parametrize("predicted", [False, True])
+def test_desktop_estimates_can_start_motion_without_a_strong_anchor(predicted):
     sent, _, records = run_ticks(
         8, fresh_pose, route=((1.0, 0.0, 0.0), (8.0, 0.0, 0.0)),
-        hooks_extra={"pose_is_weak": lambda: True, "max_weak_pose_age_s": 0.5},
+        hooks_extra={
+            "pose_is_weak": lambda: True, "max_weak_pose_age_s": 0.5,
+            "pose_is_predicted": lambda: predicted,
+        },
         enforce_weak_pose_gate=False,
     )
-    assert sent and all(c == ZERO for c in sent)
-    assert all(r["map_constraint_expired"] for r in records)
+    assert any(c != ZERO for c in sent)
+    assert any(not r["blocked"] for r in records)
+    assert all(r.get("map_constraint_expired") is not True for r in records)
+    assert all(r.get("map_constraint_age_s") is None for r in records)
+    assert all(r.get("map_pose_confirmed") is False for r in records)
 
 
 def test_recovery_requires_two_consecutive_good_fixes_before_motion():
@@ -1088,6 +1099,58 @@ def test_predicted_imu_pose_keeps_translation_when_visual_is_lost():
     assert later.get("map_constraint_expired") is not True
     assert later.get("pose_source_predicted") is True
     assert later.get("pcmd") not in (None, [0, 0, 0, 0])
+
+
+@pytest.mark.parametrize("source", ["weak", "predicted", "unconfirmed", "unobserved", "reseed"])
+def test_fill_in_poses_keep_motion_without_changing_heading_anchor(source):
+    wp = [np.zeros(3), np.array([8.0, 0.0, 0.0])]
+    ctrl = rpf.RouteAutoController(wp, poles=[], config=rpf.ControlConfig(inspect_waypoints=()))
+    state = {"t": 1.0, "fill_in": False, "yaw": 0.0}
+    records = []
+
+    def pose():
+        filling = state["fill_in"]
+        return rpf.Pose(
+            0.04 if filling else 0.02, 0, 0, state["yaw"], stamp=state["t"],
+            map_confirmed=not (filling and source == "unconfirmed"),
+            position_observed=not (filling and source == "unobserved"),
+            reseed_confirming=filling and source == "reseed",
+        )
+
+    hooks = pff.LoopHooks(
+        get_pose=pose,
+        olympe_yaw=lambda: 0.0,
+        send_pcmd=lambda *args: None,
+        pose_is_weak=lambda: state["fill_in"] and source == "weak",
+        pose_is_predicted=lambda: state["fill_in"] and source == "predicted",
+        pose_confidence=lambda: 300,
+        max_weak_pose_age_s=0.5,
+        land_on_localization_loss=False,
+        log_tick=records.append,
+        now=lambda: state["t"],
+    )
+    runner = pff._FlightLoopRunner(
+        hooks, ctrl, wp, yaw_sign=1, verbose=False, enforce_weak_pose_gate=False
+    )
+    for stamp in (1.0, 1.1):
+        state["t"] = stamp
+        runner._tick(stamp, "AUTO", {"t": stamp})
+    anchor = dict(vars(runner.heading))
+    map_stamp = runner.last_map_pose_stamp
+    state["fill_in"] = True
+    for index in range(10):
+        state.update(t=1.2 + index * 0.1, yaw=(index + 1) * 0.05)
+        runner._tick(state["t"], "AUTO", {"t": state["t"]})
+        assert vars(runner.heading) == anchor
+        assert runner.last_map_pose_stamp == map_stamp
+        assert runner.last_good.stamp == state["t"]
+        assert records[-1].get("pcmd") not in (None, [0, 0, 0, 0])
+
+    # A real map observation resumes calibration after the fill-in segment.
+    state.update(t=2.3, fill_in=False, yaw=0.05)
+    runner._tick(state["t"], "AUTO", {"t": state["t"]})
+    assert runner.heading.offset != anchor["offset"]
+    assert runner.last_map_pose_stamp == state["t"]
 
 
 def test_live_pose_jump_latches_hover_until_operator_resumes_auto():
@@ -1304,6 +1367,12 @@ def test_route_completion_waits_for_fresh_low_ground_speed():
     assert sent[-1] == ZERO
     assert any(record.get("landing_stable_samples", 0) >= 3 for record in records)
     assert any(record.get("landing_stable_span_s", 0.0) >= 1.0 for record in records)
+    settling = [
+        record for record in records
+        if str(record.get("reason", "")).startswith("final position/speed settling")
+    ]
+    assert settling
+    assert all(record["pcmd"] == [0, 0, 0, 0] for record in settling)
 
 
 def test_route_completion_holds_when_ground_speed_is_stale():
@@ -3868,8 +3937,10 @@ def test_route_loop_requires_map_confirmation_on_the_final_leg():
     # FOLLOW). Sequenced weak poses retire wp0, then wp1; the final leg then
     # holds for a map fix (operator scope 2026-09-16).
     route = ((0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (2.0, 0.0, 0.0))
+    weak = {"value": False}
     def seq(st):
         n = st["tick"] - 1
+        weak["value"] = n > 0  # Establish one real heading anchor before fill-in.
         if n < 4:
             return fresh_pose(st, x=0.0)
         if n < 8:
@@ -3880,7 +3951,7 @@ def test_route_loop_requires_map_confirmation_on_the_final_leg():
         route=route,
         control_config=rpf.ControlConfig(
             inspect_waypoints=(), waypoint_arrive_confirm_frames=1),
-        hooks_extra={"pose_is_weak": lambda: True, "pose_confidence": lambda: 100},
+        hooks_extra={"pose_is_weak": lambda: weak["value"], "pose_confidence": lambda: 100},
         enforce_weak_pose_gate=False,
     )
     waiting = [record for record in records if record.get("action") == "WAIT_MAP_CONFIRMATION"]

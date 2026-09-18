@@ -416,6 +416,7 @@ class FinalMapEDMProvider:
         intersection_cells_path: str | None = None,
         min_reference_occupied_bins: int | None = None,
         reference_depth_dir: str | None = None,
+        keyframe_index: Mapping[str, dict] | None = None,
     ) -> None:
         self.map_model = Path(map_model).resolve(strict=True)
         self.keyframes_path = Path(keyframes).resolve(strict=True)
@@ -457,7 +458,7 @@ class FinalMapEDMProvider:
         self._intersection_cells_path = cells_path if cells_path.is_file() else None
         self._intersection_cells = load_intersection_cells(self._intersection_cells_path)
 
-        self._keyframes = _keyframe_index(self.keyframes_path)
+        self._keyframes = _keyframe_index(self.keyframes_path) if keyframe_index is None else keyframe_index
         self._queries = _query_index(self.query_manifest_path)
         self._reference_names: tuple[str, ...] = ()
         self._reference_sessions: tuple[str, ...] = ()

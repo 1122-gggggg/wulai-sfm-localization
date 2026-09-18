@@ -336,13 +336,6 @@ def _draw_route_and_history(draw: Any, context: MapRenderContext) -> None:
         if len(_PROJECTION_CACHE) >= _PROJECTION_CACHE_MAX:
             _PROJECTION_CACHE.clear()
         _PROJECTION_CACHE[proj_cache_key] = (screen_x, screen_y)
-    if route_n > 1:
-        route_screen = list(zip(screen_x[:route_n], screen_y[:route_n]))
-        draw.line(route_screen, fill=context.route_color, width=2, joint="curve")
-        dot_step = max(1, route_n // max(1, context.route_dot_max))
-        for x, y in route_screen[::dot_step]:
-            draw.ellipse((x - 3, y - 3, x + 3, y + 3), fill=context.route_color)
-
     if history_n > 1:
         history_screen = list(
             zip(screen_x[route_n : route_n + history_n], screen_y[route_n : route_n + history_n])
@@ -382,12 +375,20 @@ def _draw_route_and_history(draw: Any, context: MapRenderContext) -> None:
             colour = WEAK_KIND_COLOR.get(kind)
             if colour is None:
                 colour = context.health_color.get(weak_health[index], WEAK_KIND_FALLBACK_COLOR)
-            size = 6
+            size = 3
             draw.polygon(
                 [(x, y - size), (x + size, y), (x, y + size), (x - size, y)],
                 outline=colour,
-                width=2,
+                width=1,
             )
+
+    # Keep the planned path visible when dense estimate markers overlap it.
+    if route_n > 1:
+        route_screen = list(zip(screen_x[:route_n], screen_y[:route_n]))
+        draw.line(route_screen, fill=context.route_color, width=2, joint="curve")
+        dot_step = max(1, route_n // max(1, context.route_dot_max))
+        for x, y in route_screen[::dot_step]:
+            draw.ellipse((x - 3, y - 3, x + 3, y + 3), fill=context.route_color)
 
 
 def _draw_no_orientation_marker(draw: Any, context: MapRenderContext) -> None:

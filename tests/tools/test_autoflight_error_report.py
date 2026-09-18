@@ -88,6 +88,15 @@ def test_session_without_auto_is_explicit(tmp_path: Path) -> None:
     assert result["has_auto"] is False
 
 
+def test_retained_trajectory_is_sufficient_after_diagnostic_cleanup(tmp_path):
+    session = _write_session(tmp_path, [_plan(), _tick(0, target=0, distance=0.5),
+                                      _tick(1, target=1, distance=0.1)])
+    (session / "localization.jsonl").rename(session / "trajectory.jsonl")
+    result = report.analyze_session(session)
+    assert result["verdict"] == "JOINED"
+    assert result["post_join"]["cross_track_u"]["mean"] == 0.1
+
+
 def test_post_join_vo_share_attributes_ticks_to_poses(tmp_path: Path) -> None:
     rows = [_plan()]
     rows += [_tick(step, target=1, distance=0.5) for step in range(2)]

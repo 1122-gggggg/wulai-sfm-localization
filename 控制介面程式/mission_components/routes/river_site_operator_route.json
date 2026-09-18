@@ -5,8 +5,8 @@
   },
   "revision": "operator_editor_v1",
   "route": {
-    "path": "../../../地圖檔/場域/river_site/routes/flight_route_20260914_141505_e87a66fb.json",
-    "sha256": "1fae9f7da203ff9bd0b768aba992e758e87136f7ee8ff1048361957cec5267f3"
+    "path": "../../../地圖檔/場域/river_site/routes/flight_route_20260917_222503_e4c4dfe8.json",
+    "sha256": "df008073e2edf4381cbe3d626ea8603ccd33aad1b4eaede19d08cd56d62b61a8"
   },
   "route_id": "river_site_operator_route",
   "schema": "sfm-route-package/v1",

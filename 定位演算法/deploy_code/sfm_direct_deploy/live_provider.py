@@ -1,11 +1,11 @@
 """Online, single-frame relocalizer built on the frozen offline EDM provider.
 
-``FinalMapEDMProvider`` (vendored, unmodified) is an *offline batch* localizer:
+``FinalMapEDMProvider`` is a vendored *offline batch* localizer:
 it wants a query manifest on disk, pre-extracts VPR descriptors for the
 whole query set, and reads every image back from a path.  Deployment needs the
 opposite shape -- one in-memory frame at a time, arriving from a camera.
 
-``LiveMapEDMProvider`` subclasses it and replaces exactly three things:
+``LiveMapEDMProvider`` subclasses it and adapts these stages:
 
 * the descriptor stage: the reference bank is loaded from the release's frozen
   ``.npy`` (BoQ-ResNet50, 16384-D); query descriptors are extracted from the
@@ -13,6 +13,8 @@ opposite shape -- one in-memory frame at a time, arriving from a camera.
 * the keyframe index: rebuilt from :class:`DirectMapAssets` so a release stays
   relocatable, with a per-image SHA-256 check the first time a reference is
   prepared;
+* the geometry stage: a bundle-verified archive can replace COLMAP parsing
+  with equivalent arrays; older releases retain the original loader;
 * the entry point: :meth:`localize_array` runs retrieval -> EDM match/lift ->
   PnP in the same order as the vendored ``localize()``, minus the KLT bridge
   (the deployed fast loop owns tracking).
@@ -200,6 +202,7 @@ class LiveMapEDMProvider(FinalMapEDMProvider):
         super().__init__(
             map_model=str(assets.model_dir),
             keyframes=str(assets.keyframes_manifest),
+            keyframe_index=keyframes,
             query_manifest=str(self._write_placeholder_manifest(cache, keyframes)),
             cache_dir=str(cache),
             edm_config=self._edm_config(cache, edm_repo, edm_checkpoint),
@@ -225,9 +228,6 @@ class LiveMapEDMProvider(FinalMapEDMProvider):
                 None if assets.reference_depth_dir is None else str(assets.reference_depth_dir)
             ),
         )
-        # Replace the mapping machine's absolute /home/cihcilab image URIs with
-        # this release's own paths, before any geometry load resolves them.
-        self._keyframes = keyframes
         self._vpr_runtime: BoQExtractor | None = None
         self._index: Any | None = None
         self._models_ready = False
@@ -302,12 +302,22 @@ class LiveMapEDMProvider(FinalMapEDMProvider):
 
     # -- vendor overrides --------------------------------------------------
 
+    def _load_geometry(self) -> None:
+        if self._geometry_locked and self._reference_names:
+            return
+        from direct_geometry import GEOMETRY_ARCHIVE, load_geometry_archive
+
+        if any(entry["path"] == GEOMETRY_ARCHIVE for entry in self.assets.raw["files"]):
+            load_geometry_archive(
+                self, self.assets.root / GEOMETRY_ARCHIVE, self.assets.raw["model_sha256"]
+            )
+        else:
+            super()._load_geometry()
+
     def _load_descriptors(self) -> None:
         """Install the frozen reference bank; never extract a query catalog."""
 
-        names = tuple(
-            str(name) for name in json.loads(self.assets.bank_names.read_text(encoding="utf-8"))
-        )
+        names = self.assets.ref_names
         descriptors = np.load(self.assets.bank_descriptors, allow_pickle=False)
         self.apply_reference_bank(names, descriptors)
         self._query_descriptors = {}

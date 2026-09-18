@@ -235,10 +235,10 @@ def test_incident_banner_only_occupies_a_row_when_something_is_wrong(operator) -
     assert operator.incident_banner.winfo_manager() == ""
 
 
-def test_controls_use_tabs_without_scrollbars_and_flight_actions_stay_visible(
+def test_controls_share_one_workspace_and_flight_actions_stay_visible(
     operator,
 ) -> None:
-    """All panels use fixed tabs; abort actions remain outside those tabs."""
+    """Flight, calibration and assets are visible together; abort actions stay above."""
     wanted = {"懸停", "原地降落", "手動/搖桿 (Esc)", "停止電腦動作"}
     found: dict[str, list] = {label: [] for label in wanted}
     descendants = []
@@ -273,18 +273,12 @@ def test_controls_use_tabs_without_scrollbars_and_flight_actions_stay_visible(
     assert tuple(
         operator.controls_notebook.tab(tab_id, "text")
         for tab_id in operator.controls_notebook.tabs()
-    ) == (
-        # One flight tab: 定位資訊 merged into it, then 飛行 · 操作 emptied out when
-        # the virtual sticks moved beside the flight readouts. Everything else is
-        # pre-flight setup and is only reached on the ground.
-        "飛行",
-        "校正",
-        "場域資產",
-    )
+    ) == ("操作工作區",)
+    assert set(operator.control_sections) == {"flight", "calibration", "assets"}
+    assert all(section.winfo_ismapped() for section in operator.control_sections.values())
     assert "停止自動並懸停" not in all_labels
 
-    # 懸停 deliberately exists twice: the flight row and the nudge pad centre.
-    # At least one instance of every abort action must stay above the tabs.
+    # At least one instance of every abort action must stay above the workspace.
     for label, widgets in found.items():
         assert widgets, f"missing flight control: {label}"
         assert any(not inside_control_tabs(widget) for widget in widgets), (
@@ -400,6 +394,18 @@ def test_each_control_tab_fits_the_minimum_window_without_clipping(operator) -> 
                 bottom = top + child.winfo_height()
                 assert root_left <= left <= right <= root_right
                 assert root_top <= top <= bottom <= root_bottom
+
+
+def test_short_viewport_renders_at_canvas_height_without_cropping(operator) -> None:
+    operator.geometry(_window_geometry(app.UI_MIN_SIZE))
+    operator.update_idletasks()
+    operator.tick()
+    operator.update_idletasks()
+    operator.tick()
+    operator.redraw_map_only()
+    assert operator.video_label.winfo_height() < 220
+    assert operator.video_photo.height() == operator.video_label.winfo_height()
+    assert operator.map_photo.height() == operator.map_label.winfo_height()
 
 
 def test_long_route_draws_a_bounded_number_of_dots(operator, monkeypatch) -> None:
@@ -672,18 +678,6 @@ def test_camera_and_mission_sit_in_the_always_visible_flight_bar(operator) -> No
     # The status line lives on the video now, so the bar is named rather than
     # located through whichever widget happened to be parented to it.
     flight_bar = operator.flight_bar
-    titles = set()
-    for child in flight_bar.winfo_children():
-        try:
-            titles.add(str(child.cget("text")))
-        except Exception:
-            continue
-
-    # 任務控制 merged INTO 飛行模式 on 2026-08-06: one block of flight actions,
-    # not two adjacent frames that read as unrelated groups.
-    assert {"飛行模式", "鏡頭"} <= titles, f"flight bar holds {sorted(titles)}"
-    assert "任務控制" not in titles, "the mission frame is back as a separate block"
-
     labels = set()
     stack = [flight_bar]
     while stack:
@@ -694,45 +688,71 @@ def test_camera_and_mission_sit_in_the_always_visible_flight_bar(operator) -> No
                 labels.add(str(child.cget("text")))
             except Exception:
                 continue
+    assert "鏡頭" in labels
     assert "起飛" in labels, "takeoff must still live in the always-visible bar"
     assert "起飛後錄影" in labels
-    assert operator.record_on_takeoff_var.get() is False
-    assert operator.backend.record_on_takeoff is False
+    assert operator.record_on_takeoff_var.get() is True
+    assert operator.backend.record_on_takeoff is True
     assert operator.record_status_var.get().startswith("錄影:")
 
 
-def test_record_on_takeoff_stays_off_until_the_operator_arms_it(operator) -> None:
-    assert operator.backend.record_on_takeoff is False
-    operator.record_on_takeoff_var.set(True)
-    operator._on_record_on_takeoff_toggled()
+def test_record_on_takeoff_armed_by_default_and_operator_can_disarm(operator) -> None:
     assert operator.backend.record_on_takeoff is True
     operator.record_on_takeoff_var.set(False)
     operator._on_record_on_takeoff_toggled()
     assert operator.backend.record_on_takeoff is False
+    operator.record_on_takeoff_var.set(True)
+    operator._on_record_on_takeoff_toggled()
+    assert operator.backend.record_on_takeoff is True
 
 
-def test_control_pane_follows_the_selected_tab_height(operator) -> None:
-    """Sizing to the tallest tab padded every short tab with dead space."""
+def test_preflight_navigation_keeps_all_sections_visible(operator) -> None:
     notebook = operator.controls_notebook
-    pane = notebook.master
-    # The <<NotebookTabChanged>> binding is a virtual event, which update_idletasks
-    # does not pump; call the fitter directly and assert the binding separately.
-    assert "<<NotebookTabChanged>>" in notebook.bind(), (
-        "nothing re-fits the pane when the operator switches tabs"
-    )
-    heights = {}
-    for tab_id in notebook.tabs():
-        notebook.select(tab_id)
-        operator._fit_control_pane()
+    workspace = notebook.select()
+    for step in app.PREFLIGHT_GUIDE_STEPS:
+        operator._select_preflight_tab(step)
         operator.update_idletasks()
-        heights[notebook.tab(tab_id, "text")] = pane.winfo_height()
+        assert notebook.select() == workspace
+        assert all(section.winfo_ismapped() for section in operator.control_sections.values())
+    operator._select_flight_tab()
+    assert notebook.select() == workspace
+    assert notebook.master.winfo_height() >= app.CONTROL_PANE_MIN_H
 
-    assert len(set(heights.values())) > 1, (
-        f"every tab still gets the same height: {heights}"
-    )
-    # The shortest tab must not be forced to the tallest tab's height.
-    assert heights["場域資產"] < max(heights.values())
-    assert min(heights.values()) >= app.CONTROL_PANE_MIN_H
+
+@pytest.mark.parametrize("axis", ["xAxis", "yAxis", "zAxis"])
+def test_compass_rotation_instructions_fit_the_shared_workspace(operator, axis) -> None:
+    operator.geometry(_window_geometry(app.UI_MIN_SIZE))
+    operator._draw_magnetometer_axis(app.magnetometer_axis_guide(axis))
+    operator.update_idletasks()
+    canvas = operator.magnetometer_axis_canvas
+    for item in canvas.find_all():
+        left, top, right, bottom = canvas.bbox(item)
+        assert 0 <= left <= right <= canvas.winfo_width()
+        assert 0 <= top <= bottom <= canvas.winfo_height()
+
+
+def test_imported_route_choices_fit_beside_flight_and_calibration(operator, monkeypatch) -> None:
+    from types import SimpleNamespace
+    import site_assets_panel
+
+    monkeypatch.setattr(site_assets_panel, "describe_site_routes", lambda _root: [
+        SimpleNamespace(label="巡檢航線 01", path=Path("route_01.json"), flight_ready=True),
+        SimpleNamespace(label="巡檢航線 02", path=Path("route_02.json"), flight_ready=False),
+    ])
+    panel = operator.site_assets_panel
+    panel.activate_site("/tmp/layout-profile.json", "/tmp/layout-site")
+    operator.geometry(_window_geometry(app.UI_MIN_SIZE))
+    operator.update_idletasks()
+    operator._fit_control_pane()
+    assert len(panel._permanently_disabled) >= 1
+    assert panel.winfo_rooty() + panel.winfo_height() <= operator.winfo_rooty() + operator.winfo_height()
+    for button in panel._buttons:
+        assert button.winfo_ismapped()
+        assert button.winfo_rootx() >= panel.winfo_rootx()
+        assert button.winfo_rootx() + button.winfo_width() <= panel.winfo_rootx() + panel.winfo_width()
+        assert button.winfo_rooty() + button.winfo_height() <= operator.winfo_rooty() + operator.winfo_height()
+    for command in ("manual", "hover", "land", "emergency_stop"):
+        assert operator.flight_buttons[command].winfo_ismapped()
 
 
 def test_localization_readout_is_in_the_always_visible_header(operator) -> None:
@@ -743,11 +763,11 @@ def test_localization_readout_is_in_the_always_visible_header(operator) -> None:
     assert not operator.video_label.winfo_children()
 
 
-def test_virtual_sticks_share_the_flight_tab_with_the_readouts(operator) -> None:
-    """飛行 · 操作 held only the sticks once everything else moved out."""
+def test_virtual_sticks_share_the_workspace_with_the_readouts(operator) -> None:
+    """The sticks stay beside flight settings within the shared workspace."""
     notebook = operator.controls_notebook
-    target = [t for t in notebook.tabs() if notebook.tab(t, "text") == "飛行"]
-    assert target, "the flight tab is missing"
+    target = [t for t in notebook.tabs() if notebook.tab(t, "text") == "操作工作區"]
+    assert target, "the shared workspace is missing"
     notebook.select(target[0])
     operator.update_idletasks()
 

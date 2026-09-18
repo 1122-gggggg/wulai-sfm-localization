@@ -35,6 +35,7 @@ class ImportedSite:
 class ImportedAsset:
     profile_path: Path
     asset_path: Path
+    approved_for_auto: bool = False
 
 
 class SitePackagePort(Protocol):

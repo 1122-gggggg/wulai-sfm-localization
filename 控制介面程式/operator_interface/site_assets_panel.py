@@ -49,7 +49,7 @@ class SiteAssetsPanel(ttk.LabelFrame):
     ):
         super().__init__(
             parent,
-            text="場域資產（一般匯入不解鎖；編輯器可明確核准航線）",
+            text="場域資產與航線",
         )
         self.actions = actions
         self.request_apply = request_apply
@@ -120,15 +120,16 @@ class SiteAssetsPanel(ttk.LabelFrame):
         active = self._active_site_label(available)
         available = [item for item in available if not self._is_active_site(item)]
         heading = f"切換場域（目前：{active}）" if active else "切換場域"
-        ttk.Label(self, text=heading, font=("Sans", 9, "bold")).grid(
-            row=row, column=0, sticky="w", padx=(8, 5), pady=(5, 2)
+        ttk.Label(self, text=heading, font=("Sans", 10, "bold")).grid(
+            row=row, column=0, sticky="w", padx=8, pady=(6, 3)
         )
         shortcuts = ttk.Frame(self)
-        shortcuts.grid(row=row, column=1, columnspan=2, sticky="w", padx=5, pady=(5, 2))
+        shortcuts.grid(row=row + 1, column=0, sticky="ew", padx=8, pady=(0, 6))
+        shortcuts.columnconfigure((0, 1), weight=1)
         if not available:
             text = "（沒有其他場域包）" if active else "（未偵測到場域包）"
-            ttk.Label(shortcuts, text=text).pack(side="left", padx=(0, 6))
-        for item in available:
+            ttk.Label(shortcuts, text=text).grid(row=0, column=0, sticky="w")
+        for index, item in enumerate(available):
             button = ttk.Button(
                 shortcuts,
                 text=self._short_site_name(item.display_name),
@@ -139,27 +140,28 @@ class SiteAssetsPanel(ttk.LabelFrame):
                 # where the site went. Recorded so _set_busy cannot re-enable it.
                 button.state(["disabled"])
                 self._permanently_disabled.add(button)
-            button.pack(side="left", padx=(0, 6))
+            button.grid(row=index // 2, column=index % 2, sticky="ew", padx=(0, 4), pady=2)
             self._buttons.append(button)
         browse = ttk.Button(shortcuts, text="其他資料夾…", command=self._choose_site)
-        browse.pack(side="left", padx=(6, 0))
+        slot = max(1, len(available))
+        browse.grid(row=slot // 2, column=slot % 2, sticky="ew", padx=(0, 4), pady=2)
         self._buttons.append(browse)
 
         # A standing entry point for the route. The switch flow only offers it once,
         # so declining there used to leave no way back to an existing route.
-        ttk.Label(self, text="航線", font=("Sans", 9, "bold")).grid(
-            row=row + 1, column=0, sticky="w", padx=(8, 5), pady=(2, 2)
+        ttk.Label(self, text="航線", font=("Sans", 10, "bold")).grid(
+            row=row + 2, column=0, sticky="w", padx=8, pady=(2, 3)
         )
         route_row = ttk.Frame(self)
-        route_row.grid(row=row + 1, column=1, columnspan=2, sticky="w",
-                       padx=5, pady=(2, 2))
-        for label, callback in (
+        route_row.grid(row=row + 3, column=0, sticky="ew", padx=8, pady=(0, 6))
+        route_row.columnconfigure((0, 1), weight=1)
+        for index, (label, callback) in enumerate((
             ("編輯路線", lambda: self._open_route_editor(True)),
             ("新增路線", lambda: self._open_route_editor(False)),
             ("匯入航線 JSON", self._choose_route),
-        ):
+        )):
             button = ttk.Button(route_row, text=label, command=callback)
-            button.pack(side="left", padx=(0, 6))
+            button.grid(row=index // 2, column=index % 2, sticky="ew", padx=(0, 4), pady=2)
             self._buttons.append(button)
 
     def _build_route_choices(self, row: int) -> int:
@@ -179,14 +181,15 @@ class SiteAssetsPanel(ttk.LabelFrame):
             return row
         ttk.Label(
             self,
-            text="可選航線（點擊後選為下次 AUTO；可再按「編輯路線」修改）",
-            font=("Sans", 9, "bold"),
+            text="下次 AUTO 航線（點擊選取）",
+            font=("Sans", 10, "bold"),
         ).grid(
-            row=row, column=0, sticky="w", padx=(8, 5), pady=(2, 2)
+            row=row, column=0, sticky="w", padx=8, pady=(2, 3)
         )
         choices = ttk.Frame(self)
-        choices.grid(row=row, column=1, columnspan=2, sticky="w", padx=5, pady=(2, 2))
-        for item in routes:
+        choices.grid(row=row + 1, column=0, sticky="ew", padx=8, pady=(0, 6))
+        choices.columnconfigure((0, 1), weight=1)
+        for index, item in enumerate(routes):
             button = ttk.Button(
                 choices,
                 text=item.label,
@@ -195,9 +198,9 @@ class SiteAssetsPanel(ttk.LabelFrame):
             if not item.flight_ready:
                 button.state(["disabled"])
                 self._permanently_disabled.add(button)
-            button.pack(side="left", padx=(0, 6))
+            button.grid(row=index // 2, column=index % 2, sticky="ew", padx=(0, 4), pady=2)
             self._buttons.append(button)
-        return row + 1
+        return row + 2
 
     def _preview_existing_route(self, path: Path) -> None:
         """Validate and select one route for this session's next AUTO request.
@@ -230,14 +233,18 @@ class SiteAssetsPanel(ttk.LabelFrame):
         # when there is none, goes straight into marking one. The route-editor and
         # target-import methods are kept -- that automatic flow calls them.
         self._build_site_shortcuts(0)
-        status_row = self._build_route_choices(2)
-        ttk.Label(self, textvariable=self.status_var, wraplength=1050).grid(
-            row=status_row, column=0, columnspan=3, sticky="w", padx=8, pady=(5, 7)
+        status_row = self._build_route_choices(4)
+        ttk.Label(self, text="一般匯入不解鎖；請在編輯器明確核准航線。",
+                  wraplength=250, font=("Sans", 9)).grid(
+            row=status_row, column=0, sticky="w", padx=8, pady=(4, 2)
+        )
+        ttk.Label(self, textvariable=self.status_var, wraplength=250).grid(
+            row=status_row + 1, column=0, sticky="w", padx=8, pady=(2, 3)
         )
         # The standalone 重啟套用 row is gone (operator decision 2026-08-06). Applying
         # is what switching a site MEANS, so it is offered by the switch itself --
         # removing the row without that would leave an imported site never active.
-        self.columnconfigure(1, weight=1)
+        self.columnconfigure(0, weight=1)
 
     def _set_busy(self, busy: bool) -> None:
         state = "disabled" if busy else "normal"

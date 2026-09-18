@@ -858,3 +858,89 @@ def test_site_package_validate_rejects_non_directory(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="not a folder"):
         provider.validate_folder(tmp_path / "missing")
+
+
+def test_route_import_action_propagates_committed_auto_approval(tmp_path: Path) -> None:
+    from operator_actions import SiteAssetActions
+
+    package = _write_site_package(tmp_path)
+    managed = tmp_path / "managed"
+    sites = LocalSitePackageProvider(
+        managed,
+        bundle_inspector=lambda _path, _sha256: ("ref-a.jpg",),
+        profile_loader=_profile_loader,
+    )
+    profile = sites.import_folder(package).profile_path
+    actions = SiteAssetActions(
+        sites, LocalRouteProvider(managed), LocalTargetProvider(managed), profile,
+    )
+    result = actions.import_route(_write_valid_route(tmp_path / "route.json"))
+    assert result.approved_for_auto is True
+    assert result.asset_path == load_site_profile(profile).route_json
+    assert "將套用為 AUTO 航線" in result.message
+    assert "請完成四項驗證" in result.message
+
+
+def test_route_import_action_does_not_invent_provider_approval(tmp_path: Path) -> None:
+    from types import SimpleNamespace
+    from operator_actions import SiteAssetActions
+    from site_asset_interfaces import ImportedAsset
+
+    profile = tmp_path / "site_profile.json"
+    route = tmp_path / "route.json"
+    provider = SimpleNamespace(import_file=lambda *_: ImportedAsset(profile, route))
+    actions = SiteAssetActions(None, provider, None, profile)
+    result = actions.import_route(route)
+    assert result.approved_for_auto is False
+    assert "未核准自動飛行" in result.message
+
+
+@pytest.mark.parametrize("live", [False, True], ids=["simulated", "real-flight"])
+@pytest.mark.parametrize("edit", [False, True], ids=["new-route", "edit-route"])
+def test_editor_save_automatically_approves_in_both_interfaces(tmp_path, monkeypatch, live, edit):
+    import queue
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+    import flight_operator_app as app
+    from operator_actions import SiteAssetActions
+    from site_assets_panel import SiteAssetsPanel
+
+    package = _write_site_package(tmp_path)
+    managed = tmp_path / "managed"
+    sites = LocalSitePackageProvider(
+        managed, bundle_inspector=lambda *_: ("ref-a.jpg",),
+        profile_loader=_profile_loader,
+    )
+    profile_path = sites.import_folder(package).profile_path
+    actions = SiteAssetActions(
+        sites, LocalRouteProvider(managed), LocalTargetProvider(managed), profile_path,
+    )
+    source = _write_valid_route(tmp_path / "drawn-route.json")
+    previous = actions.import_authored_route(source).asset_path if edit else None
+    results = []
+    panel = SimpleNamespace(actions=actions, _finish_ok=results.append, set_status=Mock())
+    panel.import_authored_route = lambda path, **kw: SiteAssetsPanel.import_authored_route(panel, path, **kw)
+    operator = app.OperatorApp.__new__(app.OperatorApp)
+    operator.backend = SimpleNamespace(
+        is_live=live,
+        mode=app.InterfaceMode.REAL_FLIGHT if live else app.InterfaceMode.SIMULATED_STREAM,
+    )
+    operator.site_assets_panel = panel
+    operator._route_editor_load_queue = queue.Queue()
+    operator._route_editor_load_queue.put((load_site_profile(profile_path), [], None, previous, None))
+    operator.route_editor_safety_check = lambda: (True, "landed")
+    editor_args = {}
+    monkeypatch.setattr(app, "RouteEditorWindow", lambda *_args, **kw: editor_args.update(kw))
+
+    operator._poll_route_editor_load()
+    result = editor_args["import_route"](source)
+    assert result.approved_for_auto is True
+    assert results == [result]
+    assert "已自動核准" in result.message
+    profile = load_site_profile(profile_path)
+    assert profile.flight.approved is True
+    assert profile.flight.route_clearance_approved is True
+    assert profile.asset_sha256.route_json == _sha(result.asset_path)
+    if edit:
+        assert result.asset_path == previous
+    assert (editor_args["test_route"] is None) == live

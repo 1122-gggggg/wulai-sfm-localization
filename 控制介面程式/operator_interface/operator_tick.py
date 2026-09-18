@@ -661,9 +661,9 @@ def _render_if_dirty(app: Any, state: Any, *, profile: Any = None) -> None:
     # perf_counter per render is free next to a panel repaint, and the parallel
     # Optional made every stage read as possibly-None to a type checker.
     width_map = max(300, app.map_label.winfo_width())
-    height_map = max(220, app.map_label.winfo_height())
+    height_map = max(140, app.map_label.winfo_height())
     width_video = max(300, app.video_label.winfo_width())
-    height_video = max(220, app.video_label.winfo_height())
+    height_video = max(140, app.video_label.winfo_height())
     # Map: re-render only when the view, flown history, drawn route or pose/quality
     # readouts changed. Between live fixes these are all static, so reuse the PhotoImage.
     started = time.perf_counter()

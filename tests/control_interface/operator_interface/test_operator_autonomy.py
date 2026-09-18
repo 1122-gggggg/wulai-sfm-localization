@@ -5,6 +5,7 @@ import inspect
 import json
 import threading
 import time
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -753,7 +754,7 @@ def test_desktop_auto_matches_path_follow_production_config(tmp_path, monkeypatc
     assert desktop.max_yaw_pcmd == DESKTOP_AUTO_MAX_YAW_PCMD
     assert desktop.max_translation_pcmd == DESKTOP_AUTO_MAX_TRANSLATION_PCMD
     assert desktop.yaw_alignment_timeout_s == pytest.approx(DESKTOP_AUTO_YAW_ALIGNMENT_TIMEOUT_S)
-    assert desktop.waypoint_arrive_radius >= rpf.DESKTOP_AUTO_MIN_ARRIVE_RADIUS
+    assert desktop.waypoint_arrive_radius == rpf.DESKTOP_AUTO_DEFAULT_ARRIVE_RADIUS
 
 
 class _SessionLogs:
@@ -1652,13 +1653,93 @@ def test_turn_brake_log_preserves_a_later_manual_handoff(tmp_path):
 def test_boot_pose_lock_rejects_vo_only_even_with_high_inliers(tmp_path):
     clock = _Clock()
     autonomy = _budget_autonomy(tmp_path, _Backend(), clock)
-    autonomy.accept_weak_poses = True
+    autonomy.accept_weak_poses = False
     autonomy.pose_is_weak = lambda: True
     autonomy.pose_confidence = lambda: 300
     lock = Mock()
     assert autonomy._observe_boot_pose(lock, None) == (False, None, False)
     lock.observe.assert_not_called()
     lock.reset.assert_called_once()
+
+
+@pytest.mark.parametrize("source", ["unconfirmed", "unobserved", "reseed", "predicted_hook", "reseed_hook"])
+def test_boot_lock_requires_observed_map_pose_even_when_health_is_ok(tmp_path, source):
+    clock = _Clock()
+    autonomy = _budget_autonomy(tmp_path, _Backend(), clock)
+    autonomy.accept_weak_poses = False
+    autonomy.pose_is_weak = lambda: False
+    autonomy.pose_confidence = lambda: 300
+    bad = {"active": False}
+    autonomy.get_pose = lambda: Pose(
+        0, 0, 0, 0, stamp=clock.now(),
+        map_confirmed=not (bad["active"] and source == "unconfirmed"),
+        position_observed=not (bad["active"] and source == "unobserved"),
+        reseed_confirming=bad["active"] and source == "reseed",
+    )
+    autonomy.pose_is_predicted = lambda: bad["active"] and source == "predicted_hook"
+    autonomy.pose_reseed_confirming = lambda: bad["active"] and source == "reseed_hook"
+    lock = pff.BootPoseLock((0, 0, 0))
+    _, stamp, valid = autonomy._observe_boot_pose(lock, None)
+    assert valid and lock.count == 1
+    bad["active"] = True
+    for _ in range(lock.required_fixes):
+        clock.sleep(0.1)
+        locked, stamp, valid = autonomy._observe_boot_pose(lock, stamp)
+        assert not locked and not valid and lock.count == 0
+    bad["active"] = False
+    for index in range(lock.required_fixes):
+        clock.sleep(0.1)
+        locked, stamp, valid = autonomy._observe_boot_pose(lock, stamp)
+        assert valid and locked == (index == lock.required_fixes - 1)
+
+
+@pytest.mark.parametrize("predicted", [False, True])
+def test_boot_lock_accepts_stable_estimates_without_promoting_map_confidence(tmp_path, predicted):
+    clock = _Clock()
+    autonomy = _budget_autonomy(tmp_path, _Backend(), clock)
+    autonomy.accept_weak_poses = True
+    autonomy.pose_is_weak = lambda: True
+    autonomy.pose_is_predicted = lambda: predicted
+    autonomy.pose_confidence = lambda: 0
+    autonomy.get_pose = lambda: Pose(
+        0, 0, 0, 0, stamp=clock.now(),
+        map_confirmed=False, position_observed=not predicted,
+    )
+    lock = pff.BootPoseLock((0, 0, 0))
+    stamp = None
+    for index in range(lock.required_fixes):
+        clock.sleep(0.1)
+        locked, stamp, valid = autonomy._observe_boot_pose(lock, stamp)
+        assert valid and locked == (index == lock.required_fixes - 1)
+        # Polling the same estimate must not count as another fix.
+        autonomy._observe_boot_pose(lock, stamp)
+        assert lock.count == index + 1
+    assert not autonomy.get_pose().map_confirmed
+    # Exercise the actual BOOT loop, including the post-lock runtime gate.
+    autonomy.arming_blockers = Mock(return_value=[])
+    assert autonomy._boot_hover() is None
+    autonomy.arming_blockers.assert_called_once()
+
+
+@pytest.mark.parametrize("failure", ["missing", "stale", "future", "nan", "yaw", "jump", "reseed"])
+def test_estimated_boot_lock_keeps_pose_safety_checks(tmp_path, failure):
+    clock = _Clock()
+    autonomy = _budget_autonomy(tmp_path, _Backend(), clock)
+    autonomy.accept_weak_poses = True
+    autonomy.pose_is_weak = lambda: True
+    lock = pff.BootPoseLock((0, 0, 0))
+    _, stamp, _ = autonomy._observe_boot_pose(lock, None)
+    clock.sleep(0.1)
+    pose = Pose(
+        float("nan") if failure == "nan" else 10.0 if failure == "jump" else 0.0,
+        0, 0, float("nan") if failure == "yaw" else 0.0,
+        stamp=clock.now() + (1.0 if failure == "future" else -1.0 if failure == "stale" else 0.0),
+        map_confirmed=False, position_observed=False,
+        reseed_confirming=failure == "reseed",
+    )
+    autonomy.get_pose = lambda: None if failure == "missing" else pose
+    locked, _, _ = autonomy._observe_boot_pose(lock, stamp)
+    assert not locked and lock.count == 0
 
 
 def _forward_motion_backend(clock, forward_mps):
@@ -1672,6 +1753,125 @@ def _forward_motion_backend(clock, forward_mps):
     return backend
 
 
+def test_drawn_arrival_radius_does_not_accept_unfinished_descent(tmp_path):
+    autonomy = _budget_autonomy(tmp_path, _Backend(), _Clock())
+    snapshot = replace(autonomy.snapshot, arrive_radius_map_units=0.030215517241379313)
+    config = rpf.apply_desktop_auto_authority(rpf.config_for_route(
+        snapshot, rpf.production_auto_control_config(LEGACY_MAP_FRAME)
+    ))
+    controller = rpf.RouteAutoController(snapshot.controller_waypoints(), poles=[], config=config)
+    # 0.10 map unit above the first point: inside the old forced 0.15 circle,
+    # but still over three times the route's authored arrival radius.
+    pose = Pose(0.0, -0.10, 0.0, 0.0, stamp=10.0)
+    command = controller.step(pose, now=10.0)
+    assert controller.target_index == 0
+    assert config.waypoint_arrive_radius == pytest.approx(0.030215517241379313)
+    pcmd = rpf.command_to_body_percent(command, pose, config=config)
+    assert pcmd[3] < 0
+
+
+@pytest.mark.parametrize("command", [(0, 50, 7, -3), (0, 0, 7, -3), (0, -1, 7, -3)])
+def test_overspeed_requires_braking_without_changing_yaw_or_descent(tmp_path, command):
+    clock = _Clock()
+    backend = _forward_motion_backend(clock, 1.17)
+    autonomy = _budget_autonomy(tmp_path, backend, clock)
+    accepted, _, applied = autonomy._send_authorized(command)
+    assert accepted
+    assert applied[1] <= -11
+    assert applied[2:] == command[2:]
+    assert backend.zeros == []
+
+
+def test_manual_takeover_finished_event_does_not_claim_auto_landed(tmp_path):
+    clock = _Clock()
+    backend = _Backend()
+    autonomy = _budget_autonomy(tmp_path, backend, clock)
+    autonomy.land = Mock(return_value=True)
+
+    def run_loop(*_args, **_kwargs):
+        backend.pilot_sticks = True
+        return "safety LAND command -> land"
+
+    autonomy.run_loop = run_loop
+    autonomy._run()
+    autonomy.land.assert_not_called()
+    finished = next(event for event in autonomy.drain_events() if event.kind == "finished")
+    assert "manual" in finished.detail.lower()
+    assert "-> land" not in finished.detail
+    assert autonomy.interrupted_target_index == autonomy.controller.target_index
+
+
+@pytest.mark.parametrize("target", [2, 4])
+def test_airborne_restart_resumes_unfinished_target_after_boot_lock(tmp_path, target):
+    clock = _Clock()
+    backend = _Backend()
+    snapshot = _snapshot(tmp_path, waypoints=((0, 0, 0), (1, 0, 0), (2, 0, 0), (3, 0, 0)))
+    commands = []
+    seen_targets = []
+
+    def run_loop(_hooks, controller, *_args, **_kwargs):
+        seen_targets.append(controller.target_index)
+        assert controller._arrive_frames == 0
+        assert controller._final_confirm_frames == 0
+        backend.pilot_sticks = True
+        return "safety LAND command -> land"
+
+    autonomy = DesktopRouteAutonomy(
+        backend=backend, snapshot=snapshot, map_frame=LEGACY_MAP_FRAME,
+        get_pose=lambda: Pose(0.0, 0.0, 0.0, 0.0, stamp=clock.now()),
+        pose_is_weak=lambda: False, pose_confidence=lambda: 100,
+        force_relocalize=lambda: None, stream_healthy=lambda: True,
+        takeoff=lambda: commands.append("takeoff") or True,
+        land=lambda: commands.append("land") or True,
+        take_pc_control=lambda: commands.append("pc_control") or True,
+        start_airborne=True, resume_target_index=target,
+        now=clock.now, sleep=clock.sleep, run_loop=run_loop,
+    )
+    autonomy._run()
+    assert commands == ["pc_control"]
+    assert seen_targets == [target]
+    assert autonomy.interrupted_target_index == target
+    events = autonomy.drain_events()
+    assert any(event.kind == "boot_hover" for event in events)
+    assert any("manual recovery resumes" in event.detail for event in events)
+
+
+@pytest.mark.parametrize("heading", np.linspace(-np.pi, np.pi, 17))
+def test_overspeed_braking_is_bounded_and_opposes_diagonal_motion(tmp_path, heading):
+    clock = _Clock()
+    backend = _forward_motion_backend(clock, 1.17)
+    backend.state.speed_north_mps = 1.17 * np.cos(heading)
+    backend.state.speed_east_mps = 1.17 * np.sin(heading)
+    autonomy = _budget_autonomy(tmp_path, backend, clock)
+    for roll, pitch in [(50, 50), (-50, 50), (50, -50), (-50, -50), (0, 0)]:
+        applied = autonomy._apply_speed_limit((roll, pitch, 11, -7))
+        projection = applied[1] * np.cos(heading) + applied[0] * np.sin(heading)
+        assert projection <= -11.4 + 1e-9
+        assert max(abs(applied[0]), abs(applied[1])) <= 50
+        assert applied[2:] == (11, -7)
+
+
+def test_recorded_manual_restart_descends_toward_unfinished_third_waypoint():
+    # Flight 2026-09-18 12:11:33: the old restart targeted WP1 above the
+    # localized camera. WP3 was unfinished and lies below it. No altimeter input.
+    frame = rpf.MapFrame(
+        east=np.array([0.9999409166106423, 0.01083349348623922, 0.000893703951008892]),
+        north=np.array([0.0, -0.08221525243898248, 0.9966145956518973]),
+        up=np.array([0.010870293826223672, -0.9965557122837028, -0.08221039488321148]),
+        source="recorded-river-frame",
+    )
+    config = replace(rpf.production_auto_control_config(frame), waypoint_arrive_radius=0.0302155)
+    points = [[0.4494, -0.1904, -1.3942], [0.3144, -0.1999, -1.2688], [0.2687, 0.0629, -1.1334]]
+    pose = Pose(0.5537, 0.023, -1.5092, yaw=0.0, stamp=10.0)
+    controller = rpf.RouteAutoController(points, poles=[], config=config)
+    for target, direction in [(0, 1), (2, -1)]:
+        controller.start_after_nearest_waypoint(pose.xyz, target_index=target)
+        command = controller.step(pose, now=10.0)
+        pcmd = rpf.command_to_body_percent(command, pose, config=config, require_yaw_alignment=False)
+        assert controller.target_index == target
+        assert pcmd[3] * direction > 0
+
+
 @pytest.mark.parametrize("speed, command, expected", [
     (0.0, (0, 50, 7, 3), (0, 50, 7, 3)),
     (0.12, (0, 50, 7, 3), (0, 40, 7, 3)),
@@ -1680,7 +1880,7 @@ def _forward_motion_backend(clock, forward_mps):
     (0.3, (-30, 40, 0, 0), (-30, 25, 0, 0)),
     (0.3, (0, 10, 0, 0), (0, 10, 0, 0)),
     (0.6, (0, 50, 7, 3), (0, 0, 7, 3)),
-    (0.9, (0, 50, 0, 0), (0, 0, 0, 0)),
+    (0.9, (0, 50, 0, 0), (0, -6, 0, 0)),
 ])
 def test_horizontal_auto_command_tapers_to_zero_at_speed_limit(
     tmp_path, speed, command, expected
@@ -1865,10 +2065,13 @@ def test_auto_wait_budget_latches_failure_instead_of_hovering_forever(tmp_path) 
     ("battery", "expected"),
     [
         (80.0, False),
+        (20.0, False),
+        (11.0, False),
         (AUTO_BATTERY_RESERVE_PCT, True),
+        (9.0, True),
         (float("nan"), True),
     ],
-    ids=["healthy", "at-reserve", "unreadable"],
+    ids=["healthy", "old-reserve", "above-reserve", "at-reserve", "below-reserve", "unreadable"],
 )
 def test_auto_runtime_budget_latches_on_battery_reserve(tmp_path, battery, expected) -> None:
     """In-flight AUTO stops on its own battery reserve, not only on firmware RTH."""

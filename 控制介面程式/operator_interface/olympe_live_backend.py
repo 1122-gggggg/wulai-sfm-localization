@@ -434,13 +434,15 @@ class OlympeLiveBackend:
         self._last_pcmd = (0, 0, 0, 0)
         self._last_pcmd_mono_ns: int | None = None
         # Flight recording: arm before takeoff → start on takeoff → stop+save on land.
-        self.record_on_takeoff: bool = False
+        # Armed by default so every flight leaves onboard video for post-flight
+        # localization diagnosis (operator can still disarm via the UI checkbox).
+        self.record_on_takeoff: bool = True
         self.recording_active: bool = False
         self.record_started_iso: str = ""
         self.record_last_path: str = ""
         self.recording_profile: RecordingProfile = DEFAULT_RECORDING_PROFILE
         self.record_status: str = format_record_status(
-            active=False, armed=False, profile=self.recording_profile,
+            active=False, armed=True, profile=self.recording_profile,
         )
         self.record_dir = _DEFAULT_RECORD_DIR
         self.record_dir.mkdir(parents=True, exist_ok=True)
@@ -2538,6 +2540,7 @@ class OlympeLiveBackend:
                 superseded = False
             if not superseded:
                 self.pilot_sticks = False
+                self.state.control_owner = "PC"
         if superseded:
             # A safety/manual epoch may have changed while the blocking source
             # request was in flight. Restore the physical/manual owner before
@@ -4797,6 +4800,48 @@ class OlympeLiveBackend:
         except Exception:
             pass
 
+    #: Frame age above this marks video stale in readback telemetry. Matches
+    #: path_follow_flight.STREAM_STALE_S (autonomy stops trusting frames).
+    VIDEO_STALE_S = 0.5
+
+    def _video_delivery_snapshot(self, now: float) -> dict:
+        """Continuous video-delivery health for readback telemetry + stale alert.
+
+        Both clocks are host-monotonic seconds. Never raises; returns None
+        fields when no stream is attached so offline/sim backends keep working.
+        """
+        stream = getattr(self, "video_stream", None)
+        if stream is None:
+            return {"video_fps": None, "video_frames_delivered": 0,
+                    "video_frame_age_s": None, "video_stale": None}
+        try:
+            fps = float(getattr(stream, "fps", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            fps = 0.0
+        try:
+            delivered = int(getattr(stream, "output_index", 0) or 0)
+        except (TypeError, ValueError):
+            delivered = 0
+        try:
+            last = float(getattr(stream, "last_stamp", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            last = 0.0
+        age = (float(now) - last) if last > 0.0 else None
+        stale = bool(age is not None and age > self.VIDEO_STALE_S)
+        previously_stale = bool(getattr(self, "_video_stale_latched", False))
+        if stale != previously_stale:
+            self._video_stale_latched = stale
+            try:
+                self.log.event("video_stale" if stale else "video_fresh",
+                               video_frame_age_s=round(age, 3) if age is not None else None,
+                               video_fps=round(fps, 2),
+                               video_frames_delivered=delivered)
+            except Exception:
+                pass
+        return {"video_fps": round(fps, 2), "video_frames_delivered": delivered,
+                "video_frame_age_s": round(age, 3) if age is not None else None,
+                "video_stale": stale}
+
     def _poll_stick_axes(self, now: float) -> None:
         """Log what the pilot is asking for; see ``stick_log_sample``."""
         if self._stick_monitor is None:
@@ -4866,6 +4911,7 @@ class OlympeLiveBackend:
             last_session_tel = getattr(self, "_last_session_telemetry_t", 0.0)
             if now - last_session_tel >= 1.0:
                 self._last_session_telemetry_t = now
+                video_health = self._video_delivery_snapshot(now)
                 self.session_logs.telemetry(
                     "readback",
                     battery_pct=getattr(self.state, "battery_pct", None),
@@ -4898,6 +4944,7 @@ class OlympeLiveBackend:
                     distance_geofence=getattr(
                         self.state, "distance_geofence_enabled", None
                     ),
+                    **video_health,
                 )
 
     def _poll_gimbal(self) -> None:

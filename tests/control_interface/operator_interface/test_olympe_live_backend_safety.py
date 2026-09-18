@@ -754,6 +754,15 @@ def make_backend(monkeypatch: pytest.MonkeyPatch, tmp_path):
     return make
 
 
+def test_control_owner_tracks_confirmed_pc_handoff_and_manual_return(make_backend):
+    backend = make_backend()
+    backend.state.control_owner = "SKYCONTROLLER"
+    assert backend.take_pc_control()
+    assert backend.state.control_owner == "PC"
+    assert backend.give_to_pilot(reason="stick_override")
+    assert backend.state.control_owner == "SKYCONTROLLER"
+
+
 def test_inventory_reads_and_logs_actual_connected_hardware(make_backend):
     backend = make_backend()
 
@@ -845,6 +854,40 @@ def test_video_inventory_is_logged_once_after_first_observed_frame(make_backend)
     assert len(records) == 1
     assert records[0]["codec"] == "H.264"
     assert backend.connection_inventory["video"]["ui_frame_width_px"] == 1280
+
+
+def test_video_delivery_snapshot_reports_age_and_stale_edges(make_backend):
+    import time as _time
+    backend = make_backend()
+    now = _time.monotonic()
+    backend.video_stream = SimpleNamespace(fps=24.0, output_index=100,
+                                           last_stamp=now - 0.1)
+    snap = backend._video_delivery_snapshot(now)
+    assert snap["video_stale"] is False
+    assert snap["video_frames_delivered"] == 100
+    assert snap["video_frame_age_s"] == pytest.approx(0.1, abs=0.05)
+    assert snap["video_fps"] == pytest.approx(24.0)
+
+    backend.video_stream = SimpleNamespace(fps=0.0, output_index=100,
+                                           last_stamp=now - 2.0)
+    snap = backend._video_delivery_snapshot(now)
+    assert snap["video_stale"] is True
+    assert snap["video_frame_age_s"] == pytest.approx(2.0, abs=0.05)
+    assert any(event == "video_stale" for event, _ in backend.log.records)
+
+    backend.video_stream = SimpleNamespace(fps=24.0, output_index=200,
+                                           last_stamp=now - 0.05)
+    snap = backend._video_delivery_snapshot(now)
+    assert snap["video_stale"] is False
+    assert any(event == "video_fresh" for event, _ in backend.log.records)
+
+
+def test_video_delivery_snapshot_without_stream_is_null(make_backend):
+    backend = make_backend()
+    backend.video_stream = None
+    snap = backend._video_delivery_snapshot(time.monotonic())
+    assert snap == {"video_fps": None, "video_frames_delivered": 0,
+                    "video_frame_age_s": None, "video_stale": None}
 
 
 def test_preflight_does_not_gate_on_runtime_or_firmware_receipt_lists(make_backend):
@@ -1964,7 +2007,7 @@ def test_takeoff_preflight_success_checks_video_battery_gps_source_and_limits(
     assert backend.drone.source_state == "Controller"
 
 
-def test_mock_takeoff_does_not_record_unless_armed(make_backend, monkeypatch):
+def test_mock_takeoff_records_by_default_and_not_when_disarmed(make_backend, monkeypatch):
     backend = make_backend(max_altitude_m=10.0, max_distance_m=50.0)
     backend.drone.flight_state = "landed"
     recording_starts: list[str] = []
@@ -1974,9 +2017,21 @@ def test_mock_takeoff_does_not_record_unless_armed(make_backend, monkeypatch):
         lambda reason: recording_starts.append(reason) or True,
     )
 
-    assert backend.record_on_takeoff is False
+    assert backend.record_on_takeoff is True
     assert backend.takeoff_cmd()
-    assert recording_starts == []
+    assert recording_starts == ["post_takeoff"]
+
+    backend2 = make_backend(max_altitude_m=10.0, max_distance_m=50.0)
+    backend2.drone.flight_state = "landed"
+    backend2.set_record_on_takeoff(False)
+    recording_starts2: list[str] = []
+    monkeypatch.setattr(
+        backend2,
+        "start_flight_recording",
+        lambda reason: recording_starts2.append(reason) or True,
+    )
+    assert backend2.takeoff_cmd()
+    assert recording_starts2 == []
 
 
 def test_recording_quality_log_is_json_serializable(make_backend):

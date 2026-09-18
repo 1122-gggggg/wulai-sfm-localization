@@ -13,6 +13,10 @@
   - 生命週期：支援 `--smoke` 與完整（full）兩層 tier 驗證；內建自動輪替政策，嚴格保留最新 10 份 receipt 與對應 log 目錄，超出者自動清理，防止無界增長。
 - `flight_logs/`
   - 飛行與操作日誌目錄，新的操作 session 使用該目錄。
+  - `session_*/trajectory.jsonl` 保留規劃路線快照、AUTO 控制軌跡、定位來源與
+    AUTO 起訖事件，不隨診斷日誌輪替清除。降落後使用
+    [`tools/flight_trajectory_review.py`](../tools/flight_trajectory_review.py)
+    匯出離線回放頁、CSV 與 JSON；操作方式見 [`tools/README.md`](../tools/README.md)。
 
 ## 歷史註記（已清理 1.19 GB 十目錄）
 

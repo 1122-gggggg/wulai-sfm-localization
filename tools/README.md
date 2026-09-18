@@ -1,5 +1,29 @@
 # 工作區工具
 
+## AUTO 軌跡回顧
+
+新場次自動將完整規劃航點、控制週期位置／指令／偏差、定位來源與 AUTO 起訖
+寫入 `outputs/flight_logs/session_*/trajectory.jsonl`。也保留 BOOT／等待期間的
+精簡定位結果及失敗紀錄。這個檔案不在診斷日誌的自動輪替刪除清單內。
+重新開啟操作介面後，新場次才會使用此記錄格式。
+
+降落後可產生無網路依賴的回顧頁（只讀取日誌，不連接飛機）：
+
+```bash
+.venv/bin/python tools/flight_trajectory_review.py outputs/flight_logs/session_場次名稱 \
+  --out outputs/analysis/trajectory_review
+```
+
+以瀏覽器開啟輸出的 `index.html`，選擇 AUTO 場次、俯視／兩個側視角，拖曳時間軸
+或播放。`trajectory.csv` 提供時間、原始 XYZ、定位來源、當時目標航段偏差、
+地速與電量；`trajectory.json` 保留路線快照及其座標系／SHA-256。
+舊場次尚有 `localization.jsonl`／`telemetry.jsonl` 時也能回顧。
+
+所有軌跡均為定位／IMU 估計，非獨立真值。距離用地圖單位，不假設公尺比例。
+偏差以當時目標航段計算，包含首次靠攏段；BOOT 無目標時不計偏差。
+缺失／過期位置與超過 0.5 秒的紀錄空檔不連線，不把人工接管間隔接成 AUTO。
+
+
 | 檔案 | 用途 |
 |---|---|
 | `system_validation.py` | 編排主系統與 `parrot_stimulate` 的完整純地面驗證 |

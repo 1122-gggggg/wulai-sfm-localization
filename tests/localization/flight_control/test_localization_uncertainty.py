@@ -15,6 +15,7 @@ from localization_uncertainty import (
         {"uncertain_since": 10.0},
         {"uncertain_land_after": 4.0},
         {"recovery_good_fixes": -1},
+        {"dirty_streak": -1},
     ),
 )
 def test_localization_state_rejects_inconsistent_values(state):
@@ -121,6 +122,18 @@ def test_localization_state_rejects_inconsistent_values(state):
             None,
         ),
         (
+            "second good fix resumes TRACK",
+            LocalizationState(10.0, 8.0, 1),
+            12.0,
+            True,
+            False,
+            "track",
+            None,
+            None,
+            0,
+            None,
+        ),
+        (
             "good fix with no uncertainty tracks immediately",
             LocalizationState(),
             10.0,
@@ -161,3 +174,53 @@ def test_localization_transition_table(
     assert decision.state.uncertain_land_after == expected_land_after, label
     assert decision.state.recovery_good_fixes == expected_recovery_fixes, label
     assert decision.waited_s == expected_waited, label
+
+
+def _decide(state, now, fresh, low_confidence=False):
+    return decide_localization_transition(
+        state,
+        now=now,
+        fresh=fresh,
+        low_confidence=low_confidence,
+        weak_hover_land_s=8.0,
+        lost_land_s=4.0,
+        recovery_good_fixes_required=2,
+    )
+
+
+def test_single_dirty_tick_keeps_recovery_count():
+    d = _decide(LocalizationState(10.0, 8.0, 1), 12.0, False)
+    assert d.action == "uncertain_hover"
+    assert d.state.recovery_good_fixes == 1
+    assert d.state.dirty_streak == 1
+    assert d.state.uncertain_since == 10.0
+    # Next fresh fix resumes TRACK instead of restarting confirmation.
+    d2 = _decide(d.state, 12.05, True)
+    assert d2.action == "track"
+
+
+def test_second_consecutive_dirty_tick_resets_recovery_count():
+    s1 = _decide(LocalizationState(10.0, 8.0, 1), 12.0, False).state
+    d = _decide(s1, 12.05, False)
+    assert d.action == "uncertain_hover"
+    assert d.state.recovery_good_fixes == 0
+    assert d.state.dirty_streak == 2
+    # Confirmation restarts from zero.
+    d2 = _decide(d.state, 12.1, True)
+    assert d2.action == "recovery_hover"
+    assert d2.state.recovery_good_fixes == 1
+
+
+def test_dirty_tick_outside_recovery_keeps_zero_count():
+    d = _decide(LocalizationState(10.0, 4.0, 0), 11.0, False)
+    assert d.action == "uncertain_hover"
+    assert d.state.recovery_good_fixes == 0
+    assert d.state.dirty_streak == 1
+
+
+def test_fresh_fix_clears_dirty_streak():
+    s1 = _decide(LocalizationState(10.0, 8.0, 0), 11.0, False).state
+    assert s1.dirty_streak == 1
+    d = _decide(s1, 11.05, True)
+    assert d.action == "recovery_hover"
+    assert d.state.dirty_streak == 0

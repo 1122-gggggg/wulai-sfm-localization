@@ -248,6 +248,7 @@ def test_nonfinite_guidance_fails_closed():
 def test_follow_applies_correction_priority_with_along_leg_share():
     """FOLLOW corrects small drift every tick while keeping forward progress."""
     control = controller([(0, 0, 0), (10, 0, 0)])
+    control.cfg = replace(control.cfg, slowdown_distance=0.15)
     control.step(rpf.Pose(0, 0, 0, 0, stamp=0), now=0)
     pose = rpf.Pose(3, 0, 0.015, 0, stamp=0.1)
     command = control.step(pose, now=0.1)
@@ -289,3 +290,70 @@ def test_path_pull_gain_zero_falls_back_to_carrot_guidance():
     assert unblended == carrot
     assert rpf._route_translation_components(command, pose, flat) is None
     assert blended[1] >= unblended[1] or blended[0] >= unblended[0]
+
+
+@pytest.mark.parametrize("offset", [-0.06, 0.06])
+def test_small_arrival_spheres_do_not_amplify_horizontal_route_feedback(offset):
+    """Sep 18 flight: small spheres drove alternating ~45% cross-track pulls."""
+    traces = []
+    for radius in (0.030347, 0.051948):
+        cfg = replace(rpf.production_auto_control_config(rpf.LEGACY_MAP_FRAME),
+                      slowdown_distance=0.34757225729367,
+                      waypoint_arrive_radius=radius)
+        gate = rpf.YawAlignedPcmdController(cfg)
+        gate.target_key = 1
+        gate.aligned_for_translation = True
+        cmd = rpf.Command(
+            "REJOIN", np.zeros(3), 0.0, np.array([1., 0., 0.]), abs(offset), 0.,
+            path_pull=np.array([0., 0., -offset]),
+            path_pull_radius=radius, path_tangent=np.array([1., 0., 0.]),
+        )
+        trace = []
+        for index in range(21):
+            now = 1.0 + index * 0.05
+            pose = rpf.Pose(0.5, 0., offset, 0., stamp=now)
+            trace.append(gate.update(cmd, pose, now, target_key=1,
+                                     body_velocity=(0., 0., now))[0])
+        traces.append(trace)
+    assert traces[0] == traces[1]
+    assert 0 < abs(traces[0][0]) < 15
+    assert all(value * offset > 0 for value in traces[0])
+    assert abs(traces[0][-1]) > abs(traces[0][0])  # Steady wind still gets integral effort.
+
+
+def test_small_arrival_spheres_do_not_amplify_centering_feedback():
+    traces = []
+    for radius in (0.030347, 0.051948):
+        cfg = replace(rpf.production_auto_control_config(rpf.LEGACY_MAP_FRAME),
+                      slowdown_distance=0.34757225729367,
+                      waypoint_arrive_radius=radius)
+        gate = rpf.YawAlignedPcmdController(cfg)
+        cmd = rpf.Command("FOLLOW", np.zeros(3), 0., np.array([0.02, 0., 0.]), 0., 0.)
+        trace = []
+        for index in range(21):
+            now = 1.0 + index * 0.05
+            trace.append(gate.update(cmd, rpf.Pose(0., 0., 0., 0., stamp=now), now,
+                                     target_key=0, body_velocity=(0., 0., now))[1])
+            assert gate.phase == "waypoint_centering"
+        traces.append(trace)
+    assert traces[0] == traces[1]
+    assert 0 < traces[0][0] < 5
+
+
+def test_large_cross_track_error_retains_bounded_wind_authority():
+    cfg = replace(rpf.production_auto_control_config(rpf.LEGACY_MAP_FRAME),
+                  slowdown_distance=0.34757225729367, waypoint_arrive_radius=0.030347)
+    gate = rpf.YawAlignedPcmdController(cfg)
+    gate.target_key = 1
+    gate.aligned_for_translation = True
+    pose = rpf.Pose(0.5, 0., 1., 0., stamp=1.)
+    cmd = rpf.Command(
+        "REJOIN", np.zeros(3), 0., np.array([1., 0., 0.]), 1., 0.,
+        path_pull=np.array([0., 0., -1.]),
+        path_pull_radius=cfg.waypoint_arrive_radius, path_tangent=np.array([1., 0., 0.]),
+    )
+    roll, pitch, yaw, gaz = gate.update(cmd, pose, 1., target_key=1,
+                                       body_velocity=(0., -0.3, 1.))
+    assert roll >= 0.9 * cfg.max_translation_pcmd
+    assert max(abs(roll), abs(pitch)) <= cfg.max_translation_pcmd == 50
+    assert yaw == gaz == 0

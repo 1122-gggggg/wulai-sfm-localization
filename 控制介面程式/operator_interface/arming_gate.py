@@ -25,6 +25,12 @@ AUTONOMY_OK_LOC_STATES = frozenset({"TRACK"})
 #: flight loop's RECOVERY_GOOD_FIXES: one lucky frame is not a lock.
 AUTONOMY_MIN_CONSECUTIVE_FIXES = 2
 
+#: The consecutive-fix streak must additionally span this long. Counts alone
+#: pass after ~0.1 s at 20 Hz; the 2026-09-18 flight armed AUTO on ~2 s of
+#: FAST_TRACK and then sat through 24 s with zero strong fixes. Duration forces
+#: the operator to wait for genuinely stable conditions instead of flicker.
+AUTONOMY_MIN_STABLE_S = 5.0
+
 
 def autonomous_approval_blockers(snapshot: dict[str, Any]) -> list[str]:
     """Return profile/external-approval reasons AUTO may not even start."""
@@ -78,14 +84,25 @@ def _consecutive_fix_blocker(snapshot: dict[str, Any]) -> str | None:
             f"needs {AUTONOMY_MIN_CONSECUTIVE_FIXES} consecutive good fixes "
             f"(have {'unknown' if fixes is None else int(fixes)})"
         )
+    streak_s = _finite_snapshot_number(snapshot, "good_streak_s")
+    if streak_s is None or streak_s < AUTONOMY_MIN_STABLE_S:
+        have = "unknown" if streak_s is None else f"{streak_s:.1f}s"
+        return (
+            f"needs {AUTONOMY_MIN_STABLE_S:.0f}s of continuous strong fixes "
+            f"(have {have})"
+        )
     return None
 
 
-def autonomous_arming_blockers(snapshot: dict[str, Any]) -> list[str]:
+def autonomous_arming_blockers(
+    snapshot: dict[str, Any], *, boot_pose_locked: bool = False
+) -> list[str]:
     """Return every reason autonomy may NOT be armed. Empty list == may arm.
 
     Unknown/missing fields are treated as blocking: a gate that cannot see the
     evidence must not conclude the evidence is good.
+    Desktop AUTO may supply boot_pose_locked after BootPoseLock has confirmed
+    consecutive fresh, stable estimates; those do not require PnP metrics.
     """
     blockers = autonomous_approval_blockers(snapshot)
 
@@ -97,6 +114,18 @@ def autonomous_arming_blockers(snapshot: dict[str, Any]) -> list[str]:
     state = str(snapshot.get("loc_state") or "")
     if state not in AUTONOMY_OK_LOC_STATES:
         blockers.append(f"localization state {state or 'unknown'!s} is not TRACK")
+
+    if boot_pose_locked:
+        age_blocker = _metric_limit_blocker(
+            snapshot,
+            value_key="pose_age_s",
+            limit_key="max_pose_age_s",
+            unknown_message="pose age is unknown",
+            violation_message="pose is stale ({value:.2f}s > {limit:.2f}s)",
+        )
+        if age_blocker is not None:
+            blockers.append(age_blocker)
+        return blockers
 
     metric_blockers = (
         _metric_limit_blocker(
@@ -138,6 +167,7 @@ def manual_flight_blockers(snapshot: dict[str, Any]) -> list[str]:
 
 __all__ = [
     "AUTONOMY_MIN_CONSECUTIVE_FIXES",
+    "AUTONOMY_MIN_STABLE_S",
     "AUTONOMY_OK_LOC_STATES",
     "autonomous_approval_blockers",
     "autonomous_arming_blockers",

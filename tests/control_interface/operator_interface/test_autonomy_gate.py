@@ -29,11 +29,32 @@ def _good() -> dict:
         "reproj_rms": 1.3,
         "max_reproj_rms": 6.0,
         "consecutive_good_fixes": 3,
+        "good_streak_s": 6.0,
     }
 
 
 def test_all_localization_conditions_good_allows_arming():
     assert rs.autonomous_arming_blockers(_good()) == []
+
+
+def test_confirmed_boot_estimates_do_not_require_pnp_metrics():
+    snap = _good()
+    snap.update(inliers=0, reproj_rms=None, consecutive_good_fixes=0)
+    assert rs.autonomous_arming_blockers(snap)
+    assert rs.autonomous_arming_blockers(snap, boot_pose_locked=True) == []
+
+
+@pytest.mark.parametrize("field,bad", [
+    ("mission_flight_ready", False), ("mission_evaluation_only", True),
+    ("autonomous_locked", True), ("autonomous_approval_valid", False),
+    ("profile_verified", False), ("localizer_ready", False),
+    ("zoom_paused", True), ("loc_state", "LOST"),
+    ("pose_age_s", None), ("pose_age_s", 1.0), ("pose_age_s", float("nan")),
+])
+def test_confirmed_boot_estimates_keep_runtime_gates(field, bad):
+    snap = _good()
+    snap[field] = bad
+    assert rs.autonomous_arming_blockers(snap, boot_pose_locked=True)
 
 
 @pytest.mark.parametrize("field,bad,expect", [
@@ -51,6 +72,8 @@ def test_all_localization_conditions_good_allows_arming():
     ("inliers", 10, "inliers"),
     ("reproj_rms", 9.9, "reprojection"),
     ("consecutive_good_fixes", 1, "consecutive"),
+    ("good_streak_s", 2.0, "continuous"),
+    ("good_streak_s", None, "continuous"),
 ])
 def test_each_localization_condition_blocks_autonomy(field, bad, expect):
     snap = _good()
@@ -62,6 +85,7 @@ def test_each_localization_condition_blocks_autonomy(field, bad, expect):
 
 @pytest.mark.parametrize("missing", [
     "pose_age_s", "inliers", "reproj_rms", "consecutive_good_fixes",
+    "good_streak_s",
     "loc_state", "localizer_ready", "profile_verified",
     "autonomous_locked", "autonomous_approval_valid", "mission_flight_ready",
 ])
@@ -78,7 +102,7 @@ def test_empty_snapshot_blocks_everything():
 
 @pytest.mark.parametrize("field", [
     "pose_age_s", "max_pose_age_s", "inliers", "min_inliers",
-    "reproj_rms", "max_reproj_rms", "consecutive_good_fixes",
+    "reproj_rms", "max_reproj_rms", "consecutive_good_fixes", "good_streak_s",
 ])
 @pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
 def test_non_finite_evidence_fails_closed(field, bad):

@@ -27,7 +27,7 @@ Layout:
 - Left: point-cloud map, planned route, and localization trail. The planned route is always shown when loaded. Mouse controls: left drag 360-degree rotate, double left click sets the rotation pivot like CloudCompare, middle drag roll, right drag pan, wheel zoom. Use `重設地圖` to restore the default upright view.
 - Right: ANAFI-like drone video stream. Input stream is resized to `1280x720`
   and paced as 720p30 by default.
-- Bottom: manual/PC control, hover, land, takeoff, autonomous flight, localization, gimbal pitch, zoom.
+- Bottom: persistent flight actions, followed by camera/recording controls and preflight confirmation. A single 操作工作區 shows flight limits, virtual sticks, compass calibration, and site/route assets together; flight status and recent waypoint events sit below the flight settings.
 
 ### UI 與可替換接口邊界
 
@@ -69,9 +69,11 @@ Z-up 顯示座標並輸出 `frame: aligned`；匯入端再轉回 GLOMAP 的 X/Z 
 真機模式只有明確回讀為 `landed` 且沒有飛行命令處理中才可開啟；狀態改變時
 編輯器會自動關閉。「儲存路線」會
 驗證場域、座標系與航點，原子更新 managed profile 的路線 SHA-256、`flight.approved`
-與 `route_clearance_approved`，再把路線綁為下一個 AUTO 候選；若目前使用 system
-profile，會在編輯器關閉後套用更新過的 managed profile。這不會立即起飛，一般外部
-JSON 匯入也仍維持未核准。AUTO 請求送出後，航線選擇鎖定；HOVER、MANUAL 與重新
+與 `route_clearance_approved`，再把路線綁為下一個 AUTO 候選。模擬與真機模式皆在
+介面內儲存有效、已綁定場域的航線後自動核准，不需另外申請路線核准；若目前使用 system
+profile，會在編輯器關閉後套用更新過的 managed profile。這不會立即起飛；匯入正式
+JSON 時，介面也會同步底層驗證後的核准結果。真機仍須通過四項驗證與既有任務、
+定位及後端檢查，由操作員親自按「自動飛行」。AUTO 請求送出後，航線選擇鎖定；HOVER、MANUAL 與重新
 定位不會解除，只有後端拒絕該次請求或確認降落完成後才可選下一條航線。
 
 「新增路線」會建立新的正式航線並保留既有航線；「編輯路線」只覆蓋目前選取的航線。
@@ -83,8 +85,11 @@ SHA 驗證與航線綁定，再用 production `RouteAutoController` 和記憶體
 閉迴路測試；到達最後一點並通過地速確認後結束。這條流程不會連接真機或送出
 Olympe 指令；真機介面不顯示此按鈕，仍須完成四步 preflight 並親自按「自動飛行」。
 
-AUTO 起飛後以連續穩定的定位姿態判定起飛位置，不要求位於第一個航點附近；系統一律先飛往第 1 航點，到了之後依序往第 2、3 點移動，方便除錯。開放航線不循環，最後回到返程起點降落。起飛位置仍須在任一航點的
+新的 AUTO 任務以連續穩定的定位姿態判定起飛位置，不要求位於第一個航點附近；先飛往第 1 航點，再依序往第 2、3 點移動。同一趟飛行、同一路線在搖桿接管後再次按 AUTO，會重新交接控制權與確認定位，接續尚未完成的航點，包含返程進度；落地、更換路線或更換 backend 後清除接續紀錄。開放航線不循環，最後回到返程起點降落。起飛位置仍須在任一航點的
 `SFM_BOOT_START_MAX_U` 範圍內（預設 `1.5` map units），避免從航線外直接橫切進入。
+
+AUTO 尊重路線設定的全域或逐點到站半徑，不把已設定的小半徑放大到 0.15 map units。
+高度誤差仍取自定位姿態與航點的三維差；高度計不參與這個位置控制迴路。
 
 ## Single-Process Desktop App
 
@@ -292,9 +297,13 @@ frames to the localizer, so per-tick waste there is not free.
   battery, localization and GPS into textual status chips. GPS NO FIX explicitly
   says that manual takeoff remains available and AUTO will hover first.
 - Flight actions (手動/搖桿, 恢復電腦控制, 懸停, 原地降落) stay **above** the
-  selectable tabs. The control pane has three tabs: 飛行、校正、場域資產. The map/video
-  sash defaults to 35/65 and remains operator-adjustable. Tests verify every tab
-  fits the minimum 1180×768 client area and abort actions remain always visible.
+  shared 操作工作區. 飛行、校正、場域資產 appear together on that page, so
+  preflight navigation never hides another section. Camera and recording controls
+  use their own compact row. Warm ivory surfaces, fields, buttons and virtual sticks
+  share the same palette with enlarged interface text; flight actions retain their distinct safety colours.
+  The map/video sash defaults to 35/65 and remains operator-adjustable. Tests
+  verify the 1180×768 minimum client area, visible abort actions, imported route
+  choices, and all three compass rotation instructions without clipping.
 - Localization alerts (LOCALIZATION LOST, LOW CONFIDENCE, LOST hold) live only in
   the video panel (`render_video`) and in `loc_health_label`. **2026-08-03 operator
   decision:** the top-level banner was removed as duplicated by the middle of the

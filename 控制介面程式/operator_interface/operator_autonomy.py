@@ -37,7 +37,7 @@ AUTO_PCMD_FAILURE_LIMIT = 3
 AUTO_WORKER_STALL_TIMEOUT_S = 2.0
 AUTO_WATCHDOG_POLL_S = 0.05
 AUTO_MAX_DURATION_S = 300.0
-AUTO_BATTERY_RESERVE_PCT = 20.0
+AUTO_BATTERY_RESERVE_PCT = 10.0
 AUTO_TELEMETRY_MAX_AGE_S = 2.0
 # Total time AUTO may hold a hover waiting for something it cannot supply itself
 # (a usable pose, a fresh ground-speed sample).  boot_timeout_s only bounds the
@@ -108,6 +108,7 @@ class DesktopRouteAutonomy:
         land: Callable[[], object],
         take_pc_control: Callable[[], object] | None = None,
         start_airborne: bool = False,
+        resume_target_index: int | None = None,
         arming_blockers: Callable[[], list[str]] | None = None,
         boot_timeout_s: float = pff.FIRST_FIX_TIMEOUT_S,
         boot_search_config: YawSearchConfig | None = None,
@@ -156,6 +157,14 @@ class DesktopRouteAutonomy:
         self.snapshot = snapshot
         self.waypoints = waypoints
         self.controller = rpf.RouteAutoController(waypoints, poles=[], config=config)
+        if resume_target_index is not None and (
+            not start_airborne
+            or type(resume_target_index) is not int
+            or not 0 <= resume_target_index < len(self.controller.wp)
+        ):
+            raise ValueError("AUTO resume requires an airborne, valid route target")
+        self.resume_target_index = resume_target_index
+        self.interrupted_target_index: int | None = None
         self.get_pose = get_pose
         self.pose_is_weak = pose_is_weak
         self.pose_is_predicted = pose_is_predicted or (lambda: False)
@@ -252,6 +261,7 @@ class DesktopRouteAutonomy:
         self._waypoint_progress = None
         self._mission_started = None
         self._route_progress = _fresh_route_progress()
+        self.interrupted_target_index = None
         self._watchdog_stop.clear()
         self._touch_heartbeat()
         self._thread = threading.Thread(
@@ -270,6 +280,10 @@ class DesktopRouteAutonomy:
 
     def cancel(self, reason: str) -> None:
         self._cancel_reason = str(reason or "operator")
+        if self.phase == "ROUTE" and self._cancel_reason in {
+            "manual", "pc_control", "resume_pc", "keyboard_nudge", "nudge_button", "virtual_stick",
+        }:
+            self.interrupted_target_index = int(self.controller.target_index)
         self._cancel.set()
         self._watchdog_stop.set()
         self._paused.clear()
@@ -515,6 +529,8 @@ class DesktopRouteAutonomy:
             return True
         if not self._pilot_override():
             return False
+        if self.phase == "ROUTE" and not self._uncommanded_landing():
+            self.interrupted_target_index = int(self.controller.target_index)
         if not self._manual_handoff_attempted:
             self._manual_handoff_attempted = True
             reason = "auto_stick_override"
@@ -610,21 +626,19 @@ class DesktopRouteAutonomy:
         return speed + max(0.0, self._speed_rate_mps2) * horizon
 
     def _apply_speed_limit(self, pcmd: Pcmd) -> Pcmd:
-        """Shrink only the along-motion PCMD that would push past the limit.
+        """Limit along-motion acceleration and brake proportional to overspeed.
 
         Never latched: the allowed forward projection falls linearly from the
         full cap at standstill to zero at the limit, evaluated on speed
         predicted past the telemetry delay. Decomposed in the body horizontal
         plane with q=(pitch, roll) and v=(forward_v, right_v): the orthogonal
-        correction c is preserved and only the positive along-motion
-        projection a is limited. Commands that do not add speed along the
-        current motion (braking, wind hold) pass untouched, as does everything
-        when fresh body velocity is unavailable.
+        correction c is preserved while it fits the command caps.
+        Above the predicted limit, require braking
+        using the existing velocity-damping gain; stronger braking is retained.
+        Commands pass untouched when fresh body velocity is unavailable.
         """
         roll, pitch = int(pcmd[0]), int(pcmd[1])
         state = self.backend.state
-        if not (roll or pitch):
-            return pcmd
         if not bool(getattr(state, "autonomous_speed_limit_enabled", True)):
             state.autonomous_speed_guard_status = "SPEED_LIMIT_DISABLED"
             return pcmd
@@ -653,9 +667,6 @@ class DesktopRouteAutonomy:
         q_pitch, q_roll = float(pitch), float(roll)
         u_pitch, u_roll = forward_v / speed, right_v / speed
         along = q_pitch * u_pitch + q_roll * u_roll
-        if along <= 0.0:
-            state.autonomous_speed_guard_status = "FRESH_SPEED_LIMIT"
-            return pcmd
         try:
             cap = int(self.controller.cfg.max_translation_pcmd)
         except (AttributeError, TypeError, ValueError, OverflowError):
@@ -665,33 +676,24 @@ class DesktopRouteAutonomy:
         predicted = self._predicted_speed(speed, stamp)
         full_cap = cap_f / max(abs(u_pitch), abs(u_roll))
         allowed = full_cap * max(0.0, 1.0 - predicted / limit)
+        allowed -= rpf.DESKTOP_AUTO_WIND_REJECT_PCMD_PER_MPS * max(0.0, predicted - limit)
+        allowed = max(-full_cap, allowed)
         if along <= allowed:
             state.autonomous_speed_guard_status = "FRESH_SPEED_LIMIT"
             return pcmd
         c_pitch = q_pitch - along * u_pitch
         c_roll = q_roll - along * u_roll
-        peak = max(abs(c_pitch), abs(c_roll))
-        if peak > cap_f:
-            scale = cap_f / peak
-            c_pitch *= scale
-            c_roll *= scale
-        upper = min(along, allowed)
-        lower = 0.0
+        new_along = min(along, allowed)
+        # Reserve the required braking component before fitting lateral
+        # correction into the per-axis box. Keep all of it when it fits.
+        cross_scale = 1.0
         for c_i, u_i in ((c_pitch, u_pitch), (c_roll, u_roll)):
-            if abs(u_i) < 1e-12:
+            if abs(c_i) < 1e-12:
                 continue
-            lo = (-cap_f - c_i) / u_i
-            hi = (cap_f - c_i) / u_i
-            if lo > hi:
-                lo, hi = hi, lo
-            lower = max(lower, lo)
-            upper = min(upper, hi)
-        if not math.isfinite(lower) or not math.isfinite(upper):
-            state.autonomous_speed_guard_status = "SPEED_UNAVAILABLE"
-            return pcmd
-        new_along = min(max(upper, 0.0), min(along, allowed))
-        if new_along < 0.0:
-            new_along = 0.0
+            bound = (math.copysign(cap_f, c_i) - new_along * u_i) / c_i
+            cross_scale = min(cross_scale, max(0.0, bound))
+        c_pitch *= cross_scale
+        c_roll *= cross_scale
         out_pitch = max(-cap, min(cap, int(round(c_pitch + new_along * u_pitch))))
         out_roll = max(-cap, min(cap, int(round(c_roll + new_along * u_roll))))
         order = tuple(sorted(
@@ -1185,7 +1187,7 @@ class DesktopRouteAutonomy:
                 waypoint_stall_limit_s=AUTO_WAYPOINT_STALL_S,
                 heading_convention="map CCW; firmware yaw NED CW",
                 waypoints_u=[
-                    [round(float(value), 4) for value in point] for point in self.controller.wp
+                    [float(value) for value in point] for point in self.controller.wp
                 ],
                 drawn_waypoint_count=len(self.waypoints),
                 return_to_start=bool(self.controller.cfg.return_to_start),
@@ -1302,7 +1304,18 @@ class DesktopRouteAutonomy:
         last_pose_stamp: float | None,
     ) -> tuple[bool, float | None, bool]:
         pose = self.get_pose()
-        if pose is None or self.pose_is_weak() or self.pose_confidence() < pff.LOW_CONF_INLIERS:
+        if (
+            pose is None
+            or pose.reseed_confirming
+            or (self.pose_reseed_confirming is not None and self.pose_reseed_confirming())
+            or (not self.accept_weak_poses and (
+                self.pose_is_weak()
+                or self.pose_confidence() < pff.LOW_CONF_INLIERS
+                or not pose.map_confirmed
+                or not pose.position_observed
+                or self.pose_is_predicted()
+            ))
+        ):
             lock.reset()
             return False, last_pose_stamp, False
         try:
@@ -1313,6 +1326,9 @@ class DesktopRouteAutonomy:
             lock.reset()
             return False, last_pose_stamp, False
         pose_stamp = float(pose.stamp)
+        if not math.isfinite(pose_stamp) or not -0.05 <= self.now() - pose_stamp <= pff.POSE_STALE_S:
+            lock.reset()
+            return False, last_pose_stamp, False
         if last_pose_stamp is None or pose_stamp > last_pose_stamp:
             last_pose_stamp = pose_stamp
             if lock.observe(pose, now=self.now()):
@@ -1359,9 +1375,9 @@ class DesktopRouteAutonomy:
         )
 
     def _select_route_start(self, position: Any) -> None:
-        """Start the route at waypoint 1, disclosing the flight to it.
+        """Start at waypoint 1, or the unfinished target after manual recovery.
 
-        AUTO always flies the authored waypoints in order, even when the
+        A new AUTO mission flies the authored waypoints in order, even when the
         takeoff pose sits nearer a later point: that leg is flown direct to
         waypoint 1, then waypoint 2, and so on. There is no corridor policing
         that opening leg or the drawn route: every tick flies direct at the
@@ -1372,16 +1388,21 @@ class DesktopRouteAutonomy:
         route_distance, _nearest_point, _segment, _s = rpf.project_to_path(
             position, self.controller.wp, self.controller.cum
         )
-        start = int(self.controller.start_after_nearest_waypoint(position))
+        start = self.controller.start_after_nearest_waypoint(
+            position, target_index=self.resume_target_index if self.resume_target_index is not None else 0,
+        )
         target = self.controller.target_index
         if self.controller.cfg.return_to_start:
             tail = "flies the route to its last waypoint, then returns along it and lands at waypoint 1"
         else:
             tail = "lands at the last waypoint"
+        start_detail = (
+            f"manual recovery resumes at waypoint {self._drawn_waypoint_number(start)} "
+            if self.resume_target_index is not None else f"takeoff pose starts at waypoint {start + 1} "
+        )
         self._emit(
             "route_start_selected",
-            f"takeoff pose starts at waypoint {start + 1} "
-            f"({float(route_distance):.3f} map units off route); "
+            start_detail + f"({float(route_distance):.3f} map units off route); "
             f"first target is waypoint "
             f"{self._drawn_waypoint_number(target)} of {len(self.waypoints)}; {tail}",
         )
@@ -1575,6 +1596,13 @@ class DesktopRouteAutonomy:
                 zero_reason="auto_worker_failure_hover",
             )
         finally:
+            if self._cancel.is_set() and self.phase in {"ROUTE", "LANDING"}:
+                terminal_detail = f"AUTO cancelled: {self._cancel_reason}"
+            elif (
+                self._manual_handoff_attempted and not self._auto_failed
+                and self.phase in {"ROUTE", "LANDING"}
+            ):
+                terminal_detail = "AUTO yielded to manual control"
             self._clear_motion()
             self._paused.clear()
             self._watchdog_stop.set()

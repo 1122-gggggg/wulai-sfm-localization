@@ -6,7 +6,7 @@ was the flown trajectory from the planned path? Join-phase wandering (takeoff
 to first waypoint arrival) is reported separately and never mixed into the
 error statistics.
 
-Reads only ``localization.jsonl`` from the session directory (the
+Reads ``trajectory.jsonl`` (or legacy ``localization.jsonl``) from the session directory (the
 ``auto_route_plan`` / ``auto_route_tick`` / ``pose_result`` events the AUTO
 loop already emits). Writes nothing unless ``--out`` is given.
 """
@@ -371,7 +371,9 @@ def _session_pose_timeline(session):
     vo_only = 0
     pose_success = 0
     pose_timeline: list[tuple[float, bool]] = []
-    for record in read_jsonl(session / "localization.jsonl"):
+    archive = session / "trajectory.jsonl"
+    source = archive if archive.is_file() else session / "localization.jsonl"
+    for record in read_jsonl(source):
         event = record.get("event")
         if event in ("auto_route_plan", "auto_route_tick"):
             events.append(record)

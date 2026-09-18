@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import json
-import struct
 from pathlib import Path
 
 import numpy as np
@@ -62,50 +61,25 @@ def _read_binary_ply_points(
     dt = np.dtype(fields)
     itemsize = dt.itemsize
 
-    try:
-        raw_bytes = source.read(n_vertices * itemsize)
-        if len(raw_bytes) == n_vertices * itemsize:
-            raw_arr = np.frombuffer(raw_bytes, dtype=dt, count=n_vertices)
-            sliced = raw_arr[::step]
-            pts = np.empty((len(sliced), 6), dtype=np.float32)
-            pts[:, :3] = sliced["pos"]
-            if has_colors:
-                rgb = sliced["rgb"]
-                pts[:, 3:] = rgb[:, :3] if has_alpha else rgb
-            else:
-                pts[:, 3:] = (200.0, 200.0, 200.0)
-            return pts
-    except Exception:
-        pass
-
-    # Header 回退 (fallback): rewind to header end and read via struct
-    if header_pos is not None and hasattr(source, "seek"):
-        try:
-            source.seek(header_pos)
-        except Exception:
-            pass
-
-    fmt_str = "<fff"
-    if has_normals:
-        fmt_str += "fff"
-    if has_colors:
-        fmt_str += "BBBB" if has_alpha else "BBB"
-    record = struct.Struct(fmt_str)
-    points: list[tuple] = []
-    for index in range(n_vertices):
-        raw = source.read(record.size)
-        if len(raw) != record.size:
-            break
-        if index % step:
-            continue
-        values = record.unpack(raw)
-        xyz = values[:3]
+    # Bound the temporary payload independently of the cloud size. Keep the
+    # sampling phase relative to the whole file, including across chunks.
+    points = np.empty(((n_vertices + step - 1) // step, 6), dtype=np.float32)
+    written = 0
+    for offset in range(0, n_vertices, 65536):
+        count = min(65536, n_vertices - offset)
+        raw = source.read(count * itemsize)
+        complete = len(raw) // itemsize
+        sliced = np.frombuffer(raw, dtype=dt, count=complete)[(-offset) % step::step]
+        end = written + len(sliced)
+        points[written:end, :3] = sliced["pos"]
         if has_colors:
-            rgb = values[-4:-1] if has_alpha else values[-3:]
+            points[written:end, 3:] = sliced["rgb"][:, :3]
         else:
-            rgb = (200.0, 200.0, 200.0)
-        points.append((*xyz, *rgb))
-    return points
+            points[written:end, 3:] = (200.0, 200.0, 200.0)
+        written = end
+        if complete < count:
+            break
+    return points[:written]
 
 
 def _read_ascii_ply_points(
@@ -202,5 +176,4 @@ def read_map_points(path: Path, max_points: int) -> np.ndarray:
     if path.suffix.lower() == ".json":
         return read_reference_pose_points(path, max_points)
     return read_ply_points(path, max_points)
-
 
