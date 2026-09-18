@@ -2582,7 +2582,31 @@ class YawAlignedPcmdController:
             # Turn holds height as well as position: gaz=0 even though the
             # adapter already returns 0 here; belt and suspenders so a future
             # adapter change cannot reintroduce climb-during-turn.
-            return hold_roll, hold_pitch, yaw_cmd[2], 0
+            turn_roll, turn_pitch = hold_roll, hold_pitch
+            if (
+                cmd.action in {"FOLLOW", "REJOIN"}
+                and cmd.path_tangent is not None
+                and cmd.path_pull is not None
+            ):
+                # Segment leg with the nose off: keep turning, but also
+                # correct back toward the segment (no along-leg progress)
+                # so wind cannot walk the aircraft off the route while the
+                # yaw target chases the drift. Height stays locked.
+                try:
+                    turn_parts = _route_translation_components(cmd, pose, self.config)
+                except (AttributeError, TypeError, ValueError, OverflowError):
+                    turn_parts = None
+                if turn_parts is not None:
+                    try:
+                        correction = np.asarray(turn_parts[0], dtype=float).reshape(3)
+                        corr_roll, corr_pitch, _, _ = self._route_translate(
+                            cmd, pose, now, body_velocity,
+                            (correction, np.zeros(3, dtype=float), 0.0),
+                        )
+                    except (AttributeError, TypeError, ValueError, OverflowError):
+                        corr_roll, corr_pitch = 0, 0
+                    turn_roll, turn_pitch = int(corr_roll), int(corr_pitch)
+            return turn_roll, turn_pitch, yaw_cmd[2], 0
         if stable:
             self.aligned_for_translation = True
             self.phase = "yaw_alignment_confirmed"

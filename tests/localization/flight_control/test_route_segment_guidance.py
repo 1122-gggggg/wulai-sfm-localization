@@ -140,6 +140,28 @@ def test_route_rejoin_holds_yaw_even_when_the_nose_is_not_aligned():
     assert yaw == 0 and gaz == 0
 
 
+def test_turn_phase_still_corrects_toward_the_segment():
+    # 2026-09-18 real flight: a FOLLOW leg sat in turn with yaw ~45 deg off
+    # while wind walked it 0.08 -> 0.23 u off route. Turn keeps yaw priority
+    # and height lock, but must not hold position: correction toward the
+    # segment stays on, along-leg progress stays off.
+    cfg = rpf.ControlConfig(inspect_waypoints=())
+    gate = rpf.YawAlignedPcmdController(cfg)
+    goal = np.array([10.0, 0.0, 0.0])
+    command = rpf.Command(
+        "FOLLOW", np.array([1.0, 0.0, 0.0]), 0.0, goal, 0.5, 0.0,
+        guidance_goal=np.array([3.0, 0.0, 0.0]),
+        path_pull=np.array([0.0, 0.0, -0.5]),
+        path_pull_radius=0.15,
+        path_tangent=np.array([1.0, 0.0, 0.0]),
+    )
+    pose = rpf.Pose(3, 0, 0.5, math.pi / 2, stamp=0.1)
+    roll, pitch, yaw, gaz = gate.update(command, pose, 0.1, target_key=1)
+    assert gate.phase == "turn"
+    assert yaw != 0 and gaz == 0
+    assert roll or pitch
+
+
 def test_route_rejoin_has_a_separate_return_to_follow_boundary():
     control = controller([(0, 0, 0), (10, 0, 0)])
     control.step(rpf.Pose(0, 0, 0, 0, stamp=0), now=0)

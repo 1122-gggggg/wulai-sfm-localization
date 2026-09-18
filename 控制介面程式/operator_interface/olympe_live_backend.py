@@ -434,15 +434,16 @@ class OlympeLiveBackend:
         self._last_pcmd = (0, 0, 0, 0)
         self._last_pcmd_mono_ns: int | None = None
         # Flight recording: arm before takeoff → start on takeoff → stop+save on land.
-        # Armed by default so every flight leaves onboard video for post-flight
-        # localization diagnosis (operator can still disarm via the UI checkbox).
-        self.record_on_takeoff: bool = True
+        # Off by default; operator arms via the UI checkbox when onboard video
+        # is needed. Auto-starting reconfigures the camera right after takeoff
+        # and has stalled the live stream (2026-09-18 real flights).
+        self.record_on_takeoff: bool = False
         self.recording_active: bool = False
         self.record_started_iso: str = ""
         self.record_last_path: str = ""
         self.recording_profile: RecordingProfile = DEFAULT_RECORDING_PROFILE
         self.record_status: str = format_record_status(
-            active=False, armed=True, profile=self.recording_profile,
+            active=False, armed=False, profile=self.recording_profile,
         )
         self.record_dir = _DEFAULT_RECORD_DIR
         self.record_dir.mkdir(parents=True, exist_ok=True)

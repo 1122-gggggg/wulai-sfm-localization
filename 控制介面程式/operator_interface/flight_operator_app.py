@@ -939,7 +939,7 @@ class DroneBackend:
         self.target_altitude_m = 0.0
         self.flight_start: float | None = None
         self.route_test_plant = SimulatedRoutePlant(self)
-        self.record_on_takeoff = True
+        self.record_on_takeoff = False
         self.recording_active = False
         self.recording_profile = DEFAULT_RECORDING_PROFILE
         self.record_status = format_record_status(
@@ -2820,7 +2820,7 @@ class OperatorApp(tk.Tk):
             DEFAULT_RECORDING_PROFILE,
         )
         self._recording_quality_syncing = False
-        self.record_on_takeoff_var = tk.BooleanVar(value=True)
+        self.record_on_takeoff_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(
             recording,
             text="起飛後錄影",

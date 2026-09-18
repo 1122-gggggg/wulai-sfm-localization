@@ -691,19 +691,19 @@ def test_camera_and_mission_sit_in_the_always_visible_flight_bar(operator) -> No
     assert "鏡頭" in labels
     assert "起飛" in labels, "takeoff must still live in the always-visible bar"
     assert "起飛後錄影" in labels
-    assert operator.record_on_takeoff_var.get() is True
-    assert operator.backend.record_on_takeoff is True
+    assert operator.record_on_takeoff_var.get() is False
+    assert operator.backend.record_on_takeoff is False
     assert operator.record_status_var.get().startswith("錄影:")
 
 
-def test_record_on_takeoff_armed_by_default_and_operator_can_disarm(operator) -> None:
-    assert operator.backend.record_on_takeoff is True
-    operator.record_on_takeoff_var.set(False)
-    operator._on_record_on_takeoff_toggled()
+def test_record_on_takeoff_disarmed_by_default_and_operator_can_arm(operator) -> None:
     assert operator.backend.record_on_takeoff is False
     operator.record_on_takeoff_var.set(True)
     operator._on_record_on_takeoff_toggled()
     assert operator.backend.record_on_takeoff is True
+    operator.record_on_takeoff_var.set(False)
+    operator._on_record_on_takeoff_toggled()
+    assert operator.backend.record_on_takeoff is False
 
 
 def test_preflight_navigation_keeps_all_sections_visible(operator) -> None:

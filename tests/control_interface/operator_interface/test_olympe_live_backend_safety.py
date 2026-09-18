@@ -2007,7 +2007,7 @@ def test_takeoff_preflight_success_checks_video_battery_gps_source_and_limits(
     assert backend.drone.source_state == "Controller"
 
 
-def test_mock_takeoff_records_by_default_and_not_when_disarmed(make_backend, monkeypatch):
+def test_mock_takeoff_no_record_by_default_and_records_when_armed(make_backend, monkeypatch):
     backend = make_backend(max_altitude_m=10.0, max_distance_m=50.0)
     backend.drone.flight_state = "landed"
     recording_starts: list[str] = []
@@ -2017,13 +2017,13 @@ def test_mock_takeoff_records_by_default_and_not_when_disarmed(make_backend, mon
         lambda reason: recording_starts.append(reason) or True,
     )
 
-    assert backend.record_on_takeoff is True
+    assert backend.record_on_takeoff is False
     assert backend.takeoff_cmd()
-    assert recording_starts == ["post_takeoff"]
+    assert recording_starts == []
 
     backend2 = make_backend(max_altitude_m=10.0, max_distance_m=50.0)
     backend2.drone.flight_state = "landed"
-    backend2.set_record_on_takeoff(False)
+    backend2.set_record_on_takeoff(True)
     recording_starts2: list[str] = []
     monkeypatch.setattr(
         backend2,
@@ -2031,7 +2031,7 @@ def test_mock_takeoff_records_by_default_and_not_when_disarmed(make_backend, mon
         lambda reason: recording_starts2.append(reason) or True,
     )
     assert backend2.takeoff_cmd()
-    assert recording_starts2 == []
+    assert recording_starts2 == ["post_takeoff"]
 
 
 def test_recording_quality_log_is_json_serializable(make_backend):
