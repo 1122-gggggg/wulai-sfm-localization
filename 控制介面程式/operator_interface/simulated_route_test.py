@@ -102,9 +102,10 @@ class SimulatedRoutePlant:
 
         roll_value, pitch_value, yaw_value, gaz_value = values
         control_dt = 1.0 / 20.0
-        # Translation runs four times faster than wall time so route checks stay
-        # short. Yaw keeps the dry-run rate because its stability gate rejects jumps.
-        translation_dt = 4.0 * control_dt
+        # Pose timestamps and controller integration use this same 20 Hz clock.
+        # Accelerating only translation made final centering oscillate forever
+        # across the arrival sphere while reporting a nonzero ground speed.
+        translation_dt = control_dt
         with self._lock:
             self.backend.sim_yaw = (
                 self.backend.sim_yaw - 0.06 * yaw_value * control_dt + math.pi
@@ -128,6 +129,10 @@ class SimulatedRoutePlant:
             self.state.ground_speed_mps = (
                 map_frame.horizontal_distance(displacement) / translation_dt
             )
+            velocity = displacement / translation_dt
+            self.state.speed_north_mps = float(np.dot(velocity, map_frame.north))
+            self.state.speed_east_mps = float(np.dot(velocity, map_frame.east))
+            self.state.speed_down_mps = -float(np.dot(velocity, map_frame.up))
             stamp = time.monotonic_ns()
             self.state.ground_speed_mono_ns = stamp
             self.state.telemetry_read_mono_ns = stamp

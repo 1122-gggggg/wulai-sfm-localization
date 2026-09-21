@@ -104,6 +104,7 @@ OUTPUT_EVIDENCE_PREFIXES = (
     "replay_",
     "reverse_topk_",
     "river_",
+    "route_workflow_audit_",
     "video720_",
 )
 HISTORIC_EVIDENCE_PREFIXES = (

@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 import math
 import time
-from typing import Any, Callable
+from typing import Any, Callable, TYPE_CHECKING
 
 import numpy as np
 
@@ -30,6 +30,9 @@ from localization_result_ui import (
     validate_live_localization_result,
 )
 from operator_rendering import weak_pose_source_kind
+
+if TYPE_CHECKING:
+    from real_path_follow_controller import Pose
 
 
 RollingEventFps = Callable[[list[float], float], tuple[list[float], float]]
@@ -999,7 +1002,16 @@ def _update_live_heading(
     )
 
 
-def _make_autonomy_pose(result: dict, xyz: np.ndarray, heading: float, stamp: float):
+def _pose_result_field(result: dict, name: str, *, boolean: bool) -> Any:
+    """Read an optional worker field with the same malformed-payload fallback."""
+    try:
+        value = result.get(name)
+        return bool(value) if boolean else value
+    except (AttributeError, KeyError, TypeError, ValueError):
+        return False if boolean else None
+
+
+def _make_autonomy_pose(result: dict, xyz: np.ndarray, heading: float, stamp: float) -> Pose:
     """Build one control pose carrying its source quality. No Tk, no mutation."""
     from real_path_follow_controller import Pose
     from operator_rendering import classify_localization_health
@@ -1007,30 +1019,12 @@ def _make_autonomy_pose(result: dict, xyz: np.ndarray, heading: float, stamp: fl
         health = classify_localization_health(result)
     except (AttributeError, KeyError, TypeError, ValueError):
         health = "LOST"
-    try:
-        direct_status = result.get("direct_status")
-    except (AttributeError, KeyError, TypeError, ValueError):
-        direct_status = None
-    try:
-        pose_status = result.get("pose_status")
-    except (AttributeError, KeyError, TypeError, ValueError):
-        pose_status = None
-    try:
-        reseed = bool(result.get("reseed_confirming"))
-    except (AttributeError, KeyError, TypeError, ValueError):
-        reseed = False
-    try:
-        confirming = bool(result.get("pose_source_confirming"))
-    except (AttributeError, KeyError, TypeError, ValueError):
-        confirming = False
-    try:
-        imu_bridge = bool(result.get("imu_bridge"))
-    except (AttributeError, KeyError, TypeError, ValueError):
-        imu_bridge = False
-    try:
-        success = bool(result.get("success"))
-    except (AttributeError, KeyError, TypeError, ValueError):
-        success = False
+    direct_status = _pose_result_field(result, "direct_status", boolean=False)
+    pose_status = _pose_result_field(result, "pose_status", boolean=False)
+    reseed = _pose_result_field(result, "reseed_confirming", boolean=True)
+    confirming = _pose_result_field(result, "pose_source_confirming", boolean=True)
+    imu_bridge = _pose_result_field(result, "imu_bridge", boolean=True)
+    success = _pose_result_field(result, "success", boolean=True)
     predicted_only = pose_status == "PREDICTED_ONLY"
     unknown_direct = (
         direct_status is not None
@@ -1067,10 +1061,7 @@ def _make_autonomy_pose(result: dict, xyz: np.ndarray, heading: float, stamp: fl
         reseed_confirming=reseed,
         position_observed=position_observed,
     )
-    try:
-        held = bool(result.get("confidence_hold_active"))
-    except (AttributeError, KeyError, TypeError, ValueError):
-        held = False
+    held = _pose_result_field(result, "confidence_hold_active", boolean=True)
     if held and (direct_status is None or str(direct_status) in observed_statuses):
         pose.position_observed = True
     return pose

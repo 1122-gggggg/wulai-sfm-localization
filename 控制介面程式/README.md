@@ -11,9 +11,10 @@
 定位 worker 與場域 profile，但只有實機接口載入 Olympe。起飛仍只允許操作員
 本人在 UI 親手按下按鈕。
 
-真機 AUTO 在落地或已在空中重新啟動時都必須先完成同一套四步 preflight。水平
-移動還要求 0.5 秒內的新鮮地速且低於 landed-only 可調的安全閘門；閘門不是物理
-硬速度上限。AUTO worker 例外、2 秒 heartbeat timeout 或連續三次 PCMD 發送失敗
+真機 AUTO 在落地或已在空中重新啟動時都必須先完成同一套四步 preflight。新鮮地速
+用於比例加速限制與超速煞車；缺少或過期地速不會單獨觸發零輸出懸停。這不是物理
+硬速度上限。完整操作語意以 [`SAFETY.md`](SAFETY.md) 為準。
+AUTO worker 例外、2 秒 heartbeat timeout 或連續三次 PCMD 發送失敗
 會鎖存 `AUTO_FAILED`、清零並停止路線。
 
 模擬入口不帶參數時使用唯一的河濱 profile `../地圖檔/場域/river_site/site_profile.json`；影片會從
@@ -45,4 +46,5 @@ flight readiness 決定；缺少校正或核准時 fail closed。
 - `影片模擬串流/`：以預錄影片進行離線驗證的入口。
 - `真機串流/`：真機操作入口，必須明確指定已驗證的 mission selection。
 
-先從 `site_profiles/example_site_edm.json` 建立自己的設定。真機啟動器不會預設選取任何場域。
+目前只註冊 `direct` 後端。新增場域請依建圖端輸出規格建立 direct release 與 mission
+selection；舊 `example_site_edm.json` 只保留歷史格式參考。真機啟動器不會預設選取任何場域。

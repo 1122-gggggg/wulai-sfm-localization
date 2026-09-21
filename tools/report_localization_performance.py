@@ -474,19 +474,25 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def main(argv: list[str] | None = None) -> int:
-    args = parse_args(argv)
+def _validate_report_args(args) -> bool:
     if not args.sessions:
         print("至少需要一個 --session", file=sys.stderr)
-        return 2
+        return False
     if not args.window_s or args.window_s <= 0:
         print("--window-s 必須為正數", file=sys.stderr)
-        return 2
+        return False
     if args.warmup_s is None or args.warmup_s < 0:
         print("--warmup-s 不得為負數", file=sys.stderr)
-        return 2
+        return False
     if args.nominal_fps is not None and args.nominal_fps <= 0:
         print("--nominal-fps 必須為正數", file=sys.stderr)
+        return False
+    return True
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    if not _validate_report_args(args):
         return 2
     reports = []
     for raw in args.sessions:

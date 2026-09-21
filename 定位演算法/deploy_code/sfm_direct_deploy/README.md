@@ -1,6 +1,6 @@
 # `sfm_direct_deploy` — `direct` 定位後端的部署 package
 
-`direct` 是系統的第三個定位後端，與 `edm`、`xfeat` 並列，由
+`direct` 是目前唯一註冊的正式定位後端，由
 `localizer_registry.py` 依 `site_profile.localizer` 建立。它跑的是 two-rate 迴路：
 
 ```text

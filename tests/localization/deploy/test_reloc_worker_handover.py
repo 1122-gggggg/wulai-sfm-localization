@@ -24,7 +24,7 @@ import cv2
 pytestmark = pytest.mark.smoke
 
 from live_provider import RelocFix
-from two_rate_tracker import KLTTracker, RelocWorker, TwoRateTracker
+from two_rate_tracker import KLTTracker, RelocResult, RelocWorker, TwoRateTracker
 
 
 class RecordingProvider:
@@ -76,10 +76,12 @@ def test_the_relocalizer_is_given_the_grey_frame_only(worker_factory) -> None:
     worker = worker_factory(provider)
     gray = np.full((6, 8), 40, dtype=np.uint8)
 
-    assert worker.submit(gray, 17) is True
-    _, ordinal = drain(worker)
+    assert worker.submit(gray, 17, 2.5, 3) is True
+    delivered = drain(worker)
 
-    assert ordinal == 17
+    assert delivered.ordinal == 17
+    assert delivered.capture_stamp == pytest.approx(2.5)
+    assert delivered.source_epoch == 3
     seen_gray, extra = provider.calls[0]
     np.testing.assert_array_equal(seen_gray, gray)
     assert extra == {}
@@ -90,18 +92,20 @@ def test_busy_worker_keeps_only_the_latest_waiting_capture(worker_factory) -> No
     provider = RecordingProvider(block=release)
     worker = worker_factory(provider)
     gray = np.zeros((6, 8), dtype=np.uint8)
-    assert worker.submit(gray, 0)
+    assert worker.submit(gray, 0, 0.0, 0)
     assert provider.entered.wait(timeout=5.0)
     for ordinal in range(1, 100):
         gray.fill(ordinal)
-        assert worker.submit(gray, ordinal)
+        assert worker.submit(gray, ordinal, float(ordinal), 0)
     assert worker.busy and worker.queued
     gray.fill(0)  # Caller reuse must not mutate the queued capture.
     release.set()
     delivered = drain(worker)
-    if delivered[1] == 0:
+    if delivered.ordinal == 0:
         delivered = drain(worker)
-    assert delivered[1] == 99
+    assert delivered.ordinal == 99
+    assert delivered.capture_stamp == pytest.approx(99.0)
+    assert delivered.source_epoch == 0
     assert len(provider.calls) == 2
     assert np.all(provider.calls[-1][0] == 99)
 
@@ -111,12 +115,30 @@ def test_reset_discards_an_inflight_result(worker_factory):
     provider = RecordingProvider(block=release)
     worker = worker_factory(provider)
     gray = np.zeros((6, 8), dtype=np.uint8)
-    assert worker.submit(gray, 1)
+    assert worker.submit(gray, 1, 1.0, 0)
     assert provider.entered.wait(timeout=5.0)
     worker.reset()
-    assert worker.submit(gray, 2)
+    assert worker.submit(gray, 2, 2.0, 1)
     release.set()
-    assert drain(worker)[1] == 2
+    delivered = drain(worker)
+    assert delivered.ordinal == 2
+    assert delivered.capture_stamp == pytest.approx(2.0)
+    assert delivered.source_epoch == 1
+
+
+def test_worker_drops_an_older_ready_result_but_keeps_capture_identity() -> None:
+    worker = RelocWorker(RecordingProvider())
+    fix = SimpleNamespace(ok=False)
+
+    worker._publish(fix, 4, 10.0, 2, 0)
+    worker._publish(fix, 5, 10.37, 2, 0)
+
+    delivered = worker.poll()
+    assert delivered is not None
+    assert delivered.ordinal == 5
+    assert delivered.capture_stamp == pytest.approx(10.37)
+    assert delivered.source_epoch == 2
+    assert worker.poll() is None
 
 
 def test_a_closed_worker_refuses_work() -> None:
@@ -125,7 +147,7 @@ def test_a_closed_worker_refuses_work() -> None:
     worker.start()
     worker.close()
 
-    assert worker.submit(np.zeros((6, 8), dtype=np.uint8), 0) is False
+    assert worker.submit(np.zeros((6, 8), dtype=np.uint8), 0, 0.0, 0) is False
     assert provider.calls == []
 
 
@@ -143,7 +165,7 @@ def test_map_unconfirmed_pose_relocalizes_without_waiting_for_period(status, occ
     tracker._worker = SimpleNamespace(
         busy=occupied == "busy",
         queued=occupied == "pending",
-        submit=lambda gray, ordinal: submitted.append(ordinal) or True,
+        submit=lambda gray, ordinal, stamp, epoch: submitted.append(ordinal) or True,
     )
     triggered = tracker._step_reloc_trigger(np.zeros((8, 8), np.uint8), 2, 10.1, status)
     assert triggered
@@ -161,7 +183,7 @@ def test_map_confirmed_tracking_keeps_the_normal_relocalization_period(status):
     tracker._worker = SimpleNamespace(
         busy=False,
         queued=False,
-        submit=lambda gray, ordinal: submitted.append(ordinal) or True,
+        submit=lambda gray, ordinal, stamp, epoch: submitted.append(ordinal) or True,
     )
     gray = np.zeros((8, 8), np.uint8)
     assert not tracker._step_reloc_trigger(gray, 2, 10.1, status)
@@ -234,7 +256,11 @@ def _handover_tracker(fix: RelocFix):
     tracker._w = 64
     tracker._h = 64
     tracker._tracker = _StubKLT()
-    tracker._worker = SimpleNamespace(poll=lambda: (fix, 0), busy=False, submit=lambda *_a: False)
+    tracker._worker = SimpleNamespace(
+        poll=lambda: RelocResult(fix=fix, ordinal=0, capture_stamp=1.0, source_epoch=0),
+        busy=False,
+        submit=lambda *_a: False,
+    )
     tracker._step_reloc_trigger = lambda *_a, **_k: False
 
     def fake_absolute(reseeded, stamp):
@@ -252,6 +278,15 @@ def _handover_tracker(fix: RelocFix):
     )
     tracker._live_xyz = np.tile(np.array([100.0, 0.0, 0.0]), (live_n, 1))
     return tracker
+
+
+def test_failed_handover_does_not_report_the_previous_capture_age():
+    fix = replace(_reloc_fix(120), ok=False)
+    tracker = _handover_tracker(fix)
+    tracker._handover_capture_age_s = 0.4
+    ids, _, _ = tracker._walk_handover(fix, 0)
+    assert len(ids) == 0
+    assert tracker._handover_capture_age_s is None
 
 
 def test_strong_reloc_handover_replaces_and_skips_klt_on_new_ids() -> None:
@@ -274,12 +309,58 @@ def test_strong_reloc_handover_replaces_and_skips_klt_on_new_ids() -> None:
     assert info["center"][0] == pytest.approx(0.0)
 
 
+def test_handover_accepts_jittered_capture_times_and_reports_elapsed_age() -> None:
+    fix = _reloc_fix(120)
+    tracker = _handover_tracker(fix)
+    tracker._ring.extend(
+        (0, ordinal, stamp, np.full((64, 64), ordinal, np.uint8))
+        for ordinal, stamp in ((0, 10.0), (1, 10.07), (2, 10.37))
+    )
+
+    ids, _xy, _xyz = tracker._walk_handover(
+        fix,
+        0,
+        trigger_epoch=0,
+        trigger_stamp=10.0,
+        current_epoch=0,
+        current_stamp=10.37,
+        current_ordinal=2,
+    )
+
+    assert len(ids) == 120
+    assert tracker._handover_capture_age_s == pytest.approx(0.37)
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        RelocResult(fix=_reloc_fix(120), ordinal=0, capture_stamp=10.0, source_epoch=1),
+        RelocResult(fix=_reloc_fix(120), ordinal=0, capture_stamp=9.9, source_epoch=0),
+        RelocResult(fix=_reloc_fix(120), ordinal=0, capture_stamp=10.1, source_epoch=0),
+    ],
+)
+def test_handover_rejects_reset_or_inconsistent_capture_identity(result) -> None:
+    tracker = _handover_tracker(result.fix)
+    tracker._ring.extend(
+        (0, ordinal, stamp, np.full((64, 64), ordinal, np.uint8))
+        for ordinal, stamp in ((0, 10.0), (1, 10.07), (2, 10.37))
+    )
+    tracker._worker = SimpleNamespace(poll=lambda: result)
+
+    ids, _xy, _xyz, _status, _refs, _delivered = tracker._step_handover(
+        np.zeros((64, 64), np.uint8), 2, 10.37
+    )
+
+    assert ids.size == 0
+    assert tracker._handover_dropped == 1
+
+
 @pytest.mark.parametrize("frames", [3, 4, 7])
 @pytest.mark.parametrize("motion", ["healthy", "retry_better", "retry_worse"])
 def test_handover_retries_only_weak_two_frame_hops(frames, motion):
     fix = _reloc_fix(120)
     tracker = _handover_tracker(fix)
-    tracker._ring.extend((i, np.full((64, 64), i, np.uint8)) for i in range(frames))
+    tracker._ring.extend((0, i, float(i), np.full((64, 64), i, np.uint8)) for i in range(frames))
     calls = []
 
     def track(previous, current, xy):
@@ -320,7 +401,7 @@ def test_handover_recovers_real_klt_points_through_intermediate_exposures():
     tracker._w, tracker._h = 960, 540
     tracker.profile.fast_loop.track_cap = 500
     tracker._tracker = KLTTracker(fb_max_px=1, win=15, levels=3)
-    tracker._ring.extend(enumerate(chain))
+    tracker._ring.extend((0, i, float(i), frame) for i, frame in enumerate(chain))
     old_xy = xy.copy()
     for a, b in ((0, 2), (2, 4)):
         fwd, keep = tracker._tracker.track_pair(chain[a], chain[b], old_xy)
@@ -374,6 +455,7 @@ def test_fast_track_label_does_not_bypass_strong_map_confidence(count):
 
 def test_reloc_idle_detects_hover_only():
     from two_rate_tracker import _reloc_idle
+
     assert _reloc_idle([]) is False
     assert _reloc_idle([0.0001, 0.0003, 0.0002]) is True
     assert _reloc_idle([0.0001, 0.05, 0.0001, 0.0001, 0.0001, 0.0001]) is True
@@ -383,6 +465,7 @@ def test_reloc_idle_detects_hover_only():
 
 def test_reloc_refresh_due_stretches_only_idle_strong():
     from two_rate_tracker import _reloc_refresh_due as due
+
     assert due("FAST_TRACK", 100.0, None, 1.0, False) is True
     assert due("FAST_TRACK", 102.0, 100.0, 1.0, False) is True
     assert due("FAST_TRACK", 100.5, 100.0, 1.0, False) is False

@@ -1889,6 +1889,19 @@ def _allocate_route_translation(correction, along, along_scale, config):
     return roll, pitch, 0, gaz
 
 
+def _command_translation(cmd, pose, cfg, delta, distance_to_waypoint, recovering):
+    zero = (0, 0, 0, 0)
+    if cmd.action in {"FOLLOW", "REJOIN"} and cmd.path_tangent is not None:
+        try:
+            parts = _route_translation_components(cmd, pose, cfg)
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            return zero
+        if parts is not None:
+            correction, along, along_scale = parts
+            return _allocate_route_translation(correction, along, along_scale, cfg)
+    return _translation_percent_command(
+        delta, pose, cfg, distance_to_waypoint=distance_to_waypoint, recovering=recovering
+    )
 def command_to_body_percent(
     cmd: Command,
     pose: Pose,
@@ -1954,17 +1967,8 @@ def command_to_body_percent(
 
     if not movement:
         return zero
-    if cmd.action in {"FOLLOW", "REJOIN"} and cmd.path_tangent is not None:
-        try:
-            parts = _route_translation_components(cmd, pose, cfg)
-        except (AttributeError, TypeError, ValueError, OverflowError):
-            return zero
-        if parts is not None:
-            correction, along, along_scale = parts
-            return _allocate_route_translation(correction, along, along_scale, cfg)
-    return _translation_percent_command(
-        delta, pose, cfg, distance_to_waypoint=distance_to_waypoint, recovering=recovering
-    )
+    return _command_translation(cmd, pose, cfg, delta, distance_to_waypoint, recovering)
+
 
 
 #: VerticalConsistencyGuard defaults: barometric climb or descent after which
@@ -2047,15 +2051,21 @@ class VerticalConsistencyGuard:
         return False
 
 
+# Turn-phase along-leg share cap: the nose is off, so forward progress crawls
+# while correction keeps priority. 2026-09-18 flight: 25% of ticks sat in
+# turn at zero progress; a full 130-degree reversal took most of a leg.
+TURN_ALONG_CRAWL_MAX = 0.30
+
+
 class YawAlignedPcmdController:
     """Yaw toward a new waypoint, then translate with mid-leg yaw repair.
 
     After each target change the nose aligns to the next point while
-    horizontal PCMD holds against measured wind. Cruise then flies toward
-    the goal; a large mid-leg heading error blends limited yaw back in
-    without stopping translation (operator scope 2026-09-16: never park to
-    re-turn). Near-waypoint centering and REJOIN still hold yaw and close
-    position.
+    horizontal PCMD corrects back toward the segment with a bounded
+    along-leg crawl (never parks: operator scope 2026-09-16, 2026-09-18).
+    Cruise then flies toward the goal; a large mid-leg heading error blends
+    limited yaw back in without stopping translation. Near-waypoint
+    centering and REJOIN still hold yaw and close position.
     """
 
     def __init__(self, config: ControlConfig):
@@ -2098,38 +2108,7 @@ class YawAlignedPcmdController:
             return None
         return forward_v, right_v
 
-    def _position_integral(self, error_map, pose, now, radius, cap, *, saturated=False, integrate=True):
-        """Map-frame position integral, returned as body forward/right PCMD.
-
-        The accumulator lives in map east/north so one world offset keeps one
-        direction when the nose turns; each call projects it into the current
-        body frame. Only strictly newer valid pose stamps integrate, with
-        capture-stamp dt capped at 0.2 s (first sample dt=0, repeats add
-        nothing); wall time only drives the 2 s leak. Accumulates unless the
-        correction already saturates while the error still pushes the same way
-        (opposing errors unload); integrate=False only leaks and advances
-        time, returning no output. Stale/future/non-finite stamps only leak
-        and clear the anchor so the next valid sample restarts with dt=0.
-        The feedback radius is at least half the route slowdown distance,
-        keeping small arrival spheres from amplifying integral effort. The
-        accumulator is capped by vector norm (3*r), direction preserved.
-        """
-        try:
-            now_f = float(now)
-        except (TypeError, ValueError, OverflowError):
-            return 0.0, 0.0
-        if not math.isfinite(now_f):
-            return 0.0, 0.0
-        try:
-            stamp = float(pose.stamp)
-        except (AttributeError, TypeError, ValueError, OverflowError):
-            stamp = float("nan")
-        try:
-            max_age = float(self.config.max_pose_age_s)
-        except (AttributeError, TypeError, ValueError, OverflowError):
-            max_age = 0.5
-        if not math.isfinite(max_age) or max_age < 0.0:
-            max_age = 0.5
+    def _integral_wall_delta(self, now_f):
         if self._integral_wall is None:
             wall_dt = 0.0
             self._integral_wall = now_f
@@ -2145,23 +2124,9 @@ class YawAlignedPcmdController:
                 self._integral_wall = now_f
             else:
                 wall_dt = 0.0
-        leak = math.exp(-wall_dt / 2.0) if wall_dt > 0.0 else 1.0
-        try:
-            radius_f = max(float(radius), 0.5 * self.config.slowdown_distance, 1e-3)
-        except (TypeError, ValueError, OverflowError):
-            radius_f = 1e-3
-        imax = 3.0 * radius_f
-        leaked = np.asarray(self._integral_map, dtype=float).reshape(2) * leak
-        leaked_norm = float(np.linalg.norm(leaked))
-        if leaked_norm > imax and leaked_norm > 0.0:
-            leaked = leaked * (imax / leaked_norm)
-        self._integral_map = leaked
-        age = now_f - stamp if math.isfinite(stamp) else float("nan")
-        valid = bool(math.isfinite(stamp) and math.isfinite(age) and 0.0 <= age <= max_age)
-        if not valid:
-            self._integral_now_pose = None
-            self._integral_now = now_f
-            return 0.0, 0.0
+        return wall_dt
+
+    def _integral_capture_delta(self, stamp, now_f, max_age):
         if self._integral_now_pose is not None:
             try:
                 fresh = bool(stamp > float(self._integral_now_pose))
@@ -2188,6 +2153,9 @@ class YawAlignedPcmdController:
         if fresh:
             self._integral_now_pose = stamp
         self._integral_now = now_f
+        return fresh, dt
+
+    def _accumulate_position_integral(self, error_map, dt, imax, *, integrate, fresh, saturated):
         try:
             err = np.asarray(error_map, dtype=float).reshape(2)
         except (TypeError, ValueError, OverflowError):
@@ -2202,6 +2170,68 @@ class YawAlignedPcmdController:
                 if updated_norm > imax and updated_norm > 0.0:
                     updated = updated * (imax / updated_norm)
                 self._integral_map = updated
+
+    def _integral_pose_timing(self, pose):
+        try:
+            stamp = float(pose.stamp)
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            stamp = float("nan")
+        try:
+            max_age = float(self.config.max_pose_age_s)
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            max_age = 0.5
+        if not math.isfinite(max_age) or max_age < 0.0:
+            max_age = 0.5
+        return stamp, max_age
+
+    def _position_integral(self, error_map, pose, now, radius, cap, *, saturated=False, integrate=True):
+        """Map-frame position integral, returned as body forward/right PCMD.
+
+        The accumulator lives in map east/north so one world offset keeps one
+        direction when the nose turns; each call projects it into the current
+        body frame. Only strictly newer valid pose stamps integrate, with
+        capture-stamp dt capped at 0.2 s (first sample dt=0, repeats add
+        nothing). Retain learned compensation while observations are usable;
+        otherwise wall time drives the 2 s leak. Accumulates unless the
+        correction already saturates while the error still pushes the same way
+        (opposing errors unload); integrate=False only leaks and advances
+        time, returning no output. Stale/future/non-finite stamps only leak
+        and clear the anchor so the next valid sample restarts with dt=0.
+        The feedback radius is at least half the route slowdown distance,
+        keeping small arrival spheres from amplifying integral effort. The
+        accumulator is capped by vector norm (3*r), direction preserved.
+        """
+        try:
+            now_f = float(now)
+        except (TypeError, ValueError, OverflowError):
+            return 0.0, 0.0
+        if not math.isfinite(now_f):
+            return 0.0, 0.0
+        stamp, max_age = self._integral_pose_timing(pose)
+        wall_dt = self._integral_wall_delta(now_f)
+        age = now_f - stamp if math.isfinite(stamp) else float("nan")
+        valid = bool(math.isfinite(stamp) and math.isfinite(age) and 0.0 <= age <= max_age)
+        # Leaking while tracking turns the integral into a finite position
+        # gain: sustained wind can then balance it outside the arrival sphere.
+        leak = math.exp(-wall_dt / 2.0) if wall_dt > 0.0 and not (integrate and valid) else 1.0
+        try:
+            radius_f = max(float(radius), 0.5 * self.config.slowdown_distance, 1e-3)
+        except (TypeError, ValueError, OverflowError):
+            radius_f = 1e-3
+        imax = 3.0 * radius_f
+        leaked = np.asarray(self._integral_map, dtype=float).reshape(2) * leak
+        leaked_norm = float(np.linalg.norm(leaked))
+        if leaked_norm > imax and leaked_norm > 0.0:
+            leaked = leaked * (imax / leaked_norm)
+        self._integral_map = leaked
+        if not valid:
+            self._integral_now_pose = None
+            self._integral_now = now_f
+            return 0.0, 0.0
+        fresh, dt = self._integral_capture_delta(stamp, now_f, max_age)
+        self._accumulate_position_integral(
+            error_map, dt, imax, integrate=integrate, fresh=fresh, saturated=saturated
+        )
         if not integrate:
             return 0.0, 0.0
         try:
@@ -2390,17 +2420,16 @@ class YawAlignedPcmdController:
                 pitch = int(np.clip(round(raw_pitch), -cap, cap))
                 roll = int(np.clip(round(raw_roll), -cap, cap))
                 return roll, pitch, 0, command[3]
-        else:
-            # No fresh velocity here: still advance integral time/leak so a
-            # stale-speed interval cannot resume with a pre-gap windup.
-            try:
-                fallback_cap = int(self.config.max_translation_pcmd)
-            except (AttributeError, TypeError, ValueError, OverflowError):
-                fallback_cap = 10
-            try:
-                self._position_integral(np.zeros(2), pose, now, radius, fallback_cap, integrate=False)
-            except (AttributeError, TypeError, ValueError, OverflowError):
-                pass
+        # No usable velocity/position servo here, including a present but
+        # stale velocity tuple: decay compensation and advance its timestamp.
+        try:
+            fallback_cap = int(self.config.max_translation_pcmd)
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            fallback_cap = 10
+        try:
+            self._position_integral(np.zeros(2), pose, now, radius, fallback_cap, integrate=False)
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            pass
         roll, pitch, yaw, gaz = command
         roll, pitch = self._wind_corrected_horizontal(roll, pitch, body_velocity, now)
         return roll, pitch, yaw, gaz
@@ -2589,9 +2618,9 @@ class YawAlignedPcmdController:
                 and cmd.path_pull is not None
             ):
                 # Segment leg with the nose off: keep turning, but also
-                # correct back toward the segment (no along-leg progress)
-                # so wind cannot walk the aircraft off the route while the
-                # yaw target chases the drift. Height stays locked.
+                # correct back toward the segment with a bounded along-leg
+                # crawl, so the turn makes progress instead of parking while
+                # wind walks the aircraft off the route. Height stays locked.
                 try:
                     turn_parts = _route_translation_components(cmd, pose, self.config)
                 except (AttributeError, TypeError, ValueError, OverflowError):
@@ -2599,9 +2628,11 @@ class YawAlignedPcmdController:
                 if turn_parts is not None:
                     try:
                         correction = np.asarray(turn_parts[0], dtype=float).reshape(3)
+                        along = np.asarray(turn_parts[1], dtype=float).reshape(3)
+                        crawl = min(float(turn_parts[2]), TURN_ALONG_CRAWL_MAX)
                         corr_roll, corr_pitch, _, _ = self._route_translate(
                             cmd, pose, now, body_velocity,
-                            (correction, np.zeros(3, dtype=float), 0.0),
+                            (correction, along, crawl),
                         )
                     except (AttributeError, TypeError, ValueError, OverflowError):
                         corr_roll, corr_pitch = 0, 0

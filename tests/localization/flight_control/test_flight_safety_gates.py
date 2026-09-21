@@ -940,6 +940,40 @@ def test_recovery_requires_two_consecutive_good_fixes_before_motion():
     assert any(cmd != ZERO for cmd in sent[2:])
 
 
+def test_cruise_accepts_weak_poses_for_translation():
+    # Real flight 2026-09-18: WEAK flicker at 39% caused 30+ hover-recover
+    # cycles mid-leg. Far from the arrival sphere, WEAK fixes may drive
+    # cruise translation; only approach/centering requires strong fixes.
+    # A strong anchor first (as in flight between flickers), then WEAK.
+    quality = {"weak": False}
+
+    def mid_leg(st):
+        quality["weak"] = st["tick"] > 3
+        return fresh_pose(st, x=4.0)
+
+    sent, reason, records = run_ticks(
+        12, mid_leg, hooks_extra={"pose_is_weak": lambda: quality["weak"]}
+    )
+    assert all(cmd != ZERO for cmd in sent[3:])
+    assert reason != "low confidence -> land"
+    assert any(r.get("cruise_weak_ok") is True for r in records)
+
+
+def test_weak_flicker_in_cruise_costs_no_recovery_hover():
+    quality = {"weak": False}
+
+    def flicker(st):
+        quality["weak"] = st["tick"] > 5 and bool(st["tick"] % 2)
+        return fresh_pose(st, x=4.0)
+
+    sent, _reason, records = run_ticks(
+        30, flicker, hooks_extra={"pose_is_weak": lambda: quality["weak"]}
+    )
+    assert all(cmd != ZERO for cmd in sent[5:])
+    assert all("recovery confirmation" not in r.get("reason", "") for r in records[5:])
+    assert all("holding before resuming" not in r.get("reason", "") for r in records[5:])
+
+
 def test_brief_pose_dropout_uses_imu_heading_without_treating_failure_as_weak(
     monkeypatch,
 ):
@@ -1372,7 +1406,9 @@ def test_route_completion_waits_for_fresh_low_ground_speed():
         if str(record.get("reason", "")).startswith("final position/speed settling")
     ]
     assert settling
-    assert all(record["pcmd"] == [0, 0, 0, 0] for record in settling)
+    assert all(record["command_action"] == "FINAL_HOLD" for record in settling)
+    assert all(record["pcmd_phase"] == "final_centering" for record in settling)
+    assert all(record["pcmd"][2] == 0 for record in settling)
 
 
 def test_route_completion_holds_when_ground_speed_is_stale():

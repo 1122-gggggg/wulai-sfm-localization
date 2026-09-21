@@ -178,6 +178,25 @@ class SimulatedLocalizer:
         self._reseed_remaining = 0
         self._last_seq = 0
 
+    def _validate_motion_config(self) -> None:
+        cfg = self.config
+        if not math.isfinite(float(cfg.imu_bridge_max_age_s)) or float(cfg.imu_bridge_max_age_s) <= 0.0:
+            raise ValueError("imu_bridge_max_age_s must be finite and > 0")
+        bridge_frames = cfg.imu_bridge_max_frames
+        if isinstance(bridge_frames, bool) or not isinstance(bridge_frames, int) or bridge_frames <= 0:
+            raise ValueError("imu_bridge_max_frames must be a positive int")
+        for name in ("drift_every_s", "drift_dur_s", "drift_offset_s", "drift_gain", "drift_mps"):
+            value = float(getattr(cfg, name))
+            if not math.isfinite(value) or value < 0.0:
+                raise ValueError(f"{name} must be finite and >= 0")
+        if not math.isfinite(float(cfg.vertical_gain)):
+            raise ValueError("vertical_gain must be finite")
+        if cfg.map_up_u is not None:
+            up = np.asarray(cfg.map_up_u, float)
+            if up.shape != (3,) or not np.all(np.isfinite(up)) or float(np.linalg.norm(up)) <= 1e-9:
+                raise ValueError("map_up_u must be a finite nonzero 3-vector")
+        elif float(cfg.drift_mps) > 0.0 or float(cfg.vertical_gain) != 1.0:
+            raise ValueError("drift_mps and vertical_gain need map_up_u")
     def _validate(self) -> None:
         cfg = self.config
         for name in ("s", "pose_rate_hz"):
@@ -202,23 +221,8 @@ class SimulatedLocalizer:
         frames = cfg.reseed_confirm_frames
         if isinstance(frames, bool) or not isinstance(frames, int) or frames < 0:
             raise ValueError("reseed_confirm_frames must be a non-negative int")
-        if not math.isfinite(float(cfg.imu_bridge_max_age_s)) or float(cfg.imu_bridge_max_age_s) <= 0.0:
-            raise ValueError("imu_bridge_max_age_s must be finite and > 0")
-        bridge_frames = cfg.imu_bridge_max_frames
-        if isinstance(bridge_frames, bool) or not isinstance(bridge_frames, int) or bridge_frames <= 0:
-            raise ValueError("imu_bridge_max_frames must be a positive int")
-        for name in ("drift_every_s", "drift_dur_s", "drift_offset_s", "drift_gain", "drift_mps"):
-            value = float(getattr(cfg, name))
-            if not math.isfinite(value) or value < 0.0:
-                raise ValueError(f"{name} must be finite and >= 0")
-        if not math.isfinite(float(cfg.vertical_gain)):
-            raise ValueError("vertical_gain must be finite")
-        if cfg.map_up_u is not None:
-            up = np.asarray(cfg.map_up_u, float)
-            if up.shape != (3,) or not np.all(np.isfinite(up)) or float(np.linalg.norm(up)) <= 1e-9:
-                raise ValueError("map_up_u must be a finite nonzero 3-vector")
-        elif float(cfg.drift_mps) > 0.0 or float(cfg.vertical_gain) != 1.0:
-            raise ValueError("drift_mps and vertical_gain need map_up_u")
+        self._validate_motion_config()
+
 
     @property
     def dropped_late(self) -> int:
@@ -356,39 +360,29 @@ class SimulatedLocalizer:
         return (fix_est + self.drift_gain * (observed - fix_observed)
                 + velocity * (float(capture_t) - start))
 
-    def report(self, t: float):
-        self.fault = "ok"
-        self.map_confirmed = True
-        if not self._truth:
-            return None
-        if self._in_outage(t):
-            self._blackout_active = False
-            self.fault = "outage"
-            return None
-        if self._in_blackout(t):
-            return self._report_blackout(t)
-        self._blackout_active = False
-        capture_tick = None
-        if self._capture_due(t):
-            capture_tick = self._next_capture - 1.0 / self.pose_rate
-            if capture_tick > float(t):
-                capture_tick = float(t)
-        if capture_tick is not None and self.rng.random() >= self.drop_rate:
-            receive, pose, fault = self._make_capture(float(capture_tick))
-            if pose is None:
-                # No position at all (lost before any map fix): like a dropout.
-                self.fault = fault
-                self.map_confirmed = bool(getattr(self._last_report, "map_confirmed", True))
-                return self._last_report
-            # Capture stamp is the cadence tick, not the poll time.
-            capture = float(pose.stamp)
-            self._pending.append((receive, capture, pose))
-            self._pending.sort(key=lambda row: (row[0], row[1]))
-            self.fault = fault
-        elif capture_tick is not None:
-            self.fault = "dropout"
-            self.map_confirmed = bool(getattr(self._last_report, "map_confirmed", True))
-            return self._last_report
+    def _record_visual_capture(self, pose):
+        try:
+            position_observed = bool(getattr(pose, "position_observed", True))
+        except (AttributeError, TypeError, ValueError):
+            position_observed = True
+        if position_observed:
+            try:
+                self._blackout_visual_capture = float(pose.stamp)
+            except (AttributeError, TypeError, ValueError, OverflowError):
+                pass
+            self._blackout_frames = 0
+        if self._reseed_remaining > 0:
+            self._reseed_remaining -= 1
+            try:
+                pose.reseed_confirming = True
+            except (AttributeError, TypeError, ValueError):
+                pass
+        self._prev_report = self._last_report
+        self._last_report = pose
+        self.fault = getattr(pose, "_sim_fault", self.fault)
+        return pose
+
+    def _deliver_capture(self, t: float):
         ready = [row for row in self._pending if row[0] <= float(t) + 1e-12]
         if not ready:
             # Hold the last delivered pose value/stamp across polls with no
@@ -423,26 +417,44 @@ class SimulatedLocalizer:
                 self.map_confirmed = False
                 return pose
         self._last_delivered_capture = float(capture)
-        try:
-            position_observed = bool(getattr(pose, "position_observed", True))
-        except (AttributeError, TypeError, ValueError):
-            position_observed = True
-        if position_observed:
-            try:
-                self._blackout_visual_capture = float(pose.stamp)
-            except (AttributeError, TypeError, ValueError, OverflowError):
-                pass
-            self._blackout_frames = 0
-        if self._reseed_remaining > 0:
-            self._reseed_remaining -= 1
-            try:
-                pose.reseed_confirming = True
-            except (AttributeError, TypeError, ValueError):
-                pass
-        self._prev_report = self._last_report
-        self._last_report = pose
-        self.fault = getattr(pose, "_sim_fault", self.fault)
-        return pose
+        return self._record_visual_capture(pose)
+
+    def report(self, t: float):
+        self.fault = "ok"
+        self.map_confirmed = True
+        if not self._truth:
+            return None
+        if self._in_outage(t):
+            self._blackout_active = False
+            self.fault = "outage"
+            return None
+        if self._in_blackout(t):
+            return self._report_blackout(t)
+        self._blackout_active = False
+        capture_tick = None
+        if self._capture_due(t):
+            capture_tick = self._next_capture - 1.0 / self.pose_rate
+            if capture_tick > float(t):
+                capture_tick = float(t)
+        if capture_tick is not None and self.rng.random() >= self.drop_rate:
+            receive, pose, fault = self._make_capture(float(capture_tick))
+            if pose is None:
+                # No position at all (lost before any map fix): like a dropout.
+                self.fault = fault
+                self.map_confirmed = bool(getattr(self._last_report, "map_confirmed", True))
+                return self._last_report
+            # Capture stamp is the cadence tick, not the poll time.
+            capture = float(pose.stamp)
+            self._pending.append((receive, capture, pose))
+            self._pending.sort(key=lambda row: (row[0], row[1]))
+            self.fault = fault
+        elif capture_tick is not None:
+            self.fault = "dropout"
+            self.map_confirmed = bool(getattr(self._last_report, "map_confirmed", True))
+            return self._last_report
+        return self._deliver_capture(t)
+
+
 
     def _report_blackout(self, t: float):
         if self._last_report is None:

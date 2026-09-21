@@ -18,7 +18,7 @@ from backend_contract import (
     SessionConfig,
 )
 from flight_operator_app import DroneBackend, OperatorApp
-from operator_autonomy import DesktopRouteAutonomy
+from operator_autonomy import AUTO_MAX_DURATION_S, DesktopRouteAutonomy
 from operator_command_coordinator import OperatorCommandCoordinator
 from operator_localization_search import YawSearchConfig
 from operator_shutdown import OperatorShutdownCoordinator
@@ -38,6 +38,44 @@ class _Clock:
 
     def sleep(self, duration: float) -> None:
         self.value += float(duration)
+
+
+@pytest.fixture
+def simulated_clock(monkeypatch):
+    """Run the real controller on one virtual clock without wall-time sleeps."""
+    import simulated_route_test
+
+    clock = _Clock()
+    monkeypatch.setattr(
+        simulated_route_test,
+        "time",
+        SimpleNamespace(
+            monotonic=clock.now,
+            monotonic_ns=lambda: int(clock.now() * 1e9),
+        ),
+    )
+
+    def run_loop(hooks, controller, waypoints, **kwargs):
+        runner = pff._FlightLoopRunner(hooks, controller, waypoints, **kwargs)
+        runner.period = 0.0
+        for _ in range(int(AUTO_MAX_DURATION_S * 20)):
+            outcome = runner.step()
+            if outcome.reason is not None:
+                return outcome.reason
+            clock.sleep(1.0 / 20.0)
+        raise RuntimeError("simulated route exhausted the production mission budget")
+
+    return {"now": clock.now, "sleep": clock.sleep, "run_loop": run_loop}
+
+
+def _complete_simulated_autonomy(autonomy):
+    assert autonomy.start()
+    try:
+        assert autonomy.join(timeout=3.0)
+    finally:
+        if autonomy.phase != "DONE":
+            autonomy.cancel("test cleanup")
+            autonomy.join(timeout=1.0)
 
 
 class _ScenarioBackend:
@@ -180,6 +218,7 @@ def test_manual_takeoff_command_lifecycle_is_typed_and_simulated() -> None:
 
 def test_simulated_route_test_runs_the_production_controller_on_drawn_waypoints(
     tmp_path,
+    simulated_clock,
 ) -> None:
     backend = DroneBackend()
     snapshot = _snapshot(
@@ -202,11 +241,10 @@ def test_simulated_route_test_runs_the_production_controller_on_drawn_waypoints(
         take_pc_control=lambda: True,
         start_airborne=True,
         land=plant.finish,
+        **simulated_clock,
     )
 
-    assert autonomy.start()
-    # The route is flown out and back, so this runs roughly twice the drawn path.
-    assert autonomy.join(timeout=24.0)
+    _complete_simulated_autonomy(autonomy)
     assert autonomy.phase == "DONE"
     assert plant.finished
     assert backend.state.flight_state == "landed"
@@ -214,7 +252,9 @@ def test_simulated_route_test_runs_the_production_controller_on_drawn_waypoints(
     assert backend.sim_xyz == pytest.approx(snapshot.waypoints[0], abs=0.08)
 
 
-def test_start_near_the_far_endpoint_still_flies_from_waypoint_one(tmp_path) -> None:
+def test_start_near_the_far_endpoint_still_flies_from_waypoint_one(
+    tmp_path, simulated_clock
+) -> None:
     import numpy as np
 
     backend = DroneBackend()
@@ -239,10 +279,10 @@ def test_start_near_the_far_endpoint_still_flies_from_waypoint_one(tmp_path) -> 
         take_pc_control=lambda: True,
         start_airborne=True,
         land=plant.finish,
+        **simulated_clock,
     )
 
-    assert autonomy.start()
-    assert autonomy.join(timeout=24.0)
+    _complete_simulated_autonomy(autonomy)
     details = [
         event.detail for event in autonomy.drain_events() if event.kind == "route_start_selected"
     ]
@@ -250,6 +290,25 @@ def test_start_near_the_far_endpoint_still_flies_from_waypoint_one(tmp_path) -> 
     assert autonomy.phase == "DONE"
     assert plant.finished
     assert backend.sim_xyz == pytest.approx(snapshot.waypoints[0], abs=0.08)
+
+
+def test_simulated_velocity_and_displacement_share_the_control_clock(tmp_path, simulated_clock):
+    import numpy as np
+
+    backend = DroneBackend()
+    plant = backend.route_test_plant
+    assert plant.begin(_snapshot(tmp_path), LEGACY_MAP_FRAME)
+    start = backend.sim_xyz.copy()
+    assert plant.send_pcmd(2, 3, 0, 1, reason="offline telemetry regression")
+
+    velocity = (backend.sim_xyz - start) * 20.0
+    assert backend.state.speed_north_mps == pytest.approx(np.dot(velocity, LEGACY_MAP_FRAME.north))
+    assert backend.state.speed_east_mps == pytest.approx(np.dot(velocity, LEGACY_MAP_FRAME.east))
+    assert backend.state.speed_down_mps == pytest.approx(-np.dot(velocity, LEGACY_MAP_FRAME.up))
+    assert backend.state.ground_speed_mps == pytest.approx(
+        LEGACY_MAP_FRAME.horizontal_distance(velocity)
+    )
+    assert plant.pose().stamp == backend.state.ground_speed_mono_ns / 1e9
 
 
 def test_simulated_auto_route_is_not_blocked_by_real_flight_preflight() -> None:

@@ -114,6 +114,10 @@ def test_next_flight_diagnostics_survive_the_metrics_allowlist():
         "imu_bridge_reason": "sample_stale",
         "imu_sample_stamp_mono": 12.0,
         "frame_stamp_mono": 12.6,
+        "handover_capture_age_s": 0.37,
+        "reloc_capture_stamp_mono": 12.23,
+        "reloc_source_epoch": 4,
+        "reloc_ordinal": 123,
         "pnp_observation_sample": {
             "image_size_px": [512, 384],
             "ids": [42],

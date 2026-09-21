@@ -126,3 +126,80 @@ def test_missing_capture_stamp_is_not_a_fresh_pose():
     assert adapter.last_info["mode"] == "LOST"
     assert adapter.last_info["weak"] is True
     assert adapter.last_info["direct_status"] == "NO_POSE"
+
+
+def test_direct_adapter_preserves_handover_capture_metadata():
+    from direct_localizer_adapter import DirectTrackerAdapter, RuntimeState
+
+    adapter = object.__new__(DirectTrackerAdapter)
+    adapter.profile = SimpleNamespace(
+        fast_loop=SimpleNamespace(resolution=(8, 8)),
+        reloc=SimpleNamespace(
+            top_k=2,
+            frozen_pnp_thresholds={"strong_inliers": 80},
+        ),
+        max_jump_u=1.5,
+    )
+    adapter.trk = SimpleNamespace(map_frame=None)
+    adapter.map_frame = None
+    adapter._fused_sample = None
+    adapter.state = RuntimeState()
+    adapter._pose_continuity = SimpleNamespace()
+    adapter._pose_centers = []
+    adapter._reseed_confirming = False
+    adapter._confirm_pose = lambda pose, info, mode, weak, status: (
+        pose,
+        mode,
+        weak,
+        False,
+    )
+    adapter._advance_state = lambda *_args: None
+
+    info = {
+        "status": "FAST_TRACK",
+        "ok": True,
+        "center": np.zeros(3),
+        "yaw": 0.0,
+        "R": np.eye(3),
+        "inliers": 80,
+        "map_inliers": 80,
+        "vo_inliers": 0,
+        "live_points": 80,
+        "n_corr": 80,
+        "loop_ms": 5.0,
+        "track_ms": 2.0,
+        "handover_ms": 0.2,
+        "bookkeeping_ms": 0.1,
+        "pnp_ms": 1.0,
+        "vo_ms": 0.0,
+        "gray_ms": 0.1,
+        "map_constraint_age_s": 0.0,
+        "dead_reckon_age": 0,
+        "reloc_status": "LOCALIZED_STRONG",
+        "handover_points": 120,
+        "handover_dropped": 0,
+        "handover_capture_age_s": 0.37,
+        "reloc_ms": 160.0,
+        "reloc_retrieval_ms": 10.0,
+        "reloc_match_lift_ms": 140.0,
+        "reloc_pnp_ms": 7.0,
+        "reloc_reference_count": 2,
+        "reloc_capture_stamp_mono": 10.0,
+        "reloc_source_epoch": 4,
+        "reloc_ordinal": 100,
+        "reloc_delivered": True,
+        "reloc_busy": False,
+        "vo_candidates": 0,
+        "step": None,
+        "reference_names": ("r0",),
+        "reloc_submitted": False,
+    }
+    adapter.trk = SimpleNamespace(map_frame=None, step=lambda _gray, _stamp: info)
+
+    pose = adapter.localize_frame(np.zeros((8, 8, 3), dtype=np.uint8), capture_stamp=10.37)
+
+    assert pose is not None
+    assert adapter.last_info["handover_capture_age_s"] == pytest.approx(0.37)
+    assert adapter.last_info["reloc_capture_stamp_mono"] == pytest.approx(10.0)
+    assert adapter.last_info["reloc_source_epoch"] == 4
+    assert adapter.last_info["reloc_ordinal"] == 100

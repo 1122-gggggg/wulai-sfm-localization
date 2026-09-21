@@ -162,6 +162,27 @@ def test_turn_phase_still_corrects_toward_the_segment():
     assert roll or pitch
 
 
+def test_turn_phase_crawls_along_the_leg_while_correcting():
+    # On-segment with the nose off: the turn still advances toward the
+    # waypoint instead of parking (2026-09-18: 25% of flight ticks sat in
+    # turn at zero progress). Height stays locked.
+    cfg = rpf.ControlConfig(inspect_waypoints=())
+    gate = rpf.YawAlignedPcmdController(cfg)
+    goal = np.array([10.0, 0.0, 0.0])
+    command = rpf.Command(
+        "FOLLOW", np.array([1.0, 0.0, 0.0]), 0.0, goal, 0.0, 0.5,
+        guidance_goal=np.array([5.0, 0.0, 0.0]),
+        path_pull=np.zeros(3),
+        path_pull_radius=0.15,
+        path_tangent=np.array([1.0, 0.0, 0.0]),
+    )
+    pose = rpf.Pose(3, 0, 0, math.pi / 2, stamp=0.1)
+    roll, pitch, yaw, gaz = gate.update(command, pose, 0.1, target_key=1)
+    assert gate.phase == "turn"
+    assert yaw != 0 and gaz == 0
+    assert roll or pitch
+
+
 def test_route_rejoin_has_a_separate_return_to_follow_boundary():
     control = controller([(0, 0, 0), (10, 0, 0)])
     control.step(rpf.Pose(0, 0, 0, 0, stamp=0), now=0)

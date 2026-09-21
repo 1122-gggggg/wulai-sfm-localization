@@ -1169,7 +1169,123 @@ def test_live_localizer_sends_imu_even_when_pose_guided_search_is_off() -> None:
     assert fused is not None
     assert fused.stamp == pytest.approx(10.05)
     assert fused.yaw == pytest.approx(1.3)
+    # A legacy timing payload has no independent speed source stamp.  Keep the
+    # attitude-compatible header, but do not relabel velocity as fresh attitude.
+    assert not fused.has_velocity
+
+
+def test_live_localizer_keeps_legacy_poll_fallback_attitude_stamp() -> None:
+    client = object.__new__(app.LiveLocalizerClient)
+    client._runtime_benchmark_control = True
+    client._benchmark_mode_lock = threading.Lock()
+    client._benchmark_mode = "auto"
+    client._relocalize_once = False
+    header = client._request_prefix(
+        {
+            "source_frame_stamp_mono": 10.0,
+            "fused_telemetry_mono": 10.05,
+            "fused_attitude_mono": None,
+            "fused_stamp_source": "poll_fallback",
+            "fused_roll": 0.1,
+            "fused_pitch": -0.2,
+            "fused_yaw": 1.3,
+        }
+    )
+    _mode, _stamp, fused = localizer_protocol.decode_control_header(header)
+    assert fused is not None
+    assert fused.has_attitude
+    assert fused.stamp == pytest.approx(10.05)
+
+
+def test_live_localizer_preserves_independent_attitude_and_velocity_stamps() -> None:
+    client = object.__new__(app.LiveLocalizerClient)
+    client._runtime_benchmark_control = True
+    client._benchmark_mode_lock = threading.Lock()
+    client._benchmark_mode = "auto"
+    client._relocalize_once = False
+    header = client._request_prefix(
+        {
+            "source_frame_stamp_mono": 10.0,
+            "fused_telemetry_mono": 10.05,
+            "fused_attitude_mono": 10.05,
+            "fused_speed_mono": 10.10,
+            "fused_roll": 0.1,
+            "fused_pitch": -0.2,
+            "fused_yaw": 1.3,
+            "fused_speed_north": 0.4,
+            "fused_speed_east": -0.1,
+            "fused_speed_down": 0.0,
+        }
+    )
+    _mode, _stamp, fused = localizer_protocol.decode_control_header(header)
+    assert fused is not None
+    assert header.startswith(localizer_protocol.INDEPENDENT_FUSED_MAGIC)
+    assert fused.has_attitude
+    assert fused.has_velocity
+    assert fused.attitude_stamp == pytest.approx(10.05)
+    assert fused.speed_stamp == pytest.approx(10.10)
     assert fused.speed_north == pytest.approx(0.4)
+
+
+def test_live_localizer_drops_velocity_when_its_source_stamp_is_unusable() -> None:
+    client = object.__new__(app.LiveLocalizerClient)
+    client._runtime_benchmark_control = True
+    client._benchmark_mode_lock = threading.Lock()
+    client._benchmark_mode = "auto"
+    client._relocalize_once = False
+
+    for stamp_kind in ("stale", "nan", "future"):
+        now = time.monotonic()
+        speed_stamp = {
+            "stale": now - 0.3,
+            "nan": float("nan"),
+            "future": now + 1.0,
+        }[stamp_kind]
+        header = client._request_prefix(
+            {
+                "source_frame_stamp_mono": now - 0.05,
+                "fused_attitude_mono": now - 0.02,
+                "fused_speed_mono": speed_stamp,
+                "fused_roll": 0.1,
+                "fused_pitch": -0.2,
+                "fused_yaw": 1.3,
+                "fused_speed_north": 0.4,
+                "fused_speed_east": -0.1,
+                "fused_speed_down": 0.0,
+            }
+        )
+        _mode, _stamp, fused = localizer_protocol.decode_control_header(header)
+        assert fused is not None
+        assert fused.has_attitude
+        assert not fused.has_velocity
+
+
+def test_live_localizer_preserves_fresh_velocity_when_attitude_is_stale() -> None:
+    client = object.__new__(app.LiveLocalizerClient)
+    client._runtime_benchmark_control = True
+    client._benchmark_mode_lock = threading.Lock()
+    client._benchmark_mode = "auto"
+    client._relocalize_once = False
+    now = time.monotonic()
+    header = client._request_prefix(
+        {
+            "source_frame_stamp_mono": now - 0.05,
+            "fused_attitude_mono": now - 0.3,
+            "fused_speed_mono": now - 0.02,
+            "fused_roll": 0.1,
+            "fused_pitch": -0.2,
+            "fused_yaw": 1.3,
+            "fused_speed_north": 0.4,
+            "fused_speed_east": -0.1,
+            "fused_speed_down": 0.0,
+        }
+    )
+    _mode, _stamp, fused = localizer_protocol.decode_control_header(header)
+    assert fused is not None
+    assert not fused.has_attitude
+    assert fused.has_velocity
+    assert fused.stamp is None
+    assert fused.speed_stamp == pytest.approx(now - 0.02, abs=0.01)
 
 
 def test_live_localizer_sends_gnss_with_its_independent_stamp() -> None:
@@ -3376,17 +3492,43 @@ def test_worker_loop_forwards_fused_telemetry_to_the_tracker(monkeypatch) -> Non
 
     now = time.monotonic()
     capture = now - 0.05
-    fused_stamp = now - 0.02
+    attitude_stamp = now - 0.02
+    speed_stamp = now - 0.10
     header = localizer_protocol.encode_fused_request(
         "auto",
         capture,
         localizer_protocol.FusedTelemetry(
-            stamp=fused_stamp,
+            stamp=attitude_stamp,
+            attitude_stamp=attitude_stamp,
+            speed_stamp=speed_stamp,
             roll=0.1,
             pitch=0.0,
             yaw=0.2,
+            speed_north=0.4,
+            speed_east=-0.1,
+            speed_down=0.0,
         ),
-        telemetry_stamp=fused_stamp,
+        telemetry_stamp=attitude_stamp,
+    )
+    second_now = time.monotonic()
+    second_capture = second_now - 0.04
+    second_attitude_stamp = second_now - 0.015
+    second_speed_stamp = second_now - 0.08
+    second_header = localizer_protocol.encode_fused_request(
+        "auto",
+        second_capture,
+        localizer_protocol.FusedTelemetry(
+            stamp=second_attitude_stamp,
+            attitude_stamp=second_attitude_stamp,
+            speed_stamp=second_speed_stamp,
+            roll=0.3,
+            pitch=0.1,
+            yaw=0.4,
+            speed_north=0.5,
+            speed_east=-0.2,
+            speed_down=0.1,
+        ),
+        telemetry_stamp=second_attitude_stamp,
     )
     args = SimpleNamespace(
         width=1,
@@ -3396,12 +3538,19 @@ def test_worker_loop_forwards_fused_telemetry_to_the_tracker(monkeypatch) -> Non
         runtime_benchmark_control=True,
         force_track_bench=False,
         force_track_ref=-1,
-        max_frames=1,
+        max_frames=2,
     )
     monkeypatch.setattr(
         localizer_worker.sys,
         "stdin",
-        SimpleNamespace(buffer=io.BytesIO(header + b"\x01\x02\x03")),
+        SimpleNamespace(
+            buffer=io.BytesIO(
+                header
+                + b"\x01\x02\x03"
+                + second_header
+                + b"\x04\x05\x06"
+            )
+        ),
     )
     output = io.StringIO()
     localizer_worker._run_worker_loop(
@@ -3415,15 +3564,25 @@ def test_worker_loop_forwards_fused_telemetry_to_the_tracker(monkeypatch) -> Non
         None,
         lambda *_args, **_kwargs: None,
     )
-    payload = json.loads(output.getvalue())
-    # The fused sample decoded from this frame's header reaches the tracker,
-    # which decides (yaw bridge or nothing) -- the worker never interprets it.
-    assert len(observed) == 1
-    assert observed[0].stamp == pytest.approx(fused_stamp)
+    payloads = [json.loads(line) for line in output.getvalue().splitlines()]
+    # Back-to-back SFM5 header/body pairs retain their own capture and source
+    # stamps; the worker never reuses the previous frame's telemetry.
+    assert len(observed) == 2
+    assert observed[0].stamp == pytest.approx(attitude_stamp)
+    assert observed[0].attitude_stamp == pytest.approx(attitude_stamp)
+    assert observed[0].speed_stamp == pytest.approx(speed_stamp)
+    assert observed[0].speed_north == pytest.approx(0.4)
     assert (observed[0].roll, observed[0].pitch, observed[0].yaw) == pytest.approx(
         (0.1, 0.0, 0.2)
     )
-    assert payload["success"] is True
+    assert observed[1].stamp == pytest.approx(second_attitude_stamp)
+    assert observed[1].attitude_stamp == pytest.approx(second_attitude_stamp)
+    assert observed[1].speed_stamp == pytest.approx(second_speed_stamp)
+    assert observed[1].speed_north == pytest.approx(0.5)
+    assert (observed[1].roll, observed[1].pitch, observed[1].yaw) == pytest.approx(
+        (0.3, 0.1, 0.4)
+    )
+    assert [payload["success"] for payload in payloads] == [True, True]
 
 
 def test_client_lifecycle_metrics_follow_outage_and_ready_transitions() -> None:

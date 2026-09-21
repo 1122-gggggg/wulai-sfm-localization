@@ -63,7 +63,12 @@ EXCLUDED_PREFIXES = (
     "river-deploy-5060-20260908.tar.zst",
 )
 SOURCE_EXTERNAL_PARTS = {"offline_wheelhouse", "torch_hub_cache"}
-SOURCE_EXTERNAL_PREFIXES = ("定位演算法/deploy_code/runtime/EDM/weights/",)
+SOURCE_EXTERNAL_PREFIXES = (
+    "定位演算法/deploy_code/runtime/EDM/weights/",
+    "執行環境/models/moge-2-vits-normal/",
+    "執行環境/models/boq/",
+    "模擬器/parrot_stimulate/firmware/",
+)
 
 
 @dataclass(frozen=True)

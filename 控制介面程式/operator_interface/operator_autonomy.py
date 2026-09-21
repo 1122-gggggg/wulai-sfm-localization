@@ -615,7 +615,9 @@ class DesktopRouteAutonomy:
         if previous is None or stamp > previous[1]:
             gap = None if previous is None else stamp - previous[1]
             raw_rate = (
-                (speed - previous[0]) / gap if gap is not None and gap <= 0.5 else 0.0
+                (speed - previous[0]) / gap
+                if previous is not None and gap is not None and gap <= 0.5
+                else 0.0
             )
             # 2026-09-16: single-tick telemetry jumps differenced at 20 Hz
             # produced metre-per-s² spikes that predicted past the limit at

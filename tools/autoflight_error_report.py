@@ -56,6 +56,63 @@ def _percentile(sorted_values: list[float], pct: float) -> float | None:
     return sorted_values[low] + (sorted_values[high] - sorted_values[low]) * (rank - low)
 
 
+def _point3(value: Any) -> tuple[float, float, float] | None:
+    if isinstance(value, dict):
+        value = [value.get(key) for key in ("x", "y", "z")]
+    if not isinstance(value, (list, tuple)) or len(value) < 3:
+        return None
+    numbers = [_finite(item) for item in value[:3]]
+    if any(number is None for number in numbers):
+        return None
+    return float(numbers[0]), float(numbers[1]), float(numbers[2])
+
+
+def _target_distance_u(tick: dict[str, Any], plan: dict[str, Any]) -> float | None:
+    direct = _finite(tick.get("target_distance_u"))
+    if direct is not None and direct >= 0.0:
+        return direct
+    pose = _point3(tick.get("pose_u"))
+    target = _point3(tick.get("target_u"))
+    if target is None:
+        target_index = tick.get("target_index")
+        waypoints = plan.get("waypoints_u")
+        try:
+            index = int(target_index)
+        except (TypeError, ValueError, OverflowError):
+            index = -1
+        if isinstance(waypoints, list) and 0 <= index < len(waypoints):
+            target = _point3(waypoints[index])
+    if pose is None or target is None:
+        return None
+    return math.dist(pose, target)
+
+
+def _target_radius_u(tick: dict[str, Any], plan: dict[str, Any]) -> float | None:
+    direct = _finite(tick.get("target_radius_u"))
+    if direct is not None and direct > 0.0:
+        return direct
+    target_index = tick.get("target_index")
+    radii = plan.get("waypoint_arrive_radii_u")
+    try:
+        index = int(target_index)
+    except (TypeError, ValueError, OverflowError):
+        index = -1
+    if isinstance(radii, list) and 0 <= index < len(radii):
+        radius = _finite(radii[index])
+        if radius is not None and radius > 0.0:
+            return radius
+    radius = _finite(plan.get("waypoint_arrive_radius_u"))
+    return radius if radius is not None and radius > 0.0 else None
+
+
+def _within_arrival_sphere(tick: dict[str, Any], plan: dict[str, Any]) -> bool | None:
+    distance = _target_distance_u(tick, plan)
+    radius = _target_radius_u(tick, plan)
+    if distance is None or radius is None:
+        return None
+    return distance <= radius
+
+
 def _phase_bucket(tick: dict[str, Any]) -> str:
     reason = str(tick.get("reason") or "").lower()
     if tick.get("blocked") is True:
@@ -164,10 +221,8 @@ def _analyze_run(
         if tick["target_index"] > initial_target:
             join_tick = tick
             break
-    distances = [
-        _finite(tick.get("route_distance_u"))
-        for tick in ticks
-        if _finite(tick.get("route_distance_u")) is not None
+    target_distances = [
+        distance for tick in ticks if (distance := _target_distance_u(tick, plan)) is not None
     ]
     entry: dict[str, Any] = {
         "auto_run_id": run.get("auto_run_id"),
@@ -183,7 +238,7 @@ def _analyze_run(
         "join": {
             "joined": join_tick is not None,
             "initial_target": initial_target,
-            "closest_approach_u": round(min(distances), 3) if distances else None,
+            "closest_approach_u": round(min(target_distances), 3) if target_distances else None,
         },
     }
     if join_tick is not None:
@@ -226,10 +281,12 @@ def _analyze_run(
         "vo_share": _vo_share(post, pose_timeline),
     }
     entry["post_join"] = post_join
-    if post_errors and (radius := _finite(plan.get("waypoint_arrive_radius_u"))):
-        post_join["within_arrival_sphere_share"] = round(
-            sum(1 for value in post_errors if value <= radius) / len(post_errors), 3
-        )
+    arrival_samples = [
+        within for tick in post if (within := _within_arrival_sphere(tick, plan)) is not None
+    ]
+    post_join["within_arrival_sphere_share"] = (
+        round(sum(arrival_samples) / len(arrival_samples), 3) if arrival_samples else None
+    )
     entry["verdict"] = "JOINED"
     return entry
 

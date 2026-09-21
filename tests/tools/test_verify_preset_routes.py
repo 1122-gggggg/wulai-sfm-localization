@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 import subprocess
 import sys
+from types import SimpleNamespace
 
 import pytest
 import numpy as np
@@ -20,7 +21,40 @@ ALIGN = (
 )
 
 
+@pytest.mark.parametrize("recovery_s,accepted", [(5.0, True), (5.1, False)])
+def test_final_gust_must_meet_recovery_deadline(monkeypatch, recovery_s, accepted):
+    import verify_preset_routes as verifier
+
+    controller = SimpleNamespace(wp=[np.zeros(3), np.ones(3)])
+    result = SimpleNamespace(
+        success=True,
+        waypoints_reached=[0, 1],
+        reason="route complete",
+        time_s=10.0,
+        trace=[{"pcmd": [0, 0, 0, 0], "phase": "final_centering"}],
+    )
+    monkeypatch.setattr(
+        sim, "build_production_controller", lambda *a, **k: (controller, None, None, None)
+    )
+    monkeypatch.setattr(sim, "run_sim", lambda params: (result, {}))
+    monkeypatch.setattr(
+        verifier,
+        "_gust_recoveries",
+        lambda *a: [
+            {"t": 1.0, "displacement_m": 0.2, "recovery_s": recovery_s},
+        ],
+    )
+
+    report = evaluate_gust_recovery(sim.SimParams(route=Path("route.json"), align=None))
+
+    assert report["accepted"] is accepted
+    if not accepted:
+        assert report["reason"] == "final gust did not re-enter the 2-radius band within 5s"
+
+
 @pytest.mark.skipif(not ALIGN.is_file(), reason="requires the operator's river site assets")
+@pytest.mark.slow
+@pytest.mark.timeout(300)
 def test_every_preset_route_from_every_nearest_waypoint(tmp_path):
     routes = sorted(ROUTES.glob("*.json"))
     assert routes, "preset routes must be present for route acceptance"
@@ -38,7 +72,9 @@ def test_every_preset_route_from_every_nearest_waypoint(tmp_path):
         cwd=ROOT,
         capture_output=True,
         text=True,
-        timeout=60,
+        # Each authored start runs a full out-and-back route. New presets must
+        # not share a fixed minute allocated for the original smaller corpus.
+        timeout=min(270, max(60, expected_count * 15)),
     )
     assert result.returncode == 0, result.stdout + result.stderr
     rows = json.loads((tmp_path / "results.json").read_text())
@@ -77,7 +113,7 @@ def test_every_route_recovers_from_repeated_wind_displacement(route, gust_m):
         sim.SimParams(
             route=route,
             align=ALIGN,
-            duration_s=300,
+            duration_s=sim.AUTO_MAX_DURATION_S,
             meters_per_unit=5,
             seed=53,
             gust_m=gust_m,

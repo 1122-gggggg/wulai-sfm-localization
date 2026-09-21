@@ -159,6 +159,33 @@ def test_source_manifest_separates_external_runtime_artifacts() -> None:
     assert included(wheel, source_only=False)
 
 
+@pytest.mark.parametrize(
+    "relative",
+    [
+        "執行環境/models/moge-2-vits-normal/model.pt",
+        "執行環境/models/boq/resnet50_16384.pth",
+        "模擬器/parrot_stimulate/firmware/anafi-pc.ext2.zip",
+    ],
+)
+def test_source_manifest_verifies_without_local_models_or_firmware(tmp_path, relative):
+    source = tmp_path / "app.py"
+    source.write_text("print('source')\n")
+    artifact = tmp_path / relative
+    artifact.parent.mkdir(parents=True)
+    artifact.write_bytes(b"private runtime payload")
+
+    rows = generate(tmp_path, source_only=True)
+    assert [entry.path for entry in rows] == ["app.py"]
+    artifact.unlink()
+    assert verify(tmp_path, source_only=True) == []
+
+    artifact.write_bytes(b"portable payload")
+    rows = generate(tmp_path, source_only=False)
+    assert relative in {entry.path for entry in rows}
+    artifact.write_bytes(b"tampered")
+    assert any(relative in issue for issue in verify(tmp_path, source_only=False))
+
+
 def test_runtime_artifact_resolver_reports_seed_guidance_for_clean_checkout(
     tmp_path: Path,
 ) -> None:

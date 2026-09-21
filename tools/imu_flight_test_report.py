@@ -381,9 +381,26 @@ def _motion_warnings(imu: dict[str, Any], sticks: dict[str, Any]) -> list[str]:
     return found
 
 
+def _recorder_warnings(frames: dict[str, Any]) -> list[str]:
+    found: list[str] = []
+    recorder = frames.get("recorder") or {}
+    if isinstance(recorder, dict):
+        if recorder.get("incomplete") is True:
+            found.append("錄製器 summary 標記 incomplete；這段資料不能當成完整場次。")
+        if recorder.get("writer_shutdown_timeout") is True:
+            found.append("錄製器 writer 在關閉期限內未完成；最後一段資料可能尚未寫入。")
+        if recorder.get("writer_alive") is True:
+            found.append("錄製器 summary 顯示 writer 仍在執行；影像索引可能尚未收尾。")
+        writer_error = recorder.get("writer_error") or recorder.get("last_error")
+        if writer_error:
+            found.append(f"錄製器 writer 發生錯誤：{writer_error}")
+    return found
+
+
 def _coverage_warnings(localization: dict[str, Any], frames: dict[str, Any]) -> list[str]:
     """Gaps that leave part of the comparison unevaluated."""
     found: list[str] = []
+    found.extend(_recorder_warnings(frames))
     if localization["lost_episodes"] < MIN_LOST_EPISODES:
         found.append("整段沒有進過 LOST；recovery 這一半評不到，下次記得掃過難定位區再回來。")
     if localization["sync_error_over_bound"]:
@@ -540,8 +557,14 @@ def render(report: dict[str, Any]) -> str:
         lines.append(
             f"- 錄製器 written={recorder.get('written')} "
             f"dropped_queue_full={recorder.get('dropped_queue_full')} "
-            f"stop_reason={recorder.get('stop_reason') or '-'}"
+            f"stop_reason={recorder.get('stop_reason') or '-'} "
+            f"incomplete={recorder.get('incomplete', '-')} "
+            f"writer_alive={recorder.get('writer_alive', '-')} "
+            f"shutdown_timeout={recorder.get('writer_shutdown_timeout', '-')}"
         )
+        writer_error = recorder.get("writer_error") or recorder.get("last_error")
+        if writer_error:
+            lines.append(f"- 錄製器 writer error={writer_error}")
     scale = report.get("map_scale") or {}
     if scale.get("available"):
         lines += [

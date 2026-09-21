@@ -33,7 +33,7 @@ Pose + FAST_TRACK / RELOC_SEED / VO_ONLY / DEAD_RECKON / NO_POSE
         │
         ├─ operator desktop UI（含 weak 軌跡顯示）
         ├─ validation / replay quality gate
-        └─ flight controller safety gates（weak 不得飛 AUTO）
+        └─ flight controller safety gates（目前弱定位／IMU 策略見 SAFETY.md）
 ```
 
 ## 目錄所有權
@@ -41,7 +41,8 @@ Pose + FAST_TRACK / RELOC_SEED / VO_ONLY / DEAD_RECKON / NO_POSE
 | 目錄 | 所有權 |
 |---|---|
 | `控制介面程式/` | site profile、任務入口、桌面 UI、worker protocol、串流 launcher |
-| `定位演算法/deploy_code/sfm_glomap_deploy/` | 可部署的定位 runtime、localizer adapter、bundle loader |
+| `定位演算法/deploy_code/sfm_direct_deploy/` | 正式 direct 定位、地圖載入、快慢迴路與交接 |
+| `定位演算法/deploy_code/sfm_glomap_deploy/` | 共用 pose/integrity contract、registry 與 provider factory |
 | `定位演算法/flight_control/` | 航線控制、Olympe 串流與真機安全邏輯 |
 | `定位演算法/validation/` | replay、品質 gate、硬體監控、部署一致性檢查 |
 | `定位演算法/deploy_code/runtime/EDM/` | 上游 EDM training/runtime 原始碼；視為 third-party boundary |
@@ -100,8 +101,10 @@ OperatorApp
 
 真機 AUTO 沒有額外的 release latch。操作員必須完成四步 preflight，且選定的
 site/route、座標框架、資產雜湊與 runtime lock 必須一致。AUTO 起飛後先懸停，
-只有 TRACK、pose freshness、inliers、reprojection 與連續定位樣本達標後才會開始
-沿路線平移。hardware approval receipt v2 可作為外部稽核證據記錄，但不是 runtime
+桌面 BOOT 可使用弱定位及 IMU 估計，但仍需連續新鮮、有限、跳變未超限的姿態。
+弱定位不當成地圖錨；定位、地速與終點確認的完整策略以
+[`控制介面程式/SAFETY.md`](../控制介面程式/SAFETY.md) 為準。
+hardware approval receipt v2 可作為外部稽核證據記錄，但不是 runtime
 readiness gate。GPS 不可用不會阻擋起飛，並停用依賴 GPS 的距離柵欄；其他定位與
 命令安全 gate 不受影響。靜態 mission approval 不再是 resolver gate；隨附河濱
 selection 在元件、定位品質與 route 契約通過後即為 flight-ready。ANAFI 羅盤由真機

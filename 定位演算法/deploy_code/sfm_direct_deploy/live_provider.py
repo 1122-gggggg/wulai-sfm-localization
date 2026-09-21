@@ -388,6 +388,7 @@ class LiveMapEDMProvider(FinalMapEDMProvider):
         from river_map_quality.official_edm_adapter import (
             prepare_official_megadepth_image_from_array,
         )
+
         runtime = self._matcher_runtime()
         prepared = prepare_official_megadepth_image_from_array(texture, runtime)
         # EDM runs the production matcher branch: batched when the profile
@@ -399,7 +400,9 @@ class LiveMapEDMProvider(FinalMapEDMProvider):
         self._gpu_matcher = None
         try:
             if bool(self.profile.reloc.batch_refs):
-                self._match_prepared_batch(runtime, prepared, [prepared] * int(self.profile.reloc.top_k))
+                self._match_prepared_batch(
+                    runtime, prepared, [prepared] * int(self.profile.reloc.top_k)
+                )
             else:
                 self._match_prepared(runtime, prepared, prepared)
         finally:
@@ -407,6 +410,7 @@ class LiveMapEDMProvider(FinalMapEDMProvider):
             self._gpu_matcher = saved_matcher
         try:
             import torch
+
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
         except (AttributeError, RuntimeError, ValueError):

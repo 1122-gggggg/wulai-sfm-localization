@@ -44,7 +44,7 @@ import queue
 import threading
 import time
 from collections import deque
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import cv2
 import numpy as np
@@ -106,8 +106,7 @@ def _reloc_idle(step_history) -> bool:
     return float(np.median(recent)) < RELOC_IDLE_STEP_U
 
 
-def _reloc_refresh_due(status: str, stamp: float, last_stamp, period_s: float,
-                       idle: bool) -> bool:
+def _reloc_refresh_due(status: str, stamp: float, last_stamp, period_s: float, idle: bool) -> bool:
     """Background-refresh cadence. Pure. Idle strong tracking refreshes slower."""
     period = RELOC_STRONG_IDLE_PERIOD_S if (status == "FAST_TRACK" and idle) else float(period_s)
     return last_stamp is None or (float(stamp) - float(last_stamp)) >= period
@@ -253,10 +252,10 @@ class RelocWorker:
     def __init__(self, provider: Any) -> None:
         self._provider = provider
         self._cv = threading.Condition()
-        self._job: tuple[np.ndarray, int] | None = None
+        self._job: tuple[np.ndarray, int, int, float] | None = None
         self._busy = False
         self._closed = False
-        self._out: "queue.Queue[tuple[RelocFix, int]]" = queue.Queue(maxsize=1)
+        self._out: "queue.Queue[RelocResult]" = queue.Queue(maxsize=1)
         self._generation = 0
         self._thread: threading.Thread | None = None
 
@@ -293,15 +292,21 @@ class RelocWorker:
         with self._cv:
             return self._job is not None
 
-    def submit(self, gray: np.ndarray, ordinal: int) -> bool:
+    def submit(
+        self,
+        gray: np.ndarray,
+        ordinal: int,
+        capture_stamp: float,
+        source_epoch: int,
+    ) -> bool:
         with self._cv:
             if self._closed or self._thread is None:
                 return False
-            self._job = (gray.copy(), int(ordinal))
+            self._job = (gray.copy(), int(ordinal), int(source_epoch), float(capture_stamp))
             self._cv.notify()
         return True
 
-    def poll(self) -> tuple["RelocFix", int] | None:
+    def poll(self) -> "RelocResult | None":
         try:
             return self._out.get_nowait()
         except queue.Empty:
@@ -327,7 +332,7 @@ class RelocWorker:
                 if self._closed:
                     self._busy = False
                     return
-                gray, ordinal = self._job
+                gray, ordinal, source_epoch, capture_stamp = self._job
                 self._job = None
                 generation = self._generation
                 self._busy = True
@@ -343,9 +348,16 @@ class RelocWorker:
                 with self._cv:
                     self._busy = False
                     self._cv.notify_all()
-            self._publish(fix, ordinal, generation)
+            self._publish(fix, ordinal, capture_stamp, source_epoch, generation)
 
-    def _publish(self, fix, ordinal: int, generation: int) -> None:
+    def _publish(
+        self,
+        fix,
+        ordinal: int,
+        capture_stamp: float,
+        source_epoch: int,
+        generation: int,
+    ) -> None:
         with self._cv:
             if self._closed or generation != self._generation:
                 return
@@ -353,7 +365,23 @@ class RelocWorker:
                 self._out.get_nowait()
             except queue.Empty:
                 pass
-            self._out.put_nowait((fix, ordinal))
+            self._out.put_nowait(
+                RelocResult(
+                    fix=fix,
+                    ordinal=int(ordinal),
+                    capture_stamp=float(capture_stamp),
+                    source_epoch=int(source_epoch),
+                )
+            )
+
+
+class RelocResult(NamedTuple):
+    """One worker result with the capture identity it localized."""
+
+    fix: Any
+    ordinal: int
+    capture_stamp: float
+    source_epoch: int
 
 
 def _failed_fix(runtime_ms: float, reason: str) -> "RelocFix":
@@ -467,6 +495,7 @@ class TwoRateTracker:
         self._worker = RelocWorker(provider)
 
         self._ordinal = -1
+        self._source_epoch = 0
         self._models_ready = False
         self._reset_tracking_state()
 
@@ -483,11 +512,14 @@ class TwoRateTracker:
 
     def reset(self) -> None:
         """Drop every tracking prior. The map assets and models are untouched."""
+        self._source_epoch += 1
         self._tracker.reset()
         self._worker.reset()
         self._reset_tracking_state()
 
     def _reset_tracking_state(self) -> None:
+        if not hasattr(self, "_source_epoch"):
+            self._source_epoch = 0
         self._live_xy = np.zeros((0, 2), dtype=np.float64)
         self._live_ids = np.zeros((0,), dtype=np.int64)
         self._live_xyz = np.zeros((0, 3), dtype=np.float64)
@@ -497,8 +529,13 @@ class TwoRateTracker:
         self._vo_pose_by_bid: dict[int, np.ndarray] = {}
         self._vo_bid_next = 0
         self._vo_next_id = -1
-        self._ring: deque[tuple[int, np.ndarray]] = deque(maxlen=HANDOVER_MAX_FRAMES)
+        # (source epoch, ordinal, capture stamp, grayscale frame). The worker
+        # must hand back the same capture identity before its anchor can cross
+        # this ring; ordinal alone survives neither a reset nor timestamp jitter.
+        self._ring: deque[tuple[int, int, float, np.ndarray]] = deque(maxlen=HANDOVER_MAX_FRAMES)
         self._pending_ordinal: int | None = None
+        self._pending_source_epoch: int | None = None
+        self._pending_capture_stamp: float | None = None
         self._last_reloc_stamp: float | None = None
         self._last_pose: np.ndarray | None = None
         self._last_gray: np.ndarray | None = None
@@ -513,9 +550,13 @@ class TwoRateTracker:
         self._last_reloc_status: str | None = None
         self._last_reloc_ms: float | None = None
         self._last_reloc_stages: dict = {}
+        self._last_reloc_capture_stamp: float | None = None
+        self._last_reloc_source_epoch: int | None = None
+        self._last_reloc_ordinal: int | None = None
         self._last_map_stamp: float | None = None
         self._handover_dropped = 0
         self._handover_retry_hops = 0
+        self._handover_capture_age_s: float | None = None
         # Cumulative DR-guard hits (hover rejects + yaw downweights). Internal
         # only: direct_localizer_adapter builds last_info from an explicit
         # key whitelist, so a new info-dict key would be silently dropped --
@@ -557,7 +598,7 @@ class TwoRateTracker:
         return dr_prev, dr_curr, t_track
 
     def _step_handover(
-        self, gray: np.ndarray
+        self, gray: np.ndarray, ordinal: int, capture_stamp: float
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, str | None, tuple[str, ...], Any]:
         """Poll the worker and walk the fix to this frame without writing _live_*."""
         empty_ids = np.zeros((0,), dtype=np.int64)
@@ -568,13 +609,34 @@ class TwoRateTracker:
         delivered = self._worker.poll()
         if delivered is None:
             return empty_ids, empty_xy, empty_xyz, reloc_status, reference_names, None
-        fix, trigger_ordinal = delivered
-        self._pending_ordinal = None
+        fix = delivered.fix
+        trigger_ordinal = delivered.ordinal
+        trigger_stamp = delivered.capture_stamp
+        trigger_epoch = delivered.source_epoch
+        self._last_reloc_capture_stamp = float(trigger_stamp)
+        self._last_reloc_source_epoch = int(trigger_epoch)
+        self._last_reloc_ordinal = int(trigger_ordinal)
+        if (
+            self._pending_source_epoch == trigger_epoch
+            and self._pending_ordinal == trigger_ordinal
+            and self._pending_capture_stamp == trigger_stamp
+        ):
+            self._pending_ordinal = None
+            self._pending_source_epoch = None
+            self._pending_capture_stamp = None
         self._last_reloc_status = reloc_status = str(fix.status)
         self._last_reloc_ms = float(fix.runtime_ms)
         self._last_reloc_stages = dict(fix.stage_ms or {})
         reference_names = tuple(str(name) for name in (fix.reference_names or ()))
-        ids, xy, xyz = self._walk_handover(fix, trigger_ordinal)
+        ids, xy, xyz = self._walk_handover(
+            fix,
+            trigger_ordinal,
+            trigger_epoch=trigger_epoch,
+            trigger_stamp=trigger_stamp,
+            current_epoch=self._source_epoch,
+            current_stamp=float(capture_stamp),
+            current_ordinal=ordinal,
+        )
         return ids, xy, xyz, reloc_status, reference_names, delivered
 
     def _step_dead_reckon(
@@ -779,7 +841,9 @@ class TwoRateTracker:
         if sample_dt < 0.0 or (sample_dt == 0.0 and abs(delta_ned) > 0.0):
             self._imu_bridge_debug["imu_bridge_reason"] = "yaw_rate_excessive"
             return None
-        if sample_dt > 0.0 and abs(delta_ned) / sample_dt > math.radians(IMU_BRIDGE_MAX_YAW_RATE_DEG_S):
+        if sample_dt > 0.0 and abs(delta_ned) / sample_dt > math.radians(
+            IMU_BRIDGE_MAX_YAW_RATE_DEG_S
+        ):
             self._imu_bridge_debug["imu_bridge_reason"] = "yaw_rate_excessive"
             return None
         return delta_ned, sample_age
@@ -787,17 +851,20 @@ class TwoRateTracker:
     def _step_reloc_trigger(
         self, gray: np.ndarray, ordinal: int, stamp: float, status: str
     ) -> bool:
+        if not math.isfinite(float(stamp)):
+            return False
         reloc = self.profile.reloc
         idle = status == "FAST_TRACK" and _reloc_idle(self._step_history)
-        due = _reloc_refresh_due(status, stamp, self._last_reloc_stamp,
-                                 float(reloc.period_s), idle)
+        due = _reloc_refresh_due(status, stamp, self._last_reloc_stamp, float(reloc.period_s), idle)
         # VO tracks can be numerous while none constrain the pose to the map.
         # Request a map fix as soon as the one-job worker is available, without
         # waiting for the normal refresh period or clearing the usable tracks.
         unconfirmed = status in {"VO_ONLY", "DEAD_RECKON", "IMU_BRIDGE", "NO_POSE"}
         if len(self._live_ids) < int(reloc.min_points) or unconfirmed or due or self._worker.queued:
-            if self._worker.submit(gray, ordinal):
+            if self._worker.submit(gray, ordinal, stamp, self._source_epoch):
                 self._pending_ordinal = ordinal
+                self._pending_source_epoch = self._source_epoch
+                self._pending_capture_stamp = stamp
                 self._last_reloc_stamp = stamp
                 return True
         return False
@@ -882,7 +949,7 @@ class TwoRateTracker:
         else:
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         gray = np.ascontiguousarray(gray, dtype=np.uint8)
-        self._ring.append((ordinal, gray))
+        self._ring.append((self._source_epoch, ordinal, stamp, gray))
         t_gray = time.perf_counter()
 
         # 1. worker handover: poll and catch-up walk, do not write _live_* yet
@@ -893,7 +960,7 @@ class TwoRateTracker:
             reloc_status,
             reference_names,
             delivered,
-        ) = self._step_handover(gray)
+        ) = self._step_handover(gray, ordinal, stamp)
         t_handover = time.perf_counter()
 
         # A partial handover can augment a viable track, but cannot seed an empty one.
@@ -982,6 +1049,7 @@ class TwoRateTracker:
             "handover_points": int(handover_points),
             "handover_dropped": int(self._handover_dropped),
             "handover_retry_hops": int(self._handover_retry_hops),
+            "handover_capture_age_s": self._handover_capture_age_s,
             "reloc_status": reloc_status if reloc_status is not None else self._last_reloc_status,
             "reloc_delivered": delivered is not None,
             "reloc_submitted": submitted,
@@ -1001,6 +1069,9 @@ class TwoRateTracker:
             "reloc_match_lift_ms": self._last_reloc_stages.get("match_lift_ms"),
             "reloc_pnp_ms": self._last_reloc_stages.get("reloc_pnp_ms"),
             "reloc_reference_count": self._last_reloc_stages.get("matched_references"),
+            "reloc_capture_stamp_mono": self._last_reloc_capture_stamp,
+            "reloc_source_epoch": self._last_reloc_source_epoch,
+            "reloc_ordinal": self._last_reloc_ordinal,
         }
 
     def _step_absolute_pose(
@@ -1070,28 +1141,7 @@ class TwoRateTracker:
         return status, cam_from_world, center, inliers, map_inliers, vo_inliers, n_corr, quality
 
     # ---------- handover ----------
-    def _walk_handover(
-        self, fix: "RelocFix", trigger_ordinal: int
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        empty_ids = np.zeros((0,), dtype=np.int64)
-        empty_xy = np.zeros((0, 2), dtype=np.float64)
-        empty_xyz = np.zeros((0, 3), dtype=np.float64)
-        if not fix.ok or fix.cam_from_world is None:
-            return empty_ids, empty_xy, empty_xyz
-        ids = np.asarray(fix.point3d_ids, dtype=np.int64)
-        xy = np.asarray(fix.query_xy, dtype=float)
-        xyz = np.asarray(fix.point_xyz, dtype=float)
-        if ids.size < int(self.profile.fast_loop.pnp.min_points):
-            return empty_ids, empty_xy, empty_xyz
-
-        chain = [frame for ordinal, frame in self._ring if ordinal >= trigger_ordinal]
-        first = next((ordinal for ordinal, _ in self._ring if ordinal >= trigger_ordinal), None)
-        if first != trigger_ordinal or len(chain) > HANDOVER_MAX_FRAMES:
-            # the worker outran the ring buffer: the anchor's 2D can no longer
-            # be walked to this frame, so the whole handover is discarded
-            self._handover_dropped += 1
-            return empty_ids, empty_xy, empty_xyz
-
+    def _track_handover_chain(self, chain, ids, xy, xyz):
         ids, xy, xyz = self._cap_handover_points(ids, xy, xyz)
         n = len(chain)
         # Keep stride-2 while it supplies enough anchors. If a hop drops below
@@ -1126,6 +1176,73 @@ class TwoRateTracker:
                 self._tracker.last_diagnostics = wide_diagnostics
             xy, ids, xyz = fwd[inside], ids[inside], xyz[inside]
             a = b
+        return ids, xy, xyz
+
+    def _walk_handover(
+        self,
+        fix: "RelocFix",
+        trigger_ordinal: int,
+        *,
+        trigger_epoch: int | None = None,
+        trigger_stamp: float | None = None,
+        current_epoch: int | None = None,
+        current_stamp: float | None = None,
+        current_ordinal: int | None = None,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        empty_ids = np.zeros((0,), dtype=np.int64)
+        empty_xy = np.zeros((0, 2), dtype=np.float64)
+        empty_xyz = np.zeros((0, 3), dtype=np.float64)
+        self._handover_capture_age_s = None
+        if not fix.ok or fix.cam_from_world is None:
+            return empty_ids, empty_xy, empty_xyz
+        ids = np.asarray(fix.point3d_ids, dtype=np.int64)
+        xy = np.asarray(fix.query_xy, dtype=float)
+        xyz = np.asarray(fix.point_xyz, dtype=float)
+        if ids.size < int(self.profile.fast_loop.pnp.min_points):
+            return empty_ids, empty_xy, empty_xyz
+
+        if trigger_epoch is None:
+            trigger_epoch = self._source_epoch
+        if current_epoch is None:
+            current_epoch = self._source_epoch
+        entries = [
+            entry
+            for entry in self._ring
+            if entry[0] == trigger_epoch and entry[1] >= trigger_ordinal
+        ]
+        first = entries[0][1] if entries else None
+        if first != trigger_ordinal or trigger_epoch != current_epoch:
+            self._handover_dropped += 1
+            return empty_ids, empty_xy, empty_xyz
+        if trigger_stamp is None:
+            trigger_stamp = entries[0][2]
+        if current_stamp is None:
+            current_stamp = entries[-1][2]
+        if current_ordinal is not None and entries[-1][1] != current_ordinal:
+            self._handover_dropped += 1
+            return empty_ids, empty_xy, empty_xyz
+        stamps = [entry[2] for entry in entries]
+        if (
+            not math.isfinite(float(trigger_stamp))
+            or not math.isfinite(float(current_stamp))
+            or not stamps
+            or stamps[0] != float(trigger_stamp)
+            or (current_ordinal is not None and stamps[-1] != float(current_stamp))
+            or float(current_stamp) < float(trigger_stamp)
+            or any(not math.isfinite(float(stamp)) for stamp in stamps)
+            or any(later < earlier for earlier, later in zip(stamps, stamps[1:]))
+        ):
+            self._handover_dropped += 1
+            return empty_ids, empty_xy, empty_xyz
+        self._handover_capture_age_s = float(current_stamp) - float(trigger_stamp)
+        chain = [entry[3] for entry in entries]
+        if len(chain) > HANDOVER_MAX_FRAMES:
+            # the worker outran the ring buffer: the anchor's 2D can no longer
+            # be walked to this frame, so the whole handover is discarded
+            self._handover_dropped += 1
+            return empty_ids, empty_xy, empty_xyz
+
+        ids, xy, xyz = self._track_handover_chain(chain, ids, xy, xyz)
         if ids.size == 0:
             return empty_ids, empty_xy, empty_xyz
         return ids, xy, xyz

@@ -242,6 +242,12 @@ LOST_YAW_SEARCH_TIMEOUT_S = 300.0
 LOST_YAW_SEARCH_TARGET_RAD = 2.0 * math.pi
 LOW_CONF_INLIERS = _env_int("SFM_LOW_CONF_INLIERS", 60, minimum=1, maximum=10000)
 RECOVERY_GOOD_FIXES = _env_int("SFM_RECOVERY_GOOD_FIXES", 2, minimum=1, maximum=20)
+# Outside this multiple of the arrival sphere, cruise translation may use WEAK
+# fixes; approach/centering still requires strong fixes. Real flight 2026-09-18:
+# WEAK flicker at 39% caused 30+ hover-recover-resume cycles mid-leg. The jump
+# gate and the strong-anchor age cap (max_weak_pose_age_s) stay active, so a
+# WEAK stretch without a recent strong anchor still hovers.
+CRUISE_WEAK_ACCEPT_RADIUS_FACTOR = 4.0
 LOCALIZATION_RETRY_INTERVAL_S = 1.0
 # A WEAK (low-confidence) fix in repetitive line-corridor geometry can be plausible
 # but wrong and still pass the jump/deviation gates; treat it as "uncertain" -> hover.
@@ -2339,6 +2345,33 @@ class _FlightLoopRunner:
             return None
         return radius
 
+    def _cruise_accepts_weak(self, pose) -> bool:
+        """May a WEAK fix drive cruise translation right now?
+
+        Far from the arrival sphere the route servo tolerates WEAK fixes (the
+        jump gate and the strong-anchor age cap stay active independently);
+        inside the approach band only strong fixes count, so arrival and
+        centering precision are unchanged.
+        """
+        if pose is None:
+            return False
+        try:
+            target = int(self.ctrl.target_index)
+            goal = np.asarray(self.ctrl.wp[target], dtype=float).reshape(3)
+            pos = np.asarray(pose.xyz, dtype=float).reshape(3)
+            radius = float(self.ctrl._arrive_radius_for(target))
+        except (AttributeError, TypeError, ValueError, IndexError):
+            return False
+        if not math.isfinite(radius) or radius <= 0.0:
+            return False
+        try:
+            dist = float(np.linalg.norm(goal - pos))
+        except (TypeError, ValueError, OverflowError):
+            return False
+        if not math.isfinite(dist):
+            return False
+        return dist > CRUISE_WEAK_ACCEPT_RADIUS_FACTOR * radius
+
     def _confirm_pose_source(self, pose, fresh: bool, low_confidence: bool,
                              record: dict) -> bool:
         return True
@@ -2365,20 +2398,29 @@ class _FlightLoopRunner:
             record["repeated_pose_stamp"] = round(float(pose.stamp), 6)
             fresh = False
         candidate_low_confidence = self._is_low_confidence(fresh, fresh)
+        cruise_weak_ok = self._cruise_accepts_weak(pose) if fresh else False
+        if cruise_weak_ok:
+            record["cruise_weak_ok"] = True
+        # Cruise WEAK fixes may drive translation, but the jump gate keeps its
+        # original confidence accounting: a jumping WEAK fix is still counted
+        # as low-confidence (tolerated) rather than latching a pause.
+        gate_low_confidence = False if cruise_weak_ok else candidate_low_confidence
         if fresh and self.hooks.max_weak_pose_age_s is not None:
-            candidate_low_confidence |= self._map_constraint_expired(now, record)
+            gate_low_confidence |= self._map_constraint_expired(
+                now, record, cruise_weak_ok=cruise_weak_ok,
+            )
         fresh, jump_rejected = self._apply_jump_gate(
             pose, fresh, candidate_low_confidence, now, record,
         )
         if record.get("jump_confirmed"):
             self.source_confirmation = PoseSourceConfirmation()
         if fresh and not self._confirm_pose_source(
-            pose, fresh, candidate_low_confidence, record
+            pose, fresh, gate_low_confidence, record
         ):
             fresh = False
             jump_rejected = True  # No holdover while a new source is pending.
         new_visual_fix = fresh
-        low_confidence = bool(fresh and candidate_low_confidence)
+        low_confidence = bool(fresh and gate_low_confidence)
         if not fresh and (
             not jump_rejected
             and self.last_good is not None
@@ -2462,7 +2504,8 @@ class _FlightLoopRunner:
             return False
         return bool(pose_value)
 
-    def _map_constraint_expired(self, now: float, record: dict, *, from_holdover=False) -> bool:
+    def _map_constraint_expired(self, now: float, record: dict, *, from_holdover=False,
+                                  cruise_weak_ok=False) -> bool:
         assert self.hooks.max_weak_pose_age_s is not None
         predicted = self._pose_is_predicted()
         weak = from_holdover or (self.hooks.pose_is_weak is not None and self.hooks.pose_is_weak())
@@ -2485,6 +2528,10 @@ class _FlightLoopRunner:
             return False
         expired = age is None or age > self.hooks.max_weak_pose_age_s
         record["map_constraint_expired"] = expired
+        if cruise_weak_ok:
+            # Cruise translation may use WEAK fixes; only the strong-anchor
+            # age cap remains. Approach/centering still needs strong fixes.
+            return expired
         # Once hovering, only distinct strong fixes may confirm recovery.
         return expired or self.uncertainty.uncertain_since is not None
 
@@ -2990,17 +3037,20 @@ class _FlightLoopRunner:
             import dataclasses as _dc
             try:
                 settled = _dc.replace(
-                    command, action="HOVER", should_land=False,
+                    command, action="FINAL_HOLD", should_land=False,
                     status=f"final position/speed settling; {speed_reason}",
                 )
             except (AttributeError, TypeError, ValueError):
                 return command
-            # FINAL_HOLD centers on the waypoint. Waiting for low speed must
-            # instead hold still, or its centering PCMD prevents settling.
+            # Keep the terminal position servo and its learned wind correction
+            # active until both position and speed are confirmed. A HOVER here
+            # clears that correction and can drift forever outside the gate.
             try:
                 self.ctrl.state = "CRUISE"
             except AttributeError:
                 pass
+            record["command_action"] = settled.action
+            record["action"] = settled.status
             return settled
         return command
 
@@ -3011,10 +3061,22 @@ class _FlightLoopRunner:
         now: float,
         record: dict,
     ) -> _LoopOutcome | None:
-        if not command.should_land and self.ctrl.state not in ("LANDING", "DONE"):
+        settling = command.action == "FINAL_HOLD"
+        if not settling and not command.should_land and self.ctrl.state not in ("LANDING", "DONE"):
+            self.landing_wait_started = None
             return None
         if self.landing_wait_started is None:
             self.landing_wait_started = now
+        if settling:
+            if self.hooks.wait_expired is not None and self.hooks.wait_expired(
+                "landing position/speed confirmation unavailable", now - self.landing_wait_started
+            ):
+                self._reset_pcmd_controller()
+                _sent, _why, actual = self._send_command((0, 0, 0, 0))
+                reason = "landing confirmation wait expired -> manual"
+                self._emit(record, actual, True, reason)
+                return _LoopOutcome(reason)
+            return None
         transition = decide_route_completion_landing(
             command.action,
             ground_speed_sample,

@@ -1,5 +1,9 @@
 # 下一次飛行：狀態、風漂移與定位除錯
 
+2026-09-21 補充：下次要一併收集 EKF 驗證資料，請使用
+[EKF 同步資料收集清單](next_flight_ekf_capture_20260921.md)。該流程為人工飛行的
+evaluation-only 資料收集，不啟用實驗性 EKF／滑動視窗控制。
+
 2026-09-14。適用目前桌面介面的 direct 定位與 AUTO 巡航。修改只經離線測試，沒有代操作員起飛。驗收數字與版本見 [本次驗證報告](../outputs/analysis/next_flight_debug/report.md)。
 
 ## 螢幕上的狀態

@@ -31,7 +31,14 @@ def _plan() -> dict:
     }
 
 
-def _tick(step: int, *, target: int | None, distance: float | None) -> dict:
+def _tick(
+    step: int,
+    *,
+    target: int | None,
+    distance: float | None,
+    target_distance: float | None = None,
+    target_radius: float | None = None,
+) -> dict:
     row: dict = {
         "event": "auto_route_tick",
         "t": 100.0 + step * 0.1,
@@ -46,6 +53,10 @@ def _tick(step: int, *, target: int | None, distance: float | None) -> dict:
     }
     if distance is not None:
         row["route_distance_u"] = distance
+    if target_distance is not None:
+        row["target_distance_u"] = target_distance
+    if target_radius is not None:
+        row["target_radius_u"] = target_radius
     return row
 
 
@@ -72,12 +83,81 @@ def test_join_boundary_excludes_approach_wander_from_error(tmp_path: Path) -> No
 
 def test_never_joined_reports_closest_approach_without_error(tmp_path: Path) -> None:
     rows = [_plan()]
-    rows += [_tick(step, target=1, distance=0.5 - step * 0.05) for step in range(5)]
+    rows += [
+        _tick(
+            step,
+            target=1,
+            distance=0.5 - step * 0.05,
+            target_distance=0.9 - step * 0.1,
+        )
+        for step in range(5)
+    ]
     result = report.analyze_session(_write_session(tmp_path, rows))
 
     assert result["verdict"] == "NEVER_JOINED"
-    assert result["join"]["closest_approach_u"] == 0.3
+    assert result["join"]["closest_approach_u"] == 0.5
     assert "post_join" not in result
+
+
+def test_arrival_share_uses_target_distance_when_pose_stays_on_the_route(tmp_path: Path) -> None:
+    rows = [_plan()]
+    rows += [
+        _tick(
+            step,
+            target=0,
+            distance=0.0,
+            target_distance=1.0,
+            target_radius=0.2,
+        )
+        for step in range(1)
+    ] + [
+        _tick(
+            1 + step,
+            target=1,
+            distance=0.0,
+            target_distance=target_distance,
+            target_radius=0.2,
+        )
+        for step, target_distance in enumerate((1.0, 0.1, 1.0))
+    ]
+    result = report.analyze_session(_write_session(tmp_path, rows))
+
+    assert result["post_join"]["within_arrival_sphere_share"] == pytest.approx(0.333)
+
+
+def test_arrival_share_uses_per_point_radius(tmp_path: Path) -> None:
+    plan = _plan()
+    plan["waypoint_arrive_radii_u"] = [0.2, 0.05, 0.3]
+    rows = [plan]
+    rows += [
+        _tick(0, target=0, distance=0.0, target_distance=1.0),
+        _tick(1, target=1, distance=0.0, target_distance=0.08),
+        _tick(2, target=2, distance=0.0, target_distance=0.08),
+        _tick(3, target=2, distance=0.0, target_distance=0.4),
+    ]
+    result = report.analyze_session(_write_session(tmp_path, rows))
+
+    assert result["post_join"]["within_arrival_sphere_share"] == pytest.approx(0.333)
+
+
+def test_arrival_share_falls_back_to_logged_pose_and_target(tmp_path: Path) -> None:
+    rows = [_plan()]
+    rows += [
+        _tick(0, target=0, distance=0.0),
+        _tick(1, target=1, distance=0.0),
+    ]
+    rows[-2].update(pose_u=[0.2, 0.0, -1.8], target_u=[0.2, 0.0, -1.8])
+    rows[-1].update(pose_u=[0.5, 0.0, -1.5], target_u=[0.5, 0.0, -1.5])
+    result = report.analyze_session(_write_session(tmp_path, rows))
+
+    assert result["post_join"]["within_arrival_sphere_share"] == pytest.approx(1.0)
+
+
+def test_arrival_share_is_none_when_old_tick_has_no_target_geometry(tmp_path: Path) -> None:
+    rows = [_plan(), _tick(0, target=0, distance=0.0), _tick(1, target=1, distance=0.0)]
+    result = report.analyze_session(_write_session(tmp_path, rows))
+
+    assert result["post_join"]["within_arrival_sphere_share"] is None
 
 
 def test_session_without_auto_is_explicit(tmp_path: Path) -> None:
@@ -89,8 +169,9 @@ def test_session_without_auto_is_explicit(tmp_path: Path) -> None:
 
 
 def test_retained_trajectory_is_sufficient_after_diagnostic_cleanup(tmp_path):
-    session = _write_session(tmp_path, [_plan(), _tick(0, target=0, distance=0.5),
-                                      _tick(1, target=1, distance=0.1)])
+    session = _write_session(
+        tmp_path, [_plan(), _tick(0, target=0, distance=0.5), _tick(1, target=1, distance=0.1)]
+    )
     (session / "localization.jsonl").rename(session / "trajectory.jsonl")
     result = report.analyze_session(session)
     assert result["verdict"] == "JOINED"
@@ -183,6 +264,25 @@ def test_two_auto_runs_do_not_share_join_timing_or_error(tmp_path: Path) -> None
     # Legacy top-level shape still exposes the latest run.
     assert result["join"]["time_to_join_s"] == 0.3
     assert result["verdict"] == "JOINED"
+
+
+def test_arrival_share_stays_scoped_to_each_auto_run(tmp_path: Path) -> None:
+    first = [_plan()]
+    first += [_tick(0, target=0, distance=0.0, target_distance=1.0, target_radius=0.1)]
+    first += [_tick(1, target=1, distance=0.0, target_distance=0.05, target_radius=0.1)]
+    second = [_plan()]
+    second += [_tick(0, target=0, distance=0.0, target_distance=1.0, target_radius=0.1)]
+    second += [_tick(1, target=1, distance=0.0, target_distance=1.0, target_radius=0.1)]
+    for row in first:
+        row["auto_run_id"] = "run-a"
+    for row in second:
+        row["auto_run_id"] = "run-b"
+        if "t" in row:
+            row["t"] += 10.0
+    result = report.analyze_session(_write_session(tmp_path, first + second))
+
+    assert result["auto_runs"][0]["post_join"]["within_arrival_sphere_share"] == pytest.approx(1.0)
+    assert result["auto_runs"][1]["post_join"]["within_arrival_sphere_share"] == pytest.approx(0.0)
 
 
 def test_runs_split_by_auto_run_id_even_without_a_time_gap(tmp_path: Path) -> None:

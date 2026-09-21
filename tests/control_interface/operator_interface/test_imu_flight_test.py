@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 from types import SimpleNamespace
 
 import numpy as np
@@ -26,6 +27,10 @@ def _timing(**overrides) -> dict:
         "client_submit_mono": 1000.30,
         "hold_kind": "none",
         "fused_telemetry_mono": 1000.24,
+        "fused_stamp_source": "attitude_event",
+        "fused_attitude_mono": 1000.24,
+        "fused_speed_mono": 1000.20,
+        "fused_altitude_mono": 1000.18,
         "fused_roll": 0.01,
         "fused_pitch": -0.02,
         "fused_yaw": 1.5,
@@ -76,6 +81,10 @@ def test_recorder_pairs_each_frame_with_the_telemetry_that_rode_with_it(tmp_path
     assert row["file"] == "frames/000001.jpg"
     assert row["capture_stamp_mono"] == pytest.approx(1000.25)
     assert row["fused_telemetry_mono"] == pytest.approx(1000.24)
+    assert row["fused_stamp_source"] == "attitude_event"
+    assert row["fused_attitude_mono"] == pytest.approx(1000.24)
+    assert row["fused_speed_mono"] == pytest.approx(1000.20)
+    assert row["fused_altitude_mono"] == pytest.approx(1000.18)
     assert row["fused_speed_north"] == pytest.approx(0.4)
     assert (tmp_path / "frames" / "000001.jpg").is_file()
     assert json.loads((tmp_path / "summary.json").read_text(encoding="utf-8"))["written"] == 1
@@ -115,6 +124,222 @@ def test_recorder_drops_instead_of_blocking_the_ui_thread(tmp_path, monkeypatch)
     finally:
         gate.set()
         recorder.close()
+
+
+def test_recorder_close_timeout_keeps_writer_owner_and_marks_incomplete(
+    tmp_path, monkeypatch
+) -> None:
+    entered = threading.Event()
+    release = threading.Event()
+
+    def _blocked_encode(_image, _quality):
+        entered.set()
+        release.wait(5.0)
+        return b"\xff\xd8\xff\xd9"
+
+    monkeypatch.setattr(imu_flight_test, "_encode_jpeg", _blocked_encode)
+    recorder = ImuFlightTestRecorder(tmp_path)
+    try:
+        assert recorder.capture(0, "stream_000000", _frame(), _timing()) is True
+        assert entered.wait(1.0)
+
+        recorder.close(timeout=0.01)
+        summary = json.loads((tmp_path / "summary.json").read_text(encoding="utf-8"))
+        assert summary["incomplete"] is True
+        assert summary["writer_shutdown_timeout"] is True
+        assert summary["writer_alive"] is True
+        assert summary["writer_error"] is None
+        assert recorder._thread.is_alive()
+        assert not recorder._index.closed
+    finally:
+        release.set()
+        recorder._thread.join(timeout=2.0)
+
+    assert not recorder._thread.is_alive()
+    assert recorder._index.closed
+    summary = json.loads((tmp_path / "summary.json").read_text(encoding="utf-8"))
+    assert summary["incomplete"] is True
+    assert summary["writer_shutdown_timeout"] is True
+    assert summary["writer_alive"] is False
+
+
+def test_close_timeout_does_not_wait_on_a_writer_summary_lock(tmp_path) -> None:
+    recorder = ImuFlightTestRecorder(tmp_path)
+    recorder._summary_lock.acquire()
+    try:
+        started = time.monotonic()
+        recorder.close(timeout=0.01)
+        assert time.monotonic() - started < 0.5
+    finally:
+        recorder._summary_lock.release()
+        recorder._thread.join(timeout=2.0)
+
+    assert not recorder._thread.is_alive()
+    summary = json.loads((tmp_path / "summary.json").read_text(encoding="utf-8"))
+    assert summary["incomplete"] is True
+    assert summary["writer_shutdown_timeout"] is True
+    assert summary["writer_alive"] is False
+
+
+def test_timeout_revision_survives_a_blocked_summary_write(tmp_path) -> None:
+    recorder = ImuFlightTestRecorder(tmp_path)
+    original = recorder._write_summary_locked
+    entered = threading.Event()
+    release = threading.Event()
+    calls: list[bool] = []
+
+    def _blocked_summary(*, writer_alive: bool) -> None:
+        calls.append(writer_alive)
+        if len(calls) == 1:
+            entered.set()
+            release.wait(2.0)
+        original(writer_alive=writer_alive)
+
+    recorder._write_summary_locked = _blocked_summary
+    close_done = threading.Event()
+
+    def _close() -> None:
+        recorder.close(timeout=0.01)
+        close_done.set()
+
+    close_thread = threading.Thread(target=_close)
+    close_thread.start()
+    try:
+        assert entered.wait(1.0)
+        assert close_done.wait(1.0)
+    finally:
+        release.set()
+        close_thread.join(timeout=2.0)
+        recorder._thread.join(timeout=2.0)
+
+    assert not close_thread.is_alive()
+    assert not recorder._thread.is_alive()
+    assert len(calls) >= 2
+    summary = json.loads((tmp_path / "summary.json").read_text(encoding="utf-8"))
+    assert summary["incomplete"] is True
+    assert summary["writer_shutdown_timeout"] is True
+    assert summary["writer_alive"] is False
+
+
+def test_timeout_summary_rechecks_writer_finished_after_lock_acquisition(tmp_path) -> None:
+    class _SummaryLockGate:
+        def __init__(self, lock, writer_finished, attempted, allow, writer_waiting):
+            self.lock = lock
+            self.writer_finished = writer_finished
+            self.attempted = attempted
+            self.allow = allow
+            self.writer_waiting = writer_waiting
+
+        def __enter__(self):
+            self.writer_waiting.set()
+            self.lock.acquire()
+            return self
+
+        def __exit__(self, *_args):
+            self.lock.release()
+
+        def acquire(self, blocking=True, timeout=-1):
+            if blocking:
+                return self.lock.acquire(blocking, timeout)
+            self.attempted.set()
+            if not self.allow.wait(2.0) or not self.writer_waiting.wait(2.0):
+                return False
+            if not self.writer_finished.wait(2.0):
+                return False
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline:
+                if self.lock.acquire(blocking=False):
+                    return True
+                time.sleep(0.001)
+            return False
+
+        def release(self):
+            self.lock.release()
+
+    recorder = ImuFlightTestRecorder(tmp_path)
+    underlying = threading.Lock()
+    underlying.acquire()
+    attempted = threading.Event()
+    allow = threading.Event()
+    writer_waiting = threading.Event()
+    recorder._summary_lock = _SummaryLockGate(
+        underlying,
+        recorder._writer_finished,
+        attempted,
+        allow,
+        writer_waiting,
+    )
+    close_done = threading.Event()
+
+    def _close() -> None:
+        recorder.close(timeout=0.01)
+        close_done.set()
+
+    close_thread = threading.Thread(target=_close)
+    close_thread.start()
+    released = False
+    try:
+        assert attempted.wait(1.0)
+        underlying.release()
+        released = True
+        allow.set()
+        assert close_done.wait(1.0)
+    finally:
+        allow.set()
+        if not released:
+            underlying.release()
+        close_thread.join(timeout=2.0)
+        recorder._thread.join(timeout=2.0)
+
+    assert not close_thread.is_alive()
+    assert not recorder._thread.is_alive()
+    summary = json.loads((tmp_path / "summary.json").read_text(encoding="utf-8"))
+    assert summary["incomplete"] is True
+    assert summary["writer_shutdown_timeout"] is True
+    assert summary["writer_alive"] is False
+
+
+def test_writer_exception_is_preserved_in_summary(tmp_path, monkeypatch) -> None:
+    def _raise_encode(_image, _quality):
+        raise OSError("encoder failed")
+
+    monkeypatch.setattr(imu_flight_test, "_encode_jpeg", _raise_encode)
+    recorder = ImuFlightTestRecorder(tmp_path)
+    assert recorder.capture(0, "stream_000000", _frame(), _timing()) is True
+    recorder.close()
+
+    summary = json.loads((tmp_path / "summary.json").read_text(encoding="utf-8"))
+    assert summary["incomplete"] is True
+    assert "encoder failed" in summary["writer_error"]
+    assert "encoder failed" in summary["last_error"]
+    assert summary["writer_alive"] is False
+
+
+def test_writer_flush_failure_is_preserved_in_summary(tmp_path, monkeypatch) -> None:
+    def _raise_fsync(_fd):
+        raise OSError("fsync failed")
+
+    monkeypatch.setattr(imu_flight_test.os, "fsync", _raise_fsync)
+    recorder = ImuFlightTestRecorder(tmp_path)
+    assert recorder.capture(0, "stream_000000", _frame(), _timing()) is True
+    recorder.close()
+
+    summary = json.loads((tmp_path / "summary.json").read_text(encoding="utf-8"))
+    assert summary["incomplete"] is True
+    assert "fsync failed" in summary["writer_error"]
+    assert summary["stop_reason"] == "writer_flush_error"
+    assert summary["writer_alive"] is False
+
+
+def test_rgb_conversion_owns_a_contiguous_caller_buffer() -> None:
+    frame = _frame()
+    owned = imu_flight_test._as_rgb_array(frame)
+
+    assert owned is not None
+    assert owned is not frame
+    assert not np.shares_memory(owned, frame)
+    frame.fill(0)
+    assert np.all(owned == 128)
 
 
 def test_recorder_stops_at_the_frame_cap(tmp_path) -> None:

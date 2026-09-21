@@ -81,6 +81,7 @@ def test_output_classification_keeps_new_names_visible() -> None:
     assert classify_output("edm_speed_20260803") == "experiment_evidence"
     assert classify_output("megaloc_tensorrt_full5_20260813") == "experiment_evidence"
     assert classify_output("river_site_generalization") == "experiment_evidence"
+    assert classify_output("route_workflow_audit_20260917") == "experiment_evidence"
     assert classify_output("validation_receipts") == "validation"
     assert classify_output("security") == "validation"
     assert classify_output("flight_logs") == "operations"

@@ -107,6 +107,7 @@ from skycontroller_stick import (  # noqa: E402
     _STICK_DEADZONE,
     _STICK_FLIGHT_AXES,
 )
+from backend_telemetry import poll_session_telemetry, video_delivery_snapshot  # noqa: E402
 from live_command_log import _CmdLog, quiet_olympe_logs as quiet_olympe_logs  # noqa: E402
 from live_anafi_video_stream import LiveAnafiVideoStream  # noqa: E402
 
@@ -4806,42 +4807,7 @@ class OlympeLiveBackend:
     VIDEO_STALE_S = 0.5
 
     def _video_delivery_snapshot(self, now: float) -> dict:
-        """Continuous video-delivery health for readback telemetry + stale alert.
-
-        Both clocks are host-monotonic seconds. Never raises; returns None
-        fields when no stream is attached so offline/sim backends keep working.
-        """
-        stream = getattr(self, "video_stream", None)
-        if stream is None:
-            return {"video_fps": None, "video_frames_delivered": 0,
-                    "video_frame_age_s": None, "video_stale": None}
-        try:
-            fps = float(getattr(stream, "fps", 0.0) or 0.0)
-        except (TypeError, ValueError):
-            fps = 0.0
-        try:
-            delivered = int(getattr(stream, "output_index", 0) or 0)
-        except (TypeError, ValueError):
-            delivered = 0
-        try:
-            last = float(getattr(stream, "last_stamp", 0.0) or 0.0)
-        except (TypeError, ValueError):
-            last = 0.0
-        age = (float(now) - last) if last > 0.0 else None
-        stale = bool(age is not None and age > self.VIDEO_STALE_S)
-        previously_stale = bool(getattr(self, "_video_stale_latched", False))
-        if stale != previously_stale:
-            self._video_stale_latched = stale
-            try:
-                self.log.event("video_stale" if stale else "video_fresh",
-                               video_frame_age_s=round(age, 3) if age is not None else None,
-                               video_fps=round(fps, 2),
-                               video_frames_delivered=delivered)
-            except Exception:
-                pass
-        return {"video_fps": round(fps, 2), "video_frames_delivered": delivered,
-                "video_frame_age_s": round(age, 3) if age is not None else None,
-                "video_stale": stale}
+        return video_delivery_snapshot(self, now)
 
     def _poll_stick_axes(self, now: float) -> None:
         """Log what the pilot is asking for; see ``stick_log_sample``."""
@@ -4864,89 +4830,7 @@ class OlympeLiveBackend:
         )
 
     def _poll_session_telemetry(self, now: float) -> None:
-        if self.session_logs is None:
-            return
-        flush = getattr(self.session_logs, "flush_deferred", None)
-        if callable(flush):
-            flush()
-        self._poll_stick_axes(now)
-        # High-rate NED velocity + attitude for offline ESEKF/KLT-3D A/B replay
-        # (定位演算法/validation/benchmark_esekf_live_replay.py). The 1 Hz
-        # "readback" event below is too coarse to feed observe_fused_state.
-        last_fused = getattr(self, "_last_fused_odometry_t", 0.0)
-        if now - last_fused >= 0.1:
-            self._last_fused_odometry_t = now
-            self.session_logs.telemetry(
-                "fused_odometry",
-                t_mono_ns=time.monotonic_ns(),
-                poll_mono_ns=getattr(self.state, "telemetry_read_mono_ns", None),
-                attitude_mono_ns=getattr(self.state, "attitude_mono_ns", None),
-                attitude_stamp_source=getattr(self.state, "attitude_stamp_source", None),
-                speed_stamp_source=getattr(self.state, "ground_speed_stamp_source", None),
-                speed_mono_ns=getattr(self.state, "ground_speed_mono_ns", None),
-                altitude_mono_ns=getattr(self.state, "altitude_mono_ns", None),
-                gps_mono_ns=getattr(self.state, "gps_location_mono_ns", None),
-                velocity_frame="NED", attitude_kind="firmware_fused_euler",
-                flight_state=getattr(self.state, "flight_state", None),
-                control_owner=getattr(self.state, "control_owner", None),
-                wind_state=getattr(self.state, "wind_state", None),
-                gimbal_pitch_deg=getattr(self.state, "gimbal_pitch_deg", None),
-                zoom=getattr(self.state, "zoom", None),
-                gps_fixed=getattr(self.state, "gps_fixed", None),
-                gps_latitude_accuracy_m=getattr(self.state, "gps_latitude_accuracy_m", None),
-                gps_longitude_accuracy_m=getattr(self.state, "gps_longitude_accuracy_m", None),
-                gps_altitude_accuracy_m=getattr(self.state, "gps_altitude_accuracy_m", None),
-                speed_north_mps=getattr(self.state, "speed_north_mps", None),
-                speed_east_mps=getattr(self.state, "speed_east_mps", None),
-                speed_down_mps=getattr(self.state, "speed_down_mps", None),
-                att_roll=getattr(self.state, "att_roll", None),
-                att_pitch=getattr(self.state, "att_pitch", None),
-                att_yaw=getattr(self.state, "att_yaw", None),
-                drone_altitude_m=getattr(self.state, "drone_altitude_m", None),
-                agl_altitude_m=getattr(self.state, "agl_altitude_m", None),
-                gps_latitude_deg=getattr(self.state, "gps_latitude_deg", None),
-                gps_longitude_deg=getattr(self.state, "gps_longitude_deg", None),
-                gps_altitude_m=getattr(self.state, "gps_altitude_m", None),
-            )
-        if self.session_logs is not None:
-            last_session_tel = getattr(self, "_last_session_telemetry_t", 0.0)
-            if now - last_session_tel >= 1.0:
-                self._last_session_telemetry_t = now
-                video_health = self._video_delivery_snapshot(now)
-                self.session_logs.telemetry(
-                    "readback",
-                    battery_pct=getattr(self.state, "battery_pct", None),
-                    gps_fixed=getattr(self.state, "gps_fixed", None),
-                    home_valid=getattr(self.state, "home_valid", None),
-                    home_reachable=getattr(self.state, "home_reachable", None),
-                    distance_from_home_m=getattr(
-                        self.state, "distance_from_home_m", None
-                    ),
-                    rth_policy_valid=getattr(self.state, "rth_policy_valid", None),
-                    rth_policy_configured=getattr(
-                        self.state, "rth_policy_configured", None
-                    ),
-                    stick_monitor_ok=getattr(self.state, "stick_monitor_ok", None),
-                    active_incident=getattr(self.state, "active_incident", None),
-                    altitude_m=getattr(self.state, "drone_altitude_m", None),
-                    agl_altitude_m=getattr(self.state, "agl_altitude_m", None),
-                    ground_speed_mps=getattr(self.state, "ground_speed_mps", None),
-                    speed_north_mps=getattr(self.state, "speed_north_mps", None),
-                    speed_east_mps=getattr(self.state, "speed_east_mps", None),
-                    speed_down_mps=getattr(self.state, "speed_down_mps", None),
-                    airspeed_mps=getattr(self.state, "airspeed_mps", None),
-                    heading_state=getattr(self.state, "heading_state", None),
-                    alert_state=getattr(self.state, "alert_state", None),
-                    wind_state=getattr(self.state, "wind_state", None),
-                    vibration_state=getattr(self.state, "vibration_state", None),
-                    link_status=getattr(self.state, "link_status", None),
-                    max_altitude_m=getattr(self.state, "max_altitude_m", None),
-                    max_distance_m=getattr(self.state, "max_distance_m", None),
-                    distance_geofence=getattr(
-                        self.state, "distance_geofence_enabled", None
-                    ),
-                    **video_health,
-                )
+        poll_session_telemetry(self, now)
 
     def _poll_gimbal(self) -> None:
         try:

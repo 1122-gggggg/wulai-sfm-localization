@@ -54,6 +54,7 @@ def test_production_stack_matches_offline_sim_builder():
     # same expanded return-to-start waypoints.
     import sys as _sys
     from pathlib import Path as _Path
+
     root = _Path(__file__).resolve()
     for parent in root.parents:
         if (parent / "tools" / "sim_route_autoflight.py").is_file():
@@ -61,6 +62,7 @@ def test_production_stack_matches_offline_sim_builder():
                 _sys.path.insert(0, str(parent / "tools"))
             break
     import sim_route_autoflight as _sim
+
     sim_ctrl, sim_cfg, sim_frame, _doc = _sim.build_production_controller(
         route, align, return_to_start=True
     )
@@ -73,16 +75,27 @@ def test_bridge_truth_conversion_round_trips_through_map_frame():
     import tempfile as _tf
 
     import numpy as _np
+
     route, align = _route_and_align()
     _rpf, _doc, frame, _cfg, ctrl = production_route.build_production_stack(route, align)
     parsed = production_route.ProductionRouteArgs(
-        route=route, align=align, meters_per_unit=5.0, output_dir=_Path(_tf.mkdtemp()),
-        dry_run=True, attach_hovering=False, seed=7, duration_s=300.0,
-        wind_mean_mps=(0.0, 0.0, 0.0), gust_mps=0.0,
-        gust_duration_s=2.0, gust_transition_s=1.0, gust_pause_s=15.0,
+        route=route,
+        align=align,
+        meters_per_unit=5.0,
+        output_dir=_Path(_tf.mkdtemp()),
+        dry_run=True,
+        attach_hovering=False,
+        seed=7,
+        duration_s=300.0,
+        wind_mean_mps=(0.0, 0.0, 0.0),
+        gust_mps=0.0,
+        gust_duration_s=2.0,
+        gust_transition_s=1.0,
+        gust_pause_s=15.0,
     )
     import simulated_localization as _loc
     from heading_fusion import HeadingEstimator as _Heading
+
     _rng = _np.random.default_rng(7)
     _loc_obj = _loc.SimulatedLocalizer(_loc.SimulatedLocalizerConfig(s=5.0), _rng)
     _bridge = production_route._SphinxProductionPoseBridge(
@@ -106,8 +119,11 @@ def test_bridge_truth_conversion_round_trips_through_map_frame():
 
 def test_bridge_predicted_flag_mirrors_pose_observation():
     import types as _types
+
     _ns = _types.SimpleNamespace(
-        yaw_noise_deg=0.0, meters_per_unit=5.0, seed=7,
+        yaw_noise_deg=0.0,
+        meters_per_unit=5.0,
+        seed=7,
     )
     _bridge = production_route._SphinxProductionPoseBridge.__new__(
         production_route._SphinxProductionPoseBridge

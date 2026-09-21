@@ -51,6 +51,7 @@ def test_only_the_run_a_reseed_starts_is_reseed_confirming():
         accepted, mode, _weak, _pending = adapter._confirm_pose(pose, info, "TRACK", weak, status)
         adapter._advance_state(accepted, info, mode, status)
         return adapter._reseed_confirming
+
     assert offer(0.0, 10.0) is False
     # Flight 2026-09-15 14:25: the seed frame is held; the next consistent
     # FAST_TRACK releases the shared map-fix source and ends the reseed run.

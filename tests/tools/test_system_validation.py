@@ -47,6 +47,7 @@ def test_release_receipt_tracks_operator_runtime_seams() -> None:
         "一鍵啟動.sh",
         "控制介面程式/operator_interface/localization_contract.py",
         "控制介面程式/operator_interface/olympe_live_backend.py",
+        "控制介面程式/operator_interface/backend_telemetry.py",
         "控制介面程式/operator_interface/operator_autonomy.py",
         "控制介面程式/operator_interface/operator_preflight.py",
         "控制介面程式/operator_interface/operator_rendering.py",

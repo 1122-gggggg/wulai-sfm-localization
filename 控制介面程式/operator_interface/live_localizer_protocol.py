@@ -20,6 +20,9 @@ FUSED_HEADER_SIZE = _FUSED_HEADER.size
 GNSS_FUSED_MAGIC = b"SFM4"
 _GNSS_FUSED_HEADER = struct.Struct("!4sBdddI12d")
 GNSS_FUSED_HEADER_SIZE = _GNSS_FUSED_HEADER.size
+INDEPENDENT_FUSED_MAGIC = b"SFM5"
+_INDEPENDENT_FUSED_HEADER = struct.Struct("!4sBddddI12d")
+INDEPENDENT_FUSED_HEADER_SIZE = _INDEPENDENT_FUSED_HEADER.size
 FLAG_HAS_ATTITUDE = 1
 FLAG_HAS_VELOCITY = 2
 FLAG_HAS_GNSS = 4
@@ -31,6 +34,8 @@ MAX_GNSS_AGE_S = 2.5
 class FusedTelemetry:
     __slots__ = (
         "stamp",
+        "attitude_stamp",
+        "speed_stamp",
         "roll",
         "pitch",
         "yaw",
@@ -50,6 +55,8 @@ class FusedTelemetry:
         self,
         *,
         stamp: float | None = None,
+        attitude_stamp: float | None = None,
+        speed_stamp: float | None = None,
         roll: float | None = None,
         pitch: float | None = None,
         yaw: float | None = None,
@@ -64,7 +71,12 @@ class FusedTelemetry:
         longitude_accuracy: float | None = None,
         altitude_accuracy: float | None = None,
     ) -> None:
-        self.stamp = stamp
+        # ``stamp`` is the legacy common timestamp and remains the property
+        # consumed by existing trackers.  New independent headers use the
+        # attitude source stamp as that compatibility value.
+        self.stamp = attitude_stamp if attitude_stamp is not None else stamp
+        self.attitude_stamp = attitude_stamp
+        self.speed_stamp = speed_stamp
         self.roll = roll
         self.pitch = pitch
         self.yaw = yaw
@@ -136,6 +148,20 @@ def _validate_telemetry_stamp(stamp: float, capture_stamp: float) -> float:
             f"stale live-localizer telemetry stamp: {stamp!r} vs capture {capture_stamp!r}"
         )
     return stamp
+
+
+def optional_telemetry_stamp(stamp: float | None, capture_stamp: float) -> float | None:
+    """Return a usable per-signal source stamp, or drop that signal.
+
+    Missing, malformed, non-finite, future, or capture-mismatched values are
+    unavailable instead of being replaced by another signal's timestamp.
+    """
+    if stamp is None or stamp == "":
+        return None
+    try:
+        return _validate_telemetry_stamp(float(stamp), float(capture_stamp))
+    except (TypeError, ValueError, OverflowError):
+        return None
 
 
 def _validate_gnss_stamp(stamp: float, capture_stamp: float) -> float:
@@ -215,6 +241,96 @@ def _optional_finite(value: float) -> float | None:
     return float(value) if math.isfinite(value) else None
 
 
+def _encode_independent_fused_request(
+    mode: str,
+    capture_stamp: float,
+    code: int,
+    fused: FusedTelemetry,
+) -> bytes:
+    """Encode per-signal source stamps while keeping SFM3/SFM4 unchanged."""
+    attitude_stamp = optional_telemetry_stamp(fused.attitude_stamp, capture_stamp)
+    speed_stamp = optional_telemetry_stamp(fused.speed_stamp, capture_stamp)
+    has_attitude = fused.has_attitude and attitude_stamp is not None
+    has_velocity = fused.has_velocity and speed_stamp is not None
+    has_gnss = fused.has_gnss
+    flags = 0
+    if has_attitude:
+        flags |= FLAG_HAS_ATTITUDE
+    if has_velocity:
+        flags |= FLAG_HAS_VELOCITY
+    if has_gnss:
+        flags |= FLAG_HAS_GNSS
+    if flags == 0:
+        return encode_request(mode, capture_stamp)
+
+    if has_gnss:
+        gps_stamp = _validate_gnss_stamp(float(fused.gps_stamp), capture_stamp)
+        latitude = _validated_gnss_value("latitude", fused.latitude)
+        longitude = _validated_gnss_value("longitude", fused.longitude)
+        altitude = _validated_gnss_value("altitude", fused.altitude)
+        if not -90.0 <= latitude <= 90.0 or not -180.0 <= longitude <= 180.0:
+            raise ValueError("invalid live-localizer GNSS coordinates")
+        accuracies = tuple(
+            _validated_gnss_value(name, value)
+            for name, value in (
+                ("latitude accuracy", fused.latitude_accuracy),
+                ("longitude accuracy", fused.longitude_accuracy),
+                ("altitude accuracy", fused.altitude_accuracy),
+            )
+        )
+        if any(value < 0.0 for value in accuracies):
+            raise ValueError("invalid live-localizer GNSS accuracy")
+    else:
+        gps_stamp = latitude = longitude = altitude = float("nan")
+        accuracies = (float("nan"),) * 3
+
+    attitude_values = (
+        _finite_or_nan(fused.roll),
+        _finite_or_nan(fused.pitch),
+        _finite_or_nan(fused.yaw),
+    ) if has_attitude else (float("nan"),) * 3
+    speed_values = (
+        _finite_or_nan(fused.speed_north),
+        _finite_or_nan(fused.speed_east),
+        _finite_or_nan(fused.speed_down),
+    ) if has_velocity else (float("nan"),) * 3
+    return _INDEPENDENT_FUSED_HEADER.pack(
+        INDEPENDENT_FUSED_MAGIC,
+        code,
+        capture_stamp,
+        float(attitude_stamp) if has_attitude else float("nan"),
+        float(speed_stamp) if has_velocity else float("nan"),
+        float(gps_stamp) if has_gnss else float("nan"),
+        flags,
+        *attitude_values,
+        *speed_values,
+        latitude,
+        longitude,
+        altitude,
+        *accuracies,
+    )
+
+
+def _validated_gnss_fields(fused: FusedTelemetry, stamp: float):
+    gps_stamp = _validate_gnss_stamp(float(fused.gps_stamp), stamp)
+    latitude = _validated_gnss_value("latitude", fused.latitude)
+    longitude = _validated_gnss_value("longitude", fused.longitude)
+    altitude = _validated_gnss_value("altitude", fused.altitude)
+    if not -90.0 <= latitude <= 90.0 or not -180.0 <= longitude <= 180.0:
+        raise ValueError("invalid live-localizer GNSS coordinates")
+    accuracies = tuple(
+        _validated_gnss_value(name, value)
+        for name, value in (
+            ("latitude accuracy", fused.latitude_accuracy),
+            ("longitude accuracy", fused.longitude_accuracy),
+            ("altitude accuracy", fused.altitude_accuracy),
+        )
+    )
+    if any(value < 0.0 for value in accuracies):
+        raise ValueError("invalid live-localizer GNSS accuracy")
+    return gps_stamp, latitude, longitude, altitude, accuracies
+
+
 def encode_fused_request(
     mode: str,
     capture_stamp: float,
@@ -226,13 +342,13 @@ def encode_fused_request(
         code = MODE_TO_CODE[str(mode)]
     except KeyError as exc:
         raise ValueError(f"unsupported localization control mode: {mode!r}") from exc
-    flags = 0
-    if fused.has_attitude:
-        flags |= FLAG_HAS_ATTITUDE
-    if fused.has_velocity:
-        flags |= FLAG_HAS_VELOCITY
-    if fused.has_gnss:
-        flags |= FLAG_HAS_GNSS
+    if fused.attitude_stamp is not None or fused.speed_stamp is not None:
+        return _encode_independent_fused_request(mode, stamp, code, fused)
+    flags = (
+        (FLAG_HAS_ATTITUDE if fused.has_attitude else 0)
+        | (FLAG_HAS_VELOCITY if fused.has_velocity else 0)
+        | (FLAG_HAS_GNSS if fused.has_gnss else 0)
+    )
     if flags == 0:
         return encode_request(mode, stamp)
     fused_stamp = telemetry_stamp if telemetry_stamp is not None else fused.stamp
@@ -256,22 +372,7 @@ def encode_fused_request(
             flags,
             *common,
         )
-    gps_stamp = _validate_gnss_stamp(float(fused.gps_stamp), stamp)
-    latitude = _validated_gnss_value("latitude", fused.latitude)
-    longitude = _validated_gnss_value("longitude", fused.longitude)
-    altitude = _validated_gnss_value("altitude", fused.altitude)
-    if not -90.0 <= latitude <= 90.0 or not -180.0 <= longitude <= 180.0:
-        raise ValueError("invalid live-localizer GNSS coordinates")
-    accuracies = tuple(
-        _validated_gnss_value(name, value)
-        for name, value in (
-            ("latitude accuracy", fused.latitude_accuracy),
-            ("longitude accuracy", fused.longitude_accuracy),
-            ("altitude accuracy", fused.altitude_accuracy),
-        )
-    )
-    if any(value < 0.0 for value in accuracies):
-        raise ValueError("invalid live-localizer GNSS accuracy")
+    gps_stamp, latitude, longitude, altitude, accuracies = _validated_gnss_fields(fused, stamp)
     return _GNSS_FUSED_HEADER.pack(
         GNSS_FUSED_MAGIC,
         code,
@@ -296,8 +397,31 @@ def decode_control_header(
         return mode, stamp, None
     if len(raw) == LEGACY_FUSED_HEADER_SIZE and raw[:4] == FUSED_MAGIC:
         raise ValueError("legacy fused live-localizer control header")
+    is_independent = len(raw) == INDEPENDENT_FUSED_HEADER_SIZE and raw[:4] == INDEPENDENT_FUSED_MAGIC
     is_gnss = len(raw) == GNSS_FUSED_HEADER_SIZE and raw[:4] == GNSS_FUSED_MAGIC
-    if is_gnss:
+    if is_independent:
+        (
+            magic,
+            code,
+            stamp,
+            attitude_stamp,
+            speed_stamp,
+            gps_stamp,
+            flags,
+            roll,
+            pitch,
+            yaw,
+            vn,
+            ve,
+            vd,
+            latitude,
+            longitude,
+            altitude,
+            latitude_accuracy,
+            longitude_accuracy,
+            altitude_accuracy,
+        ) = _INDEPENDENT_FUSED_HEADER.unpack(raw)
+    elif is_gnss:
         (
             magic,
             code,
@@ -336,7 +460,13 @@ def decode_control_header(
         latitude_accuracy = longitude_accuracy = altitude_accuracy = float("nan")
     else:
         raise ValueError("invalid live-localizer request header size")
-    expected_magic = GNSS_FUSED_MAGIC if is_gnss else FUSED_MAGIC
+    expected_magic = (
+        INDEPENDENT_FUSED_MAGIC
+        if is_independent
+        else GNSS_FUSED_MAGIC
+        if is_gnss
+        else FUSED_MAGIC
+    )
     if magic != expected_magic:
         raise ValueError("invalid fused live-localizer control header")
     try:
@@ -344,28 +474,70 @@ def decode_control_header(
     except KeyError as exc:
         raise ValueError(f"invalid live-localizer mode code: {code}") from exc
     stamp = _validate_capture_stamp(stamp)
-    fused_stamp = _validate_telemetry_stamp(fused_stamp, stamp)
-    has_gnss = bool(flags & FLAG_HAS_GNSS)
-    if has_gnss:
-        gps_stamp = _validate_gnss_stamp(gps_stamp, stamp)
-        if (
-            not math.isfinite(latitude)
-            or not math.isfinite(longitude)
-            or not math.isfinite(altitude)
-            or not -90.0 <= latitude <= 90.0
-            or not -180.0 <= longitude <= 180.0
-            or any(
-                not math.isfinite(value) or value < 0.0
-                for value in (
-                    latitude_accuracy,
-                    longitude_accuracy,
-                    altitude_accuracy,
+    if is_independent:
+        has_attitude = bool(flags & FLAG_HAS_ATTITUDE)
+        has_velocity = bool(flags & FLAG_HAS_VELOCITY)
+        has_gnss = bool(flags & FLAG_HAS_GNSS)
+        attitude_stamp = (
+            optional_telemetry_stamp(attitude_stamp, stamp) if has_attitude else None
+        )
+        speed_stamp = optional_telemetry_stamp(speed_stamp, stamp) if has_velocity else None
+        if attitude_stamp is None:
+            flags &= ~FLAG_HAS_ATTITUDE
+            has_attitude = False
+        if speed_stamp is None:
+            flags &= ~FLAG_HAS_VELOCITY
+            has_velocity = False
+        if has_gnss:
+            try:
+                gps_stamp = _validate_gnss_stamp(gps_stamp, stamp)
+                if (
+                    not math.isfinite(latitude)
+                    or not math.isfinite(longitude)
+                    or not math.isfinite(altitude)
+                    or not -90.0 <= latitude <= 90.0
+                    or not -180.0 <= longitude <= 180.0
+                    or any(
+                        not math.isfinite(value) or value < 0.0
+                        for value in (
+                            latitude_accuracy,
+                            longitude_accuracy,
+                            altitude_accuracy,
+                        )
+                    )
+                ):
+                    raise ValueError("invalid fused live-localizer GNSS payload")
+            except (TypeError, ValueError, OverflowError):
+                flags &= ~FLAG_HAS_GNSS
+                has_gnss = False
+                gps_stamp = latitude = longitude = altitude = float("nan")
+                latitude_accuracy = longitude_accuracy = altitude_accuracy = float("nan")
+        fused_stamp = attitude_stamp if has_attitude else None
+    else:
+        fused_stamp = _validate_telemetry_stamp(fused_stamp, stamp)
+        has_gnss = bool(flags & FLAG_HAS_GNSS)
+        if has_gnss:
+            gps_stamp = _validate_gnss_stamp(gps_stamp, stamp)
+            if (
+                not math.isfinite(latitude)
+                or not math.isfinite(longitude)
+                or not math.isfinite(altitude)
+                or not -90.0 <= latitude <= 90.0
+                or not -180.0 <= longitude <= 180.0
+                or any(
+                    not math.isfinite(value) or value < 0.0
+                    for value in (
+                        latitude_accuracy,
+                        longitude_accuracy,
+                        altitude_accuracy,
+                    )
                 )
-            )
-        ):
-            raise ValueError("invalid fused live-localizer GNSS payload")
+            ):
+                raise ValueError("invalid fused live-localizer GNSS payload")
     fused = FusedTelemetry(
         stamp=fused_stamp,
+        attitude_stamp=attitude_stamp if is_independent and has_attitude else None,
+        speed_stamp=speed_stamp if is_independent and has_velocity else None,
         roll=_optional_finite(roll) if flags & FLAG_HAS_ATTITUDE else None,
         pitch=_optional_finite(pitch) if flags & FLAG_HAS_ATTITUDE else None,
         yaw=_optional_finite(yaw) if flags & FLAG_HAS_ATTITUDE else None,
@@ -381,5 +553,3 @@ def decode_control_header(
         altitude_accuracy=float(altitude_accuracy) if has_gnss else None,
     )
     return mode, stamp, fused
-
-

@@ -97,41 +97,7 @@ class RouteLandingConfirmation:
             return 0.0
         return max(0.0, float(self._last_capture) - float(self._first_capture))
 
-    def update(self, sample: object, now: float, *, position_ok: bool, reseed_pause: bool = False) -> bool:
-        try:
-            now_f = float(now)
-        except (TypeError, ValueError, OverflowError):
-            self.reset()
-            return False
-        if not math.isfinite(now_f):
-            self.reset()
-            return False
-        if not bool(position_ok):
-            self.reset()
-            return False
-        if self._inside_since is None:
-            self._inside_since = now_f
-        self._last_position_time = now_f
-        if bool(reseed_pause):
-            # Hold the window during the brief reseed-confirming policy; a long
-            # pause means the position evidence itself went stale.
-            if self._last_capture is not None and now_f - self._last_capture > float(self.max_position_age_s):
-                self.reset()
-                return False
-            if self._first_capture is not None and now_f - self._first_capture > float(self.max_position_age_s) and self._samples == 0:
-                self.reset()
-                return False
-            return False
-        allowed, _reason, speed = landing_speed_allows_land(
-            sample, now_f, max_age_s=GROUND_SPEED_MAX_AGE_S,
-        )
-        if not allowed:
-            self.reset()
-            # Re-enter the circle on this tick so a still-valid position does
-            # not need one extra tick to restart the window.
-            self._inside_since = now_f
-            self._last_position_time = now_f
-            return False
+    def _accept_capture(self, sample: object, now_f: float, speed: float | None) -> bool:
         try:
             _speed_value = float(speed) if speed is not None else float("nan")
             capture = float(sample[1]) if isinstance(sample, (tuple, list)) else float("nan")
@@ -169,6 +135,43 @@ class RouteLandingConfirmation:
         if float(self._last_capture - self._first_capture) < LANDING_STABLE_S - 1e-9:
             return False
         return True
+    def update(self, sample: object, now: float, *, position_ok: bool, reseed_pause: bool = False) -> bool:
+        try:
+            now_f = float(now)
+        except (TypeError, ValueError, OverflowError):
+            self.reset()
+            return False
+        if not math.isfinite(now_f):
+            self.reset()
+            return False
+        if not bool(position_ok):
+            self.reset()
+            return False
+        if self._inside_since is None:
+            self._inside_since = now_f
+        self._last_position_time = now_f
+        if bool(reseed_pause):
+            # Hold the window during the brief reseed-confirming policy; a long
+            # pause means the position evidence itself went stale.
+            if self._last_capture is not None and now_f - self._last_capture > float(self.max_position_age_s):
+                self.reset()
+                return False
+            if self._first_capture is not None and now_f - self._first_capture > float(self.max_position_age_s) and self._samples == 0:
+                self.reset()
+                return False
+            return False
+        allowed, _reason, speed = landing_speed_allows_land(
+            sample, now_f, max_age_s=GROUND_SPEED_MAX_AGE_S,
+        )
+        if not allowed:
+            self.reset()
+            # Re-enter the circle on this tick so a still-valid position does
+            # not need one extra tick to restart the window.
+            self._inside_since = now_f
+            self._last_position_time = now_f
+            return False
+        return self._accept_capture(sample, now_f, speed)
+
 
 
 def decide_route_completion_landing(

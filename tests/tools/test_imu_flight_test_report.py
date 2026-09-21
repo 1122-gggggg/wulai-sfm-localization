@@ -83,7 +83,9 @@ def _localization_rows(*, fused: bool = True, lost: bool = True, esekf: bool = T
     return rows
 
 
-def _write_session(tmp_path: Path, telemetry, localization, frames=6) -> Path:
+def _write_session(
+    tmp_path: Path, telemetry, localization, frames=6, recorder_summary=None
+) -> Path:
     session = tmp_path / "session_20260905T000000Z_real-flight_abcd1234"
     (session / "imu_test" / "frames").mkdir(parents=True)
     (session / "telemetry.jsonl").write_text(
@@ -108,10 +110,9 @@ def _write_session(tmp_path: Path, telemetry, localization, frames=6) -> Path:
     (session / "imu_test" / "frames.jsonl").write_text(
         "".join(json.dumps(row) + "\n" for row in index), encoding="utf-8"
     )
-    (session / "imu_test" / "summary.json").write_text(
-        json.dumps({"written": frames, "dropped_queue_full": 0, "stop_reason": ""}),
-        encoding="utf-8",
-    )
+    summary = {"written": frames, "dropped_queue_full": 0, "stop_reason": ""}
+    summary.update(recorder_summary or {})
+    (session / "imu_test" / "summary.json").write_text(json.dumps(summary), encoding="utf-8")
     return session
 
 
@@ -174,6 +175,32 @@ def test_stale_telemetry_pairs_are_counted_against_the_protocol_bound(tmp_path) 
     assert built["localization"]["sync_error_over_bound"] == len(rows)
     assert built["verdict"] == "USABLE WITH GAPS"
     assert any(str(report.MAX_FUSED_SYNC_ERROR_S) in note for note in built["notes"])
+
+
+def test_incomplete_recorder_summary_is_reported_as_a_gap(tmp_path) -> None:
+    session = _write_session(
+        tmp_path,
+        _telemetry_rows(),
+        _localization_rows(),
+        recorder_summary={
+            "incomplete": True,
+            "writer_shutdown_timeout": True,
+            "writer_alive": True,
+            "writer_error": "OSError('disk stalled')",
+        },
+    )
+
+    built = report.build_report(session)
+
+    assert built["verdict"] == "USABLE WITH GAPS"
+    joined = " ".join(built["notes"])
+    assert "incomplete" in joined
+    assert "關閉期限" in joined
+    assert "writer 仍在執行" in joined
+    assert "disk stalled" in joined
+    rendered = report.render(built)
+    assert "shutdown_timeout=True" in rendered
+    assert "writer error=OSError('disk stalled')" in rendered
 
 
 def test_cli_exits_nonzero_only_for_an_unusable_session(tmp_path, capsys) -> None:

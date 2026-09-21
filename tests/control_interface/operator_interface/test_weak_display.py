@@ -533,6 +533,8 @@ def test_hud_without_direct_status_has_no_weak_run_fragment() -> None:
         direct_status=None,
     )
     app.OperatorApp._update_localization_recovery(operator, edm_weak)
+
+
 def test_held_weak_feeds_autonomy_snapshot_only_when_opted_in() -> None:
     for flag, expected_x in ((False, 1.0), (True, 1.03)):
         policy = app.LostHoldPolicy(low_confidence_results=2, hold_on_low_confidence=True)

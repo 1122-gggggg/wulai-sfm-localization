@@ -244,22 +244,8 @@ class FFmpegFrameStream:
         except (BrokenPipeError, OSError, ValueError):
             pass
 
-    def _terminate_processes(self) -> None:
-        """Stop child processes and pipe workers with bounded waits."""
-        processes = [proc for proc in (self.proc, self.enc_proc) if proc is not None]
-        self.proc = None
-        self.enc_proc = None
-
-        # Closing the parent-side pipes also releases a reader blocked in a fake or
-        # real pipe whose child has not observed SIGTERM yet.
-        seen: set[int] = set()
-        for proc in processes:
-            if id(proc) in seen:
-                continue
-            seen.add(id(proc))
-            for attribute in ("stdin", "stdout", "stderr"):
-                self._close_pipe(proc, attribute)
-
+    @staticmethod
+    def _stop_children(processes) -> None:
         for proc in processes:
             terminate = getattr(proc, "terminate", None)
             if callable(terminate):
@@ -285,6 +271,25 @@ class FFmpegFrameStream:
                     pass
             except (OSError, ValueError):
                 pass
+
+    def _terminate_processes(self) -> None:
+        """Stop child processes and pipe workers with bounded waits."""
+        processes = [proc for proc in (self.proc, self.enc_proc) if proc is not None]
+        self.proc = None
+        self.enc_proc = None
+
+        # Closing the parent-side pipes also releases a reader blocked in a fake or
+        # real pipe whose child has not observed SIGTERM yet.
+        seen: set[int] = set()
+        for proc in processes:
+            if id(proc) in seen:
+                continue
+            seen.add(id(proc))
+            for attribute in ("stdin", "stdout", "stderr"):
+                self._close_pipe(proc, attribute)
+
+        self._stop_children(processes)
+
 
         nal_thread = self._nal_thread
         self._nal_thread = None

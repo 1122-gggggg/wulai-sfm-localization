@@ -1954,24 +1954,28 @@ class OperatorApp(tk.Tk):
             self._loc_result_poll_ms = 5
 
     def _on_localizer_result_ready(self, _fd: int, _mask: int) -> None:
-        if self.localizer is None:
+        localizer = self.localizer
+        if localizer is None:
             return
-        self.localizer.drain_result_notifications()
+        localizer.drain_result_notifications()
         if not getattr(self, "_loc_result_idle_pending", False):
             self._loc_result_idle_pending = True
 
             def _dispatch() -> None:
                 self._loc_result_idle_pending = False
-                self.update_live_results()
+                if self.localizer is localizer:
+                    self.update_live_results()
 
-            after_idle = getattr(self, "after_idle", None)
-            if callable(after_idle):
+            # A continuous stream of render/timer events can starve idle
+            # callbacks. Queue one normal event without mutating mid-callback.
+            after = getattr(self, "after", None)
+            if callable(after):
                 try:
-                    after_idle(_dispatch)
+                    after(0, _dispatch)
                     return
                 except (tk.TclError, RuntimeError):
                     self._loc_result_idle_pending = False
-            self.update_live_results()
+            _dispatch()
 
     def boot_holding(self) -> bool:
         localizer = getattr(self, "localizer", None)

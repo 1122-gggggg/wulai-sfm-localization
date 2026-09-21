@@ -49,6 +49,10 @@ from disk_policy import assess_disk_space
 #: for a field the aircraft did not report, which is itself the finding.
 FUSED_FIELDS = (
     "fused_telemetry_mono",
+    "fused_stamp_source",
+    "fused_attitude_mono",
+    "fused_speed_mono",
+    "fused_altitude_mono",
     "fused_roll",
     "fused_pitch",
     "fused_yaw",
@@ -104,7 +108,12 @@ def _as_rgb_array(frame: Any) -> np.ndarray | None:
     if not isinstance(frame, np.ndarray) or frame.ndim != 3 or frame.shape[2] < 3:
         return None
     try:
-        owned: np.ndarray = np.ascontiguousarray(frame[..., :3], dtype=np.uint8)
+        # ``ascontiguousarray`` returns its input when it is already contiguous.
+        # The live grabber reuses that buffer, so this recorder must always own
+        # an independent copy before handing it to the writer thread.
+        owned: np.ndarray = np.array(
+            frame[..., :3], dtype=np.uint8, order="C", copy=True
+        )
     except (TypeError, ValueError):
         return None
     return owned
@@ -169,6 +178,13 @@ class ImuFlightTestRecorder:
         self._last_seq: int | None = None
         self.stop_reason = ""
         self.last_error = ""
+        self._state_lock = threading.Lock()
+        self._summary_lock = threading.Lock()
+        self._writer_finished = threading.Event()
+        self._incomplete = False
+        self._writer_shutdown_timeout = False
+        self._writer_error = ""
+        self._summary_revision = 0
 
         self._queue: queue.Queue = queue.Queue(maxsize=_QUEUE_DEPTH)
         self._closed = threading.Event()
@@ -233,6 +249,7 @@ class ImuFlightTestRecorder:
             self._queue.put_nowait((row, image))
         except queue.Full:
             self.dropped_queue_full += 1
+            self._incomplete = True
             return False
         return True
 
@@ -250,13 +267,29 @@ class ImuFlightTestRecorder:
             try:
                 self._write(*item)
             except Exception as exc:
-                self.last_error = repr(exc)
-        self._flush_index()
+                self._record_writer_error(exc)
+        try:
+            self._flush_index()
+        finally:
+            # The writer is the sole owner of the index handle. close() may
+            # return while this thread is still blocked on an encoder or disk,
+            # so the caller must never close the handle behind it.
+            self._close_index()
+            with self._summary_lock:
+                while True:
+                    with self._state_lock:
+                        revision = self._summary_revision
+                    self._write_summary_locked(writer_alive=False)
+                    with self._state_lock:
+                        if self._summary_revision == revision:
+                            self._writer_finished.set()
+                            break
 
     def _write(self, row: dict[str, Any], image: np.ndarray) -> None:
         payload = _encode_jpeg(image, self.jpeg_quality)
         if payload is None:
             self.dropped_encode_failed += 1
+            self._incomplete = True
             return
         (self.directory / str(row["file"])).write_bytes(payload)
         row["bytes"] = len(payload)
@@ -282,7 +315,11 @@ class ImuFlightTestRecorder:
         try:
             status = assess_disk_space(self.directory)
         except Exception as exc:
-            self.last_error = repr(exc)
+            error = repr(exc)
+            with self._state_lock:
+                self.last_error = error
+                self._writer_error = error
+                self._incomplete = True
             return
         if status.takeoff_blocked:
             self._stop(f"disk_floor:{status.reason}")
@@ -293,11 +330,56 @@ class ImuFlightTestRecorder:
             os.fsync(self._index.fileno())
             self._index_pending = 0
         except Exception as exc:
-            self.last_error = repr(exc)
+            self._record_writer_error(exc, reason="writer_flush_error")
+
+    def _close_index(self) -> None:
+        try:
+            if not self._index.closed:
+                self._index.close()
+        except Exception as exc:
+            self._record_writer_error(exc, reason="writer_close_error")
+
+    def _record_writer_error(self, exc: BaseException, *, reason: str = "writer_error") -> None:
+        error = repr(exc)
+        with self._state_lock:
+            self.last_error = error
+            self._writer_error = error
+            self._incomplete = True
+            if not self.stop_reason:
+                self.stop_reason = reason
 
     def _stop(self, reason: str) -> None:
         if not self.stop_reason:
             self.stop_reason = reason
+
+    def _summary_payload(self, *, writer_alive: bool) -> dict[str, Any]:
+        with self._state_lock:
+            incomplete = bool(self._incomplete or writer_alive or self._writer_shutdown_timeout)
+            writer_error = self._writer_error or None
+            shutdown_timeout = bool(self._writer_shutdown_timeout)
+        return {
+            "schema_version": 1,
+            "closed_mono": time.monotonic(),
+            "incomplete": incomplete,
+            "writer_alive": bool(writer_alive),
+            "writer_shutdown_timeout": shutdown_timeout,
+            "writer_error": writer_error,
+            **self.stats(),
+        }
+
+    def _write_summary_locked(self, *, writer_alive: bool) -> None:
+        summary = self._summary_payload(writer_alive=writer_alive)
+        try:
+            temp = self.directory / ".summary.json.tmp"
+            temp.write_text(
+                json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            os.replace(temp, self.directory / "summary.json")
+        except Exception as exc:
+            # There may be no usable path left for a second diagnostic, but keep
+            # the in-memory error for callers and for any later retry.
+            self._record_writer_error(exc, reason="summary_write_error")
 
     # ------------------------------------------------------------------ close
     def stats(self) -> dict[str, Any]:
@@ -325,22 +407,26 @@ class ImuFlightTestRecorder:
             self._queue.put_nowait(None)
         except queue.Full:
             pass
-        self._thread.join(timeout=timeout)
-        self._flush_index()
-        try:
-            self._index.close()
-        except Exception as exc:
-            self.last_error = repr(exc)
-        summary = {"schema_version": 1, "closed_mono": time.monotonic(), **self.stats()}
-        try:
-            temp = self.directory / ".summary.json.tmp"
-            temp.write_text(
-                json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-                encoding="utf-8",
-            )
-            os.replace(temp, self.directory / "summary.json")
-        except Exception:
-            pass
+        wait_s = max(0.0, float(timeout))
+        self._thread.join(timeout=wait_s)
+        with self._state_lock:
+            writer_alive = not self._writer_finished.is_set()
+            if writer_alive:
+                self._writer_shutdown_timeout = True
+                self._incomplete = True
+                self._summary_revision += 1
+        if writer_alive and self._summary_lock.acquire(blocking=False):
+            try:
+                # A timed-out writer may still own the index. Publish a truthful
+                # provisional summary only when the summary sink is available;
+                # the writer's revision check prevents an older snapshot from
+                # overwriting the timeout evidence.
+                with self._state_lock:
+                    still_alive = not self._writer_finished.is_set()
+                if still_alive:
+                    self._write_summary_locked(writer_alive=True)
+            finally:
+                self._summary_lock.release()
 
 
 def create_recorder(

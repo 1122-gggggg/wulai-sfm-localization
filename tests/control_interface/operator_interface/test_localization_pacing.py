@@ -217,6 +217,39 @@ def test_attach_handler_keeps_result_loop_at_5ms() -> None:
     assert [fd for fd, _ in seen] == [99]
 
 
+def test_result_notification_runs_before_idle_work_and_coalesces() -> None:
+    timers, idle, consumed = [], [], []
+    operator = SimpleNamespace(
+        localizer=SimpleNamespace(drain_result_notifications=lambda: None),
+        after=lambda delay, callback: timers.append((delay, callback)),
+        after_idle=idle.append,
+        update_live_results=lambda: consumed.append(True),
+    )
+    for _ in range(3):
+        app.OperatorApp._on_localizer_result_ready(operator, 99, 0)
+    assert consumed == []  # No mutation inside the readable-fd callback.
+    assert len(timers) == 1 and timers[0][0] == 0
+    assert idle == []
+    timers[0][1]()
+    assert consumed == [True]
+    assert operator._loc_result_idle_pending is False
+
+
+def test_queued_result_notification_cannot_cross_localizer_replacement() -> None:
+    timers, consumed = [], []
+    operator = SimpleNamespace(
+        localizer=SimpleNamespace(drain_result_notifications=lambda: None),
+        after=lambda delay, callback: timers.append(callback),
+        update_live_results=lambda: consumed.append(True),
+    )
+    app.OperatorApp._on_localizer_result_ready(operator, 99, 0)
+    operator.localizer = None
+    assert len(timers) == 1
+    timers[0]()
+    assert consumed == []
+    assert operator._loc_result_idle_pending is False
+
+
 def test_file_deadline_waits_for_decoder_then_skips_expired_slots() -> None:
     import time
 

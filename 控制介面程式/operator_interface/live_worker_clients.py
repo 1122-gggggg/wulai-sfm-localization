@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import queue
 import select
@@ -20,6 +21,7 @@ from live_localizer_protocol import (
     encode_fused_request,
     encode_mode,
     encode_request,
+    optional_telemetry_stamp,
 )
 from localization_metrics import CIRCUIT_BREAKER_STATES, RESTART_REASONS
 from operator_localization_config import LOCALIZATION_BENCHMARK_LABELS
@@ -1192,21 +1194,72 @@ class LiveLocalizerClient(LiveWorkerClient):
         timing = timing_metadata or {}
         capture_stamp = timing.get("source_frame_stamp_mono")
         if capture_stamp:
-            fused_stamp = timing.get("fused_telemetry_mono")
-            telemetry_stamp = None
-            if fused_stamp is not None and fused_stamp != "":
-                try:
-                    telemetry_stamp = float(fused_stamp)
-                except (TypeError, ValueError, OverflowError) as exc:
-                    raise ValueError(f"invalid fused telemetry stamp: {fused_stamp!r}") from exc
+            try:
+                capture_stamp = float(capture_stamp)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError(
+                    f"invalid source frame stamp: {timing.get('source_frame_stamp_mono')!r}"
+                ) from exc
+
+            # New timing metadata has independent source stamps.  The SFM5
+            # extension carries them separately; a legacy timing payload may
+            # have only fused_telemetry_mono, which remains the attitude stamp
+            # while an unstamped velocity is omitted.
+            if "fused_attitude_mono" in timing and (
+                timing.get("fused_attitude_mono") is not None
+                or timing.get("fused_stamp_source") != "poll_fallback"
+            ):
+                telemetry_stamp = optional_telemetry_stamp(
+                    timing.get("fused_attitude_mono"), capture_stamp
+                )
+            else:
+                telemetry_stamp = optional_telemetry_stamp(
+                    timing.get("fused_telemetry_mono"), capture_stamp
+                )
+
+            speed_stamp = optional_telemetry_stamp(
+                timing.get("fused_speed_mono"), capture_stamp
+            )
+            speed_values = (
+                timing.get("fused_speed_north"),
+                timing.get("fused_speed_east"),
+                timing.get("fused_speed_down"),
+            )
+            if speed_stamp is None or any(
+                value is None
+                or not math.isfinite(float(value))
+                for value in speed_values
+            ):
+                speed_values = (None, None, None)
+                speed_stamp = None
+            uses_independent_attitude = (
+                "fused_attitude_mono" in timing
+                and timing.get("fused_attitude_mono") is not None
+                and timing.get("fused_stamp_source") != "poll_fallback"
+            )
+            wire_attitude_stamp = (
+                telemetry_stamp
+                if telemetry_stamp is not None
+                and (uses_independent_attitude or speed_stamp is not None)
+                else None
+            )
+            attitude_values = (
+                timing.get("fused_roll"),
+                timing.get("fused_pitch"),
+                timing.get("fused_yaw"),
+            )
+            if telemetry_stamp is None:
+                attitude_values = (None, None, None)
             fused = FusedTelemetry(
                 stamp=telemetry_stamp,
-                roll=timing.get("fused_roll"),
-                pitch=timing.get("fused_pitch"),
-                yaw=timing.get("fused_yaw"),
-                speed_north=timing.get("fused_speed_north"),
-                speed_east=timing.get("fused_speed_east"),
-                speed_down=timing.get("fused_speed_down"),
+                attitude_stamp=wire_attitude_stamp,
+                speed_stamp=speed_stamp,
+                roll=attitude_values[0],
+                pitch=attitude_values[1],
+                yaw=attitude_values[2],
+                speed_north=speed_values[0],
+                speed_east=speed_values[1],
+                speed_down=speed_values[2],
                 gps_stamp=timing.get("fused_gps_mono"),
                 latitude=timing.get("fused_gps_latitude"),
                 longitude=timing.get("fused_gps_longitude"),
@@ -1215,12 +1268,12 @@ class LiveLocalizerClient(LiveWorkerClient):
                 longitude_accuracy=timing.get("fused_gps_longitude_accuracy"),
                 altitude_accuracy=timing.get("fused_gps_altitude_accuracy"),
             )
-            if telemetry_stamp is not None and (
+            if (telemetry_stamp is not None or speed_stamp is not None) and (
                 fused.has_attitude or fused.has_velocity or fused.has_gnss
             ):
                 return encode_fused_request(
                     mode,
-                    float(capture_stamp),
+                    capture_stamp,
                     fused,
                     telemetry_stamp=telemetry_stamp,
                 )

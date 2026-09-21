@@ -29,6 +29,8 @@ from live_localizer_protocol import (
     GNSS_FUSED_HEADER_SIZE,
     GNSS_FUSED_MAGIC,
     HEADER_SIZE,
+    INDEPENDENT_FUSED_HEADER_SIZE,
+    INDEPENDENT_FUSED_MAGIC,
     TIMED_HEADER_SIZE,
     TIMED_MAGIC,
     decode_control_header,
@@ -744,14 +746,13 @@ def _read_benchmark_request(args):
             )
             return None
         magic = bytes(header[:4])
-        if magic == TIMED_MAGIC:
-            extra = TIMED_HEADER_SIZE - HEADER_SIZE
-        elif magic == FUSED_MAGIC:
-            extra = FUSED_HEADER_SIZE - HEADER_SIZE
-        elif magic == GNSS_FUSED_MAGIC:
-            extra = GNSS_FUSED_HEADER_SIZE - HEADER_SIZE
-        else:
-            extra = 0
+        header_size = {
+            TIMED_MAGIC: TIMED_HEADER_SIZE,
+            FUSED_MAGIC: FUSED_HEADER_SIZE,
+            GNSS_FUSED_MAGIC: GNSS_FUSED_HEADER_SIZE,
+            INDEPENDENT_FUSED_MAGIC: INDEPENDENT_FUSED_HEADER_SIZE,
+        }.get(magic, HEADER_SIZE)
+        extra = header_size - HEADER_SIZE
         if extra:
             suffix = read_exact(sys.stdin.buffer, extra)
             if len(suffix) != extra:
