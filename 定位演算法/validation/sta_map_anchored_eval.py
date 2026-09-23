@@ -402,7 +402,6 @@ def run_edm(args) -> None:
         sys.path.insert(0, str(ROOT / relative))
     from production_localizer_factory import build_production_localizer
     from real_path_follow_controller import load_map_frame
-    from river_map_quality.official_edm_adapter import prepare_official_megadepth_image_from_array
 
     args.out.mkdir(parents=True, exist_ok=True)
     site_path = ROOT / "地圖檔/場域/river_site/site_profile.json"
@@ -425,6 +424,9 @@ def run_edm(args) -> None:
     tracker = built.tracker.trk
     provider = tracker.provider
     provider.ensure_models()
+    # vendor/ is on sys.path only once the direct provider has been built.
+    from river_map_quality.official_edm_adapter import prepare_official_megadepth_image_from_array
+
     provider_index = {name: index for index, name in enumerate(provider._reference_names)}
     data = MapData(args.release)
     path = args.out / "edm_results.jsonl"
