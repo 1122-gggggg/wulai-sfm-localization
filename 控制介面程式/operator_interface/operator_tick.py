@@ -756,9 +756,9 @@ class _TickProfile:
     rather than guess between the remaining options.
 
     Those numbers came from the simulated stream, whose ffmpeg read happens
-    inline on the Tk thread; real flight polls frames from the RTSP reader instead,
-    so the runbook is explicit that the real-hardware number has to be taken
-    separately. Emitting from here means one IMU飛行測試.sh flight
+    inline on the Tk thread; real flight feeds frames from an Olympe callback
+    thread instead, so the runbook is explicit that the real-hardware number has
+    to be taken separately. Emitting from here means one IMU飛行測試.sh flight
     produces it with no extra step.
     """
 

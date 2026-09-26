@@ -470,9 +470,9 @@ def summarize_tick_profile(records: list[dict[str, Any]]) -> dict[str, Any]:
 
     runbook 0b measured ui_poll_delay_ms p50 at 25 ms on the *simulated* path
     and is explicit that the real-hardware number must be taken separately,
-    because real frames are read on a dedicated RTSP worker thread instead of
-    inline on Tk. This separate measurement shows which stage holds the loop,
-    rather than choosing blind between the doc's candidates.
+    because live frames arrive on an Olympe callback thread instead of inline on
+    the Tk thread. This is that measurement: one flight now answers which stage
+    holds the loop, instead of choosing blind between the doc's candidates.
     """
     if not records:
         return {"windows": 0, "ticks": 0, "stages": {}, "worst": None}

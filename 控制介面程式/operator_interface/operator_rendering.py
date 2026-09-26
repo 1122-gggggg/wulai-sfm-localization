@@ -545,7 +545,7 @@ def draw_video_empty_state(
     if live_backend:
         draw.text(
             (28, 52),
-            "Waiting for live RTSP frames…",
+            "Waiting for live PDRAW frames…",
             fill="#a7b0b8",
             font=overlay_font,
         )
@@ -703,9 +703,9 @@ def build_hud_overlay_data(state: Any, loc: Any, telemetry: Any) -> dict:
             "altitude_agl",
             "link_quality",
             "current_auto_speed",
-            "flight_state",
-            "flight_attitude",
-            "flight_altitude",
+            "olympe_state",
+            "olympe_attitude",
+            "olympe_altitude",
         ):
             try:
                 if hasattr(telemetry, key):
@@ -758,37 +758,37 @@ def build_hud_overlay_data(state: Any, loc: Any, telemetry: Any) -> dict:
         "current_auto_speed",
         tele_dict.get("auto_speed", tele_dict.get("current_auto_speed_var", "AUTO PCMD -")),
     )
-    rth = tele_dict.get("rth", tele_dict.get("flight_state", "RTH ?/?"))
+    rth = tele_dict.get("rth", tele_dict.get("olympe_state", "RTH ?/?"))
     gps = tele_dict.get("gps", "")
-    attitude = tele_dict.get("attitude", tele_dict.get("flight_attitude", "飛控融合姿態 -"))
-    velocity = tele_dict.get("velocity", tele_dict.get("flight_velocity", "三軸速度 -"))
+    attitude = tele_dict.get("attitude", tele_dict.get("olympe_attitude", "飛控融合姿態 -"))
+    velocity = tele_dict.get("velocity", tele_dict.get("olympe_velocity", "三軸速度 -"))
     altitude_agl = tele_dict.get(
-        "altitude_agl", tele_dict.get("flight_altitude", "飛控高度 - | AGL -")
+        "altitude_agl", tele_dict.get("olympe_altitude", "飛控高度 - | AGL -")
     )
     link_quality = tele_dict.get("link_quality", "")
-    flight_state_val = tele_dict.get("flight_state", None)
-    flight_attitude_val = tele_dict.get("flight_attitude", None)
-    flight_altitude_val = tele_dict.get("flight_altitude", None)
-    if flight_state_val is not None or flight_attitude_val is not None:
+    olympe_state_val = tele_dict.get("olympe_state", None)
+    olympe_attitude_val = tele_dict.get("olympe_attitude", None)
+    olympe_altitude_val = tele_dict.get("olympe_altitude", None)
+    if olympe_state_val is not None or olympe_attitude_val is not None:
         line1 = " | ".join(
             part for part in (str(auto_speed), f"定位 FPS {fps_text}", f"inliers {inliers}") if part
         )
         line2 = f"wall_ms {wall_text} | core {latency_text} | e2e {e2e_text}"
         line3 = (
-            str(flight_state_val)
-            if flight_state_val is not None
+            str(olympe_state_val)
+            if olympe_state_val is not None
             else (f"{rth} | {gps}".strip(" |") if gps else str(rth))
         )
         line4 = (
-            str(flight_altitude_val)
-            if flight_altitude_val is not None
+            str(olympe_altitude_val)
+            if olympe_altitude_val is not None
             else (
                 f"{altitude_agl} | {link_quality}".strip(" |")
                 if link_quality
                 else str(altitude_agl)
             )
         )
-        att = str(flight_attitude_val) if flight_attitude_val is not None else str(attitude)
+        att = str(olympe_attitude_val) if olympe_attitude_val is not None else str(attitude)
         if " | 三軸速度 " in att:
             att_part, sep, vel_part = att.partition(" | 三軸速度 ")
             attitude_line = att_part

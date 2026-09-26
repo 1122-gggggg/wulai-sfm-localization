@@ -523,7 +523,7 @@ def env_with_mission(args, profile: SiteProfile | None = None) -> dict[str, str]
     env["SFM_POLES_JSON"] = args.poles_json
     env["SFM_SAFEZONE_DIR"] = str(Path(args.path_json).resolve().parent)
     env["SFM_MAP_ROOT"] = str((_WS.algorithms / "source" / "sfm_glomap").resolve())
-    env["SFM_ARSDK_CONTROLLER"] = args.controller
+    env["SFM_OLYMPE_CONTROLLER"] = args.controller
     env["SFM_SAFETY_FILE"] = str(args.safety_file)
     if args.site_profile:
         env["SFM_SITE_PROFILE"] = args.site_profile
@@ -755,7 +755,7 @@ def main() -> None:
     parser.add_argument("--poles-json", default=None)
     parser.add_argument("--safezone-dir", default=None)
     parser.add_argument("--ip", default="192.168.42.1")
-    parser.add_argument("--controller", default=os.environ.get("SFM_ARSDK_CONTROLLER", "auto"))
+    parser.add_argument("--controller", default=os.environ.get("SFM_OLYMPE_CONTROLLER", "auto"))
     parser.add_argument("--safety-file", default=str(DEFAULT_SAFETY_FILE))
     parser.add_argument("--secs", type=float, default=20.0)
     parser.add_argument("--yaw-sign", type=int, choices=(-1, 1), default=1)

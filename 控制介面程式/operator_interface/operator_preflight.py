@@ -189,7 +189,7 @@ def _evidence_float(value: object) -> float:
 
 def _live_state_problem(state: object) -> str | None:
     if not bool(getattr(state, "link_ok", False)):
-        return "ARSDK-NG 控制連線異常"
+        return "Olympe 控制連線異常"
     return None
 
 

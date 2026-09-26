@@ -1,5 +1,11 @@
 # 時間取樣、重定位銜接與失鎖補位（2026-09-26）
 
+> 2026-09-27 更新：操作員決定真機繼續使用 Olympe，ARSDK-NG／RTSP 後端已移除
+> （完整版本保留在分支 `backup/arsdk-ng-20260927`）。第 1 項的事件歷史改由
+> Olympe `drone.subscribe()` 收集（`backend_telemetry.MotionEventHistory`），
+> 影像回到 PDRAW 與 `ntp_raw_timestamp`。以下第 1 項中 ARSDK／RTSP 的描述是
+> 當時的實作紀錄，不代表現行程式。
+
 對應本次評估表的第 1、3、4 項。以開始時的未提交工作區為基準；沒有操作硬體。
 
 ## 1. 保留遙測事件時間與中間樣本

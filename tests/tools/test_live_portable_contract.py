@@ -20,7 +20,6 @@ LAUNCHER = ROOT / "一鍵啟動.sh"
 def test_live_minimal_export_contract_excludes_development_payload() -> None:
     assert "一鍵啟動.sh" in exporter.LIVE_MINIMAL_COPY_FILES
     assert "requirements/runtime-lock.txt" in exporter.LIVE_MINIMAL_COPY_FILES
-    assert "tools/build_arsdk_ng.sh" in exporter.LIVE_MINIMAL_COPY_FILES
     assert "tools/simulator_preflight.py" in exporter.LIVE_MINIMAL_COPY_FILES
     assert (
         "模擬器/parrot_stimulate/src/anafi_pcmd_sim/scale_free_control.py"
@@ -65,10 +64,6 @@ def test_live_minimal_export_uses_live_entrypoint_and_filters_tests(
         ),
         encoding="utf-8",
     )
-    native_libraries = source / exporter.ARSDK_NG_LIBRARY_DIRECTORY
-    native_libraries.mkdir(parents=True)
-    for index, name in enumerate(exporter.ARSDK_NG_LIBRARY_FILES):
-        (native_libraries / name).write_bytes(f"native-{index}".encode("ascii"))
     monkeypatch.setattr(exporter, "ROOT", source)
     monkeypatch.setattr(exporter, "LIVE_MINIMAL_COPY_DIRS", ("code",))
     monkeypatch.setattr(exporter, "LIVE_MINIMAL_COPY_FILES", ("RUNTIME_ARTIFACTS.json",))
@@ -82,8 +77,6 @@ def test_live_minimal_export_uses_live_entrypoint_and_filters_tests(
     assert metadata["package_kind"] == "live-operator-runtime"
     assert metadata["entrypoint"] == "一鍵啟動.sh"
     assert (destination / "code/runtime.py").is_file()
-    for name in exporter.ARSDK_NG_LIBRARY_FILES:
-        assert (destination / exporter.ARSDK_NG_LIBRARY_DIRECTORY / name).is_file()
     assert not (destination / "code/test_runtime.py").exists()
     assert verify(destination) == []
 

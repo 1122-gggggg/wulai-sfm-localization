@@ -25,16 +25,16 @@ SAFETY (non-negotiable)
 
 Verification without motors
   python manual_nudge_pilot.py --dry-run --selftest
-  # prints/logs every mapped PCMD; no ARSDK connection
+  # prints/logs every mapped PCMD; no Olympe
 
 Live (props OFF first for bench; open field + stick pilot for air)
-  # stop any other ARSDK telemetry logger first (single connection)
+  # stop any other Olympe logger first (single connection)
   python manual_nudge_pilot.py --ip 192.168.53.1 --controller skycontroller3 \\
       --secs 600 --cmd-log /tmp/nudge_cmdlog.jsonl
 
 Piloting source (SkyController 3)
   SkyController  sticks active, app PCMD blocked
-  Controller     app/ARSDK-NG PCMD active, sticks silent
+  Controller     app/Olympe PCMD active, sticks silent
   We take Controller only while PC is piloting; always restore SkyController on exit.
 """
 from __future__ import annotations
@@ -196,7 +196,7 @@ class SafetyState:
 
 
 def _wait_result(result, timeout_s: float, label: str) -> bool:
-    """Wait for a backend expectation with a caller-enforced timeout."""
+    """Wait for an Olympe expectation with a caller-enforced timeout."""
     if result is None or result is True:
         return True
     if result is False:
@@ -233,7 +233,7 @@ def _wait_result(result, timeout_s: float, label: str) -> bool:
 
 
 class NudgePilot:
-    """Shared core: dry-run or live ARSDK-NG."""
+    """Shared core: dry-run or live Olympe."""
 
     def __init__(self, *, dry_run: bool, ip: str, controller: str,
                  pct: int, pulse_s: float, cmd_log: CommandLog):
@@ -261,8 +261,8 @@ class NudgePilot:
             self.log.event("connect", mode="dry-run")
             return
         sys.path.insert(0, str(Path(__file__).resolve().parent))
-        import rtsp_frame_source as rtsp
-        self.drone = rtsp.connect(self.ip, controller=self.controller)
+        import olympe_frame_source as ofs
+        self.drone = ofs.connect(self.ip, controller=self.controller)
         self.log.event("connect", mode="live", ip=self.ip, controller=self.controller)
         if not self._set_piloting_source("Controller"):
             self.log.event("connect_failed", reason="Controller handoff unconfirmed")
@@ -278,14 +278,14 @@ class NudgePilot:
             self.log.event("piloting_source", source=source, dry_run=True)
             return True
         try:
-            messages = self.drone.messages
-            set_source = messages.Skyctrl.CoPiloting.setPilotingSource
-            source_state = messages.Skyctrl.CoPilotingState.pilotingSource
-            result = self.drone(set_source(source=source))
+            from olympe.messages.skyctrl.CoPiloting import (
+                pilotingSource, setPilotingSource,
+            )
+            result = self.drone(setPilotingSource(source=source))
             if not _wait_result(result, PILOTING_SOURCE_WAIT_S,
                                 f"setPilotingSource({source})"):
                 raise RuntimeError("setPilotingSource expectation failed or timed out")
-            state = self.drone.get_state(source_state)
+            state = self.drone.get_state(pilotingSource)
             actual = state.get("source") if isinstance(state, dict) else None
             actual_name = str(getattr(actual, "name", actual)).rsplit(".", 1)[-1]
             if actual_name.casefold() != str(source).casefold():
@@ -308,8 +308,8 @@ class NudgePilot:
             del self._sent[:-_SENT_CAPTURE_MAX]
         if self.dry_run or self.drone is None:
             return
-        pcmd = self.drone.messages.Ardrone3.Piloting.PCMD
-        self.drone(pcmd(1, r, p, y, g, 0))
+        from olympe.messages.ardrone3.Piloting import PCMD
+        self.drone(PCMD(1, r, p, y, g, 0))
 
     def send_pcmd(self, roll: int, pitch: int, yaw: int, gaz: int, *, reason: str) -> bool:
         with self._send_lock:
@@ -352,7 +352,7 @@ class NudgePilot:
                 return False
             self.safety.pilot_sticks = False
         self.hover("pc_control_resumed")
-        self.log.event("pc_control", detail="ARSDK-NG owns PCMD")
+        self.log.event("pc_control", detail="Olympe owns PCMD")
         return True
 
     def land(self, reason: str = "land") -> bool:
@@ -371,14 +371,18 @@ class NudgePilot:
                 self.log.event("land_zero_failed", error=repr(exc))
             if not self.dry_run and self.drone is not None:
                 try:
-                    messages = self.drone.messages
-                    landing = messages.Ardrone3.Piloting.Landing
-                    landed = messages.Ardrone3.PilotingState.FlyingStateChanged
+                    from olympe.messages.ardrone3.Piloting import Landing
+                    from olympe.messages.ardrone3.PilotingState import (
+                        FlyingStateChanged,
+                    )
                     # Queuing Landing() is not touchdown. Marking the airframe landed
                     # on a queued (or raising) command made every later guard that
                     # keys off `landed` believe the aircraft was safely down.
                     landed_ok = _wait_result(
-                        self.drone(landing() >> landed(state="landed")),
+                        self.drone(
+                            Landing()
+                            >> FlyingStateChanged(state="landed", _timeout=20)
+                        ),
                         22.0,
                         "landing/landed",
                     )
@@ -429,12 +433,13 @@ class NudgePilot:
                 if not self._set_piloting_source("Controller"):
                     self.log.event("takeoff_blocked", reason="Controller handoff unconfirmed")
                     return False
-                messages = self.drone.messages
-                takeoff = messages.Ardrone3.Piloting.TakeOff
-                hovering = messages.Ardrone3.PilotingState.FlyingStateChanged
+                from olympe.messages.ardrone3.Piloting import TakeOff
+                from olympe.messages.ardrone3.PilotingState import FlyingStateChanged
                 self.safety.pilot_sticks = False
                 ok = _wait_result(
-                    self.drone(takeoff() >> hovering(state="hovering")),
+                    self.drone(
+                        TakeOff() >> FlyingStateChanged(state="hovering", _timeout=12)
+                    ),
                     TAKEOFF_WAIT_S,
                     "takeoff/hovering",
                 )
@@ -607,7 +612,7 @@ def run_deadman(pilot: NudgePilot) -> None:
     """If UI loop dies (no beat), hover then land. Runs as daemon thread.
 
     Every step is guarded: this thread exists precisely because the rest of the
-    program may already be broken, so an exception here (a dropped ARSDK-NG link
+    program may already be broken, so an exception here (a dropped Olympe link
     during land() is the obvious one) must not be what removes the protection.
     """
     # NOT gated on safety.stop: land() sets that only on a CONFIRMED touchdown now,
@@ -825,7 +830,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if not args.dry_run:
         print(
-            "!!! LIVE MODE: will send ARSDK-NG commands (sticks silent until Esc/手動).\n"
+            "!!! LIVE MODE: will take Olympe piloting source (sticks silent until Esc/手動).\n"
             "    Safety pilot must hold the SkyController. Props-off first for bench.\n"
             "    Ctrl-C / close window / kill terminal -> bounded safety cleanup.",
             flush=True,

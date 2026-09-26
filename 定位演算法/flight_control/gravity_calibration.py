@@ -2,7 +2,7 @@
 """Ground gravity / IMU attitude calibration helper.
 
 Operator physically rotates the (props-off) airframe through three motions while
-we sample ARSDK-NG attitude (roll, pitch, yaw in radians):
+we sample Olympe-style attitude (roll, pitch, yaw in radians):
 
   1. YAW   — horizontal spin about gravity (keep deck roughly level)
   2. PITCH — tip nose forward / back
@@ -414,10 +414,10 @@ def _run_live(ip: str, controller: str, out: Path | None) -> int:
     import sys
 
     sys.path.insert(0, str(Path(__file__).resolve().parent))
-    import rtsp_frame_source as rtsp
+    import olympe_frame_source as ofs
 
     print("Connecting (passive). PROPS OFF. Follow on-screen phases.", flush=True)
-    drone = rtsp.connect(ip, controller=controller)
+    drone = ofs.connect(ip, controller=controller)
     cal = GravityCalibrator()
     cal.start()
     print(f"\n=== PHASE yaw: {PHASE_LABELS['yaw']} ===", flush=True)
@@ -425,13 +425,12 @@ def _run_live(ip: str, controller: str, out: Path | None) -> int:
 
     stop = {"f": False}
 
-    attitude_changed = drone.messages.Ardrone3.PilotingState.AttitudeChanged
-
     def reader():
+        from olympe.messages.ardrone3.PilotingState import AttitudeChanged
 
         while not stop["f"]:
             try:
-                st = drone.get_state(attitude_changed)
+                st = drone.get_state(AttitudeChanged)
             except Exception:
                 st = None
             if st:

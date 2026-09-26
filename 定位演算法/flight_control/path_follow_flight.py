@@ -1,21 +1,20 @@
 #!/usr/bin/env python3
-"""REAL ANAFI localization and path-follow logic (direct ARSDK-NG + RTSP).
+"""REAL ANAFI closed-loop path-follow flight (Parrot Olympe / Ground SDK).
 
-This connects the production tracker and route controller using one direct
-ARSDK-NG control client plus Parrot RTSP video:
+This is the ONE missing wiring piece. Every block below already exists and was
+sim-validated separately; this file joins them into a single runnable real-flight
+entrypoint on ONE Olympe connection:
 
-    RtspFrameGrabber (720p /live stream)                   [rtsp_frame_source.py]
+    OlympePdrawGrabber (720p live stream)              [olympe_frame_source.py]
       -> site-selected direct production tracker
              KLT fast loop with MegaLoc/EDM reloc handover
-      -> map-frame heading fusion  (visual camera ray <-> firmware NED yaw)
+      -> map-frame heading fusion  (visual camera ray <-> Olympe yaw)
       -> RouteAutoController.step(pose) -> Command      [real_path_follow_controller.py]
              FOLLOW / LAND (direct waypoint legs; drift corrected every tick)
       -> command_to_body_percent(cmd, pose) -> PCMD(roll, pitch, yaw, gaz)
-      -> ARSDK-NG PCMD command              same control client
+      -> drone(PCMD(...))            same single connection used for the video
 
-Video timestamps are RTSP host-receipt times and degraded; strict source-time
-consumers fail closed. The live TakeOff path remains locked to the operator UI.
-
+SDK      : Parrot Olympe (Ground SDK).  https://developer.parrot.com/docs/olympe/
 Map      : river direct release; reloc manifest localization/direct_bundle.json.
 Path     : pre-drawn polyline  safezone/flight_path.json  (Blender Z-up waypoints).
 Frame    : raw GLOMAP  horizontal = X/Z, gravity-up = -Y   (matches RouteAutoController).
@@ -23,8 +22,8 @@ Frame    : raw GLOMAP  horizontal = X/Z, gravity-up = -Y   (matches RouteAutoCon
 Heading contract
 ----------------
 The production localizer publishes pose.yaw from the camera forward ray projected
-into the site's measured MapFrame. That visual heading anchors firmware NED yaw
-after converting clockwise-from-North NED into counter-clockwise map heading.
+into the site's measured MapFrame. That visual heading anchors Olympe's faster NED
+yaw after converting clockwise-from-North NED into counter-clockwise map heading.
 Route direction and translation are never treated as heading measurements.
 
 SAFETY  -- real flight is irreversible and can injure people or destroy the drone.
@@ -34,6 +33,7 @@ SAFETY  -- real flight is irreversible and can injure people or destroy the dron
   --fly       : rejected. Live TakeOff is only allowed from the operator UI.
 The aircraft's initial nose direction is measured, never assumed from the route.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -96,11 +96,11 @@ from landing_transition import (  # noqa: E402
     landing_speed_allows_land,  # noqa: F401 - compatibility API
 )
 from heading_fusion import (  # noqa: E402
-    OFFSET_EMA,  # noqa: F401
-    ArsdkGroundSpeedTracker,
-    VISUAL_IMU_YAW_MISMATCH_RAD,  # noqa: F401
+    OFFSET_EMA,  # noqa: F401 - compatibility API
+    OlympeGroundSpeedTracker as OlympeGroundSpeedTracker,
+    VISUAL_IMU_YAW_MISMATCH_RAD,  # noqa: F401 - compatibility API
     HeadingEstimator,
-    arsdk_yaw_of,
+    olympe_yaw_of,
 )
 from control_state_estimator import ControlPoseSmoother, ControlStateEstimator  # noqa: E402
 from wind_observer import ResidualDriftObserver  # noqa: E402
@@ -596,7 +596,7 @@ def _bounded_call(callback, timeout_s: float, label: str):
 
 
 def _await_confirmed_action(result, label: str, timeout_s: float = ACTION_WAIT_TIMEOUT_S) -> None:
-    """Accept explicit local success or a confirmed ARSDK-NG expectation."""
+    """Accept explicit local success or a confirmed Olympe expectation."""
     if result is None or result is True:
         return
     if result is False:
@@ -620,15 +620,14 @@ def wait_success(expectation, label: str) -> None:
 
 def set_piloting_source(drone, source: str) -> bool:
     """Set and read back SkyController CoPiloting ownership."""
-    set_source = drone.messages.Skyctrl.CoPiloting.setPilotingSource
-    source_state = drone.messages.Skyctrl.CoPilotingState.pilotingSource
+    from olympe.messages.skyctrl.CoPiloting import setPilotingSource, pilotingSource
 
     requested = str(source)
     _await_confirmed_action(
-        drone(set_source(source=requested)),
+        drone(setPilotingSource(source=requested)),
         f"setPilotingSource({requested})",
     )
-    state = drone.get_state(source_state)
+    state = drone.get_state(pilotingSource)
     actual = state.get("source") if isinstance(state, dict) else None
     actual_name = str(getattr(actual, "name", actual)).rsplit(".", 1)[-1]
     if actual_name.lower() != requested.lower():
@@ -640,9 +639,9 @@ def set_piloting_source(drone, source: str) -> bool:
 
 def require_landed_for_firmware_config(drone) -> None:
     """Keep the aircraft-state gate separate from advisory firmware setup."""
-    flying_state_changed = drone.messages.Ardrone3.PilotingState.FlyingStateChanged
+    from olympe.messages.ardrone3.PilotingState import FlyingStateChanged
 
-    flying_state = drone.get_state(flying_state_changed)
+    flying_state = drone.get_state(FlyingStateChanged)
     state = flying_state.get("state") if isinstance(flying_state, dict) else None
     state_name = str(getattr(state, "name", state)).rsplit(".", 1)[-1].lower()
     if state_name != "landed":
@@ -671,9 +670,9 @@ def _preflight_battery_percent(drone, battery_message) -> int:
 
 
 def _require_distance_geofence_gps(drone) -> None:
-    gps_fix_state = drone.messages.Ardrone3.GPSSettingsState.GPSFixStateChanged
+    from olympe.messages.ardrone3.GPSSettingsState import GPSFixStateChanged
 
-    state = drone.get_state(gps_fix_state)
+    state = drone.get_state(GPSFixStateChanged)
     fixed = state.get("fixed") if isinstance(state, dict) else None
     if int(fixed or 0) != 1:
         raise RuntimeError("distance geofence requires a confirmed GPS fix")
@@ -732,42 +731,43 @@ def configure_flight_preflight(
     """Check battery and try to apply optional firmware flight limits."""
     if check_landed:
         require_landed_for_firmware_config(drone)
-    messages = drone.messages
-    max_altitude = messages.Ardrone3.PilotingSettings.MaxAltitude
-    max_distance = messages.Ardrone3.PilotingSettings.MaxDistance
-    no_fly_over_max_distance = messages.Ardrone3.PilotingSettings.NoFlyOverMaxDistance
-    max_altitude_changed = messages.Ardrone3.PilotingSettingsState.MaxAltitudeChanged
-    max_distance_changed = messages.Ardrone3.PilotingSettingsState.MaxDistanceChanged
-    no_fly_over_max_distance_changed = (
-        messages.Ardrone3.PilotingSettingsState.NoFlyOverMaxDistanceChanged
+    from olympe.messages.ardrone3.PilotingSettings import (
+        MaxAltitude,
+        MaxDistance,
+        NoFlyOverMaxDistance,
     )
-    battery_state_changed = messages.Common.CommonState.BatteryStateChanged
+    from olympe.messages.ardrone3.PilotingSettingsState import (
+        MaxAltitudeChanged,
+        MaxDistanceChanged,
+        NoFlyOverMaxDistanceChanged,
+    )
+    from olympe.messages.common.CommonState import BatteryStateChanged
 
     altitude = _positive_firmware_limit(max_altitude_m, "max altitude")
     distance = _positive_firmware_limit(max_distance_m, "max distance")
-    battery = _preflight_battery_percent(drone, battery_state_changed)
+    battery = _preflight_battery_percent(drone, BatteryStateChanged)
 
     if distance_geofence:
         _require_distance_geofence_gps(drone)
 
     _confirm_firmware_limit(
         drone,
-        max_altitude(current=altitude),
-        max_altitude_changed,
+        MaxAltitude(current=altitude),
+        MaxAltitudeChanged,
         altitude,
         "MaxAltitude",
     )
     _confirm_firmware_limit(
         drone,
-        max_distance(value=distance),
-        max_distance_changed,
+        MaxDistance(value=distance),
+        MaxDistanceChanged,
         distance,
         "MaxDistance",
     )
     _configure_distance_geofence(
         drone,
-        no_fly_over_max_distance,
-        no_fly_over_max_distance_changed,
+        NoFlyOverMaxDistance,
+        NoFlyOverMaxDistanceChanged,
         distance_geofence,
     )
     return {
@@ -779,7 +779,7 @@ def configure_flight_preflight(
 
 
 # ---------------------------------------------------------------------------
-# Map-frame heading: firmware NED yaw (fast) anchored to measured visual orientation
+# Map-frame heading: Olympe yaw (fast) anchored to measured visual orientation
 
 
 def _wrap(a: float) -> float:
@@ -889,16 +889,14 @@ def set_gimbal(
     timeout_s: float = 2.0,
     tolerance_deg: float = 3.0,
 ):
-    """Point the camera to a fixed absolute (horizon-referenced) tilt."""
+    """Point the camera to a fixed absolute (horizon-referenced) tilt so live frames
+    resemble the map reference views. Absolute frame == EIS-stabilized vs horizon."""
     target = float(pitch_deg)
     timeout = float(timeout_s)
     tolerance = float(tolerance_deg)
     if not _valid_gimbal_request(target, timeout, tolerance):
         return False
-    messages = drone.messages.Gimbal
-    absolute_attitude_bounds = messages.absolute_attitude_bounds
-    attitude = messages.attitude
-    set_target = messages.set_target
+    from olympe.messages.gimbal import absolute_attitude_bounds, attitude, set_target
 
     if require_confirmation and not _gimbal_target_in_bounds(
         drone, absolute_attitude_bounds, target
@@ -1725,7 +1723,7 @@ def start_skycontroller_stick_override(drone, safety_monitor: SafetyMonitor):
     operator_root = MISSION_ROOT / "operator_interface"
     if str(operator_root) not in sys.path:
         sys.path.insert(0, str(operator_root))
-    from arsdk_ng_live_backend import SkyControllerStickMonitor, _STICK_FLIGHT_AXES
+    from olympe_live_backend import SkyControllerStickMonitor, _STICK_FLIGHT_AXES
 
     stick_monitor = SkyControllerStickMonitor(
         on_active=lambda axes: _handle_physical_stick_override(safety_monitor, axes),
@@ -3762,7 +3760,7 @@ def _make_live_loop_hooks(
         force_relocalize=lambda: setattr(localizer.state, "mode", "LOST"),
         request_manual=request_manual,
         stick_active=getattr(stick_monitor, "is_active", None),
-        olympe_yaw=lambda: arsdk_yaw_of(drone),
+        olympe_yaw=lambda: olympe_yaw_of(drone),
         send_pcmd=send_if_active,
         send_authorized_pcmd=lambda pcmd: monitor.send_authorized(
             pcmd,
@@ -4013,13 +4011,13 @@ def _run_until(hooks, ctrl, wp, yaw_sign, stop):
 
 
 def grab_only(ip: str, secs: float, controller: str):
-    import rtsp_frame_source as rtsp
+    import olympe_frame_source as ofs
 
     drone = None
     grab = None
     try:
-        drone = rtsp.connect(ip, controller=controller)
-        grab = rtsp.RtspFrameGrabber(drone).start()
+        drone = ofs.connect(ip, controller=controller)
+        grab = ofs.OlympePdrawGrabber(drone).start()
         loc = build_localizer(grab)
         print(f"[grab] localizing live for {secs:.0f}s (PROPS OFF, no arm)...")
         t0 = time.monotonic()

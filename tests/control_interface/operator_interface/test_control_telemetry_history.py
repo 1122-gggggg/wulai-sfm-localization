@@ -1,63 +1,89 @@
-"""Offline ARSDK event/history and control-consumer contracts."""
+"""Offline Olympe motion-event history and control-consumer contracts."""
 
 from dataclasses import replace
+from datetime import datetime
 from types import SimpleNamespace
-import threading
 
 import numpy as np
 import pytest
 
-import arsdk_ng as sdk
 import backend_telemetry as telemetry
 import path_follow_flight as pff
 import real_path_follow_controller as rpf
 
 
-def test_motion_events_between_polls_are_retained_with_receipt_timestamps(monkeypatch):
-    spec = SimpleNamespace(
-        id=1, fullname="Ardrone3.PilotingState.SpeedChanged", list_type=sdk._LIST_NONE
+def _event(wall_s, **args):
+    return SimpleNamespace(args=args, date=datetime.fromtimestamp(wall_s))
+
+
+def _history(clock):
+    return telemetry.MotionEventHistory(
+        now=lambda: clock["mono"], wall_now=lambda: clock["wall"]
     )
-    client = sdk.ArsdkNgClient.__new__(sdk.ArsdkNgClient)
-    client._lock = threading.RLock()
-    client._condition = threading.Condition(client._lock)
-    client._events, client._states, client._map_states = {}, {}, {}
-    client._event_history = {}
-    client._event_serial = 0
-    client._runtime = SimpleNamespace(_decode=lambda command: (spec, {"speedX": command}))
+
+
+def test_motion_events_between_polls_are_retained_with_receipt_timestamps():
+    clock = {"mono": 100.0, "wall": 5000.0}
+    history = _history(clock)
     for index in range(520):
-        monkeypatch.setattr(sdk.time, "monotonic_ns", lambda: 1_000_000_000 + index * 10_000_000)
-        client._on_recv_cmd(None, index, None)
-    history = client.get_event_history(spec)
-    assert len(history) == 512
-    assert history[0].args["speedX"] == 8
-    assert history[-1].monotonic_ns == 6_190_000_000
-    assert client.get_last_event(spec).serial == history[-1].serial
-    history.clear()
-    assert len(client.get_event_history(spec)) == 512
-    spec = SimpleNamespace(
-        id=2, fullname="Common.CommonState.BatteryStateChanged", list_type=sdk._LIST_NONE
-    )
-    client._on_recv_cmd(None, 100, None)
-    assert client.get_event_history(spec) == []
+        clock["mono"] += 0.01
+        clock["wall"] += 0.01
+        # Delivered 30 ms after receipt: the stamp is the receipt, not delivery.
+        history.record(1, _event(clock["wall"] - 0.03, speedX=float(index), speedY=0.0))
+    attitude, velocity = history.histories()
+    assert attitude == []
+    assert len(velocity) == 512
+    assert velocity[0][0] == 8.0
+    assert velocity[-1][-1] == pytest.approx(clock["mono"] - 0.03)
+    velocity.clear()
+    assert len(history.histories()[1]) == 512
 
 
-def test_backend_history_preserves_receipt_time_and_rejects_invalid_samples(monkeypatch):
-    monkeypatch.setattr(telemetry, "arsdk_message", lambda name: name)
-    histories = {
-        "AttitudeChanged": [sdk._Event({"yaw": 0.1}, 9_800_000_000, 1)],
-        "SpeedChanged": [
-            sdk._Event({"speedX": 1.0, "speedY": 2.0}, 9_900_000_000, 2),
-            sdk._Event({"speedX": float("nan"), "speedY": 2.0}, 9_950_000_000, 3),
-        ],
-    }
-    backend = SimpleNamespace(
-        drone=SimpleNamespace(
-            get_event_history=lambda message: histories[message.rsplit(".", 1)[-1]]
-        )
+def test_motion_history_rejects_untrusted_or_repeated_samples():
+    clock = {"mono": 50.0, "wall": 1000.0}
+    history = _history(clock)
+    history.record(0, _event(999.9, yaw=0.1))
+    history.record(0, _event(999.9, yaw=0.2))          # same receipt: not new
+    history.record(0, _event(1000.5, yaw=0.3))         # future receipt
+    history.record(0, _event(990.0, yaw=0.4))          # older than 5 s
+    history.record(0, _event(999.95, yaw=float("nan")))
+    history.record(0, SimpleNamespace(args={}, date=datetime.fromtimestamp(999.95)))
+    assert history.histories()[0] == [(0.1, pytest.approx(49.9))]
+
+
+def test_motion_history_subscribes_to_attitude_and_speed_and_detaches(monkeypatch):
+    # Other tests may shadow the olympe package; the message type is irrelevant here.
+    monkeypatch.setattr(
+        telemetry, "olympe_message",
+        lambda _module, name: lambda **kwargs: SimpleNamespace(name=name, kwargs=kwargs),
     )
+    subscriptions = []
+
+    class Subscription:
+        def __init__(self, callback, expectation):
+            self.callback, self.expectation, self.active = callback, expectation, True
+
+        def unsubscribe(self):
+            self.active = False
+
+    class Drone:
+        def subscribe(self, callback, expectation):
+            subscriptions.append(Subscription(callback, expectation))
+            return subscriptions[-1]
+
+    clock = {"mono": 10.0, "wall": 100.0}
+    history = _history(clock)
+    history.attach(Drone())
+    assert len(subscriptions) == 2
+    subscriptions[0].callback(_event(99.98, yaw=0.5), None)
+    subscriptions[1].callback(_event(99.99, speedX=1.0, speedY=2.0), None)
+    backend = SimpleNamespace(motion_history=history)
     attitude, velocity = telemetry.control_telemetry_history(backend)
-    assert attitude == [(0.1, 9.8)]
-    assert velocity == [(1.0, 2.0, 9.9)]
+    assert attitude == [(0.5, pytest.approx(9.98))]
+    assert velocity == [(1.0, 2.0, pytest.approx(9.99))]
+    history.detach()
+    assert not any(item.active for item in subscriptions)
+    assert telemetry.control_telemetry_history(SimpleNamespace()) == ([], [])
 
 
 def test_control_loop_consumes_intermediate_events_once():
@@ -115,30 +141,14 @@ def test_motion_log_records_each_event_once_without_advancing_sample_clocks(monk
     assert rows[1][1]["horizontal_ned_samples"] == [(0.0, 2.0, 10.2)]
 
 
-def test_video_connection_passes_connected_client_to_real_grabber_constructor(monkeypatch):
-    import arsdk_ng_live_backend as backend_module
-    import rtsp_frame_source as rtsp
+def test_backend_keeps_connecting_when_motion_subscriptions_fail():
+    import olympe_live_backend as backend_module
 
-    backend = backend_module.ArsdkNgLiveBackend.__new__(backend_module.ArsdkNgLiveBackend)
-    backend.ip, backend.controller, backend.with_video = "192.168.42.1", "drone", True
-    backend.state = SimpleNamespace()
-    backend.log = SimpleNamespace(event=lambda *_args, **_kwargs: None)
-    client = SimpleNamespace(address=backend.ip)
-    monkeypatch.setattr(rtsp, "connect", lambda *_: client)
-    monkeypatch.setattr(rtsp.RtspFrameGrabber, "start", lambda self: self)
-    monkeypatch.setattr(backend_module, "quiet_arsdk_logs", lambda: None)
-    monkeypatch.setattr(backend_module, "LiveAnafiVideoStream", lambda grabber: grabber)
-    monkeypatch.setattr(backend_module, "LegacyFrameSourceAdapter", lambda stream, _url: stream)
-    monkeypatch.setattr(backend, "_set_piloting_source", lambda _: True)
-    monkeypatch.setattr(backend, "_set_tracker_state", lambda *_args, **_kwargs: None)
-    for name in (
-        "_configure_lost_link_policy_if_safe",
-        "read_connection_inventory",
-        "_read_magnetometer_calibration_state",
-        "_configure_firmware_limits_if_safe",
-        "_auto_take_pc_control_if_safe",
-    ):
-        monkeypatch.setattr(backend, name, lambda: None)
-    backend._connect()
-    assert backend.state.stream == "OK"
-    assert backend.grabber.client is client
+    backend = backend_module.OlympeLiveBackend.__new__(backend_module.OlympeLiveBackend)
+    events = []
+    backend.log = SimpleNamespace(event=lambda name, **fields: events.append((name, fields)))
+    backend.motion_history = None
+    backend.drone = SimpleNamespace()          # no subscribe(): old SDK or test fake
+    backend._attach_motion_history()
+    assert backend.motion_history is None
+    assert events and events[0][0] == "motion_history_unavailable"

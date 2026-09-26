@@ -80,8 +80,6 @@ if str(OPERATOR_ROOT) not in sys.path:
 
 # Never touch hardware SDKs in the simulator.
 sys.modules.setdefault("olympe", None)
-sys.modules.setdefault("arsdk_ng", None)
-sys.modules.setdefault("arsdk_ng_live_backend", None)
 
 import real_path_follow_controller as rpf  # noqa: E402
 from route_domain import RouteDocument  # noqa: E402

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Demo-only HTTP server with synthetic flight and localization state.
 
-This module never connects to a drone or loads a hardware-control SDK. It exists
+This module never connects to Olympe, a drone, or the production localizer. It exists
 only for browser/UI prototyping. Real and replay operation use flight_operator_app.py.
 """
 from __future__ import annotations

@@ -959,7 +959,7 @@ def test_operator_interface_modes_are_exactly_two_and_mutually_exclusive(
 
 
 def test_real_flight_interface_rejects_video_file_fallback() -> None:
-    with pytest.raises(ValueError, match="accepts only the ANAFI RTSP stream"):
+    with pytest.raises(ValueError, match="accepts only the ANAFI PDRAW stream"):
         app.resolve_operator_interface("real-flight", False, "/tmp/replay.mp4")
 
 

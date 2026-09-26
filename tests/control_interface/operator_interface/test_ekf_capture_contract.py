@@ -4,13 +4,10 @@ import hashlib
 import json
 from pathlib import Path
 import subprocess
-import sys
-import threading
 import time
 from types import SimpleNamespace
 
 import numpy as np
-import pytest
 
 from backend_contract import InterfaceMode
 from ekf_capture_contract import write_capture_contract
@@ -123,35 +120,14 @@ def test_source_timestamps_are_counted_independently_of_repeated_polls(tmp_path)
     assert result["integrity_errors"] == ["localization.jsonl:2: invalid JSON"]
 
 
-def test_rtsp_frames_expose_degraded_receipt_clock_not_sensor_time():
-    from rtsp_frame_source import RtspFrameGrabber
-
-    stream = RtspFrameGrabber.__new__(RtspFrameGrabber)
-    stream._lock = threading.Lock()
-    stream._latest, stream._digest, stream._n = None, None, 0
-    stream._stamp = stream._receipt_stamp = 0.0
-    stream._frames_received = stream._dup_n = 0
-    stream._latest_timing = {}
-    now = time.monotonic() - .1
-    stream._store(
-        np.zeros((8, 16, 3), dtype=np.uint8),
-        receipt_stamp=now,
-        receipt_mono_ns=round(now * 1e9),
-    )
-    timing = stream._latest_timing
-    assert timing["source_timestamp_trusted"] is False
-    assert timing["source_timestamp_degraded"] is True
-    assert timing["source_ntp_timestamp_us"] is None
-    assert timing["frame_receipt_mono_ns"] == round(now * 1e9)
-
 def test_gimbal_records_all_axes_without_refreshing_an_unchanged_cache(tmp_path, monkeypatch):
-    from arsdk_ng_live_backend import ArsdkNgLiveBackend
+    from olympe_live_backend import OlympeLiveBackend
     import backend_telemetry
     from operator_flight_safety import TelemetryFreshnessStore
     from operator_state import DroneState
 
-    monkeypatch.setattr(backend_telemetry, "arsdk_message", lambda _: object())
-    backend = ArsdkNgLiveBackend.__new__(ArsdkNgLiveBackend)
+    monkeypatch.setattr(backend_telemetry, "olympe_message", lambda *_: object())
+    backend = OlympeLiveBackend.__new__(OlympeLiveBackend)
     backend.state = DroneState()
     backend.drone = SimpleNamespace()
     backend.telemetry_freshness = TelemetryFreshnessStore()
@@ -168,13 +144,13 @@ def test_gimbal_records_all_axes_without_refreshing_an_unchanged_cache(tmp_path,
 
 
 def test_zoom_readback_is_logged_without_changing_operator_control_state(monkeypatch):
-    from arsdk_ng_live_backend import ArsdkNgLiveBackend
+    from olympe_live_backend import OlympeLiveBackend
     import backend_telemetry
     from operator_flight_safety import TelemetryFreshnessStore
     from operator_state import DroneState
 
-    monkeypatch.setattr(backend_telemetry, "arsdk_message", lambda _: object())
-    backend = ArsdkNgLiveBackend.__new__(ArsdkNgLiveBackend)
+    monkeypatch.setattr(backend_telemetry, "olympe_message", lambda *_: object())
+    backend = OlympeLiveBackend.__new__(OlympeLiveBackend)
     backend.state = DroneState()
     backend.drone = SimpleNamespace()
     backend.telemetry_freshness = TelemetryFreshnessStore()

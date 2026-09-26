@@ -22,7 +22,7 @@ from flight_operator_app import (
     _positive_env_float,
     _positive_env_int,
     format_magnetometer_calibration,
-    format_arsdk_telemetry,
+    format_olympe_telemetry,
     gps_operator_message,
     inventory_ui_status,
     next_tick_deadline,
@@ -1692,7 +1692,7 @@ def test_gps_header_is_advisory_and_invalid_values_are_hidden() -> None:
     assert "手動可起飛" in message
     assert "自動先懸停" in message
 
-    telemetry = format_arsdk_telemetry(state)
+    telemetry = format_olympe_telemetry(state)
     assert "GPS — m" in telemetry["altitude"]
     assert "lat —, lon —" in telemetry["gps"]
     assert "500" not in telemetry["altitude"] + telemetry["gps"]
@@ -1704,7 +1704,7 @@ def test_inventory_status_separates_hardware_version_and_lost_link() -> None:
         connection_inventory={
             "aircraft": {"name": "ANAFI", "software": "1.8.2"},
             "controller": {"variant": None, "software": "1.8.1"},
-            "runtime": {"arsdk_ng_source_revision": "409daec0e8fc"},
+            "runtime": {"olympe_version": "8.4.0"},
             "lost_link": {
                 "fallback": "land_in_place",
                 "policy_confirmed": True,
@@ -1724,12 +1724,12 @@ def test_inventory_status_separates_hardware_version_and_lost_link() -> None:
     assert statuses["lost_link"] == ("good", "已確認：無 Home 時原地降落")
 
 
-def test_ui_exposes_read_only_arsdk_flight_telemetry() -> None:
+def test_ui_exposes_read_only_olympe_flight_telemetry() -> None:
     source = inspect.getsource(OperatorApp._build_ui)
     # The panel became rows of the single video overlay on 2026-08-06; what must
     # still hold is that the readouts exist and are composed read-only.
-    assert "flight_state_var" in source
-    assert "flight_altitude_var" in source
+    assert "olympe_state_var" in source
+    assert "olympe_altitude_var" in source
 
     state = DroneState(
         flight_state="hovering",
@@ -1763,7 +1763,7 @@ def test_ui_exposes_read_only_arsdk_flight_telemetry() -> None:
     state.att_pitch = -0.2
     state.att_yaw = 0.3
 
-    telemetry = format_arsdk_telemetry(
+    telemetry = format_olympe_telemetry(
         state, now_mono_ns=1_025_000_000
     )
 
@@ -2266,9 +2266,10 @@ def test_real_flight_interface_refuses_a_replay_driven_hud(monkeypatch, tmp_path
 
 
 def test_operator_speed_envelope_defaults_match_backend():
-    """The UI duplicates envelope defaults because ARSDK-NG is imported lazily."""
+    """The UI duplicates the envelope defaults because olympe_live_backend is
+    imported lazily (it pulls Olympe). Keep the two copies in step."""
     import flight_operator_app as app
-    import arsdk_ng_live_backend as backend
+    import olympe_live_backend as backend
 
     assert app.DEFAULT_MAX_TILT_DEG == backend.DEFAULT_MAX_TILT_DEG
     assert app.DEFAULT_MAX_VERTICAL_SPEED_MS == backend.DEFAULT_MAX_VERTICAL_SPEED_MS

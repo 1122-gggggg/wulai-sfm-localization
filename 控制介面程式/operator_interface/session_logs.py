@@ -67,6 +67,7 @@ _INCIDENT_EVENTS = {
 _RUNTIME_DISTRIBUTIONS = (
     "numpy",
     "opencv-python",
+    "parrot-olympe",
     "Pillow",
     "pycolmap",
     "torch",
@@ -161,12 +162,13 @@ def flight_debug_contract() -> dict[str, Any]:
         "定位演算法/flight_control/real_path_follow_controller.py",
         "定位演算法/flight_control/path_follow_flight.py",
         "定位演算法/deploy_code/sfm_direct_deploy/two_rate_tracker.py",
-        "控制介面程式/operator_interface/arsdk_ng_live_backend.py",
+        "控制介面程式/operator_interface/operator_autonomy.py",
+        "控制介面程式/operator_interface/olympe_live_backend.py",
         "定位演算法/flight_control/control_state_estimator.py",
         "定位演算法/flight_control/wind_observer.py",
         "定位演算法/flight_control/heading_fusion.py",
         "定位演算法/flight_control/pose_frame_chain.py",
-        "定位演算法/flight_control/rtsp_frame_source.py",
+        "定位演算法/flight_control/olympe_frame_source.py",
         "控制介面程式/operator_interface/imu_flight_test.py",
         "控制介面程式/operator_interface/ekf_capture_contract.py",
         "控制介面程式/operator_interface/localization_metrics.py",
@@ -261,7 +263,7 @@ class _JsonlSink:
 
 
 class SessionCommandLog:
-    """Adapter used by ArsdkNgLiveBackend in place of its legacy single JSONL."""
+    """Adapter used by OlympeLiveBackend in place of its legacy single JSONL."""
 
     def __init__(self, session: "SessionLogs"):
         self._session = session

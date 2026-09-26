@@ -32,18 +32,18 @@ Layout:
 ### UI 與可替換接口邊界
 
 - `site_assets_panel.py`：只負責場域資產區的 Tk 排版、檔案選擇器與狀態文字。
-- `operator_actions.py`：按鍵規格與操作流程；不依賴 Tk，也不直接讀寫 ARSDK-NG。
+- `operator_actions.py`：按鍵規格與操作流程；不依賴 Tk，也不直接讀寫 Olympe。
 - `site_asset_interfaces.py`：場域包、航線、巡檢目標三個 replaceable Protocol。
 - `local_site_assets.py`：目前的本機資料夾／JSON 實作與格式驗證。
 - `route_editor_model.py`：航線 schema、場域綁定與 GLOMAP ↔ Z-up 座標轉換。
 - `route_editor_controller.py`：航點、復原／重做、G 與軸向鎖定；不依賴 Tk。
 - `route_editor_window.py`：自製全螢幕點雲編輯畫面；沒有 backend 或飛行指令接口。
 - `simulated_route_test.py`：把正式 route controller 的 PCMD 接到記憶體內運動模型；
-  只供模擬介面測試，不連 ARSDK-NG。
+  只供模擬介面測試，不連 Olympe。
 - `flight_operator_app.py`：composition root，接上既有地圖、串流、飛控與安全清理；
   不在 UI view 內實作資產格式。
 
-因此日後可替換本機地圖來源或航線來源，而不需要改動飛行按鍵與 ARSDK-NG backend。
+因此日後可替換本機地圖來源或航線來源，而不需要改動飛行按鍵與 Olympe backend。
 建圖端五檔交付契約見 `../site_profiles/建圖端輸出規格.md`。
 
 ### 自製航線編輯器
@@ -97,7 +97,7 @@ JSON 時，介面也會同步底層驗證後的核准結果。真機仍須通過
 模擬介面另顯示「儲存並開始模擬航線」。操作員按下後會先完成相同的原子儲存、
 SHA 驗證與航線綁定，再用 production `RouteAutoController` 和記憶體內運動模型執行
 閉迴路測試；到達最後一點並通過地速確認後結束。這條流程不會連接真機或送出
-ARSDK-NG 指令；真機介面不顯示此按鈕，仍須完成四步 preflight 並親自按「自動飛行」。
+Olympe 指令；真機介面不顯示此按鈕，仍須完成四步 preflight 並親自按「自動飛行」。
 
 新的 AUTO 任務以連續穩定的定位姿態判定起飛位置，不要求位於第一個航點附近；先飛往第 1 航點，再依序往第 2、3 點移動。同一趟飛行、同一路線在搖桿接管後再次按 AUTO，會重新交接控制權與確認定位，接續尚未完成的航點，包含返程進度；落地、更換路線或更換 backend 後清除接續紀錄。開放航線不循環，最後回到返程起點降落。起飛位置仍須在任一航點的
 `SFM_BOOT_START_MAX_U` 範圍內（預設 `1.5` map units），避免從航線外直接橫切進入。
@@ -107,12 +107,12 @@ AUTO 尊重路線設定的全域或逐點到站半徑，不把已設定的小半
 
 ## Single-Process Desktop App
 
-### REAL-FLIGHT interface (ARSDK-NG control + RTSP video)
+### REAL-FLIGHT interface (Olympe via SkyController)
 
-**`--interface real-flight` connects controls through the direct Parrot ARSDK-NG
-backend and accepts only the ANAFI RTSP `/live` stream. It never falls back to a
-video file. The old `--live` flag remains only as a compatibility alias. Only a
-human UI click on `起飛` or `自動飛行` may initiate takeoff.**
+**`--interface real-flight` connects the controls below to a real Olympe backend
+and accepts only ANAFI PDRAW video. It never falls back to a video file. The old
+`--live` flag remains only as a compatibility alias. Only a human UI click on
+`起飛` or `自動飛行` may initiate takeoff.**
 
 介面進入後會顯示一條不會遮住降落／緊急控制的「起飛前依序確認」導引。操作員必須
 依序親手確認：① 飛機羅盤校正狀態；② 目前匯入的地圖與場域；③ 顯示後逐點檢查的
@@ -126,7 +126,7 @@ GPS 時才阻擋。前一步未確認時不能跳到後一步；任何已確認�
 
 ```bash
 cd .../localization/控制介面程式/operator_interface
-# stop any other ARSDK-NG session first (single connection)
+# stop any other Olympe session first (single connection)
 python3 flight_operator_app.py --interface real-flight \
   --ip 192.168.53.1 --controller skycontroller3 \
   --max-altitude-m <METERS> --max-distance-m <METERS> \
@@ -163,7 +163,7 @@ against firmware bounds and readback.
 The launcher keeps the UI and localization interpreters explicit:
 
 ```bash
-SFM_UI_PYTHON=/path/to/localization/.venv/bin/python \
+SFM_UI_PYTHON=/path/to/olympe-python \
 SFM_LOCALIZER_PYTHON=/path/to/torch-python \
 IP=192.168.53.1 CTRL=skycontroller3 ./start_anafi_live.sh
 ```
@@ -190,12 +190,13 @@ distance still require field validation. Route completion still waits for
 fresh ground speed at or below 0.10 m/s before requesting Landing.
 
 On connection the backend records the actual ANAFI model/serial/firmware,
-SkyController 3 model/serial/software, ARSDK-NG source revision, transport, Home
-Point, lost-link/RTH policy, and firmware limit readbacks. Ground diagnostics remain
-available when these are incomplete. Firmware versions and an optional signed
-hardware receipt are diagnostic/audit records; they are not takeoff or AUTO gates.
-The selected profile, immutable route snapshot, asset digests, four preflight
-steps, and post-takeoff localization gates remain enforced.
+SkyController 3 model/serial/software, Olympe version, transport, Home Point,
+lost-link/RTH policy, and firmware limit readbacks. Ground diagnostics remain
+available when these are incomplete. Firmware/Olympe versions and an optional
+signed hardware receipt are diagnostic/audit records; they are not takeoff or
+AUTO readiness gates. The selected profile, immutable route snapshot, asset
+digests, four preflight steps, and post-takeoff localization gates remain
+enforced.
 
 UI Python resolution is `SFM_UI_PYTHON` > legacy `VENV` executable > the
 nearest package/workspace `.venv/bin/python` (up to two parent levels) >
@@ -227,7 +228,7 @@ CPU throttle counters increase or GPU thermal slowdown is active; it never
 changes hardware state. Use `--warning-interval 0` only when stderr warnings
 would interfere with an automated capture.
 
-This wires the UI buttons to direct ARSDK-NG commands:
+This wires the UI buttons to real Olympe:
 
 | UI | Real action |
 |---|---|
@@ -251,12 +252,12 @@ critical disk failure zeros PCMD and hands control to manual without auto-resume
 
 ### Latest-frame and latency pipeline
 
-The live video path reads the aircraft's RTSP `/live` endpoint through
-OpenCV/FFmpeg on a dedicated reader thread. Each frame gets a host-monotonic
-receipt timestamp when `VideoCapture.read()` returns; that timestamp is marked
-degraded and untrusted, never presented as a camera sensor timestamp. The
-reader keeps only the newest frame, and the control connection remains
-independent of video.
+The live path is deliberately lossy: Pdraw's raw callback only records
+`time.monotonic_ns()`, calls `ref()`, replaces one pending YUV slot, releases the
+replaced frame, and returns. `VideoFrame.info()`, `as_ndarray()`, YUV-to-RGB,
+resize, localization, detection, display, and logging never run in that
+callback. Pdraw keeps two decoder buffers for decoder progress, while the
+application has exactly one pending frame; those are different layers.
 
 The UI copies the newest contiguous RGB array into the inactive slot of a
 two-slot shared-memory buffer; the localization worker receives only a one-byte
@@ -285,15 +286,15 @@ latency, its recent 5 s p95, and frame age. In
 SIM this is explicitly labelled as real-link simulation: frames first pass the
 720p30/H.264 Main/5 Mb/s encoder-decoder, fixed 280 ms frame backlog, and
 optional slice loss, then EDM, and are counted only when results reach Tk. REAL
-counts the corresponding RTSP-receipt-to-EDM-to-UI results. Missing or expired
+counts the corresponding PDRAW-to-EDM-to-UI results. Missing or expired
 measurements are `N/A`; core model throughput is kept separate and is never
 presented as end-to-end FPS.
 
-The **飛控與限制** tab contains **飛控遙測（ARSDK-NG 事件讀回）**, which shows the
+The **飛控與限制** tab contains **飛控遙測（Olympe 讀回）**, which shows the
 flight-state cache independently of visual localization: fused roll/pitch/yaw, altitude above
 takeoff, AGL, NED ground speed, GPS fix/location/accuracy/satellites, heading/RTH,
 wind/vibration/hover warnings, Wi-Fi/link quality, and IMU/barometer/GPS/etc.
-sensor health. These are read-only ARSDK-NG event-cache values. Original ANAFI's
+sensor health. These are read-only Olympe event-cache values. Original ANAFI's
 public events expose sensor health and flight-controller estimates, not raw IMU
 samples or raw barometric pressure; the UI labels that limitation explicitly.
 
@@ -465,7 +466,7 @@ python3 flight_operator_app.py --no-live-localize \
 ```
 
 Offline replay uses the simulator backend. `--interface real-flight` selects
-`ArsdkNgLiveBackend`; cross-interface video/flag combinations fail before either
+`OlympeLiveBackend`; cross-interface video/flag combinations fail before either
 backend is created.
 
 Keyboard safety shortcuts:
@@ -554,7 +555,7 @@ Backend API expected by the UI:
   - Returns mode, localization status, pose, inliers, reprojection error, tracker state.
 - `POST /api/control`
   - Body: `{"command": "hover|land|manual|auto|takeoff|boot_lock|start_auto|pause|resume|gimbal_pitch|zoom", "payload": {...}}`
-  This is the hook that should call ARSDK-NG / ANAFI commands.
+  - This is the hook that should call Olympe / ANAFI commands.
 - `GET /api/video.jpg` or future MJPEG/WebRTC endpoint
   - Drone live stream.
 - `GET /api/map_points`
@@ -562,6 +563,6 @@ Backend API expected by the UI:
 
 Safety rule for real integration:
 
-- `hover`, `land`, and `manual` must bypass AUTO mission logic and be handled at the highest priority in the ARSDK-NG backend.
+- `hover`, `land`, and `manual` must bypass AUTO mission logic and be handled at the highest priority in the Olympe backend.
 - Losing the 720p stream should force `STREAM_LOST_HOVER` before localization or path-follow commands run.
 - Losing localization should force hover before any path-follow command is sent.

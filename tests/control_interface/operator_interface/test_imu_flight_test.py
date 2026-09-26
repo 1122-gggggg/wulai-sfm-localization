@@ -12,7 +12,7 @@ import pytest
 from PIL import Image
 
 import imu_flight_test
-import arsdk_ng_live_backend as backend_module
+import olympe_live_backend as backend_module
 from imu_flight_test import ImuFlightTestRecorder, create_recorder
 
 
@@ -469,7 +469,7 @@ def _backend(axes: dict[int, int] | None) -> SimpleNamespace:
 
 
 def _poll(backend, now: float) -> None:
-    backend_module.ArsdkNgLiveBackend._poll_stick_axes(backend, now)
+    backend_module.OlympeLiveBackend._poll_stick_axes(backend, now)
 
 
 def test_stick_axes_are_recorded_so_manual_flight_has_an_input_track() -> None:

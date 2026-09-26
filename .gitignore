@@ -32,9 +32,6 @@ outputs/*
 # 離線種入，不進 git 歷史。
 執行環境/models/boq/
 # direct 後端的執行期 scratch（placeholder manifest、EDM runtime config）。
-# ARSDK-NG native libraries are generated from pinned Parrot sources and may be
-# included in a portable release manifest after the build.
-執行環境/native/arsdk-ng/lib/
 執行環境/direct_reloc_cache/
 river-localization-bundle-20260831/
 river-localization-bundle-20260831.tar.zst

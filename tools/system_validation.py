@@ -46,7 +46,7 @@ P119_VIDEO = Path(
 # ROOT_FORMAT_SCOPE defines paths checked by root_ruff_format.
 # 巨檔排除註記：
 # 控制介面程式/operator_interface/flight_operator_app.py (~7850 行) 與
-# 控制介面程式/operator_interface/arsdk_ng_live_backend.py (~5208 行) 體積龐大，
+# 控制介面程式/operator_interface/olympe_live_backend.py (~5208 行) 體積龐大，
 # 由專屬維護與 LINE_BUDGETS 控管行數，避免全量 reformat 造成歷史 git blame 斷層與併行衝突，
 # 故不納入全域 ruff format 範圍，維持針對性檔案或子模組檢查。
 ROOT_FORMAT_SCOPE = (
@@ -116,7 +116,7 @@ RELEASE_FILES = (
     "控制介面程式/operator_interface/local_site_assets.py",
     "控制介面程式/operator_interface/localization_contract.py",
     "控制介面程式/operator_interface/localization_metrics.py",
-    "控制介面程式/operator_interface/arsdk_ng_live_backend.py",
+    "控制介面程式/operator_interface/olympe_live_backend.py",
     "控制介面程式/operator_interface/backend_telemetry.py",
     "控制介面程式/operator_interface/hardware_approval_trust.py",
     "控制介面程式/operator_interface/operator_command_coordinator.py",
@@ -161,7 +161,7 @@ RELEASE_FILES = (
     "定位演算法/flight_control/path_follow_flight.py",
     "定位演算法/flight_control/route_domain.py",
     "定位演算法/flight_control/real_path_follow_controller.py",
-    "定位演算法/flight_control/rtsp_frame_source.py",
+    "定位演算法/flight_control/olympe_frame_source.py",
     "定位演算法/deploy_code/runtime/EDM/weights/edm_outdoor.ckpt",
     "定位演算法/validation/monitor_hardware.py",
     "定位演算法/validation/check_runtime_mirrors.py",

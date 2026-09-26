@@ -8,8 +8,8 @@ UI.  It is intended to be wired to:
 
   1. a visual localizer that returns the current camera/drone pose in the SAME
      GLOMAP map frame, and
-  2. a drone adapter that converts the returned map-frame command into
-     ARSDK-NG piloting commands.
+  2. a drone adapter that converts the returned map-frame command into Olympe
+     PCMD / velocity commands.
 
 Current frame convention (matches the present operator dashboard)
 -----------------------------------------------------------------
@@ -37,7 +37,7 @@ remove this conversion or use T_align consistently before calling this module.
 Safety notes
 ------------
 This is not a complete flight app by itself.  It does not arm motors or talk to
-ARSDK-NG.  It outputs a Command.  A real-flight runner must:
+Olympe.  It outputs a Command.  A real-flight runner must:
 - keep a manual override pilot ready,
 - verify yaw/body-frame signs with props off first,
 - set conservative speed gains,

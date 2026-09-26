@@ -72,7 +72,7 @@ PCMD，再回讀確認 piloting source 已交回 `SkyController`；交接失敗�
 
 起飛後只會懸停定位，必須在 25 秒內同時滿足：
 
-- 連續 3 個 fresh Pose。RTSP `VideoCapture.read()` 回傳後記錄 host-monotonic receipt time；此時間是 degraded 估計值，不是相機 sensor timestamp。需要 source timestamp 的巡檢 acknowledgement 會 fail closed。
+- 連續 3 個 fresh Pose。Pose 時戳使用 PDRAW `ntp_raw_timestamp` 的 source-clock 變化對映至主機 monotonic clock，絕不使用推論完成時間。metadata 缺失時的 callback-receipt fallback 只供診斷／離線模式；真飛會標記 degraded、拒絕該 frame 並懸停。
 - 每個 Pose 距航線起點不超過 `1.5` map-units（可用 `SFM_BOOT_START_MAX_U` 在實測尺度後調整）。
 - 連續 fix 之間不可超過 pose-jump gate。
 
@@ -85,7 +85,7 @@ runner 的逾時降落策略：它會保持懸停，執行 MegaLoc／向右 yaw 
 無人機到達巡檢 waypoint 後會停住等待，不會因為「進入半徑」就標記完成。只有下列條件全部成功才會 acknowledgement：
 
 1. 在 authority lock 下先送零 PCMD，並在整個阻塞式擷取期間持續保持零輸出。
-2. 目前這一幀必須有可用的 ARSDK-NG body-yaw telemetry 與 map-frame 校正；機身 yaw 對準電桿水平 bearing，誤差不超過 6 度。
+2. 目前這一幀必須有可用的 Olympe body-yaw telemetry 與 map-frame 校正；機身 yaw 對準電桿水平 bearing，誤差不超過 6 度。
 3. 依相機與電桿目標的相對高度計算 gimbal absolute pitch；target 在實際 bounds 內，且回讀的 `pitch_absolute` 與 target 相差不超過 3 度。
 4. gimbal 確認後記錄 source NTP baseline，同時等待 host receipt 與 source clock 都前進至少 `SFM_INSPECTION_PIPELINE_DRAIN_S`（預設 1 秒；280 ms 只是白皮書下限），排除確認前曝光但延遲抵達的 frame；最後 frame 仍須不超過 0.5 秒。
 5. JPEG 實際寫入 workspace 的 `outputs/flight_inspections/`。
@@ -109,7 +109,7 @@ python 定位演算法/validation/check_runtime_mirrors.py
 ```bash
 python manual_nudge_pilot.py --selftest
 python manual_nudge_pilot.py --dry-run
-# LIVE：先停掉其他 ARSDK-NG 連線；安全員握住搖桿
+# LIVE：先停掉其他 Olympe 連線；安全員握住搖桿
 python manual_nudge_pilot.py --ip 192.168.53.1 --controller skycontroller3
 ```
 

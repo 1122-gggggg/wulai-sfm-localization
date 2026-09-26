@@ -5,13 +5,94 @@ These helpers log observations; they never issue aircraft commands.
 
 from __future__ import annotations
 
-from arsdk_ng import arsdk_message
-
-import time
+import importlib
 import math
+import threading
+import time
+from collections import deque
 
-_LIST_FLAG_EMPTY = 1 << 2
-_LIST_FLAG_REMOVE = 1 << 3
+#: Attitude/speed events kept for the control loop between UI polls.
+MOTION_HISTORY_SIZE = 512
+#: Olympe stamps ``event.date`` when the event object is created on receipt.
+#: Ages outside this window are clock faults, not usable receipt times.
+_MAX_EVENT_AGE_S = 5.0
+
+
+def olympe_message(module: str, name: str):
+    """Resolve ``olympe.messages.<module>.<name>`` lazily (Olympe is heavy)."""
+    return getattr(importlib.import_module(f"olympe.messages.{module}"), name)
+
+
+def _map_entry(state, key_field: str, key: int) -> dict | None:
+    """Return one MAP_ITEM entry from Olympe's keyed state (or a flat dict)."""
+    if not isinstance(state, dict) or not state:
+        return None
+    if key_field in state:
+        return state
+    for entry in state.values():
+        if isinstance(entry, dict) and int(entry.get(key_field) or 0) == key:
+            return entry
+    return None
+
+
+class MotionEventHistory:
+    """Bounded yaw and horizontal-NED event history on the host monotonic clock.
+
+    Olympe's ``get_state`` only exposes the newest value, so the UI poll would
+    drop intermediate turns and accelerations. Each event is converted from its
+    Olympe receipt time (``event.date``) to ``time.monotonic()``; samples whose
+    receipt time cannot be trusted are discarded rather than restamped.
+    """
+
+    FIELDS = (("AttitudeChanged", ("yaw",)), ("SpeedChanged", ("speedX", "speedY")))
+
+    def __init__(self, maxlen: int = MOTION_HISTORY_SIZE, *, now=time.monotonic, wall_now=time.time):
+        self._lock = threading.Lock()
+        self._now = now
+        self._wall_now = wall_now
+        self._rows = tuple(deque(maxlen=maxlen) for _ in self.FIELDS)
+        self._subscriptions: list = []
+
+    def record(self, index: int, event) -> None:
+        fields = self.FIELDS[index][1]
+        try:
+            values = [float(event.args[key]) for key in fields]
+            age_s = float(self._wall_now()) - float(event.date.timestamp())
+            stamp = float(self._now()) - max(0.0, age_s)
+        except (AttributeError, KeyError, TypeError, ValueError, OverflowError):
+            return
+        if not -0.05 <= age_s <= _MAX_EVENT_AGE_S:
+            return
+        sample = (*values, stamp)
+        if not all(math.isfinite(value) for value in sample):
+            return
+        with self._lock:
+            rows = self._rows[index]
+            if rows and stamp <= rows[-1][-1]:
+                return
+            rows.append(sample)
+
+    def attach(self, drone) -> None:
+        for index, (name, _fields) in enumerate(self.FIELDS):
+            message = olympe_message("ardrone3.PilotingState", name)
+            self._subscriptions.append(
+                drone.subscribe(
+                    lambda event, _scheduler, index=index: self.record(index, event),
+                    message(_policy="wait"),
+                )
+            )
+
+    def detach(self) -> None:
+        subscriptions, self._subscriptions = self._subscriptions, []
+        for subscription in subscriptions:
+            try:
+                subscription.unsubscribe()
+            except Exception:
+                pass
+
+    def histories(self) -> tuple[list, list]:
+        with self._lock:
+            return tuple(list(rows) for rows in self._rows)
 
 
 def control_telemetry_history(backend):
@@ -20,24 +101,10 @@ def control_telemetry_history(backend):
     This bypasses the UI polling interval, not the aircraft/network delay.
     Consumers must still enforce freshness and reject duplicate samples.
     """
-    read = getattr(getattr(backend, "drone", None), "get_event_history", None)
-    if not callable(read):
+    history = getattr(backend, "motion_history", None)
+    if history is None:
         return [], []
-    histories = []
-    for message, fields in (("AttitudeChanged", ("yaw",)), ("SpeedChanged", ("speedX", "speedY"))):
-        samples = []
-        for event in read(arsdk_message("Ardrone3.PilotingState." + message)):
-            try:
-                sample = (
-                    *[float(event.args[key]) for key in fields],
-                    int(event.monotonic_ns) * 1e-9,
-                )
-            except (KeyError, TypeError, ValueError, OverflowError):
-                continue
-            if all(math.isfinite(value) for value in sample):
-                samples.append(sample)
-        histories.append(samples)
-    return tuple(histories)
+    return history.histories()
 
 
 def _log_control_history(backend, now):
@@ -61,8 +128,11 @@ def _log_control_history(backend, now):
 
 
 def _active_drone_rssi(backend) -> int | None:
-    """SkyController 3 RSSI (dBm) of the connected drone; None on direct Wi-Fi."""
-    items = backend._poll_get_state(arsdk_message("Drone_manager.Drone_list_item"))
+    """SkyController 3 RSSI (dBm) of the active drone entry, or None.
+
+    Olympe already drops LIST_ITEM entries flagged Empty/Remove from its state.
+    """
+    items = backend._poll_get_state(olympe_message("drone_manager", "drone_list_item"))
     if not isinstance(items, dict):
         return None
     for entry in items.values():
@@ -70,16 +140,13 @@ def _active_drone_rssi(backend) -> int | None:
             continue
         try:
             active = int(entry.get("active") or 0)
-            flags = int(entry.get("list_flags") or 0)
         except (TypeError, ValueError):
             continue
-        if active != 1 or flags & (_LIST_FLAG_EMPTY | _LIST_FLAG_REMOVE):
+        if active != 1:
             continue
         rssi = backend._finite_float(entry.get("rssi"))
         return None if rssi is None else int(rssi)
     return None
-
-
 
 
 def video_delivery_snapshot(backend, now: float) -> dict:
@@ -224,7 +291,7 @@ def poll_session_telemetry(backend, now: float) -> None:
 
 def poll_gps_fix(backend) -> None:
     try:
-        message = arsdk_message("Ardrone3.GPSSettingsState.GPSFixStateChanged")
+        message = olympe_message("ardrone3.GPSSettingsState", "GPSFixStateChanged")
         gps = backend._poll_get_state(message)
         if gps is not None and gps.get("fixed") is not None:
             backend.state.gps_fixed = bool(int(gps.get("fixed") or 0))
@@ -234,7 +301,7 @@ def poll_gps_fix(backend) -> None:
 
 def poll_satellites(backend) -> None:
     try:
-        message = arsdk_message("Ardrone3.GPSState.NumberOfSatelliteChanged")
+        message = olympe_message("ardrone3.GPSState", "NumberOfSatelliteChanged")
         satellites = backend._poll_get_state(message)
         if satellites and satellites.get("numberOfSatellite") is not None:
             number = int(satellites["numberOfSatellite"])
@@ -245,8 +312,8 @@ def poll_satellites(backend) -> None:
 
 def poll_signal_sensors(backend) -> None:
     try:
-        link_quality_message = arsdk_message("Common.CommonState.LinkSignalQuality")
-        sensors_message = arsdk_message("Common.CommonState.SensorsStatesListChanged")
+        link_quality_message = olympe_message("common.CommonState", "LinkSignalQuality")
+        sensors_message = olympe_message("common.CommonState", "SensorsStatesListChanged")
         link_quality = backend._poll_get_state(link_quality_message)
         if link_quality and link_quality.get("value") is not None:
             quality = int(link_quality["value"])
@@ -261,22 +328,27 @@ def poll_signal_sensors(backend) -> None:
     except Exception:
         pass
     try:
-        backend.state.wifi_rssi_dbm = _active_drone_rssi(backend)
+        if backend.via_skycontroller():
+            backend.state.wifi_rssi_dbm = _active_drone_rssi(backend)
+        else:
+            wifi = backend._poll_get_state(olympe_message("common.CommonState", "WifiSignalChanged"))
+            rssi = backend._finite_float(wifi.get("rssi")) if wifi else None
+            backend.state.wifi_rssi_dbm = None if rssi is None else int(rssi)
     except Exception:
         pass
 
 
 def poll_gimbal(backend) -> None:
     try:
-        message = arsdk_message("Gimbal.Attitude")
-        state = backend._poll_get_state(message)
-        if not isinstance(state, dict) or state.get("pitch_absolute") is None:
-            return
-        if int(state.get("gimbal_id") or 0) != 0:
+        message = olympe_message("gimbal", "attitude")
+        state = _map_entry(backend._poll_get_state(message), "gimbal_id", 0)
+        if state is None or state.get("pitch_absolute") is None:
             return
         sample = backend._observe_telemetry(
             "gimbal", message, state, now_mono_ns=time.monotonic_ns()
         )
+        if int(sample.get("gimbal_id") or 0) != 0:
+            return  # Olympe's last event may belong to another MAP_ITEM key.
         for attribute, key in (
             ("gimbal_pitch_deg", "pitch_absolute"),
             ("gimbal_yaw_deg", "yaw_absolute"),
@@ -294,15 +366,15 @@ def poll_gimbal(backend) -> None:
 
 def poll_camera_zoom(backend) -> None:
     try:
-        message = arsdk_message("Camera.Zoom_level")
-        raw = backend._poll_get_state(message)
-        if not isinstance(raw, dict) or raw.get("level") is None:
-            return
-        if int(raw.get("cam_id") or 0) != 0:
+        message = olympe_message("camera", "zoom_level")
+        raw = _map_entry(backend._poll_get_state(message), "cam_id", 0)
+        if raw is None or raw.get("level") is None:
             return
         sample = backend._observe_telemetry(
             "camera_zoom", message, raw, now_mono_ns=time.monotonic_ns()
         )
+        if int(sample.get("cam_id") or 0) != 0:
+            return
         value = backend._finite_float(sample.get("level"))
         backend.state.camera_zoom_level = value if value is not None and value > 0 else None
     except Exception:

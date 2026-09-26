@@ -43,7 +43,7 @@ cd 模擬器/parrot_stimulate
 CI 與本機共用這些門檻。功能新增不應靠放寬複雜度或降低 coverage 門檻通過。
 第三方 EDM 與 direct vendor 不做全面格式化；修改 vendor 必須更新來源與 patch 雜湊紀錄。
 
-大型 Tk/ARSDK-NG 檔案未加入全域 formatter，避免不必要的全檔變動。新增邏輯優先放到
+大型 Tk/Olympe 檔案未加入全域 formatter，避免不必要的全檔變動。新增邏輯優先放到
 已有責任模組；抽取函式後要保留輸入驗證、呼叫順序、例外與空值行為。
 
 ## 測試與飛行邊界

@@ -2,7 +2,7 @@
 """Single-process desktop flight operator app.
 
 No browser, no localhost server, no network API. The backend class is the single
-place to connect ARSDK-NG/localization/control.
+place to connect Olympe/localization/control later.
 
 *** FLIGHT-CRITICAL CONTROLS — DO NOT CASUALLY EDIT ***
 【之後改這份檔案的人請注意】
@@ -180,7 +180,7 @@ from operator_hud_text import (
     _telemetry_number,
     _telemetry_text,
     format_magnetometer_calibration,
-    format_arsdk_telemetry,
+    format_olympe_telemetry,
     gps_operator_message,
     inventory_block_summary,
     inventory_ui_status,
@@ -524,7 +524,7 @@ def resolve_operator_interface(
         raise ValueError("--live cannot be combined with --interface simulated-stream")
     if mode == REAL_FLIGHT_INTERFACE and str(video or "").strip():
         raise ValueError(
-            "real-flight accepts only the ANAFI RTSP stream; remove --video and "
+            "real-flight accepts only the ANAFI PDRAW stream; remove --video and "
             "use the simulated-stream interface for files"
         )
     return mode, mode == REAL_FLIGHT_INTERFACE
@@ -651,7 +651,7 @@ ROUTE_DOT_MAX = _positive_env_int("SFM_ROUTE_DOT_MAX", 200)
 # full Enum split deferred to keep this batch narrow.
 #
 # TrackerState now lives in operator_state.py (imported above) so both this
-# module and arsdk_ng_live_backend.py can use it without a circular import.
+# module and olympe_live_backend.py can use it without a circular import.
 
 # format_latency_text, classify_localization_health, build_hud_overlay_data
 # are defined in operator_rendering.py and re-exported above.
@@ -946,7 +946,7 @@ DEFAULT_MAP_ZOOM = 3.2
 
 
 class DroneBackend:
-    """Simulation-only backend; live operation uses ArsdkNgLiveBackend."""
+    """Stub backend. Replace methods here with real Olympe/localizer calls."""
 
     mode = InterfaceMode.SIMULATED_STREAM
     is_live = False
@@ -1520,7 +1520,7 @@ def _desired_firmware_limit_values(backend: object) -> tuple[object, object, obj
 
 def _initial_drone_magnetometer_text(*, live: bool) -> str:
     if live:
-        return "飛機羅盤：等待 ARSDK-NG 韌體狀態讀回"
+        return "飛機羅盤：等待 Olympe 韌體狀態讀回"
     return "飛機羅盤：SIM 不提供韌體校正"
 
 
@@ -1610,7 +1610,7 @@ class OperatorApp(tk.Tk):
             LocalTargetProvider(_WS.site_packages),
             current_profile=self.site_profile_path,
         )
-        # Slow ARSDK-NG expectations must never block Tk. Land is intentionally
+        # Slow Olympe expectations must never block Tk. Land is intentionally
         # allowed to run while a takeoff expectation is pending.
         self._flight_results: queue.Queue[tuple[str, object | None, str | None]] = queue.Queue(
             maxsize=FLIGHT_RESULT_QUEUE_MAX
@@ -1852,7 +1852,7 @@ class OperatorApp(tk.Tk):
         self._autonomy_pose_error: str | None = None
         self._sync_autonomy_profile_approval()
         self.title(
-            "SfM Flight Operator - LIVE ARSDK-NG"
+            "SfM Flight Operator - LIVE Olympe"
             if live
             else "SfM Flight Operator - Parrot ANAFI profile (SIM)"
         )
@@ -3114,9 +3114,9 @@ class OperatorApp(tk.Tk):
         self._build_auto_status_panel(events)
         # Read-only engineering telemetry is composed into the bottom-left video
         # HUD. These variables keep the existing telemetry update paths intact.
-        self.flight_state_var = DedupStringVar(value="RTH ?/? | GPS ?")
-        self.flight_attitude_var = DedupStringVar(value="飛控融合姿態 - | 三軸速度 -")
-        self.flight_altitude_var = DedupStringVar(value="飛控高度 - | AGL - | 連接品質 -")
+        self.olympe_state_var = DedupStringVar(value="RTH ?/? | GPS ?")
+        self.olympe_attitude_var = DedupStringVar(value="飛控融合姿態 - | 三軸速度 -")
+        self.olympe_altitude_var = DedupStringVar(value="飛控高度 - | AGL - | 連接品質 -")
 
         self.site_assets_panel = SiteAssetsPanel(
             site_tab,
@@ -3909,7 +3909,7 @@ class OperatorApp(tk.Tk):
         return True
 
     def _start_simulated_route_test(self, snapshot: MissionRouteSnapshot) -> bool:
-        """Run the production route controller without hardware or ARSDK-NG."""
+        """Run the production route controller without hardware or Olympe."""
         if self._integrated_auto_active():
             self.write_log("模擬航線已在執行中；略過重複啟動")
             return False
@@ -3949,7 +3949,7 @@ class OperatorApp(tk.Tk):
             self.write_log("模擬航線已拒絕：控制器執行緒無法啟動")
             return False
         self.write_log(
-            "模擬航線已開始：使用正式 RouteAutoController；不連真機、不送 ARSDK-NG 指令"
+            "模擬航線已開始：使用正式 RouteAutoController；不連真機、不送 Olympe 指令"
         )
         return True
 
@@ -4572,7 +4572,7 @@ class OperatorApp(tk.Tk):
         self._get_command_coordinator().publish(item)
 
     def _dispatch_live_command(self, command: str, payload: dict) -> bool:
-        """Run a potentially blocking ARSDK-NG expectation off the Tk thread."""
+        """Run a potentially blocking Olympe expectation off the Tk thread."""
         return self._get_command_coordinator().dispatch(command, payload)
 
     def _backend_command(self, command: str, payload: dict | None = None):
@@ -5246,7 +5246,7 @@ class OperatorApp(tk.Tk):
         self._sync_autonomy_profile_approval()
         live = bool(getattr(self.backend, "is_live", False))
         self.title(
-            "SfM Flight Operator - LIVE ARSDK-NG"
+            "SfM Flight Operator - LIVE Olympe"
             if live
             else "SfM Flight Operator - Parrot ANAFI profile (SIM)"
         )
@@ -6150,7 +6150,7 @@ class OperatorApp(tk.Tk):
             and not drone_active
             and getattr(st, "drone_magnetometer_failed", None) is not True
         )
-        # Must mirror arsdk_ng_live_backend._magnetometer_control_error(): an
+        # Must mirror olympe_live_backend._magnetometer_control_error(): an
         # UNCALIBRATED controller compass no longer blocks takeoff (it only feeds
         # pilot-referenced features this system never uses). A calibration actively
         # RUNNING still does -- the controller is being rotated by hand.
@@ -6168,12 +6168,12 @@ class OperatorApp(tk.Tk):
         # backlog age / fps / GPS / link are in the video HUD; only the two
         # figures nothing else reports stay here.
         self.anafi_stream_var.set(f"ground speed {speed_txt} | PCMD→telemetry poll {ctl_poll_txt}")
-        telemetry = format_arsdk_telemetry(st)
-        if hasattr(self, "flight_state_var"):
+        telemetry = format_olympe_telemetry(st)
+        if hasattr(self, "olympe_state_var"):
             gps_summary = " | ".join(telemetry["gps"].split(" | ")[:2])
-            self.flight_state_var.set(telemetry["rth"] + " | " + gps_summary)
-            self.flight_attitude_var.set(telemetry["attitude"] + " | " + telemetry["velocity"])
-            self.flight_altitude_var.set(
+            self.olympe_state_var.set(telemetry["rth"] + " | " + gps_summary)
+            self.olympe_attitude_var.set(telemetry["attitude"] + " | " + telemetry["velocity"])
+            self.olympe_altitude_var.set(
                 telemetry["altitude_agl"] + " | " + telemetry["link_quality"]
             )
             auto_pcmd_cap_pct = max(
@@ -6781,9 +6781,9 @@ class OperatorApp(tk.Tk):
             }
             telemetry = {
                 "current_auto_speed": _val("current_auto_speed_var", "AUTO PCMD -"),
-                "flight_state": _val("flight_state_var", "RTH ?/? | GPS ?"),
-                "flight_altitude": _val("flight_altitude_var", "飛控高度 - | AGL - | 連接品質 -"),
-                "flight_attitude": _val("flight_attitude_var", "飛控融合姿態 - | 三軸速度 -"),
+                "olympe_state": _val("olympe_state_var", "RTH ?/? | GPS ?"),
+                "olympe_altitude": _val("olympe_altitude_var", "飛控高度 - | AGL - | 連接品質 -"),
+                "olympe_attitude": _val("olympe_attitude_var", "飛控融合姿態 - | 三軸速度 -"),
             }
             data = build_hud_overlay_data(None, loc, telemetry)
             lines = data.get("diagnostic_lines")
@@ -6792,7 +6792,7 @@ class OperatorApp(tk.Tk):
                 return tuple(str(x) for x in lines)
         except (OSError, ValueError, AttributeError, TypeError, RuntimeError):  # Tier3: fallback best-effort — narrow, keep pass
             pass
-        attitude_and_velocity = _val("flight_attitude_var", "飛控融合姿態 - | 三軸速度 -")
+        attitude_and_velocity = _val("olympe_attitude_var", "飛控融合姿態 - | 三軸速度 -")
         attitude, separator, velocity = attitude_and_velocity.partition(" | 三軸速度 ")
         return (
             " | ".join(
@@ -6803,8 +6803,8 @@ class OperatorApp(tk.Tk):
                 )
             ),
             _val("loc_latency_var", "wall_ms - | core - | e2e -"),
-            _val("flight_state_var", "RTH ?/? | GPS ?"),
-            _val("flight_altitude_var", "飛控高度 - | AGL - | 連接品質 -"),
+            _val("olympe_state_var", "RTH ?/? | GPS ?"),
+            _val("olympe_altitude_var", "飛控高度 - | AGL - | 連接品質 -"),
             attitude,
             f"三軸速度 {velocity}" if separator else "三軸速度 -",
         )

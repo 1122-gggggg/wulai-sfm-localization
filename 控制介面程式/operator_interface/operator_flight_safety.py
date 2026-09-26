@@ -19,7 +19,7 @@ class TelemetrySample:
 class TelemetryFreshnessStore:
     """Keep event receipt age separate from UI polling age.
 
-    Re-reading the same ARSDK-NG event-cache entry must not make telemetry fresh.  A
+    Re-reading the same Olympe cache entry must not make telemetry fresh.  A
     field advances only when its event marker changes.
     """
 

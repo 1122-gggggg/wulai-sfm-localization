@@ -16,10 +16,6 @@ def test_run_session_remains_passive_and_cleans_up(monkeypatch, tmp_path):
 
     class FakeGrabber:
         fps = 0.0
-        stream_metadata = {
-            "timestamp_degraded": True,
-            "stamp_source": "opencv-rtsp-receipt-degraded",
-        }
 
         def __init__(self, *_args, **_kwargs):
             events.append("construct_video")
@@ -51,8 +47,8 @@ def test_run_session_remains_passive_and_cleans_up(monkeypatch, tmp_path):
             "_channels_missing": [],
         },
     )
-    monkeypatch.setattr(session.rtsp, "connect", lambda *_args, **_kwargs: FakeDrone())
-    monkeypatch.setattr(session.rtsp, "RtspFrameGrabber", FakeGrabber)
+    monkeypatch.setattr(session.ofs, "connect", lambda *_args, **_kwargs: FakeDrone())
+    monkeypatch.setattr(session.ofs, "OlympePdrawGrabber", FakeGrabber)
     monkeypatch.setattr(session.pff, "_env_float", lambda *_args, **_kwargs: 1.5)
     monkeypatch.setattr(session.time, "monotonic", lambda: next(monotonic_values))
     monkeypatch.setattr(session.time, "sleep", lambda _seconds: None)
@@ -72,9 +68,6 @@ def test_run_session_remains_passive_and_cleans_up(monkeypatch, tmp_path):
     assert records[0]["safety"] == "passive_no_arm"
     assert records[0]["with_localize"] is False
     assert records[1]["video.frame"] is None
-    assert records[1]["video.source_timestamp_degraded"] is True
-    assert records[1]["video.source_timestamp_trusted"] is False
-    assert records[1]["video.stamp_source"] == "opencv-rtsp-receipt-degraded"
     assert records[1]["loc"] is None
     assert records[2]["event"] == "end"
     assert records[2]["samples"] == 1

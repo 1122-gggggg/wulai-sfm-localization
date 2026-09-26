@@ -1,19 +1,18 @@
 from __future__ import annotations
 
-import errno
 import inspect
 import json
 import struct
 import sys
 import threading
 import time
-from pathlib import Path
+from datetime import datetime, timezone
 from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
 
-import arsdk_ng_live_backend as backend_module
+import olympe_live_backend as backend_module
 from backend_contract import (
     ControlAction,
     ControlRequest,
@@ -409,11 +408,10 @@ class _FakeDrone:
             return {"state": "ok"}
         if name == "NumberOfSatelliteChanged":
             return {"numberOfSatellite": 14}
-        if name == "Drone_list_item":
-            return {"PI000001": {"serial": "PI000001", "model": 0x0914,
-                    "name": "ANAFI", "connection_order": 1, "active": 1,
-                    "visible": 1, "security": 1, "has_saved_key": 1,
-                    "rssi": -55, "list_flags": 0}}
+        if name == "WifiSignalChanged":
+            return {"rssi": -55}
+        if name == "drone_list_item":
+            return {"PI000001": {"serial": "PI000001", "active": 1, "rssi": -55}}
         if name == "LinkSignalQuality":
             return {"value": 0x84}
         if name == "SensorsStatesListChanged":
@@ -434,7 +432,7 @@ class _FakeDrone:
         return SimpleNamespace(
             uuid=f"{name}:{self.event_markers.get(name, 1)}",
             args=self.get_state(message_type),
-            monotonic_ns=time.monotonic_ns(),
+            date=datetime.now(timezone.utc),
         )
 
     def connection_state(self):
@@ -490,53 +488,209 @@ def _install_fake_stick_monitor(monkeypatch):
     monkeypatch.setattr(backend_module, "SkyControllerStickMonitor", _FakeStickMonitor)
 
 
-def _install_fake_arsdk(monkeypatch: pytest.MonkeyPatch) -> None:
-    old_names = {
-        "Skyctrl.CoPiloting.SetPilotingSource": "setPilotingSource",
-        "Skyctrl.CoPilotingState.PilotingSource": "pilotingSource",
-        "Drone_manager.Connection_state": "connection_state",
-        "Camera.Recording_mode": "recording_mode",
-        "Camera.Set_camera_mode": "set_camera_mode",
-        "Camera.Set_recording_mode": "set_recording_mode",
-        "Camera.Start_recording": "start_recording",
-        "Camera.Stop_recording": "stop_recording",
-        "Camera.Recording_state": "recording_state",
-        "Camera.Set_zoom_target": "set_zoom_target",
-        "Camera.Reset_zoom": "reset_zoom",
-        "Gimbal.Set_target": "set_target",
-        "Rth.Home_reachability": "home_reachability",
-        "Rth.Auto_trigger_mode": "auto_trigger_mode",
-        "Rth.Delay": "delay",
-        "Rth.Ending_behavior": "ending_behavior",
-        "Rth.Return_to_home": "return_to_home",
-        "Rth.Set_auto_trigger_mode": "set_auto_trigger_mode",
-        "Rth.Set_delay": "set_delay",
-        "Rth.Set_ending_behavior": "set_ending_behavior",
-        "Rth.Set_min_altitude": "set_min_altitude",
-        "Rth.Min_altitude": "min_altitude",
+def _install_fake_olympe(monkeypatch: pytest.MonkeyPatch) -> None:
+    package_names = (
+        "olympe",
+        "olympe.messages",
+        "olympe.messages.ardrone3",
+        "olympe.messages.common",
+        "olympe.messages.skyctrl",
+        "olympe.messages.drone_manager",
+        "olympe.features",
+        "olympe.enums",
+    )
+    # olympe.messages has no directory -- module_loader.py generates it at import
+    # time and inserts it straight into sys.modules. Shadowing a name that is NOT
+    # there yet makes monkeypatch DELETE it on teardown, permanently, breaking
+    # every later test that imports an olympe message. So import the real ones
+    # FIRST (when a real olympe is present) to give monkeypatch something to
+    # restore, then stub. Skipping the stub instead left the fakes uninstalled and
+    # `from olympe.messages import rth` reached the real module, so the fake
+    # return_to_home was never recorded.
+    if "olympe" in sys.modules and getattr(sys.modules["olympe"], "__file__", None):
+        import importlib
+
+        for name in package_names:
+            try:
+                importlib.import_module(name)
+            except Exception:
+                pass
+    for name in package_names:
+        module = ModuleType(name)
+        module.__path__ = []
+        monkeypatch.setitem(sys.modules, name, module)
+
+    modules = {
+        "olympe.messages.ardrone3.Piloting": {
+            "PCMD": _message_factory("PCMD"),
+            "Landing": _message_factory("Landing"),
+            "TakeOff": _message_factory("TakeOff"),
+        },
+        "olympe.messages.ardrone3.PilotingState": {
+            "FlyingStateChanged": _message_factory("FlyingStateChanged"),
+            "AttitudeChanged": _message_factory("AttitudeChanged"),
+            "AltitudeChanged": _message_factory("AltitudeChanged"),
+            "SpeedChanged": _message_factory("SpeedChanged"),
+            "AltitudeAboveGroundChanged": _message_factory("AltitudeAboveGroundChanged"),
+            "GpsLocationChanged": _message_factory("GpsLocationChanged"),
+            "AlertStateChanged": _message_factory("AlertStateChanged"),
+            "NavigateHomeStateChanged": _message_factory("NavigateHomeStateChanged"),
+            "HeadingLockedStateChanged": _message_factory("HeadingLockedStateChanged"),
+            "HoveringWarning": _message_factory("HoveringWarning"),
+            "WindStateChanged": _message_factory("WindStateChanged"),
+            "VibrationLevelChanged": _message_factory("VibrationLevelChanged"),
+        },
+        "olympe.messages.ardrone3.GPSState": {
+            "NumberOfSatelliteChanged": _message_factory("NumberOfSatelliteChanged"),
+        },
+        "olympe.messages.ardrone3.PilotingSettings": {
+            "MaxAltitude": _message_factory("MaxAltitude"),
+            "MaxDistance": _message_factory("MaxDistance"),
+            "MaxTilt": _message_factory("MaxTilt"),
+            "NoFlyOverMaxDistance": _message_factory("NoFlyOverMaxDistance"),
+        },
+        "olympe.messages.ardrone3.SpeedSettings": {
+            "MaxVerticalSpeed": _message_factory("MaxVerticalSpeed"),
+            "MaxRotationSpeed": _message_factory("MaxRotationSpeed"),
+            "MaxPitchRollRotationSpeed": _message_factory(
+                "MaxPitchRollRotationSpeed"
+            ),
+        },
+        "olympe.messages.ardrone3.PilotingSettingsState": {
+            name: _message_factory(name) for name in (
+                "MaxAltitudeChanged",
+                "MaxDistanceChanged",
+                "NoFlyOverMaxDistanceChanged",
+                "MaxTiltChanged",
+            )
+        },
+        "olympe.messages.ardrone3.SpeedSettingsState": {
+            "MaxVerticalSpeedChanged": _message_factory("MaxVerticalSpeedChanged"),
+            "MaxRotationSpeedChanged": _message_factory("MaxRotationSpeedChanged"),
+            "MaxPitchRollRotationSpeedChanged": _message_factory(
+                "MaxPitchRollRotationSpeedChanged"
+            ),
+        },
+        "olympe.messages.ardrone3.GPSSettingsState": {
+            "GPSFixStateChanged": _message_factory("GPSFixStateChanged"),
+        },
+        "olympe.messages.common.CommonState": {
+            "BatteryStateChanged": _message_factory("BatteryStateChanged"),
+            "WifiSignalChanged": _message_factory("WifiSignalChanged"),
+            "LinkSignalQuality": _message_factory("LinkSignalQuality"),
+            "SensorsStatesListChanged": _message_factory("SensorsStatesListChanged"),
+        },
+        "olympe.messages.common.Calibration": {
+            "MagnetoCalibration": _message_factory("MagnetoCalibration"),
+        },
+        "olympe.messages.common.CalibrationState": {
+            name: _message_factory(name) for name in (
+                "MagnetoCalibrationRequiredState",
+                "MagnetoCalibrationStartedChanged",
+                "MagnetoCalibrationAxisToCalibrateChanged",
+                "MagnetoCalibrationStateChanged",
+            )
+        },
+        "olympe.messages.skyctrl.Calibration": {
+            "StartCalibration": _message_factory("StartCalibration"),
+            "AbortCalibration": _message_factory("AbortCalibration"),
+        },
+        "olympe.messages.skyctrl.CalibrationState": {
+            "MagnetoCalibrationStateV2": _message_factory(
+                "MagnetoCalibrationStateV2"
+            ),
+        },
+        "olympe.messages.skyctrl.CoPiloting": {
+            "setPilotingSource": _message_factory("setPilotingSource"),
+        },
+        "olympe.messages.skyctrl.CoPilotingState": {
+            "pilotingSource": _message_factory("pilotingSource"),
+        },
+        "olympe.messages.common.SettingsState": {
+            name: _message_factory(name) for name in (
+                "ProductNameChanged",
+                "ProductVersionChanged",
+                "ProductSerialHighChanged",
+                "ProductSerialLowChanged",
+                "BoardIdChanged",
+            )
+        },
+        "olympe.messages.skyctrl.SettingsState": {
+            name: _message_factory(name) for name in (
+                "ProductSerialChanged",
+                "ProductVersionChanged",
+                "ProductVariantChanged",
+            )
+        },
+        "olympe.messages.camera": {
+            "set_zoom_target": _message_factory("set_zoom_target"),
+            "reset_zoom": _message_factory("reset_zoom"),
+            "set_camera_mode": _message_factory("set_camera_mode"),
+            "set_recording_mode": _message_factory("set_recording_mode"),
+            "start_recording": _message_factory("start_recording"),
+            "stop_recording": _message_factory("stop_recording"),
+            "recording_state": _message_factory("recording_state"),
+            "recording_mode": _message_factory("recording_mode"),
+            "zoom_level": _message_factory("zoom_level"),
+        },
+        "olympe.messages.gimbal": {
+            "set_target": _message_factory("set_target"),
+            "attitude": _message_factory("attitude"),
+        },
+        "olympe.enums.camera": {
+            "zoom_control_mode": SimpleNamespace(level="level"),
+        },
+        "olympe.features.media": {
+            "download_media": _message_factory("download_media"),
+        },
+        "olympe.messages.rth": {
+            name: _message_factory(name) for name in (
+                "home_location",
+                "home_reachability",
+                "auto_trigger_mode",
+                "delay",
+                "ending_behavior",
+                "return_to_home",
+                "set_auto_trigger_mode",
+                "set_delay",
+                "set_ending_behavior",
+                "set_min_altitude",
+                "min_altitude",
+            )
+        },
+        "olympe.messages.drone_manager": {
+            "connection_state": _message_factory("connection_state"),
+            "drone_list_item": _message_factory("drone_list_item"),
+        },
     }
-
-    def fake_message(fullname: str):
-        name = old_names.get(fullname, fullname.rsplit(".", 1)[-1])
-        return _message_factory(name)
-
-    rth_names = (
-        "home_location", "home_reachability", "auto_trigger_mode", "delay",
-        "ending_behavior", "return_to_home", "set_auto_trigger_mode",
-        "set_delay", "set_ending_behavior", "set_min_altitude", "min_altitude",
+    modules["olympe.messages.common.CommonState"]["ProductModel"] = (
+        _message_factory("ProductModel")
     )
-    fake_root = SimpleNamespace(
-        Rth=SimpleNamespace(**{name: _message_factory(name) for name in rth_names})
-    )
-    monkeypatch.setattr(backend_module, "arsdk_message", fake_message)
-    monkeypatch.setattr(backend_module, "ArsdkMessage", fake_root)
-    telemetry_module = sys.modules["backend_telemetry"]
-    monkeypatch.setattr(telemetry_module, "arsdk_message", fake_message)
+    modules["olympe.messages.ardrone3.GPSSettingsState"].update({
+        name: _message_factory(name) for name in (
+            "HomeChanged",
+            "ReturnHomeDelayChanged",
+            "ReturnHomeMinAltitudeChanged",
+        )
+    })
+    for name, attributes in modules.items():
+        module = ModuleType(name)
+        for key, value in attributes.items():
+            setattr(module, key, value)
+        monkeypatch.setitem(sys.modules, name, module)
+        # `from olympe.messages import rth` resolves the ATTRIBUTE on the parent,
+        # not just the sys.modules entry. Without this link the import fell through
+        # and _request_rth bailed before ever issuing return_to_home -- the RTH
+        # tests then saw a Landing and blamed the flight logic.
+        parent_name, _, leaf = name.rpartition(".")
+        parent = sys.modules.get(parent_name)
+        if parent is not None:
+            monkeypatch.setattr(parent, leaf, module, raising=False)
 
 
 @pytest.fixture
 def make_backend(monkeypatch: pytest.MonkeyPatch, tmp_path):
-    _install_fake_arsdk(monkeypatch)
+    _install_fake_olympe(monkeypatch)
     monkeypatch.setattr(backend_module, "_DEFAULT_RECORD_DIR", tmp_path)
     # Unit tests must not inherit the workstation's current free-space state.
     # Dedicated storage-guard tests override this stub with warning/critical
@@ -553,7 +707,7 @@ def make_backend(monkeypatch: pytest.MonkeyPatch, tmp_path):
         ),
     )
     monkeypatch.setattr(
-        backend_module.ArsdkNgLiveBackend, "_connect", lambda self: None,
+        backend_module.OlympeLiveBackend, "_connect", lambda self: None,
     )
 
     def make(
@@ -575,7 +729,7 @@ def make_backend(monkeypatch: pytest.MonkeyPatch, tmp_path):
             gimbal_pitch_max_deg=90.0,
             digital_zoom_max=3.0,
         )
-        backend = backend_module.ArsdkNgLiveBackend(
+        backend = backend_module.OlympeLiveBackend(
             lambda: state,
             profile,
             ip="192.168.53.1" if skycontroller else "192.168.42.1",
@@ -590,6 +744,7 @@ def make_backend(monkeypatch: pytest.MonkeyPatch, tmp_path):
             require_gps_for_geofence=require_gps_for_geofence,
             approved_aircraft_firmware=("1.8.2",),
             approved_controller_firmware=("1.8.2",),
+            approved_olympe_versions=("8.4.0",),
             with_video=with_video,
         )
         backend.log = _FakeLog()
@@ -603,32 +758,6 @@ def make_backend(monkeypatch: pytest.MonkeyPatch, tmp_path):
 
     return make
 
-
-
-def test_arsdk_event_loop_continues_after_idle_timeout():
-    from arsdk_ng import ArsdkNgClient
-
-    client = object.__new__(ArsdkNgClient)
-    client._loop_stop = threading.Event()
-    client._condition = threading.Condition()
-    client._connection_error = ""
-    client._loop = object()
-    calls: list[int] = []
-
-    def wait_and_process(_loop, timeout):
-        calls.append(timeout)
-        if len(calls) == 1:
-            return -errno.ETIMEDOUT
-        client._loop_stop.set()
-        return 0
-
-    client._runtime = SimpleNamespace(
-        pomp=SimpleNamespace(pomp_loop_wait_and_process=wait_and_process)
-    )
-    client._run_loop()
-
-    assert calls == [250, 250]
-    assert client._connection_error == ""
 
 def test_control_owner_tracks_confirmed_pc_handoff_and_manual_return(make_backend):
     backend = make_backend()
@@ -664,8 +793,8 @@ def test_inventory_reads_and_logs_actual_connected_hardware(make_backend):
     ((0, -3, 0, 2), 1),
 ])
 def test_zero_horizontal_pcmd_uses_sdk_hover_flag(make_backend, axes, flag):
-    # Preserve the firmware's PCMD flag rule, including yaw-only and
-    # vertical-only input; only horizontal roll/pitch requires the active flag.
+    # 18:03 flight: [0, 0, 50, gaz] still moved horizontally. Match Olympe
+    # ControllerBase._send_piloting_command, including yaw-only/vertical-only.
     backend = make_backend()
     backend.pilot_sticks = False
     assert backend.send_pcmd(*axes, reason="desktop_auto_route")
@@ -771,14 +900,12 @@ def test_preflight_does_not_gate_on_runtime_or_firmware_receipt_lists(make_backe
     backend.drone.flight_state = "landed"
     backend.approved_aircraft_firmware = frozenset({"different-version"})
     backend.approved_controller_firmware = frozenset({"different-version"})
+    backend.approved_olympe_versions = frozenset({"different-version"})
 
     assert backend._takeoff_preflight(), backend.state.preflight_reason
     assert backend.connection_inventory["aircraft"]["software"] == "1.8.2"
     assert backend.connection_inventory["controller"]["software"] == "1.8.2"
-    assert (
-        backend.connection_inventory["runtime"]["arsdk_ng_source_revision"]
-        == backend_module.ARSDK_NG_SOURCE_REVISION
-    )
+    assert backend.connection_inventory["runtime"]["olympe_version"] == "8.4.0"
     assert not any(
         "approved receipt" in reason
         for reason in backend.connection_inventory["block_reasons"]
@@ -827,7 +954,7 @@ def test_critical_disk_pressure_blocks_new_takeoff_but_is_only_logged_in_flight(
 
 def test_takeoff_battery_floor_is_fail_closed(make_backend):
     default = inspect.signature(
-        backend_module.ArsdkNgLiveBackend.__init__
+        backend_module.OlympeLiveBackend.__init__
     ).parameters["min_takeoff_battery_pct"].default
     assert default == pytest.approx(30.0)
 
@@ -934,18 +1061,18 @@ def test_unreadable_disk_in_flight_still_fails_safe(
 )
 def test_connect_keeps_skycontroller_sticks_until_explicit_pc_request(
         monkeypatch, tmp_path, skycontroller, pilot_sticks, tracker_state):
-    _install_fake_arsdk(monkeypatch)
+    _install_fake_olympe(monkeypatch)
     _install_fake_stick_monitor(monkeypatch)
     monkeypatch.setattr(backend_module, "_DEFAULT_RECORD_DIR", tmp_path)
-    monkeypatch.setattr(backend_module, "quiet_arsdk_logs", lambda: None)
+    monkeypatch.setattr(backend_module, "quiet_olympe_logs", lambda: None)
     drone = _FakeDrone()
     if skycontroller:
-        # This controller firmware leaves the variant state unavailable; inventory
+        # Firmware 1.8.1 leaves the Olympe variant state unavailable; inventory
         # must therefore see the HID monitor that _connect starts.
         drone.controller_variant = None
-    frame_source = ModuleType("rtsp_frame_source")
+    frame_source = ModuleType("olympe_frame_source")
     frame_source.connect = lambda _ip, _controller: drone
-    monkeypatch.setitem(sys.modules, "rtsp_frame_source", frame_source)
+    monkeypatch.setitem(sys.modules, "olympe_frame_source", frame_source)
     state = SimpleNamespace(
         loc="", stream="", mode="", tracker_state="", last_command="",
     )
@@ -955,13 +1082,14 @@ def test_connect_keeps_skycontroller_sticks_until_explicit_pc_request(
         digital_zoom_max=3.0,
     )
 
-    backend = backend_module.ArsdkNgLiveBackend(
+    backend = backend_module.OlympeLiveBackend(
         lambda: state,
         profile,
         ip="192.168.53.1" if skycontroller else "192.168.42.1",
         controller="skycontroller3" if skycontroller else "drone",
         approved_aircraft_firmware=("1.8.2",),
         approved_controller_firmware=("1.8.2",),
+        approved_olympe_versions=("8.4.0",),
         with_video=False,
     )
 
@@ -1329,20 +1457,45 @@ def test_poll_displays_all_current_firmware_readbacks(make_backend):
 def test_rssi_comes_from_the_active_skycontroller_drone_entry(make_backend):
     backend = make_backend()
     original = backend.drone.get_state
+    # Olympe drops LIST_ITEM entries flagged Empty/Remove before they reach state.
     entries = {
-        "A": {"serial": "A", "active": 0, "list_flags": 0, "rssi": -30},
-        "B": {"serial": "B", "active": 1, "list_flags": 8, "rssi": -40},
-        "C": {"serial": "C", "active": 1, "list_flags": 0, "rssi": -61},
+        "A": {"serial": "A", "active": 0, "rssi": -30},
+        "C": {"serial": "C", "active": 1, "rssi": -61},
     }
     backend.drone.get_state = (
-        lambda message: entries if getattr(message, "_message_name", "") == "Drone_list_item"
+        lambda message: entries if getattr(message, "_message_name", "") == "drone_list_item"
         else original(message)
     )
     backend.poll()
     assert backend.state.wifi_rssi_dbm == -61
 
 
-def test_poll_does_not_refresh_speed_age_without_a_new_arsdk_event(
+def test_direct_wifi_rssi_uses_the_aircraft_wifi_signal(make_backend):
+    backend = make_backend(skycontroller=False)
+    backend.poll()
+    assert backend.state.wifi_rssi_dbm == -55
+
+
+def test_gimbal_and_zoom_readback_use_the_primary_map_item(make_backend):
+    backend = make_backend()
+    original = backend.drone.get_state
+    maps = {
+        "attitude": {0: {"gimbal_id": 0, "pitch_absolute": -12.5, "yaw_absolute": 3.0,
+                         "roll_absolute": 0.5, "pitch_relative": -12.0,
+                         "yaw_relative": 0.0, "roll_relative": 0.0}},
+        "zoom_level": {0: {"cam_id": 0, "level": 2.0}},
+    }
+    backend.drone.get_state = lambda message: maps.get(
+        getattr(message, "_message_name", ""), None
+    ) or original(message)
+    backend.drone.get_last_event = lambda message: (_ for _ in ()).throw(KeyError("none"))
+    backend.poll()
+    assert backend.state.gimbal_pitch_deg == -12.5
+    assert backend.state.gimbal_yaw_deg == 3.0
+    assert backend.state.camera_zoom_level == 2.0
+
+
+def test_poll_does_not_refresh_speed_age_without_a_new_olympe_event(
     make_backend,
 ) -> None:
     backend = make_backend()
@@ -1392,21 +1545,6 @@ def test_every_sdk_dispatch_is_deferred_without_changing_the_command(make_backen
     assert recorder.call_args.kwargs["flag"] == 0
 
 
-def test_telemetry_stamp_is_the_arsdk_event_receipt_time(make_backend):
-    backend = make_backend()
-    now_ns = time.monotonic_ns()
-    event = SimpleNamespace(uuid="7", args={"speedX": 1.0}, monotonic_ns=now_ns - 150_000_000)
-    backend.drone.get_last_event = lambda _message: event
-    backend._observe_telemetry("ground_speed", object(), {}, now_mono_ns=now_ns)
-    assert backend.state.ground_speed_mono_ns == now_ns - 150_000_000
-    assert backend.state.ground_speed_stamp_source == "event"
-
-    event = SimpleNamespace(uuid="8", args={"yaw": 0.0}, monotonic_ns=now_ns + 5_000_000)
-    backend.drone.get_last_event = lambda _message: event
-    backend._observe_telemetry("attitude", object(), {}, now_mono_ns=now_ns)
-    assert backend.state.attitude_mono_ns == now_ns
-
-
 def test_future_telemetry_event_does_not_replace_last_valid_state(make_backend):
     backend = make_backend()
     old_state = {"speedX": 0.18, "speedY": 0.24, "speedZ": -0.04}
@@ -1416,7 +1554,7 @@ def test_future_telemetry_event_does_not_replace_last_valid_state(make_backend):
     future_event = SimpleNamespace(
         uuid="future-event",
         args={"speedX": 99.0, "speedY": 99.0, "speedZ": 99.0},
-        monotonic_ns=time.monotonic_ns() + 10_000_000_000,
+        date=SimpleNamespace(timestamp=lambda: time.time() + 10.0),
     )
     backend.drone.get_last_event = lambda _message: future_event
 
@@ -1448,7 +1586,7 @@ def test_first_future_critical_telemetry_is_rejected(
     future_event = SimpleNamespace(
         uuid=f"future-{name}",
         args=future_state,
-        monotonic_ns=time.monotonic_ns() + 10_000_000_000,
+        date=SimpleNamespace(timestamp=lambda: time.time() + 10.0),
     )
     backend.drone.get_last_event = lambda _message: future_event
 
@@ -2046,7 +2184,7 @@ def test_firmware_configuration_failure_blocks_takeoff_preflight(make_backend):
     ("case", "reason"),
     [
         ("airborne", "confirmed landed"),
-        ("link", "healthy ARSDK-NG link"),
+        ("link", "healthy Olympe link"),
         ("video", "live video frame"),
         ("battery", "takeoff floor"),
         ("source", "source command"),
@@ -3184,71 +3322,43 @@ def test_start_recording_fails_closed_when_quality_readback_mismatches(
 
 
 
-def test_recording_download_uses_direct_http_media_api(make_backend, monkeypatch):
-    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-    from urllib.parse import urlsplit
-
+def test_recording_download_waits_have_explicit_timeouts(
+        make_backend, monkeypatch):
     backend = make_backend()
-    media_bytes = b"recorded-video"
-    request_paths: list[str] = []
+    pending_timeouts: list[float | None] = []
+    download_timeouts: list[float | None] = []
 
-    class MediaHandler(BaseHTTPRequestHandler):
-        def do_GET(self):
-            request_paths.append(self.path)
-            path = urlsplit(self.path).path
-            if path == "/api/v1/media/medias":
-                body = json.dumps(
-                    [
-                        {
-                            "media_id": "media-1",
-                            "datetime": "2026-09-23T10:00:00Z",
-                            "resources": [
-                                {
-                                    "type": "VIDEO",
-                                    "resource_id": "recording.mp4",
-                                    "url": "/data/media/recording.mp4",
-                                    "size": len(media_bytes),
-                                }
-                            ],
-                        }
-                    ]
-                ).encode("utf-8")
-                content_type = "application/json"
-            elif path == "/data/media/recording.mp4":
-                body = media_bytes
-                content_type = "application/octet-stream"
-            else:
-                self.send_error(404)
-                return
-            self.send_response(200)
-            self.send_header("Content-Type", content_type)
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+    class TimedOutDownload:
+        def wait(self, _timeout=None):
+            download_timeouts.append(_timeout)
+            return self
 
-        def log_message(self, _format, *_args):
-            pass
+        def success(self) -> bool:
+            return False
 
-    server = ThreadingHTTPServer(("127.0.0.1", 0), MediaHandler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    backend.ip = f"127.0.0.1:{server.server_port}"
+    class FakeMedia:
+        download_dir = ""
+
+        @staticmethod
+        def last_media_id():
+            return "media-1"
+
+        def wait_for_pending_downloads(self, timeout=None):
+            pending_timeouts.append(timeout)
+
+        def __call__(self, request):
+            assert request.name == "download_media"
+            assert request.args == ("media-1",)
+            return TimedOutDownload()
+
+    backend.drone.media = FakeMedia()
     monkeypatch.setattr(backend_module.time, "sleep", lambda _seconds: None)
-    thread.start()
-    try:
-        downloaded = backend._try_download_last_recording()
-    finally:
-        server.shutdown()
-        thread.join(timeout=2.0)
-        server.server_close()
 
-    assert downloaded
-    assert Path(downloaded).read_bytes() == media_bytes
-    assert request_paths == [
-        "/api/v1/media/medias?media_type=video&sort_order=DESC",
-        "/data/media/recording.mp4",
-    ]
+    assert backend._try_download_last_recording() == ""
+    assert pending_timeouts == [backend_module._MEDIA_PENDING_TIMEOUT_S]
+    assert download_timeouts == [backend_module._MEDIA_DOWNLOAD_TIMEOUT_S]
     assert any(
-        event == "record_download" and fields["ok"]
+        event == "record_download" and not fields["ok"]
         for event, fields in backend.log.records
     )
 
@@ -3341,7 +3451,7 @@ def test_hold_loop_error_drops_the_hold_and_hovers(make_backend):
         if getattr(first, "name", "") == "PCMD" and first.args[1:5] != (0, 0, 0, 0):
             calls["pcmd"] += 1
             if calls["pcmd"] >= 2:
-                raise ConnectionError("ARSDK-NG link error during hold")
+                raise ConnectionError("olympe link error during hold")
         return original_call(self, message)
 
     type(drone).__call__ = flaky
@@ -3568,17 +3678,17 @@ def test_land_before_takeoff_schedule_prevents_takeoff_command(
     backend.drone.flight_state = "landed"
     backend._firmware_config_ok = True
     factory_entered = threading.Event()
-    results: list[bool] = []
     release_factory = threading.Event()
-    original_message = backend_module.arsdk_message
+    piloting = sys.modules["olympe.messages.ardrone3.Piloting"]
+    original_takeoff = piloting.TakeOff
 
-    def blocked_takeoff_factory(fullname):
-        if fullname == "Ardrone3.Piloting.TakeOff":
-            factory_entered.set()
-            assert release_factory.wait(timeout=1.0)
-        return original_message(fullname)
+    def blocked_takeoff_factory(*args, **kwargs):
+        factory_entered.set()
+        assert release_factory.wait(timeout=1.0)
+        return original_takeoff(*args, **kwargs)
 
-    monkeypatch.setattr(backend_module, "arsdk_message", blocked_takeoff_factory)
+    monkeypatch.setattr(piloting, "TakeOff", blocked_takeoff_factory)
+    results: list[bool] = []
     thread = threading.Thread(target=lambda: results.append(backend.takeoff_cmd()))
     thread.start()
     assert factory_entered.wait(timeout=1.0)
@@ -3796,7 +3906,7 @@ def test_pc_control_is_refused_when_stick_monitor_is_unavailable(make_backend):
 
 
 def test_takeoff_battery_blocker_pure_decision() -> None:
-    from arsdk_ng_live_backend import takeoff_battery_blocker
+    from olympe_live_backend import takeoff_battery_blocker
 
     assert takeoff_battery_blocker(50.0, None) == (
         "takeoff battery floor is unavailable or invalid"
@@ -3809,7 +3919,7 @@ def test_takeoff_battery_blocker_pure_decision() -> None:
 
 
 def test_takeoff_gps_outcome_pure_decision() -> None:
-    from arsdk_ng_live_backend import takeoff_gps_outcome
+    from olympe_live_backend import takeoff_gps_outcome
 
     fixed_ok = takeoff_gps_outcome(fixed=True, gps_required=True)
     assert fixed_ok.blocker is None and fixed_ok.advisory is None
@@ -4417,8 +4527,9 @@ def test_stream_loss_grace_is_validated(make_backend):
 
 
 def test_controller_confirmed_from_hid_when_variant_is_never_emitted(make_backend):
-    """Variant readback may be absent; resolved HID identity must confirm
-    SkyController 3 without relaxing unknown-controller rejection."""
+    """SkyController 3 fw 1.8.1 / Olympe 8.4.0 never emits ProductVariantChanged
+    (verified on the reference unit), so the model must be confirmable from the
+    HID product string the stick monitor already resolved."""
     backend = make_backend(skycontroller=True)
     backend.drone.controller_variant = None          # as on the real unit
     backend._stick_monitor = SimpleNamespace(

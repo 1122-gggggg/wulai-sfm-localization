@@ -252,7 +252,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
         dest="interface_mode",
         choices=(SIMULATED_STREAM_INTERFACE, REAL_FLIGHT_INTERFACE),
         default="",
-        help="explicit input/control boundary: local video or real ANAFI/ARSDK-NG",
+        help="explicit input/control boundary: local video or real ANAFI/Olympe",
     )
     ap.add_argument(
         "--live",
@@ -376,7 +376,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
         help="legacy compatibility flag; GPS status is advisory and never gates takeoff",
     )
     ap.add_argument(
-        "--no-live-video", action="store_true", help="skip RTSP video (control+telemetry only)"
+        "--no-live-video", action="store_true", help="skip PDRAW video (control+telemetry only)"
     )
     ap.add_argument("--cmd-log", default="", help="JSONL path for live command log")
     return ap
@@ -650,13 +650,13 @@ def _resolve_live_safety(
 def _announce_interface(args: argparse.Namespace) -> None:
     if args.live:
         try:
-            from arsdk_ng_live_backend import quiet_arsdk_logs
+            from olympe_live_backend import quiet_olympe_logs
 
-            quiet_arsdk_logs()
+            quiet_olympe_logs()
         except Exception:
             pass
         print(
-            "[mode] REAL-FLIGHT interface: LIVE ARSDK-NG TakeOff/PCMD/Landing via "
+            "[mode] REAL-FLIGHT interface: LIVE Olympe TakeOff/PCMD/Landing via "
             f"ip={args.ip} controller={args.controller}. "
             "Esc/手動=交回搖桿; 關窗=Landing+還搖桿. "
             "Safety pilot must hold the sticks.",
@@ -874,6 +874,7 @@ def _hardware_approval_manifest(hardware_approval: object | None) -> dict | None
         "controller_product": hardware_approval.controller_product,
         "aircraft_firmware_versions": list(hardware_approval.aircraft_firmware_versions),
         "controller_firmware_versions": list(hardware_approval.controller_firmware_versions),
+        "olympe_versions": list(hardware_approval.olympe_versions),
     }
 
 
@@ -1014,10 +1015,10 @@ def _build_operator_backend(
             backend.video = LegacyFrameSourceAdapter(video_stream, str(Path(args.video).resolve()))
         return backend, video_stream, None
 
-    from arsdk_ng_live_backend import ArsdkNgLiveBackend
+    from olympe_live_backend import OlympeLiveBackend
 
     cmd_log = session_logs.directory / "commands.jsonl"
-    live_backend = ArsdkNgLiveBackend(
+    live_backend = OlympeLiveBackend(
         DroneState,
         ANAFI,
         ip=args.ip,
@@ -1042,6 +1043,7 @@ def _build_operator_backend(
         approved_controller_firmware=_approved_versions(
             hardware_approval, "controller_firmware_versions"
         ),
+        approved_olympe_versions=_approved_versions(hardware_approval, "olympe_versions"),
         cmd_log=cmd_log,
         event_log=session_logs.command_log,
         session_logs=session_logs,
@@ -1050,7 +1052,7 @@ def _build_operator_backend(
     video_stream = live_backend.video_stream
     if video_stream is None:
         print(
-            "[live] RTSP unavailable; file fallback is prohibited in real-flight mode",
+            "[live] PDRAW unavailable; file fallback is prohibited in real-flight mode",
             flush=True,
         )
     print(f"[live] command log -> {cmd_log}", flush=True)

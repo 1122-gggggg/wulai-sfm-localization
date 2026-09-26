@@ -9,8 +9,8 @@ import live_non_map_acceptance as acceptance
 def _stub_runtime_imports(monkeypatch):
     monkeypatch.setitem(
         sys.modules,
-        "arsdk_ng_live_backend",
-        SimpleNamespace(ArsdkNgLiveBackend=object),
+        "olympe_live_backend",
+        SimpleNamespace(OlympeLiveBackend=object),
     )
     monkeypatch.setitem(
         sys.modules,

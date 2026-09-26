@@ -11,16 +11,38 @@ from pathlib import Path
 from typing import Any
 
 
-def quiet_arsdk_logs() -> None:
-    """Reduce verbose native ARSDK and video-decoder logging."""
+def quiet_olympe_logs() -> None:
+    """Cut Olympe/pdraw INFO spam (AVCC unsupported, renderer empty queue, etc.).
+
+    Does not change flight commands — log level only. Call before connect.
+    """
     import logging
 
+    # Force WARNING even if handlers already exist (Olympe reconfigures often).
     logging.basicConfig(level=logging.WARNING)
+    # Olympe creates per-device child loggers after connection and may attach
+    # their own INFO handlers. The global threshold keeps verbose state payloads
+    # out of the operator terminal regardless of later logger reconfiguration.
     logging.disable(logging.INFO)
-    for name in ("arsdk", "arsdkctrl", "pomp", "ulog", "cv2"):
-        logger = logging.getLogger(name)
-        logger.setLevel(logging.WARNING)
-        logger.propagate = True
+    for name in (
+        "olympe",
+        "ulog",
+        "olympe.pdraw",
+        "olympe.drone",
+        "olympe.video",
+        "olympe.video.renderer",
+        "olympe.backend",
+        "olympe.media",
+        "olympe.module_loader",
+        "olympe.scheduler",
+        "olympe.update",
+        "olympe.flightplan",
+        "olympe.missions",
+        "olympe.arsdkng",
+    ):
+        lg = logging.getLogger(name)
+        lg.setLevel(logging.WARNING)
+        lg.propagate = True
 
 
 class _CmdLog:
@@ -34,7 +56,7 @@ class _CmdLog:
             try:
                 path.parent.mkdir(parents=True, exist_ok=True)
                 self._f = path.open("w", encoding="utf-8", buffering=1)
-                self.event("start", sink="arsdk_live_ui")
+                self.event("start", sink="olympe_live_ui")
             except Exception as exc:
                 self.healthy = False
                 self.last_error = repr(exc)

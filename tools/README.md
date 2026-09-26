@@ -142,7 +142,7 @@ python tools/security_dependency_gate.py
 ```
 
 `mypy` 只對 `pyproject.toml` 的明確 typed boundary 清單設 fail gate，並不宣稱
-整個 Tk/ARSDK-NG/Torch 應用程式已完成型別化。安全 gate 的 vulnerability exception 在
+整個 Tk/Olympe/Torch 應用程式已完成型別化。安全 gate 的 vulnerability exception 在
 `pyproject.toml` 以 package、advisory ID、理由和 ISO 到期日保存；到期或未列出的
 漏洞都會 fail。pip-audit 的 `skip_reason` 不能以一般 vulnerability exception
 略過，必須在 `[[tool.security_dependency_gate.skip_exceptions]]` 以精確的 package、
@@ -158,5 +158,5 @@ CUDA wheel 即使被 pip-audit skip，也會以 `audited=false` 與原始 `skip_
 - `report_relocalization.py --capture <capture.json> --out <report.json>`：按獨立重定位工作統計 p50/p95/p99、缺失階段與最慢案例；不是按重複 UI 記錄計數。
 - `replay_telemetry_ekf.py --session <session> --out <directory>`：用前 40% 時間校準水平尺度／方向，後 60% 比較純視覺與速度融合 ESKF；每五個強觀測保留一個不送入濾波器。需要包含地圖軸的 route plan、相機軸、來源時間與速度。資料不足時報告原因，不產生假校準。
 
-上述工具只讀資料與寫入報告，不載入 ARSDK-NG native libraries 或發送控制命令。詳細結果與限制見
+上述工具只讀資料與寫入報告，不載入 Olympe 或發送控制命令。詳細結果與限制見
 [`system_optimization_20260922.md`](../docs/system_optimization_20260922.md)。

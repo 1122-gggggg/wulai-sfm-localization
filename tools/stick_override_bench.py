@@ -10,7 +10,7 @@ HID device and reports exactly what the backend would see:
     ``_maybe_reclaim_from_sticks() -> give_to_pilot()`` -- fires.
 
 The reclaim path has no airborne condition, so this exercises the whole
-host-side chain except the final ARSDK-NG piloting-source call, on the ground.
+host-side chain except the final Olympe piloting-source call, on the ground.
 
     python tools/stick_override_bench.py [seconds]
 """
@@ -24,7 +24,7 @@ from pathlib import Path
 OI = Path(__file__).resolve().parents[1] / "控制介面程式" / "operator_interface"
 sys.path.insert(0, str(OI))
 
-from arsdk_ng_live_backend import (  # noqa: E402
+from olympe_live_backend import (  # noqa: E402
     SkyControllerStickMonitor,
     axes_active,
     find_skycontroller_joystick_path,

@@ -18,24 +18,6 @@
 - `定位演算法/deploy_code/runtime/EDM/deploy/requirements_deploy.txt`
 - `模擬器/parrot_stimulate/pyproject.toml`
 
-
-主 runtime 不再安裝 Olympe 或 Python protobuf。真機控制透過
-`控制介面程式/operator_interface/arsdk_ng.py` 綁定 Parrot 官方 ARSDK-NG C API；
-影像直接讀取 ANAFI RTSP `/live`，媒體與設備資訊走標準 HTTP。官方 native
-source pins 與建置／ctypes smoke test 由工作區根目錄執行：
-
-```bash
-bash tools/build_arsdk_ng.sh
-```
-
-預設輸出為 `執行環境/native/arsdk-ng/lib`，正式啟動器會檢查並載入
-`libarsdk.so`、`libarsdkctrl.so`、`libpomp.so`、`libfutils.so`、`libmux.so`、
-`libulog.so`。若來源已預先 checkout，可用 `SFM_ARSDK_NG_SOURCE_ROOT` 指定以
-避免重新下載；輸出目錄可用 `SFM_ARSDK_NG_LIB_DIR` 覆寫。這些 native libraries
-不是 pip 套件，需在目標 Linux 架構建置並隨 runtime 發布。
-
-`模擬器/parrot_stimulate/pyproject.toml` 是獨立 Sphinx 模擬環境；其模擬用 SDK
-與主 runtime 相依彼此隔離。
 更新 lockfile 時，從工作區根目錄依各 lockfile 首行記錄的 `uv pip compile`
 命令重新產生，並執行完整 system validation。
 

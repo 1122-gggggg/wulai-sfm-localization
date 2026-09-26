@@ -19,7 +19,7 @@
 ## 執行資料流
 
 ```text
-MP4 或 ANAFI RTSP /live RGB frame
+MP4 或 ANAFI Pdraw RGB frame
         │
         ▼
 live_localizer_worker（direct 唯一後端）
@@ -43,7 +43,7 @@ Pose + FAST_TRACK / RELOC_SEED / VO_ONLY / DEAD_RECKON / NO_POSE
 | `控制介面程式/` | site profile、任務入口、桌面 UI、worker protocol、串流 launcher |
 | `定位演算法/deploy_code/sfm_direct_deploy/` | 正式 direct 定位、地圖載入、快慢迴路與交接 |
 | `定位演算法/deploy_code/sfm_glomap_deploy/` | 共用 pose/integrity contract、registry 與 provider factory |
-| `定位演算法/flight_control/` | 航線控制、RTSP 影像來源與真機安全邏輯 |
+| `定位演算法/flight_control/` | 航線控制、Olympe 串流與真機安全邏輯 |
 | `定位演算法/validation/` | replay、品質 gate、硬體監控、部署一致性檢查 |
 | `定位演算法/deploy_code/runtime/EDM/` | 上游 EDM training/runtime 原始碼；視為 third-party boundary |
 | `地圖檔/` | 使用者提供的場域資產；預設不納入 Git |
@@ -75,7 +75,7 @@ symlink、容量與未分類 output。
 |---|---|
 | `deploy_code/sfm_glomap_deploy/` | `artifact_integrity.py`、`localizer_registry.py`、`pose_types.py`、`production_localizer_factory.py`（direct 唯一後端接線） |
 | `deploy_code/sfm_direct_deploy/` | `direct_map.py`、`direct_profile.py`、`live_provider.py`、`two_rate_tracker.py`、`direct_localizer_adapter.py`、`vendor/` |
-| `flight_control/` | `autoflight.py`、`manual_nudge_pilot.py`、`rtsp_frame_source.py`、`path_follow_flight.py`、`plan_path.py`、`real_path_follow_controller.py`、`route_domain.py` |
+| `flight_control/` | `autoflight.py`、`manual_nudge_pilot.py`、`olympe_frame_source.py`、`path_follow_flight.py`、`plan_path.py`、`real_path_follow_controller.py`、`route_domain.py` |
 
 呼叫端直接從 owner 匯入，另一個目錄不得再放相容副本。CI 由下列命令驗證 owner
 存在、舊副本沒有回流，且沒有未分類的同名 runtime 檔案：

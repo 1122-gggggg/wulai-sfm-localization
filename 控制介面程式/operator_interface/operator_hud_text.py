@@ -66,6 +66,7 @@ def gps_operator_message(state: object, *, live: bool) -> tuple[str, str]:
 
 _INVENTORY_REASON_ZH = (
     ("hardware inventory not read", "硬體清單尚未讀回"),
+    ("olympe version", "Olympe 版本尚無核准紀錄"),
     ("aircraft firmware", "飛機韌體版本尚無核准紀錄"),
     ("controller firmware", "控制器韌體版本尚無核准紀錄"),
     (
@@ -123,7 +124,7 @@ def inventory_ui_status(backend: object) -> dict[str, tuple[str, str]]:
     version_errors = [
         reason for reason in reasons
         if any(token in reason.lower() for token in (
-            "aircraft firmware", "controller firmware",
+            "olympe version", "aircraft firmware", "controller firmware",
         ))
     ]
     lost_link_errors = [
@@ -141,7 +142,7 @@ def inventory_ui_status(backend: object) -> dict[str, tuple[str, str]]:
     controller_name = controller.get("variant") or "SkyController 3"
     hardware_text = f"{aircraft_name} / {controller_name}"
     version_text = (
-        f"ARSDK-NG {runtime.get('arsdk_ng_source_revision') or '?'} · "
+        f"Olympe {runtime.get('olympe_version') or '?'} · "
         f"飛機 {aircraft.get('software') or '?'} · "
         f"控制器 {controller.get('software') or '?'}"
     )
@@ -185,12 +186,12 @@ def inventory_block_summary(backend: object) -> str:
     return _inventory_reason_zh(raw) or "硬體清單尚未通過"
 
 
-def format_arsdk_telemetry(
+def format_olympe_telemetry(
     state: object,
     *,
     now_mono_ns: int | None = None,
 ) -> dict[str, str]:
-    """Format safety-relevant values from the ARSDK-NG event cache."""
+    """Format safety-relevant values read from Olympe's local event cache."""
     roll = math.degrees(float(getattr(state, "att_roll", 0.0) or 0.0))
     pitch = math.degrees(float(getattr(state, "att_pitch", 0.0) or 0.0))
     yaw = math.degrees(float(getattr(state, "att_yaw", 0.0) or 0.0))
@@ -304,7 +305,7 @@ def format_arsdk_telemetry(
             f"{_telemetry_number(getattr(state, 'wifi_rssi_dbm', None), digits=0)} dBm | "
             f"鏈路品質 {link_quality_text}"
         ),
-        "sensors": f"感測器健康 {sensor_text} | ARSDK-NG cache age {cache_age_text}",
+        "sensors": f"感測器健康 {sensor_text} | Olympe cache age {cache_age_text}",
     }
 
 

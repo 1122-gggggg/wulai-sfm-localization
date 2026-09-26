@@ -67,7 +67,6 @@ SOURCE_EXTERNAL_PREFIXES = (
     "執行環境/models/moge-2-vits-normal/",
     "執行環境/models/boq/",
     "模擬器/parrot_stimulate/firmware/",
-    "執行環境/native/arsdk-ng/lib/",
     "執行環境/torch_hub_cache/",
     "執行環境/offline_wheelhouse/",
 )

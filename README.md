@@ -50,13 +50,13 @@ python tools/workspace_audit.py --strict-output-names
 
 | 接口 | 唯一入口 | 影像來源 | 飛控 backend |
 |---|---|---|---|
-| 模擬串流 | `控制介面程式/影片模擬串流/選擇啟動.sh` | 本機影片 / FFmpeg | 模擬，不載入飛控 SDK |
-| 實機操作（人工／preflight 後 AUTO） | `控制介面程式/真機串流/啟動.sh` | ANAFI RTSP | Parrot ARSDK-NG；操作員 UI 控制，只接受 mission selection |
-| IMU 飛行測試（手動飛行資料採集） | `IMU飛行測試.sh` | ANAFI RTSP | 同上，只是額外錄 IMU／搖桿／定位當幀畫面 |
+| 模擬串流 | `控制介面程式/影片模擬串流/選擇啟動.sh` | 本機影片 / FFmpeg | 模擬，永不載入 Olympe |
+| 實機操作（人工／preflight 後 AUTO） | `控制介面程式/真機串流/啟動.sh` | ANAFI PDRAW | Olympe，操作員 UI 控制；只接受 mission selection |
+| IMU 飛行測試（手動飛行資料採集） | `IMU飛行測試.sh` | ANAFI PDRAW | 同上，只是額外錄 IMU／搖桿／定位當幀畫面 |
 | 任務 authoring／檢查 | `控制介面程式/mission_pipeline.py` | 本機資產 | 不直接取代真機操作入口 |
 
 兩個 runtime 入口互斥。模擬入口拒絕 `--live` / `real-flight`；實機入口拒絕
-`--video`，且 RTSP 不可用時不會拿錄影檔冒充實機畫面。真機入口只接受
+`--video`，且 PDRAW 不可用時不會拿錄影檔冒充實機畫面。真機入口只接受
 `sfm-mission-selection/v1`；resolver 驗證所有 component SHA、定位品質、必要校正與
 route 契約後產生唯讀 site-profile snapshot。AUTO 仍須由操作員在當次 UI 完成四步
 preflight 並親自按下按鈕。
@@ -207,7 +207,7 @@ AUTO readiness 必須由當次 resolver/preflight 確認，不以文件中的靜
 |---|---|
 | `定位演算法/deploy_code/sfm_direct_deploy/` | direct 地圖、tracker、provider 與 adapter |
 | `定位演算法/deploy_code/sfm_glomap_deploy/` | 共用 pose/integrity、registry 與 factory |
-| `定位演算法/flight_control/` | 控制器、RTSP frame source、安全監控與人工工具的 owner |
+| `定位演算法/flight_control/` | 控制器、Olympe frame source、安全監控與人工工具的 owner |
 | `定位演算法/EDM工具包/deploy` `runtime` | symlink → `deploy_code/` |
 
 模型權重在 `定位演算法/deploy_code/runtime/EDM/weights/`（不進版控）。

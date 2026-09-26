@@ -1,14 +1,14 @@
 # 接口 A：真機串流
 
-從 SkyController / 無人機讀即時 720p RTSP 串流。一般入口是 `啟動.sh`，且必須明確
+從 SkyController / 無人機讀即時 720p 串流。一般入口是 `啟動.sh`，且必須明確
 指定 hash-pinned mission selection。resolver 會驗證 vehicle、site、map、localizer、
 route、calibration 與 approval，再產生介面使用的唯讀 site-profile snapshot。
 
-- 有直接 Parrot ARSDK-NG 控制連線、RTSP 真機畫面與 `stick_override`（動搖桿交回）
-- 固定傳入 `--interface real-flight`，只接受 ANAFI RTSP `/live`；`--video` 會直接拒絕
+- 有 Olympe 連線、真機畫面與 `stick_override`（動搖桿交回）
+- 固定傳入 `--interface real-flight`，只接受 ANAFI PDRAW；`--video` 會直接拒絕
 - 禁止 AI 或腳本代為起飛；起飛僅操作員按 UI
 - 正式飛行只允許 ANAFI 4K + SkyController 3；direct Wi-Fi 只供地面診斷
-- 連線後會讀取並記錄機型、serial、firmware、ARSDK-NG revision、Home、RTH 與 firmware limits
+- 連線後會讀取並記錄機型、serial、firmware、Olympe、Home、RTH 與 firmware limits
 - 沒有 profile 內 SHA 固定的核准 receipt 時可顯示地面診斷，但起飛 fail closed
 - 未達 mission flight readiness 時 AUTO 鎖定；地面定位與診斷仍可使用
 - 落地與空中重新啟動 AUTO 都必須完成同一套四步 preflight

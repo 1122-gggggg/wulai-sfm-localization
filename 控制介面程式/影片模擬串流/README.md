@@ -72,7 +72,7 @@ SFM_SITE_PROFILE=/absolute/path/to/your_site.json \\
 
 | | 真機串流 | 影片模擬串流 |
 |--|----------|----------------|
-| 畫面 | ARSDK-NG + RTSP | FFmpeg 讀檔 |
+| 畫面 | Olympe PDRAW | FFmpeg 讀檔 |
 | BOOT MegaLoc | 真機串流首幀 | 凍第一幀模擬 |
 | LOST | 飛機實際懸停 | **暫停影片串流** 凍幀重抓 |
 | 飛控 | 可（人類起飛） | 無 |

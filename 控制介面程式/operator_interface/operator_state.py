@@ -25,7 +25,7 @@ class TrackerState(str, Enum):
 
     Two write sites intentionally still assign a plain ``str`` rather than a
     member of this enum, and are not refactored in this batch:
-      - arsdk_ng_live_backend.py forwards the ANAFI firmware's own
+      - olympe_live_backend.py forwards the ANAFI firmware's own
         FlyingStateChanged string (uppercased) when nothing more specific
         (this enum's values) already applies.
       - flight_operator_app.py forwards the localization worker's own

@@ -1,9 +1,6 @@
 # IMU / fused-state capability audit
 
 > 2026-09-15：本文涉及 ProductionEDMTracker／ESEKF 的段落屬歷史資料，相關程式已退役。現行 DIRECT 的能力與離線檢查以 [direct_offline_validation.md](direct_offline_validation.md) 為準。
-> 2026-09-29：主 runtime 已改用 ARSDK-NG native direct client 與 RTSP。以下表格是
-> 2026-08 的 source-bound audit，保留當時的 Olympe source path 作為歷史證據，不代表
-> 現行模組路徑或 Python SDK 依賴。
 
 Date: 2026-08-17
 Scope: production live localization (GlueMap/EDM/PnP) and ANAFI Olympe telemetry.
@@ -115,8 +112,9 @@ Olympe event cache (parrot-olympe 8.4)
         │     → HUD, gravity_cal, HeadingEstimator, landing speed gate
         │     ✖ live_localizer_worker
         │
-        └─ RTSP /live 1280x720
-              → host-monotonic receipt stamp (degraded; never a sensor timestamp)
+        └─ PDRAW 1280x720
+              → ntp_raw_timestamp → host monotonic (olympe_frame_source.py)
+              → SHM RGB + SFM2 capture_stamp
               → ProductionEDMTracker
               → MegaLoc only BOOT / each LOST episode
               → spatial EDM refs → PnP cam_from_world
@@ -223,10 +221,10 @@ EDM matcher, MegaLoc weights, `edm_production_profile.json` required key set, py
 
 | Clock | Domain | Notes |
 |---|---|---|
-| Camera | host monotonic receipt from `VideoCapture.read()` | RTSP only; always degraded (`opencv-rtsp-receipt-degraded`), not sensor time; source-time consumers fail closed (`rtsp_frame_source.py`) |
-| Attitude | ARSDK-NG `get_state(AttitudeChanged)` | Host polling time is not a firmware sensor timestamp |
-| Speed | ARSDK-NG event UUID + `monotonic_ns` receipt | Fail-closed if frozen or stale |
-| PnP pose stamp | host-monotonic RTSP receipt time | Degraded; must not be described as camera capture time |
+| Camera | host monotonic, NTP-mapped from `ntp_raw_timestamp` | Trusted only if `stamp_source==ntp-mapped` (`olympe_frame_source.py`) |
+| Attitude | poll monotonic via `get_state` | **Not** UUID-fresh in live backend |
+| Speed / alt / GPS | event UUID + `event.date` → monotonic | Fail-closed if frozen |
+| PnP pose stamp | image `capture_stamp` | Must not be refreshed by inference delay |
 
 There is **no** IMU–camera interpolator in production. New code interpolates only samples that share host monotonic and are within `max_sync_error_s`. Attitude without a trustworthy stamp is unused.
 

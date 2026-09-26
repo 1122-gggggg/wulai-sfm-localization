@@ -269,6 +269,6 @@ def test_safety_advisor_escalates_to_recommendations_only() -> None:
 def test_advisor_has_no_live_backend_or_protocol_dependency() -> None:
     source = Path(advisor.__file__).read_text(encoding="utf-8").lower()
 
-    assert "import arsdk_ng" not in source
-    assert "arsdk_ng_live_backend" not in source
+    assert "import olympe" not in source
+    assert "olympe_live_backend" not in source
     assert "flight_operator_app" not in source
