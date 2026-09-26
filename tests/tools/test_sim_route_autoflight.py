@@ -552,9 +552,18 @@ def test_cli_localization_failure_flags_reach_params():
 
 
 def test_wind_observer_logs_residual_drift_from_the_production_loop():
-    params = sim.SimParams(route=_route(), align=_align(), duration_s=60.0, seed=7,
-                           wind_mean_mps=(0.3, 0.0, 0.0), wind_sigma_mps=0.0)
+    params = sim.SimParams(
+        route=_route(),
+        align=_align(),
+        duration_s=60.0,
+        seed=7,
+        wind_mean_mps=(0.3, 0.0, 0.0),
+        wind_sigma_mps=0.0,
+    )
     result, _ = sim.run_sim(params, record_trace=True)
-    ready = [row["wind_observer"] for row in result.trace
-             if (row.get("wind_observer") or {}).get("reason") == "ready"]
+    ready = [
+        row["wind_observer"]
+        for row in result.trace
+        if (row.get("wind_observer") or {}).get("reason") == "ready"
+    ]
     assert ready and math.hypot(*ready[-1]["drift_ned_mps"]) > 0.1

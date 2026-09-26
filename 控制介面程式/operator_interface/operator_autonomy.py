@@ -98,7 +98,8 @@ class RouteErrorStats:
 
     def observe(self, record: dict) -> None:
         try:
-            distance = float(record.get("route_distance_u"))
+            # A missing key becomes NaN and is rejected by the finiteness check.
+            distance = float(record.get("route_distance_u", math.nan))
         except (TypeError, ValueError):
             return
         if not math.isfinite(distance) or distance < 0.0:
@@ -121,7 +122,7 @@ class RouteErrorStats:
         values = np.asarray(self.distances, dtype=float)
         result = {
             "samples": int(values.size),
-            "current_u": round(float(self.current), 4),
+            "current_u": round(float(values[-1]), 4),  # == self.current
             "mean_u": round(float(values.mean()), 4),
             "rms_u": round(float(np.sqrt(np.mean(values * values))), 4),
             "p95_u": round(float(np.percentile(values, 95)), 4),

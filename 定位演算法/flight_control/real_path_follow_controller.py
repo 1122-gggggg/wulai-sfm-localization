@@ -458,6 +458,13 @@ DESKTOP_AUTO_YAW_TOLERANCE_DEG = 20.0
 DESKTOP_AUTO_WIND_REJECT_PCMD_PER_MPS = 20.0
 # Fallback only for routes without an authored arrival radius.
 DESKTOP_AUTO_DEFAULT_ARRIVE_RADIUS = 0.15
+#: Approach taper length as a fraction of the drawn route length. At 0.25 the
+#: taper outlasted every leg of short routes, so no leg reached full authority:
+#: the 2026-09-23 route (4.6 u) never finished inside the 600 s AUTO budget in
+#: simulation and waypoint centering crept for ~10 s per point while drifting
+#: off the line. 0.075 was chosen over 0.05 as the less aggressive of the two
+#: that restored completion (preset matrix 13 -> 21 of 26 accepted).
+SLOWDOWN_ROUTE_FRACTION = 0.075
 
 # Horizontal tilt is capped by DESKTOP_AUTO_MAX_TRANSLATION_PCMD (50% of
 # MaxTilt 20° ≈ 10°). Gaz has its own vertical-speed percentage. After each
@@ -839,10 +846,10 @@ def config_for_route(
         # unit route it caps every in-corridor fix at 1-2% PCMD, which cannot
         # close a 0.3-0.5 unit gap against wind (measured 2026-09-13: 140 s of
         # translate at pcmd 1 with the error stuck at ~0.38). Scale it to the
-        # drawn route so full authority resumes beyond ~1/4 route length.
+        # drawn route (SLOWDOWN_ROUTE_FRACTION) so legs reach full authority.
         if path_len is not None:
             changes["slowdown_distance"] = min(
-                float(cfg.slowdown_distance), max(0.15, 0.25 * path_len)
+                float(cfg.slowdown_distance), max(0.15, SLOWDOWN_ROUTE_FRACTION * path_len)
             )
     if point_radii is not None:
         # Per-point spheres replace the global one index-wise; the arrival

@@ -260,6 +260,7 @@ from operator_preflight import (
     evaluate_preflight_step,
 )
 from operator_rendering import (
+    VIEWPORT_MIN_H,
     draw_magnetometer_axis,
     MapRenderContext,
     build_hud_overlay_data as build_hud_overlay_data,
@@ -2626,11 +2627,12 @@ class OperatorApp(tk.Tk):
         main_paned.grid(row=0, column=0, sticky="nsew")
         self.main_paned = main_paned
 
-        # 140: the map/video pane expands into whatever height is spare, so this
-        # REQUESTED size only decides who loses on a short window -- and it must
-        # not be the controls below. Lowered 240 -> 180 -> 140 by operator request.
+        # VIEWPORT_MIN_H: the map/video pane expands into whatever height is spare,
+        # so this REQUESTED size only decides who loses on a short window -- and it
+        # must not be the controls below. Lowered 240 -> 180 -> 140 by operator
+        # request, then to 96 so the 1180x768 minimum keeps every control visible.
         self.map_label = tk.Canvas(
-            main_paned, bg="#15181c", highlightthickness=0, bd=0, width=440, height=140
+            main_paned, bg="#15181c", highlightthickness=0, bd=0, width=440, height=VIEWPORT_MIN_H
         )
         self.map_label.bind("<ButtonPress-1>", self.on_map_press)
         self.map_label.bind("<B1-Motion>", self.on_map_drag)
@@ -2666,7 +2668,7 @@ class OperatorApp(tk.Tk):
         )
         self.map_zoom_out_button.pack(pady=(4, 0))
         self.video_label = tk.Canvas(
-            main_paned, bg="#08090b", highlightthickness=0, bd=0, width=760, height=140
+            main_paned, bg="#08090b", highlightthickness=0, bd=0, width=760, height=VIEWPORT_MIN_H
         )
         main_paned.add(self.map_label, minsize=300, stretch="always")
         main_paned.add(self.video_label, minsize=480, stretch="always")
@@ -6395,7 +6397,7 @@ class OperatorApp(tk.Tk):
         if len(self.map_points) == 0:
             return
         width = max(300, self.map_label.winfo_width())
-        height = max(140, self.map_label.winfo_height())
+        height = max(VIEWPORT_MIN_H, self.map_label.winfo_height())
         step = max(1, len(self.map_points) // 90000)
         pts = self.map_points[::step, :3].astype(float)
         view = self.transform_xyz(pts)
@@ -6579,7 +6581,7 @@ class OperatorApp(tk.Tk):
 
     def redraw_map_only(self) -> None:
         mw = max(300, self.map_label.winfo_width())
-        mh = max(140, self.map_label.winfo_height())
+        mh = max(VIEWPORT_MIN_H, self.map_label.winfo_height())
         self._present_frame(
             self.map_label, "map_photo", self.render_map(mw, mh, self.current_state)
         )

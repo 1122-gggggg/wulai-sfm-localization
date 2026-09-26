@@ -62,8 +62,12 @@ def test_sta_crop_keeps_centre_and_central_square_for_anafi_frames():
         centre = crop.to_crop(np.array([[width / 2, height / 2]]))[0]
         assert np.all(np.abs(centre - 112.0) <= 1.0)
         left_edge, right_edge = crop.to_crop(
-            np.array([[crop.left + (crop.left2) / crop.scale_x, height / 2],
-                      [crop.left + (crop.left2 + 224) / crop.scale_x, height / 2]])
+            np.array(
+                [
+                    [crop.left + (crop.left2) / crop.scale_x, height / 2],
+                    [crop.left + (crop.left2 + 224) / crop.scale_x, height / 2],
+                ]
+            )
         )[:, 0]
         assert abs(left_edge) < 1e-9 and abs(right_edge - 224.0) < 1e-9
         top_edge = crop.to_crop(np.array([[width / 2, crop.top]]))[0, 1]
@@ -85,7 +89,10 @@ def test_gamma_is_robust_to_outlier_depths():
 
 def test_gamma_abstains_below_minimum_samples_and_drops_invalid_depths():
     fit = estimate_gamma(
-        np.array([1.0, -1.0, np.nan, 2.0]), np.array([1.0, 1.0, 1.0, 0.0]), np.ones(4), min_samples=2
+        np.array([1.0, -1.0, np.nan, 2.0]),
+        np.array([1.0, 1.0, 1.0, 0.0]),
+        np.ones(4),
+        min_samples=2,
     )
     assert fit.gamma is None and fit.samples == 1
 
@@ -112,7 +119,9 @@ def test_consensus_rejects_outlier_and_averages_independent_agreement():
 
     assert result.accepted
     assert set(result.members) == {"a", "b", "c"}
-    np.testing.assert_allclose(camera_center(result.cam_from_world), [1.02, 0.02 / 3, 0.0], atol=1e-9)
+    np.testing.assert_allclose(
+        camera_center(result.cam_from_world), [1.02, 0.02 / 3, 0.0], atol=1e-9
+    )
     reference = _hypothesis("ref", "v", 0, [0, 0, 0], 11.0).cam_from_world[:3, :3]
     assert rotation_angle_deg(result.cam_from_world[:3, :3], reference) < 1.0
 

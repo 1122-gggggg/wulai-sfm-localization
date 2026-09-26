@@ -38,11 +38,16 @@ def load_ticks(path):
                 north = float(row["speed_north_mps"])
                 east = float(row["speed_east_mps"])
                 speed_stamp = float(row["ground_speed_mono_ns"]) * 1e-9
-                command_stamp = float(row.get("command_authorized_mono_ns") or row["t_mono_ns"]) * 1e-9
+                command_stamp = (
+                    float(row.get("command_authorized_mono_ns") or row["t_mono_ns"]) * 1e-9
+                )
                 tick_stamp = float(row["t_mono_ns"]) * 1e-9
             except (KeyError, TypeError, ValueError, OverflowError):
                 continue
-            if not all(math.isfinite(v) for v in (*values, yaw, north, east, speed_stamp, command_stamp, tick_stamp)):
+            if not all(
+                math.isfinite(v)
+                for v in (*values, yaw, north, east, speed_stamp, command_stamp, tick_stamp)
+            ):
                 continue
             ticks.append((tick_stamp, command_stamp, speed_stamp, yaw, values, north, east))
     return sorted(ticks)
@@ -53,8 +58,13 @@ def build_segments(ticks):
     velocities = {}
     for tick_stamp, command_stamp, speed_stamp, yaw, pcmd, north, east in ticks:
         forward, right = pcmd[1], pcmd[0]
-        commands.append((command_stamp, math.cos(yaw) * forward - math.sin(yaw) * right,
-                         math.sin(yaw) * forward + math.cos(yaw) * right))
+        commands.append(
+            (
+                command_stamp,
+                math.cos(yaw) * forward - math.sin(yaw) * right,
+                math.sin(yaw) * forward + math.cos(yaw) * right,
+            )
+        )
         velocities.setdefault(speed_stamp, (north, east))
     commands.sort()
     speeds = sorted((stamp, *value) for stamp, value in velocities.items())
@@ -74,8 +84,14 @@ def build_segments(ticks):
         if not usable:
             continue
         grid = start + np.arange(int((end - start) / GRID_S) + 1) * GRID_S
-        indices = np.clip(np.rint((np.asarray([row[0] for row in usable]) - start) / GRID_S).astype(int), 0, len(grid) - 1)
-        prepared.append((np.asarray(segment), grid, indices, np.asarray([row[1:] for row in usable])))
+        indices = np.clip(
+            np.rint((np.asarray([row[0] for row in usable]) - start) / GRID_S).astype(int),
+            0,
+            len(grid) - 1,
+        )
+        prepared.append(
+            (np.asarray(segment), grid, indices, np.asarray([row[1:] for row in usable]))
+        )
     return speeds, segments, prepared
 
 
@@ -97,10 +113,12 @@ def fit_response(prepared):
         for tau_step in range(1, 16):
             tau = tau_step * 0.2
             alpha = 1 - math.exp(-GRID_S / tau)
-            filtered = np.concatenate([
-                lfilter([0, alpha], [1, -(1 - alpha)], signal, axis=0)[indices]
-                for signal, indices in inputs
-            ])
+            filtered = np.concatenate(
+                [
+                    lfilter([0, alpha], [1, -(1 - alpha)], signal, axis=0)[indices]
+                    for signal, indices in inputs
+                ]
+            )
             avg = filtered.mean(axis=0)
             centered_input = filtered - avg
             denom = float(np.sum(centered_input * centered_input))
@@ -109,9 +127,15 @@ def fit_response(prepared):
             gain = float(np.sum(centered_input * centered) / denom)
             bias = mean - gain * avg
             residual = measured - (gain * filtered + bias)
-            candidates.append({"delay_s": round(delay, 2), "tau_s": round(tau, 2),
-                               "gain_mps_per_pct": gain, "bias_ned_mps": bias.tolist(),
-                               "r2": 1 - float(np.sum(residual * residual)) / total})
+            candidates.append(
+                {
+                    "delay_s": round(delay, 2),
+                    "tau_s": round(tau, 2),
+                    "gain_mps_per_pct": gain,
+                    "bias_ned_mps": bias.tolist(),
+                    "r2": 1 - float(np.sum(residual * residual)) / total,
+                }
+            )
     return sorted(candidates, key=lambda row: row["r2"], reverse=True)
 
 
@@ -137,10 +161,13 @@ def replay_observer(ticks):
         observer.observe_command(pcmd, yaw, command_stamp)
         _, reason = observer.feedforward(now, yaw, 50)
         ready += reason == "ready"
-    return {"innovation_rms_ned_mps": np.sqrt(squares / max(innovations, 1)).tolist(),
-            "drift_min_ned_mps": np.where(np.isfinite(low), low, 0).tolist(),
-            "drift_max_ned_mps": np.where(np.isfinite(high), high, 0).tolist(),
-            "divergence_resets": resets, "ready_fraction": ready / len(ticks)}
+    return {
+        "innovation_rms_ned_mps": np.sqrt(squares / max(innovations, 1)).tolist(),
+        "drift_min_ned_mps": np.where(np.isfinite(low), low, 0).tolist(),
+        "drift_max_ned_mps": np.where(np.isfinite(high), high, 0).tolist(),
+        "divergence_resets": resets,
+        "ready_fraction": ready / len(ticks),
+    }
 
 
 def identify(path):
@@ -153,10 +180,16 @@ def identify(path):
     candidates = fit_response(prepared)
     if not candidates:
         raise ValueError("insufficient auto_route_tick rows")
-    return {"input_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
-            "rows": len(ticks), "velocity_samples": len(speeds), "segments": len(segments),
-            "best": candidates[0], "top5": candidates[:5],
-            "observer_replay": replay_observer(ticks), "scope": SCOPE}
+    return {
+        "input_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        "rows": len(ticks),
+        "velocity_samples": len(speeds),
+        "segments": len(segments),
+        "best": candidates[0],
+        "top5": candidates[:5],
+        "observer_replay": replay_observer(ticks),
+        "scope": SCOPE,
+    }
 
 
 def main():

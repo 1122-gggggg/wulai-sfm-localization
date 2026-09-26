@@ -31,6 +31,8 @@ outputs/*
 # BoQ-ResNet50 檢索權重（92 MB）。RUNTIME_ARTIFACTS.json 以 SHA-256 綁定它並在
 # 離線種入，不進 git 歷史。
 執行環境/models/boq/
+# 已結案的 STA 地圖錨定實驗模型（sta_map_anchored_eval.py），不進 git。
+執行環境/models/vista_slam/
 # direct 後端的執行期 scratch（placeholder manifest、EDM runtime config）。
 執行環境/direct_reloc_cache/
 river-localization-bundle-20260831/

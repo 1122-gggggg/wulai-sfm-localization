@@ -22,12 +22,21 @@ def test_identifies_fused_speed_response(tmp_path):
                 sampled = velocity + [-0.1, 0.05]
                 speed_stamp = t
             pcmd = [int(commands[index // 20, 1]), int(commands[index // 20, 0]), 0, 0]
-            stream.write(json.dumps({"event": "auto_route_tick", "t_mono_ns": round((1000 + t) * 1e9),
-                                     "command_authorized_mono_ns": round((1000 + t) * 1e9),
-                                     "ground_speed_mono_ns": round((1000 + speed_stamp) * 1e9),
-                                     "speed_north_mps": float(sampled[0]),
-                                     "speed_east_mps": float(sampled[1]), "att_yaw": 0.0,
-                                     "pcmd": pcmd}) + "\n")
+            stream.write(
+                json.dumps(
+                    {
+                        "event": "auto_route_tick",
+                        "t_mono_ns": round((1000 + t) * 1e9),
+                        "command_authorized_mono_ns": round((1000 + t) * 1e9),
+                        "ground_speed_mono_ns": round((1000 + speed_stamp) * 1e9),
+                        "speed_north_mps": float(sampled[0]),
+                        "speed_east_mps": float(sampled[1]),
+                        "att_yaw": 0.0,
+                        "pcmd": pcmd,
+                    }
+                )
+                + "\n"
+            )
     result = identify(trajectory)
     best = result["best"]
     assert abs(best["delay_s"] - 0.4) <= 0.1

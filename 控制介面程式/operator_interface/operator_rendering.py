@@ -19,6 +19,10 @@ from PIL import Image
 
 from localization_result_ui import localization_result_is_weak
 
+#: Smallest requested map/video canvas height. The pane is elastic above it;
+#: at the 1180x768 minimum window this floor is what the controls rely on.
+VIEWPORT_MIN_H = 96
+
 
 def _positive_env_int(key: str, default: int) -> int:
     try:

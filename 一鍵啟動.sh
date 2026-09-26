@@ -40,7 +40,7 @@ for name in ("PORTABLE_PACKAGE.json", "MANIFEST.tsv"):
 print(digest.hexdigest())
 PY
 )"
-elif [[ ! -d "$root_dir/.git" ]]; then
+elif [[ ! -e "$root_dir/.git" ]]; then  # a worktree has a .git file
   echo "[一鍵啟動] 非 Git 原始碼目錄必須包含 PORTABLE_PACKAGE.json；拒絕未封裝內容" >&2
   exit 1
 fi

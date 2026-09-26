@@ -143,7 +143,7 @@ PY
       exit 1
     fi
   fi
-elif [[ ! -d "$root_dir/.git" ]]; then
+elif [[ ! -e "$root_dir/.git" ]]; then  # a worktree has a .git file
   echo "[runtime] 非 Git 原始碼目錄必須包含 PORTABLE_PACKAGE.json" >&2
   exit 1
 fi

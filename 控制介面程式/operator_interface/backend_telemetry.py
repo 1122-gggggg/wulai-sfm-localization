@@ -46,7 +46,9 @@ class MotionEventHistory:
 
     FIELDS = (("AttitudeChanged", ("yaw",)), ("SpeedChanged", ("speedX", "speedY")))
 
-    def __init__(self, maxlen: int = MOTION_HISTORY_SIZE, *, now=time.monotonic, wall_now=time.time):
+    def __init__(
+        self, maxlen: int = MOTION_HISTORY_SIZE, *, now=time.monotonic, wall_now=time.time
+    ):
         self._lock = threading.Lock()
         self._now = now
         self._wall_now = wall_now
@@ -318,9 +320,7 @@ def poll_signal_sensors(backend) -> None:
         if link_quality and link_quality.get("value") is not None:
             quality = int(link_quality["value"])
             backend.state.link_signal_quality_raw = quality if 0 <= quality <= 255 else None
-        sensor_updates = backend._sensor_state_updates(
-            backend._poll_get_state(sensors_message)
-        )
+        sensor_updates = backend._sensor_state_updates(backend._poll_get_state(sensors_message))
         if sensor_updates:
             current = dict(getattr(backend.state, "sensor_states", {}) or {})
             current.update(sensor_updates)
@@ -331,7 +331,9 @@ def poll_signal_sensors(backend) -> None:
         if backend.via_skycontroller():
             backend.state.wifi_rssi_dbm = _active_drone_rssi(backend)
         else:
-            wifi = backend._poll_get_state(olympe_message("common.CommonState", "WifiSignalChanged"))
+            wifi = backend._poll_get_state(
+                olympe_message("common.CommonState", "WifiSignalChanged")
+            )
             rssi = backend._finite_float(wifi.get("rssi")) if wifi else None
             backend.state.wifi_rssi_dbm = None if rssi is None else int(rssi)
     except Exception:

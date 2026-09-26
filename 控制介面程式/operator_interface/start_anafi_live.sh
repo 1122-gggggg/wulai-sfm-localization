@@ -27,7 +27,7 @@ verify_portable_package() {
   local tag="${1:-[start]}"
   local pkg_root="${2:-${PACKAGE_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}}"
   if [[ ! -f "$pkg_root/PORTABLE_PACKAGE.json" ]]; then
-    if [[ ! -d "$pkg_root/.git" ]]; then
+    if [[ ! -e "$pkg_root/.git" ]]; then  # a worktree has a .git file
       echo "$tag ERROR: non-Git runtime is missing PORTABLE_PACKAGE.json" >&2
       exit 2
     fi
