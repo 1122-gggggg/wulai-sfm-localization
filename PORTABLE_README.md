@@ -12,6 +12,21 @@
 
 建議在搬移前保留至少 12 GiB 可用空間，供 package-local `.venv` 安裝使用。
 
+## ARSDK-NG 真機驅動
+
+真機操作需要 Parrot 官方 ARSDK-NG native libraries。若在匯出前已完成建置，
+portable exporter 會一併複製六個 library 並納入 manifest；也可在 Linux x86_64
+目標機上、第一次啟動前執行：
+
+```bash
+bash tools/build_arsdk_ng.sh
+```
+
+此步驟需要網路以取得固定版本的 Parrot source；離線交付時，請先在 source workspace
+建置，再匯出 portable package。建置腳本會更新並驗證 package manifest。若已建立
+package-local `.venv`，manifest 更新後其 identity 不再相符；依一鍵啟動的安全規則，
+須移除該 `.venv` 再由同一套件重新建立。`SFM_LAUNCH_DRY_RUN=1` 不需要 native libraries。
+
 ## 一鍵啟動
 
 ```bash

@@ -1,27 +1,30 @@
 #!/usr/bin/env python3
-"""Passive ANAFI / SkyController telemetry logger.
+"""Passive ANAFI / SkyController ARSDK-NG telemetry logger.
 
 SAFETY
   - Connects only. Never TakeOff / PCMD / Landing / Emergency / moveBy.
   - Intended for lab logging while a human flies with SkyController sticks.
-  - Use ONE Olympe connection: prefer PC -> SkyController (USB or SC WiFi).
+  - Use ONE ARSDK-NG control connection: prefer PC -> SkyController (USB or SC WiFi).
 
-Network (typical)
-  SkyController pilot (sticks) + PC Olympe both go through the SC:
-    PC <-> SkyController  (IP often 192.168.53.1)  <-> ANAFI
-  Do NOT also join the drone's own 192.168.42.x AP as a second controller
-  while SC already owns the link (ANAFI is single-controller).
+Network
+  SkyController pilot (sticks) + PC ARSDK-NG both go through the SC:
+    PC <-> SkyController (IP often 192.168.53.1) <-> ANAFI
+  Do not also open a second aircraft control connection while SC owns the link.
 
-Examples
-  # Log via SkyController while you fly FreeFlight / SC sticks:
-  python log_anafi_telemetry.py --ip 192.168.53.1 --controller skycontroller3 --secs 120
+Prerequisite (from repository root)
+  bash tools/build_arsdk_ng.sh
+  The pinned libraries under 執行環境/native/arsdk-ng/lib are loaded automatically;
+  set ARSDK_NG_LIB_DIR to use another compatible build.
 
-  # Direct drone WiFi (no SC; props-off bench only recommended):
-  python log_anafi_telemetry.py --ip 192.168.42.1 --controller drone --secs 60
-
-  # Also sample video FPS (still no arm):
-  python log_anafi_telemetry.py --ip 192.168.53.1 --controller skycontroller3 --secs 60 --with-video
+Examples (from repository root)
+  .venv/bin/python 定位演算法/flight_control/log_anafi_telemetry.py \
+    --ip 192.168.53.1 --controller skycontroller3 --secs 120
+  .venv/bin/python 定位演算法/flight_control/log_anafi_telemetry.py \
+    --ip 192.168.42.1 --controller drone --secs 60
+  .venv/bin/python 定位演算法/flight_control/log_anafi_telemetry.py \
+    --ip 192.168.53.1 --controller skycontroller3 --secs 60 --with-video
 """
+
 from __future__ import annotations
 
 import argparse
@@ -31,8 +34,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-# Reuse the project's single-connection helper.
-from olympe_frame_source import connect  # noqa: E402
+# Reuse the project's single ARSDK-NG connection and RTSP helper.
+from rtsp_frame_source import RtspFrameGrabber, connect  # noqa: E402
 
 
 def _safe_state(drone, msg) -> Any | None:
@@ -43,135 +46,71 @@ def _safe_state(drone, msg) -> Any | None:
 
 
 def _jsonable(obj: Any) -> Any:
-    if obj is None or isinstance(obj, (bool, int, float, str)):
-        return obj
     if isinstance(obj, dict):
         return {str(k): _jsonable(v) for k, v in obj.items()}
     if isinstance(obj, (list, tuple)):
         return [_jsonable(v) for v in obj]
-    # olympe sometimes returns enums / special objects
     if hasattr(obj, "name") and not callable(obj):
         try:
             return str(obj.name)
         except Exception:
             pass
+    if obj is None or isinstance(obj, (bool, int, float, str)):
+        return obj
     try:
         return float(obj)
     except Exception:
-        pass
-    return str(obj)
+        return str(obj)
 
 
-def _build_message_table():
-    """Import every telemetry-ish message we can; skip missing ones."""
-    table: list[tuple[str, Any]] = []
-
-    def add(label: str, msg) -> None:
-        table.append((label, msg))
-
-    from olympe.messages.ardrone3.PilotingState import (
-        AirSpeedChanged,
-        AlertStateChanged,
-        AltitudeAboveGroundChanged,
-        AltitudeChanged,
-        AttitudeChanged,
-        FlyingStateChanged,
-        GpsLocationChanged,
-        MotionState,
-        NavigateHomeStateChanged,
-        PositionChanged,
-        SpeedChanged,
-        VibrationLevelChanged,
-        WindStateChanged,
+def _build_message_table(client):
+    """Resolve supported ARSDK message descriptors, skipping absent channels."""
+    paths = (
+        ("piloting.attitude", "Ardrone3.PilotingState.AttitudeChanged"),
+        ("piloting.altitude", "Ardrone3.PilotingState.AltitudeChanged"),
+        ("piloting.altitude_agl", "Ardrone3.PilotingState.AltitudeAboveGroundChanged"),
+        ("piloting.position", "Ardrone3.PilotingState.PositionChanged"),
+        ("piloting.speed", "Ardrone3.PilotingState.SpeedChanged"),
+        ("piloting.airspeed", "Ardrone3.PilotingState.AirSpeedChanged"),
+        ("piloting.gps_location", "Ardrone3.PilotingState.GpsLocationChanged"),
+        ("piloting.flying_state", "Ardrone3.PilotingState.FlyingStateChanged"),
+        ("piloting.motion_state", "Ardrone3.PilotingState.MotionState"),
+        ("piloting.alert", "Ardrone3.PilotingState.AlertStateChanged"),
+        ("piloting.vibration", "Ardrone3.PilotingState.VibrationLevelChanged"),
+        ("piloting.wind", "Ardrone3.PilotingState.WindStateChanged"),
+        ("piloting.rth_state", "Ardrone3.PilotingState.NavigateHomeStateChanged"),
+        ("gps.fix", "Ardrone3.GPSSettingsState.GPSFixStateChanged"),
+        ("gps.home", "Ardrone3.GPSSettingsState.HomeChanged"),
+        ("common.battery", "Common.CommonState.BatteryStateChanged"),
+        ("common.wifi", "Common.CommonState.WifiSignalChanged"),
+        ("common.link", "Common.CommonState.LinkSignalQuality"),
+        ("common.sensors", "Common.CommonState.SensorsStatesListChanged"),
+        ("gimbal.attitude", "Gimbal.attitude"),
+        ("gimbal.calibration", "Gimbal.calibration_state"),
+        ("settings.max_altitude", "Ardrone3.PilotingSettingsState.MaxAltitudeChanged"),
+        ("settings.max_distance", "Ardrone3.PilotingSettingsState.MaxDistanceChanged"),
+        ("settings.max_tilt", "Ardrone3.PilotingSettingsState.MaxTiltChanged"),
+        (
+            "settings.nofly_maxdist",
+            "Ardrone3.PilotingSettingsState.NoFlyOverMaxDistanceChanged",
+        ),
+        ("settings.max_vspeed", "Ardrone3.SpeedSettingsState.MaxVerticalSpeedChanged"),
+        ("settings.max_yaw_rate", "Ardrone3.SpeedSettingsState.MaxRotationSpeedChanged"),
+        (
+            "settings.max_pitch_roll_rate",
+            "Ardrone3.SpeedSettingsState.MaxPitchRollRotationSpeedChanged",
+        ),
+        ("camera.orientation_v2", "Ardrone3.CameraState.OrientationV2"),
     )
-    add("piloting.attitude", AttitudeChanged)
-    add("piloting.altitude", AltitudeChanged)
-    add("piloting.altitude_agl", AltitudeAboveGroundChanged)
-    add("piloting.position", PositionChanged)
-    add("piloting.speed", SpeedChanged)
-    add("piloting.airspeed", AirSpeedChanged)
-    add("piloting.gps_location", GpsLocationChanged)
-    add("piloting.flying_state", FlyingStateChanged)
-    add("piloting.motion_state", MotionState)
-    add("piloting.alert", AlertStateChanged)
-    add("piloting.vibration", VibrationLevelChanged)
-    add("piloting.wind", WindStateChanged)
-    add("piloting.rth_state", NavigateHomeStateChanged)
-
-    try:
-        from olympe.messages.ardrone3.GPSSettingsState import (
-            GPSFixStateChanged,
-            HomeChanged,
-        )
-        add("gps.fix", GPSFixStateChanged)
-        add("gps.home", HomeChanged)
-    except Exception:
-        pass
-
-    try:
-        from olympe.messages.common.CommonState import (
-            BatteryStateChanged,
-            LinkSignalQuality,
-            SensorsStatesListChanged,
-            WifiSignalChanged,
-        )
-        add("common.battery", BatteryStateChanged)
-        add("common.wifi", WifiSignalChanged)
-        add("common.link", LinkSignalQuality)
-        add("common.sensors", SensorsStatesListChanged)
-    except Exception:
-        pass
-
-    try:
-        from olympe.messages.battery import capacity as bat_capacity
-        from olympe.messages.battery import health as bat_health
-        from olympe.messages.battery import voltage as bat_voltage
-        add("battery.capacity", bat_capacity)
-        add("battery.health", bat_health)
-        add("battery.voltage", bat_voltage)
-    except Exception:
-        pass
-
-    try:
-        from olympe.messages.gimbal import attitude as gimbal_attitude
-        from olympe.messages.gimbal import calibration_state as gimbal_cal
-        add("gimbal.attitude", gimbal_attitude)
-        add("gimbal.calibration", gimbal_cal)
-    except Exception:
-        pass
-
-    try:
-        from olympe.messages.ardrone3.PilotingSettingsState import (
-            MaxAltitudeChanged,
-            MaxDistanceChanged,
-            MaxTiltChanged,
-            NoFlyOverMaxDistanceChanged,
-        )
-        add("settings.max_altitude", MaxAltitudeChanged)
-        add("settings.max_distance", MaxDistanceChanged)
-        add("settings.max_tilt", MaxTiltChanged)
-        add("settings.nofly_maxdist", NoFlyOverMaxDistanceChanged)
-    except Exception:
-        pass
-
-    try:
-        from olympe.messages.ardrone3.SpeedSettingsState import (
-            MaxPitchRollRotationSpeedChanged,
-            MaxRotationSpeedChanged,
-            MaxVerticalSpeedChanged,
-        )
-        add("settings.max_vspeed", MaxVerticalSpeedChanged)
-        add("settings.max_yaw_rate", MaxRotationSpeedChanged)
-        add("settings.max_pitch_roll_rate", MaxPitchRollRotationSpeedChanged)
-    except Exception:
-        pass
-
-    try:
-        from olympe.messages.ardrone3.CameraState import OrientationV2
-        add("camera.orientation_v2", OrientationV2)
-    except Exception:
-        pass
-
+    table = []
+    for label, path in paths:
+        descriptor = client.messages
+        try:
+            for component in path.split("."):
+                descriptor = getattr(descriptor, component)
+        except AttributeError:
+            continue
+        table.append((label, descriptor))
     return table
 
 
@@ -200,8 +139,7 @@ def _start_video_grabber(drone, *, enabled: bool):
         return None
     candidate = None
     try:
-        from olympe_frame_source import OlympePdrawGrabber
-        candidate = OlympePdrawGrabber(drone, resize=(1280, 720), stale_s=0.8)
+        candidate = RtspFrameGrabber(drone, resize=(1280, 720), stale_s=0.8)
         candidate.start()
         print("[log] video grabber started (still no arm)", flush=True)
         return candidate
@@ -216,6 +154,13 @@ def _start_video_grabber(drone, *, enabled: bool):
 
 
 def _add_video_sample(row: dict[str, Any], grabber) -> tuple[int, int]:
+    metadata = dict(grabber.stream_metadata)
+    degraded = bool(metadata.get("timestamp_degraded", True))
+    trusted = bool(metadata.get("source_timestamp_trusted", False))
+    stamp_source = str(metadata.get("stamp_source", "unknown"))
+    row["video.source_timestamp_degraded"] = degraded
+    row["video.source_timestamp_trusted"] = trusted
+    row["video.stamp_source"] = stamp_source
     try:
         result = grabber()
     except Exception:
@@ -230,6 +175,9 @@ def _add_video_sample(row: dict[str, Any], grabber) -> tuple[int, int]:
         "h": height,
         "stamp_mono": stamp,
         "age_s": (time.monotonic() - stamp) if stamp else None,
+        "timestamp_degraded": degraded,
+        "source_timestamp_trusted": trusted,
+        "stamp_source": stamp_source,
     }
     return 1, 0
 
@@ -338,11 +286,11 @@ def _cleanup_session(drone, grabber) -> None:
 
 def run_log(*, ip: str, controller: str, secs: float, hz: float, out: Path,
             with_video: bool) -> Path:
-    messages = _build_message_table()
     out.parent.mkdir(parents=True, exist_ok=True)
     print(f"[log] connecting ip={ip} controller={controller}", flush=True)
     print("[log] PASSIVE ONLY — no TakeOff/PCMD/Landing will be sent", flush=True)
     drone = connect(ip, controller=controller)
+    messages = _build_message_table(drone)
     grabber = _start_video_grabber(drone, enabled=with_video)
     sample_count = video_ok = video_none = 0
     try:
@@ -403,7 +351,7 @@ def main() -> None:
     ap.add_argument("--hz", type=float, default=20.0,
                     help="sample rate (get_state polling); attitude often ~5 Hz source")
     ap.add_argument("--with-video", action="store_true",
-                    help="also sample PDRAW frames for fps/age (no arm)")
+                    help="also sample Parrot RTSP /live frames for fps/age (no arm)")
     ap.add_argument("--out", default="",
                     help="JSONL path; default under outputs/flight_logs/")
     ap.add_argument("--summarize", default="",

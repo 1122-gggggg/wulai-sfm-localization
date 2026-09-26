@@ -4,12 +4,12 @@
 
 1. `影片模擬串流/啟動.sh`：固定為 `simulated-stream`，只讀影片，使用模擬 backend。
    `影片模擬串流/選擇啟動.sh` 會先用檔案選擇器挑選地圖 PLY/profile 與影片。
-2. `真機串流/啟動.sh`：固定為 `real-flight`，只讀 ANAFI Olympe PDRAW，且只接受
+2. `真機串流/啟動.sh`：固定為 `real-flight`，只讀 ANAFI RTSP `/live`，且只接受
    `SFM_MISSION_SELECTION`；site profile 由 resolver 產生。
 
 兩個啟動器都拒絕跨接口參數；實機接口不會回退到影片檔。兩者共用同一套
-定位 worker 與場域 profile，但只有實機接口載入 Olympe。起飛仍只允許操作員
-本人在 UI 親手按下按鈕。
+定位 worker 與場域 profile，但只有實機接口載入官方 Parrot ARSDK-NG native
+libraries。起飛仍只允許操作員本人在 UI 親手按下按鈕。
 
 真機 AUTO 在落地或已在空中重新啟動時都必須先完成同一套四步 preflight。新鮮地速
 用於比例加速限制與超速煞車；缺少或過期地速不會單獨觸發零輸出懸停。這不是物理
@@ -21,7 +21,7 @@ AUTO worker 例外、2 秒 heartbeat timeout 或連續三次 PCMD 發送失敗
 `模擬器/測試影片/` 自動選擇：P1190119.MP4 優先，否則只有一部影片時使用該影片，多部時必須明確傳入。P119 會先驗證 SHA-256，再模擬 720p30、5 Mb/s、
 280 ms 無線鏈路；影片結束後停在最後完整幀。直接真機入口無預設場域；根目錄
 `一鍵啟動.sh` 會明確提供隨附的定位用 mission selection，但它目前不是飛行核准。
-連線後讀取並記錄飛機、SkyController、firmware、Olympe、Home 與 RTH。
+連線後讀取並記錄飛機、SkyController、ARSDK-NG source revision、Home 與 RTH。
 hardware approval receipt 是可選的診斷與追溯資料；沒有 receipt 時仍依 profile、資產
 hash、路線與其他真機安全條件判定是否可起飛。
 介面也分別回讀 ANAFI 與 SkyController 3 的韌體羅盤校正狀態；狀態未知、必須
@@ -41,7 +41,7 @@ flight readiness 決定；缺少校正或核准時 fail closed。
 [`site_profiles/建圖端輸出規格.md`](site_profiles/建圖端輸出規格.md)。真機只有在
 飛控明確回讀 `landed` 時才能安全重啟套用新場域；匯入和套用都不送出起飛指令。
 
-- `operator_interface/`：操作 UI、即時定位 worker 與 ANAFI 後端。
+- `operator_interface/`：操作 UI、即時定位 worker 與 ARSDK-NG/RTSP ANAFI 後端。
 - `site_profiles/`：每個場域的一組原子化定位資產設定。
 - `影片模擬串流/`：以預錄影片進行離線驗證的入口。
 - `真機串流/`：真機操作入口，必須明確指定已驗證的 mission selection。

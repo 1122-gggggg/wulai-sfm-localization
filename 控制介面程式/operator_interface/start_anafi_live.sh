@@ -92,7 +92,7 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
   cat <<'EOF'
 用法: ./start_anafi_live.sh [flight_operator_app.py 的真機選項]
 
-此入口只會啟動 real-flight Olympe 介面，禁止傳入 --video 或
+此入口只會啟動 real-flight ARSDK-NG 介面，禁止傳入 --video 或
 --interface simulated-stream。它可能連線 SkyController/ANAFI；離線檢查請使用：
   控制介面程式/影片模擬串流/選擇啟動.sh
 EOF
@@ -102,6 +102,18 @@ export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
 source "$OI/resolve_display.sh"
 configure_operator_display "$DRY_RUN"
 enforce_stream_interface_exclusion real "[start]" "$@"
+if [[ "$DRY_RUN" != "1" ]]; then
+  ARSDK_NG_LIB_DIR="${SFM_ARSDK_NG_LIB_DIR:-${ARSDK_NG_LIB_DIR:-$PACKAGE_ROOT/執行環境/native/arsdk-ng/lib}}"
+  for library in libarsdk.so libarsdkctrl.so libpomp.so libfutils.so libmux.so libulog.so; do
+    if [[ ! -f "$ARSDK_NG_LIB_DIR/$library" ]]; then
+      echo "[start] ERROR: missing official ARSDK-NG runtime library: $ARSDK_NG_LIB_DIR/$library" >&2
+      echo "[start] Build the pinned Parrot SDK with: bash tools/build_arsdk_ng.sh" >&2
+      exit 2
+    fi
+  done
+  export ARSDK_NG_LIB_DIR
+  export LD_LIBRARY_PATH="$ARSDK_NG_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+fi
 MAX_PERFORMANCE="${SFM_MAX_PERFORMANCE:-1}"
 if [[ "$MAX_PERFORMANCE" != "0" && "$MAX_PERFORMANCE" != "1" ]]; then
   echo "[start] ERROR: SFM_MAX_PERFORMANCE must be 0 or 1" >&2

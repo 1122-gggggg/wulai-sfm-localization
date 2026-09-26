@@ -61,10 +61,20 @@ LIVE_MINIMAL_COPY_FILES = (
     "tools/package_manifest.py",
     "tools/simulated_ui_smoke.sh",
     "tools/simulator_preflight.py",
+    "tools/build_arsdk_ng.sh",
     "模擬器/parrot_stimulate/src/anafi_pcmd_sim/scale_free_control.py",
     "一鍵啟動.sh",
 )
 LIVE_MINIMAL_COPY_MAPPINGS = ()
+ARSDK_NG_LIBRARY_DIRECTORY = "執行環境/native/arsdk-ng/lib"
+ARSDK_NG_LIBRARY_FILES = (
+    "libarsdk.so",
+    "libarsdkctrl.so",
+    "libpomp.so",
+    "libfutils.so",
+    "libmux.so",
+    "libulog.so",
+)
 EXCLUDED_NAMES = {
     ".git",
     ".codegraph",
@@ -1192,6 +1202,48 @@ def _copy_live_minimal_mappings(destination: Path) -> None:
         shutil.copy2(source, target, follow_symlinks=False)
 
 
+
+def _copy_optional_arsdk_ng_libraries(
+    destination: Path,
+    known_digests: dict[str, str] | None,
+) -> None:
+    source_directory = ROOT / ARSDK_NG_LIBRARY_DIRECTORY
+    if not source_directory.exists():
+        return
+    if source_directory.is_symlink() or not source_directory.is_dir():
+        raise ArtifactResolutionError(
+            f"ARSDK-NG library directory is not a real directory: {source_directory}"
+        )
+    sources = tuple(source_directory / name for name in ARSDK_NG_LIBRARY_FILES)
+    present = tuple(source.exists() or source.is_symlink() for source in sources)
+    if not any(present):
+        return
+    if not all(present):
+        missing = [source.name for source, exists in zip(sources, present) if not exists]
+        raise ArtifactResolutionError(
+            f"incomplete ARSDK-NG library set; missing {', '.join(missing)}"
+        )
+
+    for source in sources:
+        if source.is_symlink() or not source.is_file():
+            raise ArtifactResolutionError(
+                f"ARSDK-NG library is not a regular file: {source}"
+            )
+        relative = f"{ARSDK_NG_LIBRARY_DIRECTORY}/{source.name}"
+        target = destination / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        expected_size = source.stat().st_size
+        expected_sha256 = _sha256(source)
+        _copy_verified_file(
+            source,
+            target,
+            expected_size=expected_size,
+            expected_sha256=expected_sha256,
+            label=f"ARSDK-NG library {source.name}",
+        )
+        if known_digests is not None:
+            known_digests[relative] = expected_sha256
+
 def _copy_export_payload(
     destination: Path,
     resolved_artifacts: tuple[ResolvedRuntimeArtifact, ...],
@@ -1217,6 +1269,7 @@ def _copy_export_payload(
         if not source.is_dir():
             raise FileNotFoundError(source)
         _copy_tree(source, destination / relative, live_minimal=live_minimal)
+    _copy_optional_arsdk_ng_libraries(destination, known_digests)
     _copy_resolved_runtime_artifacts(resolved_artifacts, destination)
     if known_digests is not None:
         for resolved in resolved_artifacts:

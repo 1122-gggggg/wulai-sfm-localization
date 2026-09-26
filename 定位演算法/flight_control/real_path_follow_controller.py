@@ -8,8 +8,8 @@ UI.  It is intended to be wired to:
 
   1. a visual localizer that returns the current camera/drone pose in the SAME
      GLOMAP map frame, and
-  2. a drone adapter that converts the returned map-frame command into Olympe
-     PCMD / velocity commands.
+  2. a drone adapter that converts the returned map-frame command into
+     ARSDK-NG piloting commands.
 
 Current frame convention (matches the present operator dashboard)
 -----------------------------------------------------------------
@@ -37,7 +37,7 @@ remove this conversion or use T_align consistently before calling this module.
 Safety notes
 ------------
 This is not a complete flight app by itself.  It does not arm motors or talk to
-Olympe.  It outputs a Command.  A real-flight runner must:
+ARSDK-NG.  It outputs a Command.  A real-flight runner must:
 - keep a manual override pilot ready,
 - verify yaw/body-frame signs with props off first,
 - set conservative speed gains,
@@ -60,6 +60,7 @@ from route_domain import (
     MissionRouteLock as _MissionRouteLock,
     MissionRouteSnapshot,
     RouteDocument,
+    WaypointAction,
     _validated_waypoints as _validated_route_waypoints,
     aligned_to_glomap as _domain_aligned_to_glomap,
     capture_mission_route_snapshot as _capture_mission_route_snapshot,
@@ -145,6 +146,8 @@ class Command:
     # to 1 when the aircraft is inside the lookahead of a sharp authored
     # turn. Only scales the along-leg PCMD share; correction is untouched.
     corner_weight: float = 0.0
+    # WAYPOINT_ACTION only: which operator action is running, for the log/UI.
+    waypoint_action: Optional[dict] = None
 
 
 @dataclass(frozen=True, eq=False)
@@ -305,6 +308,7 @@ _CONTROL_FLOAT_LIMITS = {
     "inspect_radius": (0.0, 100.0),
     "inspect_resume_margin": (0.0, 100.0),
     "inspect_yaw_tolerance_deg": (0.0, 45.0),
+    "waypoint_action_yaw_tolerance_deg": (0.0, 45.0),
     "max_pose_age_s": (0.0, 10.0),
     "max_progress_regression": (0.0, 100.0),
     "progress_jump_slack": (0.0, 100.0),
@@ -401,6 +405,14 @@ class ControlConfig:
     #: entries must each clear translation_arrival_tolerance like the global
     #: sphere. None means every waypoint uses waypoint_arrive_radius.
     waypoint_arrive_radii: tuple[float, ...] | None = None
+    #: Optional per-waypoint actions (route_domain.WaypointAction), index-aligned
+    #: with the route like waypoint_arrive_radii. They run at the waypoint after
+    #: arrival and before the turn toward the next one; None means none anywhere.
+    waypoint_actions: tuple[tuple[WaypointAction, ...], ...] | None = None
+    #: Stop band and completion band for a waypoint yaw action. The operator
+    #: asked for a specific angle; the 6-degree inspection band left 30-degree
+    #: turns 20% short in simulation.
+    waypoint_action_yaw_tolerance_deg: float = 3.0
     #: Fly the authored route out, then back along it to waypoint 1 and land
     #: there instead of landing at the last waypoint. See _return_to_start_route.
     return_to_start: bool = False
@@ -430,6 +442,7 @@ class ControlConfig:
         _validate_control_float_limits(self)
         _validate_control_shape(self)
         _validate_arrival_contract(self)
+        _validate_waypoint_actions(self)
         _validate_map_frame(self)
         _validate_control_integer_limits(self)
         _validate_realign_threshold(self)
@@ -556,6 +569,20 @@ def _validate_arrival_contract(config: ControlConfig) -> None:
                     f"({radius!r} <= {config.translation_arrival_tolerance}); "
                     "autonomy would stall short of that waypoint"
                 )
+
+
+def _validate_waypoint_actions(config: ControlConfig) -> None:
+    actions = config.waypoint_actions
+    if actions is None:
+        return
+    if not isinstance(actions, tuple) or not actions or any(
+        not isinstance(entry, tuple)
+        or any(not isinstance(action, WaypointAction) for action in entry)
+        for entry in actions
+    ):
+        raise ValueError(
+            "waypoint_actions must be a non-empty tuple of WaypointAction tuples or None"
+        )
 
 
 def _validate_map_frame(config: ControlConfig) -> None:
@@ -774,6 +801,7 @@ def config_for_route(
     if isinstance(path_json, MissionRouteSnapshot):
         radius = path_json.arrive_radius_map_units
         point_radii = path_json.waypoint_arrive_radii
+        actions = path_json.waypoint_actions
     else:
         # Only the scalar limits are wanted here, but parsing the document also
         # converts its waypoints, and that needs the frame the route was authored
@@ -784,6 +812,7 @@ def config_for_route(
         route = RouteDocument.from_path(path_json, require_map_units=True, map_frame=cfg.map_frame)
         radius = route.arrive_radius_map_units
         point_radii = route.waypoint_arrive_radii
+        actions = route.waypoint_actions
     if isinstance(path_json, MissionRouteSnapshot):
         drawn_points = list(path_json.waypoints)
     else:
@@ -825,6 +854,8 @@ def config_for_route(
         )
         widest = max(float(value) for value in point_radii)
         changes["progress_jump_slack"] = max(float(cfg.progress_jump_slack), widest)
+    if actions is not None and any(actions):
+        changes["waypoint_actions"] = actions
     if not changes:
         return cfg
     return replace(cfg, **changes)
@@ -909,6 +940,17 @@ def _corner_angle_between(incoming: np.ndarray, outgoing: np.ndarray, map_frame)
     return max(angle_3d, float(math.acos(cos_h)))
 
 
+def _waypoint_action_table(actions, count: int) -> dict[int, tuple[WaypointAction, ...]]:
+    """Index -> actions for waypoints that carry any; the landing point may not."""
+    if actions is None:
+        return {}
+    if len(actions) != count:
+        raise ValueError(f"waypoint_actions has {len(actions)} entries for {count} waypoints")
+    if actions[-1]:
+        raise ValueError("the landing waypoint cannot carry waypoint actions")
+    return {index: tuple(entry) for index, entry in enumerate(actions) if entry}
+
+
 def _return_to_start_route(
     waypoints: list[np.ndarray], config: ControlConfig
 ) -> tuple[list[np.ndarray], ControlConfig]:
@@ -928,11 +970,16 @@ def _return_to_start_route(
     if len(outbound) < 2:
         return outbound, config
     full = outbound + [np.array(point, dtype=float, copy=True) for point in reversed(outbound[:-1])]
+    changes = {}
     radii = config.waypoint_arrive_radii
-    if radii is None:
-        return full, config
-    drawn = tuple(radii)
-    return full, replace(config, waypoint_arrive_radii=drawn + tuple(reversed(drawn[:-1])))
+    if radii is not None:
+        drawn = tuple(radii)
+        changes["waypoint_arrive_radii"] = drawn + tuple(reversed(drawn[:-1]))
+    actions = config.waypoint_actions
+    if actions is not None:
+        # Actions run on the outbound pass only; the return pass just flies home.
+        changes["waypoint_actions"] = tuple(actions) + ((),) * (len(outbound) - 1)
+    return full, (replace(config, **changes) if changes else config)
 
 
 class RouteAutoController:
@@ -962,6 +1009,11 @@ class RouteAutoController:
                 f"waypoint_arrive_radii has {len(radii)} entries for "
                 f"{len(self.wp)} waypoints; radii must be per-waypoint aligned"
             )
+        self.waypoint_actions = _waypoint_action_table(self.cfg.waypoint_actions, len(self.wp))
+        self._actions_done: set[int] = set()
+        self._action: dict | None = None
+        #: Waypoint indices whose actions hit the yaw timeout and were skipped.
+        self.action_timeouts: list[int] = []
         invalid_inspections = [i for i in self.cfg.inspect_waypoints if i > len(self.wp)]
         if invalid_inspections:
             raise ValueError(
@@ -1016,6 +1068,7 @@ class RouteAutoController:
         self.holding_for_inspection = False
         self._arrive_frames = 0
         self._last_sequence_pose_stamp = None
+        self._action = None
         self._reset_final_hold()
         return target_index
 
@@ -1258,13 +1311,7 @@ class RouteAutoController:
                     # Inside the sphere, but not for long enough yet. One stray fix
                     # landing in it must not retire a waypoint the drone never reached.
                     break
-            if (
-                self.target_index in self.inspect_waypoints
-                and self.target_index not in self.completed_inspections
-            ):
-                # Reached an inspection point: hold the target here until the
-                # capture is acknowledged, or advancing would fly away mid-shot.
-                self.holding_for_inspection = True
+            if self._hold_reached_waypoint():
                 break
             # The configured budget is exactly one. Keeping this bounded loop
             # makes that invariant explicit and preserves an alignment phase for
@@ -1278,6 +1325,22 @@ class RouteAutoController:
         # controller keys its per-waypoint yaw realignment on.
         self.active_segment = max(0, self.target_index - 1)
         self.progress_s = float(self.cum[self.target_index])
+
+    def _hold_reached_waypoint(self) -> bool:
+        """Keep a reached waypoint as the target for an inspection or its actions."""
+        index = self.target_index
+        if index in self.inspect_waypoints and index not in self.completed_inspections:
+            # Reached an inspection point: hold the target here until the
+            # capture is acknowledged, or advancing would fly away mid-shot.
+            self.holding_for_inspection = True
+            return True
+        if index in self.waypoint_actions and index not in self._actions_done:
+            # Run the operator's actions here; step() retires the waypoint
+            # once they are done.
+            self._action = {"index": index, "step": 0, "started": False, "heading": None}
+            self._arrive_frames = 0
+            return True
+        return False
 
     def seed_goal(self, pos: np.ndarray) -> np.ndarray:
         """Waypoint to seed the heading estimate from.
@@ -1405,14 +1468,10 @@ class RouteAutoController:
             )
 
         pos = pose.xyz
-        goal, seg, path_error, progress, action = self._auto_goal(
-            pos,
-            float(pose.stamp),
-            now,
-            map_confirmed=bool(getattr(pose, "map_confirmed", True)),
-            reseed_confirming=bool(getattr(pose, "reseed_confirming", False)),
-            position_observed=bool(getattr(pose, "position_observed", True)),
-        )
+        command, route = self._route_goal_or_action(pose, now)
+        if command is not None:
+            return command
+        goal, seg, path_error, progress, action = route
         if action == "WAIT_MAP_CONFIRMATION":
             self.state = "HOVER"
             return Command(
@@ -1524,6 +1583,113 @@ class RouteAutoController:
             )
 
         return self._guidance_command(pose, goal, path_error, progress, action)
+
+    def _route_goal_or_action(self, pose: Pose, now: float):
+        """(action command, None) while a waypoint's actions run, else (None, goal)."""
+
+        def route_goal():
+            return self._auto_goal(
+                pose.xyz,
+                float(pose.stamp),
+                now,
+                map_confirmed=bool(getattr(pose, "map_confirmed", True)),
+                reseed_confirming=bool(getattr(pose, "reseed_confirming", False)),
+                position_observed=bool(getattr(pose, "position_observed", True)),
+            )
+
+        if self._action is None:
+            route = route_goal()
+            if self._action is None:
+                return None, route
+        command = self._waypoint_action_command(pose, now)
+        if command is not None:
+            return command, None
+        # Actions finished: fly on toward the next waypoint this tick.
+        return None, route_goal()
+
+    def _waypoint_action_command(self, pose: Pose, now: float) -> Command | None:
+        """Run the reached waypoint's actions in order; None once all are done.
+
+        Time and yaw confirmation advance only on ticks with a fresh pose (a
+        stale pose returns HOVER before reaching here), so an outage neither
+        completes a hover nor burns the yaw budget beyond max_pose_age_s.
+        A yaw that never converges within yaw_alignment_timeout_s skips the
+        waypoint's remaining actions; the next leg's own turn gate still holds.
+        """
+        state = self._action
+        index = int(state["index"])
+        actions = self.waypoint_actions[index]
+        stamp = float(pose.stamp)
+        while True:
+            action = actions[state["step"]]
+            if not state["started"]:
+                base = float(pose.yaw) if state["heading"] is None else state["heading"]
+                state.update(
+                    started=True, elapsed=0.0, last_now=now, last_stamp=stamp, confirmed=0,
+                    # Right is clockwise seen from above; map heading is CCW.
+                    heading=(wrap_angle(base - math.radians(action.value))
+                             if action.kind == "yaw" else base),
+                )
+            dt = now - state["last_now"]
+            if 0.0 <= dt <= float(self.cfg.max_pose_age_s):
+                state["elapsed"] += dt
+            state["last_now"] = now
+            if action.kind == "yaw":
+                if stamp > state["last_stamp"]:
+                    error = abs(math.degrees(wrap_angle(state["heading"] - float(pose.yaw))))
+                    in_band = error <= float(self.cfg.waypoint_action_yaw_tolerance_deg)
+                    state["confirmed"] = state["confirmed"] + 1 if in_band else 0
+                    state["last_stamp"] = stamp
+                done = state["confirmed"] >= int(self.cfg.yaw_alignment_confirmation_updates)
+                if not done and state["elapsed"] > float(self.cfg.yaw_alignment_timeout_s):
+                    self.action_timeouts.append(index)
+                    self._finish_waypoint_actions(stamp)
+                    return None
+            else:
+                done = state["elapsed"] >= action.value
+            if not done:
+                break
+            state["step"] += 1
+            state["started"] = False
+            if state["step"] >= len(actions):
+                self._finish_waypoint_actions(stamp)
+                return None
+        goal = self.wp[index].copy()
+        path_error, _nearest, _t = point_segment_distance(
+            pose.xyz, self.wp[max(0, index - 1)], goal
+        )
+        self.state = "CRUISE"
+        return Command(
+            "WAYPOINT_ACTION",
+            np.zeros(3),
+            float(state["heading"]),
+            goal,
+            path_error,
+            float(index) / float(max(1, len(self.wp) - 1)),
+            status=(
+                f"waypoint {index + 1} action {state['step'] + 1}/{len(actions)}: "
+                f"{action.kind} {action.value:g}"
+            ),
+            waypoint_action={
+                "waypoint_index": index,
+                "step": state["step"] + 1,
+                "count": len(actions),
+                **action.to_json(),
+                "elapsed_s": round(float(state["elapsed"]), 2),
+            },
+        )
+
+    def _finish_waypoint_actions(self, pose_stamp: float) -> None:
+        index = int(self._action["index"])
+        self._action = None
+        self._actions_done.add(index)
+        self.target_index = index + 1
+        self._rejoining = False
+        self._arrive_frames = 0
+        # This pose already retired a waypoint; the next one needs a new fix.
+        self._last_sequence_pose_stamp = pose_stamp
+        self.active_segment = max(0, self.target_index - 1)
+        self.progress_s = float(self.cum[self.target_index])
 
     def _guidance_command(self, pose, goal, path_error, progress, action):
         pos = pose.xyz
@@ -1673,16 +1839,18 @@ def _yaw_percent_command(
     yaw_sign: int,
     inspection: bool,
     require_yaw_alignment: bool,
+    tolerance_deg: float | None = None,
 ) -> tuple[int, int, int, int] | None:
     yaw_error_deg = math.degrees(yaw_error)
+    tolerance = config.yaw_tolerance_deg if tolerance_deg is None else float(tolerance_deg)
     needs_yaw = inspection or (
         require_yaw_alignment
         and projected_error is not None
-        and abs(yaw_error_deg) > config.yaw_tolerance_deg
+        and abs(yaw_error_deg) > tolerance
     )
     if not needs_yaw:
         return None
-    if abs(yaw_error_deg) <= config.yaw_tolerance_deg:
+    if abs(yaw_error_deg) <= tolerance:
         return 0, 0, 0, 0
     yaw_strength = min(
         config.max_yaw_pcmd,
@@ -1986,8 +2154,10 @@ class VerticalConsistencyGuard:
     error. Per target, the first `window` samples fix a reference (median
     altitude and vertical error). Once the barometer shows the aircraft moved
     `baro_move_m` up or down while the localized height moved less than
-    `min_follow_u` the same way, that target's height is waived: hold altitude
-    and arrive horizontally. Direction-free, because a segment pull can climb
+    `min_follow_u` the same way, localized altitude is latched unreliable for
+    this AUTO run. Intermediate targets arrive horizontally without repeated
+    blind climbs; the final target keeps its raw 3-D evidence. Direction-free,
+    because a segment pull can climb
     toward a lower target. On 2026-09-18 the barometer climbed 1.8 m while the
     localized height fell 0.06 u, and AUTO climbed to 4 m. Only engages when
     height alone keeps the aircraft outside the arrival sphere. Compares
@@ -2009,6 +2179,7 @@ class VerticalConsistencyGuard:
         self.min_follow_u = float(min_follow_u)
         self.window = int(window)
         self.waived: set[int] = set()
+        self.unreliable = False
         self.last_check: dict | None = None
         self._target: int | None = None
         self._reference: list[tuple[float, float]] = []
@@ -2025,7 +2196,12 @@ class VerticalConsistencyGuard:
         target = int(target)
         if target != self._target:
             self._target, self._reference, self._recent = target, [], []
-            self.last_check = None
+            if not self.unreliable:
+                self.last_check = None
+        if self.unreliable and target not in self.waived:
+            self.waived.add(target)
+            self.last_check = {**(self.last_check or {}), "inherited": True}
+            return True
         if target in self.waived or altitude_m is None:
             return False
         sample = (float(altitude_m), float(vertical_error_u))
@@ -2047,25 +2223,19 @@ class VerticalConsistencyGuard:
         self.last_check = {"baro_moved_m": round(moved_m, 3), "localized_followed_u": round(followed_u, 4)}
         if abs(moved_m) >= self.baro_move_m and followed_u < self.min_follow_u:
             self.waived.add(target)
+            self.unreliable = True
             return True
         return False
-
-
-# Turn-phase along-leg share cap: the nose is off, so forward progress crawls
-# while correction keeps priority. 2026-09-18 flight: 25% of ticks sat in
-# turn at zero progress; a full 130-degree reversal took most of a leg.
-TURN_ALONG_CRAWL_MAX = 0.30
 
 
 class YawAlignedPcmdController:
     """Yaw toward a new waypoint, then translate with mid-leg yaw repair.
 
-    After each target change the nose aligns to the next point while
-    horizontal PCMD corrects back toward the segment with a bounded
-    along-leg crawl (never parks: operator scope 2026-09-16, 2026-09-18).
+    After each target change, hold the turn-start position while aligning.
+    REJOIN cannot interrupt this turn or advance backward along the new leg.
     Cruise then flies toward the goal; a large mid-leg heading error blends
     limited yaw back in without stopping translation. Near-waypoint
-    centering and REJOIN still hold yaw and close position.
+    centering and already-aligned REJOIN hold yaw and close position.
     """
 
     def __init__(self, config: ControlConfig):
@@ -2086,11 +2256,41 @@ class YawAlignedPcmdController:
         self.centering = False
         self.vertical_adjusting = False
         self.turn_anchor_error_u = 0.0
+        self._turn_anchor = None
         self._integral_map = np.zeros(2, dtype=float)
         self._integral_now: float | None = None
         self._integral_now_pose: float | None = None
         self._integral_wall: float | None = None
         self._correction_saturated = False
+        self._integral_step_map = np.zeros(2, dtype=float)
+        self._feedback_yaw = 0.0
+        self._requested_horizontal = np.zeros(2, dtype=float)
+        self.control_terms: dict = {}
+
+    def feedback_applied(self, pcmd) -> None:
+        """Cancel this tick's learning along a downstream-limited direction.
+
+        Directional conditional integration preserves the previously learned
+        wind bias and orthogonal learning. Feedback is the authorized command,
+        not a claim about aircraft actuator readback; consume it only once.
+        """
+        increment = self._integral_step_map.copy()
+        self._integral_step_map.fill(0.0)
+        lost = self._requested_horizontal - np.array([pcmd[1], pcmd[0]], dtype=float)
+        cos_y, sin_y = math.cos(self._feedback_yaw), math.sin(self._feedback_yaw)
+        lost_map = np.array([lost[0] * cos_y + lost[1] * sin_y,
+                             lost[0] * sin_y - lost[1] * cos_y])
+        norm = float(np.linalg.norm(lost_map))
+        if norm > 1e-9:
+            direction = lost_map / norm
+            blocked = max(0.0, float(np.dot(increment, direction)))
+            self._integral_map -= blocked * direction
+        radius = max(self._target_radius(), .5 * self.config.slowdown_distance, 1e-3)
+        integral_norm = float(np.linalg.norm(self._integral_map))
+        if integral_norm > 3.0 * radius:
+            self._integral_map *= 3.0 * radius / integral_norm
+        self.control_terms["applied_pcmd"] = list(pcmd[:2])
+        self.control_terms["limited_pcmd"] = [float(lost[1]), float(lost[0])]
 
     def _usable_body_velocity(self, body_velocity, now: float):
         if body_velocity is None:
@@ -2229,9 +2429,11 @@ class YawAlignedPcmdController:
             self._integral_now = now_f
             return 0.0, 0.0
         fresh, dt = self._integral_capture_delta(stamp, now_f, max_age)
+        before = self._integral_map.copy()
         self._accumulate_position_integral(
             error_map, dt, imax, integrate=integrate, fresh=fresh, saturated=saturated
         )
+        self._integral_step_map = self._integral_map - before
         if not integrate:
             return 0.0, 0.0
         try:
@@ -2274,6 +2476,8 @@ class YawAlignedPcmdController:
 
     def _wind_corrected_horizontal(self, roll, pitch, body_velocity, now):
         """Fallback wind hold for direct/turn legs without a segment frame."""
+        self.control_terms = {"position_pcmd": [roll, pitch], "integral_pcmd": [0., 0.],
+                              "velocity_pcmd": [0., 0.]}
         velocity = self._usable_body_velocity(body_velocity, now)
         cap = int(self.config.max_translation_pcmd)
         kv = DESKTOP_AUTO_WIND_REJECT_PCMD_PER_MPS
@@ -2282,6 +2486,7 @@ class YawAlignedPcmdController:
         forward_v, right_v = velocity
         cmd_mag = math.hypot(float(pitch), float(roll))
         if cmd_mag < 1e-6:
+            self.control_terms["velocity_pcmd"] = [-kv * right_v, -kv * forward_v]
             hold_pitch = int(np.clip(round(-kv * forward_v), -cap, cap))
             hold_roll = int(np.clip(round(-kv * right_v), -cap, cap))
             return hold_roll, hold_pitch
@@ -2290,6 +2495,7 @@ class YawAlignedPcmdController:
         along = forward_v * dir_f + right_v * dir_r
         cross_f = forward_v - along * dir_f
         cross_r = right_v - along * dir_r
+        self.control_terms["velocity_pcmd"] = [-kv * cross_r, -kv * cross_f]
         pitch = int(np.clip(round(float(pitch) - kv * cross_f), -cap, cap))
         roll = int(np.clip(round(float(roll) - kv * cross_r), -cap, cap))
         return roll, pitch
@@ -2301,6 +2507,17 @@ class YawAlignedPcmdController:
             radius = float(radii[self.target_key])
         return radius
 
+    def _retain_cross_track_integral(self, tangent):
+        if tangent is None:
+            return
+        horizontal = np.asarray(self.config.map_frame.horizontal(tangent))
+        norm = float(np.linalg.norm(horizontal))
+        if norm > 1e-9:
+            horizontal /= norm
+            # A carried along-leg bias must not cancel forward demand in a
+            # mode that only observes cross-track error to unload its integral.
+            self._integral_map -= float(np.dot(self._integral_map, horizontal)) * horizontal
+
     def _route_translate(self, cmd, pose, now, body_velocity, parts):
         """One-shot correction-priority allocation for an active-segment leg."""
         correction, along, along_scale = (
@@ -2311,8 +2528,10 @@ class YawAlignedPcmdController:
         cap = int(self.config.max_translation_pcmd)
         vert = int(self.config.max_vertical_pcmd)
         radius = self._target_radius()
+        position_correction = correction.copy()
         pull = np.asarray(cmd.path_pull, dtype=float).reshape(3)
         tangent = np.asarray(cmd.path_tangent, dtype=float).reshape(3)
+        self._retain_cross_track_integral(tangent)
         damp = self._segment_damping(cmd.path_tangent, pose, body_velocity, now)
         fresh_vel = damp is not None
         if damp is not None:
@@ -2356,6 +2575,12 @@ class YawAlignedPcmdController:
             integrate=bool(fresh_vel and position_observed),
         )
         correction = correction + np.array([i_r, i_f, 0.0])
+        self.control_terms = {
+            "position_pcmd": position_correction[:2].tolist(),
+            "integral_pcmd": [i_r, i_f],
+            "velocity_pcmd": (correction - position_correction - [i_r, i_f, 0.0])[:2].tolist(),
+            "along_pcmd": (along[:2] * along_scale).tolist(),
+        }
         worst = max(
             abs(float(correction[0])) / max(float(cap), 1e-9),
             abs(float(correction[1])) / max(float(cap), 1e-9),
@@ -2374,6 +2599,15 @@ class YawAlignedPcmdController:
         not here. The first slot is an unused placeholder kept so the route
         allocation cannot be confused with a precomputed stateless command.
         """
+        approaching = (cmd.action in {"FOLLOW", "REJOIN"} and cmd.path_tangent is not None
+                       and self.aligned_for_translation
+                       and self.config.map_frame.horizontal_distance(cmd.goal - pose.xyz) <= 3.0 * self._target_radius())
+        if approaching:
+            # A tapered open-loop along-leg command can balance headwind just
+            # outside the sphere. After the required turn, use the full
+            # position servo on approach so longitudinal bias can also learn.
+            cmd = replace(cmd, guidance_goal=None, path_tangent=None, path_pull=None,
+                          path_pull_radius=None)
         if cmd.action in {"FOLLOW", "REJOIN"} and cmd.path_tangent is not None:
             try:
                 parts = _route_translation_components(cmd, pose, self.config)
@@ -2396,7 +2630,7 @@ class YawAlignedPcmdController:
                                   else float(np.linalg.norm(cmd.goal - pose.xyz))),
             recovering=recovering,
         )
-        close_or_recovering = self.phase != "translate" or float(np.linalg.norm(cmd.goal - pose.xyz)) <= 3.0 * radius
+        close_or_recovering = approaching or self.phase != "translate" or float(np.linalg.norm(cmd.goal - pose.xyz)) <= 3.0 * radius
         if body_velocity is not None and close_or_recovering and command[2] == 0:
             velocity = self._usable_body_velocity(body_velocity, now)
             if velocity is not None:
@@ -2416,6 +2650,11 @@ class YawAlignedPcmdController:
                 horizontal_span = max(float(self.config.slowdown_distance), 4.0 * radius)
                 raw_pitch = cap * forward / horizontal_span + i_f - kv * forward_v
                 raw_roll = cap * right / horizontal_span + i_r - kv * right_v
+                self.control_terms = {
+                    "position_pcmd": [cap * right / horizontal_span, cap * forward / horizontal_span],
+                    "integral_pcmd": [i_r, i_f],
+                    "velocity_pcmd": [-kv * right_v, -kv * forward_v],
+                }
                 self._correction_saturated = bool(max(abs(raw_pitch), abs(raw_roll)) > cap)
                 pitch = int(np.clip(round(raw_pitch), -cap, cap))
                 roll = int(np.clip(round(raw_roll), -cap, cap))
@@ -2472,20 +2711,33 @@ class YawAlignedPcmdController:
             return None
         return value
 
-    def _prepare_target(self, now: float, target_key) -> None:
+    def _prepare_target(self, now: float, target_key, pose, body_velocity) -> None:
         if (
             self.previous_timestamp is not None
             and now - self.previous_timestamp > self.config.max_pose_age_s
         ):
             self.reset()
         if target_key != self.target_key:
-            was_centering = bool(self.centering)
+            # A normal next-leg transition must not throw away a steady wind
+            # correction. Discontinuities, weak fixes and explicit resets do.
+            carry = (
+                type(target_key) is int and type(self.target_key) is int
+                and target_key == self.target_key + 1
+                and pose.map_confirmed and pose.position_observed and not pose.reseed_confirming
+                and 0.0 <= now - pose.stamp <= self.config.max_pose_age_s
+                and self._usable_body_velocity(body_velocity, now) is not None
+            )
+            old_radius = max(self._target_radius(), .5 * self.config.slowdown_distance, 1e-3)
+            learned = self._integral_map.copy()
             self.reset()
             self.target_key = target_key
-            # Recompute the saturation flag in the new mode instead of
-            # carrying the previous mode's stale value into the integral.
-            if was_centering:
-                self._correction_saturated = False
+            if carry:
+                radius = max(self._target_radius(), .5 * self.config.slowdown_distance, 1e-3)
+                learned *= radius / old_radius  # Preserve PCMD across different sphere sizes.
+                # Carry at most half the horizontal authority into a new leg.
+                bound = .5 * radius / .35
+                norm = float(np.linalg.norm(learned))
+                self._integral_map = learned * min(1.0, bound / max(norm, 1e-12))
 
     def _alignment_measurement(
         self,
@@ -2592,6 +2844,8 @@ class YawAlignedPcmdController:
                 return zero
         # Adjacent two-point yaw_rate_deg_s is log-only; do not use it to confirm.
         _ = yaw_rate_deg_s
+        if self._turn_anchor is None:
+            self._turn_anchor = pose.xyz.copy()
         stable = self._alignment_window_stable(
             stamp=float(pose.stamp),
             yaw=float(pose.yaw),
@@ -2599,6 +2853,18 @@ class YawAlignedPcmdController:
             fresh_sample=fresh_sample,
         )
         hold_roll, hold_pitch = self._wind_corrected_horizontal(0, 0, body_velocity, now)
+        if cmd.path_tangent is None or abs(math.degrees(yaw_error)) <= self.config.yaw_tolerance_deg:
+            # The alignment-confirmation phase also needs the carried bias.
+            # Active-segment turns integrate in _route_translate below instead.
+            self._retain_cross_track_integral(cmd.path_tangent)
+            i_f, i_r = self._position_integral(
+                np.zeros(2), pose, now, self._target_radius(), self.config.max_translation_pcmd,
+                integrate=bool(pose.position_observed and self._usable_body_velocity(body_velocity, now) is not None),
+            )
+            self.control_terms["integral_pcmd"] = [i_r, i_f]
+            cap = self.config.max_translation_pcmd
+            hold_roll = int(np.clip(round(hold_roll + i_r), -cap, cap))
+            hold_pitch = int(np.clip(round(hold_pitch + i_f), -cap, cap))
         if abs(math.degrees(yaw_error)) > self.config.yaw_tolerance_deg:
             self.phase = "turn"
             yaw_cmd = command_to_body_percent(
@@ -2611,32 +2877,11 @@ class YawAlignedPcmdController:
             # Turn holds height as well as position: gaz=0 even though the
             # adapter already returns 0 here; belt and suspenders so a future
             # adapter change cannot reintroduce climb-during-turn.
-            turn_roll, turn_pitch = hold_roll, hold_pitch
-            if (
-                cmd.action in {"FOLLOW", "REJOIN"}
-                and cmd.path_tangent is not None
-                and cmd.path_pull is not None
-            ):
-                # Segment leg with the nose off: keep turning, but also
-                # correct back toward the segment with a bounded along-leg
-                # crawl, so the turn makes progress instead of parking while
-                # wind walks the aircraft off the route. Height stays locked.
-                try:
-                    turn_parts = _route_translation_components(cmd, pose, self.config)
-                except (AttributeError, TypeError, ValueError, OverflowError):
-                    turn_parts = None
-                if turn_parts is not None:
-                    try:
-                        correction = np.asarray(turn_parts[0], dtype=float).reshape(3)
-                        along = np.asarray(turn_parts[1], dtype=float).reshape(3)
-                        crawl = min(float(turn_parts[2]), TURN_ALONG_CRAWL_MAX)
-                        corr_roll, corr_pitch, _, _ = self._route_translate(
-                            cmd, pose, now, body_velocity,
-                            (correction, along, crawl),
-                        )
-                    except (AttributeError, TypeError, ValueError, OverflowError):
-                        corr_roll, corr_pitch = 0, 0
-                    turn_roll, turn_pitch = int(corr_roll), int(corr_pitch)
+            hold = replace(cmd, action="FOLLOW", goal=self._turn_anchor,
+                           guidance_goal=None, path_tangent=None, path_pull=None,
+                           path_pull_radius=None)
+            turn_roll, turn_pitch, _, _ = self._separate_translation_axes(
+                zero, hold, pose, now, body_velocity)
             return turn_roll, turn_pitch, yaw_cmd[2], 0
         if stable:
             self.aligned_for_translation = True
@@ -2674,9 +2919,48 @@ class YawAlignedPcmdController:
         return self._separate_translation_axes((0, 0, 0, 0), hold_cmd, pose, now, body_velocity)
 
 
+    def _waypoint_action_hold(self, cmd, pose, now, yaw_sign, body_velocity):
+        """Hold the waypoint while turning to, or keeping, the action heading.
+
+        Position uses the same servo as terminal centering. Yaw uses its own
+        tight band, since the route turn tolerance is far too wide for an
+        operator-specified angle. Like every turn, yawing holds height.
+        """
+        try:
+            yaw_error = wrap_angle(float(cmd.yaw_target) - float(pose.yaw))
+            stamp = float(pose.stamp)
+            goal = _finite_vec3(cmd.goal, "waypoint action goal")
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            self.reset()
+            return 0, 0, 0, 0
+        if not math.isfinite(yaw_error) or not math.isfinite(stamp):
+            self.reset()
+            return 0, 0, 0, 0
+        self._record_alignment_sample(stamp, float(pose.yaw))
+        self.centering = True
+        yaw_cmd = _yaw_percent_command(
+            yaw_error, yaw_error, config=self.config, yaw_sign=yaw_sign,
+            inspection=True, require_yaw_alignment=True,
+            tolerance_deg=self.config.waypoint_action_yaw_tolerance_deg,
+        )
+        turning = yaw_cmd is not None and yaw_cmd[2] != 0
+        self.phase = "waypoint_action_yaw" if turning else "waypoint_action_hold"
+        hold = Command(
+            "FOLLOW", np.zeros(3, dtype=float), float(pose.yaw), goal,
+            cmd.path_error, cmd.progress, status="waypoint action hold",
+        )
+        roll, pitch, _yaw, gaz = self._separate_translation_axes(
+            (0, 0, 0, 0), hold, pose, now, body_velocity
+        )
+        if turning:
+            return roll, pitch, yaw_cmd[2], 0
+        return roll, pitch, 0, gaz
+
     def _position_recovery_command(self, cmd, pose, now, radius, yaw_sign, body_velocity):
+        if cmd.path_tangent is not None and not self.aligned_for_translation and not self.centering:
+            return None  # Finish the new leg's turn, including REJOIN/reversal.
         horizontal_distance = self.config.map_frame.horizontal_distance(cmd.goal - pose.xyz)
-        enter = radius
+        enter = 3.0 * radius if cmd.path_tangent is not None else radius
         if cmd.guidance_goal is None:
             # Direct-to-point leg (join / resume): its bearing is goal - pose,
             # which pose noise dominates this close, so the yaw hold starts at
@@ -2705,6 +2989,18 @@ class YawAlignedPcmdController:
         return None
 
     def update(
+        self, cmd: Command, pose: Pose, now: float, *, target_key,
+        yaw_sign: int = 1, body_velocity: tuple[float, float, float] | None = None,
+    ) -> tuple[int, int, int, int]:
+        self._integral_step_map.fill(0.0)
+        self.control_terms = {}
+        output = self._update(cmd, pose, now, target_key=target_key,
+                              yaw_sign=yaw_sign, body_velocity=body_velocity)
+        self._feedback_yaw = float(pose.yaw)
+        self._requested_horizontal = np.array([output[1], output[0]], dtype=float)
+        return output
+
+    def _update(
         self,
         cmd: Command,
         pose: Pose,
@@ -2719,10 +3015,12 @@ class YawAlignedPcmdController:
             return 0, 0, 0, 0
         now = normalized_now
 
-        self._prepare_target(now, target_key)
+        self._prepare_target(now, target_key, pose, body_velocity)
 
         if cmd.action == "FINAL_HOLD" and not cmd.should_land:
             return self._final_centering_command(cmd, pose, now, yaw_sign, body_velocity)
+        if cmd.action == "WAYPOINT_ACTION":
+            return self._waypoint_action_hold(cmd, pose, now, yaw_sign, body_velocity)
 
         if cmd.action not in {"FOLLOW", "REJOIN"} or cmd.should_land:
             self.reset()

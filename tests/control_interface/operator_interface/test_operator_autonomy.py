@@ -1889,12 +1889,8 @@ def test_horizontal_auto_command_tapers_to_zero_at_speed_limit(
     backend = _forward_motion_backend(clock, speed)
     autonomy = _budget_autonomy(tmp_path, backend, clock)
     assert autonomy.controller.cfg.max_translation_pcmd == 50
-    accepted, _, applied = autonomy._send_authorized(command)
-    assert accepted
-    assert applied == expected
-    authority = autonomy._pcmd_authority_pct()
-    assert backend.vectors[-1] == pytest.approx(tuple(value / authority for value in expected))
-    assert backend.zeros == []
+    # The steady speed envelope is independent of the startup acceleration ramp.
+    assert autonomy._apply_speed_limit(command) == expected
 
 
 def test_speed_limit_extrapolates_measured_acceleration_past_telemetry_delay(tmp_path):
@@ -1902,17 +1898,16 @@ def test_speed_limit_extrapolates_measured_acceleration_past_telemetry_delay(tmp
     clock = _Clock()
     backend = _forward_motion_backend(clock, 0.2)
     autonomy = _budget_autonomy(tmp_path, backend, clock)
-    autonomy._send_authorized((0, 50, 0, 0))
+    autonomy._apply_speed_limit((0, 50, 0, 0))
     clock.sleep(0.2)
     backend.state.ground_speed_mps = 0.3
     backend.state.speed_north_mps = 0.3
     backend.state.ground_speed_mono_ns = int(clock.now() * 1e9)
     clock.sleep(0.1)
 
-    accepted, _, applied = autonomy._send_authorized((0, 50, 0, 0))
+    applied = autonomy._apply_speed_limit((0, 50, 0, 0))
 
     # 0.3 m/s + 0.5 m/s^2 * (0.1 s age + 0.25 s) = 0.475 m/s -> 50 * (1 - 0.475/0.6)
-    assert accepted
     assert applied == (0, 10, 0, 0)
     assert backend.state.autonomous_speed_guard_status == "SPEED_LIMITED"
 
@@ -2294,3 +2289,68 @@ def test_route_hooks_feed_firmware_altitude_and_announce_a_height_waiver(tmp_pat
     waiver = [event for event in events if event.kind == "vertical_unobservable"]
     assert len(waiver) == 1
     assert "1.02 m" in waiver[0].detail and "-0.09" in waiver[0].detail
+
+
+def test_accelerating_tilt_ramps_and_pause_discards_previous_acceleration(tmp_path):
+    clock = _Clock()
+    backend = _forward_motion_backend(clock, 0.)
+    autonomy = _budget_autonomy(tmp_path, backend, clock)
+    for index in range(4):
+        clock.value = 10. + index * .05
+        backend.state.ground_speed_mono_ns = int(clock.now() * 1e9)
+        accepted, _, applied = autonomy._send_authorized((0, 50, 7, -3))
+        assert accepted and 0 < applied[1] <= 3 * (index + 1)
+        assert applied[2:] == (7, -3)
+    autonomy._clear_motion()
+    clock.sleep(.05)
+    assert autonomy._send_authorized((0, 50, 7, -3))[2][1] <= 3
+    backend.state.speed_north_mps = .9
+    assert autonomy._send_authorized((0, -50, 7, -3))[2] == (0, -50, 7, -3)
+
+
+def test_low_authority_acceleration_accumulates_fractional_pcmd(tmp_path):
+    clock = _Clock()
+    backend = _forward_motion_backend(clock, 0.)
+    autonomy = _budget_autonomy(tmp_path, backend, clock)
+    autonomy.controller.cfg = replace(autonomy.controller.cfg, max_translation_pcmd=3)
+    commands = []
+    for index in range(30):
+        clock.value = 10. + index * .05
+        backend.state.ground_speed_mono_ns = int(clock.now() * 1e9)
+        commands.append(autonomy._send_authorized((0, 3, 0, 0))[2][1])
+    assert commands[0] == 0 and max(commands) >= 2
+
+
+def test_first_motion_sample_measures_acceleration_from_the_stationary_sample(tmp_path):
+    clock = _Clock()
+    backend = _forward_motion_backend(clock, 0.)
+    autonomy = _budget_autonomy(tmp_path, backend, clock)
+    autonomy._apply_speed_limit((0, 50, 0, 0))
+    clock.sleep(.2)
+    backend.state.speed_north_mps = backend.state.ground_speed_mps = .2
+    backend.state.ground_speed_mono_ns = int(clock.now() * 1e9)
+    clock.sleep(.1)
+    assert autonomy._apply_speed_limit((0, 50, 0, 0))[1] <= 5
+
+
+@pytest.mark.parametrize('response_s', [.2, .4, .6])
+def test_delayed_five_hz_speed_does_not_allow_a_full_tilt_launch(tmp_path, response_s):
+    # Stress model only: 0.04 m/s per PCMD, 250 ms delayed 5 Hz telemetry.
+    # This identifies a startup overshoot mechanism, not an ANAFI calibration.
+    clock = _Clock()
+    backend = _forward_motion_backend(clock, 0.)
+    autonomy = _budget_autonomy(tmp_path, backend, clock)
+    speed, history = 0., []
+    for index in range(160):
+        clock.value = 10. + index * .05
+        history.append(speed)
+        if index % 4 == 0:
+            sampled = max(0, index - 5)
+            backend.state.speed_north_mps = history[sampled]
+            backend.state.ground_speed_mps = abs(history[sampled])
+            backend.state.ground_speed_mono_ns = int((10. + sampled * .05) * 1e9)
+        accepted, _, applied = autonomy._send_authorized((0, 50, 0, 0))
+        assert accepted
+        speed += (.04 * applied[1] - speed) * (1. - np.exp(-.05 / response_s))
+    assert max(abs(v) for v in history) <= .6
+    assert sum(history) * .05 > 1., 'passing requires forward travel, not a zero-command stop'

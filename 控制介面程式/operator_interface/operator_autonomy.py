@@ -1,6 +1,6 @@
 """Desktop AUTO coordinator using the production route-control loop.
 
-The coordinator owns no Olympe connection.  It uses the already-connected
+The coordinator owns no ARSDK-NG connection. It uses the already-connected
 operator backend so takeoff, PCMD, manual takeover, and landing all share one
 authority path.
 """
@@ -51,6 +51,7 @@ AUTO_WAYPOINT_STALL_S = 30.0
 # max 1.22 m/s against 0.6). The limit acts on speed extrapolated this far past
 # the sample's age at its measured acceleration.
 AUTO_SPEED_LIMIT_LOOKAHEAD_S = 0.25
+AUTO_ACCEL_RAMP_S = 1.5
 # Lost-pose yaw search runs at the hook-validated ceiling (20); the 50%
 # route-yaw cap lives in production_auto_control_config and must not be
 # reused here.
@@ -78,6 +79,61 @@ class _WaypointProgress:
     best_errors: dict[str, float] = field(default_factory=dict)
 
 
+class RouteErrorStats:
+    """Flown-trajectory vs planned-route distance for one AUTO run, map units.
+
+    Same definition as tools/autoflight_error_report.py so the live numbers
+    and the offline debrief agree: each route tick's ``route_distance_u`` is
+    the 3-D distance from the pose to the nearest point of the planned
+    polyline, and ticks count only after the first waypoint arrival (the
+    takeoff-to-route join is not path error). The horizontal part is split
+    out because the map's height axis is the least reliable one.
+    """
+
+    def __init__(self, map_frame: rpf.MapFrame):
+        self.map_frame = map_frame
+        self.distances: list[float] = []
+        self.horizontal: list[float] = []
+        self.current: float | None = None
+
+    def observe(self, record: dict) -> None:
+        try:
+            distance = float(record.get("route_distance_u"))
+        except (TypeError, ValueError):
+            return
+        if not math.isfinite(distance) or distance < 0.0:
+            return
+        self.current = distance
+        self.distances.append(distance)
+        try:
+            offset = np.asarray(record.get("pose_u"), dtype=float) - np.asarray(
+                record.get("route_nearest_u"), dtype=float
+            )
+            horizontal = float(self.map_frame.horizontal_distance(offset))
+        except (TypeError, ValueError):
+            return
+        if math.isfinite(horizontal):
+            self.horizontal.append(horizontal)
+
+    def summary(self) -> dict | None:
+        if not self.distances:
+            return None
+        values = np.asarray(self.distances, dtype=float)
+        result = {
+            "samples": int(values.size),
+            "current_u": round(float(self.current), 4),
+            "mean_u": round(float(values.mean()), 4),
+            "rms_u": round(float(np.sqrt(np.mean(values * values))), 4),
+            "p95_u": round(float(np.percentile(values, 95)), 4),
+            "max_u": round(float(values.max()), 4),
+        }
+        if self.horizontal:
+            horizontal = np.asarray(self.horizontal, dtype=float)
+            result["horizontal_mean_u"] = round(float(horizontal.mean()), 4)
+            result["horizontal_max_u"] = round(float(horizontal.max()), 4)
+        return result
+
+
 def _fresh_route_progress() -> dict:
     return {
         "initial_target": None,
@@ -86,6 +142,7 @@ def _fresh_route_progress() -> dict:
         "last_tick": {},
         "last_stage": None,
         "last_stage_target": None,
+        "action_timeouts_seen": 0,
     }
 
 
@@ -191,6 +248,7 @@ class DesktopRouteAutonomy:
         self.run_loop = run_loop
         self._speed_sample: tuple[float, float] | None = None
         self._speed_rate_mps2 = 0.0
+        self._accel_command: tuple[float, np.ndarray] | None = None
         self.events: queue.Queue[AutonomyEvent] = queue.Queue()
         self._cancel = threading.Event()
         self._paused = threading.Event()
@@ -212,6 +270,7 @@ class DesktopRouteAutonomy:
         self._waypoint_progress: _WaypointProgress | None = None
         self._mission_started: float | None = None
         self._route_progress: dict = _fresh_route_progress()
+        self._route_error = RouteErrorStats(map_frame)
         self.phase = "IDLE"
 
     @property
@@ -542,6 +601,7 @@ class DesktopRouteAutonomy:
         return True
 
     def _clear_motion(self) -> None:
+        self._accel_command = None
         clear = getattr(self.backend, "clear_nudge_vector", None)
         if callable(clear):
             try:
@@ -593,7 +653,10 @@ class DesktopRouteAutonomy:
 
         epoch = int(self._command_epoch)
         pcmd = self._apply_speed_limit(pcmd)
+        pcmd = self._limit_acceleration_slew(pcmd)
         result = self._dispatch_route_pcmd(pcmd)
+        if not result[0]:
+            self._accel_command = None
         if (
             int(self._command_epoch) != epoch
             or self._auto_failed
@@ -608,6 +671,44 @@ class DesktopRouteAutonomy:
             self._send_zero(reason)
             return False, reason, (0, 0, 0, 0)
         return result
+
+    def _limit_acceleration_slew(self, pcmd: Pcmd) -> Pcmd:
+        """Ramp acceleration, retaining damping and full overspeed braking."""
+        velocity = self._body_velocity()
+        if not getattr(self.backend.state, "autonomous_speed_limit_enabled", True) or velocity is None:
+            self._accel_command = None
+            return pcmd
+        forward, right, _stamp = velocity
+        yaw = self._olympe_yaw()
+        if yaw is None:
+            self._accel_command = None
+            return pcmd
+        now = self.now()
+        c, s = math.cos(yaw), math.sin(yaw)
+        world = np.array([pcmd[1] * c - pcmd[0] * s, pcmd[1] * s + pcmd[0] * c])
+        magnitude = float(np.linalg.norm(world))
+        braking = pcmd[1] * forward + pcmd[0] * right < 0.0
+        speed = math.hypot(forward, right)
+        overspeed_brake = braking and speed >= self.backend.state.autonomous_speed_limit_mps
+        if magnitude > 0.0 and not overspeed_brake:
+            direction = world / magnitude
+            previous = self._accel_command
+            dt = 1.0 / pff.CTRL_HZ if previous is None else max(0.0, min(.1, now - previous[0]))
+            prior = 0.0 if previous is None else max(0.0, float(np.dot(previous[1], direction)))
+            allowed = prior + self.controller.cfg.max_translation_pcmd * dt / AUTO_ACCEL_RAMP_S
+            if braking:
+                # Below the limit, a full opposite tilt held on delayed data
+                # can accelerate through zero. Preserve immediate damping;
+                # build stronger reverse effort through the same slew budget.
+                allowed = max(allowed, rpf.DESKTOP_AUTO_WIND_REJECT_PCMD_PER_MPS * speed)
+            if magnitude > allowed:
+                scale = allowed / magnitude
+                world *= scale
+                # Truncation keeps quantization from exceeding the slew budget.
+                pcmd = (int(pcmd[0] * scale), int(pcmd[1] * scale), pcmd[2], pcmd[3])
+        # Keep the fractional budget so low authority cannot round to zero forever.
+        self._accel_command = (now, world)
+        return pcmd
 
     def _predicted_speed(self, speed: float, stamp: float) -> float:
         """Speed expected once this tick's tilt takes effect."""
@@ -624,7 +725,15 @@ class DesktopRouteAutonomy:
             # 0.2 m/s and zeroed cruise. Clamp to plausible ANAFI accel.
             self._speed_rate_mps2 = max(0.0, min(2.0, raw_rate))
             self._speed_sample = (speed, stamp)
-        horizon = max(0.0, self.now() - stamp) + AUTO_SPEED_LIMIT_LOOKAHEAD_S
+        lookahead = AUTO_SPEED_LIMIT_LOOKAHEAD_S
+        if self._accel_command is not None:
+            state = self.backend.state
+            velocity = np.array([state.speed_north_mps, state.speed_east_mps])
+            if float(np.dot(self._accel_command[1], velocity)) <= 0.0:
+                # A measured acceleration predating our brake must not be
+                # extrapolated into another future actuator interval.
+                lookahead = 0.0
+        horizon = max(0.0, self.now() - stamp) + lookahead
         return speed + max(0.0, self._speed_rate_mps2) * horizon
 
     def _apply_speed_limit(self, pcmd: Pcmd) -> Pcmd:
@@ -664,6 +773,7 @@ class DesktopRouteAutonomy:
             return pcmd
         speed = math.hypot(forward_v, right_v)
         if speed < 1e-9:
+            self._predicted_speed(speed, stamp)
             state.autonomous_speed_guard_status = "FRESH_SPEED_LIMIT"
             return pcmd
         q_pitch, q_roll = float(pitch), float(roll)
@@ -823,6 +933,29 @@ class DesktopRouteAutonomy:
             return None
         return speed, stamp
 
+    def _attitude_sample(self) -> tuple[float, float] | None:
+        yaw = self._olympe_yaw()
+        try:
+            stamp = int(self.backend.state.attitude_mono_ns) / 1e9
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            return None
+        if yaw is None or not 0.0 <= self.now() - stamp <= pff.POSE_STALE_S:
+            return None
+        return yaw, stamp
+
+    def _ned_velocity(self) -> tuple[float, float, float] | None:
+        sample = self._ground_speed()
+        if sample is None or not 0.0 <= self.now() - sample[1] <= GROUND_SPEED_MAX_AGE_S:
+            return None
+        try:
+            north = float(self.backend.state.speed_north_mps)
+            east = float(self.backend.state.speed_east_mps)
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            return None
+        if not math.isfinite(north) or not math.isfinite(east):
+            return None
+        return north, east, sample[1]
+
     def _altitude(self) -> tuple[float, float] | None:
         """Firmware altitude above takeoff and its stamp; freshness is the loop's call."""
         state = self.backend.state
@@ -890,6 +1023,9 @@ class DesktopRouteAutonomy:
             localization_yaw_search_event=self._on_localization_yaw_search,
             ground_speed=self._ground_speed,
             body_velocity=self._body_velocity,
+            attitude_sample=self._attitude_sample,
+            ned_velocity=self._ned_velocity,
+            telemetry_history=getattr(self.backend, "control_telemetry_history", None),
             altitude=self._altitude,
             wait_expired=self._check_wait_budget,
             # Localization loss never auto-lands the AUTO route: the loop holds
@@ -931,15 +1067,22 @@ class DesktopRouteAutonomy:
         record["auto_elapsed_s"] = None if self._mission_started is None else now - self._mission_started
         if record.get("vertical_waived_now"):
             check = record.get("vertical_guard") or {}
+            target = int(record.get("vertical_guard_target", record.get("target_index", 0)))
+            detail = (
+                "延續本段 AUTO 的高度不一致保護，停止依視覺高度升降"
+                if check.get("inherited") else
+                f"氣壓計高度已變化 {check.get('baro_moved_m')} m，"
+                f"EDM 高度同向只變化 {check.get('localized_followed_u')} map unit"
+            )
             self._emit(
                 "vertical_unobservable",
-                f"{self._drawn_waypoint_label(int(record.get('target_index', 0)))}："
-                f"氣壓計高度已變化 {check.get('baro_moved_m')} m，"
-                f"EDM 高度同向只變化 {check.get('localized_followed_u')} map unit；"
-                "此點改為維持高度、以水平距離判斷到站",
+                f"{self._drawn_waypoint_label(target)}：{detail}；"
+                "維持高度，中途點依水平距離到站，終點保留原始三維確認",
             )
         self._check_waypoint_progress(record)
         self._track_route_progress(record)
+        if self._route_progress["arrived"]:
+            self._route_error.observe(record)
         logs = self._session_logs()
         if logs is None:
             return
@@ -981,7 +1124,13 @@ class DesktopRouteAutonomy:
         except (TypeError, ValueError, OverflowError):
             valid = False
         motion_block = "speed" in str(record.get("reason", "")).lower()
-        if not valid or self._paused.is_set() or (record.get("blocked") and not motion_block):
+        # Waypoint actions hold still on purpose and carry their own bounded
+        # budgets (hover <= 60 s, yaw timeout) inside the controller.
+        acting = record.get("command_action") == "WAYPOINT_ACTION"
+        if (
+            not valid or acting or self._paused.is_set()
+            or (record.get("blocked") and not motion_block)
+        ):
             if state is not None:
                 state.counting = False
             return
@@ -1083,11 +1232,21 @@ class DesktopRouteAutonomy:
                 "target_index": record.get("target_index"),
                 "search": record.get("localization_yaw_search"),
                 "search_deg": record.get("localization_yaw_search_deg"),
+                "waypoint_action": record.get("waypoint_action"),
             }
         except AttributeError:
             return
         state = self._route_progress
         state["last_tick"] = last
+        timeouts = getattr(self.controller, "action_timeouts", ())
+        while state["action_timeouts_seen"] < len(timeouts):
+            index = int(timeouts[state["action_timeouts_seen"]])
+            state["action_timeouts_seen"] += 1
+            self._emit(
+                "waypoint_action_timeout",
+                f"{self._drawn_waypoint_label(index)}轉向動作逾時未完成，"
+                "略過該點其餘動作並繼續航線",
+            )
         target = self._tick_target(record)
         if target is None:
             target = state["last_target"]
@@ -1162,6 +1321,12 @@ class DesktopRouteAutonomy:
             error_text = f"｜誤差{error:.2f}u" if math.isfinite(error) else ""
         except (TypeError, ValueError):
             error_text = ""
+        route_error = self._route_error.summary()
+        if route_error is not None:
+            error_text += (
+                f"（航線誤差平均{route_error['mean_u']:.3f}u／"
+                f"最大{route_error['max_u']:.3f}u）"
+            )
         arrived_text = f"｜已到達：{'、'.join(arrived)}" if arrived else ""
         line = (
             f"AUTO 第{target + 1}站/共{total}站・{self._drawn_leg_label(target)}・"
@@ -1176,6 +1341,7 @@ class DesktopRouteAutonomy:
             "action": action,
             "stage": stage_key,
             "path_error_u": last.get("path_error_u"),
+            "route_error": route_error,
             "line": line,
         }
 
@@ -1228,6 +1394,37 @@ class DesktopRouteAutonomy:
             RuntimeError,
         ):  # Tier3: fallback best-effort — narrow, keep pass
             pass
+
+    def _report_route_error(self) -> None:
+        """Log and announce this run's flown-vs-planned error once it ends."""
+        summary = self._route_error.summary()
+        if summary is None:
+            return
+        logs = self._session_logs()
+        if logs is not None:
+            try:
+                logs.localization(
+                    "auto_route_error_summary", auto_run_id=self.run_id, **summary
+                )
+            except (
+                OSError,
+                ValueError,
+                AttributeError,
+                TypeError,
+                RuntimeError,
+            ):  # Tier3: fallback best-effort — narrow, keep pass
+                pass
+        horizontal = (
+            f"；水平平均 {summary['horizontal_mean_u']:.3f}u／"
+            f"最大 {summary['horizontal_max_u']:.3f}u"
+            if "horizontal_mean_u" in summary else ""
+        )
+        self._emit(
+            "route_error_summary",
+            f"航線誤差（進入航線後 {summary['samples']} 筆，地圖單位）："
+            f"平均 {summary['mean_u']:.3f}u、RMS {summary['rms_u']:.3f}u、"
+            f"P95 {summary['p95_u']:.3f}u、最大 {summary['max_u']:.3f}u{horizontal}",
+        )
 
     def _land_after_failure(self, detail: str) -> None:
         self.phase = "LANDING"
@@ -1630,6 +1827,7 @@ class DesktopRouteAutonomy:
             self._clear_motion()
             self._paused.clear()
             self._watchdog_stop.set()
+            self._report_route_error()
             if self._auto_failed:
                 self.phase = "AUTO_FAILED"
             elif self._landing_confirmed is False and not self._cancel.is_set():

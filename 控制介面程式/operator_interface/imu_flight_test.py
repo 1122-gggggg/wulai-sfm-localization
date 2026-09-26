@@ -1,21 +1,15 @@
-"""Opt-in flight recorder for judging whether IMU-aided localization is viable.
+"""Automatic real-flight recording for offline visual/telemetry fusion.
 
-Turned on by ``SFM_IMU_FLIGHT_TEST=1``; the ``IMU飛行測試.sh`` launcher sets it.
-Off by default, so no ordinary flight pays for any of this.
+Real-flight sessions record by default. SFM_IMU_FLIGHT_TEST=0 opts out; =1
+also enables recording in other modes without changing flight authorization.
 
 Why it exists
 -------------
-``docs/esekf_live_eval_runbook.md`` sends the operator out with the onboard SD
-recording and then replays that MP4 offline against the session
-``telemetry.jsonl``. That works, but the two clocks are independent: the runbook
-has a whole section on hand-tuning ``--telemetry-offset-s`` until the velocity
-actually lands on the right frames, and a mis-set offset shows up as a
-``DORMANT``/``INVALID`` verdict rather than as an error.
-
-This recorder writes the frames the localizer *actually saw*, each one already
-carrying the fused telemetry that was attached to that same submission, on the
-one host monotonic clock. Nothing to align afterwards: row N of ``frames.jsonl``
-and ``frames/<seq>.jpg`` are the exact (image, IMU) pair the tracker was fed.
+Keep the submitted image, capture/source-clock evidence and the telemetry
+snapshot available at that submission together. Images are JPEG reproductions,
+not pixel-identical RGB archives; all offline A/B candidates use the same files.
+Independent sensor sample times still require alignment and delay validation.
+No raw IMU, measured scale or EKF covariance is invented by this recorder.
 
 Cost and safety
 ---------------
@@ -31,10 +25,13 @@ from __future__ import annotations
 
 import atexit
 import json
+import hashlib
 import os
 import queue
 import threading
 import time
+import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -42,17 +39,20 @@ import numpy as np
 from PIL import Image
 
 from disk_policy import assess_disk_space
+from session_logs import _finite_json
 
 #: Copied verbatim out of the submission's timing metadata into every frame row.
-#: Same keys ``attach_fused_localization_telemetry`` puts on the wire, so a row
-#: says exactly what the worker received for that image -- including ``None``
-#: for a field the aircraft did not report, which is itself the finding.
+#: Input-side telemetry snapshot for this submission. The worker protocol uses
+#: a subset; the complete timing snapshot is retained for offline fusion.
+#: Missing aircraft measurements remain None.
 FUSED_FIELDS = (
     "fused_telemetry_mono",
     "fused_stamp_source",
     "fused_attitude_mono",
     "fused_speed_mono",
     "fused_altitude_mono",
+    "fused_altitude_m",
+    "fused_agl_altitude_m",
     "fused_roll",
     "fused_pitch",
     "fused_yaw",
@@ -92,8 +92,11 @@ def _env_int(name: str, default: int, *, minimum: int = 1) -> int:
     return max(minimum, value)
 
 
-def imu_flight_test_enabled() -> bool:
-    return os.environ.get("SFM_IMU_FLIGHT_TEST") == "1"
+def imu_flight_test_enabled(mode=None) -> bool:
+    override = os.environ.get("SFM_IMU_FLIGHT_TEST")
+    if override is not None:
+        return override == "1"
+    return getattr(mode, "value", mode) == "real-flight"
 
 
 def _as_rgb_array(frame: Any) -> np.ndarray | None:
@@ -175,7 +178,7 @@ class ImuFlightTestRecorder:
         self.skipped_duplicate = 0
         self.bytes_written = 0
         self._file_index = 0
-        self._last_seq: int | None = None
+        self._last_frame_key = None
         self.stop_reason = ""
         self.last_error = ""
         self._state_lock = threading.Lock()
@@ -216,10 +219,12 @@ class ImuFlightTestRecorder:
         # One copy of it is the whole picture, and storing every retry used to
         # burn the frame cap on a single held frame; each retry's own telemetry
         # is still its own row in localization.jsonl.
-        if self._last_seq is not None and int(seq) == self._last_seq:
+        timing = timing_metadata or {}
+        frame_key = (int(seq), timing.get("source_frame_stamp_mono"))
+        if frame_key == self._last_frame_key:
             self.skipped_duplicate += 1
             return False
-        self._last_seq = int(seq)
+        self._last_frame_key = frame_key
         self.captured += 1
         if (self.captured - 1) % self.every_n:
             self.skipped_stride += 1
@@ -231,7 +236,6 @@ class ImuFlightTestRecorder:
             self._stop("max_bytes")
             return False
 
-        timing = timing_metadata or {}
         # Named by the recorder's own counter, not the stream index: the stream
         # index repeats across a hold and repeated names silently overwrote the
         # previous image. Gaps here mean dropped frames, which is worth seeing.
@@ -243,6 +247,9 @@ class ImuFlightTestRecorder:
             "capture_stamp_mono": timing.get("source_frame_stamp_mono"),
             "enqueue_mono": time.monotonic(),
             "hold_kind": timing.get("hold_kind"),
+            "image_width": int(image.shape[1]),
+            "image_height": int(image.shape[0]),
+            "timing": _finite_json(dict(timing)),
         }
         row.update((field, timing.get(field)) for field in FUSED_FIELDS)
         try:
@@ -286,13 +293,21 @@ class ImuFlightTestRecorder:
                             break
 
     def _write(self, row: dict[str, Any], image: np.ndarray) -> None:
+        if self.written >= self.max_frames:
+            self._stop("max_frames")
+            return
         payload = _encode_jpeg(image, self.jpeg_quality)
         if payload is None:
             self.dropped_encode_failed += 1
             self._incomplete = True
             return
+        if self.bytes_written + len(payload) > self.max_bytes:
+            self._stop("max_bytes")
+            return
         (self.directory / str(row["file"])).write_bytes(payload)
         row["bytes"] = len(payload)
+        row["sha256"] = hashlib.sha256(payload).hexdigest()
+        row["submitted_rgb_sha256"] = hashlib.sha256(image.tobytes()).hexdigest()
         row["written_mono"] = time.monotonic()
         self._index.write(json.dumps(row, ensure_ascii=False) + "\n")
         self._index_pending += 1
@@ -433,20 +448,26 @@ def create_recorder(
     session_directory: Path | None,
     *,
     note: Any = None,
+    mode=None,
 ) -> ImuFlightTestRecorder | None:
     """Build a recorder for this session, or None when the mode is off."""
-    if session_directory is None or not imu_flight_test_enabled():
+    if session_directory is None or not imu_flight_test_enabled(mode):
         return None
     try:
-        recorder = ImuFlightTestRecorder(Path(session_directory) / "imu_test")
-    except Exception:
+        directory = Path(session_directory) / "imu_test"
+        from ekf_capture_contract import write_capture_contract
+        write_capture_contract(directory)
+        recorder = ImuFlightTestRecorder(directory)
+    except Exception as exc:
+        if callable(note):
+            note(f"EKF 資料錄製啟動失敗：{exc}")
         return None
     # The UI closes the recorder on a clean shutdown; this covers Ctrl-C and an
     # unhandled exit, where the queued tail and the summary would be lost.
     # close() is idempotent, so the normal path still wins the race harmlessly.
     atexit.register(recorder.close)
     if callable(note):
-        note(f"IMU 飛行測試錄製 -> {recorder.directory}")
+        note(f"EKF 同步資料自動錄製 -> {recorder.directory}")
     return recorder
 
 
@@ -456,6 +477,18 @@ def close_recorder(recorder: Any) -> None:
         return
     try:
         recorder.close()
+        manifest = recorder.directory.parent / "session_manifest.json"
+        if manifest.is_file() and not getattr(recorder, "_report_started", False):
+            recorder._report_started = True
+            tool = Path(__file__).resolve().parents[2] / "tools/imu_flight_test_report.py"
+            with (recorder.directory / "report.log").open("w") as log:
+                subprocess.Popen(
+                    [sys.executable, str(tool), "--session", str(manifest.parent),
+                     "--out", str(recorder.directory / "report.md"),
+                     "--json-out", str(recorder.directory / "report.json")],
+                    stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
+                    start_new_session=True,
+                )
     except (OSError, ValueError, AttributeError, TypeError, RuntimeError):
         pass
 

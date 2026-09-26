@@ -2,7 +2,7 @@
   "schema": "sfm-vehicle/v1",
   "vehicle_id": "parrot_anafi",
   "revision": "720p_river_b0_v1",
-  "adapter": "olympe",
+  "adapter": "arsdk-ng",
   "model": "Parrot ANAFI",
   "serials": [],
   "capabilities": [

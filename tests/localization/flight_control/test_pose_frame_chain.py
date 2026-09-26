@@ -138,3 +138,19 @@ def test_map_distance_scales_to_meters() -> None:
     transformer = NavigationPoseTransformer(alignment, _extrinsic())
 
     assert transformer.map_distance_to_site(0.4) == pytest.approx(1.0)
+
+
+@pytest.mark.parametrize("scale", [0.2, 2.5, 7.0])
+def test_metric_camera_offset_is_not_scaled_with_the_map(scale):
+    points = np.array([[0, 0, 0], [2, 0, 0], [0, 2, 0], [0, 0, 1]], dtype=float)
+    alignment = SiteAlignment.from_fit(
+        map_frame_id="map-v1", site_frame_id="site-v1",
+        fit=solve_similarity_alignment(points, scale * points), approved=True,
+    )
+    transformer = NavigationPoseTransformer(alignment, _extrinsic())
+    pose = transformer.body_pose(
+        camera_center_map=[.2 / scale, 0., 0.],
+        rotation_camera_from_map=R_BODY_FROM_CAMERA_IDEAL.T,
+        gimbal_pitch_deg=-10., stamp=1.,
+    )
+    assert pose.xyz == pytest.approx([0., 0., 0.], abs=1e-12)

@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
-"""Passive flight session: log everything + live-localize. NEVER arms.
+"""Passive flight session: log ARSDK-NG telemetry + RTSP video + localization. NEVER arms.
 
 Use while a human pilot flies with SkyController sticks. PC only observes:
-  - full Olympe telemetry (attitude/alt/speed/gps/battery/gimbal/...)
-  - PDRAW video frame health (shape/age/fps)
+  - direct ARSDK-NG telemetry (attitude/alt/speed/gps/battery/gimbal/...)
+  - Parrot RTSP /live video (shape/age/fps)
   - production localizer pose + inliers/mode/weak (algorithm validation)
+
+RTSP frame stamps are host-monotonic receipt times and explicitly degraded, not
+camera sensor timestamps. Consumers requiring source timestamps fail closed.
 
 SAFETY
   - No TakeOff / PCMD / Landing / Emergency / moveBy / gimbal set.
-  - Single Olympe connection via SkyController (default 192.168.53.1).
+  - Single ARSDK-NG connection via SkyController (default 192.168.53.1).
 
 Example
   python passive_flight_session.py --ip 192.168.53.1 --controller skycontroller3 \\
@@ -30,7 +33,7 @@ from typing import Any
 
 # flight_control is cwd / on sys.path when launched from there
 import log_anafi_telemetry as tel
-import olympe_frame_source as ofs
+import rtsp_frame_source as rtsp
 import path_follow_flight as pff
 import real_path_follow_controller as rpf
 
@@ -106,7 +109,7 @@ def _load_route(resources: _SessionResources) -> None:
 def _start_resources(drone, *, with_localize: bool) -> _SessionResources:
     resources = _SessionResources()
     try:
-        resources.grabber = ofs.OlympePdrawGrabber(
+        resources.grabber = rtsp.RtspFrameGrabber(
             drone,
             resize=(1280, 720),
             stale_s=0.8,
@@ -155,6 +158,14 @@ def _add_video_sample(
     if grabber is None:
         row["video.frame"] = None
         return
+    metadata = dict(grabber.stream_metadata)
+    row["video.source_timestamp_degraded"] = bool(
+        metadata.get("timestamp_degraded", True)
+    )
+    row["video.source_timestamp_trusted"] = bool(
+        metadata.get("source_timestamp_trusted", False)
+    )
+    row["video.stamp_source"] = str(metadata.get("stamp_source", "unknown"))
     try:
         result = grabber()
     except Exception:
@@ -172,6 +183,11 @@ def _add_video_sample(
         "h": height,
         "stamp_mono": stamp,
         "age_s": (time.monotonic() - stamp) if stamp else None,
+        "timestamp_degraded": bool(metadata.get("timestamp_degraded", True)),
+        "source_timestamp_trusted": bool(
+            metadata.get("source_timestamp_trusted", False)
+        ),
+        "stamp_source": str(metadata.get("stamp_source", "unknown")),
     }
     row["video.healthy"] = bool(grabber.is_healthy())
     row["video.fps"] = float(getattr(grabber, "fps", 0.0) or 0.0)
@@ -381,12 +397,12 @@ def _cleanup_resources(drone, resources: _SessionResources) -> None:
 def run_session(*, ip: str, controller: str, secs: float, hz: float,
                 out: Path, with_localize: bool) -> Path:
     out.parent.mkdir(parents=True, exist_ok=True)
-    messages = tel._build_message_table()
     stop = {"f": False}
     _install_signal_handlers(stop)
     print(f"[session] connecting ip={ip} controller={controller}", flush=True)
     print("[session] PASSIVE ONLY — no TakeOff/PCMD/Landing/Emergency/gimbal cmd", flush=True)
-    drone = ofs.connect(ip, controller=controller)
+    drone = rtsp.connect(ip, controller=controller)
+    messages = tel._build_message_table(drone)
     resources = _start_resources(drone, with_localize=with_localize)
     max_jump_u = _max_pose_jump()
     stats = _SessionStats()

@@ -58,11 +58,11 @@ cd /home/allen/localization
 | 變更 | 檔案 | 作用 |
 |---|---|---|
 | `./IMU飛行測試.sh` + 錄製器 | `IMU飛行測試.sh`、`operator_interface/imu_flight_test.py` | 上面那一節。錄製 opt-in（`SFM_IMU_FLIGHT_TEST=1`），編碼與寫檔在背景執行緒，佇列滿就丟幀 —— 錄製永遠不能卡住飛行 UI。 |
-| `stick_axes` telemetry | `skycontroller_stick.stick_log_sample` + `olympe_live_backend._poll_stick_axes` | 搖桿各軸原始值，動了就記、沒動 1 Hz 一筆。 |
+| `stick_axes` telemetry | `skycontroller_stick.stick_log_sample` + `arsdk_ng_live_backend._poll_stick_axes` | 搖桿各軸原始值，動了就記、沒動 1 Hz 一筆。 |
 | 每幀 IMU / ESEKF 診斷 | `localization_metrics.RESULT_FIELDS`、`edm_localizer_adapter`、`live_localizer_worker` | `fused_*` + `pose_status` / `prediction_mode` / `esekf_*` 進 `localization.jsonl`。 |
 | 現場判定 | `tools/imu_flight_test_report.py` | 讀 session，判 USABLE / USABLE WITH GAPS / UNUSABLE。 |
 | `SFM_EDM_ESEKF_DISABLE=1` env toggle（`_init_esekf`） | `production_edm_tracker.py`（`EDM工具包/deploy` 是同檔 symlink） | 強制 `self.esekf=None`，關掉 ESEKF + KLT-3D prior（同 gate）。預設 off。所有呼叫點都 `getattr(self,"esekf",None) is not None` 保護。 |
-| 10 Hz `fused_odometry` telemetry 事件 | `olympe_live_backend.py::_poll_session_telemetry` | 每 0.1 s 寫一行 NED 速度 + 姿態 + GPS 到 session `telemetry.jsonl`。原本只有 1 Hz `readback`，太粗。 |
+| 10 Hz `fused_odometry` telemetry 事件 | `arsdk_ng_live_backend.py::_poll_session_telemetry` | 每 0.1 s 寫一行 NED 速度 + 姿態 + GPS 到 session `telemetry.jsonl`。原本只有 1 Hz `readback`，太粗。 |
 | 離線 A/B | `定位演算法/validation/benchmark_esekf_live_replay.py` | 見下。 |
 | 測試 | `tests/localization/deploy/test_esekf_toggle.py`、`定位演算法/validation/tests/test_esekf_live_replay.py` | toggle 行為 + telemetry 解析 / 內插 / recovery 統計 / verdict。 |
 
@@ -91,7 +91,7 @@ cd /home/allen/localization
    （含 `fused_odometry` 與 `stick_axes` 事件）、`localization.jsonl`、
    `session_manifest.json`，用 `./IMU飛行測試.sh` 開的還會有 `imu_test/`。
 
-6. 把機上錄影從無人機下載出來（操作介面的 Olympe backend 會放到 `record_dir`，
+6. 把機上錄影從無人機下載出來（操作介面的 ARSDK-NG backend 會經 HTTP 放到 `record_dir`，
    或你手動用 FreeFlight / SD 卡）。記下這個 `.MP4` 路徑。
 
 ## 回來之後

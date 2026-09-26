@@ -5,10 +5,19 @@ from __future__ import annotations
 import json
 import math
 import os
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
+
+# Waypoint actions are validated by the flight route contract's owner; keep
+# this module importable before the desktop entrypoint installs that path.
+_FLIGHT_CONTROL = Path(__file__).resolve().parents[2] / "定位演算法" / "flight_control"
+if str(_FLIGHT_CONTROL) not in sys.path:
+    sys.path.insert(0, str(_FLIGHT_CONTROL))
+
+from route_domain import MAX_ACTIONS_PER_WAYPOINT, parse_waypoint_action  # noqa: E402
 
 ROUTE_SCHEMA = "sfm-flight-route/v1"
 PREVIEW_ROUTE_SCHEMA = "sfm-route-preview/v1"
@@ -94,6 +103,26 @@ def _waypoint_radii(raw: object, count: int) -> list[float] | None:
     return radii
 
 
+def waypoint_actions_json(raw: object, count: int) -> list[list[dict]] | None:
+    """Validate per-waypoint actions with the flight contract; None = none."""
+    if raw is None:
+        return None
+    if not isinstance(raw, list) or len(raw) != count:
+        raise ValueError("route waypoint_actions must be a list with one list per waypoint")
+    parsed = []
+    for index, actions in enumerate(raw):
+        if not isinstance(actions, list) or len(actions) > MAX_ACTIONS_PER_WAYPOINT:
+            raise ValueError(
+                f"route waypoint_actions[{index}] must be a list of at most "
+                f"{MAX_ACTIONS_PER_WAYPOINT} actions"
+            )
+        parsed.append([
+            parse_waypoint_action(action, f"route waypoint_actions[{index}][{step}]").to_json()
+            for step, action in enumerate(actions)
+        ])
+    return parsed if any(parsed) else None
+
+
 def _editor_points_from_route(
     raw: dict,
     *,
@@ -141,6 +170,8 @@ class RouteDocument:
     arrive_radius_map_units: float | None = None
     #: Per-waypoint arrival spheres drawn by the operator; None = all-global.
     waypoint_arrive_radii: list[float] | None = None
+    #: Per-waypoint actions (route_domain JSON form), run after arrival; None = none.
+    waypoint_actions: list[list[dict]] | None = None
 
     @classmethod
     def load(
@@ -200,6 +231,9 @@ class RouteDocument:
             waypoint_arrive_radii=_waypoint_radii(
                 raw.get("waypoint_arrive_radii"), len(editor_points)
             ),
+            waypoint_actions=waypoint_actions_json(
+                raw.get("waypoint_actions"), len(editor_points)
+            ),
         )
 
     def payload(self, *, preview_only: bool = False) -> dict:
@@ -220,6 +254,7 @@ class RouteDocument:
             "waypoints": points,
             "arrive_radius_map_units": self.arrive_radius_map_units,
             "waypoint_arrive_radii": self.aligned_point_radii(len(points)),
+            "waypoint_actions": waypoint_actions_json(self.waypoint_actions, len(points)),
             "source": "operator_route_editor",
             "note": (
                 "unbound PLY preview; cannot be imported as a flight route"

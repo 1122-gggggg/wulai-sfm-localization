@@ -11,7 +11,7 @@ import real_path_follow_controller as rpf
 
 
 @pytest.mark.parametrize("yaw", [0.0, math.pi / 2])
-@pytest.mark.parametrize("drift_mps", [-0.3, 0.0, 0.3])
+@pytest.mark.parametrize("drift_mps", [-0.3, 0.0, 0.3, "reversal", "gust"])
 def test_terminal_confirmation_keeps_wind_compensation_until_settled(yaw, drift_mps):
     cfg = replace(
         rpf.production_auto_control_config(rpf.LEGACY_MAP_FRAME),
@@ -31,7 +31,12 @@ def test_terminal_confirmation_keeps_wind_compensation_until_settled(yaw, drift_
     saw_settling = False
     for tick in range(1200):
         now = 1.0 + tick * 0.05
-        ground_speed = velocity + drift_mps
+        disturbance = drift_mps
+        if drift_mps == "reversal":
+            disturbance = .3 if tick < 20 else -.3
+        elif drift_mps == "gust":
+            disturbance = .3 if tick < 20 else -.3 if tick < 40 else 0.
+        ground_speed = velocity + disturbance
         pose = rpf.Pose(x, 0.0, 0.0, yaw, stamp=now)
         command = ctrl.step(pose, now)
         record = {}
@@ -54,7 +59,7 @@ def test_terminal_confirmation_keeps_wind_compensation_until_settled(yaw, drift_
             break
         east_pcmd = pcmd[1] * math.cos(yaw) + pcmd[0] * math.sin(yaw)
         velocity += (east_pcmd * 0.018 - velocity) * (1.0 - math.exp(-0.05 / 0.4))
-        x += (velocity + drift_mps) * 0.05 / 15.0
+        x += (velocity + disturbance) * 0.05 / 15.0
     else:
         pytest.fail("terminal position/speed did not settle within 60 simulated seconds")
     if drift_mps:

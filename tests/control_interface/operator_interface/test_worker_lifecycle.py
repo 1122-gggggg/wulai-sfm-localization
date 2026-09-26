@@ -959,7 +959,7 @@ def test_operator_interface_modes_are_exactly_two_and_mutually_exclusive(
 
 
 def test_real_flight_interface_rejects_video_file_fallback() -> None:
-    with pytest.raises(ValueError, match="accepts only the ANAFI PDRAW stream"):
+    with pytest.raises(ValueError, match="accepts only the ANAFI RTSP stream"):
         app.resolve_operator_interface("real-flight", False, "/tmp/replay.mp4")
 
 
@@ -2447,6 +2447,26 @@ def test_non_calibrated_zoom_pauses_localization_before_submit() -> None:
     assert "1.5x" in logs[0]
     assert app.localization_zoom_is_calibrated(1.0)
     assert not app.localization_zoom_is_calibrated(float("nan"))
+
+
+def test_camera_zoom_readback_pauses_localization_even_when_ui_commanded_1x() -> None:
+    logs = []
+    operator = SimpleNamespace(
+        inspecting=True,
+        localizer=SimpleNamespace(busy=lambda: pytest.fail("must not submit at non-1x zoom")),
+        video_frame=object(),
+        video_display_index=1,
+        backend=SimpleNamespace(state=SimpleNamespace(zoom=1.0, camera_zoom_level=2.0)),
+        _zoom_localization_paused=False,
+        write_log=logs.append,
+    )
+
+    app.OperatorApp.submit_current_frame_for_localization(operator)
+
+    assert operator._zoom_localization_paused
+    assert "2.0x" in logs[0]
+    assert app.localization_gate_zoom(1.0, 1.004) == 1.0
+    assert app.localization_gate_zoom(1.0, None) == 1.0
 
 
 def test_shared_frame_worker_coalesces_latest_slot_and_notifies(tmp_path: Path) -> None:

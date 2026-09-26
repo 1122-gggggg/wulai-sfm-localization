@@ -20,9 +20,9 @@
 住在 `定位演算法/deploy_code/sfm_direct_deploy/`，本目錄只負責組裝與驗證，
 不碰該目錄下任何檔案。
 
-飛控、安全監控、Olympe frame source 與人工控制工具的唯一 owner 是
+飛控、安全監控、RTSP frame source 與人工控制工具的唯一 owner 是
 `定位演算法/flight_control/`。本目錄不再保存 `path_follow_flight.py`、
-`olympe_frame_source.py` 或其他飛控相容副本；需要兩邊共用的模組也只能有一份。
+`rtsp_frame_source.py` 或其他飛控相容副本；需要兩邊共用的模組也只能有一份。
 所有權由下列純地面檢查強制：
 
 ```bash

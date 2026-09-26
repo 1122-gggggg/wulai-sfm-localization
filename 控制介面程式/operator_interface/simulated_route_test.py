@@ -13,10 +13,10 @@ from real_path_follow_controller import MapFrame, MissionRouteSnapshot, Pose, pr
 
 
 def _map_heading_to_ned_yaw(map_heading: float) -> float:
-    """Express a map-frame heading the way Olympe reports attitude yaw.
+    """Express a map-frame heading in the aircraft telemetry yaw convention.
 
-    Visual poses speak counter-clockwise-from-East; Olympe AttitudeChanged.yaw
-    is clockwise-from-North, so a clockwise turn grows one while shrinking the
+    Visual poses speak counter-clockwise-from-East; ANAFI attitude yaw is
+    clockwise-from-North, so a clockwise turn grows one while shrinking the
     other.  Reporting the same number on both used to stay under the
     visual/IMU increment gate only because AUTO never yawed above ~10%; at
     its real 50% authority the doubled increment tripped the gate and latched

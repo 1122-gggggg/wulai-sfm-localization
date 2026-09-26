@@ -37,6 +37,32 @@ def test_trajectory_write_failure_is_visible_in_log_health(tmp_path, monkeypatch
     session.close(reason="test")
 
 
+def test_fusion_inputs_survive_diagnostic_retention(tmp_path):
+    from disk_policy import enforce_retention
+
+    session = SessionLogs.create(tmp_path, mode=InterfaceMode.SIMULATED_STREAM, manifest={})
+    session.localization("pose_result", display_seq=7, pose_capture_mono_ns=100,
+                         camera_axes_world=[[1, 0, 0], [0, 1, 0], [0, 0, 1]],
+                         fused_speed_mono=1., fused_altitude_m=2.,
+                         reloc_ms=160., reloc_edm_match_ms=100., reloc_lift_prepare_ms=40.,
+                         reloc_source_epoch=2, reloc_ordinal=7, reloc_capture_stamp_mono=.5,
+                         ui_arrival_mono_ns=150, pose_status="VISUALLY_CONFIRMED")
+    session.telemetry("fused_odometry", speed_mono_ns=100, speed_north_mps=.3,
+                      attitude_mono_ns=90, altitude_mono_ns=80)
+    session.telemetry("pcmd_dispatch", command_mono_ns=110, pcmd=[1, 2, 0, 0])
+    session.close(reason="test")
+    enforce_retention(tmp_path, current_session=None, max_bytes=0)
+    rows = list(map(json.loads, (session.directory / "trajectory.jsonl").read_text().splitlines()))
+    assert [r["event"] for r in rows] == ["pose_result", "fused_odometry", "pcmd_dispatch"]
+    assert rows[0]["fused_speed_mono"] == 1.
+    assert rows[0]["ui_arrival_mono_ns"] == 150
+    assert rows[1]["speed_mono_ns"] == 100
+    from report_relocalization import build_report, session_capture
+    profile = build_report(session_capture(session.directory))
+    assert profile["jobs"] == 1
+    assert profile["stages"]["edm_match_ms"]["p50_ms"] == 100.
+
+
 def test_session_logs_create_required_files_and_dual_timestamps(tmp_path) -> None:
     session = SessionLogs.create(
         tmp_path,

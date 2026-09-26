@@ -10,14 +10,14 @@
 
 Default covers (ground only):
   A. connect + telemetry
-  B. live video frames (PDRAW)
+  B. live video frames (RTSP /live)
   C. gimbal pitch + camera zoom reset (on ground)
   F. PC freeze (Esc/manual) + resume (pc_control)  [PCMD zero only]
 
 Optional air steps D/E/G/H exist only behind the dual interlock above.
 
 Usage
-  # Free any other Olympe holder first (UI / logger).
+  # Free any other ARSDK-NG control session first (UI / logger).
   python live_non_map_acceptance.py --ip 192.168.42.1 --controller drone
 """
 from __future__ import annotations
@@ -203,8 +203,9 @@ class LiveAcceptance:
 
     def _flying_state(self) -> str:
         try:
-            from olympe.messages.ardrone3.PilotingState import FlyingStateChanged
-            st = self.backend.drone.get_state(FlyingStateChanged)
+            from arsdk_ng import arsdk_message
+            message = arsdk_message("Ardrone3.PilotingState.FlyingStateChanged")
+            st = self.backend.drone.get_state(message)
             if isinstance(st, dict):
                 return str(st.get("state", "unknown"))
             return str(st)
@@ -213,8 +214,9 @@ class LiveAcceptance:
 
     def _battery(self) -> int | None:
         try:
-            from olympe.messages.common.CommonState import BatteryStateChanged
-            st = self.backend.drone.get_state(BatteryStateChanged)
+            from arsdk_ng import arsdk_message
+            message = arsdk_message("Common.CommonState.BatteryStateChanged")
+            st = self.backend.drone.get_state(message)
             if isinstance(st, dict) and "percent" in st:
                 return int(st["percent"])
         except Exception:
@@ -483,10 +485,10 @@ class LiveAcceptance:
 
     def run(self) -> int:
         from backend_contract import ControlAction, ControlRequest, ControlResult
-        from olympe_live_backend import OlympeLiveBackend
+        from arsdk_ng_live_backend import ArsdkNgLiveBackend
 
         self.log("begin", ip=self.ip, controller=self.controller, fly=self.fly)
-        if not self._connect_backend(OlympeLiveBackend):
+        if not self._connect_backend(ArsdkNgLiveBackend):
             return 2
         flying_state = self._check_telemetry()
         self._check_video()

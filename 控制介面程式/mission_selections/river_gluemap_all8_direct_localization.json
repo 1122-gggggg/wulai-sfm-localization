@@ -15,7 +15,7 @@
   },
   "route": {
     "path": "../mission_components/routes/river_site_operator_route.json",
-    "sha256": "8f3c893b5b790ed671aabd7baeda0a5562106692dc0c7cac53f6152d981045eb"
+    "sha256": "d6b4be7d68c340f15ffa607b23735923b1bf7597ed90226dab98e8e6819fe2cb"
   },
   "schema": "sfm-mission-selection/v1",
   "selection_id": "river_gluemap_all8_direct_localization",
@@ -25,6 +25,6 @@
   },
   "vehicle": {
     "path": "../mission_components/vehicles/parrot_anafi_720p_river_direct.json",
-    "sha256": "ccf4849fb6cb0a1ad381910c6de4b0ec597feece97dc41c0af1b0f0b9a680d6b"
+    "sha256": "9f5c7dc4a157b038084a730f7882801b4dce600e09b2d0fe952b450def606680"
   }
 }

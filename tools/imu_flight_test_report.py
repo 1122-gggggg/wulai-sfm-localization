@@ -38,17 +38,19 @@ MIN_SPEED_SPAN_MPS = 0.5
 MIN_LOST_EPISODES = 1
 
 
-def read_jsonl(path: Path) -> Iterator[dict[str, Any]]:
+def read_jsonl(path: Path, errors: list[str] | None = None) -> Iterator[dict[str, Any]]:
     if not path.is_file():
         return
     with path.open(encoding="utf-8") as handle:
-        for line in handle:
+        for number, line in enumerate(handle, 1):
             line = line.strip()
             if not line:
                 continue
             try:
                 record = json.loads(line)
             except ValueError:
+                if errors is not None:
+                    errors.append(f"{path.name}:{number}: invalid JSON")
                 continue
             if isinstance(record, dict):
                 yield record
@@ -267,7 +269,7 @@ def summarize_map_scale(
         return {"available": False, "reason": "map_scale estimator unavailable"}
     speeds: list[tuple[float, float]] = []
     for row in fused:
-        stamp = _finite(row.get("t_mono_ns"))
+        stamp = _finite(row.get("speed_mono_ns"))
         velocity = [
             _finite(row.get(key)) for key in ("speed_north_mps", "speed_east_mps", "speed_down_mps")
         ]
@@ -279,9 +281,14 @@ def summarize_map_scale(
     visual: list[tuple[float, float, float, float]] = []
     for row in localization:
         pose = row.get("pose")
-        stamp = _finite(row.get("ui_arrival_mono"))
-        if stamp is None:
-            stamp = _finite(row.get("t_mono"))
+        if (
+            row.get("direct_status") not in {"FAST_TRACK", "RELOC_SEED"}
+            or row.get("confidence_low")
+            or row.get("imu_bridge")
+            or row.get("reseed_confirming")
+        ):
+            continue
+        stamp = _finite(row.get("source_frame_stamp_mono"))
         xyz = (
             [_finite(pose.get(axis)) for axis in ("x", "y", "z")]
             if isinstance(pose, dict)
@@ -309,9 +316,9 @@ def summarize_map_scale(
     }
 
 
-def summarize_frames(session: Path) -> dict[str, Any]:
+def summarize_frames(session: Path, errors: list[str] | None = None) -> dict[str, Any]:
     directory = session / "imu_test"
-    rows = list(read_jsonl(directory / "frames.jsonl"))
+    rows = list(read_jsonl(directory / "frames.jsonl", errors))
     summary_path = directory / "summary.json"
     recorder: dict[str, Any] = {}
     if summary_path.is_file():
@@ -327,6 +334,13 @@ def summarize_frames(session: Path) -> dict[str, Any]:
         if stamp is not None
     )
     with_velocity = sum(1 for row in rows if _finite(row.get("fused_speed_north")) is not None)
+    missing = 0
+    for row in rows:
+        image = directory / str(row.get("file", ""))
+        if not image.is_file() or (
+            row.get("bytes") is not None and image.stat().st_size != row["bytes"]
+        ):
+            missing += 1
     return {
         "indexed": len(rows),
         "on_disk": (
@@ -335,6 +349,7 @@ def summarize_frames(session: Path) -> dict[str, Any]:
             else 0
         ),
         "with_velocity": with_velocity,
+        "missing_or_truncated": missing,
         "rate_hz": _rate_hz(stamps),
         "recorder": recorder,
     }
@@ -347,12 +362,9 @@ def _blockers(imu: dict[str, Any], localization: dict[str, Any]) -> list[str]:
     """Reasons the recording cannot answer the question at all."""
     found: list[str] = []
     if not imu["with_velocity"]:
-        found.append(
-            "telemetry 沒有任何 NED 速度樣本；ESEKF 的 prediction_allowed() 永遠是 False，"
-            "離線 A/B 只會回 INVALID。"
-        )
+        found.append("telemetry 沒有任何 NED 速度樣本，無法評估含飛控速度的鬆耦合融合。")
     if not imu["with_attitude"]:
-        found.append("telemetry 沒有姿態樣本；沒有 IMU 可評。")
+        found.append("telemetry 沒有飛控融合姿態樣本。")
     if not localization["frames"]:
         found.append("localization.jsonl 沒有任何一幀；這段沒有開定位。")
     elif not localization["fused_paired"]:
@@ -360,7 +372,9 @@ def _blockers(imu: dict[str, Any], localization: dict[str, Any]) -> list[str]:
     return found
 
 
-def _motion_warnings(imu: dict[str, Any], sticks: dict[str, Any]) -> list[str]:
+def _motion_warnings(
+    imu: dict[str, Any], sticks: dict[str, Any], *, auto_recorded=False
+) -> list[str]:
     """The aircraft has to have moved, and the pilot has to have moved it."""
     found: list[str] = []
     attitude_span = max(imu["roll_span_deg"], imu["pitch_span_deg"], imu["yaw_span_deg"])
@@ -370,7 +384,11 @@ def _motion_warnings(imu: dict[str, Any], sticks: dict[str, Any]) -> list[str]:
             "資訊量不足以判斷 IMU 有沒有幫助。"
         )
     if imu["with_velocity"] and imu["ground_speed_max_mps"] < MIN_SPEED_SPAN_MPS:
-        found.append(f"最大地速只有 {imu['ground_speed_max_mps']:.2f} m/s；EKF 大概不會收斂。")
+        found.append(
+            f"最大地速只有 {imu['ground_speed_max_mps']:.2f} m/s；移動尺度及動態覆蓋有限。"
+        )
+    if auto_recorded:
+        return found
     if not sticks["samples"]:
         found.append(
             "沒有 stick_axes；搖桿監控沒起來（直連無人機 Wi-Fi 就會這樣），"
@@ -385,6 +403,8 @@ def _recorder_warnings(frames: dict[str, Any]) -> list[str]:
     found: list[str] = []
     recorder = frames.get("recorder") or {}
     if isinstance(recorder, dict):
+        if recorder.get("stop_reason"):
+            found.append(f"錄製提早停止：{recorder['stop_reason']}；後續影格未必完整。")
         if recorder.get("incomplete") is True:
             found.append("錄製器 summary 標記 incomplete；這段資料不能當成完整場次。")
         if recorder.get("writer_shutdown_timeout") is True:
@@ -402,18 +422,22 @@ def _coverage_warnings(localization: dict[str, Any], frames: dict[str, Any]) -> 
     found: list[str] = []
     found.extend(_recorder_warnings(frames))
     if localization["lost_episodes"] < MIN_LOST_EPISODES:
-        found.append("整段沒有進過 LOST；recovery 這一半評不到，下次記得掃過難定位區再回來。")
+        found.append("整段沒有進過 LOST；本段無法評估失鎖恢復，不需為收集資料刻意製造失鎖。")
     if localization["sync_error_over_bound"]:
         found.append(
             f"{localization['sync_error_over_bound']} 幀的 telemetry 比影像舊超過 "
             f"{MAX_FUSED_SYNC_ERROR_S}s；這些幀的 IMU 會被 protocol 擋掉。"
         )
-    if localization["frames"] and not localization["esekf_predictions"]:
+    if localization["esekf_updates_seen"] and not localization["esekf_predictions"]:
         found.append(
             "ESEKF 全程沒有 arm（prediction_mode 從來不是 esekf）。"
             "可能是速度沒餵到、EKF 沒收斂，或飛行段太短。"
         )
-    if frames["indexed"] and frames["on_disk"] < frames["indexed"]:
+    if not frames["indexed"]:
+        found.append("沒有同步影格索引；只能分析既有姿態與遙測，不能重跑影像定位。")
+    if frames.get("missing_or_truncated"):
+        found.append(f"索引中的 {frames['missing_or_truncated']} 張影像缺失或大小不符。")
+    elif frames["indexed"] and frames["on_disk"] < frames["indexed"]:
         found.append(f"frames.jsonl 有 {frames['indexed']} 筆但磁碟只有 {frames['on_disk']} 張圖。")
     dropped = frames.get("recorder", {}).get("dropped_queue_full")
     if dropped:
@@ -426,9 +450,13 @@ def verdict(
     sticks: dict[str, Any],
     localization: dict[str, Any],
     frames: dict[str, Any],
+    *,
+    auto_recorded=False,
 ) -> tuple[str, list[str]]:
     blockers = _blockers(imu, localization)
-    warnings = _motion_warnings(imu, sticks) + _coverage_warnings(localization, frames)
+    warnings = _motion_warnings(imu, sticks, auto_recorded=auto_recorded) + _coverage_warnings(
+        localization, frames
+    )
     if blockers:
         return "UNUSABLE", blockers + warnings
     if warnings:
@@ -442,9 +470,9 @@ def summarize_tick_profile(records: list[dict[str, Any]]) -> dict[str, Any]:
 
     runbook 0b measured ui_poll_delay_ms p50 at 25 ms on the *simulated* path
     and is explicit that the real-hardware number must be taken separately,
-    because live frames arrive on an Olympe callback thread instead of inline on
-    the Tk thread. This is that measurement: one flight now answers which stage
-    holds the loop, instead of choosing blind between the doc's candidates.
+    because real frames are read on a dedicated RTSP worker thread instead of
+    inline on Tk. This separate measurement shows which stage holds the loop,
+    rather than choosing blind between the doc's candidates.
     """
     if not records:
         return {"windows": 0, "ticks": 0, "stages": {}, "worst": None}
@@ -477,19 +505,140 @@ def summarize_tick_profile(records: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def summarize_ekf_capture(session, imu_rows, loc_rows, frames):
+    """Report replay prerequisites, without mistaking collection for approval."""
+    path = session / "imu_test/capture_contract.json"
+    try:
+        contract = json.loads(path.read_text())
+    except (OSError, ValueError):
+        contract = {}
+    source_stamps = {}
+    for name, field in (
+        ("attitude", "attitude_mono_ns"),
+        ("speed", "speed_mono_ns"),
+        ("altitude", "altitude_mono_ns"),
+        ("gimbal", "gimbal_mono_ns"),
+    ):
+        stamps = sorted(
+            {
+                float(r[field]) / 1e9
+                for r in imu_rows
+                if _finite(r.get(field)) is not None and float(r[field]) > 0
+            }
+        )
+        source_stamps[name] = {
+            "distinct_samples": len(stamps),
+            "rate_hz": _rate_hz(stamps),
+            "largest_gap_s": _largest_gap_s(stamps),
+        }
+    pairing = {}
+    for name in ("attitude", "speed", "altitude"):
+        offsets = []
+        for row in loc_rows:
+            capture = _finite(row.get("source_frame_stamp_mono"))
+            stamp = _finite(row.get(f"fused_{name}_mono"))
+            if capture is not None and stamp is not None:
+                offsets.append(abs(capture - stamp))
+        pairing[name] = {"paired": len(offsets), "abs_offset_p95_s": _percentile(offsets, 0.95)}
+
+    def key(seq, stamp):
+        return (seq, round(stamp, 6)) if seq is not None and stamp is not None else None
+
+    pose_keys = {
+        key(r.get("display_seq"), _finite(r.get("source_frame_stamp_mono"))) for r in loc_rows
+    }
+    pose_keys.discard(None)
+    frame_rows = list(read_jsonl(session / "imu_test/frames.jsonl"))
+    matched = sum(
+        key(r.get("seq"), _finite(r.get("capture_stamp_mono"))) in pose_keys for r in frame_rows
+    )
+    camera = contract.get("active_query_camera") or {}
+    expected_size = (camera.get("width"), camera.get("height"))
+    dimensions_match = bool(
+        all(expected_size)
+        and frame_rows
+        and all(
+            (row.get("image_width"), row.get("image_height")) == expected_size for row in frame_rows
+        )
+    )
+    timed = all(
+        source_stamps[name]["distinct_samples"] >= 2 for name in ("attitude", "speed", "altitude")
+    )
+    visual_count = 0
+    for row in loc_rows:
+        pose = row.get("pose")
+        xyz = [pose.get(k) for k in ("x", "y", "z")] if isinstance(pose, dict) else pose
+        visual_count += bool(
+            row.get("success") is not False
+            and isinstance(xyz, (list, tuple))
+            and len(xyz) >= 3
+            and all(_finite(v) is not None for v in xyz[:3])
+        )
+    valid_telemetry = all(
+        any(all(_finite(row.get(k)) is not None for k in keys) for row in imu_rows)
+        for keys in (
+            ("att_roll", "att_pitch", "att_yaw"),
+            ("speed_north_mps", "speed_east_mps", "speed_down_mps"),
+            ("drone_altitude_m",),
+        )
+    )
+    pose_replay = bool(visual_count and timed and valid_telemetry)
+    image_replay = bool(
+        pose_replay
+        and matched
+        and not frames["missing_or_truncated"]
+        and contract.get("intrinsics_match_active_pinhole")
+        and dimensions_match
+    )
+    return {
+        "pose_telemetry_replay_ready": pose_replay,
+        "image_replay_ready": image_replay,
+        "matched_recorded_frames": matched,
+        "recorded_frames_without_result": len(frame_rows) - matched,
+        "dimensions_match_active_camera": dimensions_match,
+        "source_stamps": source_stamps,
+        "pairing_by_source": pairing,
+        "capture_contract": contract,
+        "formal_control_ready": False,
+        "remaining_before_formal_control": [
+            "verify camera distortion domain and camera/body orientation convention",
+            "independently verify metric scale, NED-to-map rotation and height datum",
+            "calibrate measurement noise; evaluate on independent reference/holdout data",
+            "offline A/B, fault injection, shadow-mode timing and operator-controlled validation",
+        ],
+    }
+
+
 def build_report(session: Path) -> dict[str, Any]:
-    telemetry = list(read_jsonl(session / "telemetry.jsonl"))
+    errors = []
+    archive = session / "trajectory.jsonl"
+    telemetry_path = session / "telemetry.jsonl"
+    localization_path = session / "localization.jsonl"
+    telemetry = list(read_jsonl(telemetry_path if telemetry_path.is_file() else archive, errors))
     imu_rows = [r for r in telemetry if r.get("event") == "fused_odometry"]
     imu = summarize_imu(imu_rows)
     sticks = summarize_sticks([r for r in telemetry if r.get("event") == "stick_axes"])
-    loc_rows = list(read_jsonl(session / "localization.jsonl"))
+    loc_events = list(
+        read_jsonl(localization_path if localization_path.is_file() else archive, errors)
+    )
+    loc_rows = [r for r in loc_events if r.get("event") == "pose_result"]
     localization = summarize_localization(loc_rows)
     map_scale = summarize_map_scale(imu_rows, loc_rows)
-    frames = summarize_frames(session)
+    frames = summarize_frames(session, errors)
     tick_profile = summarize_tick_profile(
         [r for r in telemetry if r.get("event") == "ui_tick_profile"]
     )
-    status, notes = verdict(imu, sticks, localization, frames)
+    status, notes = verdict(
+        imu,
+        sticks,
+        localization,
+        frames,
+        auto_recorded=any(r.get("event") == "auto_route_plan" for r in loc_events),
+    )
+    if errors:
+        notes.extend(errors)
+        if status == "USABLE":
+            status = "USABLE WITH GAPS"
     return {
         "session": str(session),
         "imu": imu,
@@ -500,6 +649,8 @@ def build_report(session: Path) -> dict[str, Any]:
         "tick_profile": tick_profile,
         "verdict": status,
         "notes": notes,
+        "integrity_errors": errors,
+        "ekf_capture": summarize_ekf_capture(session, imu_rows, loc_rows, frames),
     }
 
 
@@ -509,6 +660,37 @@ def _number(value: Any, digits: int = 3) -> str:
     if isinstance(value, float):
         return f"{value:.{digits}f}"
     return str(value)
+
+
+def _render_capture(report: dict[str, Any]) -> list[str]:
+    lines: list[str] = []
+    loc = report["localization"]
+    capture = report.get("ekf_capture")
+    if capture:
+        lines += [
+            "",
+            "## EKF 資料準備（不等於正式控制驗收）",
+            f"- 姿態＋遙測可重播：{capture['pose_telemetry_replay_ready']}",
+            f"- 影像＋定位結果可配對：{capture['image_replay_ready']}；"
+            f"已配對 {capture['matched_recorded_frames']} 張",
+            (
+                "- 紀錄包含 EKF 診斷；仍需獨立驗證效果。"
+                if loc["esekf_updates_seen"]
+                else "- 目前未啟用 EKF；沒有 EKF 協方差或創新量並非收集失敗。"
+            ),
+            "- 相機中心作導航位置是操作員指定的近似；不把相機與機身朝向設成相同。",
+            "- 正式控制尚須：尺度／座標與畸變驗證、量測噪聲、獨立參考評估及旁路測試。",
+        ]
+        for name, data in capture["source_stamps"].items():
+            lines.append(
+                f"- {name}：{data['distinct_samples']} 個獨立時間戳，"
+                f"來源更新率 {_number(data['rate_hz'], 2)} Hz"
+            )
+        for name, data in capture["pairing_by_source"].items():
+            lines.append(f"- 影像與 {name} 時間差 p95 {_number(data['abs_offset_p95_s'])} s")
+        for issue in capture["capture_contract"].get("issues", []):
+            lines.append(f"- 標定紀錄問題：{issue}")
+    return lines
 
 
 def render(report: dict[str, Any]) -> str:
@@ -565,6 +747,7 @@ def render(report: dict[str, Any]) -> str:
         writer_error = recorder.get("writer_error") or recorder.get("last_error")
         if writer_error:
             lines.append(f"- 錄製器 writer error={writer_error}")
+    lines += _render_capture(report)
     scale = report.get("map_scale") or {}
     if scale.get("available"):
         lines += [
@@ -615,6 +798,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--session", required=True, help="flight_logs session 目錄")
     parser.add_argument("--out", default="", help="另外寫一份 markdown 到這個路徑")
     parser.add_argument("--json", action="store_true", help="輸出 JSON 而不是 markdown")
+    parser.add_argument("--json-out", type=Path, help="另存可機讀的資料完整性報告")
     return parser.parse_args(argv)
 
 
@@ -630,6 +814,11 @@ def main(argv: list[str] | None = None) -> int:
         else render(report)
     )
     print(text, end="")
+    if args.json_out:
+        args.json_out.parent.mkdir(parents=True, exist_ok=True)
+        args.json_out.write_text(
+            json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+        )
     if args.out:
         out = Path(args.out).expanduser()
         out.parent.mkdir(parents=True, exist_ok=True)

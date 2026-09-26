@@ -2,7 +2,7 @@
 """Single-process desktop flight operator app.
 
 No browser, no localhost server, no network API. The backend class is the single
-place to connect Olympe/localization/control later.
+place to connect ARSDK-NG/localization/control.
 
 *** FLIGHT-CRITICAL CONTROLS — DO NOT CASUALLY EDIT ***
 【之後改這份檔案的人請注意】
@@ -164,6 +164,7 @@ from live_worker_clients import (
     _WorkerResponseDesync as _WorkerResponseDesync,
 )
 from map_point_io import (
+    dense_display_ply,
     read_map_points,
     read_ply_points as read_ply_points,
     read_reference_pose_points as read_reference_pose_points,
@@ -179,7 +180,7 @@ from operator_hud_text import (
     _telemetry_number,
     _telemetry_text,
     format_magnetometer_calibration,
-    format_olympe_telemetry,
+    format_arsdk_telemetry,
     gps_operator_message,
     inventory_block_summary,
     inventory_ui_status,
@@ -259,6 +260,7 @@ from operator_preflight import (
     evaluate_preflight_step,
 )
 from operator_rendering import (
+    draw_magnetometer_axis,
     MapRenderContext,
     build_hud_overlay_data as build_hud_overlay_data,
     classify_localization_health as classify_localization_health,
@@ -309,6 +311,21 @@ def localization_zoom_is_calibrated(
     except (TypeError, ValueError):
         return False
     return math.isfinite(value) and abs(value - calibrated_zoom) <= tolerance
+
+#: Firmware zoom readback is a float; within 1 % of 1.0x counts as wide.
+ZOOM_READBACK_TOLERANCE = 0.01
+
+
+def localization_gate_zoom(commanded: object, readback: object) -> object:
+    """Zoom that decides localization: the camera's own report wins when it
+    shows an uncalibrated level the UI did not command."""
+    if readback is not None and not localization_zoom_is_calibrated(
+        readback, tolerance=ZOOM_READBACK_TOLERANCE
+    ):
+        return readback
+    return commanded
+
+
 
 
 SYSTEM_ROOT = _WS.root
@@ -507,7 +524,7 @@ def resolve_operator_interface(
         raise ValueError("--live cannot be combined with --interface simulated-stream")
     if mode == REAL_FLIGHT_INTERFACE and str(video or "").strip():
         raise ValueError(
-            "real-flight accepts only the ANAFI PDRAW stream; remove --video and "
+            "real-flight accepts only the ANAFI RTSP stream; remove --video and "
             "use the simulated-stream interface for files"
         )
     return mode, mode == REAL_FLIGHT_INTERFACE
@@ -622,6 +639,9 @@ _VIRTUAL_STICK_KEY_AXES = {
 # still, decimated while the operator is dragging or zooming.
 MAP_STATIC_POINTS = _positive_env_int("SFM_MAP_STATIC_POINTS", 250000)
 MAP_INTERACTIVE_POINTS = _positive_env_int("SFM_MAP_INTERACTIVE_POINTS", 60000)
+# The route editor shows the full sparse model (map_dense.ply, 2.44M points on
+# river_site) so objects are recognisable while placing waypoints.
+ROUTE_EDITOR_POINTS = _positive_env_int("SFM_ROUTE_EDITOR_POINTS", 3000000)
 # Planned-route overlay: one PIL ellipse per point costs ~5.8 us, so a long
 # route dominates the per-pose map redraw. The polyline still uses every point;
 ROUTE_DOT_MAX = _positive_env_int("SFM_ROUTE_DOT_MAX", 200)
@@ -631,7 +651,7 @@ ROUTE_DOT_MAX = _positive_env_int("SFM_ROUTE_DOT_MAX", 200)
 # full Enum split deferred to keep this batch narrow.
 #
 # TrackerState now lives in operator_state.py (imported above) so both this
-# module and olympe_live_backend.py can use it without a circular import.
+# module and arsdk_ng_live_backend.py can use it without a circular import.
 
 # format_latency_text, classify_localization_health, build_hud_overlay_data
 # are defined in operator_rendering.py and re-exported above.
@@ -684,6 +704,47 @@ def resolve_localizer_backend(requested: str, bundle: Path) -> str:
     raise ValueError(f"unsupported localizer backend: {requested!r}")
 
 
+def _verify_operator_profile_assets(profile: SiteProfile, parser: argparse.ArgumentParser) -> None:
+    for asset, expected, label in (
+        (profile.map_ply, profile.asset_sha256.map_ply, "map_ply"),
+        (profile.route_json, profile.asset_sha256.route_json, "route_json"),
+        (
+            profile.map_reference_poses,
+            profile.asset_sha256.map_reference_poses,
+            "map_reference_poses",
+        ),
+        # Verified here too: this file decides which way is up for every
+        # commanded body axis, so a swapped one must not start the interface.
+        (profile.map_align, profile.asset_sha256.map_align, "map_align"),
+        (
+            profile.reference_index,
+            profile.asset_sha256.reference_index,
+            "reference_index",
+        ),
+    ):
+        if asset is not None and expected is not None:
+            actual = file_sha256(asset)
+            if actual != expected:
+                parser.error(
+                    f"site profile {label} SHA-256 mismatch: expected {expected}, got {actual}"
+                )
+            _register_session_verified_asset(asset, expected)
+    if _is_mission_snapshot_profile(profile.source):
+        for path_attr, digest_attr in (
+            ("localization_bundle", "localization_bundle"),
+            ("map_ply", "map_ply"),
+            ("route_json", "route_json"),
+            ("map_reference_poses", "map_reference_poses"),
+            ("map_align", "map_align"),
+            ("reference_index", "reference_index"),
+            ("track_landmarks", "track_landmarks"),
+        ):
+            asset_val = getattr(profile, path_attr, None)
+            digest_val = getattr(profile.asset_sha256, digest_attr, None)
+            if asset_val is not None and digest_val is not None:
+                _register_session_verified_asset(asset_val, digest_val)
+
+
 def resolve_operator_site_assets(args, parser: argparse.ArgumentParser) -> SiteProfile | None:
     """Resolve one profile, or preserve the legacy per-asset CLI interface."""
     profile_arg = str(getattr(args, "site_profile", "") or "").strip()
@@ -723,44 +784,7 @@ def resolve_operator_site_assets(args, parser: argparse.ArgumentParser) -> SiteP
             profile = load_site_profile(profile_arg)
         except ValueError as exc:
             parser.error(str(exc))
-        for asset, expected, label in (
-            (profile.map_ply, profile.asset_sha256.map_ply, "map_ply"),
-            (profile.route_json, profile.asset_sha256.route_json, "route_json"),
-            (
-                profile.map_reference_poses,
-                profile.asset_sha256.map_reference_poses,
-                "map_reference_poses",
-            ),
-            # Verified here too: this file decides which way is up for every
-            # commanded body axis, so a swapped one must not start the interface.
-            (profile.map_align, profile.asset_sha256.map_align, "map_align"),
-            (
-                profile.reference_index,
-                profile.asset_sha256.reference_index,
-                "reference_index",
-            ),
-        ):
-            if asset is not None and expected is not None:
-                actual = file_sha256(asset)
-                if actual != expected:
-                    parser.error(
-                        f"site profile {label} SHA-256 mismatch: expected {expected}, got {actual}"
-                    )
-                _register_session_verified_asset(asset, expected)
-        if _is_mission_snapshot_profile(profile.source):
-            for path_attr, digest_attr in (
-                ("localization_bundle", "localization_bundle"),
-                ("map_ply", "map_ply"),
-                ("route_json", "route_json"),
-                ("map_reference_poses", "map_reference_poses"),
-                ("map_align", "map_align"),
-                ("reference_index", "reference_index"),
-                ("track_landmarks", "track_landmarks"),
-            ):
-                asset_val = getattr(profile, path_attr, None)
-                digest_val = getattr(profile.asset_sha256, digest_attr, None)
-                if asset_val is not None and digest_val is not None:
-                    _register_session_verified_asset(asset_val, digest_val)
+        _verify_operator_profile_assets(profile, parser)
         args.site_profile = str(profile.source)
         args.map_ply = str(profile.map_ply)
         args.route_json = str(profile.route_json or "")
@@ -922,7 +946,7 @@ DEFAULT_MAP_ZOOM = 3.2
 
 
 class DroneBackend:
-    """Stub backend. Replace methods here with real Olympe/localizer calls."""
+    """Simulation-only backend; live operation uses ArsdkNgLiveBackend."""
 
     mode = InterfaceMode.SIMULATED_STREAM
     is_live = False
@@ -1496,7 +1520,7 @@ def _desired_firmware_limit_values(backend: object) -> tuple[object, object, obj
 
 def _initial_drone_magnetometer_text(*, live: bool) -> str:
     if live:
-        return "飛機羅盤：等待 Olympe 韌體狀態讀回"
+        return "飛機羅盤：等待 ARSDK-NG 韌體狀態讀回"
     return "飛機羅盤：SIM 不提供韌體校正"
 
 
@@ -1528,9 +1552,10 @@ class OperatorApp(tk.Tk):
         self.backend = backend
         self.session_logs = session_logs
         # First session of the process; _install_site_runtime replaces this one
-        # when the operator switches site. Off unless SFM_IMU_FLIGHT_TEST=1.
+        # when the operator switches site. Real-flight recording is automatic.
         self.imu_flight_test = create_imu_flight_test_recorder(
-            getattr(session_logs, "directory", None), note=self.write_log
+            getattr(session_logs, "directory", None), note=self.write_log,
+            mode=getattr(session_logs, "mode", None),
         )
         self._site_runtime = site_runtime
         self._prepare_site_runtime = prepare_site_runtime
@@ -1585,7 +1610,7 @@ class OperatorApp(tk.Tk):
             LocalTargetProvider(_WS.site_packages),
             current_profile=self.site_profile_path,
         )
-        # Slow Olympe expectations must never block Tk. Land is intentionally
+        # Slow ARSDK-NG expectations must never block Tk. Land is intentionally
         # allowed to run while a takeoff expectation is pending.
         self._flight_results: queue.Queue[tuple[str, object | None, str | None]] = queue.Queue(
             maxsize=FLIGHT_RESULT_QUEUE_MAX
@@ -1827,7 +1852,7 @@ class OperatorApp(tk.Tk):
         self._autonomy_pose_error: str | None = None
         self._sync_autonomy_profile_approval()
         self.title(
-            "SfM Flight Operator - LIVE Olympe"
+            "SfM Flight Operator - LIVE ARSDK-NG"
             if live
             else "SfM Flight Operator - Parrot ANAFI profile (SIM)"
         )
@@ -3089,9 +3114,9 @@ class OperatorApp(tk.Tk):
         self._build_auto_status_panel(events)
         # Read-only engineering telemetry is composed into the bottom-left video
         # HUD. These variables keep the existing telemetry update paths intact.
-        self.olympe_state_var = DedupStringVar(value="RTH ?/? | GPS ?")
-        self.olympe_attitude_var = DedupStringVar(value="飛控融合姿態 - | 三軸速度 -")
-        self.olympe_altitude_var = DedupStringVar(value="飛控高度 - | AGL - | 連接品質 -")
+        self.flight_state_var = DedupStringVar(value="RTH ?/? | GPS ?")
+        self.flight_attitude_var = DedupStringVar(value="飛控融合姿態 - | 三軸速度 -")
+        self.flight_altitude_var = DedupStringVar(value="飛控高度 - | AGL - | 連接品質 -")
 
         self.site_assets_panel = SiteAssetsPanel(
             site_tab,
@@ -3884,7 +3909,7 @@ class OperatorApp(tk.Tk):
         return True
 
     def _start_simulated_route_test(self, snapshot: MissionRouteSnapshot) -> bool:
-        """Run the production route controller without hardware or Olympe."""
+        """Run the production route controller without hardware or ARSDK-NG."""
         if self._integrated_auto_active():
             self.write_log("模擬航線已在執行中；略過重複啟動")
             return False
@@ -3924,7 +3949,7 @@ class OperatorApp(tk.Tk):
             self.write_log("模擬航線已拒絕：控制器執行緒無法啟動")
             return False
         self.write_log(
-            "模擬航線已開始：使用正式 RouteAutoController；不連真機、不送 Olympe 指令"
+            "模擬航線已開始：使用正式 RouteAutoController；不連真機、不送 ARSDK-NG 指令"
         )
         return True
 
@@ -3978,6 +4003,9 @@ class OperatorApp(tk.Tk):
         self.write_log(f"AUTO {event.detail}")
 
     def _log_integrated_auto_waypoint_arrived(self, event) -> None:
+        self.write_log(f"AUTO {event.detail}")
+
+    def _log_integrated_auto_notice(self, event) -> None:
         self.write_log(f"AUTO {event.detail}")
 
     def _log_integrated_auto_landing_unresolved(self, event) -> None:
@@ -4056,6 +4084,8 @@ class OperatorApp(tk.Tk):
             "pose_jump_paused": self._log_integrated_auto_pose_jump_paused,
             "route_started": self._log_integrated_auto_route_started,
             "waypoint_arrived": self._log_integrated_auto_waypoint_arrived,
+            "route_error_summary": self._log_integrated_auto_notice,
+            "waypoint_action_timeout": self._log_integrated_auto_notice,
             "leg_stage": self._log_integrated_auto_leg_stage,
             "landing_unresolved": self._log_integrated_auto_landing_unresolved,
             "auto_failed": self._log_integrated_auto_failed,
@@ -4542,7 +4572,7 @@ class OperatorApp(tk.Tk):
         self._get_command_coordinator().publish(item)
 
     def _dispatch_live_command(self, command: str, payload: dict) -> bool:
-        """Run a potentially blocking Olympe expectation off the Tk thread."""
+        """Run a potentially blocking ARSDK-NG expectation off the Tk thread."""
         return self._get_command_coordinator().dispatch(command, payload)
 
     def _backend_command(self, command: str, payload: dict | None = None):
@@ -5061,8 +5091,7 @@ class OperatorApp(tk.Tk):
         self._loc_metrics_f = None
         self._loc_metrics_path = None
         # The recorder writes into the outgoing session directory, so it is
-        # finalized before the new session replaces it. Off unless
-        # SFM_IMU_FLIGHT_TEST=1, in which case both calls are no-ops.
+        # finalized before the new session replaces it.
         close_imu_flight_test_recorder(self.__dict__.get("imu_flight_test"))
         self.imu_flight_test = None
 
@@ -5072,7 +5101,8 @@ class OperatorApp(tk.Tk):
         self.backend = runtime.backend
         self.session_logs = runtime.session_logs
         self.imu_flight_test = create_imu_flight_test_recorder(
-            getattr(self.session_logs, "directory", None), note=self.write_log
+            getattr(self.session_logs, "directory", None), note=self.write_log,
+            mode=getattr(self.session_logs, "mode", None),
         )
         self.video_stream = runtime.video_stream
         self.localizer = runtime.localizer
@@ -5216,7 +5246,7 @@ class OperatorApp(tk.Tk):
         self._sync_autonomy_profile_approval()
         live = bool(getattr(self.backend, "is_live", False))
         self.title(
-            "SfM Flight Operator - LIVE Olympe"
+            "SfM Flight Operator - LIVE ARSDK-NG"
             if live
             else "SfM Flight Operator - Parrot ANAFI profile (SIM)"
         )
@@ -5303,6 +5333,9 @@ class OperatorApp(tk.Tk):
         return profile, bound_profile, map_source, route_path
 
     def _read_route_editor_points(self, profile: SiteProfile | None) -> np.ndarray:
+        dense = self._route_editor_dense_ply(profile)
+        if dense is not None:
+            return read_map_points(dense, ROUTE_EDITOR_POINTS)
         if (
             profile is not None
             and self.site_profile_path == profile.source
@@ -5405,7 +5438,11 @@ class OperatorApp(tk.Tk):
     def load_route_editor_ply(self, source: Path) -> tuple[SiteProfile | None, np.ndarray, str]:
         """Load any PLY, binding it only when one managed site digest matches."""
         profile = match_managed_site_profile_for_map(source, _WS.site_packages)
-        points = read_map_points(source, MAP_STATIC_POINTS)
+        dense = self._route_editor_dense_ply(profile)
+        points = read_map_points(
+            source if dense is None else dense,
+            MAP_STATIC_POINTS if dense is None else ROUTE_EDITOR_POINTS,
+        )
         if profile is None:
             return (
                 None,
@@ -5413,10 +5450,22 @@ class OperatorApp(tk.Tk):
                 "PLY 已載入；尚未匹配已匯入場域，只能另存預覽航線",
             )
         self.site_asset_actions.current_profile = profile.source
+        detail = "" if dense is None else f"，顯示完整點雲 {len(points):,} 點"
         return (
             profile,
             points,
-            f"PLY 已匹配場域 {profile.display_name}；可儲存並匯入正式航線",
+            f"PLY 已匹配場域 {profile.display_name}{detail}；可儲存並匯入正式航線",
+        )
+
+    @staticmethod
+    def _route_editor_dense_ply(profile: SiteProfile | None) -> Path | None:
+        """map_dense.ply bound to this profile's frame and map digest, if present."""
+        if profile is None or profile.coordinate_frame is None:
+            return None
+        return dense_display_ply(
+            profile.map_ply,
+            coordinate_frame_id=profile.coordinate_frame.id,
+            map_ply_sha256=profile.asset_sha256.map_ply,
         )
 
     def _active_site_map_frame(self):
@@ -6051,95 +6100,7 @@ class OperatorApp(tk.Tk):
             widget.state(["!disabled"] if enabled else ["disabled"])
 
     def _draw_magnetometer_axis(self, guide: tuple[str, str, str] | None) -> None:
-        """Draw the rotation the firmware is currently asking for.
-
-        ``guide`` is magnetometer_axis_guide()'s result, or None when no axis is
-        being requested -- in which case the canvas is cleared rather than left
-        showing a stale rotation the operator should not perform. Kept deliberately
-        short (52 px) so the calibration buttons below it stay reachable at the
-        minimum supported window size.
-        """
-        canvas = getattr(self, "magnetometer_axis_canvas", None)
-        if canvas is None:
-            return
-        canvas.delete("all")
-        if guide is None:
-            canvas.create_text(
-                8, 26, anchor="w", text="（目前沒有要求校正軸）", fill="#655b4d", font=("Sans", 10)
-            )
-            return
-        label, view, instruction = guide
-        body, accent, arrow = "#b6a891", "#302c26", "#245b9b"
-        cx, cy = 30, 26
-
-        if view == "top":  # X/roll: seen from above, roll about nose-tail
-            canvas.create_oval(cx - 20, cy - 7, cx + 20, cy + 7, fill=body, outline=accent)
-            canvas.create_polygon(
-                cx + 20, cy, cx + 28, cy - 4, cx + 28, cy + 4, fill=accent, outline=accent
-            )
-            canvas.create_line(cx - 27, cy, cx + 30, cy, fill=arrow, dash=(3, 2))
-            canvas.create_arc(
-                cx - 12,
-                cy - 20,
-                cx + 12,
-                cy + 20,
-                start=20,
-                extent=300,
-                style="arc",
-                outline=arrow,
-                width=2,
-            )
-            canvas.create_polygon(
-                cx + 11, cy - 16, cx + 17, cy - 7, cx + 5, cy - 8, fill=arrow, outline=arrow
-            )
-        elif view == "side":  # Y/pitch: seen from the left, nose over the top
-            canvas.create_oval(cx - 21, cy - 6, cx + 21, cy + 6, fill=body, outline=accent)
-            canvas.create_polygon(
-                cx + 21, cy, cx + 29, cy - 4, cx + 29, cy + 4, fill=accent, outline=accent
-            )
-            canvas.create_line(cx, cy - 22, cx, cy + 22, fill=arrow, dash=(3, 2))
-            canvas.create_arc(
-                cx - 24,
-                cy - 19,
-                cx + 24,
-                cy + 19,
-                start=200,
-                extent=140,
-                style="arc",
-                outline=arrow,
-                width=2,
-            )
-            canvas.create_polygon(
-                cx + 20, cy - 9, cx + 27, cy - 1, cx + 15, cy - 1, fill=arrow, outline=arrow
-            )
-        else:  # Z/yaw: seen from above, spin flat
-            canvas.create_oval(cx - 14, cy - 14, cx + 14, cy + 14, fill=body, outline=accent)
-            canvas.create_polygon(
-                cx, cy - 14, cx - 5, cy - 22, cx + 5, cy - 22, fill=accent, outline=accent
-            )
-            canvas.create_arc(
-                cx - 22,
-                cy - 22,
-                cx + 22,
-                cy + 22,
-                start=45,
-                extent=250,
-                style="arc",
-                outline=arrow,
-                width=2,
-            )
-            canvas.create_polygon(
-                cx + 14, cy - 13, cx + 22, cy - 7, cx + 12, cy - 4, fill=arrow, outline=arrow
-            )
-
-        canvas.create_text(
-            66, 2, anchor="nw", text=f"現在請轉：{label}", fill=arrow,
-            font=("Sans", 11, "bold"), width=174,
-        )
-        canvas.create_text(
-            66, 44, anchor="nw", text=f"{instruction}　轉滿三圈", fill="#574a38",
-            font=("Sans", 10), width=174,
-        )
+        draw_magnetometer_axis(getattr(self, "magnetometer_axis_canvas", None), guide)
 
     def update_magnetometer_metrics(self, st: DroneState) -> None:
         if not hasattr(self, "drone_magnetometer_var"):
@@ -6189,7 +6150,7 @@ class OperatorApp(tk.Tk):
             and not drone_active
             and getattr(st, "drone_magnetometer_failed", None) is not True
         )
-        # Must mirror olympe_live_backend._magnetometer_control_error(): an
+        # Must mirror arsdk_ng_live_backend._magnetometer_control_error(): an
         # UNCALIBRATED controller compass no longer blocks takeoff (it only feeds
         # pilot-referenced features this system never uses). A calibration actively
         # RUNNING still does -- the controller is being rotated by hand.
@@ -6207,12 +6168,12 @@ class OperatorApp(tk.Tk):
         # backlog age / fps / GPS / link are in the video HUD; only the two
         # figures nothing else reports stay here.
         self.anafi_stream_var.set(f"ground speed {speed_txt} | PCMD→telemetry poll {ctl_poll_txt}")
-        telemetry = format_olympe_telemetry(st)
-        if hasattr(self, "olympe_state_var"):
+        telemetry = format_arsdk_telemetry(st)
+        if hasattr(self, "flight_state_var"):
             gps_summary = " | ".join(telemetry["gps"].split(" | ")[:2])
-            self.olympe_state_var.set(telemetry["rth"] + " | " + gps_summary)
-            self.olympe_attitude_var.set(telemetry["attitude"] + " | " + telemetry["velocity"])
-            self.olympe_altitude_var.set(
+            self.flight_state_var.set(telemetry["rth"] + " | " + gps_summary)
+            self.flight_attitude_var.set(telemetry["attitude"] + " | " + telemetry["velocity"])
+            self.flight_altitude_var.set(
                 telemetry["altitude_agl"] + " | " + telemetry["link_quality"]
             )
             auto_pcmd_cap_pct = max(
@@ -6820,9 +6781,9 @@ class OperatorApp(tk.Tk):
             }
             telemetry = {
                 "current_auto_speed": _val("current_auto_speed_var", "AUTO PCMD -"),
-                "olympe_state": _val("olympe_state_var", "RTH ?/? | GPS ?"),
-                "olympe_altitude": _val("olympe_altitude_var", "飛控高度 - | AGL - | 連接品質 -"),
-                "olympe_attitude": _val("olympe_attitude_var", "飛控融合姿態 - | 三軸速度 -"),
+                "flight_state": _val("flight_state_var", "RTH ?/? | GPS ?"),
+                "flight_altitude": _val("flight_altitude_var", "飛控高度 - | AGL - | 連接品質 -"),
+                "flight_attitude": _val("flight_attitude_var", "飛控融合姿態 - | 三軸速度 -"),
             }
             data = build_hud_overlay_data(None, loc, telemetry)
             lines = data.get("diagnostic_lines")
@@ -6831,7 +6792,7 @@ class OperatorApp(tk.Tk):
                 return tuple(str(x) for x in lines)
         except (OSError, ValueError, AttributeError, TypeError, RuntimeError):  # Tier3: fallback best-effort — narrow, keep pass
             pass
-        attitude_and_velocity = _val("olympe_attitude_var", "飛控融合姿態 - | 三軸速度 -")
+        attitude_and_velocity = _val("flight_attitude_var", "飛控融合姿態 - | 三軸速度 -")
         attitude, separator, velocity = attitude_and_velocity.partition(" | 三軸速度 ")
         return (
             " | ".join(
@@ -6842,8 +6803,8 @@ class OperatorApp(tk.Tk):
                 )
             ),
             _val("loc_latency_var", "wall_ms - | core - | e2e -"),
-            _val("olympe_state_var", "RTH ?/? | GPS ?"),
-            _val("olympe_altitude_var", "飛控高度 - | AGL - | 連接品質 -"),
+            _val("flight_state_var", "RTH ?/? | GPS ?"),
+            _val("flight_altitude_var", "飛控高度 - | AGL - | 連接品質 -"),
             attitude,
             f"三軸速度 {velocity}" if separator else "三軸速度 -",
         )
@@ -7149,7 +7110,7 @@ class OperatorApp(tk.Tk):
             return
         self.last_submitted_index = self.video_display_index
         self.live_pending_frame_name = frame_name
-        # IMU flight test only: the offline A/B then has a paired image and
+        # The offline A/B has a paired submitted image and
         # telemetry stream instead of an SD recording on another clock.
         capture_imu_flight_test_frame(
             self.__dict__.get("imu_flight_test"),
@@ -7170,7 +7131,10 @@ class OperatorApp(tk.Tk):
             return
         if self.video_display_index < 0:
             return
-        zoom = getattr(getattr(getattr(self, "backend", None), "state", None), "zoom", 1.0)
+        state = getattr(getattr(self, "backend", None), "state", None)
+        zoom = localization_gate_zoom(
+            getattr(state, "zoom", 1.0), getattr(state, "camera_zoom_level", None)
+        )
         if not OperatorApp._localization_zoom_ready(self, zoom):
             return
         boot_retry, lost_retry, hold_retry = OperatorApp._localization_hold_state(self)

@@ -314,3 +314,84 @@ def test_finish_handler_preserves_last_status_before_clearing_coordinator():
     OperatorApp._finish_integrated_auto_event(app, SimpleNamespace(detail="complete"))
     assert app._integrated_autonomy is None
     assert app._last_auto_status == status
+
+
+def test_route_error_counts_only_after_join_and_is_reported_at_the_end(tmp_path) -> None:
+    logged = []
+    autonomy = _basic_autonomy(tmp_path)
+    autonomy.backend.session_logs = SimpleNamespace(
+        localization=lambda event, **fields: logged.append((event, fields)),
+    )
+    autonomy.phase = "ROUTE"
+    autonomy.controller.target_index = 0
+    # Takeoff-to-WP1 join: far from the route, never counted.
+    autonomy._log_route_tick(_tick_record(target=0, distance=0.90))
+    assert autonomy.auto_leg_status()["route_error"] is None
+    autonomy.controller.target_index = 1
+    for distance in (0.10, 0.30, 0.20):
+        record = _tick_record(target=1, distance=distance)
+        # Offset of `distance` split 0.6/0.8 between horizontal (x) and up (-y).
+        record["route_nearest_u"] = [0.4 - 0.6 * distance, 0.8 * distance, -1.6]
+        autonomy._log_route_tick(record)
+
+    status = autonomy.auto_leg_status()
+    error = status["route_error"]
+    assert error["samples"] == 3
+    assert error["mean_u"] == 0.2 and error["max_u"] == 0.3 and error["current_u"] == 0.2
+    assert error["horizontal_max_u"] == 0.18
+    assert "航線誤差平均0.200u／最大0.300u" in status["line"]
+
+    autonomy.drain_events()
+    autonomy._report_route_error()
+    summary = [event for event in autonomy.drain_events() if event.kind == "route_error_summary"]
+    assert len(summary) == 1 and "平均 0.200u" in summary[0].detail
+    assert logged[-1][0] == "auto_route_error_summary"
+    assert logged[-1][1]["p95_u"] == 0.29
+
+
+def _hold_at_waypoint(tmp_path, *, acting):
+    clock = [100.0]
+    autonomy = _basic_autonomy(tmp_path, now=lambda: clock[0])
+    autonomy.phase = "ROUTE"
+    autonomy.controller.target_index = 1
+    for step in range(400):  # 40 s parked at the waypoint
+        clock[0] = 100.0 + 0.1 * step
+        record = _tick_record(target=1, phase="waypoint_action_hold")
+        record["pose_stamp"] = clock[0]
+        if acting:
+            record["command_action"] = "WAYPOINT_ACTION"
+            record["waypoint_action"] = {"type": "yaw", "degrees": 30.0, "step": 1, "count": 2}
+        autonomy._log_route_tick(record)
+    return autonomy
+
+
+def test_waypoint_action_hold_is_not_a_stall_and_shows_its_stage(tmp_path) -> None:
+    acting = _hold_at_waypoint(tmp_path, acting=True)
+    assert not acting._auto_failed
+    assert "路徑點2航點動作：右轉30°（1/2）" in acting.auto_leg_status()["line"]
+    # The same 40 s without an action is still a stall.
+    assert _hold_at_waypoint(tmp_path, acting=False)._auto_failed
+
+
+def test_each_waypoint_action_is_announced(tmp_path) -> None:
+    autonomy = _basic_autonomy(tmp_path)
+    autonomy.phase = "ROUTE"
+    autonomy.controller.target_index = 1
+    for step, action in enumerate(({"type": "yaw", "degrees": -45.0}, {"type": "hover", "seconds": 3.0}), 1):
+        record = _tick_record(target=1)
+        record["waypoint_action"] = {**action, "step": step, "count": 2}
+        autonomy._log_route_tick(record)
+        autonomy._log_route_tick(record)
+    stages = [e.detail for e in autonomy.drain_events() if e.kind == "leg_stage"]
+    assert stages[-2:] == ["路徑點2航點動作：左轉45°（1/2）", "路徑點2航點動作：懸停3秒（2/2）"]
+
+
+def test_waypoint_action_timeout_is_announced_once(tmp_path) -> None:
+    autonomy = _basic_autonomy(tmp_path)
+    autonomy.phase = "ROUTE"
+    autonomy.controller.target_index = 1
+    autonomy.controller.action_timeouts.append(1)
+    autonomy._log_route_tick(_tick_record(target=1))
+    autonomy._log_route_tick(_tick_record(target=1))
+    notices = [e for e in autonomy.drain_events() if e.kind == "waypoint_action_timeout"]
+    assert len(notices) == 1 and notices[0].detail.startswith("路徑點2轉向動作逾時")

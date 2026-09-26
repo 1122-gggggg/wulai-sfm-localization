@@ -128,23 +128,20 @@ def test_lateral_drift_changes_guidance_but_not_the_segment_heading():
         assert abs(roll) > abs(pitch)
 
 
-def test_route_rejoin_holds_yaw_even_when_the_nose_is_not_aligned():
+def test_route_rejoin_finishes_new_leg_alignment_before_recovery():
     control = controller([(0, 0, 0), (10, 0, 0)])
     control.step(rpf.Pose(0, 0, 0, 0, stamp=0), now=0)
     pose = rpf.Pose(3, 0, 0.5, math.pi / 2, stamp=0.1)
     command = control.step(pose, now=0.1)
     gate = rpf.YawAlignedPcmdController(control.cfg)
     roll, pitch, yaw, gaz = gate.update(command, pose, 0.1, target_key=1)
-    assert gate.phase == "route_rejoin"
-    assert roll or pitch
-    assert yaw == 0 and gaz == 0
+    assert gate.phase == "turn"
+    assert (roll, pitch) == (0, 0)
+    assert yaw != 0 and gaz == 0
 
 
-def test_turn_phase_still_corrects_toward_the_segment():
-    # 2026-09-18 real flight: a FOLLOW leg sat in turn with yaw ~45 deg off
-    # while wind walked it 0.08 -> 0.23 u off route. Turn keeps yaw priority
-    # and height lock, but must not hold position: correction toward the
-    # segment stays on, along-leg progress stays off.
+def test_turn_phase_corrects_drift_from_the_turn_start():
+    # Finish the turn at its starting position, then recover the segment.
     cfg = rpf.ControlConfig(inspect_waypoints=())
     gate = rpf.YawAlignedPcmdController(cfg)
     goal = np.array([10.0, 0.0, 0.0])
@@ -159,13 +156,15 @@ def test_turn_phase_still_corrects_toward_the_segment():
     roll, pitch, yaw, gaz = gate.update(command, pose, 0.1, target_key=1)
     assert gate.phase == "turn"
     assert yaw != 0 and gaz == 0
+    assert (roll, pitch) == (0, 0)
+    moved = replace(pose, z=.6, stamp=.15)
+    roll, pitch, yaw, gaz = gate.update(command, moved, .15, target_key=1,
+                                       body_velocity=(0., 0., .15))
     assert roll or pitch
+    assert yaw != 0 and gaz == 0
 
 
-def test_turn_phase_crawls_along_the_leg_while_correcting():
-    # On-segment with the nose off: the turn still advances toward the
-    # waypoint instead of parking (2026-09-18: 25% of flight ticks sat in
-    # turn at zero progress). Height stays locked.
+def test_turn_phase_does_not_crawl_backward_before_alignment():
     cfg = rpf.ControlConfig(inspect_waypoints=())
     gate = rpf.YawAlignedPcmdController(cfg)
     goal = np.array([10.0, 0.0, 0.0])
@@ -180,7 +179,7 @@ def test_turn_phase_crawls_along_the_leg_while_correcting():
     roll, pitch, yaw, gaz = gate.update(command, pose, 0.1, target_key=1)
     assert gate.phase == "turn"
     assert yaw != 0 and gaz == 0
-    assert roll or pitch
+    assert (roll, pitch) == (0, 0)
 
 
 def test_route_rejoin_has_a_separate_return_to_follow_boundary():
@@ -468,9 +467,9 @@ def test_vertical_guard_needs_a_height_gap_and_an_altitude():
     assert blind.last_check is None
 
 
-def test_vertical_guard_judges_each_target_afresh():
+def test_vertical_guard_retains_failed_height_across_targets():
     guard = rpf.VerticalConsistencyGuard(rpf.LEGACY_MAP_FRAME)
     climb = [(0.5 + 0.1 * k, 0.20) for k in range(1, 16)]
     assert any(_feed_guard(guard, _HOLD + climb, target=0))
-    assert not any(_feed_guard(guard, [(2.0, 0.2)] * 10, target=1))
-    assert guard.waived == {0}
+    assert any(_feed_guard(guard, [(2.0, 0.2)] * 10, target=1))
+    assert guard.waived == {0, 1}

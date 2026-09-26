@@ -9,6 +9,91 @@ from typing import Any
 import numpy as np
 
 from localization_contract import InvalidLocalizationResult, LocalizationResult
+from operator_localization_config import normalize_camera_axes
+
+
+#: Largest camera pitch/roll disagreement with the firmware gimbal before a fix
+#: is treated as a gross PnP outlier.
+CAMERA_ATTITUDE_MISMATCH_DEG = 10.0
+#: The gimbal sample riding with a frame must be this close to its capture time.
+CAMERA_ATTITUDE_MAX_GIMBAL_SKEW_S = 1.0
+
+
+def camera_attitude_errors_deg(
+    camera_axes_world: object,
+    map_up: object,
+    gimbal_pitch_deg: object,
+    gimbal_roll_deg: object,
+) -> tuple[float, float] | None:
+    """Localized camera pitch/roll vs the gimbal's absolute attitude, degrees.
+
+    Pitch is signed (below the horizon is negative, as the gimbal reports it);
+    roll compares magnitudes because the gimbal roll sign is not pinned.
+    """
+    axes = normalize_camera_axes(camera_axes_world)
+    if axes is None:
+        return None
+    try:
+        up = np.asarray(map_up, dtype=float)
+        pitch_ref = float(gimbal_pitch_deg)
+        roll_ref = float(gimbal_roll_deg)
+    except (TypeError, ValueError):
+        return None
+    if (up.shape != (3,) or not np.isfinite(up).all()
+            or not math.isfinite(pitch_ref) or not math.isfinite(roll_ref)):
+        return None
+    norm = float(np.linalg.norm(up))
+    if norm < 1e-6:
+        return None
+    up = up / norm
+    camera_pitch = math.degrees(math.asin(float(np.clip(axes[2] @ up, -1.0, 1.0))))
+    camera_roll = math.degrees(math.asin(float(np.clip(axes[0] @ up, -1.0, 1.0))))
+    return abs(camera_pitch - pitch_ref), abs(abs(camera_roll) - abs(roll_ref))
+
+
+def reject_camera_attitude_outlier(
+    result: Any,
+    xyz: np.ndarray | None,
+    *,
+    map_up: object,
+    map_up_measured: bool,
+) -> tuple[Any, np.ndarray | None, bool]:
+    """Downgrade a fix whose camera tilt contradicts the gimbal readback.
+
+    Missing gravity, gimbal event data, or camera axes skip the check.
+    """
+    if xyz is None or not map_up_measured or not result.get("success"):
+        return result, xyz, False
+    if result.get("gimbal_stamp_source") != "event":
+        return result, xyz, False
+    capture_s = localization_pose_timestamp(result)
+    try:
+        gimbal_s = int(result.get("gimbal_mono_ns")) * 1e-9
+    except (TypeError, ValueError, OverflowError):
+        return result, xyz, False
+    if capture_s is None or abs(capture_s - gimbal_s) > CAMERA_ATTITUDE_MAX_GIMBAL_SKEW_S:
+        return result, xyz, False
+    errors = camera_attitude_errors_deg(
+        result.get("camera_axes_world"), map_up,
+        result.get("gimbal_pitch_deg"), result.get("gimbal_roll_deg"),
+    )
+    if errors is None:
+        return result, xyz, False
+    pitch_error, roll_error = errors
+    result["camera_pitch_error_deg"] = round(pitch_error, 2)
+    result["camera_roll_error_deg"] = round(roll_error, 2)
+    if max(pitch_error, roll_error) <= CAMERA_ATTITUDE_MISMATCH_DEG:
+        return result, xyz, False
+    payload = result.to_payload() if isinstance(result, LocalizationResult) else dict(result)
+    payload["success"] = False
+    payload["validity"] = False
+    payload["error"] = (
+        f"camera attitude mismatch: pitch error {pitch_error:.1f} deg, "
+        f"roll error {roll_error:.1f} deg exceeds {CAMERA_ATTITUDE_MISMATCH_DEG:.0f} deg"
+    )
+    return payload, None, True
+
+
 
 def _stabilized_yaw(
     raw_pose: dict, yaw_update: object, stamp: float

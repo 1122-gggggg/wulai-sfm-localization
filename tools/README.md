@@ -27,8 +27,11 @@
 | 檔案 | 用途 |
 |---|---|
 | `system_validation.py` | 編排主系統與 `parrot_stimulate` 的完整純地面驗證 |
+| `verify_wind_control.py` | 正式控制器的持續漂移、變風向、陣風及延遲／掉幀矩陣；輸出真值指標與逐週期紀錄，見 [抗風驗證](../定位演算法/flight_control/WIND_CONTROL.md) |
+| `identify_pcmd_response.py` | 由場次 `trajectory.jsonl` 的已下發 PCMD 與融合 NED 速度辨識延遲一階響應，並重播殘餘漂移觀測器，見 [抗風驗證](../定位演算法/flight_control/WIND_CONTROL.md) |
 | `workspace_audit.py` | 唯讀檢查目錄、必要檔案、symlink、output 命名與容量 |
 | `check_maintainability.py` | 以分區 C901 預算阻止複雜度熱點數量或最壞值回升 |
+| `build_dense_display_ply.py` | 由 release 的 `model/points3D.bin` 產生航線編輯器用的完整點雲 `map/map_dense.ply`，綁定座標系與 `map.ply` SHA-256 |
 | `simulator_preflight.py` | 模擬介面啟動前檢查 Python、CUDA、模型、場域資產與影片 |
 | `offline_wheelhouse.py` | 建立／驗證與三份 lockfile 及每個 wheel SHA-256 綁定的離線安裝庫 |
 | `install_runtime.sh` | 用 hash lock 建立乾淨 CPython 3.10 venv；`--offline` 強制 `--no-index` |
@@ -139,7 +142,7 @@ python tools/security_dependency_gate.py
 ```
 
 `mypy` 只對 `pyproject.toml` 的明確 typed boundary 清單設 fail gate，並不宣稱
-整個 Tk/Olympe/Torch 應用程式已完成型別化。安全 gate 的 vulnerability exception 在
+整個 Tk/ARSDK-NG/Torch 應用程式已完成型別化。安全 gate 的 vulnerability exception 在
 `pyproject.toml` 以 package、advisory ID、理由和 ISO 到期日保存；到期或未列出的
 漏洞都會 fail。pip-audit 的 `skip_reason` 不能以一般 vulnerability exception
 略過，必須在 `[[tool.security_dependency_gate.skip_exceptions]]` 以精確的 package、
@@ -148,3 +151,12 @@ version、`skip_reason`、理由和到期日列出。版本、原因改變或例
 `outputs/security/` 產生 `pip-audit.json` 和 `sbom.cyclonedx.json`；非 PyPI 的
 CUDA wheel 即使被 pip-audit skip，也會以 `audited=false` 與原始 `skip_reason`
 保留在 CycloneDX JSON SBOM 中。
+
+## 系統優化的離線工具（2026-09-22）
+
+- `audit_camera_calibration.py --site <site.json> --out <audit.json>`：檢查內參、畸變與來源收據，量化保留原 K 的校正位移。不能取代尺度量測或實飛驗收。
+- `report_relocalization.py --capture <capture.json> --out <report.json>`：按獨立重定位工作統計 p50/p95/p99、缺失階段與最慢案例；不是按重複 UI 記錄計數。
+- `replay_telemetry_ekf.py --session <session> --out <directory>`：用前 40% 時間校準水平尺度／方向，後 60% 比較純視覺與速度融合 ESKF；每五個強觀測保留一個不送入濾波器。需要包含地圖軸的 route plan、相機軸、來源時間與速度。資料不足時報告原因，不產生假校準。
+
+上述工具只讀資料與寫入報告，不載入 ARSDK-NG native libraries 或發送控制命令。詳細結果與限制見
+[`system_optimization_20260922.md`](../docs/system_optimization_20260922.md)。

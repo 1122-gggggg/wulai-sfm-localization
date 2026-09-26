@@ -5,7 +5,81 @@ These helpers log observations; they never issue aircraft commands.
 
 from __future__ import annotations
 
+from arsdk_ng import arsdk_message
+
 import time
+import math
+
+_LIST_FLAG_EMPTY = 1 << 2
+_LIST_FLAG_REMOVE = 1 << 3
+
+
+def control_telemetry_history(backend):
+    """Return yaw/stamp and horizontal NED/stamp events on the receipt clock.
+
+    This bypasses the UI polling interval, not the aircraft/network delay.
+    Consumers must still enforce freshness and reject duplicate samples.
+    """
+    read = getattr(getattr(backend, "drone", None), "get_event_history", None)
+    if not callable(read):
+        return [], []
+    histories = []
+    for message, fields in (("AttitudeChanged", ("yaw",)), ("SpeedChanged", ("speedX", "speedY"))):
+        samples = []
+        for event in read(arsdk_message("Ardrone3.PilotingState." + message)):
+            try:
+                sample = (
+                    *[float(event.args[key]) for key in fields],
+                    int(event.monotonic_ns) * 1e-9,
+                )
+            except (KeyError, TypeError, ValueError, OverflowError):
+                continue
+            if all(math.isfinite(value) for value in sample):
+                samples.append(sample)
+        histories.append(samples)
+    return tuple(histories)
+
+
+def _log_control_history(backend, now):
+    histories = control_telemetry_history(backend)
+    previous = getattr(backend, "_logged_control_stamps", (0.0, 0.0))
+    fresh = [
+        [row for row in rows if previous[index] < row[-1] <= now]
+        for index, rows in enumerate(histories)
+    ]
+    if any(fresh):
+        backend.session_logs.telemetry(
+            "control_motion_history",
+            timestamp_kind="host_monotonic_receipt",
+            t_mono_ns=round(now * 1e9),
+            attitude_samples=fresh[0],
+            horizontal_ned_samples=fresh[1],
+        )
+        backend._logged_control_stamps = tuple(
+            rows[-1][-1] if rows else previous[index] for index, rows in enumerate(fresh)
+        )
+
+
+def _active_drone_rssi(backend) -> int | None:
+    """SkyController 3 RSSI (dBm) of the connected drone; None on direct Wi-Fi."""
+    items = backend._poll_get_state(arsdk_message("Drone_manager.Drone_list_item"))
+    if not isinstance(items, dict):
+        return None
+    for entry in items.values():
+        if not isinstance(entry, dict):
+            continue
+        try:
+            active = int(entry.get("active") or 0)
+            flags = int(entry.get("list_flags") or 0)
+        except (TypeError, ValueError):
+            continue
+        if active != 1 or flags & (_LIST_FLAG_EMPTY | _LIST_FLAG_REMOVE):
+            continue
+        rssi = backend._finite_float(entry.get("rssi"))
+        return None if rssi is None else int(rssi)
+    return None
+
+
 
 
 def video_delivery_snapshot(backend, now: float) -> dict:
@@ -63,12 +137,12 @@ def poll_session_telemetry(backend, now: float) -> None:
     if callable(flush):
         flush()
     backend._poll_stick_axes(now)
-    # High-rate NED velocity + attitude for offline ESEKF/KLT-3D A/B replay
-    # (定位演算法/validation/benchmark_esekf_live_replay.py). The 1 Hz
-    # "readback" event below is too coarse to feed observe_fused_state.
+    # Preserve source timestamps: polling this at 10 Hz does not turn cached
+    # firmware data into independent 10 Hz measurements.
     last_fused = getattr(backend, "_last_fused_odometry_t", 0.0)
     if now - last_fused >= 0.1:
         backend._last_fused_odometry_t = now
+        _log_control_history(backend, now)
         backend.session_logs.telemetry(
             "fused_odometry",
             t_mono_ns=time.monotonic_ns(),
@@ -78,6 +152,7 @@ def poll_session_telemetry(backend, now: float) -> None:
             speed_stamp_source=getattr(backend.state, "ground_speed_stamp_source", None),
             speed_mono_ns=getattr(backend.state, "ground_speed_mono_ns", None),
             altitude_mono_ns=getattr(backend.state, "altitude_mono_ns", None),
+            altitude_stamp_source=getattr(backend.state, "altitude_stamp_source", None),
             gps_mono_ns=getattr(backend.state, "gps_location_mono_ns", None),
             velocity_frame="NED",
             attitude_kind="firmware_fused_euler",
@@ -85,7 +160,17 @@ def poll_session_telemetry(backend, now: float) -> None:
             control_owner=getattr(backend.state, "control_owner", None),
             wind_state=getattr(backend.state, "wind_state", None),
             gimbal_pitch_deg=getattr(backend.state, "gimbal_pitch_deg", None),
+            gimbal_yaw_deg=getattr(backend.state, "gimbal_yaw_deg", None),
+            gimbal_roll_deg=getattr(backend.state, "gimbal_roll_deg", None),
+            gimbal_relative_pitch_deg=getattr(backend.state, "gimbal_relative_pitch_deg", None),
+            gimbal_relative_yaw_deg=getattr(backend.state, "gimbal_relative_yaw_deg", None),
+            gimbal_relative_roll_deg=getattr(backend.state, "gimbal_relative_roll_deg", None),
+            gimbal_mono_ns=getattr(backend.state, "gimbal_mono_ns", None),
+            gimbal_stamp_source=getattr(backend.state, "gimbal_stamp_source", None),
             zoom=getattr(backend.state, "zoom", None),
+            camera_zoom_level=getattr(backend.state, "camera_zoom_level", None),
+            camera_zoom_mono_ns=getattr(backend.state, "camera_zoom_mono_ns", None),
+            camera_zoom_stamp_source=getattr(backend.state, "camera_zoom_stamp_source", None),
             gps_fixed=getattr(backend.state, "gps_fixed", None),
             gps_latitude_accuracy_m=getattr(backend.state, "gps_latitude_accuracy_m", None),
             gps_longitude_accuracy_m=getattr(backend.state, "gps_longitude_accuracy_m", None),
@@ -135,3 +220,90 @@ def poll_session_telemetry(backend, now: float) -> None:
                 distance_geofence=getattr(backend.state, "distance_geofence_enabled", None),
                 **video_health,
             )
+
+
+def poll_gps_fix(backend) -> None:
+    try:
+        message = arsdk_message("Ardrone3.GPSSettingsState.GPSFixStateChanged")
+        gps = backend._poll_get_state(message)
+        if gps is not None and gps.get("fixed") is not None:
+            backend.state.gps_fixed = bool(int(gps.get("fixed") or 0))
+    except Exception:
+        pass
+
+
+def poll_satellites(backend) -> None:
+    try:
+        message = arsdk_message("Ardrone3.GPSState.NumberOfSatelliteChanged")
+        satellites = backend._poll_get_state(message)
+        if satellites and satellites.get("numberOfSatellite") is not None:
+            number = int(satellites["numberOfSatellite"])
+            backend.state.gps_satellites = number if number >= 0 else None
+    except Exception:
+        pass
+
+
+def poll_signal_sensors(backend) -> None:
+    try:
+        link_quality_message = arsdk_message("Common.CommonState.LinkSignalQuality")
+        sensors_message = arsdk_message("Common.CommonState.SensorsStatesListChanged")
+        link_quality = backend._poll_get_state(link_quality_message)
+        if link_quality and link_quality.get("value") is not None:
+            quality = int(link_quality["value"])
+            backend.state.link_signal_quality_raw = quality if 0 <= quality <= 255 else None
+        sensor_updates = backend._sensor_state_updates(
+            backend._poll_get_state(sensors_message)
+        )
+        if sensor_updates:
+            current = dict(getattr(backend.state, "sensor_states", {}) or {})
+            current.update(sensor_updates)
+            backend.state.sensor_states = current
+    except Exception:
+        pass
+    try:
+        backend.state.wifi_rssi_dbm = _active_drone_rssi(backend)
+    except Exception:
+        pass
+
+
+def poll_gimbal(backend) -> None:
+    try:
+        message = arsdk_message("Gimbal.Attitude")
+        state = backend._poll_get_state(message)
+        if not isinstance(state, dict) or state.get("pitch_absolute") is None:
+            return
+        if int(state.get("gimbal_id") or 0) != 0:
+            return
+        sample = backend._observe_telemetry(
+            "gimbal", message, state, now_mono_ns=time.monotonic_ns()
+        )
+        for attribute, key in (
+            ("gimbal_pitch_deg", "pitch_absolute"),
+            ("gimbal_yaw_deg", "yaw_absolute"),
+            ("gimbal_roll_deg", "roll_absolute"),
+            ("gimbal_relative_pitch_deg", "pitch_relative"),
+            ("gimbal_relative_yaw_deg", "yaw_relative"),
+            ("gimbal_relative_roll_deg", "roll_relative"),
+        ):
+            value = backend._finite_float(sample.get(key))
+            if attribute != "gimbal_pitch_deg" or value is not None:
+                setattr(backend.state, attribute, value)
+    except Exception:
+        pass
+
+
+def poll_camera_zoom(backend) -> None:
+    try:
+        message = arsdk_message("Camera.Zoom_level")
+        raw = backend._poll_get_state(message)
+        if not isinstance(raw, dict) or raw.get("level") is None:
+            return
+        if int(raw.get("cam_id") or 0) != 0:
+            return
+        sample = backend._observe_telemetry(
+            "camera_zoom", message, raw, now_mono_ns=time.monotonic_ns()
+        )
+        value = backend._finite_float(sample.get("level"))
+        backend.state.camera_zoom_level = value if value is not None and value > 0 else None
+    except Exception:
+        pass

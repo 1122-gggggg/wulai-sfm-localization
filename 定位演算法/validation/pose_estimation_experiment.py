@@ -27,6 +27,7 @@ for relative in (
     "定位演算法/deploy_code/sfm_glomap_deploy",
     "定位演算法/deploy_code/sfm_direct_deploy",
     "控制介面程式",
+    "tools",
 ):
     sys.path.insert(0, str(ROOT / relative))
 
@@ -150,6 +151,19 @@ class ScheduledRelocalizer:
         )
 
 
+def capture_input_transform(args, camera, image_size):
+    path = getattr(args, "raw_anafi_intrinsics", None)
+    if path is None:
+        return (lambda frame: frame), None
+    from audit_camera_calibration import raw_anafi_rectifier
+
+    intrinsics = json.loads(Path(path).read_text())
+    return raw_anafi_rectifier(intrinsics, camera, image_size), {
+        "intrinsics_sha256": digest(path), "image_domain": "explicitly selected raw ANAFI",
+        "same_pinhole_K": True, "production_enabled": False,
+    }
+
+
 def capture(args):
     import torch
     from production_localizer_factory import build_production_localizer
@@ -172,6 +186,7 @@ def capture(args):
         map_frame=load_map_frame(asset(site["map_align"])),
     )
     tracker = built.tracker.trk
+    transform_input, rectification = capture_input_transform(args, camera, (tracker._w, tracker._h))
     # Load/warm models without starting the production background worker.
     started = time.perf_counter()
     tracker.provider.ensure_models()
@@ -201,8 +216,18 @@ def capture(args):
         "gpu": torch.cuda.get_device_name(),
         "versions": {"torch": torch.__version__, "opencv": cv2.__version__},
         "telemetry": None,
+        "rectification": rectification,
         "independent_ground_truth": None,
         "schedule": "inline measured GPU latency, delivered on video timestamps; not concurrent end-to-end timing",
+        "source_sha256": {
+            relative: digest(ROOT / relative) for relative in (
+                "定位演算法/validation/pose_estimation_experiment.py",
+                "定位演算法/deploy_code/sfm_direct_deploy/two_rate_tracker.py",
+                "定位演算法/deploy_code/sfm_direct_deploy/live_provider.py",
+                "tools/audit_camera_calibration.py",
+                "控制介面程式/operator_interface/ekf_capture_contract.py",
+            )
+        },
     }
     batches, rows, offsets = [], [], [0]
     original = tracker._step_absolute_pose
@@ -237,6 +262,9 @@ def capture(args):
             previous_stamp = stamp
             worker.stamp, worker.frame_reloc_ms = stamp, 0.0
             started = time.perf_counter()
+            frame = transform_input(frame)
+            query_preprocess_ms = (time.perf_counter() - started) * 1000.0
+            started = time.perf_counter()
             info = tracker.step(frame, stamp)
             elapsed_ms = (time.perf_counter() - started) * 1000.0
             batches.append((current["xy"], current["xyz"], current["ids"]))
@@ -253,6 +281,7 @@ def capture(args):
                     "reseeded": bool(info["klt_reseeded"]),
                     "pose": None if pose is None else pose.tolist(),
                     "decode_ms": decode_ms,
+                    "query_preprocess_ms": query_preprocess_ms,
                     "frontend_wall_ms": elapsed_ms,
                     "frontend_without_inline_reloc_ms": elapsed_ms - worker.frame_reloc_ms,
                     "pnp_ms": info["pnp_ms"],
@@ -286,6 +315,7 @@ def capture(args):
         timestamp_fallbacks=timestamp_fallbacks,
         status_counts=dict(Counter(r["status"] for r in rows)),
         reloc_jobs=worker.jobs,
+        artifact_sha256={name: digest(out / name) for name in ("observations.npz", "frames.jsonl")},
     )
     write_json(out / "capture.json", metadata)
     print(
@@ -563,6 +593,8 @@ def main(argv=None):
     cap.add_argument("--site", type=Path, default=ROOT / "地圖檔/場域/river_site/site_profile.json")
     cap.add_argument("--out", type=Path, required=True)
     cap.add_argument("--max-frames", type=int, default=0)
+    cap.add_argument("--raw-anafi-intrinsics", type=Path,
+                     help="offline same-K rectification candidate; only for raw ANAFI input")
     ev = sub.add_parser("evaluate")
     ev.add_argument("--capture", type=Path, required=True)
     ev.add_argument("--out", type=Path, required=True)

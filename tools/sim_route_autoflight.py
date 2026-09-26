@@ -80,6 +80,8 @@ if str(OPERATOR_ROOT) not in sys.path:
 
 # Never touch hardware SDKs in the simulator.
 sys.modules.setdefault("olympe", None)
+sys.modules.setdefault("arsdk_ng", None)
+sys.modules.setdefault("arsdk_ng_live_backend", None)
 
 import real_path_follow_controller as rpf  # noqa: E402
 from route_domain import RouteDocument  # noqa: E402
@@ -234,6 +236,9 @@ class SimParams:
     telemetry_noise_mps: float = 0.0
     telemetry_drop_rate: float = 0.0
     wind_mean_mps: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    # Additive residual drift samples (time_s, east, north, up), interpolated
+    # linearly with endpoints held. These are not aerodynamic wind speeds.
+    wind_profile: tuple[tuple[float, float, float, float], ...] = ()
     pose_rate_hz: float = 20.0
     latency_jitter_ms: float = 0.0
     position_correlation_s: float = 0.0
@@ -302,6 +307,14 @@ class SimParams:
         ) <= 1e-3 + 1e-9:
             raise ValueError("tilt dynamics require tau_tilt_s > 0.001")
         self._validate_sampling()
+        previous = -1.0
+        for row in self.wind_profile:
+            if len(row) != 4 or not all(math.isfinite(float(value)) for value in row):
+                raise ValueError("wind_profile rows must be finite [time_s, east, north, up]")
+            stamp = float(row[0])
+            if stamp < 0.0 or stamp <= previous:
+                raise ValueError("wind_profile times must be nonnegative and strictly increasing")
+            previous = stamp
 
 
 # --------------------------------------------------------------------------
@@ -453,13 +466,14 @@ class _SimulationAutonomyChecks(DesktopRouteAutonomy):
         self._speed_command_scale = 1.0
         self._speed_sample = None
         self._speed_rate_mps2 = 0.0
+        self._accel_command = None
         self.controller = controller
         self.phase = "ROUTE"
         self._waypoint_progress = None
         self.failure_reason = None
 
     def _clear_motion(self):
-        pass
+        self._accel_command = None
 
     def _send_zero(self, reason):
         return True
@@ -510,6 +524,14 @@ def adds_horizontal_speed(roll: int, pitch: int, body_velocity) -> bool:
     return pitch * forward_v + roll * right_v > 0.0
 
 
+def wind_mean_at(params, now):
+    mean = np.asarray(params.wind_mean_mps, dtype=float)
+    if not params.wind_profile:
+        return mean
+    samples = np.asarray(params.wind_profile, dtype=float)
+    return mean + np.array([np.interp(now, samples[:, 0], samples[:, axis]) for axis in (1, 2, 3)])
+
+
 def _integrate_plant(
     state,
     wind,
@@ -540,7 +562,7 @@ def _integrate_plant(
     sub = 10
     sdt = DT / sub
     sim_now = float(elapsed_s)
-    wind_mean = np.asarray(params.wind_mean_mps, dtype=float).reshape(3)
+    wind_mean = wind_mean_at(params, elapsed_s)
     wind_mean_world = (
         float(wind_mean[0]) * np.asarray(map_frame.east, dtype=float)
         + float(wind_mean[1]) * np.asarray(map_frame.north, dtype=float)
@@ -952,6 +974,7 @@ class _SimulatedTelemetry:
         self._pump_telemetry(now, wind)
         self.speed_guard.stamp = now
         self.speed_guard.backend.state.att_yaw = float(oly_yaw_now)
+        self.speed_guard.backend.state.attitude_mono_ns = int(now * 1e9)
         if self.tele_last is None:
             self.speed_guard.backend.state.ground_speed_mps = float("nan")
             self.speed_guard.backend.state.ground_speed_mono_ns = 0
@@ -1095,6 +1118,8 @@ class _SimulationRuntime:
             loop_beat=lambda: None,
             ground_speed=lambda: speed_guard._ground_speed(),
             body_velocity=lambda: speed_guard._body_velocity(),
+            attitude_sample=speed_guard._attitude_sample,
+            ned_velocity=speed_guard._ned_velocity,
             altitude=lambda: (barometer(state.pos_m, sim_clock["t"]), float(sim_clock["t"])),
             max_weak_pose_age_s=pff.POSE_STALE_S,
             log_tick=_log_tick,
@@ -1215,7 +1240,7 @@ def run_sim(params: SimParams, *, record_trace: bool = True) -> tuple[SimResult,
     vv_per_pct = params.max_vertical_speed_mps / 100.0
     yaw_per_pct = params.max_rotation_speed_deg_s / 100.0
     initial_wait, max_steps = _simulation_budget(params)
-    wind_mean = np.asarray(params.wind_mean_mps, dtype=float).reshape(3)
+    wind_mean = wind_mean_at(params, initial_wait)
     if not np.all(np.isfinite(wind_mean)):
         raise ValueError("wind_mean_mps must be finite")
     for k in range(8):
@@ -1415,6 +1440,11 @@ def run_sim(params: SimParams, *, record_trace: bool = True) -> tuple[SimResult,
                 "gust_displacement_m": [0.0, 0.0, 0.0],
                 "gust_time_s": None,
                 "loc_fault": loc.fault,
+                "wind_drift_mps": list(map_frame.horizontal(wind)),
+                "control_prediction": runner_record.get("control_prediction"),
+                "wind_observer": runner_record.get("wind_observer"),
+                "horizontal_control_terms": runner_record.get("horizontal_control_terms"),
+                "heading_time_aligned": runner_record.get("heading_time_aligned"),
                 "landing_stable_samples": int(runner_record.get("landing_stable_samples", 0) or 0),
                 "landing_stable_span_s": round(
                     float(runner_record.get("landing_stable_span_s", 0.0) or 0.0), 3
@@ -1766,6 +1796,11 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument(
         "--wind-mean-mps", type=float, nargs=3, default=[0.0, 0.0, 0.0], metavar=("E", "N", "U")
     )
+    ap.add_argument(
+        "--wind-profile",
+        type=Path,
+        help="JSON rows [time_s,east,north,up]: additive residual drift, linearly interpolated",
+    )
     ap.add_argument("--pose-rate-hz", type=float, default=20.0)
     ap.add_argument("--latency-jitter-ms", type=float, default=0.0)
     ap.add_argument("--position-correlation-s", type=float, default=0.0)
@@ -1851,6 +1886,9 @@ def _params_from_args(a: argparse.Namespace, *, seed: int, scale: float) -> SimP
         telemetry_noise_mps=a.telemetry_noise_mps,
         telemetry_drop_rate=a.telemetry_drop_rate,
         wind_mean_mps=tuple(a.wind_mean_mps),
+        wind_profile=tuple(tuple(row) for row in json.loads(a.wind_profile.read_text()))
+        if a.wind_profile is not None
+        else (),
         pose_rate_hz=a.pose_rate_hz,
         latency_jitter_ms=a.latency_jitter_ms,
         position_correlation_s=a.position_correlation_s,

@@ -62,14 +62,15 @@ EXCLUDED_PREFIXES = (
     "river-deploy-5060-20260908/",
     "river-deploy-5060-20260908.tar.zst",
 )
-SOURCE_EXTERNAL_PARTS = {"offline_wheelhouse", "torch_hub_cache"}
 SOURCE_EXTERNAL_PREFIXES = (
     "定位演算法/deploy_code/runtime/EDM/weights/",
     "執行環境/models/moge-2-vits-normal/",
     "執行環境/models/boq/",
     "模擬器/parrot_stimulate/firmware/",
+    "執行環境/native/arsdk-ng/lib/",
+    "執行環境/torch_hub_cache/",
+    "執行環境/offline_wheelhouse/",
 )
-
 
 @dataclass(frozen=True)
 class Entry:
@@ -105,7 +106,6 @@ def included(
     return (
         value not in CONTROL_FILES
         and not any(part in EXCLUDED_PARTS for part in relative.parts)
-        and not (source_only and any(part in SOURCE_EXTERNAL_PARTS for part in relative.parts))
         and relative.name not in EXCLUDED_NAMES
         and not relative.name.startswith(".coverage.")
         and not relative.name.endswith("~")

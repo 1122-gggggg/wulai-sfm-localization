@@ -140,7 +140,7 @@ class OperatorCommandCoordinator:
 
         threading.Thread(
             target=run,
-            name=f"olympe-ui-{command}",
+            name=f"arsdk-ng-ui-{command}",
             daemon=True,
         ).start()
         self._log(f"{command}: 已送至背景飛控執行緒，介面保持可操作")

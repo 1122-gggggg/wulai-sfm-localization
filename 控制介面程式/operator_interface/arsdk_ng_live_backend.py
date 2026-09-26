@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Real Olympe backend for the flight operator UI (SkyController / direct drone).
+"""Direct arsdk-ng backend for the flight operator UI (SkyController / Wi-Fi).
 
-Replaces the sim DroneBackend when launched with --live.
+Replaces the simulated DroneBackend when launched with --live.
 
 *** FLIGHT-CRITICAL FILE — DO NOT CASUALLY EDIT ***
 【之後改這份檔案的人請注意】
@@ -11,36 +11,38 @@ Replaces the sim DroneBackend when launched with --live.
     takeoff_cmd（起飛）/ land_cmd（原地降落）/
     cleanup（關窗‧Ctrl+C 強制降落）/
     nudge_begin|end（按住微移‧放開懸停）/ give_to_pilot（Esc）
-  改壞可能造成意外。細節見 mission/SAFETY.md。
+  改壞可能造成意外。細節見 SAFETY.md。
   只有操作員明確要求並審過風險才可動。
 
 SAFETY
-  - Single Olympe connection via SkyController (preferred) or direct drone WiFi.
+  - One ARSDK-NG connection via SkyController (preferred) or direct drone Wi-Fi.
   - On SkyController connect: physical sticks retain authority until the
     operator explicitly requests PC control or presses TakeOff.
   - manual / Esc: zero PCMD + piloting source = SkyController (sticks reclaim).
   - Stick override (SC USB): any physical stick deflection while PC is
     piloting source forces give_to_pilot() immediately (HID joystick read).
   - land / window close / Ctrl-C / cleanup: ALWAYS in-place Landing if still
-    connected (even after Esc / pilot_sticks). Closing the UI is an emergency
-    exit — the aircraft must not stay airborne without the operator app.
+    connected. Closing the UI is an emergency exit.
   - Nudges: hold-to-move; release → hover.
   - Does NOT start path_follow_flight --fly. Live TakeOff is only the operator UI.
-
+  - Video uses the independent RTSP `/live` endpoint.
 
 Network
   SkyController USB:  --ip 192.168.53.1 --controller skycontroller3
-  Direct drone WiFi:  --ip 192.168.42.1 --controller drone
+  Direct drone Wi-Fi:  --ip 192.168.42.1 --controller drone
 """
 from __future__ import annotations
 
-import importlib.metadata
 import json
 import math
 import os as os
 import sys
 import threading
 import time
+import tempfile
+import urllib.error
+import urllib.parse
+import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -107,8 +109,12 @@ from skycontroller_stick import (  # noqa: E402
     _STICK_DEADZONE,
     _STICK_FLIGHT_AXES,
 )
-from backend_telemetry import poll_session_telemetry, video_delivery_snapshot  # noqa: E402
-from live_command_log import _CmdLog, quiet_olympe_logs as quiet_olympe_logs  # noqa: E402
+from backend_telemetry import (  # noqa: E402
+    poll_session_telemetry, video_delivery_snapshot, poll_gimbal, poll_camera_zoom,
+    poll_satellites, poll_signal_sensors, poll_gps_fix, control_telemetry_history,
+)
+from live_command_log import _CmdLog, quiet_arsdk_logs  # noqa: E402
+from arsdk_ng import ARSDK_NG_SOURCE_REVISION, ArsdkMessage, arsdk_message  # noqa: E402
 from live_anafi_video_stream import LiveAnafiVideoStream  # noqa: E402
 
 
@@ -122,6 +128,9 @@ _FIRMWARE_SETTING_TIMEOUT_S = 10.0
 # LAND_NOW and EMERGENCY_STOP requests remain executable regardless of age.
 CONTROL_REQUEST_MAX_AGE_NS = 250_000_000
 CRITICAL_TELEMETRY_MAX_AGE_S = 1.0
+#: The native client stamps receipt on its event thread. A receipt this far past
+#: the poll start is the same sample; anything later is a clock fault.
+_EVENT_RECEIPT_SKEW_NS = 50_000_000
 
 
 def _clamp_pct(v: int) -> int:
@@ -219,7 +228,7 @@ _EARTH_RADIUS_M = 6_371_000.0
 
 
 
-class OlympeLiveBackend:
+class ArsdkNgLiveBackend:
     """Drop-in live backend for OperatorApp (same methods as DroneBackend)."""
 
     mode = InterfaceMode.REAL_FLIGHT
@@ -250,7 +259,6 @@ class OlympeLiveBackend:
         require_gps_for_geofence: bool = True,
         approved_aircraft_firmware: tuple[str, ...] = (),
         approved_controller_firmware: tuple[str, ...] = (),
-        approved_olympe_versions: tuple[str, ...] = (),
         cmd_log: Path | None = None,
         event_log: Any | None = None,
         session_logs: Any | None = None,
@@ -304,9 +312,6 @@ class OlympeLiveBackend:
         )
         self.approved_controller_firmware = frozenset(
             str(value).strip() for value in approved_controller_firmware if str(value).strip()
-        )
-        self.approved_olympe_versions = frozenset(
-            str(value).strip() for value in approved_olympe_versions if str(value).strip()
         )
         self.connection_inventory: dict[str, Any] = {}
         self._inventory_takeoff_ready = False
@@ -487,8 +492,8 @@ class OlympeLiveBackend:
         return ("sky" in c) or str(self.ip).startswith("192.168.53")
 
     def _connect(self) -> None:
-        quiet_olympe_logs()
-        import olympe_frame_source as ofs
+        quiet_arsdk_logs()
+        import rtsp_frame_source as ofs
 
         self.log.event(
             "connect_begin",
@@ -530,25 +535,19 @@ class OlympeLiveBackend:
         self._auto_take_pc_control_if_safe()
 
         if self.with_video:
-            # SC3 RTSP often advertises "DefaultVideo"; direct ANAFI uses "Front camera".
-            media = "DefaultVideo" if self.via_skycontroller() else "Front camera"
+            rtsp_url = f"rtsp://{self.ip}/live"
             try:
-                # stale_s low → reject backlog; 720p kept for future localization.
-                self.grabber = ofs.OlympePdrawGrabber(
+                self.grabber = ofs.RtspFrameGrabber(
                     self.drone, resize=(1280, 720), stale_s=0.35,
-                    media_name=media,
                 ).start()
                 self.video_stream = LiveAnafiVideoStream(self.grabber)
-                self.video = LegacyFrameSourceAdapter(
-                    self.video_stream,
-                    f"anafi://{self.ip}/{getattr(self.grabber, 'media_name', media)}",
-                )
+                self.video = LegacyFrameSourceAdapter(self.video_stream, rtsp_url)
                 self.state.stream = "OK"
                 self.log.event(
                     "video_ok",
-                    media_name=getattr(self.grabber, "media_name", media),
+                    source="rtsp",
+                    rtsp_url=rtsp_url,
                     stale_s=0.35,
-                    note="low_latency_queue",
                 )
             except Exception as exc:
                 self.grabber = None
@@ -596,8 +595,8 @@ class OlympeLiveBackend:
                 "piloting_source", source=source, ok=True, note="direct_wifi_noop")
             return True
         try:
-            from olympe.messages.skyctrl.CoPiloting import setPilotingSource
-            from olympe.messages.skyctrl.CoPilotingState import pilotingSource
+            setPilotingSource = arsdk_message("Skyctrl.CoPiloting.SetPilotingSource")
+            pilotingSource = arsdk_message("Skyctrl.CoPilotingState.PilotingSource")
 
             waited = self.drone(
                 setPilotingSource(source=source)
@@ -617,7 +616,7 @@ class OlympeLiveBackend:
                 return str(getattr(value, "name", value)).rsplit(".", 1)[-1].lower()
 
             readback_ok = source_name(actual) == source_name(source)
-            # Enum values in olympe state are not JSON-serializable; log name only.
+            # Native enum values are not JSON-serializable; log the name only.
             self.log.event(
                 "piloting_source",
                 source=source,
@@ -660,15 +659,13 @@ class OlympeLiveBackend:
         if callable(get_last_event):
             try:
                 event = get_last_event(message)
-                wall_age_s = time.time() - float(event.date.timestamp())
-                if not math.isfinite(wall_age_s) or wall_age_s < 0.0:
+                event_mono_ns = int(event.monotonic_ns)
+                if event_mono_ns - observed_mono_ns > _EVENT_RECEIPT_SKEW_NS:
                     invalid_event_timestamp = True
-                    raise ValueError("invalid telemetry event timestamp")
-                # Validate the event clock before allowing its payload or marker
-                # to replace the last trusted state.
+                    raise ValueError("telemetry event receipt time is in the future")
                 state = dict(event.args)
                 marker = ("event", str(event.uuid))
-                observed_mono_ns -= int(max(0.0, wall_age_s) * 1_000_000_000)
+                observed_mono_ns = min(event_mono_ns, observed_mono_ns)
             except (
                 AttributeError,
                 KeyError,
@@ -705,7 +702,7 @@ class OlympeLiveBackend:
 
     @classmethod
     def _sensor_state_updates(cls, raw: Any) -> dict[str, bool]:
-        """Normalize Olympe's MAP_ITEM cache for SensorsStatesListChanged."""
+        """Normalize ARSDK MAP_ITEM cache for SensorsStatesListChanged."""
         if not isinstance(raw, dict):
             return {}
         if "sensorName" in raw and "sensorState" in raw:
@@ -757,19 +754,15 @@ class OlympeLiveBackend:
         self, errors: list[str],
     ) -> dict[str, dict | None]:
         try:
-            from olympe.messages.common.CommonState import ProductModel
-            from olympe.messages.common.SettingsState import (
-                BoardIdChanged,
-                ProductNameChanged,
-                ProductSerialHighChanged,
-                ProductSerialLowChanged,
-                ProductVersionChanged,
-            )
-            from olympe.messages.ardrone3.GPSSettingsState import (
-                HomeChanged,
-                ReturnHomeDelayChanged,
-                ReturnHomeMinAltitudeChanged,
-            )
+            ProductModel = arsdk_message("Common.CommonState.ProductModel")
+            ProductNameChanged = arsdk_message("Common.SettingsState.ProductNameChanged")
+            ProductSerialHighChanged = arsdk_message("Common.SettingsState.ProductSerialHighChanged")
+            ProductSerialLowChanged = arsdk_message("Common.SettingsState.ProductSerialLowChanged")
+            ProductVersionChanged = arsdk_message("Common.SettingsState.ProductVersionChanged")
+            BoardIdChanged = arsdk_message("Common.SettingsState.BoardIdChanged")
+            HomeChanged = arsdk_message("Ardrone3.GPSSettingsState.HomeChanged")
+            ReturnHomeDelayChanged = arsdk_message("Ardrone3.GPSSettingsState.ReturnHomeDelayChanged")
+            ReturnHomeMinAltitudeChanged = arsdk_message("Ardrone3.GPSSettingsState.ReturnHomeMinAltitudeChanged")
         except Exception as exc:
             errors.append(f"aircraft inventory API unavailable: {exc!r}")
             return {}
@@ -812,11 +805,9 @@ class OlympeLiveBackend:
         if not self.via_skycontroller():
             return None
         try:
-            from olympe.messages.skyctrl.SettingsState import (
-                ProductSerialChanged,
-                ProductVariantChanged,
-                ProductVersionChanged as ControllerVersionChanged,
-            )
+            ProductSerialChanged = arsdk_message("Skyctrl.SettingsState.ProductSerialChanged")
+            ProductVariantChanged = arsdk_message("Skyctrl.SettingsState.ProductVariantChanged")
+            ControllerVersionChanged = arsdk_message("Skyctrl.SettingsState.ProductVersionChanged")
         except Exception as exc:
             errors.append(f"controller inventory API unavailable: {exc!r}")
             return None
@@ -850,15 +841,18 @@ class OlympeLiveBackend:
         self, errors: list[str],
     ) -> dict[str, dict | None]:
         try:
-            from olympe.messages import rth
+            home_reachability = arsdk_message("Rth.Home_reachability")
+            auto_trigger_mode = arsdk_message("Rth.Auto_trigger_mode")
+            delay = arsdk_message("Rth.Delay")
+            ending_behavior = arsdk_message("Rth.Ending_behavior")
         except Exception as exc:
             errors.append(f"RTH inventory API unavailable: {exc!r}")
             return {}
         return {
-            "home_reachability": self._state_dict(rth.home_reachability),
-            "auto_trigger_mode": self._state_dict(rth.auto_trigger_mode),
-            "delay": self._state_dict(rth.delay),
-            "ending_behavior": self._state_dict(rth.ending_behavior),
+            "home_reachability": self._state_dict(home_reachability),
+            "auto_trigger_mode": self._state_dict(auto_trigger_mode),
+            "delay": self._state_dict(delay),
+            "ending_behavior": self._state_dict(ending_behavior),
         }
 
     def _read_lost_link_inventory(
@@ -945,10 +939,8 @@ class OlympeLiveBackend:
         if not self.via_skycontroller():
             errors.append("formal flight requires SkyController 3")
         else:
-            # ProductVariantChanged is never emitted by SkyController 3 firmware
-            # 1.8.1 under Olympe 8.4.0 (verified on the reference unit: the state
-            # stays uninitialized while serial/version arrive normally), so the
-            # variant alone can never confirm the model. Fall back to the HID
+            # ProductVariantChanged can be absent from controller firmware, so
+            # the variant alone cannot confirm the model. Fall back to HID
             # product string the stick monitor already resolved -- that is the same
             # physical device, read from the kernel, and it is independent evidence
             # rather than an assumption.
@@ -981,11 +973,6 @@ class OlympeLiveBackend:
                 note="no usable Home Point: link loss lands in place",
             )
 
-    def _olympe_version(self) -> str | None:
-        try:
-            return importlib.metadata.version("parrot-olympe")
-        except importlib.metadata.PackageNotFoundError:
-            return None
 
     def _commit_connection_inventory(
         self,
@@ -1023,7 +1010,7 @@ class OlympeLiveBackend:
                 self.log.event("hardware_inventory_receipt_failed")
 
     def read_connection_inventory(self) -> dict[str, Any]:
-        """Read hardware, firmware, Home and lost-link state from Olympe cache."""
+        """Read hardware, firmware, Home and lost-link state from ARSDK-NG cache."""
         errors: list[str] = []
         states = self._read_aircraft_inventory_states(errors)
         aircraft = self._read_aircraft_inventory(states)
@@ -1032,7 +1019,7 @@ class OlympeLiveBackend:
         lost_link, rth_policy_valid = self._read_lost_link_inventory(
             states, home, errors
         )
-        olympe_version = self._olympe_version()
+        arsdk_ng_source_revision = ARSDK_NG_SOURCE_REVISION
         self._validate_connection_inventory(
             aircraft, controller, home, lost_link, errors
         )
@@ -1040,7 +1027,7 @@ class OlympeLiveBackend:
             "aircraft": aircraft,
             "controller": controller,
             "runtime": {
-                "olympe_version": olympe_version,
+                "arsdk_ng_source_revision": arsdk_ng_source_revision,
                 "ip": self.ip,
                 "transport": "skycontroller" if self.via_skycontroller() else "direct_wifi",
             },
@@ -1073,20 +1060,16 @@ class OlympeLiveBackend:
         self.state.max_pitch_roll_rotation_speed_dps = None
 
     def _read_firmware_safety_state(self) -> dict[str, dict | None]:
-        """Refresh UI fields exclusively from Olympe state readback."""
+        """Refresh UI fields exclusively from ARSDK-NG state readback."""
         self._clear_firmware_safety_state()
         try:
-            from olympe.messages.ardrone3.PilotingSettingsState import (
-                MaxAltitudeChanged,
-                MaxDistanceChanged,
-                MaxTiltChanged,
-                NoFlyOverMaxDistanceChanged,
-            )
-            from olympe.messages.ardrone3.SpeedSettingsState import (
-                MaxPitchRollRotationSpeedChanged,
-                MaxRotationSpeedChanged,
-                MaxVerticalSpeedChanged,
-            )
+            MaxAltitudeChanged = arsdk_message("Ardrone3.PilotingSettingsState.MaxAltitudeChanged")
+            MaxDistanceChanged = arsdk_message("Ardrone3.PilotingSettingsState.MaxDistanceChanged")
+            MaxTiltChanged = arsdk_message("Ardrone3.PilotingSettingsState.MaxTiltChanged")
+            NoFlyOverMaxDistanceChanged = arsdk_message("Ardrone3.PilotingSettingsState.NoFlyOverMaxDistanceChanged")
+            MaxPitchRollRotationSpeedChanged = arsdk_message("Ardrone3.SpeedSettingsState.MaxPitchRollRotationSpeedChanged")
+            MaxRotationSpeedChanged = arsdk_message("Ardrone3.SpeedSettingsState.MaxRotationSpeedChanged")
+            MaxVerticalSpeedChanged = arsdk_message("Ardrone3.SpeedSettingsState.MaxVerticalSpeedChanged")
         except Exception:
             states: dict[str, dict | None] = {}
         else:
@@ -1130,7 +1113,7 @@ class OlympeLiveBackend:
 
     def _flight_state_name(self) -> str:
         try:
-            from olympe.messages.ardrone3.PilotingState import FlyingStateChanged
+            FlyingStateChanged = arsdk_message("Ardrone3.PilotingState.FlyingStateChanged")
         except Exception:
             return ""
         raw = self._state_dict(FlyingStateChanged)
@@ -1150,17 +1133,15 @@ class OlympeLiveBackend:
         )
 
     def _read_magnetometer_calibration_state(self) -> bool:
-        """Read aircraft and SkyController calibration state from Olympe cache."""
+        """Read aircraft and SkyController calibration state from ARSDK-NG cache."""
         self._clear_magnetometer_calibration_state()
         if self.drone is None:
             return False
         try:
-            from olympe.messages.common.CalibrationState import (
-                MagnetoCalibrationAxisToCalibrateChanged,
-                MagnetoCalibrationRequiredState,
-                MagnetoCalibrationStartedChanged,
-                MagnetoCalibrationStateChanged,
-            )
+            MagnetoCalibrationAxisToCalibrateChanged = arsdk_message("Common.CalibrationState.MagnetoCalibrationAxisToCalibrateChanged")
+            MagnetoCalibrationRequiredState = arsdk_message("Common.CalibrationState.MagnetoCalibrationRequiredState")
+            MagnetoCalibrationStartedChanged = arsdk_message("Common.CalibrationState.MagnetoCalibrationStartedChanged")
+            MagnetoCalibrationStateChanged = arsdk_message("Common.CalibrationState.MagnetoCalibrationStateChanged")
         except Exception:
             return False
 
@@ -1199,9 +1180,7 @@ class OlympeLiveBackend:
         controller_ok = True
         if self.via_skycontroller():
             try:
-                from olympe.messages.skyctrl.CalibrationState import (
-                    MagnetoCalibrationStateV2,
-                )
+                MagnetoCalibrationStateV2 = arsdk_message("Skyctrl.CalibrationState.MagnetoCalibrationStateV2")
             except Exception:
                 controller_ok = False
             else:
@@ -1394,7 +1373,7 @@ class OlympeLiveBackend:
             if not self._prepare_magnetometer_calibration("aircraft"):
                 return False
             try:
-                from olympe.messages.common.Calibration import MagnetoCalibration
+                MagnetoCalibration = arsdk_message("Common.Calibration.MagnetoCalibration")
             except Exception as exc:
                 self.log.event(
                     "magnetometer_calibration",
@@ -1421,7 +1400,7 @@ class OlympeLiveBackend:
             if self.drone is None or self._cleanup_done:
                 return False
             try:
-                from olympe.messages.common.Calibration import MagnetoCalibration
+                MagnetoCalibration = arsdk_message("Common.Calibration.MagnetoCalibration")
             except Exception:
                 return False
             return self._wait_magnetometer_command(
@@ -1445,7 +1424,7 @@ class OlympeLiveBackend:
             if not self._prepare_magnetometer_calibration("skycontroller"):
                 return False
             try:
-                from olympe.messages.skyctrl.Calibration import StartCalibration
+                StartCalibration = arsdk_message("Skyctrl.Calibration.StartCalibration")
             except Exception as exc:
                 self.log.event(
                     "magnetometer_calibration",
@@ -1476,7 +1455,7 @@ class OlympeLiveBackend:
             ):
                 return False
             try:
-                from olympe.messages.skyctrl.Calibration import AbortCalibration
+                AbortCalibration = arsdk_message("Skyctrl.Calibration.AbortCalibration")
             except Exception:
                 return False
             return self._wait_magnetometer_command(
@@ -1500,7 +1479,7 @@ class OlympeLiveBackend:
             )
             return False
         try:
-            from olympe.messages import rth
+            rth = ArsdkMessage.Rth
         except Exception as exc:
             self.log.event("lost_link_policy", ok=False, error=repr(exc))
             return False
@@ -1653,28 +1632,20 @@ class OlympeLiveBackend:
 
     def _firmware_setting_messages(self):
         try:
-            from olympe.messages.ardrone3.PilotingSettings import (
-                MaxAltitude,
-                MaxDistance,
-                MaxTilt,
-                NoFlyOverMaxDistance,
-            )
-            from olympe.messages.ardrone3.PilotingSettingsState import (
-                MaxAltitudeChanged,
-                MaxDistanceChanged,
-                MaxTiltChanged,
-                NoFlyOverMaxDistanceChanged,
-            )
-            from olympe.messages.ardrone3.SpeedSettings import (
-                MaxPitchRollRotationSpeed,
-                MaxRotationSpeed,
-                MaxVerticalSpeed,
-            )
-            from olympe.messages.ardrone3.SpeedSettingsState import (
-                MaxPitchRollRotationSpeedChanged,
-                MaxRotationSpeedChanged,
-                MaxVerticalSpeedChanged,
-            )
+            MaxAltitude = arsdk_message("Ardrone3.PilotingSettings.MaxAltitude")
+            MaxDistance = arsdk_message("Ardrone3.PilotingSettings.MaxDistance")
+            MaxTilt = arsdk_message("Ardrone3.PilotingSettings.MaxTilt")
+            NoFlyOverMaxDistance = arsdk_message("Ardrone3.PilotingSettings.NoFlyOverMaxDistance")
+            MaxAltitudeChanged = arsdk_message("Ardrone3.PilotingSettingsState.MaxAltitudeChanged")
+            MaxDistanceChanged = arsdk_message("Ardrone3.PilotingSettingsState.MaxDistanceChanged")
+            MaxTiltChanged = arsdk_message("Ardrone3.PilotingSettingsState.MaxTiltChanged")
+            NoFlyOverMaxDistanceChanged = arsdk_message("Ardrone3.PilotingSettingsState.NoFlyOverMaxDistanceChanged")
+            MaxPitchRollRotationSpeed = arsdk_message("Ardrone3.SpeedSettings.MaxPitchRollRotationSpeed")
+            MaxRotationSpeed = arsdk_message("Ardrone3.SpeedSettings.MaxRotationSpeed")
+            MaxVerticalSpeed = arsdk_message("Ardrone3.SpeedSettings.MaxVerticalSpeed")
+            MaxPitchRollRotationSpeedChanged = arsdk_message("Ardrone3.SpeedSettingsState.MaxPitchRollRotationSpeedChanged")
+            MaxRotationSpeedChanged = arsdk_message("Ardrone3.SpeedSettingsState.MaxRotationSpeedChanged")
+            MaxVerticalSpeedChanged = arsdk_message("Ardrone3.SpeedSettingsState.MaxVerticalSpeedChanged")
         except Exception as exc:
             return None, f"firmware settings API unavailable: {exc!r}"
         return {
@@ -1906,7 +1877,7 @@ class OlympeLiveBackend:
         if not self.via_skycontroller():
             return True
         try:
-            from olympe.messages.skyctrl.CoPilotingState import pilotingSource
+            pilotingSource = arsdk_message("Skyctrl.CoPilotingState.PilotingSource")
         except Exception:
             return False
         raw = self._state_dict(pilotingSource)
@@ -1980,7 +1951,7 @@ class OlympeLiveBackend:
         self.state.link_ok = link_ok
         self.state.link_status = "OK" if link_ok else "LOST"
         if not link_ok:
-            self._takeoff_preflight_fail("takeoff requires a healthy Olympe link")
+            self._takeoff_preflight_fail("takeoff requires a healthy ARSDK-NG link")
             return None
 
         calibration_error = self._magnetometer_control_error()
@@ -2035,7 +2006,7 @@ class OlympeLiveBackend:
         self, battery_floor: float | None, advisories: list[str]
     ) -> bool:
         try:
-            from olympe.messages.common.CommonState import BatteryStateChanged
+            BatteryStateChanged = arsdk_message("Common.CommonState.BatteryStateChanged")
         except Exception:
             return self._takeoff_preflight_fail("battery state API unavailable")
         else:
@@ -2053,7 +2024,7 @@ class OlympeLiveBackend:
             self.desired_distance_geofence and self.require_gps_for_geofence
         )
         try:
-            from olympe.messages.ardrone3.GPSSettingsState import GPSFixStateChanged
+            GPSFixStateChanged = arsdk_message("Ardrone3.GPSSettingsState.GPSFixStateChanged")
         except Exception:
             self.state.gps_fixed = None
             outcome = takeoff_gps_outcome(fixed=None, gps_required=gps_required)
@@ -2236,9 +2207,9 @@ class OlympeLiveBackend:
         r, p, y, g = map(_clamp_pct, (roll, pitch, yaw, gaz))
         if self.drone is None:
             return None
-        from olympe.messages.ardrone3.Piloting import PCMD
+        PCMD = arsdk_message("Ardrone3.Piloting.PCMD")
         call_mono_ns = time.monotonic_ns()
-        # Match Olympe's piloting sender, including yaw/gaz-only commands.
+        # Match the pilot command sender, including yaw/gaz-only commands.
         flag = int(bool(r or p))
         self.drone(PCMD(flag, r, p, y, g, 0))
         self._last_pcmd_flag = flag
@@ -2586,8 +2557,8 @@ class OlympeLiveBackend:
             self.log.event("land_cmd", reason=reason, ok=False, error="no_drone")
             return False
         try:
-            from olympe.messages.ardrone3.Piloting import Landing
-            from olympe.messages.ardrone3.PilotingState import FlyingStateChanged
+            Landing = arsdk_message("Ardrone3.Piloting.Landing")
+            FlyingStateChanged = arsdk_message("Ardrone3.PilotingState.FlyingStateChanged")
 
             exp = self.drone(
                 Landing() >> FlyingStateChanged(state="landed", _timeout=20)
@@ -2598,7 +2569,7 @@ class OlympeLiveBackend:
         except Exception as exc:
             # Last-ditch command issue is intentionally not treated as touchdown.
             try:
-                from olympe.messages.ardrone3.Piloting import Landing
+                Landing = arsdk_message("Ardrone3.Piloting.Landing")
                 self.drone(Landing())
                 self.log.event(
                     "land_cmd", reason=reason, ok=False, command_issued=True,
@@ -2731,8 +2702,8 @@ class OlympeLiveBackend:
     def _takeoff_cmd_run(self, takeoff_epoch: int) -> bool:
         takeoff_scheduled = False
         try:
-            from olympe.messages.ardrone3.Piloting import TakeOff
-            from olympe.messages.ardrone3.PilotingState import FlyingStateChanged
+            TakeOff = arsdk_message("Ardrone3.Piloting.TakeOff")
+            FlyingStateChanged = arsdk_message("Ardrone3.PilotingState.FlyingStateChanged")
             takeoff_request = (
                 TakeOff() >> FlyingStateChanged(state="hovering", _timeout=15)
             )
@@ -2901,11 +2872,9 @@ class OlympeLiveBackend:
     def _apply_recording_quality(self) -> bool:
         profile = self.recording_profile
         try:
-            from olympe.messages.camera import (
-                recording_mode,
-                set_camera_mode,
-                set_recording_mode,
-            )
+            recording_mode = arsdk_message("Camera.Recording_mode")
+            set_camera_mode = arsdk_message("Camera.Set_camera_mode")
+            set_recording_mode = arsdk_message("Camera.Set_recording_mode")
             try:
                 self.drone(set_camera_mode(cam_id=0, value="recording")).wait(_timeout=5)
             except Exception as exc:
@@ -2961,11 +2930,9 @@ class OlympeLiveBackend:
             )
             return False
         try:
-            from olympe.messages.camera import (
-                set_camera_mode,
-                start_recording,
-                recording_state,
-            )
+            set_camera_mode = arsdk_message("Camera.Set_camera_mode")
+            start_recording = arsdk_message("Camera.Start_recording")
+            recording_state = arsdk_message("Camera.Recording_state")
             # Ensure camera is in recording mode (not photo).
             try:
                 self.drone(set_camera_mode(cam_id=0, value="recording")).wait(_timeout=5)
@@ -3009,7 +2976,8 @@ class OlympeLiveBackend:
             return False
         ok_stop = False
         try:
-            from olympe.messages.camera import stop_recording, recording_state
+            stop_recording = arsdk_message("Camera.Stop_recording")
+            recording_state = arsdk_message("Camera.Recording_state")
             exp = self.drone(stop_recording(cam_id=0)).wait(_timeout=10)
             ok_stop = bool(getattr(exp, "success", lambda: True)())
             # Best-effort wait until inactive
@@ -3045,69 +3013,145 @@ class OlympeLiveBackend:
                            note="onboard_only_or_download_failed")
         return ok_stop
 
-    def _prepare_recording_download(self, media: Any) -> None:
+    def _download_recording_media(
+        self, media: dict[str, Any], resource: dict[str, Any],
+    ) -> str:
+        media_id = media.get("media_id")
+        resource_id = resource.get("resource_id")
+        resource_url = resource.get("url")
+        temporary_path: Path | None = None
         try:
-            media.download_dir = str(self.record_dir)
-        except (OSError, RuntimeError) as exc:  # Tier1: recording media setup — narrow, log, fallback
-            self.log.event("record_prepare_download_dir_failed", error=repr(exc), dir=str(self.record_dir))
-        # Allow media indexing a moment after stop_recording.
-        time.sleep(1.0)
-        try:
-            media.wait_for_pending_downloads(timeout=_MEDIA_PENDING_TIMEOUT_S)
-        except (OSError, RuntimeError) as exc:  # Tier1: recording media setup — narrow, log, fallback
-            self.log.event("record_prepare_pending_wait_failed", error=repr(exc))
-
-    def _download_recording_media(self, media: Any, media_id: Any) -> None:
-        try:
-            from olympe.features.media import download_media
-            waited = media(download_media(media_id)).wait(
-                _timeout=_MEDIA_DOWNLOAD_TIMEOUT_S,
+            if (
+                not isinstance(resource_url, str)
+                or not resource_url.startswith("/data/media/")
+                or resource_url.startswith("//")
+            ):
+                raise ValueError("invalid media resource URL")
+            parsed_url = urllib.parse.urlsplit(resource_url)
+            if parsed_url.scheme or parsed_url.netloc:
+                raise ValueError("media resource URL must be relative")
+            filename = Path(str(resource_id or "")).name
+            if not filename or filename in {".", ".."}:
+                raise ValueError("media resource has no filename")
+            self.record_dir.mkdir(parents=True, exist_ok=True)
+            target = self.record_dir / filename
+            request_url = urllib.parse.urljoin(f"http://{self.ip}/", resource_url)
+            request = urllib.request.Request(
+                request_url, headers={"Accept": "application/octet-stream"}
             )
-            if not bool(getattr(waited, "success", lambda: False)()):
-                raise TimeoutError("media download failed or timed out")
-            media.wait_for_pending_downloads(
-                timeout=_MEDIA_PENDING_TIMEOUT_S,
-            )
-        except Exception as exc:
+            bytes_written = 0
+            with urllib.request.urlopen(
+                request, timeout=_MEDIA_DOWNLOAD_TIMEOUT_S
+            ) as response:
+                with tempfile.NamedTemporaryFile(
+                    mode="wb",
+                    dir=self.record_dir,
+                    prefix=f".{filename}.",
+                    suffix=".part",
+                    delete=False,
+                ) as output:
+                    temporary_path = Path(output.name)
+                    while chunk := response.read(1024 * 1024):
+                        output.write(chunk)
+                        bytes_written += len(chunk)
+            expected_size = self._finite_float(resource.get("size"))
+            if bytes_written <= 0 or (
+                expected_size is not None
+                and expected_size > 0
+                and bytes_written != int(expected_size)
+            ):
+                raise IOError(
+                    f"incomplete media resource ({bytes_written} bytes)"
+                )
+            os.replace(temporary_path, target)
+            temporary_path = None
             self.log.event(
-                "record_download", ok=False, media_id=str(media_id),
+                "record_download",
+                ok=True,
+                media_id=str(media_id or ""),
+                resource_id=filename,
+                path=str(target),
+            )
+            return str(target)
+        except Exception as exc:
+            if temporary_path is not None:
+                try:
+                    temporary_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            self.log.event(
+                "record_download",
+                ok=False,
+                media_id=str(media_id or ""),
+                resource_id=str(resource_id or ""),
                 error=repr(exc),
             )
-
-    def _recording_download_candidates(self) -> list[Path]:
-        # Pick newest file in download dir
-        return sorted(
-            list(self.record_dir.glob("*.mp4"))
-            + list(self.record_dir.glob("*.MP4"))
-            + list(self.record_dir.glob("*.mov"))
-            + list(self.record_dir.glob("*.MOV")),
-            key=lambda p: p.stat().st_mtime,
-            reverse=True,
-        )
+            return ""
 
     def _try_download_last_recording(self) -> str:
-        """Best-effort: download newest video resource into record_dir."""
+        """Download the newest indexed video through the drone HTTP API."""
         if self.drone is None:
             return ""
+        media_url = (
+            f"http://{self.ip}/api/v1/media/medias"
+            "?media_type=video&sort_order=DESC"
+        )
+        time.sleep(1.0)
+        indexing_deadline = time.monotonic() + _MEDIA_PENDING_TIMEOUT_S
         try:
-            media = getattr(self.drone, "media", None)
-            if media is None:
+            while True:
+                try:
+                    request = urllib.request.Request(
+                        media_url, headers={"Accept": "application/json"}
+                    )
+                    with urllib.request.urlopen(
+                        request, timeout=_MEDIA_PENDING_TIMEOUT_S
+                    ) as response:
+                        medias = json.load(response)
+                    break
+                except urllib.error.HTTPError as exc:
+                    if exc.code != 541 or time.monotonic() >= indexing_deadline:
+                        raise
+                    time.sleep(0.2)
+            if not isinstance(medias, list):
+                raise ValueError("media listing response must be an array")
+            candidates = []
+            for media in medias:
+                if not isinstance(media, dict):
+                    continue
+                try:
+                    media_time = datetime.fromisoformat(
+                        str(media.get("datetime", "")).replace("Z", "+00:00")
+                    ).timestamp()
+                except (TypeError, ValueError, OverflowError):
+                    media_time = 0.0
+                for resource in media.get("resources", ()):
+                    if (
+                        isinstance(resource, dict)
+                        and str(resource.get("type", "")).upper() == "VIDEO"
+                        and resource.get("url")
+                    ):
+                        candidates.append(
+                            (
+                                media_time,
+                                str(media.get("media_id") or ""),
+                                media,
+                                resource,
+                            )
+                        )
+            if not candidates:
+                self.log.event(
+                    "record_download", ok=False, error="no_video_resource"
+                )
                 return ""
-            self._prepare_recording_download(media)
-            # Prefer explicit download of last media if API exposes it.
-            last_id = getattr(media, "last_media_id", None)
-            try:
-                mid = last_id() if callable(last_id) else last_id
-            except Exception:
-                mid = None
-            if mid:
-                self._download_recording_media(media, mid)
-            candidates = self._recording_download_candidates()
-            if candidates:
-                return str(candidates[0])
+            _media_time, _media_id, media, resource = max(
+                candidates, key=lambda candidate: (candidate[0], candidate[1])
+            )
+            return self._download_recording_media(media, resource)
         except Exception as exc:
             self.log.event("record_download", ok=False, error=repr(exc))
-        return ""
+            return ""
+
 
     def set_nudge_vector(self, roll: float, pitch: float, yaw: float,
                          gaz: float, *, authority_pct: int | None = None) -> bool:
@@ -3534,7 +3578,7 @@ class OlympeLiveBackend:
         pitch = float(np.clip(pitch_deg, self.ANAFI.gimbal_pitch_min_deg,
                               self.ANAFI.gimbal_pitch_max_deg))
         try:
-            from olympe.messages.gimbal import set_target
+            set_target = arsdk_message("Gimbal.Set_target")
             self.drone(set_target(
                 gimbal_id=0,
                 control_mode="position",
@@ -3551,7 +3595,7 @@ class OlympeLiveBackend:
         except Exception as exc:
             # Fallback older API
             try:
-                from olympe.messages.ardrone3.Camera import Orientation
+                Orientation = arsdk_message("Ardrone3.Camera.Orientation")
                 self.drone(Orientation(tilt=int(pitch), pan=0))
                 self.state.gimbal_pitch_deg = pitch
                 self.log.event("gimbal_pitch_legacy", pitch=pitch, ok=True)
@@ -3568,11 +3612,10 @@ class OlympeLiveBackend:
                            applied=getattr(self.state, "zoom", None))
             return False
         try:
-            from olympe.messages.camera import set_zoom_target
-            from olympe.enums.camera import zoom_control_mode
+            set_zoom_target = arsdk_message("Camera.Set_zoom_target")
             self.drone(set_zoom_target(
                 cam_id=0,
-                control_mode=zoom_control_mode.level,
+                control_mode="level",
                 target=z,
             ))
         except Exception as exc:
@@ -3595,7 +3638,7 @@ class OlympeLiveBackend:
         # Prefer dedicated reset_zoom when target is wide; else set level.
         if self.drone is not None and not self.pilot_sticks and abs(zoom0 - 1.0) < 1e-6:
             try:
-                from olympe.messages.camera import reset_zoom
+                reset_zoom = arsdk_message("Camera.Reset_zoom")
                 self.drone(reset_zoom(cam_id=0))
                 self.state.zoom = 1.0
                 self.log.event("zoom_reset", zoom=1.0, ok=True)
@@ -4097,7 +4140,7 @@ class OlympeLiveBackend:
 
     def _refresh_home_state(self) -> bool:
         try:
-            from olympe.messages import rth
+            rth = ArsdkMessage.Rth
 
             home = self._state_dict(rth.home_location)
             reachability = self._state_dict(rth.home_reachability)
@@ -4144,7 +4187,7 @@ class OlympeLiveBackend:
         if self.drone is None:
             return False
         try:
-            from olympe.messages import rth
+            rth = ArsdkMessage.Rth
         except Exception as exc:
             self.log.event("rth", ok=False, reason=reason, error=repr(exc))
             return False
@@ -4446,7 +4489,7 @@ class OlympeLiveBackend:
         if host_ok is None:
             try:
                 # Fallback: any get_state success implies the host command link is up.
-                from olympe.messages.common.CommonState import BatteryStateChanged
+                BatteryStateChanged = arsdk_message("Common.CommonState.BatteryStateChanged")
                 self.drone.get_state(BatteryStateChanged)
                 host_ok = True
             except Exception:
@@ -4454,12 +4497,12 @@ class OlympeLiveBackend:
         return bool(host_ok)
 
     def _probe_link_ok(self) -> bool:
-        """Best-effort Olympe connection probe (display only; no flight cmds)."""
+        """Best-effort ARSDK-NG connection probe (display only; no flight cmds)."""
         host_ok = self._probe_host_link_ok()
         if not host_ok or not self.via_skycontroller():
             return host_ok
         try:
-            from olympe.messages.drone_manager import connection_state
+            connection_state = arsdk_message("Drone_manager.Connection_state")
 
             managed = self._state_dict(connection_state)
         except Exception:
@@ -4499,13 +4542,11 @@ class OlympeLiveBackend:
 
     def _poll_mandatory_messages(self):
         try:
-            from olympe.messages.ardrone3.PilotingState import (
-                AttitudeChanged,
-                AltitudeChanged,
-                FlyingStateChanged,
-                SpeedChanged,
-            )
-            from olympe.messages.common.CommonState import BatteryStateChanged
+            AttitudeChanged = arsdk_message("Ardrone3.PilotingState.AttitudeChanged")
+            AltitudeChanged = arsdk_message("Ardrone3.PilotingState.AltitudeChanged")
+            FlyingStateChanged = arsdk_message("Ardrone3.PilotingState.FlyingStateChanged")
+            SpeedChanged = arsdk_message("Ardrone3.PilotingState.SpeedChanged")
+            BatteryStateChanged = arsdk_message("Common.CommonState.BatteryStateChanged")
         except Exception:
             return None
         return AttitudeChanged, AltitudeChanged, FlyingStateChanged, SpeedChanged, BatteryStateChanged
@@ -4626,13 +4667,7 @@ class OlympeLiveBackend:
             )
 
     def _poll_gps_fix(self) -> None:
-        try:
-            from olympe.messages.ardrone3.GPSSettingsState import GPSFixStateChanged
-            gps = self._poll_get_state(GPSFixStateChanged)
-            if gps is not None and gps.get("fixed") is not None:
-                self.state.gps_fixed = bool(int(gps.get("fixed") or 0))
-        except Exception:
-            pass
+        poll_gps_fix(self)
 
     def _poll_navigation_location(self, messages, poll_mono_ns: int) -> None:
         AltitudeAboveGroundChanged, GpsLocationChanged = messages[:2]
@@ -4735,16 +4770,14 @@ class OlympeLiveBackend:
 
     def _poll_optional_navigation(self, poll_mono_ns: int) -> None:
         try:
-            from olympe.messages.ardrone3.PilotingState import (
-                AlertStateChanged,
-                AltitudeAboveGroundChanged,
-                GpsLocationChanged,
-                HeadingLockedStateChanged,
-                HoveringWarning,
-                NavigateHomeStateChanged,
-                VibrationLevelChanged,
-                WindStateChanged,
-            )
+            AlertStateChanged = arsdk_message("Ardrone3.PilotingState.AlertStateChanged")
+            AltitudeAboveGroundChanged = arsdk_message("Ardrone3.PilotingState.AltitudeAboveGroundChanged")
+            GpsLocationChanged = arsdk_message("Ardrone3.PilotingState.GpsLocationChanged")
+            HeadingLockedStateChanged = arsdk_message("Ardrone3.PilotingState.HeadingLockedStateChanged")
+            HoveringWarning = arsdk_message("Ardrone3.PilotingState.HoveringWarning")
+            NavigateHomeStateChanged = arsdk_message("Ardrone3.PilotingState.NavigateHomeStateChanged")
+            VibrationLevelChanged = arsdk_message("Ardrone3.PilotingState.VibrationLevelChanged")
+            WindStateChanged = arsdk_message("Ardrone3.PilotingState.WindStateChanged")
             self._poll_navigation_location(
                 (AltitudeAboveGroundChanged, GpsLocationChanged), poll_mono_ns
             )
@@ -4759,48 +4792,15 @@ class OlympeLiveBackend:
                 )
             )
         except Exception:
-            # These read-only events are optional across Olympe/product
+            # These read-only events are optional across ARSDK-NG/product
             # versions; mandatory battery/attitude/altitude remain visible.
             pass
 
     def _poll_satellites(self) -> None:
-        try:
-            from olympe.messages.ardrone3.GPSState import NumberOfSatelliteChanged
-
-            satellites = self._poll_get_state(NumberOfSatelliteChanged)
-            if satellites and satellites.get("numberOfSatellite") is not None:
-                number = int(satellites["numberOfSatellite"])
-                self.state.gps_satellites = number if number >= 0 else None
-        except Exception:
-            pass
+        poll_satellites(self)
 
     def _poll_signal_sensors(self) -> None:
-        try:
-            from olympe.messages.common.CommonState import (
-                LinkSignalQuality,
-                SensorsStatesListChanged,
-                WifiSignalChanged,
-            )
-
-            wifi = self._poll_get_state(WifiSignalChanged)
-            if wifi and wifi.get("rssi") is not None:
-                rssi = self._finite_float(wifi.get("rssi"))
-                self.state.wifi_rssi_dbm = None if rssi is None else int(rssi)
-            link_quality = self._poll_get_state(LinkSignalQuality)
-            if link_quality and link_quality.get("value") is not None:
-                quality = int(link_quality["value"])
-                self.state.link_signal_quality_raw = (
-                    quality if 0 <= quality <= 255 else None
-                )
-            sensor_updates = self._sensor_state_updates(
-                self._poll_get_state(SensorsStatesListChanged)
-            )
-            if sensor_updates:
-                current = dict(getattr(self.state, "sensor_states", {}) or {})
-                current.update(sensor_updates)
-                self.state.sensor_states = current
-        except Exception:
-            pass
+        poll_signal_sensors(self)
 
     #: Frame age above this marks video stale in readback telemetry. Matches
     #: path_follow_flight.STREAM_STALE_S (autonomy stops trusting frames).
@@ -4832,16 +4832,14 @@ class OlympeLiveBackend:
     def _poll_session_telemetry(self, now: float) -> None:
         poll_session_telemetry(self, now)
 
+    def control_telemetry_history(self):
+        return control_telemetry_history(self)
+
     def _poll_gimbal(self) -> None:
-        try:
-            from olympe.messages.gimbal import attitude as gimbal_attitude
-            g = self._poll_get_state(gimbal_attitude)
-            if isinstance(g, dict) and g:
-                first = next(iter(g.values())) if g else None
-                if isinstance(first, dict) and first.get("pitch_absolute") is not None:
-                    self.state.gimbal_pitch_deg = float(first["pitch_absolute"])
-        except Exception:
-            pass
+        poll_gimbal(self)
+
+    def _poll_camera_zoom(self) -> None:
+        poll_camera_zoom(self)
 
     def _poll_telemetry(self, poll_mono_ns: int, now: float) -> bool:
         link_ok = self._poll_link_status()
@@ -4857,11 +4855,12 @@ class OlympeLiveBackend:
         self._poll_optional_navigation(poll_mono_ns)
         self._poll_satellites()
         self._poll_signal_sensors()
-        # Olympe get_state reads the local event cache; these values shown
+        # ARSDK-NG get_state reads the local event cache; these values shown
         # in the UI never come from desired constructor settings.
         self._read_firmware_safety_state()
         self._poll_session_telemetry(now)
         self._poll_gimbal()
+        self._poll_camera_zoom()
         self.state.telemetry_read_mono_ns = time.monotonic_ns()
         last_pcmd_ns = getattr(self.state, "last_pcmd_call_mono_ns", None)
         if last_pcmd_ns is not None:
@@ -4981,7 +4980,7 @@ class OlympeLiveBackend:
         if self.drone is None:
             return False
         try:
-            from olympe.messages.ardrone3.PilotingState import FlyingStateChanged
+            FlyingStateChanged = arsdk_message("Ardrone3.PilotingState.FlyingStateChanged")
             st = self.drone.get_state(FlyingStateChanged)
             if isinstance(st, dict):
                 value = st.get("state", "")

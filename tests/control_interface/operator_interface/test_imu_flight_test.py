@@ -12,7 +12,7 @@ import pytest
 from PIL import Image
 
 import imu_flight_test
-import olympe_live_backend as backend_module
+import arsdk_ng_live_backend as backend_module
 from imu_flight_test import ImuFlightTestRecorder, create_recorder
 
 
@@ -62,6 +62,40 @@ def test_recorder_is_off_unless_the_flight_test_env_is_set(tmp_path, monkeypatch
         assert recorder.directory == tmp_path / "imu_test"
     finally:
         recorder.close()
+
+
+def test_normal_real_flight_records_automatically_without_evaluation_mode(tmp_path, monkeypatch):
+    from backend_contract import InterfaceMode
+
+    monkeypatch.delenv("SFM_IMU_FLIGHT_TEST", raising=False)
+    monkeypatch.delenv("SFM_EVALUATION_ONLY", raising=False)
+    recorder = create_recorder(tmp_path, mode=InterfaceMode.REAL_FLIGHT)
+    assert recorder is not None
+    recorder.close()
+    assert "SFM_EVALUATION_ONLY" not in __import__("os").environ
+
+
+def test_frame_retains_camera_altitude_and_independent_submission_timing(tmp_path):
+    timing = _timing(fused_altitude_m=2.1, gimbal_pitch_deg=-20., gimbal_yaw_deg=3.,
+                     gimbal_mono_ns=1000200000000, zoom=1., flight_state="flying",
+                     frame_callback_enter_mono_ns=1000260000000)
+    recorder = ImuFlightTestRecorder(tmp_path)
+    recorder.capture(1, "frame_1", _frame(), timing)
+    recorder.close()
+    row = _rows(tmp_path)[0]
+    assert row["timing"]["fused_altitude_m"] == 2.1
+    assert row["timing"]["gimbal_yaw_deg"] == 3.
+    assert row["timing"]["frame_callback_enter_mono_ns"] == 1000260000000
+    assert row["image_width"] == 16 and row["image_height"] == 8
+    assert len(row["sha256"]) == 64
+
+
+def test_same_sequence_with_a_new_capture_is_not_mistaken_for_a_hold(tmp_path):
+    recorder = ImuFlightTestRecorder(tmp_path)
+    assert recorder.capture(1, "frame", _frame(), _timing())
+    assert recorder.capture(1, "frame", _frame(), _timing(source_frame_stamp_mono=1001.25))
+    recorder.close()
+    assert len(_rows(tmp_path)) == 2
 
 
 def test_recorder_pairs_each_frame_with_the_telemetry_that_rode_with_it(tmp_path) -> None:
@@ -435,7 +469,7 @@ def _backend(axes: dict[int, int] | None) -> SimpleNamespace:
 
 
 def _poll(backend, now: float) -> None:
-    backend_module.OlympeLiveBackend._poll_stick_axes(backend, now)
+    backend_module.ArsdkNgLiveBackend._poll_stick_axes(backend, now)
 
 
 def test_stick_axes_are_recorded_so_manual_flight_has_an_input_track() -> None:

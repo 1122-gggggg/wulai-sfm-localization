@@ -29,12 +29,14 @@ MoGe checkpoint 另有 Git LFS pointer；一般 checkout 不等於完整 runtime
 └── .venv/            Python 3.10 執行環境
 ```
 
-目前唯一註冊的正式定位後端為 `direct`，由 CPU KLT/PnP 快迴路與 GPU MegaLoc/EDM
+目前唯一註冊的正式定位後端為 `direct`，由 CPU KLT/PnP 快迴路與 GPU BoQ/EDM
 背景重定位組成。`sfm_glomap_deploy` 保留共用 contract 與 factory，不代表仍支援舊
 EDM `.pt` 後端。歷史參數見 [`舊 EDM 後端紀錄`](docs/legacy_edm_backend.md)。
 
 開發安裝、測試、品質門檻與提交流程見 [`CONTRIBUTING.md`](CONTRIBUTING.md)。
 本次檢查的範圍與量測見 [`專案品質檢查`](docs/project_quality_review_20260922.md)。
+後續相機來源、尺度報告、重定位量測、離線 ESKF 與既有航線失敗的狀態見
+[`五項系統改善`](docs/system_optimization_20260922.md)。
 
 Git 只追蹤程式碼、設定與必要說明；場域資產、影片、權重與 outputs 不進版控。
 
@@ -48,13 +50,13 @@ python tools/workspace_audit.py --strict-output-names
 
 | 接口 | 唯一入口 | 影像來源 | 飛控 backend |
 |---|---|---|---|
-| 模擬串流 | `控制介面程式/影片模擬串流/選擇啟動.sh` | 本機影片 / FFmpeg | 模擬，永不載入 Olympe |
-| 實機操作（人工／preflight 後 AUTO） | `控制介面程式/真機串流/啟動.sh` | ANAFI PDRAW | Olympe，操作員 UI 控制；只接受 mission selection |
-| IMU 飛行測試（手動飛行資料採集） | `IMU飛行測試.sh` | ANAFI PDRAW | 同上，只是額外錄 IMU／搖桿／定位當幀畫面 |
+| 模擬串流 | `控制介面程式/影片模擬串流/選擇啟動.sh` | 本機影片 / FFmpeg | 模擬，不載入飛控 SDK |
+| 實機操作（人工／preflight 後 AUTO） | `控制介面程式/真機串流/啟動.sh` | ANAFI RTSP | Parrot ARSDK-NG；操作員 UI 控制，只接受 mission selection |
+| IMU 飛行測試（手動飛行資料採集） | `IMU飛行測試.sh` | ANAFI RTSP | 同上，只是額外錄 IMU／搖桿／定位當幀畫面 |
 | 任務 authoring／檢查 | `控制介面程式/mission_pipeline.py` | 本機資產 | 不直接取代真機操作入口 |
 
 兩個 runtime 入口互斥。模擬入口拒絕 `--live` / `real-flight`；實機入口拒絕
-`--video`，且 PDRAW 不可用時不會拿錄影檔冒充實機畫面。真機入口只接受
+`--video`，且 RTSP 不可用時不會拿錄影檔冒充實機畫面。真機入口只接受
 `sfm-mission-selection/v1`；resolver 驗證所有 component SHA、定位品質、必要校正與
 route 契約後產生唯讀 site-profile snapshot。AUTO 仍須由操作員在當次 UI 完成四步
 preflight 並親自按下按鈕。
@@ -205,7 +207,7 @@ AUTO readiness 必須由當次 resolver/preflight 確認，不以文件中的靜
 |---|---|
 | `定位演算法/deploy_code/sfm_direct_deploy/` | direct 地圖、tracker、provider 與 adapter |
 | `定位演算法/deploy_code/sfm_glomap_deploy/` | 共用 pose/integrity、registry 與 factory |
-| `定位演算法/flight_control/` | 控制器、Olympe frame source、安全監控與人工工具的 owner |
+| `定位演算法/flight_control/` | 控制器、RTSP frame source、安全監控與人工工具的 owner |
 | `定位演算法/EDM工具包/deploy` `runtime` | symlink → `deploy_code/` |
 
 模型權重在 `定位演算法/deploy_code/runtime/EDM/weights/`（不進版控）。

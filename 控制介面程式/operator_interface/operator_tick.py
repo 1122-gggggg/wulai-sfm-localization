@@ -27,6 +27,7 @@ from localization_result_ui import (
     localization_pose_timestamp,
     localization_result_is_weak,
     normalize_live_localization_result,
+    reject_camera_attitude_outlier,
     validate_live_localization_result,
 )
 from operator_rendering import weak_pose_source_kind
@@ -755,9 +756,9 @@ class _TickProfile:
     rather than guess between the remaining options.
 
     Those numbers came from the simulated stream, whose ffmpeg read happens
-    inline on the Tk thread; real flight feeds frames from an Olympe callback
-    thread instead, so the runbook is explicit that the real-hardware number has
-    to be taken separately. Emitting from here means one IMU飛行測試.sh flight
+    inline on the Tk thread; real flight polls frames from the RTSP reader instead,
+    so the runbook is explicit that the real-hardware number has to be taken
+    separately. Emitting from here means one IMU飛行測試.sh flight
     produces it with no extra step.
     """
 
@@ -1248,6 +1249,27 @@ def _record_weak_display_pose(
     return True
 
 
+def _map_up_for_attitude_check(app: Any) -> tuple[object, bool]:
+    basis = getattr(app, "_map_axis_basis", None)
+    if not callable(basis):
+        return None, False
+    try:
+        _east, _north, up, measured = basis()
+    except Exception:
+        return None, False
+    return up, bool(measured)
+
+
+def _request_relocalize_after_attitude_reject(app: Any) -> None:
+    request = getattr(app.localizer, "request_relocalize", None)
+    if not callable(request):
+        return
+    try:
+        request()
+    except Exception as exc:
+        app.write_log(f"MegaLoc recovery 請求失敗: {exc!r}")
+
+
 def update_live_results(
     app: Any,
     *,
@@ -1269,6 +1291,12 @@ def update_live_results(
         annotate_ui_arrival_timing(result)
         handle_localization_exception(app, result)
         update_benchmark_status(app, result)
+        map_up, map_up_measured = _map_up_for_attitude_check(app)
+        result, xyz, attitude_rejected = reject_camera_attitude_outlier(
+            result, xyz, map_up=map_up, map_up_measured=map_up_measured,
+        )
+        if attitude_rejected:
+            _request_relocalize_after_attitude_reject(app)
         xyz = stabilize_result_pose(app, result, xyz)
         try:
             invalid_success_pose = bool(

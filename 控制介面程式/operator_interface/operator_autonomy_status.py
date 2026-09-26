@@ -79,6 +79,13 @@ def leg_stage(label: str, last: dict) -> tuple[str, str]:
         return _blocked_leg_stage(label, lowered)
     if not last.get("has_pose", True):
         return "searching_pose", f"找尋{label}中"
+    waypoint_action = last.get("waypoint_action")
+    if isinstance(waypoint_action, dict):
+        # One stage per action, so the operator log announces each in turn.
+        return (
+            f"waypoint_action_{waypoint_action.get('step')}",
+            f"{label}航點動作：{waypoint_action_text(waypoint_action)}",
+        )
     if "final hold" in action:
         return "final_hold", f"終點{label}到達確認中"
     if "pending inspection" in action or action.startswith("ABORT"):
@@ -94,6 +101,23 @@ def leg_stage(label: str, last: dict) -> tuple[str, str]:
     if phase_stage is not None:
         return phase_stage
     return _reason_leg_stage(label, lowered, phase, last)
+
+
+def waypoint_action_text(action: dict) -> str:
+    """Operator text for one waypoint action dict (route JSON or tick record)."""
+    kind = action.get("type")
+    try:
+        if kind == "yaw":
+            degrees = float(action["degrees"])
+            text = f"{'右' if degrees > 0 else '左'}轉{abs(degrees):g}°"
+        elif kind == "hover":
+            text = f"懸停{float(action['seconds']):g}秒"
+        else:
+            return str(kind)
+    except (KeyError, TypeError, ValueError):
+        return str(kind)
+    step, count = action.get("step"), action.get("count")
+    return f"{text}（{step}/{count}）" if step and count else text
 
 
 def _search_suffix(last: dict) -> str:

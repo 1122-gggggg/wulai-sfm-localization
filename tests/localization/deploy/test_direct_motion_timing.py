@@ -182,6 +182,8 @@ def test_direct_adapter_preserves_handover_capture_metadata():
         "reloc_ms": 160.0,
         "reloc_retrieval_ms": 10.0,
         "reloc_match_lift_ms": 140.0,
+        "reloc_edm_match_ms": 100.0,
+        "reloc_lift_prepare_ms": 40.0,
         "reloc_pnp_ms": 7.0,
         "reloc_reference_count": 2,
         "reloc_capture_stamp_mono": 10.0,
@@ -203,3 +205,5 @@ def test_direct_adapter_preserves_handover_capture_metadata():
     assert adapter.last_info["reloc_capture_stamp_mono"] == pytest.approx(10.0)
     assert adapter.last_info["reloc_source_epoch"] == 4
     assert adapter.last_info["reloc_ordinal"] == 100
+    assert adapter.last_info["reloc_edm_match_ms"] == 100.0
+    assert adapter.last_info["reloc_lift_prepare_ms"] == 40.0

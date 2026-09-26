@@ -241,6 +241,70 @@ def _waypoint_arrive_radii(data: dict[str, Any], count: int) -> tuple[float, ...
     return tuple(radii)
 
 
+#: Per-waypoint actions the operator may attach in the route editor, run after
+#: the waypoint is reached and before the turn toward the next one. "yaw" turns
+#: the nose by ``degrees`` relative to the heading on arrival (positive = right,
+#: clockwise seen from above); "hover" holds position for ``seconds``.
+WAYPOINT_ACTION_LIMITS = {
+    "yaw": ("degrees", 180.0),
+    "hover": ("seconds", 60.0),
+}
+MAX_ACTIONS_PER_WAYPOINT = 8
+
+
+@dataclass(frozen=True)
+class WaypointAction:
+    kind: str
+    value: float
+
+    def to_json(self) -> dict[str, Any]:
+        return {"type": self.kind, WAYPOINT_ACTION_LIMITS[self.kind][0]: self.value}
+
+
+def parse_waypoint_action(raw: object, label: str) -> WaypointAction:
+    if not isinstance(raw, dict):
+        raise ValueError(f"{label} must be an object")
+    kind = raw.get("type")
+    if kind not in WAYPOINT_ACTION_LIMITS:
+        raise ValueError(f"{label}.type must be one of {sorted(WAYPOINT_ACTION_LIMITS)}")
+    key, limit = WAYPOINT_ACTION_LIMITS[kind]
+    if set(raw) != {"type", key}:
+        raise ValueError(f"{label} must contain exactly 'type' and '{key}'")
+    value = raw[key]
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{label}.{key} must be a number")
+    value = float(value)
+    if kind == "yaw" and not (math.isfinite(value) and 0.0 < abs(value) <= limit):
+        raise ValueError(f"{label}.degrees must be non-zero and within +/-{limit:g}")
+    if kind == "hover" and not (math.isfinite(value) and 0.0 < value <= limit):
+        raise ValueError(f"{label}.seconds must be > 0 and <= {limit:g}")
+    return WaypointAction(kind, value)
+
+
+def _waypoint_actions(
+    data: dict[str, Any], count: int
+) -> tuple[tuple[WaypointAction, ...], ...] | None:
+    raw = data.get("waypoint_actions")
+    if raw is None:
+        return None
+    if not isinstance(raw, list) or len(raw) != count:
+        raise ValueError(
+            "route waypoint_actions must be a list with one action list per waypoint"
+        )
+    parsed = []
+    for index, actions in enumerate(raw):
+        label = f"route waypoint_actions[{index}]"
+        if not isinstance(actions, list) or len(actions) > MAX_ACTIONS_PER_WAYPOINT:
+            raise ValueError(
+                f"{label} must be a list of at most {MAX_ACTIONS_PER_WAYPOINT} actions"
+            )
+        parsed.append(tuple(
+            parse_waypoint_action(action, f"{label}[{step}]")
+            for step, action in enumerate(actions)
+        ))
+    return tuple(parsed)
+
+
 def validate_flight_route_fields(
     data: object,
     *,
@@ -263,6 +327,7 @@ def validate_flight_route_fields(
     )
     _arrival_radius(data)
     _waypoint_arrive_radii(data, len(source_points))
+    _waypoint_actions(data, len(source_points))
 
 
 @dataclass(frozen=True)
@@ -287,6 +352,7 @@ class RouteDocument:
     align_source: str | None = None
     arrive_radius_map_units: float | None = None
     waypoint_arrive_radii: tuple[float, ...] | None = None
+    waypoint_actions: tuple[tuple[WaypointAction, ...], ...] | None = None
 
     @classmethod
     def from_data(
@@ -327,6 +393,7 @@ class RouteDocument:
         )
         arrive_radius = _arrival_radius(data)
         point_radii = _waypoint_arrive_radii(data, len(source_points))
+        actions = _waypoint_actions(data, len(source_points))
         return cls(
             waypoints=source_points,
             controller_points=controller_points,
@@ -340,6 +407,7 @@ class RouteDocument:
             align_source=align_source,
             arrive_radius_map_units=arrive_radius,
             waypoint_arrive_radii=point_radii,
+            waypoint_actions=actions,
         )
 
     @classmethod
@@ -422,6 +490,7 @@ class MissionRouteSnapshot:
     waypoints: tuple[tuple[float, float, float], ...]
     arrive_radius_map_units: float | None = None
     waypoint_arrive_radii: tuple[float, ...] | None = None
+    waypoint_actions: tuple[tuple[WaypointAction, ...], ...] | None = None
 
     def controller_waypoints(self) -> list[np.ndarray]:
         return [np.array(point, dtype=float, copy=True) for point in self.waypoints]
@@ -481,6 +550,7 @@ def capture_mission_route_snapshot(
         waypoints=tuple((point[0], point[1], point[2]) for point in route.controller_points),
         arrive_radius_map_units=route.arrive_radius_map_units,
         waypoint_arrive_radii=route.waypoint_arrive_radii,
+        waypoint_actions=route.waypoint_actions,
     )
 
 

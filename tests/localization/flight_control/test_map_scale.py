@@ -109,3 +109,28 @@ def test_garbage_rows_are_ignored_not_fatal() -> None:
     est = estimate_map_scale(visual, speeds)
     assert est.converged, est.reason
     assert est.scale_m_per_unit == pytest.approx(2.5, rel=0.05)
+
+
+def test_drift_ratio_preserves_time_order_when_scale_decreases():
+    times = np.arange(0., 100., .1)
+    velocity_u = np.where(times < 50., .25, .5)
+    x = np.cumsum(velocity_u) * .1
+    visual = [(float(t), float(v), 0., 0.) for t, v in zip(times, x)]
+    estimate = estimate_map_scale(visual, [(float(t), 1.) for t in times])
+    assert estimate.drift_ratio == pytest.approx(.5, rel=.08)
+
+
+def test_telemetry_and_visual_gaps_are_not_integrated_as_observations():
+    times = np.concatenate([np.arange(start, start + 2., .1) for start in range(0, 100, 20)])
+    visual = [(float(t), float(t / 2.), 0., 0.) for t in times]
+    estimate = estimate_map_scale(visual, [(float(t), 1.) for t in times])
+    assert not estimate.converged
+    assert estimate.metric_distance_m < 10.
+
+
+def test_telemetry_before_and_after_visual_capture_does_not_discard_shared_interval():
+    visual, speeds = _synthetic_flight()
+    speeds = [(-10., 0.)] + speeds + [(130., 0.)]
+    estimate = estimate_map_scale(visual, speeds)
+    assert estimate.converged
+    assert estimate.scale_m_per_unit == pytest.approx(2.5, rel=.05)

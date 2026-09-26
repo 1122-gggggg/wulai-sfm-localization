@@ -8,6 +8,40 @@ import pytest
 import sim_route_autoflight as sim
 
 
+def test_continuous_wind_profile_interpolates_gusts_and_direction_reversals():
+    params = sim.SimParams(
+        route=_route(),
+        align=None,
+        wind_mean_mps=(0.1, 0.0, 0.0),
+        wind_profile=((0.0, 0.0, 0.3, 0.0), (2.0, 0.0, -0.3, 0.0), (4.0, 0.0, 0.0, 0.0)),
+    )
+    np.testing.assert_allclose(sim.wind_mean_at(params, 1.0), [0.1, 0.0, 0.0], atol=1e-9)
+    np.testing.assert_allclose(sim.wind_mean_at(params, 3.0), [0.1, -0.15, 0.0])
+    np.testing.assert_allclose(sim.wind_mean_at(params, 10.0), [0.1, 0.0, 0.0])
+
+
+@pytest.mark.parametrize(
+    "profile",
+    [
+        ((0.0, 1.0, 0.0),),
+        ((-1.0, 0.0, 0.0, 0.0),),
+        ((1.0, 0.0, 0.0, 0.0), (1.0, 1.0, 0.0, 0.0)),
+        ((0.0, float("nan"), 0.0, 0.0),),
+    ],
+)
+def test_wind_profile_rejects_ambiguous_times_and_invalid_vectors(profile):
+    with pytest.raises(ValueError, match="wind_profile"):
+        sim.SimParams(route=_route(), align=None, wind_profile=profile)
+
+
+def test_wind_profile_cli_reaches_the_production_simulator(tmp_path):
+    path = tmp_path / "gust.json"
+    path.write_text("[[0, 0, 0, 0], [1, 0, 0.3, 0], [2, 0, 0, 0]]")
+    args = sim.build_parser().parse_args(["--wind-profile", str(path)])
+    params = sim._params_from_args(args, seed=7, scale=15.0)
+    assert params.wind_profile[1] == (1.0, 0.0, 0.3, 0.0)
+
+
 def _route():
     from pathlib import Path as _P
 
@@ -515,3 +549,12 @@ def test_cli_localization_failure_flags_reach_params():
     assert (params.drift_gain, params.drift_mps, params.vertical_gain) == (5.0, 0.5, 0.0)
     assert (params.baro_noise_m, params.baro_drift_mps) == (0.1, -0.01)
     assert params.start_offset_frame == "raw" and params.start_offset_u == (0.1, 0.2, 0.3)
+
+
+def test_wind_observer_logs_residual_drift_from_the_production_loop():
+    params = sim.SimParams(route=_route(), align=_align(), duration_s=60.0, seed=7,
+                           wind_mean_mps=(0.3, 0.0, 0.0), wind_sigma_mps=0.0)
+    result, _ = sim.run_sim(params, record_trace=True)
+    ready = [row["wind_observer"] for row in result.trace
+             if (row.get("wind_observer") or {}).get("reason") == "ready"]
+    assert ready and math.hypot(*ready[-1]["drift_ned_mps"]) > 0.1

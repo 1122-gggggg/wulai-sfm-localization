@@ -545,7 +545,7 @@ def draw_video_empty_state(
     if live_backend:
         draw.text(
             (28, 52),
-            "Waiting for live PDRAW frames…",
+            "Waiting for live RTSP frames…",
             fill="#a7b0b8",
             font=overlay_font,
         )
@@ -703,9 +703,9 @@ def build_hud_overlay_data(state: Any, loc: Any, telemetry: Any) -> dict:
             "altitude_agl",
             "link_quality",
             "current_auto_speed",
-            "olympe_state",
-            "olympe_attitude",
-            "olympe_altitude",
+            "flight_state",
+            "flight_attitude",
+            "flight_altitude",
         ):
             try:
                 if hasattr(telemetry, key):
@@ -758,37 +758,37 @@ def build_hud_overlay_data(state: Any, loc: Any, telemetry: Any) -> dict:
         "current_auto_speed",
         tele_dict.get("auto_speed", tele_dict.get("current_auto_speed_var", "AUTO PCMD -")),
     )
-    rth = tele_dict.get("rth", tele_dict.get("olympe_state", "RTH ?/?"))
+    rth = tele_dict.get("rth", tele_dict.get("flight_state", "RTH ?/?"))
     gps = tele_dict.get("gps", "")
-    attitude = tele_dict.get("attitude", tele_dict.get("olympe_attitude", "飛控融合姿態 -"))
-    velocity = tele_dict.get("velocity", tele_dict.get("olympe_velocity", "三軸速度 -"))
+    attitude = tele_dict.get("attitude", tele_dict.get("flight_attitude", "飛控融合姿態 -"))
+    velocity = tele_dict.get("velocity", tele_dict.get("flight_velocity", "三軸速度 -"))
     altitude_agl = tele_dict.get(
-        "altitude_agl", tele_dict.get("olympe_altitude", "飛控高度 - | AGL -")
+        "altitude_agl", tele_dict.get("flight_altitude", "飛控高度 - | AGL -")
     )
     link_quality = tele_dict.get("link_quality", "")
-    olympe_state_val = tele_dict.get("olympe_state", None)
-    olympe_attitude_val = tele_dict.get("olympe_attitude", None)
-    olympe_altitude_val = tele_dict.get("olympe_altitude", None)
-    if olympe_state_val is not None or olympe_attitude_val is not None:
+    flight_state_val = tele_dict.get("flight_state", None)
+    flight_attitude_val = tele_dict.get("flight_attitude", None)
+    flight_altitude_val = tele_dict.get("flight_altitude", None)
+    if flight_state_val is not None or flight_attitude_val is not None:
         line1 = " | ".join(
             part for part in (str(auto_speed), f"定位 FPS {fps_text}", f"inliers {inliers}") if part
         )
         line2 = f"wall_ms {wall_text} | core {latency_text} | e2e {e2e_text}"
         line3 = (
-            str(olympe_state_val)
-            if olympe_state_val is not None
+            str(flight_state_val)
+            if flight_state_val is not None
             else (f"{rth} | {gps}".strip(" |") if gps else str(rth))
         )
         line4 = (
-            str(olympe_altitude_val)
-            if olympe_altitude_val is not None
+            str(flight_altitude_val)
+            if flight_altitude_val is not None
             else (
                 f"{altitude_agl} | {link_quality}".strip(" |")
                 if link_quality
                 else str(altitude_agl)
             )
         )
-        att = str(olympe_attitude_val) if olympe_attitude_val is not None else str(attitude)
+        att = str(flight_attitude_val) if flight_attitude_val is not None else str(attitude)
         if " | 三軸速度 " in att:
             att_part, sep, vel_part = att.partition(" | 三軸速度 ")
             attitude_line = att_part
@@ -998,3 +998,104 @@ def draw_video_banner(
             anchor="mm",
             font=banner_font,
         )
+
+
+def draw_magnetometer_axis(canvas: Any, guide: tuple[str, str, str] | None) -> None:
+    """Draw the rotation the firmware is currently asking for.
+
+    ``guide`` is magnetometer_axis_guide()'s result, or None when no axis is
+    being requested -- in which case the canvas is cleared rather than left
+    showing a stale rotation the operator should not perform. Kept deliberately
+    short (52 px) so the calibration buttons below it stay reachable at the
+    minimum supported window size.
+    """
+    if canvas is None:
+        return
+    canvas.delete("all")
+    if guide is None:
+        canvas.create_text(
+            8, 26, anchor="w", text="（目前沒有要求校正軸）", fill="#655b4d", font=("Sans", 10)
+        )
+        return
+    label, view, instruction = guide
+    body, accent, arrow = "#b6a891", "#302c26", "#245b9b"
+    cx, cy = 30, 26
+
+    if view == "top":  # X/roll: seen from above, roll about nose-tail
+        canvas.create_oval(cx - 20, cy - 7, cx + 20, cy + 7, fill=body, outline=accent)
+        canvas.create_polygon(
+            cx + 20, cy, cx + 28, cy - 4, cx + 28, cy + 4, fill=accent, outline=accent
+        )
+        canvas.create_line(cx - 27, cy, cx + 30, cy, fill=arrow, dash=(3, 2))
+        canvas.create_arc(
+            cx - 12,
+            cy - 20,
+            cx + 12,
+            cy + 20,
+            start=20,
+            extent=300,
+            style="arc",
+            outline=arrow,
+            width=2,
+        )
+        canvas.create_polygon(
+            cx + 11, cy - 16, cx + 17, cy - 7, cx + 5, cy - 8, fill=arrow, outline=arrow
+        )
+    elif view == "side":  # Y/pitch: seen from the left, nose over the top
+        canvas.create_oval(cx - 21, cy - 6, cx + 21, cy + 6, fill=body, outline=accent)
+        canvas.create_polygon(
+            cx + 21, cy, cx + 29, cy - 4, cx + 29, cy + 4, fill=accent, outline=accent
+        )
+        canvas.create_line(cx, cy - 22, cx, cy + 22, fill=arrow, dash=(3, 2))
+        canvas.create_arc(
+            cx - 24,
+            cy - 19,
+            cx + 24,
+            cy + 19,
+            start=200,
+            extent=140,
+            style="arc",
+            outline=arrow,
+            width=2,
+        )
+        canvas.create_polygon(
+            cx + 20, cy - 9, cx + 27, cy - 1, cx + 15, cy - 1, fill=arrow, outline=arrow
+        )
+    else:  # Z/yaw: seen from above, spin flat
+        canvas.create_oval(cx - 14, cy - 14, cx + 14, cy + 14, fill=body, outline=accent)
+        canvas.create_polygon(
+            cx, cy - 14, cx - 5, cy - 22, cx + 5, cy - 22, fill=accent, outline=accent
+        )
+        canvas.create_arc(
+            cx - 22,
+            cy - 22,
+            cx + 22,
+            cy + 22,
+            start=45,
+            extent=250,
+            style="arc",
+            outline=arrow,
+            width=2,
+        )
+        canvas.create_polygon(
+            cx + 14, cy - 13, cx + 22, cy - 7, cx + 12, cy - 4, fill=arrow, outline=arrow
+        )
+
+    canvas.create_text(
+        66,
+        2,
+        anchor="nw",
+        text=f"現在請轉：{label}",
+        fill=arrow,
+        font=("Sans", 11, "bold"),
+        width=174,
+    )
+    canvas.create_text(
+        66,
+        44,
+        anchor="nw",
+        text=f"{instruction}　轉滿三圈",
+        fill="#574a38",
+        font=("Sans", 10),
+        width=174,
+    )

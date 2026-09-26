@@ -3,7 +3,7 @@ A. 影片模擬串流（無真機，用測試影片跑定位與 UI）
 
   cd /home/allen/localization
   SFM_SITE_PROFILE="/home/allen/localization/地圖檔/場域/river_site/site_profile.json" \
-  VIDEO="/home/allen/下載/P1740174_720p.MP4" \
+  VIDEO="/home/allen/localization/模擬器/測試影片/720p/P1670167_720p.MP4" \
   ./控制介面程式/影片模擬串流/啟動.sh
 
 B. 真機串流

@@ -2,9 +2,7 @@ from __future__ import annotations
 
 import json
 
-# Source modules are supplied by the repository's pytest pythonpath.
-import olympe_frame_source as frame_source
-
+from types import SimpleNamespace
 import log_anafi_telemetry as telemetry
 
 
@@ -27,9 +25,9 @@ def test_partial_video_start_is_stopped_and_drone_disconnects(monkeypatch, tmp_p
             events.append("stop")
 
     clock = iter((0.0, 1.0))
-    monkeypatch.setattr(telemetry, "_build_message_table", lambda: [])
+    monkeypatch.setattr(telemetry, "_build_message_table", lambda *_: [])
     monkeypatch.setattr(telemetry, "connect", lambda *_args, **_kwargs: FakeDrone())
-    monkeypatch.setattr(frame_source, "OlympePdrawGrabber", PartialGrabber)
+    monkeypatch.setattr(telemetry, "RtspFrameGrabber", PartialGrabber)
     monkeypatch.setattr(telemetry.time, "monotonic", lambda: next(clock))
 
     telemetry.run_log(
@@ -52,7 +50,7 @@ def test_run_log_writes_start_sample_and_end_records(monkeypatch, tmp_path):
             events.append("disconnect")
 
     monotonic_values = iter((0.0, 0.0, 0.0, 0.0, 1.0))
-    monkeypatch.setattr(telemetry, "_build_message_table", lambda: [("attitude", object())])
+    monkeypatch.setattr(telemetry, "_build_message_table", lambda *_: [("attitude", object())])
     monkeypatch.setattr(telemetry, "connect", lambda *_args, **_kwargs: FakeDrone())
     monkeypatch.setattr(
         telemetry,
@@ -92,3 +90,25 @@ def test_run_log_writes_start_sample_and_end_records(monkeypatch, tmp_path):
         "t_iso": records[2]["t_iso"],
     }
     assert events == ["disconnect"]
+
+
+def test_video_log_marks_receipt_stamp_as_degraded():
+    frame = SimpleNamespace(shape=(720, 1280, 3))
+
+    class Grabber:
+        stream_metadata = {
+            "timestamp_degraded": True,
+            "stamp_source": "opencv-rtsp-receipt-degraded",
+        }
+
+        def __call__(self):
+            return frame, 12.5
+
+    row = {}
+    assert telemetry._add_video_sample(row, Grabber()) == (1, 0)
+    assert row["video.source_timestamp_degraded"] is True
+    assert row["video.source_timestamp_trusted"] is False
+    assert row["video.stamp_source"] == "opencv-rtsp-receipt-degraded"
+    assert row["video.frame"]["stamp_mono"] == 12.5
+    assert row["video.frame"]["timestamp_degraded"] is True
+    assert row["video.frame"]["source_timestamp_trusted"] is False

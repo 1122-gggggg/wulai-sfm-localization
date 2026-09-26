@@ -1,20 +1,21 @@
 #!/usr/bin/env python3
-"""REAL ANAFI closed-loop path-follow flight (Parrot Olympe / Ground SDK).
+"""REAL ANAFI localization and path-follow logic (direct ARSDK-NG + RTSP).
 
-This is the ONE missing wiring piece. Every block below already exists and was
-sim-validated separately; this file joins them into a single runnable real-flight
-entrypoint on ONE Olympe connection:
+This connects the production tracker and route controller using one direct
+ARSDK-NG control client plus Parrot RTSP video:
 
-    OlympePdrawGrabber (720p live stream)              [olympe_frame_source.py]
+    RtspFrameGrabber (720p /live stream)                   [rtsp_frame_source.py]
       -> site-selected direct production tracker
              KLT fast loop with MegaLoc/EDM reloc handover
-      -> map-frame heading fusion  (visual camera ray <-> Olympe yaw)
+      -> map-frame heading fusion  (visual camera ray <-> firmware NED yaw)
       -> RouteAutoController.step(pose) -> Command      [real_path_follow_controller.py]
              FOLLOW / LAND (direct waypoint legs; drift corrected every tick)
       -> command_to_body_percent(cmd, pose) -> PCMD(roll, pitch, yaw, gaz)
-      -> drone(PCMD(...))            same single connection used for the video
+      -> ARSDK-NG PCMD command              same control client
 
-SDK      : Parrot Olympe (Ground SDK).  https://developer.parrot.com/docs/olympe/
+Video timestamps are RTSP host-receipt times and degraded; strict source-time
+consumers fail closed. The live TakeOff path remains locked to the operator UI.
+
 Map      : river direct release; reloc manifest localization/direct_bundle.json.
 Path     : pre-drawn polyline  safezone/flight_path.json  (Blender Z-up waypoints).
 Frame    : raw GLOMAP  horizontal = X/Z, gravity-up = -Y   (matches RouteAutoController).
@@ -22,8 +23,8 @@ Frame    : raw GLOMAP  horizontal = X/Z, gravity-up = -Y   (matches RouteAutoCon
 Heading contract
 ----------------
 The production localizer publishes pose.yaw from the camera forward ray projected
-into the site's measured MapFrame. That visual heading anchors Olympe's faster NED
-yaw after converting clockwise-from-North NED into counter-clockwise map heading.
+into the site's measured MapFrame. That visual heading anchors firmware NED yaw
+after converting clockwise-from-North NED into counter-clockwise map heading.
 Route direction and translation are never treated as heading measurements.
 
 SAFETY  -- real flight is irreversible and can injure people or destroy the drone.
@@ -33,7 +34,6 @@ SAFETY  -- real flight is irreversible and can injure people or destroy the dron
   --fly       : rejected. Live TakeOff is only allowed from the operator UI.
 The aircraft's initial nose direction is measured, never assumed from the route.
 """
-
 from __future__ import annotations
 
 import argparse
@@ -96,12 +96,14 @@ from landing_transition import (  # noqa: E402
     landing_speed_allows_land,  # noqa: F401 - compatibility API
 )
 from heading_fusion import (  # noqa: E402
-    OFFSET_EMA,  # noqa: F401 - compatibility API
-    OlympeGroundSpeedTracker as OlympeGroundSpeedTracker,
-    VISUAL_IMU_YAW_MISMATCH_RAD,  # noqa: F401 - compatibility API
+    OFFSET_EMA,  # noqa: F401
+    ArsdkGroundSpeedTracker,
+    VISUAL_IMU_YAW_MISMATCH_RAD,  # noqa: F401
     HeadingEstimator,
-    olympe_yaw_of,
+    arsdk_yaw_of,
 )
+from control_state_estimator import ControlPoseSmoother, ControlStateEstimator  # noqa: E402
+from wind_observer import ResidualDriftObserver  # noqa: E402
 from safety_command import (  # noqa: E402
     default_safety_file as _default_safety_file,  # noqa: F401 - compatibility API
     prepare_safety_file as _prepare_safety_file,
@@ -267,8 +269,10 @@ LOW_CONF_JUMP_HOVER_COUNT = _env_int("SFM_LOW_CONF_JUMP_HOVER_COUNT", 3, minimum
 # as one step (2026-09-14: 0.333u after ~13 s VO; 2026-09-15 14:23:10: a 0.166u
 # reseed during a turn, under the 1.5u jump gate, switched AUTO to REJOIN at
 # roll 50 on the next tick and the pilot took over). When the position the
-# route controller steers from moves farther than the active arrival radius in
-# one step, horizontal PCMD is capped from zero back to full over this window.
+# route controller steers from moves by more than 0.1 map unit in one step,
+# horizontal PCMD is capped from zero back to full over this window. This
+# correction threshold is independent of the authored arrival radius.
+POSE_CORRECTION_RAMP_THRESHOLD_U = 0.1
 POSE_CORRECTION_RAMP_S = _env_float("SFM_POSE_CORRECTION_RAMP_S", 1.0, minimum=0.05, maximum=10.0)
 # If the control loop stalls longer than this (model/GPU hang), a helper thread
 # forces zero PCMD so the drone hovers instead of holding the last command.
@@ -592,7 +596,7 @@ def _bounded_call(callback, timeout_s: float, label: str):
 
 
 def _await_confirmed_action(result, label: str, timeout_s: float = ACTION_WAIT_TIMEOUT_S) -> None:
-    """Accept explicit local success or a confirmed Olympe expectation."""
+    """Accept explicit local success or a confirmed ARSDK-NG expectation."""
     if result is None or result is True:
         return
     if result is False:
@@ -616,14 +620,15 @@ def wait_success(expectation, label: str) -> None:
 
 def set_piloting_source(drone, source: str) -> bool:
     """Set and read back SkyController CoPiloting ownership."""
-    from olympe.messages.skyctrl.CoPiloting import setPilotingSource, pilotingSource
+    set_source = drone.messages.Skyctrl.CoPiloting.setPilotingSource
+    source_state = drone.messages.Skyctrl.CoPilotingState.pilotingSource
 
     requested = str(source)
     _await_confirmed_action(
-        drone(setPilotingSource(source=requested)),
+        drone(set_source(source=requested)),
         f"setPilotingSource({requested})",
     )
-    state = drone.get_state(pilotingSource)
+    state = drone.get_state(source_state)
     actual = state.get("source") if isinstance(state, dict) else None
     actual_name = str(getattr(actual, "name", actual)).rsplit(".", 1)[-1]
     if actual_name.lower() != requested.lower():
@@ -635,9 +640,9 @@ def set_piloting_source(drone, source: str) -> bool:
 
 def require_landed_for_firmware_config(drone) -> None:
     """Keep the aircraft-state gate separate from advisory firmware setup."""
-    from olympe.messages.ardrone3.PilotingState import FlyingStateChanged
+    flying_state_changed = drone.messages.Ardrone3.PilotingState.FlyingStateChanged
 
-    flying_state = drone.get_state(FlyingStateChanged)
+    flying_state = drone.get_state(flying_state_changed)
     state = flying_state.get("state") if isinstance(flying_state, dict) else None
     state_name = str(getattr(state, "name", state)).rsplit(".", 1)[-1].lower()
     if state_name != "landed":
@@ -666,9 +671,9 @@ def _preflight_battery_percent(drone, battery_message) -> int:
 
 
 def _require_distance_geofence_gps(drone) -> None:
-    from olympe.messages.ardrone3.GPSSettingsState import GPSFixStateChanged
+    gps_fix_state = drone.messages.Ardrone3.GPSSettingsState.GPSFixStateChanged
 
-    state = drone.get_state(GPSFixStateChanged)
+    state = drone.get_state(gps_fix_state)
     fixed = state.get("fixed") if isinstance(state, dict) else None
     if int(fixed or 0) != 1:
         raise RuntimeError("distance geofence requires a confirmed GPS fix")
@@ -727,43 +732,42 @@ def configure_flight_preflight(
     """Check battery and try to apply optional firmware flight limits."""
     if check_landed:
         require_landed_for_firmware_config(drone)
-    from olympe.messages.ardrone3.PilotingSettings import (
-        MaxAltitude,
-        MaxDistance,
-        NoFlyOverMaxDistance,
+    messages = drone.messages
+    max_altitude = messages.Ardrone3.PilotingSettings.MaxAltitude
+    max_distance = messages.Ardrone3.PilotingSettings.MaxDistance
+    no_fly_over_max_distance = messages.Ardrone3.PilotingSettings.NoFlyOverMaxDistance
+    max_altitude_changed = messages.Ardrone3.PilotingSettingsState.MaxAltitudeChanged
+    max_distance_changed = messages.Ardrone3.PilotingSettingsState.MaxDistanceChanged
+    no_fly_over_max_distance_changed = (
+        messages.Ardrone3.PilotingSettingsState.NoFlyOverMaxDistanceChanged
     )
-    from olympe.messages.ardrone3.PilotingSettingsState import (
-        MaxAltitudeChanged,
-        MaxDistanceChanged,
-        NoFlyOverMaxDistanceChanged,
-    )
-    from olympe.messages.common.CommonState import BatteryStateChanged
+    battery_state_changed = messages.Common.CommonState.BatteryStateChanged
 
     altitude = _positive_firmware_limit(max_altitude_m, "max altitude")
     distance = _positive_firmware_limit(max_distance_m, "max distance")
-    battery = _preflight_battery_percent(drone, BatteryStateChanged)
+    battery = _preflight_battery_percent(drone, battery_state_changed)
 
     if distance_geofence:
         _require_distance_geofence_gps(drone)
 
     _confirm_firmware_limit(
         drone,
-        MaxAltitude(current=altitude),
-        MaxAltitudeChanged,
+        max_altitude(current=altitude),
+        max_altitude_changed,
         altitude,
         "MaxAltitude",
     )
     _confirm_firmware_limit(
         drone,
-        MaxDistance(value=distance),
-        MaxDistanceChanged,
+        max_distance(value=distance),
+        max_distance_changed,
         distance,
         "MaxDistance",
     )
     _configure_distance_geofence(
         drone,
-        NoFlyOverMaxDistance,
-        NoFlyOverMaxDistanceChanged,
+        no_fly_over_max_distance,
+        no_fly_over_max_distance_changed,
         distance_geofence,
     )
     return {
@@ -775,7 +779,7 @@ def configure_flight_preflight(
 
 
 # ---------------------------------------------------------------------------
-# Map-frame heading: Olympe yaw (fast) anchored to measured visual orientation
+# Map-frame heading: firmware NED yaw (fast) anchored to measured visual orientation
 
 
 def _wrap(a: float) -> float:
@@ -885,14 +889,16 @@ def set_gimbal(
     timeout_s: float = 2.0,
     tolerance_deg: float = 3.0,
 ):
-    """Point the camera to a fixed absolute (horizon-referenced) tilt so live frames
-    resemble the map reference views. Absolute frame == EIS-stabilized vs horizon."""
+    """Point the camera to a fixed absolute (horizon-referenced) tilt."""
     target = float(pitch_deg)
     timeout = float(timeout_s)
     tolerance = float(tolerance_deg)
     if not _valid_gimbal_request(target, timeout, tolerance):
         return False
-    from olympe.messages.gimbal import absolute_attitude_bounds, attitude, set_target
+    messages = drone.messages.Gimbal
+    absolute_attitude_bounds = messages.absolute_attitude_bounds
+    attitude = messages.attitude
+    set_target = messages.set_target
 
     if require_confirmation and not _gimbal_target_in_bounds(
         drone, absolute_attitude_bounds, target
@@ -942,6 +948,9 @@ class LoopHooks:
     pcmd_timing: callable | None = None  # () -> latest desired/wire monotonic_ns markers
     ground_speed: callable | None = None  # () -> (horizontal_mps, monotonic_stamp) | None
     body_velocity: callable | None = None  # () -> (forward_mps, right_mps, source_stamp) | None
+    attitude_sample: callable | None = None  # () -> (NED yaw, sample_stamp) | None
+    ned_velocity: callable | None = None  # () -> (north_mps, east_mps, sample_stamp) | None
+    telemetry_history: callable | None = None  # () -> (yaw/stamp rows, north/east/stamp rows)
     # () -> (firmware altitude above takeoff in metres, monotonic stamp) | None;
     # None disables the barometric height cross-check (VerticalConsistencyGuard).
     altitude: callable | None = None
@@ -1716,7 +1725,7 @@ def start_skycontroller_stick_override(drone, safety_monitor: SafetyMonitor):
     operator_root = MISSION_ROOT / "operator_interface"
     if str(operator_root) not in sys.path:
         sys.path.insert(0, str(operator_root))
-    from olympe_live_backend import SkyControllerStickMonitor, _STICK_FLIGHT_AXES
+    from arsdk_ng_live_backend import SkyControllerStickMonitor, _STICK_FLIGHT_AXES
 
     stick_monitor = SkyControllerStickMonitor(
         on_active=lambda axes: _handle_physical_stick_override(safety_monitor, axes),
@@ -1789,7 +1798,13 @@ class _FlightLoopRunner:
         self.verbose = verbose
         self.enforce_weak_pose_gate = enforce_weak_pose_gate
         self.heading = HeadingEstimator(ctrl.cfg.map_frame if ctrl is not None else None)
+        self._heading_pending: list[tuple[float, float, bool]] = []
+        self._heading_anchor_stamp: float | None = None
         self.pcmd_controller = rpf.YawAlignedPcmdController(ctrl.cfg) if ctrl is not None else None
+        self.control_state = ControlStateEstimator(ctrl.cfg.map_frame) if ctrl is not None else None
+        self.control_smoother = ControlPoseSmoother(ctrl.cfg.map_frame) if ctrl is not None else None
+        self.wind_observer = ResidualDriftObserver() if ctrl is not None else None
+        self._clock_now: float | None = None
         self.vertical_guard = (
             rpf.VerticalConsistencyGuard(ctrl.cfg.map_frame)
             if ctrl is not None and hooks.altitude is not None else None
@@ -1816,7 +1831,6 @@ class _FlightLoopRunner:
         self.pose_jump_pause_observed = False
         self.pose_jump_resume_authorized = False
         self.source_confirmation = PoseSourceConfirmation()
-        self._last_route_xyz: np.ndarray | None = None
         self.pose_correction_started: float | None = None
         self.landing_confirmation = RouteLandingConfirmation(max_position_age_s=GROUND_SPEED_MAX_AGE_S)
         self.steps = 0
@@ -1843,6 +1857,7 @@ class _FlightLoopRunner:
     def step(self) -> _LoopOutcome:
         """Advance one 20 Hz control tick without sleeping. Shared by flight and sim."""
         started_at = self.hooks.now()
+        self._clock_now = started_at
         if self.hooks.loop_beat is not None:
             self.hooks.loop_beat()
         safety_mode = self.hooks.safety_poll() if self.hooks.safety_poll is not None else "AUTO"
@@ -1867,6 +1882,14 @@ class _FlightLoopRunner:
     def _reset_pcmd_controller(self) -> None:
         if self.pcmd_controller is not None:
             self.pcmd_controller.reset()
+        if self.control_state is not None:
+            self.control_state.reset_position()
+        if self.control_smoother is not None:
+            self.control_smoother.reset()
+        if self.wind_observer is not None:
+            self.wind_observer.reset()
+        self.pose_correction_started = None
+        self._heading_pending.clear()
 
     def _emit(self, record: dict, pcmd, blocked: bool, why: str) -> None:
         """Write a per-tick record without disturbing the flight loop."""
@@ -1930,6 +1953,14 @@ class _FlightLoopRunner:
 
     def _send_command(self, pcmd):
         """Route every loop-originated PCMD through one final authority."""
+        sent, reason, actual = self._authorize_command(pcmd)
+        if sent and actual is not None and self.wind_observer is not None and self._clock_now is not None:
+            # Reuse this tick's clock read; extra hooks.now() calls shift virtual clocks.
+            now = self._clock_now
+            self.wind_observer.observe_command(actual, self._fresh_ned_yaw(now), now)
+        return sent, reason, actual
+
+    def _authorize_command(self, pcmd):
         command = tuple(int(value) for value in pcmd)
         if self.hooks.send_authorized_pcmd is not None:
             return self.hooks.send_authorized_pcmd(command)
@@ -1946,6 +1977,20 @@ class _FlightLoopRunner:
         self.hooks.send_pcmd(0, 0, 0, 0)
         return False, f"safety mode={mode} stream={stream_ok}", (0, 0, 0, 0)
 
+    def _fresh_ned_yaw(self, now) -> float | None:
+        if self.hooks.attitude_sample is None:
+            return None
+        try:
+            sample = self.hooks.attitude_sample()
+            if sample is None:
+                return None
+            yaw, stamp = float(sample[0]), float(sample[1])
+        except (AttributeError, TypeError, ValueError, RuntimeError, IndexError):
+            return None
+        if not math.isfinite(yaw) or not 0.0 <= now - stamp <= 0.5:
+            return None
+        return yaw
+
     def _tick(self, started_at: float, safety_mode: str, record: dict) -> _LoopOutcome:
         outcome = self._initial_safety_outcome(safety_mode, record)
         if outcome is not None:
@@ -1961,9 +2006,12 @@ class _FlightLoopRunner:
         if outcome is not None:
             return outcome
         olympe_yaw = self._read_olympe_yaw()
+        self._observe_control_telemetry(now)
+        self._update_delayed_heading(now, record)
         self._record_olympe_yaw(olympe_yaw, record)
         localized_pose = self._read_localized_pose()
         now = self.hooks.now()
+        self._clock_now = now
         outcome = self._post_inference_safety_outcome(record)
         if outcome is not None:
             return outcome
@@ -1983,9 +2031,9 @@ class _FlightLoopRunner:
             # only observed map fixes recalibrate the visual-to-IMU anchor.
             initialize_heading = (
                 not self.enforce_weak_pose_gate
-                and self.heading.heading(olympe_yaw) is None
+                and self.heading.offset is None
             )
-            if not (map_pose_new or initialize_heading) or self.heading.update(localized_pose.yaw, olympe_yaw):
+            if not (map_pose_new or initialize_heading) or self._anchor_heading(localized_pose, olympe_yaw, record):
                 self.last_good = localized_pose
                 self.last_good_accepted_at = now
                 if map_pose_new:
@@ -2157,6 +2205,70 @@ class _FlightLoopRunner:
             return self.hooks.olympe_yaw()
         except Exception:
             return None
+
+    def _observe_control_telemetry(self, now):
+        if self.control_state is None:
+            return
+        if self.hooks.telemetry_history is not None:
+            try:
+                attitudes, velocities = self.hooks.telemetry_history()
+                for attitude in attitudes:
+                    self.control_state.observe_telemetry(attitude, None, now)
+                for velocity in velocities:
+                    self.control_state.observe_telemetry(None, velocity, now)
+            except (AttributeError, TypeError, ValueError, RuntimeError):
+                pass  # Legacy/current samples below retain their own freshness checks.
+        samples = []
+        for hook in (self.hooks.attitude_sample, self.hooks.ned_velocity):
+            try:
+                samples.append(hook() if hook is not None else None)
+            except (AttributeError, TypeError, ValueError, RuntimeError):
+                samples.append(None)
+        self.control_state.observe_telemetry(*samples, now)
+        if self.wind_observer is not None:
+            self.wind_observer.observe_velocities(tuple(self.control_state.velocities))
+
+    def _anchor_heading(self, pose, current_yaw, record):
+        if self.hooks.attitude_sample is None and self.hooks.telemetry_history is None:
+            return self.heading.update(pose.yaw, current_yaw)
+        capture_yaw = self.control_state.yaw_at(pose.stamp)
+        record["heading_time_aligned"] = capture_yaw is not None
+        if capture_yaw is None:
+            # A visual-only initial heading is usable, but an unmatched pair
+            # must never move an established visual-to-IMU offset.
+            if self.heading.offset is None:
+                self.heading.update(pose.yaw, None)
+            stamp = float(pose.stamp)
+            if not self._heading_pending or stamp > self._heading_pending[-1][0]:
+                self._heading_pending.append((stamp, float(pose.yaw),
+                                              self._control_pose_map_confirmed(pose)))
+                self._heading_pending = self._heading_pending[-32:]
+            return True
+        record["heading_anchor_stamp"] = float(pose.stamp)
+        accepted = self.heading.update(pose.yaw, capture_yaw)
+        if accepted:
+            self._heading_anchor_stamp = float(pose.stamp)
+        return accepted
+
+    def _update_delayed_heading(self, now, record):
+        if self.control_state is None or not self.control_state.yaws:
+            return
+        pending, self._heading_pending = self._heading_pending, []
+        for stamp, visual_yaw, confirmed in pending:
+            if now - stamp > self.ctrl.cfg.max_pose_age_s:
+                continue
+            if self._heading_anchor_stamp is not None and stamp <= self._heading_anchor_stamp:
+                continue
+            if not confirmed and self.heading.offset is not None:
+                continue  # BOOT may seed once; weak poses never recalibrate.
+            capture_yaw = self.control_state.yaw_at(stamp)
+            if capture_yaw is None:
+                if stamp > self.control_state.yaws[-1][0]:
+                    self._heading_pending.append((stamp, visual_yaw, confirmed))
+                continue
+            if self.heading.update(visual_yaw, capture_yaw):
+                self._heading_anchor_stamp = stamp
+                record["heading_delayed_anchor_stamp"] = stamp
 
     def _read_localized_pose(self):
         try:
@@ -2794,7 +2906,8 @@ class _FlightLoopRunner:
         Once VerticalConsistencyGuard waives the current target, the controller
         is given the pose at the target's own localized height: no vertical
         error, so no climb or descent, and arrival is judged horizontally. The
-        raw pose stays in pose_u; the next target is judged afresh.
+        raw pose stays in pose_u. A detected inconsistency persists across
+        targets, but the final landing sphere always uses the raw height.
         """
         guard = self.vertical_guard
         if guard is None:
@@ -2804,6 +2917,7 @@ class _FlightLoopRunner:
         altitude = self._fresh_altitude(now)
         record["localized_vertical_error_u"] = round(error, 4)
         record["baro_altitude_m"] = None if altitude is None else round(altitude, 3)
+        record["vertical_guard_target"] = target
         if guard.observe(target, error, altitude, self.ctrl._arrive_radius_for(target)):
             record["vertical_waived_now"] = True
         if guard.last_check is not None:
@@ -2811,17 +2925,22 @@ class _FlightLoopRunner:
         if target not in guard.waived:
             return pose
         record["vertical_waived"] = True
+        if target == len(self.ctrl.wp) - 1:
+            # Holding an unobservable altitude is not evidence that the raw
+            # final 3-D position satisfies the existing landing sphere.
+            record["vertical_hold_only"] = True
+            return pose
         x, y, z = (float(value) for value in pose.xyz + error * guard.up)
         return replace(pose, x=x, y=y, z=z)
 
     def _note_pose_correction(self, pose, now: float, record: dict) -> None:
-        previous = self._last_route_xyz
-        self._last_route_xyz = pose.xyz.copy()
-        radius = self._settle_radius()
-        if previous is None or radius is None:
-            return
-        step = float(np.linalg.norm(pose.xyz - previous))
-        if step > radius:
+        previous = self.control_smoother.previous
+        expected = None if previous is None else self.control_state.observed_motion(
+            previous[0], pose.stamp, now, self.heading.offset)
+        step = self.control_smoother.observe(pose, now, expected)
+        if step > .02:
+            self.control_state.reset_observation()
+        if step > POSE_CORRECTION_RAMP_THRESHOLD_U:
             self.pose_correction_started = now
             record["pose_correction_u"] = round(step, 3)
 
@@ -2843,7 +2962,7 @@ class _FlightLoopRunner:
         scale = cap / magnitude
         return int(roll * scale), int(pitch * scale), yaw, gaz
 
-    def _compute_route_pcmd(self, command, pose, now: float):
+    def _compute_route_pcmd(self, command, pose, now: float, record: dict):
         self._last_body_velocity = None
         if command.look_at_pole is not None:
             self._reset_pcmd_controller()
@@ -2857,6 +2976,13 @@ class _FlightLoopRunner:
         if self.hooks.body_velocity is not None:
             body_velocity = self.hooks.body_velocity()
         self._last_body_velocity = body_velocity
+        # Shadow only: the offline matrix rejected applying this feedforward.
+        feedforward, reason = self.wind_observer.feedforward(
+            now, self._fresh_ned_yaw(now), self.ctrl.cfg.max_translation_pcmd)
+        record["wind_observer"] = {
+            **self.wind_observer.diagnostics(), "reason": reason,
+            "shadow_feedforward_body_pcmd": None if feedforward is None else [round(v, 3) for v in feedforward],
+        }
         return self.pcmd_controller.update(
             command,
             pose,
@@ -2865,6 +2991,26 @@ class _FlightLoopRunner:
             yaw_sign=self.yaw_sign,
             body_velocity=body_velocity,
         )
+
+    def _predict_control_pose(self, command, pose, now, record):
+        """Predict servo inputs only; the sequencer and landing use raw fixes."""
+        radius = self.ctrl._arrive_radius_for(self.ctrl.target_index)
+        xyz, diagnostics = self.control_state.predict(pose, now, self.heading.offset, radius)
+        record["control_prediction"] = diagnostics
+        correction = self.control_smoother.correction(now)
+        if not diagnostics["applied"] and not np.any(correction):
+            return command, pose
+        xyz = xyz + correction
+        record["handover_correction_u"] = correction.tolist()
+        control_pose = replace(pose, x=float(xyz[0]), y=float(xyz[1]), z=float(xyz[2]))
+        record["control_pose_u"] = xyz.tolist()
+        if command.path_tangent is not None and command.path_pull is not None:
+            # Reproject without calling step/_guidance_command: both mutate
+            # route progress or mode and may only consume observed positions.
+            distance, nearest, _ = self.rpf.point_segment_distance(
+                xyz, self.ctrl.wp[max(0, self.ctrl.target_index - 1)], command.goal)
+            command = replace(command, path_pull=nearest - xyz, path_error=float(distance))
+        return command, control_pose
 
     @staticmethod
     def _debug_deg(value: object) -> float | None:
@@ -2901,6 +3047,7 @@ class _FlightLoopRunner:
         if (
             getattr(command, "look_at_pole", None) is not None
             or getattr(command, "guidance_goal", None) is not None
+            or getattr(command, "action", None) == "WAYPOINT_ACTION"
         ):
             return self._debug_deg(_wrap(yaw_target - nose))
         if pose is None:
@@ -2939,6 +3086,8 @@ class _FlightLoopRunner:
             record["active_segment_index"] = int(self.ctrl.active_segment)
         if command.guidance_goal is not None:
             record["guidance_u"] = [round(float(value), 4) for value in command.guidance_goal]
+        if getattr(command, "waypoint_action", None) is not None:
+            record["waypoint_action"] = dict(command.waypoint_action)
         # Continuous path-pull decomposition: blends the carrot ray with the
         # lateral part of the active-leg projection offset, so the flown
         # trajectory can be audited against the plan every tick.
@@ -3190,6 +3339,11 @@ class _FlightLoopRunner:
         sent, send_reason, actual = self._send_command(pcmd)
         record["command_authorized_mono_ns"] = time.monotonic_ns()
         record["pcmd_semantics"] = "authorized_for_dispatch"
+        if sent and actual is not None:
+            self.pcmd_controller.feedback_applied(actual)
+            record["horizontal_control_terms"] = dict(self.pcmd_controller.control_terms)
+        else:
+            self._reset_pcmd_controller()
         self._emit(record, actual, not sent, command.status if sent else send_reason)
         if not sent:
             terminal = self._blocked_send_outcome(send_reason, context="before PCMD")
@@ -3250,16 +3404,19 @@ class _FlightLoopRunner:
             getattr(self.heading, "offset", None)
         )
         self._note_pose_correction(pose, now, record)
+        self.control_state.observe_pose(pose, now, self.heading.offset)
+        observed_pose = pose
         pose = self._vertical_guarded_pose(pose, now, record)
         command = self.ctrl.step(pose, now)
         record["yaw_error_deg"] = self._debug_yaw_error_deg(command, heading, pose)
         self._record_route_command(record, command, heading, pose=pose)
         self._record_route_projection(pose, record)
         ground_speed_sample = self._ground_speed_sample(command)
-        settled_command = self._apply_landing_settling(command, pose, ground_speed_sample, now, record)
-        pcmd = self._compute_route_pcmd(settled_command, pose, now)
+        settled_command = self._apply_landing_settling(command, observed_pose, ground_speed_sample, now, record)
+        control_command, control_pose = self._predict_control_pose(settled_command, pose, now, record)
+        pcmd = self._compute_route_pcmd(control_command, control_pose, now, record)
         pcmd = self._cap_after_pose_correction(pcmd, now, record)
-        if self.vertical_guard is not None and int(self.ctrl.target_index) in self.vertical_guard.waived:
+        if self.vertical_guard is not None and self.vertical_guard.unreliable:
             pcmd = (pcmd[0], pcmd[1], pcmd[2], 0)  # hold altitude; see _vertical_guarded_pose
         record["pcmd_phase"] = self.pcmd_controller.phase
         record["map_confirmed"] = pose.map_confirmed
@@ -3605,7 +3762,7 @@ def _make_live_loop_hooks(
         force_relocalize=lambda: setattr(localizer.state, "mode", "LOST"),
         request_manual=request_manual,
         stick_active=getattr(stick_monitor, "is_active", None),
-        olympe_yaw=lambda: olympe_yaw_of(drone),
+        olympe_yaw=lambda: arsdk_yaw_of(drone),
         send_pcmd=send_if_active,
         send_authorized_pcmd=lambda pcmd: monitor.send_authorized(
             pcmd,
@@ -3856,13 +4013,13 @@ def _run_until(hooks, ctrl, wp, yaw_sign, stop):
 
 
 def grab_only(ip: str, secs: float, controller: str):
-    import olympe_frame_source as ofs
+    import rtsp_frame_source as rtsp
 
     drone = None
     grab = None
     try:
-        drone = ofs.connect(ip, controller=controller)
-        grab = ofs.OlympePdrawGrabber(drone).start()
+        drone = rtsp.connect(ip, controller=controller)
+        grab = rtsp.RtspFrameGrabber(drone).start()
         loc = build_localizer(grab)
         print(f"[grab] localizing live for {secs:.0f}s (PROPS OFF, no arm)...")
         t0 = time.monotonic()

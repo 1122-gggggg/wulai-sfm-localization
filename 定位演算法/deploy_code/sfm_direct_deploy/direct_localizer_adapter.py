@@ -294,6 +294,8 @@ class DirectTrackerAdapter(Localizer):
             "reloc_ms": info["reloc_ms"],
             "reloc_retrieval_ms": info.get("reloc_retrieval_ms"),
             "reloc_match_lift_ms": info.get("reloc_match_lift_ms"),
+            "reloc_edm_match_ms": info.get("reloc_edm_match_ms"),
+            "reloc_lift_prepare_ms": info.get("reloc_lift_prepare_ms"),
             "reloc_pnp_ms": info.get("reloc_pnp_ms"),
             "reloc_reference_count": info.get("reloc_reference_count"),
             "reloc_capture_stamp_mono": info.get("reloc_capture_stamp_mono"),

@@ -5,7 +5,7 @@ import time
 import numpy as np
 import pytest
 
-from olympe_live_backend import LiveAnafiVideoStream
+from arsdk_ng_live_backend import LiveAnafiVideoStream
 
 
 class _StampedGrabber:
@@ -76,22 +76,25 @@ def test_live_stream_grabber_failure_keeps_delivery_state_unchanged():
     assert stream.last_timing == {}
 
 
-def test_live_stream_reports_observed_frame_and_pdraw_metadata():
+def test_live_stream_reports_observed_frame_and_rtsp_metadata():
     frame = np.zeros((720, 1280, 3), dtype=np.uint8)
 
     class Grabber:
         fps = 29.5
         stream_metadata = {
+            "transport": "RTSP",
+            "rtsp_uri": "rtsp://192.168.53.1:554/live",
+            "rtsp_path": "/live",
             "codec": "H.264",
-            "codec_evidence": "configured-pdraw-input-contract",
-            "codec_observed": False,
-            "pdraw_media_name": "DefaultVideo",
-            "pdraw_stream_mode": "play",
+            "codec_observed": True,
             "source_width_px": 1920,
             "source_height_px": 1080,
-            "source_timestamp_capable": True,
-            "source_timestamp_trusted": True,
-            "stamp_source": "ntp-mapped",
+            "output_width_px": 1280,
+            "output_height_px": 720,
+            "source_timestamp_capable": False,
+            "source_timestamp_trusted": False,
+            "timestamp_degraded": True,
+            "stamp_source": "opencv-rtsp-receipt-degraded",
         }
 
         @staticmethod
@@ -106,15 +109,19 @@ def test_live_stream_reports_observed_frame_and_pdraw_metadata():
     assert stream.next_frame() is frame
 
     metadata = stream.metadata_snapshot()
+    assert metadata["transport"] == "RTSP"
+    assert metadata["rtsp_path"] == "/live"
     assert metadata["codec"] == "H.264"
-    assert metadata["codec_observed"] is False
+    assert metadata["codec_observed"] is True
     assert metadata["source_width_px"] == 1920
     assert metadata["source_height_px"] == 1080
     assert metadata["ui_frame_width_px"] == 1280
     assert metadata["ui_frame_height_px"] == 720
     assert metadata["observed_fps"] == 29.5
     assert metadata["frames_delivered"] == 1
-    assert metadata["source_timestamp_capable"] is True
+    assert metadata["source_timestamp_capable"] is False
+    assert metadata["source_timestamp_trusted"] is False
+    assert metadata["timestamp_degraded"] is True
 
 
 @pytest.mark.parametrize("stamp", [float("nan"), float("inf"), -float("inf")])

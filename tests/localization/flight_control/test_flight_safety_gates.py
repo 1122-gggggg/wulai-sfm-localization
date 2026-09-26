@@ -2,7 +2,7 @@
 """Failure-injection tests for the real-flight safety gates (pure python, no drone).
 
 Every test drives the REAL path_follow_flight.run_loop / SafetyMonitor /
-command_to_body_percent / OlympePdrawGrabber logic with mock hooks. No olympe,
+`command_to_body_percent` / ``RtspFrameGrabber`` logic with mock hooks. No ARSDK client,
 no torch, no GPU, no hardware.
 
 Run:  pytest -q tests/localization/flight_control/test_flight_safety_gates.py
@@ -30,7 +30,7 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 FLIGHT_CONTROL_ROOT = REPO_ROOT / "定位演算法" / "flight_control"
 sys.path.insert(0, str(FLIGHT_CONTROL_ROOT))
 
-import olympe_frame_source as ofs
+import rtsp_frame_source as rfs
 import path_follow_flight as pff
 import real_path_follow_controller as rpf
 
@@ -97,15 +97,18 @@ def fresh_pose(st, x=0.0, y=0.0, z=0.0, yaw=0.0):
 # Mode separation
 
 
-def test_selftest_and_dry_run_never_import_olympe(tmp_path, monkeypatch):
+def test_selftest_and_dry_run_never_import_hardware_sdks(tmp_path, monkeypatch):
     real_import = builtins.__import__
 
-    def reject_olympe(name, *args, **kwargs):
-        if name == "olympe" or name.startswith("olympe."):
+    def reject_hardware_sdk(name, *args, **kwargs):
+        if name == "olympe" or name.startswith("olympe.") or name in {
+            "arsdk_ng",
+            "arsdk_ng_live_backend",
+        }:
             raise AssertionError(f"offline mode attempted to import {name}")
         return real_import(name, *args, **kwargs)
 
-    monkeypatch.setattr(builtins, "__import__", reject_olympe)
+    monkeypatch.setattr(builtins, "__import__", reject_hardware_sdk)
     pff.selftest()
     route = tmp_path / "flight_path.json"
     route.write_text(json.dumps({"waypoints": [[0, 0, 0], [8, 0, 0]]}), encoding="utf-8")
@@ -265,226 +268,6 @@ def test_stream_lost_continues_hovering_past_previous_land_threshold():
     assert reason == "tick cap"
     assert records and all(r["blocked"] for r in records)
     assert any("stream" in r["reason"] for r in records)
-
-
-def _install_fake_pdraw_modules(monkeypatch):
-    class Callbacks:
-        def __init__(self, **kwargs):
-            self.media_type = kwargs.get("media_type")
-            self.video_frame = kwargs.get("video_frame")
-            self.flush = kwargs.get("flush")
-
-    class StreamInfoSingle:
-        def __init__(self):
-            self.name = None
-            self.has_renderer = None
-            self.callbacks = []
-
-    class StreamInfoDefault(StreamInfoSingle):
-        pass
-
-    fake_deps = SimpleNamespace(VDEF_FRAME_TYPE_RAW="raw")
-    fake_pdraw = SimpleNamespace(
-        Callbacks=Callbacks,
-        StreamInfoDefault=StreamInfoDefault,
-        StreamInfoSingle=StreamInfoSingle,
-        h264_coded_data_format=SimpleNamespace(bytestream="bytestream"),
-    )
-    real_import = builtins.__import__
-
-    def fake_import(name, globals=None, locals=None, fromlist=(), level=0):
-        if name == "olympe_deps":
-            return fake_deps
-        if name == "olympe.features.video.pdraw":
-            return fake_pdraw
-        return real_import(name, globals, locals, fromlist, level)
-
-    monkeypatch.setattr(builtins, "__import__", fake_import)
-
-
-def test_live_multistream_keeps_raw_callbacks_without_renderer(monkeypatch):
-    _install_fake_pdraw_modules(monkeypatch)
-
-    class Streaming:
-        def play_multiple_stream(self, *, streams_list, timeout):
-            self.streams = streams_list
-            self.timeout = timeout
-            return True
-
-    streaming = Streaming()
-    grabber = ofs.OlympePdrawGrabber(SimpleNamespace(streaming=streaming), resize=None)
-    grabber._start_with_play("DefaultVideo")
-
-    assert len(streaming.streams) == 2
-    for stream in streaming.streams:
-        assert stream.has_renderer is False
-        assert len(stream.callbacks) == 1
-        callback = stream.callbacks[0]
-        assert callback.media_type == ("raw", None)
-        assert callable(callback.video_frame)
-
-
-def test_live_single_stream_keeps_raw_callback_without_renderer(monkeypatch):
-    _install_fake_pdraw_modules(monkeypatch)
-
-    class Streaming:
-        def play(self, **kwargs):
-            self.kwargs = kwargs
-            return True
-
-    streaming = Streaming()
-    grabber = ofs.OlympePdrawGrabber(SimpleNamespace(streaming=streaming), resize=None)
-    grabber._start_with_play("DefaultVideo")
-
-    assert streaming.kwargs["has_renderer"] is False
-    assert callable(streaming.kwargs["raw_cb"])
-    assert streaming.kwargs["data_formats"] == ["bytestream"]
-
-
-def test_frozen_stream_goes_unhealthy():
-    g = ofs.OlympePdrawGrabber.__new__(ofs.OlympePdrawGrabber)
-    import threading
-
-    g._lock = threading.Lock()
-    g._latest = None
-    g._stamp = 0.0
-    g._n = 0
-    g._digest = None
-    g._dup_n = 0
-    g._frozen_warned = False
-    g.stale_s = 5.0
-    frame = (np.arange(720 * 1280 * 3, dtype=np.uint8) % 251).reshape(720, 1280, 3)
-    for _ in range(ofs.FROZEN_DUP_FRAMES + 1):
-        g._store(frame)
-    assert g() is None, "frozen (duplicated) stream must yield no frame"
-    assert not g.is_healthy(), "frozen stream must be unhealthy despite fresh stamps"
-    g._store(frame.copy() + 1)
-    assert g.is_healthy(), "a distinct new frame must recover the stream"
-
-
-def test_frame_sample_carries_capture_timestamp():
-    g = ofs.OlympePdrawGrabber.__new__(ofs.OlympePdrawGrabber)
-    import threading
-
-    g._lock = threading.Lock()
-    g._latest = None
-    g._stamp = 0.0
-    g._n = 0
-    g._digest = None
-    g._dup_n = 0
-    g._frozen_warned = False
-    g.stale_s = 5.0
-    frame = np.zeros((4, 6, 3), dtype=np.uint8)
-    g._store(frame)
-    sample = g()
-    assert isinstance(sample, tuple) and len(sample) == 2
-    out, capture_stamp = sample
-    assert np.array_equal(out, frame)
-    assert capture_stamp == pytest.approx(g._stamp)
-
-
-def test_olympe_ntp_timestamp_maps_to_callback_monotonic_and_detects_backlog():
-    class _Frame:
-        def __init__(self, ntp_us):
-            self.ntp_us = ntp_us
-
-        def info(self):
-            return {"ntp_raw_timestamp": self.ntp_us}
-
-    g = ofs.OlympePdrawGrabber.__new__(ofs.OlympePdrawGrabber)
-    g._source_ntp_us = None
-    g._source_to_monotonic = None
-    stamp0, kind0, source0 = g._capture_stamp(_Frame(1_000_000), receipt_stamp=10.0)
-    stamp1, kind1, source1 = g._capture_stamp(_Frame(1_100_000), receipt_stamp=10.6)
-    assert stamp0 == pytest.approx(10.0) and kind0 == "ntp-anchor"
-    assert stamp1 == pytest.approx(10.1) and kind1 == "ntp-mapped"
-    assert (source0, source1) == (1_000_000, 1_100_000)
-    assert 10.6 - stamp1 == pytest.approx(0.5), "decode/queue backlog must remain visible"
-
-
-def test_olympe_timestamp_nonincrease_restart_and_missing_metadata_fail_closed():
-    class _Frame:
-        def __init__(self, payload=None, raises=False):
-            self.payload = payload
-            self.raises = raises
-
-        def info(self):
-            if self.raises:
-                raise RuntimeError("metadata unavailable")
-            return self.payload
-
-    g = ofs.OlympePdrawGrabber.__new__(ofs.OlympePdrawGrabber)
-    g._source_ntp_us = None
-    g._source_to_monotonic = None
-    g._capture_stamp(_Frame({"ntp_raw_timestamp": 2_000_000}), 20.0)
-    stamp, kind, _source = g._capture_stamp(_Frame({"ntp_raw_timestamp": 2_000_000}), 20.1)
-    assert stamp is None and kind == "ntp-nonincreasing"
-    stamp, kind, _source = g._capture_stamp(_Frame({"ntp_raw_timestamp": 100_000}), 20.2)
-    assert stamp == pytest.approx(20.2) and kind == "ntp-restart-receipt"
-    stamp, kind, source = g._capture_stamp(_Frame(raises=True), 20.3)
-    assert stamp == pytest.approx(20.3) and kind == "callback-receipt"
-    assert source is None
-
-
-def test_strict_flight_stream_rejects_degraded_receipt_timestamps():
-    import threading
-
-    g = ofs.OlympePdrawGrabber.__new__(ofs.OlympePdrawGrabber)
-    g._lock = threading.Lock()
-    g._latest = None
-    g._stamp = 0.0
-    g._n = 0
-    g._digest = None
-    g._dup_n = 0
-    g._frozen_warned = False
-    g.require_source_timestamps = True
-    g.stale_s = 5.0
-    frame = np.zeros((4, 6, 3), dtype=np.uint8)
-    g._store(frame, stamp_source="callback-receipt")
-    assert g() is None and not g.is_healthy()
-    assert g.timestamp_degraded
-    g._store(frame + 1, stamp_source="ntp-mapped", source_ntp_us=1_100_000)
-    assert g() is not None and g.is_healthy()
-    assert not g.timestamp_degraded
-
-
-def test_inspection_source_drain_rejects_preconfirm_pipeline_frames():
-    import threading
-
-    g = ofs.OlympePdrawGrabber.__new__(ofs.OlympePdrawGrabber)
-    g._lock = threading.Lock()
-    g._latest = None
-    g._stamp = 0.0
-    g._n = 0
-    g._digest = None
-    g._dup_n = 0
-    g._frozen_warned = False
-    g.require_source_timestamps = True
-    g.stale_s = 5.0
-    frame = np.zeros((4, 6, 3), dtype=np.uint8)
-    g._store(frame, stamp_source="ntp-mapped", source_ntp_us=1_000_000, receipt_stamp=99.0)
-    baseline = g.latest_source_ntp_us()
-    assert baseline == 1_000_000
-
-    # A frame exposed before confirmation can arrive afterward because of the
-    # fixed video delay. Source time has not advanced through the configured drain.
-    g._store(frame + 1, stamp_source="ntp-mapped", source_ntp_us=1_400_000, receipt_stamp=100.2)
-    assert (
-        g.inspection_sample_after(baseline, min_source_advance_s=1.0, receipt_after=101.0) is None
-    )
-
-    # Source time alone is insufficient: this one was already queued before the
-    # host-side drain deadline.
-    g._store(frame + 2, stamp_source="ntp-mapped", source_ntp_us=2_100_000, receipt_stamp=100.9)
-    assert (
-        g.inspection_sample_after(baseline, min_source_advance_s=1.0, receipt_after=101.0) is None
-    )
-
-    g._store(frame + 3, stamp_source="ntp-mapped", source_ntp_us=2_200_000, receipt_stamp=101.1)
-    assert (
-        g.inspection_sample_after(baseline, min_source_advance_s=1.0, receipt_after=101.0)
-        is not None
-    )
 
 
 @pytest.mark.parametrize("new_mode, expected", [("HOVER", "zero"), ("MANUAL", "silent")])
@@ -1450,30 +1233,29 @@ def test_landing_speed_gate_fails_closed(sample, allowed, reason_fragment):
     assert reason_fragment in reason
 
 
-def test_olympe_ground_speed_tracker_uses_event_receipt_time():
+def test_arsdk_ground_speed_tracker_uses_event_monotonic_receipt_time():
     event = SimpleNamespace(
         args={"speedX": 0.3, "speedY": 0.4, "speedZ": 0.0},
         uuid="speed-1",
-        date=SimpleNamespace(timestamp=lambda: 99.8),
+        monotonic_ns=9_800_000_000,
     )
     drone = SimpleNamespace(get_last_event=lambda _message: event)
-    clock = {"mono": 10.0, "wall": 100.0}
-    tracker = pff.OlympeGroundSpeedTracker(
+    clock = {"mono": 10.0}
+    tracker = pff.ArsdkGroundSpeedTracker(
         drone,
         message=object(),
         now=lambda: clock["mono"],
-        wall_now=lambda: clock["wall"],
     )
 
     speed, stamp = tracker.sample()
     assert speed == pytest.approx(0.5)
     assert stamp == pytest.approx(9.8)
     clock["mono"] = 10.31
-    clock["wall"] = 100.31
     speed, stamp = tracker.sample()
     ok, reason, _ = pff.landing_speed_allows_land((speed, stamp), now=clock["mono"])
     assert not ok
     assert "stale" in reason
+
 
 
 def test_final_waypoint_requires_continuous_unique_pose_hold():
@@ -2583,24 +2365,18 @@ def test_terminal_expectation_must_wait_and_report_success():
         pff._await_confirmed_action(object(), "truthy object")
 
 
-def test_piloting_source_is_confirmed_and_read_back(monkeypatch):
+def test_piloting_source_is_confirmed_and_read_back():
     state_message = object()
 
     def source_command(*, source):
         return SimpleNamespace(source=source)
 
-    fake_module = SimpleNamespace(
-        setPilotingSource=source_command,
-        pilotingSource=state_message,
+    messages = SimpleNamespace(
+        Skyctrl=SimpleNamespace(
+            CoPiloting=SimpleNamespace(setPilotingSource=source_command),
+            CoPilotingState=SimpleNamespace(pilotingSource=state_message),
+        )
     )
-    real_import = builtins.__import__
-
-    def fake_import(name, globals=None, locals=None, fromlist=(), level=0):
-        if name == "olympe.messages.skyctrl.CoPiloting":
-            return fake_module
-        return real_import(name, globals, locals, fromlist, level)
-
-    monkeypatch.setattr(builtins, "__import__", fake_import)
 
     class _Confirmation:
         @staticmethod
@@ -2616,6 +2392,7 @@ def test_piloting_source_is_confirmed_and_read_back(monkeypatch):
 
     class _Drone:
         def __init__(self):
+            self.messages = messages
             self.expectation = _Expectation()
             self.requested = None
 
@@ -2631,7 +2408,6 @@ def test_piloting_source_is_confirmed_and_read_back(monkeypatch):
     assert pff.set_piloting_source(drone, "Controller")
     assert drone.requested == "Controller" and drone.expectation.waited == 1
 
-
 def _fake_firmware_preflight(monkeypatch, *, battery=80, gps_fixed=1, flying_state="landed"):
     tokens = {
         name: object()
@@ -2641,35 +2417,25 @@ def _fake_firmware_preflight(monkeypatch, *, battery=80, gps_fixed=1, flying_sta
     def command(kind):
         return lambda **kwargs: SimpleNamespace(kind=kind, kwargs=kwargs)
 
-    modules = {
-        "olympe.messages.ardrone3.PilotingSettings": SimpleNamespace(
-            MaxAltitude=command("max_altitude"),
-            MaxDistance=command("max_distance"),
-            NoFlyOverMaxDistance=command("geofence"),
+    messages = SimpleNamespace(
+        Ardrone3=SimpleNamespace(
+            PilotingSettings=SimpleNamespace(
+                MaxAltitude=command("max_altitude"),
+                MaxDistance=command("max_distance"),
+                NoFlyOverMaxDistance=command("geofence"),
+            ),
+            PilotingSettingsState=SimpleNamespace(
+                MaxAltitudeChanged=tokens["max_altitude"],
+                MaxDistanceChanged=tokens["max_distance"],
+                NoFlyOverMaxDistanceChanged=tokens["geofence"],
+            ),
+            PilotingState=SimpleNamespace(FlyingStateChanged=tokens["flying"]),
+            GPSSettingsState=SimpleNamespace(GPSFixStateChanged=tokens["gps"]),
         ),
-        "olympe.messages.ardrone3.PilotingSettingsState": SimpleNamespace(
-            MaxAltitudeChanged=tokens["max_altitude"],
-            MaxDistanceChanged=tokens["max_distance"],
-            NoFlyOverMaxDistanceChanged=tokens["geofence"],
+        Common=SimpleNamespace(
+            CommonState=SimpleNamespace(BatteryStateChanged=tokens["battery"])
         ),
-        "olympe.messages.ardrone3.PilotingState": SimpleNamespace(
-            FlyingStateChanged=tokens["flying"]
-        ),
-        "olympe.messages.ardrone3.GPSSettingsState": SimpleNamespace(
-            GPSFixStateChanged=tokens["gps"]
-        ),
-        "olympe.messages.common.CommonState": SimpleNamespace(
-            BatteryStateChanged=tokens["battery"]
-        ),
-    }
-    real_import = builtins.__import__
-
-    def fake_import(name, globals=None, locals=None, fromlist=(), level=0):
-        if name in modules:
-            return modules[name]
-        return real_import(name, globals, locals, fromlist, level)
-
-    monkeypatch.setattr(builtins, "__import__", fake_import)
+    )
 
     class _Expectation:
         def __init__(self):
@@ -2685,6 +2451,7 @@ def _fake_firmware_preflight(monkeypatch, *, battery=80, gps_fixed=1, flying_sta
 
     class _Drone:
         def __init__(self):
+            self.messages = messages
             self.calls = []
             self.reads = []
             self.states = {
@@ -4336,6 +4103,27 @@ def test_heading_estimator_rejects_visual_yaw_increment_that_disagrees_with_imu(
     assert estimator.heading(math.pi / 2.0 - 0.20) == pytest.approx(0.20)
 
 
+def test_heading_estimator_reanchors_after_firmware_yaw_step():
+    estimator = pff.HeadingEstimator(max_increment_mismatch_rad=math.radians(10.0))
+    assert estimator.update(0.0, math.pi / 2.0)
+    jumped = math.pi / 2.0 + math.radians(30.0)
+
+    for _ in range(3):
+        assert not estimator.update(0.0, jumped)
+    for _ in range(13):
+        assert estimator.update(0.0, jumped)
+
+    assert estimator.heading(jumped) == pytest.approx(0.0, abs=math.radians(1.0))
+
+
+def test_heading_estimator_single_visual_outlier_does_not_move_offset():
+    estimator = pff.HeadingEstimator(max_increment_mismatch_rad=math.radians(10.0))
+    assert estimator.update(0.0, math.pi / 2.0)
+    assert not estimator.update(math.radians(40.0), math.pi / 2.0)
+    assert estimator.update(0.0, math.pi / 2.0)
+    assert estimator.offset == pytest.approx(0.0, abs=1e-9)
+
+
 def test_heading_estimator_has_no_position_or_path_seed_api():
     estimator = pff.HeadingEstimator()
 
@@ -4746,46 +4534,8 @@ def test_legacy_entrypoints_stay_locked_even_when_legacy_env_is_enabled(monkeypa
     with pytest.raises(SystemExit, match="permanently locked"):
         legacy_cruise.run(None, None, dry_run=False)
     with pytest.raises(SystemExit, match="permanently locked"):
-        ofs.run_real(object(), None, None, None)
+        rfs.run_real(object(), None, None, None)
 
-
-def test_canonical_frame_source_has_live_hard_lock_and_timestamp_safety():
-    source = (FLIGHT_CONTROL_ROOT / "olympe_frame_source.py").read_text(encoding="utf-8")
-    assert "SFM_ALLOW_LEGACY_FLIGHT" not in source
-    assert "TakeOff()" not in source
-    assert ".wait()" not in source
-    assert ".join()" not in source
-    assert ".wait(timeout=0.5)" in source
-    assert ".join(timeout=5.0)" in source
-    assert "require_source_timestamps" in source
-    assert "_source_timing_trusted_locked" in source
-
-
-def test_frame_source_has_no_unreferenced_coded_decoder_helpers():
-    dead_names = {
-        "_init_pyav_decoder",
-        "_avcc_to_annexb",
-        "_decode_h264_payload",
-        "_coded_payload_bytes",
-        "_coded_avcc_cb",
-        "_coded_bytestream_cb",
-    }
-    path = FLIGHT_CONTROL_ROOT / "olympe_frame_source.py"
-    source = path.read_text(encoding="utf-8")
-    assert "if skipped_stale" not in source
-    tree = ast.parse(source, filename=str(path))
-    definitions = {
-        node.name
-        for node in ast.walk(tree)
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-    }
-    calls = {
-        node.func.id
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
-    }
-    assert not (dead_names & definitions), f"dead helpers remain in {path}"
-    assert not (dead_names & calls), f"dead helper calls remain in {path}"
 
 
 def test_sphinx_smoke_is_simulator_only_and_uses_bounded_waits():

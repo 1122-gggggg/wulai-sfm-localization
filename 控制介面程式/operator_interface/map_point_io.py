@@ -177,3 +177,50 @@ def read_map_points(path: Path, max_points: int) -> np.ndarray:
         return read_reference_pose_points(path, max_points)
     return read_ply_points(path, max_points)
 
+
+#: Display-only full sparse cloud written beside map.ply by
+#: tools/build_dense_display_ply.py. Only the route editor reads it.
+DENSE_DISPLAY_PLY_NAME = "map_dense.ply"
+DENSE_FRAME_COMMENT = "coordinate_frame_id"
+DENSE_MAP_SHA_COMMENT = "display_for_map_ply_sha256"
+
+
+def read_ply_comments(path: Path) -> dict[str, str]:
+    """``comment <key> <value>`` header lines of a PLY as a dict."""
+    comments: dict[str, str] = {}
+    with path.open("rb") as source:
+        while True:
+            line = source.readline()
+            if not line:
+                raise ValueError("PLY ended before end_header")
+            text = line.decode("ascii", "replace").strip()
+            if text == "end_header":
+                return comments
+            parts = text.split(maxsplit=2)
+            if len(parts) == 3 and parts[0] == "comment":
+                comments[parts[1]] = parts[2]
+
+
+def dense_display_ply(
+    map_ply: Path, *, coordinate_frame_id: str, map_ply_sha256: str | None
+) -> Path | None:
+    """The dense display cloud bound to this exact map, or None.
+
+    Waypoints are snapped to displayed points, so a cloud from another
+    release or frame would silently move every clicked waypoint. It is used
+    only when its header names this frame and this map.ply digest.
+    """
+    candidate = Path(map_ply).with_name(DENSE_DISPLAY_PLY_NAME)
+    if not map_ply_sha256 or not candidate.is_file() or candidate.is_symlink():
+        return None
+    try:
+        comments = read_ply_comments(candidate)
+    except (OSError, ValueError):
+        return None
+    if (
+        comments.get(DENSE_FRAME_COMMENT) != coordinate_frame_id
+        or comments.get(DENSE_MAP_SHA_COMMENT) != map_ply_sha256
+    ):
+        return None
+    return candidate
+

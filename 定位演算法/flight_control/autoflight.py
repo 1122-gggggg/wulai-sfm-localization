@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Autonomous pole-inspection flight for Parrot ANAFI 4K (Olympe).
+"""Autonomous pole-inspection flight for Parrot ANAFI 4K.
 
 Legacy reactive controller (TakeOff permanently locked; dry-run only):
 it follows a carrot point along a pre-drawn polyline through NAV ->
@@ -225,9 +225,7 @@ def _send_command(dry_run, sim, drone, period, roll, pitch, yaw, gaz) -> None:
         if sim:
             sim.step(roll, pitch, yaw, gaz, period)
         return
-    from olympe.messages.ardrone3.Piloting import PCMD
-
-    drone(PCMD(1, roll, pitch, yaw, gaz, 0))
+    raise RuntimeError("live autoflight commands are permanently locked")
 
 
 def _run_controller_loop(
@@ -277,53 +275,27 @@ def _run_controller_loop(
             time.sleep(period - elapsed)
 
 
-def _cleanup_legacy_flight(dry_run: bool, drone, airborne: bool, period: float) -> None:
-    if dry_run or drone is None:
-        return
-    from olympe.messages.ardrone3.Piloting import Landing
-
-    if airborne:
-        print("[auto] landing")
-        try:
-            _send_command(False, None, drone, period, 0, 0, 0, 0)
-        except Exception as exc:
-            print(f"[auto] zero PCMD before landing FAILED: {exc!r}", flush=True)
-        try:
-            result = drone(Landing()).wait(_timeout=20)
-            if hasattr(result, "success") and not result.success():
-                print("[auto] warning: legacy autoflight landing did not report success")
-        except (Exception, SystemExit) as exc:
-            print(f"[auto] warning: landing raised: {exc}")
-    try:
-        drone.disconnect()
-    except Exception:
-        pass
 
 
 def run(loc: Localizer, det: PoleDetector, ctrl: AutoFlight, dry_run=False, sim=None):
     period = 1.0 / CTRL_HZ
-    drone = None
-    airborne = False
     stop = {"f": False}
     signal.signal(signal.SIGINT, lambda *_: stop.__setitem__("f", True))
-    try:
-        if not dry_run:
-            raise SystemExit(
-                "autoflight.py legacy TakeOff is permanently locked; "
-                "use the operator-approved flight path instead"
-            )
-        _run_controller_loop(
-            loc,
-            det,
-            ctrl,
-            dry_run=dry_run,
-            sim=sim,
-            drone=drone,
-            stop=stop,
-            period=period,
+    if not dry_run:
+        raise SystemExit(
+            "autoflight.py legacy TakeOff is permanently locked; "
+            "use the operator-approved flight path instead"
         )
-    finally:
-        _cleanup_legacy_flight(dry_run, drone, airborne, period)
+    _run_controller_loop(
+        loc,
+        det,
+        ctrl,
+        dry_run=True,
+        sim=sim,
+        drone=None,
+        stop=stop,
+        period=period,
+    )
 
 
 # ----------------------------- dry-run sim ---------------------------------

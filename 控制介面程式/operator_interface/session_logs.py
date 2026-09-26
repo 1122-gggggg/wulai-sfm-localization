@@ -67,7 +67,6 @@ _INCIDENT_EVENTS = {
 _RUNTIME_DISTRIBUTIONS = (
     "numpy",
     "opencv-python",
-    "parrot-olympe",
     "Pillow",
     "pycolmap",
     "torch",
@@ -162,17 +161,33 @@ def flight_debug_contract() -> dict[str, Any]:
         "定位演算法/flight_control/real_path_follow_controller.py",
         "定位演算法/flight_control/path_follow_flight.py",
         "定位演算法/deploy_code/sfm_direct_deploy/two_rate_tracker.py",
-        "控制介面程式/operator_interface/operator_autonomy.py",
-        "控制介面程式/operator_interface/olympe_live_backend.py",
+        "控制介面程式/operator_interface/arsdk_ng_live_backend.py",
+        "定位演算法/flight_control/control_state_estimator.py",
+        "定位演算法/flight_control/wind_observer.py",
+        "定位演算法/flight_control/heading_fusion.py",
+        "定位演算法/flight_control/pose_frame_chain.py",
+        "定位演算法/flight_control/rtsp_frame_source.py",
+        "控制介面程式/operator_interface/imu_flight_test.py",
+        "控制介面程式/operator_interface/ekf_capture_contract.py",
+        "控制介面程式/operator_interface/localization_metrics.py",
+        "控制介面程式/operator_interface/live_localizer_worker.py",
+        "控制介面程式/operator_interface/live_worker_clients.py",
+        "控制介面程式/operator_interface/backend_telemetry.py",
+        "控制介面程式/operator_interface/session_logs.py",
+        "控制介面程式/operator_interface/flight_operator_app.py",
+        "tools/imu_flight_test_report.py",
     )
     return {
-        "version": 2,
+        "version": 3,
         "clock": "host_monotonic; *_mono_ns nanoseconds, *_mono seconds",
         "map_position_units": "map units; not metres without measured scale",
         "velocity": "firmware-fused NED, metres/second",
         "attitude": "firmware-fused Euler radians; yaw clockwise from North",
         "raw_accelerometer_available": False, "raw_gyroscope_available": False,
         "sensor_covariance_available": False,
+        "position_reference": "camera_center; coincident body-center approximation requested by operator",
+        "body_orientation_is_camera_orientation": False,
+        "ekf_enabled": False,
         "pcmd_order": ["roll", "pitch", "yaw", "gaz"],
         "pcmd_dispatch_semantics": "SDK call; not firmware execution acknowledgement",
         "source_files_at_session_start": {
@@ -246,7 +261,7 @@ class _JsonlSink:
 
 
 class SessionCommandLog:
-    """Adapter used by OlympeLiveBackend in place of its legacy single JSONL."""
+    """Adapter used by ArsdkNgLiveBackend in place of its legacy single JSONL."""
 
     def __init__(self, session: "SessionLogs"):
         self._session = session
@@ -399,11 +414,33 @@ class SessionLogs:
                 "mode", "direct_status", "pose_status", "confidence_low",
                 "imu_bridge", "map_inliers", "vo_inliers", "inliers",
                 "reproj_rms", "map_constraint_age_s", "reseed_confirming",
+                "camera_axes_world", "camera_forward_world",
+                "camera_pitch_error_deg", "camera_roll_error_deg", "pnp_observation_sample",
+                "n_corr", "inlier_ratio", "inlier_grid_cells", "inlier_hull_coverage",
+                "positive_depth_ratio", "reproj_p90", "imu_bridge_reason",
+                "frame_name", "hold_retry", "hold_kind", "fused_telemetry_mono",
+                "fused_attitude_mono", "fused_speed_mono", "fused_altitude_mono",
+                "fused_roll", "fused_pitch", "fused_yaw", "fused_speed_north",
+                "fused_speed_east", "fused_speed_down", "fused_altitude_m",
+                "fused_agl_altitude_m", "fused_stamp_source", "fused_gps_mono",
+                "client_submit_mono_ns", "worker_core_start_mono_ns",
+                "worker_core_done_mono_ns", "ui_arrival_mono_ns",
+                "frame_callback_enter_mono_ns", "source_stamp_age_at_ui_ms",
+                "restart_reason", "relocalize_requested", "reloc_capture_stamp_mono",
+                "reloc_source_epoch", "reloc_ordinal", "reloc_ms", "reloc_retrieval_ms",
+                "reloc_match_lift_ms", "reloc_edm_match_ms", "reloc_lift_prepare_ms", "reloc_pnp_ms",
+                "source_ntp_timestamp_us", "source_timestamp_kind", "source_to_host_offset_s",
+                "frame_receipt_mono_ns", "gimbal_pitch_deg", "gimbal_yaw_deg", "gimbal_roll_deg",
+                "gimbal_relative_pitch_deg", "gimbal_relative_yaw_deg", "gimbal_relative_roll_deg",
+                "gimbal_mono_ns", "gimbal_stamp_source", "zoom", "flight_state", "control_owner",
+                "speed_stamp_source", "altitude_stamp_source",
+                "camera_zoom_level", "camera_zoom_mono_ns", "camera_zoom_stamp_source",
             )
             saved = self._write("trajectory", event, {key: row[key] for key in keys if key in row})
             ok = ok and saved
         elif (stream == "localization" and event in {"auto_route_plan", "auto_route_tick"}
-              or stream == "telemetry" and event == "autonomy_event"):
+              or stream == "telemetry" and event in {
+                  "autonomy_event", "fused_odometry", "pcmd_dispatch", "stick_axes"}):
             saved = self._write("trajectory", event, {key: value for key, value in row.items() if key != "event"})
             ok = ok and saved
         return ok

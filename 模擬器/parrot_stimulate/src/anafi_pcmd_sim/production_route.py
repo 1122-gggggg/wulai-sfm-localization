@@ -22,6 +22,7 @@ import contextlib
 import hashlib
 import json
 import math
+import subprocess
 import sys
 import time
 from dataclasses import dataclass
@@ -331,11 +332,16 @@ def _sphinx_wind_commands(parsed: ProductionRouteArgs) -> list[list[str]]:
         ],
     ]
     gust_expr = _gust_expr(parsed)
-    if gust_expr is not None:
-        commands.append(
-            ["sphinx-cli", "param", "-m", "anafi", "wind/wind", "magnitude_expr", gust_expr]
-        )
+    commands.append(
+        ["sphinx-cli", "param", "-m", "anafi", "wind/wind", "magnitude_expr", gust_expr or "0"]
+    )
     return commands
+
+
+def _apply_sphinx_wind(parsed: ProductionRouteArgs) -> None:
+    """Apply every declared wind setting; a calm case also clears old gusts."""
+    for command in _sphinx_wind_commands(parsed):
+        subprocess.run(command, check=True, timeout=10, capture_output=True, text=True)
 
 
 def _write_dry_run_artifacts(parsed: ProductionRouteArgs, payload: dict) -> None:
@@ -371,6 +377,7 @@ class _SphinxProductionPoseBridge:
         self.last_pose_accepted_at: float | None = None
         self.last_map_stamp: float | None = None
         self.last_attitude_yaw: float | None = None
+        self.last_attitude_stamp: float | None = None
         self.yaw_perturb_deg = 0.0
         self.speed_north_mps = 0.0
         self.speed_east_mps = 0.0
@@ -410,6 +417,7 @@ class _SphinxProductionPoseBridge:
         reported_yaw = float(fused) if fused is not None else float(visual_map_yaw)
         self.last_truth_yaw = float(reported_yaw)
         self.last_attitude_yaw = float(attitude)
+        self.last_attitude_stamp = float(now)
         if vel_ned is not None:
             self.speed_north_mps = float(vel_ned[0])
             self.speed_east_mps = float(vel_ned[1])
@@ -431,6 +439,16 @@ class _SphinxProductionPoseBridge:
 
     def olympe_yaw(self):
         return self.last_attitude_yaw
+
+    def attitude_sample(self):
+        if self.last_attitude_stamp is None:
+            return None
+        return self.last_attitude_yaw, self.last_attitude_stamp
+
+    def ned_velocity(self):
+        if self.speed_stamp is None:
+            return None
+        return self.speed_north_mps, self.speed_east_mps, self.speed_stamp
 
     def pose_is_weak(self) -> bool:
         pose = self.last_pose
@@ -496,6 +514,7 @@ class _SharedSpeedLimitShim:
         self.now = lambda: self.stamp
         self._speed_sample = None
         self._speed_rate_mps2 = 0.0
+        self._accel_command = None
 
     def _bind(self, source) -> None:
         import operator_autonomy as autonomy
@@ -505,6 +524,7 @@ class _SharedSpeedLimitShim:
             "_body_velocity",
             "_olympe_yaw",
             "_apply_speed_limit",
+            "_limit_acceleration_slew",
             "_ground_speed",
         ):
             bound = getattr(autonomy.DesktopRouteAutonomy, name, None)
@@ -514,18 +534,20 @@ class _SharedSpeedLimitShim:
                 except (AttributeError, TypeError):
                     pass
 
-    def apply(self, pcmd, *, yaw_ned: float, north_mps: float, east_mps: float, stamp: float):
+    def apply(self, pcmd, *, yaw_ned: float, north_mps: float, east_mps: float, stamp: float,
+              attitude_stamp: float | None, velocity_stamp: float | None):
         self.stamp = float(stamp)
         state = self.backend.state
         state.att_yaw = float(yaw_ned)
-        state.attitude_mono_ns = int(float(stamp) * 1e9)
+        state.attitude_mono_ns = None if attitude_stamp is None else int(attitude_stamp * 1e9)
         state.speed_north_mps = float(north_mps)
         state.speed_east_mps = float(east_mps)
         state.ground_speed_mps = float(math.hypot(float(north_mps), float(east_mps)))
-        state.ground_speed_mono_ns = int(float(stamp) * 1e9)
+        state.ground_speed_mono_ns = None if velocity_stamp is None else int(velocity_stamp * 1e9)
         self._bind(self)
         try:
-            return self._apply_speed_limit(tuple(int(v) for v in pcmd))
+            limited = self._apply_speed_limit(tuple(int(v) for v in pcmd))
+            return self._limit_acceleration_slew(limited)
         except AttributeError:
             return tuple(int(v) for v in pcmd)
 
@@ -605,25 +627,33 @@ def _run_attach(parsed: ProductionRouteArgs) -> int:
         return 2
     for command in _sphinx_wind_commands(parsed):
         print("+ " + " ".join(command), flush=True)
+    try:
+        _apply_sphinx_wind(parsed)
+    except (OSError, subprocess.SubprocessError) as exc:
+        drone.disconnect()
+        print(f"production-route: wind setup failed: {exc}", file=sys.stderr)
+        return 2
     log_path = out / "production_route_cmdlog.jsonl"
     from path_follow_flight import CommandLog
 
     cmdlog = CommandLog(log_path, sink="sphinx-production-route")
     sent = {"count": 0}
 
-    def send_pcmd(roll, pitch, yaw, gaz):
+    def send_authorized_pcmd(pcmd):
         limited = speed_shim.apply(
-            (roll, pitch, yaw, gaz),
+            pcmd,
             yaw_ned=float(bridge.olympe_yaw() or 0.0),
             north_mps=float(bridge.speed_north_mps),
             east_mps=float(bridge.speed_east_mps),
             stamp=time.monotonic(),
+            attitude_stamp=bridge.last_attitude_stamp,
+            velocity_stamp=bridge.speed_stamp,
         )
         ok = bool(
             drone(PCMD(1, int(limited[0]), int(limited[1]), int(limited[2]), int(limited[3]), 0))
         )
         sent["count"] += 1 if ok else 0
-        return ok
+        return ok, "Sphinx dispatch" if ok else "Sphinx dispatch failed", limited if ok else None
 
     _gps_origin: dict = {"lat": None, "lon": None, "alt": None}
 
@@ -664,7 +694,8 @@ def _run_attach(parsed: ProductionRouteArgs) -> int:
     hooks = pff.LoopHooks(
         get_pose=get_pose,
         olympe_yaw=bridge.olympe_yaw,
-        send_pcmd=send_pcmd,
+        send_pcmd=lambda *pcmd: send_authorized_pcmd(pcmd),
+        send_authorized_pcmd=send_authorized_pcmd,
         pose_is_weak=bridge.pose_is_weak,
         pose_is_predicted=bridge.pose_is_predicted,
         pose_confidence=bridge.pose_confidence,
@@ -672,6 +703,8 @@ def _run_attach(parsed: ProductionRouteArgs) -> int:
         stream_healthy=lambda: True,
         ground_speed=bridge.ground_speed,
         body_velocity=bridge.body_velocity,
+        attitude_sample=bridge.attitude_sample,
+        ned_velocity=bridge.ned_velocity,
         log_tick=cmdlog,
         land_on_localization_loss=False,
         wait_expired=lambda _reason, _elapsed_s: False,

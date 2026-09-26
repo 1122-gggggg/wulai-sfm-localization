@@ -86,13 +86,21 @@ class OrthoView:
 class RouteEditorController:
     """State changes for the two-stage placement/position-edit workflow."""
 
-    def __init__(self, points=None):
+    def __init__(self, points=None, actions=None):
         self.points = [list(map(float, point)) for point in (points or [])]
+        #: Per-waypoint action dicts, index-aligned with points so undo/redo
+        #: can never shift an action onto a different waypoint.
+        self.actions = (
+            [[dict(action) for action in entry] for entry in actions]
+            if actions is not None else [[] for _ in self.points]
+        )
+        if len(self.actions) != len(self.points):
+            raise ValueError("航點動作數量與航點數量不一致")
         self.phase = "height" if self.points else "layout"
         self.placement_enabled = False
         self.selected: int | None = 0 if self.points else None
-        self._undo: list[list[list[float]]] = []
-        self._redo: list[list[list[float]]] = []
+        self._undo: list[tuple[list[list[float]], list[list[dict]]]] = []
+        self._redo: list[tuple[list[list[float]], list[list[dict]]]] = []
         self._move_start: list[float] | None = None
         self._move_snapshot: list[list[float]] | None = None
         self.move_axis: int | None = None
@@ -104,8 +112,11 @@ class RouteEditorController:
     def _snapshot(self) -> list[list[float]]:
         return [point.copy() for point in self.points]
 
+    def _actions_snapshot(self) -> list[list[dict]]:
+        return [[dict(action) for action in entry] for entry in self.actions]
+
     def _record(self) -> None:
-        self._undo.append(self._snapshot())
+        self._undo.append((self._snapshot(), self._actions_snapshot()))
         self._redo.clear()
 
     def set_placement_enabled(self, enabled: bool) -> bool:
@@ -119,6 +130,7 @@ class RouteEditorController:
             raise ValueError("請先開啟「標路徑點模式」")
         self._record()
         self.points.append([float(value) for value in point])
+        self.actions.append([])
         self.selected = len(self.points) - 1
         return self.selected
 
@@ -127,9 +139,27 @@ class RouteEditorController:
             return False
         self._record()
         del self.points[self.selected]
+        del self.actions[self.selected]
         self.selected = (
             min(self.selected, len(self.points) - 1) if self.points else None
         )
+        return True
+
+    def add_action(self, action: dict) -> bool:
+        """Append one already-validated action to the selected waypoint."""
+        if self.selected is None or not (0 <= self.selected < len(self.points)):
+            return False
+        self._record()
+        self.actions[self.selected].append(dict(action))
+        return True
+
+    def remove_last_action(self) -> bool:
+        if self.selected is None or not (0 <= self.selected < len(self.points)):
+            return False
+        if not self.actions[self.selected]:
+            return False
+        self._record()
+        self.actions[self.selected].pop()
         return True
 
     def spheres_overlap(self, radius: float) -> bool:
@@ -188,7 +218,7 @@ class RouteEditorController:
             return False
         changed = self.points != self._move_snapshot
         if changed:
-            self._undo.append(self._move_snapshot)
+            self._undo.append((self._move_snapshot, self._actions_snapshot()))
             self._redo.clear()
         self._move_start = None
         self._move_snapshot = None
@@ -210,8 +240,8 @@ class RouteEditorController:
             return True
         if not self._undo:
             return False
-        self._redo.append(self._snapshot())
-        self.points = self._undo.pop()
+        self._redo.append((self._snapshot(), self._actions_snapshot()))
+        self.points, self.actions = self._undo.pop()
         self.selected = (
             min(self.selected or 0, len(self.points) - 1) if self.points else None
         )
@@ -220,8 +250,8 @@ class RouteEditorController:
     def redo(self) -> bool:
         if not self._redo:
             return False
-        self._undo.append(self._snapshot())
-        self.points = self._redo.pop()
+        self._undo.append((self._snapshot(), self._actions_snapshot()))
+        self.points, self.actions = self._redo.pop()
         self.selected = (
             min(self.selected or 0, len(self.points) - 1) if self.points else None
         )

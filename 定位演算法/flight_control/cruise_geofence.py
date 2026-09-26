@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Cruise + geofence controller for Parrot ANAFI 4K via Olympe.
+"""Cruise + geofence controller for Parrot ANAFI 4K.
 
 Legacy patrol controller (TakeOff permanently locked). The old SLOW BAND is
 gone: there is no gradual slowdown or inward steering near the polygon or
@@ -157,15 +157,13 @@ def _clamp(v, lo, hi):
 
 
 # ---------------------------------------------------------------------------
-# Olympe wiring
+# Live control remains locked; the controller is exercised through dry-run only.
 # ---------------------------------------------------------------------------
 def _send_cruise_command(dry_run, drone, roll, pitch, yaw, gaz) -> None:
     if dry_run:
         print(f"[PCMD] roll={roll:+d} pitch={pitch:+d} yaw={yaw:+d} gaz={gaz:+d}")
         return
-    from olympe.messages.ardrone3.Piloting import PCMD
-
-    drone(PCMD(1, roll, pitch, yaw, gaz, 0))
+    raise RuntimeError("live cruise commands are permanently locked")
 
 
 def _run_cruise_loop(localizer, ctrl, *, dry_run, drone, stop, period) -> None:
@@ -196,29 +194,10 @@ def _run_cruise_loop(localizer, ctrl, *, dry_run, drone, stop, period) -> None:
             time.sleep(period - elapsed)
 
 
-def _cleanup_cruise_flight(dry_run: bool, drone) -> None:
-    if dry_run or drone is None:
-        return
-    from olympe.messages.ardrone3.Piloting import Landing
-
-    print("[cruise] landing ...")
-    try:
-        _send_cruise_command(False, drone, 0, 0, 0, 0)
-        result = drone(Landing()).wait(_timeout=20)
-        if hasattr(result, "success") and not result.success():
-            print("[cruise] warning: legacy cruise_geofence landing did not report success")
-    except (Exception, SystemExit) as exc:
-        print(f"[cruise] warning: landing raised: {exc}")
-    try:
-        drone.disconnect()
-    except Exception:
-        pass
-
 
 def run(localizer: Localizer, zone: SafeZone2p5D, dry_run: bool = False):
     ctrl = CruiseController(zone)
     period = 1.0 / CTRL_HZ
-    drone = None
     if not dry_run:
         raise SystemExit(
             "cruise_geofence.py legacy TakeOff is permanently locked; "
@@ -226,18 +205,14 @@ def run(localizer: Localizer, zone: SafeZone2p5D, dry_run: bool = False):
         )
     stop = {"flag": False}
     signal.signal(signal.SIGINT, lambda *_: stop.__setitem__("flag", True))
-    try:
-        _run_cruise_loop(
-            localizer,
-            ctrl,
-            dry_run=dry_run,
-            drone=drone,
-            stop=stop,
-            period=period,
-        )
-    finally:
-        _cleanup_cruise_flight(dry_run, drone)
-
+    _run_cruise_loop(
+        localizer,
+        ctrl,
+        dry_run=True,
+        drone=None,
+        stop=stop,
+        period=period,
+    )
 
 # ---------------------------------------------------------------------------
 # Example wiring (replace DemoLocalizer + polygon with your real ones)

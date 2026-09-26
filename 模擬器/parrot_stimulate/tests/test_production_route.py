@@ -211,3 +211,59 @@ def test_wind_mapping_matches_documented_sphinx_example():
     assert east_5["direction_mean"] == pytest.approx(0.0)
     north = production_route._wind_to_sphinx_params((0.0, 2.0, 0.0))
     assert north["direction_mean"] == pytest.approx(90.0)
+
+
+def test_wind_setup_executes_settings_and_clears_previous_gusts(monkeypatch):
+    from types import SimpleNamespace
+
+    parsed = SimpleNamespace(wind_mean_mps=(3., 0., 0.), gust_mps=0.)
+    calls = []
+    monkeypatch.setattr(production_route.subprocess, 'run', lambda command, **kw: calls.append((command, kw)))
+    production_route._apply_sphinx_wind(parsed)
+    assert len(calls) == 4
+    assert calls[0][0][-2:] == ['magnitude_mean', '3.0']
+    assert calls[-1][0][-2:] == ['magnitude_expr', '0']
+    assert all(options['check'] and options['timeout'] == 10 for _, options in calls)
+
+
+def test_failed_wind_configuration_is_not_reported_as_a_completed_setup(monkeypatch):
+    import subprocess
+    from types import SimpleNamespace
+
+    def failure(command, **_kwargs):
+        raise subprocess.CalledProcessError(1, command)
+
+    monkeypatch.setattr(production_route.subprocess, 'run', failure)
+    with pytest.raises(subprocess.CalledProcessError):
+        production_route._apply_sphinx_wind(SimpleNamespace(wind_mean_mps=(0., 0., 0.), gust_mps=0.))
+
+
+def test_sphinx_limiter_keeps_sample_age_instead_of_refreshing_cached_speed():
+    from types import SimpleNamespace
+
+    production_route._ensure_flight_imports()
+    import real_path_follow_controller as rpf
+
+    cfg = rpf.production_auto_control_config(rpf.LEGACY_MAP_FRAME)
+    shim = production_route._SharedSpeedLimitShim(SimpleNamespace(cfg=cfg))
+    fresh = shim.apply((0, 50, 0, 0), yaw_ned=0., north_mps=1.17, east_mps=0.,
+                        stamp=10., attitude_stamp=10., velocity_stamp=10.)
+    assert fresh[1] < 0
+    stale = shim.apply((0, 50, 0, 0), yaw_ned=0., north_mps=1.17, east_mps=0.,
+                        stamp=11., attitude_stamp=11., velocity_stamp=10.)
+    assert stale == (0, 50, 0, 0)
+    assert shim.backend.state.autonomous_speed_guard_status == 'SPEED_UNAVAILABLE'
+
+
+def test_sphinx_adapter_uses_the_production_acceleration_ramp():
+    from types import SimpleNamespace
+
+    production_route._ensure_flight_imports()
+    import real_path_follow_controller as rpf
+
+    cfg = rpf.production_auto_control_config(rpf.LEGACY_MAP_FRAME)
+    shim = production_route._SharedSpeedLimitShim(SimpleNamespace(cfg=cfg))
+    applied = shim.apply((0, 50, 7, -3), yaw_ned=0., north_mps=0., east_mps=0.,
+                         stamp=10., attitude_stamp=10., velocity_stamp=10.)
+    assert 0 < applied[1] <= 3
+    assert applied[2:] == (7, -3)

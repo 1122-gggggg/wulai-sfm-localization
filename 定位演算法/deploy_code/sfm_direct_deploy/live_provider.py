@@ -427,6 +427,7 @@ class LiveMapEDMProvider(FinalMapEDMProvider):
 
         key = id(reference)
         if key not in self._query_matches:
+            started = time.perf_counter()
             capacity = self.profile.optimizations.gpu_cache_size
             if capacity:
                 if self._gpu_matcher is None:
@@ -435,6 +436,10 @@ class LiveMapEDMProvider(FinalMapEDMProvider):
             else:
                 matched = match_official_prepared(runtime, query, reference)
             self._query_matches[key] = (reference, matched)
+            self.last_stage_ms["edm_match_ms"] = (
+                self.last_stage_ms.get("edm_match_ms", 0.0)
+                + (time.perf_counter() - started) * 1000.0
+            )
         return self._query_matches[key][1]
 
     def _match_prepared_batch(self, runtime, query, references):
@@ -444,9 +449,14 @@ class LiveMapEDMProvider(FinalMapEDMProvider):
             reference for reference in references if id(reference) not in self._query_matches
         ]
         if missing:
+            started = time.perf_counter()
             matched = match_official_prepared_batch(runtime, query, missing)
             self._query_matches.update(
                 (id(ref), (ref, result)) for ref, result in zip(missing, matched, strict=True)
+            )
+            self.last_stage_ms["edm_match_ms"] = (
+                self.last_stage_ms.get("edm_match_ms", 0.0)
+                + (time.perf_counter() - started) * 1000.0
             )
         return [self._query_matches[id(reference)][1] for reference in references]
 
@@ -494,11 +504,11 @@ class LiveMapEDMProvider(FinalMapEDMProvider):
     def _localize_array(self, gray: np.ndarray, color_bgr: np.ndarray | None) -> RelocFix:
         import cv2
 
+        self.last_stage_ms = {}
         if self._index is None:
             raise RuntimeError("ensure_models() must run before localize_array()")
         started = time.perf_counter()
         self._query_matches.clear()
-        self.last_stage_ms = {}
         image = np.ascontiguousarray(gray)
         if image.ndim == 3:
             image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
@@ -559,6 +569,11 @@ class LiveMapEDMProvider(FinalMapEDMProvider):
             self._last_strong_refs = base
         else:
             self._last_strong_refs = ()
+        self.last_stage_ms["lift_prepare_ms"] = max(
+            0.0,
+            self.last_stage_ms.get("match_lift_ms", 0.0)
+            - self.last_stage_ms.get("edm_match_ms", 0.0),
+        )
         return replace(
             fix,
             runtime_ms=(time.perf_counter() - started) * 1000.0,

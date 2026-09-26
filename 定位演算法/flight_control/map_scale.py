@@ -10,7 +10,7 @@ and the median over chunks converges while the IQR measures how much
 monocular scale drift is still in the data.
 
 Inputs are plain sequences on the SAME host-monotonic clock
-(``fused_odometry.t_mono_ns`` and the visual pose clock already share it)::
+(``fused_odometry.speed_mono_ns`` and visual capture time share this clock)::
 
     visual = [(t_mono_s, x, y, z), ...]   # map units, success poses only
     speeds = [(t_mono_s, speed_mps), ...] # metric, e.g. NED speed norm
@@ -80,8 +80,9 @@ def _finite_rows(visual: Sequence, speeds: Sequence) -> tuple[np.ndarray, np.nda
         if all(isinstance(v, (int, float)) and np.isfinite(v) for v in (t, s))
         and float(s) >= 0.0
     ]
-    v = np.array(sorted(clean_visual), dtype=float)
-    s = np.array(sorted(clean_speeds), dtype=float)
+    # Repeated polling of the same source timestamp is one observation.
+    v = np.array(sorted({row[0]: row for row in reversed(clean_visual)}.values()), dtype=float)
+    s = np.array(sorted({row[0]: row for row in reversed(clean_speeds)}.values()), dtype=float)
     return v, s
 
 
@@ -120,6 +121,9 @@ def estimate_map_scale(
     )
     if len(v) < 2 or len(s) < 2:
         return empty
+    # Telemetry normally starts before localization and ends after it. Crop
+    # to the shared interval without extrapolating camera observations.
+    s = s[(s[:, 0] >= v[0, 0]) & (s[:, 0] <= v[-1, 0])]
     times = s[:, 0]
     xyz = _interpolate_visual(v, times)
     if xyz is None:
@@ -129,7 +133,11 @@ def estimate_map_scale(
         )
     speed = s[:, 1]
     dt = np.diff(times)
-    ok_step = dt > 0.0
+    ok_step = (dt > 0.0) & (dt <= 0.5)
+    # Never interpolate across a visual outage while learning metric scale.
+    for start, end in zip(v[:-1, 0], v[1:, 0]):
+        if end - start > 0.5:
+            ok_step &= ~((times[:-1] < end) & (times[1:] > start))
     if not np.any(ok_step):
         return empty
     # Per-step metric lengths on the shared timeline (visual uses chunk
@@ -172,7 +180,10 @@ def estimate_map_scale(
         chunk_xyz0 = xyz1.copy()
 
     for index in range(len(dt)):
-        if dt[index] <= 0.0:
+        if not ok_step[index]:
+            close_chunk(times[index], xyz[index])
+            chunk_start = times[index + 1]
+            chunk_xyz0 = xyz[index + 1].copy()
             continue
         if times[index] - chunk_start >= seg_max_s:
             close_chunk(times[index], xyz[index])
@@ -202,7 +213,7 @@ def _summarize_scale(ratios, total_metric, total_visual, duration,
             duration, False,
             f"only {total_metric:.1f} m of motion (< {d_min_m:.0f} m)",
         )
-    ordered = np.sort(np.asarray(ratios, dtype=float))
+    ordered = np.asarray(ratios, dtype=float)
     median = float(np.median(ordered))
     q1 = float(np.percentile(ordered, 25))
     q3 = float(np.percentile(ordered, 75))

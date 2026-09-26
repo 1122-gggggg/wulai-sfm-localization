@@ -1385,3 +1385,87 @@ def test_site_routes_are_listed_newest_first(tmp_path):
 
 def test_route_listing_of_a_missing_folder_is_empty(tmp_path):
     assert lsa.list_site_routes(tmp_path / "absent") == []
+
+
+RIGHT_30 = {"type": "yaw", "degrees": 30.0}
+HOVER_3 = {"type": "hover", "seconds": 3.0}
+
+
+def test_waypoint_actions_stay_on_their_waypoint_through_delete_and_undo() -> None:
+    controller = RouteEditorController()
+    controller.set_placement_enabled(True)
+    for x in range(3):
+        controller.add((float(x), 0.0, 0.0))
+    controller.selected = 1
+    assert controller.add_action(RIGHT_30)
+    controller.selected = 2
+    assert controller.add_action(HOVER_3)
+    assert controller.actions == [[], [RIGHT_30], [HOVER_3]]
+
+    controller.selected = 1
+    assert controller.delete_selected()
+    assert controller.actions == [[], [HOVER_3]]
+    assert controller.undo()
+    assert controller.points[1] == [1.0, 0.0, 0.0]
+    assert controller.actions == [[], [RIGHT_30], [HOVER_3]]
+    assert controller.redo()
+    assert controller.actions == [[], [HOVER_3]]
+
+    controller.selected = 1
+    assert controller.remove_last_action() and controller.actions == [[], []]
+    assert controller.undo() and controller.actions == [[], [HOVER_3]]
+
+
+def test_route_file_round_trips_waypoint_actions(tmp_path) -> None:
+    document = RouteDocument(
+        site_id="yard", coordinate_frame_id="yard-map-v1",
+        points=[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
+        waypoint_actions=[[RIGHT_30, HOVER_3], []],
+    )
+    saved = document.save(tmp_path / "route.json")
+    payload = json.loads(saved.read_text(encoding="utf-8"))
+    assert payload["waypoint_actions"] == [[RIGHT_30, HOVER_3], []]
+    # The flight loader accepts exactly what the editor wrote.
+    route = rpf.RouteDocument.from_path(saved)
+    assert route.waypoint_actions[0][0].to_json() == RIGHT_30
+
+    loaded = RouteDocument.load(saved, site_id="yard", coordinate_frame_id="yard-map-v1")
+    assert loaded.waypoint_actions == [[RIGHT_30, HOVER_3], []]
+
+    document.waypoint_actions = [[], []]
+    assert document.payload()["waypoint_actions"] is None
+    payload["waypoint_actions"] = [[{"type": "yaw", "degrees": 0}], []]
+    saved.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(ValueError, match="degrees"):
+        RouteDocument.load(saved, site_id="yard", coordinate_frame_id="yard-map-v1")
+
+
+def test_bound_save_emits_the_controller_actions(tmp_path):
+    import route_editor_window as rew
+
+    document = rem.RouteDocument(
+        site_id="yard", coordinate_frame_id="yard-map-v1", arrive_radius_map_units=0.02,
+    )
+    imported = []
+
+    def import_route(path):
+        imported.append(json.loads(path.read_text(encoding="utf-8")))
+        return SimpleNamespace(message="saved", asset_path=tmp_path / "route.json")
+
+    editor = SimpleNamespace(
+        controller=RouteEditorController(
+            [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]], [[], [RIGHT_30]]
+        ),
+        document=document,
+        arrive_radius_var=SimpleNamespace(get=lambda: 0.02),
+        _preview_only=False,
+        import_route=import_route,
+        profile=SimpleNamespace(route_json=tmp_path / "route.json"),
+        _signature=lambda: ("saved",),
+        status_var=SimpleNamespace(set=lambda _message: None),
+        close_editor=lambda *, force=False: None,
+    )
+    editor._update_document = lambda: rew.RouteEditorWindow._update_document(editor)
+
+    rew.RouteEditorWindow.save_route(editor)
+    assert imported[0]["waypoint_actions"] == [[], [RIGHT_30]]

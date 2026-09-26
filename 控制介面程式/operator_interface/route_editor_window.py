@@ -15,7 +15,13 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageTk
 from route_editor_controller import OrthoView, RouteEditorController, pointer_is_drag
 from local_site_assets import discover_site_package
-from route_editor_model import RouteDocument, glomap_to_editor
+from operator_autonomy_status import waypoint_action_text
+from route_editor_model import (
+    MAX_ACTIONS_PER_WAYPOINT,
+    RouteDocument,
+    glomap_to_editor,
+    parse_waypoint_action,
+)
 from x11_pinch_zoom import install_x11_pinch_zoom
 
 
@@ -30,9 +36,23 @@ _ARRIVE_FILL = (63, 191, 127, 52)
 DEFAULT_ARRIVE_RADIUS_U = 0.02
 ARRIVE_RADIUS_MIN_U = 0.005
 ARRIVE_RADIUS_MAX_U = 0.05
+#: Points drawn per frame. The dense display cloud (map_dense.ply) holds 2.44M
+#: points on river_site and takes ~0.3 s to draw in full, so drag and zoom draw
+#: a stride sample and the full cloud is drawn once the view settles.
+_DRAW_POINTS_INTERACTIVE = 250_000
+_DRAW_POINTS_STATIC = 3_000_000
+_ZOOM_SETTLE_MS = 200
 _ROUTE = "#ff3ea5"
 _SELECTED = "#ffe169"
 _AXIS = ("#ff6b5f", "#55d187", "#5aa7e8")
+
+
+def _action_marker(action: dict) -> str:
+    """Compact canvas marker: R30 / L45 turn, H3s hover."""
+    if action.get("type") == "yaw":
+        degrees = float(action["degrees"])
+        return f"{'R' if degrees > 0 else 'L'}{abs(degrees):g}"
+    return f"H{float(action['seconds']):g}s"
 
 
 def _resolve_map_frame(profile):
@@ -144,7 +164,9 @@ class RouteEditorWindow(tk.Toplevel):
         self.title(f"航線編輯器 — {display_name}")
         self.configure(bg="#121519")
         self.protocol("WM_DELETE_WINDOW", self.close_editor)
-        self.controller = RouteEditorController(self.document.points)
+        self.controller = RouteEditorController(
+            self.document.points, self.document.waypoint_actions
+        )
         self.map_points = self._aligned_map_points(map_points)
         center, radius = self._bounds(self.map_points[:, :3])
         self.view = OrthoView(center=center, radius=radius, zoom=1.0)
@@ -153,6 +175,7 @@ class RouteEditorWindow(tk.Toplevel):
         self._canvas_item = None
         self._redraw_pending = False
         self._interacting = False
+        self._zoom_settle_after: str | None = None
         self._nav_button: int | None = None
         self._nav_last: tuple[int, int] | None = None
         self._mouse = (0, 0)
@@ -330,6 +353,31 @@ class RouteEditorWindow(tk.Toplevel):
         ttk.Label(arrive, textvariable=self.point_radius_note_var,
                   style="RouteEditor.TLabel").pack(anchor="w", padx=6)
         self._on_arrive_radius(None)
+        actions = ttk.LabelFrame(side, text="航點動作（到達選取點後依序執行）")
+        actions.pack(fill="x", padx=12, pady=(0, 10))
+        self.action_list_var = tk.StringVar()
+        ttk.Label(actions, textvariable=self.action_list_var, style="RouteEditor.TLabel",
+                  justify="left", wraplength=260).pack(anchor="w", padx=6, pady=(4, 2))
+        yaw_row = ttk.Frame(actions)
+        yaw_row.pack(fill="x", padx=6, pady=2)
+        self.action_degrees_var = tk.StringVar(value="30")
+        ttk.Spinbox(yaw_row, from_=1, to=180, increment=5, width=5,
+                    textvariable=self.action_degrees_var).pack(side="left")
+        ttk.Label(yaw_row, text="度", style="RouteEditor.TLabel").pack(side="left", padx=(2, 6))
+        ttk.Button(yaw_row, text="左轉", width=5,
+                   command=lambda: self._add_yaw_action(-1)).pack(side="left", padx=2)
+        ttk.Button(yaw_row, text="右轉", width=5,
+                   command=lambda: self._add_yaw_action(+1)).pack(side="left", padx=2)
+        hover_row = ttk.Frame(actions)
+        hover_row.pack(fill="x", padx=6, pady=2)
+        self.action_seconds_var = tk.StringVar(value="3")
+        ttk.Spinbox(hover_row, from_=0.5, to=60, increment=0.5, width=5,
+                    textvariable=self.action_seconds_var).pack(side="left")
+        ttk.Label(hover_row, text="秒", style="RouteEditor.TLabel").pack(side="left", padx=(2, 6))
+        ttk.Button(hover_row, text="懸停", width=5,
+                   command=self._add_hover_action).pack(side="left", padx=2)
+        ttk.Button(actions, text="刪除最後一個動作",
+                   command=self._remove_last_action).pack(anchor="w", padx=6, pady=(2, 6))
         ttk.Label(
             side,
             textvariable=self.selection_var,
@@ -347,6 +395,7 @@ class RouteEditorWindow(tk.Toplevel):
             "  Enter：進入第二階段\n\n"
             "第二階段：逐點調整位置\n"
             "  左鍵：選取航點\n"
+            "  航點動作：到點後轉向／懸停，再轉往下一點\n"
             "  G：開始平移\n"
             "  G 後 X / Y / Z：鎖定軸向\n"
             "  左鍵／Enter：確認，Esc：取消\n"
@@ -409,6 +458,7 @@ class RouteEditorWindow(tk.Toplevel):
             points,
             float(self.arrive_radius_var.get()),
             tuple(self.document.waypoint_arrive_radii or ()),
+            repr(self.controller.actions),
         )
 
     def _refresh_labels(self) -> None:
@@ -434,6 +484,7 @@ class RouteEditorWindow(tk.Toplevel):
                 f"選取：航點 {selected + 1}\nX {x:.3f}  Y {y:.3f}  高度 Z {z:.3f}"
             )
         self._sync_point_radius_box()
+        self._sync_action_list()
         self.finish_button.configure(
             state="normal" if self.controller.phase == "layout" else "disabled"
         )
@@ -469,7 +520,7 @@ class RouteEditorWindow(tk.Toplevel):
         height = max(240, self.canvas.winfo_height())
         arr = np.empty((height, width, 3), dtype=np.uint8)
         arr[:] = _BG
-        limit = 60000 if self._interacting else 220000
+        limit = _DRAW_POINTS_INTERACTIVE if self._interacting else _DRAW_POINTS_STATIC
         step = max(1, len(self.map_points) // max(1, limit))
         points = self.map_points[::step]
         if len(points):
@@ -525,6 +576,7 @@ class RouteEditorWindow(tk.Toplevel):
                     outline=_ARRIVE,
                     width=2,
                 )
+        actions = getattr(self.controller, "actions", None) or []
         for index, (x, y) in enumerate(projected):
             selected = index == self.controller.selected
             radius = 8 if selected else 6
@@ -534,7 +586,11 @@ class RouteEditorWindow(tk.Toplevel):
                 fill=fill,
                 outline="white",
             )
-            draw.text((x + radius + 3, y - radius - 2), str(index + 1), fill="white")
+            label = str(index + 1)
+            if index < len(actions) and actions[index]:
+                # ASCII only: PIL's default bitmap font has no CJK glyphs.
+                label += " [" + " ".join(_action_marker(a) for a in actions[index]) + "]"
+            draw.text((x + radius + 3, y - radius - 2), label, fill="white")
 
     def _canvas_size(self) -> tuple[int, int]:
         return max(320, self.canvas.winfo_width()), max(240, self.canvas.winfo_height())
@@ -746,6 +802,18 @@ class RouteEditorWindow(tk.Toplevel):
 
     def _set_zoom(self, zoom: float) -> None:
         self.view.zoom = float(np.clip(zoom, 0.08, 120.0))
+        if self._nav_last is None and self._left_press is None:
+            self._interacting = True
+            if self._zoom_settle_after is not None:
+                self.after_cancel(self._zoom_settle_after)
+            self._zoom_settle_after = self.after(_ZOOM_SETTLE_MS, self._zoom_settled)
+        self.request_redraw()
+
+    def _zoom_settled(self) -> None:
+        self._zoom_settle_after = None
+        if self._closed or self._nav_last is not None or self._left_press is not None:
+            return
+        self._interacting = False
         self.request_redraw()
 
     def _handle_undo_redo(self, *, shift: bool) -> None:
@@ -900,6 +968,62 @@ class RouteEditorWindow(tk.Toplevel):
         radii[selected] = radius
         self._sync_point_radius_box()
         self.request_redraw()
+
+    def _sync_action_list(self) -> None:
+        selected = self.controller.selected
+        if selected is None or not (0 <= selected < len(self.controller.points)):
+            self.action_list_var.set("先選取一個航點")
+            return
+        entries = self.controller.actions[selected]
+        lines = [f"{step}. {waypoint_action_text(action)}"
+                 for step, action in enumerate(entries, start=1)]
+        self.action_list_var.set(
+            f"航點 {selected + 1}：" + ("\n" + "\n".join(lines) if lines else "無動作")
+        )
+
+    def _add_action(self, raw: dict) -> None:
+        selected = self.controller.selected
+        if selected is None or not (0 <= selected < len(self.controller.points)):
+            self.status_var.set("先選取一個航點再加入動作")
+            return
+        if len(self.controller.actions[selected]) >= MAX_ACTIONS_PER_WAYPOINT:
+            self.status_var.set(f"每個航點最多 {MAX_ACTIONS_PER_WAYPOINT} 個動作")
+            return
+        try:
+            action = parse_waypoint_action(raw, "動作").to_json()
+        except ValueError as exc:
+            self.status_var.set(f"動作數值不合法：{exc}")
+            return
+        self.controller.add_action(action)
+        self.status_var.set(
+            f"航點 {selected + 1} 已加入動作：{waypoint_action_text(action)}"
+        )
+        self._refresh_labels()
+        self.request_redraw()
+
+    def _add_yaw_action(self, direction: int) -> None:
+        try:
+            degrees = float(str(self.action_degrees_var.get()).strip())
+        except ValueError:
+            self.status_var.set("轉向角度必須是數字")
+            return
+        self._add_action({"type": "yaw", "degrees": direction * degrees})
+
+    def _add_hover_action(self) -> None:
+        try:
+            seconds = float(str(self.action_seconds_var.get()).strip())
+        except ValueError:
+            self.status_var.set("懸停秒數必須是數字")
+            return
+        self._add_action({"type": "hover", "seconds": seconds})
+
+    def _remove_last_action(self) -> None:
+        if self.controller.remove_last_action():
+            self.status_var.set("已刪除選取航點的最後一個動作")
+            self._refresh_labels()
+            self.request_redraw()
+        else:
+            self.status_var.set("選取航點沒有動作可刪除")
 
     def finish_layout(self) -> None:
         try:
@@ -1178,6 +1302,11 @@ class RouteEditorWindow(tk.Toplevel):
         if self.controller.moving:
             self.controller.confirm_move()
         self.document.points = self.controller.points
+        actions = getattr(self.controller, "actions", None)
+        if actions is not None:
+            self.document.waypoint_actions = (
+                [list(entry) for entry in actions] if any(actions) else None
+            )
         self.document.arrive_radius_map_units = float(self.arrive_radius_var.get())
         radii = self.document.waypoint_arrive_radii
         if radii is not None:

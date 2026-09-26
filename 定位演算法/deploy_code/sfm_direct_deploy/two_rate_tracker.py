@@ -1067,6 +1067,8 @@ class TwoRateTracker:
             "reloc_ms": self._last_reloc_ms,
             "reloc_retrieval_ms": self._last_reloc_stages.get("retrieval_ms"),
             "reloc_match_lift_ms": self._last_reloc_stages.get("match_lift_ms"),
+            "reloc_edm_match_ms": self._last_reloc_stages.get("edm_match_ms"),
+            "reloc_lift_prepare_ms": self._last_reloc_stages.get("lift_prepare_ms"),
             "reloc_pnp_ms": self._last_reloc_stages.get("reloc_pnp_ms"),
             "reloc_reference_count": self._last_reloc_stages.get("matched_references"),
             "reloc_capture_stamp_mono": self._last_reloc_capture_stamp,

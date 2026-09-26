@@ -25,7 +25,7 @@ class TrackerState(str, Enum):
 
     Two write sites intentionally still assign a plain ``str`` rather than a
     member of this enum, and are not refactored in this batch:
-      - olympe_live_backend.py forwards the ANAFI firmware's own
+      - arsdk_ng_live_backend.py forwards the ANAFI firmware's own
         FlyingStateChanged string (uppercased) when nothing more specific
         (this enum's values) already applies.
       - flight_operator_app.py forwards the localization worker's own
@@ -106,7 +106,17 @@ class DroneState:
     altitude_m: float = 0.0
     drone_altitude_m: float | None = None
     gimbal_pitch_deg: float = -20.0
+    gimbal_yaw_deg: float | None = None
+    gimbal_roll_deg: float | None = None
+    gimbal_relative_pitch_deg: float | None = None
+    gimbal_relative_yaw_deg: float | None = None
+    gimbal_relative_roll_deg: float | None = None
+    gimbal_mono_ns: int | None = None
+    gimbal_stamp_source: str | None = None
     zoom: float = 1.0
+    camera_zoom_level: float | None = None
+    camera_zoom_mono_ns: int | None = None
+    camera_zoom_stamp_source: str | None = None
     link_latency_ms: float = ANAFI.stream_latency_ms
     frame_age_ms: float | None = None
     telemetry_read_mono_ns: int | None = None

@@ -276,10 +276,10 @@ class NavigationPoseTransformer:
         R_C_M = _proper_rotation(rotation_camera_from_map, "R_camera_from_map")
         R_M_C = R_C_M.T
         R_M_B = R_M_C @ self.extrinsic.R_C_B
-        p_M_B = camera_center + R_M_C @ self.extrinsic.t_C_B
-
         transform = self.site_alignment.transform
-        p_W_B = transform.map_to_site_point(p_M_B)
+        # The camera center is in map units, but the lever arm is in metres.
+        p_W_B = (transform.map_to_site_point(camera_center)
+                 + transform.R @ R_M_C @ self.extrinsic.t_C_B)
         R_W_B = transform.map_to_site_rotation(R_M_B)
         R_W_B = _proper_rotation(R_W_B, "R_site_from_body")
         forward = R_W_B[:, 0]

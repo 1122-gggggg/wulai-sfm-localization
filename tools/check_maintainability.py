@@ -45,11 +45,10 @@ BUDGETS = {
 # +28 and +24 lines. Push these back down; do not raise them for a feature that
 # has not first been moved out.
 # flight_operator_app: 8010 -> 7850 -> 7870 -> 8140（實測 8123：ChainFixB 免重算註冊表 + Gap3 自動前進邏輯）。
-# olympe_live_backend: 5208 -> 5234（+26：MaxPitchRollRotationSpeed 併入韌體限制
-# 封套）。這 26 行搬不出去 -- 它們就是既有三個限制所在的韌體寫入／讀回邊界本身。
+# arsdk_ng_live_backend: 5208 -> 5234 (+26 for the consolidated firmware envelope).
 LINE_BUDGETS = {
     "控制介面程式/operator_interface/flight_operator_app.py": 8140,
-    "控制介面程式/operator_interface/olympe_live_backend.py": 5234,
+    "控制介面程式/operator_interface/arsdk_ng_live_backend.py": 5234,
 }
 
 

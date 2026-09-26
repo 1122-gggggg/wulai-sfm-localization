@@ -10,7 +10,7 @@
     "label_route": "authoring/label_route_points.py"
   },
   "flight_control": {
-    "sdk": "Parrot Olympe Python SDK",
+    "sdk": "Parrot ARSDK-NG",
     "default_drone_ip": "192.168.42.1",
     "field_drone_ip": "192.168.53.1",
     "field_controller": "skycontroller3",

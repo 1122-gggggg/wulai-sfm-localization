@@ -88,7 +88,7 @@ def _enum_token(value: object) -> str:
 
 
 def unwrap_camera_state(state: object) -> dict | None:
-    """Normalize Olympe camera get_state maps to one cam_id=0 field dict."""
+    """Normalize camera get_state maps to one cam_id=0 field dict."""
     if not isinstance(state, dict) or not state:
         return None
     if "resolution" in state or "framerate" in state:
@@ -106,7 +106,7 @@ def unwrap_camera_state(state: object) -> dict | None:
 
 
 def jsonable_camera_state(state: object) -> dict[str, object] | None:
-    """JSON-safe recording_mode readback. Olympe enums must not reach dumps."""
+    """JSON-safe recording_mode readback. Native enum values must not reach dumps."""
     fields = unwrap_camera_state(state)
     if fields is None:
         return None

@@ -16,6 +16,7 @@ Covers the WeakDisplay acceptance slice:
 
 from __future__ import annotations
 
+import math
 from types import SimpleNamespace
 
 import numpy as np
@@ -192,6 +193,71 @@ def _drain(operator: SimpleNamespace, payloads: list[dict]) -> None:
     for _payload in payloads:
         operator.live_new_pose = False
         app.OperatorApp.update_live_results(operator)
+
+
+_EAST = np.array([1.0, 0.0, 0.0])
+_NORTH = np.array([0.0, 0.0, 1.0])
+_UP = np.array([0.0, -1.0, 0.0])
+
+
+def _camera_axes(pitch_deg: float) -> list:
+    pitch = math.radians(pitch_deg)
+    forward = math.cos(pitch) * _NORTH + math.sin(pitch) * _UP
+    right = _EAST
+    down = np.cross(forward, right)
+    return [right.tolist(), down.tolist(), forward.tolist()]
+
+
+def _attitude_payload(seq: int, camera_pitch_deg: float) -> dict:
+    payload = _fast(seq, 1.0)
+    payload.update(
+        source_frame_stamp_mono=12.0,
+        camera_axes_world=_camera_axes(camera_pitch_deg),
+        gimbal_pitch_deg=-20.0,
+        gimbal_roll_deg=0.0,
+        gimbal_mono_ns=12_000_000_000,
+        gimbal_stamp_source="event",
+    )
+    return payload
+
+
+def test_camera_attitude_mismatch_rejects_fix_and_requests_relocalization() -> None:
+    operator = _make_operator([[_attitude_payload(1, 25.0)]], app.LostHoldPolicy())
+    calls = []
+    operator._map_axis_basis = lambda: (_EAST, _NORTH, _UP, True)
+    operator.localizer.request_relocalize = lambda: calls.append(1)
+    _drain(operator, [_attitude_payload(1, 25.0)])
+
+    assert operator.live_new_pose is False
+    assert operator.loc_health == "FAIL"
+    assert calls == [1]
+    assert operator.live_result["error"].startswith("camera attitude mismatch")
+    assert operator.live_result["camera_pitch_error_deg"] == pytest.approx(45.0, abs=0.01)
+
+
+def test_camera_attitude_consistent_fix_is_accepted_and_logged() -> None:
+    operator = _make_operator([[_attitude_payload(1, -21.0)]], app.LostHoldPolicy())
+    calls = []
+    operator._map_axis_basis = lambda: (_EAST, _NORTH, _UP, True)
+    operator.localizer.request_relocalize = lambda: calls.append(1)
+    _drain(operator, [_attitude_payload(1, -21.0)])
+
+    assert operator.live_new_pose is True
+    assert np.allclose(operator.live_last_xyz, [1.0, 2.0, 3.0])
+    assert operator.live_result["camera_pitch_error_deg"] == pytest.approx(1.0, abs=0.01)
+    assert calls == []
+
+
+def test_camera_attitude_check_skips_unmeasured_gravity() -> None:
+    operator = _make_operator([[_attitude_payload(1, 25.0)]], app.LostHoldPolicy())
+    calls = []
+    operator._map_axis_basis = lambda: (_EAST, _NORTH, _UP, False)
+    operator.localizer.request_relocalize = lambda: calls.append(1)
+    _drain(operator, [_attitude_payload(1, 25.0)])
+
+    assert operator.live_new_pose is True
+    assert "camera_pitch_error_deg" not in operator.live_result
+    assert calls == []
 
 
 # --------------------------------------------------------------------------

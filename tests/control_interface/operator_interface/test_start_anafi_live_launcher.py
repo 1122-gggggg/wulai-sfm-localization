@@ -6,6 +6,7 @@ import json
 import shutil
 import signal
 import subprocess
+import tempfile
 import sys
 import time
 from pathlib import Path
@@ -21,6 +22,7 @@ SCRIPT = (
 APP = SCRIPT.with_name("flight_operator_app.py")
 PACKAGE_MANIFEST_TOOL = SCRIPT.parents[2] / "tools" / "package_manifest.py"
 LAUNCH_ENV = {
+    "ARSDK_NG_LIB_DIR",
     "CTRL",
     "DISPLAY",
     "IP",
@@ -42,9 +44,26 @@ LAUNCH_ENV = {
     "SFM_SITE_PROFILE",
     "SFM_MISSION_SELECTION",
     "SFM_UI_PYTHON",
+    "SFM_ARSDK_NG_LIB_DIR",
     "VENV",
     "WAYLAND_DISPLAY",
 }
+
+
+ARSDK_NG_LIBRARIES = (
+    "libarsdk.so",
+    "libarsdkctrl.so",
+    "libpomp.so",
+    "libfutils.so",
+    "libmux.so",
+    "libulog.so",
+)
+
+
+def _write_fake_arsdk_ng_libraries(directory: Path) -> None:
+    directory.mkdir(parents=True, exist_ok=True)
+    for name in ARSDK_NG_LIBRARIES:
+        (directory / name).write_bytes(b"launcher fixture")
 
 
 def run_launcher(*args: str, **overrides: str) -> subprocess.CompletedProcess[str]:
@@ -57,15 +76,19 @@ def run_launcher(*args: str, **overrides: str) -> subprocess.CompletedProcess[st
         "SFM_MISSION_SELECTION": "offline-shell-fixture",
         **overrides,
     })
-    return subprocess.run(
-        [str(SCRIPT), *args],
-        cwd=SCRIPT.parent,
-        env=env,
-        text=True,
-        capture_output=True,
-        check=False,
-        timeout=10,
-    )
+    with tempfile.TemporaryDirectory(prefix="test-arsdk-ng-") as library_root:
+        library_dir = Path(library_root)
+        _write_fake_arsdk_ng_libraries(library_dir)
+        env.setdefault("SFM_ARSDK_NG_LIB_DIR", str(library_dir))
+        return subprocess.run(
+            [str(SCRIPT), *args],
+            cwd=SCRIPT.parent,
+            env=env,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=10,
+        )
 
 
 def test_app_help_formats_percent_literals() -> None:
@@ -91,7 +114,7 @@ def test_launcher_help_exits_before_live_setup() -> None:
     result = run_launcher("--help")
 
     assert result.returncode == 0, result.stderr
-    assert "只會啟動 real-flight Olympe 介面" in result.stdout
+    assert "只會啟動 real-flight ARSDK-NG 介面" in result.stdout
     assert "checking target" not in result.stdout
     assert "sustained CPU thread budget" not in result.stdout
 
@@ -764,6 +787,8 @@ def test_live_max_performance_forwards_signal_before_restoring(
         'fi\n',
     )
     write_executable(bin_dir / "gamemoderun", 'exec "$@"\n')
+    native_library_dir = tmp_path / "native"
+    _write_fake_arsdk_ng_libraries(native_library_dir)
     env = os.environ.copy()
     for name in LAUNCH_ENV:
         env.pop(name, None)
@@ -778,6 +803,7 @@ def test_live_max_performance_forwards_signal_before_restoring(
         "SFM_MISSION_SELECTION": "offline-shell-fixture",
         "SFM_LAUNCH_DRY_RUN": "0",
         "SFM_UI_PYTHON": str(fake_python),
+        "SFM_ARSDK_NG_LIB_DIR": str(native_library_dir),
     })
     process = subprocess.Popen(
         [str(SCRIPT)],

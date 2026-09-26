@@ -16,6 +16,7 @@ from contextlib import contextmanager
 from collections.abc import Callable, Iterable
 from pathlib import Path
 
+from map_point_io import DENSE_DISPLAY_PLY_NAME
 from site_asset_interfaces import (
     AssetCheck,
     ImportedAsset,
@@ -135,6 +136,8 @@ def discover_ply_files(folder: str | Path) -> list[Path]:
         if path.is_file()
         and not path.is_symlink()
         and path.suffix.lower() == ".ply"
+        # The editor loads the bound dense cloud itself once map.ply matches.
+        and path.name != DENSE_DISPLAY_PLY_NAME
     ]
     return sorted(found, key=lambda path: path.relative_to(root).as_posix().casefold())
 
@@ -151,9 +154,11 @@ SITE_ASSET_PATTERNS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
     ("route_json", "航線", ("flight_path.json", "*route*.json")),
 )
 
-#: PLY files the route editor itself writes. They live beside the map but are
-#: previews of a route, never the map, so proposing one would be a trap.
-_ROUTE_PREVIEW_PLY = ("flight_path.ply", "route.ply", "poles.ply", "wires.ply")
+#: PLY files the route editor itself writes, plus its dense display cloud. They
+#: live beside the map but are never the map, so proposing one would be a trap.
+_ROUTE_PREVIEW_PLY = (
+    "flight_path.ply", "route.ply", "poles.ply", "wires.ply", DENSE_DISPLAY_PLY_NAME,
+)
 
 
 @contextmanager

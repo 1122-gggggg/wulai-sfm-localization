@@ -163,7 +163,7 @@ def test_a_parked_flight_is_flagged_but_not_rejected(tmp_path) -> None:
     joined = " ".join(built["notes"])
     assert "靜止" in joined
     assert "LOST" in joined
-    assert "ESEKF" in joined
+    assert "全程沒有 arm" not in joined  # An unimplemented EKF is not a recording failure.
 
 
 def test_stale_telemetry_pairs_are_counted_against_the_protocol_bound(tmp_path) -> None:
@@ -265,7 +265,8 @@ def test_flown_session_reports_converged_map_scale(tmp_path) -> None:
         telemetry.append(
             {
                 "event": "fused_odometry",
-                "t_mono_ns": int(t * 1e9),
+                "t_mono_ns": int((t + 8.0) * 1e9),
+                "speed_mono_ns": int(t * 1e9),
                 "speed_north_mps": -8.0 * math.sin(angle) * 2.0 * math.pi / 40.0,
                 "speed_east_mps": 8.0 * math.cos(angle) * 2.0 * math.pi / 40.0,
                 "speed_down_mps": 0.0,
@@ -282,7 +283,9 @@ def test_flown_session_reports_converged_map_scale(tmp_path) -> None:
             {
                 "event": "pose_result",
                 "t_mono": t,
-                "ui_arrival_mono": t,
+                "ui_arrival_mono": t + 12.0,
+                "source_frame_stamp_mono": t,
+                "direct_status": "FAST_TRACK",
                 "success": True,
                 "pose": {
                     "x": 4.0 * (math.cos(angle) - 1.0),
