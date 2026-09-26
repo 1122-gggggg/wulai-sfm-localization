@@ -21,6 +21,8 @@ ROUTES = describe_site_routes(SITE)
 def test_available_route_overlay_is_the_desktop_auto_input(route):
     """Select through the UI path; build AUTO, without starting any worker."""
     profile_path = SITE / "site_profile.json"
+    if not profile_path.is_file():
+        pytest.skip("requires the operator's river site profile")
     frame = resolve_site_map_frame(load_site_profile(profile_path))
     operator = OperatorApp.__new__(OperatorApp)
     operator.site_profile_path = profile_path

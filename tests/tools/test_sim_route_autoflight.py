@@ -59,7 +59,9 @@ def _align():
         root
         / "地圖檔/場域/river_site/releases/river_gluemap_all8_direct_20260908/localization/T_align_gravity.json"
     )
-    return align if align.is_file() else None
+    if not align.is_file():
+        pytest.skip("requires the operator's measured river site alignment")
+    return align
 
 
 def _plant_state(map_frame, yaw=0.0):
