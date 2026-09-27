@@ -388,6 +388,7 @@ def test_apply_regression_scenario_unknown_raises():
 
 
 def test_cli_out_and_scenario_flags_write_artifacts(tmp_path):
+    _align()  # the CLI resolves the same measured site alignment
     route = _flown_route()
     outdir = tmp_path / "simR2"
     rc = sim.main(
