@@ -74,6 +74,9 @@ EDM 失敗時 STA 的表現、STA 各階段延遲。
   `執行環境/models/vista_slam/src`（被 `models` 規則忽略，不進版控）。
 - STA 權重 `frontend_sta_weights.pth`，SHA-256
   `8b8cc1c49172731f8c8de928810aa969502411b7f263d6013951207d27fa06a3`。
+- 2026-09-27 依操作員指示刪除 `執行環境/models/vista_slam/`（約 1.8 GB）。重跑本評估須從
+  `https://github.com/zhangganlin/vista-slam` 取回上述 commit 放回 `src/`，並把權重放回
+  `pretrains/`、核對 SHA-256。
 - 授權：DUSt3R 衍生檔案與權重為 CC BY-NC-SA 4.0（限非商業）。
 - torch 2.11.0+cu128、RTX 5060 Laptop。未編譯 curope，使用 vendor 內建的 PyTorch RoPE。
 - vendor 注意力層固定呼叫 xformers；未安裝 xformers（會改動正式 venv 的 torch），
