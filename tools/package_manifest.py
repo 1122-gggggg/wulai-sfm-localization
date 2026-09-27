@@ -124,8 +124,12 @@ def package_files(
     root: Path, *, source_only: bool = False, include_site_assets: bool = False
 ) -> list[Path]:
     files: list[Path] = []
+    # A nested worktree or repository (its own ``.git`` entry) is a separate checkout.
+    nested_checkouts = [marker.parent for marker in root.rglob(".git") if marker.parent != root]
     for path in root.rglob("*"):
         relative = path.relative_to(root)
+        if any(checkout in path.parents for checkout in nested_checkouts):
+            continue
         if not included(
             relative,
             source_only=source_only,

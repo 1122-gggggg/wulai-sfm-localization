@@ -88,6 +88,20 @@ def test_manifest_round_trip(tmp_path: Path) -> None:
     )
 
 
+def test_manifest_skips_nested_git_checkouts(tmp_path: Path) -> None:
+    (tmp_path / "a.txt").write_text("a", encoding="utf-8")
+    worktree = tmp_path / "experiments" / "overlay"
+    worktree.mkdir(parents=True)
+    (worktree / ".git").write_text("gitdir: /elsewhere/.git/worktrees/overlay\n", encoding="utf-8")
+    (worktree / "copy.py").write_text("print('separate checkout')\n", encoding="utf-8")
+    (tmp_path / "experiments" / "notes.md").write_text("kept", encoding="utf-8")
+
+    entries = generate(tmp_path, source_only=True)
+
+    assert [entry.path for entry in entries] == ["a.txt", "experiments/notes.md"]
+    assert verify(tmp_path, source_only=True) == []
+
+
 @pytest.mark.parametrize("control_name", ("MANIFEST.tsv", "SHA256SUMS"))
 def test_manifest_rejects_symlinked_control_files(tmp_path: Path, control_name: str) -> None:
     root = tmp_path / "package"
