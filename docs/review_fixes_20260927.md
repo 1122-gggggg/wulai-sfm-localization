@@ -50,3 +50,36 @@
 - 品質門檻：ruff、format、mypy、維護性檢查全部通過；已結案的
   `執行環境/models/vista_slam/` 加入 `.gitignore`。
 - 啟動腳本以 `-e .git` 判斷原始碼目錄，git worktree 不再被當成未封裝的 portable 內容。
+- 缺少私有場域對齊（`T_align_gravity.json`）或 site profile 時，模擬與路線測試
+  改為明確略過而非失敗；有資產的主系統仍照常執行。
+- 來源 manifest 略過巢狀 git checkout（`experiments/edm-overlay` worktree、
+  `vista_slam/src` clone），重新產生後 `verify --source-only` 通過。
+
+## 線上工作圖分支（`exp/edm-overlay-holdout`）
+
+分支已合併本頁所有主線修正。以下只在該分支：
+
+- 維護性門檻：deploy、tools、validation、control 四區全數回到預算內。拆分時以
+  行為等價驗證把關：線上工作圖驗收工具在合併成三種合成矩陣的 report.json 完全
+  相同；P6 pack 組裝 102 種突變情境（含完整輸出逐位元組）、session 解析 86 種、
+  mock EDM/BA 的重建 15 種，新舊版結果一致；真實 P6 session（213 張關鍵幀、
+  5,400 個新點）的來源驗證、解析與底圖資產結果也一致。
+- 新增測試：以假 worker 與合成影片實跑一次完整驗收（`_run_one`／`_validate_run`），
+  以及以小型 pycolmap 模型實跑一次 `assemble_workmap_pack`。兩者原本都沒有測試。
+- P6 pack 組裝有兩個在真實底圖上必定失敗的缺陷，已修正：
+  - MoGe3-G 深度檔的 `source.npy` 讀完標頭後又用 `read_array` 從目前位置讀，
+    後者會重讀 magic，所以 334 個深度檔全被判為無效。
+  - occupancy 與參考觀測數不接受同一影像內重複觀測同一 3D 點，但凍結底圖
+    1,058 張有 1,031 張有這種情況（EDM 密集匹配，約 1.3% 觀測）。計數處改為
+    允許；新工作圖影像與量測的比對仍要求一對一。
+  修正後，底圖資產載入與 occupancy 可在真實 release 上完成；P6 仍因缺少
+  FIM/LWTL 原始評分來源而無法產出 pack，這點不變。
+- 已被正式 worker 路徑取代的 09-24 實驗腳本（`edm_overlay_capture/eval/geometry/
+  holdout_eval.py` 與 validation 版 `edm_online_workmap.py`）已移除，可由
+  commit `23fec4c` 取回。
+- worker 收到 SIGTERM 時的快速關閉改放在 context manager，行為不變。
+- 格式檢查範圍內 29 個未格式化檔案已套用 `ruff format`（純格式）。
+
+驗證結果：主線 2,547 通過、1 略過、2 失敗（即上述 09-23 航線）；分支 2,618 通過、
+37 略過、0 失敗。兩邊 ruff、format、mypy、維護性檢查與 `verify --source-only`
+全部通過。
