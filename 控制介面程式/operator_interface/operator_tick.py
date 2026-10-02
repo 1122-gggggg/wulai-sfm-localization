@@ -1063,7 +1063,9 @@ def _make_autonomy_pose(result: dict, xyz: np.ndarray, heading: float, stamp: fl
         position_observed=position_observed,
     )
     held = _pose_result_field(result, "confidence_hold_active", boolean=True)
-    if held and (direct_status is None or str(direct_status) in observed_statuses):
+    if held and not confirming and (
+        direct_status is None or str(direct_status) in observed_statuses
+    ):
         pose.position_observed = True
     return pose
 

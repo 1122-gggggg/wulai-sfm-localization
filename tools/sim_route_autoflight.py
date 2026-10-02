@@ -26,6 +26,10 @@ the route-authored arrival spheres (`arrive_radius_map_units` / per-point
 radii) gate every waypoint. The controller prioritizes returning to the active
 segment when tracking error grows; this simulator adds no hard safety tube.
 
+``duration_s`` bounds offline computation and trace size, not live AUTO flight.
+The production route has no fixed wall-clock cutoff; its independent
+localization, telemetry, battery, and waypoint-stall protections still apply.
+
 Frames ("兩者並沒有對齊")
 ------------------------
 Map frame (route + localization output, map units) and the drone's true world
@@ -83,17 +87,15 @@ sys.modules.setdefault("olympe", None)
 
 import real_path_follow_controller as rpf  # noqa: E402
 from route_domain import RouteDocument  # noqa: E402
-from operator_autonomy import (  # noqa: E402
-    AUTO_MAX_DURATION_S,
-    DesktopRouteAutonomy,
-    _fresh_route_progress,
-)
+from operator_autonomy import DesktopRouteAutonomy, _fresh_route_progress  # noqa: E402
 
 CTRL_HZ = 20
 DT = 1.0 / CTRL_HZ
 VH_MAX_MPS = 15.0
 VV_MAX_MPS = 4.0
 YAW_MAX_DEG_S = 200.0
+# Finite analysis horizon only; not a production AUTO mission deadline.
+SIM_DEFAULT_DURATION_S = 1200.0
 
 # --------------------------------------------------------------------------
 # Config helpers (mirror path_follow_flight.build_controller, minus Olympe env)
@@ -148,8 +150,8 @@ class SimParams:
     return_to_start: bool = True
     yaw_sign: int = 1
     seed: int = 7
-    duration_s: float = AUTO_MAX_DURATION_S
-    localization_wait_s: float = 0.0  # Included in the total mission budget.
+    duration_s: float = SIM_DEFAULT_DURATION_S
+    localization_wait_s: float = 0.0  # Included in this offline analysis horizon.
     # takeoff
     start_offset_u: tuple[float, float, float] = (0.25, 0.0, 0.0)
     start_offset_frame: str = "lateral"  # lateral | raw
@@ -1264,7 +1266,11 @@ def run_sim(params: SimParams, *, record_trace: bool = True) -> tuple[SimResult,
     max_dev = 0.0
     debrief = _TruthDebrief(ctrl, cfg, map_frame, s, state.pos_m, join_target)
     barometer = _barometer(params, baro_rng, debrief.up)
-    reason = "step cap" if max_steps else "localization wait exhausted total budget"
+    reason = (
+        "offline analysis horizon reached"
+        if max_steps
+        else "localization wait exhausted analysis horizon"
+    )
     success = False
     dist_m = 0.0
     t = initial_wait
@@ -1677,12 +1683,12 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--no-return-to-start", action="store_true")
     ap.add_argument("--yaw-sign", type=int, default=1, choices=[-1, 1])
     ap.add_argument("--seed", type=int, default=7)
-    ap.add_argument("--duration-s", type=float, default=AUTO_MAX_DURATION_S)
+    ap.add_argument("--duration-s", type=float, default=SIM_DEFAULT_DURATION_S)
     ap.add_argument(
         "--localization-wait-s",
         type=float,
         default=0.0,
-        help="initial wait charged to the total budget",
+        help="initial wait charged to the offline analysis horizon",
     )
     ap.add_argument(
         "--start-offset-u",

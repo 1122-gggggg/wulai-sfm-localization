@@ -1,11 +1,48 @@
-A. 影片模擬串流（無真機，用測試影片跑定位與 UI）
-------------------------------------------------
+影片模擬串流入口（無真機、無起飛指令；起飛/降落只更新模擬狀態）
+換影片：改 VIDEO= 那一行（預設是 P231）。
 
+注意：A 是舊正式程式，不是「弱位姿不凍結」的比較基準；要比較原版定位演算法與擴圖，請使用下方 B／C。
+B／C 關掉影片模擬器的「連續低信心」凍幀；真正沒有位姿的 LOST 重試、首幀 BOOT 保持原樣。
+這只是離線影片的啟動設定，不放寬真機、AUTO 或控制安全守門。擴圖場域 flight.approved=false，不能用來飛行。
+
+A. 舊正式系統（主目錄；弱位姿遠離強定位時可能凍結，不適合作不凍結對照）
+------------------------------------------------
   cd /home/allen/localization
   SFM_SITE_PROFILE="/home/allen/localization/地圖檔/場域/river_site/site_profile.json" \
-  VIDEO="/home/allen/localization/模擬器/測試影片/720p/P1670167_720p.MP4" \
+  VIDEO="/home/allen/下載/超過地圖範圍影片/P2310231.MP4" \
   ./控制介面程式/影片模擬串流/啟動.sh
 
-B. 真機串流
+
+B. 擴圖版本：邊定位邊擴圖（實驗分支，不飛行）
+------------------------------------------------
+地圖窗格顯示新增點；首次強定位前可建子圖，強錨後對齊並以局部 BA 驗證併圖。
+工作樹沒有自己的 .venv，借用主目錄的 Python；弱位姿沿相鄰影格更新，但單幀超過 max_jump_u 的跳點仍擋下。
+
+  cd /home/allen/localization/experiments/edm-overlay
+  SFM_UI_PYTHON="/home/allen/localization/.venv/bin/python" \
+  SFM_PORTABLE_ALLOW_EXTERNAL_PYTHON=1 \
+  SFM_SITE_PROFILE="/home/allen/localization/experiments/edm-overlay/地圖檔/場域/river_site/releases/river_gluemap_all8_online_ui_20260929/site_profile.json" \
+  SFM_HOLD_ON_LOW_CONF=0 \
+  VIDEO="/home/allen/下載/超過地圖範圍影片/P2310231.MP4" \
+  ./控制介面程式/影片模擬串流/啟動.sh
+
+  航線對話框可按 No；只做定位，不啟動 AUTO。
+
+C. 不擴圖的原版定位演算法（實驗分支，不凍結弱位姿的對照）
+------------------------------------------------
+  跟 B 用同一份程式碼，但場域換成沒有工作圖的凍結 release。
+
+  cd /home/allen/localization/experiments/edm-overlay
+  SFM_UI_PYTHON="/home/allen/localization/.venv/bin/python" \
+  SFM_PORTABLE_ALLOW_EXTERNAL_PYTHON=1 \
+  SFM_SITE_PROFILE="/home/allen/localization/地圖檔/場域/river_site/site_profile.json" \
+  SFM_HOLD_ON_LOW_CONF=0 \
+  VIDEO="/home/allen/下載/超過地圖範圍影片/P2310231.MP4" \
+  ./控制介面程式/影片模擬串流/啟動.sh
+
+
+
+D. 真機串流（不變）
+------------------------------------------------
   cd /home/allen/localization
   ./一鍵啟動.sh

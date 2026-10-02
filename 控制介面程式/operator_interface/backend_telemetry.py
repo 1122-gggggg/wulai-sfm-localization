@@ -92,12 +92,34 @@ class MotionEventHistory:
             except Exception:
                 pass
 
-    def histories(self) -> tuple[list, list]:
+    def since(self, since_stamps: tuple[float | None, ...] | None = None) -> tuple[list, list]:
         with self._lock:
-            return tuple(list(rows) for rows in self._rows)
+            result = []
+            for index, rows in enumerate(self._rows):
+                if not rows:
+                    result.append([])
+                    continue
+                cutoff = None
+                if since_stamps is not None and index < len(since_stamps):
+                    cutoff = since_stamps[index]
+                if cutoff is None or cutoff < rows[0][-1]:
+                    result.append(list(rows))
+                elif cutoff >= rows[-1][-1]:
+                    result.append([])
+                else:
+                    selected = []
+                    for row in reversed(rows):
+                        if row[-1] <= cutoff:
+                            break
+                        selected.append(row)
+                    selected.reverse()
+                    result.append(selected)
+            return tuple(result)
 
 
-def control_telemetry_history(backend):
+def control_telemetry_history(
+    backend, since_stamps: tuple[float | None, ...] | None = None
+) -> tuple[list, list]:
     """Return yaw/stamp and horizontal NED/stamp events on the receipt clock.
 
     This bypasses the UI polling interval, not the aircraft/network delay.
@@ -106,26 +128,27 @@ def control_telemetry_history(backend):
     history = getattr(backend, "motion_history", None)
     if history is None:
         return [], []
-    return history.histories()
+    return history.since(since_stamps)
 
 
 def _log_control_history(backend, now):
-    histories = control_telemetry_history(backend)
-    previous = getattr(backend, "_logged_control_stamps", (0.0, 0.0))
-    fresh = [
-        [row for row in rows if previous[index] < row[-1] <= now]
-        for index, rows in enumerate(histories)
-    ]
-    if any(fresh):
+    previous = getattr(backend, "_logged_control_stamps", None)
+    attitudes, velocities = control_telemetry_history(backend, previous)
+    fresh_attitudes = [row for row in attitudes if row[-1] <= now]
+    fresh_velocities = [row for row in velocities if row[-1] <= now]
+    if fresh_attitudes or fresh_velocities:
         backend.session_logs.telemetry(
             "control_motion_history",
             timestamp_kind="host_monotonic_receipt",
             t_mono_ns=round(now * 1e9),
-            attitude_samples=fresh[0],
-            horizontal_ned_samples=fresh[1],
+            attitude_samples=fresh_attitudes,
+            horizontal_ned_samples=fresh_velocities,
         )
-        backend._logged_control_stamps = tuple(
-            rows[-1][-1] if rows else previous[index] for index, rows in enumerate(fresh)
+        prev_att = previous[0] if previous is not None else None
+        prev_vel = previous[1] if previous is not None else None
+        backend._logged_control_stamps = (
+            fresh_attitudes[-1][-1] if fresh_attitudes else prev_att,
+            fresh_velocities[-1][-1] if fresh_velocities else prev_vel,
         )
 
 
@@ -347,7 +370,7 @@ def poll_gimbal(backend) -> None:
         if state is None or state.get("pitch_absolute") is None:
             return
         sample = backend._observe_telemetry(
-            "gimbal", message, state, now_mono_ns=time.monotonic_ns()
+            "gimbal", message, state, map_key=0, now_mono_ns=time.monotonic_ns()
         )
         if int(sample.get("gimbal_id") or 0) != 0:
             return  # Olympe's last event may belong to another MAP_ITEM key.
@@ -373,7 +396,7 @@ def poll_camera_zoom(backend) -> None:
         if raw is None or raw.get("level") is None:
             return
         sample = backend._observe_telemetry(
-            "camera_zoom", message, raw, now_mono_ns=time.monotonic_ns()
+            "camera_zoom", message, raw, map_key=0, now_mono_ns=time.monotonic_ns()
         )
         if int(sample.get("cam_id") or 0) != 0:
             return

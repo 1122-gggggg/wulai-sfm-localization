@@ -223,3 +223,61 @@ def test_export_preserves_source_symlink_and_fails_closed(
 
     assert list(destination.iterdir()) == []
     assert outside.read_text(encoding="utf-8") == "outside"
+
+
+def test_export_rejects_stale_source_manifest_same_size_content(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = _minimal_source(tmp_path, monkeypatch)
+    from package_manifest import generate
+
+    generate(source)
+    target_file = source / "code/main.py"
+    original_size = target_file.stat().st_size
+    target_file.write_text("evil\n", encoding="utf-8")
+    assert target_file.stat().st_size == original_size
+
+    destination = tmp_path / "portable"
+    destination.mkdir()
+
+    with pytest.raises(ValueError, match="stale relative to MANIFEST.tsv"):
+        exporter.export(destination)
+
+    assert list(destination.iterdir()) == []
+    assert not any(path.name.startswith(".portable.") for path in tmp_path.iterdir())
+
+
+def test_export_rejects_source_file_changed_during_copy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = _minimal_source(tmp_path, monkeypatch)
+    destination = tmp_path / "portable"
+    destination.mkdir()
+
+    original_copy_tree = exporter._copy_tree
+
+    def mutate_source_during_copy(src: Path, dst: Path, **kwargs: object) -> None:
+        original_copy_tree(src, dst, **kwargs)
+        (source / "code/main.py").write_text("modified\n", encoding="utf-8")
+
+    monkeypatch.setattr(exporter, "_copy_tree", mutate_source_during_copy)
+
+    with pytest.raises(ValueError, match="changed during export"):
+        exporter.export(destination)
+
+    assert list(destination.iterdir()) == []
+    assert not any(path.name.startswith(".portable.") for path in tmp_path.iterdir())
+
+
+def test_export_successful_output_verifies(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    source = _minimal_source(tmp_path, monkeypatch)
+    from package_manifest import generate, verify
+
+    generate(source)
+    destination = tmp_path / "portable"
+    destination.mkdir()
+
+    exporter.export(destination)
+    assert verify(destination) == []
+    assert (destination / "PORTABLE_PACKAGE.json").is_file()
+    assert (destination / "code/main.py").read_text(encoding="utf-8") == "main\n"

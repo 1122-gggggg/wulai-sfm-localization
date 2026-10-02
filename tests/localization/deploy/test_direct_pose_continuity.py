@@ -75,3 +75,79 @@ def test_weak_jump_cannot_bypass_the_shared_continuity_gate():
     assert gate.pending is not None
     assert not gate.accept(np.ones(3), 10.2, reliable=True, radius=0.02)
     assert gate.accept(np.ones(3), 10.3, reliable=True, radius=0.02)
+
+
+def test_direct_worker_pose_keeps_accepted_camera_basis_while_a_jump_is_pending():
+    adapter = object.__new__(DirectTrackerAdapter)
+    adapter.profile = SimpleNamespace(
+        fast_loop=SimpleNamespace(resolution=(8, 8)),
+        reloc=SimpleNamespace(top_k=2, frozen_pnp_thresholds={"strong_inliers": 60}),
+        max_jump_u=1.5,
+    )
+    adapter.state = RuntimeState()
+    adapter._pose_continuity = PoseSourceConfirmation()
+    adapter._pose_centers = []
+    adapter._reseed_confirming = False
+    adapter._accepted_camera_axes_world = None
+    adapter._fused_sample = None
+    old_rotation = np.eye(3)
+    new_rotation = np.array([[0.0, 0.0, -1.0], [0.0, 1.0, 0.0], [1.0, 0.0, 0.0]])
+    samples = [
+        (0.0, 10.0, old_rotation, np.pi / 2),
+        (2.0, 10.1, new_rotation, 0.0),
+        (2.0, 10.2, new_rotation, 0.0),
+    ]
+
+    def step(_gray, _stamp):
+        x, stamp, rotation, yaw = samples.pop(0)
+        assert _stamp == stamp
+        return {
+            "status": "FAST_TRACK",
+            "ok": True,
+            "center": np.array([x, 0.0, 0.0]),
+            "R": rotation,
+            "yaw": yaw,
+            "inliers": 80,
+            "map_inliers": 80,
+            "vo_inliers": 0,
+            "live_points": 80,
+            "n_corr": 80,
+            "loop_ms": 5.0,
+            "track_ms": 2.0,
+            "pnp_ms": 1.0,
+            "vo_ms": 0.0,
+            "dead_reckon_age": 0,
+            "reloc_status": "IDLE",
+            "handover_points": 0,
+            "handover_dropped": 0,
+            "reloc_ms": None,
+            "reloc_delivered": False,
+            "reloc_busy": False,
+            "vo_candidates": 0,
+            "step": None,
+        }
+
+    adapter.trk = SimpleNamespace(
+        map_frame=None,
+        step=step,
+        _speed_history=[1.0],
+    )
+    frame = np.zeros((8, 8), dtype=np.uint8)
+    first = adapter.localize_frame(frame, capture_stamp=10.0)
+    assert (first.x, first.yaw) == (0.0, np.pi / 2)
+    assert adapter.last_info["camera_axes_world"] == old_rotation.tolist()
+    held = adapter.localize_frame(frame, capture_stamp=10.1)
+    held_info = adapter.last_info
+    assert held is first
+    assert held_info["pose_source_confirming"] is True
+    assert held_info["mode"] == "WEAK_TRACK" and held_info["weak"] is True
+    assert held_info["camera_axes_world"] == old_rotation.tolist()
+    assert held_info["camera_forward_world"] == old_rotation[2].tolist()
+    assert not adapter.trk._speed_history
+    confirmed = adapter.localize_frame(frame, capture_stamp=10.2)
+    assert (confirmed.x, confirmed.yaw) == (2.0, 0.0)
+    assert adapter.last_info["camera_axes_world"] == new_rotation.tolist()
+    assert adapter.last_info["camera_forward_world"] == new_rotation[2].tolist()
+    assert adapter.last_info["mode"] == "TRACK"
+    assert adapter.last_info["weak"] is False
+    assert adapter.last_info["pose_source_confirming"] is False

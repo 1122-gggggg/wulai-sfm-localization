@@ -652,6 +652,7 @@ class OlympeLiveBackend:
         message: Any,
         fallback_state: dict[str, Any],
         *,
+        map_key: Any = None,
         now_mono_ns: int,
     ) -> dict[str, Any]:
         """Record one SDK event without refreshing an unchanged cache entry."""
@@ -665,7 +666,12 @@ class OlympeLiveBackend:
         invalid_event_timestamp = False
         if callable(get_last_event):
             try:
-                event = get_last_event(message)
+                if map_key is not None:
+                    event = get_last_event(message, key=map_key)
+                else:
+                    event = get_last_event(message)
+                if event is None:
+                    raise KeyError(f"missing event for map key {map_key}")
                 wall_age_s = time.time() - float(event.date.timestamp())
                 if not math.isfinite(wall_age_s) or wall_age_s < 0.0:
                     invalid_event_timestamp = True
@@ -3551,7 +3557,7 @@ class OlympeLiveBackend:
                 roll_frame_of_reference="none",
                 roll=0.0,
             ))
-            self.state.gimbal_pitch_deg = pitch
+            self.state.gimbal_target_pitch_deg = pitch
             self.log.event("gimbal_pitch", pitch=pitch, ok=True)
             return True
         except Exception as exc:
@@ -3559,7 +3565,7 @@ class OlympeLiveBackend:
             try:
                 from olympe.messages.ardrone3.Camera import Orientation
                 self.drone(Orientation(tilt=int(pitch), pan=0))
-                self.state.gimbal_pitch_deg = pitch
+                self.state.gimbal_target_pitch_deg = pitch
                 self.log.event("gimbal_pitch_legacy", pitch=pitch, ok=True)
                 return True
             except Exception as exc2:
@@ -4799,8 +4805,10 @@ class OlympeLiveBackend:
     def _poll_session_telemetry(self, now: float) -> None:
         poll_session_telemetry(self, now)
 
-    def control_telemetry_history(self):
-        return control_telemetry_history(self)
+    def control_telemetry_history(
+        self, since_stamps: tuple[float | None, ...] | None = None
+    ):
+        return control_telemetry_history(self, since_stamps=since_stamps)
 
     def _poll_gimbal(self) -> None:
         poll_gimbal(self)

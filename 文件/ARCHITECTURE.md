@@ -75,7 +75,7 @@ symlink、容量與未分類 output。
 |---|---|
 | `deploy_code/sfm_glomap_deploy/` | `artifact_integrity.py`、`localizer_registry.py`、`pose_types.py`、`production_localizer_factory.py`（direct 唯一後端接線） |
 | `deploy_code/sfm_direct_deploy/` | `direct_map.py`、`direct_profile.py`、`live_provider.py`、`two_rate_tracker.py`、`direct_localizer_adapter.py`、`vendor/` |
-| `flight_control/` | `autoflight.py`、`manual_nudge_pilot.py`、`olympe_frame_source.py`、`path_follow_flight.py`、`plan_path.py`、`real_path_follow_controller.py`、`route_domain.py` |
+| `flight_control/` | `autoflight.py`、`manual_nudge_pilot.py`、`olympe_frame_source.py`、`path_follow_flight.py`、`real_path_follow_controller.py`、`route_domain.py` |
 
 呼叫端直接從 owner 匯入，另一個目錄不得再放相容副本。CI 由下列命令驗證 owner
 存在、舊副本沒有回流，且沒有未分類的同名 runtime 檔案：

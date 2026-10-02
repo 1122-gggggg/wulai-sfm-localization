@@ -948,7 +948,7 @@ class LoopHooks:
     body_velocity: callable | None = None  # () -> (forward_mps, right_mps, source_stamp) | None
     attitude_sample: callable | None = None  # () -> (NED yaw, sample_stamp) | None
     ned_velocity: callable | None = None  # () -> (north_mps, east_mps, sample_stamp) | None
-    telemetry_history: callable | None = None  # () -> (yaw/stamp rows, north/east/stamp rows)
+    telemetry_history: callable | None = None  # (since_stamps) -> (yaw/stamp rows, north/east/stamp rows)
     # () -> (firmware altitude above takeoff in metres, monotonic stamp) | None;
     # None disables the barometric height cross-check (VerticalConsistencyGuard).
     altitude: callable | None = None
@@ -1798,6 +1798,7 @@ class _FlightLoopRunner:
         self.heading = HeadingEstimator(ctrl.cfg.map_frame if ctrl is not None else None)
         self._heading_pending: list[tuple[float, float, bool]] = []
         self._heading_anchor_stamp: float | None = None
+        self._control_telemetry_stamps: tuple[float | None, float | None] | None = None
         self.pcmd_controller = rpf.YawAlignedPcmdController(ctrl.cfg) if ctrl is not None else None
         self.control_state = ControlStateEstimator(ctrl.cfg.map_frame) if ctrl is not None else None
         self.control_smoother = ControlPoseSmoother(ctrl.cfg.map_frame) if ctrl is not None else None
@@ -2209,11 +2210,30 @@ class _FlightLoopRunner:
             return
         if self.hooks.telemetry_history is not None:
             try:
-                attitudes, velocities = self.hooks.telemetry_history()
-                for attitude in attitudes:
+                attitudes, velocities = self.hooks.telemetry_history(
+                    self._control_telemetry_stamps
+                )
+                eligible_attitudes = [row for row in attitudes if row[-1] <= now]
+                eligible_velocities = [row for row in velocities if row[-1] <= now]
+                for attitude in eligible_attitudes:
                     self.control_state.observe_telemetry(attitude, None, now)
-                for velocity in velocities:
+                for velocity in eligible_velocities:
                     self.control_state.observe_telemetry(None, velocity, now)
+                if eligible_attitudes or eligible_velocities:
+                    prev_att = (
+                        self._control_telemetry_stamps[0]
+                        if self._control_telemetry_stamps is not None
+                        else None
+                    )
+                    prev_vel = (
+                        self._control_telemetry_stamps[1]
+                        if self._control_telemetry_stamps is not None
+                        else None
+                    )
+                    self._control_telemetry_stamps = (
+                        eligible_attitudes[-1][-1] if eligible_attitudes else prev_att,
+                        eligible_velocities[-1][-1] if eligible_velocities else prev_vel,
+                    )
             except (AttributeError, TypeError, ValueError, RuntimeError):
                 pass  # Legacy/current samples below retain their own freshness checks.
         samples = []
@@ -2232,10 +2252,9 @@ class _FlightLoopRunner:
         capture_yaw = self.control_state.yaw_at(pose.stamp)
         record["heading_time_aligned"] = capture_yaw is not None
         if capture_yaw is None:
-            # A visual-only initial heading is usable, but an unmatched pair
-            # must never move an established visual-to-IMU offset.
-            if self.heading.offset is None:
-                self.heading.update(pose.yaw, None)
+            # An unmatched capture refreshes the accepted visual fallback without
+            # moving an established visual-to-IMU offset.
+            self.heading.update(pose.yaw, None)
             stamp = float(pose.stamp)
             if not self._heading_pending or stamp > self._heading_pending[-1][0]:
                 self._heading_pending.append((stamp, float(pose.yaw),

@@ -156,8 +156,34 @@ def test_unmatched_capture_cannot_move_an_existing_heading_anchor():
     runner = pff._FlightLoopRunner(hooks, ctrl, ctrl.wp, yaw_sign=1, verbose=False,
                                    enforce_weak_pose_gate=False)
     runner.heading.update(.2, math.pi / 2)
-    anchor = vars(runner.heading).copy()
+    anchor_offset = runner.heading.offset
     record = {}
     assert runner._anchor_heading(rpf.Pose(0, 0, 0, 1., stamp=1.), 0., record)
     assert not record['heading_time_aligned']
-    assert vars(runner.heading) == anchor
+    assert runner.heading.offset == anchor_offset
+    assert runner.heading.heading(None) == pytest.approx(1.0)
+
+
+def test_anchor_heading_missing_imu_preserves_offset_and_refreshes_visual_fallback():
+    ctrl = rpf.RouteAutoController(
+        [np.zeros(3), np.ones(3)], config=rpf.ControlConfig(inspect_waypoints=())
+    )
+    hooks = pff.LoopHooks(
+        get_pose=lambda: None,
+        olympe_yaw=lambda: 0.0,
+        attitude_sample=lambda: None,
+        send_pcmd=lambda *_args: None,
+    )
+    runner = pff._FlightLoopRunner(
+        hooks, ctrl, ctrl.wp, yaw_sign=1, verbose=False, enforce_weak_pose_gate=False
+    )
+    runner.heading.update(0.0, math.pi / 2)
+    established_offset = runner.heading.offset
+    assert established_offset is not None
+
+    record = {}
+    pose = rpf.Pose(0, 0, 0, math.pi / 2, stamp=1.0)
+    assert runner._anchor_heading(pose, 0.0, record)
+    assert not record["heading_time_aligned"]
+    assert runner.heading.offset == established_offset
+    assert runner.heading.heading(None) == pytest.approx(math.pi / 2)

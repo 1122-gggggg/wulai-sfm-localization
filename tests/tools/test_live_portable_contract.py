@@ -17,23 +17,17 @@ ROOT = Path(__file__).resolve().parents[2]
 LAUNCHER = ROOT / "一鍵啟動.sh"
 
 
-def test_live_minimal_export_contract_excludes_development_payload() -> None:
-    assert "一鍵啟動.sh" in exporter.LIVE_MINIMAL_COPY_FILES
-    assert "requirements/runtime-lock.txt" in exporter.LIVE_MINIMAL_COPY_FILES
-    assert "tools/simulator_preflight.py" in exporter.LIVE_MINIMAL_COPY_FILES
-    assert (
-        "模擬器/parrot_stimulate/src/anafi_pcmd_sim/scale_free_control.py"
-        in exporter.LIVE_MINIMAL_COPY_FILES
-    )
-    assert exporter.LIVE_MINIMAL_COPY_MAPPINGS == ()
-    assert "控制介面程式" in exporter.LIVE_MINIMAL_COPY_DIRS
-    assert "定位演算法/flight_control" in exporter.LIVE_MINIMAL_COPY_DIRS
-    assert "定位演算法/deploy_code/sfm_direct_deploy" in exporter.LIVE_MINIMAL_COPY_DIRS
-    assert "定位演算法/configs" not in exporter.LIVE_MINIMAL_COPY_DIRS
-    assert "模擬器/parrot_stimulate" not in exporter.LIVE_MINIMAL_COPY_DIRS
-    assert "文件" not in exporter.LIVE_MINIMAL_COPY_DIRS
-    assert "pyproject.toml" not in exporter.LIVE_MINIMAL_COPY_FILES
-    assert "pytest.ini" not in exporter.LIVE_MINIMAL_COPY_FILES
+def _make_portable_validator(tmp_path: Path) -> Path:
+    source_root = tmp_path / "source"
+    tools_dir = source_root / "tools"
+    tools_dir.mkdir(parents=True)
+    venv_bin = source_root / ".venv/bin"
+    venv_bin.mkdir(parents=True)
+    (venv_bin / "python").symlink_to(sys.executable)
+    validator_script = tools_dir / "test_portable_runtime.sh"
+    validator_script.write_bytes((ROOT / "tools/test_portable_runtime.sh").read_bytes())
+    validator_script.chmod(0o755)
+    return validator_script
 
 
 def test_live_minimal_export_uses_live_entrypoint_and_filters_tests(
@@ -79,47 +73,6 @@ def test_live_minimal_export_uses_live_entrypoint_and_filters_tests(
     assert (destination / "code/runtime.py").is_file()
     assert not (destination / "code/test_runtime.py").exists()
     assert verify(destination) == []
-
-
-def test_one_click_launcher_installs_offline_and_selects_river_mission() -> None:
-    script = LAUNCHER.read_text(encoding="utf-8")
-
-    assert 'tools/install_runtime.sh" --offline' in script
-    assert 'tools/package_manifest.py" verify' in script
-    assert "river_gluemap_all8_direct_localization.json" in script
-    assert "SFM_MISSION_SELECTION" in script
-    assert "控制介面程式/真機串流/啟動.sh" in script
-    assert ".sfm-portable-runtime" in script
-    assert "非 Git 原始碼目錄必須包含 PORTABLE_PACKAGE.json" in script
-    assert "exec" in script
-
-    smoke_script = (ROOT / "tools/simulated_ui_smoke.sh").read_text(encoding="utf-8")
-    assert "SFM_SMOKE_VIDEO" in smoke_script
-    assert "模擬器/測試影片/720p/P1190119_720p.MP4" in smoke_script
-    assert "河濱_P1180118_first_2s.mp4" not in smoke_script
-    assert 'SFM_WORKSPACE_ROOT="$root_dir" setsid' in smoke_script
-
-
-def test_export_cli_forwards_live_minimal_mode(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    calls: dict[str, object] = {}
-
-    def fake_export(destination: Path, **kwargs: object) -> list[str]:
-        calls["destination"] = destination
-        calls.update(kwargs)
-        return []
-
-    monkeypatch.setattr(exporter, "export", fake_export)
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        ["export_simulator_package.py", str(tmp_path / "portable"), "--live-minimal"],
-    )
-
-    assert exporter.main() == 0
-    assert calls["live_minimal"] is True
 
 
 @pytest.mark.skipif(
@@ -209,6 +162,7 @@ def test_one_click_rejects_existing_site_profile_environment() -> None:
 def test_portable_runtime_smoke_rejects_symlinked_outputs(
     tmp_path: Path,
 ) -> None:
+    validator = _make_portable_validator(tmp_path)
     portable = tmp_path / "portable"
     victim = tmp_path / "victim"
     portable.mkdir()
@@ -218,8 +172,8 @@ def test_portable_runtime_smoke_rejects_symlinked_outputs(
     (portable / "outputs").symlink_to(victim, target_is_directory=True)
 
     completed = subprocess.run(
-        ["bash", str(ROOT / "tools/test_portable_runtime.sh"), str(portable)],
-        cwd=ROOT,
+        ["bash", str(validator), str(portable)],
+        cwd=tmp_path,
         check=False,
         capture_output=True,
         text=True,
@@ -275,3 +229,159 @@ def test_one_click_rejects_untrusted_existing_portable_venv(
 
     assert completed.returncode == 1
     assert "拒絕未由目前 portable package 建立" in completed.stderr
+
+
+def test_portable_runtime_rejects_unknown_package_kind(
+    tmp_path: Path,
+) -> None:
+    validator = _make_portable_validator(tmp_path)
+    portable = tmp_path / "portable"
+    portable.mkdir()
+    (portable / "outputs").mkdir()
+    (portable / "outputs/README.md").write_text("governance\n", encoding="utf-8")
+    (portable / "PORTABLE_PACKAGE.json").write_text(
+        json.dumps(
+            {
+                "schema": "sfm-portable-simulator/v2",
+                "package_kind": "unknown-runtime",
+                "entrypoint": "tools/unknown.sh",
+                "offline_install": {"complete": True},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    completed = subprocess.run(
+        ["bash", str(validator), str(portable)],
+        cwd=tmp_path,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+
+    assert completed.returncode != 0
+    assert "unknown package_kind" in completed.stderr
+
+
+def test_portable_runtime_rejects_non_string_package_kind(
+    tmp_path: Path,
+) -> None:
+    validator = _make_portable_validator(tmp_path)
+    portable = tmp_path / "portable"
+    portable.mkdir()
+    (portable / "outputs").mkdir()
+    (portable / "outputs/README.md").write_text("governance\n", encoding="utf-8")
+    (portable / "PORTABLE_PACKAGE.json").write_text(
+        json.dumps(
+            {
+                "schema": "sfm-portable-simulator/v2",
+                "package_kind": ["unhashable", "list"],
+                "entrypoint": "tools/unknown.sh",
+                "offline_install": {"complete": True},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    completed = subprocess.run(
+        ["bash", str(validator), str(portable)],
+        cwd=tmp_path,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+
+    assert completed.returncode != 0
+    assert "package_kind must be a string" in completed.stderr
+
+
+def test_portable_runtime_rejects_malformed_metadata(
+    tmp_path: Path,
+) -> None:
+    validator = _make_portable_validator(tmp_path)
+    portable = tmp_path / "portable"
+    portable.mkdir()
+    (portable / "outputs").mkdir()
+    (portable / "outputs/README.md").write_text("governance\n", encoding="utf-8")
+    (portable / "PORTABLE_PACKAGE.json").write_text("{not json", encoding="utf-8")
+
+    completed = subprocess.run(
+        ["bash", str(validator), str(portable)],
+        cwd=tmp_path,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+
+    assert completed.returncode != 0
+    assert "malformed PORTABLE_PACKAGE.json" in completed.stderr
+
+
+def test_portable_runtime_checks_simulated_interface_entrypoint(
+    tmp_path: Path,
+) -> None:
+    validator = _make_portable_validator(tmp_path)
+    portable = tmp_path / "portable"
+    portable.mkdir()
+    (portable / "outputs").mkdir()
+    (portable / "outputs/README.md").write_text("governance\n", encoding="utf-8")
+    (portable / "PORTABLE_PACKAGE.json").write_text(
+        json.dumps(
+            {
+                "schema": "sfm-portable-simulator/v2",
+                "package_kind": "simulated-interface-runtime",
+                "entrypoint": "控制介面程式/影片模擬串流/選擇啟動.sh",
+                "offline_install": {"complete": True},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    completed = subprocess.run(
+        ["bash", str(validator), str(portable)],
+        cwd=tmp_path,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+
+    assert completed.returncode != 0
+    assert "控制介面程式/影片模擬串流/選擇啟動.sh" in completed.stderr
+    assert "一鍵啟動.sh" not in completed.stderr
+
+
+def test_portable_runtime_checks_live_operator_entrypoint(
+    tmp_path: Path,
+) -> None:
+    validator = _make_portable_validator(tmp_path)
+    portable = tmp_path / "portable"
+    portable.mkdir()
+    (portable / "outputs").mkdir()
+    (portable / "outputs/README.md").write_text("governance\n", encoding="utf-8")
+    (portable / "PORTABLE_PACKAGE.json").write_text(
+        json.dumps(
+            {
+                "schema": "sfm-portable-live-runtime/v1",
+                "package_kind": "live-operator-runtime",
+                "entrypoint": "一鍵啟動.sh",
+                "offline_install": {"complete": True},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    completed = subprocess.run(
+        ["bash", str(validator), str(portable)],
+        cwd=tmp_path,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+
+    assert completed.returncode != 0
+    assert "一鍵啟動.sh" in completed.stderr

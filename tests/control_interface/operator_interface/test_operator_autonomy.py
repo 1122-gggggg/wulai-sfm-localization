@@ -14,7 +14,6 @@ import numpy as np
 
 from operator_autonomy import (
     AUTO_BATTERY_RESERVE_PCT,
-    AUTO_MAX_DURATION_S,
     AUTO_PCMD_FAILURE_LIMIT,
     AUTO_WAIT_BUDGET_S,
     DesktopRouteAutonomy,
@@ -2068,7 +2067,7 @@ def test_auto_wait_budget_latches_failure_instead_of_hovering_forever(tmp_path) 
     ],
     ids=["healthy", "old-reserve", "above-reserve", "at-reserve", "below-reserve", "unreadable"],
 )
-def test_auto_runtime_budget_latches_on_battery_reserve(tmp_path, battery, expected) -> None:
+def test_auto_runtime_safety_latches_on_battery_reserve(tmp_path, battery, expected) -> None:
     """In-flight AUTO stops on its own battery reserve, not only on firmware RTH."""
     clock = _Clock()
     backend = _Backend()
@@ -2079,19 +2078,28 @@ def test_auto_runtime_budget_latches_on_battery_reserve(tmp_path, battery, expec
     autonomy._mission_started = clock.now()
     autonomy.phase = "ROUTE"
 
-    assert autonomy._check_runtime_budget() is expected
+    assert autonomy._check_runtime_safety() is expected
     assert autonomy._auto_failed is expected
 
 
-def test_auto_runtime_budget_latches_on_mission_duration(tmp_path) -> None:
+def test_auto_runtime_has_no_fixed_duration_but_retains_battery_guard(tmp_path) -> None:
     clock = _Clock()
-    autonomy = _budget_autonomy(tmp_path, _Backend(), clock)
+    backend = _Backend()
+    backend.is_live = True
+    backend.state.battery_pct = 80.0
+    autonomy = _budget_autonomy(tmp_path, backend, clock)
     autonomy._mission_started = clock.now()
     autonomy.phase = "ROUTE"
 
-    assert autonomy._check_runtime_budget() is False
-    clock.sleep(AUTO_MAX_DURATION_S)
-    assert autonomy._check_runtime_budget() is True
+    clock.sleep(601.0)
+    backend.state.telemetry_read_mono_ns = int(clock.now() * 1_000_000_000)
+    accepted, _reason, applied = autonomy._send_authorized((0, 5, 0, 0))
+    assert accepted and applied[1] > 0
+    assert autonomy._auto_failed is False
+
+    backend.state.battery_pct = AUTO_BATTERY_RESERVE_PCT
+    accepted, _reason, applied = autonomy._send_authorized((0, 5, 0, 0))
+    assert not accepted and applied == (0, 0, 0, 0)
     assert autonomy.phase == "AUTO_FAILED"
 
 

@@ -113,7 +113,7 @@ def test_every_route_recovers_from_repeated_wind_displacement(route, gust_m):
         sim.SimParams(
             route=route,
             align=ALIGN,
-            duration_s=sim.AUTO_MAX_DURATION_S,
+            duration_s=sim.SIM_DEFAULT_DURATION_S,
             meters_per_unit=5,
             seed=53,
             gust_m=gust_m,

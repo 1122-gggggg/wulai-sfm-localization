@@ -104,6 +104,7 @@ class DirectTrackerAdapter(Localizer):
         self._pose_continuity = PoseSourceConfirmation()
         self._pose_centers: list[np.ndarray] = []
         self._reseed_confirming = False
+        self._accepted_camera_axes_world: list[list[float]] | None = None
 
     @property
     def map_frame(self):
@@ -152,6 +153,7 @@ class DirectTrackerAdapter(Localizer):
         self._pose_continuity = PoseSourceConfirmation()
         self._pose_centers.clear()
         self._reseed_confirming = False
+        self._accepted_camera_axes_world = None
 
     # ---------- fusion / retrieval hooks ----------
     def observe_fused_state(self, sample) -> None:
@@ -227,13 +229,19 @@ class DirectTrackerAdapter(Localizer):
         pose, mode, weak, confirming = self._confirm_pose(pose, info, mode, weak, status)
         self._advance_state(pose, info, mode, status)
 
-        camera_axes_world = None
-        camera_forward_world = None
-        if rotation is not None and rotation.shape == (3, 3) and np.isfinite(rotation).all():
-            # cam_from_world is p_cam = R @ p_world + t. Each row of R is one
-            # camera axis expressed in world coordinates: right, down, forward.
-            camera_axes_world = rotation.tolist()
-            camera_forward_world = rotation[2].tolist()
+        # A rejected jump publishes the previous pose, not this frame's candidate.
+        # Keep the camera basis from the same accepted pose until confirmation.
+        if not confirming:
+            self._accepted_camera_axes_world = (
+                rotation.tolist()
+                if pose is not None
+                and rotation is not None
+                and rotation.shape == (3, 3)
+                and np.isfinite(rotation).all()
+                else None
+            )
+        camera_axes_world = self._accepted_camera_axes_world if pose is not None else None
+        camera_forward_world = camera_axes_world[2] if camera_axes_world is not None else None
 
         references = list(info.get("reference_names") or ())
         self._last_info = {

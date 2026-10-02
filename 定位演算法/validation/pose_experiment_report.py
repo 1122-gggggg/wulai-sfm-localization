@@ -13,12 +13,22 @@ from pathlib import Path
 
 import numpy as np
 
-from pose_estimation_experiment import projection_errors, quantiles, write_json
+from pose_estimation_experiment import (
+    digest, projection_errors, quantiles, verify_capture_artifacts, write_json,
+)
 
 
 def summarize(capture_path: Path, result_path: Path):
     capture = json.loads((capture_path / "capture.json").read_text())
     summary = json.loads((result_path / "summary.json").read_text())
+    verify_capture_artifacts(capture_path, capture)
+    if (
+        summary.get("capture_sha256") != digest(capture_path / "capture.json")
+        or summary.get("artifact_sha256") != capture["artifact_sha256"]
+        or summary.get("video_sha256") != capture.get("video_sha256")
+        or summary.get("results_sha256") != digest(result_path / "results.jsonl")
+    ):
+        raise ValueError("results/capture provenance mismatch; rerun evaluation on this capture")
     records = [json.loads(line) for line in (result_path / "results.jsonl").read_text().splitlines()]
     data = np.load(capture_path / "observations.npz", allow_pickle=False)
     xy, xyz, ids, offsets = (data[key] for key in ("xy", "xyz", "ids", "offsets"))
@@ -68,6 +78,11 @@ def summarize(capture_path: Path, result_path: Path):
         row["paired_frame_improved_fraction"] = float(np.mean(differences < -1e-6)) if len(differences) else None
     report = {
         "video": capture["video"], "video_sha256": capture["video_sha256"],
+        "source_identity": {
+            "capture_sha256": summary["capture_sha256"],
+            "artifact_sha256": capture["artifact_sha256"],
+            "results_sha256": summary["results_sha256"],
+        },
         "decoded_frames": capture["frames"], "declared_frames": capture["declared_frames"],
         "capture_status_counts": capture["status_counts"],
         "metrics_contract": {

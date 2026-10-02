@@ -94,6 +94,7 @@ DIRECT_INFO_FIELDS = (
     "reloc_reference_names",
     "pnp_observation_sample",
     "reseed_confirming",
+    "pose_source_confirming",
 )
 
 RESULT_FIELDS = (

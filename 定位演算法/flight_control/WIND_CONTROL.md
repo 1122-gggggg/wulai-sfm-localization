@@ -70,7 +70,7 @@
 .venv/bin/python tools/verify_wind_control.py \
   --route 地圖檔/場域/river_site/routes/flight_route_20260913_145051_ec20651d.json \
   --align 地圖檔/場域/river_site/releases/river_gluemap_all8_direct_20260908/localization/T_align_gravity.json \
-  --meters-per-unit 15 --seeds 7 11 19 \
+  --meters-per-unit 15 --speed-limit-mps 0.6 --seeds 7 11 19 \
   --out outputs/analysis/wind_control
 ```
 
@@ -90,6 +90,42 @@
 `[time_s, east_mps, north_mps, up_mps]`，時間嚴格遞增，線性插值後加到原有平均
 漂移上，首尾端點保持。這是殘餘地面漂移模型，數值不能換算成真機可承受風速。
 `--meters-per-unit` 只設定模擬真值，控制器必須自行從觀測估計尺度。
+
+上述範例使用 09-13 航線及模擬器預設 `speed_limit_mps=0.6` m/s；目前場域
+`site_profile.json` 選用 09-23 航線（到站半徑 0.02 map unit），設定地速上限
+0.3 m/s。範例矩陣通過不代表目前場域航線通過。評估現行配置須以該航線、
+0.3 m/s 地速上限和實測動態參數重跑完整航線與陣風案例，不可放寬到站條件
+或將模擬殘餘漂移當成真機可承受的風速。
+
+現行航線的離線對照可使用下列指令；`--speed-limit-mps` 僅改模擬器的桌面
+AUTO 地速限制，不會修改場域設定或連接實機：
+
+```bash
+.venv/bin/python tools/verify_wind_control.py \
+  --route 地圖檔/場域/river_site/routes/flight_route_20260923_103847_468e1a95.json \
+  --align 地圖檔/場域/river_site/releases/river_gluemap_all8_direct_20260908/localization/T_align_gravity.json \
+  --meters-per-unit 15 --speed-limit-mps 0.3 --duration-s 1200 --seeds 7 11 19 \
+  --out outputs/analysis/wind_control_current
+```
+
+2026-09-29 起正式 AUTO 不再有固定 600 秒任務截止；60 秒等待、
+30 秒航點停滯、電池保留、失聯與接管等保護仍在。`--duration-s`
+僅為離線運算的有限分析時域，預設 1200 秒，碰到此上界仍算未完成，
+不得把增大模擬時域當成改善抗風或真機飛行許可。
+
+原 600 秒時域的對照使用同一現行航線、15 m/map unit、0.3 m/s 上限、
+seed 7 測試 `calm`、`direction_changes`、`gusts_delayed_dropout`：
+0/3 通過，三者都未在該分析時域內完成；橫向偏差 p95 分別為到站半徑的
+1.175、1.110、1.377 倍。這是模擬器結果（
+`outputs/analysis/wind_control_current_review_20260929/summary.json`），
+不能推出實機的實際風速、可承受風力或加大控制命令的安全性。
+
+無固定實飛總時限後，以 1200 秒離線時域重新跑同一 seed：
+`calm` 936.25 秒、`gusts_delayed_dropout` 997.7 秒完成，但
+橫向 p95 分別為半徑的 1.215／1.239 倍；`direction_changes`
+在第 5 個目標附近停滯，1200 秒仍未完成。三案仍是未通過，
+不能因前兩案完成就宣稱已具備抗風能力。紀錄：
+`outputs/analysis/wind_control_no_deadline_20260929/summary.json`。
 
 ## 殘餘漂移觀測器（只記錄）
 

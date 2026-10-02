@@ -80,9 +80,11 @@ def _read_frames(visual_path):
         stamp = row.get("source_frame_stamp_mono")
         if not isinstance(stamp, (int, float)) or not np.isfinite(stamp):
             continue
-        frames.setdefault(
-            stamp, {"stamp": stamp, "pose": camera_pose(row), "status": row.get("direct_status")}
-        )
+        pose = camera_pose(row)
+        # A retry can recover the same capture stamp; once a trustworthy
+        # measurement exists, later failed/weak deliveries cannot erase it.
+        if stamp not in frames or (frames[stamp]["pose"] is None and pose is not None):
+            frames[stamp] = {"stamp": stamp, "pose": pose, "status": row.get("direct_status")}
     return frames, bases, identities
 
 

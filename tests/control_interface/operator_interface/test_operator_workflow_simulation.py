@@ -18,7 +18,7 @@ from backend_contract import (
     SessionConfig,
 )
 from flight_operator_app import DroneBackend, OperatorApp
-from operator_autonomy import AUTO_MAX_DURATION_S, DesktopRouteAutonomy
+from operator_autonomy import DesktopRouteAutonomy
 from operator_command_coordinator import OperatorCommandCoordinator
 from operator_localization_search import YawSearchConfig
 from operator_shutdown import OperatorShutdownCoordinator
@@ -58,12 +58,12 @@ def simulated_clock(monkeypatch):
     def run_loop(hooks, controller, waypoints, **kwargs):
         runner = pff._FlightLoopRunner(hooks, controller, waypoints, **kwargs)
         runner.period = 0.0
-        for _ in range(int(AUTO_MAX_DURATION_S * 20)):
+        for _ in range(12_000):
             outcome = runner.step()
             if outcome.reason is not None:
                 return outcome.reason
             clock.sleep(1.0 / 20.0)
-        raise RuntimeError("simulated route exhausted the production mission budget")
+        raise RuntimeError("simulated route exceeded test step guard")
 
     return {"now": clock.now, "sleep": clock.sleep, "run_loop": run_loop}
 

@@ -36,7 +36,6 @@ LAND_ATTEMPTS = 2
 AUTO_PCMD_FAILURE_LIMIT = 3
 AUTO_WORKER_STALL_TIMEOUT_S = 2.0
 AUTO_WATCHDOG_POLL_S = 0.05
-AUTO_MAX_DURATION_S = 600.0
 AUTO_BATTERY_RESERVE_PCT = 10.0
 AUTO_TELEMETRY_MAX_AGE_S = 2.0
 # Total time AUTO may hold a hover waiting for something it cannot supply itself
@@ -416,7 +415,7 @@ class DesktopRouteAutonomy:
                 return
             if self._cancel.is_set():
                 return
-            if self._check_runtime_budget():
+            if self._check_runtime_safety():
                 return
             if self._paused.is_set():
                 self._touch_heartbeat()
@@ -504,7 +503,7 @@ class DesktopRouteAutonomy:
         return getattr(self.backend, "_maneuver_in_progress", None) != "landing"
 
     def _safety_mode(self) -> str:
-        self._check_runtime_budget()
+        self._check_runtime_safety()
         if self._operator_stop():
             # run_loop exits on LAND.  _run distinguishes operator/manual cancel
             # from an actual landing request and therefore does not auto-land.
@@ -547,29 +546,27 @@ class DesktopRouteAutonomy:
         )
         return True
 
-    def _check_runtime_budget(self) -> bool:
-        if self._mission_started is None or self._cancel.is_set():
+    def _check_runtime_safety(self) -> bool:
+        if (
+            self._mission_started is None
+            or self._cancel.is_set()
+            or self.phase not in {"BOOT_HOVER", "ROUTE"}
+            or not bool(getattr(self.backend, "is_live", False))
+        ):
             return False
-        if self.phase not in {"BOOT_HOVER", "ROUTE"}:
-            return False
-        elapsed = self.now() - self._mission_started
-        reason = None
-        if elapsed >= AUTO_MAX_DURATION_S:
-            reason = f"AUTO exceeded {AUTO_MAX_DURATION_S:g}s mission budget"
-        elif bool(getattr(self.backend, "is_live", False)):
-            state = self.backend.state
-            try:
-                battery = float(state.battery_pct)
-                age = self.now() - int(state.telemetry_read_mono_ns) * 1e-9
-            except (AttributeError, TypeError, ValueError, OverflowError):
-                battery, age = float("nan"), float("inf")
-            if not math.isfinite(age) or not 0.0 <= age <= AUTO_TELEMETRY_MAX_AGE_S:
-                reason = "AUTO telemetry unavailable or stale"
-            elif not math.isfinite(battery) or not 0.0 <= battery <= 100.0:
-                reason = "AUTO battery unavailable"
-            elif battery <= AUTO_BATTERY_RESERVE_PCT:
-                reason = f"AUTO battery {battery:g}% reached {AUTO_BATTERY_RESERVE_PCT:g}% reserve"
-        if reason is None:
+        state = self.backend.state
+        try:
+            battery = float(state.battery_pct)
+            age = self.now() - int(state.telemetry_read_mono_ns) * 1e-9
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            battery, age = float("nan"), float("inf")
+        if not math.isfinite(age) or not 0.0 <= age <= AUTO_TELEMETRY_MAX_AGE_S:
+            reason = "AUTO telemetry unavailable or stale"
+        elif not math.isfinite(battery) or not 0.0 <= battery <= 100.0:
+            reason = "AUTO battery unavailable"
+        elif battery <= AUTO_BATTERY_RESERVE_PCT:
+            reason = f"AUTO battery {battery:g}% reached {AUTO_BATTERY_RESERVE_PCT:g}% reserve"
+        else:
             return False
         self._latch_auto_failure(reason + "; manual recovery required")
         return True
@@ -621,7 +618,7 @@ class DesktopRouteAutonomy:
 
     def _send_authorized(self, pcmd: Pcmd) -> AuthorizedPcmdResult:
         self._touch_heartbeat()
-        self._check_runtime_budget()
+        self._check_runtime_safety()
         if self._auto_failed:
             self._clear_motion()
             self._send_zero("auto_failure_hover")
@@ -1374,7 +1371,6 @@ class DesktopRouteAutonomy:
                 route_sha256=self.snapshot.sha256,
                 coordinate_frame_id=self.snapshot.coordinate_frame_id,
                 map_pose_max_age_s=pff.POSE_STALE_S,
-                auto_duration_limit_s=AUTO_MAX_DURATION_S,
                 waypoint_stall_limit_s=AUTO_WAYPOINT_STALL_S,
                 heading_convention="map CCW; firmware yaw NED CW",
                 waypoints_u=[
@@ -1513,7 +1509,7 @@ class DesktopRouteAutonomy:
     def _hold_boot_hover_paused(self) -> bool:
         while self._paused.is_set():
             self._touch_heartbeat()
-            self._check_runtime_budget()
+            self._check_runtime_safety()
             if self._operator_stop():
                 return False
             self._send_zero("auto_operator_pause")
@@ -1661,7 +1657,7 @@ class DesktopRouteAutonomy:
         self._clear_motion()
         while True:
             self._touch_heartbeat()
-            self._check_runtime_budget()
+            self._check_runtime_safety()
             if self._operator_stop():
                 return "AUTO cancelled during localization hover"
             if self._paused.is_set():

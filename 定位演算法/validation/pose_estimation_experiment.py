@@ -42,6 +42,25 @@ def digest(path):
     return h.hexdigest()
 
 
+CAPTURE_ARTIFACTS = ("observations.npz", "frames.jsonl")
+
+
+def verify_capture_artifacts(source, meta):
+    """Reject legacy unbound captures and changed/mixed capture artifacts."""
+    expected = meta.get("artifact_sha256")
+    if not isinstance(expected, dict) or set(expected) != set(CAPTURE_ARTIFACTS):
+        raise ValueError("capture lacks complete artifact_sha256 provenance; recapture required")
+    for name in CAPTURE_ARTIFACTS:
+        recorded = expected[name]
+        if (
+            not isinstance(recorded, str)
+            or len(recorded) != 64
+            or any(c not in "0123456789abcdef" for c in recorded)
+            or digest(Path(source) / name) != recorded
+        ):
+            raise ValueError(f"capture artifact_sha256 mismatch: {name}")
+
+
 def write_json(path, value):
     Path(path).write_text(json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False) + "\n")
 
@@ -375,13 +394,14 @@ def _motion_metrics(previous, name, row, pose, center):
 
 
 def evaluate(args):
+    source, out = Path(args.capture), Path(args.out)
+    meta = json.loads((source / "capture.json").read_text())
+    verify_capture_artifacts(source, meta)
     import pycolmap
     from pose_filter_experiment import VisualPoseESKF
     from pose_window_experiment import PoseWindowOptimizer
 
-    source, out = Path(args.capture), Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
-    meta = json.loads((source / "capture.json").read_text())
     rows = [json.loads(line) for line in (source / "frames.jsonl").read_text().splitlines()]
     data = np.load(source / "observations.npz", allow_pickle=False)
     arrays = (data["xy"], data["xyz"], data["ids"])
@@ -562,6 +582,9 @@ def evaluate(args):
         {
             "capture": str(source.resolve()),
             "video_sha256": meta["video_sha256"],
+            "capture_sha256": digest(source / "capture.json"),
+            "artifact_sha256": dict(meta["artifact_sha256"]),
+            "results_sha256": digest(out / "results.jsonl"),
             "paired_input": True,
             "split": "ids % 5 == 0 held out from every estimator",
             "refinement_comparison": "one shared RANSAC pose and mask per frame; each refinement starts from a fresh copy",

@@ -85,6 +85,47 @@ def test_complete_replay_calibrates_only_prefix_and_keeps_predictions_separate(t
     assert np.percentile(error, 95) < 0.03
 
 
+def test_replay_prefers_successful_retry_but_never_overwrites_it_with_weak_delivery(tmp_path):
+    session = tmp_path / "retries"
+    session.mkdir()
+    basis = dict(zip(("east", "north", "up"), np.eye(3).tolist()))
+    rows = [
+        {
+            "event": "auto_route_plan",
+            "coordinate_frame_id": "map",
+            "control_config": {"map_frame": basis},
+        }
+    ]
+
+    def result(stamp, x, *, status="FAST_TRACK", success=True, **flags):
+        return {
+            "event": "pose_result",
+            "source_frame_stamp_mono": stamp,
+            "success": success,
+            "direct_status": status,
+            "pose_raw": {"x": x, "y": 0.0, "z": 0.0},
+            "camera_axes_world": np.eye(3).tolist(),
+            **flags,
+        }
+
+    rows.extend(
+        [
+            result(1.0, 99.0, success=False),
+            result(1.0, 2.0, hold_retry=True),
+            result(1.0, 88.0, status="VO_ONLY"),
+            result(1.0, 77.0, confidence_low=True),
+            result(1.0, 66.0),  # later valid delivery does not overwrite the first valid retry
+            result(2.0, 3.0),
+            result(2.0, 55.0, success=False, hold_retry=True),
+        ]
+    )
+    (session / "localization.jsonl").write_text("".join(json.dumps(row) + "\n" for row in rows))
+    (session / "telemetry.jsonl").write_text("")
+    frames, _, _, _ = load_session(session)
+    assert [frame["status"] for frame in frames] == ["FAST_TRACK", "FAST_TRACK"]
+    np.testing.assert_allclose([-frame["pose"][0, 3] for frame in frames], [2.0, 3.0])
+
+
 def test_insufficient_scale_is_reported_without_inventing_calibration():
     result = fit_horizontal_calibration([(np.array([1.0, 0.0]), np.array([2.0, 0.0]))])
     assert not result["ready"] and "scale_m_per_unit" not in result

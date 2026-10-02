@@ -189,6 +189,11 @@ def test_evaluate_holds_out_id_split_for_every_estimator(monkeypatch, tmp_path: 
         xyz=xyz,
         ids=ids,
     )
+    metadata = json.loads((source / "capture.json").read_text())
+    metadata["artifact_sha256"] = {
+        name: experiment.digest(source / name) for name in experiment.CAPTURE_ARTIFACTS
+    }
+    (source / "capture.json").write_text(json.dumps(metadata), encoding="utf-8")
 
     experiment.evaluate(
         types.SimpleNamespace(capture=source, out=tmp_path / "results", max_frames=0)
@@ -206,3 +211,32 @@ def test_evaluate_holds_out_id_split_for_every_estimator(monkeypatch, tmp_path: 
     assert {row["train_count"] for row in records} == {12}
     assert {row["holdout_count"] for row in records} == {3}
     assert all(row["heldout_within4px"] == 1.0 for row in records)
+    summary = json.loads((tmp_path / "results" / "summary.json").read_text())
+    assert summary["capture_sha256"] == experiment.digest(source / "capture.json")
+    assert summary["results_sha256"] == experiment.digest(tmp_path / "results" / "results.jsonl")
+
+
+def test_evaluate_rejects_changed_capture_and_unbound_legacy_data(tmp_path) -> None:
+    import pytest
+
+    capture = tmp_path / "capture"
+    capture.mkdir()
+    (capture / "observations.npz").write_bytes(b"original")
+    (capture / "frames.jsonl").write_text('{"stamp": 1.0}\n')
+    metadata = {
+        "artifact_sha256": {
+            name: experiment.digest(capture / name) for name in experiment.CAPTURE_ARTIFACTS
+        }
+    }
+    (capture / "capture.json").write_text(json.dumps(metadata))
+    args = types.SimpleNamespace(capture=capture, out=tmp_path / "results", max_frames=0)
+    (capture / "frames.jsonl").write_text('{"stamp": 2.0}\n')
+    with pytest.raises(ValueError, match="artifact_sha256 mismatch: frames.jsonl"):
+        experiment.evaluate(args)
+    (capture / "frames.jsonl").write_text('{"stamp": 1.0}\n')
+    (capture / "observations.npz").write_bytes(b"replacement")
+    with pytest.raises(ValueError, match="artifact_sha256 mismatch: observations.npz"):
+        experiment.evaluate(args)
+    (capture / "capture.json").write_text("{}")
+    with pytest.raises(ValueError, match="recapture required"):
+        experiment.evaluate(args)

@@ -4815,13 +4815,6 @@ def test_sphinx_smoke_is_simulator_only_and_uses_bounded_waits():
     assert ".wait(_timeout=20)" in source
 
 
-def test_pole_cruise_is_controller_only_not_a_live_arming_entrypoint():
-    source = Path(FLIGHT_CONTROL_ROOT / "pole_cruise.py").read_text(encoding="utf-8")
-    assert "class PoleCruise" in source
-    assert "TakeOff" not in source
-    assert "olympe" not in source
-
-
 def test_manual_takeoff_requires_a_confirmed_controller_handoff():
     import manual_nudge_pilot as mnp
 

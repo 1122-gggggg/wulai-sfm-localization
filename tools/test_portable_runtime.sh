@@ -46,9 +46,75 @@ for path in "$portable_root/.venv"; do
     exit 2
   fi
 done
+if [[ ! -f "$portable_root/PORTABLE_PACKAGE.json" ]]; then
+  echo "[portable-runtime] portable package is missing: $portable_root/PORTABLE_PACKAGE.json" >&2
+  exit 1
+fi
+
+package_meta="$("$source_root/.venv/bin/python" - "$portable_root/PORTABLE_PACKAGE.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+try:
+    raw = Path(sys.argv[1]).read_text(encoding="utf-8")
+    metadata = json.loads(raw)
+except (json.JSONDecodeError, OSError, UnicodeError) as exc:
+    raise SystemExit(f"[portable-runtime] malformed PORTABLE_PACKAGE.json: {exc}")
+
+if not isinstance(metadata, dict):
+    raise SystemExit("[portable-runtime] malformed PORTABLE_PACKAGE.json: root must be a JSON object")
+
+package_kind = metadata.get("package_kind")
+schema = metadata.get("schema")
+entrypoint = metadata.get("entrypoint")
+
+if not isinstance(package_kind, str):
+    raise SystemExit("[portable-runtime] malformed PORTABLE_PACKAGE.json: package_kind must be a string")
+
+SUPPORTED_PACKAGES = {
+    "live-operator-runtime": {
+        "schema": "sfm-portable-live-runtime/v1",
+        "entrypoint": "一鍵啟動.sh",
+    },
+    "simulated-interface-runtime": {
+        "schema": "sfm-portable-simulator/v2",
+        "entrypoint": "控制介面程式/影片模擬串流/選擇啟動.sh",
+    },
+}
+
+if package_kind not in SUPPORTED_PACKAGES:
+    raise SystemExit(f"[portable-runtime] unknown package_kind: {package_kind!r}")
+
+expected = SUPPORTED_PACKAGES[package_kind]
+if not isinstance(schema, str) or schema != expected["schema"]:
+    raise SystemExit(
+        f"[portable-runtime] schema mismatch for {package_kind}: "
+        f"expected {expected['schema']!r}, got {schema!r}"
+    )
+if not isinstance(entrypoint, str) or entrypoint != expected["entrypoint"]:
+    raise SystemExit(
+        f"[portable-runtime] entrypoint mismatch for {package_kind}: "
+        f"expected {expected['entrypoint']!r}, got {entrypoint!r}"
+    )
+
+offline_install = metadata.get("offline_install")
+if not isinstance(offline_install, dict) or offline_install.get("complete") is not True:
+    raise SystemExit(
+        "[portable-runtime] PORTABLE_PACKAGE.json must set "
+        "offline_install.complete to literal true"
+    )
+
+print(f"{package_kind}\t{entrypoint}")
+PY
+)"
+
+package_kind="${package_meta%%	*}"
+package_entrypoint="${package_meta#*	}"
+
 for path in \
   "$portable_root/PORTABLE_PACKAGE.json" \
-  "$portable_root/一鍵啟動.sh" \
+  "$portable_root/$package_entrypoint" \
   "$portable_root/tools/install_runtime.sh" \
   "$portable_root/tools/simulated_ui_smoke.sh" \
   "$portable_root/執行環境/offline_wheelhouse/WHEELHOUSE.json" \
@@ -72,19 +138,6 @@ if [[ "$has_site" == "1" && ! -s "$smoke_video" ]]; then
   exit 2
 fi
 
-"$source_root/.venv/bin/python" - "$portable_root/PORTABLE_PACKAGE.json" <<'PY'
-import json
-import sys
-from pathlib import Path
-
-metadata = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-offline_install = metadata.get("offline_install")
-if not isinstance(offline_install, dict) or offline_install.get("complete") is not True:
-    raise SystemExit(
-        "[portable-runtime] PORTABLE_PACKAGE.json must set "
-        "offline_install.complete to literal true"
-    )
-PY
 
 offline_wheelhouse="$portable_root/執行環境/offline_wheelhouse"
 wheelhouse_payload="$(find "$offline_wheelhouse" -type f ! -name WHEELHOUSE.json -print -quit)"
@@ -140,12 +193,16 @@ SFM_LOCALIZER_PYTHON="$portable_venv/bin/python" \
 SFM_PORTABLE_ALLOW_EXTERNAL_PYTHON=1 \
 SFM_SMOKE_VIDEO="$smoke_video" \
   bash "$portable_root/tools/simulated_ui_smoke.sh"
-SFM_UI_PYTHON="$portable_venv/bin/python" \
-SFM_LOCALIZER_PYTHON="$portable_venv/bin/python" \
-SFM_PORTABLE_ALLOW_EXTERNAL_PYTHON=1 \
-SFM_LAUNCH_DRY_RUN=1 \
-SFM_EVALUATION_ONLY=1 \
-SFM_MAX_PERFORMANCE=0 \
-  bash "$portable_root/一鍵啟動.sh"
+if [[ "$package_kind" == "live-operator-runtime" ]]; then
+  SFM_UI_PYTHON="$portable_venv/bin/python" \
+  SFM_LOCALIZER_PYTHON="$portable_venv/bin/python" \
+  SFM_PORTABLE_ALLOW_EXTERNAL_PYTHON=1 \
+  SFM_LAUNCH_DRY_RUN=1 \
+  SFM_EVALUATION_ONLY=1 \
+  SFM_MAX_PERFORMANCE=0 \
+    bash "$portable_root/一鍵啟動.sh"
 
-echo "[portable-runtime] PASS: clean install, valid pose, and live launcher dry-run"
+  echo "[portable-runtime] PASS: clean install, valid pose, and live launcher dry-run"
+else
+  echo "[portable-runtime] PASS: clean install, valid pose, and simulated interface smoke"
+fi

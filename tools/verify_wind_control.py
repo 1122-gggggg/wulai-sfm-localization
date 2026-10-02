@@ -5,6 +5,7 @@ import argparse
 from dataclasses import asdict, replace
 import hashlib
 import json
+import math
 from pathlib import Path
 
 import numpy as np
@@ -183,13 +184,29 @@ def main():
     parser.add_argument("--cases", nargs="+", choices=list(scenarios()), default=list(scenarios()))
     parser.add_argument("--cruise-mps", type=float, default=0.90)
     parser.add_argument("--tau-h-s", type=float, default=0.4)
+    parser.add_argument(
+        "--duration-s",
+        type=float,
+        default=sim.SIM_DEFAULT_DURATION_S,
+        help="finite offline analysis horizon, not a production AUTO flight deadline",
+    )
+    parser.add_argument(
+        "--speed-limit-mps",
+        type=float,
+        required=True,
+        help="approved site AUTO speed limit; never infer it from the simulator default",
+    )
     args = parser.parse_args()
+    if not math.isfinite(args.speed_limit_mps) or args.speed_limit_mps <= 0:
+        parser.error("--speed-limit-mps must be finite and positive")
     base = sim.SimParams(
         route=args.route,
         align=args.align,
         meters_per_unit=args.meters_per_unit,
+        duration_s=args.duration_s,
         wind_sigma_mps=0.0,
         cruise_mps=args.cruise_mps,
+        speed_limit_mps=args.speed_limit_mps,
         tau_h_s=args.tau_h_s,
     )
     report = run_matrix(base, args.out, args.seeds, args.cases)

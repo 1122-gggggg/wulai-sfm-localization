@@ -40,7 +40,7 @@
 | `release_activation.py` | 驗證 commit/version-bound package，原子 stage/activate/rollback |
 | `test_clean_install.sh` | 在暫存目錄重建 CPython 3.10 venv 並執行 runtime preflight |
 | `simulated_ui_smoke.sh` | 實際啟動地圖/影片選擇路徑，等 GUI 產生有效 pose 後安全終止 |
-| `test_portable_runtime.sh` | 在 actual portable 暫時匯入固定場域，乾淨安裝並要求 UI 產生有效 pose，後恢復發布邊界 |
+| `test_portable_runtime.sh` | 依 package kind 驗證入口、乾淨離線安裝；有場域時要求 GUI 有效 pose，真機操作包另做 live launcher dry-run |
 | `../tests/tools/test_system_validation.py` | 驗證編排步驟和 Python 環境隔離 |
 | `../tests/tools/test_workspace_audit.py` | 驗證工作區結構契約 |
 | `security_dependency_gate.py` | 執行 pip-audit、驗證到期中的安全例外，並輸出 CycloneDX SBOM |

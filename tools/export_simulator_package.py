@@ -1232,6 +1232,61 @@ def _copy_export_payload(
     return None
 
 
+def _read_source_manifest_digests(root: Path) -> dict[str, str]:
+    manifest_path = root / "MANIFEST.tsv"
+    if not manifest_path.is_file():
+        return {}
+    from tools.package_manifest import read_manifest
+
+    return {entry.path: entry.sha256 for entry in read_manifest(root)}
+
+
+def _verify_staged_source_payload(
+    root: Path,
+    temporary: Path,
+    *,
+    known_digests: dict[str, str],
+) -> None:
+    """Ensure every copied source file matches source manifest and root without drift."""
+    source_manifest_entries = _read_source_manifest_digests(root)
+    target_to_source = {target: source for source, target in LIVE_MINIMAL_COPY_MAPPINGS}
+    excluded_staged = {
+        "PORTABLE_PACKAGE.json",
+        "MANIFEST.tsv",
+        "SHA256SUMS",
+        SITE_ASSET_MANIFEST,
+    }
+
+    for current, _directories, files in os.walk(temporary, followlinks=False):
+        for name in files:
+            path = Path(current) / name
+            rel = path.relative_to(temporary).as_posix()
+            if rel in known_digests or rel in excluded_staged:
+                continue
+
+            actual_sha256 = _sha256(path)
+            source_rel = target_to_source.get(rel, rel)
+            source_file = root / source_rel
+
+            if source_rel in source_manifest_entries:
+                expected_sha256 = source_manifest_entries[source_rel]
+                if actual_sha256 != expected_sha256:
+                    raise ValueError(
+                        f"source checkout is stale relative to MANIFEST.tsv: {source_rel} "
+                        "content does not match source manifest; package was not published"
+                    )
+
+            if source_file.is_file():
+                current_source_sha256 = _sha256(source_file)
+                if actual_sha256 != current_source_sha256:
+                    raise ValueError(
+                        f"source file changed during export: {source_rel}; "
+                        "package was not published"
+                    )
+
+            known_digests[rel] = actual_sha256
+
+
 def export(
     destination: Path,
     *,
@@ -1253,19 +1308,6 @@ def export(
     source_release = dict(_source_release())
     known_digests: dict[str, str] = {}
     manifest_path = ROOT / "MANIFEST.tsv"
-    if manifest_path.is_file():
-        try:
-            from tools.package_manifest import read_manifest
-
-            for entry in read_manifest(ROOT):
-                known_digests[entry.path] = entry.sha256
-        except Exception:
-            pass
-    if live_minimal:
-        for source_relative, target_relative in LIVE_MINIMAL_COPY_MAPPINGS:
-            if source_relative in known_digests:
-                known_digests[target_relative] = known_digests[source_relative]
-
     initial_manifest_stat = (
         (manifest_path.stat().st_mtime_ns, manifest_path.stat().st_size)
         if manifest_path.is_file()
@@ -1279,7 +1321,7 @@ def export(
             text=True,
             check=False,
         ).stdout
-        if (ROOT / ".git").is_dir()
+        if (ROOT / ".git").exists()
         else ""
     )
     configured_wheelhouse = _offline_wheelhouse_root(wheelhouse_root)
@@ -1311,6 +1353,11 @@ def export(
         )
         _copy_export_site_bundle(temporary, site_bundle, known_digests)
         _reject_package_symlinks(temporary)
+        _verify_staged_source_payload(
+            ROOT,
+            temporary,
+            known_digests=known_digests,
+        )
 
         current_manifest_stat = (
             (manifest_path.stat().st_mtime_ns, manifest_path.stat().st_size)
@@ -1325,7 +1372,7 @@ def export(
                 text=True,
                 check=False,
             ).stdout
-            if (ROOT / ".git").is_dir()
+            if (ROOT / ".git").exists()
             else ""
         )
         if (
@@ -1346,13 +1393,21 @@ def export(
         )
 
         sys.path.insert(0, str(ROOT))
-        from tools.package_manifest import generate
+        from tools.package_manifest import generate, verify
 
         entries = generate(
             temporary,
             include_site_assets=site_bundle is not None,
             known_digests=known_digests,
         )
+        verification_issues = verify(
+            temporary,
+            include_site_assets=site_bundle is not None,
+        )
+        if verification_issues:
+            raise ValueError(
+                f"staged package verification failed before publication: {verification_issues}"
+            )
         os.replace(temporary, destination)
         temporary = None
         return [entry.path for entry in entries]
@@ -1417,7 +1472,7 @@ def main() -> int:
 
 
 def _verify_source_git_state():
-    if (ROOT / ".git").is_dir():
+    if (ROOT / ".git").exists():
         git_proc = subprocess.run(
             ["git", "status", "--porcelain"],
             cwd=ROOT,

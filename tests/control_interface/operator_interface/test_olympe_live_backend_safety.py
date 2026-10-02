@@ -2,14 +2,17 @@ from __future__ import annotations
 
 import inspect
 import json
+import math
 import struct
 import sys
 import threading
 import time
+from collections import OrderedDict
 from datetime import datetime, timezone
 from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock
 
+import numpy as np
 import pytest
 
 import olympe_live_backend as backend_module
@@ -22,7 +25,8 @@ from backend_contract import (
     MissionRoutePayload,
     SessionConfig,
 )
-from operator_state import TrackerState
+from localization_result_ui import reject_camera_attitude_outlier
+from operator_state import DroneState, TrackerState
 
 
 class _Message:
@@ -427,11 +431,29 @@ class _FakeDrone:
 
         return {}
 
-    def get_last_event(self, message_type):
+    def get_last_event(self, message_type, key=None):
         name = getattr(message_type, "_message_name", "")
+        state = self.get_state(message_type)
+        if key is None:
+            if name in ("attitude", "zoom_level"):
+                item_state = state.get(0, state) if isinstance(state, dict) else {}
+                item = SimpleNamespace(
+                    uuid=f"{name}:{self.event_markers.get(name, 1)}",
+                    args=item_state if isinstance(item_state, dict) else {},
+                    date=datetime.now(timezone.utc),
+                )
+                return OrderedDict([(0, item)])
+            args = state if isinstance(state, dict) else {}
+        else:
+            if isinstance(state, dict):
+                args = state.get(key)
+                if args is None:
+                    raise KeyError(f"Message `{name}` last event for key {key} is unavailable")
+            else:
+                args = {}
         return SimpleNamespace(
             uuid=f"{name}:{self.event_markers.get(name, 1)}",
-            args=self.get_state(message_type),
+            args=args,
             date=datetime.now(timezone.utc),
         )
 
@@ -1495,6 +1517,129 @@ def test_gimbal_and_zoom_readback_use_the_primary_map_item(make_backend):
     assert backend.state.camera_zoom_level == 2.0
 
 
+def test_sdk_map_gimbal_future_timestamp_fails_closed(make_backend):
+    from datetime import timedelta
+    from backend_telemetry import poll_gimbal
+
+    backend = make_backend()
+    future_utc = datetime.now(timezone.utc) + timedelta(seconds=10)
+    future_event = SimpleNamespace(
+        uuid="gimbal:attitude:0:fut",
+        args={"gimbal_id": 0, "pitch_absolute": -45.0},
+        date=future_utc,
+    )
+    backend.drone.get_last_event = lambda _msg, key=None: future_event
+    poll_gimbal(backend)
+    assert getattr(backend.state, "gimbal_pitch_deg", None) != -45.0
+
+
+def test_sdk_map_gimbal_offline_olympe_subprocess():
+    """Isolated subprocess regression using actual Olympe SDK structures.
+
+    Verifies CommandInterfaceBase.get_last_event without key returns OrderedDict,
+    with key=0 returns ArsdkMessageEvent, and _observe_telemetry uses key=0 to
+    obtain event timestamp, enabling reject_camera_attitude_outlier.
+    """
+    import pathlib
+    import subprocess
+    import sys
+
+    repo_root = pathlib.Path(__file__).resolve().parents[3]
+    code = '''
+import math
+from collections import OrderedDict
+from pathlib import Path
+import sys
+from types import SimpleNamespace
+import numpy as np
+
+repo_root = Path(sys.argv[1])
+sys.path.insert(0, str(repo_root / "控制介面程式" / "operator_interface"))
+
+import olympe
+from olympe.messages.gimbal import attitude
+from olympe.controllers.cmd_itf import CommandInterfaceBase
+from olympe.messaging.arsdk_events import ArsdkMessageEvent
+from operator_state import DroneState
+from olympe_live_backend import OlympeLiveBackend, TelemetryFreshnessStore
+from localization_result_ui import reject_camera_attitude_outlier
+
+msg = attitude.new()
+event = ArsdkMessageEvent(msg, {
+    "gimbal_id": 0,
+    "pitch_absolute": -10.0,
+    "yaw_absolute": 0.0,
+    "roll_absolute": 0.0,
+    "pitch_relative": -10.0,
+    "yaw_relative": 0.0,
+    "roll_relative": 0.0,
+})
+msg._set_last_event(event)
+cmd_itf = SimpleNamespace(_get_message=lambda _id: msg)
+
+res_no_key = CommandInterfaceBase.get_last_event(cmd_itf, msg)
+assert isinstance(res_no_key, OrderedDict)
+assert not hasattr(res_no_key, "date")
+
+res_key0 = CommandInterfaceBase.get_last_event(cmd_itf, msg, key=0)
+assert isinstance(res_key0, ArsdkMessageEvent)
+assert hasattr(res_key0, "date")
+assert res_key0.args["pitch_absolute"] == -10.0
+
+backend = SimpleNamespace(
+    drone=SimpleNamespace(get_last_event=lambda m, key=None: CommandInterfaceBase.get_last_event(cmd_itf, m, key=key)),
+    state=DroneState(),
+    telemetry_freshness=TelemetryFreshnessStore(),
+)
+obs_method = OlympeLiveBackend._observe_telemetry.__get__(backend, OlympeLiveBackend)
+
+sample = obs_method("gimbal", msg, {}, map_key=0, now_mono_ns=50_000_000_000)
+assert backend.state.gimbal_stamp_source == "event"
+assert backend.state.gimbal_mono_ns > 0
+backend.state.gimbal_pitch_deg = float(sample["pitch_absolute"])
+backend.state.gimbal_roll_deg = float(sample["roll_absolute"])
+
+result_data = {
+    "success": True,
+    "capture_mono_ns": backend.state.gimbal_mono_ns,
+    "gimbal_mono_ns": backend.state.gimbal_mono_ns,
+    "gimbal_stamp_source": backend.state.gimbal_stamp_source,
+    "gimbal_pitch_deg": backend.state.gimbal_pitch_deg,
+    "gimbal_roll_deg": backend.state.gimbal_roll_deg,
+    "camera_axes_world": np.array([
+        [1.0, 0.0, 0.0],
+        [0.0, math.cos(math.radians(15.0)), -math.sin(math.radians(15.0))],
+        [0.0, math.sin(math.radians(15.0)), math.cos(math.radians(15.0))],
+    ]),
+}
+up = np.array([0.0, 0.0, 1.0])
+rejected_payload, xyz, rejected = reject_camera_attitude_outlier(
+    result_data, np.array([1.0, 2.0, 3.0]), map_up=up, map_up_measured=True
+)
+assert rejected
+assert xyz is None
+assert not rejected_payload["success"]
+
+result_data_cached = dict(result_data, gimbal_stamp_source="observed_cache_value")
+_p, _x, skipped = reject_camera_attitude_outlier(
+    result_data_cached, np.array([1.0, 2.0, 3.0]), map_up=up, map_up_measured=True
+)
+assert not skipped
+print("OK")
+'''
+    proc = subprocess.run(
+        [sys.executable, "-c", code, str(repo_root)],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    if proc.returncode != 0:
+        if "No module named 'olympe'" in proc.stderr:
+            pytest.skip("olympe SDK not installed in test environment")
+        raise AssertionError(f"Subprocess failed:\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}")
+    assert "OK" in proc.stdout
+
+
 def test_poll_does_not_refresh_speed_age_without_a_new_olympe_event(
     make_backend,
 ) -> None:
@@ -2391,16 +2536,138 @@ def test_zoom_blocked_by_sticks_is_not_recorded_as_applied(make_backend):
 def test_camera_setters_and_reset_report_real_application(make_backend):
     backend = make_backend(skycontroller=False)
     backend.pilot_sticks = False
+    # The UI retains its default pitch before the first firmware readback.
+    backend.state = DroneState()
 
     assert backend.set_gimbal_pitch(-30.0)
+    assert backend.state.gimbal_target_pitch_deg == pytest.approx(-30.0)
+    assert backend.state.gimbal_mono_ns is None
+    assert backend.state.gimbal_pitch_deg == pytest.approx(-20.0)
     assert backend.set_zoom(2.0)
     assert backend.reset_camera_defaults()
+    assert backend.state.gimbal_target_pitch_deg == pytest.approx(-20.0)
     assert backend.state.gimbal_pitch_deg == pytest.approx(-20.0)
     assert backend.state.zoom == pytest.approx(1.0)
 
     backend.pilot_sticks = True
     assert not backend.set_gimbal_pitch(-10.0)
     assert not backend.reset_camera_defaults()
+    assert backend.state.gimbal_target_pitch_deg == pytest.approx(-20.0)
+
+
+def test_gimbal_target_never_relabels_measured_attitude_or_event_time(make_backend):
+    from backend_telemetry import poll_gimbal
+
+    backend = make_backend(skycontroller=False)
+    reading = {"pitch_absolute": -20.0}
+    event_id = [1]
+    backend.drone.get_state = lambda _message: {
+        0: {"gimbal_id": 0, "pitch_absolute": reading["pitch_absolute"],
+            "roll_absolute": 0.0}
+    }
+    backend.drone.get_last_event = lambda _message, key=None: SimpleNamespace(
+        uuid=f"attitude:{event_id[0]}",
+        args={"gimbal_id": 0, "pitch_absolute": reading["pitch_absolute"],
+              "roll_absolute": 0.0},
+        date=datetime.now(timezone.utc),
+    )
+    poll_gimbal(backend)
+    first_stamp = backend.state.gimbal_mono_ns
+    assert backend.state.gimbal_stamp_source == "event"
+
+    def reject_frame(pitch: float, capture_ns: int):
+        pitch_rad = math.radians(pitch)
+        result = {
+            "success": True,
+            "capture_mono_ns": capture_ns,
+            "gimbal_pitch_deg": backend.state.gimbal_pitch_deg,
+            "gimbal_roll_deg": backend.state.gimbal_roll_deg,
+            "gimbal_mono_ns": backend.state.gimbal_mono_ns,
+            "gimbal_stamp_source": backend.state.gimbal_stamp_source,
+            "camera_axes_world": [
+                [1.0, 0.0, 0.0],
+                [0.0, math.sin(pitch_rad), -math.cos(pitch_rad)],
+                [0.0, math.cos(pitch_rad), math.sin(pitch_rad)],
+            ],
+        }
+        return reject_camera_attitude_outlier(
+            result, np.array([1.0, 2.0, 3.0]),
+            map_up=(0.0, 0.0, 1.0), map_up_measured=True,
+        )
+
+    assert backend.set_gimbal_pitch(-60.0)
+    assert backend.state.gimbal_target_pitch_deg == pytest.approx(-60.0)
+    assert backend.state.gimbal_pitch_deg == pytest.approx(-20.0)
+    assert backend.state.gimbal_mono_ns == first_stamp
+    poll_gimbal(backend)  # Re-reading the same event is not new telemetry.
+    assert backend.state.gimbal_pitch_deg == pytest.approx(-20.0)
+    assert backend.state.gimbal_mono_ns == first_stamp
+    result, xyz, rejected = reject_frame(-20.0, first_stamp)
+    assert not rejected and result["camera_pitch_error_deg"] == pytest.approx(0.0)
+    assert xyz is not None
+
+    reading["pitch_absolute"] = -60.0
+    event_id[0] += 1
+    poll_gimbal(backend)
+    assert backend.state.gimbal_pitch_deg == pytest.approx(-60.0)
+    assert backend.state.gimbal_stamp_source == "event"
+    result, xyz, rejected = reject_frame(-20.0, first_stamp)
+    assert rejected and xyz is None
+    assert result["camera_pitch_error_deg"] == pytest.approx(40.0)
+
+
+def test_failed_gimbal_command_keeps_measured_attitude(make_backend, monkeypatch):
+    from backend_telemetry import poll_gimbal
+
+    backend = make_backend(skycontroller=False)
+    backend.drone.get_state = lambda _message: {
+        0: {"gimbal_id": 0, "pitch_absolute": -20.0, "roll_absolute": 0.0}
+    }
+    poll_gimbal(backend)
+    previous = (backend.state.gimbal_pitch_deg, backend.state.gimbal_mono_ns,
+                backend.state.gimbal_stamp_source)
+    legacy_camera = ModuleType("olympe.messages.ardrone3.Camera")
+    legacy_camera.Orientation = _message_factory("Orientation")
+    monkeypatch.setitem(sys.modules, legacy_camera.__name__, legacy_camera)
+    original_call = type(backend.drone).__call__
+
+    def reject_commands(self, message):
+        if self._first(message).name in {"set_target", "Orientation"}:
+            raise RuntimeError("command rejected")
+        return original_call(self, message)
+
+    monkeypatch.setattr(type(backend.drone), "__call__", reject_commands)
+    assert not backend.set_gimbal_pitch(-60.0)
+    assert (backend.state.gimbal_pitch_deg, backend.state.gimbal_mono_ns,
+            backend.state.gimbal_stamp_source) == previous
+    assert not hasattr(backend.state, "gimbal_target_pitch_deg")
+
+
+def test_legacy_gimbal_command_keeps_the_last_measured_event(make_backend, monkeypatch):
+    from backend_telemetry import poll_gimbal
+
+    backend = make_backend(skycontroller=False)
+    backend.drone.get_state = lambda _message: {
+        0: {"gimbal_id": 0, "pitch_absolute": -20.0, "roll_absolute": 0.0}
+    }
+    poll_gimbal(backend)
+    previous_stamp = backend.state.gimbal_mono_ns
+    legacy_camera = ModuleType("olympe.messages.ardrone3.Camera")
+    legacy_camera.Orientation = _message_factory("Orientation")
+    monkeypatch.setitem(sys.modules, legacy_camera.__name__, legacy_camera)
+    original_call = type(backend.drone).__call__
+
+    def fail_modern_target(self, message):
+        if self._first(message).name == "set_target":
+            raise RuntimeError("modern command unavailable")
+        return original_call(self, message)
+
+    monkeypatch.setattr(type(backend.drone), "__call__", fail_modern_target)
+    assert backend.set_gimbal_pitch(-60.0)
+    assert "Orientation" in backend.drone.events
+    assert backend.state.gimbal_target_pitch_deg == pytest.approx(-60.0)
+    assert backend.state.gimbal_pitch_deg == pytest.approx(-20.0)
+    assert backend.state.gimbal_mono_ns == previous_stamp
 
 
 @pytest.mark.parametrize(

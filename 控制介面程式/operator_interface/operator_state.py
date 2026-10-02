@@ -106,6 +106,9 @@ class DroneState:
     altitude_m: float = 0.0
     drone_altitude_m: float | None = None
     gimbal_pitch_deg: float = -20.0
+    # Requested pitch is not telemetry; only gimbal_pitch_deg is paired with
+    # gimbal_mono_ns / gimbal_stamp_source for camera-attitude validation.
+    gimbal_target_pitch_deg: float = -20.0
     gimbal_yaw_deg: float | None = None
     gimbal_roll_deg: float | None = None
     gimbal_relative_pitch_deg: float | None = None
