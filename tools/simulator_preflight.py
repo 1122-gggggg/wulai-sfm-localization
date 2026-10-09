@@ -220,7 +220,11 @@ def _check_profile_runtime_containment(root: Path, profile, failures: list[str])
     if getattr(profile, "localizer", "") == "direct":
         # The direct two-rate backend ships its own deployment package; its
         # release tooling writes this exact directory into the site profile.
+        # The workmap-expansion variant is the one sibling package allowed.
         allowed_deploy_dirs.add((root / "定位演算法/deploy_code/sfm_direct_deploy").resolve())
+        allowed_deploy_dirs.add(
+            (root / "定位演算法/deploy_code_expand/sfm_direct_deploy").resolve()
+        )
     if deploy_dir.resolve() not in allowed_deploy_dirs:
         failures.append(
             "site profile localizer_deploy_dir is outside the fixed package: "
@@ -298,16 +302,22 @@ def _check_edm_cuda_runtime(failures: list[str], runtime: dict[str, object]) -> 
         failures.append(f"EDM CUDA runtime failed: {exc}")
 
 
+def _import_operator_module(
+    module_name: str, failures: list[str], runtime: dict[str, object]
+) -> None:
+    try:
+        importlib.import_module(module_name)
+        runtime[f"import_{module_name}"] = "ok"
+    except Exception as exc:  # noqa: BLE001 - report UI/worker import failures
+        failures.append(f"{module_name} import failed: {exc}")
+
+
 def _check_operator_imports(root: Path, failures: list[str], runtime: dict[str, object]) -> None:
     operator_dir = root / "控制介面程式/operator_interface"
     control_dir = root / "控制介面程式"
     _prepend_import_paths(control_dir, operator_dir)
     for module_name in ("flight_operator_app", "live_localizer_worker"):
-        try:
-            importlib.import_module(module_name)
-            runtime[f"import_{module_name}"] = "ok"
-        except Exception as exc:  # noqa: BLE001 - report UI/worker import failures
-            failures.append(f"{module_name} import failed: {exc}")
+        _import_operator_module(module_name, failures, runtime)
 
 
 def _check_full_runtime(

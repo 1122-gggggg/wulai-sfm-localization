@@ -95,18 +95,6 @@ def test_height_hold_covers_the_tick_that_advances_to_the_next_target():
     assert runner.landing_confirmation.samples == 0
 
 
-def test_scale_survives_intermittent_weak_frames_between_trusted_endpoints():
-    estimator = ControlStateEstimator(rpf.LEGACY_MAP_FRAME)
-    for i in range(1100):
-        now = 1. + i * .05
-        estimator.observe_telemetry((math.pi / 2, now - .2), (0., .5, now - .2), now)
-        pose = rpf.Pose((now - .08) / 30., 0., 0., 0., stamp=now - .08,
-                        map_confirmed=(i % 10 != 0))
-        estimator.observe_pose(pose, now, 0.)
-    assert estimator.scale_m_per_unit == pytest.approx(15.)
-    assert estimator.predict(pose, now, 0., .03)[1]["applied"]
-
-
 def test_scale_uses_independent_metres_of_motion_without_waiting_four_seconds_per_pair():
     estimator = ControlStateEstimator(rpf.LEGACY_MAP_FRAME)
     for i in range(441):

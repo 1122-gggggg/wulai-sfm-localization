@@ -92,13 +92,16 @@ def load_geometry_archive(provider, path: Path, model_sha256: dict) -> None:
         for i, name in enumerate(names)
     }
     provider._reference_occupied_bins = tuple(int(v) for v in rows["occupied_bins"])
-    provider._cam_from_world = dict(zip(names, rows["cam_from_world"]))
+    provider._cam_from_world = dict(zip(names, rows["cam_from_world"], strict=False))
     provider._native_wh = {
-        n: tuple(int(v) for v in row) for n, row in zip(names, rows["native_wh"])
+        n: tuple(int(v) for v in row) for n, row in zip(names, rows["native_wh"], strict=False)
     }
     provider._camera_params = {
-        n: tuple(float(v) for v in row) for n, row in zip(names, rows["camera_params"])
+        n: tuple(float(v) for v in row)
+        for n, row in zip(names, rows["camera_params"], strict=False)
     }
-    provider._median_sparse_z = {n: float(v) for n, v in zip(names, rows["median_sparse_z"])}
+    provider._median_sparse_z = {
+        n: float(v) for n, v in zip(names, rows["median_sparse_z"], strict=False)
+    }
     provider._drop_empty_side_references()
     provider._geometry_locked = True

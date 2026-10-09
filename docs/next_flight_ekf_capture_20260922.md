@@ -4,6 +4,10 @@
 按原本方式開啟介面並啟動定位即可，AUTO／人工飛行均可收集；不會為了錄製
 更改任務授權或起降控制，也不會啟用 EKF。
 
+2026-10-03 文件整理：本頁合併原 2026-09-21 人工收集清單與已退役 ESEKF
+操作頁中的仍適用流程；目前資料收集與報告以本頁為單一入口，歷史實驗結論仍保留在
+[能力稽核](imu_odometry_capability_audit.md)與[優化總帳](verified_localization_optimization_ledger.md)。
+
 ## 相機參考點與內參
 
 - 依操作員約定，以相機中心代表無人機位置，平移偏移近似為零。
@@ -56,7 +60,6 @@ JPEG 是有損副本，離線 A/B 必須共用同一份輸入，不能宣稱與�
 
 若環境曾設定 `SFM_IMU_FLIGHT_TEST=0`，會明確停用錄製；未設定時真機預設啟用。
 `SFM_IMU_FLIGHT_TEST=1` 可讓其他模式也錄製。這個旗標不改變飛行授權。
-`IMU飛行測試.sh` 仍保留 evaluation-only，供操作員選擇人工收集。
 
 手動重建報告（唯讀原始資料，不連飛機）：
 
@@ -66,6 +69,31 @@ JPEG 是有損副本，離線 A/B 必須共用同一份輸入，不能宣稱與�
   --out outputs/flight_logs/session_實際場次/imu_test/report.md \
   --json-out outputs/flight_logs/session_實際場次/imu_test/report.json
 ```
+
+報告的 `UNUSABLE` 代表缺少關鍵資料；`USABLE WITH GAPS` 必須保留缺口與
+丟幀資訊，只用可配對部分。`USABLE` 只表示資料契約可用，不代表 EKF 通過驗收。
+
+## 可選的人工 evaluation-only 收集
+
+操作員也可在專案根目錄執行 `./IMU飛行測試.sh`。此入口設定
+`SFM_IMU_FLIGHT_TEST=1`、`SFM_EVALUATION_ONLY=1`，並拒絕 AUTO；不要移除
+evaluation-only 來做這次收集。這不是讓實驗性 EKF 或滑動視窗接管飛機。
+AI 不得執行真機入口或代為起飛；操作員依正常 preflight 親自在 UI 起飛，
+起降與接管以 [SAFETY.md](../控制介面程式/SAFETY.md)及
+[AGENTS.md](../定位演算法/AGENTS.md)為準。
+
+- [ ] 起飛前確認影像、定位、遙測持續更新，錄製沒有磁碟／佇列錯誤。
+- [ ] 維持正常相機設定，盡量固定雲台角度與變焦，並記錄設定。
+- [ ] 場地及電量允許時，人工保留短暫懸停、平緩直線移動與停住、另一方向的
+  平移及平緩轉向，供區分雜訊、延遲、尺度與方向對齊。
+- [ ] 自然遇到弱定位或失鎖時保留紀錄，依正常操作回到可定位區；不得為製造
+  LOST 而冒險飛出可控範圍。
+- [ ] 若能獨立量測地標距離，記下量測值、兩端地標與對應時段供尺度交叉檢查；
+  不要把 profile 的 `map_scale=2.3444` 當公尺換算。
+- [ ] 正常降落後關閉介面，讓錄製完成寫檔；保留完整 session 目錄，包括
+  `session_manifest.json`、`session_summary.json`、`commands.jsonl`、
+  `incidents.jsonl`、原始定位／遙測及 `imu_test/`。機上 MP4 可作備份，
+  不能替代帶主機 capture timestamp 的同步影格。
 
 ## 下次回來可以做什麼
 

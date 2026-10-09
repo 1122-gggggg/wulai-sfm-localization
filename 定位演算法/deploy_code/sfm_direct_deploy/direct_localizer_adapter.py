@@ -284,6 +284,16 @@ class DirectTrackerAdapter(Localizer):
             "requested_reference_count": int(self.profile.reloc.top_k),
             "camera_axes_world": camera_axes_world,
             "camera_forward_world": camera_forward_world,
+            # The bridge rotates the camera basis around measured map gravity,
+            # but only fused yaw is observed; retained visual tilt is not a new
+            # camera pitch/roll estimate.
+            "camera_attitude_kind": (
+                "heading_only"
+                if status == "IMU_BRIDGE"
+                else "full"
+                if camera_axes_world is not None
+                else "none"
+            ),
             "pose_status": "VISUALLY_CONFIRMED" if (info["ok"] and not weak) else "NONE",
             "prediction_valid": False,
             "prediction_mode": None,

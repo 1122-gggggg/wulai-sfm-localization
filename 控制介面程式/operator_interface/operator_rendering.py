@@ -19,8 +19,8 @@ from PIL import Image
 
 from localization_result_ui import localization_result_is_weak
 
-#: Smallest requested map/video canvas height. The pane is elastic above it;
-#: at the 1180x768 minimum window this floor is what the controls rely on.
+#: Initial requested map/video canvas height, not a rendering floor. Fixed
+#: controls receive their natural height; renderers use the allocated remainder.
 VIEWPORT_MIN_H = 96
 
 
@@ -91,6 +91,16 @@ class MapRenderContext:
     #: history_weak. Appended last so existing positional constructors keep
     #: working; missing entries fall back to the health colour.
     history_weak_kind: Sequence[str] = ()
+    #: Current display-only estimate, independent of the held flight pose.
+    #: Empty kind/auto attitude preserve measured/replay camera rendering.
+    camera_estimate_kind: str = ""
+    camera_attitude: str = "auto"
+    camera_estimate_stale: bool = False
+    #: Identifies the complete application projection, including its pivot.
+    projection_key: tuple = ()
+    #: Map-aligned historical submap trails, never live pose/flight history.
+    workmap_trajectories: Mapping[int, Sequence[Sequence[float]]] | None = None
+    workmap_mapping_diagnostics: Mapping[str, Any] | None = None
 
 
 #: Camera picture rectangle: a real plane in map space, oriented by the full
@@ -173,47 +183,87 @@ def _camera_picture_basis(
     it needs the whole attitude: a ground-flattened azimuth cannot tilt it,
     and tilt is the point of drawing it in 3D.
     """
+    if context.camera_attitude == "none":
+        return None
+    if context.camera_attitude == "heading":
+        return _heading_picture_basis(context)
     if context.camera_axes is not None:
-        axes = np.asarray(context.camera_axes, dtype=float)
-        if axes.shape != (3, 3) or not np.isfinite(axes).all():
-            return None
-        right, down, forward = axes
-        f_norm = float(np.linalg.norm(forward))
-        if f_norm < 1e-9:
-            return None
-        forward = forward / f_norm
-        r_norm = float(np.linalg.norm(right))
-        d_norm = float(np.linalg.norm(down))
-        if r_norm >= 1e-9 and d_norm >= 1e-9:
-            return right / r_norm, -down / d_norm, forward, False
-        # Degenerate in-plane rows (e.g. right collapsed at nadir): rebuild
-        # them off the optical axis instead of drawing nothing.
-        built = _basis_from_forward(context, forward)
-        return (*built, False) if built is not None else None
+        return _axes_picture_basis(context)
     if context.camera_forward is not None:
-        built = _basis_from_forward(context, context.camera_forward)
-        return (*built, False) if built is not None else None
+        return _flagged_basis(_basis_from_forward(context, context.camera_forward), False)
+    return _telemetry_picture_basis(context)
+
+
+def _flagged_basis(
+    built: tuple[np.ndarray, np.ndarray, np.ndarray] | None, telemetry_fallback: bool
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, bool] | None:
+    return (*built, telemetry_fallback) if built is not None else None
+
+
+def _yaw_horizontal(context: MapRenderContext, yaw: float) -> np.ndarray:
+    horizontal: np.ndarray = math.cos(yaw) * np.asarray(context.map_east, dtype=float) + math.sin(
+        yaw
+    ) * np.asarray(context.map_north, dtype=float)
+    return horizontal
+
+
+def _heading_picture_basis(
+    context: MapRenderContext,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, bool] | None:
     try:
-        yaw_value = float(context.pose[3])
+        yaw = float(context.pose[3])
     except (TypeError, ValueError, IndexError):
         return None
-    if not np.isfinite(yaw_value):
+    if not math.isfinite(yaw):
         return None
+    return _flagged_basis(_basis_from_forward(context, _yaw_horizontal(context, yaw)), True)
+
+
+def _axes_picture_basis(
+    context: MapRenderContext,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, bool] | None:
+    axes = np.asarray(context.camera_axes, dtype=float)
+    if axes.shape != (3, 3) or not np.isfinite(axes).all():
+        return None
+    right, down, forward = axes
+    f_norm = float(np.linalg.norm(forward))
+    if f_norm < 1e-9:
+        return None
+    forward = forward / f_norm
+    r_norm = float(np.linalg.norm(right))
+    d_norm = float(np.linalg.norm(down))
+    if r_norm >= 1e-9 and d_norm >= 1e-9:
+        return right / r_norm, -down / d_norm, forward, False
+    # Degenerate in-plane rows (e.g. right collapsed at nadir): rebuild
+    # them off the optical axis instead of drawing nothing.
+    return _flagged_basis(_basis_from_forward(context, forward), False)
+
+
+def _gimbal_pitch_radians(context: MapRenderContext) -> float:
     try:
         pitch_value = math.radians(float(context.gimbal_pitch_deg))
     except (TypeError, ValueError):
         pitch_value = 0.0
     if not math.isfinite(pitch_value):
         pitch_value = 0.0
-    pitch_value = max(-math.pi / 2 + 1e-6, min(math.pi / 2 - 1e-6, pitch_value))
-    horizontal = math.cos(yaw_value) * np.asarray(context.map_east, dtype=float) + math.sin(
-        yaw_value
-    ) * np.asarray(context.map_north, dtype=float)
+    return max(-math.pi / 2 + 1e-6, min(math.pi / 2 - 1e-6, pitch_value))
+
+
+def _telemetry_picture_basis(
+    context: MapRenderContext,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, bool] | None:
+    try:
+        yaw_value = float(context.pose[3])
+    except (TypeError, ValueError, IndexError):
+        return None
+    if not np.isfinite(yaw_value):
+        return None
+    pitch_value = _gimbal_pitch_radians(context)
+    horizontal = _yaw_horizontal(context, yaw_value)
     forward = math.cos(pitch_value) * horizontal + math.sin(pitch_value) * np.asarray(
         context.map_up, dtype=float
     )
-    built = _basis_from_forward(context, forward)
-    return (*built, True) if built is not None else None
+    return _flagged_basis(_basis_from_forward(context, forward), True)
 
 
 def camera_view_plane_corners(
@@ -252,16 +302,12 @@ _PROJECTION_CACHE_MAX = 64
 
 
 def _pts_sig(seq: Sequence[Any] | None) -> tuple | int:
-    if not seq:
+    if seq is None or len(seq) == 0:
         return 0
-    n = len(seq)
-    if n <= 32:
-        return tuple(tuple(round(float(x), 4) for x in p[:3]) for p in seq)
-    step = max(1, n // 16)
-    sampled = tuple(tuple(round(float(x), 4) for x in seq[i][:3]) for i in range(0, n, step))
-    if (n - 1) % step != 0:
-        sampled = sampled + (tuple(round(float(x), 4) for x in seq[-1][:3]),)
-    return (n, sampled)
+    # Sampling missed edits in the middle of a capped trail or route. Retain
+    # exact coordinates, not references to mutable points or sampled endpoints.
+    points = np.asarray(seq, dtype=float)
+    return (len(points), points[:, :3].tobytes())
 
 
 def _draw_route_and_history(draw: Any, context: MapRenderContext) -> None:
@@ -304,6 +350,7 @@ def _draw_route_and_history(draw: Any, context: MapRenderContext) -> None:
         size_key,
         rotation_key,
         round(float(getattr(context, "map_radius", 1.0)), 4),
+        context.projection_key,
         _pts_sig(context.route_pts),
         _pts_sig(context.history),
         _pts_sig(weak_trail),
@@ -395,6 +442,67 @@ def _draw_route_and_history(draw: Any, context: MapRenderContext) -> None:
             draw.ellipse((x - 3, y - 3, x + 3, y + 3), fill=context.route_color)
 
 
+def _draw_workmap_trajectories(draw: Any, context: MapRenderContext) -> None:
+    trails = context.workmap_trajectories
+    if not trails:
+        return
+    scale = _map_scale(context)
+    for points in trails.values():
+        if len(points) < 2:
+            continue
+        view = context.transform_xyz(np.asarray(points, dtype=float))
+        screen = list(
+            zip(
+                (context.width * 0.5 + context.map_pan[0] + view[:, 0] * scale).astype(int),
+                (context.height * 0.5 + context.map_pan[1] - view[:, 1] * scale).astype(int),
+            )
+        )
+        # One line per segment, not a bridge across unrelated weak-map runs.
+        draw.line(screen, fill="#c084fc", width=2)
+
+
+def _draw_workmap_mapping_health(draw: Any, context: MapRenderContext) -> None:
+    diagnostics = context.workmap_mapping_diagnostics
+    if not diagnostics:
+        return
+    healthy = diagnostics.get("workmap_mapping_healthy")
+    health = "正常" if healthy is True else "停止" if healthy is False else "未知"
+    state = diagnostics.get("workmap_mapping_state")
+    source = diagnostics.get("workmap_output_source")
+    error = diagnostics.get("workmap_mapping_error")
+    detail = " | ".join(str(value) for value in (state, source, error) if value is not None)
+    draw.text(
+        (10, 28),
+        f"工作圖建圖：{health}" + (f" | {detail}" if detail else ""),
+        fill="#ff6b5f" if healthy is False else "#00e6ff",
+        font=context.overlay_font,
+    )
+
+
+def _camera_estimate_color(context: MapRenderContext) -> str | None:
+    if not context.camera_estimate_kind:
+        return None
+    return WEAK_KIND_COLOR.get(context.camera_estimate_kind, WEAK_KIND_FALLBACK_COLOR)
+
+
+def _draw_camera_estimate_label(draw: Any, context: MapRenderContext, x: float, y: float) -> None:
+    color = _camera_estimate_color(context)
+    if color is None:
+        return
+    detail = {
+        "full": "attitude estimate",
+        "direction": "direction-only estimate",
+        "heading": "heading-only estimate",
+        "none": "position-only estimate",
+    }.get(context.camera_attitude, "estimate")
+    draw.text(
+        (x + 10, y + 12),
+        f"{context.camera_estimate_kind} {'stale ' if context.camera_estimate_stale else ''}{detail}",
+        fill=color,
+        font=context.overlay_font,
+    )
+
+
 def _draw_no_orientation_marker(draw: Any, context: MapRenderContext) -> None:
     """Hollow ring when no orientation source survives: position without bearing."""
     screen_x, screen_y = context.project_world(
@@ -402,9 +510,10 @@ def _draw_no_orientation_marker(draw: Any, context: MapRenderContext) -> None:
     )
     draw.ellipse(
         (screen_x - 7, screen_y - 7, screen_x + 7, screen_y + 7),
-        outline="#3fbf7f",
+        outline=_camera_estimate_color(context) or "#3fbf7f",
         width=3,
     )
+    _draw_camera_estimate_label(draw, context, screen_x, screen_y)
 
 
 def _draw_camera_overlay(draw: Any, context: MapRenderContext) -> None:
@@ -437,18 +546,22 @@ def _draw_camera_overlay(draw: Any, context: MapRenderContext) -> None:
     )
     screen_x = context.width * 0.5 + context.map_pan[0] + view[:, 0] * scale
     screen_y = context.height * 0.5 + context.map_pan[1] - view[:, 1] * scale
-    border_color = "#3fbf7f" if from_yaw else "#00d4ff"
+    estimate_color = _camera_estimate_color(context)
+    border_color = estimate_color or ("#3fbf7f" if from_yaw else "#00d4ff")
     drone_pt = (screen_x[0], screen_y[0])
     quad = list(zip(screen_x[1:5], screen_y[1:5]))
     # The gaze line runs under the fill, drone -> picture -> arrowhead: one
     # stem, not a cone of corner lines, and it carries the facing direction
     # even when the quad is seen edge-on.
-    draw.line((*drone_pt, screen_x[5], screen_y[5]), fill="#ffffff", width=2)
-    draw.polygon(quad, fill="#0a5f73")
-    draw.line(quad + [quad[0]], fill=border_color, width=3, joint="curve")
+    draw.line((*drone_pt, screen_x[5], screen_y[5]), fill=estimate_color or "#ffffff", width=2)
+    # Without observed image axes a picture plane would invent camera roll.
+    # Heading/direction estimates therefore draw only their honest arrow.
+    if context.camera_attitude not in {"heading", "direction"}:
+        draw.polygon(quad, fill="#0a5f73")
+        draw.line(quad + [quad[0]], fill=border_color, width=3, joint="curve")
     draw.polygon(
         [(screen_x[5], screen_y[5]), (screen_x[6], screen_y[6]), (screen_x[7], screen_y[7])],
-        fill="#ffffff",
+        fill=estimate_color or "#ffffff",
     )
     draw.ellipse(
         (drone_pt[0] - 4, drone_pt[1] - 4, drone_pt[0] + 4, drone_pt[1] + 4),
@@ -456,12 +569,15 @@ def _draw_camera_overlay(draw: Any, context: MapRenderContext) -> None:
         outline="#ffffff",
         width=2,
     )
+    _draw_camera_estimate_label(draw, context, *drone_pt)
 
 
 def draw_map_overlays(draw: Any, context: MapRenderContext) -> None:
     """Paint dynamic map overlays over an already-rendered map base."""
+    _draw_workmap_trajectories(draw, context)
     _draw_route_and_history(draw, context)
     _draw_camera_overlay(draw, context)
+    _draw_workmap_mapping_health(draw, context)
 
 
 def _fit_pil_frame(
@@ -474,7 +590,12 @@ def _fit_pil_frame(
         max(1, int(source.width * scale)),
         max(1, int(source.height * scale)),
     )
-    return source.resize(new_size, Image.Resampling.BILINEAR), scale
+    if source.size == new_size:
+        return source, scale
+    # Integer box reduction avoids running the bilinear kernel over all 720p
+    # source pixels for the much smaller operator pane. No fitted-frame cache
+    # or changing metric strings are retained here.
+    return source.resize(new_size, Image.Resampling.BILINEAR, reducing_gap=1.0), scale
 
 
 def prepare_video_frame(
@@ -507,12 +628,7 @@ def prepare_video_frame(
                     new_size,
                     interpolation=cv2.INTER_AREA,
                 )
-                source_height, source_width = new_size[1], new_size[0]
             frame = Image.fromarray(source, mode="RGB")
-            scale = min(
-                width / max(1, source_width),
-                height / max(1, source_height),
-            )
             return frame, scale
 
         pil_source = (
@@ -531,6 +647,265 @@ def prepare_video_frame(
             return _fit_pil_frame(pil_source, width, height)
         except Exception:
             return None, 1.0
+
+
+class VideoCanvasDraw:
+    """Retained Canvas painter shared by the map/video drawing helpers.
+
+    Overlay items are reused and only changed coordinates/options cross Tcl.
+    No image pixels are touched when age, telemetry or a banner changes.
+    Instances, fonts and all calls belong to the Tk thread.
+    """
+
+    def __init__(self, canvas: Any, *, tag: str = "video-overlay") -> None:
+        self.canvas = canvas
+        self._tag = tag
+        self._items: list[tuple[str, int, tuple, dict]] = []
+        self._cursor = 0
+        self._fonts: dict[tuple[int, bool], Any] = {}
+        self._order_dirty = False
+        self._hud_layout_cache = None
+        self._hud_measure_cache = None
+
+    def font(self, size: int, *, bold: bool = False) -> Any:
+        from tkinter import font as tkfont
+
+        key = (size, bold)
+        if key not in self._fonts:
+            available = set(tkfont.families(self.canvas))
+            family = next(
+                (
+                    name
+                    for name in ("Noto Sans CJK TC", "Noto Sans TC", "DejaVu Sans")
+                    if name in available
+                ),
+                "TkDefaultFont",
+            )
+            self._fonts[key] = tkfont.Font(
+                root=self.canvas,
+                family=family,
+                size=-size,
+                weight="bold" if bold else "normal",
+            )
+        return self._fonts[key]
+
+    def _tk_font(self, font: Any) -> Any:
+        if hasattr(font, "measure"):
+            return font
+        # Detection labels still supply the shared PIL font.
+        try:
+            _, style = font.getname()
+        except AttributeError:
+            style = ""
+        return self.font(int(getattr(font, "size", 11)), bold="bold" in style.lower())
+
+    def begin(self) -> None:
+        self._cursor = 0
+
+    def end(self) -> None:
+        for _, item, _, _ in self._items[self._cursor :]:
+            self.canvas.delete(item)
+        del self._items[self._cursor :]
+        if self._order_dirty:
+            for _, item, _, _ in self._items:
+                self.canvas.tag_raise(item)
+            self._order_dirty = False
+
+    def _paint(self, kind: str, coordinates: tuple, options: dict) -> None:
+        index = self._cursor
+        self._cursor += 1
+        if index < len(self._items):
+            previous_kind, item, previous_coordinates, previous_options = self._items[index]
+            if previous_kind != kind:
+                self.canvas.delete(item)
+                item = getattr(self.canvas, f"create_{kind}")(
+                    *coordinates,
+                    **options,
+                    tags=self._tag,
+                )
+                self._order_dirty = True
+            else:
+                if previous_coordinates != coordinates:
+                    self.canvas.coords(item, *coordinates)
+                changed = {
+                    key: value
+                    for key, value in options.items()
+                    if previous_options.get(key) != value
+                }
+                if changed:
+                    self.canvas.itemconfigure(item, **changed)
+            self._items[index] = (kind, item, coordinates, options)
+        else:
+            item = getattr(self.canvas, f"create_{kind}")(
+                *coordinates,
+                **options,
+                tags=self._tag,
+            )
+            self._items.append((kind, item, coordinates, options))
+            self._order_dirty = True
+
+    def rectangle(self, coordinates: tuple, **options: Any) -> None:
+        self._paint(
+            "rectangle",
+            tuple(coordinates),
+            {
+                "fill": options.get("fill", ""),
+                "outline": options.get("outline", ""),
+                "width": options.get("width", 1),
+            },
+        )
+
+    def line(self, coordinates: tuple, **options: Any) -> None:
+        if coordinates and isinstance(coordinates[0], (tuple, list)):
+            coordinates = tuple(value for point in coordinates for value in point)
+        self._paint(
+            "line",
+            tuple(coordinates),
+            {
+                "fill": options.get("fill", ""),
+                "width": options.get("width", 1),
+            },
+        )
+
+    def ellipse(self, coordinates: tuple, **options: Any) -> None:
+        self._paint(
+            "oval",
+            tuple(coordinates),
+            {
+                "fill": options.get("fill", ""),
+                "outline": options.get("outline", ""),
+                "width": options.get("width", 1),
+            },
+        )
+
+    def polygon(self, coordinates: tuple, **options: Any) -> None:
+        self._paint(
+            "polygon",
+            tuple(value for point in coordinates for value in point),
+            {
+                "fill": options.get("fill", ""),
+                "outline": options.get("outline", ""),
+                "width": options.get("width", 1),
+                "stipple": options.get("stipple", ""),
+            },
+        )
+
+    def textlength(self, text: str, *, font: Any) -> float:
+        return float(self._tk_font(font).measure(text))
+
+    def text(self, coordinates: tuple, text: str, **options: Any) -> None:
+        anchor = "center" if options.get("anchor") == "mm" else "nw"
+        self._paint(
+            "text",
+            tuple(coordinates),
+            {
+                "text": text,
+                "fill": options.get("fill", ""),
+                "font": self._tk_font(options["font"]),
+                "anchor": anchor,
+            },
+        )
+
+
+class MapCanvasPresenter:
+    """One view-dependent cloud photo with bounded retained route/trail items."""
+
+    def __init__(self, canvas: Any) -> None:
+        self.canvas = canvas
+        self.draw = VideoCanvasDraw(canvas, tag="map-overlay")
+        self.photo = None
+        self._key: tuple | None = None
+        self._item = None
+
+    def present(
+        self, key: tuple, base: Callable[[], Image.Image], context: MapRenderContext
+    ) -> None:
+        from PIL import ImageTk
+
+        if key != self._key:
+            image = base()
+            if self.photo is not None and (self.photo.width(), self.photo.height()) == image.size:
+                self.photo.paste(image)
+            else:
+                self.photo = ImageTk.PhotoImage(image, master=self.canvas)
+                if self._item is not None:
+                    self.canvas.itemconfigure(self._item, image=self.photo)
+            if self._item is None:
+                # Replace any startup/export photo without disturbing controls.
+                self.canvas.delete("frame")
+                self._item = self.canvas.create_image(
+                    0,
+                    0,
+                    image=self.photo,
+                    anchor="nw",
+                    tags="frame",
+                )
+                self.canvas.tag_lower(self._item)
+            self._key = key
+        self.draw.begin()
+        draw_map_overlays(self.draw, context)
+        self.draw.end()
+
+
+class VideoCanvasPresenter:
+    """One fitted frame and one Tk photo, independently of changing overlays."""
+
+    def __init__(self, canvas: Any) -> None:
+        self.canvas = canvas
+        self.draw = VideoCanvasDraw(canvas)
+        self.photo = None
+        self._key: tuple | None = None
+        self._source = None
+        self._item = None
+        self._scale = 1.0
+        self._offset = (0, 0)
+        self._image_size = (0, 0)
+        self.has_frame = False
+
+    def present(self, source: Any, stamp: float, width: int, height: int) -> tuple[float, int, int]:
+        from PIL import ImageTk
+
+        source_size = None
+        if isinstance(source, Image.Image):
+            source_size = source.size
+        elif isinstance(source, np.ndarray) and source.ndim >= 2:
+            source_size = (int(source.shape[1]), int(source.shape[0]))
+        fitted_size = (width, height)
+        if source_size is not None and min(source_size) > 0:
+            scale = min(width / source_size[0], height / source_size[1])
+            fitted_size = (
+                max(1, int(source_size[0] * scale)),
+                max(1, int(source_size[1] * scale)),
+            )
+        key = (id(source), stamp, source_size, fitted_size)
+        if key != self._key or (not self.has_frame and self._image_size != (width, height)):
+            frame, self._scale = prepare_video_frame(source, width, height)
+            self.has_frame = frame is not None
+            if frame is None:
+                frame = Image.new("RGB", (width, height), "#08090b")
+            if self.photo is not None and self._image_size == frame.size:
+                self.photo.paste(frame)
+            else:
+                self.photo = ImageTk.PhotoImage(frame, master=self.canvas)
+                if self._item is not None:
+                    self.canvas.itemconfigure(self._item, image=self.photo)
+            self._image_size = frame.size
+            self._key = key
+            # Keep the source alive so object-id reuse cannot alias a held frame.
+            self._source = source
+        offset = ((width - self._image_size[0]) // 2, (height - self._image_size[1]) // 2)
+        if self._item is None:
+            self._item = self.canvas.create_image(
+                *offset,
+                image=self.photo,
+                anchor="nw",
+                tags="video-frame",
+            )
+            self.canvas.tag_lower(self._item)
+        elif offset != self._offset:
+            self.canvas.coords(self._item, *offset)
+        self._offset = offset
+        return self._scale, *self._offset
 
 
 def draw_video_empty_state(
@@ -634,6 +1009,8 @@ def weak_pose_source_kind(result: Any) -> str:
         if get("candidate_mode") in ("klt_bridge", "klt_fast"):
             return "KLT"
         if get("pose_status") == "KLT_BRIDGED":
+            return "KLT"
+        if get("direct_status") in ("FAST_TRACK", "VO_ONLY", "DEAD_RECKON"):
             return "KLT"
         if get("direct_status") == "IMU_BRIDGE" or bool(get("imu_bridge")):
             return "IMU"
@@ -745,6 +1122,7 @@ def build_hud_overlay_data(state: Any, loc: Any, telemetry: Any) -> dict:
         )
     except (TypeError, ValueError):
         fps_text = "-"
+    fps_label = str(loc_dict.get("fps_label") or "定位 FPS")
     # Latencies
     latency_raw = loc_dict.get(
         "latency_ms",
@@ -775,7 +1153,9 @@ def build_hud_overlay_data(state: Any, loc: Any, telemetry: Any) -> dict:
     olympe_altitude_val = tele_dict.get("olympe_altitude", None)
     if olympe_state_val is not None or olympe_attitude_val is not None:
         line1 = " | ".join(
-            part for part in (str(auto_speed), f"定位 FPS {fps_text}", f"inliers {inliers}") if part
+            part
+            for part in (str(auto_speed), f"{fps_label} {fps_text}", f"inliers {inliers}")
+            if part
         )
         line2 = f"wall_ms {wall_text} | core {latency_text} | e2e {e2e_text}"
         line3 = (
@@ -805,7 +1185,7 @@ def build_hud_overlay_data(state: Any, loc: Any, telemetry: Any) -> dict:
         diagnostic_lines = (line1, line2, line3, line4, attitude_line, velocity_line)
     else:
         diagnostic_lines = (
-            " | ".join((str(auto_speed), f"定位 FPS {fps_text}", f"inliers {inliers}")),
+            " | ".join((str(auto_speed), f"{fps_label} {fps_text}", f"inliers {inliers}")),
             f"wall_ms {wall_text} | core {latency_text} | e2e {e2e_text}",
             f"{rth} | {gps}".strip(" |") if gps else str(rth),
             f"{altitude_agl} | {link_quality}".strip(" |") if link_quality else str(altitude_agl),
@@ -878,6 +1258,238 @@ def heading_arrow_polygon(
     ]
 
 
+_HudChoice = tuple[Any, Any, int, int, list[list[int]], list[Any], int]
+_HudLayout = tuple[int, int, list[tuple[int, int, int, Any]]]
+
+
+class _HudMeasure:
+    """Per-draw text measurement caches shared across HUD layout passes."""
+
+    def __init__(self, draw: Any, row_count: int) -> None:
+        self.draw = draw
+        # Result metrics change one or two rows per completion. Re-measuring every
+        # unchanged CJK telemetry row at every candidate size dominated actual Tk
+        # rendering in the offline profile. Keep only the last text per row/font,
+        # not an unbounded history of changing metric strings.
+        measured: tuple[int, dict[tuple[str, int], tuple[str, float]], dict[str, int]] | None = (
+            getattr(draw, "_hud_measure_cache", None)
+        )
+        if measured is None or measured[0] != row_count:
+            measured = (row_count, {}, {})
+            if hasattr(draw, "_hud_measure_cache"):
+                draw._hud_measure_cache = measured
+        self.widths_by_row = measured[1]
+        self.font_heights = measured[2]
+
+    def text_width(self, index: int, text: str, font: Any) -> float:
+        row_key = (str(font), index)
+        previous = self.widths_by_row.get(row_key)
+        if previous is None or previous[0] != text:
+            previous = (text, self.draw.textlength(text, font=font))
+            self.widths_by_row[row_key] = previous
+        return previous[1]
+
+    def sized(self, font: Any, size: int) -> Any:
+        factory = getattr(self.draw, "font", None)
+        if callable(factory):
+            return factory(size, bold=True)
+        variant = getattr(font, "font_variant", None)
+        return variant(size=size) if callable(variant) else font
+
+    def line_height(self, font: Any) -> int:
+        # VideoCanvasDraw owns these fonts; their size/style never mutate.
+        font_key = str(font)
+        if font_key not in self.font_heights:
+            metrics = getattr(font, "metrics", None)
+            if callable(metrics):
+                self.font_heights[font_key] = int(metrics("linespace"))
+            else:
+                bbox = font.getbbox("Ag國")
+                self.font_heights[font_key] = max(1, int(bbox[3]) + 2)
+        return self.font_heights[font_key]
+
+
+def _hud_fit_size(
+    measure: _HudMeasure,
+    size: int,
+    source_line: str,
+    diagnostic_lines: Sequence[str],
+    hud_font: Any,
+    main_hud_font: Any,
+    available_width: int,
+    available_height: int,
+    gap: int,
+) -> _HudChoice | None:
+    font = measure.sized(hud_font, size)
+    main_font = measure.sized(main_hud_font, size + 2)
+    row_h, source_h = measure.line_height(font), measure.line_height(main_font)
+    # Reserve width for source-age/FPS digits, and include the source row in
+    # the layout key so unusually long fresh/stale readouts still reflow.
+    if measure.text_width(-1, source_line, main_font) + 40 > available_width:
+        main_font = font
+        source_h = row_h
+    indices = list(range(len(diagnostic_lines)))
+    for column_count in range(1, 4):
+        rows = max(1, math.ceil(len(indices) / column_count))
+        groups = [indices[start : start + rows] for start in range(0, len(indices), rows)]
+        needed = source_h + rows * row_h
+        if needed > available_height:
+            continue
+        widths = [
+            max(
+                (measure.text_width(index, diagnostic_lines[index], font) for index in group),
+                default=0,
+            )
+            for group in groups
+        ]
+        if sum(widths) + gap * max(0, len(groups) - 1) <= available_width:
+            return (font, main_font, row_h, source_h, groups, widths, needed)
+    return None
+
+
+def _hud_scale_only_layout(
+    measure: _HudMeasure,
+    source_line: str,
+    diagnostic_lines: Sequence[str],
+    scale_indices: list[int],
+    hud_font: Any,
+    left: int,
+    bottom: int,
+    available_width: int,
+    available_height: int,
+    gap: int,
+) -> _HudLayout | None:
+    # Two vertical rows may not fit beneath the link-loss banner. Use the
+    # remaining band horizontally for freshness and scale, at the largest
+    # readable font that fits; do not discard scale to save a row.
+    for size in range(18, 7, -1):
+        priority_font = measure.sized(hud_font, size)
+        priority_h = measure.line_height(priority_font)
+        source_width = measure.text_width(-1, source_line, priority_font) + 40
+        scale_widths = [
+            measure.text_width(index, diagnostic_lines[index], priority_font)
+            for index in scale_indices
+        ]
+        if not (
+            priority_h <= available_height
+            and source_width + sum(scale_widths) + gap * len(scale_indices) <= available_width
+        ):
+            continue
+        top = bottom - priority_h
+        placements = [(left, top, -1, priority_font)]
+        x = left + source_width + gap
+        for index, scale_width in zip(scale_indices, scale_widths, strict=True):
+            placements.append((int(x), top, index, priority_font))
+            x += scale_width + gap
+        return (top, bottom, placements)
+    return None
+
+
+def _hud_truncated_choice(
+    font: Any,
+    row_h: int,
+    scale_indices: list[int],
+    line_count: int,
+    available_width: int,
+    available_height: int,
+) -> _HudChoice:
+    priority = scale_indices + [index for index in range(line_count) if index not in scale_indices]
+    rows = max(0, available_height // row_h - 1)
+    needed = min(available_height, row_h + rows * row_h)
+    return (font, font, row_h, row_h, [priority[:rows]], [available_width], needed)
+
+
+def _hud_place_rows(
+    chosen: _HudChoice, left: int, bottom: int, minimum_top: int, gap: int
+) -> _HudLayout:
+    font, main_font, row_h, source_h, groups, widths, needed = chosen
+    top = max(minimum_top, bottom - needed)
+    placements = [(left, top, -1, main_font)]
+    x = left
+    for group, column_width in zip(groups, widths, strict=True):
+        for row, index in enumerate(group):
+            placements.append((int(x), top + source_h + row * row_h, index, font))
+        x += column_width + gap
+    return (top, bottom, placements)
+
+
+def _store_hud_layout(draw: Any, key: tuple, result: _HudLayout) -> _HudLayout:
+    if hasattr(draw, "_hud_layout_cache"):
+        draw._hud_layout_cache = (key, result)
+    return result
+
+
+def _video_hud_layout(
+    draw: Any,
+    width: int,
+    height: int,
+    source_line: str,
+    diagnostic_lines: Sequence[str],
+    hud_height: int,
+    hud_font: Any,
+    main_hud_font: Any,
+    banner_bottom: int,
+) -> tuple[int, int, list[tuple[int, int, int, Any]]]:
+    """Fit readable rows inside the panel, reserving active alert-banner space."""
+    key = (width, height, source_line, tuple(diagnostic_lines), hud_height, banner_bottom)
+    cached: tuple[tuple, _HudLayout] | None = getattr(draw, "_hud_layout_cache", None)
+    if cached is not None and cached[0] == key:
+        return cached[1]
+
+    measure = _HudMeasure(draw, len(diagnostic_lines))
+    margin = 18 if height >= hud_height + 36 else 6
+    if banner_bottom and height - banner_bottom < 48:
+        margin = 0
+    bottom = height - margin - 1  # Reserve the text shadow's one-pixel offset.
+    minimum_top = max(margin, banner_bottom)
+    available_height = max(0, bottom - minimum_top)
+    left, right, gap = 28, width - 28, 20
+    available_width = max(1, right - left)
+    chosen = None
+    for size in range(18, 7, -1):
+        chosen = _hud_fit_size(
+            measure,
+            size,
+            source_line,
+            diagnostic_lines,
+            hud_font,
+            main_hud_font,
+            available_width,
+            available_height,
+            gap,
+        )
+        if chosen is not None:
+            break
+    if chosen is None:
+        # A 96px pane with a 72px safety banner cannot show every engineering
+        # metric. Keep source freshness and map-wide scale ahead of secondary
+        # device telemetry; never paint text under the banner or past the pane.
+        font = measure.sized(hud_font, 8)
+        row_h = measure.line_height(font)
+        scale_indices = [
+            index for index, line in enumerate(diagnostic_lines) if line.startswith("全場")
+        ]
+        if scale_indices and available_height < 2 * row_h:
+            result = _hud_scale_only_layout(
+                measure,
+                source_line,
+                diagnostic_lines,
+                scale_indices,
+                hud_font,
+                left,
+                bottom,
+                available_width,
+                available_height,
+                gap,
+            )
+            if result is not None:
+                return _store_hud_layout(draw, key, result)
+        chosen = _hud_truncated_choice(
+            font, row_h, scale_indices, len(diagnostic_lines), available_width, available_height
+        )
+    return _store_hud_layout(draw, key, _hud_place_rows(chosen, left, bottom, minimum_top, gap))
+
+
 def draw_video_hud(
     draw: Any,
     width: int,
@@ -890,14 +1502,15 @@ def draw_video_hud(
     overlay_font: Any,
     live_backend: bool,
     stream_latency_ms: float,
+    *,
+    banner_bottom: int = 0,
 ) -> bool:
-    """Paint the border and engineering HUD, returning the link status."""
+    """Paint the border and transparent engineering HUD, returning link status."""
     draw.rectangle(
         (18, 18, width - 18, height - 18),
         outline="#363c44",
         width=2,
     )
-    hud_top = max(18, height - hud_height)
     age = getattr(state, "frame_age_ms", None)
     if age is None and live_backend:
         age = getattr(state, "link_latency_ms", None)
@@ -913,22 +1526,25 @@ def draw_video_hud(
         f"鏡頭 {state.gimbal_pitch_deg:.0f}° / {state.zoom:.1f}x",
         *diagnostic_lines,
     )
-    line_spacing = max(
-        17,
-        (height - 26 - hud_top) // len(hud_lines),
+    _, _, placements = _video_hud_layout(
+        draw,
+        width,
+        height,
+        hud_lines[0],
+        diagnostic_lines,
+        hud_height,
+        hud_font,
+        main_hud_font,
+        banner_bottom,
     )
-    # One solid strip behind plain (stroke-free) text: stroked truetype at
-    # 13-15px cost ~44 ms per 960x540 frame on the Tk thread and capped the
-    # whole UI tick near 12 Hz; the strip keeps contrast over bright video
-    # for ~10 ms total. Display-only; localization input is untouched.
-    strip_bottom = min(height - 18, hud_top + 5 + len(hud_lines) * line_spacing)
-    draw.rectangle((18, hud_top, width - 18, strip_bottom), fill="#0b0c0e")
-    for index, line in enumerate(hud_lines):
+    for x, y, index, font in placements:
+        text = hud_lines[0] if index < 0 else diagnostic_lines[index]
+        draw.text((x + 1, y + 1), text, fill="#000000", font=font)
         draw.text(
-            (28, hud_top + 5 + index * line_spacing),
-            line,
+            (x, y),
+            text,
             fill="#f4f4f4",
-            font=main_hud_font if index == 0 else hud_font,
+            font=font,
         )
     return link_ok
 
@@ -1009,9 +1625,8 @@ def draw_magnetometer_axis(canvas: Any, guide: tuple[str, str, str] | None) -> N
 
     ``guide`` is magnetometer_axis_guide()'s result, or None when no axis is
     being requested -- in which case the canvas is cleared rather than left
-    showing a stale rotation the operator should not perform. Kept deliberately
-    short (52 px) so the calibration buttons below it stay reachable at the
-    minimum supported window size.
+    showing a stale rotation the operator should not perform. Rotation counts
+    are not completion evidence: keep rotating until the firmware changes axis.
     """
     if canvas is None:
         return
@@ -1098,7 +1713,7 @@ def draw_magnetometer_axis(canvas: Any, guide: tuple[str, str, str] | None) -> N
         66,
         44,
         anchor="nw",
-        text=f"{instruction}　轉滿三圈",
+        text=instruction,
         fill="#574a38",
         font=("Sans", 10),
         width=174,

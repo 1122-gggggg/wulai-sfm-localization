@@ -949,6 +949,7 @@ class LoopHooks:
     attitude_sample: callable | None = None  # () -> (NED yaw, sample_stamp) | None
     ned_velocity: callable | None = None  # () -> (north_mps, east_mps, sample_stamp) | None
     telemetry_history: callable | None = None  # (since_stamps) -> (yaw/stamp rows, north/east/stamp rows)
+    control_state: ControlStateEstimator | None = None  # session-wide scale; UI owns pose acquisition
     # () -> (firmware altitude above takeoff in metres, monotonic stamp) | None;
     # None disables the barometric height cross-check (VerticalConsistencyGuard).
     altitude: callable | None = None
@@ -1800,7 +1801,15 @@ class _FlightLoopRunner:
         self._heading_anchor_stamp: float | None = None
         self._control_telemetry_stamps: tuple[float | None, float | None] | None = None
         self.pcmd_controller = rpf.YawAlignedPcmdController(ctrl.cfg) if ctrl is not None else None
-        self.control_state = ControlStateEstimator(ctrl.cfg.map_frame) if ctrl is not None else None
+        self.control_state = (
+            hooks.control_state if hooks.control_state is not None else
+            ControlStateEstimator(ctrl.cfg.map_frame) if ctrl is not None else None
+        )
+        if hooks.control_state is not None and ctrl is not None:
+            source = hooks.control_state.frame
+            if any(not np.allclose(getattr(source, axis), getattr(ctrl.cfg.map_frame, axis),
+                                   rtol=0., atol=1e-9) for axis in ("east", "north", "up")):
+                raise ValueError("session metric scale belongs to a different map frame")
         self.control_smoother = ControlPoseSmoother(ctrl.cfg.map_frame) if ctrl is not None else None
         self.wind_observer = ResidualDriftObserver() if ctrl is not None else None
         self._clock_now: float | None = None
@@ -1882,7 +1891,8 @@ class _FlightLoopRunner:
         if self.pcmd_controller is not None:
             self.pcmd_controller.reset()
         if self.control_state is not None:
-            self.control_state.reset_position()
+            with self.control_state.lock:
+                self.control_state.reset_observation()
         if self.control_smoother is not None:
             self.control_smoother.reset()
         if self.wind_observer is not None:
@@ -1925,8 +1935,19 @@ class _FlightLoopRunner:
                     "inliers",
                     "reproj_rms",
                     "weak",
+                    "display_seq", "frame_name", "source_frame_stamp_mono",
+                    "pose_capture_mono_ns", "pose_status", "direct_status",
+                    "map_constraint_age_s", "dead_reckon_age", "confidence_low",
+                    "map_inliers", "vo_inliers", "imu_bridge",
+                    "imu_sample_stamp_mono", "camera_attitude_kind",
                 )
             }
+            capture_ns = info.get("pose_capture_mono_ns")
+            pose_stamp = record.get("pose_stamp")
+            record["loc_pose_stamp_matches"] = (
+                abs(float(capture_ns) / 1e9 - float(pose_stamp)) <= 1e-9
+                if capture_ns is not None and pose_stamp is not None else None
+            )
         except (
             OSError,
             ValueError,
@@ -2045,6 +2066,9 @@ class _FlightLoopRunner:
                 if mismatch is not None:
                     record["visual_imu_yaw_mismatch_deg"] = round(math.degrees(mismatch), 2)
                 fresh = False
+        # Observation-only diagnostics: holdover/prediction may still control,
+        # but are not independent measurements of the flown trajectory.
+        record["pose_new"] = bool(fresh and new_visual_fix)
         transition = decide_localization_transition(
             self.uncertainty,
             now=now,
@@ -2208,6 +2232,12 @@ class _FlightLoopRunner:
     def _observe_control_telemetry(self, now):
         if self.control_state is None:
             return
+        with self.control_state.lock:
+            self._observe_control_telemetry_locked(now)
+
+    def _observe_control_telemetry_locked(self, now):
+        if self.control_state is None:
+            return
         if self.hooks.telemetry_history is not None:
             try:
                 attitudes, velocities = self.hooks.telemetry_history(
@@ -2247,6 +2277,12 @@ class _FlightLoopRunner:
             self.wind_observer.observe_velocities(tuple(self.control_state.velocities))
 
     def _anchor_heading(self, pose, current_yaw, record):
+        if self.control_state is None:
+            return self.heading.update(pose.yaw, current_yaw)
+        with self.control_state.lock:
+            return self._anchor_heading_locked(pose, current_yaw, record)
+
+    def _anchor_heading_locked(self, pose, current_yaw, record):
         if self.hooks.attitude_sample is None and self.hooks.telemetry_history is None:
             return self.heading.update(pose.yaw, current_yaw)
         capture_yaw = self.control_state.yaw_at(pose.stamp)
@@ -2268,6 +2304,12 @@ class _FlightLoopRunner:
         return accepted
 
     def _update_delayed_heading(self, now, record):
+        if self.control_state is None:
+            return
+        with self.control_state.lock:
+            self._update_delayed_heading_locked(now, record)
+
+    def _update_delayed_heading_locked(self, now, record):
         if self.control_state is None or not self.control_state.yaws:
             return
         pending, self._heading_pending = self._heading_pending, []
@@ -2952,10 +2994,11 @@ class _FlightLoopRunner:
 
     def _note_pose_correction(self, pose, now: float, record: dict) -> None:
         previous = self.control_smoother.previous
+        recovered = self.control_smoother.recovery_pending
         expected = None if previous is None else self.control_state.observed_motion(
             previous[0], pose.stamp, now, self.heading.offset)
         step = self.control_smoother.observe(pose, now, expected)
-        if step > .02:
+        if (step > .02 and recovered) or step > POSE_CORRECTION_RAMP_THRESHOLD_U:
             self.control_state.reset_observation()
         if step > POSE_CORRECTION_RAMP_THRESHOLD_U:
             self.pose_correction_started = now
@@ -3012,7 +3055,13 @@ class _FlightLoopRunner:
     def _predict_control_pose(self, command, pose, now, record):
         """Predict servo inputs only; the sequencer and landing use raw fixes."""
         radius = self.ctrl._arrive_radius_for(self.ctrl.target_index)
-        xyz, diagnostics = self.control_state.predict(pose, now, self.heading.offset, radius)
+        with self.control_state.lock:
+            xyz, diagnostics = self.control_state.predict(pose, now, self.heading.offset, radius)
+            record["map_scale"] = self.control_state.scale_diagnostics(now)
+            metric_xyz = self.control_state.metric_xyz(pose.xyz, now)
+            record["metric_pose_m"] = None if metric_xyz is None else metric_xyz.tolist()
+            record["metric_target_distance_m"] = self.control_state.metric_distance(
+                float(np.linalg.norm(command.goal - pose.xyz)), now)
         record["control_prediction"] = diagnostics
         correction = self.control_smoother.correction(now)
         if not diagnostics["applied"] and not np.any(correction):
@@ -3126,10 +3175,10 @@ class _FlightLoopRunner:
         route_distance, nearest, _segment, _progress_s = self.rpf.project_to_path(
             pose.xyz, self.ctrl.wp, self.ctrl.cum
         )
-        record["route_distance_u"] = round(float(route_distance), 3)
+        record["route_distance_u"] = float(route_distance)
         # The projection onto the planned polyline: pose - nearest is the offset
         # the operator actually wants to see plotted against the route.
-        record["route_nearest_u"] = [round(float(value), 4) for value in nearest]
+        record["route_nearest_u"] = [float(value) for value in nearest]
 
     def _ground_speed_sample(self, command):
         if command.action not in ("LAND", "FINAL_HOLD"):
@@ -3401,11 +3450,14 @@ class _FlightLoopRunner:
             reseed_confirming=self._control_pose_reseed_confirming(localized_pose),
             position_observed=self._control_pose_position_observed(localized_pose),
         )
+        # Keep the legacy rounded input used by the desktop progress guard.
         record["pose_u"] = [
-            round(float(pose.x), 4),
-            round(float(pose.y), 4),
-            round(float(pose.z), 4),
+            round(float(pose.x), 4), round(float(pose.y), 4), round(float(pose.z), 4),
         ]
+        record["observed_pose_u"] = [float(pose.x), float(pose.y), float(pose.z)]
+        record["pose_sample_time"] = float(now)
+        record["position_observed"] = bool(pose.position_observed)
+        record["pose_reseed_confirming"] = bool(pose.reseed_confirming)
         record["pose_stamp"] = float(pose.stamp)
         record["pose_yaw"] = float(pose.yaw)
         # Heading reconciliation on one tick: visual yaw, IMU-derived map
@@ -3420,18 +3472,22 @@ class _FlightLoopRunner:
         record["heading_offset_deg"] = self._debug_deg(
             getattr(self.heading, "offset", None)
         )
-        self._note_pose_correction(pose, now, record)
-        self.control_state.observe_pose(pose, now, self.heading.offset)
+        with self.control_state.lock:
+            self._note_pose_correction(pose, now, record)
+            if self.hooks.control_state is None:
+                self.control_state.observe_pose(pose, now, self.heading.offset)
         observed_pose = pose
         pose = self._vertical_guarded_pose(pose, now, record)
         command = self.ctrl.step(pose, now)
         record["yaw_error_deg"] = self._debug_yaw_error_deg(command, heading, pose)
         self._record_route_command(record, command, heading, pose=pose)
-        self._record_route_projection(pose, record)
+        record["controller_pose_u"] = [float(pose.x), float(pose.y), float(pose.z)]
+        self._record_route_projection(observed_pose, record)
         ground_speed_sample = self._ground_speed_sample(command)
         settled_command = self._apply_landing_settling(command, observed_pose, ground_speed_sample, now, record)
         control_command, control_pose = self._predict_control_pose(settled_command, pose, now, record)
         pcmd = self._compute_route_pcmd(control_command, control_pose, now, record)
+        record["pcmd_controller_raw"] = [int(value) for value in pcmd]
         pcmd = self._cap_after_pose_correction(pcmd, now, record)
         if self.vertical_guard is not None and self.vertical_guard.unreliable:
             pcmd = (pcmd[0], pcmd[1], pcmd[2], 0)  # hold altitude; see _vertical_guarded_pose

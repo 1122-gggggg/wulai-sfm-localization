@@ -1,8 +1,8 @@
 """Operator-window shutdown coordination.
 
-The live backend keeps its connection open when touchdown cannot be confirmed.
-This small coordinator makes that contract explicit at the UI boundary: only a
-successful cleanup may close the session log and destroy the window.
+The live backend keeps its connection open when reachable but touchdown cannot
+be confirmed. Cleanup may also succeed after aircraft link loss without claiming
+touchdown. Only successful cleanup closes the session log and destroys the window.
 """
 from __future__ import annotations
 
@@ -28,6 +28,7 @@ class OperatorShutdownCoordinator:
         command_coordinator: Any | None = None,
         autonomy: Any | None = None,
         get_autonomy: Callable[[], Any | None] | None = None,
+        close_resources: Callable[[], None] | None = None,
     ) -> None:
         self.backend = backend
         self.session_logs = session_logs
@@ -36,6 +37,7 @@ class OperatorShutdownCoordinator:
         self.command_coordinator = command_coordinator
         self.autonomy = autonomy
         self.get_autonomy = get_autonomy
+        self.close_resources = close_resources
         self._closed = False
         self._autonomy_cancel_latched = False
         self._shutdown_lock = threading.Lock()
@@ -198,9 +200,34 @@ class OperatorShutdownCoordinator:
             "連線與介面保留，確認落地後重試。"
         )
 
+    def _close_resources(self) -> bool:
+        if self.close_resources is None:
+            return True
+        try:
+            self.close_resources()
+        except Exception as exc:
+            self._log(f"關窗已暫停：背景資源關閉失敗（{exc!r}）；請重試。")
+            return False
+        return True
+
     def _close_session_logs(self, *, reason: str) -> bool:
         if self.session_logs is None:
             return True
+        try:
+            autonomy = self._current_autonomy()
+            if autonomy is not None and bool(getattr(autonomy, "active", False)):
+                incident = getattr(self.session_logs, "incident", None)
+                if callable(incident):
+                    incident(
+                        "auto_worker_unresolved_at_close",
+                        auto_run_id=getattr(autonomy, "run_id", None),
+                        phase=getattr(autonomy, "phase", None),
+                        terminal_summary_may_be_missing=True,
+                        resolved=False,
+                    )
+        except Exception as exc:
+            # Diagnostics must not change the independent landing/close policy.
+            self._log(f"AUTO 關閉紀錄未完成（{exc!r}）；仍繼續關閉工作階段記錄。")
         try:
             self.session_logs.close(reason=reason)
         except Exception as exc:
@@ -237,6 +264,8 @@ class OperatorShutdownCoordinator:
 
         is_live = bool(getattr(self.backend, "is_live", False))
         if not self._run_cleanup(is_live=is_live):
+            return False
+        if not self._close_resources():
             return False
 
         if not self._close_session_logs(reason=reason):

@@ -454,9 +454,9 @@ def test_not_localization_ready_selection_is_explicitly_blocked(tmp_path: Path) 
 def test_bundled_anafi_selection_flies_only_on_an_operator_accepted_receipt() -> None:
     """The shipped default carries an acceptance, not independent validation.
 
-    Unexpired operator acceptance opens the existing AUTO button under stick
-    takeover. The receipt must still say validation is NONE, and this test
-    starts failing again when the acceptance lapses.
+    Operator acceptance opens the existing AUTO button under stick takeover.
+    The operator renewed it with no expiry on 2026-10-09; the receipt must
+    still say validation is NONE.
     """
     selection = CONTROL / "mission_selections" / "river_gluemap_all8_direct_localization.json"
 
@@ -470,7 +470,7 @@ def test_bundled_anafi_selection_flies_only_on_an_operator_accepted_receipt() ->
     assert details["validation"] == "NONE"
     assert details["absolute_ground_truth"] == "NONE"
     assert mission.calibrations[0].passed is True
-    assert mission.calibrations[0].expires_at is not None
+    assert mission.calibrations[0].expires_at is None
     bundle_sha = mission.localizer.artifacts["bundle"].sha256
     profile_sha = mission.localizer.artifacts["profile"].sha256
     assert details["bundle_sha256"] == bundle_sha

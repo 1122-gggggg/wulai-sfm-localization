@@ -8,8 +8,10 @@ import time
 from typing import Any
 
 import numpy as np
+from numpy.typing import NDArray
 
 from real_path_follow_controller import MapFrame, MissionRouteSnapshot, Pose, production_auto_control_config
+from backend_contract import ControlAction, ControlRequest, ControlResult
 
 
 def _map_heading_to_ned_yaw(map_heading: float) -> float:
@@ -28,6 +30,8 @@ def _map_heading_to_ned_yaw(map_heading: float) -> float:
 class SimulatedRoutePlant:
     """Translate production PCMD decisions into a fast, hardware-free pose."""
 
+    is_live = False
+
     def __init__(self, backend: Any) -> None:
         self.backend = backend
         self.state = backend.state
@@ -37,7 +41,19 @@ class SimulatedRoutePlant:
         self._lock = threading.Lock()
         self._map_frame: MapFrame | None = None
         self._speed_limit_enabled: bool | None = None
+        self._translation_velocity: NDArray[np.float64] = np.zeros(3, dtype=float)
         self.finished = False
+
+    def command(self, request: ControlRequest) -> ControlResult:
+        """Camera-only delegation; route simulation never introduces live control."""
+        if (
+            not self.active or self.pilot_sticks
+            or getattr(self.backend, "is_live", False)
+            or request.action is not ControlAction.GIMBAL_PITCH
+        ):
+            return ControlResult.rejected("SIMULATED_CAMERA_UNAUTHORIZED", self.state)
+        result: ControlResult = self.backend.command(request)
+        return result
 
     @property
     def active(self) -> bool:
@@ -58,6 +74,7 @@ class SimulatedRoutePlant:
         self._vertical_pcmd_gain = 0.06 * config.max_translation_pcmd / config.max_vertical_pcmd
         with self._lock:
             self.backend.sim_xyz = points[0].copy()
+            self._translation_velocity[:] = 0.0
             self.backend.sim_yaw = heading
             self.state.att_yaw = _map_heading_to_ned_yaw(heading)
             self.state.attitude_mono_ns = time.monotonic_ns()
@@ -91,6 +108,7 @@ class SimulatedRoutePlant:
         gaz: int,
         *,
         reason: str,
+        auto_run_id: str | None = None,
     ) -> bool:
         values = np.asarray((roll, pitch, yaw, gaz), dtype=float)
         if not np.isfinite(values).all():
@@ -118,11 +136,21 @@ class SimulatedRoutePlant:
                 math.sin(self.backend.sim_yaw) * map_frame.east
                 - math.cos(self.backend.sim_yaw) * map_frame.north
             )
-            displacement = (
-                0.06 * pitch_value * translation_dt * forward
-                + 0.06 * roll_value * translation_dt * right
-                + self._vertical_pcmd_gain * gaz_value * translation_dt * map_frame.up
+            demanded_velocity = (
+                0.06 * pitch_value * forward
+                + 0.06 * roll_value * right
+                + self._vertical_pcmd_gain * gaz_value * map_frame.up
             )
+            # PCMD demands motion; it cannot instantaneously replace the
+            # velocity just reported to the production feedback controller.
+            # The old memoryless plant made even baseline D unstable:
+            # 30 PCMD/(m/s) * 0.06 velocity/PCMD gives a -1.8 sampled pole.
+            # A finite 0.2 s response keeps this fast geometric demo causal
+            # without changing its steady gain, clocks or arrival gates.
+            response = -math.expm1(-control_dt / 0.2)
+            self._translation_velocity += response * (
+                demanded_velocity - self._translation_velocity)
+            displacement = self._translation_velocity * translation_dt
             self.backend.sim_xyz += displacement
             self.state.pose[:] = [*self.backend.sim_xyz, self.backend.sim_yaw]
             self.state.att_yaw = _map_heading_to_ned_yaw(self.backend.sim_yaw)
@@ -138,6 +166,8 @@ class SimulatedRoutePlant:
             self.state.telemetry_read_mono_ns = stamp
             self.state.attitude_mono_ns = stamp
             self.state.last_pcmd_call_mono_ns = stamp
+            self.state.gimbal_mono_ns = stamp
+            self.state.gimbal_stamp_source = "simulated"
             self.state.last_command = reason
         return True
 
@@ -149,6 +179,7 @@ class SimulatedRoutePlant:
         gaz: float,
         *,
         authority_pct: int | None = None,
+        auto_run_id: str | None = None,
     ) -> bool:
         # Same contract as the live backend: unit axes scale by the caller's
         # authority, defaulting to the manual nudge size.  AUTO normalizes
@@ -161,7 +192,9 @@ class SimulatedRoutePlant:
         if not np.isfinite(axes).all():
             return False
         pcmd = np.rint(np.clip(axes, -1.0, 1.0) * scale).astype(int)
-        return self.send_pcmd(*pcmd, reason="simulated_route_controller")
+        return self.send_pcmd(
+            *pcmd, reason="simulated_route_controller", auto_run_id=auto_run_id,
+        )
 
     def clear_nudge_vector(self) -> None:
         self.send_pcmd(0, 0, 0, 0, reason="simulated_route_hover")

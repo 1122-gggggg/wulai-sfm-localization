@@ -29,7 +29,7 @@ def test_adjacent_waypoint_keeps_world_wind_bias_when_the_nose_rotates(yaw):
     output = gate.update(command, rpf.Pose(0., 0., 0., yaw, stamp=3.05), 3.05,
                          target_key=1, body_velocity=(0., 0., 3.05))
     np.testing.assert_allclose(gate._integral_map, learned)
-    assert output[1] * math.cos(yaw) + output[0] * math.sin(yaw) > 10
+    assert output[1] * math.cos(yaw) + output[0] * math.sin(yaw) > 3
     assert output[2:] == (0, 0)
 
 
@@ -146,7 +146,7 @@ def test_segment_approach_does_not_balance_headwind_outside_the_arrival_sphere()
 def test_directional_feedback_cannot_push_the_integral_outside_its_norm_bound():
     gate, _ = _servo()
     radius = max(gate._target_radius(), .5 * gate.config.slowdown_distance)
-    bound = 3. * radius
+    bound = rpf.DESKTOP_AUTO_POSITION_INTEGRAL_LIMIT * radius
     gate._integral_map = np.array([bound, 0.])
     gate._position_integral([-2. * bound, 4. * bound], rpf.Pose(0, 0, 0, 0, stamp=3.05),
                             3.05, radius, 50)

@@ -79,6 +79,19 @@ SFM_HOLD_ON_LOW_CONF="${SFM_HOLD_ON_LOW_CONF:-1}"
 POSE_STABILIZE="${POSE_STABILIZE:-1}"
 ADAPTIVE_LOC_SUBMIT="${ADAPTIVE_LOC_SUBMIT:-1}"
 DRY_RUN="${SFM_LAUNCH_DRY_RUN:-0}"
+LIVE_DETECT="${SFM_LIVE_DETECT:-0}"
+DETECTOR_MODEL="${SFM_DETECTOR_MODEL:-/home/allen/下載/power_equipment_sample50_3class_yolo26n_640_aug_best.pt}"
+YOLO_SEG="${SFM_YOLO_SEG:-0}"
+YOLO_SEG_MODEL="${SFM_YOLO_SEG_MODEL:-$ROOT/執行環境/models/yolo26n-seg.pt}"
+YOLO_SEG_PY="${SFM_DETECTOR_PYTHON:-$ROOT/.venv-yolo/bin/python}"
+if [[ "$LIVE_DETECT" != "0" && "$LIVE_DETECT" != "1" ]]; then
+  echo "[影片模擬串流] SFM_LIVE_DETECT 必須是 0 或 1" >&2
+  exit 2
+fi
+if [[ "$YOLO_SEG" != "0" && "$YOLO_SEG" != "1" ]]; then
+  echo "[影片模擬串流] SFM_YOLO_SEG 必須是 0 或 1" >&2
+  exit 2
+fi
 if [[ "$DRY_RUN" != "0" && "$DRY_RUN" != "1" ]]; then
   echo "[影片模擬串流] SFM_LAUNCH_DRY_RUN 必須是 0 或 1" >&2
   exit 2
@@ -152,6 +165,11 @@ P1190119.MP4；否則只有一部影片時自動使用它。多部影片時請�
   ANAFI_LINK_LOSS_PCT    slice 丟包率 %（模擬 Wi-Fi 遺失 + error concealment）
   SFM_HOLD_ON_LOW_CONF   連續低信心時凍幀並升級 MegaLoc（預設 1）
   SFM_LOW_CONF_HOLD_RESULTS  升級門檻（預設連續 2 筆）
+  SFM_LIVE_DETECT=1      同時跑現有定位與三類電力設備偵測（預設關閉）
+  SFM_DETECTOR_MODEL     偵測權重（預設 /home/allen/下載/power_equipment_sample50_3class_yolo26n_640_aug_best.pt）
+  SFM_YOLO_SEG=1         同時跑現有定位與 YOLO26 預訓練分割，影片窗格顯示 mask
+  SFM_YOLO_SEG_MODEL     分割 .pt 權重（預設 執行環境/models/yolo26n-seg.pt）
+  SFM_DETECTOR_PYTHON    偵測／分割獨立 Python（預設 .venv-yolo/bin/python）
 
 可用測試片（\$VIDEO_DIR）:
 EOF
@@ -247,6 +265,23 @@ if [[ ! -f "$SITE_PROFILE" ]]; then
   exit 1
 fi
 
+if [[ "$YOLO_SEG" == "1" ]]; then
+  if [[ ! -x "$YOLO_SEG_PY" || ! -f "$YOLO_SEG_MODEL" || "$YOLO_SEG_MODEL" != *.pt ]]; then
+    echo "[影片模擬串流] 分割需要可執行的 Python 與既有預訓練 .pt 權重" >&2
+    echo "  python=$YOLO_SEG_PY model=$YOLO_SEG_MODEL" >&2
+    exit 1
+  fi
+  if [[ "$DRY_RUN" == "0" ]]; then
+    "$YOLO_SEG_PY" -c 'import torch, ultralytics; assert torch.cuda.is_available(), "YOLO segmentation requires CUDA"'
+  fi
+elif [[ "$LIVE_DETECT" == "1" ]]; then
+  if [[ ! -x "$YOLO_SEG_PY" || ! -f "$DETECTOR_MODEL" ]]; then
+    echo "[影片模擬串流] 偵測需要可執行的 Python 與既有權重" >&2
+    echo "  python=$YOLO_SEG_PY model=$DETECTOR_MODEL" >&2
+    exit 1
+  fi
+fi
+
 if [[ "$DRY_RUN" == "0" ]]; then
   "$PY" "$ROOT/tools/simulator_preflight.py" \
     --workspace-root "$ROOT" \
@@ -264,10 +299,31 @@ ARGS=(
   --video-stride "$VIDEO_STRIDE"
   --stream-fps "$STREAM_FPS"
   --live-localize
-  --no-live-detect
   --local-topk "$LOCAL_TOPK"
   --auto-inspect
 )
+
+if [[ "$YOLO_SEG" == "1" ]]; then
+  ARGS+=(
+    --live-detect
+    --detector-task segment
+    --detector-half
+    --detector-python "$YOLO_SEG_PY"
+    --detector-model "$YOLO_SEG_MODEL"
+    --detect-every-n-frames 1
+  )
+  echo "[影片模擬串流] 並行定位＋YOLO26 分割：model=$YOLO_SEG_MODEL python=$YOLO_SEG_PY"
+elif [[ "$LIVE_DETECT" == "1" ]]; then
+  ARGS+=(
+    --live-detect
+    --detector-task detect
+    --detector-python "$YOLO_SEG_PY"
+    --detector-model "$DETECTOR_MODEL"
+  )
+  echo "[影片模擬串流] 並行定位＋三類電力設備偵測：model=$DETECTOR_MODEL python=$YOLO_SEG_PY"
+else
+  ARGS+=(--no-live-detect)
+fi
 
 if [[ "$POSE_STABILIZE" == "1" ]]; then
   ARGS+=(--pose-stabilize)

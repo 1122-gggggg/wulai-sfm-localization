@@ -1,6 +1,6 @@
 # direct 後端總帳
 
-最後更新：2026-09-17。硬體基準：NVIDIA GeForce RTX 5060 Laptop GPU，repo venv
+最後更新：2026-10-06。硬體基準：NVIDIA GeForce RTX 5060 Laptop GPU，repo venv
 （torch 2.11.0+cu128、opencv 4.13.0、pycolmap 4.0.4）。
 
 ## 這份文件為什麼存在
@@ -17,6 +17,40 @@ bundle）那條路徑。那條路徑已經整條從 worktree 移除，`localizer
 **在 5060 上實測、且已落地**的項目。
 
 准入規則沿用舊總帳：任何項目在通過對應驗證之前，不得寫進本檔、不得改凍結 profile。
+
+## 2026-10-06：定位暖機載入優化
+
+福和橋同一 SHA-bound profile／bundle，baseline 與優化版各兩個 fresh process，
+交錯執行正式 factory → tracker → provider `ensure_models()`：
+
+| 項目 | 原始 | 優化後 |
+|---|---:|---:|
+| ensure_models 平均 | 14.999 s | 5.836 s |
+| 幾何與 descriptor bank | 13.737～14.097 s | 4.910～4.946 s |
+| BoQ 權重載入 | 238～242 ms | 119～121 ms |
+| GPU kernel warmup | 412～425 ms | 412～416 ms |
+
+總等待減少 **61.1%**，約 **2.57 倍**。最大收益是重用既有 COLMAP binary
+向量化 observation reader，避免為 8,323,116 筆觀測建立／遍歷 Python Point2D
+wrapper。仍由 pycolmap 取得 rig-aware pose，保留 point ID 排序、occupancy、
+median-depth 算術與無觀測參考圖准入；text-only COLMAP 保留原解析路徑。
+BoQ 以 meta 建模再 strict assign 已驗證權重，略過被完整覆寫的隨機初始化；
+EDM 保留 CPU constructor 產生的非 persistent RoPE buffer，strict load 後只傳
+一次 GPU，不對整個 EDM 套用 meta。
+
+611 張參考影像、1,196,899 個地圖點的 **1,836 個完整幾何陣列逐元素相同**；
+兩個實際 reference query 的 descriptor、raw EDM matches、pose／anchor 共
+22 個陣列也逐元素相同，reference index、metadata 與 warmup 後空 cache 狀態相同。
+河濱既有 archive 路徑另驗兩個 query、22 陣列相同；該場域 loader-only 單次量測
+1.546 → 1.368 s，不能把福和橋的倍數推廣到已附幾何 archive 的場域。
+
+證據：[final_warmup_summary.json](../outputs/analysis/localization_warmup_20261006/final_warmup_summary.json)、
+[geometry_parity_summary.json](../outputs/analysis/localization_warmup_20261006/geometry_parity_summary.json)。
+量測前 checkpoint／bank／COLMAP 檔案 page cache 已 100% resident，constructor
+仍做原有 SHA 驗證，約 0.302～0.307 s；不宣稱冷開機磁碟時間。既有使用者 UI
+GPU worker 未停止，背景資源波動限制小幅 stage 差異解讀。
+此表只證明暖機，不代表定位＋YOLO 同幀 FPS 或實飛精度提升。
+
 
 ## 測試影片身分（先看這個，再看任何數字）
 

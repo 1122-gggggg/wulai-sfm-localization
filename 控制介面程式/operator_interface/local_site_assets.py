@@ -34,6 +34,7 @@ from site_profile import (
     SiteProfile,
     load_site_profile,
 )
+from workspace_layout import workspace_from_file
 
 
 _REQUIRED_ASSETS = (
@@ -1247,10 +1248,248 @@ def _finite_vec3(raw: object, label: str) -> tuple[float, float, float]:
     return tuple(float(value) for value in raw)
 
 
+_NESTED_MANIFEST_REFERENCES = (
+    ("pose_chain", ("site_alignment", "camera_body_extrinsic")),
+    ("hardware_approval", ("receipt", "signature", "trust_store")),
+)
+
+
+def _route_deletion_candidates(profile_path: Path, requested_profile: Path) -> set[Path]:
+    workspace = workspace_from_file(profile_path).root
+    control = workspace / "控制介面程式"
+    candidates = set(profile_path.parent.rglob("*.json"))
+    candidates.update((control / "site_profiles").glob("*.json"))
+    candidates.update((control / "mission_components" / "routes").glob("*.json"))
+    candidates.update((control / "mission_selections").glob("*.json"))
+    candidates.update({profile_path, requested_profile})
+    return candidates
+
+
+def _load_scanned_manifest(
+    candidate: Path, profile_path: Path, requested_profile: Path
+) -> dict | None:
+    try:
+        return _json(candidate)
+    except ValueError:
+        if candidate in {profile_path, requested_profile}:
+            raise
+        # Other site assets may be arrays, or incomplete editor output.
+        # They are not manifests owned by this transaction.
+        return None
+
+
+def _manifest_asset_references(candidate: Path, raw: dict, assets: dict) -> dict[str, Path | None]:
+    references = {key: _referenced_path(candidate, value) for key, value in assets.items()}
+    for key in ("localizer_profile", "map_reference_poses", "map_align"):
+        references[key] = _referenced_path(candidate, raw.get(key))
+    for section, keys in _NESTED_MANIFEST_REFERENCES:
+        nested = raw.get(section)
+        if isinstance(nested, dict):
+            for key in keys:
+                references[f"{section}.{key}"] = _referenced_path(candidate, nested.get(key))
+    return references
+
+
+def _detach_route_from_manifest(raw: dict, assets: dict) -> None:
+    assets["route_json"] = None
+    digests = raw.get("asset_sha256")
+    if isinstance(digests, dict):
+        digests.pop("route_json", None)
+    flight = raw.get("flight")
+    if flight is None:
+        flight = raw["flight"] = {}
+    flight["approved"] = False
+    flight["route_clearance_approved"] = False
+    flight["approval_note"] = "Selected route deleted; flight re-approval required."
+
+
+def _detached_manifest_bytes(candidate: Path, raw: dict, assets: dict, target: Path) -> bytes | None:
+    # A map/target/runtime asset must never become deletable merely
+    # because it also happens to contain a waypoints array.
+    references = _manifest_asset_references(candidate, raw, assets)
+    if any(path == target and key != "route_json" for key, path in references.items()):
+        raise ValueError("selected route is also a non-route site asset")
+    if references.get("route_json") != target:
+        return None
+    _detach_route_from_manifest(raw, assets)
+    return _json_bytes(raw)
+
+
+def _package_references_route(candidate: Path, raw: dict, target: Path) -> bool:
+    route_ref = raw.get("route")
+    return (
+        isinstance(route_ref, dict)
+        and _referenced_path(candidate, route_ref.get("path")) == target
+    )
+
+
+def _selection_detach_updates(selections: dict[Path, dict], removals: set[Path]) -> dict[Path, bytes]:
+    updates: dict[Path, bytes] = {}
+    removed_components = {path.resolve() for path in removals}
+    for selection_path, raw in selections.items():
+        route_ref = raw.get("route")
+        if (
+            isinstance(route_ref, dict)
+            and _referenced_path(selection_path, route_ref.get("path")) in removed_components
+        ):
+            raw["route"] = None
+            raw["approval"] = None
+            updates[selection_path] = _json_bytes(raw)
+    return updates
+
+
+def _unlink_linked_manifests(removals: set[Path], replaced: list[Path]) -> None:
+    for linked_path in sorted(removals):
+        linked_path.unlink()
+        replaced.append(linked_path)
+
+
+def _cleanup_route_deletion(
+    temps: dict[Path, Path],
+    backup_asset: Path | None,
+    backups: dict[Path, Path],
+    rollback_error: BaseException | None,
+) -> None:
+    for temp in temps.values():
+        _remove_file(temp)
+    if rollback_error is None:
+        _remove_file(backup_asset)
+        for backup in backups.values():
+            _remove_file(backup)
+
+
 class LocalRouteProvider(_LocalSupplementProvider):
     profile_key = "route_json"
     digest_key = "route_json"
     relative_path = Path("routes/flight_route.json")
+
+    def _deletion_manifest_changes(
+        self, target: Path, profile_path: Path, requested_profile: Path
+    ) -> tuple[dict[Path, bytes], set[Path]]:
+        """Detach optional references; remove only directly linked mandatory packages."""
+        candidates = _route_deletion_candidates(profile_path, requested_profile)
+        updates: dict[Path, bytes] = {}
+        removals: set[Path] = set()
+        selections: dict[Path, dict] = {}
+        for candidate in sorted(candidates):
+            if candidate == target:
+                continue
+            raw = _load_scanned_manifest(candidate, profile_path, requested_profile)
+            if raw is None:
+                continue
+            assets = raw.get("assets")
+            if isinstance(assets, dict) and "schema_version" in raw:
+                payload = _detached_manifest_bytes(candidate, raw, assets, target)
+                if payload is not None:
+                    updates[candidate] = payload
+            elif raw.get("schema") == "sfm-route-package/v1":
+                if _package_references_route(candidate, raw, target):
+                    # route-package/v1 requires a real route ArtifactRef. It
+                    # cannot represent an empty route; do not leave an invalid
+                    # package or retarget it to an unchosen replacement.
+                    removals.add(candidate)
+            elif raw.get("schema") == "sfm-mission-selection/v1":
+                selections[candidate] = raw
+        updates.update(_selection_detach_updates(selections, removals))
+        return updates, removals
+
+    def _resolve_deletion_target(self, source: str | Path, path: Path) -> Path:
+        candidate = Path(source).expanduser().absolute()
+        target = candidate.resolve()
+        if not _is_inside(target, path.parent):
+            raise ValueError("deleted route must stay inside the active site folder")
+        # Check the lexical path before resolving: resolve() hides symlinks to
+        # both files and directories, including links pointing back into site.
+        for part in (candidate, *candidate.parents):
+            if part.is_symlink():
+                raise ValueError("deleted route must not use symlinks")
+        return target
+
+    def _plan_route_deletion(
+        self, path: Path, target: Path, requested_profile: Path
+    ) -> tuple[dict[Path, bytes], set[Path]]:
+        if target not in {route.path for route in describe_site_routes(path.parent)}:
+            raise ValueError("selected file is not a listed site route")
+        route_raw = _json(target)
+        if "assets" in route_raw or route_raw.get("schema") in {
+            "sfm-route-package/v1", "sfm-mission-selection/v1",
+        }:
+            raise ValueError("selected route is a manifest, not a route asset")
+        return self._deletion_manifest_changes(target, path, requested_profile)
+
+    def _stage_route_deletion_manifests(
+        self,
+        updates: dict[Path, bytes],
+        removals: set[Path],
+        backups: dict[Path, Path],
+        temps: dict[Path, Path],
+    ) -> None:
+        for linked_path in sorted(updates.keys() | removals):
+            if not linked_path.is_file() or any(
+                part.is_symlink()
+                for part in (linked_path, *linked_path.parents)
+            ):
+                raise ValueError(
+                    f"linked mission manifest is not a regular file: {linked_path}"
+                )
+            backup = _new_temp_path(
+                linked_path.parent, f".{linked_path.name}.", ".bak"
+            )
+            backups[linked_path] = backup
+            shutil.copy2(linked_path, backup)
+            if linked_path in updates:
+                temp = _new_temp_path(linked_path.parent, f".{linked_path.name}.")
+                temps[linked_path] = temp
+                temp.write_bytes(updates[linked_path])
+                raw = json.loads(updates[linked_path])
+                if "schema_version" in raw:
+                    load_site_profile(temp)
+
+    def delete_file(
+        self, source: str | Path, profile_path: str | Path
+    ) -> ImportedAsset:
+        """Delete a listed route and detach its references as one locked transaction."""
+        requested_profile = Path(profile_path).expanduser().resolve()
+        path, profile, _raw = self._load_managed_profile(requested_profile)
+        target = self._resolve_deletion_target(source, path)
+
+        backups: dict[Path, Path] = {}
+        temps: dict[Path, Path] = {}
+        replaced: list[Path] = []
+        backup_asset = None
+        target_deleted = False
+        rollback_error = None
+        lock_path = _site_asset_lock_path(self.managed_root, profile.site_id)
+        try:
+            with _site_asset_lock(lock_path):
+                try:
+                    profile = load_site_profile(path)
+                    updates, removals = self._plan_route_deletion(path, target, requested_profile)
+                    self._stage_route_deletion_manifests(updates, removals, backups, temps)
+                    backup_asset = _new_temp_path(
+                        target.parent, f".{target.name}.", ".bak"
+                    )
+                    shutil.copy2(target, backup_asset)
+                    self._replace_linked_manifests(temps, replaced)
+                    _unlink_linked_manifests(removals, replaced)
+                    target.unlink()
+                    target_deleted = True
+                    profile = load_site_profile(path)
+                except Exception:
+                    rollback_error = self._rollback_asset_transaction(
+                        target, backup_asset, target_deleted, backups, replaced
+                    )
+                    if rollback_error is not None:
+                        raise RuntimeError(
+                            f"route deletion rollback failed for {target}; recovery backups retained"
+                        ) from rollback_error
+                    raise
+        finally:
+            _cleanup_route_deletion(temps, backup_asset, backups, rollback_error)
+        return ImportedAsset(
+            path, target,
+            approved_for_auto=bool(profile.flight and profile.flight.approved),
+        )
 
     def _linked_manifest_updates(
         self,

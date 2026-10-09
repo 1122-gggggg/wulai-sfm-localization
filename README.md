@@ -25,7 +25,7 @@ MoGe checkpoint 另有 Git LFS pointer；一般 checkout 不等於完整 runtime
 ├── 文件/             系統規格、架構邊界、工作區稽核
 ├── tools/            驗證實作、測試與唯讀工作區稽核
 ├── 驗證系統.sh       唯一的純地面驗證入口
-├── IMU飛行測試.sh    手動飛行 + 定位，錄 IMU／搖桿／畫面（見 docs/esekf_live_eval_runbook.md）
+├── IMU飛行測試.sh    手動飛行 + 定位，錄 IMU／搖桿／畫面（見 docs/next_flight_ekf_capture_20260922.md）
 └── .venv/            Python 3.10 執行環境
 ```
 
@@ -58,7 +58,7 @@ python tools/workspace_audit.py --strict-output-names
 兩個 runtime 入口互斥。模擬入口拒絕 `--live` / `real-flight`；實機入口拒絕
 `--video`，且 PDRAW 不可用時不會拿錄影檔冒充實機畫面。真機入口只接受
 `sfm-mission-selection/v1`；resolver 驗證所有 component SHA、定位品質、必要校正與
-route 契約後產生唯讀 site-profile snapshot。AUTO 仍須由操作員在當次 UI 完成四步
+route 契約後產生唯讀 site-profile snapshot。AUTO 仍須由操作員在當次 UI 完成三步
 preflight 並親自按下按鈕。
 
 AUTO 巡航水平輸出受短 TTL 與 PCMD 百分比上限（`nudge_pct`／AUTO 自身 cap）
@@ -77,6 +77,11 @@ worker 若 2 秒沒有 heartbeat、發生例外或連續三次發送失敗，會
 檢索 bank 與參考影像，以及同一座標系的顯示點雲與 site profile。交付清單與雜湊規格見
 [`建圖端輸出規格`](控制介面程式/site_profiles/建圖端輸出規格.md)，後端分工見
 [`direct README`](定位演算法/deploy_code/sfm_direct_deploy/README.md)。
+
+匯入後可用離線 MVS 產生同座標表面，在影片右鍵的「MVS 絕對深度」查詢配對影格的
+公尺 Z 深度或預覽深度圖。尺度未可信、未建圖或無命中的區域不會捏造公尺值；
+這不是即時深度感測或避障。環境與操作見
+[`MVS 工具說明`](tools/README.md#離線-mvs-與公尺深度查詢)。
 
 換地圖等於換座標系，航線須重新建立並重新驗證。真機使用 mission selection
 解析後的 snapshot，不能用 PLY 或任意 site profile 繞過 resolver。定位品質收據與
@@ -214,6 +219,22 @@ AUTO readiness 必須由當次 resolver/preflight 確認，不以文件中的靜
 兩個 runtime 目錄沒有同名 Python 實作；需要共用的模組各自只有一個 owner。
 `定位演算法/validation/check_runtime_mirrors.py` 保存權威所有權清單，並在 CI
 拒絕缺少 owner、重新出現重複副本或未分類的同名 runtime 檔案。
+
+### 原始版本與擴圖版本
+
+同一支 UI 可選兩個定位版本，由 site profile 的 `localizer_deploy_dir` 決定 worker 載入哪份：
+
+| 版本 | 演算法 | 場域 profile（河濱） | 測試 |
+|---|---|---|---|
+| 原始版本 | `定位演算法/deploy_code/sfm_direct_deploy/` | `地圖檔/場域/river_site/site_profile.json` | `pytest`（預設） |
+| 擴圖版本（邊定位邊擴圖） | `定位演算法/deploy_code_expand/sfm_direct_deploy/`（含同層 `sfm_glomap_deploy/`） | `地圖檔/場域/river_site/releases/river_gluemap_all8_online_ui_20260929/site_profile.json` | `pytest -c pytest-expand.ini` |
+
+兩版共用 `deploy_code/runtime/EDM` 權重、`.venv` 與控制介面。切換方式見
+`開啟介面的終端機代碼` 第 A 段（改 `LOCALIZER=original|expand`），或用
+`控制介面程式/影片模擬串流/選擇啟動.sh`（`--mode localize|expand`）。擴圖場域包
+`flight.approved=false`，AUTO 鎖定；離線驗證不構成實飛許可。
+擴圖演算法與驗證數據見 [`docs/edm_overlay_eval_20260924.md`](docs/edm_overlay_eval_20260924.md)、
+[`定位演算法/deploy_code_expand/sfm_direct_deploy/README.md`](定位演算法/deploy_code_expand/sfm_direct_deploy/README.md)。
 
 ## 驗證
 

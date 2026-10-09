@@ -24,8 +24,8 @@ Rule: only quantities that exist in code or sampled logs. No assumed sensors.
 > river site, and still **no approved camera-body extrinsic** -- so this remains
 > Level D (orientation prior) plus the existing visual-velocity position, and
 > `esekf.prediction_allowed()` is what decides whether any of it is used.
-> To see whether it ever armed on a real flight: `./IMU飛行測試.sh` then
-> `tools/imu_flight_test_report.py` (`docs/esekf_live_eval_runbook.md`).
+> The old ESEKF live-replay procedure was retired with that backend. Current
+> capture and report instructions: [EKF data collection](next_flight_ekf_capture_20260922.md).
 > **2026-09-12 update — direct backend now consumes fused yaw (Level D).**
 > The worker forwards each frame's SFM3/SFM4 sample to
 > `DirectTrackerAdapter.observe_fused_state`, and `TwoRateTracker` bridges

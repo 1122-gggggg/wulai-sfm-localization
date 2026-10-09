@@ -136,6 +136,7 @@ def test_direct_worker_pose_keeps_accepted_camera_basis_while_a_jump_is_pending(
     first = adapter.localize_frame(frame, capture_stamp=10.0)
     assert (first.x, first.yaw) == (0.0, np.pi / 2)
     assert adapter.last_info["camera_axes_world"] == old_rotation.tolist()
+    assert adapter.last_info["camera_attitude_kind"] == "full"
     held = adapter.localize_frame(frame, capture_stamp=10.1)
     held_info = adapter.last_info
     assert held is first
@@ -151,3 +152,59 @@ def test_direct_worker_pose_keeps_accepted_camera_basis_while_a_jump_is_pending(
     assert adapter.last_info["mode"] == "TRACK"
     assert adapter.last_info["weak"] is False
     assert adapter.last_info["pose_source_confirming"] is False
+
+
+def test_direct_imu_adapter_labels_rotated_basis_as_heading_only_and_stays_weak():
+    adapter = object.__new__(DirectTrackerAdapter)
+    adapter.profile = SimpleNamespace(
+        fast_loop=SimpleNamespace(resolution=(8, 8)),
+        reloc=SimpleNamespace(top_k=2, frozen_pnp_thresholds={"strong_inliers": 60}),
+        max_jump_u=1.5,
+    )
+    adapter.state = RuntimeState()
+    adapter._pose_continuity = PoseSourceConfirmation()
+    adapter._pose_centers = []
+    adapter._reseed_confirming = False
+    adapter._accepted_camera_axes_world = None
+    adapter._fused_sample = None
+    rotation = np.array([[0.0, 0.0, -1.0], [0.0, -1.0, 0.0], [1.0, 0.0, 0.0]])
+    info = dict(
+        status="IMU_BRIDGE",
+        ok=True,
+        center=np.array([1.0, 2.0, 3.0]),
+        R=rotation,
+        yaw=0.4,
+        inliers=0,
+        map_inliers=0,
+        vo_inliers=0,
+        live_points=0,
+        n_corr=0,
+        loop_ms=1.0,
+        track_ms=0.0,
+        pnp_ms=0.0,
+        vo_ms=0.0,
+        dead_reckon_age=1,
+        reloc_status="IDLE",
+        handover_points=0,
+        handover_dropped=0,
+        reloc_ms=None,
+        reloc_delivered=False,
+        reloc_busy=False,
+        vo_candidates=0,
+        step=None,
+        imu_bridge=True,
+        imu_sample_age_s=0.1,
+        imu_yaw_delta_deg=-10.0,
+    )
+    adapter.trk = SimpleNamespace(
+        map_frame=None,
+        step=lambda _gray, _stamp: info,
+        _speed_history=[],
+    )
+    pose = adapter.localize_frame(np.zeros((8, 8), dtype=np.uint8), capture_stamp=10.1)
+    assert pose is not None
+    assert adapter.last_info["camera_axes_world"] == rotation.tolist()
+    assert adapter.last_info["camera_attitude_kind"] == "heading_only"
+    assert adapter.last_info["weak"] is True
+    assert adapter.last_info["mode"] == "WEAK_TRACK"
+    assert adapter.last_info["pose_status"] == "NONE"

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import threading
+import sys
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -330,3 +331,43 @@ def test_live_ui_sample_reuses_owned_rgb_and_carries_monotonic_nodes(module):
     assert out_timing["frame_store_mono_ns"] >= out_timing["frame_preprocess_done_mono_ns"]
     defensive, _ = grabber()
     assert defensive is not frame
+
+
+@pytest.mark.parametrize("module", MODULES, ids=("canonical",))
+@pytest.mark.parametrize("connect_raises", [False, True])
+@pytest.mark.parametrize("cleanup_raises", [False, True])
+def test_failed_connect_releases_controller_and_preserves_failure(
+    module, monkeypatch, connect_raises, cleanup_raises
+):
+    released = []
+    created = []
+
+    class Controller:
+        def __init__(self, _ip):
+            created.append(self)
+
+        def connect(self, **_kwargs):
+            if connect_raises:
+                raise RuntimeError("connection failed")
+            return False
+
+        def disconnect(self):
+            released.append((self, "disconnect"))
+            if cleanup_raises:
+                raise RuntimeError("disconnect failed")
+
+        def destroy(self):
+            released.append((self, "destroy"))
+            if cleanup_raises:
+                raise RuntimeError("destroy failed")
+
+    monkeypatch.setitem(sys.modules, "olympe", SimpleNamespace(SkyController3=Controller))
+    for _ in range(2):
+        error_type = RuntimeError if connect_raises else SystemExit
+        with pytest.raises(error_type, match="connection failed" if connect_raises else "could not connect"):
+            module.connect("192.168.53.1", "skycontroller3")
+    assert created[0] is not created[1]
+    assert released == [
+        (created[0], "disconnect"), (created[0], "destroy"),
+        (created[1], "disconnect"), (created[1], "destroy"),
+    ]

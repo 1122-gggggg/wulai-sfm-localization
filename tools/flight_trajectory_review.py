@@ -30,14 +30,20 @@ def moment(row):
 
 
 def segment_error(point, start, end):
-    delta = [b - a for a, b in zip(start, end)]
+    delta = [b - a for a, b in zip(start, end, strict=False)]
     length2 = sum(v * v for v in delta)
     fraction = (
-        max(0.0, min(1.0, sum((p - a) * d for p, a, d in zip(point, start, delta)) / length2))
+        max(
+            0.0,
+            min(
+                1.0,
+                sum((p - a) * d for p, a, d in zip(point, start, delta, strict=False)) / length2,
+            ),
+        )
         if length2
         else 0.0
     )
-    offset = [p - (a + fraction * d) for p, a, d in zip(point, start, delta)]
+    offset = [p - (a + fraction * d) for p, a, d in zip(point, start, delta, strict=False)]
     return math.sqrt(sum(v * v for v in offset))
 
 
@@ -112,8 +118,12 @@ def build_replay(session: Path):
         frame = plan.get("control_config", {}).get("map_frame", {})
         basis = [xyz(frame.get(k)) for k in ("east", "north", "up")]
 
-        def project(p):
-            return [sum(a * b for a, b in zip(p, axis)) for axis in basis] if all(basis) else p
+        def project(p, basis=basis):
+            return (
+                [sum(a * b for a, b in zip(p, axis, strict=False)) for axis in basis]
+                if all(basis)
+                else p
+            )
 
         samples = []
         # Route-loop samples retain the exact target and pose used by control.

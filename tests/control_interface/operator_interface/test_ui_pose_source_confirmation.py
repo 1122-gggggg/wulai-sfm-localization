@@ -9,16 +9,26 @@ from live_localizer_worker import _build_success_payload
 from operator_rendering import classify_localization_health
 
 
-def _worker_result(*, confirming: bool, weak: bool, hold: bool = False):
+def _worker_result(
+    *, confirming: bool, weak: bool, hold: bool = False,
+    camera_axes=None, direct_status="FAST_TRACK", camera_attitude_kind=None,
+    prediction=None,
+):
     pose = SimpleNamespace(x=1., y=2., z=3., yaw=0.4, stamp=10.)
     tracker = SimpleNamespace(last_info={
         "mode": "WEAK_TRACK" if weak else "TRACK",
         "next_mode": "WEAK_TRACK" if weak else "TRACK",
         "weak": weak, "inliers": 80, "inlier_ratio": 1.,
-        "direct_status": "FAST_TRACK",
+        "direct_status": direct_status,
+        "camera_axes_world": camera_axes,
+        "camera_forward_world": camera_axes[2] if camera_axes is not None else None,
+        "camera_attitude_kind": camera_attitude_kind,
         "pose_source_confirming": confirming,
         "confidence_hold_active": hold,
     })
+    if prediction is not None:
+        pose = None
+        tracker.last_info.update(prediction)
     return _build_success_payload(
         args=SimpleNamespace(force_track_bench=False),
         seq=1, pose=pose, tracker=tracker, capture_stamp=10.1,
@@ -69,3 +79,51 @@ def test_worker_confirmation_reaches_autonomy_without_becoming_a_new_observation
     observed_pose = operator_tick._make_autonomy_pose(weak_observed, xyz, 0.4, 10.)
     assert observed_pose.position_observed
     assert not observed_pose.map_confirmed
+
+
+def test_worker_estimated_camera_metadata_survives_typed_contract_and_adapter():
+    from localization_contract import LocalizationResult
+    from localization_result_ui import estimated_camera_display_pose
+    from operator_rendering import weak_pose_source_kind
+
+    axes = [[0., 0., -1.], [0., -1., 0.], [1., 0., 0.]]
+    for status, kind, attitude_kind, display_attitude in (
+        ("VO_ONLY", "KLT", "full", "full"),
+        ("IMU_BRIDGE", "IMU", "heading_only", "heading"),
+    ):
+        payload = _worker_result(
+            confirming=False, weak=True, hold=True, camera_axes=axes,
+            direct_status=status, camera_attitude_kind=attitude_kind,
+        )
+        typed = LocalizationResult.from_payload(payload, now_mono_ns=11_000_000_000)
+        assert typed["camera_attitude_kind"] == attitude_kind
+        assert typed["camera_axes_world"] == axes
+        assert weak_pose_source_kind(typed) == kind
+        display = estimated_camera_display_pose(typed, now=10.2)
+        assert display is not None
+        assert display.attitude == display_attitude
+        assert not display.stale
+        # The worker contract encodes weakness in mode/next_mode rather than
+        # publishing the adapter's optional "weak" boolean.
+        assert typed["mode"] == typed["next_mode"] == "WEAK_TRACK"
+        assert classify_localization_health(typed) == "DEGRADED"
+        control_pose = operator_tick._make_autonomy_pose(typed, np.array([1., 2., 3.]), 0.4, 10.)
+        assert not control_pose.map_confirmed
+
+
+def test_prediction_placeholder_yaw_never_becomes_camera_orientation():
+    from localization_result_ui import estimated_camera_display_pose
+
+    for yaw, expected in ((None, "none"), (float("nan"), "none"), (0.7, "heading")):
+        payload = _worker_result(
+            confirming=False, weak=True, prediction={
+                "prediction_valid": True, "pose_status": "PREDICTED_ONLY",
+                "predicted_center": [1., 2., 3.], "predicted_yaw": yaw,
+            },
+        )
+        snapshot = estimated_camera_display_pose(payload, now=10.2)
+        assert snapshot is not None
+        assert snapshot.attitude == expected
+        assert snapshot.camera_axes is snapshot.camera_forward is None
+        if expected == "none":
+            assert np.isnan(snapshot.pose[3])

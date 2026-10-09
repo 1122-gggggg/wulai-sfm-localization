@@ -1,0 +1,2 @@
+# CPU raycasting only; existing localization pycolmap remains unchanged.
+open3d==0.19.0

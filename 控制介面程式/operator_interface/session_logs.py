@@ -19,11 +19,14 @@ import sys
 import time
 import threading
 import uuid
+from collections.abc import Mapping
 from datetime import datetime, timezone
+from numbers import Integral, Real
 from pathlib import Path
 from typing import Any
 
 from backend_contract import InterfaceMode
+from localization_metrics import DIRECT_INFO_FIELDS
 
 
 _BULK_LOG_SYNC_EVERY = 16
@@ -142,7 +145,7 @@ def _record(event: str, fields: dict[str, Any]) -> dict[str, Any]:
 def _finite_json(value):
     if isinstance(value, float) and not math.isfinite(value):
         return None
-    if isinstance(value, dict):
+    if isinstance(value, Mapping):
         return {key: _finite_json(item) for key, item in value.items()}
     if isinstance(value, (list, tuple)):
         return [_finite_json(item) for item in value]
@@ -150,6 +153,11 @@ def _finite_json(value):
         return value
     if isinstance(value, float):
         return value
+    if isinstance(value, Integral):
+        return int(value)
+    if isinstance(value, Real):
+        number = float(value)
+        return number if math.isfinite(number) else None
     name = getattr(value, "name", None)
     if isinstance(name, str) and name.strip():
         return name.strip().rsplit(".", 1)[-1]
@@ -230,36 +238,42 @@ class _JsonlSink:
         self.durable = True
 
     def write(self, value: dict[str, Any]) -> bool:
-        if not self.healthy:
-            return False
-        try:
-            with self._lock:
+        with self._lock:
+            if not self.healthy:
+                return False
+            try:
                 self._handle.write(json.dumps(value, ensure_ascii=False, allow_nan=False) + "\n")
                 self._pending_writes += 1
                 if self._pending_writes >= self._sync_every:
                     self._sync()
-            return True
-        except Exception as exc:
-            self.healthy = False
-            self.durable = False
-            self.last_error = repr(exc)
-            print(
-                f"[session-log] write failed path={self.path}: {exc!r}",
-                file=sys.stderr,
-                flush=True,
-            )
-            return False
+                return True
+            except Exception as exc:
+                self.healthy = False
+                self.durable = False
+                self.last_error = repr(exc)
+                print(
+                    f"[session-log] write failed path={self.path}: {exc!r}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                return False
 
     def close(self) -> None:
-        try:
-            with self._lock:
+        with self._lock:
+            try:
                 if self.healthy and self._pending_writes:
                     self._sync()
-                self._handle.close()
-        except Exception as exc:
-            self.healthy = False
-            self.durable = False
-            self.last_error = repr(exc)
+            except Exception as exc:
+                self.healthy = False
+                self.durable = False
+                self.last_error = repr(exc)
+            finally:
+                try:
+                    self._handle.close()
+                except Exception as exc:
+                    self.healthy = False
+                    self.durable = False
+                    self.last_error = repr(exc)
 
 
 class SessionCommandLog:
@@ -294,12 +308,22 @@ class SessionLogs:
         self.directory = directory
         self.mode = mode
         self._closed = False
+        self._closing = False
+        self._lock = threading.RLock()
+        # Never hold this admission lock while performing disk I/O: the SDK
+        # dispatch thread only queues records and updates loss counters.
+        self._deferred_lock = threading.Lock()
+        self._summary_error: str | None = None
+        self._summary_write_failures = 0
         self._inventory_error: str | None = None
         self._counts = {name: 0 for name in self.REQUIRED_STREAMS}
+        self._write_failures = {name: 0 for name in self.REQUIRED_STREAMS}
+        self._failure_reported: set[str] = set()
         self._latency_samples_ms: list[float] = []
         self._unresolved_incidents: set[str] = set()
         self._deferred_telemetry = queue.Queue(maxsize=512)
         self._deferred_dropped = 0
+        self._deferred_reported_dropped = 0
         self._sinks = {
             name: _JsonlSink(
                 directory / f"{name}.jsonl",
@@ -353,11 +377,18 @@ class SessionLogs:
     def durable(self) -> bool:
         return (
             self._inventory_error is None
+            and self._summary_error is None
             and all(sink.durable for sink in self._sinks.values())
         )
 
     def write_inventory(self, kind: str, inventory: dict[str, Any]) -> bool:
         """Write one immutable hardware or video inventory receipt."""
+        with self._lock:
+            if self._closed:
+                return False
+            return self._write_inventory_locked(kind, inventory)
+
+    def _write_inventory_locked(self, kind: str, inventory: dict[str, Any]) -> bool:
         if kind not in {"hardware", "video"}:
             raise ValueError("inventory kind must be 'hardware' or 'video'")
         path = self.directory / f"{kind}_inventory.json"
@@ -385,9 +416,13 @@ class SessionLogs:
         return True
 
     def _write(self, stream: str, event: str, fields: dict[str, Any]) -> bool:
+        with self._lock:
+            return self._write_locked(stream, event, fields)
+
+    def _write_locked(self, stream: str, event: str, fields: dict[str, Any]) -> bool:
         if self._closed:
             return False
-        row = _record(event, fields)
+        row = _record(event, {"session_id": self.directory.name, **fields})
         ok = self._sinks[stream].write(row)
         if ok:
             self._counts[stream] += 1
@@ -407,6 +442,16 @@ class SessionLogs:
                 if math.isfinite(value) and value >= 0.0:
                     self._latency_samples_ms.append(value)
                     break
+        else:
+            self._write_failures[stream] += 1
+            if stream not in self._failure_reported:
+                self._failure_reported.add(stream)
+                self.incident(
+                    "diagnostic_write_failed",
+                    failed_stream=stream,
+                    failed_event=event,
+                    last_error=self._sinks[stream].last_error,
+                )
         if stream == "localization" and event == "pose_result":
             # Compact pose evidence survives diagnostic-log retention. Keep
             # failed fixes too, so reconstruction never silently bridges loss.
@@ -417,6 +462,7 @@ class SessionLogs:
                 "imu_bridge", "map_inliers", "vo_inliers", "inliers",
                 "reproj_rms", "map_constraint_age_s", "reseed_confirming",
                 "camera_axes_world", "camera_forward_world",
+                "camera_attitude_kind",
                 "camera_pitch_error_deg", "camera_roll_error_deg", "pnp_observation_sample",
                 "n_corr", "inlier_ratio", "inlier_grid_cells", "inlier_hull_coverage",
                 "positive_depth_ratio", "reproj_p90", "imu_bridge_reason",
@@ -437,12 +483,19 @@ class SessionLogs:
                 "gimbal_mono_ns", "gimbal_stamp_source", "zoom", "flight_state", "control_owner",
                 "speed_stamp_source", "altitude_stamp_source",
                 "camera_zoom_level", "camera_zoom_mono_ns", "camera_zoom_stamp_source",
-            )
+                "pose_filter", "prediction_valid", "prediction_mode", "prediction_source",
+                "esekf_pos_trace", "esekf_d2", "esekf_update_accepted",
+                "esekf_update_exceptions", "error", "auto_run_id",
+            ) + DIRECT_INFO_FIELDS
             saved = self._write("trajectory", event, {key: row[key] for key in keys if key in row})
             ok = ok and saved
-        elif (stream == "localization" and event in {"auto_route_plan", "auto_route_tick"}
+        elif (stream == "localization" and event in {
+                  "auto_route_plan", "auto_route_tick", "auto_route_error_summary"}
+              or stream == "incidents" and event in {
+                  "diagnostic_write_failed", "diagnostic_records_dropped"}
               or stream == "telemetry" and event in {
-                  "autonomy_event", "fused_odometry", "pcmd_dispatch", "stick_axes"}):
+                  "autonomy_event", "fused_odometry", "pcmd_dispatch", "stick_axes",
+                  "control_motion_history"}):
             saved = self._write("trajectory", event, {key: value for key, value in row.items() if key != "event"})
             ok = ok and saved
         return ok
@@ -458,34 +511,67 @@ class SessionLogs:
 
     def defer_telemetry(self, event: str, **fields: Any) -> bool:
         """Keep SDK dispatch logging off the piloting thread's disk path."""
-        if self._closed:
-            return False
-        try:
-            self._deferred_telemetry.put_nowait((event, fields))
-            return True
-        except queue.Full:
-            self._deferred_dropped += 1
-            return False
+        with self._deferred_lock:
+            if self._closing or self._closed:
+                return False
+            try:
+                # Preserve producer time, not the later UI drain time.
+                self._deferred_telemetry.put_nowait((event, {
+                    "t_utc": _utc_now(),
+                    "t_mono_ns": time.monotonic_ns(),
+                    **fields,
+                }))
+                return True
+            except queue.Full:
+                self._deferred_dropped += 1
+                return False
 
     def flush_deferred(self) -> None:
-        for _ in range(self._deferred_telemetry.maxsize):
-            try:
-                event, fields = self._deferred_telemetry.get_nowait()
-            except queue.Empty:
-                break
-            self.telemetry(event, **fields)
+        with self._lock:
+            if self._closed:
+                return
+            for _ in range(self._deferred_telemetry.maxsize):
+                try:
+                    event, fields = self._deferred_telemetry.get_nowait()
+                except queue.Empty:
+                    break
+                self.telemetry(event, **fields)
+            with self._deferred_lock:
+                dropped = self._deferred_dropped
+            if dropped != self._deferred_reported_dropped:
+                self.incident(
+                    "diagnostic_records_dropped",
+                    stream="telemetry",
+                    queue_capacity=self._deferred_telemetry.maxsize,
+                    dropped_since_marker=dropped - self._deferred_reported_dropped,
+                    dropped_total=dropped,
+                )
+                self._deferred_reported_dropped = dropped
 
     def incident(self, event: str, **fields: Any) -> bool:
-        if fields.get("resolved") is True:
-            self._unresolved_incidents.discard(str(event))
-        else:
-            self._unresolved_incidents.add(str(event))
-        return self._write("incidents", event, fields)
+        with self._lock:
+            if fields.get("resolved") is True:
+                self._unresolved_incidents.discard(str(event))
+            else:
+                self._unresolved_incidents.add(str(event))
+            return self._write("incidents", event, fields)
 
     def close(self, *, reason: str, extra: dict[str, Any] | None = None) -> None:
-        if self._closed:
-            return
-        self.flush_deferred()
+        with self._lock:
+            if self._closed:
+                if self._summary_error is not None:
+                    self._write_summary(reason=reason, extra=extra)
+                return
+            with self._deferred_lock:
+                self._closing = True
+            self.flush_deferred()
+            # Capture final fsync/close failures in the permanent summary.
+            for sink in self._sinks.values():
+                sink.close()
+            self._closed = True
+            self._write_summary(reason=reason, extra=extra)
+
+    def _write_summary(self, *, reason: str, extra: dict[str, Any] | None) -> None:
         samples = sorted(self._latency_samples_ms)
         p95 = None
         maximum = None
@@ -493,6 +579,7 @@ class SessionLogs:
             p95 = samples[min(len(samples) - 1, max(0, math.ceil(0.95 * len(samples)) - 1))]
             maximum = samples[-1]
         summary = {
+            **(extra or {}),
             "schema_version": 1,
             "session_id": self.directory.name,
             "mode": self.mode.value,
@@ -501,6 +588,15 @@ class SessionLogs:
             "closed_mono_ns": time.monotonic_ns(),
             "event_counts": dict(self._counts),
             "debug_deferred_dropped": self._deferred_dropped,
+            "write_failures": dict(self._write_failures),
+            "summary_write_failures": self._summary_write_failures,
+            "recording_complete": (
+                self._deferred_dropped == 0
+                and not any(self._write_failures.values())
+                and self._inventory_error is None
+                and all(sink.healthy and sink.durable for sink in self._sinks.values())
+            ),
+            "inventory_error": self._inventory_error,
             "metrics": {
                 "p95_ms": p95,
                 "max_ms": maximum,
@@ -520,17 +616,28 @@ class SessionLogs:
                 }
                 for name, sink in self._sinks.items()
             },
-            **(extra or {}),
         }
         temp = self.directory / ".session_summary.json.tmp"
-        temp.write_text(
-            json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
-        )
-        os.replace(temp, self.directory / "session_summary.json")
-        for sink in self._sinks.values():
-            sink.close()
-        self._closed = True
+        try:
+            with temp.open("w", encoding="utf-8") as handle:
+                handle.write(
+                    json.dumps(_finite_json(summary), ensure_ascii=False, indent=2, sort_keys=True)
+                    + "\n"
+                )
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp, self.directory / "session_summary.json")
+            directory_fd = os.open(self.directory, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+            self._summary_error = None
+        except Exception as exc:
+            self._summary_error = repr(exc)
+            self._summary_write_failures += 1
+            print(f"[session-log] summary persistence failed: {exc!r}", file=sys.stderr, flush=True)
+            raise
 
 
 __all__ = [

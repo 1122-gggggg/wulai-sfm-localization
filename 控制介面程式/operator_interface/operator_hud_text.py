@@ -5,6 +5,32 @@ import math
 import time
 
 
+def format_map_scale(snapshot: dict) -> str:
+    """Show a candidate distinctly from a usable map-wide metric scale."""
+    candidate = snapshot.get("candidate_m_per_unit")
+    reliable = bool(snapshot.get("reliable"))
+    value = snapshot.get("scale_m_per_unit") if reliable else candidate
+    estimate = "-" if value is None else f"{float(value):.2f}"
+    reason = {
+        "converged": "可用",
+        "insufficient_segments": "累積中",
+        "insufficient_displacement": "位移不足",
+        "scale_iqr_unstable": "分散未收斂",
+        "scale_drift_unstable": "前後尺度不一致",
+        "scale_stale": "證據過期",
+        "direction_mismatch": "位移方向不一致",
+        "scale_outlier": "新尺度不一致",
+    }.get(snapshot.get("reason"), "尚不可用")
+    label = "尺度" if reliable else "尺度候選"
+    spread = snapshot.get("relative_iqr")
+    spread_text = "" if spread is None else f"｜IQR {float(spread):.0%}"
+    return (
+        f"全場{label} {estimate} m/u（{reason}）"
+        f"｜{snapshot.get('scale_segments', 0)}段／"
+        f"{float(snapshot.get('cumulative_distance_m') or 0.):.1f} m{spread_text}"
+    )
+
+
 def _telemetry_text(value: object) -> str:
     if value is None:
         return "?"
@@ -309,13 +335,91 @@ def format_olympe_telemetry(
     }
 
 
+def format_device_telemetry(state: object) -> tuple[str, ...]:
+    """Compact read-only device details; missing telemetry is never 'normal'."""
+    def event(group: str, name: str) -> dict:
+        values = getattr(state, group, {}) or {}
+        result = values.get(name)
+        return result if isinstance(result, dict) else {}
+
+    def text(value) -> str:
+        return "未知" if value is None else str(value)
+
+    def number(value, digits=1) -> str:
+        result = _telemetry_number(value, digits=digits)
+        return "未知" if result == "?" else result
+
+    def flags(value) -> str:
+        return "未知" if value is None else (str(value) or "無")
+
+    battery = getattr(state, "battery_info", {}) or {}
+    voltage = event("battery_info", "voltage").get("voltage")
+    voltage_v = None if voltage is None else float(voltage) / 1000.0
+    controller = event("battery_info", "BatteryChanged").get("percent")
+    controller_text = "充電中" if controller == 255 else f"{number(controller, 0)}%"
+    alerts = battery.get("alert")
+    alert_text = "未知"
+    if isinstance(alerts, dict) and alerts:
+        entries = [alerts] if "alert" in alerts else list(alerts.values())
+        active = [
+            f"{text(entry.get('alert'))}:{text(entry.get('level'))}"
+            for entry in entries if isinstance(entry, dict) and entry.get("level") != "none"
+        ]
+        alert_text = "、".join(active) if active else "無"
+
+    exposure = event("camera_info", "exposure")
+    shutter = exposure.get("shutter_speed")
+    shutter_text = (
+        "未知" if shutter is None
+        else str(shutter).removeprefix("shutter_").replace("_over_", "/") + " s"
+    )
+    iso = exposure.get("iso_sensitivity")
+    iso_text = "未知" if iso is None else str(iso).removeprefix("iso_")
+    white_balance = event("camera_info", "white_balance")
+    wb_text = text(white_balance.get("mode"))
+    if white_balance.get("mode") == "custom":
+        wb_text += "/" + text(white_balance.get("temperature"))
+    recording = event("camera_info", "recording_mode")
+    bitrate = recording.get("bitrate")
+    mbps = None if not bitrate else float(bitrate) / 1_000_000.0
+    framerate = recording.get("framerate")
+    fps_text = "未知" if framerate is None else str(framerate).removeprefix("fps_")
+    zoom = event("camera_info", "zoom_info")
+
+    def angles(prefix: str) -> str:
+        return "/".join(
+            number(getattr(state, f"gimbal_{prefix}{axis}_deg", None))
+            for axis in ("roll", "pitch", "yaw")
+        )
+
+    return (
+        f"電池 {number(getattr(state, 'battery_pct', None), 0)}% | "
+        f"{number(voltage_v, 2)} V | "
+        f"健康 {number(event('battery_info', 'health').get('state_of_health'), 0)}% | "
+        f"循環 {number(event('battery_info', 'cycle_count').get('count'), 0)} | "
+        f"遙控器 {controller_text}",
+        f"電池警告 {alert_text} | "
+        f"遙控器電池 {text(event('battery_info', 'BatteryState').get('state'))}",
+        f"相機 {text(event('camera_info', 'camera_mode').get('mode'))} | "
+        f"曝光 {text(event('camera_info', 'exposure_settings').get('mode'))} "
+        f"{shutter_text} ISO {iso_text} | 白平衡 {wb_text}",
+        f"機載錄影 {text(event('camera_info', 'recording_state').get('state'))} | "
+        f"{text(recording.get('resolution'))} {fps_text} fps {number(mbps)} Mb/s | "
+        f"無損變焦上限 {number(zoom.get('high_quality_maximum_level'))}x",
+        f"雲台絕對 R/P/Y {angles('')}° | 相對 R/P/Y {angles('relative_')}°",
+        f"雲台校正 {text(event('gimbal_info', 'calibration_state').get('state'))} | "
+        f"穩定 {text(event('gimbal_info', 'stabilization_state').get('state'))} | "
+        f"鎖軸 {flags(event('gimbal_info', 'axis_lock_state').get('locked'))} | "
+        f"錯誤 {flags(event('gimbal_info', 'alert').get('error'))}",
+    )
+
+
 #: Which rotation the operator must perform for each firmware-requested axis.
-#: ``view`` selects the drawing: "top" = seen from above, "side" = seen from the
-#: left, "front" = seen from behind. ``spin`` is the arrow direction drawn on it.
+#: ``view`` selects the matching aircraft projection in the renderer.
 MAGNETOMETER_AXIS_GUIDE = {
     "x": ("X/roll", "top", "沿機頭—機尾軸滾轉（像轉烤肉串）"),
     "y": ("Y/pitch", "side", "沿左右翼尖軸翻轉（機頭往上翻過頂）"),
-    "z": ("Z/yaw", "front", "機身保持水平、原地自轉（像轉盤）"),
+    "z": ("Z/yaw", "yaw", "機身保持水平、原地自轉（像轉盤）"),
 }
 
 
@@ -335,13 +439,16 @@ def format_magnetometer_calibration(state: object) -> dict[str, str]:
     """Format aircraft/controller firmware calibration without guessing state."""
     required = getattr(state, "drone_magnetometer_required", None)
     requirement = {0: "有效", 1: "必需", 2: "建議"}.get(required, "未知")
-    started = getattr(state, "drone_magnetometer_started", None) is True
+    started_state = getattr(state, "drone_magnetometer_started", None)
+    started = started_state is True
     failed = getattr(state, "drone_magnetometer_failed", None) is True
     axis_results = (
         getattr(state, "drone_magnetometer_x_done", None),
         getattr(state, "drone_magnetometer_y_done", None),
         getattr(state, "drone_magnetometer_z_done", None),
     )
+    if failed:
+        axis_results = (False, False, False)
     axis_raw = str(getattr(state, "drone_magnetometer_axis", "unknown") or "unknown")
     axis_key = axis_raw.rsplit(".", 1)[-1].replace("_", "").lower()
     axis = {
@@ -363,10 +470,13 @@ def format_magnetometer_calibration(state: object) -> dict[str, str]:
     elif started:
         progress = f"進行中：目前 {axis}"
         result = "最新讀回校正結果：進行中；完成後會自動更新"
+    elif started_state is not False:
+        progress = "等待韌體校正進行狀態讀回"
+        result = "校正結果：未知，尚不能判定是否可沿用"
     elif required == 0:
         progress = "待命"
         detail = "X/Y/Z 已完成" if all(value is True for value in axis_results) else "韌體回報有效"
-        result = f"最新讀回校正結果：PASS（{detail}），可沿用"
+        result = f"PASS：{detail}，可沿用"
     elif required == 2:
         progress = "待命，可選擇重新校正"
         result = "機上既有校正結果：可沿用；韌體建議重新校正"

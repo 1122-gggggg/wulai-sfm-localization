@@ -76,11 +76,26 @@ def connect(ip: str = DRONE_IP_REAL, controller: str = "auto"):
     drone = klass(ip)
     # retry=3 matches official examples; SC needs a moment after USB discovery.
     try:
-        ok = drone.connect(retry=3)
-    except TypeError:
-        ok = drone.connect()
-    if not ok:
-        raise SystemExit(f"could not connect to {ctrl} at {ip}")
+        try:
+            ok = drone.connect(retry=3)
+        except TypeError:
+            ok = drone.connect()
+        if not ok:
+            raise SystemExit(f"could not connect to {ctrl} at {ip}")
+    except BaseException:
+        # Failed attempts never reach the backend; release their controller
+        # before allowing another button-driven attempt.
+        try:
+            drone.disconnect()
+        except Exception:
+            pass
+        destroy = getattr(drone, "destroy", None)
+        if callable(destroy):
+            try:
+                destroy()
+            except Exception:
+                pass
+        raise
     # Brief settle so drone-side RTSP medias (DefaultVideo / Front camera) appear.
     time.sleep(1.0)
     return drone

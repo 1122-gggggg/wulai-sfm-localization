@@ -86,7 +86,7 @@ def _rate_hz(stamps: list[float]) -> float | None:
 def _largest_gap_s(stamps: list[float]) -> float | None:
     if len(stamps) < 2:
         return None
-    return max(b - a for a, b in zip(stamps, stamps[1:]))
+    return max(b - a for a, b in zip(stamps, stamps[1:], strict=False))
 
 
 # --------------------------------------------------------------------------

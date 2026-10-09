@@ -303,3 +303,90 @@ def test_runs_split_by_auto_run_id_even_without_a_time_gap(tmp_path: Path) -> No
     assert [run["auto_run_id"] for run in result["auto_runs"]] == ["run-a", "run-b"]
     assert result["auto_runs"][0]["verdict"] == "NEVER_JOINED"
     assert result["auto_runs"][1]["verdict"] == "JOINED"
+
+
+def test_modern_observation_boundary_rejects_duplicate_stale_and_paused_ticks(tmp_path):
+    plan = _plan()
+    plan["map_pose_max_age_s"] = 0.5
+    join = _tick(1, target=1, distance=0.5)
+    join.update(
+        pose_stamp=100.1,
+        pose_u=[0.5, 0.3, 0.4],
+        route_nearest_u=[0.5, 0.0, 0.0],
+        route_error_joined=True,
+        route_error_sample=True,
+    )
+    rows = [
+        plan,
+        _tick(0, target=0, distance=0.9),
+        join,
+        {**join, "t": 100.2},  # duplicate stamp
+        {**join, "t": 101.0},  # stale
+        {**join, "t": 100.3, "pose_stamp": 100.3, "route_error_sample": False},
+        {**join, "t": 100.4, "pose_stamp": 100.4, "position_observed": False},
+        {**join, "t": 100.5, "pose_stamp": 100.5, "reason": "AUTO paused"},
+    ]
+    result = report.analyze_session(_write_session(tmp_path, rows))
+    assert result["post_join"]["samples"] == 1
+    assert result["post_join"]["cross_track_u"] == {
+        "mean": 0.5,
+        "rms": 0.5,
+        "p95": 0.5,
+        "max": 0.5,
+    }
+    assert result["post_join"]["sample_validity"] == "observed"
+
+
+def _terminal_summary(run_id, *, samples=0, joined=False):
+    return {
+        "event": "auto_route_error_summary",
+        "run_id": run_id,
+        "auto_run_id": run_id,
+        "planned_waypoints_u": [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
+        "route_sha256": "captured-route-hash",
+        "site_id": "offline",
+        "coordinate_frame_id": "map-test",
+        "units": "map_units",
+        "acquisition_excluded": True,
+        "joined": joined,
+        "outcome": "cancelled",
+        "terminal_detail": "offline cancellation",
+        "state": "ok" if samples else "no_samples",
+        "samples": samples,
+        "mean_u": 0.1234 if samples else None,
+        "rms_u": 0.1234 if samples else None,
+        "p95_u": 0.1234 if samples else None,
+        "max_u": 0.1234 if samples else None,
+        "horizontal_mean_u": 0.1 if samples else None,
+        "horizontal_max_u": 0.1 if samples else None,
+    }
+
+
+def test_summary_only_failed_acquisition_is_auto_and_explicit_no_samples(tmp_path):
+    result = report.analyze_session(_write_session(tmp_path, [_terminal_summary("run-a")]))
+    assert result["has_auto"] is True
+    assert result["verdict"] == "NO_SAMPLES"
+    assert result["auto_runs"][0]["route_error_summary"]["state"] == "no_samples"
+    text = report.format_report(result)
+    assert "無法計算" in text and "offline cancellation" in text
+
+
+def test_terminal_summary_keeps_exact_producer_metrics_and_run_identity(tmp_path):
+    plan = {**_plan(), "auto_run_id": "run-a"}
+    ticks = [
+        {**_tick(0, target=0, distance=0.5), "auto_run_id": "run-a"},
+        {**_tick(1, target=1, distance=0.123), "auto_run_id": "run-a"},
+    ]
+    summary = _terminal_summary("run-a", samples=1, joined=True)
+    empty = _terminal_summary("run-b")
+    result = report.analyze_session(_write_session(tmp_path, [plan, *ticks, summary, empty]))
+    assert len(result["auto_runs"]) == 2
+    first, second = result["auto_runs"]
+    assert first["tick_count"] == 2  # Summary must never masquerade as a tick.
+    assert first["post_join"]["cross_track_u"]["mean"] == summary["mean_u"]
+    assert first["post_join"]["cross_track_u"]["rms"] == summary["rms_u"]
+    assert first["post_join"]["horizontal_u"] == {"mean": 0.1, "max": 0.1}
+    assert first["route_error_summary"]["route_sha256"] == "captured-route-hash"
+    assert second["verdict"] == "NO_SAMPLES"
+    assert second["auto_run_id"] == "run-b"
+    assert second["route_error_summary"]["samples"] == 0

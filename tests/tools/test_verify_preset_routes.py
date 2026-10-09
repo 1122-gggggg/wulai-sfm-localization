@@ -96,13 +96,25 @@ def test_every_preset_route_from_every_nearest_waypoint(tmp_path):
 
 
 @pytest.mark.skipif(not ALIGN.is_file(), reason="requires the operator's river site assets")
-def test_gust_parameter_applies_the_requested_physical_displacement():
+def test_gust_is_continuous_horizontal_drift_not_a_position_teleport():
     route = next(ROUTES.glob("*.json"))
     params = sim.SimParams(
-        route=route, align=ALIGN, duration_s=0.05, gust_every_s=0.05, gust_m=0.3, wind_sigma_mps=0
+        route=route,
+        align=ALIGN,
+        duration_s=5.0,
+        gust_every_s=3.0,
+        gust_duration_s=2.0,
+        gust_m=0.3,
+        wind_sigma_mps=0,
     )
     result, _ = sim.run_sim(params)
-    assert np.linalg.norm(result.trace[0]["gust_displacement_m"]) == pytest.approx(0.3)
+    deltas = np.asarray([r["gust_displacement_m"] for r in result.trace])
+    up = np.asarray(sim.rpf.load_map_frame(ALIGN).up)
+    # Half-sine area is the requested drift; no tick may teleport that distance.
+    assert np.linalg.norm(deltas.sum(axis=0)) == pytest.approx(0.3, abs=1e-4)
+    assert np.max(np.linalg.norm(deltas, axis=1)) < 0.012
+    assert np.count_nonzero(np.linalg.norm(deltas, axis=1) > 1e-9) >= 39
+    np.testing.assert_allclose(deltas @ up, 0.0, atol=1e-12)
 
 
 @pytest.mark.parametrize("route", sorted(ROUTES.glob("*.json")), ids=lambda path: path.stem)
@@ -121,7 +133,9 @@ def test_every_route_recovers_from_repeated_wind_displacement(route, gust_m):
         )
     )
     assert result["accepted"], result
-    assert all(item["displacement_m"] == pytest.approx(gust_m) for item in result["gusts"])
+    assert all(
+        item["displacement_m"] == pytest.approx(gust_m, abs=1e-4) for item in result["gusts"]
+    )
 
 
 @pytest.mark.parametrize("join_index", [0, 3, 5], ids=["waypoint_1", "waypoint_4", "waypoint_6"])
@@ -200,8 +214,6 @@ def test_short_visual_blackout_recovers_on_imu_hold():
         seed=7,
         blackout_every_s=40,
         blackout_dur_s=3,
-        blackout_drift_mps=0.05,
-        blackout_yaw_drift_deg_s=2.0,
     )
     result, _info = sim.run_sim(params, record_trace=True)
     assert result.success, result.reason

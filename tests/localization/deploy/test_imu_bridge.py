@@ -86,6 +86,10 @@ def test_bridge_rotates_camera_axes_in_the_measured_world_frame(tracker):
     pose, moved_center, *_ = tracker._step_imu_bridge(10.1)
     expected_forward = tracker._rot_about_axis(frame.up, math.radians(-10)) @ rotation[2]
     np.testing.assert_allclose(pose[2, :3], expected_forward, atol=1e-12)
+    # Every camera row transforms in world coordinates around measured gravity;
+    # body NED yaw is never applied as a rotation around arbitrary GLOMAP Z.
+    world_turn = tracker._rot_about_axis(frame.up, math.radians(-10))
+    np.testing.assert_allclose(pose[:, :3], rotation @ world_turn.T, atol=1e-12)
     assert math.degrees(
         wrap_angle(frame.heading(pose[2, :3]) - frame.heading(rotation[2]))
     ) == pytest.approx(-10)

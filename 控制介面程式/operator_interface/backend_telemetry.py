@@ -49,10 +49,12 @@ class MotionEventHistory:
     def __init__(
         self, maxlen: int = MOTION_HISTORY_SIZE, *, now=time.monotonic, wall_now=time.time
     ):
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._now = now
         self._wall_now = wall_now
         self._rows = tuple(deque(maxlen=maxlen) for _ in self.FIELDS)
+        self._evicted_counts = [0 for _ in self.FIELDS]
+        self._evicted_through = [None for _ in self.FIELDS]
         self._subscriptions: list = []
 
     def record(self, index: int, event) -> None:
@@ -72,6 +74,9 @@ class MotionEventHistory:
             rows = self._rows[index]
             if rows and stamp <= rows[-1][-1]:
                 return
+            if len(rows) == rows.maxlen:
+                self._evicted_counts[index] += 1
+                self._evicted_through[index] = rows[0][-1]
             rows.append(sample)
 
     def attach(self, drone) -> None:
@@ -116,6 +121,30 @@ class MotionEventHistory:
                     result.append(selected)
             return tuple(result)
 
+    def diagnostic_snapshot(self, since_stamps=None) -> dict:
+        """Ring turnover is not necessarily loss; flag evictions beyond the log cursor."""
+        with self._lock:
+            unread = []
+            for index, stamp in enumerate(self._evicted_through):
+                cutoff = (
+                    since_stamps[index]
+                    if since_stamps is not None and index < len(since_stamps)
+                    else None
+                )
+                unread.append(stamp is not None and (cutoff is None or stamp > cutoff))
+            return {
+                "capacity_per_source": self._rows[0].maxlen,
+                "source_names": [name for name, _ in self.FIELDS],
+                "evicted_total": list(self._evicted_counts),
+                "evicted_through_mono": list(self._evicted_through),
+                "unread_eviction_since_log_cursor": unread,
+            }
+
+    def since_with_diagnostics(self, since_stamps=None):
+        """Snapshot samples and their loss indicator under the same source lock."""
+        with self._lock:
+            return self.since(since_stamps), self.diagnostic_snapshot(since_stamps)
+
 
 def control_telemetry_history(
     backend, since_stamps: tuple[float | None, ...] | None = None
@@ -133,7 +162,12 @@ def control_telemetry_history(
 
 def _log_control_history(backend, now):
     previous = getattr(backend, "_logged_control_stamps", None)
-    attitudes, velocities = control_telemetry_history(backend, previous)
+    history = getattr(backend, "motion_history", None)
+    if hasattr(history, "since_with_diagnostics"):
+        (attitudes, velocities), history_health = history.since_with_diagnostics(previous)
+    else:
+        attitudes, velocities = control_telemetry_history(backend, previous)
+        history_health = None
     fresh_attitudes = [row for row in attitudes if row[-1] <= now]
     fresh_velocities = [row for row in velocities if row[-1] <= now]
     if fresh_attitudes or fresh_velocities:
@@ -143,6 +177,7 @@ def _log_control_history(backend, now):
             t_mono_ns=round(now * 1e9),
             attitude_samples=fresh_attitudes,
             horizontal_ned_samples=fresh_velocities,
+            history_health=history_health,
         )
         prev_att = previous[0] if previous is not None else None
         prev_vel = previous[1] if previous is not None else None
@@ -311,6 +346,10 @@ def poll_session_telemetry(backend, now: float) -> None:
                 max_distance_m=getattr(backend.state, "max_distance_m", None),
                 distance_geofence=getattr(backend.state, "distance_geofence_enabled", None),
                 **video_health,
+                battery_info=getattr(backend.state, "battery_info", {}),
+                camera_info=getattr(backend.state, "camera_info", {}),
+                gimbal_info=getattr(backend.state, "gimbal_info", {}),
+                device_info_read_mono_ns=getattr(backend.state, "device_info_read_mono_ns", None),
             )
 
 
@@ -404,3 +443,65 @@ def poll_camera_zoom(backend) -> None:
         backend.state.camera_zoom_level = value if value is not None and value > 0 else None
     except Exception:
         pass
+
+
+def _device_json(value):
+    """Preserve raw units while making SDK enums/map keys JSON-safe."""
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, dict):
+        return {str(_device_json(key)): _device_json(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_device_json(item) for item in value]
+    return str(getattr(value, "name", value))
+
+
+def _device_event(backend, module: str, name: str, key_field: str | None = None):
+    try:
+        raw = backend._poll_get_state(olympe_message(module, name))
+        if key_field is not None:
+            raw = _map_entry(raw, key_field, 0)
+            if raw is not None and int(raw.get(key_field, -1)) != 0:
+                return None
+        return _device_json(raw) if isinstance(raw, dict) and raw else None
+    except (ImportError, AttributeError, TypeError, ValueError, OverflowError, RuntimeError):
+        return None
+
+
+def poll_device_info(backend, now: float) -> None:
+    """Read optional battery/camera/gimbal caches at 1 Hz; never send commands."""
+    previous = getattr(backend, "_last_device_info_t", None)
+    if previous is not None and now - previous < 1.0:
+        return
+    backend._last_device_info_t = now
+    battery = {
+        name: _device_event(backend, "battery", name)
+        for name in ("voltage", "health", "cycle_count", "alert")
+    }
+    for name in ("BatteryChanged", "BatteryState"):
+        battery[name] = (
+            _device_event(backend, "skyctrl.SkyControllerState", name)
+            if backend.via_skycontroller()
+            else None
+        )
+    backend.state.battery_info = battery
+    backend.state.camera_info = {
+        name: _device_event(backend, "camera", name, "cam_id")
+        for name in (
+            "camera_mode",
+            "exposure",
+            "exposure_settings",
+            "white_balance",
+            "recording_mode",
+            "recording_state",
+            "zoom_info",
+        )
+    }
+    backend.state.gimbal_info = {
+        name: _device_event(backend, "gimbal", name, "gimbal_id")
+        for name in ("alert", "calibration_state", "stabilization_state", "axis_lock_state")
+    }
+    # This is cache-read time, not sensor/event freshness.
+    backend.state.device_info_read_mono_ns = time.monotonic_ns()

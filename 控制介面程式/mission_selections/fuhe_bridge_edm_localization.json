@@ -1,0 +1,30 @@
+{
+  "calibrations": [
+    {
+      "path": "../../地圖檔/場域/fuhe_bridge/compat/localizer_quality_receipt.json",
+      "sha256": "a4fe3b26394581c70a6c2c573b433172ef21fb897f72254560f8a5ef9300c689"
+    }
+  ],
+  "localizer": {
+    "path": "../../地圖檔/場域/fuhe_bridge/compat/localizer_direct_manifest.json",
+    "sha256": "fb3c90cb5ec33da754cfa6b162652ad5766c15c93388b28752565cd47259fd3b"
+  },
+  "map": {
+    "path": "../../地圖檔/場域/fuhe_bridge/compat/map_manifest.json",
+    "sha256": "495e6ae4cb2bdab92393fc9c7876c19a06756a985759534d5943f2e5c33cee37"
+  },
+  "route": {
+    "path": "../mission_components/routes/fuhe_bridge_operator_route.json",
+    "sha256": "0f5713bc2b7d5d4f3e7acb999ef82210eedeed994498e5b1d2ca4ad625a34d72"
+  },
+  "schema": "sfm-mission-selection/v1",
+  "selection_id": "fuhe_bridge_edm_localization",
+  "site": {
+    "path": "../../地圖檔/場域/fuhe_bridge/manifests/site.json",
+    "sha256": "2577c297334a4a1b5973c3aa8b921576ffa65c894e82a50619c271558fb4b9d3"
+  },
+  "vehicle": {
+    "path": "../mission_components/vehicles/parrot_anafi_720p_fuhe_direct.json",
+    "sha256": "9bfe22587c10fb800c0a855207eae5c180eecc77505083806038340e6110f02e"
+  }
+}

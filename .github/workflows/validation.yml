@@ -40,7 +40,8 @@ jobs:
             --exclude '**/test*.py' \
             --exclude '**/tests/**' \
             --exclude '定位演算法/deploy_code/runtime/**' \
-            --exclude '定位演算法/deploy_code/sfm_direct_deploy/vendor/**'
+            --exclude '定位演算法/deploy_code/sfm_direct_deploy/vendor/**' \
+            --exclude '定位演算法/deploy_code_expand/sfm_direct_deploy/vendor/**'
       - name: Dependency vulnerability audit and CycloneDX SBOM
         run: |
           python tools/security_dependency_gate.py \

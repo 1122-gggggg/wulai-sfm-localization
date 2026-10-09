@@ -638,5 +638,172 @@ def test_weak_trail_records_estimate_source_kind() -> None:
     assert operator_tick._record_weak_display_pose(operator, imu, np.array([2.0, 2.0, 3.0]))
     assert operator_tick._record_weak_display_pose(operator, vo, np.array([3.0, 2.0, 3.0]))
 
-    assert operator.history_weak_kind == ["KLT", "IMU", "OTHER"]
+    assert operator.history_weak_kind == ["KLT", "IMU", "KLT"]
     assert len(operator.history_weak) == 3
+
+
+@pytest.mark.parametrize("source", ["KLT", "IMU"])
+def test_held_estimate_renders_camera_at_weak_center_without_moving_flight(
+    monkeypatch,
+    tmp_path,
+    source,
+) -> None:
+    """No backend/connection: production acceptance + app map renderer + PIL."""
+    import os
+    from PIL import Image, ImageDraw
+    from operator_rendering import draw_map_overlays
+
+    monkeypatch.setattr("localization_result_ui.time.monotonic", lambda: 12.1)
+    anchor = _fast(1, 1.0)
+    weak = _vo(2, 1.3)
+    weak.update(
+        confidence_hold_active=True,
+        source_frame_stamp_mono=12.0,
+        camera_axes_world=[[0.0, 0.0, -1.0], [0.0, -1.0, 0.0], [1.0, 0.0, 0.0]],
+        camera_forward_world=[1.0, 0.0, 0.0],
+        camera_attitude_kind="full",
+    )
+    if source == "IMU":
+        weak.update(
+            direct_status="IMU_BRIDGE", imu_bridge=True, camera_attitude_kind="heading_only"
+        )
+    policy = app.LostHoldPolicy(low_confidence_results=2, hold_on_low_confidence=True)
+    operator = _make_operator([[anchor], [weak]], policy)
+    operator.history_weak_kind = []
+    _drain(operator, [anchor])
+    frozen_pose = operator.live_pose.copy()
+    _drain(operator, [weak])
+    np.testing.assert_array_equal(operator.live_pose, frozen_pose)
+    np.testing.assert_allclose(operator.history_weak[-1], [1.3, 2.0, 3.0])
+    # Map state only; no drone backend, widgets, command hooks or telemetry IO.
+    operator._is_live_backend = lambda: True
+    operator.map_base_image = lambda w, h: Image.new("RGB", (w, h), "#15181c")
+    operator.map_base_key = lambda w, h: (w, h, tuple(operator.map_pan))
+    operator.map_zoom, operator.map_radius, operator.map_pan = 3.2, 12.0, np.zeros(2)
+    operator.map_yaw = operator.map_pitch = operator.map_roll = 0.0
+    operator.route_pts, operator.history, operator.history_health, operator.no_loc_markers = (
+        [],
+        [],
+        [],
+        [],
+    )
+    operator._map_axis_basis = lambda: (
+        np.array([1.0, 0.0, 0.0]),
+        np.array([0.0, 1.0, 0.0]),
+        np.array([0.0, 0.0, 1.0]),
+        True,
+    )
+    # Oblique projection reveals the actual right/down picture plane, not an
+    # arbitrary screen-aligned rectangle.
+    operator.transform_xyz = lambda points: (
+        np.asarray(points, dtype=float)
+        @ np.array(
+            [
+                [1.0, 0.0, 0.0],
+                [0.0, 0.8, 0.6],
+                [0.0, -0.6, 0.8],
+            ]
+        )
+    )
+    scale = 430 * 0.46 * operator.map_zoom / operator.map_radius
+    operator.project_world = lambda p, w, h: (
+        int(w * 0.5 + operator.transform_xyz(np.asarray(p))[0] * scale),
+        int(h * 0.5 - operator.transform_xyz(np.asarray(p))[1] * scale),
+    )
+    state = SimpleNamespace(pose=frozen_pose.copy(), gimbal_pitch_deg=-65.0)
+
+    def render_estimate():
+        context = app.OperatorApp._map_render_context(operator, 620, 430, state)
+        image = operator.map_base_image(620, 430)
+        draw_map_overlays(ImageDraw.Draw(image), context)
+        return image, context
+
+    first_image, context = render_estimate()
+    np.testing.assert_allclose(context.pose[:3], [1.3, 2.0, 3.0])
+    assert context.camera_estimate_kind == source
+    assert context.camera_attitude == ("heading" if source == "IMU" else "full")
+    assert context.camera_estimate_stale is False
+    color = np.array([255, 214, 10] if source == "IMU" else [63, 191, 127])
+    assert np.count_nonzero(np.all(np.asarray(first_image) == color, axis=2)) > 40
+    first_image.save(tmp_path / f"{source.lower()}_held_estimate.png")
+    # Rotate this estimate at the same point while the held flight pose stays
+    # fixed: the visible camera must change rather than borrowing that pose.
+    if source == "IMU":
+        operator.live_result["pose"]["yaw_raw"] = 0.9
+    else:
+        angle = math.radians(35.0)
+        rotation = np.array(
+            [
+                [math.cos(angle), -math.sin(angle), 0.0],
+                [math.sin(angle), math.cos(angle), 0.0],
+                [0.0, 0.0, 1.0],
+            ]
+        )
+        operator.live_result["camera_axes_world"] = (
+            np.asarray(weak["camera_axes_world"]) @ rotation.T
+        ).tolist()
+    second_image, _ = render_estimate()
+    assert not np.array_equal(np.asarray(first_image), np.asarray(second_image))
+    second_image.save(tmp_path / f"{source.lower()}_rotated_estimate.png")
+    np.testing.assert_array_equal(operator.live_pose, frozen_pose)
+    np.testing.assert_array_equal(state.pose, frozen_pose)
+    # Optional real Tk proof on an Xvfb display, still without constructing a
+    # backend or the operator controls. Parent verification opts in explicitly.
+    if os.environ.get("SFM_ESTIMATED_CAMERA_TK_PROOF") == "1":
+        import tkinter as tk
+        from PIL import ImageGrab, ImageTk
+
+        root = tk.Tk()
+        try:
+            root.title(f"Offline {source} estimated camera attitude — no hardware")
+            root.geometry("1240x430+0+0")
+            left, right = ImageTk.PhotoImage(first_image), ImageTk.PhotoImage(second_image)
+            tk.Label(root, image=left).pack(side="left")
+            tk.Label(root, image=right).pack(side="left")
+            root.lift()
+            root.focus_force()
+
+            def capture():
+                ImageGrab.grab(
+                    bbox=(
+                        root.winfo_rootx(),
+                        root.winfo_rooty(),
+                        root.winfo_rootx() + root.winfo_width(),
+                        root.winfo_rooty() + root.winfo_height(),
+                    ),
+                    xdisplay=os.environ.get("DISPLAY"),
+                ).save(tmp_path / f"{source.lower()}_tk_proof.png")
+                root.quit()
+
+            root.after(600, capture)
+            root.mainloop()
+        finally:
+            root.destroy()
+    print(f"Offline camera rendering proof: {tmp_path}")
+
+
+def test_backfilled_submap_on_failed_pose_stays_out_of_control_history() -> None:
+    anchored = _fast(1, 1.0)
+    no_fix = _no_pose(2)
+    no_fix["workmap_output_source"] = "baseline"
+    no_fix["workmap_trajectory_backfill"] = {
+        "segment_id": 12,
+        "points": [[189, 3.0, 2.0, 1.0], [919, 4.0, 2.0, 1.0]],
+    }
+    operator = _make_operator([[anchored], [no_fix]], app.LostHoldPolicy())
+    operator.history = [np.array([0.0, 2.0, 3.0])]
+    app.OperatorApp.update_live_results(operator)
+    pose_before = operator.live_pose.copy()
+    last_before = operator.live_last_xyz.copy()
+    snapshot_before = operator._autonomy_pose_snapshot
+    history_before = [point.copy() for point in operator.history]
+    operator.live_new_pose = False
+    app.OperatorApp.update_live_results(operator)
+
+    assert operator.workmap_trajectories == {12: [(3.0, 2.0, 1.0), (4.0, 2.0, 1.0)]}
+    np.testing.assert_array_equal(operator.live_pose, pose_before)
+    np.testing.assert_array_equal(operator.live_last_xyz, last_before)
+    np.testing.assert_array_equal(operator.history, history_before)
+    assert operator._autonomy_pose_snapshot is snapshot_before
+    assert operator.history_weak == []
+    assert operator.live_new_pose is False

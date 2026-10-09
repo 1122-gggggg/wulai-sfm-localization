@@ -52,6 +52,7 @@ _BUNDLE_KEYS = frozenset(
 _BANK_KEYS = frozenset({"name", "descriptors", "names"})
 _FILE_ENTRY_KEYS = frozenset({"path", "sha256", "size_bytes"})
 _MODEL_BINARIES = ("cameras.bin", "images.bin", "points3D.bin")
+_OPTIONAL_MODEL_BINARIES = ("rigs.bin", "frames.bin")
 
 
 class DirectMapError(ValueError):
@@ -141,10 +142,10 @@ def _verify_model_binaries(declared: object, *, model_dir: Path, source: Path) -
     if not isinstance(declared, dict):
         raise DirectMapError(f"bundle model_sha256 must be an object: {source}")
     missing = sorted(set(_MODEL_BINARIES) - declared.keys())
-    unknown = sorted(declared.keys() - set(_MODEL_BINARIES))
+    unknown = sorted(declared.keys() - set(_MODEL_BINARIES + _OPTIONAL_MODEL_BINARIES))
     if missing or unknown:
         raise DirectMapError(f"bundle model_sha256 missing={missing} unknown={unknown}: {source}")
-    for name in _MODEL_BINARIES:
+    for name in declared:
         binary = model_dir / name
         if not binary.is_file():
             raise DirectMapError(f"COLMAP model binary is absent: {binary}")

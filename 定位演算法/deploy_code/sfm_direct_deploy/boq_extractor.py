@@ -292,10 +292,15 @@ def verify_weights_sha256(path: Path, expected: str = BOQ_WEIGHTS_SHA256) -> Pat
 
 
 def load_boq_model(weights_path: str | Path) -> BoQVPRModel:
-    """Strict-load the sanctioned BoQ checkpoint (SHA verified by the caller)."""
-    model = BoQVPRModel()
+    """Strict-load verified weights without allocating a random CPU model first."""
+    # Every parameter and buffer is checkpoint-backed. Meta construction also
+    # avoids allocating/initializing the ResNet layer4/fc discarded by ResNetCrop.
+    # Only return the local model after strict key/shape validation has succeeded;
+    # assign adopts the checkpoint's sanctioned float32/int64 tensors directly.
+    with torch.device("meta"):
+        model = BoQVPRModel()
     state = torch.load(str(weights_path), map_location="cpu", weights_only=True)
-    model.load_state_dict(state, strict=True)
+    model.load_state_dict(state, strict=True, assign=True)
     return model.eval()
 
 

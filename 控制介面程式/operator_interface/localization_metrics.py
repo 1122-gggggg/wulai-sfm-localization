@@ -11,6 +11,150 @@ from typing import Any
 
 CUDA_SAMPLE_MIN_INTERVAL_S = 1.0
 
+
+class SessionMapScale:
+    """One passive map-wide metric estimate for a localization session.
+
+    The UI alone teaches exposure-time pose/heading pairs, including manual
+    flight. AUTO reads the same estimator and adds timestamped telemetry under
+    its lock. Missing/weak visual intervals never become calibration evidence.
+    """
+
+    def __init__(self, map_frame):
+        from control_state_estimator import ControlPoseSmoother, ControlStateEstimator
+        from heading_fusion import HeadingEstimator
+
+        self.state = ControlStateEstimator(map_frame)
+        self.heading = HeadingEstimator(map_frame)
+        self.smoother = ControlPoseSmoother(map_frame)
+        self._history_stamps = None
+        self._pending_heading = []
+        self._heading_stamp = None
+
+    def _observe_history(self, history, now):
+        attitudes, velocities = history(self._history_stamps)
+        # The history snapshot can include events received after the
+        # caller sampled now. Leave them behind the cursor for retry.
+        attitudes = [sample for sample in attitudes if sample[-1] <= now]
+        velocities = [sample for sample in velocities if sample[-1] <= now]
+        for attitude in attitudes:
+            self.state.observe_telemetry(attitude, None, now)
+        for velocity in velocities:
+            self.state.observe_telemetry(None, velocity, now)
+        old = self._history_stamps or (None, None)
+        self._history_stamps = (
+            attitudes[-1][-1] if attitudes else old[0],
+            velocities[-1][-1] if velocities else old[1],
+        )
+
+    def _observe_state(self, backend, now):
+        telemetry = backend.state
+        try:
+            attitude = (telemetry.att_yaw, telemetry.attitude_mono_ns * 1e-9)
+            velocity = (
+                telemetry.speed_north_mps,
+                telemetry.speed_east_mps,
+                telemetry.ground_speed_mono_ns * 1e-9,
+            )
+        except (AttributeError, TypeError):
+            attitude = velocity = None
+        self.state.observe_telemetry(attitude, velocity, now)
+
+    def _observe_backend(self, backend, now):
+        history = getattr(backend, "control_telemetry_history", None)
+        if callable(history):
+            self._observe_history(history, now)
+        else:
+            self._observe_state(backend, now)
+
+    def _observe_smoother(self, pose, now):
+        if pose is None:
+            self.smoother.recovery_pending = True
+            return
+        recovered = self.smoother.recovery_pending
+        expected = (
+            None
+            if self.smoother.previous is None
+            else self.state.observed_motion(
+                self.smoother.previous[0], pose.stamp, now, self.heading.offset
+            )
+        )
+        step = self.smoother.observe(pose, now, expected)
+        if (step > 0.02 and recovered) or step > 0.1:
+            self.state.reset_observation()
+            self._pending_heading.clear()
+
+    def _queue_pending_heading(self, pose, trusted):
+        if not trusted:
+            self._pending_heading.clear()
+        elif self._heading_stamp is None or pose.stamp > self._heading_stamp:
+            if not self._pending_heading or pose.stamp > self._pending_heading[-1][0]:
+                if len(self._pending_heading) == 32:
+                    self.state._break_scale_interval("heading_pending_overflow")
+                    self._pending_heading.clear()
+                self._pending_heading.append((pose.stamp, pose))
+
+    def _skip_uncovered_capture(self, stamp):
+        if self.state.yaws and self.state.yaws[-1][0] >= stamp:
+            # Monotonic history already passed this capture: no
+            # future event can repair its missing/invalid bracket.
+            # Do not silently leap over it to a newer matched pose.
+            self.state._break_scale_interval("heading_capture_uncovered")
+            self._heading_stamp = stamp
+            return True
+        return False
+
+    def _fuse_heading_pair(self, stamp, observed, attitude, now):
+        # Process matched captures monotonically, including refused
+        # pairs: an older pending frame must not rewind yaw fusion.
+        self._heading_stamp = stamp
+        if self.heading.update(observed.yaw, attitude):
+            # Scale uses the actual exposure-time pair, not the
+            # smoothed latest heading used by the control loop.
+            offset = (observed.yaw - (math.pi / 2.0 - attitude) + math.pi) % (
+                2.0 * math.pi
+            ) - math.pi
+            self.state.observe_pose(observed, now, offset)
+        else:
+            self.state._break_scale_interval("heading_pair_rejected")
+
+    def _drain_pending_heading(self, now):
+        remaining = []
+        for index, (stamp, observed) in enumerate(self._pending_heading):
+            if self._heading_stamp is not None and stamp <= self._heading_stamp:
+                continue
+            if not 0.0 <= now - stamp <= 0.5:
+                self.state._break_scale_interval("heading_capture_stale")
+                continue
+            attitude = self.state.yaw_at(stamp)
+            if attitude is not None:
+                self._fuse_heading_pair(stamp, observed, attitude, now)
+            elif not self._skip_uncovered_capture(stamp):
+                # Wait in capture order for asynchronous attitude.
+                # Each capture still expires at the existing 0.5s bound.
+                remaining.extend(self._pending_heading[index:])
+                break
+        return remaining
+
+    def observe(self, pose, backend, now):
+        with self.state.lock:
+            self._observe_backend(backend, now)
+            trusted = (
+                pose is not None
+                and pose.map_confirmed
+                and pose.position_observed
+                and not pose.reseed_confirming
+                and 0.0 <= now - pose.stamp <= 0.5
+            )
+            self._observe_smoother(pose, now)
+            self._queue_pending_heading(pose, trusted)
+            self._pending_heading = self._drain_pending_heading(now)
+            # Update the raw prediction anchor even while its yaw pair waits.
+            # Passing no scale heading cannot admit unaligned evidence.
+            self.state.observe_pose(pose, now, None)
+            return self.state.scale_diagnostics(now)
+
+
 RESTART_REASONS = (
     "stall",
     "worker_exit",
@@ -23,12 +167,13 @@ RESTART_REASONS = (
 CIRCUIT_BREAKER_STATES = ("closed", "open")
 
 
-#: Direct-backend two-rate diagnostics. The worker forwards these only when the
-#: direct tracker sets them, so an edm/xfeat record never gains a field; here
+#: Direct-backend tracker diagnostics (two-rate and session workmap).
+#: The worker forwards these only when the direct tracker sets them; here
 #: they are appended to RESULT_FIELDS so a direct session logs its own state
 #: (which sub-state produced the pose, how many inliers were map points vs VO
 #: points, and how long dead reckoning has been running) into
 #: session_logs/localization.jsonl.
+#: Workmap fields are opt-in: absent values stay absent for baseline records.
 #:
 #: The relocalizer group is what makes `reloc.period_s` tunable on a given
 #: machine. `period_s` only does anything while the background worker is idle,
@@ -95,6 +240,99 @@ DIRECT_INFO_FIELDS = (
     "pnp_observation_sample",
     "reseed_confirming",
     "pose_source_confirming",
+    "reference_scope",
+    "workmap_session_id",
+    "workmap_session_dir",
+    "workmap_output_source",
+    "workmap_mapping_healthy",
+    "workmap_mapping_error",
+    "workmap_pose_landmarks",
+    "workmap_mapping_state",
+    "workmap_frozen_ratio",
+    "workmap_pose_basis",
+    "workmap_trajectory_backfill",
+    "workmap_presubmap_state",
+    "workmap_presubmap_points",
+    "workmap_presubmap_merged",
+    "workmap_presubmap_ms",
+    "workmap_pre_ms",
+    "workmap_core_ms",
+    "workmap_post_ms",
+    "workmap_revision",
+    "workmap_points_created",
+    "workmap_points_used",
+    "workmap_retained_tracks",
+    "workmap_keyframes_ready",
+    "workmap_reloc_accepted",
+    "workmap_ba_submitted",
+    "workmap_optimizer",
+    "workmap_solver_ms",
+    "workmap_graph_rebuilt",
+    "workmap_graph_keyframes",
+    "workmap_graph_observations",
+    "workmap_graph_new_observations",
+    "workmap_graph_points",
+    "workmap_graph_factors",
+    "workmap_graph_solves",
+    "workmap_graph_applied",
+    "workmap_graph_solver",
+    "workmap_ba_applied",
+    "workmap_ba_stale",
+    "workmap_scale_applied",
+    "workmap_writer_healthy",
+    "workmap_reloc_pending",
+    "workmap_reloc_oldest_age_ms",
+    "workmap_index_pending",
+    "workmap_index_oldest_age_ms",
+    "workmap_ba_pending",
+    "workmap_ba_oldest_age_ms",
+    "workmap_writer_pending",
+    "workmap_writer_oldest_age_ms",
+    "workmap_index_healthy",
+    "workmap_index_errors",
+    "workmap_writer_overflow_count",
+    "workmap_ba_healthy",
+    "workmap_ba_rejected",
+    "workmap_ba_applied_this_frame",
+    "workmap_scale_applied_this_frame",
+    "workmap_overlap_evidence_count",
+    "workmap_overlap_stale",
+    "workmap_overlap_rejected",
+    "workmap_overlap_superseded",
+    "workmap_merge_submitted",
+    "workmap_merge_committed",
+    "workmap_merge_rejected",
+    "workmap_merge_noop",
+    "workmap_landmarks_fused",
+    "workmap_merge_scale",
+    "workmap_active_submap",
+    "workmap_submaps",
+    "workmap_anchor_count",
+    "workmap_anchor_rows",
+    "workmap_anchor_local_inliers",
+    "workmap_overlap_healthy",
+    "workmap_overlap_pending",
+    "workmap_overlap_oldest_age_ms",
+    "workmap_frozen_cells",
+    "workmap_frozen_gate_rejected",
+    "workmap_query_candidates",
+    "workmap_query_added",
+    "workmap_query_inliers",
+    "workmap_query_ms",
+    "workmap_query_added_total",
+    "workmap_query_inliers_total",
+    "workmap_depth_submitted",
+    "workmap_depth_completed",
+    "workmap_depth_rejected",
+    "workmap_depth_superseded",
+    "workmap_depth_expired",
+    "workmap_depth_promoted",
+    "workmap_depth_last_scale",
+    "workmap_depth_last_infer_ms",
+    "workmap_depth_pending",
+    "workmap_depth_oldest_age_ms",
+    "workmap_depth_healthy",
+    "workmap_depth_errors",
 )
 
 RESULT_FIELDS = (
@@ -153,6 +391,7 @@ RESULT_FIELDS = (
     "pose",
     "pose_raw",
     "pose_filter",
+    "camera_attitude_kind",
     "camera_axes_world",
     "camera_forward_world",
     "camera_pitch_error_deg",

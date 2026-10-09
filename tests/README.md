@@ -20,6 +20,13 @@ Parrot simulator 固定由自己的 Python 3.11 環境及 system validation step
 定位演算法的第一方測試已集中在 `tests/localization/`；測試不得再放回 production
 source 目錄。
 
+擴圖版本（`定位演算法/deploy_code_expand/`）與原始版本有同名模組，不能在同一個 pytest
+程序共存，其測試在 `tests/localization/deploy_expand/`，預設 `pytest` 不收集，另跑：
+
+```bash
+.venv/bin/python -m pytest -c pytest-expand.ini -q --timeout=300 -m 'not hardware'
+```
+
 完整開發流程見 [`CONTRIBUTING.md`](../CONTRIBUTING.md)。常用離線指令：
 
 ```bash

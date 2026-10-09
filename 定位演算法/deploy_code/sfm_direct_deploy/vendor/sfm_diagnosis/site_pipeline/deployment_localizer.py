@@ -1017,12 +1017,29 @@ class FinalMapEDMProvider:
         )
         images_by_name = {str(image.name): image for image in reconstruction.images.values()}
         observations: dict[str, tuple[np.ndarray, np.ndarray]] = {}
-        for name in names:
-            points = [point for point in images_by_name[name].points2D if point.has_point3D()]
-            observations[name] = (
-                np.asarray([point.xy for point in points], dtype=np.float64).reshape(-1, 2),
-                np.asarray([point.point3D_id for point in points], dtype=np.int64),
-            )
+        images_binary = self.map_model / "images.bin"
+        if images_binary.is_file():
+            from river_map_quality.colmap_binary import iter_binary_image_observations
+
+            # Read the same ordered records as COLMAP in bulk. Iterating
+            # pycolmap.Point2D in Python creates millions of wrappers merely to
+            # copy coordinates/IDs. Keep pycolmap for rig-aware poses below.
+            for image in iter_binary_image_observations(images_binary):
+                valid = image.point3d_ids != -1
+                observations[image.name] = (
+                    np.ascontiguousarray(image.xy[valid], dtype=np.float64),
+                    np.ascontiguousarray(image.point3d_ids[valid], dtype=np.int64),
+                )
+            if set(observations) != set(names):
+                raise RuntimeError("binary observations disagree with COLMAP image identities")
+        else:
+            # Text-only COLMAP models still use the authoritative parser.
+            for name in names:
+                points = [point for point in images_by_name[name].points2D if point.has_point3D()]
+                observations[name] = (
+                    np.asarray([point.xy for point in points], dtype=np.float64).reshape(-1, 2),
+                    np.asarray([point.point3D_id for point in points], dtype=np.int64),
+                )
         point_rows = sorted(reconstruction.points3D.items(), key=lambda item: int(item[0]))
         self._point_ids = np.asarray([int(point_id) for point_id, _ in point_rows], dtype=np.int64)
         self._point_xyz = np.asarray([point.xyz for _, point in point_rows], dtype=np.float64)
@@ -1174,8 +1191,6 @@ class FinalMapEDMProvider:
         import cv2
         from river_map_quality.official_edm_adapter import (
             deduplicate_lifted_matches,
-            lift_reference_matches,
-            lift_unmapped_with_depth,
             prepare_official_megadepth_image_from_array,
         )
         from river_map_quality.official_edm_adapter_loo import (
@@ -1225,57 +1240,72 @@ class FinalMapEDMProvider:
         for (reference_index, name, prepared_reference, reference_shape), matched in zip(
             ref_items, matched_list, strict=True
         ):
-            query_points = np.asarray(matched["mkpts0_f"], dtype=float).reshape(-1, 2)
-            reference_points = np.asarray(matched["mkpts1_f"], dtype=float).reshape(-1, 2)
-            confidences = np.asarray(matched["mconf"], dtype=float).reshape(-1)
-            valid = _valid_matches(
-                query_points,
-                reference_points,
-                confidences,
-                query_shape=query_image.shape,
-                reference_shape=reference_shape,
-                confidence_threshold=threshold,
+            reference_lifts, reference_raw = self._lift_matched_reference(
+                query_image.shape, name, reference_shape, matched, threshold
             )
-            query_points = query_points[valid]
-            reference_points = reference_points[valid]
-            confidences = confidences[valid]
-            geometry = _two_view_inliers(query_points, reference_points, threshold_px=3.0)
-            query_points = query_points[geometry]
-            reference_points = reference_points[geometry]
-            confidences = confidences[geometry]
-            raw_matches += len(query_points)
-            observation_xy, observation_ids = self._observations[name]
-            lift_result = lift_reference_matches(
-                query_points=query_points,
-                reference_points=reference_points,
-                observation_points=observation_xy,
-                observation_point3d_ids=observation_ids,
-                confidences=confidences,
-                maximum_distance_px=self.lift_distance_px,
-                reference_name=name,
-            )
-            lifted.extend(lift_result.matches)
-            depth = self._depth_for_reference(name)
-            if depth is not None and lift_result.unmapped_pairs:
-                fx, fy, cx, cy = self._camera_params[name]
-                lifted.extend(
-                    lift_unmapped_with_depth(
-                        unmapped=lift_result.unmapped_pairs,
-                        depth=depth,
-                        native_wh=self._native_wh[name],
-                        fx=fx,
-                        fy=fy,
-                        cx=cx,
-                        cy=cy,
-                        cam_from_world_3x4=self._cam_from_world[name],
-                        median_sparse_z=self._median_sparse_z[name],
-                    )
-                )
+            lifted.extend(reference_lifts)
+            raw_matches += reference_raw
         deduplicated = deduplicate_lifted_matches(
             lifted,
             query_conflict_distance_px=1.0,
         )
         return deduplicated.matches, raw_matches
+
+    def _lift_matched_reference(
+        self, query_shape, name, reference_shape, matched, threshold
+    ):
+        """Lift one reference before cross-reference conflict deduplication."""
+        from river_map_quality.official_edm_adapter import (
+            lift_reference_matches,
+            lift_unmapped_with_depth,
+        )
+
+        query_points = np.asarray(matched["mkpts0_f"], dtype=float).reshape(-1, 2)
+        reference_points = np.asarray(matched["mkpts1_f"], dtype=float).reshape(-1, 2)
+        confidences = np.asarray(matched["mconf"], dtype=float).reshape(-1)
+        valid = _valid_matches(
+            query_points,
+            reference_points,
+            confidences,
+            query_shape=query_shape,
+            reference_shape=reference_shape,
+            confidence_threshold=threshold,
+        )
+        query_points = query_points[valid]
+        reference_points = reference_points[valid]
+        confidences = confidences[valid]
+        geometry = _two_view_inliers(query_points, reference_points, threshold_px=3.0)
+        query_points = query_points[geometry]
+        reference_points = reference_points[geometry]
+        confidences = confidences[geometry]
+        observation_xy, observation_ids = self._observations[name]
+        lift_result = lift_reference_matches(
+            query_points=query_points,
+            reference_points=reference_points,
+            observation_points=observation_xy,
+            observation_point3d_ids=observation_ids,
+            confidences=confidences,
+            maximum_distance_px=self.lift_distance_px,
+            reference_name=name,
+        )
+        lifted = list(lift_result.matches)
+        depth = self._depth_for_reference(name)
+        if depth is not None and lift_result.unmapped_pairs:
+            fx, fy, cx, cy = self._camera_params[name]
+            lifted.extend(
+                lift_unmapped_with_depth(
+                    unmapped=lift_result.unmapped_pairs,
+                    depth=depth,
+                    native_wh=self._native_wh[name],
+                    fx=fx,
+                    fy=fy,
+                    cx=cx,
+                    cy=cy,
+                    cam_from_world_3x4=self._cam_from_world[name],
+                    median_sparse_z=self._median_sparse_z[name],
+                )
+            )
+        return lifted, len(query_points)
 
     def _solve(
         self,

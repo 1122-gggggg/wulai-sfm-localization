@@ -20,6 +20,13 @@
       "patched_sha256": "52aae1f1b686d9aa6f3f3425e613120a5cc801174fb0258aa719fbd1e0748ee2",
       "change": "Accept an already verified and relocated keyframe_index so live startup does not parse the manifest twice.",
       "reason": "Reuse DirectMapAssets validation and identities; legacy callers retain the original parser."
+    },
+    {
+      "file": "sfm_diagnosis/site_pipeline/deployment_localizer.py",
+      "upstream_sha256": "52aae1f1b686d9aa6f3f3425e613120a5cc801174fb0258aa719fbd1e0748ee2",
+      "patched_sha256": "2d3f001f27a92e01cdac077ff8ed6f967b118df7426dc0f6b0d0210572b64462",
+      "change": "Extract the unchanged per-reference validity, two-view, sparse/depth lifting body into _lift_matched_reference, before the original cross-reference greedy deduplication.",
+      "reason": "LiveMapEDMProvider caches these exact pre-dedup lifts only for the current capture, avoiding repeated baseline geometry work during bounded recovery. The input digest is the preceding local patch, not a new upstream revision; packages.files retains the original upstream digest. Differential overlap/depth oracle: tests/localization/deploy/test_direct_lift_cache.py. Actual frozen JPG replay receipts: outputs/analysis/flight_optimization_latest_20261004/relocalization."
     }
   ],
   "origin": "river-deploy-5060-20260908 (河濱 EDM fixed-pose retriangulate 建圖 + two-rate 定位)",

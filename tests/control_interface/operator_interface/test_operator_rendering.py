@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import math
 from pathlib import Path
-from types import SimpleNamespace
 import sys
 
 import numpy as np
@@ -19,58 +18,6 @@ HERE = (
 if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 
-from operator_rendering import draw_video_hud  # noqa: E402
-
-
-class _RecordingDraw:
-    def __init__(self) -> None:
-        self.rectangles: list[tuple[tuple[int, ...], dict]] = []
-        self.texts: list[tuple[tuple[int, int], str, dict]] = []
-
-    def rectangle(self, box, **kwargs) -> None:
-        self.rectangles.append((tuple(box), kwargs))
-
-    def text(self, xy, text, **kwargs) -> None:
-        self.texts.append((tuple(xy), text, kwargs))
-
-
-def test_video_hud_draws_plain_text_on_a_contrast_strip() -> None:
-    draw = _RecordingDraw()
-    state = SimpleNamespace(
-        frame_age_ms=12.4,
-        stream_fps=30.0,
-        gimbal_pitch_deg=-20.0,
-        zoom=1.0,
-        link_ok=False,
-    )
-
-    link_ok = draw_video_hud(
-        draw,
-        320,
-        240,
-        state,
-        ("diagnostic one", "diagnostic two"),
-        60,
-        object(),
-        object(),
-        object(),
-        True,
-        280.0,
-    )
-
-    assert link_ok is False
-    assert draw.rectangles == [
-        ((18, 18, 302, 222), {"outline": "#363c44", "width": 2}),
-        ((18, 180, 302, 222), {"fill": "#0b0c0e"}),
-    ]
-    assert [text for _, text, _ in draw.texts] == [
-        "影像 30.0 FPS · 影格新鮮度 12 ms · 鏡頭 -20° / 1.0x",
-        "diagnostic one",
-        "diagnostic two",
-    ]
-    assert [xy for xy, _, _ in draw.texts] == [(28, 185), (28, 202), (28, 219)]
-    assert all(kwargs["fill"] == "#f4f4f4" for _, _, kwargs in draw.texts)
-    assert all("stroke_width" not in kwargs for _, _, kwargs in draw.texts)
 
 
 def _map_context(**overrides):
@@ -134,6 +81,7 @@ class _RecordingMapDraw:
         self.lines: list[tuple[tuple, dict]] = []
         self.polygons: list[tuple[list, dict]] = []
         self.ellipses: list[tuple[tuple, dict]] = []
+        self.texts: list[tuple[tuple, str, dict]] = []
 
     def line(self, xy, **kwargs) -> None:
         self.lines.append((tuple(xy), kwargs))
@@ -143,6 +91,9 @@ class _RecordingMapDraw:
 
     def ellipse(self, xy, **kwargs) -> None:
         self.ellipses.append((tuple(xy), kwargs))
+
+    def text(self, xy, text, **kwargs) -> None:
+        self.texts.append((tuple(xy), text, kwargs))
 
 
 def _camera_overlay(context) -> _RecordingMapDraw:
@@ -513,7 +464,9 @@ def test_weak_pose_source_kind_splits_klt_imu_other() -> None:
     assert weak_pose_source_kind({"pose_status": "KLT_BRIDGED"}) == "KLT"
     assert weak_pose_source_kind({"direct_status": "IMU_BRIDGE"}) == "IMU"
     assert weak_pose_source_kind({"imu_bridge": True}) == "IMU"
-    assert weak_pose_source_kind({"direct_status": "VO_ONLY"}) == "OTHER"
+    assert weak_pose_source_kind({"direct_status": "VO_ONLY"}) == "KLT"
+    assert weak_pose_source_kind({"direct_status": "FAST_TRACK"}) == "KLT"
+    assert weak_pose_source_kind({"direct_status": "DEAD_RECKON"}) == "KLT"
     assert weak_pose_source_kind({}) == "OTHER"
     assert weak_pose_source_kind(None) == "OTHER"
 
@@ -539,3 +492,206 @@ def test_weak_diamonds_take_kind_colors() -> None:
         WEAK_KIND_COLOR["IMU"],
         WEAK_KIND_FALLBACK_COLOR,
     ]
+
+
+def _estimated_camera_context(**payload_overrides):
+    from localization_contract import LocalizationResult
+    from localization_result_ui import estimated_camera_display_pose
+    from operator_rendering import weak_pose_source_kind
+
+    payload = dict(
+        seq=1, frame_id="offline-1", capture_mono_ns=100, pose_mono_ns=110,
+        validity=True, success=True, confidence=0.2, weak=True,
+        pose={"x": 0.1, "y": 0.2, "z": 0.3, "yaw_raw": 0.4},
+        mode="WEAK_TRACK", next_mode="WEAK_TRACK", direct_status="VO_ONLY",
+        camera_axes_world=_FACE_ON_AXES.tolist(), camera_attitude_kind="full",
+        map_confirmed=False, position_observed=False, reliability="WEAK",
+    )
+    payload.update(payload_overrides)
+    result = LocalizationResult.from_payload(payload, now_mono_ns=200)
+    snapshot = estimated_camera_display_pose(result, now=120e-9)
+    assert snapshot is not None
+    assert result["map_confirmed"] is False
+    assert result["position_observed"] is False
+    assert result["reliability"] == "WEAK"
+    assert result["direct_status"] == payload["direct_status"]
+    assert result["camera_attitude_kind"] == payload["camera_attitude_kind"]
+    return _map_context(
+        pose=snapshot.pose, camera_axes=snapshot.camera_axes,
+        camera_forward=snapshot.camera_forward, camera_attitude=snapshot.attitude,
+        camera_estimate_kind=weak_pose_source_kind(result),
+        camera_estimate_stale=snapshot.stale,
+    )
+
+
+def test_estimated_rotated_camera_axes_render_attitude_and_keep_klt_color():
+    context = _estimated_camera_context()
+    first = _camera_overlay(context)
+    angle = math.radians(35.0)
+    rotation = np.array([
+        [math.cos(angle), -math.sin(angle), 0.0],
+        [math.sin(angle), math.cos(angle), 0.0],
+        [0.0, 0.0, 1.0],
+    ])
+    rotated_axes = _FACE_ON_AXES @ rotation.T
+    second = _camera_overlay(_estimated_camera_context(camera_axes_world=rotated_axes.tolist()))
+    assert len(first.polygons) == len(second.polygons) == 2
+    assert not np.allclose(_quad(first), _quad(second))
+    assert first.ellipses[-1][1]["fill"] == "#3fbf7f"
+    assert first.texts[-1][1] == "KLT attitude estimate"
+    assert first.texts[-1][2]["fill"] == "#3fbf7f"
+
+
+def test_imu_bridge_displays_changed_heading_without_claiming_retained_camera_tilt():
+    first_context = _estimated_camera_context(
+        direct_status="IMU_BRIDGE", camera_attitude_kind="heading_only",
+    )
+    second_context = _estimated_camera_context(
+        direct_status="IMU_BRIDGE", camera_attitude_kind="heading_only",
+        pose={"x": 0.1, "y": 0.2, "z": 0.3, "yaw_raw": 1.0},
+    )
+    assert first_context.camera_axes is None
+    assert first_context.camera_forward is None
+    first, second = _camera_overlay(first_context), _camera_overlay(second_context)
+    assert len(first.polygons) == len(second.polygons) == 1  # arrow, not picture
+    assert first.lines[0][0] != second.lines[0][0]
+    assert first.ellipses[-1][1]["fill"] == "#ffd60a"
+    assert first.texts[-1][1] == "IMU heading-only estimate"
+    assert first.texts[-1][2]["fill"] == "#ffd60a"
+
+
+@pytest.mark.parametrize("bad_axes", [None, np.zeros((3, 3)).tolist(), [[float("nan")] * 3] * 3])
+def test_missing_or_invalid_estimated_orientation_never_invents_camera_axes(bad_axes):
+    from localization_result_ui import estimated_camera_display_pose
+
+    payload = dict(
+        success=True, weak=True, direct_status="VO_ONLY",
+        pose={"x": 0.1, "y": 0.2, "z": 0.3},
+        camera_axes_world=bad_axes,
+    )
+    snapshot = estimated_camera_display_pose(payload)
+    assert snapshot is not None
+    assert snapshot.attitude == "none"
+    assert snapshot.camera_axes is snapshot.camera_forward is None
+    draw = _camera_overlay(_map_context(
+        pose=snapshot.pose, camera_axes=snapshot.camera_axes,
+        camera_forward=snapshot.camera_forward, camera_attitude=snapshot.attitude,
+        camera_estimate_kind="KLT",
+    ))
+    assert not draw.polygons
+    assert not draw.lines
+    assert draw.texts[-1][1] == "KLT position-only estimate"
+
+
+def test_direction_only_estimate_never_draws_a_full_camera_picture():
+    draw = _camera_overlay(_estimated_camera_context(
+        camera_axes_world=None, camera_forward_world=[1.0, 0.0, 0.0],
+        camera_attitude_kind="none",
+    ))
+    assert len(draw.polygons) == 1
+    assert draw.texts[-1][1] == "KLT direction-only estimate"
+
+
+@pytest.mark.parametrize("stamp,now,expected_stale", [
+    (10.0, 10.1, False), (10.0, 12.1, True), (10.0, 9.0, True), (None, 10.1, True),
+])
+def test_estimated_camera_freshness_is_explicit_not_an_unrelated_pose_fallback(
+    stamp, now, expected_stale,
+):
+    from localization_result_ui import estimated_camera_display_pose
+
+    payload = dict(
+        success=True, weak=True, direct_status="VO_ONLY",
+        pose={"x": 1.0, "y": 2.0, "z": 3.0, "yaw_raw": 0.4},
+        camera_axes_world=_FACE_ON_AXES.tolist(), source_frame_stamp_mono=stamp,
+    )
+    snapshot = estimated_camera_display_pose(payload, now=now)
+    assert snapshot is not None
+    assert snapshot.stale is expected_stale
+    draw = _camera_overlay(_map_context(
+        pose=snapshot.pose, camera_axes=snapshot.camera_axes,
+        camera_forward=snapshot.camera_forward, camera_attitude=snapshot.attitude,
+        camera_estimate_kind="KLT", camera_estimate_stale=snapshot.stale,
+    ))
+    expected = "KLT stale attitude estimate" if expected_stale else "KLT attitude estimate"
+    assert draw.texts[-1][1] == expected
+    np.testing.assert_allclose(snapshot.pose[:3], [1.0, 2.0, 3.0])
+
+
+@pytest.mark.parametrize("as_pil", [False, True])
+@pytest.mark.parametrize("panel,expected_size,expected_scale", [
+    ((640, 480), (640, 360), 0.5),
+    ((800, 360), (640, 360), 0.5),
+    ((1280, 720), (1280, 720), 1.0),
+])
+def test_video_fit_preserves_rgb_and_source_coordinate_scale(as_pil, panel, expected_size, expected_scale):
+    from PIL import Image
+    from operator_rendering import prepare_video_frame
+
+    source = np.full((720, 1280, 3), (31, 70, 200), dtype=np.uint8)
+    if as_pil:
+        source = Image.fromarray(source)
+    frame, scale = prepare_video_frame(source, *panel)
+    assert frame is not None
+    assert frame.size == expected_size
+    assert scale == pytest.approx(expected_scale)
+    assert frame.getpixel((0, 0)) == (31, 70, 200)
+
+
+def test_capped_trail_middle_edit_and_projection_change_do_not_reuse_stale_coordinates() -> None:
+    from dataclasses import replace
+    from operator_rendering import _draw_route_and_history
+
+    history = [[index * 0.01, 0.0, 0.0] for index in range(64)]
+    context = _map_context(history=history, history_health=["OK"] * 64)
+    first = _RecordingMapDraw()
+    _draw_route_and_history(first, context)
+    history[1][1] = 1.0
+    edited = _RecordingMapDraw()
+    _draw_route_and_history(edited, context)
+    assert edited.lines[0][0][1] != first.lines[0][0][1]
+    # The view's center/pivot can change without changing zoom/pan/rotation.
+    shifted = replace(
+        context, projection_key=("shifted-center",),
+        transform_xyz=lambda points: np.asarray(points) + [1.0, 0.0, 0.0],
+    )
+    moved = _RecordingMapDraw()
+    _draw_route_and_history(moved, shifted)
+    assert moved.lines[0][0] != edited.lines[0][0]
+
+
+def test_aligned_submap_lines_are_distinct_from_live_history_and_each_other() -> None:
+    from operator_rendering import _draw_workmap_trajectories
+
+    draw = _RecordingMapDraw()
+    context = _map_context(
+        workmap_trajectories={
+            7: [(0, 0, 0), (1, 0, 0)],
+            9: [(4, 0, 0), (5, 0, 0)],
+        },
+    )
+    _draw_workmap_trajectories(draw, context)
+    assert len(draw.lines) == 2
+    scale = min(context.width, context.height) * 0.46 * context.map_zoom / context.map_radius
+    assert draw.lines[0][0] == ((310, 215), (int(310 + scale), 215))
+    assert draw.lines[1][0] == ((int(310 + 4 * scale), 215), (int(310 + 5 * scale), 215))
+    assert draw.lines[0][1]["fill"] == draw.lines[1][1]["fill"] == "#c084fc"
+
+
+def test_mapping_health_overlay_is_opt_in_and_reports_mapping_failure() -> None:
+    from operator_rendering import _draw_workmap_mapping_health
+
+    draw = _RecordingMapDraw()
+    _draw_workmap_mapping_health(draw, _map_context())
+    assert draw.texts == []
+    _draw_workmap_mapping_health(draw, _map_context(workmap_mapping_diagnostics={
+        "workmap_mapping_healthy": False,
+        "workmap_mapping_state": "RELOCALIZE",
+        "workmap_output_source": "baseline",
+        "workmap_mapping_error": "writer failed",
+    }))
+    assert len(draw.texts) == 1
+    assert "停止" in draw.texts[0][1]
+    assert "RELOCALIZE" in draw.texts[0][1]
+    assert "writer failed" in draw.texts[0][1]
+    assert draw.texts[0][2]["fill"] == "#ff6b5f"

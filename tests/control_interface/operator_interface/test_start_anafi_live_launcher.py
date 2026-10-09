@@ -6,6 +6,7 @@ import json
 import shutil
 import signal
 import subprocess
+import shlex
 import sys
 import time
 from pathlib import Path
@@ -40,6 +41,7 @@ LAUNCH_ENV = {
     "SFM_MAX_PERFORMANCE",
     "SFM_CPU_THREADS",
     "SFM_SITE_PROFILE",
+    "SFM_SKIP_LIVE_PREFLIGHT",
     "SFM_MISSION_SELECTION",
     "SFM_UI_PYTHON",
     "VENV",
@@ -92,14 +94,32 @@ def test_launcher_help_exits_before_live_setup() -> None:
 
     assert result.returncode == 0, result.stderr
     assert "只會啟動 real-flight Olympe 介面" in result.stdout
-    assert "checking target" not in result.stdout
     assert "sustained CPU thread budget" not in result.stdout
 
-def test_live_launcher_invokes_runtime_preflight_without_video() -> None:
-    text = SCRIPT.read_text(encoding="utf-8")
-    assert "live runtime preflight" in text
-    assert "simulator_preflight.py" in text
-    assert "refusing PATH python3" in text
+def test_live_launcher_invokes_runtime_preflight_without_video(tmp_path: Path) -> None:
+    call_log = tmp_path / "calls.log"
+    fake_python = tmp_path / "python"
+    write_executable(fake_python, 'printf \'%s\\n\' "$*" >> "$CALL_LOG"\n')
+    profile = SCRIPT.parents[2] / "site-profile.json"
+
+    result = run_launcher(
+        CALL_LOG=str(call_log),
+        SFM_LAUNCH_DRY_RUN="0",
+        SFM_MAX_PERFORMANCE="0",
+        SFM_SITE_PROFILE=str(profile),
+        SFM_UI_PYTHON=str(fake_python),
+    )
+
+    assert result.returncode == 0, result.stderr
+    calls = [shlex.split(line) for line in call_log.read_text().splitlines()]
+    assert len(calls) == 2
+    assert calls[0] == [
+        str(SCRIPT.parents[2] / "tools/simulator_preflight.py"),
+        "--workspace-root", str(SCRIPT.parents[2]),
+        "--site-profile", str(profile),
+        "--check-runtime", "--full-runtime",
+    ]
+    assert calls[1][:4] == ["-u", str(APP), "--interface", "real-flight"]
 
 
 
@@ -352,7 +372,7 @@ def run_portable_launcher(
         Path("控制介面程式/真機串流/啟動.sh"),
     ),
 )
-def test_tampered_portable_manifest_fails_before_reachability(
+def test_tampered_portable_manifest_fails_before_ui_startup(
     tmp_path: Path, relative_launcher: Path
 ) -> None:
     package = make_fake_portable_package(tmp_path)
@@ -362,23 +382,22 @@ def test_tampered_portable_manifest_fails_before_reachability(
     rows[1] = f"{size}\t{'0' * 64}\t{relative}"
     manifest.write_text("\n".join(rows) + "\n", encoding="utf-8")
     call_log = tmp_path / "calls.log"
-    bin_dir = tmp_path / "bin"
-    bin_dir.mkdir()
-    write_executable(bin_dir / "ping", 'printf \'ping\\n\' >> "$CALL_LOG"\nexit 0\n')
+    fake_python = tmp_path / "python"
+    write_executable(fake_python, 'printf \'python started\\n\' >> "$CALL_LOG"\n')
 
     result = run_portable_launcher(
         package / relative_launcher,
         dry_run="0",
         package=package,
         CALL_LOG=str(call_log),
-        PATH=f"{bin_dir}:{os.environ['PATH']}",
+        SFM_UI_PYTHON=str(fake_python),
         IP="192.168.42.1",
         CTRL="drone",
     )
 
     assert result.returncode == 1, (result.stdout, result.stderr)
     assert "SHA-256 mismatch" in result.stdout
-    assert not call_log.exists(), "manifest verification must precede reachability"
+    assert not call_log.exists(), "manifest verification must precede UI startup"
     assert "dry-run command" not in result.stdout
 
 
@@ -402,7 +421,6 @@ def test_valid_portable_manifest_reaches_dry_run_without_connecting(
     assert result.returncode == 0, (result.stdout, result.stderr)
     assert "portable package manifest OK" in result.stdout
     assert "dry-run command" in result.stdout
-    assert "checking target" not in result.stdout
 
 
 @pytest.mark.parametrize(
@@ -465,7 +483,6 @@ def test_direct_ip_derives_drone_and_preserves_benchmark_flags():
 
     assert result.returncode == 0, result.stderr
     assert "--ip 192.168.42.1 --controller drone" in result.stdout
-    assert "--no-live-detect" in result.stdout
     assert "--max-altitude-m 50 --max-distance-m 100" in result.stdout
     assert "--auto-inspect --boot-lock-ms 0" in result.stdout
     assert "--loc-force-track-bench" in result.stdout
@@ -510,8 +527,16 @@ def test_launcher_leaves_the_distance_geofence_to_the_documented_env_switch():
     assert "SFM_DISTANCE_GEOFENCE=1" in on.stdout
 
 
-def test_inconsistent_ip_controller_pair_fails_before_launch():
-    result = run_launcher(IP="192.168.42.1", CTRL="skycontroller3")
+@pytest.mark.parametrize(
+    ("ip", "controller"),
+    (
+        ("192.168.42.1", "skycontroller3"),
+        ("192.168.53.1", "drone"),
+        ("192.168.53.1", "anafi"),
+    ),
+)
+def test_inconsistent_ip_controller_pair_fails_before_launch(ip, controller):
+    result = run_launcher(IP=ip, CTRL=controller)
 
     assert result.returncode == 2
     assert "inconsistent IP/controller pair" in result.stderr
@@ -577,7 +602,6 @@ def test_live_launcher_rejects_system_site_packages_venv(tmp_path: Path):
 
     assert result.returncode == 2
     assert "include-system-site-packages=true" in result.stderr
-    assert "checking target" not in result.stdout
 
 
 def test_live_max_performance_is_best_effort_and_wraps_app(tmp_path: Path):
@@ -591,7 +615,6 @@ def test_live_max_performance_is_best_effort_and_wraps_app(tmp_path: Path):
         '"$OMP_NUM_THREADS" "$MKL_NUM_THREADS" "$OPENBLAS_NUM_THREADS" '
         '>> "$CALL_LOG"\nprintf \'python %s\\n\' "$*" >> "$CALL_LOG"\n',
     )
-    write_executable(bin_dir / "ping", "exit 0\n")
     write_executable(
         bin_dir / "powerprofilesctl",
         'printf \'powerprofilesctl %s\\n\' "$*" >> "$CALL_LOG"\n'
@@ -634,32 +657,59 @@ def test_live_max_performance_is_best_effort_and_wraps_app(tmp_path: Path):
     assert "continuing without it" in result.stderr
 
 
-def test_live_reachability_accepts_http_when_drone_drops_icmp(tmp_path: Path):
+@pytest.mark.parametrize("dry_run", ["0", "1"])
+@pytest.mark.parametrize(
+    ("overrides", "ip", "controller"),
+    (
+        ({}, "192.168.53.1", "skycontroller3"),
+        ({"IP": "192.168.53.1"}, "192.168.53.1", "skycontroller3"),
+        ({"CTRL": "skycontroller3"}, "192.168.53.1", "skycontroller3"),
+        ({"IP": "192.168.42.1"}, "192.168.42.1", "drone"),
+        ({"CTRL": "drone"}, "192.168.42.1", "drone"),
+        (
+            {"IP": "10.0.0.2", "CTRL": "skycontroller3"},
+            "10.0.0.2", "skycontroller3",
+        ),
+    ),
+)
+def test_offline_launcher_uses_selected_target_without_network_probes(
+    tmp_path: Path, dry_run: str, overrides: dict[str, str], ip: str, controller: str
+):
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     call_log = tmp_path / "calls.log"
+    call_log.touch()
     fake_python = tmp_path / "python"
-    write_executable(fake_python, 'printf \'python started\\n\' >> "$CALL_LOG"\n')
-    write_executable(bin_dir / "ping", "exit 1\n")
-    write_executable(
-        bin_dir / "curl",
-        'printf \'curl %s\\n\' "$*" >> "$CALL_LOG"\nexit 0\n',
-    )
+    write_executable(fake_python, 'printf \'%s\\n\' "$*" >> "$CALL_LOG"\n')
+    for name in ("ping", "curl"):
+        write_executable(
+            bin_dir / name,
+            f'printf \'{name}\\n\' >> "$CALL_LOG"\nexit 1\n',
+        )
 
     result = run_launcher(
         CALL_LOG=str(call_log),
-        CTRL="drone",
-        IP="192.168.42.1",
         PATH=f"{bin_dir}:{os.environ['PATH']}",
-        SFM_LAUNCH_DRY_RUN="0",
+        SFM_LAUNCH_DRY_RUN=dry_run,
         SFM_MAX_PERFORMANCE="0",
         SFM_UI_PYTHON=str(fake_python),
+        **overrides,
     )
 
     assert result.returncode == 0, result.stderr
-    calls = call_log.read_text().splitlines()
-    assert any(line.startswith("curl ") for line in calls)
-    assert "python started" in calls
+    if dry_run == "1":
+        assert call_log.read_text() == ""
+        command = shlex.split(result.stdout.split("[start] dry-run command:", 1)[1])
+        assert command[0] == str(fake_python)
+        command = command[1:]
+    else:
+        calls = call_log.read_text().splitlines()
+        assert len(calls) == 1
+        command = shlex.split(calls[0])
+    assert command[:8] == [
+        "-u", str(APP), "--interface", "real-flight",
+        "--ip", ip, "--controller", controller,
+    ]
 
 
 def test_live_max_performance_restores_session_settings_and_exit_code(tmp_path: Path):
@@ -674,7 +724,6 @@ def test_live_max_performance_restores_session_settings_and_exit_code(tmp_path: 
         'printf \'python sees %s/%s\\n\' "$(< "$POWER_STATE")" '
         '"$(< "$BATTERY_STATE")" >> "$CALL_LOG"\nexit 7\n',
     )
-    write_executable(bin_dir / "ping", "exit 0\n")
     write_executable(
         bin_dir / "powerprofilesctl",
         'if [[ "$1" == "get" ]]; then\n'
@@ -744,7 +793,6 @@ def test_live_max_performance_forwards_signal_before_restoring(
         'trap \'printf "python hup\\n" >> "$CALL_LOG"; exit 129\' HUP\n'
         'touch "$READY"\nwhile true; do sleep 0.05; done\n',
     )
-    write_executable(bin_dir / "ping", "exit 0\n")
     write_executable(
         bin_dir / "powerprofilesctl",
         'if [[ "$1" == "get" ]]; then\n'
@@ -817,7 +865,6 @@ def test_live_max_performance_zero_skips_all_tuning(tmp_path: Path):
     call_log = tmp_path / "calls.log"
     fake_python = tmp_path / "python"
     write_executable(fake_python, 'printf \'python %s\\n\' "$*" >> "$CALL_LOG"\n')
-    write_executable(bin_dir / "ping", "exit 0\n")
     for name in ("powerprofilesctl", "gsettings", "gamemoderun"):
         write_executable(
             bin_dir / name,
@@ -835,16 +882,9 @@ def test_live_max_performance_zero_skips_all_tuning(tmp_path: Path):
     )
 
     assert result.returncode == 0, result.stderr
-    assert call_log.read_text().splitlines() == [
-        (
-            f"python -u {APP} --interface real-flight "
-            "--ip 192.168.42.1 "
-            "--controller drone --no-live-detect --max-altitude-m 50 "
-            "--max-distance-m 100 "
-            "--rth-min-altitude-m 20.0 --stream-loss-grace-s 10.0 --nudge-pct 8 "
-            "--nudge-pulse-s 0.20"
-        )
-    ]
+    calls = call_log.read_text().splitlines()
+    assert len(calls) == 1
+    assert calls[0].startswith("python ")
 
 
 @pytest.mark.parametrize(
@@ -865,8 +905,16 @@ def test_real_launcher_rejects_cross_interface_arguments(args: tuple[str, ...]):
 
 
 @pytest.mark.parametrize("selection", ["", "   "])
-def test_missing_selection_fails_before_reachability(selection):
-    result = run_launcher(SFM_MISSION_SELECTION=selection, SFM_LAUNCH_DRY_RUN="0")
+def test_missing_selection_fails_before_ui_startup(tmp_path: Path, selection):
+    call_log = tmp_path / "calls.log"
+    fake_python = tmp_path / "python"
+    write_executable(fake_python, 'printf \'python started\\n\' >> "$CALL_LOG"\n')
+    result = run_launcher(
+        CALL_LOG=str(call_log),
+        SFM_MISSION_SELECTION=selection,
+        SFM_LAUNCH_DRY_RUN="0",
+        SFM_UI_PYTHON=str(fake_python),
+    )
     assert result.returncode == 2
     assert "requires SFM_MISSION_SELECTION" in result.stderr
-    assert "checking target" not in result.stdout
+    assert not call_log.exists()

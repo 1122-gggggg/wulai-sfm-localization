@@ -421,6 +421,20 @@ def build_argument_parser() -> argparse.ArgumentParser:
         default="",
         help="trusted SHA-256 for --production-profile",
     )
+    ap.add_argument(
+        "--workmap-session-dir",
+        default="",
+        help="Writable session workmap directory (defaults to a unique direct-cache path).",
+    )
+    ap.add_argument(
+        "--workmap-eval-stage",
+        choices=("baseline", "reuse", "ba", "full"),
+        default=None,
+        help=(
+            "Optional workmap evaluation stage; non-full stages require "
+            "SFM_EVALUATION_ONLY=1."
+        ),
+    )
     return ap
 
 
@@ -429,6 +443,11 @@ def _validate_backend_options(ap, args, backend: str) -> None:
         ap.error(f"unsupported localizer backend: {backend!r} (only direct remains)")
     if args.production_profile_sha256 and not args.production_profile:
         ap.error("--production-profile-sha256 requires --production-profile")
+    if (
+        args.workmap_eval_stage not in (None, "full")
+        and os.environ.get("SFM_EVALUATION_ONLY") != "1"
+    ):
+        ap.error("non-full workmap evaluation stages require SFM_EVALUATION_ONLY=1")
     # The direct backend has no built-in thresholds: the SHA-pinned
     # direct-deployment-profile IS its gate configuration.
     if not args.production_profile:
@@ -447,6 +466,23 @@ def _validate_backend_options(ap, args, backend: str) -> None:
         ap.error("--local-topk is not supported by --localizer-backend direct")
 
 
+def _select_worker_deployment(deploy_dir: str) -> None:
+    """Set algorithm imports before camera validation imports the factory."""
+    selected_deploy_dir = Path(deploy_dir).resolve()
+    factory_dir = selected_deploy_dir
+    if selected_deploy_dir.name == "sfm_direct_deploy":
+        sibling_factory_dir = selected_deploy_dir.parent / "sfm_glomap_deploy"
+        if (sibling_factory_dir / "production_localizer_factory.py").is_file():
+            factory_dir = sibling_factory_dir
+    # Direct-only transferred packages retain the canonical UI adapter fallback.
+    # A workspace deployment instead uses its own sibling factory and runtime;
+    # workers restart between selections, so no imported modules need swapping.
+    import_dirs = list(
+        dict.fromkeys((str(selected_deploy_dir), str(factory_dir), str(DEPLOY_DIR)))
+    )
+    sys.path[:] = import_dirs + [entry for entry in sys.path if entry not in import_dirs]
+
+
 def _parse_worker_args():
     ap = build_argument_parser()
     args = ap.parse_args()
@@ -454,6 +490,7 @@ def _parse_worker_args():
         ap.error("--frame-shm-name and positive --frame-shm-slots must be used together")
     if args.frame_shm_slots > 255:
         ap.error("--frame-shm-slots must fit in one byte")
+    _select_worker_deployment(args.deploy_dir)
     try:
         query_camera_override = resolve_query_camera_override(
             args.query_camera_model,
@@ -484,14 +521,6 @@ def _prepare_worker_runtime(args, backend: str):
     except (AttributeError, io.UnsupportedOperation, OSError):
         json_out = sys.stdout
     sys.stdout = sys.stderr
-    selected_deploy_dir = Path(args.deploy_dir).resolve()
-    sys.path.insert(0, str(selected_deploy_dir))
-    # A transferred deployment package contains its localizer implementation but
-    # deliberately omits the UI adapter. Keep the UI adapter from the workspace
-    # available after the selected deployment so its imports resolve to the
-    # package's modules first.
-    if selected_deploy_dir != DEPLOY_DIR.resolve():
-        sys.path.insert(1, str(DEPLOY_DIR))
     map_frame = None
     if args.map_align:
         from real_path_follow_controller import load_map_frame
@@ -584,6 +613,11 @@ def _build_worker_backend(args, backend: str, query_camera_override, map_frame):
                 "(--query-camera-model/--query-camera-width/--query-camera-height/"
                 "--query-camera-params); it has no built-in camera default"
             )
+        workmap_kwargs = {}
+        if args.workmap_session_dir:
+            workmap_kwargs["workmap_session_dir"] = args.workmap_session_dir
+        if args.workmap_eval_stage is not None:
+            workmap_kwargs["workmap_eval_stage"] = args.workmap_eval_stage
         built = build_production_localizer(
             backend="direct",
             bundle=args.bundle,
@@ -593,6 +627,7 @@ def _build_worker_backend(args, backend: str, query_camera_override, map_frame):
             production_profile=args.production_profile or None,
             production_profile_sha256=(args.production_profile_sha256 or None),
             map_frame=map_frame,
+            **workmap_kwargs,
         )
         tracker = built.tracker
         xmap = built.reloc_map
@@ -717,17 +752,22 @@ def main() -> None:
         )
         json_out.flush()
 
-    _run_worker_loop(
-        args,
-        json_out,
-        backend,
-        torch,
-        tracker,
-        tracker_variant,
-        force_track_ref_resolved,
-        force_track_label,
-        seed_local_prior,
-    )
+    try:
+        _run_worker_loop(
+            args,
+            json_out,
+            backend,
+            torch,
+            tracker,
+            tracker_variant,
+            force_track_ref_resolved,
+            force_track_label,
+            seed_local_prior,
+        )
+    finally:
+        close = getattr(tracker, "close", None)
+        if callable(close):
+            close()
 
 
 def _read_benchmark_request(args):
@@ -930,6 +970,73 @@ def _close_worker_frame_shm(frame_shm) -> None:
         frame_shm.close()
 
 
+def _predicted_pose_payload(info: dict) -> tuple[dict, str] | None:
+    predicted = info.get("predicted_center")
+    predicted_yaw = info.get("predicted_yaw")
+    try:
+        guessed = [float(predicted[0]), float(predicted[1]), float(predicted[2])]
+        yaw = 0.0 if predicted_yaw is None else float(predicted_yaw)
+    except (TypeError, ValueError, OverflowError, IndexError):
+        guessed = None
+        yaw = 0.0
+    if guessed is None or not all(math.isfinite(value) for value in guessed):
+        return None
+    pose_payload = {
+        "x": guessed[0],
+        "y": guessed[1],
+        "z": guessed[2],
+        "yaw_raw": yaw if math.isfinite(yaw) else 0.0,
+    }
+    # The legacy pose requires finite yaw and uses zero when no
+    # predictor heading exists. Mark that placeholder as orientation
+    # unavailable so the display never invents an East-facing camera.
+    camera_attitude_kind = (
+        "heading_only" if predicted_yaw is not None and math.isfinite(yaw) else "none"
+    )
+    return pose_payload, camera_attitude_kind
+
+
+def _payload_confidence(info: dict, pose_ok: bool) -> float:
+    raw_confidence = info.get("confidence", info.get("inlier_ratio"))
+    try:
+        confidence = float(raw_confidence)
+    except (TypeError, ValueError, OverflowError):
+        confidence = 1.0 if pose_ok else 0.0
+    if not math.isfinite(confidence):
+        confidence = 1.0 if pose_ok else 0.0
+    return min(1.0, max(0.0, confidence))
+
+
+def _pose_capture_mono_ns(pose, pose_ok: bool, capture_stamp) -> int | None:
+    if not pose_ok or pose is None:
+        return None
+    try:
+        pose_stamp = float(getattr(pose, "stamp", float("nan")))
+    except (TypeError, ValueError, OverflowError):
+        pose_stamp = float("nan")
+    if (
+        math.isfinite(pose_stamp)
+        and pose_stamp > 0.0
+        and capture_stamp is not None
+        and math.isfinite(float(capture_stamp))
+        and 0.0 < pose_stamp <= float(capture_stamp)
+    ):
+        return int(round(pose_stamp * 1_000_000_000.0))
+    return None
+
+
+def _copy_direct_info(payload: dict, info: dict) -> None:
+    # Direct-backend two-rate diagnostics. Copied only when the tracker sets them.
+    for key in DIRECT_INFO_FIELDS:
+        if key in info:
+            payload[key] = info[key]
+    payload.update(
+        {key: info[key] for key in ("workmap_session_id", "workmap_session_dir") if key in info}
+    )
+    if info.get("workmap_points_delta"):
+        payload["workmap_points"] = info["workmap_points_delta"]
+
+
 def _build_success_payload(
     *,
     args,
@@ -964,6 +1071,7 @@ def _build_success_payload(
     # (invalid JSON) and could steer the UI trajectory -> report it as no fix.
     pose_ok = pose is not None and bool(np.isfinite([pose.x, pose.y, pose.z, pose.yaw]).all())
     pose_payload = None
+    camera_attitude_kind = info.get("camera_attitude_kind")
     if pose_ok:
         pose_payload = {
             "x": float(pose.x),
@@ -972,51 +1080,20 @@ def _build_success_payload(
             "yaw_raw": float(pose.yaw),
         }
     elif info.get("prediction_valid"):
-        predicted = info.get("predicted_center")
-        predicted_yaw = info.get("predicted_yaw")
-        try:
-            guessed = [float(predicted[0]), float(predicted[1]), float(predicted[2])]
-            yaw = 0.0 if predicted_yaw is None else float(predicted_yaw)
-        except (TypeError, ValueError, OverflowError, IndexError):
-            guessed = None
-            yaw = 0.0
-        if guessed is not None and all(math.isfinite(value) for value in guessed):
-            pose_payload = {
-                "x": guessed[0],
-                "y": guessed[1],
-                "z": guessed[2],
-                "yaw_raw": yaw if math.isfinite(yaw) else 0.0,
-            }
-    raw_confidence = info.get("confidence", info.get("inlier_ratio"))
-    try:
-        confidence = float(raw_confidence)
-    except (TypeError, ValueError, OverflowError):
-        confidence = 1.0 if pose_ok else 0.0
-    if not math.isfinite(confidence):
-        confidence = 1.0 if pose_ok else 0.0
-    confidence = min(1.0, max(0.0, confidence))
+        predicted_pose = _predicted_pose_payload(info)
+        if predicted_pose is not None:
+            pose_payload, camera_attitude_kind = predicted_pose
+    confidence = _payload_confidence(info, pose_ok)
     capture_mono_ns = (
         int(round(float(capture_stamp) * 1_000_000_000.0))
         if capture_stamp is not None
         else worker_read_done_mono_ns
     )
-    pose_capture_mono_ns = None
-    if pose_ok and pose is not None:
-        try:
-            pose_stamp = float(getattr(pose, "stamp", float("nan")))
-        except (TypeError, ValueError, OverflowError):
-            pose_stamp = float("nan")
-        if (
-            math.isfinite(pose_stamp)
-            and pose_stamp > 0.0
-            and capture_stamp is not None
-            and math.isfinite(float(capture_stamp))
-            and 0.0 < pose_stamp <= float(capture_stamp)
-        ):
-            pose_capture_mono_ns = int(round(pose_stamp * 1_000_000_000.0))
+    pose_capture_mono_ns = _pose_capture_mono_ns(pose, pose_ok, capture_stamp)
     payload = {
         "seq": seq,
         "frame_id": f"worker-{seq}",
+        "coordinate_frame_id": getattr(getattr(tracker, "assets", None), "coordinate_frame_id", None),
         "capture_mono_ns": capture_mono_ns,
         "pose_capture_mono_ns": pose_capture_mono_ns,
         "pose_mono_ns": worker_core_done_mono_ns,
@@ -1088,6 +1165,7 @@ def _build_success_payload(
         "lost_search_stage": info.get("lost_search_stage"),
         "lost_search_radius_factor": info.get("lost_search_radius_factor"),
         "camera_axes_world": info.get("camera_axes_world"),
+        "camera_attitude_kind": camera_attitude_kind,
         "ood_verdict": info.get("ood_verdict"),
         "ood_vpr_vote": info.get("ood_vpr_vote"),
         "ood_match_vote": info.get("ood_match_vote"),
@@ -1133,10 +1211,7 @@ def _build_success_payload(
         "async_anchor_rejects": info.get("slow_anchor_rejects"),
         "async_inline_runs": info.get("slow_inline_runs"),
     }
-    # Direct-backend two-rate diagnostics. Copied only when the tracker sets them.
-    for key in DIRECT_INFO_FIELDS:
-        if key in info:
-            payload[key] = info[key]
+    _copy_direct_info(payload, info)
     return {k: v for k, v in payload.items() if v is not None}
 
 

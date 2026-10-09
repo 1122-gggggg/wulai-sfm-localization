@@ -247,9 +247,9 @@ class DirectDeadReckon:
 
 @dataclass(frozen=True)
 class DirectOptimizations:
-    """Optional, SHA-bound experiments; legacy releases retain their policy."""
+    """Bounded recovery is standard; optional GPU/spatial experiments stay off."""
 
-    adaptive_retrieval: bool = False
+    adaptive_retrieval: bool = True
     spatial_selection: bool = False
     gpu_cache_size: int = 0
 

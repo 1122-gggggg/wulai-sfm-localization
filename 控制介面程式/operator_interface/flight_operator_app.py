@@ -46,11 +46,6 @@ from pathlib import Path
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 try:
-    from PIL import ImageTk  # type: ignore
-except Exception:  # pragma: no cover - Tk unavailable in headless tests
-    ImageTk = None  # type: ignore
-
-try:
     import tkinter as tk
     from tkinter import messagebox, ttk
 except Exception:  # pragma: no cover - Tk unavailable for TrackerState import
@@ -95,6 +90,7 @@ from recording_quality import (
 )
 from local_site_assets import (
     discover_ply_files,
+    describe_site_routes,
     LocalRouteProvider,
     LocalSitePackageProvider,
     LocalTargetProvider,
@@ -105,6 +101,7 @@ from localization_result_ui import (
     TemporalPoseStabilizer,
     TemporalYawStabilizer,
     annotate_ui_arrival_timing as annotate_ui_arrival_timing,
+    estimated_camera_display_pose,
     localization_pose_timestamp,
     localization_result_display_seq,
     localization_result_is_weak,
@@ -119,6 +116,7 @@ from imu_flight_test import (
 from localization_metrics import (
     attach_fused_localization_telemetry,
     build_localization_metric_record,
+    SessionMapScale,
 )
 from live_safety_config import (
     DEFAULT_MAX_ROTATION_SPEED_DEGS as DEFAULT_MAX_ROTATION_SPEED_DEGS,
@@ -156,6 +154,12 @@ from operator_site_runtime import (
 from site_assets_panel import SiteAssetsPanel
 from route_editor_window import RouteEditorWindow
 from x11_pinch_zoom import install_x11_pinch_zoom
+from operator_depth import (
+    DEPTH_VIEW_OFF_TEXT,
+    DEPTH_VIEW_ON_TEXT,
+    DepthInspector,
+    draw_depth_view,
+)
 from ffmpeg_frame_stream import FFmpegFrameStream
 from live_worker_clients import (
     LiveDetectorClient,
@@ -180,9 +184,9 @@ from operator_hud_text import (
     _telemetry_number,
     _telemetry_text,
     format_magnetometer_calibration,
+    format_device_telemetry,
     format_olympe_telemetry,
     gps_operator_message,
-    inventory_block_summary,
     inventory_ui_status,
     magnetometer_axis_guide,
 )
@@ -261,19 +265,21 @@ from operator_preflight import (
 )
 from operator_rendering import (
     VIEWPORT_MIN_H,
+    VideoCanvasPresenter,
+    MapCanvasPresenter,
     draw_magnetometer_axis,
     MapRenderContext,
     build_hud_overlay_data as build_hud_overlay_data,
     classify_localization_health as classify_localization_health,
-    draw_map_overlays,
     draw_video_banner,
     draw_video_empty_state,
     draw_video_hud,
     format_latency_text as format_latency_text,
     heading_arrow_polygon as heading_arrow_polygon,
-    prepare_video_frame,
+    weak_pose_source_kind,
 )
 import operator_tick
+from operator_pair_metrics import EndToEndFpsTracker, PairedPresentationMetrics
 from operator_tick import (
     pump_localization_frame,
     run_tick,
@@ -357,8 +363,8 @@ DEFAULT_MEGALOC = os.environ.get(
     "",
 )
 DEFAULT_TRACK_LANDMARKS = os.environ.get("SFM_TRACK_LANDMARKS", "")
-DEFAULT_DETECTOR_MODEL = (
-    _WS.algorithms / "object_detection" / "models" / "power_equipment_yolo26n_640_fp16.engine"
+DEFAULT_DETECTOR_MODEL = Path(
+    "/home/allen/下載/power_equipment_sample50_3class_yolo26n_640_aug_best.pt"
 )
 LIVE_DETECTION_STATUS_PATH = Path("/tmp/sfm_flight_operator_detection_status.json")
 SIMULATED_STREAM_INTERFACE = "simulated-stream"
@@ -532,6 +538,7 @@ def resolve_operator_interface(
 
 
 ROUTE_COLOR = "#ff3ea5"  # planned drawn route overlay (distinct from the flown track)
+WORKMAP_POINT_RGB = (0, 230, 255)  # session workmap landmarks (display only)
 
 
 def _positive_env_int(name: str, default: int) -> int:
@@ -1120,6 +1127,7 @@ class DroneBackend:
                     ANAFI.gimbal_pitch_max_deg,
                 )
             )
+            self.state.gimbal_target_pitch_deg = self.state.gimbal_pitch_deg
         elif name == "zoom":
             self.state.zoom = float(
                 np.clip(
@@ -1449,6 +1457,9 @@ class DroneBackend:
         dt = min(0.1, max(0.0, now - self.last_poll))
         self.last_poll = now
         t = now - self.started_mono
+        # Simulated camera attitude observations, never labeled as live events.
+        self.state.gimbal_mono_ns = int(now * 1e9)
+        self.state.gimbal_stamp_source = "simulated"
         self._log_sim_session_telemetry(now)
         self._advance_sim_motion(t, dt)
         if self._apply_sim_tracker_state():
@@ -1548,6 +1559,7 @@ class OperatorApp(tk.Tk):
         site_runtime: ActiveSiteRuntime | None = None,
         prepare_site_runtime=None,
         start_site_runtime=None,
+        connect_live_runtime=None,
     ):
         super().__init__()
         self.backend = backend
@@ -1561,6 +1573,9 @@ class OperatorApp(tk.Tk):
         self._site_runtime = site_runtime
         self._prepare_site_runtime = prepare_site_runtime
         self._start_site_runtime = start_site_runtime
+        self._connect_live_runtime = connect_live_runtime
+        self._connect_live_busy = False
+        self._connect_live_results: queue.Queue[str | None] = queue.Queue(maxsize=1)
         self._runtime_available = True
         self._site_switching = False
         self._site_switch_landed_confirmed = False
@@ -1641,6 +1656,9 @@ class OperatorApp(tk.Tk):
         self.video_stream = video_stream
         self.localizer = localizer
         self.detector = detector  # YOLO optional; default None / off
+        self._segmentation_pipeline = PairedPresentationMetrics()
+        self._e2e_fps = EndToEndFpsTracker()
+        self._depth_inspector = DepthInspector(self)
         self.detect_every_n_frames = max(1, int(detect_every_n_frames))
         self.loc_every_n_frames = max(1, int(loc_every_n_frames))
         self.adaptive_loc_submit = bool(adaptive_loc_submit)
@@ -1661,6 +1679,7 @@ class OperatorApp(tk.Tk):
         self.det_latency_ms: float | None = None
         self.det_count = 0
         self.det_status = "OFF"
+        self.detection_enabled = False  # operator button or AUTO start; independent of localization
         self.loc_fps = 0.0
         self.loc_core_fps = 0.0
         self.loc_latency_ms: float | None = None  # core_wall_ms (inference)
@@ -1736,7 +1755,9 @@ class OperatorApp(tk.Tk):
         self.camera_forward_world: np.ndarray | None = None
         self.live_pose = np.array([0.0, 0.0, 0.0, np.nan], dtype=float)
         self.live_locked = False
+        operator_tick.reset_workmap_display(self)
         self._autonomy_pose_snapshot = None
+        self.field_scale: SessionMapScale | None = None
         self.live_new_pose = False
         self.last_submitted_index = -1
         self.last_detect_submitted_index = -1
@@ -1797,15 +1818,12 @@ class OperatorApp(tk.Tk):
         self._video_dirty_key = (
             None  # skip video re-render+PhotoImage when the frame/overlays are unchanged
         )
-        # Interleave state for _render_if_dirty: when both panels are dirty only
-        # one paints per tick (alternating), capping the worst-case tick body.
-        self._render_turn = 0
-        # Resized-frame cache: HUD-only ticks (battery/age/diagnostic text move
-        # every tick) must not repay the 720p cv2.resize. Keyed by frame stamp +
-        # panel size + source shape/identity; the cached PIL frame is only ever
-        # pasted from, never drawn into, so sharing it is safe.
-        self._video_resized_cache_key = None
-        self._video_resized_cache = None
+        # Render deadlines apply only to painting, never controls/result polling.
+        self._map_render_next = 0.0
+        self._map_presenter = None
+        # Video pixels and changing HUD/banner/detection items have independent
+        # lifetimes; the presenter retains only one source and one Tk photo.
+        self._video_presenter = None
         # Point-cloud base rebuild costs ~16 ms at 250k points (depth argsort +
         # scatter). During a drag that runs on every mouse motion, so drop to a
         # decimated cloud while the operator is moving the view and restore full
@@ -1869,6 +1887,7 @@ class OperatorApp(tk.Tk):
             destroy=None,
             command_coordinator=self._command_coordinator,
             get_autonomy=lambda: self.__dict__.get("_integrated_autonomy"),
+            close_resources=self._close_shutdown_resources,
         )
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self._loc_file_handler_registered = False
@@ -1913,8 +1932,10 @@ class OperatorApp(tk.Tk):
     def poll_localization_results(self) -> None:
         """Drain completed poses independently of the heavier render cadence."""
         try:
-            if self.__dict__.get("_site_switching", False) or not self.__dict__.get(
-                "_runtime_available", True
+            if (
+                self.__dict__.get("_shutdown_in_progress", False)
+                or self.__dict__.get("_site_switching", False)
+                or not self.__dict__.get("_runtime_available", True)
             ):
                 return
             localizer = getattr(self, "localizer", None)
@@ -1947,7 +1968,10 @@ class OperatorApp(tk.Tk):
                 except (OSError, ValueError, AttributeError, TypeError, RuntimeError):  # Tier3: fallback best-effort — narrow, keep pass
                     pass
         finally:
-            self.after(self._loc_result_poll_ms, self.poll_localization_results)
+            # With no worker there are no results or frames to submit. Active
+            # localization retains the inter-tick 5 ms path and filehandler.
+            delay = self._loc_result_poll_ms if getattr(self, "localizer", None) is not None else 250
+            self.after(delay, self.poll_localization_results)
 
     def _detach_localizer_file_handler(self) -> None:
         if not self.__dict__.get("_loc_file_handler_registered", False):
@@ -2190,12 +2214,11 @@ class OperatorApp(tk.Tk):
         return headings
 
     def _fit_control_pane(self) -> None:
-        """Size the fixed control pane to the tallest tab.
+        """Request the selected tab's natural height, including notebook chrome.
 
-        It used to be a hard-coded 295 px with pack_propagate(False), so any tab
-        that grew past it was silently cut off -- the operator simply could not see
-        or click the bottom of 飛控與限制. A measured height cannot drift out of
-        date the way that constant did.
+        The fixed control stack is allocated before the elastic map/video pane;
+        measuring this request alone cannot prevent clipping if the viewport is
+        packed first and consumes height needed by the controls.
         """
         notebook = getattr(self, "controls_notebook", None)
         pane = getattr(self, "_controls_pane", None)
@@ -2212,6 +2235,36 @@ class OperatorApp(tk.Tk):
         if pane.winfo_reqheight() != height:
             pane.configure(height=height)
             self.update_idletasks()
+        details = getattr(self, "preflight_steps_frame", None)
+        bar = getattr(self, "preflight_bar", None)
+        if details is None or bar is None or not bar.winfo_manager():
+            return
+        viewport_height = self.main_paned.winfo_height()
+        if details.winfo_manager() and viewport_height < VIEWPORT_MIN_H:
+            self._set_preflight_expanded(False)
+            self._preflight_resize_collapsed = True
+        elif (
+            getattr(self, "_preflight_resize_collapsed", False)
+            and viewport_height >= VIEWPORT_MIN_H + details.winfo_reqheight() + 6
+        ):
+            self._preflight_resize_collapsed = False
+            self._set_preflight_expanded(True)
+
+    def _fit_map_zoom_controls(self, event) -> None:
+        """Keep both full-size zoom targets inside a short map viewport."""
+        vertical_height = (
+            self.map_zoom_in_button.winfo_reqheight()
+            + self.map_zoom_out_button.winfo_reqheight() + 4 + 16
+        )
+        horizontal = event.height < vertical_height
+        side = "left" if horizontal else "top"
+        if self.map_zoom_in_button.pack_info()["side"] == side:
+            return
+        self.map_zoom_in_button.pack_configure(side=side)
+        self.map_zoom_out_button.pack_configure(
+            side=side, padx=(4, 0) if horizontal else 0,
+            pady=0 if horizontal else (4, 0),
+        )
 
     def _set_initial_main_split(self) -> None:
         """Apply the 35/65 map/video split once, then leave the sash to the user."""
@@ -2295,6 +2348,7 @@ class OperatorApp(tk.Tk):
         self.after_idle(self._fit_control_pane)
 
     def toggle_preflight_details(self) -> None:
+        self._preflight_resize_collapsed = False
         self._set_preflight_expanded(not bool(getattr(self, "_preflight_details_expanded", True)))
 
     def _update_preflight_cards(
@@ -2325,7 +2379,8 @@ class OperatorApp(tk.Tk):
                     else:
                         evidence, _reason = self._preflight_step_evidence(step, st)
                 if evidence is None:
-                    state, symbol, state_text = "blocked", "!", "待處理"
+                    _evidence, reason = self._preflight_step_evidence(step, st)
+                    state, symbol, state_text = "blocked", "!", f"待處理：{reason}"
                 else:
                     state, symbol, state_text = "warning", "•", "待確認"
             else:
@@ -2466,7 +2521,7 @@ class OperatorApp(tk.Tk):
             manual = f"手動起飛：等待「{PREFLIGHT_GUIDE_LABELS[str(step)]}」，{reason}"
             colour = "#805400"
         if not guide.complete:
-            auto = "自動飛行：尚未就緒，請先完成四項驗證"
+            auto = "自動飛行：尚未就緒，請先完成三項驗證"
         elif bool(getattr(self, "_auto_paused", False)):
             auto = "自動飛行：已暫停，按「繼續自動飛行」恢復"
         elif self._integrated_auto_active():
@@ -2506,7 +2561,9 @@ class OperatorApp(tk.Tk):
             foreground="#302c26",
             font=("Sans", 11),
         )
-        style.configure("TButton", padding=(9, 4), font=("Sans", 11),
+        # Keep the readable font and horizontal targets; vertical padding, not
+        # text size, is expendable when all controls share the minimum viewport.
+        style.configure("TButton", padding=(9, 1), font=("Sans", 11),
                         background="#e8dfcf", foreground="#302c26",
                         borderwidth=1, bordercolor="#958773", focuscolor="#245b9b",
                         lightcolor="#958773", darkcolor="#958773")
@@ -2580,7 +2637,7 @@ class OperatorApp(tk.Tk):
         # from the live picture or opening a diagnostics tab. Every chip includes
         # text as well as colour, so red/green is never the only signal.
         status_strip = ttk.Frame(self, style="Panel.TFrame")
-        status_strip.pack(fill="x", padx=10, pady=(8, 6))
+        status_strip.pack(fill="x", padx=10, pady=(4, 4))
         self.status_strip = status_strip
         chip_specs = (
             ("identity", "SIMULATED"),
@@ -2608,6 +2665,14 @@ class OperatorApp(tk.Tk):
         # existing deduplicated setter. It is now the always-visible identity chip.
         self.status = self.status_chips["identity"]
 
+        # Allocate the fixed controls before the elastic viewport. Pack processes
+        # siblings in packing order, not visual order: packing the viewport first
+        # reserves its requested height and clips the last control pane on shrink.
+        # A bottom-packed stack keeps the same visual order without sacrificing
+        # any control's natural height.
+        control_stack = ttk.Frame(self, style="Panel.TFrame")
+        control_stack.pack(side="bottom", fill="x")
+
         mid = ttk.Frame(self, style="TFrame")
         # Stable pack anchor for the two banners above it; both are unpacked
         # while idle, so they cannot anchor off each other.
@@ -2627,10 +2692,9 @@ class OperatorApp(tk.Tk):
         main_paned.grid(row=0, column=0, sticky="nsew")
         self.main_paned = main_paned
 
-        # VIEWPORT_MIN_H: the map/video pane expands into whatever height is spare,
-        # so this REQUESTED size only decides who loses on a short window -- and it
-        # must not be the controls below. Lowered 240 -> 180 -> 140 by operator
-        # request, then to 96 so the 1180x768 minimum keeps every control visible.
+        # This is only the viewport's initial request, not a rendering floor.
+        # The fixed control stack owns its measured height; the map/video pane
+        # receives whatever height remains when the window shrinks.
         self.map_label = tk.Canvas(
             main_paned, bg="#15181c", highlightthickness=0, bd=0, width=440, height=VIEWPORT_MIN_H
         )
@@ -2667,9 +2731,17 @@ class OperatorApp(tk.Tk):
             command=lambda: self._set_map_zoom(self.map_zoom / 1.12),
         )
         self.map_zoom_out_button.pack(pady=(4, 0))
+        self.map_label.bind("<Configure>", self._fit_map_zoom_controls, add="+")
         self.video_label = tk.Canvas(
             main_paned, bg="#08090b", highlightthickness=0, bd=0, width=760, height=VIEWPORT_MIN_H
         )
+        self.video_label.bind("<Button-3>", lambda event: self._depth_inspector.show(event))
+        depth_bar = ttk.Frame(self.video_label)
+        self.depth_view_button = ttk.Button(
+            depth_bar, text=DEPTH_VIEW_OFF_TEXT, command=self._toggle_depth_view,
+        )
+        self.depth_view_button.pack(side="left")
+        self.video_label.create_window(8, 8, window=depth_bar, anchor="nw")
         main_paned.add(self.map_label, minsize=300, stretch="always")
         main_paned.add(self.video_label, minsize=480, stretch="always")
         self._map_pinch_zoom = install_x11_pinch_zoom(
@@ -2681,12 +2753,12 @@ class OperatorApp(tk.Tk):
 
         # Flight actions stay outside the tabbed control pane, so 懸停 and
         # 原地降落 are always visible.
-        flight_bar = ttk.Frame(self, style="Panel.TFrame")
-        flight_bar.pack(fill="x", padx=10, pady=(6, 4))
+        flight_bar = ttk.Frame(control_stack, style="Panel.TFrame")
+        flight_bar.pack(fill="x", padx=10, pady=(4, 2))
         #: The always-visible action row. Named so callers and tests do not have to
         #: locate it by walking the widget tree.
         self.flight_bar = flight_bar
-        preflight_bar = ttk.LabelFrame(self, text="起飛前依序確認（只提示，不會自行起飛）")
+        preflight_bar = ttk.LabelFrame(control_stack, text="起飛前依序確認（只提示，不會自行起飛）")
         preflight_bar.pack(fill="x", padx=10, pady=(0, 4))
         self.preflight_bar = preflight_bar
         self.preflight_guide_var = DedupStringVar(value="① 羅盤校正狀態：等待飛機狀態讀回")
@@ -2697,22 +2769,23 @@ class OperatorApp(tk.Tk):
             textvariable=self.preflight_guide_var,
             font=("Sans", 11, "bold"),
             wraplength=1080,
-        ).pack(side="left", fill="x", expand=True, padx=8, pady=5)
+        ).pack(side="left", fill="x", expand=True, padx=8, pady=3)
         self.preflight_confirm_button = ttk.Button(
             preflight_header,
             text="確認本步驟",
             command=self.confirm_current_preflight_step,
             state="disabled",
         )
-        self.preflight_confirm_button.pack(side="right", padx=(4, 8), pady=4)
+        self.preflight_confirm_button.pack(side="right", padx=(4, 8), pady=2)
         self._preflight_auto_collapsed = False
         self._preflight_details_expanded = True
+        self._preflight_resize_collapsed = False
         self.preflight_details_button = ttk.Button(
             preflight_header,
             text="收合明細",
             command=self.toggle_preflight_details,
         )
-        self.preflight_details_button.pack(side="right", padx=4, pady=4)
+        self.preflight_details_button.pack(side="right", padx=4, pady=2)
         self.preflight_steps_frame = ttk.Frame(preflight_bar)
         self.preflight_steps_frame.pack(fill="x", padx=7, pady=(0, 6))
         self.preflight_step_labels: dict[str, tk.Label] = {}
@@ -2736,8 +2809,8 @@ class OperatorApp(tk.Tk):
         # Aircraft identity and safety state live in the always-visible header;
         # engineering readouts are composed into the video HUD below.
 
-        controls = ttk.Frame(self, style="Panel.TFrame", width=920, height=CONTROL_PANE_MIN_H)
-        controls.pack(fill="x", padx=10, pady=(4, 6))
+        controls = ttk.Frame(control_stack, style="Panel.TFrame", width=920, height=CONTROL_PANE_MIN_H)
+        controls.pack(fill="x", padx=10, pady=(2, 4))
         controls.pack_propagate(False)
         self._controls_pane = controls
         control_notebook = ttk.Notebook(controls)
@@ -2767,6 +2840,20 @@ class OperatorApp(tk.Tk):
         calibration_tab.columnconfigure(0, weight=1)
         site_tab.columnconfigure(0, weight=1)
         site_tab.rowconfigure(0, weight=1)
+        if self._connect_live_runtime is not None:
+            connection = ttk.Frame(flight_bar)
+            connection.pack(fill="x")
+            self.connect_live_button = ttk.Button(
+                connection, text="連接真機串流", command=self.connect_live_stream
+            )
+            self.connect_live_button.pack(side="left", padx=4, pady=4)
+            self.connect_live_status_var = DedupStringVar(
+                value=f"尚未連線：{self.backend.ip}；真機就緒後按「連接真機串流」"
+            )
+            ttk.Label(
+                connection, textvariable=self.connect_live_status_var,
+                width=65, wraplength=700,
+            ).pack(side="left", padx=6, fill="x", expand=True)
         # Parent is flight_bar (always visible), not the tabbed control pane.
         flight = ttk.Frame(flight_bar)
         flight.pack(fill="x")
@@ -2800,7 +2887,7 @@ class OperatorApp(tk.Tk):
             )
             widget.bind("<space>", self._on_space_hover)
             widget.bind("<Return>", self._on_flight_button_return)
-            widget.pack(side="left", padx=4, pady=6)
+            widget.pack(side="left", padx=4, pady=3)
             self.flight_buttons[button.command] = widget
         for button in MISSION_MODE_BUTTONS:
             widget = ttk.Button(
@@ -2813,7 +2900,7 @@ class OperatorApp(tk.Tk):
             )
             widget.bind("<space>", self._on_space_hover)
             widget.bind("<Return>", self._on_flight_button_return)
-            widget.pack(side="left", padx=4, pady=6)
+            widget.pack(side="left", padx=4, pady=3)
             self.flight_buttons[button.command] = widget
             if button.command == "takeoff":
                 self.takeoff_button = widget
@@ -2824,9 +2911,15 @@ class OperatorApp(tk.Tk):
             text="開始定位",
             command=self.toggle_localization,
         )
-        self.start_localization_button.pack(side="left", padx=4, pady=6)
+        self.start_localization_button.pack(side="left", padx=4, pady=3)
+        self.start_detection_button = ttk.Button(
+            flight_actions,
+            text="開始物件偵測",
+            command=self.toggle_detection,
+        )
+        self.start_detection_button.pack(side="left", padx=4, pady=3)
         self.flight_action_hint_var = DedupStringVar(
-            value="請先確認場域、匯入航線並完成四項驗證，再由操作員按「自動飛行」"
+            value="請先確認場域、匯入航線並完成三項驗證，再由操作員按「自動飛行」"
         )
         self.flight_action_hint = tk.Label(
             flight,
@@ -2857,9 +2950,9 @@ class OperatorApp(tk.Tk):
             text="起飛後錄影",
             variable=self.record_on_takeoff_var,
             command=self._on_record_on_takeoff_toggled,
-        ).pack(side="left", padx=(12, 2), pady=6)
+        ).pack(side="left", padx=(12, 2), pady=3)
         self.record_quality_var = DedupStringVar(value=initial_profile.label)
-        ttk.Label(recording, text="機載錄影").pack(side="left", padx=(8, 2), pady=6)
+        ttk.Label(recording, text="機載錄影").pack(side="left", padx=(8, 2), pady=3)
         self.record_quality_combo = ttk.Combobox(
             recording,
             textvariable=self.record_quality_var,
@@ -2867,7 +2960,7 @@ class OperatorApp(tk.Tk):
             state="readonly",
             width=12,
         )
-        self.record_quality_combo.pack(side="left", padx=(0, 4), pady=6)
+        self.record_quality_combo.pack(side="left", padx=(0, 4), pady=3)
         self.record_quality_combo.bind(
             "<<ComboboxSelected>>",
             self._on_recording_quality_selected,
@@ -2881,7 +2974,7 @@ class OperatorApp(tk.Tk):
         )
         ttk.Label(
             recording, textvariable=self.record_status_var, font=("Sans", 10)
-        ).pack(side="left", padx=(4, 4), pady=6)
+        ).pack(side="left", padx=(4, 4), pady=3)
 
         nudge_title = "虛擬搖桿（放開懸停）" if live else "虛擬搖桿（模擬）"
         nudge = ttk.LabelFrame(aircraft_tab, text=nudge_title)
@@ -3086,7 +3179,7 @@ class OperatorApp(tk.Tk):
         drone_mag_buttons.pack(fill="x", padx=4)
         self.drone_magnetometer_start_button = ttk.Button(
             drone_mag_buttons,
-            text="開始飛機羅盤校正",
+            text="重新校正",
             command=lambda: self.send("drone_magnetometer_start"),
             state="disabled",
         )
@@ -3098,6 +3191,11 @@ class OperatorApp(tk.Tk):
             state="disabled",
         )
         self.drone_magnetometer_cancel_button.pack(side="left", padx=2)
+        ttk.Label(
+            magnetometer,
+            text="連線後自動沿用機上已存校正；只有按「重新校正」才重新開始。",
+            wraplength=250, font=("Sans", 10),
+        ).pack(anchor="w", padx=6, pady=(4, 2))
         # The SkyController compass panel was removed (operator decision 2026-08-06):
         # it only feeds pilot-referenced features this system never uses, and it no
         # longer gates takeoff. The backend command still exists for FreeFlight-style
@@ -3105,8 +3203,8 @@ class OperatorApp(tk.Tk):
         ttk.Label(
             magnetometer,
             text=(
-                "僅落地可校正，請手持機身依 X/Y/Z 指示各轉滿三圈。"
-                "遠離鋼筋、車輛與磁性物品；此流程不會啟動馬達。"
+                "僅落地可校正。依 X/Y/Z 指示旋轉至下一軸，"
+                "以韌體結果為準。遠離鋼筋與磁性物品；不啟動馬達。"
             ),
             wraplength=250,
             font=("Sans", 9),
@@ -3126,6 +3224,8 @@ class OperatorApp(tk.Tk):
             request_apply=self.request_site_profile_restart,
             request_route_editor=self.request_route_editor,
             request_route_preview=self.preview_site_route,
+            request_route_delete=self.delete_site_route,
+            request_route_edit=lambda path: self.request_route_editor(True, route_path=path),
             route_imported=self.apply_route_import_preview,
             site_packages_root=SYSTEM_ROOT / "地圖檔" / "場域",
             site_pack_root=site_pack_root_for_profile(self.site_profile_path, _WS.site_packages),
@@ -3137,6 +3237,11 @@ class OperatorApp(tk.Tk):
 
         self.controls_notebook.bind(
             "<<NotebookTabChanged>>", lambda _event: self._fit_control_pane()
+        )
+        self.bind(
+            "<Configure>",
+            lambda event: self.after_idle(self._fit_control_pane) if event.widget is self else None,
+            add="+",
         )
         self._fit_control_pane()
         self._sync_record_status_label()
@@ -3374,6 +3479,55 @@ class OperatorApp(tk.Tk):
             )
         )
 
+    def connect_live_stream(self) -> None:
+        """Start one connection attempt without blocking Tk or issuing takeoff."""
+        if (
+            self._connect_live_busy or self._site_switching
+            or self.__dict__.get("_shutdown_in_progress", False)
+            or self.__dict__.get("_shutdown_completed", False)
+            or self._connect_live_runtime is None or self._site_runtime is None
+        ):
+            return
+        self._connect_live_busy = True
+        self.connect_live_button.configure(state="disabled", text="連線中…")
+        self.connect_live_status_var.set(f"正在連接 {self.backend.ip}；介面可繼續操作")
+        runtime = self._site_runtime
+
+        def worker() -> None:
+            error = None
+            try:
+                self._connect_live_runtime(runtime)
+            except BaseException as exc:
+                error = str(exc) or repr(exc)
+            self._connect_live_results.put(error)
+
+        try:
+            threading.Thread(
+                target=worker, name="operator-live-connect", daemon=True
+            ).start()
+        except Exception as exc:
+            self._connect_live_results.put(str(exc) or repr(exc))
+        self.after(50, self._poll_live_connect_result)
+
+    def _poll_live_connect_result(self) -> None:
+        try:
+            error = self._connect_live_results.get_nowait()
+        except queue.Empty:
+            self.after(50, self._poll_live_connect_result)
+            return
+        self._connect_live_busy = False
+        runtime = self._site_runtime
+        self.video_stream = runtime.video_stream
+        self.lost_hold = runtime.lost_hold
+        if error is not None:
+            message = f"連線失敗：{error}；可再次按「連接真機串流」重試"
+            self.connect_live_button.configure(state="normal", text="連接真機串流")
+        else:
+            message = f"已連接真機串流：{self.backend.ip}；定位與起飛仍須另行操作"
+            self.connect_live_button.configure(state="disabled", text="已連接真機串流")
+        self.connect_live_status_var.set(message)
+        self.write_log(message)
+
     def _reset_localization_benchmark_metrics(self) -> None:
         """Start a fresh FPS/latency window after a requested worker mode is active."""
         yaw_stabilizer = getattr(self, "yaw_stabilizer", None)
@@ -3431,6 +3585,12 @@ class OperatorApp(tk.Tk):
         if self.inspecting:
             return False
         self.inspecting = True
+        pipeline = self.__dict__.get("_segmentation_pipeline")
+        if pipeline is not None:
+            pipeline.reset()
+        self.detection_result = None
+        self.detection_result_frame_name = ""
+        self.detection_pending_frame_name = ""
         OperatorApp._sync_localization_button(self)
         self.inspect_start = time.monotonic()
         self.processed_frames = 0
@@ -3476,11 +3636,18 @@ class OperatorApp(tk.Tk):
         self._autonomy_pose_snapshot = None
         self.live_new_pose = False
         self.live_result = None
+        operator_tick.reset_workmap_display(self)
         self.live_result_frame_name = ""
         self.live_pending_frame_name = ""
         self.detection_result = None
         self.detection_result_frame_name = ""
         self.detection_pending_frame_name = ""
+        pipeline = self.__dict__.get("_segmentation_pipeline")
+        if pipeline is not None:
+            pipeline.reset()
+        depth_inspector = self.__dict__.get("_depth_inspector")
+        if depth_inspector is not None:
+            depth_inspector.reset()
         self.loc_pose_updated_mono = None
         self._live_pending = None
         yaw_stabilizer = getattr(self, "yaw_stabilizer", None)
@@ -3509,6 +3676,118 @@ class OperatorApp(tk.Tk):
             self.cancel_localization()
         else:
             self.begin_auto_inspect()
+
+    def _sync_detection_button(self) -> None:
+        button = self.__dict__.get("start_detection_button")
+        if button is not None:
+            button.configure(text="停止物件偵測" if self.detection_enabled else "開始物件偵測")
+
+    def start_detection(self) -> bool:
+        """Start feeding stream frames to the YOLO worker; never sends a backend command."""
+        if self.detection_enabled:
+            return False
+        if self.detector is None:
+            self.write_log("物件偵測無法開始：未載入偵測模型（請以 --live-detect 啟動）")
+            return False
+        self.detection_enabled = True
+        self.detection_result = None
+        self.detection_result_frame_name = ""
+        self.detection_pending_frame_name = ""
+        self.last_detect_submitted_index = -1
+        pipeline = self.__dict__.get("_segmentation_pipeline")
+        if pipeline is not None:
+            pipeline.reset()
+        OperatorApp._reset_e2e_fps(self)
+        self.det_status = "RUN"
+        OperatorApp._sync_detection_button(self)
+        self.write_log("開始物件偵測：串流影格送入偵測；未發送飛控指令")
+        return True
+
+    def stop_detection(self) -> bool:
+        """Stop feeding the detector and drop any unfinished result; no flight command."""
+        if not self.detection_enabled:
+            return False
+        self.detection_enabled = False
+        self.detection_result = None
+        self.detection_result_frame_name = ""
+        self.detection_pending_frame_name = ""
+        self.last_detect_submitted_index = -1
+        pipeline = self.__dict__.get("_segmentation_pipeline")
+        if pipeline is not None:
+            pipeline.reset()
+        OperatorApp._reset_e2e_fps(self)
+        self.det_status = "OFF"
+        if hasattr(self, "det_count_var"):
+            self.det_count_var.set("objects - | OFF")
+        OperatorApp._sync_detection_button(self)
+        self.write_log("停止物件偵測：停止送入新影格並忽略尚未完成的結果；未發送飛控指令")
+        return True
+
+    def toggle_detection(self) -> None:
+        if self.detection_enabled:
+            self.stop_detection()
+        else:
+            self.start_detection()
+
+    def _detection_follows_localization(self) -> bool:
+        """While localization runs, the detector is fed the same frame as the localizer."""
+        return bool(
+            self.inspecting and self.localizer is not None
+            and not OperatorApp._segmentation_enabled(self)
+        )
+
+    def _pair_detection_with_localization(self, frame_name: str, timing: dict) -> None:
+        """Give the frame just sent to the localizer to the detector as well.
+
+        The pair is registered only when the detector accepted the frame, so the
+        end-to-end rate counts frames that completed BOTH stages. A busy detector is
+        skipped, never waited for: localization is never gated by the optional detector.
+        """
+        detector = self.__dict__.get("detector")
+        if (
+            not self.__dict__.get("detection_enabled", False) or detector is None
+            or timing.get("hold_retry")
+            or not OperatorApp._detection_follows_localization(self)
+            or detector.busy()
+        ):
+            return
+        if not self.detector.submit(self.video_display_index, frame_name, self.video_frame):
+            return
+        self.last_detect_submitted_index = self.video_display_index
+        self.detection_pending_frame_name = frame_name
+        self.det_status = "RUN"
+        tracker = self.__dict__.get("_e2e_fps")
+        if tracker is not None:
+            tracker.expect_pair(self.video_display_index, frame_name)
+
+    def _note_e2e_result(self, kind: str, result: dict, now: float | None = None) -> None:
+        tracker = self.__dict__.get("_e2e_fps")
+        if tracker is not None:
+            tracker.receive(kind, result, time.monotonic() if now is None else now)
+
+    def _reset_e2e_fps(self) -> None:
+        tracker = self.__dict__.get("_e2e_fps")
+        if tracker is not None:
+            tracker.reset()
+
+    def _pipeline_fps(self) -> tuple[str, float]:
+        """(label, value) of the FPS readout: whole-pipeline rate while detection runs."""
+        tracker = self.__dict__.get("_e2e_fps")
+        if (
+            tracker is None or not self.__dict__.get("detection_enabled", False)
+            or self.__dict__.get("detector") is None or OperatorApp._segmentation_enabled(self)
+        ):
+            return "定位 FPS", float(getattr(self, "loc_fps", 0.0) or 0.0)
+        return "端到端 FPS(定位+偵測)", tracker.fps(time.monotonic())
+
+    def _start_feeds_for_auto(self) -> None:
+        """AUTO start turns on localization and, when loaded, object detection."""
+        if not self.inspecting:
+            self._begin_inspection_feed()
+        if self.__dict__.get("detector") is not None and not self.__dict__.get(
+            "detection_enabled", False
+        ):
+            self.start_detection()
 
     def begin_auto_inspect(self) -> None:
         """Bench helper: localization/metrics only, with no flight-control command."""
@@ -3822,6 +4101,15 @@ class OperatorApp(tk.Tk):
         self._auto_resume_checkpoint = None
         return None
 
+    def _auto_resume_camera_actions(self, resume_target: int | None) -> frozenset:
+        checkpoint = self.__dict__.get("_auto_resume_camera_checkpoint")
+        if (
+            resume_target is not None and checkpoint is not None
+            and checkpoint[0] == self.__dict__.get("_auto_resume_checkpoint")
+        ):
+            return checkpoint[2]
+        return frozenset()
+
     def _start_integrated_auto(self, snapshot: MissionRouteSnapshot) -> bool:
         if self._integrated_auto_active():
             self.write_log("AUTO 已在執行中；略過重複啟動")
@@ -3852,12 +4140,16 @@ class OperatorApp(tk.Tk):
             if map_frame is None:
                 raise ValueError("AUTO requires the site's measured gravity frame")
             self._autonomy_map_frame = map_frame
+            field_scale = OperatorApp._ensure_field_scale(self, map_frame)
             resume_target = self._auto_resume_target(snapshot)
+            completed_camera_actions = self._auto_resume_camera_actions(resume_target)
             coordinator = DesktopRouteAutonomy(
                 backend=self.backend,
                 snapshot=snapshot,
                 map_frame=map_frame,
+                control_state=field_scale.state,
                 get_pose=self._autonomy_pose,
+                pose_info=lambda: self.__dict__.get("live_result") or {},
                 pose_is_weak=lambda: str(self.loc_health) != "OK",
                 pose_is_predicted=lambda: (
                     (pose := self.__dict__.get("_autonomy_pose_snapshot")) is not None
@@ -3875,6 +4167,7 @@ class OperatorApp(tk.Tk):
                 take_pc_control=lambda: self._backend_command("pc_control", {}),
                 start_airborne=start_airborne,
                 resume_target_index=resume_target,
+                completed_camera_actions=completed_camera_actions,
                 land=lambda: self._backend_command("land", {}),
                 arming_blockers=lambda: autonomous_arming_blockers(
                     self._autonomy_gate_snapshot(), boot_pose_locked=True
@@ -4042,6 +4335,23 @@ class OperatorApp(tk.Tk):
             "請使用「停止電腦動作」或「原地降落」，確認安全後重新啟動介面"
         )
 
+    def _record_integrated_auto_route_error(self, event) -> None:
+        """Keep the last completed AUTO's deviation visible after other events."""
+        self._last_auto_route_error = event.result
+        self._last_auto_route_error_text = str(event.detail)
+        variable = self.__dict__.get("auto_route_error_var")
+        if variable is not None:
+            summary = event.result
+            if summary is not None and summary.get("state") == "ok":
+                variable.set(
+                    f"上次 AUTO 誤差（地圖單位，{summary['samples']} 筆）\n"
+                    f"平均 {summary['mean_u']:.4f} · RMS {summary['rms_u']:.4f} · "
+                    f"最大 {summary['max_u']:.4f}"
+                )
+            else:
+                variable.set("上次 AUTO 誤差：無有效樣本（地圖單位）")
+        self._log_integrated_auto_notice(event)
+
     def _finish_integrated_auto_event(self, event) -> None:
         if getattr(self, "_pending_auto_route_activation", False):
             self._cancel_pending_auto_route_activation()
@@ -4061,6 +4371,10 @@ class OperatorApp(tk.Tk):
                 snapshot = coordinator.snapshot
                 self._auto_resume_checkpoint = (
                     backend, snapshot.sha256, snapshot.coordinate_frame_id, target,
+                )
+                self._auto_resume_camera_checkpoint = (
+                    self._auto_resume_checkpoint, coordinator.run_id,
+                    coordinator.controller.camera_action_checkpoint(),
                 )
             else:
                 self._auto_resume_checkpoint = None
@@ -4086,8 +4400,9 @@ class OperatorApp(tk.Tk):
             "pose_jump_paused": self._log_integrated_auto_pose_jump_paused,
             "route_started": self._log_integrated_auto_route_started,
             "waypoint_arrived": self._log_integrated_auto_waypoint_arrived,
-            "route_error_summary": self._log_integrated_auto_notice,
+            "route_error_summary": self._record_integrated_auto_route_error,
             "waypoint_action_timeout": self._log_integrated_auto_notice,
+            "waypoint_camera_action": self._log_integrated_auto_notice,
             "leg_stage": self._log_integrated_auto_leg_stage,
             "landing_unresolved": self._log_integrated_auto_landing_unresolved,
             "auto_failed": self._log_integrated_auto_failed,
@@ -4181,7 +4496,7 @@ class OperatorApp(tk.Tk):
         step = None if guide is None else guide.current_step
         label = PREFLIGHT_GUIDE_LABELS.get(str(step), "起飛前確認")
         action = "自動飛行" if command in {"start_auto", "auto"} else "起飛"
-        self.write_log(f"{action}已拒絕：四步起飛前確認尚未完成，目前等待「{label}」")
+        self.write_log(f"{action}已拒絕：三步起飛前確認尚未完成，目前等待「{label}」")
         self._select_preflight_tab(step)
         return True
 
@@ -4226,7 +4541,6 @@ class OperatorApp(tk.Tk):
         memo_key = (step, id(st), verify_route_hash)
         if memo is not None and not force and memo_key in memo:
             return memo[memo_key]
-        safety_log = getattr(self.backend, "log", None)
         route_lock = self.__dict__.get("mission_route_lock")
         displayed_route_snapshot = self.__dict__.get("_displayed_route_snapshot")
         if displayed_route_snapshot is None and route_lock is not None:
@@ -4239,22 +4553,6 @@ class OperatorApp(tk.Tk):
             route_snapshot=displayed_route_snapshot,
             displayed_route_sha256=self.__dict__.get("_displayed_route_sha256"),
             route_point_count=len(self.__dict__.get("route_pts", ())),
-            video_frame_available=self.__dict__.get("video_frame") is not None,
-            stream_last_stamp=getattr(self.__dict__.get("video_stream"), "last_stamp", None),
-            video_frame_stamp=self.__dict__.get("_video_frame_stamp"),
-            min_takeoff_battery_pct=getattr(self.backend, "min_takeoff_battery_pct", 30.0),
-            via_controller=bool(
-                callable(getattr(self.backend, "via_skycontroller", None))
-                and self.backend.via_skycontroller()
-            ),
-            safety_log_durable=(
-                None if safety_log is None else bool(getattr(safety_log, "durable", False))
-            ),
-            safety_log_healthy=(
-                None if safety_log is None else bool(getattr(safety_log, "healthy", False))
-            ),
-            inventory_takeoff_ready=getattr(self.backend, "_inventory_takeoff_ready", None),
-            inventory_block_reason=inventory_block_summary(self.backend),
         )
         result = evaluate_preflight_step(
             step,
@@ -4319,11 +4617,11 @@ class OperatorApp(tk.Tk):
         *,
         live: bool,
     ) -> bool:
-        """Accept an explicit valid firmware readback without a second click."""
+        """Reuse usable onboard calibration; recommended is advisory only."""
         guide = self.preflight_guide
         if not live or guide.current_step != "compass":
             return False
-        if getattr(st, "drone_magnetometer_required", None) != 0:
+        if getattr(st, "drone_magnetometer_required", None) not in {0, 2}:
             return False
         if getattr(st, "drone_magnetometer_started", None) is not False:
             return False
@@ -4333,7 +4631,7 @@ class OperatorApp(tk.Tk):
         if evidence is None:
             return False
         guide.confirm_current(evidence)
-        self.write_log(f"羅盤校正已由韌體有效回讀自動確認（{reason}）")
+        self.write_log(f"已自動沿用機上羅盤校正（{reason}）；可按「重新校正」重做")
         self._select_preflight_tab(guide.current_step)
         return True
 
@@ -4362,11 +4660,6 @@ class OperatorApp(tk.Tk):
         flight_state_name = flight_state.rsplit(".", 1)[-1].lower()
         landed = flight_state_name == "landed"
         if live and not landed:
-            can_confirm_system = False
-            evidence = None
-            if guide.current_step == "system":
-                evidence, _reason = self._preflight_step_evidence("system", st)
-                can_confirm_system = evidence is not None
             can_restart_auto = (
                 flight_state_name in {"hovering", "flying"} and not self._integrated_auto_active()
             )
@@ -4374,18 +4667,15 @@ class OperatorApp(tk.Tk):
                 guide.complete and (getattr(self, "_auto_paused", False) or can_restart_auto)
             )
             self.preflight_guide_var.set(
-                "飛行中：起飛按鈕維持關閉；四步確認完成後才可由懸停／飛行狀態重新啟動自動巡航"
+                "飛行中：起飛按鈕維持關閉；三步確認完成後才可由懸停／飛行狀態重新啟動自動巡航"
             )
-            self._set_widget_enabled(
-                self.preflight_confirm_button,
-                can_confirm_system,
-            )
+            self._set_widget_enabled(self.preflight_confirm_button, False)
             self._set_widget_enabled(getattr(self, "takeoff_button", None), False)
             self._set_widget_enabled(
                 getattr(self, "start_auto_button", None),
                 can_start_auto,
             )
-            self._sync_preflight_cards(st, current_evidence=evidence, evidence_known=True)
+            self._sync_preflight_cards(st, current_evidence=None, evidence_known=True)
             self._update_flight_action_guidance(st)
             return
         evidence_by_step = {}
@@ -4420,7 +4710,7 @@ class OperatorApp(tk.Tk):
             landed and (live or bool(self.__dict__.get("_auto_advance_preflight", False)))
         )
         if is_landed_stable:
-            while guide.current_step in {"map", "route", "system"}:
+            while guide.current_step in {"map", "route"}:
                 step = guide.current_step
                 evidence, reason = self._preflight_step_evidence(
                     step,
@@ -4475,8 +4765,7 @@ class OperatorApp(tk.Tk):
             self._last_preflight_guide_status = (None, guide.confirmed_steps)
             self._last_preflight_tick_update_t = time.monotonic()
             self.preflight_guide_var.set(
-                "✓ 起飛前確認完成，當前串流／遙測正常；可以由使用者按「起飛」或"
-                "「自動飛行」"
+                "✓ 起飛前確認完成；可以由使用者按「起飛」或「自動飛行」"
                 "（按下後仍會執行飛控最終硬檢查）"
             )
             self._set_widget_enabled(self.preflight_confirm_button, False)
@@ -4491,7 +4780,9 @@ class OperatorApp(tk.Tk):
             return
         if not eval_current:
             index = PREFLIGHT_GUIDE_STEPS.index(step) + 1
-            self.preflight_guide_var.set(f"{index}/4 {PREFLIGHT_GUIDE_LABELS[step]}：待確認")
+            self.preflight_guide_var.set(
+                f"{index}/{len(PREFLIGHT_GUIDE_STEPS)} {PREFLIGHT_GUIDE_LABELS[step]}：待確認"
+            )
             self._set_widget_enabled(
                 self.preflight_confirm_button,
                 False,
@@ -4503,7 +4794,9 @@ class OperatorApp(tk.Tk):
             return
         evidence, reason = self._preflight_step_evidence(step, st, force=force)
         index = PREFLIGHT_GUIDE_STEPS.index(step) + 1
-        self.preflight_guide_var.set(f"{index}/4 {PREFLIGHT_GUIDE_LABELS[step]}：{reason}")
+        self.preflight_guide_var.set(
+            f"{index}/{len(PREFLIGHT_GUIDE_STEPS)} {PREFLIGHT_GUIDE_LABELS[step]}：{reason}"
+        )
         self._set_widget_enabled(
             self.preflight_confirm_button,
             evidence is not None,
@@ -4807,8 +5100,8 @@ class OperatorApp(tk.Tk):
                 state.stream = "STICKS"
             elif getattr(self.backend, "is_live", False) and state is not None:
                 state.stream = "OK"
-        if command == "start_auto" and not self.inspecting:
-            self._begin_inspection_feed()
+        if command == "start_auto":
+            self._start_feeds_for_auto()
 
     def _dispatch_integrated_auto(
         self, command: str, snapshot: object | None, *, activated_now: bool
@@ -4954,6 +5247,8 @@ class OperatorApp(tk.Tk):
     def _validate_site_switch_request(self, profile_path: Path) -> SiteProfile:
         if self._site_switching:
             raise ValueError("場域切換已在進行中")
+        if self.__dict__.get("_connect_live_busy", False):
+            raise ValueError("真機連線正在進行，請等待結果後再切換場域")
         if self._site_runtime is None:
             raise ValueError("這個啟動模式沒有場域 runtime，無法直接切換")
         if getattr(self, "mission_route_lock", None) is not None:
@@ -5035,6 +5330,11 @@ class OperatorApp(tk.Tk):
         elif result.runtime is old_runtime and not result.old_closed:
             self._attach_localizer_file_handler()
             self._get_command_coordinator().resume()
+            active_profile = old_runtime.prepared.profile.source
+            self.site_assets_panel.activate_site(
+                active_profile,
+                site_pack_root_for_profile(active_profile, _WS.site_packages),
+            )
 
         self._site_switching = False
         self._runtime_available = result.runtime is not None
@@ -5077,6 +5377,10 @@ class OperatorApp(tk.Tk):
             operational and self.__dict__.get("localizer") is not None,
         )
         self._set_widget_enabled(
+            self.__dict__.get("start_detection_button"),
+            operational and self.__dict__.get("detector") is not None,
+        )
+        self._set_widget_enabled(
             self.__dict__.get("preflight_confirm_button"),
             False,
         )
@@ -5092,6 +5396,7 @@ class OperatorApp(tk.Tk):
                 pass
         self._loc_metrics_f = None
         self._loc_metrics_path = None
+        self.field_scale = None  # New session/map identity: no cross-map scale evidence.
         # The recorder writes into the outgoing session directory, so it is
         # finalized before the new session replaces it.
         close_imu_flight_test_recorder(self.__dict__.get("imu_flight_test"))
@@ -5113,6 +5418,10 @@ class OperatorApp(tk.Tk):
         self.current_state = runtime.backend.state
         self.site_id = profile.site_id
         self.site_profile_path = profile.source
+        old_depth = self.__dict__.get("_depth_inspector")
+        if old_depth is not None:
+            old_depth.close()
+        self._depth_inspector = DepthInspector(self)
         self.site_asset_actions.current_profile = profile.source
         if profile is not None:
             for path_attr, digest_attr in (
@@ -5143,6 +5452,7 @@ class OperatorApp(tk.Tk):
             destroy=None,
             command_coordinator=self._command_coordinator,
             get_autonomy=lambda: self.__dict__.get("_integrated_autonomy"),
+            close_resources=self._close_shutdown_resources,
         )
 
         self.map_points = prepared.map_points
@@ -5167,9 +5477,17 @@ class OperatorApp(tk.Tk):
         self.map_base_cache_key = None
         self.map_base_cache = None
         self._map_dirty_key = None
-        self._render_turn = 0
-        self._video_resized_cache_key = None
-        self._video_resized_cache = None
+        self._map_render_next = 0.0
+        self._map_presenter = None
+        map_canvas = self.__dict__.get("map_label")
+        if map_canvas is not None:
+            map_canvas.delete("map-overlay")
+        video_canvas = self.__dict__.get("video_label")
+        if video_canvas is not None:
+            video_canvas.delete("video-frame", "video-overlay")
+        self._video_presenter = None
+        self.video_photo = None
+        self._video_dirty_key = None
         self.history.clear()
         self.history_health.clear()
         self.history_weak.clear()
@@ -5204,6 +5522,9 @@ class OperatorApp(tk.Tk):
         self.detection_result_frame_name = ""
         self.detection_pending_frame_name = ""
         self.detection_result = None
+        pipeline = self.__dict__.get("_segmentation_pipeline")
+        if pipeline is not None:
+            pipeline.reset()
         self._last_applied_live_result_display_seq = None
         self._last_localization_exception_seq = None
         self._video_frame_stamp = 0.0
@@ -5215,10 +5536,13 @@ class OperatorApp(tk.Tk):
         self.live_new_pose = False
         self.camera_axes_world = None
         self.camera_forward_world = None
+        operator_tick.reset_workmap_display(self)
         self.last_submitted_index = -1
         self.last_detect_submitted_index = -1
         self.inspecting = False
         OperatorApp._sync_localization_button(self)
+        self.detection_enabled = False
+        OperatorApp._sync_detection_button(self)
         self.inspect_start = None
         self.boot_lock_start = None
         self.boot_lock_done = self.boot_lock_s <= 0.0
@@ -5258,6 +5582,43 @@ class OperatorApp(tk.Tk):
         )
         self._attach_localizer_file_handler()
         self._sync_record_status_label()
+        if self.__dict__.get("connect_live_button") is not None:
+            self.connect_live_button.configure(state="normal", text="連接真機串流")
+            self.connect_live_status_var.set(
+                f"尚未連線：{self.backend.ip}；按「連接真機串流」連接新場域"
+            )
+
+    def delete_site_route(self, route_path: Path):
+        """Delete a landed-session route and invalidate only its runtime selection."""
+        allowed, reason = self.route_editor_safety_check()
+        if not allowed:
+            raise ValueError(f"航線刪除已拒絕：{reason}")
+        if (
+            self.__dict__.get("_route_editor_window") is not None
+            or self.__dict__.get("_route_editor_loading", False)
+        ):
+            raise ValueError("請先關閉航線編輯器，避免尚未儲存的航線重新寫入")
+        path = Path(route_path).expanduser().resolve()
+        # Include the active runtime snapshot in the storage transaction even
+        # after an earlier import changed the actions' managed-profile pointer.
+        if self.site_profile_path is not None:
+            self.site_asset_actions.current_profile = Path(self.site_profile_path)
+        result = self.site_asset_actions.delete_route(path)
+        route_lock = self.__dict__.get("mission_route_lock")
+        selected = None if route_lock is None else route_lock.snapshot
+        if selected is not None and Path(selected.path).resolve() == path:
+            self.mission_route_lock = MissionRouteLock()
+            self._auto_resume_checkpoint = None
+        displayed = self.__dict__.get("_displayed_route_snapshot")
+        if displayed is not None and Path(displayed.path).resolve() == path:
+            self.route_pts = []
+            self._displayed_route_snapshot = None
+            self._displayed_route_sha256 = None
+            self._map_dirty_key = None
+            self.redraw_map_only()
+        self._sync_autonomy_profile_approval()
+        self.write_log(result.message)
+        return result
 
     def route_editor_safety_check(self) -> tuple[bool, str]:
         """Read-only gate: route authoring is never allowed over an airborne live UI."""
@@ -5281,9 +5642,11 @@ class OperatorApp(tk.Tk):
             return False, str(exc)
         return True, ""
 
-    def request_route_editor(self, edit_current: bool) -> None:
+    def request_route_editor(self, edit_current: bool, *, route_path: Path | None = None) -> None:
         """Load editor assets off the Tk thread, then open the isolated full-screen view."""
         if self._route_editor_window is not None:
+            if route_path is not None:
+                raise ValueError("請先關閉目前的航線編輯器，再編輯另一條航線")
             self._route_editor_window.lift()
             self._route_editor_window.focus_force()
             return
@@ -5293,7 +5656,7 @@ class OperatorApp(tk.Tk):
         if not allowed:
             raise ValueError(reason)
         profile, bound_profile, map_source, route_path = self._route_editor_asset_selection(
-            edit_current
+            edit_current, requested_route=route_path
         )
         self._route_editor_loading = True
         self.site_assets_panel.set_status(
@@ -5316,7 +5679,9 @@ class OperatorApp(tk.Tk):
         ).start()
         self.after(50, self._poll_route_editor_load)
 
-    def _route_editor_asset_selection(self, edit_current: bool):
+    def _route_editor_asset_selection(
+        self, edit_current: bool, *, requested_route: Path | None = None
+    ):
         profile_path = self.site_asset_actions.current_profile
         profile = load_site_profile(profile_path) if profile_path is not None else None
         bound_profile = (
@@ -5324,11 +5689,20 @@ class OperatorApp(tk.Tk):
         )
         route_path = None
         if edit_current and bound_profile is not None:
-            displayed = getattr(self, "_displayed_route_snapshot", None)
-            if displayed is not None and displayed.site_id == bound_profile.site_id:
-                route_path = displayed.path
+            if requested_route is not None:
+                candidate = Path(requested_route).expanduser().resolve()
+                site_root = self.site_assets_panel.site_pack_root
+                if site_root is None or candidate not in {
+                    item.path for item in describe_site_routes(site_root)
+                }:
+                    raise ValueError("只能編輯目前場域清單中的航線")
+                route_path = candidate
             else:
-                route_path = bound_profile.route_json
+                displayed = getattr(self, "_displayed_route_snapshot", None)
+                if displayed is not None and displayed.site_id == bound_profile.site_id:
+                    route_path = displayed.path
+                else:
+                    route_path = bound_profile.route_json
         if edit_current and route_path is None:
             raise ValueError("目前沒有已綁定場域的航線；請選擇「新增路線」後導入 PLY")
         map_source = profile.map_ply if profile is not None else None
@@ -5683,6 +6057,36 @@ class OperatorApp(tk.Tk):
             "仍須通過既有飛行核准閘門"
         )
 
+    def _close_shutdown_resources(self) -> None:
+        """Stop dependent workers only after backend cleanup was accepted."""
+        names = ("localizer", "detector")
+        if not self._is_live_backend():
+            names += ("video_stream",)
+        seen: set[int] = set()
+        errors = []
+        for name in names:
+            resource = self.__dict__.get(name)
+            if resource is None or id(resource) in seen:
+                continue
+            seen.add(id(resource))
+            try:
+                close = getattr(resource, "close", None)
+                if callable(close):
+                    close()
+            except Exception as exc:
+                errors.append(f"{name}: {exc!r}")
+        if errors:
+            raise RuntimeError("; ".join(errors))
+
+    def _poll_shutdown_result(self) -> None:
+        """Consume worker completion without making cross-thread Tk calls."""
+        try:
+            result, error = self._shutdown_results.get_nowait()
+        except queue.Empty:
+            self.after(50, self._poll_shutdown_result)
+            return
+        self._finish_background_shutdown(result, error)
+
     def _finish_background_shutdown(
         self,
         result: object,
@@ -5694,10 +6098,15 @@ class OperatorApp(tk.Tk):
             self.write_log(f"關窗背景清理失敗（{error!r}）；請重試。")
         if result is True:
             close_imu_flight_test_recorder(self.__dict__.get("imu_flight_test"))
+            depth_inspector = self.__dict__.get("_depth_inspector")
+            if depth_inspector is not None:
+                depth_inspector.close()
             self._shutdown_completed = True
             self.destroy()
+        else:
+            self._attach_localizer_file_handler()
 
-    def _on_close(self) -> None:
+    def _on_close(self, *, reason: str = "ui_window_close") -> None:
         """Start cleanup off the Tk thread; destroy only after literal success."""
         if self.__dict__.get("_site_switching", False):
             self.write_log("場域切換正在收束已落地連線；請等待切換結果後再關閉介面")
@@ -5706,7 +6115,7 @@ class OperatorApp(tk.Tk):
             self.write_log("關窗清理仍在進行；請等待落地確認或稍後重試")
             return
         try:
-            self.write_log("關窗 → 強制原地降落並斷線…")
+            self.write_log("關窗 → 有連線時確認原地降落；已失聯時釋放資源並關閉…")
         except (OSError, ValueError, AttributeError, TypeError, RuntimeError):  # Tier3: fallback best-effort — narrow, keep pass
             pass
         # ``Tk.__getattr__`` attempts to resolve unknown names through Tcl;
@@ -5721,25 +6130,23 @@ class OperatorApp(tk.Tk):
                 destroy=None,
                 command_coordinator=self._get_command_coordinator(),
                 get_autonomy=lambda: self.__dict__.get("_integrated_autonomy"),
+                close_resources=self._close_shutdown_resources,
             )
             self._shutdown_coordinator = coordinator
         self._shutdown_in_progress = True
+        self.__dict__["_pending_exit_signal_reason"] = None
+        self._detach_localizer_file_handler()
+        results: queue.Queue[tuple[object, BaseException | None]] = queue.Queue(maxsize=1)
+        self._shutdown_results = results
 
         def run_shutdown() -> None:
             result: object = False
             error: BaseException | None = None
             try:
-                result = coordinator.shutdown(reason="ui_window_close")
+                result = coordinator.shutdown(reason=reason)
             except BaseException as exc:
                 error = exc
-            try:
-                self.after(
-                    0,
-                    lambda: self._finish_background_shutdown(result, error),
-                )
-            except Exception:
-                # If Tk has already gone away there is no safe UI action left.
-                self._shutdown_in_progress = False
+            results.put_nowait((result, error))
 
         try:
             threading.Thread(
@@ -5747,8 +6154,10 @@ class OperatorApp(tk.Tk):
                 name="operator-window-shutdown",
                 daemon=True,
             ).start()
+            self.after(50, self._poll_shutdown_result)
         except Exception as exc:
             self._shutdown_in_progress = False
+            self._attach_localizer_file_handler()
             self.write_log(f"關窗清理無法啟動（{exc!r}）；請重試。")
 
     def _record_no_loc(self) -> None:
@@ -5836,6 +6245,15 @@ class OperatorApp(tk.Tk):
                     OperatorApp._localization_coalesce_interval_s(self) * 1000.0
                 ),
             )
+            field_scale = self.__dict__.get("field_scale")
+            if field_scale is not None:
+                with field_scale.state.lock:
+                    rec["map_scale"] = field_scale.state.scale_diagnostics(metric_mono_ns * 1e-9)
+                    pose = result.get("pose")
+                    if isinstance(pose, dict):
+                        xyz = field_scale.state.metric_xyz(
+                            [pose.get(key) for key in ("x", "y", "z")], metric_mono_ns * 1e-9)
+                        rec["metric_pose_m"] = None if xyz is None else xyz.tolist()
             session_logs = getattr(self, "session_logs", None)
             if session_logs is not None:
                 if not session_logs.localization("pose_result", **rec):
@@ -6055,8 +6473,44 @@ class OperatorApp(tk.Tk):
             self.loc_quality_var.set(f"inliers {inliers}")
             self.loc_recovery_var.set(self.loc_recovery_text)
 
+    def _ensure_field_scale(self, map_frame):
+        scale = self.__dict__.get("field_scale")
+        if scale is None:
+            scale = SessionMapScale(map_frame)
+            self.field_scale = scale
+        elif any(not np.allclose(getattr(scale.state.frame, axis), getattr(map_frame, axis),
+                                 rtol=0., atol=1e-9) for axis in ("east", "north", "up")):
+            raise ValueError("field scale cannot cross map frames")
+        return scale
+
+    def _update_field_scale(self, result, now):
+        frame = self.__dict__.get("_autonomy_map_frame")
+        if frame is None:
+            return
+        scale = OperatorApp._ensure_field_scale(self, frame)
+        pose = None
+        raw = result.get("pose")
+        forward = normalize_camera_forward(result.get("camera_forward_world"))
+        stamp = localization_pose_timestamp(result, arrival_mono=now)
+        if result.get("success") and isinstance(raw, dict) and forward is not None and stamp is not None:
+            xyz = np.array([raw.get(key, float("nan")) for key in ("x", "y", "z")], dtype=float)
+            if np.isfinite(xyz).all():
+                pose = operator_tick._make_autonomy_pose(result, xyz, frame.heading(forward), stamp)
+        scale.observe(pose, self.backend, now)
+
+    def _field_scale_text(self, now=None):
+        from operator_hud_text import format_map_scale
+
+        scale = self.__dict__.get("field_scale")
+        if scale is None:
+            return "全場尺度：等待有效飛行軌跡（m/u）"
+        current = time.monotonic() if now is None else now
+        with scale.state.lock:
+            return format_map_scale(scale.state.scale_diagnostics(current))
+
     def update_localization_metrics(self, result: dict) -> None:
         now = time.monotonic()
+        OperatorApp._note_e2e_result(self, "localization", result, now)
         OperatorApp._update_localization_timing(self, result, now)
         inliers, _reproj = OperatorApp._classify_localization_health(
             self,
@@ -6064,6 +6518,7 @@ class OperatorApp(tk.Tk):
             now,
         )
         OperatorApp._update_localization_recovery(self, result)
+        OperatorApp._update_field_scale(self, result, now)
         OperatorApp._render_localization_metrics(self, inliers)
         self._append_loc_metrics(result)
 
@@ -6118,7 +6573,7 @@ class OperatorApp(tk.Tk):
         active = getattr(st, "drone_magnetometer_started", None) is True
         self._draw_magnetometer_axis(
             magnetometer_axis_guide(getattr(st, "drone_magnetometer_axis", None))
-            if active
+            if active and getattr(st, "drone_magnetometer_failed", None) is not True
             else None
         )
 
@@ -6149,7 +6604,7 @@ class OperatorApp(tk.Tk):
         required = getattr(st, "drone_magnetometer_required", None)
         drone_ready = (
             required in {0, 2}
-            and not drone_active
+            and getattr(st, "drone_magnetometer_started", None) is False
             and getattr(st, "drone_magnetometer_failed", None) is not True
         )
         # Must mirror olympe_live_backend._magnetometer_control_error(): an
@@ -6171,6 +6626,7 @@ class OperatorApp(tk.Tk):
         # figures nothing else reports stay here.
         self.anafi_stream_var.set(f"ground speed {speed_txt} | PCMD→telemetry poll {ctl_poll_txt}")
         telemetry = format_olympe_telemetry(st)
+        self._device_telemetry_lines = format_device_telemetry(st)
         if hasattr(self, "olympe_state_var"):
             gps_summary = " | ".join(telemetry["gps"].split(" | ")[:2])
             self.olympe_state_var.set(telemetry["rth"] + " | " + gps_summary)
@@ -6193,6 +6649,19 @@ class OperatorApp(tk.Tk):
         label = ttk.Label(panel, textvariable=self.auto_leg_var, font=("Sans", 10, "bold"),
                           justify="left", anchor="w")
         label.grid(row=0, column=0, sticky="ew", padx=5, pady=4)
+        self.auto_route_error_var = DedupStringVar(
+            master=panel, value="AUTO 誤差：尚無紀錄（地圖單位）",
+        )
+        error_label = ttk.Label(
+            self.map_label, textvariable=self.auto_route_error_var,
+            font=("Sans", 9), justify="left", anchor="w",
+        )
+        error_label.place(x=8, rely=1.0, y=-8, anchor="sw")
+        self.map_label.bind(
+            "<Configure>",
+            lambda event: error_label.configure(wraplength=max(200, event.width - 16)),
+            add="+",
+        )
 
         def fit_status(event):
             label.configure(wraplength=max(120, event.width // 2 - 16))
@@ -6296,7 +6765,6 @@ class OperatorApp(tk.Tk):
         if not hasattr(self, "anafi_flight_var"):
             return
         self._update_flight_header(st)
-        # Map coordinate only. Other repeated values live in the header/video HUD.
         self.anafi_flight_var.set(f"map Y {-float(st.pose[1]):+.2f}u")
         link_ok = self._update_anafi_stream_readouts(st)
         self._update_auto_leg_readout()
@@ -6397,7 +6865,7 @@ class OperatorApp(tk.Tk):
         if len(self.map_points) == 0:
             return
         width = max(300, self.map_label.winfo_width())
-        height = max(VIEWPORT_MIN_H, self.map_label.winfo_height())
+        height = max(1, self.map_label.winfo_height())
         step = max(1, len(self.map_points) // 90000)
         pts = self.map_points[::step, :3].astype(float)
         view = self.transform_xyz(pts)
@@ -6441,22 +6909,6 @@ class OperatorApp(tk.Tk):
         sy = int(height * 0.5 + self.map_pan[1] - v[1] * scale)
         return sx, sy
 
-    def _present_frame(self, canvas, photo_attr: str, image: Image.Image) -> None:
-        """Blit into the existing Tk photo instead of allocating a new one.
-
-        A fresh ImageTk.PhotoImage per tick costs ~0.8 ms and churns a Tk image
-        object plus a canvas item every frame; pasting into the live photo costs
-        ~0.47 ms and leaves the canvas item alone. Size changes still need a new
-        photo, so the panel-resize path is unchanged.
-        """
-        photo = getattr(self, photo_attr, None)
-        if photo is not None and (photo.width(), photo.height()) == image.size:
-            photo.paste(image)
-            return
-        photo = ImageTk.PhotoImage(image)
-        setattr(self, photo_attr, photo)
-        canvas.delete("frame")
-        canvas.create_image(0, 0, image=photo, anchor="nw", tags="frame")
 
     def _set_widget_text(self, key: str, widget, **options) -> None:
         """configure() a widget only when something it displays actually changed.
@@ -6581,10 +7033,8 @@ class OperatorApp(tk.Tk):
 
     def redraw_map_only(self) -> None:
         mw = max(300, self.map_label.winfo_width())
-        mh = max(VIEWPORT_MIN_H, self.map_label.winfo_height())
-        self._present_frame(
-            self.map_label, "map_photo", self.render_map(mw, mh, self.current_state)
-        )
+        mh = max(1, self.map_label.winfo_height())
+        self.present_map(mw, mh, self.current_state)
 
     def map_base_key(self, width: int, height: int) -> tuple:
         return (
@@ -6599,6 +7049,7 @@ class OperatorApp(tk.Tk):
             tuple(np.round(self.map_pan.astype(float), 2)),
             len(self.map_points),
             self._map_detail_points(),
+            self.__dict__.get("workmap_points_version", 0),
         )
     def render_map_base(self, width: int, height: int) -> Image.Image:
         arr = np.empty((max(1, height), max(1, width), 3), dtype=np.uint8)
@@ -6619,9 +7070,29 @@ class OperatorApp(tk.Tk):
             arr[sy_i, sx_i] = (
                 rgb  # depth-sorted: later (nearer) points overwrite, like draw.point order
             )
+        workmap = self.__dict__.get("workmap_points")
+        if workmap:
+            view = self.transform_xyz(np.asarray(list(workmap.values()), dtype=float))
+            sx = (width * 0.5 + self.map_pan[0] + view[:, 0] * scale).astype(int)
+            sy = (height * 0.5 + self.map_pan[1] - view[:, 1] * scale).astype(int)
+            colors = self.__dict__.get("workmap_point_rgb") or {}
+            fallback = np.asarray(WORKMAP_POINT_RGB, dtype=np.uint8)
+            paint = np.stack([colors.get(key, fallback) for key in workmap])
+            for dx in (0, 1):
+                for dy in (0, 1):
+                    px, py = sx + dx, sy + dy
+                    inside = (px >= 0) & (px < width) & (py >= 0) & (py < height)
+                    arr[py[inside], px[inside]] = paint[inside]
         img = Image.fromarray(arr, "RGB")
         draw = ImageDraw.Draw(img)
         overlay_font = pil_ui_font(12, bold=True)
+        if workmap:
+            draw.text(
+                (10, 8),
+                f"工作圖新點 {len(workmap)}（原始 RGB，較大的點；僅顯示，不參與定位授權）",
+                fill=WORKMAP_POINT_RGB,
+                font=overlay_font,
+            )
 
         # Draw map axes in the current view.
         axis_len = self.map_radius * 0.18
@@ -6654,59 +7125,85 @@ class OperatorApp(tk.Tk):
             self.map_base_cache_key = key
         return self.map_base_cache
 
-    def render_map(self, width: int, height: int, st: DroneState) -> Image.Image:
-        img = self.map_base_image(width, height).copy()
-        draw = ImageDraw.Draw(img)
+
+    def present_map(self, width: int, height: int, st: DroneState) -> None:
+        """Keep cloud pixels while pose, trail and camera items change."""
+        if self._map_presenter is None:
+            self._map_presenter = MapCanvasPresenter(self.map_label)
+        self._map_presenter.present(
+            self.map_base_key(width, height),
+            lambda: self.map_base_image(width, height),
+            self._map_render_context(width, height, st),
+        )
+        self.map_photo = self._map_presenter.photo
+
+    def _map_render_context(self, width: int, height: int, st: DroneState) -> MapRenderContext:
         overlay_font = pil_ui_font(13)
         render_pose = st.pose
         camera_axes = normalize_camera_axes(getattr(self, "camera_axes_world", None))
         camera_forward = normalize_camera_forward(getattr(self, "camera_forward_world", None))
+        camera_estimate_kind = ""
+        camera_attitude = "auto"
+        camera_estimate_stale = False
+        if self._is_live_backend():
+            estimate = estimated_camera_display_pose(self.__dict__.get("live_result"))
+            if estimate is not None:
+                render_pose = estimate.pose
+                camera_axes = estimate.camera_axes
+                camera_forward = estimate.camera_forward
+                camera_attitude = estimate.attitude
+                camera_estimate_kind = weak_pose_source_kind(self.live_result)
+                camera_estimate_stale = estimate.stale
         route_pts = self.route_pts if getattr(self, "route_pts", None) else []
         map_east, map_north, map_up, _measured = self._map_axis_basis()
-        draw_map_overlays(
-            draw,
-            MapRenderContext(
-                width=width,
-                height=height,
-                map_zoom=float(self.map_zoom),
-                map_radius=float(self.map_radius),
-                map_pan=np.asarray(self.map_pan, dtype=float),
-                no_loc_markers=self.no_loc_markers,
-                route_pts=route_pts,
-                history=self.history,
-                history_health=self.history_health,
-                history_weak=self.history_weak,
-                history_weak_health=self.history_weak_health,
-                history_weak_kind=self.__dict__.get("history_weak_kind") or (),
-                pose=render_pose,
-                camera_axes=camera_axes,
-                camera_forward=camera_forward,
-                transform_xyz=self.transform_xyz,
-                project_world=self.project_world,
-                route_color=ROUTE_COLOR,
-                health_color=HEALTH_COLOR,
-                route_dot_max=ROUTE_DOT_MAX,
-                no_loc_max_markers=NO_LOC_MAX_MARKERS,
-                video_aspect_ratio=STREAM_WIDTH / STREAM_HEIGHT,
-                overlay_font=overlay_font,
-                map_east=map_east,
-                map_north=map_north,
-                map_up=map_up,
-                gimbal_pitch_deg=getattr(st, "gimbal_pitch_deg", None),
-                map_rotation=(float(self.map_yaw), float(self.map_pitch), float(self.map_roll)),
-                map_yaw=float(self.map_yaw),
-                map_pitch=float(self.map_pitch),
-                map_roll=float(self.map_roll),
-            ),
+        return MapRenderContext(
+            width=width,
+            height=height,
+            map_zoom=float(self.map_zoom),
+            map_radius=float(self.map_radius),
+            map_pan=np.asarray(self.map_pan, dtype=float),
+            no_loc_markers=self.no_loc_markers,
+            route_pts=route_pts,
+            history=self.history,
+            history_health=self.history_health,
+            history_weak=self.history_weak,
+            history_weak_health=self.history_weak_health,
+            history_weak_kind=self.__dict__.get("history_weak_kind") or (),
+            workmap_trajectories=self.__dict__.get("workmap_trajectories"),
+            workmap_mapping_diagnostics=self.__dict__.get("workmap_mapping_diagnostics"),
+            pose=render_pose,
+            camera_axes=camera_axes,
+            camera_forward=camera_forward,
+            camera_estimate_kind=camera_estimate_kind,
+            camera_attitude=camera_attitude,
+            camera_estimate_stale=camera_estimate_stale,
+            transform_xyz=self.transform_xyz,
+            project_world=self.project_world,
+            route_color=ROUTE_COLOR,
+            health_color=HEALTH_COLOR,
+            route_dot_max=ROUTE_DOT_MAX,
+            no_loc_max_markers=NO_LOC_MAX_MARKERS,
+            video_aspect_ratio=STREAM_WIDTH / STREAM_HEIGHT,
+            overlay_font=overlay_font,
+            map_east=map_east,
+            map_north=map_north,
+            map_up=map_up,
+            gimbal_pitch_deg=getattr(st, "gimbal_pitch_deg", None),
+            map_rotation=(float(self.map_yaw), float(self.map_pitch), float(self.map_roll)),
+            map_yaw=float(self.map_yaw),
+            map_pitch=float(self.map_pitch),
+            map_roll=float(self.map_roll),
+            projection_key=self.map_base_key(width, height),
         )
-        return img
 
     def draw_detections(
-        self, draw: ImageDraw.ImageDraw, scale: float, ox: int, oy: int, width: int, height: int
+        self, draw: ImageDraw.ImageDraw, scale: float, ox: int, oy: int, width: int, height: int,
+        *, result: dict | None = None,
     ) -> None:
-        if not self.detection_result or not self.detection_result.get("success"):
+        result = self.detection_result if result is None else result
+        if not result or not result.get("success"):
             return
-        boxes = self.detection_result.get("boxes") or []
+        boxes = result.get("boxes") or []
         if not boxes:
             return
         palette = [
@@ -6740,6 +7237,11 @@ class OperatorApp(tk.Tk):
             sy2 = max(0, min(height - 1, sy2))
             class_id = int(box.get("class_id", 0) or 0)
             color = palette[class_id % len(palette)]
+            polygon = box.get("mask_polygon") or []
+            if len(polygon) >= 3:
+                points = tuple((ox + float(x) * scale, oy + float(y) * scale) for x, y in polygon)
+                draw.polygon(points, fill=color, outline=color, width=2, stipple="gray50")
+            draw.rectangle((sx1, sy1, sx2, sy2), outline=color, width=2)
             conf = float(box.get("confidence", 0.0) or 0.0)
             label = f"{box.get('class_name', f'class_{class_id}')} {conf:.2f}"[:28]
             font = pil_ui_font(11, bold=True)
@@ -6751,6 +7253,15 @@ class OperatorApp(tk.Tk):
                 fill=color,
                 font=font,
             )
+
+    def _segmentation_enabled(self) -> bool:
+        return getattr(self.__dict__.get("detector"), "task", "detect") == "segment"
+
+    def _segmentation_diagnostic_lines(self) -> tuple[str, ...]:
+        pipeline = self.__dict__.get("_segmentation_pipeline")
+        if pipeline is None or not OperatorApp._segmentation_enabled(self):
+            return ()
+        return pipeline.hud_lines(time.monotonic())
 
     def _video_diagnostic_lines(self) -> tuple[str, ...]:
         """Return the requested engineering metrics for the video HUD.
@@ -6771,10 +7282,12 @@ class OperatorApp(tk.Tk):
                 except Exception:
                     return fallback
 
+            fps_label, fps_value = OperatorApp._pipeline_fps(self)
             loc = {
                 "inliers": getattr(self, "loc_health_inliers", 0),
                 "reproj_rms": getattr(self, "loc_health_reproj", None),
-                "fps": getattr(self, "loc_fps", None),
+                "fps": fps_value,
+                "fps_label": fps_label,
                 "wall_ms": getattr(self, "loc_wall_ms", None),
                 "core_wall_ms": getattr(self, "loc_latency_ms", None),
                 "latency_ms": getattr(self, "loc_latency_ms", None),
@@ -6791,12 +7304,12 @@ class OperatorApp(tk.Tk):
             lines = data.get("diagnostic_lines")
             if isinstance(lines, (list, tuple)) and len(lines) == 6:
                 # Return via wrapper path; keeps HUD identical while exercising pure helper.
-                return tuple(str(x) for x in lines)
+                return OperatorApp._segmentation_diagnostic_lines(self) + tuple(str(x) for x in lines) + (OperatorApp._field_scale_text(self),) + getattr(self, "_device_telemetry_lines", ())
         except (OSError, ValueError, AttributeError, TypeError, RuntimeError):  # Tier3: fallback best-effort — narrow, keep pass
             pass
         attitude_and_velocity = _val("olympe_attitude_var", "飛控融合姿態 - | 三軸速度 -")
         attitude, separator, velocity = attitude_and_velocity.partition(" | 三軸速度 ")
-        return (
+        return OperatorApp._segmentation_diagnostic_lines(self) + (
             " | ".join(
                 (
                     _val("current_auto_speed_var", "AUTO PCMD -"),
@@ -6809,56 +7322,63 @@ class OperatorApp(tk.Tk):
             _val("olympe_altitude_var", "飛控高度 - | AGL - | 連接品質 -"),
             attitude,
             f"三軸速度 {velocity}" if separator else "三軸速度 -",
+        ) + (OperatorApp._field_scale_text(self),) + getattr(self, "_device_telemetry_lines", ())
+
+    def _toggle_depth_view(self) -> None:
+        """Show the stream or its depth estimate in the video pane; display only."""
+        self._depth_inspector.toggle_view()
+
+    def _sync_depth_view_button(self, active: bool) -> None:
+        button = self.__dict__.get("depth_view_button")
+        text = DEPTH_VIEW_ON_TEXT if active else DEPTH_VIEW_OFF_TEXT
+        if button is not None and self.__dict__.get("_depth_view_button_text") != text:
+            button.configure(text=text)
+            self._depth_view_button_text = text
+
+    def render_video(self, width: int, height: int, st: DroneState) -> None:
+        """Present immutable video pixels separately from retained Canvas overlays."""
+        width, height = max(1, width), max(1, height)
+        if self._video_presenter is None:
+            self._video_presenter = VideoCanvasPresenter(self.video_label)
+        presenter = self._video_presenter
+        depth_inspector = self.__dict__.get("_depth_inspector")
+        depth_state = None if depth_inspector is None else depth_inspector.view_frame()
+        OperatorApp._sync_depth_view_button(
+            self, depth_inspector is not None and depth_inspector.view_active
         )
-
-    def _cached_video_frame(self, width: int, height: int):
-        """Return the panel-fitted video frame, reusing the last resize.
-
-        HUD-only ticks change battery/age/diagnostic text every tick while the
-        source frame is identical; without this each of them repays the 720p
-        cv2/PIL resize. The cached image is only pasted from, never drawn
-        into, so callers may use it directly.
-        """
-        source = self.video_frame
-        if source is None:
-            return None, 1.0
-        try:
-            if isinstance(source, np.ndarray):
-                shape = (int(source.shape[0]), int(source.shape[1]))
-            elif isinstance(source, Image.Image):
-                shape = (int(source.height), int(source.width))
-            else:
-                shape = None
-        except Exception:
-            shape = None
-        if shape is None:
-            return prepare_video_frame(source, width, height)
-        key = (
-            round(float(getattr(self, "_video_frame_stamp", 0.0) or 0.0), 4),
-            int(width),
-            int(height),
-            shape,
-            id(source),
+        pipeline = self.__dict__.get("_segmentation_pipeline")
+        segmented = (
+            depth_state is None
+            and OperatorApp._segmentation_enabled(self)
+            and pipeline is not None and pipeline.display_frame is not None
         )
-        if self._video_resized_cache_key == key and self._video_resized_cache is not None:
-            return self._video_resized_cache
-        fitted = prepare_video_frame(source, width, height)
-        self._video_resized_cache_key = key
-        self._video_resized_cache = fitted
-        return fitted
-
-    def render_video(self, width: int, height: int, st: DroneState) -> Image.Image:
-        img = Image.new("RGB", (max(1, width), max(1, height)), "#08090b")
-        draw = ImageDraw.Draw(img)
-        overlay_font = pil_ui_font(12)
-        banner_font = pil_ui_font(13, bold=True)
+        if depth_state is not None:
+            depth_frame = depth_state.frame
+            source = None if depth_frame is None else depth_frame.image
+            source_stamp = 0.0 if depth_frame is None else depth_frame.capture.stamp
+        else:
+            source = pipeline.display_frame if segmented else self.video_frame
+            source_stamp = pipeline.display_key[2] if segmented else self._video_frame_stamp
+        scale, ox, oy = presenter.present(source, source_stamp, width, height)
+        self.video_photo = presenter.photo
+        draw = presenter.draw
+        draw.begin()
+        overlay_font = draw.font(12)
+        banner_font = draw.font(13, bold=True)
         live_backend = self._is_live_backend()
-        frame, scale = self._cached_video_frame(width, height)
-        if frame is not None:
-            ox = (width - frame.width) // 2
-            oy = (height - frame.height) // 2
-            img.paste(frame, (ox, oy))
-            self.draw_detections(draw, scale, ox, oy, width, height)
+        if depth_state is not None:
+            draw_depth_view(
+                draw, depth_state, scale, ox, oy, overlay_font, draw.font(20, bold=True),
+                time.monotonic(),
+            )
+        elif presenter.has_frame:
+            if segmented:
+                # Display payload and pixels always advance together, never from the live feed.
+                self.draw_detections(
+                    draw, scale, ox, oy, width, height, result=pipeline.display_result,
+                )
+            elif not OperatorApp._segmentation_enabled(self):
+                self.draw_detections(draw, scale, ox, oy, width, height)
         else:
             draw_video_empty_state(draw, width, height, overlay_font, live_backend)
 
@@ -6866,8 +7386,14 @@ class OperatorApp(tk.Tk):
         # no separate diagnostics/log tab to inspect during flight.
         diagnostic_lines = self._video_diagnostic_lines()
         hud_h = 160
-        hud_font = pil_ui_font(13, bold=True)
-        main_hud_font = pil_ui_font(15, bold=True)
+        hud_font = draw.font(18, bold=True)
+        main_hud_font = draw.font(20, bold=True)
+        lost_holding = self.lost_holding()
+        banner_bottom = (
+            72 if (live_backend and not bool(getattr(st, "link_ok", True))) or lost_holding
+            else 60 if self.inspecting and getattr(self, "loc_health", "OK") != "OK"
+            else 0
+        )
         link_ok = draw_video_hud(
             draw,
             width,
@@ -6880,8 +7406,8 @@ class OperatorApp(tk.Tk):
             overlay_font,
             live_backend,
             ANAFI.stream_latency_ms,
+            banner_bottom=banner_bottom,
         )
-        lost_holding = self.lost_holding()
         lost_hold = self.lost_hold
         draw_video_banner(
             draw,
@@ -6889,8 +7415,8 @@ class OperatorApp(tk.Tk):
             live_backend,
             link_ok,
             lost_holding,
-            self.video_display_frame_name,
-            self.video_display_index,
+            pipeline.display_key[1] if segmented else self.video_display_frame_name,
+            pipeline.display_key[0] if segmented else self.video_display_index,
             0 if lost_hold is None else lost_hold.attempts,
             0 if lost_hold is None else lost_hold.max_attempts,
             self.inspecting,
@@ -6901,7 +7427,9 @@ class OperatorApp(tk.Tk):
             banner_font,
             overlay_font,
         )
-        return img
+        draw.end()
+        if segmented:
+            pipeline.rendered("segmentation", pipeline.display_result, time.monotonic())
 
     def state_from_replay(self, base: DroneState) -> DroneState:
         if not self.replay_rows:
@@ -7102,6 +7630,9 @@ class OperatorApp(tk.Tk):
         self, prepared: tuple[str, bytes | memoryview, dict], *, was_busy: bool, lost_retry: bool
     ) -> None:
         frame_name, raw, timing_metadata = prepared
+        pipeline = self.__dict__.get("_segmentation_pipeline")
+        if pipeline is not None and OperatorApp._segmentation_enabled(self):
+            timing_metadata["ui_pair_session"] = pipeline.session
         submitted = self.localizer.submit(
             self.video_display_index,
             frame_name,
@@ -7110,6 +7641,21 @@ class OperatorApp(tk.Tk):
         )
         if not submitted:
             return
+        depth_inspector = self.__dict__.get("_depth_inspector")
+        if depth_inspector is not None:
+            depth_inspector.remember(
+                self.video_display_index, frame_name,
+                float(timing_metadata.get("source_frame_stamp_mono") or 0.0),
+                self.video_frame,
+            )
+        if pipeline is not None and OperatorApp._segmentation_enabled(self):
+            pipeline.submit(
+                "localization", self.video_display_index, frame_name,
+                float(timing_metadata.get("source_frame_stamp_mono") or 0.0),
+                timing_metadata["ui_serialize_start_mono"],
+                hold_retry=bool(timing_metadata.get("hold_retry")),
+            )
+        OperatorApp._pair_detection_with_localization(self, frame_name, timing_metadata)
         self.last_submitted_index = self.video_display_index
         self.live_pending_frame_name = frame_name
         # The offline A/B has a paired submitted image and
@@ -7171,8 +7717,8 @@ class OperatorApp(tk.Tk):
         )
 
     def submit_current_frame_for_detection(self) -> None:
-        # Detector only after 開始定位 (same gate as localizer).
-        if not self.inspecting:
+        # Detector runs only while the operator (or AUTO start) enabled detection.
+        if not self.detection_enabled or OperatorApp._detection_follows_localization(self):
             return
         if self.detector is None or self.video_frame is None:
             return
@@ -7186,7 +7732,37 @@ class OperatorApp(tk.Tk):
         if self.detector.busy():
             return
         frame_name = self.video_display_frame_name or f"stream_{self.video_display_index:06d}"
-        if self.detector.submit(self.video_display_index, frame_name, self.video_frame):
+        pipeline = self.__dict__.get("_segmentation_pipeline")
+        segmentation = pipeline is not None and OperatorApp._segmentation_enabled(self)
+        timing = dict(getattr(self, "_video_frame_timing", {}) or {})
+        if segmentation:
+            start_ns = time.monotonic_ns()
+            raw = self._frame_rgb_bytes_for_worker(self.video_frame)
+            done_ns = time.monotonic_ns()
+            if raw is None:
+                return
+            timing.update({
+                "source_frame_stamp_mono": self._video_frame_stamp if self._video_frame_stamp > 0 else None,
+                "source_stamp_semantics": "stream_monotonic_mapped_or_receipt",
+                "ui_serialize_start_mono": start_ns * 1e-9,
+                "ui_serialize_done_mono": done_ns * 1e-9,
+                "ui_serialize_start_mono_ns": start_ns,
+                "ui_serialize_done_mono_ns": done_ns,
+                "ui_serialize_ms": (done_ns - start_ns) / 1_000_000.0,
+                "ui_pair_session": pipeline.session,
+            })
+            submitted = self.detector.submit(
+                self.video_display_index, frame_name, raw, timing_metadata=timing,
+            )
+        else:
+            submitted = self.detector.submit(self.video_display_index, frame_name, self.video_frame)
+        if submitted:
+            if segmentation:
+                pipeline.submit(
+                    "segmentation", self.video_display_index, frame_name,
+                    float(timing.get("source_frame_stamp_mono") or 0.0),
+                    timing["ui_serialize_start_mono"], frame=self.video_frame,
+                )
             self.last_detect_submitted_index = self.video_display_index
             self.detection_pending_frame_name = frame_name
             self.det_status = "RUN"
@@ -7269,27 +7845,38 @@ class OperatorApp(tk.Tk):
             stabilize_result_pose=OperatorApp._stabilize_live_result_pose,
         )
 
+    def _write_detection_status(self, result: dict) -> None:
+        _tw = time.monotonic()
+        if _tw - self._last_det_write < 0.2:  # throttle debug status file to ~5Hz
+            return
+        self._last_det_write = _tw
+        try:
+            LIVE_DETECTION_STATUS_PATH.write_text(
+                json.dumps(result, ensure_ascii=False), encoding="utf-8"
+            )
+        except Exception as exc:
+            self._record_diagnostic_failure(LIVE_DETECTION_STATUS_PATH, exc)
+
     def update_detection_results(self) -> None:
         if self.detector is None:
             if hasattr(self, "det_count_var"):
                 self.det_count_var.set("objects - | OFF")
             return
         results = self.detector.poll_results()
-        if not getattr(self, "inspecting", True):
+        if not self.detection_enabled:
+            if hasattr(self, "det_count_var"):
+                self.det_count_var.set("objects - | OFF")
             return
         for result in results:
+            OperatorApp._note_e2e_result(self, "detection", result)
+            pipeline = self.__dict__.get("_segmentation_pipeline")
+            if pipeline is not None and OperatorApp._segmentation_enabled(self):
+                if not pipeline.receive("segmentation", result):
+                    continue
             self.detection_result = result
             self.detection_result_frame_name = str(result.get("frame_name", ""))
             self.update_detection_metrics(result)
-            _tw = time.monotonic()
-            if _tw - self._last_det_write >= 0.2:  # throttle debug status file to ~5Hz
-                self._last_det_write = _tw
-                try:
-                    LIVE_DETECTION_STATUS_PATH.write_text(
-                        json.dumps(result, ensure_ascii=False), encoding="utf-8"
-                    )
-                except Exception as exc:
-                    self._record_diagnostic_failure(LIVE_DETECTION_STATUS_PATH, exc)
+            self._write_detection_status(result)
             if not result.get("success"):
                 self.write_log(
                     f"LIVE_DETECT_FAIL {self.detection_result_frame_name}: {result.get('error', 'no boxes')}"

@@ -162,7 +162,7 @@ GPU gate 明細在總帳「2026-09-02 GPU gate 結果」+ 項 12 / 13。
 |---|---|
 | **KLT bridge `SFM_EDM_KLT_BRIDGE_INTERVAL` 預設 `0`（關閉）** | 2026-09-03 曾開成 `3`,同日 production-path 重測後**改回 `0`**（總帳項 13）。重測:P168 700f 同設定 4 次,bridge-off 穩定 575/685、bridge-on 516–528 → **−47~−59 succ**（原記錄 −18 是單次量測）。sequential 七段仍淨 +89 succ / −121 LOST,所以功能保留,平順延遲敏感場景可設 `=3`（P117 wall p50 3.3x 改善、succ 平手）。**replay baseline 回到 bridge-off 語意。** |
 | **Tier 4 — 1045-ref 地圖相依參數重驗** | 2026-09-02 完成（總帳「Tier 4」）。S=2.3346915 重算 exact 相符、radius=0.40·S 為 P168 sweep 峰值、cache 192 在 P168/P117 與 cache-64 trace byte-identical。無參數變動 → SHA chain 不動。 |
-| **ESEKF / KLT 3D-aware live gate** | `SFM_EDM_ESEKF_DISABLE=1` toggle + `benchmark_esekf_live_replay.py` + `docs/esekf_live_eval_runbook.md`（一次手動飛行 + 機上錄影 → 離線 on/off 相對指標）。純 replay 仍評不到（無 live velocity）。 |
+| **ESEKF / KLT 3D-aware live gate（已退役）** | 當時以 `SFM_EDM_ESEKF_DISABLE=1` toggle + `benchmark_esekf_live_replay.py`，將一次手動飛行的機上錄影與遙測離線 on/off 比較相對指標。純 replay 評不到（無 live velocity）；舊腳本與操作頁已移除，現行收集見 [EKF 資料錄製](next_flight_ekf_capture_20260922.md)。 |
 | **`lost_global_retrieval_interval` 15→3** | **已升級進 flight profile**（總帳項 12）。P168 536→608（+72），P117 366→366（0）。profile SHA `93e0c2…`→`a65f78ca…`,manifest chain 已同步。 |
 | `use_temporal_reference` true→false | REJECTED — P168 +20 但 P117 −20 / LOST +12 / p50 +12。候選 profile 已刪。 |
 | `lost_prior_strategy` full_global / score_fusion | REJECTED — 同型（P168 +65，P117 −17）。 |
@@ -443,7 +443,7 @@ holdout 淨 +89 succ / −121 LOST、mean −7~−13 ms/段。**已知成本:pro
 
 | 實驗 | 檔案 | 狀態 |
 |---|---|---|
-| ESEKF 15 維融合（IMU/NED 速度 + visual pose） | `esekf.py`；接線於 `production_edm_tracker.py`（`_init_esekf`、`localize`、`_predict_center` / `_search_yaw` / `_on_miss` PREDICTED_ONLY 分支） | `_init_esekf` 建 `ESEKF(EKFConfig())`（`SFM_EDM_ESEKF_DISABLE=1` 關）。`predict` 需 `observe_fused_state` 餵 `_latest_velocity_ned`；純 replay 無此來源 → `prediction_allowed()` 維持 False → 分支不觸發。608/700 基準已含這條休眠路徑。**live-telemetry gate：`定位演算法/validation/benchmark_esekf_live_replay.py` + `docs/esekf_live_eval_runbook.md`（一次手動飛行 + 機上錄影 → 離線 on/off 相對指標）。** |
+| ESEKF 15 維融合（IMU/NED 速度 + visual pose，已退役） | `esekf.py`；當時接線於 `production_edm_tracker.py`（`_init_esekf`、`localize`、`_predict_center` / `_search_yaw` / `_on_miss` PREDICTED_ONLY 分支） | `_init_esekf` 建 `ESEKF(EKFConfig())`（`SFM_EDM_ESEKF_DISABLE=1` 關）。`predict` 需 `observe_fused_state` 餵 `_latest_velocity_ned`；純 replay 無此來源 → `prediction_allowed()` 維持 False → 分支不觸發。608/700 基準已含這條休眠路徑。當時 live-telemetry gate 以一次手動飛行的機上錄影與遙測離線 on/off 比較相對指標；舊 replay 腳本及操作頁已退役，不適用現行 DIRECT。 |
 | KLT 3D-aware init（`OPTFLOW_USE_INITIAL_FLOW` + covariance window 15→41） | `production_edm_tracker.py::_track_klt_prior` | 只有 `self.esekf.prediction_allowed()` 才啟用 → replay 也休眠,走 fallback LK。`raise StopIteration` 已移除。`test_klt_miss_prior.py` 通過。同 ESEKF live gate（`SFM_EDM_ESEKF_DISABLE` 一起關）。 |
 | EDM neck `repeat→expand` | `runtime/EDM/src/edm/neck/neck.py`（`SFM_EDM_NECK_NO_EXPAND=1` 逃生閥） | **exact 已驗證**（700 幀 0 diff），**但 B=2 無加速**（match_ms 17.89 vs 17.55）。保留 guarded,不列已驗證優化。 |
 | `megaloc_token_reduction.py` | 接線於 `reloc_localizer_edm.py`（預設 off） | 總帳已否決 L2/EViT token reduction。工具留著,不預設開。 |
@@ -466,7 +466,7 @@ holdout 淨 +89 succ / −121 LOST、mean −7~−13 ms/段。**已知成本:pro
 
 - **無獨立 ANAFI camera-pipeline holdout。** flight release `validation: NONE`；總帳每一項都標同資料集單幀 smoke。任何 flight 核准前必須補。**hard-negative 現況（2026-09-04 更新）：off-map corpus 已有可用配方 —— 河濱影片 vs 烏來地圖（`控制介面程式/site_profiles/urai_edm.json`，700 幀）穩定 0/700、全程 BOOT_INIT、最佳 PnP inliers 上限 17，可當 acceptance-gate 改動的 off-map 迴歸。仍缺兩種：(1) 開機在圖上、中途離圖的序列（能真正走到 LOST 路徑的 off-map corpus），(2) 同地圖錯位 ground truth（P119 植被假鎖那一類）。**
 - ~~**地圖 1045 refs 的地圖相依參數未依 B/C 重算**~~ **已補（2026-09-02，總帳「Tier 4 — 1045-ref 地圖相依參數重驗」）：** `S=2.3346915` 從 1045 ref centers 重算 exact 相符；`radius=max_jump=0.40·S=0.9338766` 在 P168 700f 掃描（0.20–0.60·S）為峰值，較小傷 recovery、較大中性且略慢；`reference_feature_cache_size=192` 在 P168/P117 cache 64/192 trace byte-identical（working set 75 / 36 distinct refs），full-1045 在 8 GiB GPU 不可行但 cache miss 只是重抓不影響結果。**無參數變動 → SHA chain 不動。** 仍缺的是上一項的獨立 holdout + hard-negative。
-- **`docs/imu_odometry_capability_audit.md`** 是 ESEKF/IMU 相關的既有稽核，接 ESEKF 前先讀。ESEKF/KLT-3D 的 live gate 見 `docs/esekf_live_eval_runbook.md`。
+- **`docs/imu_odometry_capability_audit.md`** 保留 ESEKF/IMU 的歷史能力稽核。舊 ESEKF/KLT-3D live gate 已隨後端退役；現行資料收集見 [EKF 資料錄製](next_flight_ekf_capture_20260922.md)，離線驗證見 [DIRECT 驗證](direct_offline_validation.md)。
 
 ---
 

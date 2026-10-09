@@ -55,7 +55,7 @@ def evaluate_outages(frames, velocities, basis, calibration, cutoff, horizons):
         next_start = cutoff
         errors = {name: [] for name in ("frozen", "visual_velocity", "ned_velocity")}
         rejected = 0
-        for index, row in enumerate(observed):
+        for row in observed:
             start = row["stamp"]
             if start < next_start:
                 continue

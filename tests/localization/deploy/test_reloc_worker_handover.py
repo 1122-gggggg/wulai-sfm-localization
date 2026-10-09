@@ -156,7 +156,11 @@ def test_a_closed_worker_refuses_work() -> None:
 def test_map_unconfirmed_pose_relocalizes_without_waiting_for_period(status, occupied):
     tracker = object.__new__(TwoRateTracker)
     tracker._reset_tracking_state()
-    tracker.profile = SimpleNamespace(reloc=SimpleNamespace(period_s=1.0, min_points=12))
+    tracker.profile = SimpleNamespace(
+        reloc=SimpleNamespace(
+            period_s=1.0, min_points=12, frozen_pnp_thresholds={"strong_inliers": 80}
+        )
+    )
     # Many tracked points do not imply a valid map-constrained solution.
     tracker._live_ids = np.arange(200)
     tracker._last_reloc_stamp = 10.0
@@ -176,7 +180,11 @@ def test_map_unconfirmed_pose_relocalizes_without_waiting_for_period(status, occ
 def test_map_confirmed_tracking_keeps_the_normal_relocalization_period(status):
     tracker = object.__new__(TwoRateTracker)
     tracker._reset_tracking_state()
-    tracker.profile = SimpleNamespace(reloc=SimpleNamespace(period_s=1.0, min_points=12))
+    tracker.profile = SimpleNamespace(
+        reloc=SimpleNamespace(
+            period_s=1.0, min_points=12, frozen_pnp_thresholds={"strong_inliers": 80}
+        )
+    )
     tracker._live_ids = np.arange(200)
     tracker._last_reloc_stamp = 10.0
     submitted = []
@@ -189,6 +197,31 @@ def test_map_confirmed_tracking_keeps_the_normal_relocalization_period(status):
     assert not tracker._step_reloc_trigger(gray, 2, 10.1, status)
     assert tracker._step_reloc_trigger(gray, 3, 11.0, status)
     assert submitted == [3]
+
+
+@pytest.mark.parametrize("map_points", [12, 60, 79, 80])
+def test_fast_track_refresh_uses_strong_map_support_not_total_vo_count(map_points):
+    tracker = object.__new__(TwoRateTracker)
+    tracker._reset_tracking_state()
+    tracker.profile = SimpleNamespace(
+        reloc=SimpleNamespace(
+            period_s=1.0, min_points=12, frozen_pnp_thresholds={"strong_inliers": 80}
+        )
+    )
+    tracker._live_ids = np.r_[np.arange(1, map_points + 1), -np.arange(1, 339)]
+    tracker._step_history.extend([0.001] * 5)
+    tracker._last_reloc_stamp = 10.0
+    calls = []
+    tracker._worker = SimpleNamespace(
+        queued=False,
+        submit=lambda gray, ordinal, stamp, epoch: calls.append((ordinal, stamp, epoch)) or True,
+    )
+    original_ids = tracker._live_ids.copy()
+    assert tracker._step_reloc_trigger(np.zeros((8, 8), np.uint8), 2, 10.1, "FAST_TRACK") is (
+        map_points < 80
+    )
+    assert calls == ([(2, 10.1, 0)] if map_points < 80 else [])
+    np.testing.assert_array_equal(tracker._live_ids, original_ids)
 
 
 class _StubKLT:
@@ -355,6 +388,26 @@ def test_handover_rejects_reset_or_inconsistent_capture_identity(result) -> None
     assert tracker._handover_dropped == 1
 
 
+@pytest.mark.parametrize("stamps", [(10.0, float("nan")), (10.0, float("inf")), (10.0, 9.9)])
+def test_handover_rejects_nonfinite_or_backward_capture_freshness(stamps):
+    fix = _reloc_fix(120)
+    tracker = _handover_tracker(fix)
+    tracker._ring.extend(
+        (0, ordinal, stamp, np.zeros((64, 64), np.uint8)) for ordinal, stamp in enumerate(stamps)
+    )
+    ids, _, _ = tracker._walk_handover(
+        fix,
+        0,
+        trigger_epoch=0,
+        trigger_stamp=stamps[0],
+        current_epoch=0,
+        current_stamp=stamps[-1],
+        current_ordinal=1,
+    )
+    assert ids.size == 0
+    assert tracker._handover_dropped == 1
+
+
 @pytest.mark.parametrize("frames", [3, 4, 7])
 @pytest.mark.parametrize("motion", ["healthy", "retry_better", "retry_worse"])
 def test_handover_retries_only_weak_two_frame_hops(frames, motion):
@@ -476,3 +529,64 @@ def test_reloc_refresh_due_stretches_only_idle_strong():
     assert due("VO_ONLY", 100.5, 100.0, 1.0, True) is False
     assert due("VO_ONLY", 101.0, 100.0, 1.0, True) is True
     assert due("NO_POSE", 100.1, 100.0, 1.0, True) is False
+
+
+@pytest.mark.parametrize("reject", [None, "few_inliers", "poor_geometry", "no_pnp"])
+def test_partial_strong_handover_recovers_from_a_dominant_drifting_vo_vote(reject):
+    # Flight handovers of 91/89 map points lost the mixed PnP vote to hundreds
+    # of drifted VO points, despite already passing strong capture admission.
+    count = 91
+    grid = np.array([(x, y) for y in np.linspace(8, 56, 7) for x in np.linspace(8, 56, 13)])
+    xyz = np.column_stack(((grid - 32) / 10, np.full(count, 5.0)))
+    if reject == "poor_geometry":
+        grid[:, 0] = 32
+        xyz[:, 0] = 0
+    fix = replace(_reloc_fix(count), query_xy=grid + [0.05, 0], point_xyz=xyz)
+    tracker = _handover_tracker(fix)
+    tracker._live_ids = -np.arange(1, 201)
+    tracker.profile.reloc.frozen_pnp_thresholds = {
+        "strong_inliers": 80,
+        "minimum_inlier_ratio": 0.25,
+        "minimum_hull_coverage": 0.15,
+        "minimum_occupancy_4x4": 6,
+        "minimum_positive_depth_ratio": 0.99,
+        "maximum_reprojection_p90_px": 3.0,
+    }
+    tracker._K = np.array([[50, 0, 32], [0, 50, 32], [0, 0, 1]], dtype=float)
+    tracker._camera = tracker._pnp_estimation = tracker._pnp_refinement = None
+    calls = []
+
+    def estimate(xy, points, *_args):
+        mixed = bool(np.any(points[:, 0] == 100))
+        calls.append((mixed, len(points)))
+        if not mixed and reject == "no_pnp":
+            return None
+        mask = points[:, 0] == 100 if mixed else np.ones(len(points), bool)
+        if not mixed and reject == "few_inliers":
+            mask[79:] = False
+        matrix = np.column_stack((np.eye(3), [-100.0 if mixed else 0.0, 0.0, 0.0]))
+        return {
+            "inlier_mask": mask,
+            "cam_from_world": SimpleNamespace(matrix=lambda: matrix),
+        }
+
+    tracker._pycolmap = SimpleNamespace(estimate_and_refine_absolute_pose=estimate)
+    tracker._step_absolute_pose = TwoRateTracker._step_absolute_pose.__get__(tracker)
+    info = tracker.step(np.zeros((64, 64), np.uint8), 1.0)
+
+    assert calls == [(True, 291), (False, 91)]
+    assert info["klt_reseeded"] is False  # Configured 120-point seed floor unchanged.
+    assert tracker._tracker.track_calls == [200]
+    if reject is None:
+        assert info["status"] == "RELOC_SEED"
+        assert info["map_inliers"] == 91
+        assert info["vo_inliers"] == 0
+        np.testing.assert_allclose(info["center"], 0)
+        np.testing.assert_array_equal(tracker._live_ids, fix.point3d_ids)
+        assert tracker._last_map_stamp == 1.0
+    else:
+        assert info["status"] == "VO_ONLY"
+        assert info["map_inliers"] == 0
+        assert info["vo_inliers"] == 200
+        np.testing.assert_array_equal(tracker._live_ids, -np.arange(1, 201))
+        assert tracker._last_map_stamp is None

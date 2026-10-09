@@ -183,7 +183,7 @@ def analyze_heading_reconciliation(ticks: list[dict[str, Any]]) -> dict[str, Any
         out["bearing_walk_deg"] = round(_angle_span_deg(bearings), 2)
     out["imu_walk_deg"] = round(_angle_span_deg(imus), 2)
     mismatches: list[float] = []
-    for first, second in zip(visuals, visuals[1:]):
+    for first, second in zip(visuals, visuals[1:], strict=False):
         visual_delta = _wrap(
             math.radians(float(second["heading_deg"])) - math.radians(float(first["heading_deg"]))
         )
@@ -516,7 +516,7 @@ def main(argv: list[str] | None = None) -> int:
 
 def _turn_timing(ticks, out):
     ordered = sorted(ticks, key=lambda t: float(t.get("t", 0.0) or 0.0))
-    for tick, nxt in zip(ordered, ordered[1:]):
+    for tick, nxt in zip(ordered, ordered[1:], strict=False):
         span = float(nxt.get("t", 0.0) or 0.0) - float(tick.get("t", 0.0) or 0.0)
         if not math.isfinite(span) or span < 0.0 or span > 5.0:
             continue

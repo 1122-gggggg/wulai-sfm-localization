@@ -28,6 +28,8 @@ EXCLUDED_PARTS = {
     ".mypy_cache",
     ".tox",
     ".venv",
+    ".venv-yolo",
+    ".venv-mvs",
     "htmlcov",
     "env",
     "__pycache__",

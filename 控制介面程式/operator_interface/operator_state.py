@@ -103,6 +103,11 @@ class DroneState:
     inliers: int = 0
     reproj: float | None = None
     battery_pct: float = 100.0
+    # Optional device event-cache snapshots; absent events remain None.
+    battery_info: dict[str, object] = field(default_factory=dict)
+    camera_info: dict[str, object] = field(default_factory=dict)
+    gimbal_info: dict[str, object] = field(default_factory=dict)
+    device_info_read_mono_ns: int | None = None
     altitude_m: float = 0.0
     drone_altitude_m: float | None = None
     gimbal_pitch_deg: float = -20.0

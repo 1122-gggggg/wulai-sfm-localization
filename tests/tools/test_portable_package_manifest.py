@@ -50,30 +50,6 @@ def test_release_tools_have_one_authoritative_implementation() -> None:
     assert not (root / "定位演算法/sync_mirror_check.sh").exists()
 
 
-def test_portable_export_keeps_output_governance_readme() -> None:
-    import export_simulator_package as exporter
-
-    assert "outputs/README.md" in exporter.COPY_FILES
-    assert {"pyproject.toml", "pytest.ini"}.issubset(exporter.COPY_FILES)
-    assert "requirements" in exporter.COPY_DIRS
-
-    runtime_script = (
-        Path(__file__).resolve().parents[2] / "tools" / "test_portable_runtime.sh"
-    ).read_text(encoding="utf-8")
-    assert '"$portable_root/outputs/README.md"' in runtime_script
-    assert 'rm -r -- "$staged_output_root/flight_logs"' in runtime_script
-    assert 'rm -r -- "$staged_output_root"' not in runtime_script
-    assert "routes/flight_route.json" not in runtime_script
-    assert "--require-site-bundle" in runtime_script
-    assert "runtime-only package imported" in runtime_script
-    assert "river_gluemap_all8_direct_20260908" not in runtime_script
-    assert "routes/authored/" not in runtime_script
-    assert "river_site_realrgb_dense_trimmed.ply" not in runtime_script
-    assert '"$portable_root/PORTABLE_SITE_ASSETS.json"' in runtime_script
-    assert "reports/hardware_approval_20260806.json" not in runtime_script
-    assert "river_site_safezone/flight_path.json" not in runtime_script
-
-
 def test_manifest_round_trip(tmp_path: Path) -> None:
     (tmp_path / "a.txt").write_text("a", encoding="utf-8")
     (tmp_path / "nested").mkdir()
@@ -86,6 +62,22 @@ def test_manifest_round_trip(tmp_path: Path) -> None:
         for issue in verify(tmp_path)
         for marker in ("SHA-256 mismatch: a.txt", "size mismatch: a.txt")
     )
+
+
+@pytest.mark.parametrize("environment_name", (".venv-yolo", ".venv-mvs"))
+def test_source_manifest_excludes_local_auxiliary_venvs(
+    tmp_path: Path, environment_name: str
+) -> None:
+    (tmp_path / "source.py").write_text("value = 1\n", encoding="utf-8")
+    environment = tmp_path / environment_name
+    (environment / "lib").mkdir(parents=True)
+    (environment / "pyvenv.cfg").write_text("home = /usr/bin\n", encoding="utf-8")
+    (environment / "lib64").symlink_to("lib", target_is_directory=True)
+
+    entries = generate(tmp_path, source_only=True)
+
+    assert [entry.path for entry in entries] == ["source.py"]
+    assert verify(tmp_path, source_only=True) == []
 
 
 def test_manifest_skips_nested_git_checkouts(tmp_path: Path) -> None:

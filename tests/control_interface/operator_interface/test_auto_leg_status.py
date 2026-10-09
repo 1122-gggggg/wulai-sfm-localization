@@ -5,6 +5,10 @@ from __future__ import annotations
 import hashlib
 import json
 from types import SimpleNamespace
+from unittest.mock import Mock
+
+import pytest
+import numpy as np
 
 from operator_autonomy import DesktopRouteAutonomy
 from real_path_follow_controller import LEGACY_MAP_FRAME, MissionRouteSnapshot
@@ -26,11 +30,11 @@ class _Backend:
             stream="OK",
         )
 
-    def send_pcmd(self, roll, pitch, yaw, gaz, *, reason):
+    def send_pcmd(self, roll, pitch, yaw, gaz, *, reason, auto_run_id=None):
         self.zeros.append((roll, pitch, yaw, gaz, reason))
         return True
 
-    def set_nudge_vector(self, roll, pitch, yaw, gaz):
+    def set_nudge_vector(self, roll, pitch, yaw, gaz, *, authority_pct=None, auto_run_id=None):
         self.vectors.append((roll, pitch, yaw, gaz))
         return True
 
@@ -328,8 +332,9 @@ def test_route_error_counts_only_after_join_and_is_reported_at_the_end(tmp_path)
     autonomy._log_route_tick(_tick_record(target=0, distance=0.90))
     assert autonomy.auto_leg_status()["route_error"] is None
     autonomy.controller.target_index = 1
-    for distance in (0.10, 0.30, 0.20):
+    for step, distance in enumerate((0.10, 0.30, 0.20)):
         record = _tick_record(target=1, distance=distance)
+        record["pose_stamp"] = record["t"] = 100.0 + step * 0.1
         # Offset of `distance` split 0.6/0.8 between horizontal (x) and up (-y).
         record["route_nearest_u"] = [0.4 - 0.6 * distance, 0.8 * distance, -1.6]
         autonomy._log_route_tick(record)
@@ -347,6 +352,16 @@ def test_route_error_counts_only_after_join_and_is_reported_at_the_end(tmp_path)
     assert len(summary) == 1 and "平均 0.200u" in summary[0].detail
     assert logged[-1][0] == "auto_route_error_summary"
     assert logged[-1][1]["p95_u"] == 0.29
+    assert summary[0].result["state"] == "ok"
+    assert summary[0].result["units"] == "map_units"
+    assert summary[0].result["route_sha256"] == autonomy.snapshot.sha256
+    assert summary[0].result["acquisition_excluded"] is True
+    with pytest.raises(TypeError):
+        summary[0].result["samples"] = 9
+    with pytest.raises(TypeError):
+        summary[0].result["map_frame"]["up"] = (1.0, 0.0, 0.0)
+    autonomy._report_route_error()
+    assert not autonomy.drain_events()
 
 
 def _hold_at_waypoint(tmp_path, *, acting):
@@ -395,3 +410,112 @@ def test_waypoint_action_timeout_is_announced_once(tmp_path) -> None:
     autonomy._log_route_tick(_tick_record(target=1))
     notices = [e for e in autonomy.drain_events() if e.kind == "waypoint_action_timeout"]
     assert len(notices) == 1 and notices[0].detail.startswith("路徑點2轉向動作逾時")
+
+
+@pytest.mark.parametrize("invalid", [
+    {"pose_stamp": 100.0},  # duplicate of the accepted capture
+    {"pose_stamp": 99.0},  # old capture
+    {"pose_stamp": 101.0},  # future capture
+    {"pose_stamp": float("nan")},
+    {"pose_u": [0.0, float("nan"), 0.0]},
+    {"pose_u": None},
+    {"route_distance_u": None},
+    {"route_distance_u": -1.0},
+    {"route_nearest_u": None},
+    {"pose_source": "holdover"},
+    {"position_observed": False},
+    {"pose_new": False},
+    {"pose_reseed_confirming": True},
+    {"reason": "AUTO paused"},
+])
+def test_route_error_rejects_non_observations_and_keeps_immutable_snapshot(tmp_path, invalid):
+    auto = _basic_autonomy(tmp_path, now=lambda: 100.1)
+    auto._log_route_tick({"t": 99.9, "target_index": 0})
+    observed = {
+        **_tick_record(target=1, distance=0.5),
+        "pose_stamp": 100.0, "pose_u": [0.5, 0.3, 0.4],
+        "route_nearest_u": [0.5, 0.0, 0.0],
+    }
+    auto._log_route_tick(observed)
+    old = auto.auto_leg_status()["route_error"]
+    auto._log_route_tick({**observed, "t": 100.1, "pose_stamp": 100.1, **invalid})
+    assert auto.auto_leg_status()["route_error"] is old
+    assert old["samples"] == 1
+    assert old["mean_u"] == old["rms_u"] == old["max_u"] == 0.5
+    assert old["horizontal_mean_u"] == 0.4
+
+
+def test_live_route_error_never_recomputes_percentiles(tmp_path, monkeypatch):
+    auto = _basic_autonomy(tmp_path)
+    auto._log_route_tick({"t": 100.0, "target_index": 0})
+    auto._log_route_tick({
+        **_tick_record(target=1), "pose_stamp": 100.0,
+        "route_nearest_u": [0.4, 0.0, -1.5],
+    })
+    percentile = Mock(wraps=np.percentile)
+    monkeypatch.setattr(np, "percentile", percentile)
+    snapshot = auto.auto_leg_status()["route_error"]
+    for _ in range(50):
+        assert auto.auto_leg_status()["route_error"] is snapshot
+    percentile.assert_not_called()
+    auto._report_route_error()
+    auto._report_route_error()
+    percentile.assert_called_once()
+
+
+@pytest.mark.parametrize("joined", [False, True])
+def test_empty_route_error_is_reported_once_and_never_fabricated(tmp_path, joined):
+    auto = _basic_autonomy(tmp_path)
+    auto._log_route_tick({"target_index": 0})
+    if joined:
+        auto._log_route_tick({"target_index": 1})
+    auto._report_route_error("offline stopped")
+    auto._report_route_error("must not replace first terminal summary")
+    events = [event for event in auto.drain_events() if event.kind == "route_error_summary"]
+    assert len(events) == 1
+    summary = events[0].result
+    assert summary["samples"] == 0 and summary["state"] == "no_samples"
+    assert summary["mean_u"] is summary["rms_u"] is summary["p95_u"] is summary["max_u"] is None
+    assert summary["joined"] is joined
+    assert summary["terminal_detail"] == "offline stopped"
+    assert "無法計算" in events[0].detail and "起飛靠攏段不計" in events[0].detail
+    assert auto.auto_leg_status()["route_error"] is None
+
+
+def test_route_error_plan_identity_is_captured_before_ui_route_changes(tmp_path):
+    from dataclasses import replace
+
+    auto = _basic_autonomy(tmp_path)
+    original = auto.snapshot
+    auto.snapshot = replace(original, sha256="another-route", coordinate_frame_id="another-frame")
+    auto._report_route_error()
+    summary = next(event.result for event in auto.drain_events() if event.kind == "route_error_summary")
+    assert summary["route_sha256"] == original.sha256
+    assert summary["coordinate_frame_id"] == original.coordinate_frame_id
+    assert summary["planned_waypoints_u"] == tuple(tuple(point) for point in auto.controller.wp)
+
+
+def test_first_waypoint_action_confirms_join_without_waiting_for_departure(tmp_path):
+    auto = _basic_autonomy(tmp_path)
+    auto._log_route_tick({
+        **_tick_record(target=0), "command_action": "WAYPOINT_ACTION",
+        "pose_stamp": 100.0, "route_nearest_u": [0.4, 0.0, -1.5],
+    })
+    assert auto.auto_leg_status()["route_error"]["samples"] == 1
+
+
+def test_metrics_use_full_observation_without_changing_rounded_guard_input(tmp_path):
+    auto = _basic_autonomy(tmp_path)
+    auto._log_route_tick({"target_index": 0})
+    record = {
+        **_tick_record(target=1),
+        "pose_stamp": 100.0,
+        "pose_u": [-0.1235, 0.0, 0.1235],
+        "observed_pose_u": [-0.12345, 0.0, 0.12345],
+        "route_nearest_u": [0.0, 0.0, 0.0],
+        "route_distance_u": np.sqrt(2.0) * 0.12345,
+    }
+    auto._log_route_tick(record)
+    summary = auto.auto_leg_status()["route_error"]
+    assert summary["mean_u"] == summary["horizontal_mean_u"] == 0.1746
+    assert record["pose_u"] == [-0.1235, 0.0, 0.1235]

@@ -3,8 +3,8 @@
 
 Wraps true meters into reported map-unit poses with misalignment residue,
 capture cadence, latency/jitter delivery, correlated OU noise, bias walk,
-dropouts/outages, the production IMU-bridge law during blackout, drifting
-weak estimates during localization-failure windows, and a height gain. Owns
+dropouts/outages, a timestamped fused-attitude heading bridge during blackout,
+drifting weak estimates during localization-failure windows, and a height gain. Owns
 the capture/receive contract used by the fast simulator and the Sphinx
 production-route adapter so both consume one implementation.
 
@@ -72,8 +72,6 @@ class SimulatedLocalizerConfig:
     predicted_rate: float = 0.0
     blackout_every_s: float = 0.0
     blackout_dur_s: float = 0.0
-    blackout_drift_mps: float = 0.0
-    blackout_yaw_drift_deg_s: float = 0.0
     pose_rate_hz: float = 20.0
     latency_jitter_ms: float = 0.0
     position_correlation_s: float = 0.0
@@ -130,8 +128,6 @@ class SimulatedLocalizer:
         self.predicted_rate = float(self.config.predicted_rate)
         self.blackout_every = float(self.config.blackout_every_s)
         self.blackout_dur = float(self.config.blackout_dur_s)
-        self.blackout_drift = float(self.config.blackout_drift_mps)
-        self.blackout_yaw_drift = math.radians(float(self.config.blackout_yaw_drift_deg_s))
         self.pose_rate = float(self.config.pose_rate_hz)
         self.jitter = float(self.config.latency_jitter_ms) / 1000.0
         self.pos_tau = float(self.config.position_correlation_s)
@@ -166,14 +162,18 @@ class SimulatedLocalizer:
         self._prev_report = None
         self._last_delivered_capture: float | None = None
         self._dropped_late = 0
-        self.map_confirmed = True
+        self.map_confirmed = False
         self.fault = "ok"
         self._blackout_active = False
         self._blackout_anchor: np.ndarray | None = None
         self._blackout_anchor_yaw = 0.0
-        self._blackout_start = 0.0
-        self._blackout_true_yaw = 0.0
+        self._blackout_imu_yaw = 0.0
         self._blackout_visual_capture = 0.0
+        self._last_visual_pose = None
+        self._visual_imu_reference = None
+        self._visual_unavailable = False
+        self._imu: list[tuple[float, float, float, float]] = []
+        self._imu_input_fault = None
         self._blackout_frames = 0
         self._reseed_remaining = 0
         self._last_seq = 0
@@ -206,8 +206,7 @@ class SimulatedLocalizer:
         for name in ("pos_sigma_u", "yaw_sigma_deg", "latency_ms", "outage_every_s",
                      "outage_dur_s", "jump_rate", "jump_max_u", "outlier_rate",
                      "outlier_max_u", "weak_rate", "weak_noise_gain", "predicted_rate",
-                     "blackout_every_s", "blackout_dur_s", "blackout_drift_mps",
-                     "blackout_yaw_drift_deg_s", "latency_jitter_ms",
+                     "blackout_every_s", "blackout_dur_s", "latency_jitter_ms",
                      "position_correlation_s", "yaw_correlation_s", "bias_walk_u_sqrt_s"):
             value = float(getattr(cfg, name))
             if not math.isfinite(value) or value < 0.0:
@@ -227,6 +226,56 @@ class SimulatedLocalizer:
     @property
     def dropped_late(self) -> int:
         return int(self._dropped_late)
+
+    def push_imu(self, stamp: float, yaw: float, *, tilt_deg=0, yaw_rate_deg_s=0) -> None:
+        """Observe independent fused attitude, not truth or raw acceleration.
+
+        ``stamp`` uses the report/capture simulation clock; ``yaw`` is map
+        heading in radians. Tilt and yaw rate are degrees and degrees/second.
+        Invalid/latest unsafe samples disable the bridge until a valid sample
+        arrives. History aligns its reference to the last visual capture.
+        """
+        try:
+            sample = tuple(float(value) for value in (stamp, yaw, tilt_deg, yaw_rate_deg_s))
+        except (TypeError, ValueError, OverflowError):
+            self._imu_input_fault = "blackout-imu-invalid"
+            return
+        if not all(math.isfinite(value) for value in sample):
+            self._imu_input_fault = "blackout-imu-invalid"
+            return
+        if self._imu and sample[0] <= self._imu[-1][0]:
+            if sample == self._imu[-1]:
+                return
+            self._imu_input_fault = "blackout-imu-out-of-order"
+            return
+        self._imu_input_fault = None
+        self._imu.append(sample)
+        horizon = sample[0] - self.latency - abs(self.jitter) - 2.0
+        while len(self._imu) > 2 and self._imu[0][0] < horizon:
+            self._imu.pop(0)
+        if len(self._imu) > 1024:
+            del self._imu[:-1024]
+
+    @staticmethod
+    def _imu_sample_fault(sample, stamp: float):
+        if sample is None:
+            return "blackout-imu-missing"
+        age = float(stamp) - sample[0]
+        if age < -1e-12:
+            return "blackout-imu-future"
+        if age > 0.5 + 1e-12:
+            return "blackout-imu-stale"
+        if abs(sample[2]) > 35.0:
+            return "blackout-imu-tilt"
+        if abs(sample[3]) > 180.0:
+            return "blackout-imu-yaw-rate"
+        return None
+
+    def _imu_at(self, stamp: float):
+        for sample in reversed(self._imu):
+            if sample[0] <= float(stamp) + 1e-12:
+                return sample
+        return None
 
     def push_truth(self, t: float, position_m, yaw: float) -> None:
         try:
@@ -255,7 +304,7 @@ class SimulatedLocalizer:
     def _truth_at(self, want: float):
         sample = self._truth[0]
         for entry in self._truth:
-            if entry[0] <= want:
+            if entry[0] <= want + 1e-12:
                 sample = entry
             else:
                 break
@@ -263,7 +312,7 @@ class SimulatedLocalizer:
 
     def _capture_due(self, t: float) -> bool:
         if not self._capture_initialized:
-            self._next_capture = float(t)
+            self._next_capture = float(t) + 1.0 / self.pose_rate
             self._capture_initialized = True
             return True
         period = 1.0 / self.pose_rate
@@ -366,11 +415,18 @@ class SimulatedLocalizer:
         except (AttributeError, TypeError, ValueError):
             position_observed = True
         if position_observed:
+            self._visual_unavailable = False
             try:
                 self._blackout_visual_capture = float(pose.stamp)
             except (AttributeError, TypeError, ValueError, OverflowError):
                 pass
             self._blackout_frames = 0
+            self._last_visual_pose = pose
+            reference = self._imu_at(self._blackout_visual_capture)
+            self._visual_imu_reference = (
+                reference if self._imu_sample_fault(reference, self._blackout_visual_capture) is None
+                else None
+            )
         if self._reseed_remaining > 0:
             self._reseed_remaining -= 1
             try:
@@ -380,13 +436,20 @@ class SimulatedLocalizer:
         self._prev_report = self._last_report
         self._last_report = pose
         self.fault = getattr(pose, "_sim_fault", self.fault)
+        self.map_confirmed = bool(getattr(pose, "map_confirmed", False))
         return pose
 
     def _deliver_capture(self, t: float):
         ready = [row for row in self._pending if row[0] <= float(t) + 1e-12]
         if not ready:
+            if self._visual_unavailable:
+                self.map_confirmed = False
+                return None
             # Hold the last delivered pose value/stamp across polls with no
             # newly matured capture (e.g. 10 Hz poses polled at 20 Hz).
+            self.map_confirmed = bool(getattr(self._last_report, "map_confirmed", False))
+            if self._last_report is None:
+                self.fault = "awaiting-visual"
             return self._last_report
         # Deliver newest ready capture; count older late arrivals as dropped.
         ready.sort(key=lambda row: (row[1], row[0]))
@@ -419,80 +482,109 @@ class SimulatedLocalizer:
         self._last_delivered_capture = float(capture)
         return self._record_visual_capture(pose)
 
+    @staticmethod
+    def _finite_time(t):
+        try:
+            t = float(t)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return t if math.isfinite(t) else None
+
+    def _report_outage(self):
+        self._blackout_active = False
+        self._visual_unavailable = True
+        self._pending.clear()
+        self._capture_initialized = False
+        self.fault = "outage"
+
+    def _capture_tick(self, t: float):
+        if not self._capture_due(t):
+            return None
+        capture_tick = self._next_capture - 1.0 / self.pose_rate
+        if capture_tick > float(t):
+            capture_tick = float(t)
+        return capture_tick
+
+    def _enqueue_capture(self, capture_tick) -> bool:
+        receive, pose, fault = self._make_capture(float(capture_tick))
+        if pose is None:
+            self.fault = fault
+            self._visual_unavailable = True
+            self.map_confirmed = False
+            return False
+        # Capture stamp is the cadence tick, not the poll time.
+        capture = float(pose.stamp)
+        self._pending.append((receive, capture, pose))
+        self._pending.sort(key=lambda row: (row[0], row[1]))
+        self.fault = fault
+        return True
+
     def report(self, t: float):
         self.fault = "ok"
-        self.map_confirmed = True
+        self.map_confirmed = False
+        t = self._finite_time(t)
+        if t is None:
+            self.fault = "invalid-time"
+            return None
         if not self._truth:
+            self.fault = "no-truth"
             return None
         if self._in_outage(t):
-            self._blackout_active = False
-            self.fault = "outage"
+            self._report_outage()
             return None
         if self._in_blackout(t):
             return self._report_blackout(t)
         self._blackout_active = False
-        capture_tick = None
-        if self._capture_due(t):
-            capture_tick = self._next_capture - 1.0 / self.pose_rate
-            if capture_tick > float(t):
-                capture_tick = float(t)
+        capture_tick = self._capture_tick(t)
         if capture_tick is not None and self.rng.random() >= self.drop_rate:
-            receive, pose, fault = self._make_capture(float(capture_tick))
-            if pose is None:
-                # No position at all (lost before any map fix): like a dropout.
-                self.fault = fault
-                self.map_confirmed = bool(getattr(self._last_report, "map_confirmed", True))
-                return self._last_report
-            # Capture stamp is the cadence tick, not the poll time.
-            capture = float(pose.stamp)
-            self._pending.append((receive, capture, pose))
-            self._pending.sort(key=lambda row: (row[0], row[1]))
-            self.fault = fault
+            if not self._enqueue_capture(capture_tick):
+                return None
         elif capture_tick is not None:
             self.fault = "dropout"
-            self.map_confirmed = bool(getattr(self._last_report, "map_confirmed", True))
-            return self._last_report
+            self._visual_unavailable = True
+            self.map_confirmed = False
         return self._deliver_capture(t)
 
 
 
     def _report_blackout(self, t: float):
-        if self._last_report is None:
+        self.map_confirmed = False
+        self._visual_unavailable = True
+        self._pending.clear()
+        self._capture_initialized = False
+        if self._last_visual_pose is None:
             self.fault = "blackout-no-anchor"
             return None
         if not self._blackout_active:
             self._blackout_active = True
-            self._blackout_anchor = np.array(self._last_report.xyz, float)
-            self._blackout_anchor_yaw = float(self._last_report.yaw)
-            self._blackout_start = float(t)
-            _, _, yaw = self._truth_at(float(t) - self.latency)
-            self._blackout_true_yaw = float(yaw)
-            try:
-                self._blackout_visual_capture = float(self._last_report.stamp)
-            except (AttributeError, TypeError, ValueError, OverflowError):
-                self._blackout_visual_capture = float(t)
+            self._blackout_anchor = np.array(self._last_visual_pose.xyz, float)
+            self._blackout_anchor_yaw = float(self._last_visual_pose.yaw)
+            self._blackout_visual_capture = float(self._last_visual_pose.stamp)
             self._blackout_frames = 0
-        age = max(0.0, float(t) - float(self._blackout_visual_capture))
-        if age > float(self.imu_bridge_max_age_s) or int(self._blackout_frames) >= int(self.imu_bridge_max_frames):
+            if self._visual_imu_reference is not None:
+                self._blackout_imu_yaw = self._visual_imu_reference[1]
+        age = float(t) - self._blackout_visual_capture
+        if age < 0.0 or age > self.imu_bridge_max_age_s or self._blackout_frames >= self.imu_bridge_max_frames:
             self.fault = "blackout-expired"
             return None
-        self._blackout_frames = int(self._blackout_frames) + 1
-        dt = max(0.0, float(t) - self._blackout_start)
-        _, _, yaw = self._truth_at(float(t) - self.latency)
-        true_dyaw = float(yaw) - float(self._blackout_true_yaw)
-        yaw_walk = self.rng.normal(0.0, math.radians(1.0) * math.sqrt(max(dt, 0.0)))
-        yaw_walk += self.rng.normal(0.0, float(self.blackout_yaw_drift) * math.sqrt(max(dt, 0.0)))
-        est_yaw = float(self._blackout_anchor_yaw) + true_dyaw + yaw_walk
-        drift_step = float(self.blackout_drift) / max(self.s, 1e-9) * 0.05
-        self._blackout_anchor = np.array(self._blackout_anchor, float) + self.rng.normal(0.0, drift_step, 3)
+        if self._visual_imu_reference is None:
+            self.fault = "blackout-imu-no-reference"
+            return None
+        sample = self._imu[-1] if self._imu else None
+        fault = self._imu_input_fault or self._imu_sample_fault(sample, t)
+        if fault is not None:
+            self.fault = fault
+            return None
+        self._blackout_frames += 1
+        dyaw = (sample[1] - self._blackout_imu_yaw + math.pi) % (2.0 * math.pi) - math.pi
+        est_yaw = (self._blackout_anchor_yaw + dyaw + math.pi) % (2.0 * math.pi) - math.pi
         pose = _make_pose(self._pose_cls, float(self._blackout_anchor[0]),
                           float(self._blackout_anchor[1]), float(self._blackout_anchor[2]),
-                          float(est_yaw), float(t), map_confirmed=False,
+                          float(est_yaw), float(sample[0]), map_confirmed=False,
                           position_observed=False)
         self._prev_report = self._last_report
         self._last_report = pose
         self.fault = "blackout-imu"
-        self.map_confirmed = False
         self._reseed_remaining = int(self.reseed_confirm_frames)
         return pose
 
@@ -505,10 +597,16 @@ class CommandChannelConfig:
     latency_ms: float = 0.0
     drop_rate: float = 0.0
     ttl_s: float = 0.2
+    max_pending: int = 4096
 
 
 class CommandChannel:
-    """Bounded command FIFO: plant applies the newest unexpired arrived command."""
+    """Bounded FIFO; TTL starts at arrival, not send, so long links can deliver.
+
+    Retains one newest unexpired arrived command and at most ``max_pending``
+    future arrivals. Overload drops the latest pending command rather than
+    the oldest, avoiding starvation under continuous publication.
+    """
 
     def __init__(self, config=None, rng=None, **overrides):
         self.config = config if config is not None else CommandChannelConfig(**overrides)
@@ -531,6 +629,23 @@ class CommandChannel:
             raise ValueError("command drop rate must be in [0, 1]")
         if not math.isfinite(ttl) or ttl <= 0.0:
             raise ValueError("command TTL must be finite and > 0")
+        capacity = self.config.max_pending
+        if isinstance(capacity, bool) or not isinstance(capacity, int) or capacity <= 0:
+            raise ValueError("command max_pending must be a positive int")
+
+    def _prune(self, now: float) -> None:
+        latest = None
+        pending = []
+        for row in self._queue:
+            if row[0] > float(now) + 1e-12:
+                pending.append(row)
+            elif float(now) - row[0] <= float(self.config.ttl_s) and row[1] >= self._applied_seq:
+                if latest is None or row[1] > latest[1]:
+                    latest = row
+        pending.sort(key=lambda row: (row[0], row[1]))
+        # Keep earliest arrivals under overload; discarding the oldest pending
+        # command would starve a long-delay link under continuous publication.
+        self._queue = ([] if latest is None else [latest]) + pending[:self.config.max_pending]
 
     def send(self, pcmd, now: float) -> int | None:
         if self.rng.random() < float(self.config.drop_rate):
@@ -538,12 +653,11 @@ class CommandChannel:
         self._seq += 1
         receive = float(now) + float(self.config.latency_ms) / 1000.0
         self._queue.append((receive, int(self._seq), (int(pcmd[0]), int(pcmd[1]), int(pcmd[2]), int(pcmd[3]))))
-        capacity = 8
-        while len(self._queue) > capacity:
-            self._queue.pop(0)
-        return int(self._seq)
+        self._prune(now)
+        return int(self._seq) if any(row[1] == self._seq for row in self._queue) else None
 
     def applied(self, now: float) -> tuple[tuple[int, int, int, int], float, int | None]:
+        self._prune(now)
         ready = [row for row in self._queue if row[0] <= float(now) + 1e-12]
         if not ready:
             return (0, 0, 0, 0), float("inf"), None

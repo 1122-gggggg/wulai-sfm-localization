@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import inspect
 import json
+import math
 import threading
 import time
 from dataclasses import replace
@@ -59,11 +60,11 @@ class _Backend:
             stream="OK",
         )
 
-    def send_pcmd(self, roll, pitch, yaw, gaz, *, reason):
+    def send_pcmd(self, roll, pitch, yaw, gaz, *, reason, auto_run_id=None):
         self.zeros.append((roll, pitch, yaw, gaz, reason))
         return True
 
-    def set_nudge_vector(self, roll, pitch, yaw, gaz):
+    def set_nudge_vector(self, roll, pitch, yaw, gaz, *, authority_pct=None, auto_run_id=None):
         self.vectors.append((roll, pitch, yaw, gaz))
         return True
 
@@ -1067,7 +1068,7 @@ def test_repeated_auto_pcmd_rejection_terminates_route_in_hover_failure(
     tmp_path,
 ) -> None:
     class RejectingBackend(_Backend):
-        def set_nudge_vector(self, roll, pitch, yaw, gaz):
+        def set_nudge_vector(self, roll, pitch, yaw, gaz, *, authority_pct=None, auto_run_id=None):
             self.vectors.append((roll, pitch, yaw, gaz))
             return False
 
@@ -1873,13 +1874,13 @@ def test_recorded_manual_restart_descends_toward_unfinished_third_waypoint():
 
 @pytest.mark.parametrize("speed, command, expected", [
     (0.0, (0, 50, 7, 3), (0, 50, 7, 3)),
-    (0.12, (0, 50, 7, 3), (0, 40, 7, 3)),
-    (0.3, (0, 50, 7, 3), (0, 25, 7, 3)),
+    (0.12, (0, 50, 7, 3), (0, 14, 7, 3)),
+    (0.3, (0, 50, 7, 3), (0, 9, 7, 3)),
     # Orthogonal roll is preserved: only the forward projection is limited.
-    (0.3, (-30, 40, 0, 0), (-30, 25, 0, 0)),
-    (0.3, (0, 10, 0, 0), (0, 10, 0, 0)),
+    (0.3, (-30, 40, 0, 0), (-30, 9, 0, 0)),
+    (0.3, (0, 10, 0, 0), (0, 9, 0, 0)),
     (0.6, (0, 50, 7, 3), (0, 0, 7, 3)),
-    (0.9, (0, 50, 0, 0), (0, -6, 0, 0)),
+    (0.9, (0, 50, 0, 0), (0, -9, 0, 0)),
 ])
 def test_horizontal_auto_command_tapers_to_zero_at_speed_limit(
     tmp_path, speed, command, expected
@@ -1890,6 +1891,47 @@ def test_horizontal_auto_command_tapers_to_zero_at_speed_limit(
     assert autonomy.controller.cfg.max_translation_pcmd == 50
     # The steady speed envelope is independent of the startup acceleration ramp.
     assert autonomy._apply_speed_limit(command) == expected
+
+
+@pytest.mark.parametrize("limit", [0.15, 0.3, 0.6, 2.0])
+@pytest.mark.parametrize("yaw", [-2.7, 0.0, 1.2])
+@pytest.mark.parametrize("heading", [-2.0, 0.0, 0.7, 2.8])
+def test_accelerating_tilt_spends_damping_equivalent_speed_headroom(
+    tmp_path, limit, yaw, heading
+):
+    # Full-cap taper used to permit 33 PCMD at .1 m/s with a .3 limit:
+    # a high thrust burst during .4-.5 s delay and 1.4-2 s response. Budget
+    # headroom in the existing braking units instead of fitting a plant gain.
+    clock = _Clock()
+    speed = limit / 3.0
+    backend = _forward_motion_backend(clock, speed)
+    backend.state.autonomous_speed_limit_mps = limit
+    backend.state.att_yaw = yaw
+    backend.state.speed_north_mps = speed * math.cos(yaw + heading)
+    backend.state.speed_east_mps = speed * math.sin(yaw + heading)
+    autonomy = _budget_autonomy(tmp_path, backend, clock)
+    command = (round(50 * math.sin(heading)), round(50 * math.cos(heading)), 7, -3)
+
+    applied = autonomy._apply_speed_limit(command)
+
+    projection = applied[1] * math.cos(heading) + applied[0] * math.sin(heading)
+    assert projection <= rpf.DESKTOP_AUTO_WIND_REJECT_PCMD_PER_MPS * (limit - speed) + 1e-9
+    assert projection > 0
+    assert max(abs(applied[0]), abs(applied[1])) <= 50
+    assert applied[2:] == command[2:]
+
+
+@pytest.mark.parametrize("speed", [0.1, 0.3, 0.6])
+def test_headroom_budget_preserves_orthogonal_hold_and_stronger_braking(tmp_path, speed):
+    clock = _Clock()
+    backend = _forward_motion_backend(clock, speed)
+    backend.state.autonomous_speed_limit_mps = 0.3
+    autonomy = _budget_autonomy(tmp_path, backend, clock)
+    # A speed guard must not scale the position/wind servo as a whole. Full
+    # opposing pitch, or a lateral correction at/below the limit, still fits.
+    assert autonomy._apply_speed_limit((35, -40, 7, -3)) == (35, -40, 7, -3)
+    if speed <= 0.3:
+        assert autonomy._apply_speed_limit((35, 0, 7, -3)) == (35, 0, 7, -3)
 
 
 def test_speed_limit_extrapolates_measured_acceleration_past_telemetry_delay(tmp_path):
@@ -1906,9 +1948,121 @@ def test_speed_limit_extrapolates_measured_acceleration_past_telemetry_delay(tmp
 
     applied = autonomy._apply_speed_limit((0, 50, 0, 0))
 
-    # 0.3 m/s + 0.5 m/s^2 * (0.1 s age + 0.25 s) = 0.475 m/s -> 50 * (1 - 0.475/0.6)
-    assert applied == (0, 10, 0, 0)
+    # Rising delayed telemetry needs less accelerating tilt than the steady
+    # .3m/s headroom (9 PCMD), without changing the prediction horizon.
+    assert applied[1] < 9
+    assert applied[0] == 0 and applied[2:] == (0, 0)
     assert backend.state.autonomous_speed_guard_status == "SPEED_LIMITED"
+
+
+def test_authorized_brake_does_not_cancel_prediction_before_aircraft_decelerates(tmp_path):
+    clock = _Clock()
+    backend = _forward_motion_backend(clock, 0.2)
+    autonomy = _budget_autonomy(tmp_path, backend, clock)
+    autonomy._apply_speed_limit((0, 50, 7, -3))
+    clock.sleep(0.2)
+    backend.state.ground_speed_mps = backend.state.speed_north_mps = 0.4
+    backend.state.ground_speed_mono_ns = int(clock.now() * 1e9)
+    # Brake authorized in the previous tick, but the new measured sample is
+    # still accelerating under old tilt. The aircraft has not acted on it yet.
+    autonomy._accel_command = (clock.now() - 0.05, np.array([-12.0, 0.0]))
+    applied = autonomy._apply_speed_limit((0, 20, 7, -3))
+    assert applied[1] < 0 and applied[2:] == (7, -3)
+    # Reusing that sample cannot remove the command-delay horizon.
+    clock.sleep(0.05)
+    assert autonomy._apply_speed_limit((0, 20, 7, -3))[1] <= applied[1]
+    # A genuinely decelerating new sample releases prediction, without a latch.
+    clock.sleep(0.15)
+    backend.state.ground_speed_mps = backend.state.speed_north_mps = 0.3
+    backend.state.ground_speed_mono_ns = int(clock.now() * 1e9)
+    assert autonomy._apply_speed_limit((0, 20, 7, -3)) == (0, 9, 7, -3)
+
+
+@pytest.mark.parametrize("heading", np.linspace(-np.pi, np.pi, 17))
+def test_predicted_overspeed_brake_survives_slew_at_measured_underspeed(tmp_path, heading):
+    clock = _Clock()
+    backend = _forward_motion_backend(clock, 0.0)
+    backend.state.autonomous_speed_limit_mps = 0.3
+    autonomy = _budget_autonomy(tmp_path, backend, clock)
+    autonomy._send_authorized((0, 50, 7, -3))
+    clock.sleep(0.2)
+    stamp = clock.now()
+    backend.state.ground_speed_mps = 0.29
+    backend.state.speed_north_mps = 0.29 * np.cos(heading)
+    backend.state.speed_east_mps = 0.29 * np.sin(heading)
+    backend.state.ground_speed_mono_ns = int(stamp * 1e9)
+    clock.sleep(0.2)
+
+    accepted, _, applied = autonomy._send_authorized((20, 50, 7, -3))
+
+    # 5 Hz telemetry: actual underspeed, but acceleration plus sample age
+    # and command lookahead require more than immediate velocity damping.
+    predicted = 0.29 + (0.29 / 0.2) * (0.2 + 0.25)
+    projection = applied[1] * np.cos(heading) + applied[0] * np.sin(heading)
+    assert accepted
+    assert projection <= -rpf.DESKTOP_AUTO_WIND_REJECT_PCMD_PER_MPS * (predicted - 0.3) + 1e-9
+    assert max(abs(applied[0]), abs(applied[1])) <= 50
+    assert applied[2:] == (7, -3)
+
+
+def test_speed_envelope_does_not_bank_unapproved_acceleration(tmp_path):
+    clock = _Clock()
+    backend = _forward_motion_backend(clock, 0.3)
+    backend.state.autonomous_speed_limit_mps = 0.3
+    autonomy = _budget_autonomy(tmp_path, backend, clock)
+    for _ in range(50):
+        backend.state.ground_speed_mono_ns = int(clock.now() * 1e9)
+        assert autonomy._send_authorized((0, 50, 7, -3))[2] == (0, 0, 7, -3)
+        clock.sleep(0.05)
+    # A new decelerated sample releases the speed envelope without a latch,
+    # but cannot resurrect tilt withheld during those stationary commands.
+    backend.state.ground_speed_mps = backend.state.speed_north_mps = 0.0
+    backend.state.ground_speed_mono_ns = int(clock.now() * 1e9)
+    accepted, _, applied = autonomy._send_authorized((0, 50, 7, -3))
+    assert accepted and 0 < applied[1] <= 2
+    assert applied[2:] == (7, -3)
+
+
+def test_final_speed_envelope_preserves_available_crosswind_authority(tmp_path):
+    clock = _Clock()
+    backend = _forward_motion_backend(clock, 0.0)
+    backend.state.autonomous_speed_limit_mps = 0.3
+    autonomy = _budget_autonomy(tmp_path, backend, clock)
+    autonomy._send_authorized((20, 50, 7, -3))
+    clock.sleep(0.2)
+    backend.state.ground_speed_mps = backend.state.speed_north_mps = 0.29
+    backend.state.ground_speed_mono_ns = int(clock.now() * 1e9)
+    clock.sleep(0.2)
+    # Crosswind tilt is already established; final braking must reserve
+    # along-motion authority without discarding the orthogonal correction.
+    autonomy._accel_command = (clock.now() - 0.05, np.array([50.0, 20.0]))
+    accepted, _, applied = autonomy._send_authorized((20, 50, 7, -3))
+    assert accepted
+    assert applied[0] == 20 and applied[1] <= -19
+    assert applied[2:] == (7, -3)
+
+
+def test_quantized_low_speed_reversal_does_not_restore_full_reverse_tilt(tmp_path):
+    clock = _Clock()
+    backend = _forward_motion_backend(clock, 0.03)
+    backend.state.autonomous_speed_limit_mps = 0.3
+    autonomy = _budget_autonomy(tmp_path, backend, clock)
+    for event in range(8):
+        velocity = 0.03 if event % 2 == 0 else -0.03
+        backend.state.ground_speed_mps = abs(velocity)
+        backend.state.speed_north_mps = velocity
+        backend.state.ground_speed_mono_ns = int(clock.now() * 1e9)
+        for _ in range(4):
+            accepted, _, applied = autonomy._send_authorized(
+                (0, -50 if velocity > 0.0 else 50, 7, -3)
+            )
+            assert accepted
+            # Immediate low-speed damping plus four 20 Hz ramp increments,
+            # not full opposite tilt held on a delayed quantized speed sign.
+            assert 0 < abs(applied[1]) <= 6
+            assert applied[1] * velocity < 0.0
+            assert applied[2:] == (7, -3)
+            clock.sleep(0.05)
 
 
 def test_braking_command_is_not_limited_above_speed_limit(tmp_path):
@@ -2233,7 +2387,7 @@ def test_send_authorized_race_with_failure_clears_nudge_and_zeros_pcmd(
             self._release = threading.Event()
             self.state.autonomous_speed_limit_enabled = False
 
-        def set_nudge_vector(self, roll, pitch, yaw, gaz, authority_pct=10):
+        def set_nudge_vector(self, roll, pitch, yaw, gaz, *, authority_pct=10, auto_run_id=None):
             self._entered.set()
             assert self._release.wait(timeout=2.0)
             self._nudge_vector = (roll, pitch, yaw, gaz)
@@ -2244,7 +2398,7 @@ def test_send_authorized_race_with_failure_clears_nudge_and_zeros_pcmd(
             self._nudge_vector = None
             self.vectors.append((0.0, 0.0, 0.0, 0.0))
 
-        def send_pcmd(self, roll, pitch, yaw, gaz, *, reason):
+        def send_pcmd(self, roll, pitch, yaw, gaz, *, reason, auto_run_id=None):
             self.zeros.append((roll, pitch, yaw, gaz, reason))
             return True
 
@@ -2362,3 +2516,260 @@ def test_delayed_five_hz_speed_does_not_allow_a_full_tilt_launch(tmp_path, respo
         speed += (.04 * applied[1] - speed) * (1. - np.exp(-.05 / response_s))
     assert max(abs(v) for v in history) <= .6
     assert sum(history) * .05 > 1., 'passing requires forward travel, not a zero-command stop'
+
+
+def test_real_route_loop_reports_observed_geometry_not_holdover_or_prediction(tmp_path, monkeypatch):
+    """Real coordinator/controller/loop; backend and localization are offline only."""
+    clock = _Clock()
+    backend = _Backend()
+    backend.session_logs = _SessionLogs()
+    auto = _budget_autonomy(tmp_path, backend, clock)
+    auto.run_loop = pff.run_loop
+    monkeypatch.setattr(pff.time, "sleep", clock.sleep)
+    post_reads = 0
+    previous_stamp = None
+
+    def pose():
+        nonlocal post_reads, previous_stamp
+        assert clock.now() < 20.0, "offline probe must not leave a worker running"
+        backend.state.ground_speed_mono_ns = int(clock.now() * 1e9)
+        if auto.phase != "ROUTE" or auto.controller.target_index == 0:
+            return Pose(0.0, 0.0, 0.0, 0.0, stamp=clock.now())
+        post_reads += 1
+        if post_reads == 12:
+            auto.cancel("offline geometry probe")
+        stamp = clock.now()
+        if post_reads == 2:
+            stamp = previous_stamp
+        elif post_reads == 3:
+            stamp -= 1.0
+        else:
+            previous_stamp = stamp
+        return Pose(
+            0.5, 0.3, 0.4, 0.0, stamp=stamp,
+            position_observed=post_reads != 5,
+        )
+
+    auto.get_pose = pose
+    auto.pose_info = lambda: {
+        "display_seq": post_reads, "pose_capture_mono_ns": int(clock.now() * 1e9),
+        "direct_status": "OFFLINE_OBSERVATION",
+    }
+    auto._run()
+    summaries = [event for event in auto.drain_events() if event.kind == "route_error_summary"]
+    assert len(summaries) == 1
+    summary = summaries[0].result
+    ticks = [fields for event, fields in backend.session_logs.records if event == "auto_route_tick"]
+    accepted = [tick for tick in ticks if tick["route_error_sample"]]
+    offset_ticks = [tick for tick in accepted if tick["pose_u"] == [0.5, 0.3, 0.4]]
+    assert offset_ticks
+    assert all(tick["route_distance_u"] == pytest.approx(0.5) for tick in offset_ticks)
+    assert all(tick["route_nearest_u"] == pytest.approx([0.5, 0.0, 0.0]) for tick in offset_ticks)
+    assert any(tick.get("pose_source") == "holdover" and not tick["route_error_sample"] for tick in ticks)
+    assert any(tick.get("position_observed") is False and not tick["route_error_sample"] for tick in ticks)
+    assert len({tick["pose_stamp"] for tick in accepted}) == len(accepted)
+    assert summary["samples"] == len(accepted)
+    assert summary["mean_u"] == round(sum(tick["route_distance_u"] for tick in accepted) / len(accepted), 4)
+    assert summary["rms_u"] == round(np.sqrt(sum(tick["route_distance_u"] ** 2 for tick in accepted) / len(accepted)), 4)
+    assert summary["max_u"] == summary["p95_u"] == 0.5
+    assert summary["horizontal_max_u"] == 0.4
+    assert summary["outcome"] == "cancelled"
+    assert all(tick["auto_run_id"] == summary["run_id"] for tick in ticks)
+    assert any(tick.get("loc_pose_stamp_matches") is False for tick in ticks)
+    auto._report_route_error()
+    assert not auto.drain_events()
+
+
+@pytest.mark.parametrize("terminal", ["complete", "cancel", "failure"])
+def test_worker_always_emits_one_terminal_route_error_summary(tmp_path, terminal):
+    clock = _Clock()
+    auto = _budget_autonomy(tmp_path, _Backend(), clock)
+
+    def route_loop(*_args, **_kwargs):
+        if terminal == "cancel":
+            auto.cancel("offline cancellation")
+        elif terminal == "failure":
+            raise RuntimeError("offline worker failure")
+        return "offline complete"
+
+    auto.run_loop = route_loop
+    auto._run()
+    auto._report_route_error("must not duplicate")
+    events = [event for event in auto.drain_events() if event.kind == "route_error_summary"]
+    assert len(events) == 1
+    assert events[0].result["state"] == "no_samples"
+    assert events[0].result["outcome"] == {
+        "complete": "landed", "cancel": "cancelled", "failure": "failed",
+    }[terminal]
+
+
+def test_restarting_same_coordinator_keeps_route_error_runs_independent(tmp_path):
+    clock = _Clock()
+    auto = _budget_autonomy(tmp_path, _Backend(), clock)
+    offsets = iter((0.1, 0.2))
+
+    def route_loop(hooks, *_args, **_kwargs):
+        distance = next(offsets)
+        hooks.log_tick({"t": clock.now(), "target_index": 0})
+        hooks.log_tick({
+            "t": clock.now(), "pose_stamp": clock.now(), "target_index": 1,
+            "pose_u": [0.5, 0.0, distance], "route_nearest_u": [0.5, 0.0, 0.0],
+            "route_distance_u": distance, "action": "FOLLOW",
+        })
+        return "offline complete"
+
+    auto.run_loop = route_loop
+    results = []
+    for _ in range(2):
+        assert auto.start()
+        assert auto.join(timeout=2.0)
+        events = [event for event in auto.drain_events() if event.kind == "route_error_summary"]
+        assert len(events) == 1
+        results.append(events[0].result)
+    assert results[0]["run_id"] != results[1]["run_id"]
+    assert [result["samples"] for result in results] == [1, 1]
+    assert [result["mean_u"] for result in results] == [0.1, 0.2]
+
+
+def test_auto_backend_dispatch_carries_run_identity_without_changing_commands(tmp_path):
+    auto = _budget_autonomy(tmp_path, _Backend(), _Clock())
+    setter = Mock(wraps=auto.backend.set_nudge_vector)
+    auto.backend.set_nudge_vector = setter
+    accepted, _, actual = auto._dispatch_route_pcmd((0, 4, 7, -2))
+    assert accepted and actual == (0, 4, 7, -2)
+    setter.assert_called_once()
+    assert setter.call_args.kwargs["auto_run_id"] == auto.run_id
+    assert setter.call_args.kwargs["authority_pct"] == auto._pcmd_authority_pct()
+
+    auto.backend.set_nudge_vector = None
+    send = Mock(wraps=auto.backend.send_pcmd)
+    auto.backend.send_pcmd = send
+    accepted, _, actual = auto._dispatch_route_pcmd((0, 4, 7, -2))
+    assert accepted and actual == (0, 4, 7, -2)
+    send.assert_called_once_with(
+        0, 4, 7, -2, reason="desktop_auto_route", auto_run_id=auto.run_id,
+    )
+    send.reset_mock()
+    assert auto._send_zero("offline stop")
+    send.assert_called_once_with(
+        0, 0, 0, 0, reason="offline stop", auto_run_id=auto.run_id,
+    )
+
+
+def test_waypoint_camera_dispatch_uses_typed_command_and_fresh_event_readback(tmp_path):
+    from backend_contract import ControlAction, ControlResult
+    from operator_flight_safety import TelemetryFreshnessStore
+
+    clock = _Clock()
+    backend = _Backend()
+    backend.is_live = True
+    backend.state.battery_pct = 80
+    backend.state.gimbal_pitch_deg = -30.
+    backend.state.gimbal_mono_ns = 10_000_000_000
+    backend.state.gimbal_stamp_source = "observed_cache_value"
+    backend.telemetry_freshness = TelemetryFreshnessStore()
+    backend.telemetry_freshness.observe(
+        "gimbal", {"gimbal_id": 0, "pitch_absolute": -30.},
+        marker=("cache", "old"), observed_mono_ns=10_000_000_000,
+    )
+    requests = []
+
+    def command(request):
+        requests.append(request)
+        return ControlResult.completed(backend.state, raw_result=True)
+
+    backend.command = command
+    auto = _budget_autonomy(tmp_path, backend, clock)
+    auto.phase = "ROUTE"
+    assert auto._request_waypoint_gimbal_pitch(0)
+    assert requests[0].action is ControlAction.GIMBAL_PITCH
+    assert requests[0].payload.value == 0 and not requests[0].human_origin
+    assert auto._read_waypoint_gimbal_pitch() is None
+    backend.telemetry_freshness.observe(
+        "gimbal", {"gimbal_id": 0, "pitch_absolute": -30.},
+        marker=("event", "confirmed"), observed_mono_ns=10_000_000_000,
+    )
+    backend.state.gimbal_pitch_deg = 70.  # Unpaired UI state cannot fabricate readback.
+    assert auto._read_waypoint_gimbal_pitch() == (-30., 10.)
+    assert auto.pause()
+    assert not auto._request_waypoint_gimbal_pitch(45)
+    assert auto._read_waypoint_gimbal_pitch() is None
+    assert auto.resume()
+    backend.pilot_sticks = True
+    assert not auto._request_waypoint_gimbal_pitch(45)
+    backend.pilot_sticks = False
+    auto._cancel.set()
+    assert not auto._request_waypoint_gimbal_pitch(45)
+    assert len(requests) == 1
+
+
+def test_waypoint_camera_session_dispatch_confirmation_pause_and_result_events(tmp_path):
+    from backend_contract import ControlResult
+    from route_domain import WaypointAction
+
+    clock = _Clock()
+    backend = _Backend()
+    backend.is_live = False
+    backend.state.gimbal_pitch_deg = 20.
+    backend.state.gimbal_mono_ns = 9_000_000_000
+    backend.state.gimbal_stamp_source = "simulated"
+    requests = []
+
+    def command(request):
+        requests.append(request)
+        backend.state.gimbal_pitch_deg = request.payload.value
+        return ControlResult.completed(backend.state, raw_result=True)
+
+    backend.command = command
+    auto = _budget_autonomy(tmp_path, backend, clock)
+    auto.phase = "ROUTE"
+    auto.controller = rpf.RouteAutoController(
+        auto.waypoints,
+        config=replace(auto.controller.cfg, waypoint_arrive_confirm_frames=1,
+                       waypoint_actions=((WaypointAction("gimbal_pitch", 0),), ())),
+        request_gimbal_pitch=auto._request_waypoint_gimbal_pitch,
+        read_gimbal_pitch=auto._read_waypoint_gimbal_pitch,
+    )
+
+    def tick(now):
+        clock.value = now
+        return auto.controller.step(Pose(0, 0, 0, 0., stamp=now), now=now)
+
+    assert tick(10.).action == "WAYPOINT_ACTION" and len(requests) == 1
+    assert auto.pause()
+    clock.value = 50.
+    assert auto.resume()
+    assert tick(50.).waypoint_action["elapsed_s"] == 0
+    backend.state.gimbal_mono_ns = 50_100_000_000
+    assert tick(50.1).action == "WAYPOINT_ACTION"
+    backend.state.gimbal_mono_ns = 50_200_000_000
+    assert tick(50.2).action == "FOLLOW"
+    assert len(requests) == 1
+    auto._track_route_progress({"target_index": 1})
+    auto._track_route_progress({"target_index": 1})
+    results = [event for event in auto.drain_events() if event.kind == "waypoint_camera_action"]
+    assert len(results) == 1 and results[0].result["state"] == "confirmed"
+
+
+def test_simulated_route_consumer_delegates_camera_only_and_emits_simulated_readback():
+    from backend_contract import ControlAction, ControlRequest, ScalarPayload
+    from flight_operator_app import DroneBackend
+
+    backend = DroneBackend()
+    plant = backend.route_test_plant
+    camera = ControlRequest.create(
+        ControlAction.GIMBAL_PITCH, payload=ScalarPayload(-45), human_origin=False,
+    )
+    assert not plant.command(camera).accepted  # No active simulated session.
+    plant._map_frame = LEGACY_MAP_FRAME
+    plant._vertical_pcmd_gain = 0.06
+    assert plant.command(camera).accepted
+    assert backend.state.gimbal_pitch_deg == -45
+    plant.send_pcmd(0, 0, 0, 0, reason="offline_camera_observation")
+    assert backend.state.gimbal_stamp_source == "simulated"
+    assert backend.state.gimbal_mono_ns > 0
+    zoom = ControlRequest.create(ControlAction.ZOOM, payload=ScalarPayload(2), human_origin=False)
+    assert not plant.command(zoom).accepted
+    plant.pilot_sticks = True
+    assert not plant.command(camera).accepted
+    assert backend.state.gimbal_pitch_deg == -45  # No implicit reset on cancellation.

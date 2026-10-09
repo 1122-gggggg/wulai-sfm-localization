@@ -20,6 +20,7 @@ import local_site_assets as lsa
 import route_editor_controller as rec
 import route_editor_model as rem
 from route_editor_controller import OrthoView, RouteEditorController, pointer_is_drag
+from route_editor_objects import ObjectBoxController
 from route_editor_model import (
     PREVIEW_ROUTE_SCHEMA,
     ROUTE_SCHEMA,
@@ -27,6 +28,7 @@ from route_editor_model import (
     editor_to_glomap,
     glomap_to_editor,
 )
+from route_editor_rendering import BACKGROUND, PointCloudRenderer
 
 
 def test_editor_frame_round_trip_keeps_z_as_physical_up() -> None:
@@ -91,11 +93,9 @@ def test_successful_route_save_approves_and_closes_the_finished_editor(tmp_path)
         )
 
     editor = SimpleNamespace(
+        objects=ObjectBoxController(),
         _preview_only=False,
-        controller=SimpleNamespace(
-            moving=False,
-            points=[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
-        ),
+        controller=RouteEditorController([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]]),
         document=RouteDocument(site_id="yard", coordinate_frame_id="yard-map-v1"),
         arrive_radius_var=SimpleNamespace(get=lambda: 0.025),
         import_route=import_route,
@@ -310,7 +310,8 @@ def test_save_preview_persists_the_dragged_arrive_limit(tmp_path):
     document = RouteDocument(site_id="yard", coordinate_frame_id="yard-map-v1")
     points = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]]
     editor = SimpleNamespace(
-        controller=SimpleNamespace(moving=False, points=points),
+        objects=ObjectBoxController(),
+        controller=RouteEditorController(points),
         _choose_preview_path=lambda: target,
         document=document,
         arrive_radius_var=SimpleNamespace(get=lambda: 0.025),
@@ -352,7 +353,8 @@ def test_bound_save_stages_before_atomic_route_import(tmp_path):
         return SimpleNamespace(message="saved", asset_path=target)
 
     editor = SimpleNamespace(
-        controller=SimpleNamespace(moving=False, points=replacement),
+        objects=ObjectBoxController(),
+        controller=RouteEditorController(replacement),
         document=document,
         arrive_radius_var=SimpleNamespace(get=lambda: 0.025),
         _preview_only=False,
@@ -391,7 +393,8 @@ def test_bound_save_failure_without_managed_site_points_to_import():
         points=[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
     )
     editor = SimpleNamespace(
-        controller=SimpleNamespace(moving=False, points=document.points),
+        objects=ObjectBoxController(),
+        controller=RouteEditorController(document.points),
         document=document,
         arrive_radius_var=SimpleNamespace(get=lambda: 0.025),
         _preview_only=False,
@@ -426,7 +429,8 @@ def test_bound_save_emits_drawn_per_waypoint_radii(tmp_path):
         return SimpleNamespace(message="saved", asset_path=target)
 
     editor = SimpleNamespace(
-        controller=SimpleNamespace(moving=False, points=document.points),
+        objects=ObjectBoxController(),
+        controller=RouteEditorController(document.points),
         document=document,
         arrive_radius_var=SimpleNamespace(get=lambda: 0.02),
         _preview_only=False,
@@ -452,9 +456,8 @@ def test_update_document_realigns_radii_after_undo(tmp_path):
         waypoint_arrive_radii=[0.05, 0.02, 0.03, 0.04],
     )
     editor = SimpleNamespace(
-        controller=SimpleNamespace(
-            moving=False, points=[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]]
-        ),
+        objects=ObjectBoxController(),
+        controller=RouteEditorController([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]]),
         document=document,
         arrive_radius_var=SimpleNamespace(get=lambda: 0.02),
     )
@@ -495,7 +498,9 @@ def test_per_waypoint_spheres_draw_at_own_sizes():
 
     draw = Draw()
     editor = SimpleNamespace(
-        controller=SimpleNamespace(points=[[0, 0, 0], [1, 0, 0]], selected=None),
+        controller=SimpleNamespace(
+            points=[[0, 0, 0], [1, 0, 0]], selected=None, segment_look_at=[None],
+        ),
         document=SimpleNamespace(waypoint_arrive_radii=[0.02, 0.05]),
         view=View(),
         show_arrive_var=SimpleNamespace(get=lambda: True),
@@ -533,16 +538,86 @@ def test_dragging_the_arrive_limit_turns_on_its_live_visualization():
         arrive_radius_var=Variable(0.02),
         arrive_label_var=Variable(""),
         show_arrive_var=Variable(False),
+        document=SimpleNamespace(waypoint_arrive_radii=None),
         controller=SimpleNamespace(
+            points=[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
             shortest_leg=lambda: 1.0,
             spheres_overlap=lambda _radius: False,
         ),
         request_redraw=lambda: redraws.append("arrive"),
     )
+    arrive._set_all_arrive_radii = lambda r: rew.RouteEditorWindow._set_all_arrive_radii(arrive, r)
     rew.RouteEditorWindow._on_arrive_radius(arrive, "0.02")
 
     assert arrive.show_arrive_var.get() is True
     assert redraws == ["arrive"]
+
+
+def _radius_editor(radii, points=3):
+    import route_editor_window as rew
+
+    class Variable:
+        def __init__(self, value):
+            self.value = value
+
+        def get(self):
+            return self.value
+
+        def set(self, value):
+            self.value = value
+
+    editor = SimpleNamespace(
+        arrive_radius_var=Variable(0.02),
+        arrive_label_var=Variable(""),
+        point_radius_var=Variable("0.020"),
+        point_radius_note_var=Variable(""),
+        show_arrive_var=Variable(False),
+        document=SimpleNamespace(waypoint_arrive_radii=radii),
+        controller=SimpleNamespace(
+            points=[[float(i), 0.0, 0.0] for i in range(points)],
+            selected=None,
+            shortest_leg=lambda: 1.0,
+            spheres_overlap=lambda _radius: False,
+        ),
+        request_redraw=lambda: None,
+    )
+    editor._set_all_arrive_radii = lambda r: rew.RouteEditorWindow._set_all_arrive_radii(editor, r)
+    editor._on_arrive_radius = lambda v: rew.RouteEditorWindow._on_arrive_radius(editor, v)
+    editor._point_radius_for = lambda i: rew.RouteEditorWindow._point_radius_for(editor, i)
+    editor._update_point_radius_note = lambda: None
+    editor._sync_point_radius_box = lambda: rew.RouteEditorWindow._sync_point_radius_box(editor)
+    return rew, editor
+
+
+def test_dragging_the_slider_resizes_every_sphere_of_a_route_with_per_point_radii():
+    rew, editor = _radius_editor([0.05, 0.04, 0.023])
+    editor.arrive_radius_var.set(0.07)
+
+    rew.RouteEditorWindow._on_arrive_radius(editor, "0.07")
+
+    assert editor.document.waypoint_arrive_radii == [0.07, 0.07, 0.07]
+    assert [editor._point_radius_for(i) for i in range(3)] == [0.07, 0.07, 0.07]
+
+
+def test_typing_a_radius_resizes_every_sphere_clamped_to_the_operator_range():
+    rew, editor = _radius_editor([0.05, 0.04, 0.023])
+    for typed, expected in (("0.03", 0.03), ("0.5", rew.ARRIVE_RADIUS_MAX_U), ("0", rew.ARRIVE_RADIUS_MIN_U)):
+        editor.point_radius_var.set(typed)
+        rew.RouteEditorWindow._on_point_radius(editor)  # no waypoint needs to be selected
+        assert editor.document.waypoint_arrive_radii == [expected] * 3
+        assert editor.arrive_radius_var.get() == pytest.approx(expected)
+
+    editor.point_radius_var.set("abc")
+    rew.RouteEditorWindow._on_point_radius(editor)
+    assert editor.document.waypoint_arrive_radii == [rew.ARRIVE_RADIUS_MIN_U] * 3
+
+
+def test_a_route_without_per_point_radii_keeps_only_the_global_radius():
+    rew, editor = _radius_editor(None)
+    editor.arrive_radius_var.set(0.08)
+    rew.RouteEditorWindow._on_arrive_radius(editor, "0.08")
+    assert editor.document.waypoint_arrive_radii is None
+    assert editor.arrive_radius_var.get() == pytest.approx(0.08)
 
 
 def test_arrival_sphere_draws_a_scaled_translucent_fill():
@@ -572,7 +647,9 @@ def test_arrival_sphere_draws_a_scaled_translucent_fill():
 
     draw = Draw()
     editor = SimpleNamespace(
-        controller=SimpleNamespace(points=[[0, 0, 0], [1, 0, 0]], selected=None),
+        controller=SimpleNamespace(
+            points=[[0, 0, 0], [1, 0, 0]], selected=None, segment_look_at=[None],
+        ),
         document=SimpleNamespace(waypoint_arrive_radii=None),
         view=View(),
         show_arrive_var=SimpleNamespace(get=lambda: True),
@@ -915,78 +992,19 @@ def test_applying_never_restarts_out_from_under_the_route_editor():
     ):
         panel = _StubPanel(answer=True)
         panel._set_busy = lambda _busy: None
+        panel._select_site_folder = lambda *_args: None
+        panel._refresh = lambda: None
         panel._pending_site_folder = Path("/tmp/whatever")
         panel.follow_up_route_for_site = lambda _folder, o=outcome: o
         applied = []
         panel.offer_apply_after_import = lambda: applied.append(True) or False
-        result = type("R", (), {"kind": "site", "message": "ok"})()
+        result = type("R", (), {"kind": "site", "message": "ok", "profile_path": None})()
 
         sap.SiteAssetsPanel._finish_ok(panel, result)
 
         assert bool(applied) is expect_apply, (
             f"outcome={outcome}: apply {'ran' if applied else 'did not run'}"
         )
-
-def test_choose_route_opens_the_site_folder_of_the_current_profile(tmp_path, monkeypatch):
-    """current_profile is a Path to site_profile.json, never a SiteProfile.
-
-    Reading .source off it raised AttributeError inside the Tk callback, so
-    「選擇航線」 did nothing at all and the dialog never opened.
-    """
-    import site_assets_panel as sap
-
-    site = tmp_path / "river_site"
-    (site / "routes" / "river_site_safezone").mkdir(parents=True)
-    route = site / "routes" / "river_site_safezone" / "flight_path.json"
-    route.write_text("{}", encoding="utf-8")
-    profile_path = site / "site_profile.json"
-    profile_path.write_text("{}", encoding="utf-8")
-
-    opened: dict[str, str | None] = {}
-
-    def fake_askopenfilename(**kwargs):
-        opened["initialdir"] = kwargs.get("initialdir")
-        return ""
-
-    monkeypatch.setattr(sap.filedialog, "askopenfilename", fake_askopenfilename)
-
-    panel = SimpleNamespace(
-        actions=SimpleNamespace(current_profile=profile_path),
-        # No pack root known: this is the fallback that must still work.
-        site_pack_root=None,
-        _run=lambda *a, **k: None,
-    )
-    sap.SiteAssetsPanel._choose_route(panel)
-
-    assert opened["initialdir"] == str(route.parent)
-
-
-def test_choose_route_never_imports_while_airborne(monkeypatch):
-    import site_assets_panel as sap
-
-    statuses = []
-    opened = []
-    imported = []
-    monkeypatch.setattr(
-        sap.filedialog,
-        "askopenfilename",
-        lambda **_kwargs: opened.append(True) or "/tmp/route.json",
-    )
-
-    panel = SimpleNamespace(
-        flight_state_check=lambda: (False, "飛機尚未確認 landed"),
-        status_var=SimpleNamespace(set=statuses.append),
-        actions=SimpleNamespace(
-            current_profile=None,
-            import_route=lambda source: imported.append(source),
-        ),
-    )
-
-    sap.SiteAssetsPanel._choose_route(panel)
-
-    assert opened == []
-    assert imported == []
-    assert statuses == ["航線匯入已拒絕：飛機尚未確認 landed"]
 
 
 def _write_route(path: Path, **overrides) -> Path:
@@ -1136,34 +1154,6 @@ def test_site_pack_root_comes_from_the_map_not_the_profile_location(tmp_path):
     assert lsa.site_pack_root_for_profile(None, packages) is None
 
 
-def test_route_picker_opens_the_site_pack_when_the_profile_lives_elsewhere(
-    tmp_path, monkeypatch
-):
-    """site_pack_root wins over current_profile.parent for the dialog's start dir."""
-    import site_assets_panel as sap
-
-    site = tmp_path / "river_site"
-    route = site / "routes" / "authored" / "route.json"
-    _write_route(route)
-    elsewhere = tmp_path / "site_profiles"
-    elsewhere.mkdir()
-    (elsewhere / "river_site_edm.json").write_text("{}", encoding="utf-8")
-
-    opened: dict[str, str | None] = {}
-    monkeypatch.setattr(
-        sap.filedialog, "askopenfilename",
-        lambda **kw: opened.setdefault("initialdir", kw.get("initialdir")) and "")
-
-    panel = SimpleNamespace(
-        actions=SimpleNamespace(current_profile=elsewhere / "river_site_edm.json"),
-        site_pack_root=site,
-        _run=lambda *a, **k: None,
-    )
-    sap.SiteAssetsPanel._choose_route(panel)
-
-    assert opened["initialdir"] == str(route.parent)
-
-
 def test_route_buttons_draw_the_route_and_never_import_it():
     """The operator asked to flip between routes and see each drawn.
 
@@ -1290,12 +1280,12 @@ def test_map_axis_gizmo_uses_the_measured_basis_and_is_resolved_once():
 
 
 def test_arrival_radius_slider_matches_the_operator_range():
-    """0.005 to 0.05 map units (operator decision 2026-08-06)."""
+    """0.005 to 0.1 map units (operator decisions 2026-08-06, max raised 2026-10-09)."""
     import route_editor_window as rew
     import real_path_follow_controller as rpf_mod
 
     assert rew.ARRIVE_RADIUS_MIN_U == pytest.approx(0.005)
-    assert rew.ARRIVE_RADIUS_MAX_U == pytest.approx(0.05)
+    assert rew.ARRIVE_RADIUS_MAX_U == pytest.approx(0.1)
     assert rew.ARRIVE_RADIUS_MIN_U <= rew.DEFAULT_ARRIVE_RADIUS_U <= rew.ARRIVE_RADIUS_MAX_U
 
     # The controller default must sit in the same range, or the editor confirms a
@@ -1349,15 +1339,6 @@ def test_dedup_keeps_the_source_whichever_order_the_folders_scan_in(tmp_path):
     assert packages[0].folder.name == "zzz_source", "the un-importable copy was kept"
 
 
-def test_the_panel_keeps_a_standing_route_entry_point():
-    """The switch flow offers the editor once; declining must not strand the route."""
-    import inspect as _inspect
-    import site_assets_panel as sap
-
-    source = _inspect.getsource(sap.SiteAssetsPanel._build_site_shortcuts)
-    assert "編輯路線" in source, "no way back to an existing route"
-    assert "_open_route_editor(True)" in source, "the entry must open in EDIT mode"
-    assert "新增路線" in source
 
 
 def test_site_routes_are_listed_newest_first(tmp_path):
@@ -1453,6 +1434,7 @@ def test_bound_save_emits_the_controller_actions(tmp_path):
         return SimpleNamespace(message="saved", asset_path=tmp_path / "route.json")
 
     editor = SimpleNamespace(
+        objects=ObjectBoxController(),
         controller=RouteEditorController(
             [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]], [[], [RIGHT_30]]
         ),
@@ -1469,3 +1451,199 @@ def test_bound_save_emits_the_controller_actions(tmp_path):
 
     rew.RouteEditorWindow.save_route(editor)
     assert imported[0]["waypoint_actions"] == [[], [RIGHT_30]]
+
+
+def test_full_cloud_visibility_preserves_front_point_and_stable_depth_ties():
+    cloud = np.array([
+        [0, 0, 1, 255, 0, 0],
+        [0, 0, -1, 0, 255, 0],
+        [0, 0, 1, 0, 0, 255],
+    ], dtype=np.float32)
+    renderer = PointCloudRenderer(cloud, use_cuda=False)
+    view = OrthoView(np.zeros(3), 1)
+    image = renderer.render(view, 100, 100)
+    assert image[50, 50].tolist() == [0, 0, 255]
+    view.front()
+    image = renderer.render(view, 100, 100)
+    assert image[4, 50].tolist() == [0, 0, 255]
+    assert image[96, 50].tolist() == [0, 255, 0]
+
+
+def test_full_cloud_draws_a_point_the_old_interaction_stride_would_omit():
+    cloud = np.zeros((500_002, 6), dtype=np.float32)
+    cloud[:, 0] = 1_000  # Outside the viewport, not a decimated input cloud.
+    cloud[-1] = [0, 0, 0, 10, 20, 30]
+    renderer = PointCloudRenderer(cloud, use_cuda=False)
+    image = renderer.render(OrthoView(np.zeros(3), 1), 100, 100)
+    assert image[50, 50].tolist() == [10, 20, 30]
+    assert image[0, 0].tolist() == list(BACKGROUND)
+
+
+def test_full_cloud_clips_points_and_handles_an_empty_cloud():
+    renderer = PointCloudRenderer(np.array([
+        [100, 0, 0, 255, 0, 0],
+        [np.nan, 0, 0, 0, 255, 0],
+        [0, -100, 0, 0, 0, 255],
+    ], dtype=np.float32), use_cuda=False)
+    view = OrthoView(np.zeros(3), 1)
+    expected = np.empty((80, 100, 3), dtype=np.uint8)
+    expected[:] = BACKGROUND
+    np.testing.assert_array_equal(renderer.render(view, 100, 80), expected)
+    empty = PointCloudRenderer(np.empty((0, 6)), use_cuda=False)
+    np.testing.assert_array_equal(empty.render(view, 100, 80), expected)
+
+
+def test_point_picking_uses_displayed_view_while_latest_rotation_is_pending():
+    import route_editor_window as rew
+
+    displayed = OrthoView(np.zeros(3), 1)
+    latest = OrthoView(np.zeros(3), 1, yaw=np.pi / 2)
+    cloud = np.array([[0.5, 0, 0, 255, 0, 0]], dtype=np.float32)
+    editor = SimpleNamespace(
+        map_points=cloud, view=latest, _displayed_view=displayed,
+        _displayed_size=(100, 100), _displayed_cloud=cloud,
+        controller=RouteEditorController([[0.5, 0, 0]]),
+    )
+    point = rew.RouteEditorWindow._nearest_cloud(editor, 73, 50, threshold=1)
+    np.testing.assert_array_equal(point, [0.5, 0, 0])
+    assert rew.RouteEditorWindow._nearest_waypoint(editor, 73, 50, threshold=1) == 0
+    editor._displayed_cloud = None  # Incoming replacement map is not on-screen yet.
+    assert rew.RouteEditorWindow._nearest_cloud(editor, 73, 50) is None
+
+
+def test_camera_pitch_editor_save_reload_undo_redo_and_canvas_marker(tmp_path):
+    import route_editor_window as rew
+    from operator_autonomy_status import waypoint_action_text
+
+    points = [[0., 0., 0.], [1., 0., 0.]]
+    controller = RouteEditorController(points)
+    controller.selected = 0
+    for pitch in (-90, 0, 90):
+        action = {"type": "gimbal_pitch", "pitch_deg": float(pitch)}
+        controller.add_action(action)
+    assert controller.undo() and len(controller.actions[0]) == 2
+    assert controller.redo() and len(controller.actions[0]) == 3
+    document = RouteDocument(
+        site_id="yard", coordinate_frame_id="yard-map-v1",
+        points=controller.points, waypoint_actions=controller.actions,
+    )
+    saved = document.save(tmp_path / "camera_route.json")
+    loaded = RouteDocument.load(saved, site_id="yard", coordinate_frame_id="yard-map-v1")
+    assert loaded.waypoint_actions == controller.actions
+    flight = rpf.RouteDocument.from_path(saved)
+    assert [action.value for action in flight.waypoint_actions[0]] == [-90, 0, 90]
+    assert rew._action_marker(controller.actions[0][0]) == "C-90"
+    assert rew._action_marker(controller.actions[0][1]) == "C+0"
+    assert "鏡頭俯仰+90°" in waypoint_action_text(controller.actions[0][2])
+
+
+@pytest.mark.parametrize("value,accepted", [("0", True), ("-90", True), ("90", True),
+                                           ("91", False), ("nan", False), ("bad", False)])
+def test_camera_pitch_widget_uses_the_validated_action_contract(value, accepted):
+    import route_editor_window as rew
+
+    controller = RouteEditorController([[0., 0., 0.], [1., 0., 0.]])
+    controller.selected = 0
+    messages = []
+    editor = SimpleNamespace(
+        controller=controller,
+        action_pitch_var=SimpleNamespace(get=lambda: value),
+        action_direction_var=SimpleNamespace(get=lambda: "out"),
+        status_var=SimpleNamespace(set=messages.append),
+        _refresh_labels=lambda: None, request_redraw=lambda: None,
+    )
+    editor._add_action = lambda raw: rew.RouteEditorWindow._add_action(editor, raw)
+    rew.RouteEditorWindow._add_gimbal_pitch_action(editor)
+    assert bool(controller.actions[0]) is accepted
+    assert messages
+
+
+def test_outbound_and_return_actions_are_independent_and_follow_their_waypoint() -> None:
+    controller = RouteEditorController()
+    controller.set_placement_enabled(True)
+    for x in range(4):
+        controller.add([float(x), 0.0, 0.0])
+    controller.selected = 1
+    assert controller.add_action(RIGHT_30, "out")
+    assert controller.add_action(HOVER_3, "back")
+    assert controller.actions[1] == [RIGHT_30]
+    assert controller.return_actions[1] == [HOVER_3]
+
+    # Undo/redo restore both lists together; deleting an earlier point shifts both.
+    controller.selected = 0
+    controller.delete_selected()
+    assert controller.actions[0] == [RIGHT_30] and controller.return_actions[0] == [HOVER_3]
+    assert controller.undo()
+    assert controller.actions[1] == [RIGHT_30] and controller.return_actions[1] == [HOVER_3]
+    assert controller.redo()
+    assert controller.return_actions[0] == [HOVER_3]
+
+    controller.selected = 0
+    assert controller.remove_last_action("back")
+    assert controller.return_actions[0] == [] and controller.actions[0] == [RIGHT_30]
+
+
+def test_return_actions_are_refused_on_the_landing_and_turnaround_points() -> None:
+    controller = RouteEditorController([[0., 0., 0.], [1., 0., 0.], [2., 0., 0.]])
+    for index, allowed in ((0, False), (1, True), (2, False)):
+        controller.selected = index
+        assert controller.return_actions_allowed(index) is allowed
+        assert controller.add_action(HOVER_3, "back") is allowed
+        # Outbound actions are unaffected by that rule.
+        assert controller.add_action(HOVER_3, "out")
+    with pytest.raises(ValueError):
+        controller.add_action(HOVER_3, "sideways")
+
+
+def test_route_file_round_trips_return_actions_and_rejects_illegal_ones(tmp_path) -> None:
+    document = RouteDocument(
+        site_id="yard", coordinate_frame_id="yard-map-v1",
+        points=[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [2.0, 0.0, 0.0]],
+        waypoint_actions=[[], [RIGHT_30], []],
+        return_waypoint_actions=[[], [HOVER_3], []],
+    )
+    saved = document.save(tmp_path / "route.json")
+    payload = json.loads(saved.read_text(encoding="utf-8"))
+    assert payload["waypoint_actions"] == [[], [RIGHT_30], []]
+    assert payload["return_waypoint_actions"] == [[], [HOVER_3], []]
+    flight = rpf.RouteDocument.from_path(saved)
+    assert flight.return_waypoint_actions[1][0].to_json() == HOVER_3
+    loaded = RouteDocument.load(saved, site_id="yard", coordinate_frame_id="yard-map-v1")
+    assert loaded.return_waypoint_actions == [[], [HOVER_3], []]
+
+    document.return_waypoint_actions = [[], [], []]
+    assert document.payload()["return_waypoint_actions"] is None
+    for bad_index in (0, 2):
+        entries = [[], [], []]
+        entries[bad_index] = [HOVER_3]
+        document.return_waypoint_actions = entries
+        with pytest.raises(ValueError, match="回程動作不能設在"):
+            document.payload()
+        payload["return_waypoint_actions"] = entries
+        saved.write_text(json.dumps(payload), encoding="utf-8")
+        with pytest.raises(ValueError):
+            rpf.RouteDocument.from_path(saved)
+
+
+def test_editor_adds_to_the_selected_trip_only() -> None:
+    import route_editor_window as rew
+
+    controller = RouteEditorController([[0., 0., 0.], [1., 0., 0.], [2., 0., 0.]])
+    messages = []
+    direction = {"value": "back"}
+    editor = SimpleNamespace(
+        controller=controller,
+        action_direction_var=SimpleNamespace(get=lambda: direction["value"]),
+        status_var=SimpleNamespace(set=messages.append),
+        _refresh_labels=lambda: None, request_redraw=lambda: None,
+    )
+    controller.selected = 0
+    rew.RouteEditorWindow._add_action(editor, HOVER_3)
+    assert controller.return_actions[0] == [] and "不能設定回程動作" in messages[-1]
+    controller.selected = 1
+    rew.RouteEditorWindow._add_action(editor, HOVER_3)
+    assert controller.return_actions[1] == [HOVER_3] and controller.actions[1] == []
+    assert "回程動作" in messages[-1]
+    direction["value"] = "out"
+    rew.RouteEditorWindow._add_action(editor, RIGHT_30)
+    assert controller.actions[1] == [RIGHT_30] and controller.return_actions[1] == [HOVER_3]

@@ -5,7 +5,7 @@
 本目錄保留 legacy path-follow runner 與共用控制核心；它不是目前真機公開入口。
 現行真機 UI 只能從 `sfm-mission-selection/v1` resolver snapshot 啟動。
 `mission_pipeline.py --mode fly` 與 `path_follow_flight.py --fly` 都會拒絕起飛。
-真機 TakeOff 只允許操作員在桌面 UI 完成四步 preflight 後親自按下。
+真機 TakeOff 只允許操作員在桌面 UI 完成三步 preflight 後親自按下。
 
 ```bash
 .venv/bin/python 控制介面程式/launch_mission.py \
@@ -14,7 +14,7 @@
 
 此全八段地圖尚無獨立定位品質驗證與 ANAFI camera-pipeline 品質證據
 （validation: NONE）。2026-09-09 操作員以有人監督試飛接受風險，receipt 以
-OPERATOR_ACCEPTANCE（2026-10-09 到期）放行定位；flight 仍因 route frame 不符而阻擋。
+OPERATOR_ACCEPTANCE（2026-10-09 操作員要求續期、不設到期）放行定位；flight 仍因 route frame 不符而阻擋。
 
 或 `控制介面程式/真機串流/啟動.sh`。此專案的 agent 不得執行 `--fly` 或代為授權 AUTO。
 
@@ -33,6 +33,25 @@ OPERATOR_ACCEPTANCE（2026-10-09 到期）放行定位；flight 仍因 route fra
 
 距離圍欄只阻止飛越上限，不會自動返航。`NavigateHome` 是獨立的 RTH
 操作；本程式不會因碰到 geofence 而自行呼叫它。
+
+## 指定航段機頭朝向物體
+
+航線編輯器可用長方體 `object_boxes` 中心作為航段的水平 yaw 目標。
+可選 `segment_look_at` 為每個航段一項的物體索引（零起算）或 `null`；
+例如四航點的 `[null, 0, 0]` 指定 2→3、3→4 朝向第一個框。
+中心使用 aligned Z-up 與 `align_source`，載入時轉成 raw GLOMAP，
+並隨 SHA 綁定的 `MissionRouteSnapshot` 傳入正式控制器。
+
+指定航段先朝向物體，再沿原航線平移；`FOLLOW`／`REJOIN`／近點置中
+持續修正 yaw，位置／高度伺服與 yaw PCMD 上限不變。移動目標的比例響應
+高於原本停住轉頭／巡航漂移修正，避免目標 bearing 隨移動改變時持續落後。
+返程擴展不複製物體目標，返程各航段一律維持一般航向，只有去程朝向物體。
+水平目標射線退化時保留最近有效朝向；不使用 `atan2(0,0)` 製造轉向。
+到點動作／巡檢優先，起點靠攏、終點降落置中與自主授權／人工接管語意不變。
+這是機頭水平朝向，只取長方體中心的水平方位；長方體高度不必與航線高度相同，
+也不會影響升降或位置伺服。不是鏡頭俯仰、避障或飛行安全區。
+
+編輯與存檔流程見 [航線編輯器](../../控制介面程式/operator_interface/README.md)。
 
 ## 明確授權 AUTO
 

@@ -653,6 +653,8 @@ class LiveWorkerClient:
             with self._lock:
                 self._pending_oom_transition = True
                 self._restart_reason = "oom"
+        if payload.get("restart_required") is not True:
+            self._note_healthy_response(payload)
         self._publish_result(payload)
         if payload.get("restart_required") is True:
             self._restart(
@@ -660,8 +662,6 @@ class LiveWorkerClient:
                 fatal=True,
                 reason="oom" if oom else "fatal",
             )
-        else:
-            self._note_healthy_response(payload)
 
     def _handle_work_error(
         self, item, exc: Exception, *, announce: bool = False, fatal: bool = False
@@ -688,7 +688,7 @@ class LiveWorkerClient:
     @staticmethod
     def _immutable_frame_bytes(raw: memoryview) -> bytes | None:
         obj = getattr(raw, "obj", None)
-        if type(obj) is bytes and raw.readonly and raw.nbytes == len(obj):
+        if type(obj) is bytes and raw.readonly and raw.c_contiguous and raw.nbytes == len(obj):
             return obj
         return None
 
@@ -885,7 +885,11 @@ class LiveWorkerClient:
     def _submit_pipe_frame(
         self, seq: int, frame_name: str, prefix: bytes, raw: memoryview, timing: dict
     ) -> bool:
-        item = (seq, frame_name, prefix, bytes(raw), timing)
+        # PIL/tobytes frames already own immutable bytes; retain that snapshot
+        # instead of copying the entire RGB frame a second time on the Tk thread.
+        # Mutable buffers and partial/non-contiguous views still need a copy.
+        immutable = self._immutable_frame_bytes(raw)
+        item = (seq, frame_name, prefix, immutable if immutable is not None else bytes(raw), timing)
         with self._lock:
             if self.in_flight:
                 return self._store_coalesced(item)
@@ -1293,7 +1297,11 @@ class LiveDetectorClient(LiveWorkerClient):
         conf: float = 0.25,
         iou: float = 0.7,
         max_det: int = 300,
+        task: str = "detect",
+        half: bool = False,
     ):
+        self.task = task
+        self.half = bool(half)
         cmd = [
             str(python_bin),
             str(worker_py),
@@ -1303,6 +1311,8 @@ class LiveDetectorClient(LiveWorkerClient):
             str(height),
             "--model",
             str(model),
+            "--task",
+            str(task),
             "--imgsz",
             str(int(imgsz)),
             "--conf",
@@ -1312,6 +1322,8 @@ class LiveDetectorClient(LiveWorkerClient):
             "--max-det",
             str(int(max_det)),
         ]
+        if half:
+            cmd.append("--half")
         super().__init__(
             cmd,
             width,
@@ -1319,5 +1331,6 @@ class LiveDetectorClient(LiveWorkerClient):
             "/tmp/sfm_live_detector_worker.log",
             "live-detector-client",
             "detector",
-            error_defaults={"count": 0, "boxes": []},
+            error_defaults={"count": 0, "boxes": [], "task": task, "mask_count": 0},
+            expect_ready_event=True,
         )

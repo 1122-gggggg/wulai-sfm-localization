@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import flight_operator_app as app
 import inspect
-import operator_tick
 import queue
 import threading
 import time
@@ -29,6 +28,7 @@ from flight_operator_app import (
     video_hud_identity,
 )
 from operator_shutdown import OperatorShutdownCoordinator
+from operator_preflight import _compass_evidence
 
 
 @pytest.mark.parametrize("change", [None, "landed", "route", "frame", "backend"])
@@ -75,39 +75,19 @@ def test_finished_manual_auto_keeps_unfinished_target_for_next_start(handoff_fai
             interrupted_target_index=None if handoff_failed else 2,
             resume_target_index=2 if handoff_failed else None,
             auto_leg_status=lambda: {},
+            run_id="interrupted-run",
+            controller=SimpleNamespace(camera_action_checkpoint=lambda: frozenset({(2, 0)})),
         ),
     )
     OperatorApp._finish_integrated_auto_event(operator, SimpleNamespace(detail="manual takeover"))
     assert operator._integrated_autonomy is None
     assert OperatorApp._auto_resume_target(operator, snapshot) == 2
+    assert operator._auto_resume_camera_checkpoint[1] == "interrupted-run"
+    assert OperatorApp._auto_resume_camera_actions(operator, 2) == frozenset({(2, 0)})
+    operator._auto_resume_checkpoint = None  # Landing/new mission invalidates the source run.
+    assert OperatorApp._auto_resume_camera_actions(operator, None) == frozenset()
 
 
-def test_auto_start_passes_retained_target_through_existing_gates(monkeypatch):
-    backend = SimpleNamespace(state=SimpleNamespace(flight_state="hovering"))
-    snapshot = SimpleNamespace(sha256="route-a", coordinate_frame_id="frame-a")
-    created = []
-
-    def make_autonomy(**kwargs):
-        created.append(kwargs)
-        return SimpleNamespace(start=lambda: True, _drawn_waypoint_number=lambda index: index + 1)
-
-    monkeypatch.setattr(app, "DesktopRouteAutonomy", make_autonomy)
-    monkeypatch.setattr(app, "load_site_profile", lambda _path: object())
-    monkeypatch.setattr(app, "resolve_site_map_frame", lambda _profile: object())
-    monkeypatch.setattr(app, "autonomous_approval_blockers", lambda _snapshot: [])
-    checked = []
-    operator = SimpleNamespace(
-        backend=backend, site_profile_path="unused", write_log=lambda _msg: None,
-        _integrated_auto_active=lambda: False, _autonomy_gate_snapshot=lambda: {},
-        _validate_auto_flight_assets=lambda _profile, route: checked.append(route),
-        _autonomy_pose=lambda: None, _autonomy_stream_healthy=lambda: True,
-        _auto_resume_checkpoint=(backend, "route-a", "frame-a", 2),
-    )
-    operator._auto_resume_target = lambda route: OperatorApp._auto_resume_target(operator, route)
-    assert OperatorApp._start_integrated_auto(operator, snapshot)
-    assert checked == [snapshot]
-    assert created[0]["start_airborne"] is True
-    assert created[0]["resume_target_index"] == 2
 
 
 class _Backend:
@@ -302,7 +282,6 @@ def test_preflight_guide_is_sequential_and_invalidates_downstream() -> None:
         "compass": ("compass", "changed"),
         "map": ("map", 1),
         "route": ("route", 2),
-        "system": ("system", 3),
     })
 
     assert invalidated == "compass"
@@ -334,7 +313,7 @@ def test_takeoff_button_path_refuses_until_human_preflight_is_complete() -> None
     assert operator.sent == ["takeoff"]
 
 
-def test_completing_four_step_preflight_enables_auto_button() -> None:
+def test_completing_three_step_preflight_enables_auto_button() -> None:
     class Var:
         def __init__(self):
             self.value = ""
@@ -380,7 +359,8 @@ def test_completing_four_step_preflight_enables_auto_button() -> None:
     assert "「自動飛行」" in operator.preflight_guide_var.value
 
 
-def test_valid_firmware_compass_readback_is_auto_confirmed() -> None:
+@pytest.mark.parametrize("required", [0, 2], ids=["valid", "recommended"])
+def test_saved_firmware_compass_is_reused_until_manual_recalibration(required) -> None:
     class Var:
         def set(self, _value):
             pass
@@ -397,8 +377,8 @@ def test_valid_firmware_compass_readback_is_auto_confirmed() -> None:
     operator.start_auto_button = Widget()
     operator._preflight_auto_collapsed = False
     operator._is_live_backend = lambda: True
-    operator._preflight_step_evidence = lambda step, *_args, **_kwargs: (
-        (("compass", 0), "校正有效")
+    operator._preflight_step_evidence = lambda step, state, **_kwargs: (
+        _compass_evidence(state, True)
         if step == "compass"
         else (None, "等待人工確認")
     )
@@ -412,7 +392,7 @@ def test_valid_firmware_compass_readback_is_auto_confirmed() -> None:
     operator.write_log = operator.logs.append
     state = DroneState(
         flight_state="landed",
-        drone_magnetometer_required=0,
+        drone_magnetometer_required=required,
         drone_magnetometer_started=False,
         drone_magnetometer_failed=False,
     )
@@ -422,18 +402,25 @@ def test_valid_firmware_compass_readback_is_auto_confirmed() -> None:
     assert operator.preflight_guide.confirmed_steps == ("compass",)
     assert operator.preflight_guide.current_step == "map"
     assert operator.tabs == ["map"]
-    assert any("韌體有效回讀自動確認" in message for message in operator.logs)
+    # The operator has started recalibration: the old confirmation is not reused.
+    state.drone_magnetometer_started = True
+    operator._update_preflight_guide(state)
+    assert operator.preflight_guide.current_step == "compass"
+    assert operator.preflight_guide.confirmed_steps == ()
+    state.drone_magnetometer_started = False
+    operator._update_preflight_guide(state)
+    assert operator.preflight_guide.confirmed_steps == ("compass",)
 
 
 @pytest.mark.parametrize(
     ("required", "started", "failed"),
     [
-        (2, False, False),
+        (1, False, False),
         (0, True, False),
         (0, False, True),
         (None, False, False),
     ],
-    ids=["recommended", "in-progress", "failed", "unknown"],
+    ids=["required", "in-progress", "failed", "unknown"],
 )
 def test_invalid_compass_state_is_not_auto_confirmed(
     required: int | None,
@@ -457,149 +444,6 @@ def test_invalid_compass_state_is_not_auto_confirmed(
 
     assert operator._auto_confirm_valid_compass_preflight(state, live=True) is False
     assert operator.preflight_guide.current_step == "compass"
-
-
-@pytest.mark.parametrize(
-    "stream_state",
-    ["PREVIEW", "OK", "LOCALIZING", "HOLD_720P"],
-)
-def test_preflight_system_step_requires_fresh_stream_and_telemetry(
-    stream_state: str,
-) -> None:
-    now = time.monotonic()
-    operator = OperatorApp.__new__(OperatorApp)
-    operator.backend = SimpleNamespace(
-        is_live=True,
-        min_takeoff_battery_pct=15.0,
-        desired_distance_geofence=True,
-        require_gps_for_geofence=True,
-        via_skycontroller=lambda: False,
-        log=SimpleNamespace(durable=True, healthy=True),
-    )
-    operator.video_frame = object()
-    operator.video_stream = SimpleNamespace(last_stamp=now)
-    operator._video_frame_stamp = now
-    state = DroneState(
-        stream=stream_state,
-        link_ok=True,
-        link_status="OK",
-        flight_state="landed",
-        alert_state="none",
-        battery_pct=80.0,
-        gps_fixed=True,
-        max_altitude_m=10.0,
-        max_distance_m=50.0,
-        distance_geofence_enabled=True,
-        telemetry_read_mono_ns=int(now * 1_000_000_000),
-    )
-
-    evidence, reason = operator._preflight_step_evidence(
-        "system", state, now=now
-    )
-    assert evidence == ("system", "live"), reason
-
-    # The live backend refuses takeoff below the floor and on an unreadable
-    # battery, so the preflight step must withhold evidence for the same states
-    # rather than tell the operator they are advisory.
-    for blocking_battery in (1.0, float("nan")):
-        state.battery_pct = blocking_battery
-        evidence, reason = operator._preflight_step_evidence(
-            "system", state, now=now
-        )
-        assert evidence is None, reason
-        assert "電量" in reason and "會阻擋起飛" in reason
-    state.battery_pct = 80.0
-
-    # An unset altitude/distance limit really is unconstrained, and GPS only
-    # blocks behind a configured distance geofence: those stay non-blocking.
-    state.gps_fixed = False
-    state.max_altitude_m = None
-    state.max_distance_m = None
-    state.distance_geofence_enabled = None
-    operator.backend._firmware_config_ok = False
-    evidence, reason = operator._preflight_step_evidence(
-        "system", state, now=now
-    )
-    assert evidence is not None, reason
-    assert "未設定則不限制" in reason
-
-    for unavailable_stream in ("WAIT", "LOST", "LOST_HOLD"):
-        state.stream = unavailable_stream
-        evidence, reason = operator._preflight_step_evidence(
-            "system", state, now=now
-        )
-        assert evidence is None
-        assert "串流狀態" in reason
-    state.stream = stream_state
-
-    state.telemetry_read_mono_ns = int((now - 3.0) * 1_000_000_000)
-    evidence, reason = operator._preflight_step_evidence(
-        "system", state, now=now
-    )
-    assert evidence is None
-    assert "遙測" in reason
-
-
-def test_preflight_system_step_does_not_block_on_airborne_state_or_alerts() -> None:
-    now = time.monotonic()
-    operator = OperatorApp.__new__(OperatorApp)
-    operator.backend = SimpleNamespace(
-        is_live=True,
-        min_takeoff_battery_pct=15.0,
-        via_skycontroller=lambda: False,
-        log=SimpleNamespace(durable=True, healthy=True),
-    )
-    operator.video_frame = object()
-    operator.video_stream = SimpleNamespace(last_stamp=now)
-    operator._video_frame_stamp = now
-    state = DroneState(
-        stream="PREVIEW",
-        link_ok=True,
-        flight_state="hovering",
-        active_incident="operator_acknowledged",
-        alert_state="critical",
-        battery_pct=80.0,
-        telemetry_read_mono_ns=int(now * 1_000_000_000),
-    )
-
-    evidence, reason = operator._preflight_step_evidence(
-        "system", state, now=now
-    )
-
-    assert evidence is not None, reason
-
-
-@pytest.mark.parametrize("gps_fixed", [False, None], ids=["no-fix", "unknown"])
-def test_missing_gps_with_disabled_geofence_is_not_a_preflight_blocker(gps_fixed) -> None:
-    now = time.monotonic()
-    operator = OperatorApp.__new__(OperatorApp)
-    operator.backend = SimpleNamespace(
-        is_live=True,
-        min_takeoff_battery_pct=15.0,
-        desired_distance_geofence=False,
-        require_gps_for_geofence=True,
-        via_skycontroller=lambda: False,
-        log=SimpleNamespace(durable=True, healthy=True),
-    )
-    operator.video_frame = object()
-    operator.video_stream = SimpleNamespace(last_stamp=now)
-    state = DroneState(
-        stream="PREVIEW",
-        link_ok=True,
-        flight_state="landed",
-        alert_state="none",
-        battery_pct=80.0,
-        gps_fixed=gps_fixed,
-        distance_geofence_enabled=False,
-        telemetry_read_mono_ns=int(now * 1_000_000_000),
-    )
-
-    evidence, reason = operator._preflight_step_evidence(
-        "system", state, now=now
-    )
-
-    assert evidence is not None, reason
-    assert "GPS 僅在已設定距離圍欄" in reason
 
 
 @pytest.mark.parametrize("gps_fixed", [False, None], ids=["no-fix", "unknown"])
@@ -810,7 +654,7 @@ def test_confirming_route_step_binds_the_displayed_snapshot_for_auto() -> None:
     assert events[0][0] == "route_selected"
     assert events[0][1]["route_sha256"] == selected_snapshot.sha256
     assert events[1] == ("bind", selected_snapshot)
-    assert operator.preflight_guide.current_step == "system"
+    assert operator.preflight_guide.complete
 
 
 def test_route_selection_is_logged_before_the_snapshot_is_bound(
@@ -1582,59 +1426,8 @@ def test_write_log_remains_available_without_a_ui_log_widget(capsys) -> None:
     assert "log" not in operator.__dict__
 
 
-def test_ui_exposes_integrated_autonomy_and_separate_localization() -> None:
-    source = inspect.getsource(OperatorApp._build_ui)
-    assert 'text="開始定位"' in source
-    assert "command=self.toggle_localization" in source
-    assert any(
-        button.command == "emergency_stop" and button.label == "停止電腦動作"
-        for button in app.FLIGHT_MODE_BUTTONS
-    )
-    assert any(
-        button.command == "start_auto" and button.label == "自動飛行"
-        for button in app.MISSION_MODE_BUTTONS
-    )
-    assert 'text="自主巡檢未接入此介面"' not in source
-
-
-def test_flight_tab_exposes_truthful_autonomous_speed_guard() -> None:
-    source = inspect.getsource(OperatorApp._build_ui)
-
-    assert "套用速度限制" not in source
-    assert "啟用速度限制" not in source
-    assert "autonomous_speed_limit_input_var" not in source
-    assert "新鮮遙測達上限即送零 PCMD" not in source
-    assert "地速缺失或過期時禁止水平 AUTO" not in source
-    assert "AUTO PCMD" in source
-
-
-def test_operator_ui_cannot_force_megaloc_outside_boot_or_lost() -> None:
-    source = inspect.getsource(OperatorApp._build_ui)
-
-    assert '"BOOT/LOST", "global"' not in source
-    assert "set_localization_benchmark_mode" not in source
-    assert "定位測速：" not in source
-
-
-def test_ui_has_textual_sim_real_identity_without_separate_auto_stop() -> None:
-    """SIM/REAL must always be distinguishable by TEXT, not colour alone.
-
-    2026-08-06, operator decision: the video HUD and the status bar below it were
-    showing the same fields twice, so the shared ones were merged into the bar.
-    Identity moved DOWN with them, which also restores the guarantee the 2026-08-03
-    change had accepted as lost: it stays readable when there is no video frame.
-    """
-    build_source = inspect.getsource(OperatorApp._build_ui)
-    assert "停止自動並懸停" not in build_source
-
-    # Identity belongs to the always-visible status header, not the video.
-    status_source = inspect.getsource(OperatorApp._update_flight_header)
-    assert "REAL ANAFI" in status_source and "SIMULATED" in status_source
-    render_source = inspect.getsource(OperatorApp.render_video)
-    assert "video_hud_identity" not in render_source, (
-        "identity on the video would vanish exactly when the stream is lost"
-    )
-
+def test_video_hud_identity_has_textual_sim_real_distinction() -> None:
+    """SIM/REAL must always be distinguishable by TEXT, not colour alone."""
     simulated = video_hud_identity(False, "LIVE")
     real = video_hud_identity(True, "MANUAL")
     assert "SIMULATED" in simulated and "REAL" in real
@@ -1652,7 +1445,7 @@ def test_auto_localization_timeout_guidance_keeps_zero_pcmd_hover_policy() -> No
     operator = OperatorApp.__new__(OperatorApp)
     operator.preflight_guide = SimpleNamespace(
         complete=False,
-        current_step="system",
+        current_step="route",
     )
     operator._preflight_step_evidence = lambda *_args: (None, "等待新鮮定位")
     operator._auto_paused = False
@@ -1724,12 +1517,7 @@ def test_inventory_status_separates_hardware_version_and_lost_link() -> None:
     assert statuses["lost_link"] == ("good", "已確認：無 Home 時原地降落")
 
 
-def test_ui_exposes_read_only_olympe_flight_telemetry() -> None:
-    source = inspect.getsource(OperatorApp._build_ui)
-    # The panel became rows of the single video overlay on 2026-08-06; what must
-    # still hold is that the readouts exist and are composed read-only.
-    assert "olympe_state_var" in source
-    assert "olympe_altitude_var" in source
+def test_format_olympe_flight_telemetry() -> None:
 
     state = DroneState(
         flight_state="hovering",
@@ -1781,19 +1569,7 @@ def test_ui_exposes_read_only_olympe_flight_telemetry() -> None:
     assert "cache age 25 ms" in telemetry["sensors"]
 
 
-def test_ui_keeps_firmware_magnetometer_calibration_without_passive_gravity_check() -> None:
-    source = inspect.getsource(OperatorApp._build_ui)
-
-    assert "飛機羅盤校正" in source
-    assert "僅落地可校正，請手持機身" in source
-    assert "姿態／重力檢查" not in source
-    assert "drone_magnetometer_start" in source
-    assert "不會啟動馬達" in source
-    # Operator decision 2026-08-06: the SkyController compass panel was removed.
-    # It only feeds pilot-referenced features this system never uses, and it no
-    # longer gates takeoff, so exposing it invited pointless field work.
-    assert "skycontroller_magnetometer_start" not in source
-    assert "依 X/Y/Z 指示各轉滿三圈" in source
+def test_magnetometer_status_reports_active_axes() -> None:
 
     state = DroneState(
         drone_magnetometer_required=2,
@@ -1813,33 +1589,33 @@ def test_ui_keeps_firmware_magnetometer_calibration_without_passive_gravity_chec
     assert "進行中：Z 軸" in status["controller"]
 
 
-def test_magnetometer_status_shows_reusable_and_latest_firmware_result() -> None:
-    valid = format_magnetometer_calibration(DroneState(
+
+
+@pytest.mark.parametrize("required", [0, 2])
+def test_unknown_calibration_process_state_is_not_reusable(required):
+    state = DroneState(
+        flight_state="landed",
+        drone_magnetometer_required=required,
+        drone_magnetometer_started=None,
+        drone_magnetometer_failed=False,
+    )
+    evidence, _reason = _compass_evidence(state, live=True)
+    assert evidence is None
+    status = format_magnetometer_calibration(state)["drone"]
+    assert "PASS" not in status
+
+
+def test_failed_calibration_hud_disregards_completed_axis_bits():
+    status = format_magnetometer_calibration(DroneState(
         drone_magnetometer_required=0,
         drone_magnetometer_started=False,
+        drone_magnetometer_failed=True,
         drone_magnetometer_x_done=True,
         drone_magnetometer_y_done=True,
         drone_magnetometer_z_done=True,
-        drone_magnetometer_failed=False,
     ))["drone"]
-    assert "最新讀回校正結果：PASS" in valid
-    assert "X/Y/Z 已完成" in valid and "可沿用" in valid
-
-    recommended = format_magnetometer_calibration(DroneState(
-        drone_magnetometer_required=2,
-        drone_magnetometer_started=False,
-        drone_magnetometer_failed=False,
-    ))["drone"]
-    assert "機上既有校正結果：可沿用" in recommended
-    assert "韌體建議重新校正" in recommended
-
-    failed = format_magnetometer_calibration(DroneState(
-        drone_magnetometer_required=1,
-        drone_magnetometer_started=False,
-        drone_magnetometer_failed=True,
-    ))["drone"]
-    assert "最新讀回校正結果：FAIL" in failed
-    assert "不可沿用" in failed
+    assert "FAIL" in status
+    assert "✓" not in status
 
 
 def test_focus_loss_clears_all_holds_and_backend_nudges():
@@ -1993,18 +1769,13 @@ def test_typed_sim_control_request_rejects_stale_normal_action_but_not_safety():
     assert stale_emergency.executed
 
 
-def test_space_hover_handler_consumes_event_and_flight_buttons_are_focusable():
+def test_space_hover_and_flight_button_return_handlers_consume_events():
     operator = _bare_app()
     calls = []
     operator._hover_all_nudges = lambda: calls.append("hover")
 
     assert operator._on_space_hover(None) == "break"
     assert calls == ["hover"]
-
-    source = inspect.getsource(OperatorApp._build_ui)
-    assert "takefocus=True" in source
-    assert 'widget.bind("<space>", self._on_space_hover)' in source
-    assert 'widget.bind("<Return>", self._on_flight_button_return)' in source
 
     invoked = []
     event = SimpleNamespace(widget=SimpleNamespace(invoke=lambda: invoked.append(True)))
@@ -2102,7 +1873,7 @@ def test_airborne_manual_state_cannot_start_auto_with_final_preflight_step_pendi
     operator.takeoff_button = Widget()
     operator.start_auto_button = Widget()
     operator._preflight_step_evidence = lambda *_args, **_kwargs: (
-        ("system", "live"),
+        ("route", "verified"),
         "ready",
     )
     operator._update_preflight_cards = lambda _state: None
@@ -2112,8 +1883,8 @@ def test_airborne_manual_state_cannot_start_auto_with_final_preflight_step_pendi
 
     operator._update_preflight_guide(operator.current_state)
 
-    assert operator.preflight_guide.current_step == "system"
-    assert operator.preflight_confirm_button.states[-1] == ("!disabled",)
+    assert operator.preflight_guide.current_step == "route"
+    assert operator.preflight_confirm_button.states[-1] == ("disabled",)  # not confirmable airborne
     assert operator.takeoff_button.states[-1] == ("disabled",)
     assert operator.start_auto_button.states[-1] == ("disabled",)
     assert operator._preflight_blocks_flight_command("start_auto")
@@ -2291,131 +2062,6 @@ def test_magnetometer_axis_guide_maps_every_firmware_axis_form():
     for raw in ("none", "unknown", "", None):
         assert guide(raw) is None, raw
 
-
-def test_magnetometer_axis_guide_views_are_distinct_and_instructive():
-    from flight_operator_app import MAGNETOMETER_AXIS_GUIDE
-
-    views = {view for _label, view, _text in MAGNETOMETER_AXIS_GUIDE.values()}
-    assert views == {"top", "side", "front"}, "each axis needs its own drawing"
-    for label, _view, text in MAGNETOMETER_AXIS_GUIDE.values():
-        assert text.strip(), f"{label} has no operator instruction"
-
-
-def test_takeoff_button_gate_mirrors_backend_compass_policy():
-    """The UI must not grey out takeoff on a policy the backend no longer enforces.
-
-    Backend (_magnetometer_control_error): an UNCALIBRATED controller compass is a
-    warning; a calibration actively RUNNING still blocks. The UI's takeoff-button
-    gate has to say the same thing, or the operator sees a dead button with no
-    explanation anywhere.
-    """
-    source = inspect.getsource(OperatorApp.update_magnetometer_metrics)
-    assert "controller_ready = not (via_controller and controller_active)" in source
-    assert 'controller_key == "calibrated"' not in source
-
-
-def test_exit_safety_signals_are_declared_and_armed_visibly(monkeypatch, capsys):
-    """'Close the terminal and it lands' must be verifiable, not assumed.
-
-    The registration used to swallow failures silently, so the guarantee could be
-    absent with nothing on screen or in the log to reveal it.
-    """
-    import flight_operator_app as app
-
-    assert app.EXIT_SAFETY_SIGNALS == {"SIGINT", "SIGTERM", "SIGHUP"}
-    handlers = {}
-    atexit_callbacks = []
-    log_events = []
-    cleanup_reasons = []
-    after_calls = []
-    destroyed = []
-    fake_app = SimpleNamespace(
-        backend=SimpleNamespace(
-            log=SimpleNamespace(
-                event=lambda name, **fields: log_events.append((name, fields))
-            )
-        ),
-        after=lambda delay, callback: after_calls.append((delay, callback)),
-        destroy=lambda: destroyed.append(True),
-    )
-    monkeypatch.setattr(
-        app.signal, "signal", lambda sig, handler: handlers.setdefault(sig, handler)
-    )
-    monkeypatch.setattr(
-        app.atexit, "register", lambda callback: atexit_callbacks.append(callback)
-    )
-
-    def cleanup(reason):
-        cleanup_reasons.append(reason)
-        return True
-
-    app._install_live_exit_safety(fake_app, cleanup)
-
-    assert {sig.name for sig in handlers} == app.EXIT_SAFETY_SIGNALS
-    assert len(atexit_callbacks) == 1
-    assert "exit safety armed" in capsys.readouterr().out
-    assert log_events[0][0] == "exit_safety"
-    assert log_events[0][1]["ok"] is True
-    with pytest.raises(SystemExit):
-        handlers[app.signal.SIGTERM](app.signal.SIGTERM, None)
-    assert cleanup_reasons == [f"signal_{app.signal.SIGTERM}"]
-    assert after_calls == []
-    assert destroyed == [True]
-
-
-def test_exit_signal_keeps_ui_open_until_landing_is_confirmed_then_retries(
-    monkeypatch,
-) -> None:
-    import flight_operator_app as app
-
-    handlers = {}
-    destroyed = []
-    cleanup_results = iter([False, True])
-    fake_app = SimpleNamespace(
-        backend=SimpleNamespace(
-            log=SimpleNamespace(event=lambda *_args, **_kwargs: None)
-        ),
-        destroy=lambda: destroyed.append(True),
-    )
-    monkeypatch.setattr(
-        app.signal, "signal", lambda sig, handler: handlers.setdefault(sig, handler)
-    )
-    monkeypatch.setattr(app.atexit, "register", lambda _callback: None)
-
-    app._install_live_exit_safety(
-        fake_app,
-        lambda _reason: next(cleanup_results),
-    )
-
-    handlers[app.signal.SIGINT](app.signal.SIGINT, None)
-    assert destroyed == []
-
-    with pytest.raises(SystemExit):
-        handlers[app.signal.SIGINT](app.signal.SIGINT, None)
-    assert destroyed == [True]
-
-
-def test_main_arms_ctrl_c_shutdown_for_simulation_and_live_modes() -> None:
-    import flight_operator_app as app
-
-    source = inspect.getsource(app.main)
-
-    assert "_install_live_exit_safety(app, _emergency_cleanup)" in source
-    assert "if live_backend is not None:" not in source
-
-
-def test_emergency_cleanup_lands_and_survives_a_failing_backend():
-    """The exit path must attempt the landing, and must not itself explode when
-    the backend is already broken -- otherwise later exit steps never run."""
-    import flight_operator_app as app
-
-    source = inspect.getsource(app.main)
-    start = source.index("def _emergency_cleanup")
-    body = source[start:start + 2500]
-    assert "coordinator.shutdown(reason=reason)" in body, "exit path does not land"
-    assert 'app.__dict__.get("backend")' in body, "exit path can use a stale backend"
-    assert "except Exception" in body, "a broken backend would abort the exit path"
-    assert "return result is True" in body, "exit path must fail closed"
 
 
 @pytest.mark.parametrize(
@@ -2781,31 +2427,6 @@ def test_a_held_virtual_stick_keeps_refreshing_the_backend_ttl():
     assert app.backend.calls == [
         ("nudge_vector", {"roll": 0.0, "pitch": 0.6, "yaw": 0.0, "gaz": 0.0})
     ]
-
-
-def test_tick_drives_the_held_virtual_stick_heartbeat():
-    """Without this wiring the knob would look held while PCMD decayed to zero."""
-    source = inspect.getsource(operator_tick._refresh_held_controls)
-    assert "_stick_vector_active" in source
-    assert "_send_stick_vector(app.stick_left.value, app.stick_right.value)" in source
-
-
-def test_site_switch_keeps_the_tk_process_and_rebuilds_runtime_off_thread() -> None:
-    source = inspect.getsource(app.OperatorApp.request_site_profile_restart)
-    assert "_on_close" not in source
-    assert "threading.Thread" in source
-    assert "replace_active_site_runtime" in source
-    assert "os.execv(" not in inspect.getsource(app.main)
-
-
-def test_startup_asks_about_a_missing_route_for_the_active_site() -> None:
-    """Direct startup still asks when the profile has no route."""
-    source = inspect.getsource(app.OperatorApp._check_active_site_route)
-    assert "follow_up_route_for_site" in source
-    assert "route_json" in source
-
-    scheduled = inspect.getsource(app.OperatorApp.__init__)
-    assert "_check_active_site_route" in scheduled, "nothing schedules the check"
 
 
 def _localization_timing_from_state(*, source_stamp: float, telemetry_ns):

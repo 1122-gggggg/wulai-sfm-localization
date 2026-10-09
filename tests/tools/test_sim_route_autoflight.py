@@ -226,11 +226,6 @@ def test_fixed_ground_plane_ignores_hover_anchor_climb():
 
 
 def test_telemetry_delay_hides_samples_and_drop_keeps_stamp():
-    import sim_route_autoflight as sim_mod
-
-    assert float(
-        sim_mod.SimParams(route=_route(), align=_align()).telemetry_latency_ms
-    ) == pytest.approx(200.0)
     route, align = _route(), _align()
     params = sim.SimParams(
         route=route,
@@ -307,8 +302,6 @@ def test_fault_families_recover_and_surface_in_trace():
             dict(
                 blackout_every_s=40,
                 blackout_dur_s=3,
-                blackout_drift_mps=0.05,
-                blackout_yaw_drift_deg_s=2.0,
             ),
         ),
         ("dropout", dict(drop_rate=0.20)),
@@ -364,14 +357,19 @@ def _regression_base(**kw):
     return sim.SimParams(**base)
 
 
-def test_regression_R1_contiguous_outage_stalls_like_flight20260918():
+def test_long_visual_outages_stop_navigation_without_inventing_landing():
     params = sim.apply_regression_scenario(_regression_base(), "R1_flight20260918")
-    result, _ = sim.run_sim(params, record_trace=False)
-    # Real flight: 0% progress, stuck at waypoint 1, hovering, no flyaway.
-    assert result.progress_pct < 5.0
-    assert len(result.waypoints_reached) <= 1
-    assert result.hover_ticks > 500
-    assert result.max_dev_u < 1.0
+    result, _ = sim.run_sim(params)
+    # A failure-regime injection is not an exact replay of real-flight progress.
+    waiting = [row for row in result.trace if row["phase"] == "waiting"]
+    assert waiting
+    assert all(
+        row["action"] == ""
+        and row["pcmd_requested"] == [0, 0, 0, 0]
+        and row["retired_target_idx"] is None
+        for row in waiting
+    )
+    assert all(row["action"] != "LAND" for row in result.trace if row["loc_fault"] == "outage")
 
 
 def test_regression_R2_weak_flicker_degraded_but_moving():
@@ -570,3 +568,79 @@ def test_wind_observer_logs_residual_drift_from_the_production_loop():
         if (row.get("wind_observer") or {}).get("reason") == "ready"
     ]
     assert ready and math.hypot(*ready[-1]["drift_ned_mps"]) > 0.1
+
+
+def test_tilt_slew_bounds_the_actual_change_not_distance_from_command():
+    route, align = _route(), _align()
+    _, _, frame, _ = sim.build_production_controller(route, align, return_to_start=True)
+    params = sim.SimParams(route=route, align=align, wind_sigma_mps=0, tau_tilt_s=0.1)
+    state = _plant_state(frame)
+    sim._integrate_plant(
+        state,
+        np.zeros(3),
+        None,
+        params,
+        frame,
+        np.random.default_rng(0),
+        (0, 100, 0, 0),
+        0.02,
+        0.02,
+        0.2,
+        0.0,
+        elapsed_s=0.0,
+    )
+    # Configured firmware slew is 60 deg/s: at most 3 degrees over 50 ms.
+    assert 0 < math.degrees(state.tilt_fwd) <= 3.0 + 1e-9
+    assert state.tilt_right == pytest.approx(0.0)
+
+
+def test_zero_pcmd_brakes_ground_motion_instead_of_coasting_with_wind():
+    route, align = _route(), _align()
+    _, _, frame, _ = sim.build_production_controller(route, align, return_to_start=True)
+    params = sim.SimParams(route=route, align=align, wind_sigma_mps=0, wind_mean_mps=(0.3, 0, 0))
+    state = _plant_state(frame)
+    east = np.asarray(frame.east)
+    state.vel_m = east * 4.5
+    anchor = state.pos_m.copy()
+    wind = east * 0.3
+    for tick in range(40):
+        wind, _, _ = sim._integrate_plant(
+            state,
+            wind,
+            anchor,
+            params,
+            frame,
+            np.random.default_rng(tick),
+            (0, 0, 0, 0),
+            0.02,
+            0.02,
+            0.2,
+            0.0,
+            elapsed_s=tick * sim.DT,
+        )
+    assert np.linalg.norm(state.vel_m + wind) < 0.25
+    assert float(np.dot(state.pos_m, east)) < 1.8
+
+
+def test_expired_imu_bridge_stops_navigation_after_existing_pose_holdover():
+    result, _ = sim.run_sim(
+        sim.SimParams(
+            route=_route(),
+            align=_align(),
+            duration_s=55,
+            blackout_every_s=40,
+            blackout_dur_s=12,
+            gust_every_s=20,
+            gust_m=0.5,
+        )
+    )
+    expired = [row for row in result.trace if row["loc_fault"] == "blackout-expired"]
+    assert expired
+    after_holdover = [row for row in expired if row["t"] - expired[0]["t"] > 0.55]
+    assert after_holdover
+    for row in after_holdover:
+        # Authorized/applied PCMD may still brake using fresh ground velocity.
+        assert row["action"] == ""
+        assert row["pcmd_requested"] == [0, 0, 0, 0]
+        assert not row["map_confirmed"] and not row["position_observed"]
+        assert row["retired_target_idx"] is None

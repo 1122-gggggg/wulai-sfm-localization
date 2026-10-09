@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import struct
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -39,7 +40,22 @@ def assets(tmp_path, monkeypatch):
     files = [keyframes]
     for name in ("cameras.bin", "images.bin", "points3D.bin"):
         path = model / name
-        path.write_bytes(name.encode())
+        if name == "images.bin":
+            data = bytearray(struct.pack("<Q", len(names)))
+            for image_id, image_name in enumerate(reversed(names)):
+                data.extend(struct.pack("<i4d3di", image_id, 1, 0, 0, 0, 0, 0, 0, 1))
+                data.extend(image_name.encode() + b"\0")
+                points = (
+                    []
+                    if image_name.endswith("empty.jpg")
+                    else [(10.0, 20.0, 9), (30.0, 40.0, -1), (60.0, 70.0, 2)]
+                )
+                data.extend(struct.pack("<Q", len(points)))
+                for point in points:
+                    data.extend(struct.pack("<2dq", *point))
+            path.write_bytes(data)
+        else:
+            path.write_bytes(name.encode())
         files.append(path)
     for name, content in (("names.json", json.dumps(names[:2])), ("references.jsonl", "{}\n")):
         path = local / name
@@ -102,6 +118,39 @@ def assets(tmp_path, monkeypatch):
     return DirectMapAssets.load(bundle)
 
 
+def test_bundle_loads_colmap_rigs_and_frames(assets):
+    raw = dict(assets.raw)
+    for name in ("rigs.bin", "frames.bin"):
+        path = assets.model_dir / name
+        path.write_bytes(name.encode())
+        raw["model_sha256"][name] = digest(path)
+        raw["files"].append(
+            {"path": f"../model/{name}", "sha256": digest(path), "size_bytes": path.stat().st_size}
+        )
+    assets.bundle_path.write_text(json.dumps(raw))
+    loaded = DirectMapAssets.load(assets.bundle_path)
+    assert loaded.ref_names == ("session/a.jpg", "session/b.jpg")
+    assert loaded.coordinate_frame_id == "fixture-frame"
+
+
+@pytest.mark.parametrize("name", ["rigs.bin", "frames.bin"])
+@pytest.mark.parametrize("damage", ["tampered", "missing"])
+def test_bundle_rejects_damaged_optional_model_binary(assets, name, damage):
+    raw = dict(assets.raw)
+    path = assets.model_dir / name
+    path.write_bytes(b"original")
+    raw["model_sha256"][name] = digest(path)
+    assets.bundle_path.write_text(json.dumps(raw))
+    if damage == "tampered":
+        path.write_bytes(b"modified")
+        error = "SHA-256 mismatch"
+    else:
+        path.unlink()
+        error = "COLMAP model binary is absent"
+    with pytest.raises(ValueError, match=error):
+        DirectMapAssets.load(assets.bundle_path)
+
+
 def provider(assets, minimum=1):
     result = object.__new__(LiveMapEDMProvider)
     result.assets = assets
@@ -111,6 +160,31 @@ def provider(assets, minimum=1):
     result._reference_names = ()
     result._requested_min_reference_occupied_bins = minimum
     return result
+
+
+def test_binary_observations_preserve_order_and_skip_untriangulated_points(assets):
+    result = provider(assets)
+    result._load_geometry()
+    for name in ("session/a.jpg", "session/b.jpg"):
+        xy, ids = result._observations[name]
+        np.testing.assert_array_equal(xy, [[10.0, 20.0], [60.0, 70.0]])
+        np.testing.assert_array_equal(ids, [9, 2])
+    assert "session/empty.jpg" not in result._reference_names
+
+
+def test_binary_observation_failure_does_not_lock_geometry_cache(assets, monkeypatch):
+    from river_map_quality import colmap_binary
+
+    result = provider(assets)
+    with monkeypatch.context() as patch:
+        patch.setattr(colmap_binary, "iter_binary_image_observations", lambda _: iter(()))
+        with pytest.raises(RuntimeError, match="image identities"):
+            result._load_geometry()
+    assert not result._geometry_locked
+    assert not hasattr(result, "_observations")
+    result._load_geometry()
+    assert result._geometry_locked
+    np.testing.assert_array_equal(result._observations["session/a.jpg"][1], [9, 2])
 
 
 @pytest.mark.parametrize("minimum", [1, 2])

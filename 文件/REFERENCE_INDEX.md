@@ -1,5 +1,10 @@
 # Reference index 離線建置契約
 
+> 保留狀態：歷史離線建置契約。此工作區目前沒有 `tools/build_reference_index.py`
+> 或 `reference_index.py`；正式 direct worker 明確拒絕 `--reference-index` 與
+> `--reference-index-sha256`。以下命令與 runtime 敘述不適用於目前 direct 後端，
+> 保留供索引資產格式與舊部署契約追溯，不能當作目前可執行的操作步驟。
+
 `tools/build_reference_index.py` 會把一組已完成正規化的 reference descriptor
 建立成可攜式 IVF index。這是純離線建置工具：它只讀指定的 JSON 與 `.npy`，不會
 下載模型、存取網路或替使用者尋找其他資產。

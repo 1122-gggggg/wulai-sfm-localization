@@ -15,7 +15,8 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable
+from types import MappingProxyType
+from typing import Any, Callable, Mapping
 
 import numpy as np
 
@@ -26,9 +27,10 @@ if str(_FLIGHT_CONTROL) not in sys.path:
     sys.path.insert(0, str(_FLIGHT_CONTROL))
 
 import path_follow_flight as pff
-from operator_autonomy_status import leg_stage
+from operator_autonomy_status import leg_stage, route_error_summary_text
 import real_path_follow_controller as rpf
 from landing_transition import GROUND_SPEED_MAX_AGE_S
+from backend_contract import ControlAction, ControlRequest, ScalarPayload
 from operator_localization_search import BoundedYawSearch, YawSearchConfig
 
 
@@ -45,12 +47,14 @@ AUTO_TELEMETRY_MAX_AGE_S = 2.0
 AUTO_WAIT_BUDGET_S = 60.0
 # Fresh-pose control time persists across motion phases; external waits pause it.
 AUTO_WAYPOINT_STALL_S = 30.0
-# Ground speed arrives at 5 Hz, 0.18-0.30 s old when a tick uses it, and keeps
-# rising for ~0.5 s after tilt is cut (flight 2026-09-15: p95 0.84-0.91 m/s,
-# max 1.22 m/s against 0.6). The limit acts on speed extrapolated this far past
-# the sample's age at its measured acceleration.
+# Predict rising speed past the telemetry age plus a bounded command lookahead.
+# An authorized brake must not cancel that horizon before measured deceleration:
+# authorization is not evidence of aircraft actuator response.
 AUTO_SPEED_LIMIT_LOOKAHEAD_S = 0.25
-AUTO_ACCEL_RAMP_S = 1.5
+# Keep tilt growth conservative before delayed speed samples reveal motion.
+# This bounds command growth independently of the measured acceleration:
+# repeated stationary samples must not make startup tilt rise too quickly.
+AUTO_ACCEL_RAMP_S = 2.0
 # Lost-pose yaw search runs at the hook-validated ceiling (20); the 50%
 # route-yaw cap lives in production_auto_control_config and must not be
 # reused here.
@@ -79,59 +83,103 @@ class _WaypointProgress:
 
 
 class RouteErrorStats:
-    """Flown-trajectory vs planned-route distance for one AUTO run, map units.
+    """Independent observed poses vs this AUTO's planned polyline, map units.
 
-    Same definition as tools/autoflight_error_report.py so the live numbers
-    and the offline debrief agree: each route tick's ``route_distance_u`` is
-    the 3-D distance from the pose to the nearest point of the planned
-    polyline, and ticks count only after the first waypoint arrival (the
-    takeoff-to-route join is not path error). The horizontal part is split
-    out because the map's height axis is the least reliable one.
+    Acquisition before the first waypoint arrival is excluded by the caller.
+    Holdover, duplicate, stale and predicted-only positions are not observations.
+    Horizontal error is the horizontal component of the nearest 3-D offset.
+    Live snapshots are constant-size; percentiles are finalized once per run.
     """
 
     def __init__(self, map_frame: rpf.MapFrame):
         self.map_frame = map_frame
-        self.distances: list[float] = []
-        self.horizontal: list[float] = []
-        self.current: float | None = None
+        self._lock = threading.Lock()
+        self._distances: list[float] = []
+        self._sum = self._sum_sq = self._horizontal_sum = 0.0
+        self._max = self._horizontal_max = 0.0
+        self._last_stamp: float | None = None
+        self._live: Mapping[str, Any] | None = None
+        self._final: Mapping[str, Any] | None = None
 
-    def observe(self, record: dict) -> None:
+    def observe(self, record: dict) -> bool:
+        """Accept one finite, fresh, independently observed localization sample."""
+        if (
+            record.get("pose_new") is False
+            or record.get("position_observed") is False
+            or record.get("pose_reseed_confirming")
+            or record.get("pose_source") == "holdover"
+            or record.get("pose_source_predicted")
+            or record.get("repeated_pose_stamp") is not None
+            or "paused" in str(record.get("reason", "")).lower()
+        ):
+            return False
         try:
-            # A missing key becomes NaN and is rejected by the finiteness check.
-            distance = float(record.get("route_distance_u", math.nan))
-        except (TypeError, ValueError):
-            return
-        if not math.isfinite(distance) or distance < 0.0:
-            return
-        self.current = distance
-        self.distances.append(distance)
-        try:
-            offset = np.asarray(record.get("pose_u"), dtype=float) - np.asarray(
-                record.get("route_nearest_u"), dtype=float
-            )
-            horizontal = float(self.map_frame.horizontal_distance(offset))
-        except (TypeError, ValueError):
-            return
-        if math.isfinite(horizontal):
-            self.horizontal.append(horizontal)
+            distance = float(record["route_distance_u"])
+            stamp = float(record["pose_stamp"])
+            sample_time_value: Any = record.get("pose_sample_time", record.get("t"))
+            sample_time = float(sample_time_value)
+            pose = np.asarray(record.get("observed_pose_u", record.get("pose_u")), dtype=float)
+            nearest = np.asarray(record["route_nearest_u"], dtype=float)
+        except (KeyError, TypeError, ValueError, OverflowError):
+            return False
+        if (
+            not all(math.isfinite(value) for value in (distance, stamp, sample_time))
+            or distance < 0.0
+            or not -0.05 <= sample_time - stamp <= pff.POSE_STALE_S
+            or pose.shape != (3,) or nearest.shape != (3,)
+            or not np.isfinite(pose).all() or not np.isfinite(nearest).all()
+        ):
+            return False
+        horizontal = float(self.map_frame.horizontal_distance(pose - nearest))
+        if not math.isfinite(horizontal):
+            return False
+        with self._lock:
+            if self._final is not None or (
+                self._last_stamp is not None and stamp <= self._last_stamp
+            ):
+                return False
+            self._last_stamp = stamp
+            self._distances.append(distance)
+            self._sum += distance
+            self._sum_sq += distance * distance
+            self._max = max(self._max, distance)
+            self._horizontal_sum += horizontal
+            self._horizontal_max = max(self._horizontal_max, horizontal)
+            count = len(self._distances)
+            self._live = MappingProxyType({
+                "samples": count,
+                "current_u": round(distance, 4),
+                "mean_u": round(self._sum / count, 4),
+                "rms_u": round(math.sqrt(self._sum_sq / count), 4),
+                "max_u": round(self._max, 4),
+                "horizontal_mean_u": round(self._horizontal_sum / count, 4),
+                "horizontal_max_u": round(self._horizontal_max, 4),
+            })
+            return True
 
-    def summary(self) -> dict | None:
-        if not self.distances:
-            return None
-        values = np.asarray(self.distances, dtype=float)
-        result = {
-            "samples": int(values.size),
-            "current_u": round(float(values[-1]), 4),  # == self.current
-            "mean_u": round(float(values.mean()), 4),
-            "rms_u": round(float(np.sqrt(np.mean(values * values))), 4),
-            "p95_u": round(float(np.percentile(values, 95)), 4),
-            "max_u": round(float(values.max()), 4),
-        }
-        if self.horizontal:
-            horizontal = np.asarray(self.horizontal, dtype=float)
-            result["horizontal_mean_u"] = round(float(horizontal.mean()), 4)
-            result["horizontal_max_u"] = round(float(horizontal.max()), 4)
-        return result
+    def live_summary(self) -> Mapping[str, Any] | None:
+        """Return an immutable, constant-time snapshot without copying samples."""
+        with self._lock:
+            if self._live is None:
+                return None
+            return self._final if self._final is not None else self._live
+
+    def summary(self) -> Mapping[str, Any]:
+        """Freeze one immutable terminal snapshot, including an explicit empty state."""
+        with self._lock:
+            if self._final is None:
+                result: dict[str, Any] = dict(self._live) if self._live is not None else {
+                    "samples": 0, "current_u": None, "mean_u": None,
+                    "rms_u": None, "max_u": None,
+                    "horizontal_mean_u": None, "horizontal_max_u": None,
+                }
+                result["state"] = "ok" if self._distances else "no_samples"
+                result["p95_u"] = (
+                    round(float(np.percentile(self._distances, 95)), 4)
+                    if self._distances else None
+                )
+                self._final = MappingProxyType(result)
+            return self._final
 
 
 def _fresh_route_progress() -> dict:
@@ -143,6 +191,7 @@ def _fresh_route_progress() -> dict:
         "last_stage": None,
         "last_stage_target": None,
         "action_timeouts_seen": 0,
+        "action_results_seen": 0,
     }
 
 
@@ -166,13 +215,16 @@ class DesktopRouteAutonomy:
         take_pc_control: Callable[[], object] | None = None,
         start_airborne: bool = False,
         resume_target_index: int | None = None,
+        completed_camera_actions: frozenset[tuple[int, int]] = frozenset(),
         arming_blockers: Callable[[], list[str]] | None = None,
         boot_timeout_s: float = pff.FIRST_FIX_TIMEOUT_S,
         boot_search_config: YawSearchConfig | None = None,
         accept_weak_poses: bool = False,
         pose_source_pending: Callable[[], bool] | None = None,
         pose_reseed_confirming: Callable[[], bool] | None = None,
+        pose_info: Callable[[], dict] | None = None,
         worker_stall_timeout_s: float | None = None,
+        control_state: pff.ControlStateEstimator | None = None,
         now: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
         run_loop: Callable[..., str] = pff.run_loop,
@@ -212,14 +264,22 @@ class DesktopRouteAutonomy:
         self.backend = backend
         self.run_id = uuid.uuid4().hex
         self.snapshot = snapshot
+        self.control_state = control_state
         self.waypoints = waypoints
-        self.controller = rpf.RouteAutoController(waypoints, poles=[], config=config)
+        self.controller = rpf.RouteAutoController(
+            waypoints, poles=[], config=config,
+            request_gimbal_pitch=self._request_waypoint_gimbal_pitch,
+            read_gimbal_pitch=self._read_waypoint_gimbal_pitch,
+            completed_camera_actions=completed_camera_actions,
+        )
         if resume_target_index is not None and (
             not start_airborne
             or type(resume_target_index) is not int
             or not 0 <= resume_target_index < len(self.controller.wp)
         ):
             raise ValueError("AUTO resume requires an airborne, valid route target")
+        if completed_camera_actions and resume_target_index is None:
+            raise ValueError("camera checkpoint requires an explicitly resumed AUTO session")
         self.resume_target_index = resume_target_index
         self.interrupted_target_index: int | None = None
         self.get_pose = get_pose
@@ -242,6 +302,7 @@ class DesktopRouteAutonomy:
         # may keep translating while visual localization is down. They do not
         # renew the map anchor and cannot unlock BOOT.
         self.accept_weak_poses = bool(accept_weak_poses)
+        self.pose_info = pose_info
         self.worker_stall_timeout_s = stall_timeout
         self.now = now
         self.sleep = sleep
@@ -271,6 +332,10 @@ class DesktopRouteAutonomy:
         self._mission_started: float | None = None
         self._route_progress: dict = _fresh_route_progress()
         self._route_error = RouteErrorStats(map_frame)
+        self._route_error_joined = False
+        self._route_error_report_lock = threading.Lock()
+        self._route_error_reported = False
+        self._route_error_identity = self._capture_route_error_identity()
         self.phase = "IDLE"
 
     @property
@@ -320,6 +385,11 @@ class DesktopRouteAutonomy:
         self._waypoint_progress = None
         self._mission_started = None
         self._route_progress = _fresh_route_progress()
+        self.run_id = uuid.uuid4().hex
+        self._route_error = RouteErrorStats(self.controller.cfg.map_frame)
+        self._route_error_reported = False
+        self._route_error_joined = False
+        self._route_error_identity = self._capture_route_error_identity()
         self.interrupted_target_index = None
         self._watchdog_stop.clear()
         self._touch_heartbeat()
@@ -375,6 +445,7 @@ class DesktopRouteAutonomy:
         if self.phase not in {"TAKEOFF", "HANDOFF", "BOOT_HOVER", "ROUTE"}:
             return False
         self._paused.set()
+        self.controller.suspend_waypoint_action_clock()
         if reason == "auto_localization_source_change":
             self.controller.reset_arrival_confirmation()
         self._clear_motion()
@@ -612,13 +683,11 @@ class DesktopRouteAutonomy:
         if not callable(send):
             return False
         try:
-            return bool(send(0, 0, 0, 0, reason=reason))
+            return bool(send(0, 0, 0, 0, reason=reason, auto_run_id=self.run_id))
         except Exception:
             return False
 
-    def _send_authorized(self, pcmd: Pcmd) -> AuthorizedPcmdResult:
-        self._touch_heartbeat()
-        self._check_runtime_safety()
+    def _authorization_block(self) -> AuthorizedPcmdResult | None:
         if self._auto_failed:
             self._clear_motion()
             self._send_zero("auto_failure_hover")
@@ -648,13 +717,22 @@ class DesktopRouteAutonomy:
             self._clear_motion()
             self._send_zero("auto_stream_unhealthy")
             return False, "AUTO stream unhealthy", (0, 0, 0, 0)
+        return None
 
-        epoch = int(self._command_epoch)
-        pcmd = self._apply_speed_limit(pcmd)
-        pcmd = self._limit_acceleration_slew(pcmd)
-        result = self._dispatch_route_pcmd(pcmd)
-        if not result[0]:
-            self._accel_command = None
+    def _bank_envelope_limited_accel(self, ramped: Pcmd, pcmd: Pcmd) -> None:
+        if pcmd[:2] != ramped[:2] and self._accel_command is not None:
+            # Do not bank acceleration which the envelope never authorized.
+            # Otherwise the next released sample can resurrect full tilt.
+            yaw = self._olympe_yaw()
+            if yaw is not None:
+                c, s = math.cos(yaw), math.sin(yaw)
+                self._accel_command = (
+                    self.now(),
+                    np.array([pcmd[1] * c - pcmd[0] * s,
+                              pcmd[1] * s + pcmd[0] * c]),
+                )
+
+    def _abort_after_dispatch(self, epoch: int) -> AuthorizedPcmdResult | None:
         if (
             int(self._command_epoch) != epoch
             or self._auto_failed
@@ -668,6 +746,28 @@ class DesktopRouteAutonomy:
             )
             self._send_zero(reason)
             return False, reason, (0, 0, 0, 0)
+        return None
+
+    def _send_authorized(self, pcmd: Pcmd) -> AuthorizedPcmdResult:
+        self._touch_heartbeat()
+        self._check_runtime_safety()
+        blocked = self._authorization_block()
+        if blocked is not None:
+            return blocked
+
+        epoch = int(self._command_epoch)
+        # The speed envelope is the final horizontal authority: ramping its
+        # predicted-overspeed brake afterwards would weaken it at measured
+        # underspeed. Ramp route effort first, then restore required braking.
+        ramped = self._limit_acceleration_slew(pcmd)
+        pcmd = self._apply_speed_limit(ramped)
+        self._bank_envelope_limited_accel(ramped, pcmd)
+        result = self._dispatch_route_pcmd(pcmd)
+        if not result[0]:
+            self._accel_command = None
+        aborted = self._abort_after_dispatch(epoch)
+        if aborted is not None:
+            return aborted
         return result
 
     def _limit_acceleration_slew(self, pcmd: Pcmd) -> Pcmd:
@@ -723,27 +823,19 @@ class DesktopRouteAutonomy:
             # 0.2 m/s and zeroed cruise. Clamp to plausible ANAFI accel.
             self._speed_rate_mps2 = max(0.0, min(2.0, raw_rate))
             self._speed_sample = (speed, stamp)
-        lookahead = AUTO_SPEED_LIMIT_LOOKAHEAD_S
-        if self._accel_command is not None:
-            state = self.backend.state
-            velocity = np.array([state.speed_north_mps, state.speed_east_mps])
-            if float(np.dot(self._accel_command[1], velocity)) <= 0.0:
-                # A measured acceleration predating our brake must not be
-                # extrapolated into another future actuator interval.
-                lookahead = 0.0
-        horizon = max(0.0, self.now() - stamp) + lookahead
+        horizon = max(0.0, self.now() - stamp) + AUTO_SPEED_LIMIT_LOOKAHEAD_S
         return speed + max(0.0, self._speed_rate_mps2) * horizon
 
     def _apply_speed_limit(self, pcmd: Pcmd) -> Pcmd:
         """Limit along-motion acceleration and brake proportional to overspeed.
 
-        Never latched: the allowed forward projection falls linearly from the
-        full cap at standstill to zero at the limit, evaluated on speed
-        predicted past the telemetry delay. Decomposed in the body horizontal
-        plane with q=(pitch, roll) and v=(forward_v, right_v): the orthogonal
-        correction c is preserved while it fits the command caps.
-        Above the predicted limit, require braking
-        using the existing velocity-damping gain; stronger braking is retained.
+        Never latched: along-motion acceleration is bounded by the remaining
+        speed headroom times the existing velocity-damping gain, and by the
+        original per-axis taper. The speed is predicted past telemetry delay.
+        Decomposed in the body horizontal plane with q=(pitch, roll) and
+        v=(forward_v, right_v): orthogonal position/wind correction is preserved
+        while it fits the command caps. Above the predicted limit, require
+        braking using the same damping gain; stronger braking is retained.
         Commands pass untouched when fresh body velocity is unavailable.
         """
         roll, pitch = int(pcmd[0]), int(pcmd[1])
@@ -785,8 +877,18 @@ class DesktopRouteAutonomy:
         cap_f = float(cap)
         predicted = self._predicted_speed(speed, stamp)
         full_cap = cap_f / max(abs(u_pitch), abs(u_roll))
-        allowed = full_cap * max(0.0, 1.0 - predicted / limit)
-        allowed -= rpf.DESKTOP_AUTO_WIND_REJECT_PCMD_PER_MPS * max(0.0, predicted - limit)
+        headroom = limit - predicted
+        # Spending the entire tilt cap on a small speed headroom makes the
+        # acceleration slope cap/limit (167 PCMD/(m/s) at 50 and .3 m/s),
+        # far steeper than the existing braking slope. Delayed plants then
+        # receive a large thrust burst before speed telemetry can remove it.
+        # Use the damping-equivalent headroom instead of a flight-fitted plant
+        # gain. This only restricts acceleration along measured motion: do not
+        # scale turn position hold, orthogonal wind correction or stronger brakes.
+        damping = rpf.DESKTOP_AUTO_WIND_REJECT_PCMD_PER_MPS
+        allowed = min(full_cap * max(0.0, headroom / limit),
+                      damping * max(0.0, headroom))
+        allowed -= damping * max(0.0, -headroom)
         allowed = max(-full_cap, allowed)
         if along <= allowed:
             state.autonomous_speed_guard_status = "FRESH_SPEED_LIMIT"
@@ -872,11 +974,9 @@ class DesktopRouteAutonomy:
         setter = getattr(self.backend, "set_nudge_vector", None)
         if callable(setter):
             try:
-                accepted = bool(setter(*vector, authority_pct=authority))
-            except TypeError:
-                # Backends predating the per-vector authority (the simulated
-                # route plant) still take four positional axes.
-                accepted = bool(setter(*vector))
+                accepted = bool(setter(
+                    *vector, authority_pct=authority, auto_run_id=self.run_id,
+                ))
             except Exception as exc:
                 reason = f"AUTO PCMD failed: {exc!r}"
                 self._record_pcmd_failure(reason)
@@ -896,7 +996,7 @@ class DesktopRouteAutonomy:
             self._record_pcmd_failure("AUTO PCMD unavailable")
             return False, "AUTO PCMD unavailable", None
         try:
-            accepted = bool(send(*pcmd, reason="desktop_auto_route"))
+            accepted = bool(send(*pcmd, reason="desktop_auto_route", auto_run_id=self.run_id))
         except Exception as exc:
             reason = f"AUTO PCMD failed: {exc!r}"
             self._record_pcmd_failure(reason)
@@ -919,6 +1019,63 @@ class DesktopRouteAutonomy:
         except (TypeError, ValueError, OverflowError):
             return None
         return yaw if math.isfinite(yaw) else None
+
+    def _waypoint_camera_authorized(self) -> bool:
+        self._check_runtime_safety()
+        return (
+            self.phase == "ROUTE"
+            and not self._cancel.is_set() and not self._auto_failed
+            and not self._paused.is_set() and not self._pilot_override()
+            and not self._runtime_safety_latched() and self.stream_healthy()
+        )
+
+    def _request_waypoint_gimbal_pitch(self, pitch_deg: float) -> bool:
+        """Use the same typed camera route as the manual pitch slider, once."""
+        if not self._waypoint_camera_authorized():
+            return False
+        command = getattr(self.backend, "command", None)
+        if not callable(command):
+            return False
+        epoch = self._command_epoch
+        result = command(ControlRequest.create(
+            ControlAction.GIMBAL_PITCH,
+            payload=ScalarPayload(pitch_deg),
+            human_origin=False,
+        ))
+        return (
+            getattr(result, "accepted", False) is True
+            and epoch == self._command_epoch
+            and self._waypoint_camera_authorized()
+        )
+
+    def _read_waypoint_gimbal_pitch(self) -> tuple[float, float] | None:
+        if not self._waypoint_camera_authorized():
+            return None
+        if getattr(self.backend, "is_live", False):
+            store = getattr(self.backend, "telemetry_freshness", None)
+            sample = store.sample("gimbal") if store is not None else None
+            if (
+                sample is None or not isinstance(sample.marker, tuple)
+                or sample.marker[0] != "event" or not isinstance(sample.value, dict)
+                or sample.value.get("gimbal_id", 0) != 0
+            ):
+                return None
+            # Read the immutable event's angle and stamp together; UI state
+            # updates these fields separately and is not an atomic observation.
+            pitch = sample.value.get("pitch_absolute")
+            stamp = sample.observed_mono_ns
+        else:
+            state = self.backend.state
+            if getattr(state, "gimbal_stamp_source", None) != "simulated":
+                return None
+            pitch = getattr(state, "gimbal_pitch_deg", None)
+            stamp = getattr(state, "gimbal_mono_ns", None)
+        if (
+            isinstance(pitch, bool) or not isinstance(pitch, (int, float))
+            or type(stamp) is not int or stamp <= 0
+        ):
+            return None
+        return float(pitch), stamp * 1e-9
 
     def _ground_speed(self) -> tuple[float, float] | None:
         state = self.backend.state
@@ -997,9 +1154,10 @@ class DesktopRouteAutonomy:
     def _route_hooks(self) -> pff.LoopHooks:
         return pff.LoopHooks(
             get_pose=self.get_pose,
+            pose_info=self.pose_info,
             olympe_yaw=self._olympe_yaw,
             send_pcmd=lambda r, p, y, g: self.backend.send_pcmd(
-                r, p, y, g, reason="desktop_auto_route"
+                r, p, y, g, reason="desktop_auto_route", auto_run_id=self.run_id,
             ),
             send_authorized_pcmd=self._send_authorized,
             pose_is_weak=self.pose_is_weak,
@@ -1024,6 +1182,7 @@ class DesktopRouteAutonomy:
             attitude_sample=self._attitude_sample,
             ned_velocity=self._ned_velocity,
             telemetry_history=getattr(self.backend, "control_telemetry_history", None),
+            control_state=self.control_state,
             altitude=self._altitude,
             wait_expired=self._check_wait_budget,
             # Localization loss never auto-lands the AUTO route: the loop holds
@@ -1079,8 +1238,15 @@ class DesktopRouteAutonomy:
             )
         self._check_waypoint_progress(record)
         self._track_route_progress(record)
-        if self._route_progress["arrived"]:
-            self._route_error.observe(record)
+        self._route_error_joined |= bool(
+            self._route_progress["arrived"]
+            or record.get("command_action") == "WAYPOINT_ACTION"
+            or self.controller.holding_for_inspection
+        )
+        record["route_error_joined"] = self._route_error_joined
+        record["route_error_sample"] = bool(
+            self._route_error_joined and not self.paused and self._route_error.observe(record)
+        )
         logs = self._session_logs()
         if logs is None:
             return
@@ -1212,6 +1378,30 @@ class DesktopRouteAutonomy:
             return f"返程前往路徑點{there}"
         return f"前往路徑點{target + 1}"
 
+    def _emit_route_action_events(self, state: dict) -> None:
+        timeouts = getattr(self.controller, "action_timeouts", ())
+        while state["action_timeouts_seen"] < len(timeouts):
+            index = int(timeouts[state["action_timeouts_seen"]])
+            state["action_timeouts_seen"] += 1
+            self._emit(
+                "waypoint_action_timeout",
+                f"{self._drawn_waypoint_label(index)}轉向動作逾時未完成，"
+                "略過該點其餘動作並繼續航線",
+            )
+        results = getattr(self.controller, "action_results", ())
+        while state["action_results_seen"] < len(results):
+            result = results[state["action_results_seen"]]
+            state["action_results_seen"] += 1
+            outcome = result["state"]
+            detail = (
+                f"{self._drawn_waypoint_label(result['waypoint_index'])}"
+                f"鏡頭俯仰{result['pitch_deg']:+g}°："
+                + ("回讀已確認" if outcome == "confirmed" else
+                   "已於前一段 AUTO 回讀確認，續飛不重送" if outcome == "not_replayed" else
+                   f"未完成（{outcome}），略過該點其餘動作並繼續航線")
+            )
+            self._emit("waypoint_camera_action", detail, result=dict(result))
+
     def _track_route_progress(self, record: dict) -> None:
         """Track arrivals, stage changes, and the latest tick for display.
 
@@ -1236,15 +1426,7 @@ class DesktopRouteAutonomy:
             return
         state = self._route_progress
         state["last_tick"] = last
-        timeouts = getattr(self.controller, "action_timeouts", ())
-        while state["action_timeouts_seen"] < len(timeouts):
-            index = int(timeouts[state["action_timeouts_seen"]])
-            state["action_timeouts_seen"] += 1
-            self._emit(
-                "waypoint_action_timeout",
-                f"{self._drawn_waypoint_label(index)}轉向動作逾時未完成，"
-                "略過該點其餘動作並繼續航線",
-            )
+        self._emit_route_action_events(state)
         target = self._tick_target(record)
         if target is None:
             target = state["last_target"]
@@ -1319,7 +1501,7 @@ class DesktopRouteAutonomy:
             error_text = f"｜誤差{error:.2f}u" if math.isfinite(error) else ""
         except (TypeError, ValueError):
             error_text = ""
-        route_error = self._route_error.summary()
+        route_error = self._route_error.live_summary()
         if route_error is not None:
             error_text += (
                 f"（航線誤差平均{route_error['mean_u']:.3f}u／"
@@ -1368,8 +1550,10 @@ class DesktopRouteAutonomy:
                 "auto_route_plan",
                 auto_run_id=self.run_id,
                 control_config=config,
-                route_sha256=self.snapshot.sha256,
-                coordinate_frame_id=self.snapshot.coordinate_frame_id,
+                route_sha256=self._route_error_identity["route_sha256"],
+                coordinate_frame_id=self._route_error_identity["coordinate_frame_id"],
+                site_id=self._route_error_identity["site_id"],
+                route_path=self._route_error_identity["route_path"],
                 map_pose_max_age_s=pff.POSE_STALE_S,
                 waypoint_stall_limit_s=AUTO_WAYPOINT_STALL_S,
                 heading_convention="map CCW; firmware yaw NED CW",
@@ -1392,16 +1576,61 @@ class DesktopRouteAutonomy:
         ):  # Tier3: fallback best-effort — narrow, keep pass
             pass
 
-    def _report_route_error(self) -> None:
-        """Log and announce this run's flown-vs-planned error once it ends."""
-        summary = self._route_error.summary()
-        if summary is None:
-            return
+    def _capture_route_error_identity(self) -> dict:
+        """Keep the measured plan identity independent of later UI route changes."""
+        return {
+            "run_id": self.run_id, "auto_run_id": self.run_id,
+            "route_path": str(self.snapshot.path),
+            "route_sha256": self.snapshot.sha256,
+            "site_id": self.snapshot.site_id,
+            "coordinate_frame_id": self.snapshot.coordinate_frame_id,
+            "map_frame": MappingProxyType({
+                "east": tuple(float(value) for value in self.controller.cfg.map_frame.east),
+                "north": tuple(float(value) for value in self.controller.cfg.map_frame.north),
+                "up": tuple(float(value) for value in self.controller.cfg.map_frame.up),
+            }),
+            "planned_waypoints_u": tuple(
+                tuple(float(value) for value in point) for point in self.controller.wp
+            ),
+            "units": "map_units",
+            "distance_definition": "observed_pose_to_nearest_3d_polyline_segment",
+            "acquisition_excluded": True,
+        }
+
+    def _report_route_error(self, terminal_detail: str = "AUTO stopped") -> None:
+        """Log and announce this run's observed-vs-planned error exactly once."""
+        with self._route_error_report_lock:
+            if self._route_error_reported:
+                return
+            self._route_error_reported = True
+        if self._auto_failed:
+            outcome = "failed"
+        elif self._cancel.is_set():
+            outcome = "cancelled"
+        elif self._manual_handoff_attempted:
+            outcome = "manual_takeover"
+        elif self._landing_confirmed is False:
+            outcome = "landing_unconfirmed"
+        elif self._landing_confirmed is True:
+            outcome = "landed"
+        else:
+            outcome = "stopped"
+        metrics = self._route_error.summary()
+        summary = MappingProxyType({
+            **self._route_error_identity, **metrics,
+            "outcome": outcome, "terminal_detail": terminal_detail,
+            "joined": self._route_error_joined,
+            "no_sample_reason": (
+                None if metrics["samples"] else
+                "no_fresh_observed_poses_after_arrival"
+                if self._route_error_joined else "first_waypoint_not_reached"
+            ),
+        })
         logs = self._session_logs()
         if logs is not None:
             try:
                 logs.localization(
-                    "auto_route_error_summary", auto_run_id=self.run_id, **summary
+                    "auto_route_error_summary", **summary
                 )
             except (
                 OSError,
@@ -1411,16 +1640,10 @@ class DesktopRouteAutonomy:
                 RuntimeError,
             ):  # Tier3: fallback best-effort — narrow, keep pass
                 pass
-        horizontal = (
-            f"；水平平均 {summary['horizontal_mean_u']:.3f}u／"
-            f"最大 {summary['horizontal_max_u']:.3f}u"
-            if "horizontal_mean_u" in summary else ""
-        )
         self._emit(
             "route_error_summary",
-            f"航線誤差（進入航線後 {summary['samples']} 筆，地圖單位）："
-            f"平均 {summary['mean_u']:.3f}u、RMS {summary['rms_u']:.3f}u、"
-            f"P95 {summary['p95_u']:.3f}u、最大 {summary['max_u']:.3f}u{horizontal}",
+            route_error_summary_text(summary),
+            result=summary,
         )
 
     def _land_after_failure(self, detail: str) -> None:
@@ -1824,7 +2047,7 @@ class DesktopRouteAutonomy:
             self._clear_motion()
             self._paused.clear()
             self._watchdog_stop.set()
-            self._report_route_error()
+            self._report_route_error(terminal_detail)
             if self._auto_failed:
                 self.phase = "AUTO_FAILED"
             elif self._landing_confirmed is False and not self._cancel.is_set():

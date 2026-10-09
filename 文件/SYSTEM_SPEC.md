@@ -59,7 +59,7 @@
 - 不把稀疏點雲或 YOLO 當作正式碰撞避免系統。
 - 不宣稱絕對公尺定位精度、絕對姿態精度或 ground-truth 飛行誤差。
 - 不允許 agent、LLM、腳本或其他自動化替操作員按下真機起飛。
-- 不允許無人值守、自動按鍵或繞過當次四步 preflight 的真機自主路徑飛行。
+- 不允許無人值守、自動按鍵或繞過當次三步 preflight 的真機自主路徑飛行。
 - 不在執行時下載模型、程式碼、套件或場域資產。
 
 ### 2.3 使用者與角色
@@ -575,7 +575,7 @@ WEAK、LOST、stale pose 或 worker error 都不可沿用上一筆非零 autonom
 9. 高度、距離、lost-link、RTH/Home、低電量及 logging fail-closed 測試。
 10. `parrot_stimulate` 共用控制器測試、固定 worst-case 測試全部通過。
 11. 兩人確認、實體安全監控員及起飛前 checklist 已落實。
-12. 操作員在 UI 完成四步 preflight，並親自按下「自動飛行」。
+12. 操作員在 UI 完成三步 preflight，並親自按下「自動飛行」。
 
 ### 10.3 PCMD 指令上限的無尺度自主控制
 
@@ -675,8 +675,8 @@ stateDiagram-v2
     AIRBORNE_STICKS --> PC_MANUAL: explicit PC control
     PC_MANUAL --> AIRBORNE_STICKS: Esc/stick input/failure
     PC_MANUAL --> HOVER_HANDOFF: stream/pose/worker failure
-    GROUND_STICKS --> AUTO: human AUTO + four-step preflight
-    AIRBORNE_STICKS --> AUTO: human AUTO + four-step preflight
+    GROUND_STICKS --> AUTO: human AUTO + three-step preflight
+    AIRBORNE_STICKS --> AUTO: human AUTO + three-step preflight
     AUTO --> AUTO_HOVER_WAIT: recoverable stream/pose failure
     AUTO --> AUTO_FAILED: worker/watchdog/PCMD failure
     AUTO --> LANDING: route complete or operator LAND
@@ -693,7 +693,7 @@ stateDiagram-v2
     LINK_LOST_ONBOARD --> ONBOARD_LAND: no valid GPS/Home
 ```
 
-`AUTO` 只有在 mission selection `flight_ready=true` 且四步 preflight 完成後可進入；
+`AUTO` 只有在 mission selection `flight_ready=true` 且三步 preflight 完成後可進入；
 目前隨附 selection 為 `flight_ready=false`（無 route），未完成當次 preflight 或任一後端硬檢查
 仍會 fail closed。
 

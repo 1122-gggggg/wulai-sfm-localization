@@ -1,6 +1,8 @@
 """Operator text for route phases; no flight commands."""
 
+from collections.abc import Mapping
 import math
+from typing import Any
 
 
 def _blocked_leg_stage(label: str, lowered: str) -> tuple[str, str]:
@@ -112,6 +114,11 @@ def waypoint_action_text(action: dict) -> str:
             text = f"{'右' if degrees > 0 else '左'}轉{abs(degrees):g}°"
         elif kind == "hover":
             text = f"懸停{float(action['seconds']):g}秒"
+        elif kind == "gimbal_pitch":
+            pitch = float(action["pitch_deg"])
+            text = f"鏡頭俯仰{pitch:+g}°（0 水平，負向下）"
+            if action.get("state") == "waiting_readback":
+                text += "，等待鏡頭回讀確認"
         else:
             return str(kind)
     except (KeyError, TypeError, ValueError):
@@ -137,3 +144,25 @@ def _arrival_stage(label: str, action: str) -> tuple[str, str] | None:
     if action == "WAIT_MAP_CONFIRMATION":
         return "map_confirmation", f"等待地圖定位確認（{label}）"
     return None
+
+
+def route_error_summary_text(summary: Mapping[str, Any]) -> str:
+    """Persistent per-run readout; these are localization errors, not ground truth."""
+    outcome = {
+        "failed": "失敗", "cancelled": "已取消", "manual_takeover": "人工接管",
+        "landing_unconfirmed": "降落未確認", "landed": "已落地", "stopped": "已停止",
+    }.get(summary["outcome"], str(summary["outcome"]))
+    prefix = f"本次 AUTO 航線誤差（{outcome}，地圖單位）"
+    if summary["state"] == "no_samples":
+        reason = (
+            "尚未到達首個航點" if summary["no_sample_reason"] == "first_waypoint_not_reached"
+            else "到站後沒有新鮮、有效的定位觀測"
+        )
+        return f"{prefix}：無法計算（{reason}；起飛靠攏段不計）。"
+    return (
+        f"{prefix}：平均 {summary['mean_u']:.3f}u、RMS {summary['rms_u']:.3f}u、"
+        f"P95 {summary['p95_u']:.3f}u、最大 {summary['max_u']:.3f}u；"
+        f"水平平均 {summary['horizontal_mean_u']:.3f}u／"
+        f"最大 {summary['horizontal_max_u']:.3f}u"
+        f"（進入航線後 {summary['samples']} 筆定位觀測；起飛靠攏段不計）。"
+    )

@@ -99,7 +99,7 @@ OperatorApp
           └─ TelemetryFreshnessStore：逐欄位 freshness 與速度限制語意
 ```
 
-真機 AUTO 沒有額外的 release latch。操作員必須完成四步 preflight，且選定的
+真機 AUTO 沒有額外的 release latch。操作員必須完成三步 preflight，且選定的
 site/route、座標框架、資產雜湊與 runtime lock 必須一致。AUTO 起飛後先懸停，
 桌面 BOOT 可使用弱定位及 IMU 估計，但仍需連續新鮮、有限、跳變未超限的姿態。
 弱定位不當成地圖錨；定位、地速與終點確認的完整策略以

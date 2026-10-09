@@ -675,6 +675,324 @@ def test_editing_route_replaces_only_the_selected_route(tmp_path: Path) -> None:
     ]
 
 
+def _route_deletion_site(tmp_path: Path) -> tuple[LocalRouteProvider, Path]:
+    package = _write_site_package(tmp_path)
+    managed = tmp_path / "地圖檔" / "場域"
+    profile_path = LocalSitePackageProvider(
+        managed,
+        bundle_inspector=lambda _path, _sha256: ("ref-a.jpg",),
+        profile_loader=_profile_loader,
+    ).import_folder(package).profile_path
+    return LocalRouteProvider(managed), profile_path
+
+
+def _write_route_links(
+    tmp_path: Path, route: Path, profile_path: Path, name: str = "selected"
+) -> tuple[Path, Path, Path]:
+    profile = load_site_profile(profile_path)
+    raw = json.loads(profile_path.read_text(encoding="utf-8"))
+    for key in ("localizer_profile", "map_reference_poses", "map_align", "localizer_deploy_dir"):
+        value = getattr(profile, key)
+        raw[key] = None if value is None else str(value)
+    for key, value in raw["assets"].items():
+        if value is not None:
+            raw["assets"][key] = str(getattr(profile, key))
+    raw["assets"]["route_json"] = str(route)
+    raw["asset_sha256"]["route_json"] = _sha(route)
+    system_profile = tmp_path / "控制介面程式" / "site_profiles" / f"{name}.json"
+    system_profile.parent.mkdir(parents=True, exist_ok=True)
+    system_profile.write_text(json.dumps(raw), encoding="utf-8")
+    component = tmp_path / "控制介面程式" / "mission_components" / "routes" / f"{name}.json"
+    component.parent.mkdir(parents=True, exist_ok=True)
+    component.write_text(json.dumps({
+        "schema": "sfm-route-package/v1",
+        "route_id": name,
+        "revision": "test-v1",
+        "site_id": profile.site_id,
+        "frame": {"kind": "map", "id": profile.coordinate_frame.id},
+        "route": {"path": str(route), "sha256": _sha(route)},
+    }), encoding="utf-8")
+    selection = tmp_path / "控制介面程式" / "mission_selections" / f"{name}.json"
+    selection.parent.mkdir(parents=True, exist_ok=True)
+    # Selection loading validates artifact refs, not component schemas; the
+    # unrelated slots deliberately reuse the real map artifact in this fixture.
+    artifact = {"path": str(profile.map_ply), "sha256": _sha(profile.map_ply)}
+    selection.write_text(json.dumps({
+        "schema": "sfm-mission-selection/v1",
+        "selection_id": name,
+        "vehicle": artifact,
+        "site": artifact,
+        "map": artifact,
+        "localizer": artifact,
+        "route": {"path": str(component), "sha256": _sha(component)},
+        "calibrations": [],
+        "approval": artifact,
+    }), encoding="utf-8")
+    return system_profile, component, selection
+
+
+def test_delete_old_display_route_preserves_current_route_and_approval(tmp_path: Path) -> None:
+    provider, profile_path = _route_deletion_site(tmp_path)
+    current = provider.import_file(_write_valid_route(tmp_path / "current.json"), profile_path)
+    old = profile_path.parent / "old_flight_path.json"
+    old.write_text(json.dumps({
+        "schema": "legacy-route/v1",
+        "purpose": "display",
+        "waypoints": [[0, 0, 0], [4, 0, 0]],
+    }), encoding="utf-8")
+    # Unrelated, incomplete JSON should not become owned by route deletion.
+    (profile_path.parent / "unfinished.json").write_text("[", encoding="utf-8")
+    profile_before = profile_path.read_bytes()
+    current_before = current.asset_path.read_bytes()
+
+    deleted = provider.delete_file(old, profile_path)
+
+    assert deleted.asset_path == old
+    assert deleted.profile_path == profile_path
+    assert deleted.approved_for_auto is True
+    assert not old.exists()
+    assert profile_path.read_bytes() == profile_before
+    assert current.asset_path.read_bytes() == current_before
+
+
+def test_delete_current_route_clears_profile_without_selecting_remaining(tmp_path: Path) -> None:
+    provider, profile_path = _route_deletion_site(tmp_path)
+    first = provider.import_file(_write_valid_route(tmp_path / "first.json"), profile_path)
+    current = provider.import_file(_write_valid_route(tmp_path / "current.json"), profile_path)
+    first_before = first.asset_path.read_bytes()
+
+    deleted = provider.delete_file(current.asset_path, profile_path)
+
+    profile = load_site_profile(profile_path)
+    assert not current.asset_path.exists()
+    assert first.asset_path.read_bytes() == first_before
+    assert deleted.approved_for_auto is False
+    assert profile.route_json is None
+    assert profile.asset_sha256.route_json is None
+    assert profile.flight.approved is False
+    assert profile.flight.route_clearance_approved is False
+
+
+def test_delete_last_route_detaches_linked_manifests_and_keeps_site_editable(tmp_path: Path) -> None:
+    from mission_manifest import load_mission_selection, load_route_manifest
+    from operator_actions import SiteAssetActions
+
+    provider, profile_path = _route_deletion_site(tmp_path)
+    current = provider.import_file(_write_valid_route(tmp_path / "current.json"), profile_path)
+    system_profile, component, selection = _write_route_links(
+        tmp_path, current.asset_path, profile_path
+    )
+    load_route_manifest(component, workspace_root=tmp_path)
+    load_mission_selection(selection, workspace_root=tmp_path)
+    actions = SiteAssetActions(None, provider, None, current_profile=system_profile)
+
+    result = actions.delete_route(current.asset_path)
+
+    assert result.kind == "route_deleted"
+    assert result.asset_path == current.asset_path
+    assert result.profile_path == actions.current_profile == profile_path
+    assert result.approved_for_auto is False
+    for path in (profile_path, system_profile):
+        profile = load_site_profile(path)
+        assert profile.route_json is None
+        assert profile.asset_sha256.route_json is None
+        assert profile.flight.approved is False
+        assert profile.flight.route_clearance_approved is False
+    assert not component.exists()
+    detached = load_mission_selection(selection, workspace_root=tmp_path)
+    assert detached.route is None
+    assert detached.approval is None
+    assert not local_assets.describe_site_routes(profile_path.parent)
+
+    # Editing can resume by an explicit new import, never by resurrecting links
+    # or choosing some other route on the operator's behalf.
+    new = provider.import_file(_write_valid_route(tmp_path / "new.json"), profile_path)
+    assert load_site_profile(profile_path).route_json == new.asset_path
+    assert not current.asset_path.exists()
+    assert not component.exists()
+    assert load_mission_selection(selection, workspace_root=tmp_path).route is None
+
+
+def test_delete_linked_old_route_preserves_unrelated_links_and_active_profile(tmp_path: Path) -> None:
+    provider, profile_path = _route_deletion_site(tmp_path)
+    old = provider.import_file(_write_valid_route(tmp_path / "old.json"), profile_path)
+    current = provider.import_file(_write_valid_route(tmp_path / "current.json"), profile_path)
+    old_links = _write_route_links(tmp_path, old.asset_path, profile_path, "old")
+    current_links = _write_route_links(tmp_path, current.asset_path, profile_path, "current")
+    unchanged = {
+        path: path.read_bytes()
+        for path in (profile_path, current.asset_path, *current_links)
+    }
+
+    provider.delete_file(old.asset_path, profile_path)
+
+    assert not old.asset_path.exists()
+    assert not old_links[1].exists()
+    assert load_site_profile(old_links[0]).route_json is None
+    assert json.loads(old_links[2].read_text(encoding="utf-8"))["route"] is None
+    for path, before in unchanged.items():
+        assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize("unsafe", [
+    "outside", "other-site", "file-symlink", "directory-symlink", "non-route",
+    "draft", "profile", "directory", "missing", "shared-target",
+])
+def test_route_deletion_rejects_unsafe_or_non_route_paths(tmp_path: Path, unsafe: str) -> None:
+    provider, profile_path = _route_deletion_site(tmp_path)
+    current = provider.import_file(_write_valid_route(tmp_path / "current.json"), profile_path)
+    routes = current.asset_path.parent
+    if unsafe == "outside":
+        source = _write_valid_route(tmp_path / "outside_route.json")
+    elif unsafe == "other-site":
+        other = provider.managed_root / "other"
+        other.mkdir()
+        source = _write_valid_route(other / "flight_route.json")
+    elif unsafe == "file-symlink":
+        source = routes / "linked_route.json"
+        source.symlink_to(current.asset_path)
+    elif unsafe == "directory-symlink":
+        linked = profile_path.parent / "linked-routes"
+        linked.symlink_to(routes, target_is_directory=True)
+        source = linked / current.asset_path.name
+    elif unsafe == "non-route":
+        source = routes / "wires.json"
+        source.write_text(json.dumps({"wires": []}), encoding="utf-8")
+    elif unsafe == "draft":
+        folder = profile_path.parent / "route_drafts"
+        folder.mkdir()
+        source = _write_valid_route(folder / "flight_route.json")
+    elif unsafe == "profile":
+        source = profile_path
+    elif unsafe == "directory":
+        source = routes
+    elif unsafe == "shared-target":
+        source = current.asset_path
+        raw = json.loads(profile_path.read_text(encoding="utf-8"))
+        raw["assets"]["poles_json"] = str(source)
+        profile_path.write_text(json.dumps(raw), encoding="utf-8")
+    else:
+        source = routes / "missing_route.json"
+    profile_before = profile_path.read_bytes()
+    route_before = current.asset_path.read_bytes()
+
+    with pytest.raises(ValueError):
+        provider.delete_file(source, profile_path)
+
+    assert profile_path.read_bytes() == profile_before
+    assert current.asset_path.read_bytes() == route_before
+
+
+@pytest.mark.parametrize("failure", [
+    "profile-replace", "selection-replace", "component-delete", "route-delete",
+    "post-delete-validation",
+])
+def test_route_deletion_rolls_back_all_files_on_transaction_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    provider, profile_path = _route_deletion_site(tmp_path)
+    current = provider.import_file(_write_valid_route(tmp_path / "current.json"), profile_path)
+    links = _write_route_links(tmp_path, current.asset_path, profile_path)
+    snapshots = {
+        path: path.read_bytes() for path in (profile_path, current.asset_path, *links)
+    }
+    real_replace = local_assets.os.replace
+    real_unlink = Path.unlink
+    real_load = local_assets.load_site_profile
+    injected = False
+
+    def fail_replace(source, destination):
+        nonlocal injected
+        fail_target = profile_path if failure == "profile-replace" else links[2]
+        if failure.endswith("replace") and Path(destination) == fail_target and not injected:
+            injected = True
+            raise OSError("forced route deletion failure")
+        real_replace(source, destination)
+
+    def fail_unlink(path, *args, **kwargs):
+        nonlocal injected
+        fail_target = links[1] if failure == "component-delete" else current.asset_path
+        if failure.endswith("delete") and path == fail_target and not injected:
+            injected = True
+            raise OSError("forced route deletion failure")
+        return real_unlink(path, *args, **kwargs)
+
+    def fail_load(path, *args, **kwargs):
+        nonlocal injected
+        if (
+            failure == "post-delete-validation" and Path(path) == profile_path
+            and not current.asset_path.exists() and not injected
+        ):
+            injected = True
+            raise OSError("forced route deletion failure")
+        return real_load(path, *args, **kwargs)
+
+    monkeypatch.setattr(local_assets.os, "replace", fail_replace)
+    monkeypatch.setattr(Path, "unlink", fail_unlink)
+    monkeypatch.setattr(local_assets, "load_site_profile", fail_load)
+
+    with pytest.raises(OSError, match="forced route deletion failure"):
+        provider.delete_file(current.asset_path, profile_path)
+
+    assert injected
+    for path, before in snapshots.items():
+        assert path.read_bytes() == before
+    assert not [
+        path for path in tmp_path.rglob("*") if path.suffix in {".tmp", ".bak"}
+    ]
+
+
+def test_delete_route_clears_explicit_runtime_snapshot_outside_site_profiles(tmp_path: Path) -> None:
+    provider, profile_path = _route_deletion_site(tmp_path)
+    current = provider.import_file(_write_valid_route(tmp_path / "current.json"), profile_path)
+    system_profile, _component, _selection = _write_route_links(
+        tmp_path, current.asset_path, profile_path
+    )
+    snapshot = tmp_path / "執行環境" / "mission_snapshots" / "active.site_profile.json"
+    snapshot.parent.mkdir(parents=True)
+    system_profile.rename(snapshot)
+
+    deleted = provider.delete_file(current.asset_path, snapshot)
+
+    assert deleted.profile_path == profile_path
+    cleared = load_site_profile(snapshot)
+    assert cleared.route_json is None
+    assert cleared.asset_sha256.route_json is None
+    assert cleared.flight.approved is False
+
+
+def test_route_delete_retains_recovery_backups_if_rollback_itself_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    provider, profile_path = _route_deletion_site(tmp_path)
+    current = provider.import_file(_write_valid_route(tmp_path / "current.json"), profile_path)
+    profile_before = profile_path.read_bytes()
+    real_replace = local_assets.os.replace
+    real_unlink = Path.unlink
+
+    def fail_replace(source, destination):
+        if Path(destination) == profile_path and Path(source).suffix == ".bak":
+            raise OSError("forced rollback failure")
+        real_replace(source, destination)
+
+    def fail_unlink(path, *args, **kwargs):
+        if path == current.asset_path:
+            raise OSError("forced delete failure")
+        return real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(local_assets.os, "replace", fail_replace)
+    monkeypatch.setattr(Path, "unlink", fail_unlink)
+
+    with pytest.raises(RuntimeError, match="recovery backups retained"):
+        provider.delete_file(current.asset_path, profile_path)
+
+    assert current.asset_path.exists()
+    assert load_site_profile(profile_path).route_json is None
+    profile_backups = list(profile_path.parent.glob(".site_profile.json.*.bak"))
+    assert len(profile_backups) == 1
+    assert profile_backups[0].read_bytes() == profile_before
+
+
 def test_concurrent_site_package_imports_have_one_winner(tmp_path: Path,
                                                         monkeypatch: pytest.MonkeyPatch) -> None:
     package = _write_site_package(tmp_path)
@@ -878,7 +1196,7 @@ def test_route_import_action_propagates_committed_auto_approval(tmp_path: Path) 
     assert result.approved_for_auto is True
     assert result.asset_path == load_site_profile(profile).route_json
     assert "將套用為 AUTO 航線" in result.message
-    assert "請完成四項驗證" in result.message
+    assert "請完成三項驗證" in result.message
 
 
 def test_route_import_action_does_not_invent_provider_approval(tmp_path: Path) -> None:

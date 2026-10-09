@@ -8,9 +8,20 @@
 | 測試 | `test.txt` | `test-lock.txt` |
 | 品質與安全檢查 | `quality.txt` | `quality-lock.txt` |
 | 選配 RePoseD/MoGe | `optional-reposed.txt` | `optional-reposed-lock.txt` |
+| 選配 CPU 表面深度 | `optional-depth.txt` | `optional-depth-lock.txt`（受 runtime lock 約束） |
+| 獨立 CUDA MVS 建圖 | `mvs.txt` | `mvs-lock.txt`（只安裝到 `.venv-mvs`） |
+| 選配擴圖版工作圖 iSAM2 | 無額外基礎相依 | `optional-workmap-graph-lock.txt` |
+| 選配擴圖版工作圖 MoGe 深度 | 無額外基礎相依 | `optional-workmap-depth-lock.txt` |
 
 安裝正式環境請使用 `tools/install_runtime.sh`。lockfiles 固定 transitive
 版本與 SHA-256；不要直接用未鎖定的 `.txt` 建立正式或 portable 環境。
+
+
+`optional-depth` 以 Open3D CPU raycasting 查 mesh，不更換定位的 pycolmap。
+`mvs` 使用 CUDA pycolmap 進行 PatchMatch／融合、Open3D CPU 產生表面。
+CUDA wheel 與 runtime CPU wheel 共用 `pycolmap` import，必須獨立環境且不得混裝。
+操作與儲存需求見
+[MVS 工具說明](../tools/README.md#離線-mvs-與公尺深度查詢)。
 
 以下相依屬於不同的執行環境，因此保留在原子專案：
 

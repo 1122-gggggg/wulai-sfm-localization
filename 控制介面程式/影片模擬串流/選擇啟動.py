@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import subprocess
 import sys
@@ -12,6 +13,24 @@ from pathlib import Path
 
 class SelectionError(RuntimeError):
     """A map/profile or video could not be selected safely."""
+
+
+MODE_LOCALIZE = "localize"
+MODE_EXPAND = "expand"
+MODES = (MODE_LOCALIZE, MODE_EXPAND)
+MODE_LABELS = {
+    MODE_LOCALIZE: "純定位（主程式原版）",
+    MODE_EXPAND: "定位＋擴圖（實驗版）",
+}
+MODE_NOTES = {
+    MODE_LOCALIZE: "只用既有地圖定位，不新增地圖點。",
+    MODE_EXPAND: (
+        "離開舊圖範圍時建立暫時點與子圖，回到舊圖後縫合；"
+        "實驗演算法，離線驗證尚未全面勝過純定位。"
+    ),
+}
+#: Expansion site packages are the workmap-enabled releases under 地圖檔/場域/<site>/releases.
+EXPANSION_SITES_DIR = "地圖檔/場域"
 
 
 def workspace_root() -> Path:
@@ -80,6 +99,136 @@ def profile_for_map(root: Path, map_path: Path) -> tuple[Path, object]:
     return matches[0]
 
 
+def profile_mode(profile) -> str:
+    """Expansion iff the profile's SHA-bound direct runtime profile enables the workmap."""
+    path = profile.localizer_profile
+    if path is None:
+        return MODE_LOCALIZE
+    try:
+        raw = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise SelectionError(f"無法讀取定位 profile {path}: {exc}") from exc
+    section = raw.get("online_workmap") if isinstance(raw, dict) else None
+    enabled = isinstance(section, dict) and section.get("enabled") is True
+    return MODE_EXPAND if enabled else MODE_LOCALIZE
+
+
+def discover_expansion_profiles(root: Path) -> list[tuple[Path, object]]:
+    base = root / EXPANSION_SITES_DIR
+    paths = [
+        *base.glob("*/site_profile.json"),
+        *base.glob("*/releases/*/site_profile.json"),
+    ]
+    found: list[tuple[Path, object]] = []
+    for path in sorted(paths):
+        try:
+            profile = load_profile(path)
+            if profile_mode(profile) == MODE_EXPAND:
+                found.append((path.resolve(), profile))
+        except SelectionError:
+            continue
+    return found
+
+
+def expansion_profile_for(root: Path, profile) -> tuple[Path, object]:
+    """The expansion site package built on the same map PLY (same SHA-256)."""
+    map_sha = profile.asset_sha256.map_ply
+    matches = [
+        (path, candidate)
+        for path, candidate in discover_expansion_profiles(root)
+        if map_sha is not None and candidate.asset_sha256.map_ply == map_sha
+    ]
+    if not matches:
+        raise SelectionError(
+            f"這張地圖沒有對應的定位＋擴圖場域包（需放在 {EXPANSION_SITES_DIR} 且地圖 PLY 相同）。"
+        )
+    if len(matches) > 1:
+        names = ", ".join(str(path) for path, _candidate in matches)
+        raise SelectionError(f"這張地圖對應多個定位＋擴圖場域包，請直接選 profile JSON: {names}")
+    return matches[0]
+
+
+def choose_mode(*, expand_blocked: str | None) -> str:
+    """Ask which localization to run; the expansion choice is disabled when blocked."""
+    result: dict[str, str | None] = {"mode": None}
+    try:
+        import tkinter as tk
+
+        app = tk.Tk()
+        app.title("選擇定位模式")
+        app.attributes("-topmost", True)
+        app.resizable(False, False)
+        variable = tk.StringVar(value=MODE_LOCALIZE)
+        tk.Label(app, text="這次要使用哪一種定位？", font=("Sans", 12, "bold")).pack(
+            anchor="w", padx=14, pady=(12, 6)
+        )
+        for mode in MODES:
+            tk.Radiobutton(
+                app,
+                text=MODE_LABELS[mode],
+                variable=variable,
+                value=mode,
+                anchor="w",
+                state="disabled" if mode == MODE_EXPAND and expand_blocked else "normal",
+            ).pack(anchor="w", padx=14)
+            tk.Label(
+                app, text=MODE_NOTES[mode], wraplength=380, justify="left", fg="gray30"
+            ).pack(anchor="w", padx=36, pady=(0, 6))
+        if expand_blocked:
+            tk.Label(
+                app, text=expand_blocked, wraplength=380, justify="left", fg="red"
+            ).pack(anchor="w", padx=14, pady=(0, 6))
+
+        def confirm() -> None:
+            result["mode"] = variable.get()
+            app.destroy()
+
+        row = tk.Frame(app)
+        row.pack(fill="x", padx=14, pady=10)
+        tk.Button(row, text="開始", command=confirm).pack(side="left")
+        tk.Button(row, text="取消", command=app.destroy).pack(side="right")
+        app.protocol("WM_DELETE_WINDOW", app.destroy)
+        app.mainloop()
+    except Exception as exc:
+        raise SelectionError(f"無法開啟模式選擇視窗，請確認 tkinter/X11: {exc}") from exc
+    if result["mode"] is None:
+        raise SelectionError("已取消選擇。")
+    return str(result["mode"])
+
+
+def resolve_mode_profile(
+    root: Path, profile_path: Path, profile, mode: str | None, *, explicit: bool
+) -> tuple[Path, object]:
+    """Return the site profile that runs the chosen localization mode.
+
+    An explicitly named profile is never swapped: it fixes the mode, and a
+    conflicting --mode is refused rather than silently ignored.
+    """
+    if mode is not None and mode not in MODES:
+        raise SelectionError(f"未知的定位模式: {mode}")
+    current = profile_mode(profile)
+    if explicit or current == MODE_EXPAND:
+        if mode is not None and mode != current:
+            raise SelectionError(
+                f"指定的 site profile 是「{MODE_LABELS[current]}」，與 --mode {mode} 衝突；"
+                "要換模式請改選地圖 PLY。"
+            )
+        return profile_path, profile
+    blocked = None
+    expansion = None
+    try:
+        expansion = expansion_profile_for(root, profile)
+    except SelectionError as exc:
+        blocked = str(exc)
+    if mode is None:
+        mode = choose_mode(expand_blocked=blocked)
+    if mode == MODE_EXPAND:
+        if expansion is None:
+            raise SelectionError(blocked or "沒有對應的定位＋擴圖場域包")
+        return expansion
+    return profile_path, profile
+
+
 def choose_file(
     root, *, title: str, initialdir: Path, filetypes: list[tuple[str, str]]
 ) -> Path:
@@ -109,6 +258,7 @@ def select_inputs(
     map_path: Path | None = None,
     profile_path: Path | None = None,
     video_path: Path | None = None,
+    mode: str | None = None,
 ) -> tuple[Path, Path, Path]:
     if profile_path is None and map_path is None:
         map_path = choose_file(
@@ -121,10 +271,16 @@ def select_inputs(
                 ("site profile JSON", "*.json"),
             ],
         )
+    explicit = profile_path is not None or (
+        map_path is not None and map_path.suffix.lower() == ".json"
+    )
     selected_profile, profile = (
         (profile_path.expanduser().resolve(), load_profile(profile_path))
         if profile_path is not None
         else profile_for_map(root, map_path)
+    )
+    selected_profile, profile = resolve_mode_profile(
+        root, selected_profile, profile, mode, explicit=explicit
     )
     if video_path is None:
         video_path = choose_file(
@@ -166,6 +322,11 @@ def main() -> int:
     parser.add_argument("--map", dest="map_path", type=Path)
     parser.add_argument("--site-profile", type=Path)
     parser.add_argument("--video", type=Path)
+    parser.add_argument(
+        "--mode",
+        choices=MODES,
+        help="localize=純定位, expand=定位＋擴圖；省略時用視窗選擇（明確指定 profile 時由 profile 決定）",
+    )
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
     root = workspace_root()
@@ -175,7 +336,9 @@ def main() -> int:
             map_path=args.map_path,
             profile_path=args.site_profile,
             video_path=args.video,
+            mode=args.mode,
         )
+        print(f"[選擇介面] mode={MODE_LABELS[profile_mode(load_profile(profile_path))]}")
         print(f"[選擇介面] site_profile={profile_path}")
         print(f"[選擇介面] map={selected_map}")
         print(f"[選擇介面] video={video_path}")

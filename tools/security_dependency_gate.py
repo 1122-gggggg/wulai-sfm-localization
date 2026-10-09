@@ -258,12 +258,12 @@ def evaluate_findings(
     current_date = date.today() if today is None else today
     exception_by_key = {(_package_key(item.package), item.advisory_id): item for item in exceptions}
     errors: list[str] = []
-    for item in exceptions:
-        if item.expires <= current_date:
-            errors.append(
-                f"security exception expired: {item.package}/{item.advisory_id} "
-                f"on {item.expires.isoformat()}"
-            )
+    errors.extend(
+        f"security exception expired: {item.package}/{item.advisory_id} "
+        f"on {item.expires.isoformat()}"
+        for item in exceptions
+        if item.expires <= current_date
+    )
     for finding in findings:
         key = (_package_key(finding.package), finding.advisory_id)
         exception = exception_by_key.get(key)
@@ -292,12 +292,12 @@ def evaluate_skipped_dependencies(
         (_package_key(item.package), item.version, item.skip_reason): item for item in exceptions
     }
     errors: list[str] = []
-    for item in exceptions:
-        if item.expires <= current_date:
-            errors.append(
-                f"security skip exception expired: {item.package}=={item.version} "
-                f"on {item.expires.isoformat()}"
-            )
+    errors.extend(
+        f"security skip exception expired: {item.package}=={item.version} "
+        f"on {item.expires.isoformat()}"
+        for item in exceptions
+        if item.expires <= current_date
+    )
     for dependency in skipped:
         key = (_package_key(dependency.package), dependency.version, dependency.reason)
         exception = exception_by_key.get(key)

@@ -2,57 +2,79 @@
 
 from __future__ import annotations
 
+import math
 import queue
 import tempfile
 import threading
 import time
 import tkinter as tk
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageTk
 from route_editor_controller import OrthoView, RouteEditorController, pointer_is_drag
+from route_editor_objects import ObjectBoxController, box_corners
 from local_site_assets import discover_site_package
 from operator_autonomy_status import waypoint_action_text
 from route_editor_model import (
     MAX_ACTIONS_PER_WAYPOINT,
+    MapDistanceScale,
     RouteDocument,
     glomap_to_editor,
+    load_map_distance_scale,
     parse_waypoint_action,
 )
+from route_editor_rendering import PointCloudRenderer
 from x11_pinch_zoom import install_x11_pinch_zoom
 
 
-_BG = (18, 21, 25)
 _ARRIVE = "#3fbf7f"
 _ARRIVE_FILL = (63, 191, 127, 52)
 #: Matches ControlConfig.waypoint_arrive_radius; the exported route carries the
 #: value the operator actually confirmed, so the two cannot drift apart.
-#: Operator decision 2026-08-06: the arrival sphere is 0.005 to 0.05 map units.
+#: Operator decision 2026-08-06: the arrival sphere is 0.005 to 0.05 map units;
+#: 2026-10-09 the operator raised the maximum to 0.1.
 #: 0.3 was tried first and was 5% of urai's camera trajectory -- far too coarse to
 #: distinguish adjacent clicked points.
 DEFAULT_ARRIVE_RADIUS_U = 0.02
 ARRIVE_RADIUS_MIN_U = 0.005
-ARRIVE_RADIUS_MAX_U = 0.05
-#: Points drawn per frame. The dense display cloud (map_dense.ply) holds 2.44M
-#: points on river_site and takes ~0.3 s to draw in full, so drag and zoom draw
-#: a stride sample and the full cloud is drawn once the view settles.
-_DRAW_POINTS_INTERACTIVE = 250_000
-_DRAW_POINTS_STATIC = 3_000_000
-_ZOOM_SETTLE_MS = 200
+ARRIVE_RADIUS_MAX_U = 0.1
 _ROUTE = "#ff3ea5"
 _SELECTED = "#ffe169"
 _AXIS = ("#ff6b5f", "#55d187", "#5aa7e8")
+_BOX_EDGES = tuple(
+    (index, index ^ (1 << bit))
+    for index in range(8) for bit in range(3)
+    if index < (index ^ (1 << bit))
+)
 
 
 def _action_marker(action: dict) -> str:
-    """Compact canvas marker: R30 / L45 turn, H3s hover."""
+    """Compact canvas marker: R30 / L45 turn, H3s hover, C-20 camera pitch."""
     if action.get("type") == "yaw":
         degrees = float(action["degrees"])
         return f"{'R' if degrees > 0 else 'L'}{abs(degrees):g}"
+    if action.get("type") == "gimbal_pitch":
+        return f"C{float(action['pitch_deg']):+g}"
     return f"H{float(action['seconds']):g}s"
+
+
+def _waypoint_label(controller, index: int) -> str:
+    """Canvas label: number, outbound markers in [..], return markers in ret[..]."""
+    label = str(index + 1)
+    tables = (
+        (" [", getattr(controller, "actions", None) or []),
+        (" ret[", getattr(controller, "return_actions", None) or []),
+    )
+    for prefix, table in tables:
+        if index < len(table) and table[index]:
+            # ASCII only: PIL's default bitmap font has no CJK glyphs.
+            label += prefix + " ".join(_action_marker(a) for a in table[index]) + "]"
+    return label
 
 
 def _resolve_map_frame(profile):
@@ -94,6 +116,43 @@ def _save_failure_hint(exc: Exception) -> str | None:
     return None
 
 
+def _dispatch_measure_key(window, key: str) -> None:
+    if key == "g" and window._measurement_move_start is None:
+        window._handle_begin_move()
+    elif key in {"x", "y", "z"} and window._measurement_move_start is not None:
+        window._handle_move_axis(key)
+    elif key in {"return", "kp_enter"} and window._measurement_move_start is not None:
+        window._handle_enter()
+    elif key == "escape":
+        window._handle_escape()
+
+
+def _dispatch_route_key(window, key: str, ctrl: bool, shift: bool) -> str | None:
+    if ctrl and key == "z":
+        window._handle_undo_redo(shift=shift)
+        return "break"
+    if (
+        key == "g"
+        and window.controller.phase == "height"
+        and not window.controller.moving
+    ):
+        window._handle_begin_move()
+        return "break"
+    if key in {"x", "y", "z"} and window.controller.moving:
+        window._handle_move_axis(key)
+        return "break"
+    if key in {"return", "kp_enter"}:
+        window._handle_enter()
+        return "break"
+    if key == "escape":
+        window._handle_escape()
+        return "break"
+    if key == "delete" and window.controller.phase == "height":
+        window._handle_delete()
+        return "break"
+    return None
+
+
 class RouteEditorWindow(tk.Toplevel):
     """No backend reference and no flight-command capability by design."""
 
@@ -113,6 +172,7 @@ class RouteEditorWindow(tk.Toplevel):
         on_close: Callable[[], None] | None = None,
         on_guard_failure: Callable[[str], None] | None = None,
         test_route: Callable[[Path], object] | None = None,
+        distance_scale_loader: Callable[[object], MapDistanceScale | None] = load_map_distance_scale,
     ):
         bound = profile is not None and profile.coordinate_frame is not None
         if route_path is not None and not bound:
@@ -140,6 +200,13 @@ class RouteEditorWindow(tk.Toplevel):
                 site_id="", coordinate_frame_id="", align_source=align_source)
         super().__init__(parent)
         self.profile = profile
+        self.distance_scale_loader = distance_scale_loader
+        self.distance_scale = distance_scale_loader(profile)
+        self._measuring = False
+        self.measurement_points: list[list[float]] = []
+        self._measurement_selected: int | None = None
+        self._measurement_move_start: list[float] | None = None
+        self._measurement_move_axis: int | None = None
         self.map_frame, self.align_source = map_frame, align_source
         # Reopen the route with the radius it was saved with, clamped to the
         # operator's range so the slider and the value can never disagree.
@@ -165,8 +232,15 @@ class RouteEditorWindow(tk.Toplevel):
         self.configure(bg="#121519")
         self.protocol("WM_DELETE_WINDOW", self.close_editor)
         self.controller = RouteEditorController(
-            self.document.points, self.document.waypoint_actions
+            self.document.points, self.document.waypoint_actions,
+            self.document.segment_look_at, self.document.return_waypoint_actions,
         )
+        self.objects = ObjectBoxController(document.object_boxes)
+        self._boxing = False
+        self._box_create_armed = False
+        self._box_draw_start: tuple[int, int] | None = None
+        self._box_rectangle = None
+        self._box_numeric = ""
         self.map_points = self._aligned_map_points(map_points)
         center, radius = self._bounds(self.map_points[:, :3])
         self.view = OrthoView(center=center, radius=radius, zoom=1.0)
@@ -174,8 +248,14 @@ class RouteEditorWindow(tk.Toplevel):
         self._photo = None
         self._canvas_item = None
         self._redraw_pending = False
-        self._interacting = False
-        self._zoom_settle_after: str | None = None
+        self._render_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="route-cloud")
+        self._render_future = None
+        self._render_after = None
+        self._renderer = None
+        self._renderer_points = None
+        self._displayed_view = None
+        self._displayed_size = None
+        self._displayed_cloud = None
         self._nav_button: int | None = None
         self._nav_last: tuple[int, int] | None = None
         self._mouse = (0, 0)
@@ -209,6 +289,17 @@ class RouteEditorWindow(tk.Toplevel):
         self.mode_var = tk.StringVar()
         self.selection_var = tk.StringVar()
         self.marking_mode_var = tk.BooleanVar(value=False)
+        self.measurement_mode_var = tk.BooleanVar(value=False)
+        self.object_mode_var = tk.BooleanVar(value=False)
+        self.object_info_var = tk.StringVar()
+        self.look_at_start_var = tk.StringVar(value="1")
+        self.look_at_end_var = tk.StringVar(value="2")
+        self.look_at_object_var = tk.StringVar()
+        self.look_at_summary_var = tk.StringVar()
+        self._look_at_object_key: int | None = None
+        self.distance_scale_var = tk.StringVar()
+        self.measurement_var = tk.StringVar()
+        self.route_total_var = tk.StringVar()
         initial_status = (
             f"正在編輯 {route_path.name}；儲存後只會更新這條航線"
             if self._editing_current_route
@@ -301,10 +392,47 @@ class RouteEditorWindow(tk.Toplevel):
             body, bg="#121519", bd=0, highlightthickness=0, cursor="crosshair"
         )
         self.canvas.pack(side="left", fill="both", expand=True)
+        zoom_controls = ttk.Frame(self.canvas, style="RouteEditor.TFrame")
+        zoom_controls.place(relx=1.0, x=-12, y=12, anchor="ne")
+        self.zoom_in_button = ttk.Button(
+            zoom_controls,
+            text="＋",
+            width=3,
+            command=lambda: self._set_zoom(self.view.zoom * 1.12),
+        )
+        self.zoom_in_button.pack(pady=(0, 3))
+        self.zoom_out_button = ttk.Button(
+            zoom_controls,
+            text="－",
+            width=3,
+            command=lambda: self._set_zoom(self.view.zoom / 1.12),
+        )
+        self.zoom_out_button.pack()
 
-        side = ttk.Frame(body, width=300, style="RouteEditor.TFrame")
-        side.pack(side="right", fill="y")
-        side.pack_propagate(False)
+        side_host = ttk.Frame(body, width=320, style="RouteEditor.TFrame")
+        side_host.pack(side="right", fill="y")
+        side_host.pack_propagate(False)
+        self.sidebar_canvas = tk.Canvas(
+            side_host, bg="#1a1e23", bd=0, highlightthickness=0, width=300
+        )
+        sidebar_scroll = ttk.Scrollbar(
+            side_host, orient="vertical", command=self.sidebar_canvas.yview
+        )
+        sidebar_scroll.pack(side="right", fill="y")
+        self.sidebar_canvas.pack(side="left", fill="both", expand=True)
+        self.sidebar_canvas.configure(yscrollcommand=sidebar_scroll.set)
+        side = ttk.Frame(self.sidebar_canvas, style="RouteEditor.TFrame")
+        side_item = self.sidebar_canvas.create_window(0, 0, window=side, anchor="nw")
+        side.bind(
+            "<Configure>",
+            lambda _event: self.sidebar_canvas.configure(
+                scrollregion=self.sidebar_canvas.bbox("all")
+            ),
+        )
+        self.sidebar_canvas.bind(
+            "<Configure>",
+            lambda event: self.sidebar_canvas.itemconfigure(side_item, width=event.width),
+        )
         ttk.Label(
             side,
             textvariable=self.mode_var,
@@ -319,6 +447,113 @@ class RouteEditorWindow(tk.Toplevel):
             command=self.toggle_marking_mode,
         )
         self.marking_mode_button.pack(anchor="w", padx=12, pady=(0, 10))
+        objects = ttk.LabelFrame(side, text="物體長方體（不提供避障）")
+        objects.pack(fill="x", padx=12, pady=(0, 10))
+        self.object_mode_button = ttk.Checkbutton(
+            objects, text="物體框選模式", variable=self.object_mode_var,
+            command=self.toggle_object_mode,
+        )
+        self.object_mode_button.pack(anchor="w", padx=6, pady=(4, 2))
+        ttk.Button(
+            objects, text="新增長方體（拖曳框選）", command=self.arm_object_box,
+        ).pack(anchor="w", padx=6, pady=2)
+        ttk.Button(
+            objects, text="刪除選取長方體", command=self._delete_object_box,
+        ).pack(anchor="w", padx=6, pady=2)
+        ttk.Label(
+            objects, textvariable=self.object_info_var, style="RouteEditor.TLabel",
+            wraplength=260, justify="left",
+        ).pack(anchor="w", padx=6, pady=2)
+        ttk.Label(
+            objects,
+            text="G 平移／S 縮放，再按 X／Y／Z 鎖軸\n"
+                 "G Z 1：上移 1u；S X 2：X 長度加倍\n"
+                 "左鍵／Enter 確認；Esc／右鍵取消\n"
+                 "Ctrl+Z 復原；Ctrl+Shift+Z 重做\n"
+                 "可設定航段機頭朝向，不提供避障。",
+            style="RouteEditor.TLabel", wraplength=260, justify="left",
+        ).pack(anchor="w", padx=6, pady=(2, 6))
+        look_at = ttk.LabelFrame(side, text="航段機頭朝向物體")
+        look_at.pack(fill="x", padx=12, pady=(0, 10))
+        span = ttk.Frame(look_at)
+        span.pack(fill="x", padx=6, pady=4)
+        ttk.Label(span, text="航點", style="RouteEditor.TLabel").pack(side="left")
+        self.look_at_start_box = ttk.Combobox(
+            span, textvariable=self.look_at_start_var, state="readonly", width=4,
+        )
+        self.look_at_start_box.pack(side="left", padx=3)
+        ttk.Label(span, text="→", style="RouteEditor.TLabel").pack(side="left")
+        self.look_at_end_box = ttk.Combobox(
+            span, textvariable=self.look_at_end_var, state="readonly", width=4,
+        )
+        self.look_at_end_box.pack(side="left", padx=3)
+        self.look_at_object_box = ttk.Combobox(
+            look_at, textvariable=self.look_at_object_var, state="readonly", width=20,
+        )
+        self.look_at_object_box.pack(fill="x", padx=6, pady=2)
+        self.look_at_object_box.bind("<<ComboboxSelected>>", self._select_look_at_object)
+        self.look_at_apply_button = ttk.Button(
+            look_at, text="套用所選區間朝向", command=self._apply_look_at_range,
+        )
+        self.look_at_apply_button.pack(anchor="w", padx=6, pady=2)
+        self.look_at_clear_button = ttk.Button(
+            look_at, text="清除所選區間朝向",
+            command=lambda: self._apply_look_at_range(clear=True),
+        )
+        self.look_at_clear_button.pack(anchor="w", padx=6, pady=2)
+        ttk.Label(
+            look_at, textvariable=self.look_at_summary_var,
+            style="RouteEditor.TLabel", wraplength=260, justify="left",
+        ).pack(anchor="w", padx=6, pady=2)
+        ttk.Label(
+            look_at,
+            text="區間內移動時持續朝向長方體中心。\n"
+                 "只控制機頭水平朝向，不調整鏡頭。\n"
+                 "到點動作優先，只在去程朝向，返程維持一般航向。",
+            style="RouteEditor.TLabel", wraplength=260, justify="left",
+        ).pack(anchor="w", padx=6, pady=(2, 6))
+        measurement = ttk.LabelFrame(side, text="兩點量距（3D 直線）")
+        measurement.pack(fill="x", padx=12, pady=(0, 10))
+        self.measurement_mode_button = ttk.Checkbutton(
+            measurement, text="兩點量距模式", variable=self.measurement_mode_var,
+            command=self.toggle_measurement_mode,
+        )
+        self.measurement_mode_button.pack(anchor="w", padx=6, pady=(4, 2))
+        ttk.Button(
+            measurement, text="清除測量", command=self.clear_measurement
+        ).pack(anchor="w", padx=6, pady=2)
+        ttk.Label(
+            measurement, textvariable=self.distance_scale_var,
+            style="RouteEditor.TLabel", wraplength=260, justify="left",
+        ).pack(anchor="w", padx=6, pady=2)
+        ttk.Label(
+            measurement, textvariable=self.measurement_var,
+            style="RouteEditor.TLabel", wraplength=260, justify="left",
+        ).pack(anchor="w", padx=6, pady=(2, 6))
+        lengths = ttk.LabelFrame(side, text="完整路線航段（不閉合）")
+        lengths.pack(fill="x", padx=12, pady=(0, 10))
+        ttk.Label(
+            lengths, textvariable=self.route_total_var,
+            style="RouteEditor.TLabel", wraplength=260,
+        ).pack(anchor="w", padx=6, pady=4)
+        leg_rows = ttk.Frame(lengths)
+        leg_rows.pack(fill="x", padx=6, pady=(0, 6))
+        self.route_distance_list = tk.Listbox(
+            leg_rows, height=5, width=24, bg="#121519", fg="#f2f5f7",
+            activestyle="none", exportselection=False,
+        )
+        leg_scroll = ttk.Scrollbar(
+            leg_rows, orient="vertical", command=self.route_distance_list.yview
+        )
+        leg_scroll.pack(side="right", fill="y")
+        leg_horizontal = ttk.Scrollbar(
+            lengths, orient="horizontal", command=self.route_distance_list.xview
+        )
+        leg_horizontal.pack(fill="x", padx=6, pady=(0, 4))
+        self.route_distance_list.pack(side="left", fill="x", expand=True)
+        self.route_distance_list.configure(
+            yscrollcommand=leg_scroll.set, xscrollcommand=leg_horizontal.set
+        )
         discovery = ttk.LabelFrame(side, text="資料夾探索結果")
         discovery.pack(fill="x", padx=12, pady=(0, 10))
         ttk.Label(
@@ -340,7 +575,7 @@ class RouteEditorWindow(tk.Toplevel):
         ).pack(fill="x", padx=6, pady=(0, 6))
         point_row = ttk.Frame(arrive)
         point_row.pack(fill="x", padx=6, pady=(0, 6))
-        ttk.Label(point_row, text="選取點半徑", style="RouteEditor.TLabel").pack(side="left")
+        ttk.Label(point_row, text="全部航點半徑", style="RouteEditor.TLabel").pack(side="left")
         self.point_radius_box = ttk.Spinbox(
             point_row, from_=ARRIVE_RADIUS_MIN_U, to=ARRIVE_RADIUS_MAX_U,
             increment=0.001, textvariable=self.point_radius_var, width=7,
@@ -358,6 +593,15 @@ class RouteEditorWindow(tk.Toplevel):
         self.action_list_var = tk.StringVar()
         ttk.Label(actions, textvariable=self.action_list_var, style="RouteEditor.TLabel",
                   justify="left", wraplength=260).pack(anchor="w", padx=6, pady=(4, 2))
+        direction_row = ttk.Frame(actions)
+        direction_row.pack(fill="x", padx=6, pady=(2, 0))
+        self.action_direction_var = tk.StringVar(value="out")
+        ttk.Label(direction_row, text="設定哪一趟：", style="RouteEditor.TLabel").pack(side="left")
+        for direction_label, direction_value in (("去程", "out"), ("回程", "back")):
+            ttk.Radiobutton(
+                direction_row, text=direction_label, value=direction_value,
+                variable=self.action_direction_var, command=self._sync_action_list,
+            ).pack(side="left", padx=6)
         yaw_row = ttk.Frame(actions)
         yaw_row.pack(fill="x", padx=6, pady=2)
         self.action_degrees_var = tk.StringVar(value="30")
@@ -376,6 +620,15 @@ class RouteEditorWindow(tk.Toplevel):
         ttk.Label(hover_row, text="秒", style="RouteEditor.TLabel").pack(side="left", padx=(2, 6))
         ttk.Button(hover_row, text="懸停", width=5,
                    command=self._add_hover_action).pack(side="left", padx=2)
+        camera_row = ttk.Frame(actions)
+        camera_row.pack(fill="x", padx=6, pady=2)
+        self.action_pitch_var = tk.StringVar(value="-20")
+        ttk.Spinbox(camera_row, from_=-90, to=90, increment=5, width=5,
+                    textvariable=self.action_pitch_var).pack(side="left")
+        ttk.Button(camera_row, text="鏡頭俯仰°", width=10,
+                   command=self._add_gimbal_pitch_action).pack(side="left", padx=2)
+        ttk.Label(actions, text="鏡頭絕對角度：負向下／正向上／0 水平",
+                  style="RouteEditor.TLabel").pack(anchor="w", padx=6, pady=2)
         ttk.Button(actions, text="刪除最後一個動作",
                    command=self._remove_last_action).pack(anchor="w", padx=6, pady=(2, 6))
         ttk.Label(
@@ -395,13 +648,24 @@ class RouteEditorWindow(tk.Toplevel):
             "  Enter：進入第二階段\n\n"
             "第二階段：逐點調整位置\n"
             "  左鍵：選取航點\n"
-            "  航點動作：到點後轉向／懸停，再轉往下一點\n"
+            "  航點動作：到點後轉向／懸停／鏡頭俯仰，再轉往下一點\n"
+            "  動作可分去程／回程各自設定（第一點與最後一點沒有回程動作）\n"
             "  G：開始平移\n"
             "  G 後 X / Y / Z：鎖定軸向\n"
             "  左鍵／Enter：確認，Esc：取消\n"
             "  Delete：刪除航點\n"
             "  Ctrl+Z：復原\n"
             "  Ctrl+Shift+Z：重做\n\n"
+            "物體長方體\n"
+            "  開啟物體框選模式，拖曳粗框點雲\n"
+            "  點框線／中心選取，G 平移、S 縮放\n"
+            "  G／S 後 X／Y／Z：限制單軸\n"
+            "  可輸入位移（u）／縮放倍數\n"
+            "  與路線儲存，可設定航段機頭朝向\n\n"
+            "量距\n"
+            "  開啟兩點量距，單擊點雲／航點選 A、B\n"
+            "  第三次單擊開始下一組；Esc 清除並離開\n"
+            "  公尺以場域尺度換算，估算非實測標定\n\n"
             "視角\n"
             "  左鍵拖曳：旋轉\n"
             "  左鍵雙擊：切換地圖中心\n"
@@ -418,6 +682,7 @@ class RouteEditorWindow(tk.Toplevel):
             justify="left",
             wraplength=275,
         ).pack(anchor="w", padx=12)
+        self._bind_sidebar_scroll(side)
 
         status = tk.Label(
             self,
@@ -450,6 +715,20 @@ class RouteEditorWindow(tk.Toplevel):
             self._set_zoom,
         )
 
+    def _bind_sidebar_scroll(self, widget) -> None:
+        """Keep every sidebar control reachable without stealing map zoom."""
+        if widget is not self.route_distance_list:
+            widget.bind("<MouseWheel>", self._scroll_sidebar, add="+")
+            widget.bind("<Button-4>", self._scroll_sidebar, add="+")
+            widget.bind("<Button-5>", self._scroll_sidebar, add="+")
+        for child in widget.winfo_children():
+            self._bind_sidebar_scroll(child)
+
+    def _scroll_sidebar(self, event) -> str:
+        up = getattr(event, "num", None) == 4 or getattr(event, "delta", 0) > 0
+        self.sidebar_canvas.yview_scroll(-3 if up else 3, "units")
+        return "break"
+
     def _signature(self) -> tuple:
         points = tuple(
             tuple(float(value) for value in point) for point in self.controller.points
@@ -459,6 +738,10 @@ class RouteEditorWindow(tk.Toplevel):
             float(self.arrive_radius_var.get()),
             tuple(self.document.waypoint_arrive_radii or ()),
             repr(self.controller.actions),
+            repr(self.controller.return_actions),
+            repr(self.objects.boxes),
+            tuple(self.controller.segment_look_at),
+            tuple(self.objects.keys),
         )
 
     def _refresh_labels(self) -> None:
@@ -492,6 +775,12 @@ class RouteEditorWindow(tk.Toplevel):
         self.marking_mode_button.configure(
             state="normal" if self.controller.phase == "layout" else "disabled"
         )
+        self.measurement_mode_var.set(self._measuring)
+        self.measurement_mode_button.configure(
+            state="disabled" if self._asset_loading or self.controller.moving else "normal"
+        )
+        self._refresh_distance_labels()
+        self._refresh_object_labels()
         self.save_button.configure(
             state="disabled" if self._asset_loading else "normal"
         )
@@ -510,62 +799,106 @@ class RouteEditorWindow(tk.Toplevel):
         if self._redraw_pending or self._closed:
             return
         self._redraw_pending = True
-        self.after_idle(self._redraw)
+        # One active frame plus one latest-view request, never a drag-event backlog.
+        if self._render_future is None:
+            self._render_after = self.after(16, self._redraw)
+
+    def _render_cloud(self, points, view, width, height):
+        if self._renderer_points is not points:
+            self._renderer = PointCloudRenderer(points)
+            self._renderer_points = points
+        return self._renderer.render(view, width, height)
 
     def _redraw(self) -> None:
-        self._redraw_pending = False
+        self._render_after = None
         if self._closed:
             return
-        width = max(320, self.canvas.winfo_width())
-        height = max(240, self.canvas.winfo_height())
-        arr = np.empty((height, width, 3), dtype=np.uint8)
-        arr[:] = _BG
-        limit = _DRAW_POINTS_INTERACTIVE if self._interacting else _DRAW_POINTS_STATIC
-        step = max(1, len(self.map_points) // max(1, limit))
-        points = self.map_points[::step]
-        if len(points):
-            sx, sy, depth = self.view.project(points[:, :3], width, height)
-            ix = sx.astype(int)
-            iy = sy.astype(int)
-            inside = (ix >= 0) & (ix < width) & (iy >= 0) & (iy < height)
-            order = np.argsort(depth[inside])
-            arr[iy[inside][order], ix[inside][order]] = np.clip(
-                points[:, 3:6][inside][order], 0, 255
-            ).astype(np.uint8)
-        image = Image.fromarray(arr, "RGB")
-        draw = ImageDraw.Draw(image, "RGBA")
-        self._draw_axes(draw, width, height)
-        self._draw_route(draw, width, height)
-        photo = ImageTk.PhotoImage(image)
-        self._photo = photo
-        if self._canvas_item is None:
-            self._canvas_item = self.canvas.create_image(0, 0, image=photo, anchor="nw")
+        self._redraw_pending = False
+        width, height = self._canvas_size()
+        view = replace(self.view, center=self.view.center.copy())
+        points = self.map_points
+        self._render_future = self._render_executor.submit(
+            self._render_cloud, points, view, width, height
+        )
+        self._render_after = self.after(
+            8, lambda: self._poll_render(view, points, width, height)
+        )
+
+    def _poll_render(self, view, points, width, height) -> None:
+        self._render_after = None
+        if self._closed:
+            return
+        if not self._render_future.done():
+            self._render_after = self.after(
+                8, lambda: self._poll_render(view, points, width, height)
+            )
+            return
+        future = self._render_future
+        self._render_future = None
+        try:
+            arr = future.result()
+        except Exception as exc:
+            self.status_var.set(f"完整點雲繪製失敗：{exc}")
         else:
-            self.canvas.itemconfigure(self._canvas_item, image=photo)
-    def _draw_axes(self, draw: ImageDraw.ImageDraw, width: int, height: int) -> None:
-        origin = self.view.center
-        size = self.view.radius * 0.16
+            if points is self.map_points:
+                image = Image.fromarray(arr)
+                draw = ImageDraw.Draw(image, "RGBA")
+                self._draw_axes(draw, width, height, view)
+                self._draw_route(draw, width, height, view)
+                self._draw_measurement(draw, width, height, view)
+                self._draw_object_boxes(draw, width, height, view)
+                photo = ImageTk.PhotoImage(image)
+                self._photo = photo
+                self._displayed_view = view
+                self._displayed_size = (width, height)
+                self._displayed_cloud = points
+                if self._canvas_item is None:
+                    self._canvas_item = self.canvas.create_image(0, 0, image=photo, anchor="nw")
+                else:
+                    self.canvas.itemconfigure(self._canvas_item, image=photo)
+        if self._redraw_pending:
+            self._render_after = self.after_idle(self._redraw)
+
+    def _draw_axes(
+        self, draw: ImageDraw.ImageDraw, width: int, height: int, view: OrthoView | None = None
+    ) -> None:
+        view = self.view if view is None else view
+        origin = view.center
+        size = view.radius * 0.16
         points = np.vstack((origin, origin + np.eye(3) * size))
-        sx, sy, _ = self.view.project(points, width, height)
+        sx, sy, _ = view.project(points, width, height)
         for axis, label in enumerate(("X", "Y", "Z")):
             draw.line(
                 (sx[0], sy[0], sx[axis + 1], sy[axis + 1]), fill=_AXIS[axis], width=3
             )
             draw.text((sx[axis + 1] + 4, sy[axis + 1] + 3), label, fill=_AXIS[axis])
 
-    def _draw_route(self, draw: ImageDraw.ImageDraw, width: int, height: int) -> None:
+    def _draw_route(
+        self, draw: ImageDraw.ImageDraw, width: int, height: int, view: OrthoView | None = None
+    ) -> None:
+        view = self.view if view is None else view
         if not self.controller.points:
             return
-        sx, sy, _ = self.view.project(self.controller.points, width, height)
+        sx, sy, _ = view.project(self.controller.points, width, height)
         projected = list(zip(sx.tolist(), sy.tolist()))
         if len(projected) > 1:
             draw.line(projected, fill=_ROUTE, width=3, joint="curve")
+            for index, target in enumerate(self.controller.segment_look_at):
+                if target is None or target not in self.objects.keys:
+                    continue
+                first, second = projected[index], projected[index + 1]
+                draw.line((first, second), fill="#70e5ff", width=4)
+                object_index = self.objects.keys.index(target)
+                draw.text(
+                    ((first[0] + second[0]) * 0.5 + 4, (first[1] + second[1]) * 0.5 - 14),
+                    f"B{object_index + 1}", fill="#70e5ff",
+                )
         if self.show_arrive_var.get():
             # The arrival sphere in MAP units, drawn at the view's own scale so
             # what the operator confirms here is what the controller will use.
             # Per-point drawn values win where the operator set them.
             width_px, height_px = width, height
-            unit = self.view.scale(width_px, height_px)
+            unit = view.scale(width_px, height_px)
             for index, (x, y) in enumerate(projected):
                 pixels = self._point_radius_for(index) * unit
                 if pixels < 1.0:
@@ -576,7 +909,6 @@ class RouteEditorWindow(tk.Toplevel):
                     outline=_ARRIVE,
                     width=2,
                 )
-        actions = getattr(self.controller, "actions", None) or []
         for index, (x, y) in enumerate(projected):
             selected = index == self.controller.selected
             radius = 8 if selected else 6
@@ -586,11 +918,485 @@ class RouteEditorWindow(tk.Toplevel):
                 fill=fill,
                 outline="white",
             )
-            label = str(index + 1)
-            if index < len(actions) and actions[index]:
-                # ASCII only: PIL's default bitmap font has no CJK glyphs.
-                label += " [" + " ".join(_action_marker(a) for a in actions[index]) + "]"
+            label = _waypoint_label(self.controller, index)
             draw.text((x + radius + 3, y - radius - 2), label, fill="white")
+
+    def _draw_object_boxes(self, draw, width, height, view) -> None:
+        for index, box in enumerate(self.objects.boxes):
+            sx, sy, _ = view.project(box_corners(box), width, height)
+            color = _SELECTED if self._boxing and index == self.objects.selected else "#70e5ff"
+            for first, second in _BOX_EDGES:
+                draw.line((sx[first], sy[first], sx[second], sy[second]), fill=color, width=2)
+            cx, cy, _ = view.project([box["center"]], width, height)
+            x, y = float(cx[0]), float(cy[0])
+            draw.ellipse((x - 4, y - 4, x + 4, y + 4), fill=color, outline="white")
+            draw.text((x + 8, y - 14), f"Box {index + 1}", fill=color)
+
+    def _refresh_object_labels(self) -> None:
+        self.object_mode_var.set(self._boxing)
+        self.object_mode_button.configure(
+            state="disabled" if self._asset_loading or self.controller.moving
+            or self._measurement_move_start is not None else "normal"
+        )
+        index = self.objects.selected
+        if index is None:
+            text = f"長方體數：{len(self.objects.boxes)}；未選取\n點框線／中心選取；新增時左鍵拖曳"
+        else:
+            box = self.objects.boxes[index]
+            x, y, z = box["center"]
+            length, width, height = box["size"]
+            text = (
+                f"長方體 {index + 1}／{len(self.objects.boxes)}\n"
+                f"中心 X {x:.4f}　Y {y:.4f}　Z {z:.4f}\n"
+                f"長 X {length:.4f}u\n寬 Y {width:.4f}u\n高 Z {height:.4f}u"
+            )
+        self.object_info_var.set(text)
+        self._refresh_look_at_controls()
+
+    def _refresh_look_at_controls(self) -> None:
+        count = len(self.controller.points)
+        self.look_at_start_box.configure(values=[str(index) for index in range(1, count)])
+        self.look_at_end_box.configure(values=[str(index) for index in range(2, count + 1)])
+        try:
+            start, end = int(self.look_at_start_var.get()), int(self.look_at_end_var.get())
+        except ValueError:
+            start, end = 1, 2
+        if not 1 <= start < count:
+            self.look_at_start_var.set("1" if count >= 2 else "")
+        if not 2 <= end <= count:
+            self.look_at_end_var.set("2" if count >= 2 else "")
+        self.look_at_object_box.configure(
+            values=[f"長方體 {index + 1}" for index in range(len(self.objects.boxes))],
+        )
+        if self._look_at_object_key not in self.objects.keys:
+            selected = self.objects.selected
+            self._look_at_object_key = (
+                self.objects.keys[selected] if selected is not None else
+                self.objects.keys[0] if self.objects.keys else None
+            )
+        if self._look_at_object_key is None:
+            self.look_at_object_var.set("")
+        else:
+            self.look_at_object_var.set(f"長方體 {self.objects.keys.index(self._look_at_object_key) + 1}")
+        editing = self._asset_loading or self.controller.moving or self.objects.transforming
+        editing = editing or self._measurement_move_start is not None or self._box_draw_start is not None
+        enabled = count >= 2 and not editing
+        self.look_at_apply_button.configure(
+            state="normal" if enabled and self.objects.boxes else "disabled",
+        )
+        self.look_at_clear_button.configure(state="normal" if enabled else "disabled")
+        lines = []
+        links = self.controller.segment_look_at
+        start = 0
+        while start < len(links):
+            target = links[start]
+            end = start + 1
+            while end < len(links) and links[end] == target:
+                end += 1
+            if target is not None and target in self.objects.keys:
+                ordinal = self.objects.keys.index(target) + 1
+                lines.append(f"航點 {start + 1} → {end + 1}：長方體 {ordinal}")
+            start = end
+        self.look_at_summary_var.set("\n".join(lines) if lines else "未設定區間，維持原本航向")
+
+    def _select_look_at_object(self, _event=None) -> None:
+        index = self.look_at_object_box.current()
+        if 0 <= index < len(self.objects.keys):
+            self._look_at_object_key = self.objects.keys[index]
+            self.objects.selected = index
+            self._refresh_object_labels()
+            self.request_redraw()
+
+    def _apply_look_at_range(self, *, clear: bool = False) -> None:
+        if (
+            self._asset_loading or self.controller.moving or self.objects.transforming
+            or self._measurement_move_start is not None or self._box_draw_start is not None
+        ):
+            self.status_var.set("請先確認或取消編輯，並等待地圖載入完成")
+            return
+        target = None if clear else self._look_at_object_key
+        if not clear and target not in self.objects.keys:
+            self.status_var.set("請先建立並選擇一個長方體")
+            return
+        try:
+            start = int(self.look_at_start_var.get()) - 1
+            end = int(self.look_at_end_var.get()) - 1
+            self.controller.set_look_at_range(start, end, target)
+        except ValueError as exc:
+            self.status_var.set(f"航點區間未套用：{exc}")
+            return
+        self.status_var.set(
+            f"已清除航點 {start + 1} → {end + 1} 的朝向設定" if clear else
+            f"航點 {start + 1} → {end + 1} 移動時，持續朝向長方體中心；請儲存路線"
+        )
+        self._refresh_labels()
+        self.request_redraw()
+        self.canvas.focus_set()
+
+    def _repair_look_at_references(self) -> None:
+        if self.controller.discard_missing_look_at(self.objects.keys):
+            self.status_var.set("復原後有物體框已不存在，已清除其航段朝向設定，未改指向其他物體")
+
+    def toggle_object_mode(self) -> None:
+        if self._asset_loading or self.controller.moving or self._measurement_move_start is not None:
+            self.object_mode_var.set(self._boxing)
+            self.status_var.set("請先確認或取消移動，並等待地圖載入完成")
+            return
+        if self.objects.transforming or self._box_draw_start is not None:
+            self.object_mode_var.set(self._boxing)
+            self.status_var.set("請先確認或取消長方體編輯")
+            return
+        self._cancel_pending_single_click()
+        self._boxing = bool(self.object_mode_var.get())
+        self._box_create_armed = self._boxing and not self.objects.boxes
+        if self._boxing:
+            self._measuring = False
+            self.controller.set_placement_enabled(False)
+        self.status_var.set(
+            "物體框選：左鍵拖曳粗框點雲" if self._box_create_armed else
+            "物體框選：點框線／中心選取，G 平移、S 縮放" if self._boxing else
+            "已離開物體框選；長方體標註仍保留"
+        )
+        self._refresh_labels()
+        self.request_redraw()
+        self.canvas.focus_set()
+
+    def arm_object_box(self) -> None:
+        if self.objects.transforming or self._box_draw_start is not None:
+            self.status_var.set("請先確認或取消長方體編輯")
+            return
+        self.object_mode_var.set(True)
+        self.toggle_object_mode()
+        if self._boxing and not self._asset_loading and not self.controller.moving:
+            self._box_create_armed = True
+            self.status_var.set("左鍵拖曳框住物體點雲；會以框內點雲估計長寬高，再用 G／S 調整")
+
+    def _clear_object_rectangle(self) -> None:
+        if self._box_rectangle is not None:
+            self.canvas.delete(self._box_rectangle)
+        self._box_rectangle = None
+        self._box_draw_start = None
+
+    def _create_object_from_rectangle(self, start, end) -> None:
+        if not pointer_is_drag(start, end):
+            self.status_var.set("請左鍵拖曳出範圍；Esc 取消新增")
+            return
+        if self._displayed_cloud is not self.map_points or self._displayed_view is None:
+            self.status_var.set("請等待目前點雲顯示完成，再框選")
+            return
+        width, height = self._displayed_size
+        sx, sy, _ = self._displayed_view.project(self.map_points[:, :3], width, height)
+        x0, x1 = sorted((start[0], end[0]))
+        y0, y1 = sorted((start[1], end[1]))
+        inside = (sx >= x0) & (sx <= x1) & (sy >= y0) & (sy <= y1)
+        points = self.map_points[inside, :3]
+        points = points[np.isfinite(points).all(axis=1)]
+        if not len(points):
+            self.status_var.set("框內沒有點雲，未建立長方體；請重新框選")
+            return
+        lo, hi = points.min(axis=0), points.max(axis=0)
+        center = (lo + hi) * 0.5
+        size = np.maximum(hi - lo, self.view.radius * 0.01)
+        self.objects.add_bounds(center - size * 0.5, center + size * 0.5)
+        self._box_create_armed = False
+        self.status_var.set("已建立長方體；G 平移，S 縮放，接 X／Y／Z 調整單軸。框內背景點也會納入")
+        self._refresh_object_labels()
+        self.request_redraw()
+
+    def _nearest_object_box(self, x, y) -> int | None:
+        view = self._displayed_view or self.view
+        width, height = self._displayed_size or self._canvas_size()
+        pointer = np.array([x, y], dtype=float)
+        best, selected = 14.0 ** 2, None
+        for index, box in enumerate(self.objects.boxes):
+            sx, sy, _ = view.project(box_corners(box), width, height)
+            projected = np.column_stack((sx, sy))
+            cx, cy, _ = view.project([box["center"]], width, height)
+            distance = float((cx[0] - x) ** 2 + (cy[0] - y) ** 2)
+            for first, second in _BOX_EDGES:
+                a, b = projected[first], projected[second]
+                edge = b - a
+                denominator = float(edge @ edge)
+                fraction = 0.0 if denominator < 1e-9 else float(
+                    np.clip((pointer - a) @ edge / denominator, 0.0, 1.0)
+                )
+                offset = pointer - (a + fraction * edge)
+                distance = min(distance, float(offset @ offset))
+            if distance <= best:
+                best, selected = distance, index
+        return selected
+
+    def _begin_object_transform(self, operation: str) -> None:
+        if self._box_create_armed or self._box_draw_start is not None:
+            self.status_var.set("請先完成框選或按 Esc 取消新增")
+            return
+        self._cancel_pending_single_click()
+        if not self.objects.begin(operation):
+            self.status_var.set("請先點框線／中心選取長方體")
+            return
+        self._move_mouse_start = self._mouse
+        self._box_numeric = ""
+        self._object_transform_status()
+
+    def _object_transform_status(self) -> None:
+        action = "平移" if self.objects.operation == "g" else "縮放"
+        axis = "自由" if self.objects.axis is None else "XYZ"[self.objects.axis] + " 軸"
+        number = f"；輸入 {self._box_numeric}" if self._box_numeric else ""
+        self.status_var.set(f"長方體{action}：{axis}{number}；左鍵／Enter 確認，Esc／右鍵取消")
+
+    def _preview_object_transform(self) -> bool:
+        width, height = self._canvas_size()
+        try:
+            if self._box_numeric:
+                value = float(self._box_numeric)
+                if not math.isfinite(value):
+                    raise ValueError("數值必須有限")
+                if self.objects.operation == "g":
+                    if self.objects.axis is None:
+                        raise ValueError("數字位移請先按 X／Y／Z 選軸")
+                    delta = np.zeros(3)
+                    delta[self.objects.axis] = value
+                    self.objects.preview(delta=delta)
+                else:
+                    self.objects.preview(factor=value)
+            elif self.objects.operation == "g":
+                dx = self._mouse[0] - self._move_mouse_start[0]
+                dy = self._mouse[1] - self._move_mouse_start[1]
+                delta = self.view.screen_delta_to_world(dx, dy, width, height, self.objects.axis)
+                self.objects.preview(delta=delta)
+            else:
+                box = self.objects.boxes[self.objects.selected]
+                sx, sy, _ = self.view.project([box["center"]], width, height)
+                center = np.array([sx[0], sy[0]])
+                distance = float(np.linalg.norm(np.asarray(self._move_mouse_start) - center))
+                current = float(np.linalg.norm(np.asarray(self._mouse) - center))
+                self.objects.preview(factor=max(1e-6, 1.0 + (current - distance) / max(20.0, distance)))
+        except (ValueError, OverflowError) as exc:
+            self.status_var.set(f"長方體數值未套用：{exc}；Backspace 修改，Esc 取消")
+            return False
+        self._refresh_object_labels()
+        self.request_redraw()
+        self._object_transform_status()
+        return True
+
+    def _finish_object_transform(self) -> None:
+        if self._box_numeric and not self._preview_object_transform():
+            return
+        self.objects.confirm()
+        self._box_numeric = ""
+        self.status_var.set("已確認長方體變換；儲存路線會一併保留標註")
+        self._refresh_object_labels()
+        self.request_redraw()
+
+    def _delete_object_box(self) -> None:
+        if not self._boxing:
+            self.status_var.set("請先開啟物體框選模式並選取長方體")
+            return
+        if self.objects.transforming or self._box_draw_start is not None:
+            self.status_var.set("請先確認或取消長方體編輯")
+            return
+        selected = self.objects.selected
+        if selected is not None and self.objects.keys[selected] in self.controller.segment_look_at:
+            self.status_var.set("這個長方體正被航段朝向使用；請先清除相關區間設定再刪除")
+            return
+        if self.objects.delete_selected():
+            self.status_var.set("已刪除選取長方體；航點未變更")
+            self._refresh_object_labels()
+            self.request_redraw()
+        self.canvas.focus_set()
+
+    def _object_escape(self) -> None:
+        if self.objects.transforming:
+            self.objects.cancel()
+            self._box_numeric = ""
+            self.status_var.set("已還原長方體；仍在物體框選模式")
+        elif self._box_create_armed:
+            dragging = self._box_draw_start is not None
+            self._clear_object_rectangle()
+            self._box_create_armed = False
+            self._suppress_left_release = dragging
+            self.status_var.set("已取消新增；可點選既有長方體")
+        else:
+            self.object_mode_var.set(False)
+            self.toggle_object_mode()
+        self._refresh_object_labels()
+        self.request_redraw()
+
+    def _object_undo_redo(self, shift: bool) -> None:
+        if self._box_draw_start is not None:
+            self._clear_object_rectangle()
+            self._suppress_left_release = True
+        changed = self.objects.redo() if shift else self.objects.undo()
+        self._box_numeric = ""
+        if changed:
+            self.status_var.set("已重做長方體編輯" if shift else "已復原長方體編輯")
+            self._repair_look_at_references()
+            self._refresh_object_labels()
+            self.request_redraw()
+
+    def _object_numeric_key(self, event, key: str) -> None:
+        char = getattr(event, "char", "")
+        if key == "backspace":
+            self._box_numeric = self._box_numeric[:-1]
+            self._preview_object_transform()
+        elif char and char in "0123456789.-+":
+            self._box_numeric += char
+            self._preview_object_transform()
+
+    def _on_object_key(self, event, key, ctrl, shift) -> str:
+        if key == "escape":
+            self._object_escape()
+        elif ctrl and key == "z":
+            self._object_undo_redo(shift)
+        elif not ctrl and key in {"g", "s"} and not self.objects.transforming:
+            self._begin_object_transform(key)
+        elif key in {"x", "y", "z"} and self.objects.transforming:
+            self.objects.constrain({"x": 0, "y": 1, "z": 2}[key])
+            self._preview_object_transform()
+        elif key in {"return", "kp_enter"} and self.objects.transforming:
+            self._finish_object_transform()
+        elif key == "delete":
+            self._delete_object_box()
+        elif self.objects.transforming and not ctrl:
+            self._object_numeric_key(event, key)
+        return "break"
+
+    def _draw_measurement(
+        self, draw: ImageDraw.ImageDraw, width: int, height: int, view: OrthoView
+    ) -> None:
+        if not self.measurement_points:
+            return
+        sx, sy, _ = view.project(self.measurement_points, width, height)
+        projected = list(zip(sx.tolist(), sy.tolist()))
+        if len(projected) == 2:
+            draw.line(projected, fill="#70e5ff", width=3)
+        for index, (label, (x, y)) in enumerate(zip(("A", "B"), projected)):
+            fill = _SELECTED if index == self._measurement_selected else "#70e5ff"
+            draw.ellipse((x - 7, y - 7, x + 7, y + 7), fill=fill, outline="white")
+            draw.text((x + 10, y - 12), label, fill=fill)
+
+    def _format_distance(self, units: float, meters: float | None) -> str:
+        if meters is None:
+            return f"{units:.4f} u｜公尺不可用"
+        prefix = "估算 " if self.distance_scale.estimated else ""
+        return f"{units:.4f} u｜{prefix}{meters:.3f} m"
+
+    def _refresh_distance_labels(self) -> None:
+        scale = self.distance_scale
+        if scale is None:
+            self.distance_scale_var.set("尺度未取得；僅顯示地圖單位 u，公尺不可用")
+        else:
+            kind = "估算（非實測標定）" if scale.estimated else "標定"
+            details = f"尺度 {scale.m_per_unit:.6g} m/u｜{kind}\n來源：{scale.source}"
+            if scale.uncertainty_relative is not None:
+                details += f"\n尺度分散參考：±{scale.uncertainty_relative:.1%}（非精度保證）"
+            self.distance_scale_var.set(details)
+        self.measurement_distance_u = None
+        self.measurement_distance_m = None
+        if len(self.measurement_points) == 2:
+            first, second = self.measurement_points
+            self.measurement_distance_u = math.dist(first, second)
+            if scale is not None:
+                self.measurement_distance_m = scale.distance_m(first, second)
+            self.measurement_var.set(
+                "A → B：" + self._format_distance(
+                    self.measurement_distance_u, self.measurement_distance_m
+                )
+            )
+        else:
+            self.measurement_var.set(
+                "已選 A，請單擊選 B" if self.measurement_points
+                else "開啟量距後單擊選 A、B；第三點開始新一組"
+            )
+        points = self.controller.points
+        self.route_segment_distances_u = [
+            math.dist(first, second) for first, second in zip(points, points[1:])
+        ]
+        self.route_segment_distances_m = (
+            None if scale is None else scale.route_segment_distances(points)
+        )
+        self.route_total_u = sum(self.route_segment_distances_u)
+        self.route_total_m = (
+            None if self.route_segment_distances_m is None
+            else sum(self.route_segment_distances_m)
+        )
+        self.route_total_var.set(
+            "總長：" + self._format_distance(self.route_total_u, self.route_total_m)
+        )
+        scroll = self.route_distance_list.yview()[0]
+        self.route_distance_list.delete(0, "end")
+        for index, units in enumerate(self.route_segment_distances_u):
+            meters = (
+                None if self.route_segment_distances_m is None
+                else self.route_segment_distances_m[index]
+            )
+            self.route_distance_list.insert(
+                "end", f"{index + 1} → {index + 2}：" + self._format_distance(units, meters)
+            )
+        self.route_distance_list.yview_moveto(scroll)
+
+    def toggle_measurement_mode(self) -> None:
+        if self.objects.transforming or self._box_draw_start is not None:
+            self.measurement_mode_var.set(self._measuring)
+            self.status_var.set("請先確認或取消長方體編輯")
+            return
+        if self.controller.moving or self._measurement_move_start is not None:
+            self.measurement_mode_var.set(self._measuring)
+            self.status_var.set("請先確認或取消球體移動，再切換量距模式")
+            return
+        self._cancel_pending_single_click()
+        self._measuring = bool(self.measurement_mode_var.get())
+        if self._measuring:
+            self._boxing = False
+            self._box_create_armed = False
+            self.controller.set_placement_enabled(False)
+        self.status_var.set(
+            "兩點量距：單擊選 A／B，點測量球後 G、X／Y／Z 移動；Esc 取消／離開"
+            if self._measuring else "已離開兩點量距模式"
+        )
+        self._refresh_labels()
+        self.canvas.focus_set()
+
+    def clear_measurement(self) -> None:
+        self._cancel_pending_single_click()
+        self.measurement_points.clear()
+        self._measurement_selected = None
+        self._measurement_move_start = None
+        self._measurement_move_axis = None
+        self._refresh_distance_labels()
+        self.request_redraw()
+
+    def _measure_at(self, x: int, y: int) -> None:
+        if self.measurement_points:
+            view = self.__dict__.get("_displayed_view") or self.view
+            width, height = self.__dict__.get("_displayed_size") or self._canvas_size()
+            sx, sy, _ = view.project(self.measurement_points, width, height)
+            distance = (sx - x) ** 2 + (sy - y) ** 2
+            index = int(np.argmin(distance))
+            if float(distance[index]) <= 14.0 ** 2:
+                self._measurement_selected = index
+                self.status_var.set(f"已選測量球 {'AB'[index]}；按 G，再用 X／Y／Z 鎖軸移動")
+                self.request_redraw()
+                return
+        selected = self._nearest_waypoint(x, y)
+        point = (
+            self.controller.points[selected] if selected is not None
+            else self._nearest_cloud(x, y)
+        )
+        if point is None:
+            self.status_var.set("游標附近沒有點雲或航點，測量點未變更")
+            return
+        if len(self.measurement_points) == 2:
+            self.measurement_points.clear()
+        self.measurement_points.append([float(value) for value in point])
+        self._measurement_selected = len(self.measurement_points) - 1
+        self.status_var.set(
+            "已選 A，請單擊選 B" if len(self.measurement_points) == 1
+            else "已完成 A → B 量距；點測量球可用 G 移動，點其他位置開始新一組"
+        )
+        self._refresh_distance_labels()
+        self.request_redraw()
+
 
     def _canvas_size(self) -> tuple[int, int]:
         return max(320, self.canvas.winfo_width()), max(240, self.canvas.winfo_height())
@@ -598,8 +1404,11 @@ class RouteEditorWindow(tk.Toplevel):
     def _nearest_cloud(self, x: float, y: float, threshold: float = 20.0):
         if not len(self.map_points):
             return None
-        width, height = self._canvas_size()
-        sx, sy, depth = self.view.project(self.map_points[:, :3], width, height)
+        if "_displayed_cloud" in self.__dict__ and self._displayed_cloud is not self.map_points:
+            return None
+        view = self.__dict__.get("_displayed_view") or self.view
+        width, height = self.__dict__.get("_displayed_size") or self._canvas_size()
+        sx, sy, depth = view.project(self.map_points[:, :3], width, height)
         distance = (sx - x) ** 2 + (sy - y) ** 2
         candidates = np.flatnonzero(distance <= threshold * threshold)
         if not len(candidates):
@@ -610,8 +1419,9 @@ class RouteEditorWindow(tk.Toplevel):
     def _nearest_waypoint(self, x: float, y: float, threshold: float = 28.0):
         if not self.controller.points:
             return None
-        width, height = self._canvas_size()
-        sx, sy, _ = self.view.project(self.controller.points, width, height)
+        view = self.__dict__.get("_displayed_view") or self.view
+        width, height = self.__dict__.get("_displayed_size") or self._canvas_size()
+        sx, sy, _ = view.project(self.controller.points, width, height)
         distance = (sx - x) ** 2 + (sy - y) ** 2
         index = int(np.argmin(distance))
         return index if float(distance[index]) <= threshold * threshold else None
@@ -619,6 +1429,22 @@ class RouteEditorWindow(tk.Toplevel):
     def on_left_press(self, event) -> str:
         self.canvas.focus_set()
         self._mouse = (int(event.x), int(event.y))
+        if self._boxing:
+            self._cancel_pending_single_click()
+            if self.objects.transforming:
+                self._finish_object_transform()
+                self._left_confirmed_move = True
+                return "break"
+            if self._box_create_armed:
+                self._box_draw_start = self._mouse
+                self._box_rectangle = self.canvas.create_rectangle(
+                    *self._mouse, *self._mouse, outline="#70e5ff", width=2, dash=(6, 3),
+                )
+                return "break"
+        if self._measuring and self._measurement_move_start is not None:
+            self._handle_enter()
+            self._left_confirmed_move = True
+            return "break"
         if self.controller.moving:
             self.controller.confirm_move()
             self.status_var.set("已確認航點移動；按「儲存路線」即可更新正式航線")
@@ -633,8 +1459,15 @@ class RouteEditorWindow(tk.Toplevel):
         return "break"
 
     def on_left_drag(self, event) -> str:
+        if self._box_draw_start is not None:
+            self.canvas.coords(self._box_rectangle, *self._box_draw_start, event.x, event.y)
+            return "break"
+        if self.objects.transforming:
+            self.on_motion(event)
+            return "break"
         if (
             self.controller.moving
+            or self._measurement_move_start is not None
             or self._left_press is None
             or self._left_last is None
         ):
@@ -643,7 +1476,6 @@ class RouteEditorWindow(tk.Toplevel):
         if not self._left_dragging and not pointer_is_drag(self._left_press, (x, y)):
             return "break"
         self._left_dragging = True
-        self._interacting = True
         dx, dy = x - self._left_last[0], y - self._left_last[1]
         self._left_last = (x, y)
         self.view.yaw -= dx * 0.008
@@ -658,11 +1490,15 @@ class RouteEditorWindow(tk.Toplevel):
         if self._suppress_left_release:
             self._suppress_left_release = False
             return "break"
+        if self._box_draw_start is not None:
+            start = self._box_draw_start
+            self._clear_object_rectangle()
+            self._create_object_from_rectangle(start, (int(event.x), int(event.y)))
+            return "break"
         dragged = self._left_dragging
         self._left_press = None
         self._left_last = None
         self._left_dragging = False
-        self._interacting = False
         if dragged:
             self.status_var.set("已旋轉地圖；左鍵單擊仍可新增或選取航點")
             self.request_redraw()
@@ -676,6 +1512,10 @@ class RouteEditorWindow(tk.Toplevel):
 
     def on_left_double(self, event) -> str:
         self._cancel_pending_single_click()
+        if self._boxing:
+            self._suppress_left_release = True
+            self._clear_object_rectangle()
+            return "break"
         self._suppress_left_release = True
         self._left_press = None
         self._left_last = None
@@ -705,6 +1545,18 @@ class RouteEditorWindow(tk.Toplevel):
     def _handle_single_left(self, x: int, y: int) -> None:
         self._single_click_after = None
         if self._closed:
+            return
+        if self._boxing:
+            self.objects.selected = self._nearest_object_box(x, y)
+            self.status_var.set(
+                "已選長方體；G 平移、S 縮放，再按 X／Y／Z 鎖軸"
+                if self.objects.selected is not None else "請點長方體框線／中心，或按「新增長方體」"
+            )
+            self._refresh_object_labels()
+            self.request_redraw()
+            return
+        if self._measuring:
+            self._measure_at(x, y)
             return
         if self.controller.phase == "layout":
             if not self.controller.placement_enabled:
@@ -737,11 +1589,24 @@ class RouteEditorWindow(tk.Toplevel):
 
     def on_motion(self, event) -> None:
         self._mouse = (int(event.x), int(event.y))
-        if not self.controller.moving:
+        if self.objects.transforming:
+            self._preview_object_transform()
+            return
+        if not self.controller.moving and self._measurement_move_start is None:
             return
         self._update_move_preview()
 
     def toggle_marking_mode(self) -> None:
+        if self.objects.transforming or self._box_draw_start is not None:
+            self.marking_mode_var.set(self.controller.placement_enabled)
+            self.status_var.set("請先確認或取消長方體編輯")
+            return
+        self._cancel_pending_single_click()
+        if self.marking_mode_var.get() and self.controller.phase == "layout":
+            self._boxing = False
+            self._box_create_armed = False
+            self._measuring = False
+            self.clear_measurement()
         active = self.controller.set_placement_enabled(self.marking_mode_var.get())
         self.marking_mode_var.set(active)
         self.status_var.set(
@@ -756,21 +1621,37 @@ class RouteEditorWindow(tk.Toplevel):
         width, height = self._canvas_size()
         dx = self._mouse[0] - self._move_mouse_start[0]
         dy = self._mouse[1] - self._move_mouse_start[1]
-        delta = self.view.screen_delta_to_world(
-            dx, dy, width, height, self.controller.move_axis
-        )
-        self.controller.preview_move(delta)
+        axis = self._measurement_move_axis if self._measuring else self.controller.move_axis
+        delta = self.view.screen_delta_to_world(dx, dy, width, height, axis)
+        if self._measuring:
+            if self._measurement_move_start is None or self._measurement_selected is None:
+                return
+            self.measurement_points[self._measurement_selected] = (
+                np.asarray(self._measurement_move_start) + delta
+            ).tolist()
+        else:
+            self.controller.preview_move(delta)
         self._refresh_labels()
         self.request_redraw()
 
     def on_navigation_press(self, event) -> str:
         self.canvas.focus_set()
-        if self.controller.moving:
+        if self._boxing and self.objects.transforming:
+            self.objects.cancel()
+            self._box_numeric = ""
+            self.status_var.set("已取消長方體變換")
+            self._refresh_object_labels()
+            self.request_redraw()
+            return "break"
+        if self._box_draw_start is not None:
+            self._clear_object_rectangle()
+            self.status_var.set("已取消拖曳框選；可重新拖曳")
+            return "break"
+        if self.controller.moving or self._measurement_move_start is not None:
             self.status_var.set("請先用左鍵／Enter 確認移動，或用 Esc 取消")
             return "break"
         self._nav_button = int(event.num)
         self._nav_last = (int(event.x), int(event.y))
-        self._interacting = True
         return "break"
 
     def on_navigation_drag(self, event) -> str:
@@ -787,7 +1668,6 @@ class RouteEditorWindow(tk.Toplevel):
     def on_navigation_release(self, _event) -> str:
         self._nav_button = None
         self._nav_last = None
-        self._interacting = False
         self.request_redraw()
         return "break"
 
@@ -802,41 +1682,52 @@ class RouteEditorWindow(tk.Toplevel):
 
     def _set_zoom(self, zoom: float) -> None:
         self.view.zoom = float(np.clip(zoom, 0.08, 120.0))
-        if self._nav_last is None and self._left_press is None:
-            self._interacting = True
-            if self._zoom_settle_after is not None:
-                self.after_cancel(self._zoom_settle_after)
-            self._zoom_settle_after = self.after(_ZOOM_SETTLE_MS, self._zoom_settled)
         self.request_redraw()
 
-    def _zoom_settled(self) -> None:
-        self._zoom_settle_after = None
-        if self._closed or self._nav_last is not None or self._left_press is not None:
-            return
-        self._interacting = False
-        self.request_redraw()
 
     def _handle_undo_redo(self, *, shift: bool) -> None:
         changed = self.controller.redo() if shift else self.controller.undo()
         if changed:
             self.status_var.set("已重做" if shift else "已復原")
+            self._repair_look_at_references()
             self._refresh_labels()
             self.request_redraw()
 
     def _handle_begin_move(self) -> None:
+        if self._measuring:
+            if self._measurement_selected is None:
+                self.status_var.set("請先單擊選取測量球 A 或 B，再按 G")
+                return
+            self._cancel_pending_single_click()
+            self._measurement_move_start = self.measurement_points[self._measurement_selected].copy()
+            self._measurement_move_axis = None
+            self._move_mouse_start = self._mouse
+            self.status_var.set("測量球平移中：X／Y／Z 鎖軸；左鍵或 Enter 確認，Esc 取消")
+            return
         if self.controller.begin_move():
             self._move_mouse_start = self._mouse
             self.status_var.set(
                 "平移中：按 X / Y / Z 鎖定軸；左鍵或 Enter 確認，Esc 取消"
             )
+            self._refresh_labels()
 
     def _handle_move_axis(self, key: str) -> None:
         axis = {"x": 0, "y": 1, "z": 2}[key]
-        self.controller.constrain(axis)
+        if self._measuring:
+            self._measurement_move_axis = axis
+        else:
+            self.controller.constrain(axis)
         self._update_move_preview()
         self.status_var.set(f"平移中：已鎖定 {key.upper()} 軸")
 
     def _handle_enter(self) -> None:
+        if self._measuring:
+            self._measurement_move_start = None
+            self._measurement_move_axis = None
+            self.status_var.set("已確認測量球移動；航點未變更")
+            self._refresh_distance_labels()
+            self.request_redraw()
+            return
         if self.controller.moving:
             self.controller.confirm_move()
             self.status_var.set("已確認航點移動")
@@ -846,6 +1737,20 @@ class RouteEditorWindow(tk.Toplevel):
         self.request_redraw()
 
     def _handle_escape(self) -> None:
+        if self._measuring:
+            if self._measurement_move_start is not None:
+                self.measurement_points[self._measurement_selected] = self._measurement_move_start
+                self._measurement_move_start = None
+                self._measurement_move_axis = None
+                self.status_var.set("已取消測量球移動；仍在兩點量距模式")
+                self._refresh_distance_labels()
+                self.request_redraw()
+                return
+            self._measuring = False
+            self.clear_measurement()
+            self.status_var.set("已清除測量並離開量距模式")
+            self._refresh_labels()
+            return
         if self.controller.cancel_move():
             self.status_var.set("已取消這次移動；請使用右上角按鈕離開編輯器")
             self._refresh_labels()
@@ -867,33 +1772,26 @@ class RouteEditorWindow(tk.Toplevel):
         key = str(event.keysym).lower()
         ctrl = bool(int(event.state) & 0x0004)
         shift = bool(int(event.state) & 0x0001)
-        if ctrl and key == "z":
-            self._handle_undo_redo(shift=shift)
+        if isinstance(event.widget, (tk.Entry, ttk.Entry, ttk.Spinbox)):
+            return None
+        if self._boxing:
+            return self._on_object_key(event, key, ctrl, shift)
+        if self._measuring:
+            _dispatch_measure_key(self, key)
             return "break"
-        if (
-            key == "g"
-            and self.controller.phase == "height"
-            and not self.controller.moving
-        ):
-            self._handle_begin_move()
-            return "break"
-        if key in {"x", "y", "z"} and self.controller.moving:
-            self._handle_move_axis(key)
-            return "break"
-        if key in {"return", "kp_enter"}:
-            self._handle_enter()
-            return "break"
-        if key == "escape":
-            self._handle_escape()
-            return "break"
-        if key == "delete" and self.controller.phase == "height":
-            self._handle_delete()
-            return "break"
-        return None
+        return _dispatch_route_key(self, key, ctrl, shift)
+
+    def _set_all_arrive_radii(self, radius: float) -> None:
+        """One radius for the whole route: global value and every per-point sphere."""
+        radius = min(ARRIVE_RADIUS_MAX_U, max(ARRIVE_RADIUS_MIN_U, float(radius)))
+        self.arrive_radius_var.set(radius)
+        if self.document.waypoint_arrive_radii is not None:
+            self.document.waypoint_arrive_radii = [radius] * len(self.controller.points)
 
     def _on_arrive_radius(self, _value) -> None:
         if _value is not None:
             self.show_arrive_var.set(True)
+            self._set_all_arrive_radii(float(self.arrive_radius_var.get()))
         radius = float(self.arrive_radius_var.get())
         shortest = self.controller.shortest_leg()
         note = ""
@@ -948,10 +1846,6 @@ class RouteEditorWindow(tk.Toplevel):
         )
 
     def _on_point_radius(self, _event=None) -> None:
-        selected = self.controller.selected
-        if selected is None or not (0 <= selected < len(self.controller.points)):
-            self.status_var.set("先選取一個航點再設單點半徑")
-            return
         try:
             radius = float(str(self.point_radius_var.get()).strip())
         except (TypeError, ValueError):
@@ -960,43 +1854,57 @@ class RouteEditorWindow(tk.Toplevel):
         if not _math.isfinite(radius):
             self._sync_point_radius_box()
             return
-        radius = min(ARRIVE_RADIUS_MAX_U, max(ARRIVE_RADIUS_MIN_U, radius))
-        radii = self.document.waypoint_arrive_radii
-        if radii is None or len(radii) != len(self.controller.points):
-            radii = [float(self.arrive_radius_var.get())] * len(self.controller.points)
-            self.document.waypoint_arrive_radii = radii
-        radii[selected] = radius
+        self._set_all_arrive_radii(radius)
+        self.show_arrive_var.set(True)
+        self._on_arrive_radius(None)
         self._sync_point_radius_box()
-        self.request_redraw()
 
     def _sync_action_list(self) -> None:
         selected = self.controller.selected
         if selected is None or not (0 <= selected < len(self.controller.points)):
             self.action_list_var.set("先選取一個航點")
             return
-        entries = self.controller.actions[selected]
-        lines = [f"{step}. {waypoint_action_text(action)}"
-                 for step, action in enumerate(entries, start=1)]
-        self.action_list_var.set(
-            f"航點 {selected + 1}：" + ("\n" + "\n".join(lines) if lines else "無動作")
-        )
+        current = self.action_direction_var.get()
+        sections = []
+        for title, direction, entries in (
+            ("去程", "out", self.controller.actions[selected]),
+            ("回程", "back", self.controller.return_actions[selected]),
+        ):
+            lines = [f"{step}. {waypoint_action_text(action)}"
+                     for step, action in enumerate(entries, start=1)]
+            marker = "▶ " if direction == current else "　"
+            sections.append(
+                f"{marker}{title}：" + ("\n" + "\n".join(lines) if lines else "無動作")
+            )
+        note = ""
+        if not self.controller.return_actions_allowed(selected):
+            note = "\n（第一點是降落點、最後一點是只飛一次的折返點，沒有回程動作）"
+        self.action_list_var.set(f"航點 {selected + 1}\n" + "\n".join(sections) + note)
 
     def _add_action(self, raw: dict) -> None:
         selected = self.controller.selected
         if selected is None or not (0 <= selected < len(self.controller.points)):
             self.status_var.set("先選取一個航點再加入動作")
             return
-        if len(self.controller.actions[selected]) >= MAX_ACTIONS_PER_WAYPOINT:
-            self.status_var.set(f"每個航點最多 {MAX_ACTIONS_PER_WAYPOINT} 個動作")
+        direction = self.action_direction_var.get()
+        trip = "回程" if direction == "back" else "去程"
+        if direction == "back" and not self.controller.return_actions_allowed(selected):
+            self.status_var.set("第一點是降落點、最後一點是只飛一次的折返點，不能設定回程動作")
+            return
+        table = (
+            self.controller.return_actions if direction == "back" else self.controller.actions
+        )
+        if len(table[selected]) >= MAX_ACTIONS_PER_WAYPOINT:
+            self.status_var.set(f"每個航點{trip}最多 {MAX_ACTIONS_PER_WAYPOINT} 個動作")
             return
         try:
             action = parse_waypoint_action(raw, "動作").to_json()
         except ValueError as exc:
             self.status_var.set(f"動作數值不合法：{exc}")
             return
-        self.controller.add_action(action)
+        self.controller.add_action(action, direction)
         self.status_var.set(
-            f"航點 {selected + 1} 已加入動作：{waypoint_action_text(action)}"
+            f"航點 {selected + 1} 已加入{trip}動作：{waypoint_action_text(action)}"
         )
         self._refresh_labels()
         self.request_redraw()
@@ -1017,13 +1925,23 @@ class RouteEditorWindow(tk.Toplevel):
             return
         self._add_action({"type": "hover", "seconds": seconds})
 
+    def _add_gimbal_pitch_action(self) -> None:
+        try:
+            pitch = float(str(self.action_pitch_var.get()).strip())
+        except ValueError:
+            self.status_var.set("鏡頭俯仰角度必須是數字（-90 至 +90）")
+            return
+        self._add_action({"type": "gimbal_pitch", "pitch_deg": pitch})
+
     def _remove_last_action(self) -> None:
-        if self.controller.remove_last_action():
-            self.status_var.set("已刪除選取航點的最後一個動作")
+        direction = self.action_direction_var.get()
+        trip = "回程" if direction == "back" else "去程"
+        if self.controller.remove_last_action(direction):
+            self.status_var.set(f"已刪除選取航點{trip}的最後一個動作")
             self._refresh_labels()
             self.request_redraw()
         else:
-            self.status_var.set("選取航點沒有動作可刪除")
+            self.status_var.set(f"選取航點沒有{trip}動作可刪除")
 
     def finish_layout(self) -> None:
         try:
@@ -1264,11 +2182,24 @@ class RouteEditorWindow(tk.Toplevel):
             self._preview_only = True
             display_name = "未綁定 PLY"
         self._map_source = source
+        self._cancel_pending_single_click()
+        self._measuring = False
+        self.measurement_points.clear()
+        self._measurement_selected = None
+        self._measurement_move_start = None
+        self._measurement_move_axis = None
+        self.distance_scale = self.distance_scale_loader(self.profile)
         self.title(f"航線編輯器 — {display_name}")
         self.title_var.set(f"航線編輯器｜{display_name}")
         if self.map_loaded_callback is not None:
             self.map_loaded_callback(message)
         self.controller = RouteEditorController()
+        self.objects = ObjectBoxController()
+        self._look_at_object_key = None
+        self._boxing = False
+        self._box_create_armed = False
+        self._box_numeric = ""
+        self._clear_object_rectangle()
         self.map_points = self._aligned_map_points(points)
         center, radius = self._bounds(self.map_points[:, :3])
         self.view = OrthoView(center=center, radius=radius, zoom=1.0)
@@ -1301,11 +2232,23 @@ class RouteEditorWindow(tk.Toplevel):
     def _update_document(self) -> None:
         if self.controller.moving:
             self.controller.confirm_move()
+        self.objects.confirm()
+        self.document.object_boxes = self.objects.boxes
         self.document.points = self.controller.points
+        index_for_key = {key: index for index, key in enumerate(self.objects.keys)}
+        self.document.segment_look_at = [
+            None if key is None else index_for_key[key]
+            for key in self.controller.segment_look_at
+        ]
         actions = getattr(self.controller, "actions", None)
         if actions is not None:
             self.document.waypoint_actions = (
                 [list(entry) for entry in actions] if any(actions) else None
+            )
+        return_actions = getattr(self.controller, "return_actions", None)
+        if return_actions is not None:
+            self.document.return_waypoint_actions = (
+                [list(entry) for entry in return_actions] if any(return_actions) else None
             )
         self.document.arrive_radius_map_units = float(self.arrive_radius_var.get())
         radii = self.document.waypoint_arrive_radii
@@ -1320,6 +2263,10 @@ class RouteEditorWindow(tk.Toplevel):
             )
 
     def save_route(self) -> Path | None:
+        if self.objects.transforming:
+            self._finish_object_transform()
+            if self.objects.transforming:
+                return None
         self._update_document()
         if self._preview_only:
             path = self._choose_preview_path()
@@ -1371,6 +2318,10 @@ class RouteEditorWindow(tk.Toplevel):
             if not leave:
                 return
         self._closed = True
+        if self._render_after is not None:
+            self.after_cancel(self._render_after)
+            self._render_after = None
+        self._render_executor.shutdown(wait=False, cancel_futures=True)
         try:
             self.attributes("-fullscreen", False)
         except tk.TclError:

@@ -996,7 +996,7 @@ wall p50 5.7–10.7 ms；sync 對照 seeds 0–1：356／406（87.7%）、348／
 wall p50 20.9／27.3 ms。**四個 seed 全部 ≥ sync（+17～+42 succ），p50 全 ≤ 11 ms。**
 尾巴 p95 跨 seed 15–107 ms（threading 非確定性，預期內）。
 **判定：async multi-seed gate 通過；** 剩餘保留只有 live 飛行（KLT_BRIDGED pose 語意，
-見 09-04 條目；`docs/esekf_live_eval_runbook.md` 配方現成）。
+見 09-04 條目；當時的 ESEKF live-replay 配方與後端已退役，並無現行實飛放行效力）。
 
 **（4）最佳配置預設審計（09-04「已全是預設」的複驗，無需改）。**
 async=1、inline=True、fast 50／2.5、bridge=0、refine=True、single-early-stop=1、

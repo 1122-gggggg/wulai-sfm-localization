@@ -5,11 +5,12 @@ import math
 import time
 from collections.abc import Mapping
 from typing import Any
+from dataclasses import dataclass
 
 import numpy as np
 
 from localization_contract import InvalidLocalizationResult, LocalizationResult
-from operator_localization_config import normalize_camera_axes
+from operator_localization_config import normalize_camera_axes, normalize_camera_forward
 
 
 #: Largest camera pitch/roll disagreement with the firmware gimbal before a fix
@@ -17,6 +18,8 @@ from operator_localization_config import normalize_camera_axes
 CAMERA_ATTITUDE_MISMATCH_DEG = 10.0
 #: The gimbal sample riding with a frame must be this close to its capture time.
 CAMERA_ATTITUDE_MAX_GIMBAL_SKEW_S = 1.0
+#: Display-only expiry; does not change control/localization freshness gates.
+CAMERA_ESTIMATE_MAX_AGE_S = 2.0
 
 
 def camera_attitude_errors_deg(
@@ -208,6 +211,71 @@ def normalize_live_localization_result(result: object) -> tuple[Any, np.ndarray 
         normalized["error"] = "invalid localization pose: x/y/z must be finite"
         return normalized, None
     return normalized, xyz
+
+
+@dataclass(frozen=True)
+class EstimatedCameraDisplayPose:
+    """One estimator's display pose; never a flight-control/map-confirmation fix."""
+
+    pose: np.ndarray
+    camera_axes: np.ndarray | None
+    camera_forward: np.ndarray | None
+    attitude: str
+    stale: bool
+
+
+def estimated_camera_display_pose(
+    result: Any, *, now: float | None = None,
+) -> EstimatedCameraDisplayPose | None:
+    """Use only orientation paired with this weak result, not the held flight pose.
+
+    The inertial bridge estimates a map-frame yaw increment, not new camera
+    pitch/roll. Its rotated visual basis therefore supplies heading only.
+    Direction-only and missing orientation never acquire invented image axes.
+    """
+    if not hasattr(result, "get"):
+        return None
+    predicted = bool(result.get("prediction_valid")) and result.get("pose_status") == "PREDICTED_ONLY"
+    if not ((result.get("success") and localization_result_is_weak(result)) or predicted):
+        return None
+    raw_pose = result.get("pose")
+    xyz = _pose_xyz(raw_pose)
+    if xyz is None:
+        return None
+    try:
+        yaw = float(raw_pose.get("yaw_raw", raw_pose.get("yaw", float("nan"))))
+    except (TypeError, ValueError, OverflowError):
+        yaw = float("nan")
+    if predicted and result.get("camera_attitude_kind") != "heading_only":
+        # Old prediction payloads can carry a synthetic yaw=0 placeholder.
+        yaw = float("nan")
+    axes = normalize_camera_axes(result.get("camera_axes_world"))
+    forward = axes[2] if axes is not None else normalize_camera_forward(result.get("camera_forward_world"))
+    # An IMU yaw-only bridge preserves the old visual camera tilt. Do not
+    # depict that retained tilt as a freshly estimated full camera attitude.
+    heading_only = (
+        result.get("camera_attitude_kind") == "heading_only"
+        or result.get("direct_status") == "IMU_BRIDGE"
+        or bool(result.get("imu_bridge"))
+        or predicted
+    )
+    if heading_only:
+        attitude = "heading" if math.isfinite(yaw) else "none"
+        axes = None
+        forward = None
+    elif axes is not None:
+        attitude = "full"
+    elif forward is not None:
+        attitude = "direction"
+    else:
+        # Even when yaw exists, no optical tilt or roll was measured.
+        attitude = "heading" if math.isfinite(yaw) else "none"
+    stamp = localization_pose_timestamp(result)
+    current = time.monotonic() if now is None else float(now)
+    stale = stamp is None or not 0.0 <= current - stamp <= CAMERA_ESTIMATE_MAX_AGE_S
+    return EstimatedCameraDisplayPose(
+        np.array([*xyz, yaw], dtype=float), axes, forward, attitude, stale,
+    )
 
 
 def localization_result_display_seq(result: Any) -> int | None:

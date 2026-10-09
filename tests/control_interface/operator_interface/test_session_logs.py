@@ -200,7 +200,7 @@ def test_high_rate_logs_batch_fsync_but_safety_events_remain_immediate(
     assert len(synced) == startup_syncs + 4
 
     session.close(reason="test_complete")
-    assert len(synced) == startup_syncs + 5
+    assert len(synced) == startup_syncs + 7  # final telemetry plus summary file/directory
 
 
 def test_session_logs_do_not_claim_durable_when_fsync_fails(
@@ -307,3 +307,109 @@ def test_runtime_identity_records_packages_cuda_gpu_and_driver_fields() -> None:
         "device_names",
     }
     assert "nvidia_driver" in identity
+
+
+def test_real_offline_controller_records_survive_readback_and_retention(tmp_path):
+    from verify_flight_diagnostics import verify_controller_persistence
+
+    result = verify_controller_persistence(tmp_path)
+    assert result["controller_ticks"] > 0
+    assert result["observed_route_samples"] > 0
+    assert result["terminal_outcome"] == "cancelled"
+    assert result["scripted_iterations"] == 16
+
+
+def test_deterministic_write_close_drop_and_summary_failure_receipts(tmp_path):
+    from verify_flight_diagnostics import verify_failure_scenarios
+
+    paths = verify_failure_scenarios(tmp_path)
+    assert set(paths) == {"write_failure", "close_failure", "queue_drop", "summary_retry"}
+
+
+def test_close_final_sync_failure_is_in_persisted_summary(tmp_path, monkeypatch):
+    """Pre-fix repro: summary used to claim healthy before the final sink fsync."""
+    session = SessionLogs.create(tmp_path, mode=InterfaceMode.SIMULATED_STREAM, manifest={})
+    session.localization("auto_route_tick", auto_run_id="known-run", altitude_error_u=.125)
+
+    def fail_final_sync():
+        raise OSError("injected final close sync")
+
+    monkeypatch.setattr(session._sinks["trajectory"], "_sync", fail_final_sync)
+    session.close(reason="failure_repro")
+    summary = json.loads((session.directory / "session_summary.json").read_text())
+    assert summary["log_health"]["trajectory"]["healthy"] is False
+    assert summary["log_health"]["trajectory"]["durable"] is False
+    assert "injected final close sync" in summary["log_health"]["trajectory"]["last_error"]
+    assert summary["recording_complete"] is False
+
+
+def test_immutable_terminal_mapping_stays_numeric_after_retention(tmp_path):
+    from types import MappingProxyType
+    from disk_policy import enforce_retention
+
+    session = SessionLogs.create(tmp_path, mode=InterfaceMode.SIMULATED_STREAM, manifest={})
+    result = MappingProxyType({
+        "auto_run_id": "immutable-run",
+        "mean_u": .125,
+        "map_frame": MappingProxyType({"east": (1., 0., 0.)}),
+        "planned_waypoints_u": ((0., 0., 0.), (1., 2., 3.)),
+    })
+    session.localization("auto_route_error_summary", **result)
+    session.telemetry("autonomy_event", result=result, auto_run_id="immutable-run")
+    session.close(reason="test")
+    enforce_retention(tmp_path, current_session=None, max_bytes=0)
+    rows = [json.loads(line) for line in (session.directory / "trajectory.jsonl").read_text().splitlines()]
+    assert rows[0]["mean_u"] == .125
+    assert rows[0]["map_frame"]["east"] == [1., 0., 0.]
+    assert rows[1]["result"]["planned_waypoints_u"] == [[0., 0., 0.], [1., 2., 3.]]
+    assert rows[1]["result"]["auto_run_id"] == "immutable-run"
+
+
+def test_close_shuts_deferred_admission_without_waiting_for_sink_fsync(tmp_path, monkeypatch):
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    session = SessionLogs.create(tmp_path, mode=InterfaceMode.SIMULATED_STREAM, manifest={})
+    assert session.defer_telemetry("pcmd_dispatch", dispatch_seq=1)
+    entered = threading.Event()
+    release = threading.Event()
+    original = session._sinks["trajectory"]._sync
+
+    def slow_close_sync():
+        entered.set()
+        assert release.wait(2)
+        original()
+
+    monkeypatch.setattr(session._sinks["trajectory"], "_sync", slow_close_sync)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        closing = pool.submit(session.close, reason="concurrent_close")
+        assert entered.wait(2)
+        try:
+            assert not session.defer_telemetry("pcmd_dispatch", dispatch_seq=2)
+        finally:
+            release.set()
+        closing.result(timeout=2)
+    rows = [json.loads(line) for line in (session.directory / "trajectory.jsonl").read_text().splitlines()]
+    assert [row["dispatch_seq"] for row in rows] == [1]
+
+
+def test_actual_sdk_enqueue_producer_values_survive_retained_readback(tmp_path):
+    from verify_flight_diagnostics import verify_sdk_enqueue_persistence
+
+    result = verify_sdk_enqueue_persistence(tmp_path)
+    assert result["auto_run_id"] == "sdk-known-run"
+    assert result["pcmd"] == [11, -12, 13, -14]
+
+
+def test_numeric_scalar_metrics_are_numbers_not_repr_strings(tmp_path):
+    import numpy as np
+
+    session = SessionLogs.create(tmp_path, mode=InterfaceMode.SIMULATED_STREAM, manifest={})
+    assert session.localization(
+        "auto_route_error_summary", auto_run_id="numpy-run",
+        samples=np.int64(7), mean_u=np.float32(.125),
+    )
+    session.close(reason="numeric_readback")
+    row = json.loads((session.directory / "trajectory.jsonl").read_text())
+    assert row["samples"] == 7 and isinstance(row["samples"], int)
+    assert row["mean_u"] == .125 and isinstance(row["mean_u"], float)

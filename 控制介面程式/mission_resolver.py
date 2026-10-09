@@ -115,7 +115,7 @@ def _standard_flight_controller(frame: CoordinateFrameContract) -> dict[str, obj
     body_right_sign = 1 if v_axis == 1 else -1
     return {
         "model": "scale_free_direction_speed_guard_v1",
-        "speed_limit_mps": 0.60,
+        "speed_limit_mps": 0.30,
         "pose_max_age_ms": 500.0,
         "speed_max_age_ms": 500.0,
         "command_ttl_ms": 150.0,

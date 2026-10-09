@@ -317,11 +317,8 @@ class RelocWorker:
         with self._cv:
             self._generation += 1
             self._job = None
-            while True:
-                try:
-                    self._out.get_nowait()
-                except queue.Empty:
-                    break
+            while self.poll() is not None:
+                pass
 
     # ---------- worker thread ----------
     def _run(self) -> None:
@@ -854,12 +851,18 @@ class TwoRateTracker:
         if not math.isfinite(float(stamp)):
             return False
         reloc = self.profile.reloc
-        idle = status == "FAST_TRACK" and _reloc_idle(self._step_history)
+        # FAST_TRACK means the fast PnP minimum, not the frozen strong-map
+        # admission floor. A large VO set must not hide eroding map anchors.
+        map_confirmed = int(np.count_nonzero(self._live_ids > 0)) >= int(
+            reloc.frozen_pnp_thresholds["strong_inliers"]
+        )
+        idle = status == "FAST_TRACK" and map_confirmed and _reloc_idle(self._step_history)
         due = _reloc_refresh_due(status, stamp, self._last_reloc_stamp, float(reloc.period_s), idle)
-        # VO tracks can be numerous while none constrain the pose to the map.
-        # Request a map fix as soon as the one-job worker is available, without
-        # waiting for the normal refresh period or clearing the usable tracks.
-        unconfirmed = status in {"VO_ONLY", "DEAD_RECKON", "IMU_BRIDGE", "NO_POSE"}
+        # Retain the usable tracks while continuously replacing only the
+        # worker's waiting capture during weak-map recovery.
+        unconfirmed = status in {"VO_ONLY", "DEAD_RECKON", "IMU_BRIDGE", "NO_POSE"} or (
+            status == "FAST_TRACK" and not map_confirmed
+        )
         if len(self._live_ids) < int(reloc.min_points) or unconfirmed or due or self._worker.queued:
             if self._worker.submit(gray, ordinal, stamp, self._source_epoch):
                 self._pending_ordinal = ordinal
@@ -971,6 +974,27 @@ class TwoRateTracker:
         status, cam_from_world, center, inliers, map_inliers, vo_inliers, n_corr, quality = (
             self._step_absolute_pose(reseeded, stamp)
         )
+        # A partial strong fix can lose a mixed PnP vote to a much larger,
+        # drifting VO set. Try its current-frame map hypothesis independently
+        # only after the mixed solution failed strong map support. An empty
+        # track still requires the unchanged configured reseed minimum.
+        if (
+            not reseeded
+            and n_corr >= int(self.profile.fast_loop.pnp.min_points)
+            and map_inliers < int(self.profile.reloc.frozen_pnp_thresholds["strong_inliers"])
+        ):
+            recovered = self._recover_partial_handover(walked_ids, walked_xy, walked_xyz, stamp)
+            if recovered is not None:
+                (
+                    status,
+                    cam_from_world,
+                    center,
+                    inliers,
+                    map_inliers,
+                    vo_inliers,
+                    n_corr,
+                    quality,
+                ) = recovered
         t_pnp = time.perf_counter()
 
         # 4. dead reckoning
@@ -1142,6 +1166,53 @@ class TwoRateTracker:
                         self._last_map_stamp = stamp
         return status, cam_from_world, center, inliers, map_inliers, vo_inliers, n_corr, quality
 
+    def _recover_partial_handover(self, ids, xy, xyz, stamp):
+        """Accept a walked map-only PnP only under the existing frozen gates.
+
+        The capture pose itself is never applied: these points have already
+        passed the identity/stamp/ring checks and KLT to this exposure.
+        Rejected candidates leave the mixed track and its pose untouched.
+        """
+        thresholds = self.profile.reloc.frozen_pnp_thresholds
+        if len(ids) < max(
+            int(thresholds["strong_inliers"]), int(self.profile.fast_loop.pnp.min_points)
+        ):
+            return None
+        answer = self._pycolmap.estimate_and_refine_absolute_pose(
+            xy, xyz, self._camera, self._pnp_estimation, self._pnp_refinement
+        )
+        if answer is None:
+            return None
+        mask = np.asarray(answer["inlier_mask"], dtype=bool)
+        inliers = int(mask.sum())
+        if inliers < max(
+            int(thresholds["strong_inliers"]), int(self.profile.fast_loop.pnp.min_inliers)
+        ):
+            return None
+        pose = np.asarray(answer["cam_from_world"].matrix(), dtype=float)[:3, :4]
+        if not np.isfinite(pose).all():
+            return None
+        quality = pose_quality(xy[mask], xyz[mask], pose, self._K, self._w, self._h)
+        from sfm_diagnosis.site_pipeline.deployment_localizer import localization_is_strong
+
+        metrics = {
+            "inlier_count": inliers,
+            "inlier_ratio": inliers / len(ids),
+            "convex_hull_coverage": quality.get("inlier_hull_coverage"),
+            "occupancy_4x4": quality.get("inlier_grid_cells"),
+            "positive_depth_ratio": quality.get("positive_depth_ratio"),
+            "reprojection_p90": quality.get("reproj_p90"),
+        }
+        if not localization_is_strong(metrics, decision_status="ACCEPT", thresholds=thresholds):
+            return None
+        self._live_ids = ids[mask]
+        self._live_xy = np.ascontiguousarray(xy[mask], dtype=np.float64)
+        self._live_xyz = xyz[mask]
+        self._last_map_stamp = stamp
+        # Keep the original relocalization confirmation contract even though
+        # this was a hypothesis recovery rather than a 120-point KLT reseed.
+        return ("RELOC_SEED", pose, _center(pose), inliers, inliers, 0, len(ids), quality)
+
     # ---------- handover ----------
     def _track_handover_chain(self, chain, ids, xy, xyz):
         ids, xy, xyz = self._cap_handover_points(ids, xy, xyz)
@@ -1232,7 +1303,7 @@ class TwoRateTracker:
             or (current_ordinal is not None and stamps[-1] != float(current_stamp))
             or float(current_stamp) < float(trigger_stamp)
             or any(not math.isfinite(float(stamp)) for stamp in stamps)
-            or any(later < earlier for earlier, later in zip(stamps, stamps[1:]))
+            or any(later < earlier for earlier, later in zip(stamps, stamps[1:], strict=False))
         ):
             self._handover_dropped += 1
             return empty_ids, empty_xy, empty_xyz

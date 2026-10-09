@@ -2,8 +2,8 @@
 """Build a `direct` localizer site release from an EDM fixed-pose deploy pack.
 
 The deploy pack ships a retriangulated COLMAP model, the keyframe JPEGs the
-runtime matches against, MoGe-3 reference depth, a MegaLoc descriptor bank and
-the frozen P174 configuration.  This tool turns that pack into the on-disk
+runtime matches against, optional MoGe-3 reference depth, a BoQ descriptor bank
+and the frozen P174 configuration. This tool turns that pack into the on-disk
 release layout the operator interface loads (site_profile.json + map/ +
 model/ + keyframes/ + depth_moge3/ + localization/ + compat/ + provenance/).
 
@@ -36,6 +36,15 @@ Usage
         --pack river-deploy-5060-20260908 \
         --site river_site \
         --release-id river_gluemap_all8_direct_20260908
+
+For an isolated offline workmap evaluation release, use ``--mode copy`` and
+``--online-workmap`` with a new release ID. The flag adds only
+``online_workmap.enabled=true`` to the SHA-bound profile; it does not grant
+quality, mission, or flight approval.
+Add ``--workmap-optimizer isam2`` to select the optional incremental graph.
+``--workmap-submap-graph-solver {batch,isam2}`` picks the submap Sim(3) graph solver.
+``--workmap-expansion`` enables frozen-region-only query and MoGe depth expansion;
+it requires ``--online-workmap`` and grants no quality, mission, or flight approval.
 """
 
 from __future__ import annotations
@@ -61,7 +70,16 @@ TOOL_PATH = "tools/build_direct_site_release.py"
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 GRAVITY_TOOL = REPO_ROOT / "定位演算法" / "validation" / "derive_map_gravity.py"
-DEPLOY_DIR_RELATIVE = "../../../../../定位演算法/deploy_code/sfm_direct_deploy"
+DEPLOY_PACKAGE_ORIGINAL = "定位演算法/deploy_code/sfm_direct_deploy"
+DEPLOY_PACKAGE_EXPAND = "定位演算法/deploy_code_expand/sfm_direct_deploy"
+
+
+def deploy_package(args: argparse.Namespace) -> str:
+    """Workspace-relative direct package: the expansion one iff the release enables the workmap."""
+    return (
+        DEPLOY_PACKAGE_EXPAND if getattr(args, "online_workmap", False) else DEPLOY_PACKAGE_ORIGINAL
+    )
+
 
 MODEL_BINS = ("cameras.bin", "images.bin", "points3D.bin", "rigs.bin", "frames.bin")
 #: Order is contractual: the frame digest streams exactly these three, in this order.
@@ -592,9 +610,9 @@ def resolve_map_dir(pack: Path, explicit: str) -> Path:
     return candidates[0]
 
 
-def prepare_release_geometry(bundle_path: Path) -> str:
+def prepare_release_geometry(bundle_path: Path, package: str = DEPLOY_PACKAGE_ORIGINAL) -> str:
     """Precompute CPU geometry and bind it to the existing bundle manifest."""
-    direct_root = REPO_ROOT / "定位演算法/deploy_code/sfm_direct_deploy"
+    direct_root = REPO_ROOT / package
     for path in (direct_root, direct_root / "vendor"):
         if str(path) not in sys.path:
             sys.path.insert(0, str(path))
@@ -702,6 +720,8 @@ def populate(
         "boq_references_sideview.names.json",
         "fim_lwtl_intersection_cells.json",
     )
+    for name in copied_localization:
+        shutil.copyfile(source_localization / name, localization / name)
 
     # --- identity -----------------------------------------------------------
     model_digest = frame_digest(model_dir)
@@ -752,20 +772,32 @@ def populate(
     controller, coefficients = controller_for_scale(map_scale)
 
     profile_path = localization / "direct_localizer_profile.json"
-    profile_sha = write_json(
-        profile_path,
-        {
-            "schema": "direct-deployment-profile/v1",
-            "name": "river_p174_frozen",
-            "map_scale": map_scale,
-            "intrinsics": QUERY_INTRINSICS,
-            "reloc": FROZEN_RELOC,
-            "fast_loop": FROZEN_FAST_LOOP,
-            "vo": FROZEN_VO,
-            "dead_reckon": FROZEN_DEAD_RECKON,
-            "max_jump_u": 1.5,
-        },
-    )
+    profile = {
+        "schema": "direct-deployment-profile/v1",
+        "name": "river_p174_frozen",
+        "map_scale": map_scale,
+        "intrinsics": QUERY_INTRINSICS,
+        "reloc": FROZEN_RELOC,
+        "fast_loop": FROZEN_FAST_LOOP,
+        "vo": FROZEN_VO,
+        "dead_reckon": FROZEN_DEAD_RECKON,
+        "max_jump_u": 1.5,
+    }
+    if getattr(args, "online_workmap", False):
+        profile["online_workmap"] = {"enabled": True}
+        if getattr(args, "workmap_optimizer", None) is not None:
+            profile["online_workmap"]["optimizer"] = args.workmap_optimizer
+        if getattr(args, "workmap_submap_graph_solver", None) is not None:
+            profile["online_workmap"]["submap_graph_solver"] = args.workmap_submap_graph_solver
+        if getattr(args, "workmap_retain_tracks", False):
+            profile["online_workmap"]["retain_valid_tracks"] = True
+        if getattr(args, "workmap_expansion", False):
+            profile["online_workmap"]["expansion"] = {
+                "frozen_region_gate": True,
+                "spatiotemporal_query": True,
+                "depth_seeds": True,
+            }
+    profile_sha = write_json(profile_path, profile)
 
     shard_manifest_path, shard_manifest_sha = write_shard_manifest(
         localization,
@@ -818,7 +850,7 @@ def populate(
     )
 
     # --- site profile -------------------------------------------------------
-    bundle_sha = prepare_release_geometry(bundle_path)
+    bundle_sha = prepare_release_geometry(bundle_path, deploy_package(args))
     site_profile_path = staging / "site_profile.json"
     ply_sha = sha256_file(staging / "map/map.ply")
     write_json(
@@ -828,7 +860,7 @@ def populate(
             "site_id": release_id,
             "display_name": "河濱全八段 DIRECT（未獨立驗證）",
             "localizer": "direct",
-            "localizer_deploy_dir": DEPLOY_DIR_RELATIVE,
+            "localizer_deploy_dir": "../../../../../" + deploy_package(args),
             "localizer_profile": "localization/direct_localizer_profile.json",
             "map_reference_poses": "localization/reference_poses.json",
             "map_align": "localization/T_align_gravity.json",
@@ -919,7 +951,7 @@ def populate(
                 "device": "cuda",
                 "matcher": "edm",
                 "retrieval": "megaloc",
-                "deploy_dir": "定位演算法/deploy_code/sfm_direct_deploy",
+                "deploy_dir": deploy_package(args),
             },
         },
     )
@@ -1173,6 +1205,32 @@ def main(argv=None) -> int:
         help="how the bulk payload is transferred (default: link)",
     )
     parser.add_argument(
+        "--online-workmap",
+        action="store_true",
+        help="enable the evaluation-only online session workmap in the generated profile",
+    )
+    parser.add_argument(
+        "--workmap-optimizer",
+        choices=("local_ba", "isam2"),
+        help="workmap solver; requires --online-workmap (default: existing local BA)",
+    )
+    parser.add_argument(
+        "--workmap-submap-graph-solver",
+        choices=("batch", "isam2"),
+        help="submap Sim(3) graph solver; requires --online-workmap (default: batch)",
+    )
+    parser.add_argument(
+        "--workmap-retain-tracks",
+        action="store_true",
+        help="retain geometrically valid new tracks under a strong old-map pose",
+    )
+    parser.add_argument(
+        "--workmap-expansion",
+        action="store_true",
+        help="enable frozen-region gate, spatio-temporal query and MoGe depth seeds; "
+        "requires --online-workmap",
+    )
+    parser.add_argument(
         "--issued-at",
         default="",
         help="quality receipt timestamp (default: derived from the release id date suffix)",
@@ -1181,6 +1239,14 @@ def main(argv=None) -> int:
         "--force", action="store_true", help="replace an existing release directory"
     )
     args = parser.parse_args(argv)
+    if args.workmap_optimizer is not None and not args.online_workmap:
+        parser.error("--workmap-optimizer requires --online-workmap")
+    if args.workmap_submap_graph_solver is not None and not args.online_workmap:
+        parser.error("--workmap-submap-graph-solver requires --online-workmap")
+    if args.workmap_retain_tracks and not args.online_workmap:
+        parser.error("--workmap-retain-tracks requires --online-workmap")
+    if args.workmap_expansion and not args.online_workmap:
+        parser.error("--workmap-expansion requires --online-workmap")
     if not args.issued_at:
         stamp = args.release_id[-8:]
         if not stamp.isdigit():

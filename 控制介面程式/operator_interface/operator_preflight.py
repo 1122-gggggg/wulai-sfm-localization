@@ -1,20 +1,17 @@
-"""Read-only evidence checks for the operator's four-step preflight guide."""
+"""Read-only evidence checks for the operator's three-step preflight guide."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, cast
-
-from live_safety_config import takeoff_battery_blocker
+from typing import Any
 
 
-PREFLIGHT_GUIDE_STEPS = ("compass", "map", "route", "system")
+PREFLIGHT_GUIDE_STEPS = ("compass", "map", "route")
 PREFLIGHT_GUIDE_LABELS = {
     "compass": "羅盤校正狀態",
     "map": "地圖匯入",
     "route": "路線匯入／修改",
-    "system": "串流與系統資訊",
 }
 
 
@@ -86,15 +83,6 @@ class PreflightContext:
     route_snapshot: Any | None
     displayed_route_sha256: str | None
     route_point_count: int
-    video_frame_available: bool
-    stream_last_stamp: object | None
-    video_frame_stamp: object | None
-    min_takeoff_battery_pct: object
-    via_controller: bool
-    safety_log_durable: bool | None
-    safety_log_healthy: bool | None
-    inventory_takeoff_ready: bool | None
-    inventory_block_reason: str
 
 
 def _compass_evidence(state: object, live: bool) -> tuple[object | None, str]:
@@ -110,6 +98,8 @@ def _compass_evidence(state: object, live: bool) -> tuple[object | None, str]:
         return None, "飛機羅盤校正失敗，請重新校正"
     if getattr(state, "drone_magnetometer_started", None) is True:
         return None, "飛機羅盤校正仍在進行"
+    if getattr(state, "drone_magnetometer_started", None) is not False:
+        return None, "等待飛機羅盤校正進行狀態讀回"
     if required == 1:
         return None, "飛機要求完成羅盤校正"
     if required not in {0, 2}:
@@ -121,7 +111,7 @@ def _compass_evidence(state: object, live: bool) -> tuple[object | None, str]:
     controller_key = controller_raw.rsplit(".", 1)[-1].replace("_", "").lower()
     if controller_key.startswith("calibrating"):
         return None, "SkyController 羅盤校正仍在進行"
-    note = "校正有效" if required == 0 else "韌體建議校正，請人工確認現場條件"
+    note = "校正有效" if required == 0 else "沿用機上校正；韌體建議重新校正（非強制）"
     return ("compass", int(required)), note
 
 
@@ -176,106 +166,6 @@ def _route_evidence(
     ), f"{len(snapshot.waypoints)} 個航點，請確認順序、高度與轉向位置"
 
 
-def _fresh_stream_stamp(context: PreflightContext) -> object | None:
-    if context.stream_last_stamp not in (None, 0):
-        return context.stream_last_stamp
-    return context.video_frame_stamp
-
-
-def _evidence_float(value: object) -> float:
-    """Convert a validated-at-runtime evidence value without leaking Any."""
-    return float(cast(Any, value))
-
-
-def _live_state_problem(state: object) -> str | None:
-    if not bool(getattr(state, "link_ok", False)):
-        return "Olympe 控制連線異常"
-    return None
-
-
-def _telemetry_problem(state: object, now: float) -> str | None:
-    telemetry_ns = getattr(state, "telemetry_read_mono_ns", None)
-    if telemetry_ns is None:
-        return "等待即時遙測讀回"
-    telemetry_age_s = now - int(telemetry_ns) / 1_000_000_000.0
-    if telemetry_age_s < 0.0 or telemetry_age_s > 2.0:
-        return f"遙測已過期（{max(0.0, telemetry_age_s):.1f}s）"
-    return None
-
-
-def _stream_problem(
-    state: object,
-    context: PreflightContext,
-    now: float,
-) -> str | None:
-    try:
-        stream_age_s = now - _evidence_float(_fresh_stream_stamp(context))
-    except (TypeError, ValueError):
-        return "等待即時串流影格"
-    if (
-        not context.video_frame_available
-        or stream_age_s < 0.0
-        or stream_age_s > 1.0
-    ):
-        return f"串流影格不新鮮（{max(0.0, stream_age_s):.1f}s）"
-    stream = str(getattr(state, "stream", ""))
-    if stream.upper() not in {"PREVIEW", "OK", "LOCALIZING", "HOLD_720P"}:
-        return f"串流狀態尚未就緒：{stream or '?'}"
-    return None
-
-
-def _system_readiness_problem(
-    state: object,
-    context: PreflightContext,
-) -> str | None:
-    if context.via_controller and not bool(getattr(state, "stick_monitor_ok", False)):
-        return "SkyController 搖桿監看尚未就緒"
-    if context.safety_log_durable is False or context.safety_log_healthy is False:
-        return "安全紀錄尚未確認可寫入"
-    if context.inventory_takeoff_ready is False:
-        return context.inventory_block_reason
-    return None
-
-
-def _system_evidence(
-    state: object,
-    context: PreflightContext,
-    now: float,
-) -> tuple[object | None, str]:
-    if not context.live:
-        if not context.video_frame_available:
-            return None, "等待模擬串流畫面"
-        return ("system", "simulated"), "模擬串流已顯示"
-    problem = _live_state_problem(state)
-    if problem is not None:
-        return None, problem
-    problem = _telemetry_problem(state, now)
-    if problem is not None:
-        return None, problem
-    problem = _stream_problem(state, context, now)
-    if problem is not None:
-        return None, problem
-    problem = _system_readiness_problem(state, context)
-    if problem is not None:
-        return None, problem
-    # Same decision object the live backend enforces at the takeoff boundary, so
-    # this screen cannot promise a takeoff the backend will refuse.
-    battery_blocker = takeoff_battery_blocker(
-        getattr(state, "battery_pct", None), context.min_takeoff_battery_pct
-    )
-    if battery_blocker is not None:
-        return None, f"電量未達起飛條件（會阻擋起飛）：{battery_blocker}"
-    battery = _evidence_float(getattr(state, "battery_pct", -1.0))
-    return (
-        "system",
-        "live",
-    ), (
-        f"串流、遙測與連線正常；電量 {battery:.0f}% 已過起飛門檻；"
-        "高度／距離限制：已設定者寫入或回讀失敗會阻擋起飛，未設定則不限制；"
-        "GPS 僅在已設定距離圍欄且要求 GPS 時才阻擋"
-    )
-
-
 def evaluate_preflight_step(
     step: str,
     state: object,
@@ -295,8 +185,6 @@ def evaluate_preflight_step(
         result = _map_evidence(context)
     elif step == "route":
         result = _route_evidence(context, verify_route_hash)
-    elif step == "system":
-        result = _system_evidence(state, context, now)
     else:
         result = None, f"未知的起飛前步驟：{step}"
     if memo is not None:

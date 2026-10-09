@@ -191,7 +191,7 @@ def main(argv: list[str] | None = None) -> int:
     calc_pts = list(wps)
     if closed and calc_pts[-1] != calc_pts[0]:
         calc_pts.append(calc_pts[0])
-    total_len = sum(math.dist(a, b) for a, b in zip(calc_pts[:-1], calc_pts[1:]))
+    total_len = sum(math.dist(a, b) for a, b in zip(calc_pts[:-1], calc_pts[1:], strict=False))
     zs = [map_frame.vertical(point) for point in doc.controller_waypoints()]
     z_min, z_max = min(zs), max(zs)
 

@@ -185,3 +185,53 @@ def test_runtime_containment_rejects_localizer_profile_outside_config_roots(
     )
 
     assert any("outside approved config roots" in error for error in failures)
+
+
+def test_runtime_containment_accepts_the_workmap_expansion_package(tmp_path: Path) -> None:
+    deploy = tmp_path / "定位演算法/deploy_code_expand/sfm_direct_deploy"
+    deploy.mkdir(parents=True)
+    config = tmp_path / "地圖檔/場域/site/releases/v1/localization/profile.json"
+    config.parent.mkdir(parents=True)
+    config.write_text("{}", encoding="utf-8")
+    profile = SimpleNamespace(
+        localizer="direct",
+        localizer_deploy_dir=deploy,
+        localizer_profile=config,
+    )
+    failures: list[str] = []
+
+    simulator_preflight._check_profile_runtime_containment(tmp_path, profile, failures)
+
+    assert failures == []
+
+
+def test_runtime_containment_rejects_other_deploy_packages(tmp_path: Path) -> None:
+    deploy = tmp_path / "定位演算法/deploy_code_other/sfm_direct_deploy"
+    deploy.mkdir(parents=True)
+    profile = SimpleNamespace(
+        localizer="direct",
+        localizer_deploy_dir=deploy,
+        localizer_profile=None,
+    )
+    failures: list[str] = []
+
+    simulator_preflight._check_profile_runtime_containment(tmp_path, profile, failures)
+
+    assert any("outside the fixed package" in error for error in failures)
+
+
+def test_runtime_containment_rejects_the_expansion_package_for_non_direct_profiles(
+    tmp_path: Path,
+) -> None:
+    deploy = tmp_path / "定位演算法/deploy_code_expand/sfm_direct_deploy"
+    deploy.mkdir(parents=True)
+    profile = SimpleNamespace(
+        localizer="glomap",
+        localizer_deploy_dir=deploy,
+        localizer_profile=None,
+    )
+    failures: list[str] = []
+
+    simulator_preflight._check_profile_runtime_containment(tmp_path, profile, failures)
+
+    assert any("outside the fixed package" in error for error in failures)

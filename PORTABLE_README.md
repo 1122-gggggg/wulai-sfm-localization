@@ -23,7 +23,7 @@ wheelhouse，再從包內 wheels 建立 `.venv`。不會連線到 Python package
 建立完成的 `.venv` 會綁定目前 package/manifest identity；若套件被更新、搬入既有
 `.venv`，或缺少 `PORTABLE_PACKAGE.json`，一鍵啟動會拒絕執行，請移除舊 `.venv`
 後由同一個套件重新建立。
-啟動 UI 本身不會起飛；起飛只能由操作員在 UI 完成四步 preflight 後觸發。
+啟動 UI 本身不會起飛；起飛只能由操作員在 UI 完成三步 preflight 後觸發。
 
 預設任務為
 `控制介面程式/mission_selections/river_gluemap_all8_direct_localization.json`。真機入口會先

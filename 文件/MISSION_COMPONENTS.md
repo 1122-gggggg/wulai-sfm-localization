@@ -43,15 +43,22 @@ preflight 第三步確認，不要求靜態 mission approval。`site_alignment` 
 控制介面程式/mission_selections/river_gluemap_all8_direct_localization.json
 ```
 
-它選用全八段 GLUEMAP（1,045 refs，frame
-`river_gluemap_all8_direct_20260831_d2b8a5304eff`）與 Parrot ANAFI 720p
-vehicle slot。來源 receipt 明列 `validation: NONE`；目前只有同資料集單幀 production
-runtime 煙霧成功，尚未驗證實際 ANAFI camera pipeline。現況：
+它選用全八段 GLUEMAP，frame 為
+`river_gluemap_all8_direct_20260908_0bc1fd174740`，搭配 Parrot ANAFI 720p
+vehicle slot。兩份河濱 selection 都綁定
+`mission_components/routes/river_gluemap_all8_direct_operator_route.json`，
+預設載入 `flight_route_20261004_141411_5ce6ab62.json`（7 點）。
 
-- 地面定位：resolver fail closed，等候獨立 holdout 與 camera-pipeline 品質 receipt。
-- AUTO：另缺新座標系 route，因此 `flight_ready=false`。
+同場域、同座標系的有效路線可直接從介面選定並綁定 AUTO，不需逐條建立靜態
+mission approval；目前 6 點與 7 點路線均已通過離線 AUTO 綁定／資產檢查。
+路線 SHA、座標系與格式仍須驗證，執行期間不可換線。
 
-舊 release 保留供人工回復，但不再是預設 selection。
+operator acceptance 允許定位與 AUTO；來源 receipt 仍明列
+`validation: NONE`，不是獨立 ANAFI camera-pipeline 品質驗證。2026-10-09 操作員
+要求續期並不設到期（`expires_at: null`）；`SFM_EVALUATION_ONLY=1` 仍禁止 AUTO。
+三步 preflight、BOOT pose lock 與搖桿接管條件仍照常生效；電量、硬體 inventory、影像新鮮度由 backend 起飛閘門另行把關。
+新任務快照維持 `speed_limit_mps: 0.3`，不因開放路線把比例地速限制提高到 0.6 m/s。
+更改 selection 後須在確認落地後關閉並重新啟動介面，讓新任務快照生效。
 
 
 檢查指令：
@@ -72,7 +79,7 @@ runtime 煙霧成功，尚未驗證實際 ANAFI camera pipeline。現況：
 ```
 
 移除 `--check-only` 並在 `--` 後放既有 operator 參數即可啟動 UI。resolver 的
-`flight_ready=true` 只允許 UI 顯示 AUTO 流程，不會自動起飛；操作員仍須完成四步
+`flight_ready=true` 只允許 UI 顯示 AUTO 流程，不會自動起飛；操作員仍須完成三步
 preflight 並親自按下「自動飛行」。
 
 更換任一元件後，不必手動計算 selection 內的 manifest hash，可建立一份新 selection：
@@ -91,6 +98,21 @@ preflight 並親自按下「自動飛行」。
 工具不覆寫舊 selection，且新組合未達定位相容時不會建立輸出。route 完成後，
 再用相同方式建立下一份 selection，保留可追溯的版本歷史；`--calibration` 可重複
 指定各 receipt。`--approval` 只保留舊檔稽核相容性，不影響 readiness。
+
+## 福和橋 selection（2026-10-08）
+
+`控制介面程式/mission_selections/fuhe_bridge_edm_localization.json` 綁定福和橋
+official69 EDM 地圖（frame `fuhe_bridge_official69_edm_20261006_49f8702fa2b2`）、
+`parrot_anafi_720p_fuhe_direct.json`（相機參數取自該地圖的 query camera，與河濱不同）、
+`mission_components/routes/fuhe_bridge_operator_route.json`（綁定
+`flight_route_20261008_172857_6e4b913d.json`，6 點、第 3 航段朝向框出物體）。
+重力對齊 `地圖檔/場域/fuhe_bridge/compat/T_align_gravity.json` 由 611 個參考 pose 量測
+（殘差 p95 1.24°），與舊的 Y 向上假設差 3.03°。
+
+`compat/localizer_quality_receipt.json` 是操作員 2026-10-08 簽署的 operator acceptance，
+2026-10-09 操作員要求續期不設到期：`validation: NONE`，不是獨立 ANAFI 驗證，也沒有實測尺度。
+改航線後路線 SHA 改變，須重做 route package 與新 selection。
+`tools/resolve_mission.py --require valid` 通過；此項只代表離線檢查，不是實飛許可。
 
 ## 從另一台電腦移入新地圖
 
@@ -158,7 +180,7 @@ localization 可為 optional，但 AUTO
 4. 確認相機沒有相對機身的水平 yaw 偏移；raw-map controller 把相機水平朝向直接
    當作機頭朝向，gimbal pitch 近乎垂直時會拒絕 AUTO pose。
 5. 更新 selection；連機 preflight 仍須比對實際機身 serial、firmware 與 adapter。
-6. 重新執行 resolver，並在下一個真機 session 重新完成四步 preflight。
+6. 重新執行 resolver，並在下一個真機 session 重新完成三步 preflight。
 
 ### 換定位演算法
 
@@ -187,4 +209,4 @@ localization 可為 optional，但 AUTO
 - runtime 只使用 resolver 產生的 immutable snapshot；任務進行中不得熱換元件。
 - `site_profile` 是遷移相容層，不再是元件資料的主要來源。
 - 地圖、定位器、路徑、必要校正或無人機任何一項變更都會形成新的 immutable snapshot，
-  並要求操作員在下一個真機 session 重新完成四步 preflight。
+  並要求操作員在下一個真機 session 重新完成三步 preflight。

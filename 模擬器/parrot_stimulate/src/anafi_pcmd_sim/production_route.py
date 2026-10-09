@@ -7,22 +7,23 @@ LoopHooks. Owns no controller math: PCMD comes from YawAlignedPcmdController
 via run_loop, speed limiting from DesktopRouteAutonomy._apply_speed_limit via
 a shared-fake-backend shim, and synthetic localization from
 simulated_localization (the same capture/receive contract as the fast sim).
-Sphinx truth is converted ENU metres -> map units (divide by
-meters_per_unit); yaw is fused from perturbed firmware attitude via
-HeadingEstimator. Mean wind uses the documented Sphinx world-wind params and
-gusts use the drone-component gust_magnitude ExprTk
-(https://developer.parrot.com/docs/sphinx/wind.html). No TakeOff: the
-operator hovers first; the adapter refuses without --attach-hovering.
+Sphinx ENU metres are rotated into the measured map basis and divided by
+meters_per_unit. Independent firmware fused attitude bridges heading during
+visual loss. ANAFI4k Sphinx 2.25.2 exposes physical wind only on the world
+component. Gusts update that native ENU wind vector from the AUTO pose poll;
+no unsupported drone ExprTk component or position displacement is used.
+No TakeOff: the operator hovers first; --attach-hovering is required.
 """
 
 from __future__ import annotations
 
 import argparse
 import contextlib
+import copy
 import hashlib
+import http.client
 import json
 import math
-import subprocess
 import sys
 import time
 from dataclasses import dataclass
@@ -32,10 +33,12 @@ from typing import Any
 import numpy as np
 
 from .safety import SPHINX_DRONE_IP, require_sphinx_target
+from .telemetry import TrueTelemetryCollector
 
 PRODUCTION_SUBCOMMAND = "production-route"
 
 LOCALIZATION_SOURCE = "synthetic_pose_not_EDM"
+POSITION_SOURCE = "omniscient_anafi.worldPosition_absolute_Gazebo_ENU"
 YAW_SOURCE = "perturbed_firmware_attitude"
 WIND_DOC = "https://developer.parrot.com/docs/sphinx/wind.html"
 
@@ -74,6 +77,8 @@ class ProductionRouteArgs:
     pos_noise_u: float = 0.004
     yaw_noise_deg: float = 1.0
     drop_rate: float = 0.02
+    blackout_every_s: float = 0.0
+    blackout_dur_s: float = 0.0
 
 
 def add_production_route_parser(subparsers) -> Any:
@@ -106,6 +111,18 @@ def add_production_route_parser(subparsers) -> Any:
     parser.add_argument("--pos-noise-u", type=float, default=0.004)
     parser.add_argument("--yaw-noise-deg", type=float, default=1.0)
     parser.add_argument("--drop-rate", type=float, default=0.02)
+    parser.add_argument(
+        "--blackout-every-s",
+        type=float,
+        default=0.0,
+        help="repeat visual loss every N simulation seconds (0 disables)",
+    )
+    parser.add_argument(
+        "--blackout-dur-s",
+        type=float,
+        default=0.0,
+        help="visual-loss duration; fresh fused attitude holds center and bridges heading",
+    )
     return parser
 
 
@@ -137,6 +154,8 @@ def args_from_namespace(args: argparse.Namespace) -> ProductionRouteArgs:
         pos_noise_u=float(getattr(args, "pos_noise_u", 0.004)),
         yaw_noise_deg=float(getattr(args, "yaw_noise_deg", 1.0)),
         drop_rate=float(getattr(args, "drop_rate", 0.02)),
+        blackout_every_s=float(getattr(args, "blackout_every_s", 0.0)),
+        blackout_dur_s=float(getattr(args, "blackout_dur_s", 0.0)),
     )
 
 
@@ -192,6 +211,8 @@ def _validate_parsed(parsed: ProductionRouteArgs) -> None:
         "pos_noise_u",
         "yaw_noise_deg",
         "drop_rate",
+        "blackout_every_s",
+        "blackout_dur_s",
         "gust_mps",
         "gust_duration_s",
         "gust_transition_s",
@@ -200,6 +221,8 @@ def _validate_parsed(parsed: ProductionRouteArgs) -> None:
         value = float(getattr(parsed, name))
         if not math.isfinite(value) or value < 0.0:
             raise ValueError(f"{name} must be finite and >= 0")
+    if parsed.gust_mps > 0 and parsed.gust_duration_s + 2 * parsed.gust_transition_s <= 0:
+        raise ValueError("enabled gust must have a positive duration or transition")
     if not 0.0 <= float(parsed.drop_rate) <= 1.0:
         raise ValueError("drop_rate must be in [0, 1]")
     frames = int(parsed.reseed_confirm_frames)
@@ -233,7 +256,6 @@ def describe_dry_run(parsed: ProductionRouteArgs) -> dict:
     _rpf, doc, frame, cfg, ctrl = build_production_stack(parsed.route, parsed.align)
     route_sha = hashlib.sha256(Path(parsed.route).read_bytes()).hexdigest()
     wind = _wind_to_sphinx_params(tuple(parsed.wind_mean_mps))
-    gust_expr = _gust_expr(parsed)
     return {
         "command": PRODUCTION_SUBCOMMAND,
         "dry_run": True,
@@ -250,11 +272,25 @@ def describe_dry_run(parsed: ProductionRouteArgs) -> dict:
         "wind_mean_mps": [float(v) for v in parsed.wind_mean_mps],
         "wind_sphinx": wind,
         "gust_mps": float(parsed.gust_mps),
-        "gust_sphinx_expr": gust_expr,
+        "gust_sphinx": {
+            "mechanism": "host-driven world/wind SetParam; native physical wind",
+            "direction_enu": "East, additive to mean vector",
+            "duration_s": float(parsed.gust_duration_s),
+            "transition_s": float(parsed.gust_transition_s),
+            "pause_s": float(parsed.gust_pause_s),
+            "updates": "AUTO pose polls, nominally 20 Hz",
+        },
         "target_safety_lock": f"{SPHINX_DRONE_IP} only",
         "firmware_sha256": FIRMWARE_SHA,
         "envelope": dict(PRODUCTION_ENVELOPE),
         "localization_source": LOCALIZATION_SOURCE,
+        "position_source": POSITION_SOURCE,
+        "truth_telemetry": {
+            "endpoint": "inet:127.0.0.1:9060",
+            "rate_hz": 50,
+            "max_age_s": 0.5,
+            "origin": "absolute Gazebo world; no GPS or attach-origin subtraction",
+        },
         "yaw_source": YAW_SOURCE,
         "wind_api": WIND_DOC,
         "connect": False,
@@ -270,6 +306,13 @@ def describe_dry_run(parsed: ProductionRouteArgs) -> dict:
             "pos_noise_u": float(parsed.pos_noise_u),
             "yaw_noise_deg": float(parsed.yaw_noise_deg),
             "drop_rate": float(parsed.drop_rate),
+            "blackout_every_s": float(parsed.blackout_every_s),
+            "blackout_dur_s": float(parsed.blackout_dur_s),
+            "blackout_window": "simulation_time % blackout_every_s < blackout_dur_s",
+            "blackout_compensation": "fused attitude only; last visual center held; no map confirmation",
+            "imu_sample_max_age_s": 0.5,
+            "imu_bridge_max_age_s": 10.0,
+            "imu_bridge_max_frames": 300,
         },
         "controller": {
             "max_translation_pcmd": int(cfg.max_translation_pcmd),
@@ -280,12 +323,11 @@ def describe_dry_run(parsed: ProductionRouteArgs) -> dict:
 
 
 def _wind_to_sphinx_params(mean_enu: tuple[float, float, float]) -> dict[str, float]:
-    east, north, _up = (float(mean_enu[0]), float(mean_enu[1]), float(mean_enu[2]))
-    magnitude = math.hypot(east, north)
-    # Sphinx example: 5 m/s toward East is direction_mean 0. ENU east maps to
-    # that 0; ENU north (+90 deg CCW from east) maps to 90 in the same frame.
-    direction = (math.degrees(math.atan2(float(north), float(east))) + 360.0) % 360.0
-    elevation = 0.0
+    east, north, up = map(float, mean_enu)
+    horizontal = math.hypot(east, north)
+    magnitude = math.hypot(horizontal, up)
+    direction = math.degrees(math.atan2(north, east)) % 360.0
+    elevation = math.degrees(math.atan2(up, horizontal))
     return {
         "magnitude_mean": float(magnitude),
         "direction_mean": float(direction),
@@ -293,55 +335,89 @@ def _wind_to_sphinx_params(mean_enu: tuple[float, float, float]) -> dict[str, fl
     }
 
 
-def _gust_expr(parsed: ProductionRouteArgs) -> str | None:
-    magnitude = float(parsed.gust_mps)
-    if magnitude <= 0.0:
-        return None
-    return f"{magnitude:g} * gust_magnitude({float(parsed.gust_duration_s):g}, {float(parsed.gust_transition_s):g}, {float(parsed.gust_pause_s):g})"
+def _gust_amplitude(parsed: ProductionRouteArgs, elapsed_s: float) -> float:
+    """Rise, hold, fall, pause; zero pause means one cycle, like Sphinx gusts."""
+    if parsed.gust_mps <= 0:
+        return 0.0
+    transition = float(parsed.gust_transition_s)
+    duration = float(parsed.gust_duration_s)
+    active = duration + 2 * transition
+    elapsed = max(0.0, float(elapsed_s))
+    if parsed.gust_pause_s == 0:
+        if elapsed >= active:
+            return 0.0
+        phase = elapsed
+    else:
+        phase = elapsed % (active + float(parsed.gust_pause_s))
+    if transition > 0 and phase < transition:
+        fraction = phase / transition
+    elif phase < transition + duration:
+        fraction = 1.0
+    elif transition > 0 and phase < active:
+        fraction = (active - phase) / transition
+    else:
+        fraction = 0.0
+    return float(parsed.gust_mps) * fraction
 
 
-def _sphinx_wind_commands(parsed: ProductionRouteArgs) -> list[list[str]]:
-    wind = _wind_to_sphinx_params(tuple(parsed.wind_mean_mps))
-    commands = [
-        [
-            "sphinx-cli",
-            "param",
-            "-m",
-            "world",
-            "wind/wind",
-            "magnitude_mean",
-            repr(float(wind["magnitude_mean"])),
-        ],
-        [
-            "sphinx-cli",
-            "param",
-            "-m",
-            "world",
-            "wind/wind",
-            "direction_mean",
-            repr(float(wind["direction_mean"])),
-        ],
-        [
-            "sphinx-cli",
-            "param",
-            "-m",
-            "world",
-            "wind/wind",
-            "elevation_mean",
-            repr(float(wind["elevation_mean"])),
-        ],
-    ]
-    gust_expr = _gust_expr(parsed)
-    commands.append(
-        ["sphinx-cli", "param", "-m", "anafi", "wind/wind", "magnitude_expr", gust_expr or "0"]
-    )
-    return commands
+class _SphinxWind:
+    """Native physical world wind; no thread, SDK commands, or truth movement."""
 
+    def __init__(self, parsed: ProductionRouteArgs):
+        self.parsed = parsed
+        self._connection = http.client.HTTPConnection("127.0.0.1", 8383, timeout=0.5)
+        self._last_params: dict[str, float] = {}
+        self._started_at: float | None = None
+        try:
+            self._apply(tuple(parsed.wind_mean_mps))
+        except Exception:
+            self.close()
+            raise
 
-def _apply_sphinx_wind(parsed: ProductionRouteArgs) -> None:
-    """Apply every declared wind setting; a calm case also clears old gusts."""
-    for command in _sphinx_wind_commands(parsed):
-        subprocess.run(command, check=True, timeout=10, capture_output=True, text=True)
+    def _set_param(self, parameter: str, value: float) -> None:
+        # Same RPC and string-valued parameters as installed pysphinx.SetParam.
+        body = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "SetParam",
+                "params": {
+                    "machine": "world",
+                    "object": "wind/wind",
+                    "parameter": parameter,
+                    "value": repr(float(value)),
+                },
+            }
+        )
+        self._connection.request("POST", "/", body, {"Content-Type": "application/json"})
+        response = self._connection.getresponse()
+        payload = response.read()
+        if response.status != 200:
+            raise RuntimeError(f"Sphinx wind HTTP status {response.status}")
+        result = json.loads(payload)
+        if (
+            not isinstance(result, dict)
+            or result.get("result") is not True
+            or result.get("error") is not None
+        ):
+            raise RuntimeError(f"Sphinx rejected wind parameter {parameter}: {result}")
+
+    def _apply(self, enu: tuple[float, float, float]) -> None:
+        for parameter, value in _wind_to_sphinx_params(enu).items():
+            if self._last_params.get(parameter) == value:
+                continue
+            self._set_param(parameter, value)
+            self._last_params[parameter] = value
+
+    def update(self, now: float) -> None:
+        if self._started_at is None:
+            self._started_at = float(now)
+        gust = _gust_amplitude(self.parsed, float(now) - self._started_at)
+        east, north, up = self.parsed.wind_mean_mps
+        self._apply((float(east) + gust, float(north), float(up)))
+
+    def close(self) -> None:
+        self._connection.close()
 
 
 def _write_dry_run_artifacts(parsed: ProductionRouteArgs, payload: dict) -> None:
@@ -355,17 +431,16 @@ def _write_dry_run_artifacts(parsed: ProductionRouteArgs, payload: dict) -> None
 class _SphinxProductionPoseBridge:
     """Sphinx truth -> synthetic map-unit pose for the production controller.
 
-    Owns no estimation: converts Sphinx ENU metres to map units, pushes them
-    through SimulatedLocalizer (same capture/receive contract as the fast
-    sim), and exposes the LoopHooks pose/yaw/velocity surface. Yaw comes from
-    perturbed firmware attitude fused by HeadingEstimator.
+    Converts Sphinx ENU metres to the measured map basis, pushes them through
+    SimulatedLocalizer (the same capture/receive contract as the fast sim),
+    and exposes the LoopHooks pose/yaw/velocity surface. Visual yaw is perturbed
+    firmware heading; blackout increments use unperturbed independent samples.
     """
 
-    def __init__(self, parsed, frame, localizer, heading, *, rng):
+    def __init__(self, parsed, frame, localizer, *, rng):
         self.parsed = parsed
         self.frame = frame
         self.localizer = localizer
-        self.heading = heading
         self.rng = rng
         self.scale = float(parsed.meters_per_unit)
         self.east = np.asarray(frame.east, dtype=float)
@@ -373,6 +448,9 @@ class _SphinxProductionPoseBridge:
         self.up = np.asarray(frame.up, dtype=float)
         self.last_truth_m: np.ndarray | None = None
         self.last_truth_yaw: float | None = None
+        self.last_truth_stamp: float | None = None
+        self._truth_sample_stamp: float | None = None
+        self._truth_fault: str | None = None
         self.last_pose = None
         self.last_pose_accepted_at: float | None = None
         self.last_map_stamp: float | None = None
@@ -382,10 +460,29 @@ class _SphinxProductionPoseBridge:
         self.speed_north_mps = 0.0
         self.speed_east_mps = 0.0
         self.speed_stamp: float | None = None
+        self._time_origin: float | None = None
+
+    def _simulation_time(self, now: float) -> float:
+        if self._time_origin is None:
+            self._time_origin = float(now)
+        return float(now) - self._time_origin
 
     def enu_to_map(self, enu_m) -> np.ndarray:
         vec = np.asarray(enu_m, dtype=float).reshape(3)
         return (vec[0] * self.east + vec[1] * self.north + vec[2] * self.up) / self.scale
+
+    def invalidate_truth(self, fault="truth-missing") -> None:
+        self._truth_fault = fault
+        self.last_pose = None
+        self.localizer.map_confirmed = False
+        self.localizer.fault = fault
+
+    def truth_is_fresh(self) -> bool:
+        return bool(
+            self._truth_fault is None
+            and self.last_truth_stamp is not None
+            and 0.0 <= time.monotonic() - self.last_truth_stamp <= 0.5
+        )
 
     def observe_truth(
         self,
@@ -393,48 +490,84 @@ class _SphinxProductionPoseBridge:
         enu_m,
         attitude_yaw_ned: float | None,
         vel_ned: tuple[float, float] | None = None,
+        *,
+        attitude_stamp: float | None = None,
+        tilt_deg: float = 0.0,
+        truth_sample_stamp: float | None = None,
     ) -> None:
         enu = np.asarray(enu_m, dtype=float).reshape(3)
-        self.last_truth_m = enu.copy()
-        # SimulatedLocalizer expects world-frame metres parallel to the map
-        # basis (same contract as the offline sim's state.pos_m): ENU metres
-        # already are, so push them directly without re-scaling.
-        map_m = enu.copy()
+        source_stamp = float(now if truth_sample_stamp is None else truth_sample_stamp)
+        if not math.isfinite(source_stamp) or not np.all(np.isfinite(enu)):
+            self.invalidate_truth("truth-invalid")
+            return
+        if self._truth_sample_stamp is not None and source_stamp < self._truth_sample_stamp:
+            self.invalidate_truth("truth-out-of-order")
+            return
+        new_truth = self._truth_sample_stamp is None or source_stamp > self._truth_sample_stamp
+        sim_now = self._simulation_time(now)
+        if new_truth:
+            self.last_truth_m = enu.copy()
+            self.last_truth_stamp = float(now)
+            self._truth_sample_stamp = source_stamp
+            self._truth_fault = None
+        # Rotate ENU metres into the measured map basis before the localizer
+        # divides by scale. This is the inverse of _route_enu_metres.
+        map_m = enu[0] * self.east + enu[1] * self.north + enu[2] * self.up
         yaw_noise = (
             float(self.rng.normal(0.0, float(self.parsed.yaw_noise_deg)))
             if float(self.parsed.yaw_noise_deg) > 0
             else 0.0
         )
         self.yaw_perturb_deg = yaw_noise
-        attitude = float(attitude_yaw_ned) if attitude_yaw_ned is not None else 0.0
-        # Visual yaw anchor: project the Sphinx body yaw into the map frame
-        # through the same NED->map convention HeadingEstimator uses, then
-        # perturb it like a visual heading observation.
+        attitude = float(attitude_yaw_ned) if attitude_yaw_ned is not None else float("nan")
         map_attitude = (math.pi / 2.0 - attitude + math.pi) % (2.0 * math.pi) - math.pi
         visual_map_yaw = float(map_attitude + math.radians(yaw_noise))
-        self.heading.update(visual_map_yaw, attitude)
-        fused = self.heading.heading(attitude)
-        reported_yaw = float(fused) if fused is not None else float(visual_map_yaw)
-        self.last_truth_yaw = float(reported_yaw)
-        self.last_attitude_yaw = float(attitude)
-        self.last_attitude_stamp = float(now)
+        if not math.isfinite(visual_map_yaw):
+            visual_map_yaw = float(self.last_truth_yaw or 0.0)
+        self.last_truth_yaw = visual_map_yaw
+        sample_stamp = float(now if attitude_stamp is None else attitude_stamp)
+        yaw_rate = 0.0
+        if self.last_attitude_stamp is not None and sample_stamp > self.last_attitude_stamp:
+            delta = (attitude - self.last_attitude_yaw + math.pi) % (2.0 * math.pi) - math.pi
+            yaw_rate = math.degrees(delta) / (sample_stamp - self.last_attitude_stamp)
+        if self.last_attitude_stamp != sample_stamp or not math.isfinite(attitude):
+            self.localizer.push_imu(
+                sample_stamp - self._time_origin,
+                map_attitude,
+                tilt_deg=tilt_deg,
+                yaw_rate_deg_s=yaw_rate,
+            )
+        if math.isfinite(attitude) and math.isfinite(sample_stamp):
+            self.last_attitude_yaw = attitude
+            self.last_attitude_stamp = sample_stamp
         if vel_ned is not None:
             self.speed_north_mps = float(vel_ned[0])
             self.speed_east_mps = float(vel_ned[1])
             self.speed_stamp = float(now)
-        self.localizer.push_truth(float(now), map_m, float(reported_yaw))
+        if new_truth:
+            self.localizer.push_truth(sim_now, map_m, visual_map_yaw)
 
     def get_pose(self):
         now = time.monotonic()
-        pose = self.localizer.report(float(now))
+        if self._time_origin is None:
+            return None
+        if not self.truth_is_fresh():
+            self.invalidate_truth(self._truth_fault or "truth-stale")
+            return None
+        pose = self.localizer.report(self._simulation_time(now))
         if pose is None:
-            return self.last_pose
-        fresh = self.last_pose is None or float(pose.stamp) > float(self.last_pose.stamp)
+            self.last_pose = None
+            return None
+        fresh = self.last_pose is None or float(pose.stamp) + self._time_origin > float(
+            self.last_pose.stamp
+        )
+        # Keep localizer stamps in simulation time; hooks consume monotonic time.
         if fresh:
-            self.last_pose = pose
+            self.last_pose = copy.copy(pose)
+            self.last_pose.stamp = float(pose.stamp) + self._time_origin
             self.last_pose_accepted_at = float(now)
-            if bool(getattr(pose, "map_confirmed", True)):
-                self.last_map_stamp = float(pose.stamp)
+            if bool(getattr(pose, "map_confirmed", False)):
+                self.last_map_stamp = self.last_pose.stamp
         return self.last_pose
 
     def olympe_yaw(self):
@@ -534,8 +667,17 @@ class _SharedSpeedLimitShim:
                 except (AttributeError, TypeError):
                     pass
 
-    def apply(self, pcmd, *, yaw_ned: float, north_mps: float, east_mps: float, stamp: float,
-              attitude_stamp: float | None, velocity_stamp: float | None):
+    def apply(
+        self,
+        pcmd,
+        *,
+        yaw_ned: float,
+        north_mps: float,
+        east_mps: float,
+        stamp: float,
+        attitude_stamp: float | None,
+        velocity_stamp: float | None,
+    ):
         self.stamp = float(stamp)
         state = self.backend.state
         state.att_yaw = float(yaw_ned)
@@ -562,7 +704,6 @@ def _run_attach(parsed: ProductionRouteArgs) -> int:
         from olympe.messages.ardrone3.PilotingState import (
             AttitudeChanged,
             FlyingStateChanged,
-            PositionChanged,
             SpeedChanged,
         )
     except ImportError as exc:
@@ -570,7 +711,6 @@ def _run_attach(parsed: ProductionRouteArgs) -> int:
         return 2
     _rpf, _doc, frame, _cfg, ctrl = build_production_stack(parsed.route, parsed.align)
     import path_follow_flight as pff
-    from heading_fusion import HeadingEstimator
     from simulated_localization import SimulatedLocalizer, SimulatedLocalizerConfig
 
     rng = np.random.default_rng(int(parsed.seed))
@@ -587,11 +727,12 @@ def _run_attach(parsed: ProductionRouteArgs) -> int:
             yaw_correlation_s=float(parsed.yaw_correlation_s),
             bias_walk_u_sqrt_s=float(parsed.bias_walk_u_sqrt_s),
             reseed_confirm_frames=int(parsed.reseed_confirm_frames),
+            blackout_every_s=float(parsed.blackout_every_s),
+            blackout_dur_s=float(parsed.blackout_dur_s),
         ),
         rng,
     )
-    heading = HeadingEstimator(frame)
-    bridge = _SphinxProductionPoseBridge(parsed, frame, loc, heading, rng=rng)
+    bridge = _SphinxProductionPoseBridge(parsed, frame, loc, rng=rng)
     speed_shim = _SharedSpeedLimitShim(ctrl)
     out = Path(parsed.output_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -625,11 +766,9 @@ def _run_attach(parsed: ProductionRouteArgs) -> int:
         )
         drone.disconnect()
         return 2
-    for command in _sphinx_wind_commands(parsed):
-        print("+ " + " ".join(command), flush=True)
     try:
-        _apply_sphinx_wind(parsed)
-    except (OSError, subprocess.SubprocessError) as exc:
+        wind = _SphinxWind(parsed)
+    except (OSError, ValueError, RuntimeError, http.client.HTTPException) as exc:
         drone.disconnect()
         print(f"production-route: wind setup failed: {exc}", file=sys.stderr)
         return 2
@@ -638,6 +777,15 @@ def _run_attach(parsed: ProductionRouteArgs) -> int:
 
     cmdlog = CommandLog(log_path, sink="sphinx-production-route")
     sent = {"count": 0}
+    attitude_received = {"sample": None}
+    wind_failure: dict[str, str | None] = {"error": None}
+
+    def on_attitude(event, _scheduler):
+        # Timestamp actual firmware events, never refresh cached get_state data.
+        attitude_received["sample"] = (time.monotonic(), dict(event.args))
+
+    attitude_subscription = drone.subscribe(on_attitude, AttitudeChanged())
+    collector = TrueTelemetryCollector(stderr_path=out / "true_telemetry.stderr.log")
 
     def send_authorized_pcmd(pcmd):
         limited = speed_shim.apply(
@@ -655,40 +803,53 @@ def _run_attach(parsed: ProductionRouteArgs) -> int:
         sent["count"] += 1 if ok else 0
         return ok, "Sphinx dispatch" if ok else "Sphinx dispatch failed", limited if ok else None
 
-    _gps_origin: dict = {"lat": None, "lon": None, "alt": None}
-
     def get_pose():
+        now = time.monotonic()
         try:
-            pos = drone.get_state(PositionChanged)
-            att = drone.get_state(AttitudeChanged)
+            wind.update(now)
+        except (OSError, ValueError, RuntimeError, http.client.HTTPException) as exc:
+            # The formal loop treats getter exceptions as no fix. Latch a
+            # boundary failure separately so it exits instead of waiting forever.
+            wind_failure["error"] = str(exc)
+            return None
+        try:
+            sample = collector.latest_sample()
+        except RuntimeError:
+            bridge.invalidate_truth()
+            return None
+        att_sample = attitude_received["sample"]
+        try:
             spd = drone.get_state(SpeedChanged)
         except (AttributeError, KeyError, RuntimeError, TypeError):
-            return bridge.get_pose()
-        try:
-            lat = float(pos["latitude"])
-            lon = float(pos["longitude"])
-            alt = float(pos["altitude"])
-        except (KeyError, TypeError, ValueError):
-            return bridge.get_pose()
-        if not (math.isfinite(lat) and math.isfinite(lon) and math.isfinite(alt)):
-            return bridge.get_pose()
-        if _gps_origin["lat"] is None:
-            _gps_origin.update({"lat": lat, "lon": lon, "alt": alt})
-        now = time.monotonic()
-        # Same GPS->local conversion as the production Sphinx smoke path:
-        # north/east metres from the attach origin, up from altitude.
-        north = (lat - _gps_origin["lat"]) * 111320.0
-        east = (lon - _gps_origin["lon"]) * 111320.0 * math.cos(math.radians(_gps_origin["lat"]))
-        enu = (float(east), float(north), float(alt - _gps_origin["alt"]))
+            spd = {}
+        # Absolute Gazebo world position matches waypoints_enu_m. No GPS
+        # estimate, zeroing at attach, or discarded world-height offset.
+        enu = (sample.x_m, sample.y_m, sample.z_m)
+        attitude_stamp, att = att_sample if att_sample is not None else (now, {})
         try:
             yaw_ned = float(att["yaw"])
-        except (KeyError, TypeError, ValueError):
-            yaw_ned = bridge.olympe_yaw()
+            roll, pitch = float(att["roll"]), float(att["pitch"])
+            if not all(math.isfinite(value) for value in (yaw_ned, roll, pitch)):
+                raise ValueError("non-finite firmware attitude")
+            tilt_deg = math.degrees(
+                math.acos(max(-1.0, min(1.0, math.cos(roll) * math.cos(pitch))))
+            )
+        except (KeyError, TypeError, ValueError, OverflowError):
+            yaw_ned = float("nan")
+            tilt_deg = float("nan")
         try:
             vel = (float(spd["speedX"]), float(spd["speedY"]))
         except (KeyError, TypeError, ValueError):
             vel = None
-        bridge.observe_truth(now, enu, yaw_ned, vel_ned=vel)
+        bridge.observe_truth(
+            now,
+            enu,
+            yaw_ned,
+            vel_ned=vel,
+            attitude_stamp=attitude_stamp,
+            tilt_deg=tilt_deg,
+            truth_sample_stamp=sample.timestamp_s,
+        )
         return bridge.get_pose()
 
     hooks = pff.LoopHooks(
@@ -701,6 +862,9 @@ def _run_attach(parsed: ProductionRouteArgs) -> int:
         pose_confidence=bridge.pose_confidence,
         max_weak_pose_age_s=0.5,
         stream_healthy=lambda: True,
+        # LAND terminates this virtual run; MANUAL would leave its loop waiting.
+        # The existing finally block performs normal Sphinx landing/cleanup.
+        safety_poll=lambda: "LAND" if wind_failure["error"] is not None else "AUTO",
         ground_speed=bridge.ground_speed,
         body_velocity=bridge.body_velocity,
         attitude_sample=bridge.attitude_sample,
@@ -712,14 +876,31 @@ def _run_attach(parsed: ProductionRouteArgs) -> int:
     waypoints = [np.asarray(p, dtype=float) for p in ctrl.wp]
     ctrl.start_after_nearest_waypoint(np.asarray(waypoints[0], dtype=float))
     try:
+        try:
+            collector.start()
+            collector.wait_for_sample(timeout_s=15)
+        except (OSError, RuntimeError, TimeoutError) as exc:
+            print(f"production-route: true world telemetry unavailable: {exc}", file=sys.stderr)
+            return 2
         reason = pff.run_loop(hooks, ctrl, waypoints, yaw_sign=1, verbose=True)
+        if wind_failure["error"] is not None:
+            print(f"production-route: wind update failed: {wind_failure['error']}", file=sys.stderr)
+            return 2
+    except (OSError, ValueError, RuntimeError, http.client.HTTPException) as exc:
+        print(f"production-route: simulation boundary failed: {exc}", file=sys.stderr)
+        return 2
     finally:
+        wind.close()
+        with contextlib.suppress(Exception):
+            attitude_subscription.unsubscribe()
         with contextlib.suppress(Exception):
             drone(PCMD(1, 0, 0, 0, 0, 0))
         try:
             drone(Landing(_no_expect=True)).wait(_timeout=20)
         except Exception as exc:  # noqa: BLE001 -- cleanup retains diagnostics.
             print(f"production-route: landing did not confirm ({exc!r})", file=sys.stderr)
+        with contextlib.suppress(Exception):
+            collector.stop()
         with contextlib.suppress(Exception):
             drone.disconnect()
         with contextlib.suppress(Exception):

@@ -11,10 +11,19 @@ either does not match. Display only: localization never reads it.
 The tool refuses to write unless every ``map.ply`` point appears bit-exactly in
 the dense cloud, which proves both come from the same model coordinates.
 
+``--mvs-fused`` writes the colored MVS fused cloud (``fused.ply`` from
+``tools/build_mvs_surface.py``) instead. It stays in the release's raw map
+coordinates, so waypoints clicked on it are valid. Statistical outliers are
+dropped and the cloud is thinned to ``--max-points`` (the editor's own cap) so the
+editor never has to stride it. The release must already carry a
+``dense_surface.json`` for the same coordinate frame. Needs scipy; use ``.venv-mvs``.
+
 Usage
 -----
     .venv/bin/python tools/build_dense_display_ply.py \\
         --release 地圖檔/場域/river_site/releases/river_gluemap_all8_direct_20260908
+    .venv-mvs/bin/python tools/build_dense_display_ply.py --release <release> \\
+        --mvs-fused /path/to/fused.ply
 """
 
 from __future__ import annotations
@@ -44,6 +53,10 @@ from map_point_io import (  # noqa: E402
 # point3D_id, xyz, rgb, error, track length; the track itself follows.
 _POINT_HEAD = struct.Struct("<QdddBBBdQ")
 _TRACK_ENTRY_BYTES = 8
+MVS_MANIFEST_NAME = "dense_surface.json"
+DEFAULT_MAX_POINTS = 3_000_000  # flight_operator_app.ROUTE_EDITOR_POINTS
+OUTLIER_NEIGHBORS = 8
+OUTLIER_STD_RATIO = 3.0
 
 
 def sha256_file(path: Path) -> str:
@@ -151,6 +164,66 @@ def build(release: Path, out: Path | None = None) -> dict:
     }
 
 
+def drop_outliers(xyz: np.ndarray, *, neighbors: int, std_ratio: float) -> np.ndarray:
+    """Keep mask: mean distance to the k nearest neighbours <= mean + ratio * std."""
+    from scipy.spatial import cKDTree
+
+    distances, _ = cKDTree(xyz).query(xyz, k=neighbors + 1, workers=2)
+    mean_distance = distances[:, 1:].mean(axis=1)
+    return mean_distance <= mean_distance.mean() + std_ratio * mean_distance.std()
+
+
+def build_from_mvs(
+    release: Path, fused: Path, out: Path | None = None, *, max_points: int = DEFAULT_MAX_POINTS
+) -> dict:
+    release = Path(release).expanduser().resolve()
+    profile = json.loads((release / "site_profile.json").read_text(encoding="utf-8"))
+    frame_id = str(profile["coordinate_frame"]["id"])
+    map_ply = release / profile["assets"]["map_ply"]
+    declared = str(profile["asset_sha256"]["map_ply"])
+    actual = sha256_file(map_ply)
+    if actual != declared:
+        raise ValueError(f"map.ply digest {actual} does not match site_profile.json {declared}")
+    manifest_path = (release / profile["assets"]["localization_bundle"]).with_name(
+        MVS_MANIFEST_NAME
+    )
+    try:
+        manifest_frame = json.loads(manifest_path.read_text(encoding="utf-8")).get(
+            "coordinate_frame_id"
+        )
+    except OSError as exc:
+        raise ValueError(f"release has no MVS sidecar {manifest_path}: {exc}") from exc
+    if manifest_frame != frame_id:
+        raise ValueError(f"{MVS_MANIFEST_NAME} frame {manifest_frame} is not {frame_id}")
+    if max_points < 1:
+        raise ValueError("--max-points must be positive")
+    points = read_ply_points(Path(fused), max_points=1 << 62)
+    if not len(points) or not np.isfinite(points[:, :3]).all():
+        raise ValueError(f"fused cloud is empty or has non-finite coordinates: {fused}")
+    keep = drop_outliers(points[:, :3], neighbors=OUTLIER_NEIGHBORS, std_ratio=OUTLIER_STD_RATIO)
+    points = points[keep]
+    if len(points) > max_points:
+        chosen = np.sort(np.random.default_rng(0).choice(len(points), max_points, replace=False))
+        points = points[chosen]
+    target = out or map_ply.with_name(DENSE_DISPLAY_PLY_NAME)
+    write_dense_ply(
+        target,
+        points[:, :3],
+        points[:, 3:6].astype(np.uint8),
+        coordinate_frame_id=frame_id,
+        map_ply_sha256=actual,
+    )
+    return {
+        "output": str(target),
+        "dense_points": int(len(points)),
+        "fused_points": int(len(keep)),
+        "outliers_dropped": int((~keep).sum()),
+        "fused_sha256": sha256_file(Path(fused)),
+        "coordinate_frame_id": frame_id,
+        "map_ply_sha256": actual,
+    }
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--release", type=Path, required=True, help="direct site release folder")
@@ -160,8 +233,23 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help=f"output PLY (default: <release>/map/{DENSE_DISPLAY_PLY_NAME})",
     )
+    parser.add_argument(
+        "--mvs-fused",
+        type=Path,
+        default=None,
+        help="write this MVS fused.ply (outliers dropped, thinned) instead of the sparse model",
+    )
+    parser.add_argument(
+        "--max-points",
+        type=int,
+        default=DEFAULT_MAX_POINTS,
+        help="point cap for --mvs-fused (default: the route editor's 3,000,000 cap)",
+    )
     args = parser.parse_args(argv)
-    summary = build(args.release, args.out)
+    if args.mvs_fused is not None:
+        summary = build_from_mvs(args.release, args.mvs_fused, args.out, max_points=args.max_points)
+    else:
+        summary = build(args.release, args.out)
     print(json.dumps(summary, ensure_ascii=False, indent=2))
     return 0
 

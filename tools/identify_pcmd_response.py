@@ -56,7 +56,7 @@ def load_ticks(path):
 def build_segments(ticks):
     commands = []
     velocities = {}
-    for tick_stamp, command_stamp, speed_stamp, yaw, pcmd, north, east in ticks:
+    for _tick_stamp, command_stamp, speed_stamp, yaw, pcmd, north, east in ticks:
         forward, right = pcmd[1], pcmd[0]
         commands.append(
             (

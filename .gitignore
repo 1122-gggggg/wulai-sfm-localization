@@ -1,5 +1,7 @@
 # Local environments, maps, model weights, and generated runtime artifacts.
 .venv/
+.venv-yolo/
+.venv-mvs/
 env/
 outputs/*
 !outputs/README.md
@@ -33,6 +35,8 @@ outputs/*
 執行環境/models/boq/
 # 已結案的 STA 地圖錨定實驗模型（sta_map_anchored_eval.py），不進 git。
 執行環境/models/vista_slam/
+# Optional pretrained segmentation benchmark checkpoint; not a portable runtime asset.
+執行環境/models/yolo26n-seg.pt
 # direct 後端的執行期 scratch（placeholder manifest、EDM runtime config）。
 執行環境/direct_reloc_cache/
 river-localization-bundle-20260831/

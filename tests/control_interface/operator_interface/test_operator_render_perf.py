@@ -11,7 +11,6 @@ import sys
 
 import numpy as np
 import gc
-import inspect
 import math
 from tkinter import ttk
 
@@ -45,21 +44,6 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def _parse_window_size(value: object) -> tuple[int, int] | None:
-    if isinstance(value, str):
-        parts = value.lower().split("x")
-        if len(parts) != 2:
-            return None
-        try:
-            return int(parts[0]), int(parts[1])
-        except ValueError:
-            return None
-    if isinstance(value, (tuple, list)) and len(value) == 2:
-        try:
-            return int(value[0]), int(value[1])
-        except (TypeError, ValueError):
-            return None
-    return None
 
 
 def _window_geometry(size: tuple[int, int]) -> str:
@@ -139,29 +123,6 @@ def _force_widget_focus(operator, widget) -> None:
     assert operator.focus_get() is widget
 
 
-def test_window_sizes_come_from_production_constants_and_selftest_has_no_old_minimum(
-    operator,
-) -> None:
-    sizes = {
-        name: _parse_window_size(value)
-        for name, value in vars(app).items()
-        if name.isupper()
-    }
-    standard_names = [name for name, size in sizes.items() if size == (1440, 900)]
-    minimum_names = [name for name, size in sizes.items() if size == (1180, 768)]
-    assert standard_names, "production must expose the 1440x900 window constant"
-    assert minimum_names, "production must expose the 1180x768 minimum constant"
-
-    assert operator.geometry().split("+", 1)[0] == _window_geometry(app.UI_STANDARD_SIZE)
-    assert tuple(map(int, operator.minsize())) == app.UI_MIN_SIZE
-    init_source = inspect.getsource(app.OperatorApp.__init__)
-    launch_input_source = inspect.getsource(app._prepare_operator_launch_inputs)
-    assert any(name in init_source for name in standard_names)
-    assert any(name in init_source for name in minimum_names)
-    assert any(name in launch_input_source for name in standard_names)
-    assert any(name in launch_input_source for name in minimum_names)
-    assert f"{980}x{640}" not in launch_input_source
-
 
 def test_dedup_string_var_suppresses_only_no_op_writes(operator) -> None:
     var = app.DedupStringVar(master=operator, value="a")
@@ -187,17 +148,6 @@ def test_dedup_string_var_still_overwrites_operator_typed_text(operator) -> None
     assert var.get() == "10"
 
 
-def test_present_frame_reuses_the_photo_until_the_panel_resizes(operator) -> None:
-    state = operator.backend.poll()
-    operator._present_frame(
-        operator.map_label, "map_photo", operator.render_map(400, 300, state))
-    first = operator.map_photo
-    operator._present_frame(
-        operator.map_label, "map_photo", operator.render_map(400, 300, state))
-    assert operator.map_photo is first, "same-size repaint must reuse the PhotoImage"
-    operator._present_frame(
-        operator.map_label, "map_photo", operator.render_map(420, 300, state))
-    assert operator.map_photo is not first, "a resize must allocate a new PhotoImage"
 
 
 def test_map_detail_drops_while_interacting_and_settles_after(operator) -> None:
@@ -320,6 +270,12 @@ def test_map_has_top_right_zoom_buttons_using_the_existing_zoom_path(operator) -
         assert button.winfo_reqwidth() >= 40
         assert button.winfo_reqheight() >= 40
         assert str(button.cget("takefocus")).lower() not in {"0", "false"}
+    operator.geometry(_window_geometry(app.UI_MIN_SIZE))
+    operator.update_idletasks()
+    canvas = operator.map_label
+    for button in (operator.map_zoom_in_button, operator.map_zoom_out_button):
+        assert canvas.winfo_rooty() <= button.winfo_rooty()
+        assert button.winfo_rooty() + button.winfo_height() <= canvas.winfo_rooty() + canvas.winfo_height()
 
     initial_zoom = operator.map_zoom
     operator.map_zoom_in_button.invoke()
@@ -399,42 +355,40 @@ def test_each_control_tab_fits_the_minimum_window_without_clipping(operator) -> 
 def test_short_viewport_renders_at_canvas_height_without_cropping(operator) -> None:
     operator.geometry(_window_geometry(app.UI_MIN_SIZE))
     operator.update_idletasks()
+    requested_heights = (
+        operator.map_label.winfo_reqheight(), operator.video_label.winfo_reqheight(),
+    )
     operator.tick()
     operator.update_idletasks()
     operator.tick()
     operator.redraw_map_only()
-    assert operator.video_label.winfo_height() < 220
-    assert operator.video_photo.height() == operator.video_label.winfo_height()
+    assert app.VIEWPORT_MIN_H <= operator.video_label.winfo_height() < 220
+    assert operator.video_photo.height() <= operator.video_label.winfo_height()
+    assert operator.video_photo.width() <= operator.video_label.winfo_width()
     assert operator.map_photo.height() == operator.map_label.winfo_height()
+    # Presenting resized images must not feed allocated height back into the
+    # Canvas request, otherwise later shrinks steal height from fixed controls.
+    assert (
+        operator.map_label.winfo_reqheight(), operator.video_label.winfo_reqheight(),
+    ) == requested_heights
 
 
-def test_long_route_draws_a_bounded_number_of_dots(operator, monkeypatch) -> None:
-    ellipses = {"count": 0}
-    real_draw = app.ImageDraw.Draw
 
-    class CountingDraw:
-        def __init__(self, image):
-            self._inner = real_draw(image)
 
-        def ellipse(self, *args, **kwargs):
-            ellipses["count"] += 1
-            return self._inner.ellipse(*args, **kwargs)
-
-        def __getattr__(self, name):
-            return getattr(self._inner, name)
-
-    monkeypatch.setattr(app.ImageDraw, "Draw", CountingDraw)
-    rng = np.random.default_rng(1)
-    operator.route_pts = [tuple(p) for p in rng.random((2000, 3)) * 5.0]
+def test_long_route_items_remain_bounded_and_clear_when_route_shrinks(operator) -> None:
+    operator.route_pts = [
+        tuple(point) for point in np.random.default_rng(1).random((2000, 3)) * 5.0
+    ]
     operator.history = []
     operator.history_health = []
     operator.no_loc_markers = []
-    operator.map_base_cache = None
+    state = operator.backend.poll()
+    operator.present_map(400, 300, state)
+    assert len(operator.map_label.find_withtag("map-overlay")) <= 2 * app.ROUTE_DOT_MAX + 8
 
-    operator.render_map(400, 300, operator.backend.poll())
-    # Route dots plus a small fixed set (pivot marker, camera dot, frustum centre).
-    assert ellipses["count"] <= app.ROUTE_DOT_MAX + 8, ellipses["count"]
-    assert ellipses["count"] > 0
+    operator.route_pts[:] = operator.route_pts[:2]
+    operator.present_map(400, 300, state)
+    assert len(operator.map_label.find_withtag("map-overlay")) <= 10
 
 
 def test_magnetometer_axis_diagram_draws_and_clears(operator) -> None:
@@ -731,21 +685,34 @@ def test_compass_rotation_instructions_fit_the_shared_workspace(operator, axis) 
         assert 0 <= top <= bottom <= canvas.winfo_height()
 
 
-def test_imported_route_choices_fit_beside_flight_and_calibration(operator, monkeypatch) -> None:
+@pytest.mark.parametrize("route_count", [2, 5])
+def test_imported_route_choices_fit_beside_flight_and_calibration(
+    operator, monkeypatch, route_count,
+) -> None:
     from types import SimpleNamespace
     import site_assets_panel
 
     monkeypatch.setattr(site_assets_panel, "describe_site_routes", lambda _root: [
-        SimpleNamespace(label="巡檢航線 01", path=Path("route_01.json"), flight_ready=True),
-        SimpleNamespace(label="巡檢航線 02", path=Path("route_02.json"), flight_ready=False),
+        SimpleNamespace(
+            label=f"巡檢航線 {index + 1:02d}", path=Path(f"route_{index + 1:02d}.json"),
+            flight_ready=index == 0,
+        )
+        for index in range(route_count)
     ])
     panel = operator.site_assets_panel
     panel.activate_site("/tmp/layout-profile.json", "/tmp/layout-site")
     operator.geometry(_window_geometry(app.UI_MIN_SIZE))
     operator.update_idletasks()
     operator._fit_control_pane()
+    operator.update_idletasks()
+    assert operator.video_label.winfo_height() >= app.VIEWPORT_MIN_H
     assert len(panel._permanently_disabled) >= 1
     assert panel.winfo_rooty() + panel.winfo_height() <= operator.winfo_rooty() + operator.winfo_height()
+    for child in panel.winfo_children():
+        if child.grid_info().get("row") == 5:
+            for route_card in child.winfo_children():
+                route_card.event_generate("<Enter>")
+    operator.update_idletasks()
     for button in panel._buttons:
         assert button.winfo_ismapped()
         assert button.winfo_rootx() >= panel.winfo_rootx()
@@ -760,7 +727,7 @@ def test_localization_readout_is_in_the_always_visible_header(operator) -> None:
     operator.update_idletasks()
     assert operator.loc_health_label is operator.status_chips["localization"]
     assert operator.loc_health_label.master is operator.status_strip
-    assert not operator.video_label.winfo_children()
+    assert operator.video_label.winfo_children() == [operator.depth_view_button.master]
 
 
 def test_virtual_sticks_share_the_workspace_with_the_readouts(operator) -> None:
@@ -842,17 +809,173 @@ def test_status_header_separates_identity_link_and_flight_state(operator) -> Non
     assert all(" | " not in text for text in texts.values())
 
 
-def test_video_has_no_widget_overlay_and_one_engineering_hud(operator) -> None:
-    """Requested engineering telemetry shares the image-FPS HUD."""
-    operator.geometry(_window_geometry(app.UI_STANDARD_SIZE))
-    operator.update_idletasks()
-    assert not operator.video_label.winfo_children()
-    source = inspect.getsource(app.OperatorApp.render_video)
-    assert "_video_diagnostic_lines" in source
-    assert "hud_h = 160" in source
-    assert "hud_font = pil_ui_font(13, bold=True)" in source
-    assert "main_hud_font = pil_ui_font(15, bold=True)" in source
-    assert "video=" not in source and "loc=" not in source and "det=" not in source
+def _video_overlay_text(operator) -> str:
+    canvas = operator.video_label
+    return "\n".join(
+        canvas.itemcget(item, "text")
+        for item in canvas.find_withtag("video-overlay") if canvas.type(item) == "text"
+    )
+
+
+def test_held_video_updates_hud_without_reuploading_pixels(operator, monkeypatch) -> None:
+    operator.video_frame = np.full((720, 1280, 3), (210, 50, 30), dtype=np.uint8)
+    operator._video_frame_stamp = 1.0
+    state = operator.backend.poll()
+    state.frame_age_ms = 10.0
+    operator.render_video(640, 360, state)
+    photo = operator.video_photo
+    def unexpected_upload(_image):
+        raise AssertionError("HUD-only update must not upload the held video again")
+    monkeypatch.setattr(photo, "paste", unexpected_upload)
+    state.frame_age_ms = 1234.0
+    operator.render_video(640, 360, state)
+    assert operator.video_photo is photo
+    assert "1234 ms" in _video_overlay_text(operator)
+    assert operator.video_label.tk.call(str(photo), "get", 320, 180) == (210, 50, 30)
+
+
+def test_video_resize_centres_pixels_and_scales_detection_labels(operator, monkeypatch) -> None:
+    operator.video_frame = np.full((720, 1280, 3), (25, 70, 150), dtype=np.uint8)
+    operator._video_frame_stamp = 1.0
+    operator.detection_result = {
+        "success": True, "boxes": [
+            {"xyxy": [200, 100, 400, 200], "class_name": "target", "confidence": 0.9},
+        ],
+    }
+    state = operator.backend.poll()
+    operator.render_video(640, 480, state)
+    canvas = operator.video_label
+    frame_item, = canvas.find_withtag("video-frame")
+    assert (operator.video_photo.width(), operator.video_photo.height()) == (640, 360)
+    assert canvas.coords(frame_item) == [0.0, 60.0]
+    labels = [item for item in canvas.find_withtag("video-overlay")
+              if canvas.type(item) == "text" and canvas.itemcget(item, "text").startswith("target ")]
+    assert len(labels) == 1
+    assert canvas.coords(labels[0]) == [104.0, 111.0]
+    def unexpected_upload(_image):
+        raise AssertionError("letterbox-only resize must reuse the fitted pixels")
+    monkeypatch.setattr(operator.video_photo, "paste", unexpected_upload)
+    operator.render_video(800, 360, state)
+    assert (operator.video_photo.width(), operator.video_photo.height()) == (640, 360)
+    assert canvas.coords(frame_item) == [80.0, 0.0]
+    assert canvas.coords(labels[0]) == [184.0, 51.0]
+
+
+def test_video_banner_priority_and_removed_detections_do_not_leave_stale_items(operator, monkeypatch) -> None:
+    operator.video_frame = np.zeros((720, 1280, 3), dtype=np.uint8)
+    operator._video_frame_stamp = 1.0
+    state = operator.backend.poll()
+    operator.inspecting = True
+    operator.loc_health = "FAIL"
+    operator.detection_result = {
+        "success": True, "boxes": [
+            {"xyxy": [20, 20, 120, 100], "class_name": "target", "confidence": 0.8},
+        ],
+    }
+    monkeypatch.setattr(operator, "_is_live_backend", lambda: True)
+    state.link_ok = False
+    operator.render_video(640, 360, state)
+    assert "LINK LOST" in _video_overlay_text(operator)
+    assert "LOCALIZATION LOST" not in _video_overlay_text(operator)
+    operator.detection_result = None
+    state.link_ok = True
+    operator.render_video(640, 360, state)
+    assert "LOCALIZATION LOST" in _video_overlay_text(operator)
+    assert "LINK LOST" not in _video_overlay_text(operator)
+    assert "target " not in _video_overlay_text(operator)
+    count = len(operator.video_label.find_withtag("video-overlay"))
+    for age in range(20):
+        state.frame_age_ms = float(age)
+        operator.render_video(640, 360, state)
+    assert len(operator.video_label.find_withtag("video-overlay")) == count
+
+
+def test_scheduled_held_video_refreshes_age_and_telemetry_without_a_new_frame(operator, monkeypatch) -> None:
+    import operator_tick
+
+    operator.video_frame = np.zeros((720, 1280, 3), dtype=np.uint8)
+    operator._video_frame_stamp = 1.0
+    state = operator.backend.poll()
+    state.frame_age_ms = 20.0
+    operator._map_dirty_key = operator_tick._map_dirty_key(
+        operator, state,
+        width=max(300, operator.map_label.winfo_width()),
+        height=max(1, operator.map_label.winfo_height()),
+    )
+    operator._video_dirty_key = None
+    operator_tick._render_if_dirty(operator, state)
+    state.frame_age_ms = 2000.0
+    operator._device_telemetry_lines = ("fresh-device-reading",)
+    def unexpected_upload(_image):
+        raise AssertionError("scheduled HUD refresh must retain held pixels")
+    monkeypatch.setattr(operator.video_photo, "paste", unexpected_upload)
+    operator_tick._render_if_dirty(operator, state)
+    assert "2000 ms" in _video_overlay_text(operator)
+    assert "fresh-device-reading" in _video_overlay_text(operator)
+
+
+def test_video_hud_fits_short_viewport_without_obscuring_video(operator, monkeypatch) -> None:
+    lines = (
+        "AUTO PCMD ±10% | 定位 FPS 0.0 | inliers 0",
+        "wall_ms - | core - | e2e -",
+        "RTH UNKNOWN/UNKNOWN | GPS ? | 衛星 ?",
+        "飛控高度 [相對起飛點] ? m | AGL ? m | 連接品質 ?",
+        "飛控融合姿態 roll +0.0° | pitch +0.0° | yaw +0.0°",
+        "三軸速度 N ? | E ? | D ? m/s",
+        "全場尺度：等待有效飛行軌跡 (m/u)",
+        "電池 100% | 未知 V | 健康 未知% | 循環 未知",
+        "電池警告 未知 | 遙控器電池 未知",
+        "相機 未知 | 曝光 未知 ISO 未知 | 白平衡 未知",
+        "機載錄影 未知 | 未知 fps 未知 Mb/s | 無損變焦上限 未知x",
+        "雲台絕對 R/P/Y 未知/-20.0/未知 | 相對 R/P/Y 未知/未知/未知",
+        "雲台校正 未知 | 飽和 未知 | 鏡軸方向 未知",
+        "XYZ 未知 | 速度 未知 | 飛行模式 未知",
+    )
+    monkeypatch.setattr(operator, "_video_diagnostic_lines", lambda: lines)
+    # Exercise the HUD over actual video, not the separate no-stream placeholder.
+    operator.video_frame = np.zeros((720, 1280, 3), dtype=np.uint8)
+    state = operator.backend.poll()
+    operator.render_video(924, 154, state)
+    canvas = operator.video_label
+    assert all(
+        not canvas.itemcget(item, "fill")
+        for item in canvas.find_withtag("video-overlay") if canvas.type(item) == "rectangle"
+    )
+    texts = [
+        item for item in canvas.find_withtag("video-overlay")
+        if canvas.type(item) == "text" and canvas.itemcget(item, "fill") == "#f4f4f4"
+    ]
+    assert len(texts) == len(lines) + 1
+    for item in texts:
+        x1, y1, x2, y2 = canvas.bbox(item)
+        assert 18 <= x1 <= x2 <= 924 - 18
+        assert 6 <= y1 <= y2 <= 154 - 6
+
+
+def test_minimum_video_with_link_banner_keeps_source_age_and_scale_readable(operator, monkeypatch) -> None:
+    lines = ("AUTO PCMD ±10%",) * 6 + ("全場尺度候選 0.42 m/u（尚不可用）",) + ("次要設備資訊",) * 8
+    monkeypatch.setattr(operator, "_video_diagnostic_lines", lambda: lines)
+    monkeypatch.setattr(operator, "_is_live_backend", lambda: True)
+    state = operator.backend.poll()
+    state.link_ok = False
+    state.frame_age_ms = 24500.0
+    operator.render_video(760, 96, state)
+    canvas = operator.video_label
+    texts = [item for item in canvas.find_withtag("video-overlay") if canvas.type(item) == "text"]
+    hud = [item for item in texts if canvas.itemcget(item, "fill") == "#f4f4f4" and (
+        "24500 ms" in canvas.itemcget(item, "text")
+        or "全場尺度候選" in canvas.itemcget(item, "text")
+    )]
+    assert len(hud) == 2
+    assert "LINK LOST" in _video_overlay_text(operator)
+    for item in hud:
+        _, top, _, bottom = canvas.bbox(item)
+        assert 72 <= top <= bottom <= 96
+    source, scale = (canvas.bbox(item) for item in hud)
+    assert (
+        source[2] <= scale[0] or scale[2] <= source[0]
+        or source[3] <= scale[1] or scale[3] <= source[1]
+    ), "freshness and scale must not overlap in the remaining banner-free band"
 
 
 def test_localization_summary_and_diagnostics_are_not_duplicated(operator) -> None:
@@ -866,8 +989,6 @@ def test_localization_summary_and_diagnostics_are_not_duplicated(operator) -> No
     # The separate 位姿/影格 readout is gone; its colour grading moved to the
     # overlay's health label, which is the thing it was grading.
     assert not hasattr(operator, "loc_age_label")
-    source = inspect.getsource(app.OperatorApp._update_age_readout)
-    assert "loc_health_label" in source
 
 
 def test_video_hud_contains_only_requested_engineering_metrics(operator) -> None:
@@ -933,3 +1054,104 @@ def test_flight_tab_only_shows_limit_settings_and_has_no_duplicate_hover(
         "ground speed", "map Y",
     ):
         assert removed not in joined
+
+
+def test_video_hud_updates_dynamic_metrics_without_remeasuring_static_rows(operator, monkeypatch) -> None:
+    """Result ingestion must not redo the expensive unchanged CJK text widths."""
+    operator.video_frame = np.zeros((720, 1280, 3), dtype=np.uint8)
+    operator._video_frame_stamp = 1.0
+    state = operator.backend.poll()
+    static = "全場尺度：等待有效飛行軌跡 (m/u)"
+    lines = [static, "latency 10.0ms"]
+    monkeypatch.setattr(operator, "_video_diagnostic_lines", lambda: tuple(lines))
+    operator.render_video(640, 360, state)
+    draw = operator._video_presenter.draw
+    original = draw.textlength
+    static_measures = []
+
+    def measured(text, *, font):
+        if text == static:
+            static_measures.append(text)
+        return original(text, font=font)
+
+    monkeypatch.setattr(draw, "textlength", measured)
+    for value in range(11, 20):
+        lines[1] = f"latency {value}.0ms"
+        state.frame_age_ms = float(value)
+        operator.render_video(640, 360, state)
+    assert static_measures == []
+    assert "latency 19.0ms" in _video_overlay_text(operator)
+    assert "latency 10.0ms" not in _video_overlay_text(operator)
+    assert static in _video_overlay_text(operator)
+
+
+def test_video_hud_reflows_changed_row_instead_of_using_its_old_width(operator, monkeypatch) -> None:
+    operator.video_frame = np.zeros((720, 1280, 3), dtype=np.uint8)
+    operator._video_frame_stamp = 1.0
+    state = operator.backend.poll()
+    lines = ["short diagnostic"]
+    monkeypatch.setattr(operator, "_video_diagnostic_lines", lambda: tuple(lines))
+    operator.render_video(640, 360, state)
+    lines[0] = "Updated diagnostic " + "W" * 45
+    operator.render_video(640, 360, state)
+    canvas = operator.video_label
+    updated = [item for item in canvas.find_withtag("video-overlay")
+               if canvas.type(item) == "text" and canvas.itemcget(item, "text") == lines[0]]
+    assert lines[0] in _video_overlay_text(operator)
+    assert "short diagnostic" not in _video_overlay_text(operator)
+    for item in updated:
+        left, top, right, bottom = canvas.bbox(item)
+        assert 0 <= left < right <= 640
+        assert 0 <= top < bottom <= 360
+
+
+def test_map_updates_trails_without_uploading_cloud_and_removes_old_markers(operator, monkeypatch) -> None:
+    state = operator.backend.poll()
+    operator.route_pts = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]]
+    operator.history = [np.array([0.0, 0.0, 0.0, 0.0]), np.array([0.5, 0.0, 0.0, 0.0])]
+    operator.history_health = ["OK", "LOW"]
+    operator.present_map(640, 360, state)
+    photo = operator.map_photo
+
+    def unexpected_upload(_image):
+        raise AssertionError("a trail/pose change must not upload the cloud")
+
+    monkeypatch.setattr(photo, "paste", unexpected_upload)
+    before = [operator.map_label.coords(item) for item in operator.map_label.find_withtag("map-overlay")]
+    operator.history[-1][0] = 1.5
+    state.pose[0] += 0.5
+    operator.present_map(640, 360, state)
+    after = [operator.map_label.coords(item) for item in operator.map_label.find_withtag("map-overlay")]
+    assert after != before
+    assert operator.map_photo is photo
+    count = len(operator.map_label.find_withtag("map-overlay"))
+    operator.history_health[-1] = "OK"
+    operator.present_map(640, 360, state)
+    assert len(operator.map_label.find_withtag("map-overlay")) == count - 1
+    operator.present_map(420, 280, state)
+    assert operator.map_photo is not photo
+    assert (operator.map_photo.width(), operator.map_photo.height()) == (420, 280)
+
+
+def test_pending_map_paint_does_not_delay_video_alarm_or_recovery(operator, monkeypatch) -> None:
+    import operator_tick
+
+    operator.video_frame = np.zeros((720, 1280, 3), dtype=np.uint8)
+    operator._video_frame_stamp = 1.0
+    operator.inspecting = True
+    state = operator.backend.poll()
+    operator.loc_health = "OK"
+    operator_tick._render_if_dirty(operator, state)
+    operator._map_render_next = float("inf")
+    state.pose[0] += 0.5
+    operator.loc_health = "FAIL"
+    operator_tick._render_if_dirty(operator, state)
+    assert "LOCALIZATION LOST" in _video_overlay_text(operator)
+    operator.loc_health = "OK"
+    operator_tick._render_if_dirty(operator, state)
+    assert "LOCALIZATION LOST" not in _video_overlay_text(operator)
+    # A resize is not a paced pose update: both surfaces must fit immediately.
+    monkeypatch.setattr(operator.map_label, "winfo_width", lambda: 620)
+    monkeypatch.setattr(operator.map_label, "winfo_height", lambda: 340)
+    operator_tick._render_if_dirty(operator, state)
+    assert (operator.map_photo.width(), operator.map_photo.height()) == (620, 340)

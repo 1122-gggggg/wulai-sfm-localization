@@ -558,9 +558,14 @@ def load_official_edm_runtime(
         raise ValueError("official MegaDepth EDM adapter requires a square test resolution")
     if image_resize % image_divisor or image_resize % coarse_scale:
         raise ValueError("official MegaDepth EDM resolution disagrees with its divisors")
-    matcher = EDM(config=lower_config(config)["edm"]).eval().to(device)
+    # Load on CPU before the single device transfer. Moving the random model
+    # first would transfer every parameter twice. Keep CPU construction (rather
+    # than meta): the RoPE sin/cos buffers are nonpersistent and not in the
+    # checkpoint, so they must retain their constructor-computed values.
+    matcher = EDM(config=lower_config(config)["edm"]).eval()
     state_dict = torch.load(checkpoint, map_location="cpu", weights_only=False)["state_dict"]
-    matcher.load_state_dict(state_dict)
+    matcher.load_state_dict(state_dict, strict=True)
+    matcher.to(device)
     return OfficialEdmRuntime(
         matcher=matcher,
         torch=torch,

@@ -85,6 +85,7 @@ def test_output_classification_keeps_new_names_visible() -> None:
     assert classify_output("validation_receipts") == "validation"
     assert classify_output("security") == "validation"
     assert classify_output("flight_logs") == "operations"
+    assert classify_output("deps") == "operations"
     assert classify_output("misc") == "unclassified"
 
 

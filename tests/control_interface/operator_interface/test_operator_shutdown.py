@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import subprocess
+import sys
 import threading
+from types import SimpleNamespace
 
 from operator_shutdown import OperatorShutdownCoordinator
 
@@ -269,3 +272,69 @@ def test_shutdown_resumes_manual_commands_after_auto_timeout_then_cleanup_failur
     assert coordinator._autonomy_cancel_latched is False
     assert commands.calls == ["suspend", "suspend", "resume"]
     assert backend.cleanup_calls == 2
+
+
+def test_shutdown_stops_worker_process_only_after_confirmed_landing() -> None:
+    from flight_operator_app import OperatorApp
+
+    backend = _LiveBackend(False, True)
+    logs = _SessionLogs()
+    destroyed = []
+    worker = subprocess.Popen(
+        [sys.executable, "-c", "import sys; sys.stdin.buffer.read(1)"],
+        stdin=subprocess.PIPE,
+    )
+
+    def close_worker() -> None:
+        worker.terminate()
+        worker.wait(timeout=5.0)
+
+    operator = OperatorApp.__new__(OperatorApp)
+    operator.backend = backend
+    operator.localizer = SimpleNamespace(close=close_worker)
+    coordinator = OperatorShutdownCoordinator(
+        backend=backend,
+        session_logs=logs,
+        write_log=None,
+        destroy=lambda: destroyed.append(True),
+        close_resources=operator._close_shutdown_resources,
+    )
+    try:
+        assert coordinator.shutdown() is False
+        assert worker.poll() is None
+        assert logs.reasons == []
+        assert destroyed == []
+
+        assert coordinator.shutdown() is True
+        assert worker.poll() is not None
+        assert logs.reasons == ["ui_window_close"]
+        assert destroyed == [True]
+    finally:
+        if worker.poll() is None:
+            close_worker()
+        worker.stdin.close()
+
+
+def test_worker_close_failure_keeps_shutdown_retryable() -> None:
+    attempts = []
+    logs = _SessionLogs()
+    destroyed = []
+
+    def close_resources() -> None:
+        attempts.append(True)
+        if len(attempts) == 1:
+            raise OSError("worker teardown failed")
+
+    coordinator = OperatorShutdownCoordinator(
+        backend=_LiveBackend(True, True),
+        session_logs=logs,
+        write_log=None,
+        destroy=lambda: destroyed.append(True),
+        close_resources=close_resources,
+    )
+    assert coordinator.shutdown() is False
+    assert logs.reasons == []
+    assert destroyed == []
+    assert coordinator.shutdown() is True
+    assert logs.reasons == ["ui_window_close"]
+    assert destroyed == [True]

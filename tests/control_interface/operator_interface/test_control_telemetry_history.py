@@ -294,3 +294,32 @@ def test_missing_fields_and_corrupt_payload_rejected_safely():
     history.record(0, SimpleNamespace(args={"wrong_field": 1.0}, date=datetime.fromtimestamp(999.9)))
     history.record(0, SimpleNamespace(args={"yaw": "not_a_number"}, date=datetime.fromtimestamp(999.9)))
     assert history.since() == ([], [])
+
+
+def test_motion_ring_unread_eviction_marker_is_permanently_recorded(tmp_path):
+    import json
+    from backend_contract import InterfaceMode
+    from disk_policy import enforce_retention
+    from session_logs import SessionLogs
+
+    clock = {"mono": 100., "wall": 5000.}
+    history = telemetry.MotionEventHistory(
+        maxlen=2, now=lambda: clock["mono"], wall_now=lambda: clock["wall"]
+    )
+    for index in range(3):
+        clock["mono"] += .01
+        clock["wall"] += .01
+        history.record(0, _event(clock["wall"], yaw=float(index)))
+    health = history.diagnostic_snapshot()
+    assert health["evicted_total"] == [1, 0]
+    assert health["unread_eviction_since_log_cursor"] == [True, False]
+    assert history.diagnostic_snapshot((clock["mono"], None))["unread_eviction_since_log_cursor"] == [False, False]
+    session = SessionLogs.create(tmp_path, mode=InterfaceMode.SIMULATED_STREAM, manifest={})
+    backend = SimpleNamespace(session_logs=session, motion_history=history)
+    telemetry._log_control_history(backend, clock["mono"])
+    session.close(reason="history_loss")
+    enforce_retention(tmp_path, current_session=None, max_bytes=0)
+    rows = [json.loads(line) for line in (session.directory / "trajectory.jsonl").read_text().splitlines()]
+    assert rows[0]["event"] == "control_motion_history"
+    assert rows[0]["attitude_samples"][0][0] == 1.
+    assert rows[0]["history_health"]["unread_eviction_since_log_cursor"] == [True, False]

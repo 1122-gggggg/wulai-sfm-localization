@@ -508,6 +508,8 @@ def _steps(
                 # parameters, and an S105 on a status-string comparison.
                 "--exclude",
                 "定位演算法/deploy_code/sfm_direct_deploy/vendor/**",
+                "--exclude",
+                "定位演算法/deploy_code_expand/sfm_direct_deploy/vendor/**",
             ),
             str(ROOT),
             300,

@@ -2,9 +2,12 @@
 """Read-only AUTO trajectory-vs-route error debrief for one flight session.
 
 Answers the operator's question: after the drone joined the route, how far
-was the flown trajectory from the planned path? Join-phase wandering (takeoff
-to first waypoint arrival) is reported separately and never mixed into the
-error statistics.
+was the observed localization trajectory from the captured planned polyline?
+Only fresh, finite, independent observed poses count. Acquisition before the
+first waypoint arrival is excluded; predictions/holdover are not measurements.
+
+Unstamped historical logs are readable but explicitly labelled
+``legacy_unverified``; they cannot establish independent sample freshness.
 
 Reads ``trajectory.jsonl`` (or legacy ``localization.jsonl``) from the session directory (the
 ``auto_route_plan`` / ``auto_route_tick`` / ``pose_result`` events the AUTO
@@ -164,8 +167,8 @@ def _split_auto_runs(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Split plans+ticks by AUTO run so manual gaps never leak into one debrief.
 
     Newer rows carry ``auto_run_id``; older logs fall back to a fresh
-    ``auto_route_plan`` boundary (the caller passes plans before ticks, so a
-    plan always opens a new run even though it carries no ``t``/``step``).
+    ``auto_route_plan`` boundary. Terminal summaries belong to their run,
+    never its tick list; they also preserve runs that produced no route ticks.
     A plan row anchors its own run and never lands in the previous run's
     tick list.
     """
@@ -191,8 +194,15 @@ def _split_auto_runs(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         elif current is None:
             current = {"auto_run_id": run_id, "plan": None, "ticks": []}
             runs.append(current)
-        current["ticks"].append(row)
-    return [run for run in runs if run["ticks"] or isinstance(run.get("plan"), dict)]
+        if row.get("event") == "auto_route_error_summary":
+            current["summary"] = row
+        else:
+            current["ticks"].append(row)
+    return [
+        run
+        for run in runs
+        if run["ticks"] or isinstance(run.get("plan"), dict) or run.get("summary")
+    ]
 
 
 def _run_plan_for(run: dict[str, Any], plans: list[dict[str, Any]]) -> dict[str, Any] | None:
@@ -208,26 +218,90 @@ def _run_plan_for(run: dict[str, Any], plans: list[dict[str, Any]]) -> dict[str,
     return None
 
 
+def _observed_errors(ticks: list[dict[str, Any]], max_age_s: float) -> list[float]:
+    """Use the producer's observation boundary; qualify stamped historical ticks."""
+    errors: list[float] = []
+    last_stamp: float | None = None
+    for tick in ticks:
+        if tick.get("route_error_sample") is False:
+            continue
+        distance = _finite(tick.get("route_distance_u"))
+        if distance is None or distance < 0.0:
+            continue
+        if (
+            tick.get("pose_new") is False
+            or tick.get("position_observed") is False
+            or tick.get("pose_source") == "holdover"
+            or tick.get("pose_source_predicted")
+            or tick.get("pose_reseed_confirming")
+            or tick.get("repeated_pose_stamp") is not None
+            or "paused" in str(tick.get("reason", "")).lower()
+        ):
+            continue
+        if "pose_stamp" in tick:
+            stamp = _finite(tick.get("pose_stamp"))
+            sample_time = _finite(tick.get("pose_sample_time", tick.get("t")))
+            if (
+                stamp is None
+                or sample_time is None
+                or not -0.05 <= sample_time - stamp <= max_age_s
+                or (last_stamp is not None and stamp <= last_stamp)
+                or _point3(tick.get("observed_pose_u", tick.get("pose_u"))) is None
+                or _point3(tick.get("route_nearest_u")) is None
+            ):
+                continue
+            last_stamp = stamp
+        elif "route_error_sample" in tick:
+            continue  # New producer rows without a pose stamp are never observations.
+        # Old unstamped logs remain readable, explicitly labelled unverified.
+        errors.append(distance)
+    return errors
+
+
+def _find_join_tick(indexed: list[dict[str, Any]], initial_target: Any) -> dict[str, Any] | None:
+    for tick in indexed:
+        if tick.get("route_error_joined") or (
+            "route_error_joined" not in tick
+            and (
+                tick["target_index"] > initial_target
+                or str(tick.get("action", "")).startswith("LAND")
+                or tick.get("action") == "final path reached -> LAND"
+            )
+        ):
+            return tick
+    return None
+
+
+def _cross_track_stats(post_errors: list[float]) -> dict[str, Any]:
+    return {
+        "mean": round(sum(post_errors) / len(post_errors), 3) if post_errors else None,
+        "rms": round(math.sqrt(sum(value * value for value in post_errors) / len(post_errors)), 3)
+        if post_errors
+        else None,
+        "p95": round(p95, 3) if (p95 := _percentile(post_errors, 95)) is not None else None,
+        "max": round(post_errors[-1], 3) if post_errors else None,
+    }
+
+
 def _analyze_run(
     run: dict[str, Any],
     plan: dict[str, Any],
     pose_timeline: list[tuple[float, bool]],
 ) -> dict[str, Any]:
     ticks = sorted(run["ticks"], key=lambda tick: float(tick.get("t", 0.0) or 0.0))
+    summary = run.get("summary")
     indexed = [tick for tick in ticks if isinstance(tick.get("target_index"), int)]
     initial_target = indexed[0]["target_index"] if indexed else None
-    join_tick: dict[str, Any] | None = None
-    for tick in indexed:
-        if tick["target_index"] > initial_target:
-            join_tick = tick
-            break
+    join_tick = _find_join_tick(indexed, initial_target)
     target_distances = [
         distance for tick in ticks if (distance := _target_distance_u(tick, plan)) is not None
     ]
     entry: dict[str, Any] = {
         "auto_run_id": run.get("auto_run_id"),
         "tick_count": len(ticks),
-        "auto_window_s": round(ticks[-1].get("t", 0.0) - ticks[0].get("t", 0.0), 1),
+        "auto_window_s": (
+            round(ticks[-1].get("t", 0.0) - ticks[0].get("t", 0.0), 1) if ticks else 0.0
+        ),
         "plan": {
             "arrive_radius_u": _finite(plan.get("waypoint_arrive_radius_u")),
             "waypoint_arrive_radii_u": plan.get("waypoint_arrive_radii_u"),
@@ -241,6 +315,22 @@ def _analyze_run(
             "closest_approach_u": round(min(target_distances), 3) if target_distances else None,
         },
     }
+    if isinstance(summary, dict):
+        entry["route_error_summary"] = {
+            key: value
+            for key, value in summary.items()
+            if key not in {"event", "t", "t_mono_ns", "utc", "wall_time"}
+        }
+    if not ticks:
+        entry["arrivals"] = []
+        if isinstance(summary, dict):
+            entry["join"]["joined"] = bool(summary.get("joined"))
+            entry["verdict"] = (
+                "NO_SAMPLES" if summary.get("state") == "no_samples" else "SUMMARY_ONLY"
+            )
+        else:
+            entry["verdict"] = "NO_SAMPLES"
+        return entry
     if join_tick is not None:
         entry["join"]["join_t"] = join_tick.get("t")
         entry["join"]["time_to_join_s"] = round(join_tick.get("t", 0.0) - ticks[0].get("t", 0.0), 1)
@@ -260,7 +350,10 @@ def _analyze_run(
         if float(tick.get("t", 0.0) or 0.0) >= float(join_tick.get("t", 0.0) or 0.0)
     ]
     post_errors = sorted(
-        distance for tick in post if (distance := _finite(tick.get("route_distance_u"))) is not None
+        _observed_errors(
+            post,
+            _finite(plan.get("map_pose_max_age_s")) or 0.5,
+        )
     )
     progs = [
         _finite(tick.get("progress")) for tick in post if _finite(tick.get("progress")) is not None
@@ -268,18 +361,34 @@ def _analyze_run(
     phase_seconds, blocked_s = _post_join_timing(post)
     post_join: dict[str, Any] = {
         "samples": len(post_errors),
+        "state": "ok" if post_errors else "no_samples",
         "pose_coverage": round(len(post_errors) / max(1, len(post)), 3),
-        "cross_track_u": {
-            "mean": round(sum(post_errors) / len(post_errors), 3) if post_errors else None,
-            "p95": round(p95, 3) if (p95 := _percentile(post_errors, 95)) is not None else None,
-            "max": round(post_errors[-1], 3) if post_errors else None,
-        },
+        "sample_validity": (
+            "observed"
+            if all("route_error_sample" in tick or "pose_stamp" in tick for tick in post)
+            else "legacy_unverified"
+        ),
+        "cross_track_u": _cross_track_stats(post_errors),
         "progress_from": progs[0] if progs else None,
         "progress_to": progs[-1] if progs else None,
         "phase_seconds": {name: round(seconds, 1) for name, seconds in phase_seconds.items()},
         "blocked_seconds": round(blocked_s, 1),
         "vo_share": _vo_share(post, pose_timeline),
     }
+    if isinstance(summary, dict):
+        post_join["samples"] = int(summary.get("samples", 0))
+        post_join["state"] = summary.get("state")
+        post_join["cross_track_u"] = {
+            "mean": summary.get("mean_u"),
+            "rms": summary.get("rms_u"),
+            "p95": summary.get("p95_u"),
+            "max": summary.get("max_u"),
+        }
+        post_join["horizontal_u"] = {
+            "mean": summary.get("horizontal_mean_u"),
+            "max": summary.get("horizontal_max_u"),
+        }
+        post_join["sample_validity"] = "observed"
     entry["post_join"] = post_join
     arrival_samples = [
         within for tick in post if (within := _within_arrival_sphere(tick, plan)) is not None
@@ -301,23 +410,28 @@ def analyze_session(session: Path) -> dict[str, Any]:
     events, pose_modes, vo_only, pose_success, pose_timeline = _session_pose_timeline(session)
     plans = [row for row in events if row.get("event") == "auto_route_plan"]
     ticks = [row for row in events if row.get("event") == "auto_route_tick"]
+    summaries = [row for row in events if row.get("event") == "auto_route_error_summary"]
     report: dict[str, Any] = {
         "session": session.name,
-        "has_auto": bool(plans) and len(ticks) > 0,
+        "has_auto": bool(plans or ticks or summaries),
         "pose_modes": pose_modes,
         "pose_vo_only": vo_only,
         "pose_success": pose_success,
     }
-    if not plans or not ticks:
+    if not plans and not ticks and not summaries:
         report["verdict"] = "NO_AUTO"
         report["auto_runs"] = []
         return report
     runs = _split_auto_runs(events)
     entries: list[dict[str, Any]] = []
     for run in runs:
-        if not run["ticks"]:
-            continue
         plan = _run_plan_for(run, plans)
+        if plan is None and isinstance(run.get("summary"), dict):
+            summary = run["summary"]
+            plan = {
+                "waypoints_u": summary.get("planned_waypoints_u", []),
+                "drawn_waypoint_count": len(summary.get("planned_waypoints_u", [])),
+            }
         if plan is None:
             entries.append(
                 {
@@ -332,7 +446,15 @@ def analyze_session(session: Path) -> dict[str, Any]:
     # callers keep working while multi-run sessions gain auto_runs.
     latest = entries[-1] if entries else None
     if latest is not None:
-        for key in ("tick_count", "plan", "join", "arrivals", "verdict", "post_join"):
+        for key in (
+            "tick_count",
+            "plan",
+            "join",
+            "arrivals",
+            "verdict",
+            "post_join",
+            "route_error_summary",
+        ):
             if key in latest:
                 report[key] = latest[key]
         if "auto_window_s" in latest:
@@ -343,10 +465,48 @@ def analyze_session(session: Path) -> dict[str, Any]:
     return report
 
 
+def _summary_only_lines(summary: dict[str, Any]) -> list[str]:
+    if summary.get("state") != "ok":
+        return []
+    return [
+        f"站後誤差（{summary.get('samples')} 樣本）："
+        f"mean {summary.get('mean_u')}u / RMS {summary.get('rms_u')}u / "
+        f"p95 {summary.get('p95_u')}u / max {summary.get('max_u')}u"
+    ]
+
+
+def _join_lines(report: dict[str, Any], plan: dict[str, Any]) -> list[str]:
+    join = report["join"]
+    if not join["joined"]:
+        return [
+            f"從未進站：最接近 {join['closest_approach_u']}u（球 {plan.get('arrive_radius_u')}u），"
+            "誤差不計（起飛靠攏段不算誤差）。"
+        ]
+    lines = [f"進站耗時 {join['time_to_join_s']}s，之後才開始計誤差。"]
+    post = report["post_join"]
+    cross = post["cross_track_u"]
+    lines.append(
+        f"站後誤差（{post['samples']} 樣本，位姿覆蓋 {post['pose_coverage']}）："
+        f"mean {cross['mean']}u / RMS {cross.get('rms')}u / "
+        f"p95 {cross['p95']}u / max {cross['max']}u；"
+        f"進度 {post['progress_from']} → {post['progress_to']}"
+    )
+    horizontal = post.get("horizontal_u")
+    if isinstance(horizontal, dict):
+        lines.append(f"水平誤差：mean {horizontal.get('mean')}u / max {horizontal.get('max')}u")
+    phases = ", ".join(f"{name} {secs}s" for name, secs in sorted(post["phase_seconds"].items()))
+    lines.append(f"站後時間分配：{phases}；受阻 {post['blocked_seconds']}s")
+    if "within_arrival_sphere_share" in post:
+        lines.append(f"站後樣本在到達球內佔比 {post['within_arrival_sphere_share']}")
+    return lines
+
+
 def format_report(report: dict[str, Any]) -> str:
     lines = [f"AUTO 軌跡誤差：{report['session']}"]
     if report.get("verdict") == "NO_AUTO":
         return "\n".join(lines + ["此班沒有 AUTO（無 auto_route_plan/tick），無法分析軌跡誤差。"])
+    if report.get("verdict") == "NO_PLAN":
+        return "\n".join(lines + ["AUTO 航線計畫未記錄，無法分析軌跡誤差。"])
     plan = report.get("plan", {})
     radii = plan.get("waypoint_arrive_radii_u")
     radii_text = f"，逐點 {radii}" if radii else ""
@@ -356,27 +516,18 @@ def format_report(report: dict[str, Any]) -> str:
     )
     if len(report.get("auto_runs", [])) > 1:
         lines.append(f"共 {len(report['auto_runs'])} 段 AUTO，以下為最後一段；各段見 auto_runs。")
-    join = report["join"]
-    if not join["joined"]:
+    summary = report.get("route_error_summary")
+    if isinstance(summary, dict):
         lines.append(
-            f"從未進站：最接近 {join['closest_approach_u']}u（球 {plan.get('arrive_radius_u')}u），"
-            "誤差不計（起飛靠攏段不算誤差）。"
+            f"AUTO run {summary.get('auto_run_id')} / route SHA-256 {summary.get('route_sha256')}"
         )
-    else:
-        lines.append(f"進站耗時 {join['time_to_join_s']}s，之後才開始計誤差。")
-        post = report["post_join"]
-        cross = post["cross_track_u"]
-        lines.append(
-            f"站後誤差（{post['samples']} 樣本，位姿覆蓋 {post['pose_coverage']}）："
-            f"mean {cross['mean']}u / p95 {cross['p95']}u / max {cross['max']}u；"
-            f"進度 {post['progress_from']} → {post['progress_to']}"
-        )
-        phases = ", ".join(
-            f"{name} {secs}s" for name, secs in sorted(post["phase_seconds"].items())
-        )
-        lines.append(f"站後時間分配：{phases}；受阻 {post['blocked_seconds']}s")
-        if "within_arrival_sphere_share" in post:
-            lines.append(f"站後樣本在到達球內佔比 {post['within_arrival_sphere_share']}")
+        lines.append(f"本次結束：{summary.get('outcome')}（{summary.get('terminal_detail')}）")
+        if summary.get("state") == "no_samples":
+            lines.append("航線誤差無法計算：沒有到站後的新鮮有效定位觀測；起飛靠攏段不計。")
+        if not report["tick_count"]:
+            lines.extend(_summary_only_lines(summary))
+            return "\n".join(lines + [f"判定：{report['verdict']}"])
+    lines.extend(_join_lines(report, plan))
     arrivals = report.get("arrivals", [])
     if arrivals:
         lines.append(
@@ -407,14 +558,14 @@ def main(argv: list[str] | None = None) -> int:
 
 def _post_join_timing(post):
     phase_seconds: dict[str, float] = {}
-    for tick, nxt in zip(post, post[1:]):
+    for tick, nxt in zip(post, post[1:], strict=False):
         span = float(nxt.get("t", 0.0) or 0.0) - float(tick.get("t", 0.0) or 0.0)
         if not math.isfinite(span) or span < 0.0 or span > 5.0:
             continue
         bucket = _phase_bucket(tick)
         phase_seconds[bucket] = phase_seconds.get(bucket, 0.0) + span
     blocked_s = 0.0
-    for tick, nxt in zip(post, post[1:]):
+    for tick, nxt in zip(post, post[1:], strict=False):
         if tick.get("blocked") is True:
             span = float(nxt.get("t", 0.0) or 0.0) - float(tick.get("t", 0.0) or 0.0)
             if math.isfinite(span) and 0.0 <= span <= 5.0:
@@ -432,7 +583,7 @@ def _session_pose_timeline(session):
     source = archive if archive.is_file() else session / "localization.jsonl"
     for record in read_jsonl(source):
         event = record.get("event")
-        if event in ("auto_route_plan", "auto_route_tick"):
+        if event in ("auto_route_plan", "auto_route_tick", "auto_route_error_summary"):
             events.append(record)
         elif event == "pose_result":
             mode = str(record.get("mode") or "UNKNOWN")

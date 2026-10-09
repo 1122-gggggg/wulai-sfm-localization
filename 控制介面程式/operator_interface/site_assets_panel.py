@@ -14,7 +14,6 @@ from local_site_assets import (
     describe_site_routes,
     discover_site_package,
     list_site_packages,
-    list_site_routes,
 )
 from operator_actions import ActionResult, SiteAssetActions
 
@@ -42,6 +41,8 @@ class SiteAssetsPanel(ttk.LabelFrame):
         request_apply: Callable[[Path], None],
         request_route_editor: Callable[[bool], None] | None = None,
         request_route_preview: Callable[[Path], str] | None = None,
+        request_route_delete: Callable[[Path], ActionResult] | None = None,
+        request_route_edit: Callable[[Path], None] | None = None,
         route_imported: Callable[[ActionResult], None] | None = None,
         site_packages_root: Path | None = None,
         site_pack_root: Path | None = None,
@@ -57,6 +58,8 @@ class SiteAssetsPanel(ttk.LabelFrame):
         #: (path) -> operator message. Draws one route as the map overlay without
         #: touching the site profile.
         self.request_route_preview = request_route_preview
+        self.request_route_delete = request_route_delete
+        self.request_route_edit = request_route_edit
         self.route_imported = route_imported
         #: Where the ready-made site packages live. None falls back to browsing.
         self.site_packages_root = site_packages_root
@@ -64,6 +67,10 @@ class SiteAssetsPanel(ttk.LabelFrame):
         #: app was started from a system profile under site_profiles/, which is
         #: what left the route picker opening on a directory holding no routes.
         self.site_pack_root = Path(site_pack_root) if site_pack_root else None
+        #: Selection is a view of a validated import, not a runtime/AUTO change.
+        self._selected_site_pack_root = self.site_pack_root
+        self._active_profile_path = actions.current_profile
+        self._routes_pending_apply = False
         #: () -> (safe, reason). Anything that grabs input or edits a route must be
         #: refused while the aircraft is not confirmed landed.
         self.flight_state_check = flight_state_check or (lambda: (True, ""))
@@ -115,10 +122,11 @@ class SiteAssetsPanel(ttk.LabelFrame):
                 available = list_site_packages(self.site_packages_root)
             except Exception as exc:
                 self.status_var.set(f"場域清單讀取失敗，請用「其他資料夾…」：{exc}")
-        # Drop the active site from the shortcuts: selecting it would only rebuild
-        # the same localization/control runtime.
+        # Keep the active site available when another import is pending, so the
+        # operator can return to its routes without applying the pending site.
         active = self._active_site_label(available)
-        available = [item for item in available if not self._is_active_site(item)]
+        if not self._routes_pending_apply:
+            available = [item for item in available if not self._is_active_site(item)]
         heading = f"切換場域（目前：{active}）" if active else "切換場域"
         ttk.Label(self, text=heading, font=("Sans", 10, "bold")).grid(
             row=row, column=0, sticky="w", padx=8, pady=(4, 2)
@@ -154,63 +162,162 @@ class SiteAssetsPanel(ttk.LabelFrame):
         )
         route_row = ttk.Frame(self)
         route_row.grid(row=row + 3, column=0, sticky="ew", padx=8, pady=(0, 3))
-        route_row.columnconfigure((0, 1), weight=1)
-        for index, (label, callback) in enumerate((
-            ("編輯路線", lambda: self._open_route_editor(True)),
-            ("新增路線", lambda: self._open_route_editor(False)),
-            ("匯入航線 JSON", self._choose_route),
-        )):
-            button = ttk.Button(route_row, text=label, command=callback)
-            button.grid(row=index // 2, column=index % 2, sticky="ew", padx=(0, 4), pady=1)
-            self._buttons.append(button)
+        route_row.columnconfigure(0, weight=1)
+        button = ttk.Button(
+            route_row, text="新增路線", command=lambda: self._open_route_editor(False)
+        )
+        button.grid(row=0, column=0, sticky="ew", padx=(0, 4), pady=1)
+        self._buttons.append(button)
 
     def _build_route_choices(self, row: int) -> int:
-        """One button per route this site already has. Returns the next free row.
-
-        The panel is rebuilt after an in-process site switch, so these choices
-        always belong to the active site's package.
-        """
-        if self.site_pack_root is None:
-            return row
-        try:
-            routes = describe_site_routes(self.site_pack_root)
-        except Exception as exc:
-            self.status_var.set(f"航線清單讀取失敗，請用「匯入航線 JSON」：{exc}")
-            return row
-        if not routes:
-            return row
-        ttk.Label(
-            self,
-            text="下次 AUTO 航線（點擊選取）",
-            font=("Sans", 10, "bold"),
-        ).grid(
+        """List the selected site's routes without authorizing runtime selection."""
+        root = self._selected_site_pack_root
+        heading = (
+            f"待套用場域：{root.name}（套用後才能選取航線）"
+            if self._routes_pending_apply and root is not None
+            else "下次 AUTO 航線（點擊選取）"
+        )
+        ttk.Label(self, text=heading, font=("Sans", 10, "bold"), wraplength=250).grid(
             row=row, column=0, sticky="w", padx=8, pady=(1, 2)
         )
+        roots = [] if root is None else [root]
+        profile = self.actions.current_profile
+        if self._routes_pending_apply and profile is not None:
+            managed_root = Path(profile).parent
+            if root is None or managed_root.resolve() != root.resolve():
+                roots.append(managed_root)
+        try:
+            routes = [item for folder in roots for item in describe_site_routes(folder)]
+        except Exception as exc:
+            ttk.Label(self, text=f"航線清單讀取失敗：{exc}", wraplength=250).grid(
+                row=row + 1, column=0, sticky="w", padx=8, pady=(0, 3)
+            )
+            return row + 2
+        if not routes:
+            ttk.Label(self, text="此場域尚無可用航線", wraplength=250).grid(
+                row=row + 1, column=0, sticky="w", padx=8, pady=(0, 3)
+            )
+            return row + 2
         choices = ttk.Frame(self)
         choices.grid(row=row + 1, column=0, sticky="ew", padx=8, pady=(0, 3))
         choices.columnconfigure((0, 1), weight=1)
         for index, item in enumerate(routes):
-            button = ttk.Button(
-                choices,
-                text=item.label,
-                command=lambda path=item.path: self._preview_existing_route(path),
-            )
-            if not item.flight_ready:
-                button.state(["disabled"])
-                self._permanently_disabled.add(button)
-            button.grid(row=index // 2, column=index % 2, sticky="ew", padx=(0, 4), pady=1)
-            self._buttons.append(button)
+            self._build_route_choice(choices, index, item)
         return row + 2
+
+    def _build_route_choice(self, choices, index: int, item) -> None:
+        card = ttk.Frame(choices)
+        card.grid(row=index // 2, column=index % 2, sticky="ew", padx=(0, 4), pady=1)
+        card.columnconfigure(0, weight=1)
+        button = ttk.Button(
+            card, text=item.label,
+            command=lambda: self._preview_existing_route(item.path),
+        )
+        button.grid(row=0, column=0, sticky="ew")
+        if not item.flight_ready or self._routes_pending_apply:
+            button.state(["disabled"])
+            self._permanently_disabled.add(button)
+        controls = ttk.Frame(card)
+        edit = ttk.Button(
+            controls, text="編輯", width=4,
+            command=lambda: self._edit_existing_route(item.path),
+        )
+        edit.pack(side="left")
+        delete = ttk.Button(
+            controls, text="×", width=2,
+            command=lambda: self._delete_existing_route(item.path),
+        )
+        delete.pack(side="left")
+        self._buttons.extend((button, edit, delete))
+        if self._routes_pending_apply:
+            for control in (edit, delete):
+                control.state(["disabled"])
+                self._permanently_disabled.add(control)
+
+        def show_controls(_event=None) -> None:
+            controls.place(relx=1.0, y=0, anchor="ne")
+            controls.lift()
+
+        def hide_if_outside() -> None:
+            if not card.winfo_exists():
+                return
+            x, y = card.winfo_pointerxy()
+            inside = (
+                card.winfo_rootx() <= x < card.winfo_rootx() + card.winfo_width()
+                and card.winfo_rooty() <= y < card.winfo_rooty() + card.winfo_height()
+            )
+            if not inside:
+                controls.place_forget()
+
+        for widget in (card, button, controls, edit, delete):
+            widget.bind("<Enter>", show_controls)
+            # Moving onto either hover action is still inside the same card.
+            widget.bind("<Leave>", lambda _event: card.after_idle(hide_if_outside))
+
+    def _edit_existing_route(self, path: Path) -> None:
+        if getattr(self, "_routes_pending_apply", False):
+            self.status_var.set("待套用場域：請先套用場域再編輯清單航線")
+            return
+        if self._busy:
+            self.status_var.set("航線編輯：前一個資產作業尚未完成")
+            return
+        safe, reason = self.flight_state_check()
+        if not safe:
+            self.status_var.set(f"航線編輯已拒絕：{reason}")
+            return
+        if self.request_route_edit is None:
+            self.status_var.set("航線編輯器尚未接上")
+            return
+        try:
+            self.request_route_edit(path)
+        except Exception as exc:
+            self.status_var.set(f"開啟航線編輯器失敗（{path.name}）：{exc}")
+
+    def _delete_existing_route(self, path: Path) -> None:
+        if getattr(self, "_routes_pending_apply", False):
+            self.status_var.set("待套用場域：請先套用場域再刪除清單航線")
+            return
+        if self._busy:
+            self.status_var.set("航線刪除：前一個資產作業尚未完成")
+            return
+        if self.request_route_delete is None:
+            self.status_var.set("航線刪除尚未接上")
+            return
+        if not self.ask_yes_no(
+            "刪除航線",
+            f"確定永久刪除 {path.name}？\n"
+            "其他航線會保留；若刪除目前選取的航線，必須重新選取或新增才能 AUTO。",
+        ):
+            return
+        safe, reason = self.flight_state_check()
+        if not safe:
+            self.status_var.set(f"航線刪除已拒絕：{reason}")
+            return
+        if self._busy:
+            self.status_var.set("航線刪除：前一個資產作業尚未完成")
+            return
+        try:
+            result = self.request_route_delete(path)
+        except Exception as exc:
+            self.status_var.set(f"航線刪除失敗（{path.name}）：{exc}")
+            return
+        self._finish_ok(result)
 
     def _preview_existing_route(self, path: Path) -> None:
         """Validate and select one route for this session's next AUTO request.
 
         Deliberately NOT import_route: that needs a managed profile under the site
         packages root (local_site_assets._load_managed_profile) and resets flight
-        approval, so it stays behind the explicit 匯入航線 JSON action. Flipping
+        approval, so it stays behind the route editor's save step. Flipping
         routes changes the immutable session selection only while AUTO is inactive;
         it does not approve, arm, take off, or persist a different site profile.
         """
+        if getattr(self, "_busy", False):
+            self.status_var.set("航線選擇：前一個資產作業尚未完成")
+            return
+        if getattr(self, "_routes_pending_apply", False):
+            self.status_var.set("待套用場域：請先套用場域再選取 AUTO 航線")
+            return
         if self.request_route_preview is None:
             self.status_var.set("航線顯示尚未接上")
             return
@@ -224,6 +331,9 @@ class SiteAssetsPanel(ttk.LabelFrame):
             self.status_var.set(f"航線顯示失敗（{path.name}）：{exc}")
 
     def _import_site_folder(self, folder) -> None:
+        if self._busy:
+            self.status_var.set("場域匯入：前一個資產作業尚未完成")
+            return
         self._pending_site_folder = Path(folder)
         self._run("場域匯入", lambda: self.actions.import_site_folder(str(folder)))
 
@@ -285,6 +395,7 @@ class SiteAssetsPanel(ttk.LabelFrame):
             self._finish_ok(result)
 
     def _finish_error(self, label: str, exc: Exception) -> None:
+        self._pending_site_folder = None
         self._busy = False
         self._set_busy(False)
         self.status_var.set(f"{label}失敗：{exc}")
@@ -293,20 +404,20 @@ class SiteAssetsPanel(ttk.LabelFrame):
         self._busy = False
         self._set_busy(False)
         self.status_var.set(result.message)
-        if result.kind == "route":
-            if self.route_imported is not None:
+        if result.kind in {"route", "route_deleted"}:
+            if result.kind == "route" and self.route_imported is not None:
                 self.route_imported(result)
-            for child in self.winfo_children():
-                child.destroy()
-            self._buttons.clear()
-            self._permanently_disabled.clear()
-            self._build()
+            self._refresh()
             self.status_var.set(result.message)
         elif result.kind == "site":
             folder, self._pending_site_folder = self._pending_site_folder, None
             outcome = "declined"
             if folder is not None:
+                self._select_site_folder(folder, result.profile_path)
                 outcome = self.follow_up_route_for_site(folder)
+                # Automatic route import can create a managed route; refresh again
+                # before offering activation, never leaving the previous list.
+                self._refresh()
             # Never switch the runtime out from under an editor that was just
             # opened to draw the route.
             if outcome != "drawing":
@@ -321,7 +432,7 @@ class SiteAssetsPanel(ttk.LabelFrame):
         if not approved:
             self.status_var.set(
                 f"只找到 {len(slot.candidates)} 份航線草稿（route_drafts/），"
-                "不會自動匯入；請用「匯入航線 JSON」確認要哪一份"
+                "不會自動匯入；請用「新增路線」開啟編輯器確認後存檔"
             )
             return None, "drafts_only"
         if len(approved) != len(slot.candidates):
@@ -383,7 +494,7 @@ class SiteAssetsPanel(ttk.LabelFrame):
         if slot.ambiguous:
             # Which route the aircraft flies is not a guess worth making.
             self.status_var.set(
-                f"偵測到 {len(slot.candidates)} 個航線檔，請用「匯入航線 JSON」明確選擇"
+                f"偵測到 {len(slot.candidates)} 個航線檔，請從航線清單點擊選取要飛的一份"
             )
             return "ambiguous"
         return SiteAssetsPanel._import_discovered_route(self, slot)
@@ -466,45 +577,6 @@ class SiteAssetsPanel(ttk.LabelFrame):
             # operator picked, rather than asking them where it went.
             self._import_site_folder(folder)
 
-    def _choose_route(self) -> None:
-        flight_state_check = getattr(self, "flight_state_check", None)
-        if callable(flight_state_check):
-            safe, reason = flight_state_check()
-            if not safe:
-                self.status_var.set(f"航線匯入已拒絕：{reason}")
-                return
-        # Open where this field's routes and drafts actually are, so picking among
-        # several is one click rather than a hunt through the filesystem.
-        initial = ""
-        # The active site's own folder when we know it. current_profile is the path
-        # to site_profile.json, not a SiteProfile (.source raised AttributeError and
-        # took the whole button down), and its parent is site_profiles/ rather than
-        # the site pack whenever the app was started from a system profile.
-        profile = self.actions.current_profile
-        search_root = self.site_pack_root or (
-            Path(profile).parent if profile is not None else None
-        )
-        if search_root is not None:
-            routes = list_site_routes(search_root)
-            if routes:
-                initial = str(routes[0].parent)
-        source = filedialog.askopenfilename(
-            title="選擇要匯入的航線 JSON（新到舊）",
-            initialdir=initial or None,
-            filetypes=(("JSON", "*.json"),),
-        )
-        if source:
-            def import_route() -> ActionResult:
-                # Re-check on the worker immediately before the write: the
-                # aircraft can become airborne while the file picker is open.
-                if callable(flight_state_check):
-                    safe, reason = flight_state_check()
-                    if not safe:
-                        raise ValueError(f"航線匯入已拒絕：{reason}")
-                return self.actions.import_route(source)
-
-            self._run("航線匯入", import_route)
-
     def _open_route_editor(self, edit_current: bool) -> None:
         if self.request_route_editor is None:
             self.status_var.set("航線編輯器尚未接上")
@@ -563,6 +635,32 @@ class SiteAssetsPanel(ttk.LabelFrame):
             self.request_apply(profile)
         except Exception as exc:
             self.status_var.set(f"套用失敗：{exc}")
+            if self._active_profile_path is not None:
+                self.activate_site(self._active_profile_path, self.site_pack_root)
+
+    def _select_site_folder(self, folder: Path, profile_path: Path | None) -> None:
+        self._selected_site_pack_root = Path(folder).expanduser().resolve()
+        imported_profile = None if profile_path is None else Path(profile_path).resolve()
+        active_profile = self._active_profile_path
+        same_profile = (
+            imported_profile is not None
+            and active_profile is not None
+            and imported_profile == Path(active_profile).resolve()
+        )
+        same_pack = (
+            imported_profile is not None
+            and self.site_pack_root is not None
+            and imported_profile.parent == self.site_pack_root.resolve()
+        )
+        self._routes_pending_apply = not (same_profile or same_pack)
+        self._refresh()
+
+    def _refresh(self) -> None:
+        for child in self.winfo_children():
+            child.destroy()
+        self._buttons.clear()
+        self._permanently_disabled.clear()
+        self._build()
 
     def activate_site(
         self,
@@ -571,15 +669,14 @@ class SiteAssetsPanel(ttk.LabelFrame):
     ) -> None:
         """Rebuild shortcuts and routes after an in-process runtime swap."""
         self.actions.current_profile = Path(profile_path).expanduser().resolve()
+        self._active_profile_path = self.actions.current_profile
         self.site_pack_root = (
             None
             if site_pack_root is None
             else Path(site_pack_root).expanduser().resolve()
         )
-        for child in self.winfo_children():
-            child.destroy()
-        self._buttons.clear()
-        self._permanently_disabled.clear()
+        self._selected_site_pack_root = self.site_pack_root
+        self._routes_pending_apply = False
         self._pending_site_folder = None
         self._result_queue = queue.Queue(maxsize=1)
-        self._build()
+        self._refresh()

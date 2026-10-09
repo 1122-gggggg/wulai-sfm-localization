@@ -110,6 +110,7 @@ class _ScenarioBackend:
         gaz: int,
         *,
         reason: str,
+        auto_run_id: str | None = None,
     ) -> bool:
         self.pcmds.append((roll, pitch, yaw, gaz, reason))
         if yaw:
@@ -126,6 +127,7 @@ class _ScenarioBackend:
         gaz: float,
         *,
         authority_pct: int | None = None,
+        auto_run_id: str | None = None,
     ) -> bool:
         self.nudge_vectors.append((roll, pitch, yaw, gaz))
         if yaw:
@@ -243,13 +245,15 @@ def test_simulated_route_test_runs_the_production_controller_on_drawn_waypoints(
         land=plant.finish,
         **simulated_clock,
     )
+    final_tolerance = autonomy.controller.final_arrive_tolerance()
 
     _complete_simulated_autonomy(autonomy)
     assert autonomy.phase == "DONE"
     assert plant.finished
     assert backend.state.flight_state == "landed"
     # return_to_start: AUTO lands back at waypoint 1, not at the far end.
-    assert backend.sim_xyz == pytest.approx(snapshot.waypoints[0], abs=0.08)
+    assert math.dist(backend.sim_xyz, snapshot.waypoints[0]) <= final_tolerance
+    assert math.dist(backend.sim_xyz, snapshot.waypoints[-1]) > final_tolerance
 
 
 def test_start_near_the_far_endpoint_still_flies_from_waypoint_one(
@@ -281,6 +285,7 @@ def test_start_near_the_far_endpoint_still_flies_from_waypoint_one(
         land=plant.finish,
         **simulated_clock,
     )
+    final_tolerance = autonomy.controller.final_arrive_tolerance()
 
     _complete_simulated_autonomy(autonomy)
     details = [
@@ -289,7 +294,8 @@ def test_start_near_the_far_endpoint_still_flies_from_waypoint_one(
     assert any("first target is waypoint 1 of 3" in detail for detail in details)
     assert autonomy.phase == "DONE"
     assert plant.finished
-    assert backend.sim_xyz == pytest.approx(snapshot.waypoints[0], abs=0.08)
+    assert math.dist(backend.sim_xyz, snapshot.waypoints[0]) <= final_tolerance
+    assert math.dist(backend.sim_xyz, snapshot.waypoints[-1]) > final_tolerance
 
 
 def test_simulated_velocity_and_displacement_share_the_control_clock(tmp_path, simulated_clock):
@@ -309,6 +315,27 @@ def test_simulated_velocity_and_displacement_share_the_control_clock(tmp_path, s
         LEGACY_MAP_FRAME.horizontal_distance(velocity)
     )
     assert plant.pose().stamp == backend.state.ground_speed_mono_ns / 1e9
+
+
+def test_simulated_commands_change_velocity_without_erasing_momentum(
+    tmp_path, simulated_clock
+):
+    backend = DroneBackend()
+    plant = backend.route_test_plant
+    assert plant.begin(_snapshot(tmp_path), LEGACY_MAP_FRAME)
+    speeds = []
+    for pitch in (4, 4, 0):
+        simulated_clock["sleep"](1.0 / 20.0)
+        start = backend.sim_xyz.copy()
+        assert plant.send_pcmd(0, pitch, 0, 0, reason="offline response regression")
+        displacement = backend.sim_xyz - start
+        speed = LEGACY_MAP_FRAME.horizontal_distance(displacement) * 20.0
+        assert backend.state.ground_speed_mps == pytest.approx(speed)
+        assert backend.state.speed_east_mps == pytest.approx(
+            sum(displacement * LEGACY_MAP_FRAME.east) * 20.0)
+        speeds.append(speed)
+    assert 0.0 < speeds[0] < speeds[1]
+    assert 0.0 < speeds[2] < speeds[1]
 
 
 def test_simulated_auto_route_is_not_blocked_by_real_flight_preflight() -> None:
@@ -556,14 +583,16 @@ def test_auto_localization_loss_hovers_without_timer_handoff_or_land(
     set_nudge_vector = backend.set_nudge_vector
     clear_nudge_vector = backend.clear_nudge_vector
 
-    def record_pcmd(roll, pitch, yaw, gaz, *, reason):
-        result = send_pcmd(roll, pitch, yaw, gaz, reason=reason)
+    def record_pcmd(roll, pitch, yaw, gaz, *, reason, auto_run_id=None):
+        result = send_pcmd(roll, pitch, yaw, gaz, reason=reason, auto_run_id=auto_run_id)
         if loss_started.is_set() and (roll, pitch, yaw, gaz) == (0, 0, 0, 0):
             hover_seen.set()
         return result
 
-    def record_nudge(roll, pitch, yaw, gaz):
-        result = set_nudge_vector(roll, pitch, yaw, gaz)
+    def record_nudge(roll, pitch, yaw, gaz, *, authority_pct=None, auto_run_id=None):
+        result = set_nudge_vector(
+            roll, pitch, yaw, gaz, authority_pct=authority_pct, auto_run_id=auto_run_id,
+        )
         if loss_started.is_set() and not any(abs(value) > 0.0 for value in (roll, pitch, yaw, gaz)):
             hover_seen.set()
         return result

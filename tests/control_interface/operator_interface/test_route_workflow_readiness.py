@@ -53,7 +53,7 @@ def test_available_route_overlay_is_the_desktop_auto_input(route):
 
 def _guidance(*, complete=True, paused=False, active=False, approved=True):
     operator = OperatorApp.__new__(OperatorApp)
-    operator.preflight_guide = SimpleNamespace(complete=complete, current_step="system")
+    operator.preflight_guide = SimpleNamespace(complete=complete, current_step="route")
     operator._preflight_step_evidence = lambda *_: (None, "等待即時遙測讀回")
     operator._auto_paused = paused
     operator._integrated_auto_active = lambda: active
@@ -76,7 +76,7 @@ def test_unfinished_preflight_never_advertises_auto_ready(gps):
     operator = _guidance(complete=False)
     operator._update_flight_action_guidance(SimpleNamespace(flight_state="landed", gps_fixed=gps))
     text = operator.flight_action_hint_var.set.call_args.args[0]
-    assert "請先完成四項驗證" in text
+    assert "請先完成三項驗證" in text
     assert "等待即時遙測讀回" in text
     assert "可按" not in text
 

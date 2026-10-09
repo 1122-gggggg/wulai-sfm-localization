@@ -193,6 +193,62 @@ The Sphinx `pitch=10%` response receipt at
 current Sphinx firmware/model. The same step test must be measured on the physical ANAFI before
 using them as real-aircraft gains.
 
+## Production AUTO adapter: gusts and visual blackouts
+
+`production-route` shares the production AUTO controller and the fast simulator's
+synthetic localizer. It is separate from the generated `route` probe above. Inspect
+the plan without connecting or sending PCMD:
+
+```bash
+uv run anafi-pcmd-sim production-route \
+  --route "$ROUTE" --align "$ALIGN" --meters-per-unit 5 \
+  --output-dir /tmp/sphinx-auto-blackout-plan --dry-run \
+  --wind-mean-mps 1 0 0 --gust-mps 2 \
+  --gust-duration-s 2 --gust-transition-s 1 --gust-pause-s 15 \
+  --blackout-every-s 18 --blackout-dur-s 2.5
+```
+
+Supply the actual route, measured alignment, and appropriate simulation scale;
+`5` above is only an example. The JSON plan reports the configured visual-loss
+windows and attitude bridge limits. Windows use elapsed simulation time:
+`time % blackout_every_s < blackout_dur_s` (including the initial window at time
+zero). Either blackout setting at zero disables periodic loss.
+
+The position source is Sphinx `omniscient_anafi.worldPosition` collected with
+`tlm-data-logger -r 50 inet:127.0.0.1:9060`, not SDK GPS `PositionChanged`.
+Absolute Gazebo ENU coordinates (including spawn offset and world height) are
+rotated into the measured map basis and divided by the declared scale. They use
+the same origin as `waypoints_enu_m` in the dry-run plan; there is no subtraction
+of the attach position or altitude. The plan explicitly reports this source,
+endpoint, collection rate and 0.5 s freshness bound. Missing, invalid, reversed,
+or stale world samples yield no pose, and polling a repeated source timestamp
+does not make it new truth. Collector startup occurs only after the operator
+hover/target gates; cleanup stops it along with the existing aircraft cleanup.
+
+During visual loss, the localizer uses independently timestamped Sphinx firmware
+`AttitudeChanged` events converted from NED yaw to map heading, never truth yaw.
+It holds the last visual center and rotates heading only. These poses are weak,
+unconfirmed, and **not new position measurements**; this is not raw-accelerometer
+position integration. Current/reference attitude must be at most 0.5 s old,
+tilt at most 35°, and yaw rate at most 180°/s. Missing, invalid, stale, unsafe, or
+expired input produces no pose; the bridge expires after 10 s or 300 reports.
+Visual recovery begins with a new capture, not an old queued pre-loss packet.
+
+For an operator-authorized **virtual Sphinx** run, replace `--dry-run` with
+`--attach-hovering` only after the operator has put Sphinx in hover. This adapter
+never issues `TakeOff`, retains the `10.202.0.1` target lock and existing safety
+gates, and sends zero PCMD then requests normal landing during cleanup.
+The installed ANAFI4k / Sphinx 2.25.2 advertises only `world:wind/wind`, not
+the drone wind component shown in the generic Sphinx wind documentation.
+Gusts therefore update the **native physical world wind**, using its `SetParam`
+JSON-RPC at `127.0.0.1:8383` on AUTO pose polls (nominally 20 Hz). They rise,
+hold, fall and pause; the eastward gust is added to the full ENU mean vector.
+Zero pause means a single cycle. Failed or `false` parameter acknowledgments
+abort the simulation; CLI exit zero alone is not proof that a setting worked.
+No truth-position displacement or unsupported ExprTk fallback is used.
+Firmware simulation and public specifications cannot guarantee an exact
+replica of a physical ANAFI.
+
 ## Test and lint
 
 ```bash

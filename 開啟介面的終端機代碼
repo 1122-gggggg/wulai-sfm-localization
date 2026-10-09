@@ -1,50 +1,16 @@
-開介面終端機指令總覽（本檔只是啟動指令備忘，不改變任何程式行為）
-換影片：改各段 VIDEO= 那一行的路徑（目前預設 P2310231.MP4）。
-
-【安全總則】
-- A／B／C 都是影片模擬：無真機、無起飛指令，起飛／降落只更新模擬狀態。
-- B／C 只做定位、不啟動 AUTO；擴圖場域 flight.approved=false，不能用來飛行。
-- D 真機：起飛與自動飛行只能由操作員本人在 UI 走完四步 preflight 後親自按下
-  （見 控制介面程式/SAFETY.md）。
-
-A. 舊正式系統（主目錄）
-- 用途：正式版定位＋UI。弱位姿遠離強定位時可能凍結，不適合拿來當「不凍結」的比較基準。
-------------------------------------------------
+福和橋：正式定位＋電線杆偵測（影片離線驗證，不飛行）
   cd /home/allen/localization
-  SFM_SITE_PROFILE="/home/allen/localization/地圖檔/場域/river_site/site_profile.json" \
-  VIDEO="/home/allen/下載/P1980198.MP4" \
+  SFM_SITE_PROFILE="/home/allen/localization/地圖檔/場域/fuhe_bridge/site_profile.json" \
+  SFM_LIVE_DETECT=1 \
+  VIDEO="/home/allen/下載/P1130113.MP4" \
   ./控制介面程式/影片模擬串流/啟動.sh
 
+福和橋：正式真機串流＋電線杆偵測（實飛操作入口）
+  起飛與自動飛行只由操作員在介面親手按；「自動飛行」啟動時會自動開始定位與物件偵測
+  cd /home/allen/localization
+  SFM_MISSION_SELECTION="/home/allen/localization/控制介面程式/mission_selections/fuhe_bridge_edm_localization.json" \
+  ./一鍵啟動.sh
 
-B. 擴圖版本：邊定位邊擴圖（實驗分支，不飛行）
-- 用途：驗證邊定位邊擴圖；地圖窗格會顯示新增點，首次強定位前可建子圖，強錨後對齊並以局部 BA 驗證併圖。
-- 與 A 差異：SFM_HOLD_ON_LOW_CONF=0 只關掉「連續低信心」凍幀；首幀 BOOT、真正無位姿的 LOST 重試保持原樣；單幀超過 max_jump_u 的跳點仍擋下。
-- 工作樹沒有自己的 .venv，借用主目錄的 Python。
-------------------------------------------------
-  cd /home/allen/localization/experiments/edm-overlay
-  SFM_UI_PYTHON="/home/allen/localization/.venv/bin/python" \
-  SFM_PORTABLE_ALLOW_EXTERNAL_PYTHON=1 \
-  SFM_SITE_PROFILE="/home/allen/localization/experiments/edm-overlay/地圖檔/場域/river_site/releases/river_gluemap_all8_online_ui_20260929/site_profile.json" \
-  SFM_HOLD_ON_LOW_CONF=0 \
-  VIDEO="/home/allen/下載/超過地圖範圍影片/P2310231.MP4" \
-  ./控制介面程式/影片模擬串流/啟動.sh
-
-  航線對話框可按 No；只做定位，不啟動 AUTO。
-
-C. 不擴圖的原版對照（實驗分支）
-- 用途：跟 B 同一份程式碼，但場域換成沒有工作圖的凍結 release；要比較原版定位演算法與擴圖，用 B／C 配對，不要用 A。
-- 其餘行為同 B（不凍結弱位姿、保留 BOOT／LOST、不啟動 AUTO）。
-------------------------------------------------
-  cd /home/allen/localization/experiments/edm-overlay
-  SFM_UI_PYTHON="/home/allen/localization/.venv/bin/python" \
-  SFM_PORTABLE_ALLOW_EXTERNAL_PYTHON=1 \
-  SFM_SITE_PROFILE="/home/allen/localization/地圖檔/場域/river_site/site_profile.json" \
-  SFM_HOLD_ON_LOW_CONF=0 \
-  VIDEO="/home/allen/下載/超過地圖範圍影片/P2310231.MP4" \
-  ./控制介面程式/影片模擬串流/啟動.sh
-
-
-D. 真機串流（實飛操作入口）
-------------------------------------------------
+河濱：正式真機串流＋電線杆偵測（預設 mission）
   cd /home/allen/localization
   ./一鍵啟動.sh

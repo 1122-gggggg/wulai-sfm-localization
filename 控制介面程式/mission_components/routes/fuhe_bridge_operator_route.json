@@ -1,0 +1,14 @@
+{
+  "schema": "sfm-route-package/v1",
+  "route_id": "fuhe_bridge_operator_route",
+  "revision": "20261008_172857_6e4b913d",
+  "site_id": "fuhe_bridge_official69_edm_20261006",
+  "frame": {
+    "kind": "map",
+    "id": "fuhe_bridge_official69_edm_20261006_49f8702fa2b2"
+  },
+  "route": {
+    "path": "../../../地圖檔/場域/fuhe_bridge/routes/flight_route_20261008_172857_6e4b913d.json",
+    "sha256": "ab3b630b622c5ae800d474575fef6fff5180c07b2c11df3ee873ad15675c6430"
+  }
+}

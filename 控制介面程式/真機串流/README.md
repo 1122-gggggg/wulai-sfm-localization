@@ -11,7 +11,7 @@ route、calibration 與 approval，再產生介面使用的唯讀 site-profile s
 - 連線後會讀取並記錄機型、serial、firmware、Olympe、Home、RTH 與 firmware limits
 - 沒有 profile 內 SHA 固定的核准 receipt 時可顯示地面診斷，但起飛 fail closed
 - 未達 mission flight readiness 時 AUTO 鎖定；地面定位與診斷仍可使用
-- 落地與空中重新啟動 AUTO 都必須完成同一套四步 preflight
+- 落地與空中重新啟動 AUTO 都必須完成同一套三步 preflight
 - 水平 AUTO 需要 0.5 秒內的新鮮地速；達閾值或資料過期即清零懸停，閾值是
   fail-closed 安全閘門而非物理硬速度保證
 - UI／終端機關閉會先永久鎖掉晚到 PCMD，再以獨立於 AUTO worker 的路徑原地降落；
@@ -22,6 +22,20 @@ route、calibration 與 approval，再產生介面使用的唯讀 site-profile s
 ```bash
 SFM_MISSION_SELECTION=/absolute/path/to/selection.json ./啟動.sh
 ```
+
+UI 先開啟、不連線；啟動器不探測目標網路、不因真機離線而退出，也不自動選擇
+直連 Wi-Fi。預設目標固定為 SkyController 3（`192.168.53.1`）；顯式 `IP`／`CTRL`
+覆寫可推導已知配對的另一值，不一致組合仍會拒絕啟動。
+UI 開啟後按「連接真機串流」才開始背景連線；失敗可再次按下重試，不必重開終端機。
+開 UI 與連線不會起飛，起飛仍由操作員本人親自按下。
+`SFM_LAUNCH_DRY_RUN=1` 只印出啟動指令，不啟動 UI、不操作網路。
+
+正式入口預設同時啟動 MegaLoc＋EDM 定位與獨立三類電力設備偵測 worker。
+偵測權重為 `/home/allen/下載/power_equipment_sample50_3class_yolo26n_640_aug_best.pt`，
+使用工作區 `.venv-yolo/bin/python`；可用 `SFM_DETECTOR_PYTHON` 覆寫已備妥的環境。
+權重與環境必須事先存在，不自動下載。偵測框／類別／信心值只顯示在影片窗格，
+不參與定位或飛控；兩個 worker 共用 GPU，不能視為即時效能保證。
+要明確停用偵測，可執行 `./啟動.sh --no-live-detect`。
 
 啟動器會在重開機後重新探測有效的 X/XWayland `DISPLAY`；找不到可見桌面時拒絕啟動。
 執行中不能切到 SIM 或更換地圖，必須安全關閉後以另一啟動器重開。

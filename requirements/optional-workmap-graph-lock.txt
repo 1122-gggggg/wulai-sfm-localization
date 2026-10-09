@@ -1,0 +1,5 @@
+# Optional CPU graph solver overlay for the existing CPython 3.10 Linux x86_64 runtime.
+# Install with --require-hashes --no-deps; numpy/pytest come from the base/test locks.
+# 4.3.0 has no CPython 3.10 wheel. This tested prerelease supports our NumPy 2 runtime.
+gtsam==4.3a1 \
+    --hash=sha256:d627794fca38f830f7dba10d65826545c0df5ec547a1c1120e2a7f2ad11b0a24

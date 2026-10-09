@@ -234,7 +234,9 @@ class LiveMapEDMProvider(FinalMapEDMProvider):
         self._lock = threading.Lock()
         self._gpu_matcher: CachedEDM | None = None
         self._query_matches: dict[int, dict] = {}
+        self._query_lifts: dict[str, tuple[list, int]] = {}
         self._last_strong_refs: tuple[int, ...] = ()
+        self._recovery_attempted: set[int] = set()
         self.last_stage_ms: dict[str, float] = {}
         self._reference_norms: np.ndarray | None = None
         self.startup_stage_ms: dict[str, float] = {}
@@ -460,9 +462,33 @@ class LiveMapEDMProvider(FinalMapEDMProvider):
             )
         return [self._query_matches[id(reference)][1] for reference in references]
 
+    def _lift_matched_reference(self, query_shape, name, reference_shape, matched, threshold):
+        # Cache before greedy cross-reference deduplication. Filtering an already
+        # deduplicated baseline would discard alternatives needed by expansion.
+        # Names identify immutable reference geometry; matching/shape/threshold
+        # are fixed within this locked capture. Clear on every capture and close.
+        if name not in self._query_lifts:
+            self._query_lifts[name] = super()._lift_matched_reference(
+                query_shape, name, reference_shape, matched, threshold
+            )
+        return self._query_lifts[name]
+
+    def _has_usable_anchor(self, fix: RelocFix) -> bool:
+        return fix.ok and len(fix.point3d_ids) >= int(
+            self.profile.reloc.frozen_pnp_thresholds["strong_inliers"]
+        )
+
     def _recovery_references(self, ranked: tuple[int, ...]) -> tuple[int, ...]:
-        """Keep the global winner; add a covisible alternative when available."""
-        extra = list(ranked[self.top_k :])
+        """Search beyond failed near-duplicate views, retaining a global winner.
+
+        Only the additional matching budget rotates. The baseline pair is
+        always tried at the current ranking, so a changed camera view can
+        immediately recover without waiting for the exploratory cycle.
+        """
+        extra = [index for index in ranked[self.top_k :] if index not in self._recovery_attempted]
+        if not extra:
+            self._recovery_attempted.clear()
+            extra = list(ranked[self.top_k :])
         if len(extra) < 2 or not self._last_strong_refs:
             return tuple(extra[: self.top_k])
         seeds = np.unique(
@@ -473,12 +499,14 @@ class LiveMapEDMProvider(FinalMapEDMProvider):
                 ]
             )
         )
-        # Only rank the bounded global shortlist, never lock recovery to a prior.
+        # Covisibility may reorder only the nearest bounded alternatives, not
+        # drag an outbound prior into a distant return-facing retrieval rank.
+        nearest = extra[: self.top_k * 3]
         overlap = [
             len(np.intersect1d(seeds, self._observations[self._reference_names[index]][1]))
-            for index in extra[1:]
+            for index in nearest[1:]
         ]
-        neighbor = extra[1 + int(np.argmax(overlap))]
+        neighbor = nearest[1 + int(np.argmax(overlap))]
         return tuple(dict.fromkeys([extra[0], neighbor, *extra]))[: self.top_k]
 
     def localize_array(self, gray: np.ndarray, *, color_bgr: np.ndarray | None = None) -> RelocFix:
@@ -509,6 +537,7 @@ class LiveMapEDMProvider(FinalMapEDMProvider):
             raise RuntimeError("ensure_models() must run before localize_array()")
         started = time.perf_counter()
         self._query_matches.clear()
+        self._query_lifts.clear()
         image = np.ascontiguousarray(gray)
         if image.ndim == 3:
             image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
@@ -525,7 +554,9 @@ class LiveMapEDMProvider(FinalMapEDMProvider):
             descriptor,
             reference_sessions=self._reference_sessions,
             excluded_sessions=subset.excluded_sessions,
-            top_k=self.top_k * (3 if self.profile.optimizations.adaptive_retrieval else 1),
+            # Ranking is CPU-only. Explore a wider global shortlist over
+            # failed attempts, but match at most one extra top_k per capture.
+            top_k=self.top_k * (12 if self.profile.optimizations.adaptive_retrieval else 1),
             occupied_bins=self._reference_occupied_bins,
             min_occupied_bins=self.min_reference_occupied_bins,
             retrieve_pool=None,
@@ -541,6 +572,7 @@ class LiveMapEDMProvider(FinalMapEDMProvider):
             )
 
         base = ranked[: self.top_k]
+        matched_refs = base
         from river_map_quality.official_edm_adapter import (
             prepare_official_megadepth_image_from_array,
         )
@@ -548,10 +580,10 @@ class LiveMapEDMProvider(FinalMapEDMProvider):
         prepared = prepare_official_megadepth_image_from_array(image, self._matcher_runtime())
         fix = self._solve_references(image, prepared, base, started, viewpoint_pool_fallback)
         self.last_stage_ms["matched_references"] = float(len(base))
-        # Preserve every strong baseline decision. Expansion only rescues failures,
-        # and only while this attempt still has budget within its normal period.
+        # Depth-assisted strong poses may have no admissible sparse-map seed.
+        # Keep their decision, but continue bounded recovery for a usable anchor.
         if (
-            not fix.ok
+            not self._has_usable_anchor(fix)
             and self.profile.optimizations.adaptive_retrieval
             and time.perf_counter() - started < self.profile.reloc.period_s
         ):
@@ -561,12 +593,15 @@ class LiveMapEDMProvider(FinalMapEDMProvider):
                 expanded = self._solve_references(
                     image, prepared, refs, started, viewpoint_pool_fallback
                 )
+                self._recovery_attempted.update(extra)
+                matched_refs = refs
                 self.last_stage_ms["matched_references"] = float(len(refs))
-                if expanded.ok:
+                if expanded.ok and (not fix.ok or self._has_usable_anchor(expanded)):
                     fix = expanded
                     base = refs
-        if fix.ok:
+        if self._has_usable_anchor(fix):
             self._last_strong_refs = base
+            self._recovery_attempted.clear()
         else:
             self._last_strong_refs = ()
         self.last_stage_ms["lift_prepare_ms"] = max(
@@ -576,6 +611,7 @@ class LiveMapEDMProvider(FinalMapEDMProvider):
         )
         return replace(
             fix,
+            reference_names=tuple(self._reference_names[index] for index in matched_refs),
             runtime_ms=(time.perf_counter() - started) * 1000.0,
             stage_ms=dict(self.last_stage_ms),
         )
@@ -669,6 +705,7 @@ class LiveMapEDMProvider(FinalMapEDMProvider):
         self._matcher = None
         self._gpu_matcher = None
         self._query_matches.clear()
+        self._query_lifts.clear()
         self._vpr_runtime = None
         self._models_ready = False
         self._empty_cuda_cache()

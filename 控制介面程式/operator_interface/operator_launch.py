@@ -6,7 +6,6 @@ import argparse
 import json
 import os
 import sys
-import threading
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -129,6 +128,10 @@ def build_argument_parser() -> argparse.ArgumentParser:
     ap.add_argument("--detector-python", default=default_worker_python("SFM_DETECTOR_PYTHON"))
     ap.add_argument("--detector-worker", default=str(DEFAULT_DETECTOR_WORKER))
     ap.add_argument("--detector-model", default=str(DEFAULT_DETECTOR_MODEL))
+    ap.add_argument("--detector-task", choices=("detect", "segment"), default="detect")
+    ap.add_argument(
+        "--detector-half", action="store_true", help="Use FP16 for the optional YOLO worker"
+    )
     ap.add_argument("--detect-every-n-frames", type=int, default=3)
     ap.add_argument("--detector-conf", type=float, default=0.25)
     ap.add_argument("--detector-iou", type=float, default=0.7)
@@ -765,7 +768,8 @@ def _run_operator_selftest(args: argparse.Namespace, points: np.ndarray) -> bool
     )
     print(
         f"live detect={args.live_detect} worker={args.detector_worker} "
-        f"model={args.detector_model} every={args.detect_every_n_frames}f"
+        f"model={args.detector_model} task={args.detector_task} half={args.detector_half} "
+        f"every={args.detect_every_n_frames}f"
     )
     print(f"boot lock hold={args.boot_lock_ms} ms")
     return True
@@ -1048,15 +1052,21 @@ def _build_operator_backend(
         event_log=session_logs.command_log,
         session_logs=session_logs,
         with_video=not args.no_live_video,
+        defer_connect=True,
     )
     video_stream = live_backend.video_stream
-    if video_stream is None:
-        print(
-            "[live] PDRAW unavailable; file fallback is prohibited in real-flight mode",
-            flush=True,
-        )
     print(f"[live] command log -> {cmd_log}", flush=True)
     return live_backend, video_stream, live_backend
+
+
+def _connect_operator_live_runtime(runtime: ActiveSiteRuntime) -> None:
+    try:
+        runtime.backend.connect_live()
+    finally:
+        runtime.video_stream = runtime.backend.video_stream
+        runtime.lost_hold = _build_lost_hold_policy(
+            runtime.prepared.args, runtime.localizer, runtime.video_stream
+        )
 
 
 def _start_operator_backend(
@@ -1095,7 +1105,9 @@ def _build_operator_localizer(
     site_profile: SiteProfile | None,
     video_stream: object | None,
 ) -> object | None:
-    want_loc = args.live_localize and (video_stream is not None or not args.live)
+    want_loc = args.live_localize and (
+        video_stream is not None or not args.live or not args.no_live_video
+    )
     if not want_loc:
         return None
     localizer = LiveLocalizerClient(
@@ -1126,7 +1138,7 @@ def _build_operator_detector(
     args: argparse.Namespace,
     video_stream: object | None,
 ) -> object | None:
-    if not args.live_detect or video_stream is None:
+    if not args.live_detect or (video_stream is None and (not args.live or args.no_live_video)):
         return None
     return LiveDetectorClient(
         Path(args.detector_worker),
@@ -1138,6 +1150,8 @@ def _build_operator_detector(
         conf=args.detector_conf,
         iou=args.detector_iou,
         max_det=args.detector_max_det,
+        task=args.detector_task,
+        half=args.detector_half,
     )
 
 
@@ -1487,6 +1501,7 @@ def _build_operator_launch(inputs: _OperatorLaunchInputs) -> _OperatorLaunch:
         site_runtime=site_runtime,
         prepare_site_runtime=_prepare_operator_site_runtime,
         start_site_runtime=_start_operator_site_runtime,
+        connect_live_runtime=_connect_operator_live_runtime if args.live else None,
     )
     return _OperatorLaunch(
         app=app,
@@ -1543,41 +1558,26 @@ def _close_operator_launch(launch: _OperatorLaunch) -> None:
     launch.session_logs.close(reason="mainloop_exit")
 
 
-def _install_live_exit_safety(app: OperatorApp, emergency_cleanup) -> None:
-    import flight_operator_app as _foa
+def _install_exit_signal(_foa, sig, handler) -> str | None:
+    try:
+        _foa.signal.signal(sig, handler)
+    except Exception as exc:
+        return f"{sig.name}:{exc!r}"
+    return None
 
-    _foa.atexit.register(lambda: emergency_cleanup("atexit"))
-    exit_in_progress = threading.Event()
 
-    def _sig_handler(signum, _frame):
-        if exit_in_progress.is_set():
-            print(
-                "[operator] exit already in progress; ignoring extra signal",
-                flush=True,
-            )
-            return
-        exit_in_progress.set()
-        result = emergency_cleanup(f"signal_{signum}")
-        if result is True:
-            try:
-                app.destroy()
-            except Exception:
-                pass
-            raise SystemExit(0)
-        exit_in_progress.clear()
-        print(
-            "[operator] exit safety could not confirm landing; "
-            "keeping the interface and connection for retry",
-            flush=True,
-        )
-
+def _arm_exit_signals(_foa, handler) -> tuple[list, list]:
     armed, failed = [], []
     for sig in (_foa.signal.SIGINT, _foa.signal.SIGTERM, _foa.signal.SIGHUP):
-        try:
-            _foa.signal.signal(sig, _sig_handler)
+        error = _install_exit_signal(_foa, sig, handler)
+        if error is None:
             armed.append(sig.name)
-        except Exception as exc:
-            failed.append(f"{sig.name}:{exc!r}")
+        else:
+            failed.append(error)
+    return armed, failed
+
+
+def _report_exit_safety(app: OperatorApp, armed: list, failed: list) -> None:
     exit_safety_armed = EXIT_SAFETY_SIGNALS.issubset(set(armed))
     failure_text = f"  FAILED: {'; '.join(failed)}" if failed else ""
     print(
@@ -1599,6 +1599,67 @@ def _install_live_exit_safety(app: OperatorApp, emergency_cleanup) -> None:
         )
     except Exception:
         pass
+
+
+def _exit_poll_window_gone(app: OperatorApp) -> bool:
+    try:
+        return not app.winfo_exists()
+    except Exception:
+        return True
+
+
+def _dispatch_pending_exit_signal(app: OperatorApp, state: dict) -> None:
+    reason = state.get("_pending_exit_signal_reason")
+    if reason is not None:
+        # Also coalesce signals interrupting the dispatch itself,
+        # before _on_close has marked its worker as in progress.
+        state["_exit_signal_dispatching"] = True
+        state["_pending_exit_signal_reason"] = None
+        try:
+            app._on_close(reason=reason)
+        finally:
+            state["_exit_signal_dispatching"] = False
+
+
+def _install_live_exit_safety(app: OperatorApp, emergency_cleanup) -> None:
+    import flight_operator_app as _foa
+
+    _foa.atexit.register(lambda: emergency_cleanup("atexit"))
+    state = app.__dict__
+    state["_pending_exit_signal_reason"] = None
+    state["_exit_signal_dispatching"] = False
+
+    def _sig_handler(signum, _frame):
+        # A signal may interrupt command/log locks or buffered output. Only
+        # record intent here; Tk's normal event loop owns shutdown dispatch.
+        if (
+            state.get("_shutdown_completed", False)
+            or state.get("_shutdown_in_progress", False)
+            or state.get("_exit_signal_dispatching", False)
+        ):
+            return
+        if state.get("_pending_exit_signal_reason") is None:
+            state["_pending_exit_signal_reason"] = f"signal_{signum}"
+
+    def _poll_exit_signal() -> None:
+        if state.get("_shutdown_completed", False):
+            return
+        if _exit_poll_window_gone(app):
+            return
+
+        if state.get("_shutdown_in_progress", False):
+            # A window-close request may have started after the signal arrived.
+            # Coalesce it rather than queue an automatic retry after rejection.
+            state["_pending_exit_signal_reason"] = None
+        elif not state.get("_site_switching", False):
+            _dispatch_pending_exit_signal(app, state)
+
+        if not state.get("_shutdown_completed", False):
+            app.after(50, _poll_exit_signal)
+
+    armed, failed = _arm_exit_signals(_foa, _sig_handler)
+    _report_exit_safety(app, armed, failed)
+    app.after(50, _poll_exit_signal)
 
 
 def main() -> None:
@@ -1623,6 +1684,7 @@ def main() -> None:
                     destroy=None,
                     command_coordinator=app._get_command_coordinator(),
                     get_autonomy=lambda: app.__dict__.get("_integrated_autonomy"),
+                    close_resources=app._close_shutdown_resources,
                 )
                 app._shutdown_coordinator = coordinator
             except Exception as exc:

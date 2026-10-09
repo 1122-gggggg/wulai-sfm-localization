@@ -33,7 +33,7 @@ An invalid optional receipt must never be reported as valid, but an absent recei
 is not a runtime readiness error. GPS is intentionally represented by
 `approved_envelope.gps_required`; the current river deployment does not require
 GPS for takeoff or AUTO, and disables the GPS-dependent distance fence when no fix
-exists. This policy does not bypass route/profile hashes, four-step preflight, or
+exists. This policy does not bypass route/profile hashes, three-step preflight, or
 post-takeoff localization gates.
 
 The CLI only verifies or prepares unsigned material:

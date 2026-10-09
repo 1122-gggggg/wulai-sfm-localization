@@ -9,8 +9,9 @@ The production AUTO law (`RouteAutoController.step` + `YawAlignedPcmdController`
   * the drone's localized point (map frame, arbitrary map units), and
   * the drawn route (same map frame, same arbitrary units).
 
-It never sees a scale. This script closes the loop around the REAL controller
-(no reimplementation of the control law) with a realistic ANAFI plant:
+The controller never sees the simulation's true meters-per-unit parameter.
+This script closes the loop around the REAL controller with a calibrated
+reduced-order ANAFI plant, not a reimplementation of its control law:
 
   * true drone state lives in METERS in its own world frame,
   * the localizer reports that state back in MAP UNITS through an unknown
@@ -42,13 +43,14 @@ AUTO still starts at waypoint 1 (`start_after_nearest_waypoint`), and the
 deviation failsafe stays disarmed until that start target is reached -- same as
 `path_follow_flight._FlightLoopRunner`.
 
-Gaz/yaw percentages use configured desktop envelopes (2 m/s and 20 deg/s by
-default, matching the 2026-09-14 flight logs). Roll/pitch are tilt percentages,
-not velocity percentages: the horizontal plant approximates 0.45 m/s at the
-3% tilt cap. This is not an identified aircraft model. First-order velocity
-lag, wind, per-axis hover anchors, integer PCMD, 20 Hz control / 80 Hz integration,
-and localization defects are included. Long outages fail this simulation;
-they do not issue a live landing.
+Gaz/yaw percentages use configured desktop envelopes (2 m/s and 20 deg/s).
+Roll/pitch are tilt percentages. The calibrated R5 scenario uses a 3 s drag
+time constant, 0.4 s effective tilt lag and bounded tilt slew, fitted against
+Sphinx roll steps and the latest AUTO log. Integration runs at 200 Hz.
+The default velocity proxy is retained only for controller regressions.
+Wind here is residual ground drift, NOT atmospheric air speed; finite-duration
+gusts and localization/IMU faults exercise the production controller. Sphinx
+remains the firmware/physical-wind reference. No real aircraft is contacted.
 
 Usage
 -----
@@ -130,10 +132,18 @@ class DroneState:
     yaw: float  # map-heading convention, radians
     vel_m: np.ndarray = field(default_factory=lambda: np.zeros(3))
     yaw_rate: float = 0.0  # rad/s, persistent first-order yaw response
+    tilt_fwd: float = 0.0
+    tilt_right: float = 0.0
+    gust_velocity: np.ndarray = field(default_factory=lambda: np.zeros(3))
+    gust_direction: np.ndarray = field(default_factory=lambda: np.zeros(3))
 
     def copy(self) -> "DroneState":
         d = DroneState(self.pos_m.copy(), float(self.yaw), self.vel_m.copy())
         d.yaw_rate = float(self.yaw_rate)
+        d.tilt_fwd = float(self.tilt_fwd)
+        d.tilt_right = float(self.tilt_right)
+        d.gust_velocity = self.gust_velocity.copy()
+        d.gust_direction = self.gust_direction.copy()
         return d
 
 
@@ -185,8 +195,6 @@ class SimParams:
     # blackout_dur_s. Defaults off.
     blackout_every_s: float = 0.0
     blackout_dur_s: float = 0.0
-    blackout_drift_mps: float = 0.0
-    blackout_yaw_drift_deg_s: float = 0.0
     # Localization-failure windows: the aircraft does not know where it is,
     # but VO / dead reckoning keep reporting a weak estimate that drifts
     # (drift_gain x true motion + drift_mps). See SimulatedLocalizerConfig.
@@ -202,13 +210,15 @@ class SimParams:
     baro_noise_m: float = 0.0
     baro_drift_mps: float = 0.0
     # plant
-    cruise_mps: float = 0.90  # horizontal speed at max_translation_pcmd
+    cruise_mps: float = 0.90  # speed at max_translation_pcmd in optional velocity-proxy mode only
     max_vertical_speed_mps: float = 2.0  # configured desktop envelope, not capability maximum
     max_rotation_speed_deg_s: float = 20.0
     speed_limit_mps: float = 0.6
-    tau_h_s: float = 0.4
+    tau_h_s: float = 0.4  # velocity proxy; calibrated R5 uses 3 s
+    horizontal_accel_gain: float = 1.09  # fitted Sphinx roll response, not a white-paper constant
     tau_v_s: float = 0.3
     tau_yaw_s: float = 0.2
+    tau_brake_s: float = 0.35  # reduced-order firmware zero-PCMD braking
     wind_sigma_mps: float = 0.05
     wind_tau_s: float = 3.0
     # Firmware hover stabilization: a real ANAFI holds position (optical
@@ -217,8 +227,8 @@ class SimParams:
     # 0 disables it (pure drift, pessimistic).
     hover_hold_mps: float = 0.2
     hover_hold_gain: float = 0.5
-    # --- plant fidelity (all default to previous behavior) ---
-    # Tilt follows PCMD with its own lag; horizontal accel = tilt * g.
+    # >0.001 enables tilt acceleration + drag; default is the regression proxy.
+    # Neither path reproduces the proprietary firmware controller.
     tau_tilt_s: float = 1e-3
     thrust_margin: float = 99.0
     # Battery sag: linear thrust loss over mission; 0 disables.
@@ -230,6 +240,7 @@ class SimParams:
     yaw_coupling: float = 0.0
     gust_every_s: float = 0.0
     gust_m: float = 0.0
+    gust_duration_s: float = 2.0  # half-sine pulse; gust_m is its integrated drift
     ground_altitude_m: float | None = None
     telemetry_rate_hz: float = 5.0
     telemetry_latency_ms: float = 200.0
@@ -245,7 +256,7 @@ class SimParams:
     yaw_correlation_s: float = 0.0
     bias_walk_u_sqrt_s: float = 0.0
     reseed_confirm_frames: int = 0
-    command_latency_ms: float = 0.0
+    command_latency_ms: float = 0.0  # transport delay is separate from fitted physical response lag
     command_drop_rate: float = 0.0
     command_ttl_s: float = 0.2
     wind_model: str = "residual_ground_drift_proxy"
@@ -291,7 +302,28 @@ class SimParams:
             raise ValueError("command_drop_rate must be finite and in [0, 1]")
         self._validate_command_and_ground()
 
-    def __post_init__(self):
+    def _validate_response(self):
+        if not math.isfinite(float(self.horizontal_accel_gain)) or self.horizontal_accel_gain <= 0:
+            raise ValueError("horizontal_accel_gain must be finite and positive")
+        for name in (
+            "tau_h_s",
+            "tau_v_s",
+            "tau_yaw_s",
+            "tau_brake_s",
+            "tau_tilt_s",
+            "gust_duration_s",
+        ):
+            value = float(getattr(self, name))
+            if not math.isfinite(value) or value <= 0.0:
+                raise ValueError(f"{name} must be finite and positive")
+        for name in ("gust_m", "gust_every_s"):
+            value = float(getattr(self, name))
+            if not math.isfinite(value) or value < 0.0:
+                raise ValueError(f"{name} must be finite and nonnegative")
+        if self.gust_m > 0.0 and self.gust_every_s < self.gust_duration_s:
+            raise ValueError("gust_every_s must be >= gust_duration_s when gusts are enabled")
+
+    def _validate_thrust_model(self):
         sag = float(self.battery_sag_frac)
         if not math.isfinite(sag) or not 0.0 <= sag < 1.0:
             raise ValueError("battery_sag_frac must be finite and in [0, 1)")
@@ -306,7 +338,8 @@ class SimParams:
             self.tau_tilt_s
         ) <= 1e-3 + 1e-9:
             raise ValueError("tilt dynamics require tau_tilt_s > 0.001")
-        self._validate_sampling()
+
+    def _validate_wind_profile(self):
         previous = -1.0
         for row in self.wind_profile:
             if len(row) != 4 or not all(math.isfinite(float(value)) for value in row):
@@ -315,6 +348,12 @@ class SimParams:
             if stamp < 0.0 or stamp <= previous:
                 raise ValueError("wind_profile times must be nonnegative and strictly increasing")
             previous = stamp
+
+    def __post_init__(self):
+        self._validate_response()
+        self._validate_thrust_model()
+        self._validate_sampling()
+        self._validate_wind_profile()
 
 
 # --------------------------------------------------------------------------
@@ -341,6 +380,22 @@ _FLIGHT_20260918_1301_DELIVERY = {
     "drop_rate": 0.08,
 }
 REGRESSION_SCENARIOS: dict[str, dict] = {
+    # Latest useful AUTO (2026-10-03 09:13:52Z): identified response tau 3 s,
+    # 958/3436 weak and 345/3436 unavailable poses. Its fitted 0.5 s effective
+    # delay is not an independently measured transport delay. Gust and blackout
+    # are stress injections, not measured wind or an exact timestamp replay.
+    "R5_flight20261003_gust_imu": {
+        "tau_h_s": 3.0,
+        "tau_tilt_s": 0.4,
+        "latency_ms": 80.0,
+        "weak_rate": 0.28,
+        "drop_rate": 0.10,
+        "gust_every_s": 20.0,
+        "gust_m": 0.5,
+        "gust_duration_s": 2.0,
+        "blackout_every_s": 40.0,
+        "blackout_dur_s": 3.0,
+    },
     "R1_flight20260918": {
         "localization_wait_s": 23.0,
         "outage_every_s": 40.0,
@@ -532,6 +587,164 @@ def wind_mean_at(params, now):
     return mean + np.array([np.interp(now, samples[:, 0], samples[:, axis]) for axis in (1, 2, 3)])
 
 
+def _max_tilt_limits():
+    try:
+        from live_safety_config import (
+            DEFAULT_MAX_PITCH_ROLL_ROTATION_SPEED_DEGS as _MAX_TILT_RATE,
+            DEFAULT_MAX_TILT_DEG as _MAX_TILT,
+        )
+
+        max_tilt_deg = float(_MAX_TILT)
+        max_tilt_rate_deg_s = float(_MAX_TILT_RATE)
+    except (ImportError, AttributeError, TypeError, ValueError):
+        max_tilt_deg, max_tilt_rate_deg_s = 20.0, 60.0
+    return math.radians(max_tilt_deg), math.radians(max_tilt_rate_deg_s)
+
+
+def _clipped_hover_hold(hover_anchor, state, params):
+    hold = (hover_anchor - state.pos_m) * params.hover_hold_gain
+    hn = float(np.linalg.norm(hold))
+    if hn > params.hover_hold_mps:
+        hold = hold / hn * params.hover_hold_mps
+    return hold
+
+
+def _plant_target_velocity(
+    state, params, map_frame, hover_anchor, roll, pitch, gaz, vh_per_pct, vv_per_pct
+):
+    fwd_w, right_w, up_w = _body_axes(state.yaw, map_frame)
+    v_tgt = fwd_w * (pitch * vh_per_pct) + right_w * (roll * vh_per_pct) + up_w * (gaz * vv_per_pct)
+    if hover_anchor is not None and params.hover_hold_mps > 0:
+        hold = _clipped_hover_hold(hover_anchor, state, params)
+        # Vertical part only: the horizontal hover correction is added once
+        # per substep after the speed/tilt mode is chosen (see hover_hold
+        # below). Adding the full vector here would apply it twice.
+        v_tgt = v_tgt + np.dot(hold, up_w) * up_w
+    vh_cap = v_tgt - np.dot(v_tgt, up_w) * up_w  # horizontal part
+    if float(np.linalg.norm(vh_cap)) > VH_MAX_MPS:
+        v_tgt = vh_cap / float(np.linalg.norm(vh_cap)) * VH_MAX_MPS + np.dot(v_tgt, up_w) * up_w
+    vv_n = float(np.dot(v_tgt, up_w))
+    if abs(vv_n) > VV_MAX_MPS:
+        v_tgt = v_tgt - up_w * (vv_n - math.copysign(VV_MAX_MPS, vv_n))
+    return v_tgt
+
+
+def _wind_ou_step(wind, wind_mean_world, params, rng, sdt):
+    # wind OU drift around the configured mean (ground-drift proxy)
+    wind += (
+        (
+            (wind_mean_world - wind) / params.wind_tau_s * sdt
+            + math.sqrt(2.0 / params.wind_tau_s)
+            * params.wind_sigma_mps
+            * math.sqrt(max(sdt, 1e-9))
+            * rng.normal(0, 1, 3)
+        )
+        if params.wind_tau_s > 0
+        else 0.0
+    )
+    return wind
+
+
+def _gust_step(state, params, map_frame, rng, gust_phase, sdt, gust_displacement):
+    gust = np.zeros(3)
+    if params.gust_every_s > 0 and params.gust_m > 0:
+        gust_phase += sdt
+        if gust_phase + 1e-9 >= params.gust_every_s:
+            gust_phase -= params.gust_every_s
+            gdir = rng.normal(0, 1, 3)
+            # Horizontal wind gust: no artificial vertical displacement.
+            gdir -= np.dot(gdir, map_frame.up) * np.asarray(map_frame.up)
+            state.gust_direction = gdir / (np.linalg.norm(gdir) or 1.0)
+        if gust_phase < params.gust_duration_s:
+            amplitude = params.gust_m * math.pi / (2.0 * params.gust_duration_s)
+            gust = (
+                state.gust_direction
+                * amplitude
+                * math.sin(math.pi * gust_phase / params.gust_duration_s)
+            )
+            gust_displacement += gust * sdt
+    state.gust_velocity = gust
+    return gust, gust_phase
+
+
+def _step_tilt(
+    tilt_fwd, tilt_right, tilt_cmd_fwd, tilt_cmd_right, k_tilt, step_limit, max_tilt_rad
+):
+    tilt_fwd += max(-step_limit, min(step_limit, (tilt_cmd_fwd - tilt_fwd) * k_tilt))
+    tilt_right += max(-step_limit, min(step_limit, (tilt_cmd_right - tilt_right) * k_tilt))
+    tilt_mag = math.hypot(float(tilt_fwd), float(tilt_right))
+    if tilt_mag > max_tilt_rad and tilt_mag > 0.0:
+        tilt_fwd *= max_tilt_rad / tilt_mag
+        tilt_right *= max_tilt_rad / tilt_mag
+    return tilt_fwd, tilt_right
+
+
+def _tilt_acceleration(state, params, fwd_w, right_w, tilt_fwd, tilt_right, g0):
+    couple = 1.0 - float(params.yaw_coupling) * abs(float(state.yaw_rate)) / math.radians(200.0)
+    couple = max(0.0, min(1.0, couple))
+    return (fwd_w * tilt_fwd + right_w * tilt_right) * g0 * couple * params.horizontal_accel_gain
+
+
+def _saturate_thrust(a_h, params, gaz, vv_per_pct, sim_now, sdt, g0):
+    # thrust saturation + sag: tilt + climb share the margin over hover
+    climb_demand = abs(float(gaz * vv_per_pct)) / max(VV_MAX_MPS, 1e-6)
+    tilt_demand = float(np.linalg.norm(a_h)) / g0
+    sag_now = float(params.battery_sag_frac) * min(
+        1.0, max(0.0, (sim_now + sdt) / max(float(params.duration_s), 1e-6))
+    )
+    avail = max(0.0, float(params.thrust_margin) * (1.0 - sag_now) - 1.0)
+    if tilt_demand + climb_demand > avail and (tilt_demand + climb_demand) > 0:
+        a_h = a_h * max(0.0, avail / (tilt_demand + climb_demand))
+    return a_h
+
+
+def _ground_effect_lift(state, params, up_w):
+    # ground effect: lift cushion within ground_effect_height_m above the
+    # takeoff altitude (vertical only, no horizontal effect). Scaled to
+    # 10% of the vertical envelope so frac=1.0 ≈ 0.2 m/s, not a takeoff.
+    if float(params.ground_effect_frac) > 0 and params.ground_altitude_m is not None:
+        hagl = float(np.dot(state.pos_m, up_w)) - float(params.ground_altitude_m)
+        if 0.0 <= hagl <= float(params.ground_effect_height_m):
+            return (
+                float(params.ground_effect_frac)
+                * (1.0 - hagl / max(float(params.ground_effect_height_m), 1e-6))
+                * 0.1
+                * float(params.max_vertical_speed_mps)
+            )
+    return 0.0
+
+
+def _update_plant_velocity(
+    state, params, hover_anchor, roll, pitch, v_tgt, a_h, up_w, wind, gust, vv_lift, k_h, k_v, sdt
+):
+    hover_hold = np.zeros(3)
+    if hover_anchor is not None and params.hover_hold_mps > 0:
+        hold = _clipped_hover_hold(hover_anchor, state, params)
+        hover_hold = hold - np.dot(hold, up_w) * up_w
+    vh = v_tgt - np.dot(v_tgt, up_w) * up_w  # horizontal part (legacy velocity loop)
+    vv = np.dot(v_tgt, up_w) * up_w
+    # Tilt acceleration with linear drag; optional velocity-proxy mode.
+    if float(params.tau_tilt_s) > 1e-3 + 1e-9:
+        vh = a_h * float(params.tau_h_s)
+    vh = vh + hover_hold
+    braking = hover_anchor is not None and roll == 0 and pitch == 0
+    if braking:
+        # Firmware brakes ground motion, including residual wind, on release.
+        drift = wind + gust
+        horizontal_drift = drift - np.dot(drift, up_w) * up_w
+        vh = hover_hold - horizontal_drift
+    vh_norm = float(np.linalg.norm(vh))
+    if vh_norm > VH_MAX_MPS:
+        vh *= VH_MAX_MPS / vh_norm
+    vv = vv + up_w * vv_lift
+    cur_h = state.vel_m - np.dot(state.vel_m, up_w) * up_w
+    cur_v = np.dot(state.vel_m, up_w) * up_w
+    brake_k = 1.0 - math.exp(-sdt / params.tau_brake_s) if braking else k_h
+    cur_h += (vh - cur_h) * brake_k
+    cur_v += (vv - cur_v) * k_v
+    state.vel_m = cur_h + cur_v
+
+
 def _integrate_plant(
     state,
     wind,
@@ -555,8 +768,8 @@ def _integrate_plant(
     yaw-coupling (tilt approximation, not a 200 Hz firmware PID replica).
     Total thrust (hover + tilt + climb) saturates at thrust_margin; battery
     sag scales it down over the mission; ground effect adds a lift cushion
-    near takeoff altitude. The horizontal velocity loop is a speed
-    approximation keyed to cruise_mps, not a calibrated airframe model.
+    near takeoff altitude. Drag and braking are reduced-order fits, not a full
+    aerodynamic airframe model; wind is explicitly a residual-drift proxy.
     """
     roll, pitch, yaw_p, gaz = pcmd
     sub = 10
@@ -568,40 +781,15 @@ def _integrate_plant(
         + float(wind_mean[1]) * np.asarray(map_frame.north, dtype=float)
         + float(wind_mean[2]) * np.asarray(map_frame.up, dtype=float)
     )
-    try:
-        from live_safety_config import (
-            DEFAULT_MAX_PITCH_ROLL_ROTATION_SPEED_DEGS as _MAX_TILT_RATE,
-            DEFAULT_MAX_TILT_DEG as _MAX_TILT,
-        )
-
-        max_tilt_deg = float(_MAX_TILT)
-        max_tilt_rate_deg_s = float(_MAX_TILT_RATE)
-    except (ImportError, AttributeError, TypeError, ValueError):
-        max_tilt_deg, max_tilt_rate_deg_s = 20.0, 60.0
-    max_tilt_rad = math.radians(max_tilt_deg)
-    max_tilt_rate = math.radians(max_tilt_rate_deg_s)
+    max_tilt_rad, max_tilt_rate = _max_tilt_limits()
     g0 = 9.81
     tilt_cmd_fwd = pitch / 100.0 * max_tilt_rad
     tilt_cmd_right = roll / 100.0 * max_tilt_rad
     k_tilt = 1.0 - math.exp(-sdt / max(float(params.tau_tilt_s), 1e-6))
-    fwd_w, right_w, up_w = _body_axes(state.yaw, map_frame)
-    v_tgt = fwd_w * (pitch * vh_per_pct) + right_w * (roll * vh_per_pct) + up_w * (gaz * vv_per_pct)
-    yaw_rate_tgt = -math.radians(yaw_p * yaw_per_pct)
-    if hover_anchor is not None and params.hover_hold_mps > 0:
-        hold = (hover_anchor - state.pos_m) * params.hover_hold_gain
-        hn = float(np.linalg.norm(hold))
-        if hn > params.hover_hold_mps:
-            hold = hold / hn * params.hover_hold_mps
-        # Vertical part only: the horizontal hover correction is added once
-        # per substep after the speed/tilt mode is chosen (see hover_hold
-        # below). Adding the full vector here would apply it twice.
-        v_tgt = v_tgt + np.dot(hold, up_w) * up_w
-    vh_cap = v_tgt - np.dot(v_tgt, up_w) * up_w  # horizontal part
-    if float(np.linalg.norm(vh_cap)) > VH_MAX_MPS:
-        v_tgt = vh_cap / float(np.linalg.norm(vh_cap)) * VH_MAX_MPS + np.dot(v_tgt, up_w) * up_w
-    vv_n = float(np.dot(v_tgt, up_w))
-    if abs(vv_n) > VV_MAX_MPS:
-        v_tgt = v_tgt - up_w * (vv_n - math.copysign(VV_MAX_MPS, vv_n))
+    v_tgt = _plant_target_velocity(
+        state, params, map_frame, hover_anchor, roll, pitch, gaz, vh_per_pct, vv_per_pct
+    )
+    yaw_rate_tgt = -math.radians(max(-YAW_MAX_DEG_S, min(YAW_MAX_DEG_S, yaw_p * yaw_per_pct)))
     k_h = 1.0 - math.exp(-sdt / params.tau_h_s)
     k_v = 1.0 - math.exp(-sdt / params.tau_v_s)
     k_y = 1.0 - math.exp(-sdt / params.tau_yaw_s)
@@ -609,86 +797,36 @@ def _integrate_plant(
     tilt_right = float(getattr(state, "tilt_right", 0.0))
     gust_displacement = np.zeros(3)
     for _ in range(sub):
-        # wind OU drift around the configured mean (ground-drift proxy)
-        wind += (
-            (
-                (wind_mean_world - wind) / params.wind_tau_s * sdt
-                + math.sqrt(2.0 / params.wind_tau_s)
-                * params.wind_sigma_mps
-                * math.sqrt(max(sdt, 1e-9))
-                * rng.normal(0, 1, 3)
-            )
-            if params.wind_tau_s > 0
-            else 0.0
+        wind = _wind_ou_step(wind, wind_mean_world, params, rng, sdt)
+        gust, gust_phase = _gust_step(
+            state, params, map_frame, rng, gust_phase, sdt, gust_displacement
         )
-        gust = np.zeros(3)
-        if params.gust_every_s > 0 and params.gust_m > 0:
-            gust_phase += sdt
-            if gust_phase + 1e-9 >= params.gust_every_s:
-                gust_phase = 0.0
-                gdir = rng.normal(0, 1, 3)
-                gdir /= np.linalg.norm(gdir) or 1.0
-                gust = gdir * (params.gust_m / sdt)  # exact metre displacement per impulse
-                gust_displacement += gust * sdt
-        # achieved tilt lags command (first-order) and slews at the firmware
-        # pitch/roll rate limit; horizontal accel = achieved tilt * g.
-        tilt_fwd += (tilt_cmd_fwd - tilt_fwd) * k_tilt
-        tilt_right += (tilt_cmd_right - tilt_right) * k_tilt
+        # Limit the change from the previous tilt, not distance to the target.
         step_limit = max_tilt_rate * sdt
-        tilt_fwd = max(tilt_cmd_fwd - step_limit, min(tilt_cmd_fwd + step_limit, tilt_fwd))
-        tilt_right = max(tilt_cmd_right - step_limit, min(tilt_cmd_right + step_limit, tilt_right))
-        tilt_mag = math.hypot(float(tilt_fwd), float(tilt_right))
-        if tilt_mag > max_tilt_rad and tilt_mag > 0.0:
-            tilt_fwd *= max_tilt_rad / tilt_mag
-            tilt_right *= max_tilt_rad / tilt_mag
-        fwd_w, right_w, up_w = _body_axes(state.yaw, map_frame)
-        couple = 1.0 - float(params.yaw_coupling) * abs(float(state.yaw_rate)) / math.radians(200.0)
-        couple = max(0.0, min(1.0, couple))
-        a_h = (fwd_w * tilt_fwd + right_w * tilt_right) * g0 * couple
-        # thrust saturation + sag: tilt + climb share the margin over hover
-        climb_demand = abs(float(gaz * vv_per_pct)) / max(VV_MAX_MPS, 1e-6)
-        tilt_demand = float(np.linalg.norm(a_h)) / g0
-        sag_now = float(params.battery_sag_frac) * min(
-            1.0, max(0.0, (sim_now + sdt) / max(float(params.duration_s), 1e-6))
+        tilt_fwd, tilt_right = _step_tilt(
+            tilt_fwd, tilt_right, tilt_cmd_fwd, tilt_cmd_right, k_tilt, step_limit, max_tilt_rad
         )
-        avail = max(0.0, float(params.thrust_margin) * (1.0 - sag_now) - 1.0)
-        if tilt_demand + climb_demand > avail and (tilt_demand + climb_demand) > 0:
-            a_h = a_h * max(0.0, avail / (tilt_demand + climb_demand))
-        # ground effect: lift cushion within ground_effect_height_m above the
-        # takeoff altitude (vertical only, no horizontal effect). Scaled to
-        # 10% of the vertical envelope so frac=1.0 ≈ 0.2 m/s, not a takeoff.
-        vv_lift = 0.0
-        if float(params.ground_effect_frac) > 0 and params.ground_altitude_m is not None:
-            hagl = float(np.dot(state.pos_m, up_w)) - float(params.ground_altitude_m)
-            if 0.0 <= hagl <= float(params.ground_effect_height_m):
-                vv_lift = (
-                    float(params.ground_effect_frac)
-                    * (1.0 - hagl / max(float(params.ground_effect_height_m), 1e-6))
-                    * 0.1
-                    * float(params.max_vertical_speed_mps)
-                )
-        hover_hold = np.zeros(3)
-        if hover_anchor is not None and params.hover_hold_mps > 0:
-            hold = (hover_anchor - state.pos_m) * params.hover_hold_gain
-            hn = float(np.linalg.norm(hold))
-            if hn > params.hover_hold_mps:
-                hold = hold / hn * params.hover_hold_mps
-            hover_hold = hold - np.dot(hold, up_w) * up_w
-        vh = v_tgt - np.dot(v_tgt, up_w) * up_w  # horizontal part (legacy velocity loop)
-        vv = np.dot(v_tgt, up_w) * up_w
-        # tilt path: with tau_tilt_s at default (~0) this is an exact no-op and
-        # the legacy velocity loop above runs unchanged; with tau_tilt_s set,
-        # the horizontal target comes from achieved tilt (tilt * g * tau_h).
-        if float(params.tau_tilt_s) > 1e-3 + 1e-9:
-            vh = a_h * float(params.tau_h_s)
-        vh = vh + hover_hold
-        vv = vv + up_w * vv_lift
-        cur_h = state.vel_m - np.dot(state.vel_m, up_w) * up_w
-        cur_v = np.dot(state.vel_m, up_w) * up_w
-        cur_h += (vh - cur_h) * k_h
-        cur_v += (vv - cur_v) * k_v
-        state.vel_m = cur_h + cur_v
-        state.pos_m += (state.vel_m + wind) * sdt + gust * sdt
+        fwd_w, right_w, up_w = _body_axes(state.yaw, map_frame)
+        a_h = _tilt_acceleration(state, params, fwd_w, right_w, tilt_fwd, tilt_right, g0)
+        a_h = _saturate_thrust(a_h, params, gaz, vv_per_pct, sim_now, sdt, g0)
+        vv_lift = _ground_effect_lift(state, params, up_w)
+        _update_plant_velocity(
+            state,
+            params,
+            hover_anchor,
+            roll,
+            pitch,
+            v_tgt,
+            a_h,
+            up_w,
+            wind,
+            gust,
+            vv_lift,
+            k_h,
+            k_v,
+            sdt,
+        )
+        state.pos_m += (state.vel_m + wind + gust) * sdt
         state.yaw_rate += (yaw_rate_tgt - state.yaw_rate) * k_y
         state.yaw = rpf.wrap_angle(state.yaw + state.yaw_rate * sdt)
     state.tilt_fwd = float(tilt_fwd)
@@ -947,10 +1085,16 @@ class _SimulatedTelemetry:
             if self.tele_rng.random() < float(self.params.telemetry_drop_rate):
                 continue
             true_ned_n = float(
-                np.dot(self.state.vel_m + wind, np.asarray(self.map_frame.north, dtype=float))
+                np.dot(
+                    self.state.vel_m + wind + self.state.gust_velocity,
+                    np.asarray(self.map_frame.north, dtype=float),
+                )
             )
             true_ned_e = float(
-                np.dot(self.state.vel_m + wind, np.asarray(self.map_frame.east, dtype=float))
+                np.dot(
+                    self.state.vel_m + wind + self.state.gust_velocity,
+                    np.asarray(self.map_frame.east, dtype=float),
+                )
             )
             noise = float(self.params.telemetry_noise_mps)
             if noise > 0:
@@ -1023,13 +1167,9 @@ def _landing_trace(
         if tele_term is None
         else [float(tele_term[0]), float(tele_term[1])],
         "telemetry_stamp": None if tele_term is None else float(tele_term[2]),
-        "pcmd_requested": list(
-            tuple(int(v) for v in runner_record.get("pcmd_requested", (0, 0, 0, 0)))
-        ),
-        "pcmd": list(tuple(int(v) for v in runner_record.get("pcmd_requested", (0, 0, 0, 0)))),
-        "pcmd_applied": list(
-            tuple(int(v) for v in runner_record.get("pcmd_requested", (0, 0, 0, 0)))
-        ),
+        "pcmd_requested": [int(v) for v in runner_record.get("pcmd_requested", (0, 0, 0, 0))],
+        "pcmd": [int(v) for v in runner_record.get("pcmd_requested", (0, 0, 0, 0))],
+        "pcmd_applied": [int(v) for v in runner_record.get("pcmd_requested", (0, 0, 0, 0))],
         "speed_guard_status": str(
             getattr(speed_guard.backend.state, "autonomous_speed_guard_status", "")
         ),
@@ -1166,6 +1306,7 @@ def run_sim(params: SimParams, *, record_trace: bool = True) -> tuple[SimResult,
     loc_rng = np.random.default_rng(seed_seq.spawn(1)[0])
     cmd_rng = np.random.default_rng(seed_seq.spawn(1)[0])
     baro_rng = np.random.default_rng(seed_seq.spawn(1)[0])
+    imu_rng = np.random.default_rng(seed_seq.spawn(1)[0])
     ctrl, cfg, map_frame, doc = build_production_controller(
         params.route, params.align, return_to_start=params.return_to_start
     )
@@ -1209,8 +1350,6 @@ def run_sim(params: SimParams, *, record_trace: bool = True) -> tuple[SimResult,
         predicted_rate=params.predicted_rate,
         blackout_every_s=params.blackout_every_s,
         blackout_dur_s=params.blackout_dur_s,
-        blackout_drift_mps=params.blackout_drift_mps,
-        blackout_yaw_drift_deg_s=params.blackout_yaw_drift_deg_s,
         pose_rate_hz=params.pose_rate_hz,
         latency_jitter_ms=params.latency_jitter_ms,
         position_correlation_s=params.position_correlation_s,
@@ -1245,6 +1384,7 @@ def run_sim(params: SimParams, *, record_trace: bool = True) -> tuple[SimResult,
         raise ValueError("wind_mean_mps must be finite")
     for k in range(8):
         loc.push_truth(initial_wait - (8 - k) * DT, state.pos_m, state.yaw)
+        loc.push_imu(initial_wait - (8 - k) * DT, state.yaw)
     loc.push_truth(initial_wait, state.pos_m, state.yaw)
     wind_mean_world = (
         float(wind_mean[0]) * np.asarray(map_frame.east, dtype=float)
@@ -1286,7 +1426,7 @@ def run_sim(params: SimParams, *, record_trace: bool = True) -> tuple[SimResult,
     def _olympe_report() -> float:
         # NED clockwise-from-North, inverse of HeadingEstimator._olympe_to_map_ccw
         oly = (math.pi / 2.0 - state.yaw + math.pi) % (2.0 * math.pi) - math.pi
-        return float(oly + math.radians(rng.normal(0.0, params.oly_noise_deg)))
+        return float(oly + math.radians(imu_rng.normal(0.0, params.oly_noise_deg)))
 
     for step in range(max_steps):
         oly_yaw = _olympe_report()
@@ -1294,6 +1434,13 @@ def run_sim(params: SimParams, *, record_trace: bool = True) -> tuple[SimResult,
         runtime.oly_cell["yaw"] = float(oly_yaw)
         prev_target = int(ctrl.target_index)
         logged_before = len(runtime.logged)
+        imu_heading = rpf.wrap_angle(math.pi / 2.0 - oly_yaw)
+        loc.push_imu(
+            t,
+            imu_heading,
+            tilt_deg=math.degrees(math.hypot(state.tilt_fwd, state.tilt_right)),
+            yaw_rate_deg_s=math.degrees(state.yaw_rate),
+        )
         runtime.pose_cell["pose"] = loc.report(t)
         telemetry.publish(t, oly_yaw, wind)
         runner_outcome = runtime.runner.step()
@@ -1344,9 +1491,9 @@ def run_sim(params: SimParams, *, record_trace: bool = True) -> tuple[SimResult,
             reason = "ABORT: pending inspection at route end"
             break
         if "command_action" not in runner_record:
-            # Formal safety hold (BOOT/recovery/jump/HOVER): apply the runtime.logged
-            # zero and integrate the plant without a navigation decision.
-            action_pcmd = tuple(int(v) for v in runner_record.get("pcmd", (0, 0, 0, 0)))
+            # Formal safety hold requests zero; authorized PCMD may still
+            # contain the production speed guard's braking correction.
+            action_pcmd = tuple(int(v) for v in runner_record.get("pcmd_requested", (0, 0, 0, 0)))
             phase = str(
                 runner_record.get("localization_recovery_state")
                 or runner_record.get("reason")
@@ -1386,7 +1533,7 @@ def run_sim(params: SimParams, *, record_trace: bool = True) -> tuple[SimResult,
         if (roll, pitch, yaw_p, gaz) != requested and any(v != 0 for v in requested):
             speed_guard_interventions += 1
         body_forward, body_right, _body_up = _body_axes(state.yaw, map_frame)
-        ground_velocity = state.vel_m + wind
+        ground_velocity = state.vel_m + wind + state.gust_velocity
         body_velocity = (
             float(np.dot(ground_velocity, body_forward)),
             float(np.dot(ground_velocity, body_right)),
@@ -1440,6 +1587,8 @@ def run_sim(params: SimParams, *, record_trace: bool = True) -> tuple[SimResult,
                 "position_observed": bool(getattr(pose, "position_observed", True))
                 if pose is not None
                 else False,
+                "imu_stamp": float(t),
+                "imu_yaw_deg": math.degrees(imu_heading),
                 "retired_target_idx": retired_now,
                 "gust_displacement_m": [0.0, 0.0, 0.0],
                 "gust_time_s": None,
@@ -1556,7 +1705,7 @@ def _save_plots(
     # 1) top-down: map east (x) vs north-ish. Raw GLOMAP horizontal = X/Z, so
     # plot X vs Z with per-waypoint arrival spheres.
     fig, ax = plt.subplots(figsize=(9, 7))
-    for a, b in zip(W[:-1], W[1:]):
+    for a, b in zip(W[:-1], W[1:], strict=True):
         ax.plot([a[0], b[0]], [a[2], b[2]], "k-", lw=1.2, alpha=0.5)
     th = np.linspace(0, 2 * math.pi, 49)
     n_drawn = (len(W) + 1) // 2  # return leg revisits the same geometry
@@ -1726,7 +1875,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     ap.add_argument("--gust-every-s", type=float, default=0.0)
     ap.add_argument("--gust-m", type=float, default=0.0)
+    ap.add_argument(
+        "--gust-duration-s", type=float, default=2.0, help="finite half-sine residual-drift pulse"
+    )
     ap.add_argument("--tau-tilt-s", type=float, default=1e-3)
+    ap.add_argument("--tau-h-s", type=float, default=0.4)
+    ap.add_argument("--tau-brake-s", type=float, default=0.35)
     ap.add_argument("--thrust-margin", type=float, default=99.0)
     ap.add_argument("--battery-sag-frac", type=float, default=0.0)
     ap.add_argument("--ground-effect-frac", type=float, default=0.0)
@@ -1741,8 +1895,6 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--predicted-rate", type=float, default=0.0)
     ap.add_argument("--blackout-every-s", type=float, default=0.0)
     ap.add_argument("--blackout-dur-s", type=float, default=0.0)
-    ap.add_argument("--blackout-drift-mps", type=float, default=0.0)
-    ap.add_argument("--blackout-yaw-drift-deg-s", type=float, default=0.0)
     ap.add_argument(
         "--drift-every-s",
         type=float,
@@ -1859,6 +2011,9 @@ def _params_from_args(a: argparse.Namespace, *, seed: int, scale: float) -> SimP
         hover_hold_mps=a.hover_hold_mps,
         gust_every_s=a.gust_every_s,
         gust_m=a.gust_m,
+        gust_duration_s=a.gust_duration_s,
+        tau_h_s=a.tau_h_s,
+        tau_brake_s=a.tau_brake_s,
         tau_tilt_s=a.tau_tilt_s,
         thrust_margin=a.thrust_margin,
         battery_sag_frac=a.battery_sag_frac,
@@ -1874,8 +2029,6 @@ def _params_from_args(a: argparse.Namespace, *, seed: int, scale: float) -> SimP
         predicted_rate=a.predicted_rate,
         blackout_every_s=a.blackout_every_s,
         blackout_dur_s=a.blackout_dur_s,
-        blackout_drift_mps=a.blackout_drift_mps,
-        blackout_yaw_drift_deg_s=a.blackout_yaw_drift_deg_s,
         drift_every_s=a.drift_every_s,
         drift_dur_s=a.drift_dur_s,
         drift_offset_s=a.drift_offset_s,
@@ -2033,6 +2186,9 @@ def main(argv: list[str] | None = None) -> int:
                             "speed_guard_status",
                             "pose_stamp",
                             "map_confirmed",
+                            "position_observed",
+                            "imu_stamp",
+                            "imu_yaw_deg",
                             "retired_target_idx",
                             "gust_time_s",
                             "gust_dx_m",
@@ -2074,6 +2230,9 @@ def main(argv: list[str] | None = None) -> int:
                                 r.get("speed_guard_status", ""),
                                 r.get("pose_stamp"),
                                 r.get("map_confirmed"),
+                                r.get("position_observed"),
+                                r.get("imu_stamp"),
+                                r.get("imu_yaw_deg"),
                                 r.get("retired_target_idx"),
                                 r.get("gust_time_s"),
                                 gust[0],

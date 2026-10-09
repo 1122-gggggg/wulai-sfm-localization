@@ -93,7 +93,8 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
 用法: ./start_anafi_live.sh [flight_operator_app.py 的真機選項]
 
 此入口只會啟動 real-flight Olympe 介面，禁止傳入 --video 或
---interface simulated-stream。它可能連線 SkyController/ANAFI；離線檢查請使用：
+--interface simulated-stream。UI 先開啟、不連線；按「連接真機串流」才連線，
+失敗可再次按下重試，不必重開終端機。影片模擬入口：
   控制介面程式/影片模擬串流/選擇啟動.sh
 EOF
   exit 0
@@ -210,48 +211,21 @@ fi
 export PYTHONUNBUFFERED=1
 export PYTHONNOUSERSITE=1
 
-# Fail before network probes or any backend startup. Python also verifies
-# the selected mission and its matching snapshot before constructing a backend.
+# Fail before any backend startup. Python also verifies the selected mission
+# and its matching snapshot before constructing a backend.
 if [[ ! "${SFM_MISSION_SELECTION:-}" =~ [^[:space:]] ]]; then
   echo "[start] ERROR: real-flight requires SFM_MISSION_SELECTION" >&2
   exit 2
 fi
 
-target_reachable() {
-  local target="$1"
-  if command -v ping >/dev/null 2>&1 \
-     && ping -c 1 -W 1 "$target" >/dev/null 2>&1; then
-    return 0
-  fi
-  # Some ANAFI firmware/network combinations answer HTTP/ARSDK while dropping
-  # ICMP echo. An HTTP response (including a non-2xx status) proves reachability
-  # without sending any flight command.
-  if command -v curl >/dev/null 2>&1 \
-     && curl --silent --show-error --output /dev/null \
-       --connect-timeout 1 --max-time 2 "http://$target/"; then
-    return 0
-  fi
-  return 1
-}
-
 # Modes:
 #   SC USB (default):  IP=192.168.53.1 CTRL=skycontroller3
 #   Direct drone WiFi: IP=192.168.42.1 CTRL=drone
 #     example: IP=192.168.42.1 CTRL=drone ./start_anafi_live.sh
-# Auto: if drone WiFi is up and SC is not, prefer direct. Dry-run never probes
-# the network and uses the field-safe SkyController defaults.
+# No network probes or automatic path switching: open the UI even when offline.
 if [[ -z "${IP:-}" && -z "${CTRL:-}" ]]; then
-  if [[ "$DRY_RUN" == "1" ]]; then
-    IP=192.168.53.1
-    CTRL=skycontroller3
-  elif target_reachable 192.168.42.1 \
-       && ! target_reachable 192.168.53.1; then
-    IP=192.168.42.1
-    CTRL=drone
-  else
-    IP=192.168.53.1
-    CTRL=skycontroller3
-  fi
+  IP=192.168.53.1
+  CTRL=skycontroller3
 elif [[ -n "${IP:-}" && -z "${CTRL:-}" ]]; then
   case "$IP" in
     192.168.42.*) CTRL=drone ;;
@@ -280,20 +254,6 @@ if [[ "$IP" == 192.168.42.* && "$CTRL" == sky* ]] \
   exit 2
 fi
 
-if [[ "$DRY_RUN" != "1" ]]; then
-  echo "[start] checking target at $IP (controller=$CTRL) ..."
-fi
-if [[ "$DRY_RUN" != "1" ]] && ! target_reachable "$IP"; then
-  echo "[start] ERROR: cannot reach $IP"
-  echo "  SkyController path:"
-  echo "    1) Power on SC3 + ANAFI, USB PC↔SC, wait for drone link"
-  echo "    2) ip a should show 192.168.53.x"
-  echo "  Direct drone WiFi path:"
-  echo "    1) Connect laptop to ANAFI-XXXX WiFi"
-  echo "    2) IP=192.168.42.1 CTRL=drone $0"
-  exit 1
-fi
-
 if [[ "$CTRL" == *sky* || "$IP" == 192.168.53.* ]]; then
   echo "[start] LIVE Operator UI (ANAFI via SkyController, 720p + PCMD)"
   echo "  safety pilot: hold sticks; Esc = take over; close/Ctrl‑C = land"
@@ -302,6 +262,8 @@ else
   echo "  NO SkyController — laptop is sole controller"
   echo "  Esc freezes PC PCMD; 恢復電腦控制 resumes; close/Ctrl‑C = land"
 fi
+echo "  UI 先開啟、不連線；按「連接真機串流」才連線至 $IP (controller=$CTRL)"
+echo "  連線失敗可再次按下重試，不必重開終端機"
 # Optional env:
 #   LOC_BENCH=1        -> auto 開始定位 + no boot-lock (BOOT_INIT/MegaLoc path; NO takeoff)
 #   LOC_BENCH_TRACK=1  -> same + force TRACK path each frame (no MegaLoc; in-flight FPS)
@@ -372,7 +334,7 @@ if [[ "${POSE_STABILIZE:-0}" == "1" ]]; then
   EXTRA+=(--pose-stabilize)
   echo "[start] pose_stabilize=on (causal)"
 fi
-# YOLO is not part of this flight localization UI (default off).
+# Run the power-equipment detector alongside localization, in its own worker.
 # Optional: LOC_EVERY_N=2 to submit every 2nd stream frame to the localizer.
 if [[ -n "${LOC_EVERY_N:-}" ]]; then
   EXTRA+=(--loc-every-n-frames "${LOC_EVERY_N}")
@@ -399,7 +361,9 @@ CMD=(
   "${CMD_PREFIX[@]}"
   "$UI_PYTHON" -u "$OI/flight_operator_app.py" --interface real-flight
   --ip "$IP" --controller "$CTRL"
-  --no-live-detect
+  --live-detect
+  --detector-task detect
+  --detector-python "${SFM_DETECTOR_PYTHON:-$WORKSPACE_ROOT/.venv-yolo/bin/python}"
   --max-altitude-m "${SFM_MAX_ALTITUDE_M:-50}"
   --max-distance-m "${SFM_MAX_DISTANCE_M:-100}"
   --rth-min-altitude-m "${SFM_RTH_MIN_ALTITUDE_M:-20.0}"

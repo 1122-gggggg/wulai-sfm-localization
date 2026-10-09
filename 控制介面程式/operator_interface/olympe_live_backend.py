@@ -41,6 +41,7 @@ import os as os
 import sys
 import threading
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -111,6 +112,7 @@ from backend_telemetry import (  # noqa: E402
     MotionEventHistory, poll_session_telemetry, video_delivery_snapshot, poll_gimbal,
     poll_camera_zoom, poll_satellites, poll_signal_sensors, poll_gps_fix,
     control_telemetry_history,
+    poll_device_info,
 )
 from live_command_log import _CmdLog, quiet_olympe_logs as quiet_olympe_logs  # noqa: E402
 from live_anafi_video_stream import LiveAnafiVideoStream  # noqa: E402
@@ -259,6 +261,7 @@ class OlympeLiveBackend:
         event_log: Any | None = None,
         session_logs: Any | None = None,
         with_video: bool = True,
+        defer_connect: bool = False,
     ):
         """state_factory: callable -> DroneState; anafi_profile: AnafiProfile."""
         requested_ttl_raw = nudge_pulse_s
@@ -281,7 +284,7 @@ class OlympeLiveBackend:
         self.ANAFI = anafi_profile
         self.state = state_factory()
         self.state.loc = "LIVE"
-        self.state.stream = "CONNECTING"
+        self.state.stream = "DISCONNECTED" if defer_connect else "CONNECTING"
         self.state.mode = "MANUAL"
         # Initial construction, before self.log exists below: not a
         # transition worth an audit trail entry, just the starting state.
@@ -377,6 +380,9 @@ class OlympeLiveBackend:
         self._lock = threading.RLock()
         self.authority_controller = AuthorityController()
         self._cleanup_lock = threading.Lock()
+        self._connection_executor: ThreadPoolExecutor | None = None
+        self._ground_preflight_future: Future | None = None
+        self._ground_preflight_refresh_t = 0.0
         self._firmware_limits_lock = threading.Lock()
         self._calibration_lock = threading.Lock()
         self._pulse_token = 0
@@ -416,6 +422,8 @@ class OlympeLiveBackend:
         # size on the way out (measured 2026-09-12: every AUTO axis was pinned
         # at nudge_pct no matter what the controller asked for).
         self._nudge_vector_authority: int | None = None
+        self._nudge_auto_run_id: str | None = None
+        self._nudge_command_set_mono_ns: int | None = None
         self.zero_pcmd_failures = 0
         self.last_zero_pcmd_error: str | None = None
         self._disk_low_noted = False
@@ -458,8 +466,15 @@ class OlympeLiveBackend:
         self.target_altitude_m = 0.0
         self.started_mono = time.monotonic()
         self.last_poll = self.started_mono
+        self.connection_in_progress = False
+        self._connection_ready = False
+        if defer_connect:
+            self.state.link_ok = False
+            self.state.link_status = "DISCONNECTED"
 
-        self._connect()
+        if not defer_connect:
+            self._connect()
+            self._connection_ready = True
 
     def _set_tracker_state(self, new: TrackerState, *, reason: str) -> TrackerState:
         """Centralized tracker_state transition (C2).
@@ -491,6 +506,39 @@ class OlympeLiveBackend:
         c = str(self.controller or "").lower()
         return ("sky" in c) or str(self.ip).startswith("192.168.53")
 
+    def connect_live(self) -> None:
+        """Connect on demand; retry video without replacing a command connection."""
+        # Share shutdown's lock: closing during a pending connect must wait for
+        # that connection and then apply the existing landing/cleanup policy.
+        with self._cleanup_lock:
+            if self._shutdown_latched or self._cleanup_done:
+                raise RuntimeError("backend is shutting down")
+            self.connection_in_progress = True
+            self.state.stream = "CONNECTING"
+            try:
+                # Olympe loops monitor their creating thread. A one-shot UI
+                # worker would disconnect them as soon as connection returns.
+                if self._connection_executor is None:
+                    self._connection_executor = ThreadPoolExecutor(
+                        max_workers=1, thread_name_prefix="olympe-connection"
+                    )
+                if not self._connection_ready:
+                    self._connection_executor.submit(self._connect).result()
+                    self._connection_ready = True
+                elif self.with_video and self.video_stream is None:
+                    self._connection_executor.submit(self._start_video).result()
+                if self.with_video and self.video_stream is None:
+                    raise RuntimeError("真機已連線，但串流啟動失敗，請再次連接")
+            except BaseException as exc:
+                self.log.event("connect_failed", error=str(exc) or repr(exc))
+                if self.drone is None:
+                    self.state.stream = "DISCONNECTED"
+                    self.state.link_ok = False
+                    self.state.link_status = "DISCONNECTED"
+                raise
+            finally:
+                self.connection_in_progress = False
+
     def _connect(self) -> None:
         quiet_olympe_logs()
         import olympe_frame_source as ofs
@@ -501,7 +549,8 @@ class OlympeLiveBackend:
             controller=self.controller,
             mode="skycontroller" if self.via_skycontroller() else "direct_wifi",
         )
-        self.drone = ofs.connect(self.ip, self.controller)
+        if self.drone is None:
+            self.drone = ofs.connect(self.ip, self.controller)
         # Never steal physical sticks merely by opening the UI. Direct WiFi has
         # no SkyController, so the laptop remains the sole controller there.
         initial_source = "SkyController" if self.via_skycontroller() else "Controller"
@@ -536,6 +585,12 @@ class OlympeLiveBackend:
         self._auto_take_pc_control_if_safe()
 
         if self.with_video:
+            self._start_video()
+
+    def _start_video(self) -> None:
+        import olympe_frame_source as ofs
+
+        if self.with_video:
             # SC3 RTSP often advertises "DefaultVideo"; direct ANAFI uses "Front camera".
             media = "DefaultVideo" if self.via_skycontroller() else "Front camera"
             try:
@@ -543,7 +598,8 @@ class OlympeLiveBackend:
                 self.grabber = ofs.OlympePdrawGrabber(
                     self.drone, resize=(1280, 720), stale_s=0.35,
                     media_name=media,
-                ).start()
+                )
+                self.grabber.start()
                 self.video_stream = LiveAnafiVideoStream(self.grabber)
                 self.video = LegacyFrameSourceAdapter(
                     self.video_stream,
@@ -557,6 +613,11 @@ class OlympeLiveBackend:
                     note="low_latency_queue",
                 )
             except Exception as exc:
+                if self.grabber is not None:
+                    try:
+                        self.grabber.stop()
+                    except Exception:
+                        pass
                 self.grabber = None
                 self.video_stream = None
                 self.video = None
@@ -1066,6 +1127,49 @@ class OlympeLiveBackend:
         )
         return inventory
 
+    def _refresh_ground_preflight(self) -> None:
+        """Revisit initial UNKNOWN cache reads once ground telemetry arrives."""
+        if (
+            self.drone is None or self._shutdown_latched or self._cleanup_done
+            or self._flight_state_name() != "landed"
+            or not self.state.link_ok
+            or self.state.drone_magnetometer_started is True
+        ):
+            return
+        try:
+            if not self.state.rth_policy_configured:
+                self._configure_lost_link_policy_if_safe()
+            if self._shutdown_latched or self._cleanup_done:
+                return
+            self.read_connection_inventory()
+        except Exception as exc:
+            self._inventory_takeoff_ready = False
+            self._inventory_block_reason = f"ground preflight refresh failed: {exc!r}"
+            self.log.event("ground_preflight_refresh_failed", error=repr(exc))
+
+    def _schedule_ground_preflight_refresh(self, now: float) -> None:
+        """One background check at a time; never wait for firmware on Tk."""
+        executor = self._connection_executor
+        if (
+            executor is None or self.drone is None
+            or self._shutdown_latched or self._cleanup_done
+            or self.connection_in_progress or not self.state.link_ok
+            or self._inventory_takeoff_ready
+            or self._flight_state_name() != "landed"
+            or self.state.drone_magnetometer_started is True
+            or now - self._ground_preflight_refresh_t < 1.0
+        ):
+            return
+        future = self._ground_preflight_future
+        if future is not None and not future.done():
+            return
+        self._ground_preflight_refresh_t = now
+        try:
+            self._ground_preflight_future = executor.submit(self._refresh_ground_preflight)
+        except RuntimeError:
+            # Cleanup can retire the connection owner between the read and submit.
+            return
+
     def _state_dict(self, message_type) -> dict | None:
         if self.drone is None:
             return None
@@ -1207,6 +1311,12 @@ class OlympeLiveBackend:
         ):
             value = integer(progress_state, source, {0, 1})
             setattr(self.state, target, None if value is None else bool(value))
+        # ARSDK explicitly invalidates every axis when calibrationFailed == 1,
+        # even if the same event still contains completed-axis bits.
+        if self.state.drone_magnetometer_failed is True:
+            self.state.drone_magnetometer_x_done = False
+            self.state.drone_magnetometer_y_done = False
+            self.state.drone_magnetometer_z_done = False
 
         controller_ok = True
         if self.via_skycontroller():
@@ -1362,7 +1472,9 @@ class OlympeLiveBackend:
             self._pulse_token += 1
             if not self.pilot_sticks:
                 try:
-                    zero_sent = self._raw_pcmd(0, 0, 0, 0) is not None
+                    zero_sent = self._raw_pcmd(
+                        0, 0, 0, 0, reason=f"{target}_magnetometer_prepare"
+                    ) is not None
                 except Exception:
                     zero_sent = False
         self.state.mode = "MANUAL"
@@ -1384,6 +1496,9 @@ class OlympeLiveBackend:
             waited = self.drone(command).wait(_timeout=timeout_s)
             ok = bool(getattr(waited, "success", lambda: False)())
         except Exception as exc:
+            # The firmware may have applied a command before the wait failed.
+            # Keep its readback visible so a failed start can still be cancelled.
+            self._read_magnetometer_calibration_state()
             self.log.event(
                 "magnetometer_calibration",
                 target=target,
@@ -1393,6 +1508,10 @@ class OlympeLiveBackend:
             )
             return False
         self._read_magnetometer_calibration_state()
+        if target == "aircraft":
+            # Command ACK alone does not confirm the requested transition.
+            expected_started = action == "start"
+            ok = ok and self.state.drone_magnetometer_started is expected_started
         self.log.event(
             "magnetometer_calibration",
             target=target,
@@ -1407,6 +1526,9 @@ class OlympeLiveBackend:
                 return False
             try:
                 from olympe.messages.common.Calibration import MagnetoCalibration
+                from olympe.messages.common.CalibrationState import (
+                    MagnetoCalibrationStartedChanged,
+                )
             except Exception as exc:
                 self.log.event(
                     "magnetometer_calibration",
@@ -1417,7 +1539,10 @@ class OlympeLiveBackend:
                 )
                 return False
             ok = self._wait_magnetometer_command(
-                MagnetoCalibration(calibrate=1),
+                # The SDK default also waits for an axis-change event. A start
+                # is confirmed by started=1; the requested axis may arrive later.
+                MagnetoCalibration(calibrate=1, _no_expect=True)
+                >> MagnetoCalibrationStartedChanged(started=1, _policy="wait"),
                 target="aircraft",
                 action="start",
                 timeout_s=5.0,
@@ -1434,10 +1559,16 @@ class OlympeLiveBackend:
                 return False
             try:
                 from olympe.messages.common.Calibration import MagnetoCalibration
+                from olympe.messages.common.CalibrationState import (
+                    MagnetoCalibrationStartedChanged,
+                )
             except Exception:
                 return False
             return self._wait_magnetometer_command(
-                MagnetoCalibration(calibrate=0),
+                # Cancel need not change the axis. Wait for the actual stopped
+                # transition rather than the SDK's generic start/axis expectation.
+                MagnetoCalibration(calibrate=0, _no_expect=True)
+                >> MagnetoCalibrationStartedChanged(started=0, _policy="wait"),
                 target="aircraft",
                 action="cancel",
                 timeout_s=5.0,
@@ -1550,6 +1681,12 @@ class OlympeLiveBackend:
         for field, matches, command in requested:
             if matches:
                 continue
+            if (
+                self._shutdown_latched or self._cleanup_done
+                or self._flight_state_name() != "landed"
+            ):
+                self.log.event("lost_link_policy", ok=False, reason="ground_setup_interrupted")
+                return False
             try:
                 waited = self.drone(command).wait(_timeout=10)
                 ok = bool(getattr(waited, "success", lambda: False)())
@@ -2220,7 +2357,7 @@ class OlympeLiveBackend:
         re-acquire, matching the inline sends it replaces.
         """
         try:
-            call_mono_ns = self._raw_pcmd(0, 0, 0, 0)
+            call_mono_ns = self._raw_pcmd(0, 0, 0, 0, reason=reason)
         except Exception as exc:
             self.zero_pcmd_failures += 1
             self.last_zero_pcmd_error = repr(exc)
@@ -2244,7 +2381,11 @@ class OlympeLiveBackend:
         self.last_zero_pcmd_call_mono_ns = call_mono_ns
         return True
 
-    def _raw_pcmd(self, roll: int, pitch: int, yaw: int, gaz: int) -> int | None:
+    def _raw_pcmd(
+        self, roll: int, pitch: int, yaw: int, gaz: int, *,
+        reason: str | None = None, auto_run_id: str | None = None,
+        command_set_mono_ns: int | None = None,
+    ) -> int | None:
         r, p, y, g = map(_clamp_pct, (roll, pitch, yaw, gaz))
         if self.drone is None:
             return None
@@ -2253,6 +2394,7 @@ class OlympeLiveBackend:
         # Match Olympe's piloting sender, including yaw/gaz-only commands.
         flag = int(bool(r or p))
         self.drone(PCMD(flag, r, p, y, g, 0))
+        return_mono_ns = time.monotonic_ns()
         self._last_pcmd_flag = flag
         self._last_pcmd = (r, p, y, g)
         self._last_pcmd_mono_ns = call_mono_ns
@@ -2260,13 +2402,21 @@ class OlympeLiveBackend:
         defer = getattr(getattr(self, "session_logs", None), "defer_telemetry", None)
         if callable(defer):
             self._pcmd_debug_seq = getattr(self, "_pcmd_debug_seq", 0) + 1
-            defer("pcmd_dispatch", command_mono_ns=call_mono_ns,
-                  dispatch_seq=self._pcmd_debug_seq, pcmd=[r, p, y, g], flag=flag)
+            defer(
+                "pcmd_dispatch", command_mono_ns=call_mono_ns,
+                sdk_enqueue_start_mono_ns=call_mono_ns,
+                sdk_enqueue_return_mono_ns=return_mono_ns,
+                dispatch_seq=self._pcmd_debug_seq, pcmd=[r, p, y, g], flag=flag,
+                reason=reason, auto_run_id=auto_run_id,
+                command_set_mono_ns=command_set_mono_ns,
+                evidence_kind="sdk_enqueue_not_actuation_confirmation",
+            )
         return call_mono_ns
 
     def send_pcmd(
         self, roll: int, pitch: int, yaw: int, gaz: int, *, reason: str,
         motion_epoch: int | None = None,
+        auto_run_id: str | None = None, command_set_mono_ns: int | None = None,
     ) -> bool:
         with self._lock:
             if self._shutdown_latched or self._cleanup_done or self._landed:
@@ -2291,7 +2441,10 @@ class OlympeLiveBackend:
                 self.log.event("pcmd_blocked_maneuver", reason=reason,
                                maneuver=maneuver, pcmd=(roll, pitch, yaw, gaz))
                 return False
-            pcmd_call_mono_ns = self._raw_pcmd(roll, pitch, yaw, gaz)
+            pcmd_call_mono_ns = self._raw_pcmd(
+                roll, pitch, yaw, gaz, reason=reason, auto_run_id=auto_run_id,
+                command_set_mono_ns=command_set_mono_ns,
+            )
             if pcmd_call_mono_ns is None:
                 # drone is None (disconnected): nothing was sent. Reporting
                 # True here would tell the caller a command reached the
@@ -3122,7 +3275,8 @@ class OlympeLiveBackend:
         return ""
 
     def set_nudge_vector(self, roll: float, pitch: float, yaw: float,
-                         gaz: float, *, authority_pct: int | None = None) -> bool:
+                         gaz: float, *, authority_pct: int | None = None,
+                         auto_run_id: str | None = None) -> bool:
         """Continuous stick input, on the SAME path as the discrete nudges.
 
         Deliberately reuses the hold loop, its deadman, the pilot_sticks block and
@@ -3175,6 +3329,8 @@ class OlympeLiveBackend:
             self._nudge_loop_stop.clear()
             self._nudge_vector = tuple(axes)
             self._nudge_vector_authority = authority_pct
+            self._nudge_auto_run_id = auto_run_id
+            self._nudge_command_set_mono_ns = time.monotonic_ns()
             self._nudge_deadline = time.monotonic() + self.nudge_pulse_s
             self._nudge_held.add(_VECTOR_HOLD)
         self._set_tracker_state(TrackerState.NUDGE, reason="set_nudge_vector")
@@ -3230,6 +3386,8 @@ class OlympeLiveBackend:
         with self._lock:
             self._nudge_vector = None
             self._nudge_vector_authority = None
+            self._nudge_auto_run_id = None
+            self._nudge_command_set_mono_ns = None
             self._nudge_held.discard(_VECTOR_HOLD)
             self._motion_epoch += 1
             empty = not self._nudge_held
@@ -3239,7 +3397,7 @@ class OlympeLiveBackend:
             self._nudge_loop_stop.set()
             if not self.pilot_sticks and not self._landed and not self._cleanup_done:
                 try:
-                    self._raw_pcmd(0, 0, 0, 0)
+                    self._raw_pcmd(0, 0, 0, 0, reason="vector_release_hover")
                     self.log.event("pcmd", reason="vector_release_hover",
                                    pcmd=(0, 0, 0, 0))
                 except Exception as exc:
@@ -3247,7 +3405,9 @@ class OlympeLiveBackend:
                                    error=repr(exc))
                 self._set_tracker_state(TrackerState.HOVER, reason="clear_nudge_vector")
 
-    def _combined_nudge_pcmd(self) -> tuple[int, int, int, int]:
+    def _combined_nudge_pcmd(
+        self, *, with_context: bool = False,
+    ) -> tuple[int, int, int, int] | tuple[tuple[int, int, int, int], str | None, int | None]:
         """Sum the stick vector AND every held direction, clamped to ±nudge_pct.
 
         Both inputs contribute: returning the vector alone silently dropped a key
@@ -3265,6 +3425,11 @@ class OlympeLiveBackend:
             # operator's next button press.
             vector = self._nudge_vector if _VECTOR_HOLD in held else None
             vector_pct = self._nudge_vector_authority
+            if with_context:
+                auto_run_id = self._nudge_auto_run_id if vector is not None else None
+                command_set_mono_ns = (
+                    self._nudge_command_set_mono_ns if vector is not None else None
+                )
         pct = int(self.nudge_pct)
         vector_pct = pct if vector_pct is None else int(vector_pct)
         acc = [0, 0, 0, 0]
@@ -3287,7 +3452,10 @@ class OlympeLiveBackend:
             for i, value in enumerate(vector):
                 acc[i] += int(round(float(value) * vector_pct))
         limit = max(pct, vector_pct)
-        return tuple(max(-limit, min(limit, v)) for v in acc)  # type: ignore[return-value]
+        pcmd = tuple(max(-limit, min(limit, v)) for v in acc)
+        if with_context:
+            return pcmd, auto_run_id, command_set_mono_ns
+        return pcmd
 
     def _nudge_loop_step(self) -> tuple[bool, bool]:
         if (
@@ -3308,11 +3476,13 @@ class OlympeLiveBackend:
                 deadman_expired = True
         if not held:
             return False, deadman_expired
-        pcmd = self._combined_nudge_pcmd()
+        pcmd, auto_run_id, command_set_mono_ns = self._combined_nudge_pcmd(with_context=True)
         sent = self.send_pcmd(
             *pcmd,
             reason="nudge_hold:" + "+".join(sorted(held)),
             motion_epoch=motion_epoch,
+            auto_run_id=auto_run_id,
+            command_set_mono_ns=command_set_mono_ns,
         )
         if sent:
             self._set_tracker_state(TrackerState.NUDGE, reason="_nudge_loop_step")
@@ -3340,7 +3510,7 @@ class OlympeLiveBackend:
                 else "nudge_release_hover"
             )
             try:
-                self._raw_pcmd(0, 0, 0, 0)
+                self._raw_pcmd(0, 0, 0, 0, reason=zero_reason)
                 self.log.event("pcmd", reason=zero_reason, pcmd=(0, 0, 0, 0))
             except Exception as zero_exc:
                 # The link itself is gone; the aircraft's own link-loss
@@ -3527,6 +3697,8 @@ class OlympeLiveBackend:
         with self._lock:
             self._nudge_vector = None
             self._nudge_vector_authority = None
+            self._nudge_auto_run_id = None
+            self._nudge_command_set_mono_ns = None
             self._nudge_held.clear()
             self._nudge_deadline = 0.0
             self._motion_epoch += 1
@@ -3634,6 +3806,11 @@ class OlympeLiveBackend:
     def _typed_command_gate(self, request: ControlRequest) -> ControlResult | None:
         if request.action is ControlAction.TAKEOFF and not request.human_origin:
             return ControlResult.rejected("HUMAN_ORIGIN_REQUIRED", self.state)
+        if (
+            not getattr(self, "_connection_ready", True)
+            and request.action not in {ControlAction.LAND_NOW, ControlAction.EMERGENCY_STOP}
+        ):
+            return ControlResult.rejected("NOT_CONNECTED", self.state)
         calibration_starts = {
             ControlAction.DRONE_MAGNETOMETER_START,
             ControlAction.SKYCONTROLLER_MAGNETOMETER_START,
@@ -4525,6 +4702,11 @@ class OlympeLiveBackend:
     def _poll_link_loss(self, now: float) -> None:
         self._clear_firmware_safety_state()
         self._clear_magnetometer_calibration_state()
+        self.state.battery_info = {}
+        self.state.camera_info = {}
+        self.state.gimbal_info = {}
+        self.state.device_info_read_mono_ns = None
+        self._last_device_info_t = None
         # Skip heavy telemetry when link is down; keep LOST flags.
         if self.video_stream is not None:
             stamp = float(getattr(self.video_stream, "last_stamp", 0.0) or 0.0)
@@ -4833,6 +5015,7 @@ class OlympeLiveBackend:
         # Olympe get_state reads the local event cache; these values shown
         # in the UI never come from desired constructor settings.
         self._read_firmware_safety_state()
+        poll_device_info(self, now)
         self._poll_session_telemetry(now)
         self._poll_gimbal()
         self._poll_camera_zoom()
@@ -4856,10 +5039,12 @@ class OlympeLiveBackend:
             else float(poll_mono_ns) * 1e-9
         )
         self.last_poll = now
+        if getattr(self, "connection_in_progress", False):
+            return self.state
         self._check_runtime_storage_health(now)
         if self.drone is None:
             self.state.link_ok = False
-            self.state.link_status = "LOST"
+            self.state.link_status = "DISCONNECTED"
             self._clear_firmware_safety_state()
             self._clear_magnetometer_calibration_state()
             return self.state
@@ -4875,6 +5060,7 @@ class OlympeLiveBackend:
             self._last_telemetry_t = now
             if self._poll_telemetry(poll_mono_ns, now):
                 return self.state
+        self._schedule_ground_preflight_refresh(now)
         if self.video_stream is not None:
             self.state.stream_fps = float(getattr(self.video_stream, "fps", 0.0) or 0.0)
             stamp = float(getattr(self.video_stream, "last_stamp", 0.0) or 0.0)
@@ -5128,14 +5314,17 @@ class OlympeLiveBackend:
             except Exception as exc:
                 self._cleanup_log("disconnect_error", error=repr(exc))
             self.drone = None
+        if self._connection_executor is not None:
+            self._connection_executor.shutdown(wait=True)
+            self._connection_executor = None
 
     def cleanup(self) -> bool:
-        """Confirm touchdown before finalizing media or disconnecting.
+        """Confirm touchdown while reachable; release local resources if link is lost.
 
         Called on: UI window close, Ctrl-C / SIGTERM / SIGHUP, process atexit.
 
-        【強制降落 — 禁止刪除或弱化】關窗／Ctrl+C 時：只要未落地就必須原地 Landing，
-        即使曾按 Esc 交回搖桿。弱化此邏輯可能導致空中失控。見 mission/SAFETY.md。
+        關窗／Ctrl+C 時：仍有控制連線且未落地就必須原地 Landing，即使曾按 Esc
+        交回搖桿。飛機斷電／失聯時可關閉，但不得宣稱落地。見 控制介面程式/SAFETY.md。
         """
         with self._cleanup_lock:
             with self._lock:
@@ -5152,13 +5341,18 @@ class OlympeLiveBackend:
                     action="nudge_clear",
                     error=repr(exc),
                 )
+            link_lost = self.drone is not None and not self._probe_link_ok()
             landed = self.drone is None
-            if self.drone is not None:
+            if self.drone is not None and not link_lost:
                 landed = self._cleanup_attempt_landing()
+                if not landed:
+                    # Power-off can occur during the bounded touchdown wait.
+                    # Re-read the actual aircraft link, not a stale UI status.
+                    link_lost = not self._probe_link_ok()
 
             self._cleanup_recording(landed)
 
-            if not landed:
+            if not landed and not link_lost:
                 try:
                     self.give_to_pilot(reason="cleanup_land_unconfirmed")
                 except Exception as exc:
@@ -5173,10 +5367,21 @@ class OlympeLiveBackend:
                 )
                 return False
 
+            if link_lost:
+                self._cleanup_log(
+                    "cleanup_link_lost",
+                    reason_code="CONTROL_LINK_LOST",
+                    touchdown_confirmed=False,
+                    action="release_local_resources",
+                )
             self._cleanup_resources()
             with self._lock:
                 self._cleanup_done = True
-            self._cleanup_log("cleanup_done", touchdown_confirmed=True)
+            self._cleanup_log(
+                "cleanup_done",
+                touchdown_confirmed=landed,
+                reason_code="CONTROL_LINK_LOST" if link_lost else "OK",
+            )
             try:
                 self.log.close()
             except Exception:  # Tier3: teardown best-effort — log close optional

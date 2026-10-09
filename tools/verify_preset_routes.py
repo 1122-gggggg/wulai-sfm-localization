@@ -302,11 +302,21 @@ def evaluate(params: sim.SimParams, *, start_label: str) -> dict:
 
 def _gust_recoveries(result, controller):
     recoveries = []
+    pulses = []
     for index, tick in enumerate(result.trace):
-        displacement = float(np.linalg.norm(tick.get("gust_displacement_m", [0, 0, 0])))
-        if displacement < 1e-9:
+        displacement = np.asarray(tick.get("gust_displacement_m", [0, 0, 0]), float)
+        if float(np.linalg.norm(displacement)) < 1e-9:
             continue
+        if pulses and index == pulses[-1]["end_index"] + 1:
+            pulses[-1]["end_index"] = index
+            pulses[-1]["delta"] += displacement
+        else:
+            pulses.append({"start_index": index, "end_index": index, "delta": displacement.copy()})
+    for pulse in pulses:
+        index = pulse["end_index"]
+        tick = result.trace[index]
         start_t = float(tick.get("gust_time_s") or tick["t"])
+        displacement = float(np.linalg.norm(pulse["delta"]))
         recovery = None
         hold_start: float | None = None
         for future in result.trace[index:]:
@@ -323,21 +333,27 @@ def _gust_recoveries(result, controller):
                 if hold_start is None:
                     hold_start = float(future["t"])
                 if float(future["t"]) - hold_start >= 0.5 - 1e-9:
-                    recovery = round(float(future["t"]) - float(tick["t"]), 3)
+                    recovery = round(float(future["t"]) - start_t, 3)
                     break
             else:
                 hold_start = None
-        recoveries.append({"t": tick["t"], "displacement_m": displacement, "recovery_s": recovery})
+        recoveries.append(
+            {
+                "t": result.trace[pulse["start_index"]]["t"],
+                "end_t": start_t,
+                "displacement_m": displacement,
+                "recovery_s": recovery,
+            }
+        )
     return recoveries
 
 
 def evaluate_gust_recovery(params: sim.SimParams) -> dict:
     """Check transient recovery separately from the continuous-wind error bound.
 
-    From each gust tick (t >= gust_time_s truth only), require the truth to
-    re-enter the then-active segment band (2 * radius) and hold it for a
-    continuous 0.5 s. A waypoint switch moves the band to the new active
-    segment but never counts as recovery by itself.
+    After each finite gust pulse ends, require the truth to re-enter the active
+    segment band (2 * radius) and hold it for a continuous 0.5 s. A waypoint
+    switch moves the band but never counts as recovery by itself.
     """
     controller, _config, _frame, _doc = sim.build_production_controller(
         params.route, params.align, return_to_start=params.return_to_start
@@ -382,7 +398,7 @@ def evaluate_gust_recovery(params: sim.SimParams) -> dict:
     elif turn_bad or center_bad:
         reason = f"phase contract violations: turn={turn_bad} centering={center_bad}"
     elif not recoveries:
-        reason = "no gust impulses in trace"
+        reason = "no gust pulses in trace"
     elif not all(
         item["recovery_s"] is not None and item["recovery_s"] <= 5.0 for item in recoveries[:-1]
     ):
@@ -407,6 +423,7 @@ def evaluate_gust_recovery(params: sim.SimParams) -> dict:
         "seed": params.seed,
         "meters_per_unit": params.meters_per_unit,
         "gust_every_s": params.gust_every_s,
+        "gust_duration_s": params.gust_duration_s,
         "time_s": result.time_s,
         "waypoints_reached": result.waypoints_reached,
         "expected_waypoint_indices": expected,
@@ -467,7 +484,7 @@ def _record_tilt_starts(controller, frame, doc, route, record):
 def _record_drift_starts(controller, frame, doc, route, record):
     # Steady-drift sensitivity along the first non-vertical leg normal.
     leg = None
-    for a, b in zip(controller.wp[:-1], controller.wp[1:]):
+    for a, b in zip(controller.wp[:-1], controller.wp[1:], strict=False):
         candidate = np.asarray(b, float) - np.asarray(a, float)
         horiz = np.array(frame.horizontal(candidate), float)
         if float(np.linalg.norm(horiz)) > 1e-9:
@@ -505,20 +522,18 @@ def _record_fault_starts(controller, frame, doc, route, routes, record):
         index = sorted({0, len(doc.waypoints) // 2, len(doc.waypoints) - 1})[0]
         offset = controller.wp[index] - controller.wp[0] - 0.08 * frame.east
         fault_cases = [
-            ("fault_weak", dict(weak_rate=0.05)),
-            ("fault_predicted", dict(predicted_rate=0.05)),
-            ("fault_jump", dict(jump_rate=0.01, jump_max_u=0.05)),
-            ("fault_outlier", dict(outlier_rate=0.01, outlier_max_u=0.05)),
+            ("fault_weak", {"weak_rate": 0.05}),
+            ("fault_predicted", {"predicted_rate": 0.05}),
+            ("fault_jump", {"jump_rate": 0.01, "jump_max_u": 0.05}),
+            ("fault_outlier", {"outlier_rate": 0.01, "outlier_max_u": 0.05}),
             (
                 "fault_blackout",
-                dict(
-                    blackout_every_s=40.0,
-                    blackout_dur_s=3.0,
-                    blackout_drift_mps=0.05,
-                    blackout_yaw_drift_deg_s=2.0,
-                ),
+                {
+                    "blackout_every_s": 40.0,
+                    "blackout_dur_s": 3.0,
+                },
             ),
-            ("fault_dropout", dict(drop_rate=0.20)),
+            ("fault_dropout", {"drop_rate": 0.20}),
         ]
         for label, fault_kw in fault_cases:
             params_kw = dict(fault_kw)
@@ -653,22 +668,22 @@ def main(argv=None):
     _record_session_starts(args, routes, record)
     gust_rows = []
     if not args.quick:
-        for route in routes:
-            for gust_m in (0.2, 0.5):
-                gust_rows.append(
-                    evaluate_gust_recovery(
-                        sim.SimParams(
-                            route=route,
-                            align=sim._default_align(),
-                            meters_per_unit=5.0,
-                            duration_s=sim.SIM_DEFAULT_DURATION_S,
-                            seed=53,
-                            gust_m=gust_m,
-                            gust_every_s=20.0,
-                            localization_wait_s=args.localization_wait_s,
-                        )
-                    )
+        gust_rows.extend(
+            evaluate_gust_recovery(
+                sim.SimParams(
+                    route=route,
+                    align=sim._default_align(),
+                    meters_per_unit=5.0,
+                    duration_s=sim.SIM_DEFAULT_DURATION_S,
+                    seed=53,
+                    gust_m=gust_m,
+                    gust_every_s=20.0,
+                    localization_wait_s=args.localization_wait_s,
                 )
+            )
+            for route in routes
+            for gust_m in (0.2, 0.5)
+        )
         (args.out / "wind_results.json").write_text(
             json.dumps(gust_rows, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
         )

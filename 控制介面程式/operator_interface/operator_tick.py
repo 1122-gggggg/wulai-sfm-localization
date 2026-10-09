@@ -24,13 +24,15 @@ from operator_localization_config import (
 )
 from localization_result_ui import (
     annotate_ui_arrival_timing,
+    estimated_camera_display_pose,
     localization_pose_timestamp,
     localization_result_is_weak,
+    localization_result_display_seq,
     normalize_live_localization_result,
     reject_camera_attitude_outlier,
     validate_live_localization_result,
 )
-from operator_rendering import VIEWPORT_MIN_H, weak_pose_source_kind
+from operator_rendering import _pts_sig, weak_pose_source_kind
 
 if TYPE_CHECKING:
     from real_path_follow_controller import Pose
@@ -51,6 +53,15 @@ def _rolling_event_fps(
         return recent, 0.0
     span = recent[-1] - recent[0]
     return recent, (len(recent) - 1) / span if span > 0.0 else 0.0
+
+
+def _fps_readout(app: Any) -> tuple[str, float]:
+    """FPS label and value to show: whole-pipeline rate when the app provides it."""
+    provider = getattr(app, "_pipeline_fps", None)
+    if callable(provider):
+        label, value = provider()
+        return str(label), float(value)
+    return "定位 FPS", float(app.loc_fps)
 
 
 def stream_terminal_text(stream_state: object) -> str | None:
@@ -511,6 +522,19 @@ def _update_hud_startup(app: Any) -> None:
 
 
 def _update_hud_idle(app: Any) -> None:
+    # Idle labels are constant across ~30 Hz ticks. Tcl variable writes still
+    # trigger widget/trace work even when the text is unchanged. This is only a
+    # display key: telemetry/preflight/watchdogs keep running every tick.
+    variables = (
+        app.overall_fps_var,
+        getattr(app, "loc_fps_var", None),
+        getattr(app, "loc_latency_var", None),
+        getattr(app, "loc_quality_var", None),
+        getattr(app, "loc_recovery_var", None),
+    )
+    key = (tuple(id(variable) for variable in variables), getattr(app, "loc_recovery_text", None))
+    if key == getattr(app, "_idle_hud_key", None):
+        return
     app.overall_fps_var.set("串流 FPS - (待命，按開始定位)")
     if hasattr(app, "loc_fps_var"):
         app.loc_fps_var.set("定位 FPS -")
@@ -520,6 +544,7 @@ def _update_hud_idle(app: Any) -> None:
         app.loc_quality_var.set("inliers -")
     if hasattr(app, "loc_recovery_var"):
         app.loc_recovery_var.set(app.loc_recovery_text)
+    app._idle_hud_key = key
 
 
 def _update_hud_active(
@@ -559,7 +584,7 @@ def _update_hud_active(
             f"整體/串流 FPS 0.0 | {terminal_text} | 幀 {app.processed_frames}"
         )
         if hasattr(app, "loc_fps_var"):
-            app.loc_fps_var.set("定位 FPS 0.0")
+            app.loc_fps_var.set(f"{_fps_readout(app)[0]} 0.0")
         if hasattr(app, "loc_latency_var"):
             app.loc_latency_var.set("wall_ms - | core - | e2e -")
     else:
@@ -572,7 +597,8 @@ def _update_hud_active(
         )
         # Refresh wall/core/age every tick (not only on new loc result).
         if hasattr(app, "loc_fps_var"):
-            app.loc_fps_var.set(f"定位 FPS {app.loc_fps:.1f}")
+            label, value = _fps_readout(app)
+            app.loc_fps_var.set(f"{label} {value:.1f}")
     if terminal_text is None and hasattr(app, "loc_latency_var"):
         wall_txt = f"{app.loc_wall_ms:.1f}" if app.loc_wall_ms is not None else "-"
         core_txt = f"{app.loc_latency_ms:.1f}" if app.loc_latency_ms is not None else "-"
@@ -597,6 +623,8 @@ def _update_hud_metrics(
     if not app.inspecting:
         _update_hud_idle(app)
         return
+    # Returning to idle after active metrics must restore the standby labels.
+    app._idle_hud_key = None
     _update_hud_active(
         app,
         state,
@@ -606,6 +634,13 @@ def _update_hud_metrics(
 
 
 def _map_dirty_key(app: Any, state: Any, *, width: int, height: int) -> tuple:
+    if app.__dict__.get("_workmap_points_pending") and (
+        time.monotonic() - app.__dict__.get("_workmap_points_redraw", 0.0)
+        >= WORKMAP_POINTS_REDRAW_S
+    ):
+        app.workmap_points_version = app.__dict__.get("workmap_points_version", 0) + 1
+        app._workmap_points_redraw = time.monotonic()
+        app._workmap_points_pending = False
     pose_key = tuple(
         round(float(value), 4) if np.isfinite(value) else None
         for value in np.asarray(state.pose, dtype=float)
@@ -618,28 +653,55 @@ def _map_dirty_key(app: Any, state: Any, *, width: int, height: int) -> tuple:
         tuple(round(float(value), 4) for value in app.camera_axes_world.reshape(-1))
         if app.camera_axes_world is not None else None
     )
+    estimate_key = None
+    is_live = getattr(app, "_is_live_backend", None)
+    if callable(is_live) and is_live():
+        result = getattr(app, "live_result", None)
+        estimate = estimated_camera_display_pose(result)
+        if estimate is not None:
+            # An estimate can expire without a new pose/history entry. Repaint
+            # its stale label on that transition, not on every elapsed tick.
+            estimate_key = (localization_result_display_seq(result), estimate.stale)
     return (
         app.map_base_key(width, height),
-        len(app.history),
-        id(app.history[-1]) if app.history else 0,
-        id(app.history[0]) if app.history else 0,
-        len(getattr(app, "history_weak", ()) or ()),
-        id(app.history_weak[-1]) if getattr(app, "history_weak", None) else 0,
-        len(app.route_pts),
-        len(app.no_loc_markers),
+        _pts_sig(app.history),
+        tuple(getattr(app, "history_health", ())),
+        _pts_sig(getattr(app, "history_weak", ())),
+        tuple(getattr(app, "history_weak_health", ())),
+        tuple(getattr(app, "history_weak_kind", ())),
+        _pts_sig(app.route_pts),
+        _pts_sig(app.no_loc_markers),
         pose_key,
         camera_axes_key,
         camera_forward_key,
-        int(state.inliers),
-        None if state.reproj is None else round(float(state.reproj), 4),
+        app.__dict__.get("workmap_trajectory_version", 0),
+        tuple(app.__dict__.get("workmap_mapping_diagnostics", {}).items()),
+        # New paired localization results need a real map presentation before
+        # delivery accounting, even when their rounded pose is unchanged.
+        (
+            app._segmentation_pipeline.result_key(getattr(app, "live_result", None))
+            if getattr(app.__dict__.get("detector"), "task", "detect") == "segment"
+            and app.__dict__.get("_segmentation_pipeline") is not None
+            else None
+        ),
+        estimate_key,
+        getattr(state, "gimbal_pitch_deg", None),
     )
 
 
 def _video_dirty_key(app: Any, state: Any, *, width: int, height: int) -> tuple:
     flight_state = getattr(state, "flight_state", None) or getattr(state, "mode", None)
     return (
-        # stamp changes only on new grabber frame (avoids work on idle ticks)
-        round(float(getattr(app, "_video_frame_stamp", 0.0)), 4),
+        # A held source keeps its pixels, but frame age/telemetry still repaint.
+        float(getattr(app, "_video_frame_stamp", 0.0)),
+        id(getattr(app, "video_frame", None)),
+        tuple(app._video_diagnostic_lines()),
+        getattr(state, "frame_age_ms", None),
+        getattr(state, "link_latency_ms", None),
+        getattr(state, "stream_fps", None),
+        getattr(state, "gimbal_pitch_deg", None),
+        getattr(state, "zoom", None),
+        app._is_live_backend(),
         width,
         height,
         app.inspecting,
@@ -648,14 +710,18 @@ def _video_dirty_key(app: Any, state: Any, *, width: int, height: int) -> tuple:
         None if app.loc_health_reproj is None else round(float(app.loc_health_reproj), 4),
         id(app.detection_result),
         app.video_display_index,
+        app.video_display_frame_name,
         # Held frames stop changing the stamp; repaint the retry counter anyway.
         app.lost_holding(),
         0 if app.lost_hold is None else app.lost_hold.attempts,
+        0 if app.lost_hold is None else app.lost_hold.max_attempts,
         # Major status: link / GPS / flight state / battery
         bool(getattr(state, "link_ok", True)),
         getattr(state, "gps_fixed", None),
         flight_state,
         round(float(getattr(state, "battery_pct", 100.0) or 0.0), 0),
+        # Depth view: toggle, newest paired capture, finished render, 10 Hz age text.
+        getattr(app.__dict__.get("_depth_inspector"), "view_token", lambda: None)(),
     )
 
 
@@ -665,9 +731,9 @@ def _render_if_dirty(app: Any, state: Any, *, profile: Any = None) -> None:
     # perf_counter per render is free next to a panel repaint, and the parallel
     # Optional made every stage read as possibly-None to a type checker.
     width_map = max(300, app.map_label.winfo_width())
-    height_map = max(VIEWPORT_MIN_H, app.map_label.winfo_height())
+    height_map = max(1, app.map_label.winfo_height())
     width_video = max(300, app.video_label.winfo_width())
-    height_video = max(VIEWPORT_MIN_H, app.video_label.winfo_height())
+    height_video = max(1, app.video_label.winfo_height())
     # Map: re-render only when the view, flown history, drawn route or pose/quality
     # readouts changed. Between live fixes these are all static, so reuse the PhotoImage.
     started = time.perf_counter()
@@ -687,41 +753,37 @@ def _render_if_dirty(app: Any, state: Any, *, profile: Any = None) -> None:
         started = now
     map_dirty = map_key != app._map_dirty_key
     video_dirty = video_key != app._video_dirty_key
-    if map_dirty and video_dirty:
-        # Both panels dirty = the 44-64 ms worst case that ate the event loop
-        # (runbook 0b-1). Video streams at 30 Hz (dirty nearly every tick)
-        # while the map pose dot moves slowly, so the map paints every 3rd
-        # contested tick (~10 Hz) and video takes the others: the tick stays
-        # near 40 ms and localization submissions (one per tick) clear 20 Hz.
-        # Display-only; the pose trail still lands every result, only its
-        # paint is decimated. Either side goes stale by <=3 ticks worst case.
-        contested = int(getattr(app, "_render_contested", 0) or 0) + 1
-        app._render_contested = contested
-        if contested % 3:
-            map_dirty = False
-        else:
-            video_dirty = False
     if map_dirty:
-        app._map_dirty_key = map_key
-        app._present_frame(
-            app.map_label, "map_photo", app.render_map(width_map, height_map, state)
+        now = time.monotonic()
+        previous = app._map_dirty_key
+        # At most 20 Hz for moving trails, always the latest content. View
+        # changes and estimate freshness are visible on this tick. This does
+        # not gate localization publication, history, HUD or flight controls.
+        freshness = None if map_key[-2] is None else map_key[-2][1]
+        old_freshness = None if previous is None or previous[-2] is None else previous[-2][1]
+        immediate = (
+            previous is None or map_key[0] != previous[0]
+            or freshness != old_freshness or map_key[-1] != previous[-1]
         )
-        if detail is not None:
+        if immediate or now >= float(getattr(app, "_map_render_next", 0.0)):
+            app.present_map(width_map, height_map, state)
+            app._map_dirty_key = map_key
+            app._map_render_next = now + 0.05
+            pipeline = app.__dict__.get("_segmentation_pipeline")
+            if pipeline is not None and getattr(app.__dict__.get("detector"), "task", "detect") == "segment":
+                pipeline.rendered("localization", app.__dict__.get("live_result"), time.monotonic())
+        else:
+            map_dirty = False
+        if detail is not None and map_dirty:
             now = time.perf_counter()
             detail("render_if_dirty.map", (now - started) * 1000.0)
             started = now
-    # Video: re-render only when the source frame, panel size, the localization
-    # alert banner inputs or the detection overlay changed. The expensive 720p resize
-    # + PhotoImage is skipped on ticks where the same frame is shown again.
-    # HUD-only ticks reuse the cached resize (see _cached_video_frame) instead of
-    # paying cv2.resize again.
+    # Video presenter uploads only a new source/size. HUD age, telemetry,
+    # detections and alerts are independently retained Canvas items, so a
+    # held-source repaint does not resize, composite or upload video pixels.
     if video_dirty:
         app._video_dirty_key = video_key
-        app._present_frame(
-            app.video_label,
-            "video_photo",
-            app.render_video(width_video, height_video, state),
-        )
+        app.render_video(width_video, height_video, state)
         if detail is not None:
             detail("render_if_dirty.video", (time.perf_counter() - started) * 1000.0)
 
@@ -919,6 +981,9 @@ def _publish_live_result_state(app: Any, result: dict) -> None:
     app.live_result_frame_name = str(result.get("frame_name", ""))
     app._apply_lost_hold_result(result)
     app.update_localization_metrics(result)
+    pipeline = app.__dict__.get("_segmentation_pipeline")
+    if pipeline is not None and getattr(app.__dict__.get("detector"), "task", "detect") == "segment":
+        pipeline.receive("localization", result)
     now = time.monotonic()
     if now - app._last_status_write < 0.2:
         return
@@ -1271,6 +1336,228 @@ def _request_relocalize_after_attitude_reject(app: Any) -> None:
     except Exception as exc:
         app.write_log(f"MegaLoc recovery 請求失敗: {exc!r}")
 
+#: Display-only session landmarks; avoid rebuilding cloud pixels every result.
+WORKMAP_POINTS_REDRAW_S = 1.0
+
+
+def reset_workmap_display(app: Any) -> None:
+    """Discard session overlays without touching live pose or flight history."""
+    app.workmap_points = {}
+    app.workmap_point_rgb = {}
+    app.workmap_points_version = app.__dict__.get("workmap_points_version", 0) + 1
+    app.workmap_trajectories = {}
+    app.workmap_trajectory_version = app.__dict__.get("workmap_trajectory_version", 0) + 1
+    app.workmap_mapping_diagnostics = {}
+    app._workmap_session_identity = None
+    app._workmap_points_redraw = 0.0
+    app._workmap_points_pending = False
+
+
+def _ingest_workmap_session(app: Any, raw_result: Any) -> None:
+    if not isinstance(raw_result, dict):
+        return
+    identity = (
+        raw_result.get("workmap_session_id"),
+        raw_result.get("workmap_session_dir"),
+    )
+    if any(value is not None for value in identity):
+        if identity != app.__dict__.get("_workmap_session_identity"):
+            reset_workmap_display(app)
+            app._workmap_session_identity = identity
+    diagnostics = app.__dict__.setdefault("workmap_mapping_diagnostics", {})
+    for key in (
+        "workmap_mapping_healthy", "workmap_mapping_state",
+        "workmap_mapping_error", "workmap_output_source",
+    ):
+        if key in raw_result:
+            diagnostics[key] = raw_result[key]
+
+
+def _ingest_workmap_points(app: Any, raw_result: Any) -> None:
+    """Merge the worker's session-landmark update into the map-pane overlay."""
+    delta = raw_result.get("workmap_points") if isinstance(raw_result, dict) else None
+    if not isinstance(delta, dict):
+        return
+    try:
+        ids = [int(key) for key in delta["ids"]]
+        xyz = np.asarray(delta["xyz"], dtype=float).reshape(-1, 3)
+    except (KeyError, TypeError, ValueError):
+        return
+    if len(ids) != len(xyz) or not np.isfinite(xyz).all():
+        return
+    points = app.__dict__.setdefault("workmap_points", {})
+    points.update(zip(ids, xyz))
+    colors = app.__dict__.setdefault("workmap_point_rgb", {})
+    for key, color in zip(ids, delta.get("rgb") or [None] * len(ids)):
+        try:
+            colors[key] = np.clip(np.asarray(color, dtype=float).reshape(3), 0, 255).astype(np.uint8)
+        except (TypeError, ValueError):
+            colors.pop(key, None)
+    app._workmap_points_pending = True
+    now = time.monotonic()
+    if now - app.__dict__.get("_workmap_points_redraw", 0.0) >= WORKMAP_POINTS_REDRAW_S:
+        app._workmap_points_redraw = now
+        app.workmap_points_version = app.__dict__.get("workmap_points_version", 0) + 1
+        app._workmap_points_pending = False
+
+
+def _ingest_workmap_trajectory(app: Any, raw_result: Any) -> None:
+    """Replace one aligned submap trail; this never publishes a flight pose."""
+    update = raw_result.get("workmap_trajectory_backfill") if isinstance(raw_result, dict) else None
+    if not isinstance(update, dict):
+        return
+    segment_id = update.get("segment_id")
+    rows = update.get("points")
+    if (
+        type(segment_id) is not int or not 0 <= segment_id <= 2**63 - 1
+        or not isinstance(rows, list) or not 1 <= len(rows) <= 300
+    ):
+        return
+    points = []
+    previous_ordinal = -1
+    for row in rows:
+        if not isinstance(row, (list, tuple)) or len(row) != 4:
+            return
+        ordinal, x, y, z = row
+        if type(ordinal) is not int or not previous_ordinal < ordinal <= 2**31 - 1:
+            return
+        coords = (x, y, z)
+        if any(
+            type(value) not in (int, float) or not math.isfinite(value) or abs(value) > 1_000_000
+            for value in coords
+        ):
+            return
+        points.append(tuple(float(value) for value in coords))
+        previous_ordinal = ordinal
+    trails = app.__dict__.setdefault("workmap_trajectories", {})
+    trails[segment_id] = points
+    app.workmap_trajectory_version = app.__dict__.get("workmap_trajectory_version", 0) + 1
+
+
+
+def _report_result_shape_failure(
+    app: Any, incident_name: str, log_label: str, exc: BaseException
+) -> None:
+    incident = getattr(getattr(app, "session_logs", None), "incident", None)
+    if callable(incident):
+        incident(incident_name, error=repr(exc), resolved=False)
+    app.write_log(f"{log_label}: {exc!r}")
+
+
+def _invalid_success_pose(app: Any, raw_result: Any, result: dict) -> bool:
+    try:
+        return bool(
+            isinstance(raw_result, dict) and raw_result.get("success")
+            and not result.get("success"))
+    except (ValueError, KeyError, TypeError, AttributeError) as exc:  # Tier1: success flag shape — narrow, no silent pass
+        _report_result_shape_failure(
+            app, "localization_success_shape_failed", "LOCALIZATION_SUCCESS_SHAPE_FAILED", exc
+        )
+        return False
+
+
+def _confidence_flags(app: Any, result: dict) -> tuple[bool, bool]:
+    try:
+        return bool(result.get("confidence_hold_active")), bool(result.get("confidence_low"))
+    except (ValueError, KeyError, TypeError, AttributeError) as exc:  # Tier1: confidence hold shape — narrow, no silent pass
+        _report_result_shape_failure(
+            app,
+            "localization_confidence_shape_failed",
+            "LOCALIZATION_CONFIDENCE_SHAPE_FAILED",
+            exc,
+        )
+        return False, False
+
+
+def _confidence_hold_applies(app: Any, hold_active: bool, low: bool) -> bool:
+    confidence_hold = getattr(app, "lost_hold", None)
+    auto_flying = False
+    try:
+        auto_flying = bool(app._integrated_auto_active())
+    except Exception:
+        auto_flying = False
+    return (not auto_flying) and (
+        hold_active
+        or (low and bool(getattr(confidence_hold, "hold_on_low_confidence", False)))
+    )
+
+
+def _handle_failed_live_result(app: Any, result: dict, xyz: np.ndarray | None) -> None:
+    try:
+        pose_status = result.get("pose_status")
+    except (ValueError, KeyError, TypeError, AttributeError) as exc:  # Tier1: pose_status shape — narrow, no silent pass
+        _report_result_shape_failure(
+            app, "localization_pose_status_shape_failed", "LOCALIZATION_POSE_STATUS_FAILED", exc
+        )
+        pose_status = None
+    if pose_status == "PREDICTED_ONLY" and xyz is not None:
+        # IMU guess: map trail always; AUTO snapshot only after a
+        # visual lock, when accept_weak_poses is on.
+        _record_weak_display_pose(
+            app, result, xyz, require_success=False)
+        _accept_predicted_pose(app, result, xyz)
+        _snapshot_weak_pose_for_autonomy(
+            app, result, xyz, require_success=False,
+        )
+
+
+def _process_live_result(
+    app: Any,
+    raw_result: Any,
+    *,
+    live_result_is_new: Callable[[Any, dict], bool],
+    handle_localization_exception: Callable[[Any, dict], None],
+    update_benchmark_status: Callable[[Any, dict], None],
+    stabilize_result_pose: Callable[[Any, dict, np.ndarray | None], np.ndarray | None],
+) -> None:
+    _ingest_workmap_session(app, raw_result)
+    _ingest_workmap_points(app, raw_result)
+    _ingest_workmap_trajectory(app, raw_result)
+    validated = validate_live_localization_result(raw_result)
+    result, xyz = normalize_live_localization_result(validated)
+    if not live_result_is_new(app, result):
+        return
+    annotate_ui_arrival_timing(result)
+    handle_localization_exception(app, result)
+    update_benchmark_status(app, result)
+    map_up, map_up_measured = _map_up_for_attitude_check(app)
+    result, xyz, attitude_rejected = reject_camera_attitude_outlier(
+        result, xyz, map_up=map_up, map_up_measured=map_up_measured,
+    )
+    if attitude_rejected:
+        _request_relocalize_after_attitude_reject(app)
+    xyz = stabilize_result_pose(app, result, xyz)
+    invalid_success_pose = _invalid_success_pose(app, raw_result, result)
+    _publish_live_result_state(app, result)
+    hold_active, low = _confidence_flags(app, result)
+    if _confidence_hold_applies(app, hold_active, low):
+        # Keep low-confidence and recovery-only poses in telemetry, but
+        # hold the last trustworthy public pose until recovery releases.
+        # Display still gets the weak fix: the mirror never touches the
+        # flight pose, so the hold semantics stay exactly as they were.
+        _record_weak_display_pose(app, result, xyz)
+        # VO-flight opt-in: the AUTO snapshot still advances on weak fixes
+        # so the route loop keeps flying toward the waypoints.
+        _snapshot_weak_pose_for_autonomy(app, result, xyz)
+        return
+    if _live_result_failed(
+            app, result, invalid_success_pose=invalid_success_pose,
+    ):
+        _handle_failed_live_result(app, result, xyz)
+        return
+    assert xyz is not None
+    # Mirror weak fixes for the map before the jump gate: a rejected jump
+    # still answered "where does the estimator think we are", and the weak
+    # trail draws markers without a connecting line, so no false segment
+    # is implied. Trustworthy poses are a no-op here.
+    _record_weak_display_pose(app, result, xyz)
+    if not _live_pose_is_continuous(app, xyz):
+        return
+    _accept_live_pose(app, result, xyz)
+    depth_inspector = app.__dict__.get("_depth_inspector")
+    if depth_inspector is not None:
+        depth_inspector.receive(result)
+
 
 def update_live_results(
     app: Any,
@@ -1286,98 +1573,14 @@ def update_live_results(
     if not getattr(app, "inspecting", True):
         return
     for raw_result in results:
-        validated = validate_live_localization_result(raw_result)
-        result, xyz = normalize_live_localization_result(validated)
-        if not live_result_is_new(app, result):
-            continue
-        annotate_ui_arrival_timing(result)
-        handle_localization_exception(app, result)
-        update_benchmark_status(app, result)
-        map_up, map_up_measured = _map_up_for_attitude_check(app)
-        result, xyz, attitude_rejected = reject_camera_attitude_outlier(
-            result, xyz, map_up=map_up, map_up_measured=map_up_measured,
+        _process_live_result(
+            app,
+            raw_result,
+            live_result_is_new=live_result_is_new,
+            handle_localization_exception=handle_localization_exception,
+            update_benchmark_status=update_benchmark_status,
+            stabilize_result_pose=stabilize_result_pose,
         )
-        if attitude_rejected:
-            _request_relocalize_after_attitude_reject(app)
-        xyz = stabilize_result_pose(app, result, xyz)
-        try:
-            invalid_success_pose = bool(
-                isinstance(raw_result, dict) and raw_result.get("success")
-                and not result.get("success"))
-        except (ValueError, KeyError, TypeError, AttributeError) as exc:  # Tier1: success flag shape — narrow, no silent pass
-            incident = getattr(getattr(app, "session_logs", None), "incident", None)
-            if callable(incident):
-                incident("localization_success_shape_failed", error=repr(exc), resolved=False)
-            app.write_log(f"LOCALIZATION_SUCCESS_SHAPE_FAILED: {exc!r}")
-            invalid_success_pose = False
-        _publish_live_result_state(app, result)
-        try:
-            hold_active = bool(result.get("confidence_hold_active"))
-            low = bool(result.get("confidence_low"))
-        except (ValueError, KeyError, TypeError, AttributeError) as exc:  # Tier1: confidence hold shape — narrow, no silent pass
-            incident = getattr(getattr(app, "session_logs", None), "incident", None)
-            if callable(incident):
-                incident("localization_confidence_shape_failed", error=repr(exc), resolved=False)
-            app.write_log(f"LOCALIZATION_CONFIDENCE_SHAPE_FAILED: {exc!r}")
-            hold_active = False
-            low = False
-        confidence_hold = getattr(app, "lost_hold", None)
-        auto_flying = False
-        try:
-            auto_flying = bool(app._integrated_auto_active())
-        except Exception:
-            auto_flying = False
-        if (
-            (not auto_flying)
-            and (
-                hold_active
-                or (
-                    low
-                    and bool(getattr(
-                        confidence_hold, "hold_on_low_confidence", False
-                    ))
-                )
-            )
-        ):
-            # Keep low-confidence and recovery-only poses in telemetry, but
-            # hold the last trustworthy public pose until recovery releases.
-            # Display still gets the weak fix: the mirror never touches the
-            # flight pose, so the hold semantics stay exactly as they were.
-            _record_weak_display_pose(app, result, xyz)
-            # VO-flight opt-in: the AUTO snapshot still advances on weak fixes
-            # so the route loop keeps flying toward the waypoints.
-            _snapshot_weak_pose_for_autonomy(app, result, xyz)
-            continue
-        if _live_result_failed(
-                app, result, invalid_success_pose=invalid_success_pose,
-        ):
-            try:
-                pose_status = result.get("pose_status")
-            except (ValueError, KeyError, TypeError, AttributeError) as exc:  # Tier1: pose_status shape — narrow, no silent pass
-                incident = getattr(getattr(app, "session_logs", None), "incident", None)
-                if callable(incident):
-                    incident("localization_pose_status_shape_failed", error=repr(exc), resolved=False)
-                app.write_log(f"LOCALIZATION_POSE_STATUS_FAILED: {exc!r}")
-                pose_status = None
-            if pose_status == "PREDICTED_ONLY" and xyz is not None:
-                # IMU guess: map trail always; AUTO snapshot only after a
-                # visual lock, when accept_weak_poses is on.
-                _record_weak_display_pose(
-                    app, result, xyz, require_success=False)
-                _accept_predicted_pose(app, result, xyz)
-                _snapshot_weak_pose_for_autonomy(
-                    app, result, xyz, require_success=False,
-                )
-            continue
-        assert xyz is not None
-        # Mirror weak fixes for the map before the jump gate: a rejected jump
-        # still answered "where does the estimator think we are", and the weak
-        # trail draws markers without a connecting line, so no false segment
-        # is implied. Trustworthy poses are a no-op here.
-        _record_weak_display_pose(app, result, xyz)
-        if not _live_pose_is_continuous(app, xyz):
-            continue
-        _accept_live_pose(app, result, xyz)
 
 
 def run_tick(

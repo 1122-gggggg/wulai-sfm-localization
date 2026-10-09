@@ -48,18 +48,23 @@ def test_turn_holds_height_then_translates_and_climbs_together(height):
     assert pcmd[2] != 0
     assert gate.phase == "turn"
 
-    pose = rpf.Pose(*(0.8 * FRAME.north), yaw=math.pi / 2, stamp=0.4)
-    pcmd = gate.update(command, pose, 0.4, target_key=0)
+    for stamp in np.arange(0.4, 1.0, 0.05):
+        pose = rpf.Pose(*(0.8 * FRAME.north), yaw=math.pi / 2, stamp=float(stamp))
+        pcmd = gate.update(command, pose, float(stamp), target_key=0)
+        assert pcmd[2:] == (0, 0)  # Height stays locked through yaw confirmation.
+        if gate.aligned_for_translation:
+            break
+    stamp = float(stamp) + 0.05
+    pose.stamp = stamp
+    pcmd = gate.update(command, pose, stamp, target_key=0)
     assert pcmd[2] == 0
     assert pcmd[3] * height > 0
+    assert pcmd[0] or pcmd[1]
 
-    pose = rpf.Pose(*(height * FRAME.up), yaw=math.pi / 2, stamp=0.5)
-    pcmd = gate.update(command, pose, 0.5, target_key=0)
-    assert pcmd[2] == 0
-    assert gate.phase in {
-        "translate", "height_adjust", "waypoint_centering",
-        "yaw_alignment_hold", "yaw_alignment_confirmed",
-    }
+    pose = rpf.Pose(*(height * FRAME.up), yaw=math.pi / 2, stamp=stamp + 0.05)
+    pcmd = gate.update(command, pose, stamp + 0.05, target_key=0)
+    assert pcmd[2:] == (0, 0)
+    assert pcmd[0] or pcmd[1]
 
 
 def test_cruise_does_not_timeout_a_yaw_alignment_hold():

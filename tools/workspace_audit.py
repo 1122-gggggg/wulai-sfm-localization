@@ -91,8 +91,10 @@ OUTPUT_EVIDENCE_PREFIXES = (
     "direct_",
     "empirical_",
     "exact_latency_",
+    "flight_optimization_",
     "gates_",
     "localization_fps_",
+    "mvs",
     "optimization_",
     "p117_",
     "p157_",
@@ -104,7 +106,10 @@ OUTPUT_EVIDENCE_PREFIXES = (
     "replay_",
     "reverse_topk_",
     "river_",
+    "route_autoflight_check_",
+    "route_distance_check_",
     "route_workflow_audit_",
+    "ui_latency_controlled_",
     "video720_",
 )
 HISTORIC_EVIDENCE_PREFIXES = (
@@ -155,7 +160,7 @@ def directory_size(path: Path) -> int:
 def classify_output(name: str) -> str:
     if name in OUTPUT_GOVERNANCE_FILES:
         return "governance"
-    if name == "flight_logs":
+    if name in {"flight_logs", "deps"}:
         return "operations"
     if name in {
         "analysis",
@@ -309,19 +314,18 @@ def format_human(report: dict[str, Any]) -> str:
             f"({report['disk']['free_percent']:.1f}%)"
         ),
     ]
-    for warning in report.get("storage_warnings", []):
-        lines.append(f"WARNING: {warning}")
+    lines.extend(f"WARNING: {warning}" for warning in report.get("storage_warnings", []))
     sizes = report.get("top_level_bytes", {})
     if sizes:
         lines.append("largest top-level entries:")
-        for name, size in sorted(sizes.items(), key=lambda item: item[1], reverse=True)[:10]:
-            lines.append(f"  {name}: {_gib(size):.2f} GiB")
+        lines.extend(
+            f"  {name}: {_gib(size):.2f} GiB"
+            for name, size in sorted(sizes.items(), key=lambda item: item[1], reverse=True)[:10]
+        )
     unclassified = report["output_classes"]["unclassified"]
     lines.append(f"output entries not classified: {len(unclassified)}")
-    for failure in report["structural_failures"]:
-        lines.append(f"ERROR: {failure}")
-    for name in unclassified:
-        lines.append(f"WARN: outputs/{name}")
+    lines.extend(f"ERROR: {failure}" for failure in report["structural_failures"])
+    lines.extend(f"WARN: outputs/{name}" for name in unclassified)
     return "\n".join(lines)
 
 

@@ -1930,6 +1930,110 @@ def test_drone_magnetometer_calibration_is_human_landed_only_and_never_takes_off
     assert backend.state.preflight_ok is False
 
 
+@pytest.mark.parametrize("requested", [0, 1], ids=["cancel", "start"])
+def test_aircraft_calibration_waits_for_requested_started_transition_only(
+    make_backend, requested,
+):
+    backend = make_backend()
+    backend.drone.flight_state = "landed"
+    backend.drone.drone_calibration_started = not bool(requested)
+    received = []
+    original = backend.drone
+
+    class StartedOnlyFirmware:
+        def __getattr__(self, name):
+            return getattr(original, name)
+
+        def __call__(self, message):
+            first = original._first(message)
+            if first.name != "MagnetoCalibration":
+                return original(message)
+            received.append(message)
+            # Firmware changes started, but does not emit a fresh axis event.
+            def transition():
+                original.drone_calibration_started = bool(requested)
+
+            return _Expectation(
+                first.kwargs.get("_no_expect") is True, transition,
+            )
+
+    backend.drone = StartedOnlyFirmware()
+    operation = (
+        backend.start_drone_magnetometer_calibration
+        if requested else backend.cancel_drone_magnetometer_calibration
+    )
+    assert operation() is True
+    command, transition = received[0].parts
+    assert command.kwargs["calibrate"] == requested
+    assert transition.name == "MagnetoCalibrationStartedChanged"
+    assert transition.kwargs == {"started": requested, "_policy": "wait"}
+    assert backend.state.drone_magnetometer_started is bool(requested)
+    assert "TakeOff" not in original.events
+
+
+@pytest.mark.parametrize("requested", [0, 1], ids=["cancel", "start"])
+def test_aircraft_calibration_ack_without_requested_readback_is_not_success(
+    make_backend, requested,
+):
+    backend = make_backend()
+    backend.drone.flight_state = "landed"
+    backend.drone.drone_calibration_started = not bool(requested)
+    original = backend.drone
+
+    class AckOnlyFirmware:
+        def __getattr__(self, name):
+            return getattr(original, name)
+
+        def __call__(self, message):
+            if original._first(message).name == "MagnetoCalibration":
+                return _Expectation(True)
+            return original(message)
+
+    backend.drone = AckOnlyFirmware()
+    operation = (
+        backend.start_drone_magnetometer_calibration
+        if requested else backend.cancel_drone_magnetometer_calibration
+    )
+    assert operation() is False
+    assert backend.state.drone_magnetometer_started is not bool(requested)
+
+
+def test_aircraft_calibration_failure_invalidates_all_axis_bits(make_backend):
+    backend = make_backend()
+    backend.drone.drone_calibration_failed = True
+    # The protocol says to disregard all completed bits when failed is set.
+    assert backend._read_magnetometer_calibration_state()
+    assert backend.state.drone_magnetometer_failed is True
+    assert backend.state.drone_magnetometer_x_done is False
+    assert backend.state.drone_magnetometer_y_done is False
+    assert backend.state.drone_magnetometer_z_done is False
+    assert backend._magnetometer_control_error() == "aircraft magnetometer calibration failed"
+
+
+def test_calibration_wait_error_refreshes_applied_firmware_state(make_backend):
+    backend = make_backend()
+    backend.drone.flight_state = "landed"
+    original = backend.drone
+
+    class FailingWaitFirmware:
+        def __getattr__(self, name):
+            return getattr(original, name)
+
+        def __call__(self, message):
+            if original._first(message).name != "MagnetoCalibration":
+                return original(message)
+
+            def applied_then_error():
+                original.drone_calibration_started = True
+                raise TimeoutError("ack timeout after firmware applied start")
+
+            return _Expectation(False, applied_then_error)
+
+    backend.drone = FailingWaitFirmware()
+    assert backend.start_drone_magnetometer_calibration() is False
+    assert backend.state.drone_magnetometer_started is True
+
+
 def test_typed_live_control_request_rejects_stale_normal_action_but_not_safety(
         make_backend):
     backend = make_backend()
@@ -2041,7 +2145,6 @@ def test_legacy_nudge_command_mock_preserves_release_return(make_backend) -> Non
 
 def test_nudge_loop_mock_failure_releases_hold_and_sends_zero(make_backend) -> None:
     backend = make_backend(skycontroller=False, pulse_s=5.0)
-    backend._combined_nudge_pcmd = Mock(return_value=(backend.nudge_pct, 0, 0, 0))
     entered = threading.Event()
     release = threading.Event()
 
@@ -2051,7 +2154,6 @@ def test_nudge_loop_mock_failure_releases_hold_and_sends_zero(make_backend) -> N
         raise ConnectionError("mock hold failure")
 
     backend.send_pcmd = Mock(side_effect=fail_after_observed)
-    backend._raw_pcmd = Mock()
     with backend._lock:
         backend._nudge_held.add("前")
         backend._nudge_deadline = time.monotonic() + 5.0
@@ -2065,7 +2167,7 @@ def test_nudge_loop_mock_failure_releases_hold_and_sends_zero(make_backend) -> N
 
     assert not thread.is_alive()
     assert backend._nudge_held == set()
-    backend._raw_pcmd.assert_called_once_with(0, 0, 0, 0)
+    assert backend.drone.pcmds[-1][1:5] == (0, 0, 0, 0)
     assert backend.state.last_command == "nudge_loop_error_hover"
 
 
@@ -3647,6 +3749,69 @@ def test_cleanup_does_not_claim_unconfirmed_touchdown(make_backend):
     assert "disconnect" not in drone.events
 
 
+@pytest.mark.parametrize("loss", ["host", "managed_drone", "during_landing"])
+def test_window_closes_after_link_loss_without_claiming_touchdown(make_backend, loss):
+    from operator_shutdown import OperatorShutdownCoordinator
+
+    backend = make_backend()
+    drone = backend.drone
+    drone.flight_state = "hovering"
+    drone.landing_success = False
+    backend.recording_active = True
+    if loss == "host":
+        drone.connected = False
+    elif loss == "managed_drone":
+        # USB/SDK is still connected to the SkyController after aircraft power-off.
+        drone.managed_drone_connected = False
+    else:
+        def lose_link(_reason):
+            drone.managed_drone_connected = False
+            return False
+
+        backend._land_and_confirm = lose_link
+
+    destroyed = []
+    closed_logs = []
+    coordinator = OperatorShutdownCoordinator(
+        backend=backend,
+        session_logs=SimpleNamespace(close=lambda *, reason: closed_logs.append(reason)),
+        write_log=None,
+        destroy=lambda: destroyed.append(True),
+    )
+
+    assert coordinator.shutdown(reason="ui_window_close") is True
+    assert destroyed == [True]
+    assert closed_logs == ["ui_window_close"]
+    assert backend.drone is None
+    assert backend._cleanup_done
+    assert backend._shutdown_latched
+    assert not backend._landed
+    assert "stop_recording" not in drone.events
+    assert "disconnect" in drone.events
+    if loss != "during_landing":
+        assert "Landing" not in drone.events
+        assert "setPilotingSource" not in drone.events
+    completed = [fields for event, fields in backend.log.records if event == "cleanup_done"]
+    assert completed == [{
+        "touchdown_confirmed": False,
+        "reason_code": "CONTROL_LINK_LOST",
+    }]
+    assert coordinator.shutdown(reason="close_retry") is True
+    assert destroyed == [True]
+
+
+def test_cleanup_does_not_trust_stale_lost_link_status(make_backend):
+    backend = make_backend()
+    backend.state.link_status = "LOST"
+    backend.drone.flight_state = "hovering"
+    backend.drone.landing_success = False
+
+    assert backend.cleanup() is False
+    assert "Landing" in backend.drone.events
+    assert "disconnect" not in backend.drone.events
+    assert not backend._cleanup_done
+
+
 def test_close_keeps_live_connection_for_landing_retry(make_backend):
     backend = make_backend()
     drone = backend.drone
@@ -3780,8 +3945,8 @@ def test_stale_nudge_snapshot_cannot_send_after_motion_invalidation(
     release_snapshot = threading.Event()
     original_combined = backend._combined_nudge_pcmd
 
-    def gated_combined():
-        pcmd = original_combined()
+    def gated_combined(**kwargs):
+        pcmd = original_combined(**kwargs)
         snapshot_ready.set()
         if not release_snapshot.wait(timeout=2.0):
             raise AssertionError("test interleaving was not released")
@@ -5102,3 +5267,256 @@ def test_link_recovery_leaves_newer_incident_alone(make_backend):
 
     assert backend.state.active_incident == "something_newer"
     assert not any(event == "link_recovered" for event, _fields in backend.log.records)
+
+
+@pytest.fixture
+def deferred_backend(monkeypatch, tmp_path):
+    _install_fake_olympe(monkeypatch)
+    _install_fake_stick_monitor(monkeypatch)
+    monkeypatch.setattr(backend_module, "_DEFAULT_RECORD_DIR", tmp_path)
+    monkeypatch.setattr(backend_module, "quiet_olympe_logs", lambda: None)
+    drone = _FakeDrone()
+    drone.flight_state = "landed"
+    source = ModuleType("olympe_frame_source")
+    source.connect = Mock(return_value=drone)
+    monkeypatch.setitem(sys.modules, "olympe_frame_source", source)
+    backend = backend_module.OlympeLiveBackend(
+        DroneState, SimpleNamespace(), defer_connect=True, with_video=False,
+        auto_pc_control=False,
+        event_log=_FakeLog(),
+    )
+    try:
+        yield backend, drone, source
+    finally:
+        drone.flight_state = "landed"
+        backend.cleanup()
+
+
+def test_deferred_connection_can_fail_repeatedly_then_connect(deferred_backend):
+    backend, drone, source = deferred_backend
+    assert backend.drone is None
+    assert not backend.poll().link_ok
+    source.connect.assert_not_called()
+    source.connect.side_effect = [SystemExit("offline"), RuntimeError("offline"), drone]
+    for error_type in (SystemExit, RuntimeError):
+        with pytest.raises(error_type, match="offline"):
+            backend.connect_live()
+        assert backend.drone is None
+        assert not backend.state.link_ok
+        assert not backend.connection_in_progress
+    backend.connect_live()
+    assert backend.state.link_ok
+    assert backend.pilot_sticks
+    assert backend.state.tracker_state == TrackerState.STICKS
+    assert source.connect.call_count == 3
+    assert "TakeOff" not in drone.events
+    assert "PCMD" not in drone.events
+    assert "Landing" not in drone.events
+
+
+def test_video_retry_keeps_command_link_and_releases_failed_decoder(deferred_backend):
+    backend, drone, source = deferred_backend
+    backend.with_video = True
+    failed = SimpleNamespace(start=Mock(side_effect=RuntimeError("decoder")), stop=Mock())
+    working = SimpleNamespace(start=Mock(), stop=Mock())
+    source.OlympePdrawGrabber = Mock(side_effect=[failed, working])
+    with pytest.raises(RuntimeError, match="串流啟動失敗"):
+        backend.connect_live()
+    assert backend.drone is drone
+    assert backend.state.link_ok
+    assert backend.video_stream is None
+    failed.stop.assert_called_once()
+    commands = list(drone.events)
+    backend.connect_live()
+    assert backend.video_stream is not None
+    assert backend.video is not None
+    assert backend.state.stream == "OK"
+    source.connect.assert_called_once()
+    assert drone.events == commands
+
+
+def test_shutdown_waits_for_pending_connection_and_prevents_reconnect(deferred_backend):
+    backend, drone, source = deferred_backend
+    entered, release = threading.Event(), threading.Event()
+
+    def connect(_ip, _controller):
+        entered.set()
+        assert release.wait(5)
+        return drone
+
+    source.connect.side_effect = connect
+    connection = threading.Thread(target=backend.connect_live)
+    connection.start()
+    assert entered.wait(5)
+    assert backend.poll().stream == "CONNECTING"
+    closed = []
+    shutdown = threading.Thread(target=lambda: closed.append(backend.cleanup()))
+    shutdown.start()
+    assert shutdown.is_alive()
+    release.set()
+    connection.join(5)
+    shutdown.join(5)
+    assert not connection.is_alive()
+    assert not shutdown.is_alive()
+    assert closed == [True]
+    assert backend.drone is None
+    assert "disconnect" in drone.events
+    with pytest.raises(RuntimeError, match="shutting down"):
+        backend.connect_live()
+    assert source.connect.call_count == 1
+
+
+def test_deferred_connection_survives_ui_worker_exit(deferred_backend):
+    backend, drone, source = deferred_backend
+    owners = []
+
+    def connect(_ip, _controller):
+        owners.append(threading.current_thread())
+        return drone
+
+    def start_video():
+        owners.append(threading.current_thread())
+
+    source.connect.side_effect = connect
+    source.OlympePdrawGrabber = Mock(return_value=SimpleNamespace(start=start_video, stop=Mock()))
+    backend.with_video = True
+    # Olympe's command and Pdraw loops stop when their creating thread exits.
+    drone.connection_state = lambda: SimpleNamespace(
+        name="Connected" if owners and all(t.is_alive() for t in owners) else "Disconnected"
+    )
+    caller = threading.Thread(target=backend.connect_live)
+    caller.start()
+    caller.join(5)
+    assert not caller.is_alive()
+
+    base_ns = time.monotonic_ns()
+    for index in range(3):
+        state = backend.poll(base_ns + index * 200_000_000)
+    assert state.link_status == "OK"
+    assert state.active_incident != "control_link_lost"
+
+    # An unconfirmed landing must keep the SDK owner alive for cleanup retry.
+    drone.flight_state = "hovering"
+    drone.landing_success = False
+    assert backend.cleanup() is False
+    assert backend._probe_link_ok()
+    drone.flight_state = "landed"
+    assert backend.cleanup() is True
+    assert all(not t.is_alive() for t in owners)
+
+
+def test_ground_preflight_refresh_recovers_delayed_inventory_without_blocking_ui(
+    make_backend, monkeypatch,
+):
+    from concurrent.futures import ThreadPoolExecutor
+
+    backend = make_backend()
+    backend._stick_monitor.device_name = "Parrot Skycontroller 3"
+    backend.drone.flight_state = "unknown"
+    backend.state.link_ok = True
+    assert backend._configure_lost_link_policy_if_safe() is False
+    assert backend.state.rth_policy_configured is False
+    backend._inventory_takeoff_ready = False
+    backend._inventory_block_reason = "initial aircraft state unavailable"
+    entered, release = threading.Event(), threading.Event()
+    original = backend.read_connection_inventory
+
+    def delayed_inventory():
+        entered.set()
+        assert release.wait(2)
+        return original()
+
+    monkeypatch.setattr(backend, "read_connection_inventory", delayed_inventory)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        backend._connection_executor = executor
+        backend._schedule_ground_preflight_refresh(100.0)
+        assert backend._ground_preflight_future is None
+        backend.drone.flight_state = "landed"
+        backend._schedule_ground_preflight_refresh(101.0)
+        try:
+            assert entered.wait(1)
+            pending = backend._ground_preflight_future
+            assert pending is not None and not pending.done()
+            backend._schedule_ground_preflight_refresh(102.0)
+            assert backend._ground_preflight_future is pending
+        finally:
+            release.set()
+        pending.result(timeout=2)
+        assert backend._inventory_takeoff_ready is True
+        assert backend.state.rth_policy_configured is True
+        assert backend.connection_inventory["aircraft"]["serial"] == "PI000001"
+        assert backend.connection_inventory["lost_link"]["policy_confirmed"] is True
+        assert not {"TakeOff", "Landing", "Emergency"}.intersection(backend.drone.events)
+        backend._schedule_ground_preflight_refresh(103.0)
+        assert backend._ground_preflight_future is pending
+    backend._connection_executor = None
+
+
+@pytest.mark.parametrize("blocked", ["airborne", "calibrating", "shutdown", "disconnected"])
+def test_ground_preflight_refresh_does_not_write_during_unsafe_state(make_backend, blocked):
+    from concurrent.futures import ThreadPoolExecutor
+
+    backend = make_backend()
+    backend.drone.flight_state = "landed"
+    backend.state.link_ok = True
+    if blocked == "airborne":
+        backend.drone.flight_state = "hovering"
+    elif blocked == "calibrating":
+        backend.state.drone_magnetometer_started = True
+    elif blocked == "shutdown":
+        backend._shutdown_latched = True
+    else:
+        backend.state.link_ok = False
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        backend._connection_executor = executor
+        backend._schedule_ground_preflight_refresh(100.0)
+        assert backend._ground_preflight_future is None
+        assert backend.drone.events == []
+    backend._connection_executor = None
+
+
+def test_queued_vector_dispatch_retains_its_own_run_and_source_time(
+    make_backend, monkeypatch, tmp_path,
+):
+    from session_logs import SessionLogs
+
+    backend = make_backend(skycontroller=False)
+    backend.pilot_sticks = False
+    monkeypatch.setattr(backend, "_ensure_nudge_loop", lambda: None)
+    session = SessionLogs.create(
+        tmp_path / "dispatch", mode=InterfaceMode.SIMULATED_STREAM,
+        manifest={"offline": True},
+    )
+    backend.session_logs = session
+    assert backend.set_nudge_vector(.5, 0., 0., 0., auto_run_id="first-run")
+    first_stamp = backend._nudge_command_set_mono_ns
+    captured, release = threading.Event(), threading.Event()
+    original = backend._combined_nudge_pcmd
+
+    def gated(**kwargs):
+        command = original(**kwargs)
+        captured.set()
+        assert release.wait(2)
+        return command
+
+    monkeypatch.setattr(backend, "_combined_nudge_pcmd", gated)
+    worker = threading.Thread(target=backend._nudge_loop_step)
+    worker.start()
+    try:
+        assert captured.wait(2)
+        assert backend.set_nudge_vector(-.5, 0., 0., 0., auto_run_id="second-run")
+    finally:
+        release.set()
+        worker.join(2)
+        session.close(reason="offline_dispatch_provenance")
+    assert not worker.is_alive()
+    rows = [
+        json.loads(line)
+        for line in (session.directory / "trajectory.jsonl").read_text().splitlines()
+    ]
+    dispatch, = [row for row in rows if row["event"] == "pcmd_dispatch"]
+    assert dispatch["pcmd"] == [round(.5 * backend.nudge_pct), 0, 0, 0]
+    assert dispatch["auto_run_id"] == "first-run"
+    assert dispatch["command_set_mono_ns"] == first_stamp
+    assert dispatch["sdk_enqueue_start_mono_ns"] <= dispatch["sdk_enqueue_return_mono_ns"]
+    assert dispatch["evidence_kind"] == "sdk_enqueue_not_actuation_confirmation"

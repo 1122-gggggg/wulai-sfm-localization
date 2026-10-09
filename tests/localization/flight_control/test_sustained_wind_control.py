@@ -85,7 +85,8 @@ def test_saturated_integral_is_bounded_and_opposing_error_unloads_it():
         now = 1.0 + index * 0.05
         gate._position_integral([10.0, 0.0], rpf.Pose(0, 0, 0, 0, stamp=now), now, 0.03, 50)
     accumulated = gate._integral_map.copy()
-    assert np.linalg.norm(accumulated) <= 3.0 * 0.5 * gate.config.slowdown_distance
+    assert np.linalg.norm(accumulated) <= (
+        rpf.DESKTOP_AUTO_POSITION_INTEGRAL_LIMIT * 0.5 * gate.config.slowdown_distance)
     gate._position_integral([10.0, 0.0], rpf.Pose(0, 0, 0, 0, stamp=5.0), 5.0,
                             0.03, 50, saturated=True)
     np.testing.assert_allclose(gate._integral_map, accumulated)

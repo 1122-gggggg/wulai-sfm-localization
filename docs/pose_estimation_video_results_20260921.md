@@ -2,7 +2,7 @@
 
 結論：保留正式 profile 的 2 次 refinement。3～5 次可以作低成本候選，但這兩片尚未提供一致的幾何精度改善證據；純視覺 ESKF 與本版滑動視窗不升級為正式定位來源。
 
-下次需要真機遙測的部分已記錄於 [EKF 同步資料收集清單](next_flight_ekf_capture_20260921.md)，也已從既有下次飛行 runbook 連結。
+下次需要真機遙測的部分已記錄於 [EKF 資料錄製與收集清單](next_flight_ekf_capture_20260922.md)，也已從既有下次飛行 runbook 連結。
 
 ## 輸入與方法
 

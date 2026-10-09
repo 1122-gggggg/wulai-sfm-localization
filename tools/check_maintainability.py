@@ -47,9 +47,12 @@ BUDGETS = {
 # flight_operator_app: 8010 -> 7850 -> 7870 -> 8140（實測 8123：ChainFixB 免重算註冊表 + Gap3 自動前進邏輯）。
 # olympe_live_backend: 5208 -> 5234（+26：MaxPitchRollRotationSpeed 併入韌體限制
 # 封套）。這 26 行搬不出去 -- 它們就是既有三個限制所在的韌體寫入／讀回邊界本身。
+# olympe_live_backend: 5234 -> 5394（+160：connect_live／_start_video 連線流程、
+# 地面 preflight 背景刷新、_raw_pcmd 簽章與遙測讀回）。此檔受 SAFETY.md 保護，
+# 為壓行數而搬動其中程式等同改動起降相關檔案，需操作員明確要求；之後新增仍須先搬出。
 LINE_BUDGETS = {
     "控制介面程式/operator_interface/flight_operator_app.py": 8140,
-    "控制介面程式/operator_interface/olympe_live_backend.py": 5234,
+    "控制介面程式/operator_interface/olympe_live_backend.py": 5394,
 }
 
 
@@ -110,9 +113,11 @@ def budget_failures(summary: dict[str, dict[str, object]]) -> list[str]:
     failures: list[str] = []
     for group, budget in BUDGETS.items():
         actual = summary[group]
-        for metric in ("violations", "max_complexity"):
-            if int(actual[metric]) > budget[metric]:
-                failures.append(f"{group} {metric} increased: {actual[metric]} > {budget[metric]}")
+        failures.extend(
+            f"{group} {metric} increased: {actual[metric]} > {budget[metric]}"
+            for metric in ("violations", "max_complexity")
+            if int(actual[metric]) > budget[metric]
+        )
     return failures
 
 

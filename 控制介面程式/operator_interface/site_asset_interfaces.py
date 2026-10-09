@@ -54,6 +54,10 @@ class RoutePort(Protocol):
         replace_route: str | Path | None = None,
     ) -> ImportedAsset: ...
 
+    def delete_file(
+        self, source: str | Path, profile_path: str | Path
+    ) -> ImportedAsset: ...
+
 
 class InspectionTargetPort(Protocol):
     def import_file(

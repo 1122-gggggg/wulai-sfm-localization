@@ -832,6 +832,7 @@ def test_install_site_runtime_allows_localization_exception_seq_zero(monkeypatch
         "site_pack_root_for_profile",
         lambda *_args: Path("/tmp/site-pack"),
     )
+    monkeypatch.setattr(app, "DepthInspector", lambda _app: SimpleNamespace(close=lambda: None))
 
     app.OperatorApp._install_site_runtime(operator, runtime)
 
@@ -1099,6 +1100,97 @@ def test_localization_button_toggles_start_and_cancel_without_flight_command() -
     assert operator.lost_hold.reset_calls == 1
     assert operator.backend_calls == []
     assert "未發送飛控指令" in operator.logs[-1]
+
+
+def test_detection_button_and_auto_start_enable_detection_without_flight_command() -> None:
+    class Button:
+        text = ""
+
+        def configure(self, *, text):
+            self.text = text
+
+    class Detector:
+        def __init__(self):
+            self.submitted = []
+
+        def busy(self):
+            return False
+
+        def submit(self, index, name, frame):
+            self.submitted.append(index)
+            return True
+
+    class FakeOperator:
+        _sync_detection_button = app.OperatorApp._sync_detection_button
+        start_detection = app.OperatorApp.start_detection
+        stop_detection = app.OperatorApp.stop_detection
+        toggle_detection = app.OperatorApp.toggle_detection
+        submit_current_frame_for_detection = app.OperatorApp.submit_current_frame_for_detection
+        _apply_command_transition = app.OperatorApp._apply_command_transition
+        _start_feeds_for_auto = app.OperatorApp._start_feeds_for_auto
+        _segmentation_enabled = app.OperatorApp._segmentation_enabled
+
+        def __init__(self, detector):
+            self.detector = detector
+            self.detection_enabled = False
+            self.start_detection_button = Button()
+            self.start_localization_button = Button()
+            self.detection_result = {"success": True}
+            self.detection_result_frame_name = "frame"
+            self.detection_pending_frame_name = "frame"
+            self.last_detect_submitted_index = 7
+            self.det_status = "OFF"
+            self.video_frame = object()
+            self.video_display_index = 9
+            self.video_display_frame_name = "f9"
+            self.detect_every_n_frames = 3
+            self.inspecting = False
+            self.logs = []
+            self.backend_calls = []
+            self.cleared = 0
+
+        def write_log(self, text):
+            self.logs.append(text)
+
+        def _clear_manual_motion_before_auto(self):
+            self.cleared += 1
+
+        def _begin_inspection_feed(self):
+            self.inspecting = True
+
+    detector = Detector()
+    operator = FakeOperator(detector)
+
+    operator.submit_current_frame_for_detection()
+    assert detector.submitted == []  # off until the operator starts it
+
+    operator.toggle_detection()
+    assert operator.detection_enabled is True
+    assert operator.start_detection_button.text == "停止物件偵測"
+    assert operator.detection_result is None
+    assert operator.last_detect_submitted_index == -1
+    operator.submit_current_frame_for_detection()
+    assert detector.submitted == [9]  # runs without localization being started
+
+    operator.toggle_detection()
+    assert operator.detection_enabled is False
+    assert operator.start_detection_button.text == "開始物件偵測"
+    operator.video_display_index = 12
+    operator.submit_current_frame_for_detection()
+    assert detector.submitted == [9]
+    assert operator.backend_calls == []
+
+    operator._apply_command_transition("start_auto")
+    assert operator.inspecting is True
+    assert operator.detection_enabled is True
+
+    no_detector = FakeOperator(None)
+    no_detector.toggle_detection()
+    assert no_detector.detection_enabled is False
+    assert "未載入偵測模型" in no_detector.logs[-1]
+    no_detector._apply_command_transition("start_auto")
+    assert no_detector.inspecting is True
+    assert no_detector.detection_enabled is False
 
 
 @pytest.mark.parametrize("mode", ["auto", "global", "weak", "track", "relocalize"])
@@ -2062,6 +2154,40 @@ def test_operator_and_worker_parsers_are_side_effect_free() -> None:
     assert operator_args.video == "sample.mp4"
     assert operator_args.live is False
     assert worker_args.width == 1280
+
+
+@pytest.mark.parametrize("stage", [None, "baseline", "reuse", "ba", "full"])
+@pytest.mark.parametrize("evaluation_only", [None, "0", "1", "true"])
+def test_worker_workmap_stages_require_explicit_evaluation_environment(
+    monkeypatch, capsys, stage, evaluation_only,
+) -> None:
+    if evaluation_only is None:
+        monkeypatch.delenv("SFM_EVALUATION_ONLY", raising=False)
+    else:
+        monkeypatch.setenv("SFM_EVALUATION_ONLY", evaluation_only)
+    parser = localizer_worker.build_argument_parser()
+    argv = ["--production-profile", "direct-profile.json"]
+    if stage is not None:
+        argv.extend(("--workmap-eval-stage", stage))
+    args = parser.parse_args(argv)
+
+    if stage not in (None, "full") and evaluation_only != "1":
+        with pytest.raises(SystemExit) as error:
+            localizer_worker._validate_backend_options(parser, args, "direct")
+        assert error.value.code == 2
+        assert "non-full workmap evaluation stages require SFM_EVALUATION_ONLY=1" in (
+            capsys.readouterr().err
+        )
+    else:
+        localizer_worker._validate_backend_options(parser, args, "direct")
+
+
+def test_worker_workmap_stage_rejects_unknown_algorithms(capsys) -> None:
+    parser = localizer_worker.build_argument_parser()
+    with pytest.raises(SystemExit) as error:
+        parser.parse_args(["--workmap-eval-stage", "disabled"])
+    assert error.value.code == 2
+    assert "invalid choice" in capsys.readouterr().err
 
 
 def test_temporal_pose_stabilizer_suppresses_single_frame_flip() -> None:
@@ -3694,3 +3820,123 @@ def test_autonomy_pose_gates_weak_snapshot_on_opt_in_flag(monkeypatch) -> None:
     assert (pose.x, pose.y, pose.z, pose.yaw, pose.stamp) == pytest.approx(
         (1.0, 2.0, 3.0, 0.0, 99.8)
     )
+
+
+@pytest.mark.parametrize("in_flight", [False, True])
+def test_pipe_submit_reuses_only_complete_immutable_frames(in_flight) -> None:
+    client = object.__new__(app.LiveWorkerClient)
+    client._lock = threading.Lock()
+    client.in_flight = in_flight
+    client._coalesce = None
+    client._coalesce_drops = 0
+    client.pending = queue.Queue(maxsize=1)
+    frame = bytes(range(24))
+
+    assert client._submit_pipe_frame(1, "frame", b"", memoryview(frame), {})
+    item = client._coalesce if in_flight else client.pending.get_nowait()
+    assert item[3] is frame
+
+
+@pytest.mark.parametrize("view_kind", ["mutable", "readonly_mutable", "partial", "reversed"])
+def test_pipe_submit_keeps_snapshot_and_view_byte_order(view_kind) -> None:
+    client = object.__new__(app.LiveWorkerClient)
+    client._lock = threading.Lock()
+    client.in_flight = False
+    client.pending = queue.Queue(maxsize=1)
+    mutable = bytearray(range(24))
+    immutable = bytes(mutable)
+    raw = {
+        "mutable": memoryview(mutable),
+        "readonly_mutable": memoryview(mutable).toreadonly(),
+        "partial": memoryview(immutable)[1:],
+        "reversed": memoryview(immutable)[::-1],
+    }[view_kind]
+    expected = bytes(raw)
+
+    assert client._submit_pipe_frame(1, "frame", b"", raw, {})
+    mutable[:] = bytes(24)
+    assert client.pending.get_nowait()[3] == expected
+    assert client._immutable_frame_bytes(raw) is None
+
+
+def test_idle_hud_skips_duplicate_tcl_writes_but_refreshes_changed_inputs(monkeypatch) -> None:
+    class Variable:
+        def __init__(self):
+            self.values = []
+
+        def set(self, value):
+            self.values.append(value)
+
+    variables = {name: Variable() for name in (
+        "overall_fps_var", "loc_fps_var", "loc_latency_var",
+        "loc_quality_var", "loc_recovery_var",
+    )}
+    operator = SimpleNamespace(**variables, loc_recovery_text="ready", inspecting=False)
+    monkeypatch.setattr(operator_tick, "_update_hud_startup", lambda _app: None)
+
+    def update():
+        operator_tick._update_hud_metrics(
+            operator, SimpleNamespace(),
+            rolling_event_fps=lambda events, now: (events, 0.0),
+            stream_terminal_text=lambda _stream: None,
+        )
+
+    update()
+    update()
+    assert all(len(variable.values) == 1 for variable in variables.values())
+
+    operator.loc_recovery_text = "changed"
+    update()
+    assert operator.loc_recovery_var.values[-1] == "changed"
+    replacement = Variable()
+    operator.loc_fps_var = replacement
+    update()
+    assert replacement.values == ["定位 FPS -"]
+
+    monkeypatch.setattr(
+        operator_tick, "_update_hud_active", lambda *_args, **_kwargs: None
+    )
+    operator.inspecting = True
+    update()
+    operator.inspecting = False
+    update()
+    assert replacement.values == ["定位 FPS -", "定位 FPS -"]
+
+
+def test_map_dirty_key_tracks_live_estimate_sequence_and_expiry(monkeypatch) -> None:
+    stale = False
+    calls = []
+
+    def estimate(result):
+        calls.append(result)
+        return SimpleNamespace(stale=stale)
+
+    monkeypatch.setattr(operator_tick, "estimated_camera_display_pose", estimate)
+    operator = SimpleNamespace(
+        camera_forward_world=None,
+        camera_axes_world=None,
+        map_base_key=lambda width, height: (width, height),
+        history=[],
+        route_pts=[],
+        no_loc_markers=[],
+        live_result={"display_seq": 1},
+        _is_live_backend=lambda: True,
+    )
+    state = SimpleNamespace(pose=np.zeros(4), inliers=0, reproj=None)
+
+    def key():
+        return operator_tick._map_dirty_key(operator, state, width=400, height=300)
+
+    fresh = key()
+    assert key() == fresh
+    stale = True
+    expired = key()
+    assert expired != fresh
+    assert key() == expired
+    operator.live_result = {"display_seq": 2}
+    assert key() != expired
+
+    operator._is_live_backend = lambda: False
+    before = len(calls)
+    key()
+    assert len(calls) == before
