@@ -9,6 +9,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+import numpy as np
 import pytest
 import local_site_assets as local_assets
 from local_site_assets import (
@@ -64,9 +65,8 @@ def _sha(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def _write_site_package(root: Path) -> Path:
-    # Site packages are loaded from a workspace, not an arbitrary filesystem
-    # folder; mirror the production marker directories in this fixture.
+def _write_site_package(root: Path, *, reference_name: str = "ref-a.jpg") -> Path:
+    # Mirror the workspace markers used by tests of already-installed profiles.
     for name in ("控制介面程式", "定位演算法", "地圖檔"):
         (root / name).mkdir(parents=True, exist_ok=True)
     (root / "定位演算法" / "deploy_code" / "sfm_direct_deploy").mkdir(
@@ -81,18 +81,49 @@ def _write_site_package(root: Path) -> Path:
         "end_header\n0 0 0 255 255 255\n",
         encoding="ascii",
     )
-    (package / "direct_bundle.json").write_text(
-        json.dumps({"schema": "direct-localization-bundle/v1"}), encoding="utf-8"
-    )
+    (package / "model").mkdir()
+    model_hashes = {}
+    for name in ("cameras.bin", "images.bin", "points3D.bin"):
+        binary = package / "model" / name
+        binary.write_bytes(name.encode("ascii"))
+        model_hashes[name] = _sha(binary)
+    image = package / "keyframes/images/session/ref-a.jpg"
+    image.parent.mkdir(parents=True)
+    image.write_bytes(b"reference image")
+    manifest = package / "keyframes/keyframes.jsonl"
+    manifest.write_text(json.dumps({
+        "output_name": "session/ref-a.jpg", "image_sha256": _sha(image),
+    }) + "\n", encoding="utf-8")
+    (package / "references.jsonl").write_text("{}\n", encoding="utf-8")
+    (package / "names.json").write_text('["session/ref-a.jpg"]', encoding="utf-8")
+    np.save(package / "bank.npy", np.ones((1, 2), dtype=np.float32))
+    (package / "direct_bundle.json").write_text(json.dumps({
+        "schema": "direct-localization-bundle/v1",
+        "map_revision_id": "test-yard",
+        "coordinate_frame_id": "test-yard-reconstruction-v1",
+        "model_dir": "model",
+        "keyframes_manifest": "keyframes/keyframes.jsonl",
+        "keyframes_images_root": "keyframes/images",
+        "reference_manifest": "references.jsonl",
+        "reference_bank": {"name": "test-bank", "names": "names.json", "descriptors": "bank.npy"},
+        "intersection_cells": None,
+        "reference_depth_dir": None,
+        "model_sha256": model_hashes,
+        "files": [
+            {"path": name, "size_bytes": (package / name).stat().st_size, "sha256": _sha(package / name)}
+            for name in ("names.json", "bank.npy", "references.jsonl", "keyframes/keyframes.jsonl")
+        ],
+    }), encoding="utf-8")
     (package / "direct_runtime_profile.json").write_text(
         json.dumps({"schema": "direct-deployment-profile/v1"}), encoding="utf-8"
     )
     (package / "reference_poses.json").write_text(
         json.dumps(
             {
+                "schema": "reference-poses/v2",
                 "camera": CAMERA,
                 "poses": {
-                    "ref-a.jpg": {
+                    reference_name: {
                         "R": [[1, 0, 0], [0, 1, 0], [0, 0, 1]],
                         "t": [0, 0, 0],
                     }
@@ -175,28 +206,37 @@ def _write_valid_route(path: Path) -> Path:
 
 
 def test_site_package_is_validated_and_imported_atomically(tmp_path: Path) -> None:
-    package = _write_site_package(tmp_path)
-    managed = tmp_path / "managed"
-
-    def inspect_bundle(path: Path, expected_sha256: str) -> tuple[str, ...]:
-        assert path == package / "direct_bundle.json"
-        assert expected_sha256 == _sha(path)
-        return ("ref-a.jpg",)
-
-    provider = LocalSitePackageProvider(
-        managed,
-        bundle_inspector=inspect_bundle,
-        profile_loader=_profile_loader,
-    )
+    package = _write_site_package(tmp_path / "source", reference_name="session/ref-a.jpg")
+    workspace = tmp_path / "workspace"
+    for name in ("控制介面程式", "地圖檔", "定位演算法/deploy_code/sfm_direct_deploy"):
+        (workspace / name).mkdir(parents=True)
+    managed = workspace / "地圖檔/場域"
+    dense = package / "map_dense.ply"
+    dense.write_bytes((package / "map.ply").read_bytes())
+    (package / "original.mp4").write_bytes(b"not a localization asset")
+    provider = LocalSitePackageProvider(managed, profile_loader=_profile_loader)
 
     report = provider.validate_folder(package)
+    jpeg = package / "keyframes/images/session/ref-a.jpg"
+    jpeg.write_bytes(b"corrupted")
+    with pytest.raises(ValueError, match="reference image digest mismatch"):
+        provider.import_folder(package)
+    assert not (managed / "test-yard").exists()
+    jpeg.write_bytes(b"reference image")
     imported = provider.import_folder(package)
+    shutil.rmtree(package)
     profile = load_site_profile(imported.profile_path)
 
     assert report.site_id == "test-yard"
     assert report.reference_count == 1
     assert imported.profile_path == managed / "test-yard" / "site_profile.json"
-    assert profile.map_ply == managed / "test-yard" / "map" / "map.ply"
+    assert profile.map_ply == managed / "test-yard" / "map.ply"
+    installed = imported.profile_path.parent
+    assert inspect_direct_bundle(
+        profile.localization_bundle, profile.asset_sha256.localization_bundle
+    ) == ("session/ref-a.jpg",)
+    assert (installed / "map_dense.ply").is_file()
+    assert not (installed / "original.mp4").exists()
     assert profile.flight is not None
     assert profile.flight.approved is False
     assert profile.flight.route_clearance_approved is False
@@ -341,7 +381,7 @@ def test_site_package_rejects_asset_path_outside_selected_folder(
         profile_loader=_profile_loader,
     )
 
-    with pytest.raises(ValueError, match="inside the selected folder"):
+    with pytest.raises(ValueError, match="resolves outside"):
         provider.validate_folder(package)
 
 
@@ -374,7 +414,7 @@ def test_folder_preview_refuses_what_the_importer_would_refuse(tmp_path: Path) -
     profile_path.write_text(json.dumps(raw), encoding="utf-8")
     outside_preview = preview_site_folder(package)
     assert not outside_preview.ready
-    assert [item.label for item in outside_preview.files if item.problem] == ["點雲地圖"]
+    assert "resolves outside" in (outside_preview.error or "")
 
     raw["assets"]["map_ply"] = "map.ply"
     raw["assets"]["route_json"] = "map.ply"

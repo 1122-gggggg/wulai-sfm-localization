@@ -1507,6 +1507,21 @@ def load_site_profile(path: str | Path, *, validate_files: bool = True) -> SiteP
         raise ValueError(
             f"cannot discover site profile workspace root for {source}: {exc}"
         ) from exc
+    return _parse_site_profile(raw, source, workspace_root, validate_files=validate_files)
+
+
+def load_site_profile_for_import(path: Path) -> SiteProfile:
+    """Read a portable package without trusting its runtime path or workspace."""
+    if path.is_symlink():
+        raise ValueError(f"site profile manifest must not be a symlink: {path}")
+    raw = _read_site_profile_json(path)
+    raw.pop("localizer_deploy_dir", None)
+    return _parse_site_profile(raw, path, path.parent, validate_files=False)
+
+
+def _parse_site_profile(
+    raw: dict[str, Any], source: Path, workspace_root: Path, *, validate_files: bool
+) -> SiteProfile:
     schema_version, site_id, display_name = _load_profile_metadata(raw, source)
     localizer = _load_profile_localizer(raw, source)
     assets = _load_profile_assets(raw, source)

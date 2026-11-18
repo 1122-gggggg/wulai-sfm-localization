@@ -327,7 +327,7 @@ def test_cancelled_add_map_dialog_retains_selection_without_import(site_panel):
     assert state.panel._selected_route_path == path
 
 
-def test_add_map_dialog_only_imports_a_folder_that_passes_preview(site_panel, monkeypatch):
+def test_selecting_valid_map_folder_automatically_imports_and_applies(site_panel, monkeypatch):
     import add_map_dialog
     from local_site_assets import SiteFolderFile, SiteFolderPreview
 
@@ -335,21 +335,24 @@ def test_add_map_dialog_only_imports_a_folder_that_passes_preview(site_panel, mo
     folder = state.folders["B"]
     state.panel._choose_site()
     dialog = state.panel._add_map_dialog
-    dialog.navigate(folder.parent, select=folder)
+    dialog.navigate(folder.parent)
+    rows = {dialog.tree.item(row, "text"): row for row in dialog.tree.get_children()}
+    dialog.tree.selection_set(rows["◆  Invalid"])
     state.root.update()
     assert not dialog.preview.ready
-    assert dialog.import_button.instate(["disabled"])
-    dialog.confirm()
     assert not state.imports and dialog.winfo_exists()
 
     ready = SiteFolderPreview(
         folder, display_name="B", site_id="B",
         files=(SiteFolderFile("場域 manifest", folder / "site_profile.json", 1),),
     )
-    monkeypatch.setattr(add_map_dialog, "preview_site_folder", lambda _folder: ready)
-    dialog.show_preview(folder)
-    assert dialog.import_button.instate(["!disabled"])
-    dialog.confirm()
+    preview_site_folder = add_map_dialog.preview_site_folder
+    monkeypatch.setattr(
+        add_map_dialog, "preview_site_folder",
+        lambda selected: ready if selected == folder else preview_site_folder(selected),
+    )
+    dialog.tree.selection_set(rows["◆  B"])
+    state.root.update()
     _wait_for_import(state)
     assert state.imports == [folder]
     assert state.applied == [folder / "site_profile.json"]

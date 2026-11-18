@@ -96,8 +96,7 @@ class AddMapDialog(tk.Toplevel):
         ttk.Label(title, text="新增地圖", style="HeaderTitle.TLabel").pack(side="left")
         ttk.Label(
             header,
-            text="選擇建圖端輸出的場域資料夾（含 site_profile.json）。"
-                 "預檢通過後匯入，並切換到這張地圖。",
+            text="點選含 site_profile.json 的場域資料夾，預檢通過就會自動匯入並切換地圖。",
             style="HeaderMuted.TLabel",
         ).pack(anchor="w", pady=(4, 0))
 
@@ -120,11 +119,6 @@ class AddMapDialog(tk.Toplevel):
         status.grid(row=0, column=0, sticky="ew")
         status.bind("<Configure>", lambda event: status.configure(wraplength=max(200, event.width)))
         ttk.Button(footer, text="取消", command=self.cancel).grid(row=0, column=1, padx=(10, 0))
-        self.import_button = ttk.Button(
-            footer, text="匯入並切換到此地圖", style="Primary.TButton",
-            command=self.confirm, state="disabled",
-        )
-        self.import_button.grid(row=0, column=2, padx=(8, 0))
 
     def _build_browser(self, parent, shortcuts: Sequence[tuple[str, Path]]) -> None:
         parent.columnconfigure(0, weight=1)
@@ -171,7 +165,7 @@ class AddMapDialog(tk.Toplevel):
         self.tree.bind("<BackSpace>", lambda _event: self.go_up())
         hint = ttk.Label(
             parent,
-            text="◆ 為含 site_profile.json 的場域資料夾。雙擊或 Enter 進入，Backspace 回上一層。",
+            text="◆ 點選場域資料夾即可匯入。一般資料夾用雙擊或 Enter 開啟，Backspace 回上一層。",
             style="Secondary.TLabel",
         )
         hint.grid(row=4, column=0, sticky="ew", pady=(8, 0))
@@ -243,11 +237,9 @@ class AddMapDialog(tk.Toplevel):
             None,
         )
         if chosen is not None:
-            self.tree.selection_set(chosen)
             self.tree.focus(chosen)
             self.tree.see(chosen)
-        else:
-            self.show_preview(target)
+        self.show_preview(target)
 
     def go_up(self) -> None:
         if self.current_dir is not None and self.current_dir.parent != self.current_dir:
@@ -260,6 +252,8 @@ class AddMapDialog(tk.Toplevel):
     def _on_select(self, _event=None) -> None:
         path = self._selected_path()
         self.show_preview(path if path is not None else self.current_dir)
+        if path is not None:
+            self._import_selected()
 
     def _on_open(self, _event=None) -> str:
         path = self._selected_path()
@@ -271,6 +265,8 @@ class AddMapDialog(tk.Toplevel):
         typed = Path(self.path_var.get().strip()).expanduser()
         if typed.is_dir():
             self.navigate(typed)
+            if self.current_dir == typed.resolve():
+                self._import_selected()
         else:
             self.status_var.set(f"找不到資料夾：{typed}")
         return "break"
@@ -313,7 +309,6 @@ class AddMapDialog(tk.Toplevel):
                 error = "此資料夾已在地圖清單中，請關閉本視窗並從「① 地圖」選單直接選用。\n" + error
             self._set_error(error.strip())
             self._show_files(preview)
-        self.import_button.state(["!disabled"] if preview.ready else ["disabled"])
 
     def _is_listed(self, folder: Path) -> bool:
         return self.listed_root is not None and folder.parent == self.listed_root
@@ -349,7 +344,7 @@ class AddMapDialog(tk.Toplevel):
             ).grid(row=row, column=3, sticky="e", padx=(10, 0), pady=2)
 
     # ---- result ----------------------------------------------------------------
-    def confirm(self) -> None:
+    def _import_selected(self) -> None:
         preview = self.preview
         if preview is None or not preview.ready:
             return

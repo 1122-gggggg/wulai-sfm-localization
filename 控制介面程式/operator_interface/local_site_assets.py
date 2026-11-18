@@ -40,6 +40,7 @@ from site_profile import (
     QueryCamera,
     SiteProfile,
     load_site_profile,
+    load_site_profile_for_import,
 )
 from workspace_layout import workspace_from_file
 
@@ -478,9 +479,8 @@ class SiteFolderFile:
 class SiteFolderPreview:
     """A cheap pre-import look at a folder: no hashing, no bundle or PLY parsing.
 
-    It only decides whether offering 匯入 is worthwhile;
-    LocalSitePackageProvider.validate_folder still verifies every digest, the
-    bundle and the reference poses before anything is copied.
+    The importer still verifies digests, the bundle and the reference poses
+    before making the managed package available.
     """
 
     folder: Path
@@ -522,7 +522,7 @@ def preview_site_folder(folder: str | Path) -> SiteFolderPreview:
         return SiteFolderPreview(root, error="此資料夾沒有 site_profile.json")
     manifest_file = SiteFolderFile("場域 manifest", manifest, manifest.stat().st_size)
     try:
-        profile = load_site_profile(manifest, validate_files=False)
+        profile = load_site_profile_for_import(manifest)
     except Exception as exc:
         return SiteFolderPreview(
             root, files=(manifest_file,), error=f"site_profile.json 無法讀取：{exc}",
@@ -1004,11 +1004,13 @@ def _run_deploy_inspector(
 def inspect_direct_bundle(
     path: Path, expected_sha256: str | None = None
 ) -> tuple[str, ...]:
-    """Structurally validate a direct-localization-bundle/v1 with its own loader."""
+    """Validate a direct bundle and its JPEGs with the production loader."""
     expression = (
         "import json,sys; from direct_paths import vendor_sys_path; vendor_sys_path(); "
         "from direct_map import DirectMapAssets; "
         "assets=DirectMapAssets.load(sys.argv[1], expected_sha256=sys.argv[2] or None); "
+        "\nfor name in assets.keyframe_index(): assets.verify_reference_image(name)\n"
+        "for name in assets.ref_names: assets.verify_reference_image(name)\n"
         f"print({_DEPLOY_RESULT_PREFIX!r}+json.dumps(list(assets.ref_names)))"
     )
     try:
@@ -1049,6 +1051,8 @@ def load_direct_runtime_profile(path: Path) -> dict:
 def _validate_site_package_profile(profile: SiteProfile) -> None:
     if profile.schema_version != 2:
         raise ValueError("imported site package must use schema_version 2")
+    if profile.localizer != "direct":
+        raise ValueError(f"only direct site packages can be imported; got {profile.localizer!r}")
     if profile.coordinate_frame is None:
         raise ValueError("site_profile.json must declare coordinate_frame")
     if profile.query_camera is None:
@@ -1059,11 +1063,6 @@ def _validate_site_package_profile(profile: SiteProfile) -> None:
         "megaloc_cache": profile.megaloc_cache,
         "track_landmarks": profile.track_landmarks,
     }
-    if profile.localizer != "direct":
-        # The direct runtime lives outside every site folder (sfm_direct_deploy),
-        # so its deploy dir is part of the package contract rather than a
-        # separately managed asset the importer must reject.
-        separate_assets["localizer_deploy_dir"] = profile.localizer_deploy_dir
     configured_separately = sorted(
         key for key, value in separate_assets.items() if value is not None
     )
@@ -1096,6 +1095,96 @@ def _validate_site_package_assets(
     return checks
 
 
+def _read_site_package_profile(folder: str | Path) -> SiteProfile:
+    root = Path(folder).expanduser().resolve()
+    if not root.is_dir():
+        raise ValueError(f"selected site package is not a folder: {root}")
+    manifest = root / "site_profile.json"
+    if not manifest.is_file():
+        raise ValueError("selected folder must contain site_profile.json")
+    profile = load_site_profile_for_import(manifest)
+    _validate_site_package_profile(profile)
+    return profile
+
+
+def _package_asset_path(root: Path, base: Path, value: object) -> Path:
+    if not isinstance(value, str) or not value or Path(value).is_absolute():
+        raise ValueError(f"bundle asset path must be relative: {value!r}")
+    path = Path(os.path.normpath(base / value))
+    if not path.is_relative_to(root) or path == root:
+        raise ValueError(f"bundle asset must stay inside the selected folder: {value!r}")
+    current = root
+    for part in path.relative_to(root).parts:
+        current /= part
+        if current.is_symlink():
+            raise ValueError(f"bundle asset must not use symlinks: {current}")
+    return path
+
+
+def _site_package_contents(profile: SiteProfile) -> tuple[set[Path], set[Path]]:
+    """Collect only localization assets, retaining paths relative to the profile."""
+    root = profile.source.parent
+    bundle = profile.localization_bundle
+    raw = _json(bundle)
+    assert profile.coordinate_frame is not None
+    if raw.get("coordinate_frame_id") != profile.coordinate_frame.id:
+        raise ValueError("direct bundle coordinate_frame_id does not match site_profile.json")
+
+    def bundle_path(value: object) -> Path:
+        return _package_asset_path(root, bundle.parent, value)
+
+    bank = raw.get("reference_bank")
+    declared = raw.get("files")
+    model_hashes = raw.get("model_sha256")
+    if (
+        not isinstance(bank, dict)
+        or not isinstance(declared, list)
+        or any(not isinstance(entry, dict) for entry in declared)
+        or not isinstance(model_hashes, dict)
+    ):
+        raise ValueError(f"invalid direct bundle asset declarations: {bundle}")
+    paths: set[Path] = set()
+    for key, _label in _REQUIRED_ASSETS:
+        path = getattr(profile, key)
+        if path is None:
+            raise ValueError(f"site package is missing required {key}")
+        paths.add(path)
+    paths.update(bundle_path(entry.get("path")) for entry in declared)
+    model = bundle_path(raw.get("model_dir"))
+    paths.update(_package_asset_path(root, model, name) for name in model_hashes)
+    paths.update(
+        bundle_path(value)
+        for value in (
+            raw.get("keyframes_manifest"), raw.get("reference_manifest"),
+            bank.get("descriptors"), bank.get("names"),
+        )
+    )
+    if raw.get("intersection_cells") is not None:
+        paths.add(bundle_path(raw["intersection_cells"]))
+    dense = profile.map_ply.with_name(DENSE_DISPLAY_PLY_NAME)
+    if dense.is_file() and not dense.is_symlink():
+        paths.add(dense)
+
+    dirs = {bundle_path(raw.get("keyframes_images_root"))}
+    if raw.get("reference_depth_dir") is not None:
+        dirs.add(bundle_path(raw["reference_depth_dir"]))
+    for directory in dirs:
+        if not directory.is_dir():
+            raise ValueError(f"bundle asset directory is missing: {directory}")
+        for parent, subdirs, files in os.walk(directory):
+            parent_path = Path(parent)
+            for name in (*subdirs, *files):
+                if (parent_path / name).is_symlink():
+                    raise ValueError(f"bundle asset must not use symlinks: {parent_path / name}")
+            paths.update(parent_path / name for name in files)
+    if profile.source in paths:
+        raise ValueError("direct bundle may not use site_profile.json as a data file")
+    for path in paths:
+        if not path.is_file():
+            raise ValueError(f"site package file is missing or not a regular file: {path}")
+    return paths, dirs
+
+
 class LocalSitePackageProvider:
     def __init__(
         self,
@@ -1109,14 +1198,10 @@ class LocalSitePackageProvider:
         self.profile_loader = profile_loader
 
     def validate_folder(self, folder: str | Path) -> ValidatedSitePackage:
-        root = Path(folder).expanduser().resolve()
-        if not root.is_dir():
-            raise ValueError(f"selected site package is not a folder: {root}")
-        manifest = root / "site_profile.json"
-        if not manifest.is_file():
-            raise ValueError("selected folder must contain site_profile.json")
-        profile = load_site_profile(manifest)
-        _validate_site_package_profile(profile)
+        return self._validate_profile(_read_site_package_profile(folder))
+
+    def _validate_profile(self, profile: SiteProfile) -> ValidatedSitePackage:
+        root = profile.source.parent
         checks = _validate_site_package_assets(profile, root)
         _validate_ply(profile.map_ply)
         self.profile_loader(profile.localizer_profile)
@@ -1136,19 +1221,19 @@ class LocalSitePackageProvider:
         )
 
     def import_folder(self, folder: str | Path) -> ImportedSite:
-        report = self.validate_folder(folder)
-        source_profile = load_site_profile(report.folder / "site_profile.json")
+        source_profile = _read_site_package_profile(folder)
         self.managed_root.mkdir(parents=True, exist_ok=True)
-        lock_path = _site_asset_lock_path(self.managed_root, report.site_id)
+        lock_path = _site_asset_lock_path(self.managed_root, source_profile.site_id)
         with _site_asset_lock(lock_path):
-            return self._import_folder_locked(report, source_profile)
+            return self._import_folder_locked(source_profile)
 
     def _import_folder_locked(
-        self, report: ValidatedSitePackage, source_profile: SiteProfile
+        self, source_profile: SiteProfile
     ) -> ImportedSite:
-        destination = self.managed_root / report.site_id
+        destination = self.managed_root / source_profile.site_id
         existing = destination / "site_profile.json"
         if existing.is_file():
+            report = self._validate_profile(source_profile)
             loaded = load_site_profile(existing)
             expected = {
                 check.key: check.sha256 for check in report.checks
@@ -1163,62 +1248,38 @@ class LocalSitePackageProvider:
                 raise ValueError(
                     f"managed site {report.site_id!r} already exists with different assets"
                 )
-            return ImportedSite(existing, report.site_id, already_present=True)
+            self.bundle_inspector(loaded.localization_bundle, expected["localization_bundle"])
+            return ImportedSite(existing, source_profile.site_id, already_present=True)
+        paths, directories = _site_package_contents(source_profile)
+        root = source_profile.source.parent
+        workspace = workspace_from_file(self.managed_root)
+        deploy_dir = workspace.algorithms / "deploy_code" / "sfm_direct_deploy"
         staging = Path(
-            tempfile.mkdtemp(prefix=f".{report.site_id}-", dir=self.managed_root)
+            tempfile.mkdtemp(prefix=f".{source_profile.site_id}-", dir=self.managed_root)
         )
         try:
-            if source_profile.localizer != "direct":
-                raise ValueError(
-                    "only direct site packages can be imported; "
-                    f"got localizer {source_profile.localizer!r}"
-                )
-            copies = {
-                "map_ply": (source_profile.map_ply, Path("map/map.ply")),
-                "localization_bundle": (
-                    source_profile.localization_bundle,
-                    Path("localization/direct_bundle.json"),
-                ),
-                "localizer_profile": (
-                    source_profile.localizer_profile,
-                    Path("localization/direct_localizer_profile.json"),
-                ),
-                "map_reference_poses": (
-                    source_profile.map_reference_poses,
-                    Path("localization/reference_poses.json"),
-                ),
-                "map_align": (
-                    source_profile.map_align,
-                    Path("localization/T_align_gravity.json"),
-                ),
-            }
-            for source, relative in copies.values():
-                assert source is not None
-                target = staging / relative
+            for directory in directories:
+                (staging / directory.relative_to(root)).mkdir(parents=True, exist_ok=True)
+            for source in sorted(paths):
+                target = staging / source.relative_to(root)
                 target.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(source, target)
-            for key, (_source, relative) in copies.items():
-                expected = getattr(source_profile.asset_sha256, key)
-                actual = _sha256(staging / relative)
-                if actual != expected:
-                    raise ValueError(
-                        f"{key} changed while it was being imported; retry the package"
-                    )
+            relative = {
+                key: getattr(source_profile, key).relative_to(root).as_posix()
+                for key, _label in _REQUIRED_ASSETS
+            }
             coordinate = source_profile.coordinate_frame
             camera = source_profile.query_camera
             assert coordinate is not None and camera is not None
-            deploy_dir = source_profile.localizer_deploy_dir
-            if deploy_dir is None:
-                raise ValueError("direct site package must declare localizer_deploy_dir")
             profile_json = {
                 "schema_version": 2,
-                "site_id": report.site_id,
-                "display_name": report.display_name,
+                "site_id": source_profile.site_id,
+                "display_name": source_profile.display_name,
                 "localizer": "direct",
-                "localizer_deploy_dir": os.path.relpath(deploy_dir.resolve(), destination),
-                "localizer_profile": "localization/direct_localizer_profile.json",
-                "map_reference_poses": "localization/reference_poses.json",
-                "map_align": "localization/T_align_gravity.json",
+                "localizer_deploy_dir": os.path.relpath(deploy_dir, destination),
+                "localizer_profile": relative["localizer_profile"],
+                "map_reference_poses": relative["map_reference_poses"],
+                "map_align": relative["map_align"],
                 "query_camera": _camera_dict(camera),
                 "coordinate_frame": {
                     "id": coordinate.id,
@@ -1241,9 +1302,9 @@ class LocalSitePackageProvider:
                     "controller": None,
                 },
                 "assets": {
-                    "map_ply": "map/map.ply",
+                    "map_ply": relative["map_ply"],
                     "route_json": None,
-                    "localization_bundle": "localization/direct_bundle.json",
+                    "localization_bundle": relative["localization_bundle"],
                     "megaloc_cache": None,
                     "track_landmarks": None,
                     "poles_json": None,
@@ -1253,12 +1314,12 @@ class LocalSitePackageProvider:
                 json.dumps(profile_json, ensure_ascii=False, indent=2) + "\n",
                 encoding="utf-8",
             )
-            load_site_profile(staging / "site_profile.json")
+            self._validate_profile(load_site_profile(staging / "site_profile.json"))
             os.replace(staging, destination)
         except Exception:
             shutil.rmtree(staging, ignore_errors=True)
             raise
-        return ImportedSite(destination / "site_profile.json", report.site_id)
+        return ImportedSite(destination / "site_profile.json", source_profile.site_id)
 
 
 def _authored_route_receipt(path: str, sha256: str, current: SiteProfile) -> dict:
