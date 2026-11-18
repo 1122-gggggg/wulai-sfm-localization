@@ -16,22 +16,41 @@ tests/
 - `模擬器/sphinx_anafi_path_convergence/tests/` 由根目錄 pytest 收集。
 
 根目錄執行 `.venv/bin/python -m pytest` 會依 `pytest.ini` 收集 `tests/` 與 Sphinx 測試。
-Parrot simulator 固定由自己的 Python 3.11 環境及 system validation step 執行。
+CI 的根目錄 pytest 亦採同一收集邊界，Sphinx 不另跑一次；
+這是收集設定，不是本輪完整測試已通過的聲明。
+標記為 `slow` 的案例預設不執行（`pytest.ini` 的 `-m "not slow"`），需要時以 `-m slow`
+手動執行；手動指定 `-m` 排除硬體與慢測時須寫成 `-m 'not hardware and not slow'`，
+因為 pytest 只採用最後一個 `-m`。
+Parrot simulator 固定由自己的 Python 3.11 環境執行（CI 的 `parrot-simulator` job）。
 定位演算法的第一方測試已集中在 `tests/localization/`；測試不得再放回 production
 source 目錄。
 
 擴圖版本（`定位演算法/deploy_code_expand/`）與原始版本有同名模組，不能在同一個 pytest
-程序共存，其測試在 `tests/localization/deploy_expand/`，預設 `pytest` 不收集，另跑：
+程序共存，所以另跑（預設 `pytest` 不收集 `tests/localization/deploy_expand/`）。
+`pytest-expand.ini` 收集兩類測試：
+
+- `tests/localization/deploy/` 中與版本無關的共用測試（於 ini 的 `testpaths` 逐檔列出），
+  由 `pythonpath` 讓擴圖版模組遮蔽原版，同一份測試檔直接跑在擴圖版模組上，不再複製；
+- `tests/localization/deploy_expand/` 中擴圖版專屬或斷言與原版不同的測試。
+
+`test_direct_motion_timing.py` 與 `test_direct_retrieval_policy.py` 也已收斂為
+`tests/localization/deploy/` 的共用單份檔案，於 `pytest-expand.ini` 明列收集；
+不再另留擴圖版同名副本。清單是逐檔指定，不是把整個 `deploy/` 加入擴圖版程序。
+`testpaths` 必須維持 `deploy_expand/` 在共用檔案之前：共用 pose 實驗測試
+收集時會把 `定位演算法/validation` 插入 `sys.path`，影響後續匯入。
+擴圖版專屬測試先收集，加上 ini 的 expand-first `pythonpath`，才能維持
+同名模組的擴圖版優先順序。
+
+新增與版本無關的共用測試時，放在 `deploy/` 並加入 `pytest-expand.ini` 的清單：
 
 ```bash
 .venv/bin/python -m pytest -c pytest-expand.ini -q --timeout=300 -m 'not hardware'
 ```
 
-完整開發流程見 [`CONTRIBUTING.md`](../CONTRIBUTING.md)。常用離線指令：
+常用離線指令：
 
 ```bash
-./驗證系統.sh --smoke --allow-dirty
-.venv/bin/python -m pytest -q --timeout=300 -m 'not hardware' \
+.venv/bin/python -m pytest -q --timeout=300 -m 'not hardware and not slow' \
   --cov --cov-config="$PWD/pyproject.toml" --cov-report=term
 ```
 

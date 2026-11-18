@@ -16,6 +16,7 @@ import sys
 import time
 
 import numpy as np
+from operator_ui_style import PANEL, TEXT_BOX, VIEWPORT_DARK_BG, apply_operator_styles
 
 
 @dataclass(frozen=True)
@@ -362,18 +363,59 @@ class DepthInspector:
             self.window.lift()
             return
         self.window = tk.Toplevel(self.app)
-        self.window.title("MVS 絕對深度｜配對影格，非即時測距")
-        self.window.geometry("960x640")
+        apply_operator_styles(self.window)
+        self.window.title("深度檢視｜配對影格，非即時測距")
+        self.window.configure(bg=PANEL)
+        self.window.minsize(680, 480)
+        self.window.geometry(
+            f"{max(680, min(960, self.window.winfo_screenwidth() - 80))}"
+            f"x{max(480, min(640, self.window.winfo_screenheight() - 100))}"
+        )
         self.window.protocol("WM_DELETE_WINDOW", self._hide)
-        bar = ttk.Frame(self.window)
-        bar.pack(fill="x")
-        ttk.Button(bar, text="更新配對影格", command=self.refresh).pack(side="left")
-        ttk.Button(bar, text="產生深度圖", command=self.render_depth).pack(side="left")
+        self.window.columnconfigure(0, weight=1)
+        self.window.rowconfigure(3, weight=1)
+        bar = ttk.Frame(self.window, padding=(12, 8))
+        bar.grid(row=0, column=0, sticky="ew")
+        ttk.Button(bar, text="更新配對影格", command=self.refresh).pack(side="left", padx=(0, 6))
+        ttk.Button(bar, text="產生深度圖", command=self.render_depth).pack(side="left", padx=(0, 6))
         ttk.Button(bar, text="原始影像", command=self.show_rgb).pack(side="left")
+        self.close_button = ttk.Button(bar, text="關閉", command=self._hide)
+        self.close_button.pack(side="right")
+        warning = ttk.Label(
+            self.window,
+            text="唯讀靜態地圖估計，不是即時測距或避障。黑色／未命中為未知，不代表沒有障礙物。",
+            style="Secondary.TLabel", justify="left",
+        )
+        warning.grid(row=1, column=0, sticky="ew", padx=12, pady=(0, 4))
+        warning.bind("<Configure>", lambda event: warning.configure(wraplength=max(1, event.width)))
+        self.capture_note = tk.StringVar(value="尚無配對影格")
+        provenance = ttk.Label(self.window, textvariable=self.capture_note, justify="left")
+        provenance.grid(row=2, column=0, sticky="ew", padx=12, pady=(0, 8))
+        provenance.bind(
+            "<Configure>", lambda event: provenance.configure(wraplength=max(1, event.width)),
+        )
+        self.canvas = tk.Canvas(self.window, bg=VIEWPORT_DARK_BG, highlightthickness=0)
+        self.canvas.grid(row=3, column=0, sticky="nsew")
+        # Bounded, selectable status area: long paths/errors cannot consume the image.
+        status_frame = ttk.Frame(self.window, padding=(12, 8))
+        status_frame.grid(row=4, column=0, sticky="ew")
         self.status = tk.StringVar(value="")
-        ttk.Label(self.window, textvariable=self.status, wraplength=930).pack(fill="x")
-        self.canvas = tk.Canvas(self.window, bg="#08090b", highlightthickness=0)
-        self.canvas.pack(fill="both", expand=True)
+        self.status_text = tk.Text(
+            status_frame, height=4, wrap="word", **TEXT_BOX,
+            state="disabled", padx=8, pady=5,
+        )
+        status_scroll = ttk.Scrollbar(status_frame, command=self.status_text.yview)
+        status_scroll.pack(side="right", fill="y")
+        self.status_text.pack(side="left", fill="x", expand=True)
+        self.status_text.configure(yscrollcommand=status_scroll.set)
+
+        def update_status(*_args):
+            self.status_text.configure(state="normal")
+            self.status_text.delete("1.0", "end")
+            self.status_text.insert("1.0", self.status.get())
+            self.status_text.configure(state="disabled")
+
+        self.status.trace_add("write", update_status)
         self.presenter = VideoCanvasPresenter(self.canvas)
         self.canvas.bind("<Configure>", lambda _event: self._paint())
         self.canvas.bind("<Button-1>", self.query)
@@ -388,14 +430,22 @@ class DepthInspector:
         self.generation += 1
         self.selected = self.latest
         self.depth = None
+        if self.selected is None:
+            self.capture_note.set("尚無同影格、完整相機姿態的配對")
+        else:
+            unit_note = (
+                "單位 m（公尺）" if self.selected.meters_per_map_unit is not None
+                else "尺度未校正：單位 u（地圖單位），不是公尺"
+            )
+            self.capture_note.set(f"配對影格：{self.selected.name}｜{unit_note}")
         if self.bundle is None:
             self.status.set("未選擇具有 direct bundle 的場域。")
         elif self.selected is None:
-            self.status.set("等待同影格、完整相機姿態的強定位。弱定位或保留舊姿態不提供深度。")
+            self.status.set("等待同影格、完整相機姿態的定位。保留舊姿態不提供深度。")
         else:
             self.status.set(
                 f"配對影格：{self.selected.name}｜擷取距今 {max(0., time.monotonic()-self.selected.stamp):.1f} s"
-                "｜點擊影像查公尺 Z 深度。這是靜態地圖估計，不是現場測距或避障。"
+                "｜點擊影像查 Z 深度，單位見上方。這是靜態地圖估計，不是現場測距或避障。"
             )
         self._paint()
 

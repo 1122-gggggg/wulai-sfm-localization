@@ -17,7 +17,7 @@ from backend_contract import (
     InterfaceMode,
     SessionConfig,
 )
-from flight_operator_app import DroneBackend, OperatorApp
+from flight_operator_app import OperatorApp
 from operator_autonomy import DesktopRouteAutonomy
 from operator_command_coordinator import OperatorCommandCoordinator
 from operator_localization_search import YawSearchConfig
@@ -27,6 +27,7 @@ from real_path_follow_controller import (
     MissionRouteSnapshot,
     Pose,
 )
+from simulated_backend import DroneBackend
 
 
 class _Clock:
@@ -101,6 +102,18 @@ class _ScenarioBackend:
             ground_speed_mono_ns=10_000_000_000,
             telemetry_read_mono_ns=10_000_000_000,
         )
+
+    def pilot_override_active(self) -> bool:
+        return self.pilot_sticks
+
+    maneuver_in_progress = None
+
+    @property
+    def runtime_safety_latched(self) -> bool:
+        return self._runtime_safety_action_latched
+
+    def gimbal_pitch_sample(self):
+        return None
 
     def send_pcmd(
         self,

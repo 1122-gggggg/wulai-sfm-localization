@@ -23,7 +23,7 @@ POLES_JSON = f"{OUTD}/poles.json"
 
 # reuse draw_poles' box geometry + writer so json/ply stay identical
 import importlib.util
-spec = importlib.util.spec_from_file_location("draw_poles", f"{ROOT}/scripts/draw_poles.py")
+spec = importlib.util.spec_from_file_location("draw_poles", f"{ROOT}/draw_poles.py")
 dp = importlib.util.module_from_spec(spec)
 # draw_poles.register() runs on import; that's fine (idempotent)
 spec.loader.exec_module(dp)

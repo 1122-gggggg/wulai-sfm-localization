@@ -14,7 +14,7 @@ import json
 import math
 import os
 import platform
-import queue
+from collections import deque
 import sys
 import time
 import threading
@@ -30,6 +30,7 @@ from localization_metrics import DIRECT_INFO_FIELDS
 
 
 _BULK_LOG_SYNC_EVERY = 16
+_DIAGNOSTIC_QUEUE_CAPACITY = 512
 
 _PERMANENT_LOG_NAMES = {
     "trajectory.jsonl",
@@ -91,23 +92,15 @@ def collect_runtime_identity() -> dict[str, Any]:
         except importlib.metadata.PackageNotFoundError:
             packages[distribution] = None
 
+    # The operator process never loads the models, so importing torch here only
+    # delayed the window by ~1.2 s. The worker that really owns CUDA reports it
+    # at startup; until then (or if it never starts) the value is unknown, not False.
     cuda: dict[str, Any] = {
-        "available": False,
+        "available": None,
+        "status": "pending_worker_report",
         "runtime_version": None,
         "device_names": [],
     }
-    try:
-        import torch
-
-        cuda["runtime_version"] = getattr(torch.version, "cuda", None)
-        cuda["available"] = bool(torch.cuda.is_available())
-        if cuda["available"]:
-            cuda["device_names"] = [
-                str(torch.cuda.get_device_name(index))
-                for index in range(torch.cuda.device_count())
-            ]
-    except Exception as exc:
-        cuda["error"] = repr(exc)
 
     driver_path = Path("/proc/driver/nvidia/version")
     nvidia_driver: dict[str, Any] = {
@@ -302,6 +295,17 @@ class SessionCommandLog:
 
 
 class SessionLogs:
+    """Durable safety receipts and bounded, ordered diagnostic persistence.
+
+    Commands/incidents return only after their own sink fsync succeeds.
+    Localization/telemetry/deferred telemetry return queue admission, not disk
+    success; failures and overflow immediately affect health and receive incident
+    receipts. Offline readers must use wait_for_diagnostics or close. Close stops
+    admission, drains the writer and final-syncs sinks before summary. The daemon
+    writer permits launch's atexit cleanup to run; that cleanup explicitly joins
+    the writer, so accepted records are not abandoned at normal interpreter exit.
+    """
+
     REQUIRED_STREAMS = ("commands", "localization", "telemetry", "incidents", "trajectory")
 
     def __init__(self, directory: Path, mode: InterfaceMode):
@@ -310,20 +314,34 @@ class SessionLogs:
         self._closed = False
         self._closing = False
         self._lock = threading.RLock()
-        # Never hold this admission lock while performing disk I/O: the SDK
-        # dispatch thread only queues records and updates loss counters.
-        self._deferred_lock = threading.Lock()
+        self._condition = threading.Condition(self._lock)
+        self._close_lock = threading.Lock()
+        self._inventory_lock = threading.Lock()
+        self._active_inventory_writes = 0
+        self._active_safety_writes = 0
         self._summary_error: str | None = None
         self._summary_write_failures = 0
         self._inventory_error: str | None = None
+        self._runtime_cuda: dict[str, Any] = {
+            "available": None,
+            "status": "worker_not_reported",
+            "runtime_version": None,
+            "device_names": [],
+        }
+        self._runtime_cuda_error: str | None = None
         self._counts = {name: 0 for name in self.REQUIRED_STREAMS}
         self._write_failures = {name: 0 for name in self.REQUIRED_STREAMS}
         self._failure_reported: set[str] = set()
         self._latency_samples_ms: list[float] = []
         self._unresolved_incidents: set[str] = set()
-        self._deferred_telemetry = queue.Queue(maxsize=512)
+        # One slot owns a source row and its trajectory mirror. Admission never
+        # performs diagnostic I/O, and partial queue admission cannot lose a mirror.
+        self._diagnostics: deque = deque()
+        self._diagnostic_accepted = 0
+        self._diagnostic_completed = 0
+        self._diagnostic_dropped = {name: 0 for name in self.REQUIRED_STREAMS}
+        self._drop_reported = dict(self._diagnostic_dropped)
         self._deferred_dropped = 0
-        self._deferred_reported_dropped = 0
         self._sinks = {
             name: _JsonlSink(
                 directory / f"{name}.jsonl",
@@ -334,6 +352,12 @@ class SessionLogs:
             for name in self.REQUIRED_STREAMS
         }
         self.command_log = SessionCommandLog(self)
+        self._writer = threading.Thread(
+            target=self._write_diagnostics,
+            name=f"session-diagnostics-{directory.name}",
+            daemon=True,
+        )
+        self._writer.start()
 
     @classmethod
     def create(
@@ -369,6 +393,8 @@ class SessionLogs:
     def healthy(self) -> bool:
         return (
             not self._closed
+            and not any(self._diagnostic_dropped.values())
+            and not any(self._write_failures.values())
             and self._inventory_error is None
             and all(sink.healthy for sink in self._sinks.values())
         )
@@ -382,28 +408,40 @@ class SessionLogs:
         )
 
     def write_inventory(self, kind: str, inventory: dict[str, Any]) -> bool:
-        """Write one immutable hardware or video inventory receipt."""
-        with self._lock:
-            if self._closed:
-                return False
-            return self._write_inventory_locked(kind, inventory)
+        """Synchronously persist one immutable hardware or video receipt.
 
-    def _write_inventory_locked(self, kind: str, inventory: dict[str, Any]) -> bool:
+        Inventory serialization never holds the producer/admission lock. Close
+        waits for every admitted operation, including those queued on this lock.
+        """
+        with self._condition:
+            if self._closing or self._closed:
+                return False
+            self._active_inventory_writes += 1
+            self._condition.notify_all()
+        try:
+            with self._inventory_lock:
+                return self._persist_inventory(kind, inventory)
+        finally:
+            with self._condition:
+                self._active_inventory_writes -= 1
+                self._condition.notify_all()
+
+    def _persist_inventory(self, kind: str, inventory: dict[str, Any]) -> bool:
         if kind not in {"hardware", "video"}:
             raise ValueError("inventory kind must be 'hardware' or 'video'")
         path = self.directory / f"{kind}_inventory.json"
-        if path.exists():
-            return True
-        payload = {
-            "schema_version": 1,
-            "session_id": self.directory.name,
-            "kind": kind,
-            "captured_utc": _utc_now(),
-            "captured_mono_ns": time.monotonic_ns(),
-            "inventory": dict(inventory),
-        }
-        temp = self.directory / f".{kind}_inventory.json.tmp"
         try:
+            if path.exists():
+                return True
+            payload = {
+                "schema_version": 1,
+                "session_id": self.directory.name,
+                "kind": kind,
+                "captured_utc": _utc_now(),
+                "captured_mono_ns": time.monotonic_ns(),
+                "inventory": dict(inventory),
+            }
+            temp = self.directory / f".{kind}_inventory.json.tmp"
             temp.write_text(
                 json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True)
                 + "\n",
@@ -411,47 +449,146 @@ class SessionLogs:
             )
             os.replace(temp, path)
         except Exception as exc:
-            self._inventory_error = repr(exc)
+            with self._condition:
+                self._inventory_error = repr(exc)
             return False
         return True
 
-    def _write(self, stream: str, event: str, fields: dict[str, Any]) -> bool:
-        with self._lock:
-            return self._write_locked(stream, event, fields)
-
-    def _write_locked(self, stream: str, event: str, fields: dict[str, Any]) -> bool:
-        if self._closed:
+    def record_worker_cuda(self, cuda: Mapping[str, Any]) -> bool:
+        """Replace the manifest's pending CUDA identity with the worker's measurement."""
+        try:
+            names = [str(name) for name in cuda["device_names"]]
+            report = {
+                "available": cuda["available"] if isinstance(cuda["available"], bool) else None,
+                "status": "worker_reported",
+                "source": "live_localizer_worker",
+                "runtime_version": cuda.get("runtime_version"),
+                "device_names": names,
+            }
+            if report["available"] is None:
+                raise ValueError("worker CUDA availability must be boolean")
+        except (KeyError, TypeError, ValueError) as exc:
+            self._runtime_cuda_error = repr(exc)
             return False
-        row = _record(event, {"session_id": self.directory.name, **fields})
-        ok = self._sinks[stream].write(row)
-        if ok:
-            self._counts[stream] += 1
-            for key in (
-                "e2e_submit_to_ui_ms",
-                "e2e_ms",
-                "wall_ms",
-                "core_wall_ms",
-            ):
-                value = fields.get(key)
-                if value is None:
-                    continue
-                try:
-                    value = float(value)
-                except (TypeError, ValueError):
-                    continue
-                if math.isfinite(value) and value >= 0.0:
-                    self._latency_samples_ms.append(value)
-                    break
-        else:
-            self._write_failures[stream] += 1
-            if stream not in self._failure_reported:
-                self._failure_reported.add(stream)
-                self.incident(
-                    "diagnostic_write_failed",
-                    failed_stream=stream,
-                    failed_event=event,
-                    last_error=self._sinks[stream].last_error,
+        with self._condition:
+            if self._closing or self._closed:
+                return False
+            self._active_inventory_writes += 1
+            self._condition.notify_all()
+        try:
+            with self._inventory_lock:
+                path = self.directory / "session_manifest.json"
+                manifest = json.loads(path.read_text(encoding="utf-8"))
+                manifest["runtime"] = {**(manifest.get("runtime") or {}), "cuda": report}
+                temp = self.directory / ".session_manifest.json.tmp"
+                temp.write_text(
+                    json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+                    encoding="utf-8",
                 )
+                os.replace(temp, path)
+                self._runtime_cuda = report
+                self._runtime_cuda_error = None
+            return True
+        except Exception as exc:
+            self._runtime_cuda_error = repr(exc)
+            return False
+        finally:
+            with self._condition:
+                self._active_inventory_writes -= 1
+                self._condition.notify_all()
+
+    def _write(self, stream: str, event: str, fields: dict[str, Any]) -> bool:
+        """Safety streams return durable success; diagnostics return admission."""
+        with self._condition:
+            if self._closing or self._closed:
+                return False
+            # _record recursively copies/normalizes producer-owned collections.
+            # The worker never observes subsequent mutations or restamps a row.
+            row = _record(event, {"session_id": self.directory.name, **fields})
+            if stream not in {"commands", "incidents"}:
+                return self._enqueue_locked(stream, row)
+            self._active_safety_writes += 1
+            if stream == "incidents":
+                self._track_incident_locked(row)
+        try:
+            ok = self._persist(stream, row)
+            mirror = self._trajectory_row(stream, row)
+            if mirror is not None:
+                with self._condition:
+                    self._enqueue_locked("trajectory", mirror)
+            return ok
+        finally:
+            with self._condition:
+                self._active_safety_writes -= 1
+                self._condition.notify_all()
+
+    def _enqueue_locked(self, stream: str, row: dict[str, Any], *, deferred=False) -> bool:
+        if len(self._diagnostics) >= _DIAGNOSTIC_QUEUE_CAPACITY:
+            self._diagnostic_dropped[stream] += 1
+            if deferred:
+                self._deferred_dropped += 1
+            self._condition.notify_all()
+            return False
+        self._diagnostics.append((stream, row, self._trajectory_row(stream, row)))
+        self._diagnostic_accepted += 1
+        self._condition.notify_all()
+        return True
+
+    def _persist(self, stream: str, row: dict[str, Any], *, report=True) -> bool:
+        # No session/admission lock surrounds write, flush or fsync. Safety
+        # sinks have independent locks and never wait behind diagnostic sinks.
+        sink = self._sinks[stream]
+        ok = sink.write(row)
+        with self._condition:
+            if ok:
+                self._counts[stream] += 1
+                for key in ("e2e_submit_to_ui_ms", "e2e_ms", "wall_ms", "core_wall_ms"):
+                    value = row.get(key)
+                    if value is None:
+                        continue
+                    try:
+                        value = float(value)
+                    except (TypeError, ValueError, OverflowError):
+                        continue
+                    if math.isfinite(value) and value >= 0.0:
+                        self._latency_samples_ms.append(value)
+                        break
+            else:
+                self._write_failures[stream] += 1
+            first_failure = not ok and report and stream not in self._failure_reported
+            if first_failure:
+                self._failure_reported.add(stream)
+        if first_failure:
+            self._diagnostic_incident(
+                "diagnostic_write_failed",
+                failed_stream=stream,
+                failed_event=row["event"],
+                last_error=sink.last_error,
+            )
+        return ok
+
+    def _track_incident_locked(self, row: dict[str, Any]) -> None:
+        event = str(row["event"])
+        if row.get("resolved") is True:
+            self._unresolved_incidents.discard(event)
+        else:
+            self._unresolved_incidents.add(event)
+
+    def _diagnostic_incident(self, event: str, **fields: Any) -> None:
+        row = _record(event, {"session_id": self.directory.name, **fields})
+        with self._condition:
+            self._track_incident_locked(row)
+        # Internal reports also run during close-drain, after public admission
+        # has stopped. A broken incident sink cannot recursively report itself.
+        self._persist("incidents", row, report=False)
+        if threading.current_thread() is self._writer:
+            self._persist("trajectory", row)
+        else:
+            with self._condition:
+                self._enqueue_locked("trajectory", row)
+
+    def _trajectory_row(self, stream: str, row: dict[str, Any]) -> dict[str, Any] | None:
+        event = row["event"]
         if stream == "localization" and event == "pose_result":
             # Compact pose evidence survives diagnostic-log retention. Keep
             # failed fixes too, so reconstruction never silently bridges loss.
@@ -487,8 +624,11 @@ class SessionLogs:
                 "esekf_pos_trace", "esekf_d2", "esekf_update_accepted",
                 "esekf_update_exceptions", "error", "auto_run_id",
             ) + DIRECT_INFO_FIELDS
-            saved = self._write("trajectory", event, {key: row[key] for key in keys if key in row})
-            ok = ok and saved
+            return {
+                "session_id": row["session_id"],
+                "event": event,
+                **{key: row[key] for key in keys if key in row},
+            }
         elif (stream == "localization" and event in {
                   "auto_route_plan", "auto_route_tick", "auto_route_error_summary"}
               or stream == "incidents" and event in {
@@ -496,9 +636,59 @@ class SessionLogs:
               or stream == "telemetry" and event in {
                   "autonomy_event", "fused_odometry", "pcmd_dispatch", "stick_axes",
                   "control_motion_history"}):
-            saved = self._write("trajectory", event, {key: value for key, value in row.items() if key != "event"})
-            ok = ok and saved
-        return ok
+            return row
+        return None
+
+    def _write_diagnostics(self) -> None:
+        while True:
+            with self._condition:
+                self._condition.wait_for(
+                    lambda: self._diagnostics
+                    or self._diagnostic_dropped != self._drop_reported
+                    or (self._closing and self._active_safety_writes == 0)
+                )
+                drops = {
+                    name: (total - self._drop_reported[name], total)
+                    for name, total in self._diagnostic_dropped.items()
+                    if total != self._drop_reported[name]
+                }
+                batch = self._diagnostics.popleft() if self._diagnostics else None
+                if batch is None and not drops and self._closing:
+                    return
+            for stream, (delta, total) in drops.items():
+                self._diagnostic_incident(
+                    "diagnostic_records_dropped",
+                    stream=stream,
+                    queue_capacity=_DIAGNOSTIC_QUEUE_CAPACITY,
+                    dropped_since_marker=delta,
+                    dropped_total=total,
+                )
+                with self._condition:
+                    self._drop_reported[stream] = total
+                    self._condition.notify_all()
+            if batch is not None:
+                stream, row, mirror = batch
+                self._persist(stream, row)
+                if mirror is not None:
+                    self._persist("trajectory", mirror)
+                with self._condition:
+                    self._diagnostic_completed += 1
+                    self._condition.notify_all()
+
+    def wait_for_diagnostics(self, timeout: float | None = None) -> bool:
+        """Wait for rows/loss markers admitted before this call (not an fsync).
+
+        Explicit offline readback barrier; never call from the control/UI poll.
+        Bulk fsync cadence remains unchanged; close provides final durability.
+        """
+        with self._condition:
+            accepted = self._diagnostic_accepted
+            dropped = dict(self._diagnostic_dropped)
+            return self._condition.wait_for(
+                lambda: self._diagnostic_completed >= accepted
+                and all(self._drop_reported[name] >= total for name, total in dropped.items()),
+                timeout=timeout,
+            )
 
     def command(self, event: str, **fields: Any) -> bool:
         return self._write("commands", event, fields)
@@ -510,65 +700,42 @@ class SessionLogs:
         return self._write("telemetry", event, fields)
 
     def defer_telemetry(self, event: str, **fields: Any) -> bool:
-        """Keep SDK dispatch logging off the piloting thread's disk path."""
-        with self._deferred_lock:
+        """Admit SDK diagnostics to the same ordered, bounded background writer."""
+        with self._condition:
             if self._closing or self._closed:
                 return False
-            try:
-                # Preserve producer time, not the later UI drain time.
-                self._deferred_telemetry.put_nowait((event, {
-                    "t_utc": _utc_now(),
-                    "t_mono_ns": time.monotonic_ns(),
-                    **fields,
-                }))
-                return True
-            except queue.Full:
-                self._deferred_dropped += 1
-                return False
-
-    def flush_deferred(self) -> None:
-        with self._lock:
-            if self._closed:
-                return
-            for _ in range(self._deferred_telemetry.maxsize):
-                try:
-                    event, fields = self._deferred_telemetry.get_nowait()
-                except queue.Empty:
-                    break
-                self.telemetry(event, **fields)
-            with self._deferred_lock:
-                dropped = self._deferred_dropped
-            if dropped != self._deferred_reported_dropped:
-                self.incident(
-                    "diagnostic_records_dropped",
-                    stream="telemetry",
-                    queue_capacity=self._deferred_telemetry.maxsize,
-                    dropped_since_marker=dropped - self._deferred_reported_dropped,
-                    dropped_total=dropped,
-                )
-                self._deferred_reported_dropped = dropped
+            row = _record(event, {"session_id": self.directory.name, **fields})
+            return self._enqueue_locked("telemetry", row, deferred=True)
 
     def incident(self, event: str, **fields: Any) -> bool:
-        with self._lock:
-            if fields.get("resolved") is True:
-                self._unresolved_incidents.discard(str(event))
-            else:
-                self._unresolved_incidents.add(str(event))
-            return self._write("incidents", event, fields)
+        return self._write("incidents", event, fields)
 
     def close(self, *, reason: str, extra: dict[str, Any] | None = None) -> None:
-        with self._lock:
+        # Serialize closers, not producers. The writer may update health and
+        # persist incidents during drain, so join must not hold the session lock.
+        with self._close_lock:
+            with self._condition:
+                if self._closed:
+                    retry_summary = self._summary_error is not None
+                else:
+                    retry_summary = False
+                    self._closing = True
+                    self._condition.notify_all()
             if self._closed:
-                if self._summary_error is not None:
+                if retry_summary:
                     self._write_summary(reason=reason, extra=extra)
                 return
-            with self._deferred_lock:
-                self._closing = True
-            self.flush_deferred()
+            self._writer.join()
+            with self._condition:
+                self._condition.wait_for(
+                    lambda: self._active_safety_writes == 0
+                    and self._active_inventory_writes == 0
+                )
             # Capture final fsync/close failures in the permanent summary.
             for sink in self._sinks.values():
                 sink.close()
-            self._closed = True
+            with self._condition:
+                self._closed = True
             self._write_summary(reason=reason, extra=extra)
 
     def _write_summary(self, *, reason: str, extra: dict[str, Any] | None) -> None:
@@ -588,15 +755,18 @@ class SessionLogs:
             "closed_mono_ns": time.monotonic_ns(),
             "event_counts": dict(self._counts),
             "debug_deferred_dropped": self._deferred_dropped,
+            "diagnostic_dropped": dict(self._diagnostic_dropped),
             "write_failures": dict(self._write_failures),
             "summary_write_failures": self._summary_write_failures,
             "recording_complete": (
-                self._deferred_dropped == 0
+                not any(self._diagnostic_dropped.values())
                 and not any(self._write_failures.values())
                 and self._inventory_error is None
                 and all(sink.healthy and sink.durable for sink in self._sinks.values())
             ),
             "inventory_error": self._inventory_error,
+            "runtime_cuda": dict(self._runtime_cuda),
+            "runtime_cuda_error": self._runtime_cuda_error,
             "metrics": {
                 "p95_ms": p95,
                 "max_ms": maximum,

@@ -15,7 +15,7 @@ A pole is tall and thin, so you mark it with TWO clicks:
 The square footprint half-width (radius) defaults small and is wheel-adjustable;
 the SDF buffer is added later at bake time, so keep this hugging the real pole.
 
-Run (Blender already up via scripts/blender_mcp_launch.py):
+Run (Blender already up with the blender-mcp addon server running):
   python3 scripts/blender_send.py codefile scripts/draw_poles.py
 then in the 3D viewport press F3 -> "Mark Poles (Boxes)" (or Ctrl+Shift+B), or
 use the 3D viewport "View" menu entry.

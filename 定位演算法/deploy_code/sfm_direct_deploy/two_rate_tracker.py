@@ -44,6 +44,7 @@ import queue
 import threading
 import time
 from collections import deque
+from functools import lru_cache
 from typing import TYPE_CHECKING, Any, NamedTuple
 
 import cv2
@@ -419,6 +420,39 @@ def _yaw_from_rotation(rotation: np.ndarray) -> float:
     """
     forward = np.asarray(rotation, dtype=float)[2]
     return float(math.atan2(float(forward[1]), float(forward[0])))
+
+
+@lru_cache(maxsize=8)
+def _ellipse_footprint(radius: int) -> tuple[np.ndarray, np.ndarray]:
+    """(dy, dx) offsets of the ``(2r+1, 2r+1)`` elliptical structuring element."""
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * radius + 1, 2 * radius + 1))
+    rows, cols = np.nonzero(kernel)
+    return rows - radius, cols - radius
+
+
+def _occupied_exclusion_mask(
+    shape: tuple[int, ...], occupied: np.ndarray, min_distance: int
+) -> np.ndarray:
+    """Detection mask: 0 within the elliptical kernel footprint of every in-image seed.
+
+    Pixel-identical to eroding a mask seeded with zeros at ``occupied`` by that
+    kernel (the kernel is symmetric and erosion pads with +inf, so the zero set is
+    the union of footprints clipped to the image), without a full-frame pass.
+    ``cv2.circle`` is not used: its rasterisation differs from the kernel's.
+    """
+    mask = np.full(shape, 255, dtype=np.uint8)
+    if not occupied.size:
+        return mask
+    pts = np.asarray(occupied, dtype=int)
+    valid = (pts[:, 0] >= 0) & (pts[:, 0] < shape[1]) & (pts[:, 1] >= 0) & (pts[:, 1] < shape[0])
+    pts = pts[valid]
+    if len(pts):
+        d_row, d_col = _ellipse_footprint(min_distance)
+        rows = pts[:, 1, None] + d_row
+        cols = pts[:, 0, None] + d_col
+        inside = (rows >= 0) & (rows < shape[0]) & (cols >= 0) & (cols < shape[1])
+        mask[rows[inside], cols[inside]] = 0
+    return mask
 
 
 class TwoRateTracker:
@@ -1473,22 +1507,7 @@ class TwoRateTracker:
     def _detect_features(self, gray: np.ndarray, occupied: np.ndarray) -> np.ndarray:
         vo = self.profile.vo
         min_distance = int(vo.min_distance)
-        mask = np.full(gray.shape, 255, dtype=np.uint8)
-        if occupied.size:
-            pts = np.asarray(occupied, dtype=int)
-            valid = (
-                (pts[:, 0] >= 0)
-                & (pts[:, 0] < gray.shape[1])
-                & (pts[:, 1] >= 0)
-                & (pts[:, 1] < gray.shape[0])
-            )
-            pts = pts[valid]
-            if len(pts):
-                mask[pts[:, 1], pts[:, 0]] = 0
-                kernel = cv2.getStructuringElement(
-                    cv2.MORPH_ELLIPSE, (2 * min_distance + 1, 2 * min_distance + 1)
-                )
-                mask = cv2.erode(mask, kernel)
+        mask = _occupied_exclusion_mask(gray.shape, occupied, min_distance)
         corners = cv2.goodFeaturesToTrack(
             gray,
             maxCorners=int(vo.detect_cap),

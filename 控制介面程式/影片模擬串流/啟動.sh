@@ -80,7 +80,7 @@ POSE_STABILIZE="${POSE_STABILIZE:-1}"
 ADAPTIVE_LOC_SUBMIT="${ADAPTIVE_LOC_SUBMIT:-1}"
 DRY_RUN="${SFM_LAUNCH_DRY_RUN:-0}"
 LIVE_DETECT="${SFM_LIVE_DETECT:-0}"
-DETECTOR_MODEL="${SFM_DETECTOR_MODEL:-/home/allen/下載/power_equipment_sample50_3class_yolo26n_640_aug_best.pt}"
+DETECTOR_MODEL="${SFM_DETECTOR_MODEL:-$ROOT/執行環境/models/power_equipment_sample50_3class_yolo26n_640_aug_best.pt}"
 YOLO_SEG="${SFM_YOLO_SEG:-0}"
 YOLO_SEG_MODEL="${SFM_YOLO_SEG_MODEL:-$ROOT/執行環境/models/yolo26n-seg.pt}"
 YOLO_SEG_PY="${SFM_DETECTOR_PYTHON:-$ROOT/.venv-yolo/bin/python}"
@@ -166,7 +166,7 @@ P1190119.MP4；否則只有一部影片時自動使用它。多部影片時請�
   SFM_HOLD_ON_LOW_CONF   連續低信心時凍幀並升級 MegaLoc（預設 1）
   SFM_LOW_CONF_HOLD_RESULTS  升級門檻（預設連續 2 筆）
   SFM_LIVE_DETECT=1      同時跑現有定位與三類電力設備偵測（預設關閉）
-  SFM_DETECTOR_MODEL     偵測權重（預設 /home/allen/下載/power_equipment_sample50_3class_yolo26n_640_aug_best.pt）
+  SFM_DETECTOR_MODEL     偵測權重（預設 $ROOT/執行環境/models/power_equipment_sample50_3class_yolo26n_640_aug_best.pt）
   SFM_YOLO_SEG=1         同時跑現有定位與 YOLO26 預訓練分割，影片窗格顯示 mask
   SFM_YOLO_SEG_MODEL     分割 .pt 權重（預設 執行環境/models/yolo26n-seg.pt）
   SFM_DETECTOR_PYTHON    偵測／分割獨立 Python（預設 .venv-yolo/bin/python）

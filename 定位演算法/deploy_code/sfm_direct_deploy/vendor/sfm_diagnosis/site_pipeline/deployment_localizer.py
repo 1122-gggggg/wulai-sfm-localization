@@ -121,6 +121,29 @@ def scaled_pinhole_parameters(
     )
 
 
+def _top_reference_indices(
+    indices: Sequence[int], scores: np.ndarray, top_k: int,
+) -> tuple[int, ...]:
+    """Select only the needed ranks, retaining the original index tie-break."""
+    if not indices:
+        return ()
+    ids = np.asarray(indices, dtype=np.intp)
+    values = scores[ids]
+    if not np.isfinite(values).all():
+        # Preserve Python's historical ordering for non-finite descriptor input.
+        return tuple(sorted(indices, key=lambda index: (-float(scores[index]), index))[:top_k])
+    count = min(top_k, len(ids))
+    if count < len(ids):
+        boundary = np.partition(values, len(ids) - count)[len(ids) - count]
+        better = ids[values > boundary]
+        # Input indices are ascending. Do not let partition choose arbitrary
+        # members of a tie crossing the top-k boundary.
+        tied = ids[values == boundary][:count - len(better)]
+        ids = np.concatenate((better, tied))
+    order = np.lexsort((ids, -scores[ids]))
+    return tuple(int(index) for index in ids[order])
+
+
 def rank_reference_indices(
     reference_descriptors: np.ndarray,
     query_descriptor: np.ndarray,
@@ -156,17 +179,21 @@ def rank_reference_indices(
         for index, session in enumerate(reference_sessions)
         if session not in excluded_sessions
     ]
-    order = sorted(allowed, key=lambda index: (-float(scores[index]), index))
     if occupied_bins is None or int(min_occupied_bins) <= 0:
-        return tuple(order[:top_k]), False
+        return _top_reference_indices(allowed, scores, top_k), False
     if len(occupied_bins) != len(references):
         raise ValueError("occupied bins must align with descriptor rows")
-    return prefer_side_looking_references(
-        tuple(order),
-        occupied_bins,
-        min_occupied_bins=int(min_occupied_bins),
-        top_k=top_k,
-    )
+    if not np.isfinite(scores[allowed]).all():
+        return prefer_side_looking_references(
+            _top_reference_indices(allowed, scores, len(allowed)),
+            occupied_bins,
+            min_occupied_bins=int(min_occupied_bins),
+            top_k=top_k,
+        )
+    usable = [
+        index for index in allowed if occupied_bins[index] >= int(min_occupied_bins)
+    ]
+    return _top_reference_indices(usable or allowed, scores, top_k), not bool(usable)
 
 
 def subset_reference_identities(
@@ -427,6 +454,8 @@ class FinalMapEDMProvider:
         self.megaloc_source = Path(megaloc_source).resolve(strict=True)
         self.megaloc_checkpoint = Path(megaloc_checkpoint).resolve(strict=True)
         self.intrinsics_calibration = dict(intrinsics_calibration)
+        # (width, height) -> (scaled PINHOLE parameters, pycolmap.Camera); see `_query_camera`.
+        self._query_camera_cache: dict[tuple[int, int], tuple[tuple[float, ...], Any]] = {}
         self.precomputed_query_descriptors = _optional_file(precomputed_query_descriptors)
         self.precomputed_query_names = _optional_file(precomputed_query_names)
         self.top_k = int(top_k)
@@ -1307,6 +1336,29 @@ class FinalMapEDMProvider:
             )
         return lifted, len(query_points)
 
+    def _query_camera(self, width: int, height: int):
+        """Scaled PINHOLE parameters and the pycolmap camera for one query size.
+
+        ``intrinsics_calibration`` is fixed at construction, so the pair depends only
+        on the size and is built once. ``pycolmap`` never mutates a camera passed to
+        ``estimate_and_refine_absolute_pose`` here (focal/extra-params refinement is
+        off), and ``camera_params`` is an immutable tuple, so sharing is safe.
+        """
+        import pycolmap
+
+        key = (int(width), int(height))
+        cached = self._query_camera_cache.get(key)
+        if cached is None:
+            camera_params = scaled_pinhole_parameters(
+                self.intrinsics_calibration, width=width, height=height
+            )
+            camera = pycolmap.Camera(
+                model="PINHOLE", width=width, height=height, params=list(camera_params)
+            )
+            cached = (camera_params, camera)
+            self._query_camera_cache[key] = cached
+        return cached
+
     def _solve(
         self,
         query_path: Path,
@@ -1317,7 +1369,6 @@ class FinalMapEDMProvider:
         query_shape: tuple[int, int] | None = None,
     ):
         import cv2
-        import pycolmap
         from river_map_quality.ambiguity_localization import (
             AmbiguityConfig,
             cluster_pose_modes,
@@ -1339,17 +1390,7 @@ class FinalMapEDMProvider:
             if image is None:
                 raise FileNotFoundError(query_path)
             height, width = image.shape
-        camera_params = scaled_pinhole_parameters(
-            self.intrinsics_calibration,
-            width=width,
-            height=height,
-        )
-        camera = pycolmap.Camera(
-            model="PINHOLE",
-            width=width,
-            height=height,
-            params=list(camera_params),
-        )
+        camera_params, camera = self._query_camera(width, height)
         if len(matches) < 6:
             return None, {}, "REJECT_INSUFFICIENT_SUPPORT"
         image_points = np.asarray([match.query_xy for match in matches], dtype=float)

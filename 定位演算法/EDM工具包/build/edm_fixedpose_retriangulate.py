@@ -92,7 +92,10 @@ def _apply_roots(
     megaloc_checkpoint: Path | None = None,
     baseline_smoke: Path | None = None,
 ) -> None:
-    """Bind every filesystem-dependent global. Called at import with defaults, then from main()."""
+    """Bind every filesystem-dependent global. Called only from main(), never at import.
+
+    Importing the module resolves no paths; any other caller must invoke this first.
+    The CLI passes its parsed --map-root/--experiment-root/... values here."""
     global MAP_ROOT, EXPERIMENT_ROOT, MODEL, IMAGES, KEYFRAMES, LOCALIZER_CONFIG
     global RT5060_EDM_BASE, RT5060_MEGADEPTH, BASELINE_SMOKE, SAME_QUERY, BENCH_REF
     global P172_FRAMES, DEPTH_DIR, HEDGE_DEPTH_DIR
@@ -125,9 +128,6 @@ def _apply_roots(
     EDM_CHECKPOINT = Path(edm_checkpoint)
     MEGALOC_SOURCE = Path(megaloc_source)
     MEGALOC_CHECKPOINT = Path(megaloc_checkpoint) if megaloc_checkpoint is not None else None
-
-
-_apply_roots(map_root=DEFAULT_MAP_ROOT, megaloc_checkpoint=_default_megaloc_checkpoint())
 
 
 def _require_path(value: Path | None, flag: str) -> Path:

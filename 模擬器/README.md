@@ -20,6 +20,31 @@
 `launch_sphinx_anafi_empty.sh`、`sphinx_path_follow_smoke.py` 為舊 harness 的相容入口，
 不應再新增第三套控制公式。
 
+## 離線影片位置
+
+下載的模擬影片集中於 `測試影片/`，原始檔內容不變，不納入 Git：
+
+- `P1130113.MP4`（福和橋）、`P1980198.MP4`（河濱）、`P0170017.MP4`（烏來，4K、
+  199 秒、2.5 GB）、`P1990199.MP4`。
+- `超過地圖範圍影片/`：`P2300230.MP4`、`P2310231.MP4`、`P2320232.MP4`。
+
+影片選擇介面預設開啟這個目錄。沒有預設 P119 且有多部影片時，啟動器不會
+任選影片；請在選擇介面選檔，或從工作區根目錄明確指定，例如：
+
+```bash
+SFM_SITE_PROFILE="$PWD/地圖檔/場域/fuhe_bridge/site_profile.json" \
+VIDEO="$PWD/模擬器/測試影片/P1130113.MP4" \
+./控制介面程式/影片模擬串流/啟動.sh
+```
+
+操作介面的「離線模擬」按鈕依目前選的場域自動用對應影片，不再沿用上一個場域
+的影片：`地圖檔/場域/fuhe_bridge` → P1130113、`river_site`（含各 release）→
+P1980198、`wulai_all9_direct_20261019` → P0170017。對照表是
+`operator_launch.SITE_SIMULATION_VIDEOS`；對應影片不在 `測試影片/` 時改開檔案選擇，
+不會退回其他場域的影片。未列入對照表的場域沿用原本的記憶／設定影片規則。
+
+影片移入專案不代表與所有場域相容，也不構成定位精度或實飛核准。
+
 ## ANAFI 擬真範圍與離線情境
 
 依據 [ANAFI white paper v1.4](https://www.parrot.com/assets/s3fs-public/2020-07/white-paper_anafi-v1.4-en.pdf)，

@@ -21,7 +21,7 @@ OUTD = os.environ.get("SFM_SAFEZONE_DIR", f"{ROOT}/safezone")
 PATH_JSON = f"{OUTD}/flight_path.json"
 
 import importlib.util
-spec = importlib.util.spec_from_file_location("draw_path", f"{ROOT}/scripts/draw_path.py")
+spec = importlib.util.spec_from_file_location("draw_path", f"{ROOT}/draw_path.py")
 dpth = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(dpth)          # registers the operator (idempotent)
 

@@ -14,6 +14,7 @@ import time
 import uuid
 from contextlib import contextmanager
 from collections.abc import Callable, Iterable
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from map_point_io import DENSE_DISPLAY_PLY_NAME
@@ -27,7 +28,13 @@ from site_asset_interfaces import (
 _CONTROL_ROOT = Path(__file__).resolve().parents[1]
 if str(_CONTROL_ROOT) not in sys.path:
     sys.path.insert(0, str(_CONTROL_ROOT))
+_FLIGHT_CONTROL = _CONTROL_ROOT.parent / "定位演算法" / "flight_control"
+if str(_FLIGHT_CONTROL) not in sys.path:
+    sys.path.insert(0, str(_FLIGHT_CONTROL))
 
+from route_domain import reject_json_constant, validate_flight_route_fields
+
+from mission_manifest import sha256_file
 from site_profile import (
     ROUTE_EDITOR_AUTO_APPROVAL_NOTE,
     QueryCamera,
@@ -66,18 +73,22 @@ def _json(path: Path) -> dict:
 
 
 def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
     try:
-        with path.open("rb") as stream:
-            for chunk in iter(lambda: stream.read(8 * 1024 * 1024), b""):
-                digest.update(chunk)
+        return sha256_file(path)
     except OSError as exc:
         raise ValueError(f"cannot hash {path}: {exc}") from exc
-    return digest.hexdigest()
 
 
 def _json_bytes(raw: dict) -> bytes:
     return (json.dumps(raw, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+
+
+def _sync_path(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def _referenced_path(owner: Path, value: object) -> Path | None:
@@ -453,6 +464,92 @@ def discover_site_package(folder: str | Path) -> DiscoveredSitePackage:
     return DiscoveredSitePackage(root, assets)
 
 
+@dataclass(frozen=True)
+class SiteFolderFile:
+    """One required file of a candidate site folder, as found on disk."""
+
+    label: str
+    path: Path | None
+    size_bytes: int | None
+    problem: str | None = None
+
+
+@dataclass(frozen=True)
+class SiteFolderPreview:
+    """A cheap pre-import look at a folder: no hashing, no bundle or PLY parsing.
+
+    It only decides whether offering 匯入 is worthwhile;
+    LocalSitePackageProvider.validate_folder still verifies every digest, the
+    bundle and the reference poses before anything is copied.
+    """
+
+    folder: Path
+    display_name: str = ""
+    site_id: str = ""
+    coordinate_frame_id: str = ""
+    camera: str = ""
+    files: tuple[SiteFolderFile, ...] = ()
+    error: str | None = None
+
+    @property
+    def ready(self) -> bool:
+        return (
+            self.error is None
+            and bool(self.files)
+            and all(item.problem is None for item in self.files)
+        )
+
+
+def _preview_file(label: str, path: Path | None, root: Path) -> SiteFolderFile:
+    if path is None:
+        return SiteFolderFile(label, None, None, "site_profile.json 未指定")
+    if not _is_inside(path, root):
+        return SiteFolderFile(label, path, None, "位於所選資料夾外")
+    try:
+        size = path.stat().st_size if path.is_file() else None
+    except OSError:
+        size = None
+    if size is None:
+        return SiteFolderFile(label, path, None, "找不到檔案")
+    return SiteFolderFile(label, path, size)
+
+
+def preview_site_folder(folder: str | Path) -> SiteFolderPreview:
+    """Report what a mapping-output folder declares and which required files exist."""
+    root = Path(folder).expanduser().resolve()
+    manifest = root / "site_profile.json"
+    if not manifest.is_file():
+        return SiteFolderPreview(root, error="此資料夾沒有 site_profile.json")
+    manifest_file = SiteFolderFile("場域 manifest", manifest, manifest.stat().st_size)
+    try:
+        profile = load_site_profile(manifest, validate_files=False)
+    except Exception as exc:
+        return SiteFolderPreview(
+            root, files=(manifest_file,), error=f"site_profile.json 無法讀取：{exc}",
+        )
+    try:
+        _validate_site_package_profile(profile)
+    except ValueError as exc:
+        error = str(exc)
+    else:
+        error = None
+    camera = profile.query_camera
+    return SiteFolderPreview(
+        root,
+        display_name=profile.display_name,
+        site_id=profile.site_id,
+        coordinate_frame_id=(
+            profile.coordinate_frame.id if profile.coordinate_frame is not None else ""
+        ),
+        camera="" if camera is None else f"{camera.model} {camera.width}×{camera.height}",
+        files=(manifest_file, *(
+            _preview_file(label, getattr(profile, key), root)
+            for key, label in _REQUIRED_ASSETS
+        )),
+        error=error,
+    )
+
+
 def match_managed_site_profile_for_map(
     source: str | Path, managed_root: str | Path
 ) -> SiteProfile | None:
@@ -495,8 +592,11 @@ def site_pack_root_for_profile(
     root = Path(packages_root).expanduser().resolve()
     try:
         profile = load_site_profile(profile_path)
-        relative = profile.map_ply.resolve().relative_to(root)
-        site_root = root / relative.parts[0]
+        try:
+            relative = profile.map_ply.resolve().relative_to(root)
+            site_root = root / relative.parts[0]
+        except ValueError:
+            site_root = root / profile.site_id
         managed_path = (site_root / "site_profile.json").resolve()
         if Path(profile.source).resolve() == managed_path:
             return site_root
@@ -510,6 +610,130 @@ def site_pack_root_for_profile(
     except (IndexError, OSError, ValueError):
         return None
     return site_root
+
+
+def _validate_bound_route(route: dict, profile: SiteProfile) -> None:
+    if not isinstance(route, dict):
+        raise ValueError("route JSON must be an object")
+    frame_id = profile.coordinate_frame.id if profile.coordinate_frame else None
+    if frame_id is None:
+        raise ValueError("route approval requires a bound map coordinate frame")
+    if (
+        "map_ply_sha256" in route
+        and route["map_ply_sha256"] != profile.asset_sha256.map_ply
+    ):
+        raise ValueError("route authored map SHA-256 does not match the selected map")
+    validate_flight_route_fields(
+        route,
+        expected_site_id=profile.site_id,
+        expected_coordinate_frame_id=frame_id,
+    )
+
+
+def _resolve_selected_route(route_path: str | Path) -> Path:
+    candidate = Path(route_path).expanduser().absolute()
+    if any(part.is_symlink() for part in (candidate, *candidate.parents)):
+        raise ValueError("selected route must not use symlinks")
+    return candidate.resolve()
+
+
+def _route_receipt_profile(
+    selected: Path, profile: SiteProfile, map_digest: str | None
+) -> SiteProfile:
+    """Return the profile whose authored-route receipts govern the route."""
+    for parent in selected.parents:
+        owner = parent / "site_profile.json"
+        if not owner.is_file():
+            continue
+        if owner.resolve() == profile.source:
+            break
+        bound = load_site_profile(owner)
+        if (
+            bound.site_id != profile.site_id
+            or bound.coordinate_frame != profile.coordinate_frame
+            or bound.asset_sha256.map_ply != map_digest
+            or _sha256(bound.map_ply) != map_digest
+        ):
+            raise ValueError("selected route approval belongs to a different map")
+        return bound
+    return profile
+
+
+def _authored_route_receipt_approved(
+    selected: Path,
+    profile: SiteProfile,
+    receipt_profile: SiteProfile,
+    digest: str,
+    map_digest: str | None,
+) -> bool:
+    receipts = () if receipt_profile.flight is None else receipt_profile.flight.authored_routes
+    for receipt in receipts:
+        receipt_path = (receipt_profile.source.parent / receipt.path).resolve()
+        if selected != receipt_path:
+            continue
+        if (
+            not _is_inside(selected, receipt_profile.source.parent)
+            or receipt.sha256 != digest
+            or receipt.map_sha256 != map_digest
+            or receipt.coordinate_frame_id != profile.coordinate_frame.id
+        ):
+            raise ValueError("authored route approval SHA-256 or map identity mismatch")
+        return True
+    return False
+
+
+def _pinned_route_approved(
+    selected: Path, profile: SiteProfile, digest: str
+) -> bool:
+    # Existing pinned profiles remain eligible only for their exact route.
+    # A route's self-reported source marker never establishes provenance.
+    flight = profile.flight
+    if selected != profile.route_json:
+        return False
+    if not (flight.approved and flight.route_clearance_approved):
+        return False
+    if profile.asset_sha256.route_json != digest:
+        raise ValueError("selected route SHA-256 mismatch")
+    return True
+
+
+def profile_for_selected_route(
+    profile_path: str | Path, route_path: str | Path
+) -> SiteProfile:
+    """Verify a selected route's persisted approval without approving a preview.
+
+    An unapproved valid route remains viewable, but gets a locked flight overlay.
+    Receipts never grant controller, mission, hardware, or localization readiness.
+    """
+    profile = load_site_profile(profile_path)
+    selected = _resolve_selected_route(route_path)
+    route = _json(selected)
+    _validate_bound_route(route, profile)
+    map_digest = _sha256(profile.map_ply)
+    if map_digest != profile.asset_sha256.map_ply:
+        raise ValueError("selected route map SHA-256 mismatch")
+    digest = _sha256(selected)
+    flight = profile.flight
+    receipt_profile = _route_receipt_profile(selected, profile, map_digest)
+    if flight is not None:
+        approved = _authored_route_receipt_approved(
+            selected, profile, receipt_profile, digest, map_digest
+        ) or _pinned_route_approved(selected, profile, digest)
+        flight = replace(
+            flight,
+            approved=approved,
+            route_clearance_approved=approved,
+            approval_note=(
+                ROUTE_EDITOR_AUTO_APPROVAL_NOTE if approved
+                else "Selected route has no verified AUTO approval."
+            ),
+        )
+    return replace(
+        profile,
+        route_json=selected,
+        asset_sha256=replace(profile.asset_sha256, route_json=digest),
+        flight=flight,
+    )
 
 
 def _camera_dict(camera: QueryCamera) -> dict:
@@ -1037,6 +1261,39 @@ class LocalSitePackageProvider:
         return ImportedSite(destination / "site_profile.json", report.site_id)
 
 
+def _authored_route_receipt(path: str, sha256: str, current: SiteProfile) -> dict:
+    return {
+        "path": path,
+        "sha256": sha256,
+        "map_sha256": current.asset_sha256.map_ply,
+        "coordinate_frame_id": current.coordinate_frame.id,
+    }
+
+
+@dataclass
+class _AssetCommitState:
+    """Mutable bookkeeping for one managed-asset commit transaction."""
+
+    temp_asset: Path | None
+    backup_asset: Path | None = None
+    temp_profile: Path | None = None
+    linked_backups: dict[Path, Path] = field(default_factory=dict)
+    linked_temps: dict[Path, Path] = field(default_factory=dict)
+    linked_replaced: list[Path] = field(default_factory=list)
+    target_replaced: bool = False
+    rollback_error: Exception | None = None
+
+    def cleanup(self) -> None:
+        _remove_file(self.temp_asset)
+        _remove_file(self.temp_profile)
+        for temporary in self.linked_temps.values():
+            _remove_file(temporary)
+        if self.rollback_error is None:
+            _remove_file(self.backup_asset)
+            for backup in self.linked_backups.values():
+                _remove_file(backup)
+
+
 class _LocalSupplementProvider:
     profile_key = ""
     digest_key = ""
@@ -1053,25 +1310,94 @@ class _LocalSupplementProvider:
     ) -> dict[Path, bytes]:
         return {}
 
-    def _load_managed_profile(self, profile_path: str | Path) -> tuple[Path, SiteProfile, dict]:
-        path = Path(profile_path).expanduser().resolve()
-        if not _is_inside(path, self.managed_root):
-            site_root = site_pack_root_for_profile(path, self.managed_root)
-            managed_profile = (
-                None if site_root is None else (site_root / "site_profile.json").resolve()
-            )
-            if managed_profile is None or not managed_profile.is_file():
-                raise ValueError(
-                    "目前場域尚未對應到已匯入的場域資料夾；請先匯入場域資料"
-                )
-            path = managed_profile
-        profile = load_site_profile(path)
+    def _adoption_site_root(self, requested: Path, source: SiteProfile) -> Path:
+        site_root = site_pack_root_for_profile(requested, self.managed_root)
+        if site_root is not None:
+            return site_root
+        try:
+            relative = source.map_ply.relative_to(self.managed_root)
+            return self.managed_root / relative.parts[0]
+        except ValueError:
+            return self.managed_root / source.site_id
+
+    @staticmethod
+    def _adoption_manifest(requested: Path, site_root: Path) -> dict:
+        raw = _json(requested)
+        # Adoption keeps the deployed contract, including its controller
+        # and independent hardware references, without granting approval.
+        for key, value in raw["assets"].items():
+            asset = _referenced_path(requested, value)
+            if asset is not None:
+                raw["assets"][key] = os.path.relpath(asset, site_root)
+        for key in ("localizer_deploy_dir", "localizer_profile", "map_reference_poses", "map_align"):
+            asset = _referenced_path(requested, raw.get(key))
+            if asset is not None:
+                raw[key] = os.path.relpath(asset, site_root)
+        for section, keys in _NESTED_MANIFEST_REFERENCES:
+            fields = raw.get(section)
+            if not isinstance(fields, dict):
+                continue
+            for key in keys:
+                asset = _referenced_path(requested, fields.get(key))
+                if asset is not None:
+                    fields[key] = os.path.relpath(asset, site_root)
+        if isinstance(raw.get("flight"), dict):
+            raw["flight"].pop("authored_routes", None)
+        return raw
+
+    @classmethod
+    def _write_adopted_profile(cls, requested: Path, site_root: Path, path: Path) -> None:
+        site_root.mkdir(parents=True, exist_ok=True)
+        raw = cls._adoption_manifest(requested, site_root)
+        temporary = _new_temp_path(site_root, ".site_profile.json.")
+        try:
+            temporary.write_bytes(_json_bytes(raw))
+            load_site_profile(temporary)
+            _sync_path(temporary)
+            os.replace(temporary, path)
+            _sync_path(site_root)
+        finally:
+            _remove_file(temporary)
+
+    @staticmethod
+    def _require_adoptable_source(source: SiteProfile) -> None:
+        if source.schema_version != 2 or source.coordinate_frame is None:
+            raise ValueError("managed site adoption requires a schema v2 bound coordinate frame")
         if (
-            path.name != "site_profile.json"
-            or path.parent.parent != self.managed_root
+            source.asset_sha256.map_ply is None
+            or _sha256(source.map_ply) != source.asset_sha256.map_ply
         ):
-            raise ValueError("route and target imports require a managed site profile")
-        return path, profile, _json(path)
+            raise ValueError("managed site adoption map SHA-256 mismatch")
+
+    @staticmethod
+    def _require_adopted_identity(profile: SiteProfile, source: SiteProfile) -> None:
+        if (
+            profile.site_id != source.site_id
+            or profile.coordinate_frame != source.coordinate_frame
+            or profile.asset_sha256.map_ply != source.asset_sha256.map_ply
+            or _sha256(profile.map_ply) != source.asset_sha256.map_ply
+        ):
+            raise ValueError("managed site adoption map/coordinate identity mismatch")
+
+    def _load_managed_profile(self, profile_path: str | Path) -> tuple[Path, SiteProfile, dict]:
+        requested = Path(profile_path).expanduser().resolve()
+        source = load_site_profile(requested)
+        if requested.name == "site_profile.json" and requested.parent.parent == self.managed_root:
+            return requested, source, _json(requested)
+        self._require_adoptable_source(source)
+        site_root = self._adoption_site_root(requested, source)
+        path = site_root / "site_profile.json"
+        self.managed_root.mkdir(parents=True, exist_ok=True)
+        with _site_asset_lock(_site_asset_lock_path(self.managed_root, source.site_id)):
+            if not path.is_file():
+                self._write_adopted_profile(requested, site_root, path)
+        profile = load_site_profile(path)
+        self._require_adopted_identity(profile, source)
+        raw = _json(path)
+        source_flight = _json(requested).get("flight")
+        if isinstance(source_flight, dict) and source_flight.get("controller") is not None:
+            raw.setdefault("flight", {})["controller"] = source_flight["controller"]
+        return path, profile, raw
 
     def _stage_linked_manifests(
         self,
@@ -1136,6 +1462,182 @@ class _LocalSupplementProvider:
                 rollback_error = rollback_error or exc
         return rollback_error
 
+    def _require_route_save_identity(
+        self, temp_asset: Path, profile: SiteProfile, current: SiteProfile
+    ) -> None:
+        if (
+            current.coordinate_frame != profile.coordinate_frame
+            or current.asset_sha256.map_ply != profile.asset_sha256.map_ply
+        ):
+            raise ValueError("route save map identity changed during transaction")
+        _validate_bound_route(_json(temp_asset), current)
+        if _sha256(current.map_ply) != current.asset_sha256.map_ply:
+            raise ValueError("route save map SHA-256 mismatch")
+
+    def _previous_asset_target(self, profile_path: Path, current_raw: dict) -> Path:
+        previous_value = current_raw.get("assets", {}).get(self.profile_key)
+        if not previous_value:
+            return (profile_path.parent / self.relative_path).resolve()
+        return (profile_path.parent / str(previous_value)).resolve()
+
+    @staticmethod
+    def _commit_flight(current_raw: dict, raw: dict) -> dict:
+        flight = current_raw.get("flight")
+        if not isinstance(flight, dict):
+            flight = current_raw["flight"] = {}
+        source_flight = raw.get("flight")
+        if flight.get("controller") is None and isinstance(source_flight, dict):
+            flight["controller"] = source_flight.get("controller")
+        return flight
+
+    @staticmethod
+    def _legacy_editor_receipt(
+        flight: dict,
+        current: SiteProfile,
+        profile_path: Path,
+        previous_target: Path,
+        receipts: list,
+    ) -> dict | None:
+        # Migrate only the previously hash-pinned editor approval,
+        # never a route's untrusted self-reported source marker.
+        old_sha = current.asset_sha256.route_json
+        if not (
+            previous_target.is_file()
+            and _is_inside(previous_target, profile_path.parent / "routes")
+            and flight.get("approval_note") == ROUTE_EDITOR_AUTO_APPROVAL_NOTE
+            and flight.get("approved") is True
+            and flight.get("route_clearance_approved") is True
+            and old_sha == _sha256(previous_target)
+        ):
+            return None
+        previous_relative = previous_target.relative_to(profile_path.parent).as_posix()
+        if any(item["path"] == previous_relative for item in receipts):
+            return None
+        return _authored_route_receipt(previous_relative, old_sha, current)
+
+    def _update_route_receipts(
+        self,
+        flight: dict,
+        current: SiteProfile,
+        profile_path: Path,
+        previous_target: Path,
+        selected_relative_path: Path,
+        digest: str,
+        approve_for_auto: bool,
+    ) -> None:
+        flight.setdefault("coordinate_frame_id", current.coordinate_frame.id)
+        receipts = list(flight.get("authored_routes", []))
+        legacy = self._legacy_editor_receipt(
+            flight, current, profile_path, previous_target, receipts
+        )
+        if legacy is not None:
+            receipts.append(legacy)
+        receipts = [
+            item for item in receipts
+            if item["path"] != selected_relative_path.as_posix()
+        ]
+        if approve_for_auto:
+            receipts.append(
+                _authored_route_receipt(selected_relative_path.as_posix(), digest, current)
+            )
+        flight["authored_routes"] = receipts
+
+    @staticmethod
+    def _replace_asset_target(
+        state: _AssetCommitState, target: Path, digest: str
+    ) -> None:
+        if target.exists() and not target.is_file():
+            raise ValueError(f"managed asset target is not a file: {target}")
+        if target.is_file():
+            state.backup_asset = _new_temp_path(target.parent, f".{target.name}.", ".bak")
+            shutil.copy2(target, state.backup_asset)
+        os.replace(state.temp_asset, target)
+        state.temp_asset = None
+        state.target_replaced = True
+        if _sha256(target) != digest:
+            raise ValueError("saved asset SHA-256 mismatch")
+
+    def _publish_profile(
+        self,
+        state: _AssetCommitState,
+        target: Path,
+        digest: str,
+        previous_target: Path,
+        profile_path: Path,
+        current_raw: dict,
+    ) -> None:
+        state.temp_profile = _new_temp_path(profile_path.parent, ".site_profile.json.")
+        state.temp_profile.write_bytes(_json_bytes(current_raw))
+        load_site_profile(state.temp_profile)
+        _sync_path(state.temp_profile)
+        self._stage_linked_manifests(
+            target, digest, previous_target, state.linked_backups, state.linked_temps,
+        )
+        for temporary in state.linked_temps.values():
+            _sync_path(temporary)
+        profile_backup = _new_temp_path(profile_path.parent, ".site_profile.json.", ".bak")
+        shutil.copy2(profile_path, profile_backup)
+        state.linked_backups[profile_path] = profile_backup
+        self._replace_linked_manifests(state.linked_temps, state.linked_replaced)
+        os.replace(state.temp_profile, profile_path)
+        state.temp_profile = None
+        state.linked_replaced.append(profile_path)
+
+    def _commit_locked(
+        self,
+        state: _AssetCommitState,
+        source_profile: SiteProfile,
+        raw: dict,
+        profile_path: Path,
+        target: Path,
+        selected_relative_path: Path,
+        digest: str,
+        approve_for_auto: bool,
+    ) -> None:
+        current = load_site_profile(profile_path)
+        current_raw = _json(profile_path)
+        is_route = self.profile_key == "route_json"
+        if is_route:
+            self._require_route_save_identity(state.temp_asset, source_profile, current)
+        previous_target = self._previous_asset_target(profile_path, current_raw)
+        flight = self._commit_flight(current_raw, raw)
+        if is_route:
+            self._update_route_receipts(
+                flight, current, profile_path, previous_target,
+                selected_relative_path, digest, approve_for_auto,
+            )
+        self._replace_asset_target(state, target, digest)
+        current_raw["assets"][self.profile_key] = selected_relative_path.as_posix()
+        current_raw.setdefault("asset_sha256", {})[self.digest_key] = digest
+        flight["approved"] = bool(approve_for_auto)
+        flight["route_clearance_approved"] = bool(approve_for_auto)
+        flight["approval_note"] = (
+            ROUTE_EDITOR_AUTO_APPROVAL_NOTE if approve_for_auto
+            else "Imported asset changed; flight re-approval required."
+        )
+        self._publish_profile(
+            state, target, digest, previous_target, profile_path, current_raw
+        )
+        if approve_for_auto:
+            verified = profile_for_selected_route(profile_path, target)
+            if verified.flight is None or not verified.flight.approved:
+                raise ValueError("saved route approval did not verify")
+        for folder in {target.parent, *(path.parent for path in state.linked_replaced)}:
+            _sync_path(folder)
+
+    def _abort_commit(self, state: _AssetCommitState, target: Path) -> None:
+        state.rollback_error = self._rollback_asset_transaction(
+            target,
+            state.backup_asset,
+            state.target_replaced,
+            state.linked_backups,
+            state.linked_replaced,
+        )
+        if state.rollback_error is not None:
+            raise RuntimeError(
+                f"asset transaction rollback failed for {target}; recovery backups retained"
+            ) from state.rollback_error
+
     def _commit(
         self,
         source: Path,
@@ -1145,93 +1647,34 @@ class _LocalSupplementProvider:
         *,
         approve_for_auto: bool = False,
         relative_path: Path | None = None,
+        expected_source_sha256: str | None = None,
     ) -> ImportedAsset:
         selected_relative_path = relative_path or self.relative_path
         target = (profile_path.parent / selected_relative_path).resolve()
         if not _is_inside(target, profile_path.parent):
             raise ValueError("managed asset target must stay inside the site folder")
         target.parent.mkdir(parents=True, exist_ok=True)
-        temp_asset = _new_temp_path(target.parent, f".{target.name}.")
-        try:
-            shutil.copy2(source, temp_asset)
-        except Exception:
-            _remove_file(temp_asset)
-            raise
-
+        state = _AssetCommitState(
+            temp_asset=_new_temp_path(target.parent, f".{target.name}.")
+        )
         lock_path = _site_asset_lock_path(self.managed_root, profile.site_id)
-        backup_asset = None
-        temp_profile = None
-        linked_backups: dict[Path, Path] = {}
-        linked_temps: dict[Path, Path] = {}
-        linked_replaced: list[Path] = []
-        target_replaced = False
         try:
+            shutil.copy2(source, state.temp_asset)
+            digest = _sha256(state.temp_asset)
+            if expected_source_sha256 is not None and digest != expected_source_sha256:
+                raise ValueError("route changed while saving; approval not committed")
+            _sync_path(state.temp_asset)
             with _site_asset_lock(lock_path):
-                current_raw = _json(profile_path)
-                previous_value = current_raw.get("assets", {}).get(self.profile_key)
-                previous_target = (
-                    (profile_path.parent / self.relative_path).resolve()
-                    if not previous_value
-                    else (profile_path.parent / str(previous_value)).resolve()
-                )
-                if target.exists() and not target.is_file():
-                    raise ValueError(f"managed asset target is not a file: {target}")
-                if target.is_file():
-                    backup_asset = _new_temp_path(target.parent, f".{target.name}.", ".bak")
-                    shutil.copy2(target, backup_asset)
-
-                os.replace(temp_asset, target)
-                temp_asset = None
-                target_replaced = True
-
-                digest = _sha256(target)
-                current_raw["assets"][self.profile_key] = (
-                    selected_relative_path.as_posix()
-                )
-                current_raw.setdefault("asset_sha256", {})[self.digest_key] = digest
-                flight = current_raw.setdefault("flight", {})
-                flight["approved"] = bool(approve_for_auto)
-                flight["route_clearance_approved"] = bool(approve_for_auto)
-                flight["approval_note"] = (
-                    ROUTE_EDITOR_AUTO_APPROVAL_NOTE
-                    if approve_for_auto
-                    else "Imported asset changed; flight re-approval required."
-                )
-                temp_profile = _new_temp_path(profile_path.parent, ".site_profile.json.")
-                temp_profile.write_text(
-                    json.dumps(current_raw, ensure_ascii=False, indent=2) + "\n",
-                    encoding="utf-8",
-                )
-                load_site_profile(temp_profile)
-                self._stage_linked_manifests(
-                    target,
-                    digest,
-                    previous_target,
-                    linked_backups,
-                    linked_temps,
-                )
-                self._replace_linked_manifests(linked_temps, linked_replaced)
-                os.replace(temp_profile, profile_path)
-                temp_profile = None
-        except Exception:
-            rollback_error = self._rollback_asset_transaction(
-                target,
-                backup_asset,
-                target_replaced,
-                linked_backups,
-                linked_replaced,
-            )
-            if rollback_error is not None:
-                raise RuntimeError(
-                    f"asset transaction rollback failed for {target}"
-                ) from rollback_error
-            raise
+                try:
+                    self._commit_locked(
+                        state, profile, raw, profile_path, target,
+                        selected_relative_path, digest, approve_for_auto,
+                    )
+                except Exception:
+                    self._abort_commit(state, target)
+                    raise
         finally:
-            _remove_file(temp_asset)
-            _remove_file(temp_profile)
-            _remove_file(backup_asset)
-            for path in (*linked_temps.values(), *linked_backups.values()):
-                _remove_file(path)
+            state.cleanup()
         return ImportedAsset(profile_path, target, approved_for_auto=bool(approve_for_auto))
 
 
@@ -1309,10 +1752,20 @@ def _detached_manifest_bytes(candidate: Path, raw: dict, assets: dict, target: P
     references = _manifest_asset_references(candidate, raw, assets)
     if any(path == target and key != "route_json" for key, path in references.items()):
         raise ValueError("selected route is also a non-route site asset")
-    if references.get("route_json") != target:
-        return None
-    _detach_route_from_manifest(raw, assets)
-    return _json_bytes(raw)
+    changed = references.get("route_json") == target
+    if changed:
+        _detach_route_from_manifest(raw, assets)
+    flight = raw.get("flight")
+    if isinstance(flight, dict) and isinstance(flight.get("authored_routes"), list):
+        receipts = flight["authored_routes"]
+        remaining = [
+            item for item in receipts
+            if _referenced_path(candidate, item["path"]) != target
+        ]
+        if remaining != receipts:
+            flight["authored_routes"] = remaining
+            changed = True
+    return _json_bytes(raw) if changed else None
 
 
 def _package_references_route(candidate: Path, raw: dict, target: Path) -> bool:
@@ -1550,43 +2003,21 @@ class LocalRouteProvider(_LocalSupplementProvider):
         approve_for_auto: bool = False,
         replace_route: str | Path | None = None,
     ) -> ImportedAsset:
-        path, profile, profile_raw = self._load_managed_profile(profile_path)
+        requested = load_site_profile(profile_path)
         route_path = Path(source).expanduser().resolve()
-        route = _json(route_path)
-        frame_id = profile.coordinate_frame.id if profile.coordinate_frame else None
-        expected = {
-            "schema": "sfm-flight-route/v1",
-            "site_id": profile.site_id,
-            "coordinate_frame_id": frame_id,
-            "units": "map",
-            "purpose": "flight",
-            "closed": False,
-        }
-        for key, value in expected.items():
-            if route.get(key) != value:
-                raise ValueError(f"route {key} must be {value!r}")
-        if route.get("frame") not in {"glomap", "aligned"}:
-            raise ValueError("route frame must be 'glomap' or 'aligned'")
-        waypoints = route.get("waypoints")
-        if not isinstance(waypoints, list) or len(waypoints) < 2:
-            raise ValueError("route needs at least two waypoints")
-        parsed = [_finite_vec3(value, f"waypoint[{index}]") for index, value in enumerate(waypoints)]
-        has_nonzero_segment = any(a != b for a, b in zip(parsed, parsed[1:]))
-        if not has_nonzero_segment:
-            raise ValueError("route must contain a non-zero segment")
-        if (
-            route.get("schema") == "sfm-flight-route/v1"
-            and route.get("site_id") == profile.site_id
-            and frame_id is not None
-            and route.get("coordinate_frame_id") == frame_id
-            and has_nonzero_segment
-        ):
-            approve_for_auto = True
+        payload = route_path.read_bytes()
+        route = json.loads(payload, parse_constant=reject_json_constant)
+        source_digest = hashlib.sha256(payload).hexdigest()
+        _validate_bound_route(route, requested)
+        path, profile, profile_raw = self._load_managed_profile(profile_path)
         if replace_route is None:
             suffix = f"{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
             relative_path = Path("routes") / f"flight_route_{suffix}.json"
         else:
-            replace_path = Path(replace_route).expanduser().resolve()
+            candidate = Path(replace_route).expanduser().absolute()
+            if any(part.is_symlink() for part in (candidate, *candidate.parents)):
+                raise ValueError("edited route must not use symlinks")
+            replace_path = candidate.resolve()
             routes_root = (path.parent / "routes").resolve()
             if (
                 not _is_inside(replace_path, routes_root)
@@ -1605,6 +2036,7 @@ class LocalRouteProvider(_LocalSupplementProvider):
             profile_raw,
             approve_for_auto=approve_for_auto,
             relative_path=relative_path,
+            expected_source_sha256=source_digest,
         )
 
 

@@ -425,6 +425,7 @@ def test_live_status_is_written_for_a_typed_result(tmp_path, monkeypatch) -> Non
     import json as _json
 
     import operator_tick
+    from status_file_writer import STATUS_FILE_WRITER
 
     status = tmp_path / "live_status.json"
     monkeypatch.setattr(operator_tick, "LIVE_STATUS_PATH", status)
@@ -452,6 +453,7 @@ def test_live_status_is_written_for_a_typed_result(tmp_path, monkeypatch) -> Non
             failures.append((path, exc))
 
     operator_tick._publish_live_result_state(_App(), _Typed())
+    assert STATUS_FILE_WRITER.flush()
 
     assert failures == []
     assert _json.loads(status.read_text(encoding="utf-8"))["inliers"] == 42

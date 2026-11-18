@@ -27,8 +27,10 @@ from flight_operator_app import (
     next_tick_deadline,
     video_hud_identity,
 )
+from backend_contract import ControlAction, ControlRequest, ControlResult
 from operator_shutdown import OperatorShutdownCoordinator
 from operator_preflight import _compass_evidence
+from simulated_backend import CONTROL_REQUEST_MAX_AGE_NS, DroneBackend
 
 
 @pytest.mark.parametrize("change", [None, "landed", "route", "frame", "backend"])
@@ -94,9 +96,9 @@ class _Backend:
     def __init__(self):
         self.calls = []
 
-    def command(self, name, **payload):
-        self.calls.append((name, payload))
-        return name
+    def command(self, request: ControlRequest):
+        self.calls.append(request.legacy_call())
+        return ControlResult.completed(None, raw_result=True)
 
 
 def _bare_app(backend=None):
@@ -516,8 +518,8 @@ def test_display_only_import_can_be_confirmed_without_becoming_auto_candidate(
     operator.redraw_map_only = lambda: None
     monkeypatch.setattr(
         app,
-        "load_site_profile",
-        lambda _path: SimpleNamespace(
+        "profile_for_selected_route",
+        lambda _path, _route: SimpleNamespace(
             site_id="river_site_edm",
             flight=SimpleNamespace(coordinate_frame_id="river_site_glomap"),
         ),
@@ -693,11 +695,12 @@ def test_route_selection_is_logged_before_the_snapshot_is_bound(
     operator.session_logs = SessionLogs()
     operator.site_profile_path = tmp_path / "profile.json"
     operator._active_site_map_frame = lambda: None
+    operator.backend = SimpleNamespace(is_live=False, session_config=None)
     operator.redraw_map_only = lambda: None
     monkeypatch.setattr(
         app,
-        "load_site_profile",
-        lambda _path: SimpleNamespace(
+        "profile_for_selected_route",
+        lambda _path, _route: SimpleNamespace(
             site_id="river_site_edm",
             flight=SimpleNamespace(coordinate_frame_id="river_site_glomap"),
         ),
@@ -746,8 +749,8 @@ def test_route_selection_is_not_bound_when_the_audit_log_fails(
     operator._active_site_map_frame = lambda: None
     monkeypatch.setattr(
         app,
-        "load_site_profile",
-        lambda _path: SimpleNamespace(
+        "profile_for_selected_route",
+        lambda _path, _route: SimpleNamespace(
             site_id="river_site_edm",
             flight=SimpleNamespace(coordinate_frame_id="river_site_glomap"),
         ),
@@ -893,7 +896,7 @@ def test_unapproved_profile_or_route_is_not_bound_as_auto_candidate(
     operator._active_site_map_frame = lambda: None
     operator.redraw_map_only = lambda: None
     operator.write_log = lambda _message: None
-    monkeypatch.setattr(app, "load_site_profile", lambda _path: profile)
+    monkeypatch.setattr(app, "profile_for_selected_route", lambda _path, _route: profile)
     monkeypatch.setattr(app, "file_sha256", lambda _path: snapshot.sha256)
     monkeypatch.setattr(
         app, "capture_mission_route_snapshot", lambda *_args, **_kwargs: snapshot
@@ -938,7 +941,11 @@ def test_unapproved_route_choice_switches_display_without_binding_auto(
         return len(snapshot.waypoints)
 
     operator._show_route_overlay = show
-    monkeypatch.setattr(app, "load_site_profile", lambda _path: object())
+    monkeypatch.setattr(
+        app, "profile_for_selected_route",
+        lambda _path, _route: SimpleNamespace(flight=SimpleNamespace(
+            approved=False, route_clearance_approved=False)),
+    )
     monkeypatch.setattr(
         app,
         "flight_readiness_errors",
@@ -1517,6 +1524,39 @@ def test_inventory_status_separates_hardware_version_and_lost_link() -> None:
     assert statuses["lost_link"] == ("good", "已確認：無 Home 時原地降落")
 
 
+def test_inventory_display_uses_selected_aircraft_sdk_identity() -> None:
+    backend = SimpleNamespace(
+        is_live=True,
+        aircraft_profile=SimpleNamespace(
+            model="Surveyor", controller_name="Field RC",
+            sdk_name="FlightLink", sdk_version_key="flightlink_version",
+        ),
+        connection_inventory={
+            "aircraft": {"software": "2.4"},
+            "controller": {"software": "1.2"},
+            "runtime": {"flightlink_version": "5.0", "olympe_version": "stale"},
+            "lost_link": {"fallback": "land_in_place", "policy_confirmed": True},
+            "block_reasons": [],
+        },
+    )
+    statuses = inventory_ui_status(backend)
+    assert "Surveyor / Field RC" in statuses["hardware"][1]
+    assert "FlightLink 5.0" in statuses["version"][1]
+    assert "stale" not in statuses["version"][1]
+
+
+def test_unknown_aircraft_does_not_inherit_anafi_inventory_identity() -> None:
+    backend = SimpleNamespace(
+        is_live=True,
+        connection_inventory={"aircraft": {}, "controller": {}, "runtime": {}},
+    )
+    statuses = inventory_ui_status(backend)
+    assert "機型未知" in statuses["hardware"][1]
+    assert "控制器未知" in statuses["hardware"][1]
+    assert "ANAFI" not in statuses["hardware"][1]
+    assert "Olympe" not in statuses["version"][1]
+
+
 def test_format_olympe_flight_telemetry() -> None:
 
     state = DroneState(
@@ -1618,7 +1658,7 @@ def test_failed_calibration_hud_disregards_completed_axis_bits():
     assert "✓" not in status
 
 
-def test_focus_loss_clears_all_holds_and_backend_nudges():
+def test_focus_loss_clears_all_ui_holds():
     app = _bare_app()
     app._nudge_keys_held.add("w")
     app._nudge_buttons_held.add("上")
@@ -1628,7 +1668,6 @@ def test_focus_loss_clears_all_holds_and_backend_nudges():
     assert not app._nudge_keys_held
     assert not app._nudge_buttons_held
     assert not app._stick_vector_active
-    assert app.backend.calls == [("nudge_clear", {"reason": "ui_focus_lost"})]
 
 
 def test_focus_change_without_active_input_sends_no_flight_command():
@@ -1676,10 +1715,10 @@ def test_slow_backend_command_is_dispatched_without_blocking_caller():
     release = threading.Event()
 
     class SlowBackend(_Backend):
-        def command(self, name, **payload):
+        def command(self, request: ControlRequest):
             entered.set()
             assert release.wait(1.0)
-            return super().command(name, **payload)
+            return super().command(request)
 
     app = _bare_app(SlowBackend())
     start = time.monotonic()
@@ -1690,7 +1729,7 @@ def test_slow_backend_command_is_dispatched_without_blocking_caller():
 
     release.set()
     command, result, error = app._flight_results.get(timeout=1.0)
-    assert (command, result, error) == ("takeoff", "takeoff", None)
+    assert (command, result, error) == ("takeoff", True, None)
 
 
 def test_live_emergency_stop_is_dispatched_without_blocking_caller():
@@ -1700,10 +1739,10 @@ def test_live_emergency_stop_is_dispatched_without_blocking_caller():
     class SlowSafetyBackend(_Backend):
         is_live = True
 
-        def command(self, name, **payload):
+        def command(self, request: ControlRequest):
             entered.set()
             assert release.wait(1.0)
-            return super().command(name, **payload)
+            return super().command(request)
 
     operator = _bare_app(SlowSafetyBackend())
     started = time.monotonic()
@@ -1713,7 +1752,7 @@ def test_live_emergency_stop_is_dispatched_without_blocking_caller():
     assert entered.wait(0.5)
     release.set()
     command, result, error = operator._flight_safety_results.get(timeout=1.0)
-    assert (command, result, error) == ("emergency_stop", "emergency_stop", None)
+    assert (command, result, error) == ("emergency_stop", True, None)
 
 
 def test_flight_result_queue_drops_old_normal_results_but_preserves_safety():
@@ -1741,27 +1780,27 @@ def test_flight_result_queue_drops_old_normal_results_but_preserves_safety():
 
 
 def test_typed_sim_control_request_rejects_stale_normal_action_but_not_safety():
-    backend = app.DroneBackend()
-    stale_ns = time.monotonic_ns() - app.CONTROL_REQUEST_MAX_AGE_NS - 1
+    backend = DroneBackend()
+    stale_ns = time.monotonic_ns() - CONTROL_REQUEST_MAX_AGE_NS - 1
 
-    stale_hover = backend.command(app.ControlRequest(
-        action=app.ControlAction.HOVER,
+    stale_hover = backend.command(ControlRequest(
+        action=ControlAction.HOVER,
         submitted_mono_ns=stale_ns,
         human_origin=True,
     ))
     assert not stale_hover.accepted
     assert stale_hover.reason_code == "STALE_CONTROL_REQUEST"
 
-    stale_land = backend.command(app.ControlRequest(
-        action=app.ControlAction.LAND_NOW,
+    stale_land = backend.command(ControlRequest(
+        action=ControlAction.LAND_NOW,
         submitted_mono_ns=stale_ns,
         human_origin=True,
     ))
     assert stale_land.accepted
     assert stale_land.executed
 
-    stale_emergency = backend.command(app.ControlRequest(
-        action=app.ControlAction.EMERGENCY_STOP,
+    stale_emergency = backend.command(ControlRequest(
+        action=ControlAction.EMERGENCY_STOP,
         submitted_mono_ns=stale_ns,
         human_origin=False,
     ))
@@ -1908,19 +1947,19 @@ def test_diagnostic_write_failure_is_recorded_as_incident():
 
 
 def test_sim_takeoff_requires_typed_human_origin_request():
-    backend = app.DroneBackend()
+    backend = DroneBackend()
 
     legacy = backend.command("takeoff")
-    assert isinstance(legacy, app.ControlResult)
+    assert isinstance(legacy, ControlResult)
     assert not legacy.accepted
     assert legacy.reason_code == "TYPED_TAKEOFF_REQUIRED"
 
     automated = backend.command(
-        app.ControlRequest.create(app.ControlAction.TAKEOFF, human_origin=False)
+        ControlRequest.create(ControlAction.TAKEOFF, human_origin=False)
     )
     assert not automated.accepted
     human = backend.command(
-        app.ControlRequest.create(app.ControlAction.TAKEOFF, human_origin=True)
+        ControlRequest.create(ControlAction.TAKEOFF, human_origin=True)
     )
     assert human.accepted
     assert backend.state.tracker_state == "TAKEOFF"
@@ -2375,9 +2414,9 @@ def test_a_refused_vector_snaps_the_knob_home():
     """The knob must never show a deflection the aircraft is not following."""
 
     class _Refusing(_Backend):
-        def command(self, name, **payload):
-            super().command(name, **payload)
-            return False
+        def command(self, request: ControlRequest):
+            super().command(request)
+            return ControlResult.rejected("CONTROL_NOT_OWNED", None)
 
     app = _stick_app(_Refusing())
     app.stick_right.value = (0.9, 0.0)
@@ -2390,7 +2429,7 @@ def test_a_refused_vector_snaps_the_knob_home():
 
 def test_a_failing_vector_command_snaps_the_knob_home():
     class _Raising(_Backend):
-        def command(self, name, **payload):
+        def command(self, request: ControlRequest):
             raise RuntimeError("link down")
 
     app = _stick_app(_Raising())

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+from pathlib import Path
 import time
 
 import numpy as np
 import pytest
 
+import flight_operator_app as app
 from olympe_live_backend import LiveAnafiVideoStream
 
 
@@ -155,3 +157,30 @@ def test_live_stream_rejects_a_future_frame_timestamp():
     assert stream.next_frame() is None
     assert stream.last_stamp == 0.0
     assert stream.output_index == 0
+
+
+def test_native_replay_worker_view_retains_rgb_after_stream_close():
+    payload = b"\x15\x46\x96" * (app.STREAM_WIDTH * app.STREAM_HEIGHT)
+    stream = app.FFmpegFrameStream(
+        Path("/definitely/missing.mp4"), app.STREAM_WIDTH, app.STREAM_HEIGHT
+    )
+    # Supply completed decoder output without launching FFmpeg or a worker.
+    stream._reader_queue.put_nowait(payload)
+    frame = stream.next_frame()
+    assert frame is not None
+
+    raw = app.OperatorApp._frame_rgb_bytes_for_worker(None, frame)
+    assert isinstance(raw, memoryview)
+    assert raw.readonly
+    assert raw.nbytes == len(payload)
+    assert np.shares_memory(raw.obj, frame)
+    assert raw == memoryview(payload)
+
+    stream._reader_queue.put_nowait(b"\x01\x02\x03" * (app.STREAM_WIDTH * app.STREAM_HEIGHT))
+    following = stream.next_frame()
+    assert following is not None
+    assert tuple(following[0, 0]) == (1, 2, 3)
+    stream.close()
+    del frame, following, stream, payload
+    assert raw[:3].tolist() == [21, 70, 150]
+    assert raw[-3:].tolist() == [21, 70, 150]

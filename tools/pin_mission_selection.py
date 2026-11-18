@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
 import sys
@@ -16,27 +15,22 @@ CONTROL = ROOT / "控制介面程式"
 if str(CONTROL) not in sys.path:
     sys.path.insert(0, str(CONTROL))
 
-from mission_manifest import ManifestError  # noqa: E402
+from mission_manifest import ManifestError, sha256_file  # noqa: E402
 from mission_resolver import resolve_mission  # noqa: E402
 
 
-def _digest(path: Path) -> str:
-    value = hashlib.sha256()
-    with path.open("rb") as stream:
-        for block in iter(lambda: stream.read(8 * 1024 * 1024), b""):
-            value.update(block)
-    return value.hexdigest()
-
-
-def _reference(value: str, *, base: Path, label: str) -> dict[str, str]:
+def file_reference(
+    value: str | Path, *, base: Path, label: str, root: Path = ROOT
+) -> dict[str, str]:
+    """Hash-pinned ``{"path", "sha256"}`` reference to a workspace file, relative to *base*."""
     path = Path(value).expanduser().resolve()
-    if not path.is_relative_to(ROOT):
+    if not path.is_relative_to(root):
         raise ManifestError(f"{label} must stay inside the workspace: {path}")
     if not path.is_file() or path.is_symlink():
         raise ManifestError(f"{label} must be a regular non-symlink file: {path}")
     return {
         "path": os.path.relpath(path, base),
-        "sha256": _digest(path),
+        "sha256": sha256_file(path),
     }
 
 
@@ -69,10 +63,10 @@ def main(argv: list[str] | None = None) -> int:
         document = {
             "schema": "sfm-mission-selection/v1",
             "selection_id": args.selection_id,
-            "vehicle": _reference(args.vehicle, base=output.parent, label="vehicle"),
-            "site": _reference(args.site, base=output.parent, label="site"),
-            "map": _reference(args.map_manifest, base=output.parent, label="map"),
-            "localizer": _reference(
+            "vehicle": file_reference(args.vehicle, base=output.parent, label="vehicle"),
+            "site": file_reference(args.site, base=output.parent, label="site"),
+            "map": file_reference(args.map_manifest, base=output.parent, label="map"),
+            "localizer": file_reference(
                 args.localizer,
                 base=output.parent,
                 label="localizer",
@@ -80,15 +74,15 @@ def main(argv: list[str] | None = None) -> int:
             "route": (
                 None
                 if args.route is None
-                else _reference(args.route, base=output.parent, label="route")
+                else file_reference(args.route, base=output.parent, label="route")
             ),
             "calibrations": [
-                _reference(value, base=output.parent, label="calibration")
+                file_reference(value, base=output.parent, label="calibration")
                 for value in args.calibration
             ],
         }
         if args.approval is not None:
-            document["approval"] = _reference(
+            document["approval"] = file_reference(
                 args.approval,
                 base=output.parent,
                 label="approval",

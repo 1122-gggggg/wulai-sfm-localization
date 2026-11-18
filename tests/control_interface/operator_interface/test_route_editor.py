@@ -21,6 +21,7 @@ import route_editor_controller as rec
 import route_editor_model as rem
 from route_editor_controller import OrthoView, RouteEditorController, pointer_is_drag
 from route_editor_objects import ObjectBoxController
+from route_editor_wires import WireController
 from route_editor_model import (
     PREVIEW_ROUTE_SCHEMA,
     ROUTE_SCHEMA,
@@ -28,7 +29,7 @@ from route_editor_model import (
     editor_to_glomap,
     glomap_to_editor,
 )
-from route_editor_rendering import BACKGROUND, PointCloudRenderer
+from route_editor_rendering import BACKGROUND, PointCloudRenderer, PointCloudRenderWorker
 
 
 def test_editor_frame_round_trip_keeps_z_as_physical_up() -> None:
@@ -90,26 +91,32 @@ def test_successful_route_save_approves_and_closes_the_finished_editor(tmp_path)
         return SimpleNamespace(
             message="航線已核准供自動巡航使用",
             asset_path=saved,
+            approved_for_auto=True,
         )
 
     editor = SimpleNamespace(
         objects=ObjectBoxController(),
+        wires=WireController(),
         _preview_only=False,
         controller=RouteEditorController([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]]),
         document=RouteDocument(site_id="yard", coordinate_frame_id="yard-map-v1"),
         arrive_radius_var=SimpleNamespace(get=lambda: 0.025),
         import_route=import_route,
-        profile=SimpleNamespace(route_json=saved),
+        profile=SimpleNamespace(
+            route_json=saved, asset_sha256=SimpleNamespace(map_ply="a" * 64),
+        ),
         _signature=lambda: ("saved",),
         status_var=SimpleNamespace(set=status.append),
         close_editor=lambda *, force=False: closed.append(force),
     )
     editor._update_document = lambda: rew.RouteEditorWindow._update_document(editor)
+    editor._refresh_distance_labels = lambda: None
 
     result = rew.RouteEditorWindow.save_route(editor)
 
     assert result == saved
     assert imported_payloads[0]["arrive_radius_map_units"] == pytest.approx(0.025)
+    assert imported_payloads[0]["map_ply_sha256"] == "a" * 64
     assert "max_route_deviation_map_units" not in imported_payloads[0]
     assert "SHA 已同步" in status[-1]
     assert closed == [True]
@@ -227,6 +234,22 @@ def test_g_z_screen_motion_changes_only_editor_height() -> None:
     assert delta[2] > 0.0
 
 
+def test_left_view_mirrors_right_view_with_height_up() -> None:
+    point = [[2.0, 3.0, 5.0]]
+    right = OrthoView(center=np.zeros(3), radius=10.0)
+    left = OrthoView(center=np.zeros(3), radius=10.0)
+    right.right()
+    left.left()
+
+    rx, ry, rd = right.project(point, 1000, 800)
+    lx, ly, ld = left.project(point, 1000, 800)
+
+    assert lx[0] - 500.0 == pytest.approx(-(rx[0] - 500.0))
+    assert ly[0] == pytest.approx(ry[0])
+    assert ly[0] < 400.0
+    assert ld[0] == pytest.approx(-rd[0])
+
+
 def test_five_pixel_threshold_separates_click_from_left_drag_rotation() -> None:
     assert pointer_is_drag((100, 100), (103, 104)) is False
     assert pointer_is_drag((100, 100), (106, 100)) is True
@@ -311,6 +334,7 @@ def test_save_preview_persists_the_dragged_arrive_limit(tmp_path):
     points = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]]
     editor = SimpleNamespace(
         objects=ObjectBoxController(),
+        wires=WireController(),
         controller=RouteEditorController(points),
         _choose_preview_path=lambda: target,
         document=document,
@@ -320,6 +344,7 @@ def test_save_preview_persists_the_dragged_arrive_limit(tmp_path):
         status_var=SimpleNamespace(set=lambda _message: None),
     )
     editor._update_document = lambda: rew.RouteEditorWindow._update_document(editor)
+    editor._refresh_distance_labels = lambda: None
 
     rew.RouteEditorWindow.save_route(editor)
     payload = json.loads(target.read_text(encoding="utf-8"))
@@ -350,21 +375,25 @@ def test_bound_save_stages_before_atomic_route_import(tmp_path):
         imported.append(json.loads(path.read_text(encoding="utf-8")))
         current = json.loads(target.read_text(encoding="utf-8"))
         assert current["waypoints"] != replacement
-        return SimpleNamespace(message="saved", asset_path=target)
+        return SimpleNamespace(message="saved", asset_path=target, approved_for_auto=True)
 
     editor = SimpleNamespace(
         objects=ObjectBoxController(),
+        wires=WireController(),
         controller=RouteEditorController(replacement),
         document=document,
         arrive_radius_var=SimpleNamespace(get=lambda: 0.025),
         _preview_only=False,
         import_route=import_route,
-        profile=SimpleNamespace(route_json=target),
+        profile=SimpleNamespace(
+            route_json=target, asset_sha256=SimpleNamespace(map_ply="a" * 64),
+        ),
         _signature=lambda: ("saved",),
         status_var=SimpleNamespace(set=lambda _message: None),
         close_editor=lambda *, force=False: None,
     )
     editor._update_document = lambda: rew.RouteEditorWindow._update_document(editor)
+    editor._refresh_distance_labels = lambda: None
 
     saved = rew.RouteEditorWindow.save_route(editor)
 
@@ -373,19 +402,19 @@ def test_bound_save_stages_before_atomic_route_import(tmp_path):
     assert not (tmp_path / "route_drafts").exists()
 
 
-def test_bound_save_failure_without_managed_site_points_to_import():
+def test_bound_save_map_mismatch_points_to_reselecting_the_correct_map():
     import route_editor_window as rew
 
     assert rew._save_failure_hint(ValueError("something else")) is None
     hint = rew._save_failure_hint(
-        ValueError("route and target imports require a managed site profile")
+        ValueError("managed site adoption map/coordinate identity mismatch")
     )
-    assert hint is not None and "匯入場域資料夾" in hint
+    assert hint is not None and "重新選擇正確地圖" in hint
 
     shown = []
 
     def import_route(_path):
-        raise ValueError("route and target imports require a managed site profile")
+        raise ValueError("managed site adoption map/coordinate identity mismatch")
 
     document = RouteDocument(
         site_id="yard",
@@ -394,21 +423,58 @@ def test_bound_save_failure_without_managed_site_points_to_import():
     )
     editor = SimpleNamespace(
         objects=ObjectBoxController(),
+        wires=WireController(),
         controller=RouteEditorController(document.points),
         document=document,
         arrive_radius_var=SimpleNamespace(get=lambda: 0.025),
         _preview_only=False,
         import_route=import_route,
+        profile=SimpleNamespace(asset_sha256=SimpleNamespace(map_ply="a" * 64)),
         _signature=lambda: ("saved",),
         status_var=SimpleNamespace(set=shown.append),
         close_editor=lambda *, force=False: None,
     )
     editor._update_document = lambda: rew.RouteEditorWindow._update_document(editor)
+    editor._refresh_distance_labels = lambda: None
 
     assert rew.RouteEditorWindow.save_route(editor) is None
     assert len(shown) == 1
     assert shown[0].startswith("航線儲存失敗：")
-    assert "匯入場域資料夾" in shown[0]
+    assert "重新選擇正確地圖" in shown[0]
+
+
+@pytest.mark.parametrize("approved,has_asset", [(False, True), (True, False)])
+def test_bound_save_without_committed_approval_keeps_editor_unsaved(
+    tmp_path, approved, has_asset,
+):
+    import route_editor_window as rew
+
+    document = RouteDocument(
+        site_id="yard", coordinate_frame_id="yard-map-v1",
+        points=[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
+    )
+    shown, closed = [], []
+    editor = SimpleNamespace(
+        objects=ObjectBoxController(),
+        wires=WireController(),
+        document=document,
+        profile=SimpleNamespace(asset_sha256=SimpleNamespace(map_ply="a" * 64)),
+        _preview_only=False,
+        _update_document=lambda: None,
+        _refresh_distance_labels=lambda: None,
+        import_route=lambda _path: SimpleNamespace(
+            asset_path=tmp_path / "saved.json" if has_asset else None,
+            approved_for_auto=approved,
+        ),
+        status_var=SimpleNamespace(set=shown.append),
+        close_editor=lambda **_kw: closed.append(True),
+        _saved_signature=("old",),
+        _signature=lambda: ("edited",),
+    )
+    assert rew.RouteEditorWindow.save_route(editor) is None
+    assert editor._saved_signature == ("old",)
+    assert not closed
+    assert len(shown) == 1 and shown[0].startswith("航線儲存失敗：")
 
 
 def test_bound_save_emits_drawn_per_waypoint_radii(tmp_path):
@@ -426,21 +492,25 @@ def test_bound_save_emits_drawn_per_waypoint_radii(tmp_path):
 
     def import_route(path):
         imported.append(json.loads(path.read_text(encoding="utf-8")))
-        return SimpleNamespace(message="saved", asset_path=target)
+        return SimpleNamespace(message="saved", asset_path=target, approved_for_auto=True)
 
     editor = SimpleNamespace(
         objects=ObjectBoxController(),
+        wires=WireController(),
         controller=RouteEditorController(document.points),
         document=document,
         arrive_radius_var=SimpleNamespace(get=lambda: 0.02),
         _preview_only=False,
         import_route=import_route,
-        profile=SimpleNamespace(route_json=target),
+        profile=SimpleNamespace(
+            route_json=target, asset_sha256=SimpleNamespace(map_ply="a" * 64),
+        ),
         _signature=lambda: ("saved",),
         status_var=SimpleNamespace(set=lambda _message: None),
         close_editor=lambda *, force=False: None,
     )
     editor._update_document = lambda: rew.RouteEditorWindow._update_document(editor)
+    editor._refresh_distance_labels = lambda: None
 
     rew.RouteEditorWindow.save_route(editor)
     assert imported[0]["waypoint_arrive_radii"] == [0.05, 0.02, 0.03]
@@ -457,6 +527,7 @@ def test_update_document_realigns_radii_after_undo(tmp_path):
     )
     editor = SimpleNamespace(
         objects=ObjectBoxController(),
+        wires=WireController(),
         controller=RouteEditorController([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]]),
         document=document,
         arrive_radius_var=SimpleNamespace(get=lambda: 0.02),
@@ -954,18 +1025,6 @@ def test_missing_sites_root_lists_nothing_rather_than_raising(tmp_path):
     assert lsa.list_site_packages(tmp_path / "absent") == []
 
 
-def test_site_shortcut_labels_are_the_short_field_name():
-    """The button says 烏來, not the full audit-trail display name."""
-    import site_assets_panel as sap
-
-    short = sap.SiteAssetsPanel._short_site_name
-    assert short("烏來（目標場域）EDM v1 — 2026-07-19 驗證") == "烏來"
-    assert short("河濱場域 EDM") == "河濱場域"
-    assert short("測試場域 EDM") == "測試場域"
-    # No separator: keep it whole rather than truncating arbitrarily.
-    assert short("Alpha") == "Alpha"
-
-
 def test_switching_into_a_routeless_site_goes_straight_to_marking(tmp_path):
     """The panel is only a site switch now; the route step must be automatic."""
     panel = _StubPanel(answer=True)
@@ -976,35 +1035,6 @@ def test_switching_into_a_routeless_site_goes_straight_to_marking(tmp_path):
 
     assert outcome == "drawing"
     assert panel.editor_calls == [False]
-
-
-def test_applying_never_restarts_out_from_under_the_route_editor():
-    """Applying restarts the interface; doing that mid-drawing loses the work.
-
-    Driven through the real _finish_ok rather than asserting on its source text,
-    which would still pass if the guard were reworded into something inert.
-    """
-    import site_assets_panel as sap
-
-    for outcome, expect_apply in (
-        ("drawing", False), ("imported", True),
-        ("declined", True), ("ambiguous", True),
-    ):
-        panel = _StubPanel(answer=True)
-        panel._set_busy = lambda _busy: None
-        panel._select_site_folder = lambda *_args: None
-        panel._refresh = lambda: None
-        panel._pending_site_folder = Path("/tmp/whatever")
-        panel.follow_up_route_for_site = lambda _folder, o=outcome: o
-        applied = []
-        panel.offer_apply_after_import = lambda: applied.append(True) or False
-        result = type("R", (), {"kind": "site", "message": "ok", "profile_path": None})()
-
-        sap.SiteAssetsPanel._finish_ok(panel, result)
-
-        assert bool(applied) is expect_apply, (
-            f"outcome={outcome}: apply {'ran' if applied else 'did not run'}"
-        )
 
 
 def _write_route(path: Path, **overrides) -> Path:
@@ -1194,35 +1224,6 @@ def test_route_button_failure_reports_instead_of_killing_the_callback():
     sap.SiteAssetsPanel._preview_existing_route(panel, Path("/tmp/bad.json"))
 
     assert status and "align_source 不符" in status[0]
-
-
-def test_site_switch_hides_the_site_that_is_already_loaded(tmp_path):
-    """Switching to the active site re-imports and re-execs back to where it was."""
-    import site_assets_panel as sap
-
-    active = tmp_path / "river_site"
-    other = tmp_path / "test_field"
-    active.mkdir()
-    other.mkdir()
-    listed = [
-        SimpleNamespace(folder=active, display_name="河濱場域 EDM"),
-        SimpleNamespace(folder=other, display_name="測試場域 EDM"),
-    ]
-    panel = SimpleNamespace(
-        site_pack_root=active,
-        _short_site_name=sap.SiteAssetsPanel._short_site_name,
-    )
-    panel._is_active_site = sap.SiteAssetsPanel._is_active_site.__get__(panel)
-    panel._active_site_label = sap.SiteAssetsPanel._active_site_label.__get__(panel)
-
-    assert panel._is_active_site(listed[0]) is True
-    assert panel._is_active_site(listed[1]) is False
-    assert panel._active_site_label(listed) == "河濱場域"
-
-    # Without a known active site nothing is hidden.
-    panel.site_pack_root = None
-    assert [item for item in listed if panel._is_active_site(item)] == []
-    assert panel._active_site_label(listed) == ""
 
 
 def test_map_axis_gizmo_uses_the_measured_basis_and_is_resolved_once():
@@ -1431,10 +1432,13 @@ def test_bound_save_emits_the_controller_actions(tmp_path):
 
     def import_route(path):
         imported.append(json.loads(path.read_text(encoding="utf-8")))
-        return SimpleNamespace(message="saved", asset_path=tmp_path / "route.json")
+        return SimpleNamespace(
+            message="saved", asset_path=tmp_path / "route.json", approved_for_auto=True,
+        )
 
     editor = SimpleNamespace(
         objects=ObjectBoxController(),
+        wires=WireController(),
         controller=RouteEditorController(
             [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]], [[], [RIGHT_30]]
         ),
@@ -1442,12 +1446,15 @@ def test_bound_save_emits_the_controller_actions(tmp_path):
         arrive_radius_var=SimpleNamespace(get=lambda: 0.02),
         _preview_only=False,
         import_route=import_route,
-        profile=SimpleNamespace(route_json=tmp_path / "route.json"),
+        profile=SimpleNamespace(
+            route_json=tmp_path / "route.json", asset_sha256=SimpleNamespace(map_ply="a" * 64),
+        ),
         _signature=lambda: ("saved",),
         status_var=SimpleNamespace(set=lambda _message: None),
         close_editor=lambda *, force=False: None,
     )
     editor._update_document = lambda: rew.RouteEditorWindow._update_document(editor)
+    editor._refresh_distance_labels = lambda: None
 
     rew.RouteEditorWindow.save_route(editor)
     assert imported[0]["waypoint_actions"] == [[], [RIGHT_30]]
@@ -1491,6 +1498,43 @@ def test_full_cloud_clips_points_and_handles_an_empty_cloud():
     np.testing.assert_array_equal(renderer.render(view, 100, 80), expected)
     empty = PointCloudRenderer(np.empty((0, 6)), use_cuda=False)
     np.testing.assert_array_equal(empty.render(view, 100, 80), expected)
+
+
+def test_renderer_picks_the_frontmost_point_within_the_pixel_radius():
+    cloud = np.array([
+        [0, 0, -1, 0, 0, 0],
+        [0, 0, 1, 0, 0, 0],
+        [3, 0, 0, 0, 0, 0],
+        [np.nan, 0, 0, 0, 0, 0],
+    ], dtype=np.float32)
+    renderer = PointCloudRenderer(cloud, use_cuda=False)
+    view = OrthoView(np.zeros(3), 1)  # 100 px canvas: 46 px per unit, origin at (50, 50)
+    assert renderer.nearest(view, 100, 100, 50, 50, 5) == 1
+    assert renderer.nearest(view, 100, 100, 50 + 3 * 46, 50, 5) == 2
+    assert renderer.nearest(view, 100, 100, 10, 10, 5) is None
+    assert PointCloudRenderer(np.empty((0, 6)), use_cuda=False).nearest(
+        view, 100, 100, 50, 50, 5
+    ) is None
+
+
+def test_cuda_picking_matches_the_cpu_result_on_a_rotated_view():
+    torch = pytest.importorskip("torch")
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA unavailable")
+    rng = np.random.default_rng(7)
+    cloud = np.concatenate(
+        [rng.normal(size=(20_000, 3)) * 5 + 100, np.zeros((20_000, 3))], axis=1
+    ).astype(np.float32)
+    view = OrthoView(np.array([100.0, 100.0, 100.0]), 12.0, yaw=0.7, pitch=1.1, pan_x=9.0)
+    gpu = PointCloudRenderer(cloud)
+    cpu = PointCloudRenderer(cloud, use_cuda=False)
+    assert gpu.device == "cuda"
+    hits = 0
+    for x, y in rng.uniform(100, 700, size=(60, 2)):
+        expected = cpu.nearest(view, 800, 800, x, y, 20)
+        assert gpu.nearest(view, 800, 800, x, y, 20) == expected
+        hits += expected is not None
+    assert hits > 10
 
 
 def test_point_picking_uses_displayed_view_while_latest_rotation_is_pending():
@@ -1647,3 +1691,441 @@ def test_editor_adds_to_the_selected_trip_only() -> None:
     direction["value"] = "out"
     rew.RouteEditorWindow._add_action(editor, RIGHT_30)
     assert controller.actions[1] == [RIGHT_30] and controller.return_actions[1] == [HOVER_3]
+
+
+class _DeferredCloudExecutor:
+    def __init__(self):
+        self.calls = []
+        self.shutdown_calls = []
+
+    def submit(self, function, *args):
+        from concurrent.futures import Future
+
+        future = Future()
+        self.calls.append((function, args, future))
+        return future
+
+    def shutdown(self, *, wait, cancel_futures):
+        self.shutdown_calls.append((wait, cancel_futures))
+        if cancel_futures:
+            for _, _, future in self.calls:
+                future.cancel()
+
+    def complete(self):
+        function, args, future = self.calls[-1]
+        future.set_result(function(*args))
+
+
+class _RenderEditor(SimpleNamespace):
+    pass
+
+
+def _render_editor(monkeypatch):
+    from types import MethodType
+    import route_editor_window as rew
+    import route_editor_rendering as rendering
+
+    monkeypatch.setattr(rendering, "PointCloudRenderer",
+                        lambda points: PointCloudRenderer(points, use_cuda=False))
+    monkeypatch.setattr(rew.ImageTk, "PhotoImage", lambda image: image.copy())
+    editor = _RenderEditor(
+        map_points=np.array([
+            [-0.8, 0.4, 0.1, 230, 20, 30],
+            [0.5, -0.7, 0.2, 20, 230, 30],
+            [0, 0, 0.6, 20, 30, 230],
+        ], dtype=np.float32),
+        view=OrthoView(np.zeros(3), 1),
+        controller=RouteEditorController([
+            [-0.4, -0.3, 0], [0.2, 0.1, 0], [0.6, 0.3, 0],
+        ]),
+        objects=ObjectBoxController(),
+        wires=WireController(),
+        _wiring=False,
+        measurement_points=[],
+        _measurement_selected=None,
+        _boxing=False,
+        _show_arrive=False,
+        _cloud_revision=0,
+        _cloud_worker=PointCloudRenderWorker(),
+        _raster_cache_key=None,
+        _raster_cache=None,
+        _displayed_view=None,
+        _displayed_cloud=None,
+        _displayed_size=None,
+        _distance_labels_dirty=False,
+        _closed=False,
+        _redraw_pending=False,
+        _render_future=None,
+        _render_after=None,
+        _render_executor=_DeferredCloudExecutor(),
+        _canvas_item=None,
+        _photo=None,
+        size=(320, 240),
+        callbacks=[],
+        cancelled_callbacks=[],
+        destroyed=False,
+        on_close_callback=None,
+        status_var=SimpleNamespace(set=lambda value: pytest.fail(value)),
+        canvas=SimpleNamespace(
+            create_image=lambda *args, **kwargs: 1,
+            itemconfigure=lambda *args, **kwargs: None,
+        ),
+    )
+    editor._canvas_size = lambda: editor.size
+    editor.show_arrive_var = SimpleNamespace(get=lambda: editor._show_arrive)
+    editor._point_radius_for = lambda index: 0.05
+    editor.after = lambda delay, callback: editor.callbacks.append(callback) or "timer"
+    editor.after_idle = lambda callback: editor.after(0, callback)
+    editor.after_cancel = editor.cancelled_callbacks.append
+    editor.attributes = lambda *args: None
+    editor.destroy = lambda: setattr(editor, "destroyed", True)
+    for name in (
+        "request_redraw", "_redraw", "_poll_render", "close_editor",
+        "_current_raster_key", "_paint_render", "_draw_axes", "_draw_route",
+        "_draw_measurement", "_draw_object_boxes", "_draw_wires",
+    ):
+        setattr(editor, name, MethodType(getattr(rew.RouteEditorWindow, name), editor))
+    return editor
+
+
+def _finish_cloud_frame(editor):
+    editor.callbacks.pop(0)()
+    editor._render_executor.complete()
+    editor.callbacks.pop(0)()
+
+
+def _expected_editor_image(editor):
+    from PIL import Image, ImageDraw
+
+    width, height = editor.size
+    raster = PointCloudRenderer(editor.map_points, use_cuda=False).render(
+        editor.view, width, height
+    )
+    image = Image.fromarray(raster)
+    draw = ImageDraw.Draw(image, "RGBA")
+    for method in (
+        editor._draw_axes, editor._draw_route,
+        editor._draw_measurement, editor._draw_object_boxes,
+    ):
+        method(draw, width, height, editor.view)
+    return np.asarray(image)
+
+
+def test_fixed_camera_overlay_edits_reuse_pristine_cloud_pixels(monkeypatch):
+    editor = _render_editor(monkeypatch)
+    editor.request_redraw()
+    _finish_cloud_frame(editor)
+    pristine = np.asarray(editor._raster_cache).copy()
+    initial = np.asarray(editor._photo).copy()
+    editor.controller.selected = 1
+    editor.controller.add_action({"type": "hover", "seconds": 2})
+    editor._show_arrive = True
+    editor.measurement_points = [[-0.6, 0.6, 0], [0.7, -0.6, 0]]
+    editor.objects = ObjectBoxController([
+        {"center": [0.2, 0.2, 0], "size": [0.4, 0.5, 0.3]},
+    ])
+    editor.request_redraw()
+    editor.callbacks.pop(0)()
+    assert len(editor._render_executor.calls) == 1
+    assert not np.array_equal(initial, np.asarray(editor._photo))
+    np.testing.assert_array_equal(np.asarray(editor._photo), _expected_editor_image(editor))
+    np.testing.assert_array_equal(np.asarray(editor._raster_cache), pristine)
+    editor.controller = RouteEditorController([
+        [-0.4, -0.3, 0], [0.2, 0.1, 0], [0.6, 0.3, 0],
+    ])
+    editor._show_arrive = False
+    editor.measurement_points.clear()
+    editor.objects = ObjectBoxController()
+    editor.request_redraw()
+    editor.callbacks.pop(0)()
+    assert len(editor._render_executor.calls) == 1
+    np.testing.assert_array_equal(np.asarray(editor._photo), initial)
+
+
+@pytest.mark.parametrize("mutation", [
+    "radius", "center", "yaw", "pitch", "zoom", "pan_x", "pan_y",
+    "width", "height", "cloud_identity", "cloud_revision",
+])
+def test_cloud_cache_invalidation_matches_fresh_raster(monkeypatch, mutation):
+    editor = _render_editor(monkeypatch)
+    editor.request_redraw()
+    _finish_cloud_frame(editor)
+    if mutation == "center":
+        editor.view.center[0] += 0.15
+    elif mutation in {"width", "height"}:
+        width, height = editor.size
+        editor.size = (width + 13, height) if mutation == "width" else (width, height + 11)
+    elif mutation == "cloud_identity":
+        editor.map_points = editor.map_points.copy()
+        editor.map_points[:, 3:6] = [70, 80, 90]
+    elif mutation == "cloud_revision":
+        editor.map_points[:, 3:6] = [90, 80, 70]
+        editor._cloud_revision += 1
+    else:
+        setattr(editor.view, mutation, getattr(editor.view, mutation) + 0.2)
+    editor.request_redraw()
+    _finish_cloud_frame(editor)
+    assert len(editor._render_executor.calls) == 2
+    width, height = editor.size
+    np.testing.assert_array_equal(
+        np.asarray(editor._raster_cache),
+        PointCloudRenderer(editor.map_points, use_cuda=False).render(editor.view, width, height),
+    )
+    np.testing.assert_array_equal(np.asarray(editor._photo), _expected_editor_image(editor))
+
+
+@pytest.mark.parametrize("reload_cloud", [False, True])
+def test_pending_cloud_completion_never_displays_an_obsolete_camera(monkeypatch, reload_cloud):
+    editor = _render_editor(monkeypatch)
+    editor.request_redraw()
+    editor.callbacks.pop(0)()
+    for offset in range(1, 40):
+        editor.view.center[0] = offset / 100
+        editor.view.radius = 1 + offset / 100
+        editor.view.yaw = offset / 200
+        editor.size = (320 + offset, 240)
+        if reload_cloud and offset == 20:
+            editor.map_points = editor.map_points.copy()
+            editor.map_points[:, 3:6] = [220, 150, 70]
+            editor._cloud_revision += 1
+        editor.request_redraw()
+    assert len(editor._render_executor.calls) == 1
+    editor._render_executor.complete()
+    editor.callbacks.pop(0)()
+    assert editor._photo is None
+    assert editor._raster_cache is None
+    assert len(editor.callbacks) == 1
+    _finish_cloud_frame(editor)
+    assert len(editor._render_executor.calls) == 2
+    assert not editor.callbacks
+    np.testing.assert_array_equal(np.asarray(editor._photo), _expected_editor_image(editor))
+    np.testing.assert_array_equal(editor._displayed_view.center, editor.view.center)
+    assert editor._displayed_cloud is editor.map_points
+
+
+def test_overlay_request_during_cloud_render_does_not_submit_second_cloud(monkeypatch):
+    editor = _render_editor(monkeypatch)
+    editor.request_redraw()
+    editor.callbacks.pop(0)()
+    editor.controller.selected = 1
+    editor.measurement_points = [[0, 0.5, 0]]
+    editor.request_redraw()
+    editor._render_executor.complete()
+    editor.callbacks.pop(0)()
+    editor.callbacks.pop(0)()
+    assert len(editor._render_executor.calls) == 1
+    np.testing.assert_array_equal(np.asarray(editor._photo), _expected_editor_image(editor))
+
+
+@pytest.mark.parametrize("work_state", ["scheduled", "queued", "running", "completed"])
+def test_close_rejects_pending_render_callbacks_without_changing_pixels(monkeypatch, work_state):
+    editor = _render_editor(monkeypatch)
+    editor.request_redraw()
+    _finish_cloud_frame(editor)
+    pristine = np.asarray(editor._raster_cache).copy()
+    original_raster = editor._raster_cache
+    original_photo = editor._photo
+    editor.view.pan_x += 12
+    editor.request_redraw()
+    future = None
+    if work_state != "scheduled":
+        editor.callbacks.pop(0)()
+        future = editor._render_future
+        if work_state in {"running", "completed"}:
+            assert future.set_running_or_notify_cancel()
+        if work_state == "completed":
+            editor._render_executor.complete()
+    stale_callbacks = editor.callbacks[:]
+    editor.callbacks.clear()
+
+    editor.close_editor(force=True)
+
+    assert editor.destroyed
+    assert editor.cancelled_callbacks == ["timer"]
+    assert editor._render_executor.shutdown_calls == [(False, True)]
+    if work_state == "running":
+        editor._render_executor.complete()
+    elif work_state == "queued":
+        assert future.cancelled()
+    for callback in stale_callbacks:
+        callback()
+    editor.request_redraw()
+    editor._redraw()
+    assert not editor.callbacks
+    assert editor._render_after is None
+    assert editor._raster_cache is None
+    assert editor._raster_cache_key is None
+    assert editor._photo is original_photo
+    np.testing.assert_array_equal(np.asarray(original_raster), pristine)
+
+
+def test_running_cloud_job_does_not_retain_closed_editor(monkeypatch):
+    import gc
+    import threading
+    import weakref
+    from concurrent.futures import ThreadPoolExecutor
+
+    started = threading.Event()
+    release = threading.Event()
+    original_render = PointCloudRenderWorker.render
+
+    def blocked_render(worker, *args):
+        started.set()
+        if not release.wait(5):
+            raise AssertionError("test did not release the cloud worker")
+        return original_render(worker, *args)
+
+    monkeypatch.setattr(PointCloudRenderWorker, "render", blocked_render)
+    editor = _render_editor(monkeypatch)
+    executor = ThreadPoolExecutor(max_workers=1)
+    editor._render_executor = executor
+    try:
+        editor.request_redraw()
+        editor.callbacks.pop(0)()
+        future = editor._render_future
+        assert started.wait(5)
+        owner = weakref.ref(editor)
+        editor.close_editor(force=True)
+        assert not release.is_set()
+        assert not future.done()
+        del editor
+        # Collect the fake UI's main-thread callback cycles while the real job
+        # remains blocked. Its WorkItem may own only cloud data, not the UI.
+        gc.collect()
+        assert owner() is None
+        release.set()
+        assert future.result(timeout=5).shape == (240, 320, 3)
+    finally:
+        release.set()
+        executor.shutdown(wait=True)
+
+
+@pytest.fixture
+def route_editor_gui(monkeypatch):
+    """Real Tk layout, with only asynchronous raster work removed from geometry checks."""
+    import tkinter as tk
+    import route_editor_window as rew
+
+    try:
+        root = tk.Tk()
+    except tk.TclError as exc:
+        pytest.skip(f"Tk display required: {exc}")
+    root.withdraw()
+    callback_failures = []
+    root.report_callback_exception = lambda _kind, value, _trace: callback_failures.append(value)
+    monkeypatch.setattr(rew.RouteEditorWindow, "request_redraw", lambda self: None)
+    editor = rew.RouteEditorWindow(
+        root, profile=None,
+        map_points=np.array([[0., 0., 0.], [1., 0., 0.], [1., 1., 0.]]),
+        map_source=None, route_path=None,
+        import_route=lambda _path: pytest.fail("preview must not import a flight route"),
+        discover_map_ply=lambda _path: [], load_map_ply=lambda _path: (None, [], ""),
+        safety_check=lambda: (True, ""), distance_scale_loader=lambda _profile: None,
+        test_route=lambda _path: pytest.fail("preview must not start simulation"),
+    )
+    try:
+        yield root, editor
+    finally:
+        if editor.winfo_exists():
+            editor.close_editor(force=True)
+        root.destroy()
+    assert not callback_failures
+
+
+@pytest.mark.parametrize("size", [(1040, 640), (1280, 720), (1440, 900)])
+def test_editor_reserves_map_and_save_exit_at_supported_sizes(route_editor_gui, size):
+    from tkinter import ttk
+
+    root, editor = route_editor_gui
+    editor.geometry(f"{size[0]}x{size[1]}+0+0")
+    root.update_idletasks()
+    assert not editor.attributes("-fullscreen")
+    assert editor.canvas.winfo_width() >= 600
+    assert editor.canvas.winfo_height() >= 300
+    assert "不能供 AUTO" in editor.map_status_var.get()
+    assert str(editor.test_button["state"]) == "disabled"
+    for button in (editor.save_button, editor.exit_button, editor.finish_button, editor.ply_button):
+        assert button.winfo_ismapped()
+        assert button.winfo_width() >= button.winfo_reqwidth()
+        assert button.winfo_rootx() >= editor.winfo_rootx()
+        assert button.winfo_rootx() + button.winfo_width() <= editor.winfo_rootx() + editor.winfo_width()
+        assert button.winfo_rooty() + button.winfo_height() <= editor.winfo_rooty() + editor.winfo_height()
+
+    def descendants(widget):
+        for child in widget.winfo_children():
+            yield child
+            yield from descendants(child)
+
+    for index in range(4):
+        editor.side_tabs.select(index)
+        root.update_idletasks()
+        canvas = editor._tab_canvases[index]
+        assert canvas.winfo_height() >= 100
+        for widget in descendants(canvas):
+            if isinstance(widget, (ttk.Button, ttk.Spinbox, ttk.Combobox)):
+                assert widget.winfo_width() >= widget.winfo_reqwidth()
+                assert widget.winfo_rootx() >= canvas.winfo_rootx()
+                assert widget.winfo_rootx() + widget.winfo_width() <= canvas.winfo_rootx() + canvas.winfo_width()
+        canvas.yview_moveto(1.0)
+        root.update_idletasks()
+        assert canvas.yview()[1] == pytest.approx(1.0)
+        assert editor.save_button.winfo_ismapped() and editor.exit_button.winfo_ismapped()
+
+    editor.status_var.set("儲存失敗：" + "很長的錯誤路徑／" * 150)
+    root.update_idletasks()
+    # Tk computes wrapped Text line heights asynchronously, outside idle layout.
+    editor.status_text.count("1.0", "end", "update", "ypixels")
+    assert editor.status_text.yview()[1] < 1.0
+    editor.status_text.yview_moveto(1.0)
+    root.update_idletasks()
+    assert editor.status_text.yview()[0] > 0
+    assert editor.status_text.yview()[1] == pytest.approx(1.0)
+    assert editor.canvas.winfo_height() >= 300
+    assert editor.exit_button.winfo_rooty() + editor.exit_button.winfo_height() <= editor.winfo_rooty() + editor.winfo_height()
+
+
+def test_editor_sidebar_focus_scroll_and_keys_do_not_operate_map_or_parent(route_editor_gui):
+    root, editor = route_editor_gui
+    editor.geometry("1040x640+0+0")
+    editor.marking_mode_button.invoke()
+    for point in ([0., 0., 0.], [1., 0., 0.], [2., 0., 0.]):
+        editor.controller.add(point)
+    editor.finish_button.invoke()
+    editor.controller.selected = 1
+    editor._refresh_labels()
+    editor.action_direction_var.set("back")
+    editor._add_hover_action()
+    assert editor.controller.return_actions[1] == [{"type": "hover", "seconds": 3.0}]
+    assert editor.controller.actions[1] == []
+    root.update_idletasks()
+
+    global_bindings = {seq: root.bind_all(seq) for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>")}
+    parent_keys = []
+    root.bind("<KeyPress-g>", lambda _event: parent_keys.append("g"))
+    editor.side_tabs.select(1)
+    root.update_idletasks()
+    editor.look_at_clear_button.focus_force()
+    root.update()
+    canvas = editor._tab_canvases[1]
+    top = editor.look_at_clear_button.winfo_rooty() - canvas.winfo_rooty()
+    assert top >= 0
+    assert top + editor.look_at_clear_button.winfo_height() <= canvas.winfo_height()
+    before = (editor.view.zoom, editor.view.pan_x, editor.view.pan_y)
+    editor.look_at_clear_button.event_generate("<Button-4>")
+    editor.look_at_clear_button.event_generate("<KeyPress-g>")
+    editor.look_at_clear_button.event_generate("<KeyPress-Delete>")
+    root.update()
+    assert (editor.view.zoom, editor.view.pan_x, editor.view.pan_y) == before
+    assert len(editor.controller.points) == 3
+    assert not editor.controller.moving and not parent_keys
+    assert {seq: root.bind_all(seq) for seq in global_bindings} == global_bindings
+
+    editor.canvas.focus_force()
+    root.update()
+    editor.canvas.event_generate("<KeyPress-g>")
+    root.update()
+    assert editor.controller.moving
+    editor.canvas.event_generate("<KeyPress-Escape>")
+    root.update()
+    assert not editor.controller.moving
+    assert not editor.attributes("-fullscreen")

@@ -7,7 +7,7 @@ from pathlib import Path
 import numpy as np
 
 
-def _read_ply_header(source) -> tuple[str, int, bool, bool, int, bool]:
+def _read_ply_header(source) -> tuple[str, int, bool, bool, int, bool, bool]:
     header: list[str] = []
     header_bytes_len = 0
     while True:
@@ -34,7 +34,8 @@ def _read_ply_header(source) -> tuple[str, int, bool, bool, int, bool]:
         for h in header
     )
     has_alpha = any("alpha" in h for h in header)
-    return fmt, n_vertices, has_normals, has_colors, header_bytes_len, has_alpha
+    double_positions = "property double x" in header
+    return fmt, n_vertices, has_normals, has_colors, header_bytes_len, has_alpha, double_positions
 
 
 def _read_binary_ply_points(
@@ -46,6 +47,7 @@ def _read_binary_ply_points(
     has_colors: bool = True,
     has_alpha: bool = False,
     header_pos: int | None = None,
+    double_positions: bool = False,
 ) -> list[tuple] | np.ndarray:
     if header_pos is not None and hasattr(source, "seek"):
         try:
@@ -53,7 +55,7 @@ def _read_binary_ply_points(
         except Exception:
             pass
 
-    fields = [("pos", "<f4", (3,))]
+    fields = [("pos", "<f8" if double_positions else "<f4", (3,))]
     if has_normals:
         fields.append(("norm", "<f4", (3,)))
     if has_colors:
@@ -118,7 +120,7 @@ def _read_ascii_ply_points(
 
 def read_ply_points(path: Path, max_points: int) -> np.ndarray:
     with path.open("rb") as source:
-        fmt, n_vertices, has_normals, has_colors, header_pos, has_alpha = (
+        fmt, n_vertices, has_normals, has_colors, header_pos, has_alpha, double_positions = (
             _read_ply_header(source)
         )
         limit = max(1, int(max_points))
@@ -132,6 +134,7 @@ def read_ply_points(path: Path, max_points: int) -> np.ndarray:
                 has_colors=has_colors,
                 has_alpha=has_alpha,
                 header_pos=header_pos,
+                double_positions=double_positions,
             )
         elif fmt == "ascii":
             points = _read_ascii_ply_points(

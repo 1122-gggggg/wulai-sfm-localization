@@ -695,3 +695,35 @@ def test_mapping_health_overlay_is_opt_in_and_reports_mapping_failure() -> None:
     assert "RELOCALIZE" in draw.texts[0][1]
     assert "writer failed" in draw.texts[0][1]
     assert draw.texts[0][2]["fill"] == "#ff6b5f"
+
+
+@pytest.mark.parametrize("rotated", [False, True])
+def test_map_wires_keep_curve_shape_and_distinct_colors_under_view_changes(rotated):
+    from PIL import Image, ImageDraw
+    from operator_rendering import draw_map_overlays
+
+    first = np.array([[-1, 2, 0], [0, 1.5, 0], [1, 2, 0]], dtype=float)
+    second = first + [0, 1, 0]
+    rotation = np.array([[0, -1, 0], [1, 0, 0], [0, 0, 1]]) if rotated else np.eye(3)
+    pan = np.array([12.0, -8.0])
+    context = _map_context(
+        wire_polylines=(first, second), map_pan=pan,
+        transform_xyz=lambda points: np.asarray(points) @ rotation.T,
+    )
+    background = "#101418"
+    image = Image.new("RGB", (context.width, context.height), background)
+    draw_map_overlays(ImageDraw.Draw(image), context)
+    scale = min(context.width, context.height) * 0.46 * context.map_zoom / context.map_radius
+
+    def pixel(point):
+        transformed = rotation @ point
+        return (
+            int(context.width * 0.5 + pan[0] + transformed[0] * scale),
+            int(context.height * 0.5 + pan[1] - transformed[1] * scale),
+        )
+
+    colors = [image.getpixel(pixel(curve[1])) for curve in (first, second)]
+    assert colors[0] != colors[1]
+    assert all(color != (16, 20, 24) for color in colors)
+    # The midpoint must follow the authored dip, not the straight attachment chord.
+    assert image.getpixel(pixel((first[0] + first[-1]) / 2)) == (16, 20, 24)

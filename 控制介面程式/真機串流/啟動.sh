@@ -81,8 +81,10 @@ PY
       ;;
   esac
 fi
+REMEMBER_ARG=()
+[[ "${SFM_LAUNCH_DRY_RUN:-0}" == "1" ]] || REMEMBER_ARG=(--remember)
 if ! MISSION_REPORT="$("$MISSION_PYTHON" "$CTRL_DIR/launch_mission.py" \
-  "$SFM_MISSION_SELECTION" --check-only)"; then
+  "$SFM_MISSION_SELECTION" --check-only "${REMEMBER_ARG[@]}")"; then
   echo "[真機串流] ERROR: mission selection 驗證失敗" >&2
   exit 2
 fi

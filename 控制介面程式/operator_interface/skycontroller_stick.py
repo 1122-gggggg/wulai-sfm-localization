@@ -5,6 +5,7 @@ import glob
 import os
 import struct
 import threading
+import time
 from typing import Callable
 
 
@@ -133,6 +134,7 @@ class SkyControllerStickMonitor:
         self._thread: threading.Thread | None = None
         self._fd: int | None = None
         self._axes: dict[int, int] = {}
+        self._last_button: tuple[int, bool, float] | None = None
         self._callback_failures = 0
         self._lock = threading.Lock()
         self.resolved_path: str | None = None
@@ -225,10 +227,17 @@ class SkyControllerStickMonitor:
         if axes_active(self._axes, deadzone=self.deadzone):
             self._notify_stick_activity()
 
+    def last_button(self) -> tuple[int, bool, float] | None:
+        """(button, pressed, monotonic seconds) of the latest button event."""
+        with self._lock:
+            return self._last_button
+
     def _log_button(self, number: int, value: int) -> None:
         # Buttons never take control from the PC, but an RC land/RTH press left
         # no trace (flight 2026-09-15 14:25:20). Which HID button numbers the
         # SkyController 3 assigns to land/RTH has not been bench-verified.
+        with self._lock:
+            self._last_button = (number, bool(value), time.monotonic())
         if self._log_event is not None:
             self._log_event("stick_button", button=number, pressed=bool(value))
 

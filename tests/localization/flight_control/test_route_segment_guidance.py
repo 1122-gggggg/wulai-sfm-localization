@@ -473,3 +473,22 @@ def test_vertical_guard_retains_failed_height_across_targets():
     assert any(_feed_guard(guard, _HOLD + climb, target=0))
     assert any(_feed_guard(guard, [(2.0, 0.2)] * 10, target=1))
     assert guard.waived == {0, 1}
+
+
+@pytest.mark.parametrize("scale", [0.1, 1.0, 10.0])
+def test_vertical_guard_decision_is_invariant_to_map_scale(scale):
+    # Same geometry, expressed in map units 0.1x..10x: a correctly following
+    # height must never latch and a frozen one must always latch.
+    def run(follow_fraction):
+        guard = rpf.VerticalConsistencyGuard(rpf.LEGACY_MAP_FRAME)
+        radius = 0.03 * scale
+        hold = [(0.5, 0.20 * scale)] * 5
+        climb = [(0.5 + 0.1 * k, (0.20 - 0.1 * k * follow_fraction / 15.0) * scale)
+                 for k in range(1, 16)]
+        return any(_feed_guard(guard, hold + climb, radius=radius)), guard
+
+    followed, guard = run(1.0)
+    assert not followed and not guard.waived
+    frozen, guard = run(0.0)
+    assert frozen and guard.waived == {0}
+    assert guard.last_check["normalized_follow"] < 1.0

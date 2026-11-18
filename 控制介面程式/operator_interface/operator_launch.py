@@ -6,20 +6,17 @@ import argparse
 import json
 import os
 import sys
-from dataclasses import asdict, dataclass
+import subprocess
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
 import numpy as np
 
 import flight_operator_app as app
 from flight_operator_app import (
-    ANAFI,
     DEFAULT_DETECTOR_MODEL,
     DEFAULT_DETECTOR_WORKER,
-    DEFAULT_REPLAY_JSON,
     DEFAULT_WORKER,
-    DroneBackend,
-    DroneState,
     EXIT_SAFETY_SIGNALS,
     MissionRouteSnapshot,
     OperatorApp,
@@ -33,8 +30,10 @@ from flight_operator_app import (
     env_bool,
     optional_env_float,
 )
-from backend_contract import InterfaceMode, LegacyFrameSourceAdapter, SessionConfig
+from aircraft_adapter import CURRENT_AIRCRAFT, build_aircraft_runtime
+from backend_contract import InterfaceMode, SessionConfig
 from ffmpeg_frame_stream import FFmpegFrameStream
+from operator_route_readiness import selected_route_mission_readiness
 from live_safety_config import (
     DEFAULT_MAX_PITCH_ROLL_ROTATION_SPEED_DEGS,
     DEFAULT_MAX_ROTATION_SPEED_DEGS,
@@ -61,6 +60,7 @@ from runtime_safety import (
     enforce_retention,
     install_network_guard,
 )
+from simulated_backend import DroneBackend
 from site_profile import SiteProfile
 
 
@@ -85,7 +85,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
         help="1 means ANAFI-like 720p30 stream; >1 keeps every Nth source frame",
     )
     ap.add_argument(
-        "--replay-json", default=str(DEFAULT_REPLAY_JSON) if DEFAULT_REPLAY_JSON.exists() else ""
+        "--replay-json", default=""
     )
     ap.add_argument("--live-localize", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--localizer-python", default=default_worker_python("SFM_LOCALIZER_PYTHON"))
@@ -163,7 +163,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
     ap.add_argument(
         "--stream-fps",
         type=float,
-        default=ANAFI.stream_fps,
+        default=CURRENT_AIRCRAFT.profile.stream_fps,
         help="720p frame-source rate fed to the localizer (real ANAFI live stream is 30)",
     )
     ap.add_argument(
@@ -369,8 +369,8 @@ def build_argument_parser() -> argparse.ArgumentParser:
     ap.add_argument(
         "--min-takeoff-battery-pct",
         type=float,
-        default=float(os.environ.get("SFM_MIN_TAKEOFF_BATTERY_PCT", "30")),
-        help="advisory takeoff battery threshold; never blocks takeoff (default 30%%)",
+        default=float(os.environ.get("SFM_MIN_TAKEOFF_BATTERY_PCT", "20")),
+        help="takeoff battery floor; takeoff is refused below it (default and minimum 20%%)",
     )
     ap.add_argument(
         "--require-gps-for-geofence",
@@ -572,10 +572,7 @@ def _resolve_startup_site(
                     + "; ".join(mission.readiness.localization_errors)
                 )
             if is_snapshot:
-                flavor = ".eval" if evaluation_only_requested() else ""
-                expected_profile = (
-                    snapshots_dir / f"{mission.identity}{flavor}.site_profile.json"
-                ).resolve()
+                expected_profile = mission.compatibility_profile_path(snapshots_dir).resolve()
                 if not expected_profile.is_file():
                     raise ManifestError(f"mission snapshot not found: {expected_profile}")
             else:
@@ -607,6 +604,9 @@ def _resolve_startup_site(
             bool(mission.readiness.flight_ready) and not reported_evaluation_only
         )
         args.mission_flight_errors = tuple(mission.readiness.flight_errors)
+        args.mission_localization_errors = tuple(getattr(mission.readiness, "localization_errors", ()) or ())
+        args.mission_route_errors = getattr(mission.readiness, "route_errors", None)
+        args.mission_non_route_flight_errors = getattr(mission.readiness, "non_route_flight_errors", None)
         args.mission_evaluation_only = reported_evaluation_only
         args.mission_evaluation_waived_errors = tuple(waived)
     hardware_approval = None
@@ -725,7 +725,17 @@ def _load_runtime_map(
     args: argparse.Namespace,
     site_profile: SiteProfile | None,
 ) -> np.ndarray:
-    points = app.read_map_points(Path(args.map_ply), args.max_points)
+    dense = (
+        app.OperatorApp._dense_display_ply(site_profile)
+        if site_profile is not None
+        and Path(args.map_ply).resolve() == Path(site_profile.map_ply).resolve()
+        else None
+    )
+    if dense is None:
+        points = app.read_map_points(Path(args.map_ply), args.max_points)
+    else:
+        points = app.read_map_points(dense, app.MAP_DENSE_POINTS)
+        print(f"[operator] map display: dense {dense.name} {len(points)} points", flush=True)
     if site_profile is None or site_profile.map_reference_poses is None:
         return points
     reference_centers = app.read_reference_pose_points(
@@ -757,7 +767,7 @@ def _run_operator_selftest(args: argparse.Namespace, points: np.ndarray) -> bool
     if args.video:
         print(
             f"video stream fixed at {STREAM_WIDTH}x{STREAM_HEIGHT}"
-            f"@{ANAFI.stream_fps:g}: {args.video} stride={args.video_stride}"
+            f"@{CURRENT_AIRCRAFT.profile.stream_fps:g}: {args.video} stride={args.video_stride}"
         )
     if args.replay_json:
         replay = json.loads(Path(args.replay_json).read_text(encoding="utf-8"))
@@ -844,7 +854,7 @@ def _operator_session_identity(
     runtime_profile_sha256 = ""
     if site_profile is not None and site_profile.localizer_profile is not None:
         runtime_profile_sha256 = app.file_sha256(site_profile.localizer_profile)
-    autonomous_speed_limit_mps = 0.60
+    autonomous_speed_limit_mps = 0.80
     if (
         site_profile is not None
         and site_profile.flight is not None
@@ -882,6 +892,18 @@ def _hardware_approval_manifest(hardware_approval: object | None) -> dict | None
     }
 
 
+def _source_manifest_metadata(interface_mode: InterfaceMode, source_sha256: str) -> dict:
+    if interface_mode is InterfaceMode.REAL_FLIGHT:
+        return {"source_integrity": "LIVE_STREAM", "source_declared_frames": "", "source_decoded_frames": ""}
+    from validate_p119_source import EXPECTED_SHA256, EXPECTED_DECLARED_FRAMES, EXPECTED_DECODED_FRAMES
+    known = source_sha256 == EXPECTED_SHA256
+    return {
+        "source_integrity": "KNOWN_INCOMPLETE" if known else "UNVERIFIED",
+        "source_declared_frames": str(EXPECTED_DECLARED_FRAMES) if known else "",
+        "source_decoded_frames": str(EXPECTED_DECODED_FRAMES) if known else "",
+    }
+
+
 def _operator_session_manifest(
     args: argparse.Namespace,
     interface_mode: InterfaceMode,
@@ -899,6 +921,9 @@ def _operator_session_manifest(
         "mission_snapshot_id": str(getattr(args, "mission_snapshot_id", "") or ""),
         "mission_flight_ready": bool(getattr(args, "mission_flight_ready", False)),
         "mission_flight_errors": list(getattr(args, "mission_flight_errors", ()) or ()),
+        "mission_localization_errors": list(getattr(args, "mission_localization_errors", ()) or ()),
+        "mission_route_errors": getattr(args, "mission_route_errors", None),
+        "mission_non_route_flight_errors": getattr(args, "mission_non_route_flight_errors", None),
         "mission_evaluation_only": bool(getattr(args, "mission_evaluation_only", False)),
         "mission_evaluation_waived_errors": list(
             getattr(args, "mission_evaluation_waived_errors", ()) or ()
@@ -907,9 +932,7 @@ def _operator_session_manifest(
         "runtime_profile_sha256": identity.runtime_profile_sha256,
         "source": identity.source_identity,
         "source_sha256": identity.source_sha256,
-        "source_integrity": os.environ.get("SFM_SOURCE_INTEGRITY", "UNVERIFIED"),
-        "source_declared_frames": os.environ.get("SFM_SOURCE_DECLARED_FRAMES", ""),
-        "source_decoded_frames": os.environ.get("SFM_SOURCE_DECODED_FRAMES", ""),
+        **_source_manifest_metadata(interface_mode, identity.source_sha256),
         "python": sys.version,
         "runtime": collect_runtime_identity(),
         "argv": list(sys.argv),
@@ -950,6 +973,16 @@ def _create_operator_session(
             identity,
         ),
     )
+    try:
+        app.atexit.register(lambda: session_logs.close(reason="process_atexit"))
+    except BaseException:
+        # Until registration succeeds, this function is the shutdown owner.
+        try:
+            session_logs.close(reason="exit_registration_failed")
+        except Exception:
+            # Preserve the launch failure even if final persistence also fails.
+            pass
+        raise
     session_config = SessionConfig(
         session_id=session_logs.directory.name,
         interface_mode=interface_mode,
@@ -986,17 +1019,7 @@ def _create_operator_session(
             takeoff_blocked=disk_status.takeoff_blocked,
             reason=disk_status.reason,
         )
-    app.atexit.register(lambda: session_logs.close(reason="process_atexit"))
     return session_logs, session_config
-
-
-def _approved_versions(
-    hardware_approval: object | None,
-    attribute: str,
-) -> tuple[str, ...]:
-    if hardware_approval is None or not hardware_approval.approved:
-        return ()
-    return tuple(getattr(hardware_approval, attribute))
 
 
 def _build_operator_backend(
@@ -1004,59 +1027,10 @@ def _build_operator_backend(
     session_logs: SessionLogs,
     hardware_approval: object | None,
 ) -> tuple[object, object | None, object | None]:
-    if not args.live:
-        backend = DroneBackend(session_logs=session_logs)
-        video_stream = None
-        if args.video:
-            video_stream = FFmpegFrameStream(
-                Path(args.video),
-                STREAM_WIDTH,
-                STREAM_HEIGHT,
-                stride=args.video_stride,
-                fps=ANAFI.stream_fps,
-                link_sim=app.resolve_anafi_link_sim(),
-            )
-            backend.video = LegacyFrameSourceAdapter(video_stream, str(Path(args.video).resolve()))
-        return backend, video_stream, None
-
-    from olympe_live_backend import OlympeLiveBackend
-
-    cmd_log = session_logs.directory / "commands.jsonl"
-    live_backend = OlympeLiveBackend(
-        DroneState,
-        ANAFI,
-        ip=args.ip,
-        controller=args.controller,
-        nudge_pct=args.nudge_pct,
-        nudge_pulse_s=args.nudge_pulse_s,
-        max_altitude_m=args.max_altitude_m,
-        max_distance_m=args.max_distance_m,
-        distance_geofence=bool(args.distance_geofence),
-        min_takeoff_battery_pct=float(args.min_takeoff_battery_pct),
-        max_tilt_deg=float(args.max_tilt_deg),
-        max_vertical_speed_ms=float(args.max_vertical_speed_ms),
-        max_rotation_speed_degs=float(args.max_rotation_speed_degs),
-        max_pitch_roll_rotation_speed_degs=float(args.max_pitch_roll_rotation_speed_degs),
-        rth_min_altitude_m=float(args.rth_min_altitude_m),
-        auto_pc_control=bool(args.auto_pc_control),
-        stream_loss_grace_s=float(args.stream_loss_grace_s),
-        require_gps_for_geofence=bool(args.require_gps_for_geofence),
-        approved_aircraft_firmware=_approved_versions(
-            hardware_approval, "aircraft_firmware_versions"
-        ),
-        approved_controller_firmware=_approved_versions(
-            hardware_approval, "controller_firmware_versions"
-        ),
-        approved_olympe_versions=_approved_versions(hardware_approval, "olympe_versions"),
-        cmd_log=cmd_log,
-        event_log=session_logs.command_log,
-        session_logs=session_logs,
-        with_video=not args.no_live_video,
-        defer_connect=True,
+    return build_aircraft_runtime(
+        args, session_logs, hardware_approval,
+        definition=getattr(args, "aircraft_definition", None),
     )
-    video_stream = live_backend.video_stream
-    print(f"[live] command log -> {cmd_log}", flush=True)
-    return live_backend, video_stream, live_backend
 
 
 def _connect_operator_live_runtime(runtime: ActiveSiteRuntime) -> None:
@@ -1100,6 +1074,10 @@ def _announce_localizer_mode(args: argparse.Namespace) -> None:
         )
 
 
+def _operator_aircraft_profile(args: argparse.Namespace):
+    return (getattr(args, "aircraft_definition", None) or CURRENT_AIRCRAFT).profile
+
+
 def _build_operator_localizer(
     args: argparse.Namespace,
     site_profile: SiteProfile | None,
@@ -1110,11 +1088,16 @@ def _build_operator_localizer(
     )
     if not want_loc:
         return None
+    aircraft = _operator_aircraft_profile(args)
+    if site_profile is not None and site_profile.query_camera is not None:
+        camera = site_profile.query_camera
+        if (camera.width, camera.height) != (aircraft.stream_width, aircraft.stream_height):
+            raise ValueError("query_camera must describe the exact adapter stream geometry")
     localizer = LiveLocalizerClient(
         Path(args.localizer_worker),
         args.localizer_python,
-        STREAM_WIDTH,
-        STREAM_HEIGHT,
+        aircraft.stream_width,
+        aircraft.stream_height,
         Path(args.bundle),
         args.megaloc_cache,
         reference_index=str(getattr(args, "reference_index", "") or ""),
@@ -1140,11 +1123,12 @@ def _build_operator_detector(
 ) -> object | None:
     if not args.live_detect or (video_stream is None and (not args.live or args.no_live_video)):
         return None
+    aircraft = _operator_aircraft_profile(args)
     return LiveDetectorClient(
         Path(args.detector_worker),
         args.detector_python,
-        STREAM_WIDTH,
-        STREAM_HEIGHT,
+        aircraft.stream_width,
+        aircraft.stream_height,
         Path(args.detector_model),
         imgsz=640,
         conf=args.detector_conf,
@@ -1156,7 +1140,7 @@ def _build_operator_detector(
 
 
 def _load_operator_replay(args: argparse.Namespace) -> list:
-    if not args.replay_json or args.live_localize:
+    if args.live or not args.replay_json or args.live_localize:
         return []
     replay = json.loads(Path(args.replay_json).read_text(encoding="utf-8"))
     return replay.get("rows", [])
@@ -1211,6 +1195,63 @@ class _SiteSwitchParser:
         raise ValueError(message)
 
 
+def _same_localization_identity(left: SiteProfile, right: SiteProfile) -> bool:
+    # Routes are intentionally mutable through validated UI commits. Every
+    # other digest/frame/camera binding must still match the selected mission.
+    left_hashes = {key: value for key, value in asdict(left.asset_sha256).items() if key != "route_json"}
+    right_hashes = {key: value for key, value in asdict(right.asset_sha256).items() if key != "route_json"}
+    return (
+        left.site_id == right.site_id and left.coordinate_frame == right.coordinate_frame
+        and left.query_camera == right.query_camera and left_hashes == right_hashes
+        and getattr(left, "localizer", None) == getattr(right, "localizer", None)
+        and all(
+            getattr(getattr(left, "pose_chain", None), key, None)
+            == getattr(getattr(right, "pose_chain", None), key, None)
+            for key in ("site_frame_id", "vehicle_id", "body_frame_id", "camera_frame_id")
+        )
+    )
+
+
+def _refresh_site_mission_provenance(args, base_args, profile: SiteProfile) -> None:
+    """Reuse readiness only for the same validated map, or resolve its own mission."""
+    previous = None
+    if getattr(base_args, "site_profile", ""):
+        previous = app.load_site_profile(base_args.site_profile)
+    if previous is not None and _same_localization_identity(previous, profile):
+        return
+    args.mission_selection = ""
+    args.mission_selection_sha256 = ""
+    args.mission_snapshot_id = ""
+    args.mission_flight_ready = False
+    args.mission_flight_errors = ("selected map has no matching independently validated mission selection",)
+    args.mission_localization_errors = ()
+    args.mission_route_errors = None
+    args.mission_non_route_flight_errors = None
+    args.mission_evaluation_only = evaluation_only_requested()
+    args.mission_evaluation_waived_errors = ()
+    for selection in sorted((app._CTRL_ROOT / "mission_selections").glob("*.json")):
+        try:
+            mission = app.resolve_mission(selection, workspace_root=app._WS.root)
+            snapshot_path = mission.materialize_legacy_site_profile(app._WS.runtime / "mission_snapshots")
+            candidate = app.load_site_profile(snapshot_path)
+            if not _same_localization_identity(candidate, profile):
+                continue
+            evaluation_only, waived = evaluation_only_admission(mission.readiness)
+            args.mission_selection = str(mission.selection.source)
+            args.mission_selection_sha256 = mission.selection_sha256
+            args.mission_snapshot_id = mission.identity
+            args.mission_evaluation_only = bool(evaluation_only or evaluation_only_requested())
+            args.mission_flight_ready = bool(mission.readiness.flight_ready) and not args.mission_evaluation_only
+            args.mission_flight_errors = tuple(mission.readiness.flight_errors)
+            args.mission_localization_errors = tuple(getattr(mission.readiness, "localization_errors", ()) or ())
+            args.mission_route_errors = getattr(mission.readiness, "route_errors", None)
+            args.mission_non_route_flight_errors = getattr(mission.readiness, "non_route_flight_errors", None)
+            args.mission_evaluation_waived_errors = tuple(waived)
+            return
+        except (ManifestError, OSError, ValueError):
+            continue
+
+
 def _prepare_operator_site_runtime(
     base_args: argparse.Namespace,
     profile_path: str | Path,
@@ -1224,14 +1265,16 @@ def _prepare_operator_site_runtime(
     profile = app.resolve_operator_site_assets(args, _SiteSwitchParser())
     if profile is None:
         raise ValueError("site switch requires an explicit site profile")
+    _refresh_site_mission_provenance(args, base_args, profile)
     query_camera = profile.query_camera
+    aircraft = _operator_aircraft_profile(args)
     if query_camera is not None and (
-        query_camera.width != STREAM_WIDTH or query_camera.height != STREAM_HEIGHT
+        query_camera.width != aircraft.stream_width or query_camera.height != aircraft.stream_height
     ):
         raise ValueError(
             "query_camera must describe the exact frame sent to localization: "
             f"profile={query_camera.width}x{query_camera.height}, "
-            f"stream={STREAM_WIDTH}x{STREAM_HEIGHT}. Scale intrinsics or calibrate "
+            f"stream={aircraft.stream_width}x{aircraft.stream_height}. Scale intrinsics or calibrate "
             "the actual stream; changing only the JSON dimensions is invalid."
         )
 
@@ -1255,6 +1298,122 @@ def _prepare_operator_site_runtime(
         route_points=tuple(route_points),
         mission_route_snapshot=route_snapshot,
         replay_rows=tuple(replay_rows),
+    )
+
+
+#: 地圖檔/場域/<資料夾> -> 模擬器/測試影片 內拍攝該場域的影片。離線模擬按鈕據此
+#: 選影片；資料夾名稱即場域家族，所以其下所有 release 共用同一支影片。
+SITE_SIMULATION_VIDEOS = {
+    "fuhe_bridge": "P1130113.MP4",
+    "river_site": "P1980198.MP4",
+    "wulai_all9_direct_20261019": "P0170017.MP4",
+}
+
+
+def _site_simulation_video(profile, directory: Path) -> tuple[bool, Path | None]:
+    """(mapped, video) for the site family holding this profile."""
+    if profile is None:
+        return False, None
+    try:
+        family = profile.source.resolve().relative_to(app._WS.site_packages.resolve()).parts[0]
+    except (ValueError, IndexError):
+        return False, None
+    name = SITE_SIMULATION_VIDEOS.get(family)
+    if name is None:
+        return False, None
+    video = directory / name
+    return True, video.resolve() if video.is_file() else None
+
+
+def resolve_simulation_video(prepared: PreparedSiteRuntime, remembered: Path | None = None) -> Path | None:
+    """The site's own recording, else an existing configured source, else the launcher default.
+
+    A mapped site whose recording is missing returns None so the operator picks a
+    file; falling through would replay another site's remembered video."""
+    directory = Path(os.environ.get("VIDEO_DIR", str(app._WS.root / "模擬器" / "測試影片"))).expanduser()
+    mapped, site_video = _site_simulation_video(prepared.profile, directory)
+    if mapped:
+        return site_video
+    for raw in (
+        remembered,
+        getattr(prepared.args, "video", ""),
+        os.environ.get("SFM_SIMULATION_VIDEO", ""),
+        os.environ.get("VIDEO", ""),
+    ):
+        if raw:
+            path = Path(raw).expanduser()
+            if not path.is_absolute():
+                base = prepared.profile.source.parent if prepared.profile is not None else app._WS.root
+                path = base / path
+            if path.is_file():
+                return path.resolve()
+    preferred = directory / "P1190119.MP4"
+    if preferred.is_file():
+        return preferred.resolve()
+    candidates = sorted(
+        path for path in directory.iterdir()
+        if path.is_file() and path.suffix.lower() in {".mp4", ".mov", ".mkv", ".avi"}
+    ) if directory.is_dir() else []
+    return candidates[0].resolve() if len(candidates) == 1 else None
+
+
+def _prepare_operator_mode_runtime(
+    prepared: PreparedSiteRuntime,
+    mode: InterfaceMode,
+    video: Path | None,
+    *,
+    route_snapshot: MissionRouteSnapshot | None,
+    route_points: tuple,
+) -> PreparedSiteRuntime:
+    """Validate a mode-only plan without replacing the selected map or route."""
+    args = argparse.Namespace(**vars(prepared.args))
+    args.interface_mode = mode.value
+    args.live = mode is InterfaceMode.REAL_FLIGHT
+    args.video = ""
+    args.replay_json = ""
+    profile = prepared.profile
+    if args.live and profile is None:
+        raise ValueError("real-flight requires a selected site profile; select a map before connecting")
+    hardware_approval = prepared.hardware_approval
+    if profile is not None:
+        profile = app.load_site_profile(profile.source)
+        if not _same_localization_identity(profile, prepared.profile):
+            raise ValueError("active map/calibration identity changed; select the map again before switching mode")
+        app._verify_operator_profile_assets(profile, _SiteSwitchParser())
+        hardware_approval = (
+            app.load_hardware_approval_receipt(profile.hardware_approval)
+            if profile.hardware_approval is not None else None
+        )
+        if route_snapshot is not None:
+            route_snapshot.verify_file_unchanged()
+            profile = app.profile_for_selected_route(profile.source, route_snapshot.path)
+            args.route_json = str(route_snapshot.path)
+    readiness = selected_route_mission_readiness(args, profile, route_snapshot)
+    args.mission_flight_ready = readiness.flight_ready
+    args.mission_flight_errors = readiness.flight_errors
+    args.mission_route_errors = readiness.route_errors
+    if mode is InterfaceMode.SIMULATED_STREAM:
+        if video is None or not video.is_file() or video.stat().st_size <= 0:
+            raise ValueError("a nonempty recorded video is required for offline simulation")
+        if video.name == "P1190119.MP4":
+            from validate_p119_source import EXPECTED_SHA256
+            if app.file_sha256(video) != EXPECTED_SHA256:
+                raise ValueError("P119 source SHA-256 mismatch; select another recording explicitly")
+        # Decode a real frame before cutting over. Metadata alone can describe a
+        # truncated file with no usable frames. This subprocess never uses a SDK.
+        probe = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-loglevel", "error", "-i", str(video),
+             "-vf", "scale=1:1", "-frames:v", "1", "-f", "rawvideo",
+             "-pix_fmt", "rgb24", "pipe:1"],
+            capture_output=True, timeout=10, check=False,
+        )
+        if len(probe.stdout) != 3:
+            raise ValueError("recorded video has no decodable frame")
+        args.video = str(video.resolve())
+    return replace(
+        prepared, args=args, interface_mode=mode, profile=profile, hardware_approval=hardware_approval,
+        route_points=route_points, mission_route_snapshot=route_snapshot,
+        replay_rows=(),
     )
 
 
@@ -1285,7 +1444,7 @@ def _discard_partial_operator_runtime(
             cleanup()
         except Exception:
             pass
-    elif live_backend is None:
+    if live_backend is None:
         _best_effort_close(video_stream)
     if session_logs is not None:
         try:
@@ -1371,6 +1530,10 @@ class _OperatorLaunch:
 def _prepare_operator_launch_inputs() -> _OperatorLaunchInputs | None:
     parser = build_argument_parser()
     args = _parse_operator_arguments(parser)
+    definition = getattr(args, "aircraft_definition", None) or CURRENT_AIRCRAFT
+    args.aircraft_definition = replace(definition, profile=replace(
+        definition.profile, stream_fps=float(args.stream_fps),
+    ))
     site_profile, hardware_approval = _resolve_startup_site(args, parser)
     _resolve_live_safety(args, parser)
     route_path = Path(args.route_json) if args.route_json else None
@@ -1392,7 +1555,6 @@ def _prepare_operator_launch_inputs() -> _OperatorLaunchInputs | None:
     )
     _resolve_startup_localizer(args)
     _announce_site_assets(args, site_profile, route_path, route_hash)
-    object.__setattr__(ANAFI, "stream_fps", float(args.stream_fps))
     points = _load_runtime_map(args, site_profile)
     if _run_operator_selftest(args, points):
         return None
@@ -1427,8 +1589,7 @@ def _main_site_runtime(
     lost_hold: LostHoldPolicy | None,
     replay_rows: list[dict],
 ) -> ActiveSiteRuntime | None:
-    if inputs.site_profile is None:
-        return None
+    # Legacy per-asset launches also need an owned runtime for mode replacement.
     prepared = PreparedSiteRuntime(
         args=inputs.args,
         interface_mode=inputs.interface_mode,
@@ -1500,8 +1661,10 @@ def _build_operator_launch(inputs: _OperatorLaunchInputs) -> _OperatorLaunch:
         mission_route_snapshot=inputs.mission_route_snapshot,
         site_runtime=site_runtime,
         prepare_site_runtime=_prepare_operator_site_runtime,
+        prepare_mode_runtime=_prepare_operator_mode_runtime,
+        resolve_simulation_video=resolve_simulation_video,
         start_site_runtime=_start_operator_site_runtime,
-        connect_live_runtime=_connect_operator_live_runtime if args.live else None,
+        connect_live_runtime=_connect_operator_live_runtime,
     )
     return _OperatorLaunch(
         app=app,
@@ -1517,6 +1680,9 @@ def _configure_operator_launch(launch: _OperatorLaunch, inputs: _OperatorLaunchI
     app = launch.app
     app._mission_flight_ready = bool(getattr(inputs.args, "mission_flight_ready", False))
     app._mission_evaluation_only = bool(getattr(inputs.args, "mission_evaluation_only", False))
+    app._mission_readiness_evidence = inputs.args
+    app._sync_autonomy_profile_approval()
+    app._update_preflight_guide(app.current_state)
     app.route_pts = inputs.route_points
     if app.route_pts:
         print(

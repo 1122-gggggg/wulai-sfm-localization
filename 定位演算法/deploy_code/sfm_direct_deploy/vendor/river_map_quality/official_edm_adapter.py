@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import math
 import os
-from collections import OrderedDict, defaultdict
+from collections import OrderedDict
 from collections.abc import Mapping, Sequence
 from typing import Any
 from dataclasses import dataclass
@@ -396,34 +396,91 @@ def deduplicate_lifted_matches(
             match.query_xy,
         ),
     )
-    grid: dict[tuple[int, int], list[LiftedMatch]] = defaultdict(list)
+    if not ordered:
+        return DeduplicatedMatches(
+            matches=(),
+            conflicting_query_match_count=0,
+            duplicate_point3d_match_count=0,
+        )
+    # The greedy admission below is order dependent, so it stays a sequential
+    # pass.  What is vectorised is the spatial neighbour search: for every match
+    # the earlier matches in the same 3x3 cell neighbourhood that lie within the
+    # conflict radius are found in bulk, block by block.  The scalar pass then
+    # only consults those lists and filters them by "already accepted", which is
+    # exactly what the per-cell scan of accepted matches computed.
+    query_xy = np.array([match.query_xy for match in ordered], dtype=np.float64)
+    if not np.isfinite(query_xy).all():
+        raise ValueError("lifted query locations must be finite")
+    point3d_ids = [match.point3d_id for match in ordered]
+    radius_sq = query_conflict_distance_px * query_conflict_distance_px
+    cells = np.floor(query_xy / query_conflict_distance_px).astype(np.int64)
+    unique_x = np.unique(cells[:, 0])
+    unique_y = np.unique(cells[:, 1])
+    stride = len(unique_y)
+    keys = np.searchsorted(unique_x, cells[:, 0]) * stride
+    keys += np.searchsorted(unique_y, cells[:, 1])
+    # Stable: a cell keeps its members in ascending order index.
+    by_cell = np.argsort(keys, kind="stable")
+    cell_keys, cell_start, cell_count = np.unique(
+        keys[by_cell], return_index=True, return_counts=True
+    )
+    offsets = [(x, y) for x in (-1, 0, 1) for y in (-1, 0, 1)]
+
+    is_accepted = [False] * len(ordered)
     accepted: list[LiftedMatch] = []
     point_ids: set[int] = set()
     conflicts = 0
     duplicates = 0
-    radius_sq = query_conflict_distance_px * query_conflict_distance_px
-    for match in ordered:
-        x_cell = math.floor(match.query_xy[0] / query_conflict_distance_px)
-        y_cell = math.floor(match.query_xy[1] / query_conflict_distance_px)
-        nearby = [
-            earlier
-            for x_offset in (-1, 0, 1)
-            for y_offset in (-1, 0, 1)
-            for earlier in grid.get((x_cell + x_offset, y_cell + y_offset), ())
-            if (earlier.query_xy[0] - match.query_xy[0]) ** 2
-            + (earlier.query_xy[1] - match.query_xy[1]) ** 2
-            <= radius_sq
-        ]
-        if any(earlier.point3d_id != match.point3d_id for earlier in nearby):
-            conflicts += 1
-            continue
-        if nearby or (match.point3d_id is not None and match.point3d_id in point_ids):
-            duplicates += 1
-            continue
-        accepted.append(match)
-        if match.point3d_id is not None:
-            point_ids.add(match.point3d_id)
-        grid[(x_cell, y_cell)].append(match)
+    block = 1024
+    for first in range(0, len(ordered), block):
+        rows = np.arange(first, min(first + block, len(ordered)))
+        starts = np.zeros((len(rows), len(offsets)), dtype=np.int64)
+        counts = np.zeros_like(starts)
+        for column, (x_offset, y_offset) in enumerate(offsets):
+            rank_x, has_x = _dense_rank(unique_x, cells[rows, 0] + x_offset)
+            rank_y, has_y = _dense_rank(unique_y, cells[rows, 1] + y_offset)
+            slot, occupied = _dense_rank(cell_keys, rank_x * stride + rank_y)
+            occupied &= has_x & has_y
+            starts[:, column] = np.where(occupied, cell_start[slot], 0)
+            counts[:, column] = np.where(occupied, cell_count[slot], 0)
+        flat_counts = counts.ravel()
+        total = int(flat_counts.sum())
+        if total:
+            within_cell = np.arange(total) - np.repeat(
+                np.cumsum(flat_counts) - flat_counts, flat_counts
+            )
+            earlier = by_cell[np.repeat(starts.ravel(), flat_counts) + within_cell]
+            owner = np.repeat(np.repeat(rows, len(offsets)), flat_counts)
+            delta_x = query_xy[earlier, 0] - query_xy[owner, 0]
+            delta_y = query_xy[earlier, 1] - query_xy[owner, 1]
+            near = (earlier < owner) & (delta_x * delta_x + delta_y * delta_y <= radius_sq)
+            earlier = earlier[near]
+            owner = owner[near]
+        else:
+            earlier = owner = np.zeros(0, dtype=np.int64)
+        # ``owner`` is non-decreasing, so each row's neighbours are contiguous.
+        bounds = np.searchsorted(owner, np.arange(first, first + len(rows) + 1)).tolist()
+        neighbours = earlier.tolist()
+        for local, index in enumerate(range(first, first + len(rows))):
+            point3d_id = point3d_ids[index]
+            nearby = False
+            conflicting = False
+            for other in neighbours[bounds[local] : bounds[local + 1]]:
+                if is_accepted[other]:
+                    nearby = True
+                    if point3d_ids[other] != point3d_id:
+                        conflicting = True
+                        break
+            if conflicting:
+                conflicts += 1
+                continue
+            if nearby or (point3d_id is not None and point3d_id in point_ids):
+                duplicates += 1
+                continue
+            is_accepted[index] = True
+            accepted.append(ordered[index])
+            if point3d_id is not None:
+                point_ids.add(point3d_id)
     return DeduplicatedMatches(
         matches=tuple(accepted),
         conflicting_query_match_count=conflicts,

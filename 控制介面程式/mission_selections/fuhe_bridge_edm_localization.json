@@ -15,7 +15,7 @@
   },
   "route": {
     "path": "../mission_components/routes/fuhe_bridge_operator_route.json",
-    "sha256": "0f5713bc2b7d5d4f3e7acb999ef82210eedeed994498e5b1d2ca4ad625a34d72"
+    "sha256": "750f789a357096e569ada8856cbd19ac0dd0a4a4f9a03ec8844e781cd1222a16"
   },
   "schema": "sfm-mission-selection/v1",
   "selection_id": "fuhe_bridge_edm_localization",

@@ -6,6 +6,7 @@ env/
 outputs/*
 !outputs/README.md
 .codegraph/
+/runs/
 **/torch_hub_cache/
 # Compiled EDM coarse-tail kernels. Regenerable (~5 s cold) and machine-specific.
 執行環境/inductor_cache/
@@ -20,6 +21,7 @@ outputs/*
 # 只有說明文件進版控，讓 repo 記錄格式而不攜帶任何場域資料。
 地圖檔/場域/*/
 !地圖檔/場域/README.md
+/地圖檔/場域/.*.asset.lock
 # river_site overlay: intrinsic difficult localization spheres (red) — allowed to be tracked
 !地圖檔/場域/river_site/
 地圖檔/場域/river_site/*
@@ -37,6 +39,8 @@ outputs/*
 執行環境/models/vista_slam/
 # Optional pretrained segmentation benchmark checkpoint; not a portable runtime asset.
 執行環境/models/yolo26n-seg.pt
+# 現場三類電力設備偵測權重保存在本機 runtime store，不進 Git 歷史。
+執行環境/models/power_equipment_sample50_3class_yolo26n_640_aug_best.pt
 # direct 後端的執行期 scratch（placeholder manifest、EDM runtime config）。
 執行環境/direct_reloc_cache/
 river-localization-bundle-20260831/
@@ -57,9 +61,11 @@ river-deploy-5060-20260908.tar.zst*.sha256
 **/__pycache__/
 **/.pytest_cache/
 **/.ruff_cache/
+**/.mypy_cache/
 .coverage
 .coverage.*
 coverage.xml
 htmlcov/
 .cursor/
 執行環境/mission_snapshots/
+執行環境/last_mission_selection.json

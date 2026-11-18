@@ -1,15 +1,19 @@
-"""Read-only session telemetry and video-delivery diagnostics for the live backend.
+"""Read-only session telemetry, event receipts and video-delivery diagnostics.
 
-These helpers log observations; they never issue aircraft commands.
+These helpers observe SDK state and log it; they never issue aircraft commands.
 """
 
 from __future__ import annotations
 
 import importlib
+import json
 import math
 import threading
 import time
 from collections import deque
+from typing import Any
+
+from live_localizer_protocol import MAX_FUSED_SYNC_ERROR_S
 
 #: Attitude/speed events kept for the control loop between UI polls.
 MOTION_HISTORY_SIZE = 512
@@ -35,8 +39,56 @@ def _map_entry(state, key_field: str, key: int) -> dict | None:
     return None
 
 
+def telemetry_event_observation(
+    drone,
+    message: Any,
+    fallback_state: dict[str, Any],
+    *,
+    map_key: Any = None,
+    now_mono_ns: int,
+) -> tuple[dict[str, Any], object, int] | None:
+    """Read a receipt marker/time without trusting a future event's payload.
+
+    ``None`` rejects a faulty event clock; callers must retain their last trusted
+    sample instead of treating the SDK cache as a fresh observation.
+    """
+    state = dict(fallback_state)
+    marker: object = ("cache", json.dumps(state, sort_keys=True, default=str))
+    observed_mono_ns = int(now_mono_ns)
+    get_last_event = getattr(drone, "get_last_event", None)
+    invalid_event_timestamp = False
+    if callable(get_last_event):
+        try:
+            if map_key is not None:
+                event = get_last_event(message, key=map_key)
+            else:
+                event = get_last_event(message)
+            if event is None:
+                raise KeyError(f"missing event for map key {map_key}")
+            wall_age_s = time.time() - float(event.date.timestamp())
+            if not math.isfinite(wall_age_s) or wall_age_s < 0.0:
+                invalid_event_timestamp = True
+                raise ValueError("invalid telemetry event timestamp")
+            # Validate the event clock before allowing its payload or marker
+            # to replace the last trusted state.
+            state = dict(event.args)
+            marker = ("event", str(event.uuid))
+            observed_mono_ns -= int(max(0.0, wall_age_s) * 1_000_000_000)
+        except (
+            AttributeError,
+            KeyError,
+            RuntimeError,
+            TypeError,
+            ValueError,
+            OverflowError,
+        ):
+            if invalid_event_timestamp:
+                return None
+    return state, marker, observed_mono_ns
+
+
 class MotionEventHistory:
-    """Bounded yaw and horizontal-NED event history on the host monotonic clock.
+    """Bounded control and full localization motion history on the receipt clock.
 
     Olympe's ``get_state`` only exposes the newest value, so the UI poll would
     drop intermediate turns and accelerations. Each event is converted from its
@@ -45,6 +97,7 @@ class MotionEventHistory:
     """
 
     FIELDS = (("AttitudeChanged", ("yaw",)), ("SpeedChanged", ("speedX", "speedY")))
+    LOCALIZATION_FIELDS = (("roll", "pitch", "yaw"), ("speedX", "speedY", "speedZ"))
 
     def __init__(
         self, maxlen: int = MOTION_HISTORY_SIZE, *, now=time.monotonic, wall_now=time.time
@@ -53,31 +106,44 @@ class MotionEventHistory:
         self._now = now
         self._wall_now = wall_now
         self._rows = tuple(deque(maxlen=maxlen) for _ in self.FIELDS)
+        self._localization_rows = tuple(deque(maxlen=maxlen) for _ in self.FIELDS)
         self._evicted_counts = [0 for _ in self.FIELDS]
         self._evicted_through = [None for _ in self.FIELDS]
         self._subscriptions: list = []
 
     def record(self, index: int, event) -> None:
-        fields = self.FIELDS[index][1]
         try:
-            values = [float(event.args[key]) for key in fields]
             age_s = float(self._wall_now()) - float(event.date.timestamp())
             stamp = float(self._now()) - max(0.0, age_s)
-        except (AttributeError, KeyError, TypeError, ValueError, OverflowError):
+        except (AttributeError, TypeError, ValueError, OverflowError):
             return
-        if not -0.05 <= age_s <= _MAX_EVENT_AGE_S:
+        if not -0.05 <= age_s <= _MAX_EVENT_AGE_S or not math.isfinite(stamp):
             return
-        sample = (*values, stamp)
-        if not all(math.isfinite(value) for value in sample):
-            return
+
+        def values_for(fields):
+            try:
+                values = tuple(float(event.args[key]) for key in fields)
+            except (AttributeError, KeyError, TypeError, ValueError, OverflowError):
+                return None
+            return values if all(math.isfinite(value) for value in values) else None
+
+        values = values_for(self.FIELDS[index][1])
+        full_values = values_for(self.LOCALIZATION_FIELDS[index])
         with self._lock:
+            full_rows = self._localization_rows[index]
+            # Retain invalid full events as fences; never interpolate through
+            # a missing roll/pitch/down component or a malformed measurement.
+            if not full_rows or stamp > full_rows[-1][-1]:
+                full_rows.append((*(full_values or (None, None, None)), stamp))
+            if values is None:
+                return
             rows = self._rows[index]
             if rows and stamp <= rows[-1][-1]:
                 return
             if len(rows) == rows.maxlen:
                 self._evicted_counts[index] += 1
                 self._evicted_through[index] = rows[0][-1]
-            rows.append(sample)
+            rows.append((*values, stamp))
 
     def attach(self, drone) -> None:
         for index, (name, _fields) in enumerate(self.FIELDS):
@@ -144,6 +210,87 @@ class MotionEventHistory:
         """Snapshot samples and their loss indicator under the same source lock."""
         with self._lock:
             return self.since(since_stamps), self.diagnostic_snapshot(since_stamps)
+
+    @staticmethod
+    def _localization_sample_at(rows, capture, now, *, angular):
+        before = after = None
+        for row in reversed(rows):
+            if row[-1] > now:
+                continue
+            if row[-1] == capture:
+                return (row[:3], row[-1], (row[-1],)) if row[0] is not None else None
+            if row[-1] > capture:
+                after = row
+            else:
+                before = row
+                break
+        if (
+            before is not None and after is not None
+            and before[0] is not None and after[0] is not None
+            and capture - before[-1] <= MAX_FUSED_SYNC_ERROR_S
+            and after[-1] - capture <= MAX_FUSED_SYNC_ERROR_S
+        ):
+            alpha = (capture - before[-1]) / (after[-1] - before[-1])
+            values = []
+            for start, end in zip(before[:3], after[:3]):
+                delta = end - start
+                if angular:
+                    delta = (delta + math.pi) % (2 * math.pi) - math.pi
+                value = start + alpha * delta
+                if angular:
+                    value = (value + math.pi) % (2 * math.pi) - math.pi
+                values.append(value)
+            return tuple(values), capture, (before[-1], after[-1])
+        # No valid bracket: use only the nearest actual event, with its
+        # original stamp. Never extrapolate or restamp a stale measurement.
+        candidates = tuple(row for row in (before, after) if row is not None)
+        if not candidates:
+            return None
+        nearest = min(candidates, key=lambda row: abs(row[-1] - capture))
+        if nearest[0] is None or abs(nearest[-1] - capture) > MAX_FUSED_SYNC_ERROR_S:
+            return None
+        return nearest[:3], nearest[-1], (nearest[-1],)
+
+    def localization_at(self, capture_stamp) -> dict:
+        """Align attitude and NED velocity independently, without waiting."""
+        snapshot = {
+            "fused_telemetry_mono": None,
+            "fused_attitude_mono": None,
+            "fused_speed_mono": None,
+            "fused_stamp_source": "unavailable",
+            "speed_stamp_source": "unavailable",
+            "fused_attitude_source_mono": None,
+            "fused_speed_source_mono": None,
+            "fused_roll": None, "fused_pitch": None, "fused_yaw": None,
+            "fused_speed_north": None, "fused_speed_east": None, "fused_speed_down": None,
+        }
+        now = float(self._now())
+        try:
+            capture = float(capture_stamp)
+        except (TypeError, ValueError, OverflowError):
+            return snapshot
+        if not math.isfinite(capture) or not 0 < capture <= now:
+            return snapshot
+        signals = (
+            (("fused_roll", "fused_pitch", "fused_yaw"), "fused_attitude_mono",
+             "fused_stamp_source", "fused_attitude_source_mono"),
+            (("fused_speed_north", "fused_speed_east", "fused_speed_down"), "fused_speed_mono",
+             "speed_stamp_source", "fused_speed_source_mono"),
+        )
+        with self._lock:
+            for index, (fields, stamp_key, source_key, evidence_key) in enumerate(signals):
+                sample = self._localization_sample_at(
+                    self._localization_rows[index], capture, now, angular=index == 0,
+                )
+                if sample is None:
+                    continue
+                values, stamp, evidence = sample
+                snapshot.update(zip(fields, values))
+                snapshot[stamp_key] = stamp
+                snapshot[evidence_key] = evidence
+                snapshot[source_key] = "event_interpolated" if len(evidence) == 2 else "event_nearest"
+        snapshot["fused_telemetry_mono"] = snapshot["fused_attitude_mono"]
+        return snapshot
 
 
 def control_telemetry_history(
@@ -260,9 +407,6 @@ def video_delivery_snapshot(backend, now: float) -> dict:
 def poll_session_telemetry(backend, now: float) -> None:
     if backend.session_logs is None:
         return
-    flush = getattr(backend.session_logs, "flush_deferred", None)
-    if callable(flush):
-        flush()
     backend._poll_stick_axes(now)
     # Preserve source timestamps: polling this at 10 Hz does not turn cached
     # firmware data into independent 10 Hz measurements.

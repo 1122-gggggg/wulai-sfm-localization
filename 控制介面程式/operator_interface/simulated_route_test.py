@@ -37,12 +37,20 @@ class SimulatedRoutePlant:
         self.state = backend.state
         self.nudge_pct = 10
         self.pilot_sticks = False
-        self._runtime_safety_action_latched = False
+        self.runtime_safety_latched = False
+        self.maneuver_in_progress: str | None = None
         self._lock = threading.Lock()
         self._map_frame: MapFrame | None = None
         self._speed_limit_enabled: bool | None = None
         self._translation_velocity: NDArray[np.float64] = np.zeros(3, dtype=float)
         self.finished = False
+
+    def pilot_override_active(self) -> bool:
+        return self.pilot_sticks
+
+    def gimbal_pitch_sample(self) -> tuple[float, int] | None:
+        sample: tuple[float, int] | None = self.backend.gimbal_pitch_sample()
+        return sample
 
     def command(self, request: ControlRequest) -> ControlResult:
         """Camera-only delegation; route simulation never introduces live control."""

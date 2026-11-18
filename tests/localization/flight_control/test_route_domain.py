@@ -127,6 +127,36 @@ def test_route_arrival_radius_is_preserved_by_controller_conversion(tmp_path):
     assert config.progress_jump_slack >= 0.42
 
 
+@pytest.mark.parametrize("scale", [0.01, 0.1, 10.0, 100.0])
+def test_authored_route_geometry_scales_every_control_distance(tmp_path, scale):
+    # A route authored at another map scale has no known metres. Every control
+    # distance must therefore be a multiple of its own authored sphere.
+    def config(factor):
+        path = tmp_path / f"route_{factor}.json"
+        path.write_text(json.dumps(_route(
+            waypoints=[[0.0, 0.0, 0.0], [factor, 0.0, 0.0], [factor, factor, 0.0]],
+            arrive_radius_map_units=0.05 * factor,
+        )), encoding="utf-8")
+        return rpf.config_for_route(path)
+
+    base, scaled = config(1.0), config(scale)
+    for name in (
+        "waypoint_arrive_radius", "translation_arrival_tolerance",
+        "minimum_yaw_alignment_distance", "slowdown_distance", "lookahead",
+        "rejoin_tol", "arrive", "min_arrive", "inspect_radius",
+        "inspect_resume_margin", "max_progress_regression", "progress_jump_slack",
+    ):
+        assert getattr(scaled, name) == pytest.approx(scale * getattr(base, name)), name
+
+
+def test_route_without_authored_radius_keeps_explicit_legacy_geometry(tmp_path):
+    path = tmp_path / "route.json"
+    path.write_text(json.dumps(_route()), encoding="utf-8")
+    config = rpf.config_for_route(path)
+    assert config.waypoint_arrive_radius == rpf.DESKTOP_AUTO_DEFAULT_ARRIVE_RADIUS
+    assert config.slowdown_distance == rpf.ControlConfig().slowdown_distance
+
+
 def test_aligned_conversion_uses_the_declared_legacy_or_measured_authoring_frame():
     frame = rpf.MapFrame.from_gravity(MEASURED_GRAVITY)
     aligned = [[0.0, 0.0, 0.0], [1.0, 2.0, 3.0]]

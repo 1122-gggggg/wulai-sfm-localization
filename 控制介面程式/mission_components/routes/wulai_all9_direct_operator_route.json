@@ -1,0 +1,14 @@
+{
+  "schema": "sfm-route-package/v1",
+  "route_id": "wulai_all9_direct_operator_route",
+  "revision": "20261029_operator_accepted",
+  "site_id": "wulai_all9_direct_20261019",
+  "frame": {
+    "kind": "map",
+    "id": "wulai_all9_direct_20261019_fb82ff1efddf"
+  },
+  "route": {
+    "path": "../../../地圖檔/場域/wulai_all9_direct_20261019/routes/wulai_p0230023_10wp.json",
+    "sha256": "1b0f4a10da1ad6899cf8e40b9b34ff53bfc699fa020553359ab27a2fea74c9dc"
+  }
+}

@@ -25,7 +25,7 @@ from pathlib import Path
 
 
 _SHA256_CHUNK = 8 * 1024 * 1024
-_SHA256_CACHE: dict[tuple[int, int, int], str] = {}
+_SHA256_CACHE: dict[tuple[str, int, int, int], str] = {}
 
 
 def sha256_file(path: str | Path) -> str:
@@ -33,7 +33,7 @@ def sha256_file(path: str | Path) -> str:
     resolved = Path(path).resolve()
     try:
         st = resolved.stat()
-        key = (st.st_ino, int(st.st_mtime_ns), st.st_size)
+        key = (str(resolved), st.st_ino, int(st.st_mtime_ns), st.st_size)
     except OSError:
         key = None
     if key is not None and key in _SHA256_CACHE:

@@ -30,17 +30,14 @@ COPY_DIRS = (
     "控制介面程式",
     "定位演算法",
     "模擬器/parrot_stimulate",
-    "文件",
     "requirements",
     "tools",
 )
 COPY_FILES = (
     "README.md",
-    "outputs/README.md",
     ARTIFACT_MANIFEST,
     "pyproject.toml",
     "pytest.ini",
-    "驗證系統.sh",
 )
 LIVE_MINIMAL_COPY_DIRS = (
     "控制介面程式",
@@ -52,8 +49,6 @@ LIVE_MINIMAL_COPY_DIRS = (
 )
 LIVE_MINIMAL_COPY_FILES = (
     "README.md",
-    "PORTABLE_README.md",
-    "outputs/README.md",
     ARTIFACT_MANIFEST,
     "requirements/runtime-lock.txt",
     "tools/install_runtime.sh",

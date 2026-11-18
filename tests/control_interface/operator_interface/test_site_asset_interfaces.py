@@ -19,6 +19,8 @@ from local_site_assets import (
     inspect_direct_bundle,
     load_direct_runtime_profile,
     match_managed_site_profile_for_map,
+    preview_site_folder,
+    profile_for_selected_route,
 )
 from operator_actions import replace_site_profile_argument, require_safe_site_switch
 from site_profile import load_site_profile
@@ -343,6 +345,49 @@ def test_site_package_rejects_asset_path_outside_selected_folder(
         provider.validate_folder(package)
 
 
+def test_folder_preview_offers_import_only_for_a_complete_site_folder(
+    tmp_path: Path,
+) -> None:
+    package = _write_site_package(tmp_path)
+
+    complete = preview_site_folder(package)
+    assert complete.ready
+    assert (complete.site_id, complete.display_name) == ("test-yard", "Test Yard")
+    assert complete.coordinate_frame_id == "test-yard-reconstruction-v1"
+
+    (package / "reference_poses.json").unlink()
+    missing = preview_site_folder(package)
+    assert not missing.ready
+    assert [item.label for item in missing.files if item.problem] == ["參考影像位姿"]
+
+    no_manifest = preview_site_folder(tmp_path)
+    assert not no_manifest.ready and not no_manifest.files
+
+
+def test_folder_preview_refuses_what_the_importer_would_refuse(tmp_path: Path) -> None:
+    package = _write_site_package(tmp_path)
+    outside = tmp_path / "outside.ply"
+    outside.write_bytes((package / "map.ply").read_bytes())
+    profile_path = package / "site_profile.json"
+    raw = json.loads(profile_path.read_text(encoding="utf-8"))
+    raw["assets"]["map_ply"] = "../outside.ply"
+    profile_path.write_text(json.dumps(raw), encoding="utf-8")
+    outside_preview = preview_site_folder(package)
+    assert not outside_preview.ready
+    assert [item.label for item in outside_preview.files if item.problem] == ["點雲地圖"]
+
+    raw["assets"]["map_ply"] = "map.ply"
+    raw["assets"]["route_json"] = "map.ply"
+    profile_path.write_text(json.dumps(raw), encoding="utf-8")
+    embedded = preview_site_folder(package)
+    assert not embedded.ready
+    assert "route_json" in (embedded.error or "")
+
+    profile_path.write_text("not JSON", encoding="utf-8")
+    unreadable = preview_site_folder(package)
+    assert not unreadable.ready and unreadable.error
+
+
 def test_route_and_target_are_independent_profile_ports(tmp_path: Path) -> None:
     package = _write_site_package(tmp_path)
     managed = tmp_path / "managed"
@@ -386,8 +431,8 @@ def test_route_and_target_are_independent_profile_ports(tmp_path: Path) -> None:
     LocalRouteProvider(managed).import_file(route, profile_path)
     route_profile = load_site_profile(profile_path)
     assert route_profile.flight is not None
-    assert route_profile.flight.approved is True
-    assert route_profile.flight.route_clearance_approved is True
+    assert route_profile.flight.approved is False
+    assert route_profile.flight.route_clearance_approved is False
 
     LocalTargetProvider(managed).import_file(targets, profile_path)
     profile = load_site_profile(profile_path)
@@ -508,17 +553,16 @@ def test_auto_approval_rejects_a_route_not_authored_by_the_editor(
     )
     profile_path = site_provider.import_folder(package).profile_path
     route = _write_valid_route(tmp_path / "external-route.json")
-
-    LocalRouteProvider(managed).import_file(
-        route,
-        profile_path,
-        approve_for_auto=True,
-    )
+    payload = json.loads(route.read_text(encoding="utf-8"))
+    payload["source"] = "operator_route_editor"
+    route.write_text(json.dumps(payload), encoding="utf-8")
+    imported = LocalRouteProvider(managed).import_file(route, profile_path)
     profile = load_site_profile(profile_path)
     assert profile.flight is not None
-    assert profile.flight.approved is True
-    assert profile.flight.route_clearance_approved is True
-    assert "operator route editor" in profile.flight.approval_note.lower()
+    assert profile.flight.approved is False
+    assert profile.flight.route_clearance_approved is False
+    assert imported.approved_for_auto is False
+    assert not profile_for_selected_route(profile_path, imported.asset_path).flight.approved
 
     invalid_route = tmp_path / "invalid-route.json"
     invalid_route.write_text(
@@ -536,7 +580,7 @@ def test_auto_approval_rejects_a_route_not_authored_by_the_editor(
         ),
         encoding="utf-8",
     )
-    with pytest.raises(ValueError, match="non-zero segment"):
+    with pytest.raises(ValueError, match="zero length"):
         LocalRouteProvider(managed).import_file(invalid_route, profile_path)
 
 def test_route_commit_rolls_back_asset_when_profile_replace_fails(
@@ -562,7 +606,7 @@ def test_route_commit_rolls_back_asset_when_profile_replace_fails(
     monkeypatch.setattr(local_assets.os, "replace", fail_profile_replace)
 
     with pytest.raises(OSError, match="forced profile replace failure"):
-        LocalRouteProvider(managed).import_file(route, profile_path)
+        LocalRouteProvider(managed).import_file(route, profile_path, approve_for_auto=True)
 
     route_target = managed / "test-yard" / "routes" / "flight_route.json"
     assert not route_target.exists()
@@ -733,7 +777,9 @@ def _write_route_links(
 
 def test_delete_old_display_route_preserves_current_route_and_approval(tmp_path: Path) -> None:
     provider, profile_path = _route_deletion_site(tmp_path)
-    current = provider.import_file(_write_valid_route(tmp_path / "current.json"), profile_path)
+    current = provider.import_file(
+        _write_valid_route(tmp_path / "current.json"), profile_path, approve_for_auto=True,
+    )
     old = profile_path.parent / "old_flight_path.json"
     old.write_text(json.dumps({
         "schema": "legacy-route/v1",
@@ -1083,7 +1129,7 @@ def test_route_import_resolves_system_profile_to_its_managed_site(
     mismatched = json.loads(system_profile_path.read_text(encoding="utf-8"))
     mismatched["site_id"] = "wrong-site"
     system_profile_path.write_text(json.dumps(mismatched), encoding="utf-8")
-    with pytest.raises(ValueError, match="尚未對應"):
+    with pytest.raises(ValueError, match="wrong-site"):
         LocalRouteProvider(managed).import_file(route, system_profile_path)
 
 
@@ -1178,7 +1224,7 @@ def test_site_package_validate_rejects_non_directory(tmp_path: Path) -> None:
         provider.validate_folder(tmp_path / "missing")
 
 
-def test_route_import_action_propagates_committed_auto_approval(tmp_path: Path) -> None:
+def test_authored_route_action_propagates_committed_auto_approval(tmp_path: Path) -> None:
     from operator_actions import SiteAssetActions
 
     package = _write_site_package(tmp_path)
@@ -1192,10 +1238,10 @@ def test_route_import_action_propagates_committed_auto_approval(tmp_path: Path) 
     actions = SiteAssetActions(
         sites, LocalRouteProvider(managed), LocalTargetProvider(managed), profile,
     )
-    result = actions.import_route(_write_valid_route(tmp_path / "route.json"))
+    result = actions.import_authored_route(_write_valid_route(tmp_path / "route.json"))
     assert result.approved_for_auto is True
     assert result.asset_path == load_site_profile(profile).route_json
-    assert "將套用為 AUTO 航線" in result.message
+    assert "已自動核准" in result.message
     assert "請完成三項驗證" in result.message
 
 
@@ -1262,3 +1308,248 @@ def test_editor_save_automatically_approves_in_both_interfaces(tmp_path, monkeyp
     if edit:
         assert result.asset_path == previous
     assert (editor_args["test_route"] is None) == live
+
+
+def test_authored_routes_remain_approved_after_reopen_and_reselection(tmp_path):
+    from operator_actions import SiteAssetActions
+    from site_profile import flight_readiness_errors
+
+    provider, profile_path = _route_deletion_site(tmp_path)
+    actions = SiteAssetActions(None, provider, None, profile_path)
+    first = actions.import_authored_route(_write_valid_route(tmp_path / "first.json"))
+    second = actions.import_authored_route(_write_valid_route(tmp_path / "second.json"))
+    saved_profile = profile_path.read_bytes()
+    listed = {item.path for item in local_assets.describe_site_routes(profile_path.parent)}
+    assert {first.asset_path, second.asset_path} <= listed
+    assert load_site_profile(profile_path).route_json == second.asset_path
+    for route in (first, second):
+        selected = profile_for_selected_route(profile_path, route.asset_path)
+        assert selected.flight.approved and selected.flight.route_clearance_approved
+        assert selected.route_json == route.asset_path
+        assert selected.asset_sha256.route_json == _sha(route.asset_path)
+        assert "flight.approved is false" not in flight_readiness_errors(selected)
+        assert "flight.route_clearance_approved is false" not in flight_readiness_errors(selected)
+        # Route authoring does not invent the independent controller contract.
+        assert "missing flight.controller" in flight_readiness_errors(selected)
+    assert profile_path.read_bytes() == saved_profile
+
+
+def test_legacy_current_editor_approval_migrates_when_another_route_is_saved(tmp_path):
+    provider, profile_path = _route_deletion_site(tmp_path)
+    first = provider.import_file(
+        _write_valid_route(tmp_path / "first.json"), profile_path, approve_for_auto=True,
+    )
+    legacy = json.loads(profile_path.read_bytes())
+    legacy["flight"].pop("authored_routes")
+    profile_path.write_text(json.dumps(legacy), encoding="utf-8")
+    assert profile_for_selected_route(profile_path, first.asset_path).flight.approved
+    second = provider.import_file(
+        _write_valid_route(tmp_path / "second.json"), profile_path, approve_for_auto=True,
+    )
+    assert profile_for_selected_route(profile_path, first.asset_path).flight.approved
+    assert profile_for_selected_route(profile_path, second.asset_path).flight.approved
+
+
+def test_deleted_authored_route_cannot_reuse_its_old_approval(tmp_path):
+    provider, profile_path = _route_deletion_site(tmp_path)
+    first = provider.import_file(
+        _write_valid_route(tmp_path / "first.json"), profile_path, approve_for_auto=True,
+    )
+    second = provider.import_file(
+        _write_valid_route(tmp_path / "second.json"), profile_path, approve_for_auto=True,
+    )
+    original = first.asset_path.read_bytes()
+    provider.delete_file(first.asset_path, profile_path)
+    assert profile_for_selected_route(profile_path, second.asset_path).flight.approved
+    first.asset_path.write_bytes(original)
+    assert not profile_for_selected_route(profile_path, first.asset_path).flight.approved
+
+
+def test_editing_authored_route_replaces_sha_and_preserves_other_approvals(tmp_path):
+    provider, profile_path = _route_deletion_site(tmp_path)
+    first = provider.import_file(
+        _write_valid_route(tmp_path / "first.json"), profile_path, approve_for_auto=True,
+    )
+    second = provider.import_file(
+        _write_valid_route(tmp_path / "second.json"), profile_path, approve_for_auto=True,
+    )
+    old_bytes, old_sha = first.asset_path.read_bytes(), _sha(first.asset_path)
+    source = _write_valid_route(tmp_path / "edited.json")
+    raw = json.loads(source.read_bytes())
+    raw["waypoints"] = [[0, 0, 0], [2, 0, 0]]
+    source.write_text(json.dumps(raw), encoding="utf-8")
+    provider.import_file(source, profile_path, approve_for_auto=True, replace_route=first.asset_path)
+    selected = profile_for_selected_route(profile_path, first.asset_path)
+    assert selected.flight.approved
+    assert selected.asset_sha256.route_json != old_sha
+    assert profile_for_selected_route(profile_path, second.asset_path).flight.approved
+    first.asset_path.write_bytes(old_bytes)
+    with pytest.raises(ValueError, match="SHA-256"):
+        profile_for_selected_route(profile_path, first.asset_path)
+
+
+def test_external_edit_cannot_reuse_an_authored_approval(tmp_path):
+    provider, profile_path = _route_deletion_site(tmp_path)
+    authored = provider.import_file(
+        _write_valid_route(tmp_path / "authored.json"), profile_path, approve_for_auto=True,
+    )
+    replacement = _write_valid_route(tmp_path / "external.json")
+    imported = provider.import_file(replacement, profile_path, replace_route=authored.asset_path)
+    assert not imported.approved_for_auto
+    assert not profile_for_selected_route(profile_path, imported.asset_path).flight.approved
+
+
+@pytest.mark.parametrize("change", [
+    {"site_id": "different-map"},
+    {"coordinate_frame_id": "different-frame"},
+    {"map_ply_sha256": "b" * 64},
+    {"purpose": "preview_only"},
+    {"waypoints": [[0, 0, 0], [float("nan"), 0, 0]]},
+    {"waypoint_actions": [[{"type": "hover", "seconds": 61}], []]},
+])
+def test_invalid_authored_save_never_changes_approval(tmp_path, change):
+    provider, profile_path = _route_deletion_site(tmp_path)
+    existing = provider.import_file(
+        _write_valid_route(tmp_path / "existing.json"), profile_path, approve_for_auto=True,
+    )
+    before = profile_path.read_bytes()
+    source = _write_valid_route(tmp_path / "invalid.json")
+    raw = json.loads(source.read_bytes())
+    raw.update(change)
+    source.write_text(json.dumps(raw), encoding="utf-8")
+    with pytest.raises(ValueError):
+        provider.import_file(source, profile_path, approve_for_auto=True, replace_route=existing.asset_path)
+    assert profile_path.read_bytes() == before
+    assert profile_for_selected_route(profile_path, existing.asset_path).flight.approved
+
+
+def test_changed_map_rejects_both_saved_approval_and_new_save(tmp_path):
+    provider, profile_path = _route_deletion_site(tmp_path)
+    source = _write_valid_route(tmp_path / "source.json")
+    existing = provider.import_file(source, profile_path, approve_for_auto=True)
+    before = profile_path.read_bytes()
+    profile = load_site_profile(profile_path)
+    profile.map_ply.write_bytes(profile.map_ply.read_bytes() + b"\n")
+    with pytest.raises(ValueError, match="map SHA-256"):
+        profile_for_selected_route(profile_path, existing.asset_path)
+    with pytest.raises(ValueError, match="map SHA-256"):
+        provider.import_file(source, profile_path, approve_for_auto=True)
+    assert profile_path.read_bytes() == before
+
+
+def test_save_durability_failure_rolls_back_route_and_approval(tmp_path, monkeypatch):
+    provider, profile_path = _route_deletion_site(tmp_path)
+    source = _write_valid_route(tmp_path / "source.json")
+    existing = provider.import_file(source, profile_path, approve_for_auto=True)
+    profile_before, route_before = profile_path.read_bytes(), existing.asset_path.read_bytes()
+    raw = json.loads(source.read_bytes())
+    raw["waypoints"] = [[0, 0, 0], [2, 0, 0]]
+    source.write_text(json.dumps(raw), encoding="utf-8")
+    real_sync = local_assets._sync_path
+
+    def fail_directory_sync(path):
+        if path.is_dir():
+            raise OSError("forced durability failure")
+        real_sync(path)
+
+    monkeypatch.setattr(local_assets, "_sync_path", fail_directory_sync)
+    with pytest.raises(OSError, match="forced durability failure"):
+        provider.import_file(source, profile_path, approve_for_auto=True, replace_route=existing.asset_path)
+    assert profile_path.read_bytes() == profile_before
+    assert existing.asset_path.read_bytes() == route_before
+    assert profile_for_selected_route(profile_path, existing.asset_path).flight.approved
+
+
+def test_source_mutation_during_save_does_not_approve_different_bytes(tmp_path, monkeypatch):
+    provider, profile_path = _route_deletion_site(tmp_path)
+    source = _write_valid_route(tmp_path / "source.json")
+    before = profile_path.read_bytes()
+    real_copy = local_assets.shutil.copy2
+
+    def changed_copy(origin, destination, *args, **kwargs):
+        if Path(origin) == source:
+            raw = json.loads(source.read_bytes())
+            raw["waypoints"] = [[0, 0, 0], [4, 0, 0]]
+            source.write_text(json.dumps(raw), encoding="utf-8")
+        return real_copy(origin, destination, *args, **kwargs)
+
+    monkeypatch.setattr(local_assets.shutil, "copy2", changed_copy)
+    with pytest.raises(ValueError, match="changed while saving"):
+        provider.import_file(source, profile_path, approve_for_auto=True)
+    assert profile_path.read_bytes() == before
+
+
+@pytest.mark.parametrize("already_managed", [False, True], ids=["adopt", "existing-pack"])
+def test_deployed_profile_save_adopts_managed_site_without_source_mutation(
+    tmp_path, already_managed,
+):
+    from operator_actions import SiteAssetActions
+
+    package = _write_site_package(tmp_path)
+    source_profile = package / "site_profile.json"
+    raw = json.loads(source_profile.read_bytes())
+    raw["flight"] = {
+        "approved": False,
+        "coordinate_frame_id": "test-yard-reconstruction-v1",
+        "route_clearance_approved": False,
+        "approval_note": "Ground-only deployed profile.",
+        "controller": {
+            "model": "scale_free_direction_speed_guard_v1",
+            "speed_limit_mps": 0.30,
+            "pose_max_age_ms": 500,
+            "speed_max_age_ms": 500,
+            "command_ttl_ms": 150,
+            "yaw_tolerance_deg": 3.0,
+            "horizontal_axes": [0, 2],
+            "vertical_axis": 1,
+            "camera_to_body_yaw_deg": 0.0,
+            "body_right_sign": 1,
+            "lookahead_map_units": 0.8,
+            "rejoin_tolerance_map_units": 0.4,
+            "arrival_tolerance_map_units": 0.2,
+            "inspect_radius_map_units": 0.5,
+            "inspect_resume_margin_map_units": 0.2,
+            "max_pose_jump_map_units": 1.0,
+            "progress_jump_slack_map_units": 0.5,
+            "max_progress_regression_map_units": 0.1,
+            "segment_window": 2,
+            "progress_speed_factor": 2.0,
+            "inspect_waypoints": [],
+        },
+    }
+    source_profile.write_text(json.dumps(raw), encoding="utf-8")
+    source_controller = load_site_profile(source_profile).flight.controller
+    source_before = source_profile.read_bytes()
+    managed = tmp_path / "地圖檔" / "場域"
+    if already_managed:
+        existing = LocalSitePackageProvider(
+            managed, bundle_inspector=lambda *_: ("ref-a.jpg",),
+            profile_loader=_profile_loader,
+        ).import_folder(package).profile_path
+        assert load_site_profile(existing).flight.controller is None
+    actions = SiteAssetActions(None, LocalRouteProvider(managed), None, source_profile)
+    first = actions.import_authored_route(_write_valid_route(tmp_path / "first.json"))
+    second = actions.import_authored_route(_write_valid_route(tmp_path / "second.json"))
+    assert first.profile_path == second.profile_path == actions.current_profile
+    assert first.profile_path == managed / "test-yard" / "site_profile.json"
+    assert source_profile.read_bytes() == source_before
+    assert local_assets.site_pack_root_for_profile(source_profile, managed) == first.profile_path.parent
+    for route in (first, second):
+        # Reopening the deployed profile can select either managed-site route.
+        selected = profile_for_selected_route(source_profile, route.asset_path)
+        assert selected.flight.approved and selected.flight.route_clearance_approved
+        assert selected.flight.controller == source_controller
+        assert profile_for_selected_route(first.profile_path, route.asset_path).flight.controller == source_controller
+
+
+def test_authored_action_does_not_claim_an_uncommitted_approval(tmp_path):
+    from types import SimpleNamespace
+    from operator_actions import SiteAssetActions
+    from site_asset_interfaces import ImportedAsset
+
+    profile, route = tmp_path / "site_profile.json", tmp_path / "route.json"
+    provider = SimpleNamespace(import_file=lambda *_args, **_kw: ImportedAsset(profile, route))
+    result = SiteAssetActions(None, provider, None, profile).import_authored_route(route)
+    assert not result.approved_for_auto
+    assert "已自動核准" not in result.message
+    assert "不會解鎖飛行" in result.message

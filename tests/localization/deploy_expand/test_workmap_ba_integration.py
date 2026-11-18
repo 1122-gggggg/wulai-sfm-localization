@@ -8,7 +8,7 @@ import cv2
 import numpy as np
 import pytest
 
-from online_workmap import OnlineWorkMapTracker, SessionWorkMap
+from online_workmap import OnlineWorkMapTracker, SessionWorkMap, _BaCandidate, _Rejected
 from two_rate_tracker import SeedProvenance
 from workmap_ba import solve_ba_snapshot
 
@@ -287,5 +287,104 @@ def test_an_observer_whose_pose_changed_after_the_snapshot_rejects_the_candidate
         session.keyframes[snapshot["observers"][0]["name"]]["pose_revision"] += 1
         assert not session.apply_ba_candidate(snapshot, candidate)
         assert session.last_ba_rejection_reason == "keyframe_pose_revision"
+    finally:
+        session.close()
+
+
+class _TraversalCountedDict(dict):
+    """Count traversed rows, including rows skipped without reading their fields."""
+
+    def __init__(self, source):
+        super().__init__(source)
+        self.traversed = 0
+
+    def __iter__(self):
+        for key in super().__iter__():
+            self.traversed += 1
+            yield key
+
+    def items(self):
+        for item in super().items():
+            self.traversed += 1
+            yield item
+
+    def values(self):
+        for value in super().values():
+            self.traversed += 1
+            yield value
+
+
+def _affected_candidate(session, *, poses=None, observers=None):
+    return _BaCandidate(
+        epoch=0,
+        names=(),
+        expected_kfs={},
+        expected_points={},
+        poses=poses or {},
+        updates={-1: session.landmarks[-1]["xyz"].copy()},
+        before=1.0,
+        after=0.5,
+        expected_observers=observers or {},
+    )
+
+
+@pytest.mark.parametrize("unrelated", [1, 20])
+def test_ba_validation_work_is_bounded_by_indexed_candidates(tmp_path, unrelated):
+    session, _old, append_frame, _K = _scene(tmp_path)
+    try:
+        expected = set(session._frames_by_landmark[-1])
+        for ordinal in range(5, 5 + unrelated):
+            append_frame(ordinal, include_negative=False)
+        frames = _TraversalCountedDict(session.keyframes)
+        session.keyframes = frames
+        with session._lock:
+            changed = session._ba_changed_keyframes_locked(_affected_candidate(session))
+        assert changed == expected
+        assert frames.traversed <= len(expected)
+    finally:
+        session.close()
+
+
+def test_ba_multiple_invalid_candidates_keep_archive_insertion_precedence(tmp_path):
+    session, _old, _append_frame, _K = _scene(tmp_path)
+    try:
+        first, second = list(session.keyframes)[:2]
+        # Ordinal order is not archive order across restarted capture epochs.
+        session.keyframes[first]["ordinal"] = 100
+        session.keyframes[second]["ordinal"] = 0
+        pose = session.keyframes[second]["pose"].copy()
+        pose[0, 3] += 0.5
+        parsed = _affected_candidate(session, poses={second: pose}, observers={first: 0})
+        parsed.updates[-1][0] += 0.5
+        with session._lock, pytest.raises(_Rejected) as rejection:
+            session._ba_changed_keyframes_locked(parsed)
+        assert rejection.value.reason == "observer_support_count"
+        # Without the earlier candidate, the second failure is independently visible.
+        session._frames_by_landmark[-1].discard(first)
+        with session._lock, pytest.raises(_Rejected) as rejection:
+            session._ba_changed_keyframes_locked(parsed)
+        assert rejection.value.reason == "old_support_count"
+    finally:
+        session.close()
+
+
+def test_ba_missing_and_stale_reverse_index_entries_keep_existing_behavior(tmp_path):
+    session, _old, _append_frame, _K = _scene(tmp_path)
+    try:
+        indexed = set(session._frames_by_landmark[-1])
+        session._frames_by_landmark[-1].add("absent-keyframe")
+        parsed = _affected_candidate(session)
+        with session._lock:
+            assert session._ba_changed_keyframes_locked(parsed) == indexed
+            session._frames_by_landmark.pop(-1)
+            assert session._ba_changed_keyframes_locked(parsed) == set()
+            # Explicit pose candidates still validate even without a reverse index.
+            name = next(iter(indexed))
+            pose = session.keyframes[name]["pose"].copy()
+            pose[0, 3] += 0.5
+            parsed.poses[name] = pose
+            with pytest.raises(_Rejected) as rejection:
+                session._ba_changed_keyframes_locked(parsed)
+        assert rejection.value.reason == "old_support_count"
     finally:
         session.close()

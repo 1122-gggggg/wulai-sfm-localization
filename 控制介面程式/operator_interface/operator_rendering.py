@@ -18,6 +18,8 @@ import numpy as np
 from PIL import Image
 
 from localization_result_ui import localization_result_is_weak
+from operator_ui_style import ACCENT, BORDER, FONT_BOLD, FONT_SMALL, MUTED, TEXT
+from route_editor_wires import wire_color
 
 #: Initial requested map/video canvas height, not a rendering floor. Fixed
 #: controls receive their natural height; renderers use the allocated remainder.
@@ -101,6 +103,8 @@ class MapRenderContext:
     #: Map-aligned historical submap trails, never live pose/flight history.
     workmap_trajectories: Mapping[int, Sequence[Sequence[float]]] | None = None
     workmap_mapping_diagnostics: Mapping[str, Any] | None = None
+    #: Read-only sampled wire curves in raw map coordinates; display only.
+    wire_polylines: Sequence[np.ndarray] = ()
 
 
 #: Camera picture rectangle: a real plane in map space, oriented by the full
@@ -306,8 +310,46 @@ def _pts_sig(seq: Sequence[Any] | None) -> tuple | int:
         return 0
     # Sampling missed edits in the middle of a capped trail or route. Retain
     # exact coordinates, not references to mutable points or sampled endpoints.
-    points = np.asarray(seq, dtype=float)
+    points = np.asarray(list(seq), dtype=float)
     return (len(points), points[:, :3].tobytes())
+
+
+#: One-slot memo for the planned route's signature. The ~2000-point route is
+#: only ever replaced as a whole object (or emptied/resliced, which changes
+#: its length); no site edits its points in place. Re-serialising it every
+#: 33 ms tick therefore only buys the same bytes. The memo keeps the sequence
+#: itself, so an identity match can never be a recycled ``id()``. The trail,
+#: weak trail and no-fix markers do change in place and keep ``_pts_sig``.
+_route_sig_memo: tuple[Sequence[Any], int, tuple[bytes, bytes], tuple | int] | None = None
+
+
+def _point_xyz_bytes(point: Any) -> bytes:
+    xyz: np.ndarray = np.asarray(point, dtype=float)[:3]
+    data: bytes = xyz.tobytes()
+    return data
+
+
+def _route_sig(route: Sequence[Any] | None) -> tuple | int:
+    """``_pts_sig`` of the planned route, recomputed only when it was replaced."""
+    global _route_sig_memo
+    if route is None or len(route) == 0:
+        return 0
+    count = len(route)
+    ends = (_point_xyz_bytes(route[0]), _point_xyz_bytes(route[-1]))
+    memo = _route_sig_memo
+    if memo is not None and memo[0] is route and memo[1] == count and memo[2] == ends:
+        return memo[3]
+    sig = _pts_sig(route)
+    _route_sig_memo = (route, count, ends, sig)
+    return sig
+
+
+def _trail_xyz(trail: Sequence[Any]) -> np.ndarray:
+    """All trail points as one ``(n, 3)`` array."""
+    if len(trail) == 0:
+        return np.empty((0, 3), dtype=float)
+    points: np.ndarray = np.asarray(list(trail), dtype=float)[:, :3].reshape(-1, 3)
+    return points
 
 
 def _draw_route_and_history(draw: Any, context: MapRenderContext) -> None:
@@ -344,61 +386,69 @@ def _draw_route_and_history(draw: Any, context: MapRenderContext) -> None:
             round(float(getattr(context, "map_roll", 0.0)), 4),
         )
 
-    proj_cache_key = (
+    view_key = (
         pan_key,
         zoom_key,
         size_key,
         rotation_key,
         round(float(getattr(context, "map_radius", 1.0)), 4),
         context.projection_key,
-        _pts_sig(context.route_pts),
-        _pts_sig(context.history),
-        _pts_sig(weak_trail),
     )
-    cached = _PROJECTION_CACHE.get(proj_cache_key)
-    if cached is not None:
-        screen_x, screen_y = cached
-    else:
-        parts = []
-        if route_n:
-            parts.append(np.asarray(context.route_pts, dtype=float).reshape(-1, 3))
-        if history_n:
-            parts.append(
-                np.array(
-                    [np.asarray(point, dtype=float)[:3] for point in context.history],
-                    dtype=float,
-                ).reshape(-1, 3)
-            )
-        if weak_n:
-            parts.append(
-                np.array(
-                    [np.asarray(point, dtype=float)[:3] for point in weak_trail],
-                    dtype=float,
-                ).reshape(-1, 3)
-            )
-        view = context.transform_xyz(np.concatenate(parts, axis=0))
+
+    def project(cache_key: tuple, points: Callable[[], np.ndarray]) -> tuple[list[int], list[int]]:
+        cached = _PROJECTION_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
+        view = context.transform_xyz(points())
         scale = _map_scale(context)
-        screen_x = (
-            (context.width * 0.5 + context.map_pan[0] + view[:, 0] * scale).astype(int).tolist()
-        )
-        screen_y = (
-            (context.height * 0.5 + context.map_pan[1] - view[:, 1] * scale).astype(int).tolist()
+        projected = (
+            (context.width * 0.5 + context.map_pan[0] + view[:, 0] * scale).astype(int).tolist(),
+            (context.height * 0.5 + context.map_pan[1] - view[:, 1] * scale).astype(int).tolist(),
         )
         if len(_PROJECTION_CACHE) >= _PROJECTION_CACHE_MAX:
             _PROJECTION_CACHE.clear()
-        _PROJECTION_CACHE[proj_cache_key] = (screen_x, screen_y)
-    if history_n > 1:
-        history_screen = list(
-            zip(screen_x[route_n : route_n + history_n], screen_y[route_n : route_n + history_n])
+        _PROJECTION_CACHE[cache_key] = projected
+        return projected
+
+    # The static route is keyed by the view and its own signature, so a new
+    # pose never re-projects it; trails (<= 300 points each) change per pose.
+    route_x, route_y = (
+        project(
+            ("route", view_key, _route_sig(context.route_pts)),
+            lambda: np.asarray(context.route_pts, dtype=float).reshape(-1, 3),
         )
+        if route_n
+        else ([], [])
+    )
+    history_xyz = _trail_xyz(context.history) if history_n else None
+    history_x, history_y = (
+        project(
+            ("history", view_key, history_n, history_xyz.tobytes()),
+            lambda: history_xyz,
+        )
+        if history_xyz is not None
+        else ([], [])
+    )
+    weak_xyz = _trail_xyz(weak_trail) if weak_n else None
+    weak_x, weak_y = (
+        project(
+            ("weak", view_key, weak_n, weak_xyz.tobytes()),
+            lambda: weak_xyz,
+        )
+        if weak_xyz is not None
+        else ([], [])
+    )
+    if history_n > 1:
+        history_screen = list(zip(history_x, history_y))
         draw.line(history_screen, fill="#5aa7e8", width=3)
         # Explicit alignment: history and history_health are parallel lists,
         # but a dropped append would make zip() silently swallow the tail.
         # Draw markers only over the explicitly shared prefix.
-        dot_n = min(history_n, len(context.history_health))
+        history_health = list(context.history_health)  # a deque indexes in O(n)
+        dot_n = min(history_n, len(history_health))
         for index in range(dot_n):
             x, y = history_screen[index]
-            health = context.history_health[index]
+            health = history_health[index]
             if health and health != "OK":
                 draw.ellipse(
                     (x - 4, y - 4, x + 4, y + 4),
@@ -412,7 +462,7 @@ def _draw_route_and_history(draw: Any, context: MapRenderContext) -> None:
         # symbol, so weak reusing it would collide; markers only, no
         # connecting line, so a jump-rejected fix cannot imply a flown
         # segment that never happened.
-        weak_screen = list(zip(screen_x[route_n + history_n :], screen_y[route_n + history_n :]))
+        weak_screen = list(zip(weak_x, weak_y))
         # Same explicit alignment as the history markers above, and the
         # position has to come from weak_screen: reading a bare x/y here picked
         # up whatever the route or history loop happened to leave bound, which
@@ -435,7 +485,7 @@ def _draw_route_and_history(draw: Any, context: MapRenderContext) -> None:
 
     # Keep the planned path visible when dense estimate markers overlap it.
     if route_n > 1:
-        route_screen = list(zip(screen_x[:route_n], screen_y[:route_n]))
+        route_screen = list(zip(route_x, route_y))
         draw.line(route_screen, fill=context.route_color, width=2, joint="curve")
         dot_step = max(1, route_n // max(1, context.route_dot_max))
         for x, y in route_screen[::dot_step]:
@@ -572,9 +622,30 @@ def _draw_camera_overlay(draw: Any, context: MapRenderContext) -> None:
     _draw_camera_estimate_label(draw, context, *drone_pt)
 
 
+def _draw_wire_overlays(draw: Any, context: MapRenderContext) -> None:
+    if not context.wire_polylines:
+        return
+    scale = _map_scale(context)
+    for index, points in enumerate(context.wire_polylines):
+        view = context.transform_xyz(points)
+        sx = context.width * 0.5 + context.map_pan[0] + view[:, 0] * scale
+        sy = context.height * 0.5 + context.map_pan[1] - view[:, 1] * scale
+        color = wire_color(index)
+        draw.line(tuple(zip(sx, sy)), fill=color, width=3)
+        for endpoint in (0, -1):
+            x, y = float(sx[endpoint]), float(sy[endpoint])
+            draw.ellipse((x - 3, y - 3, x + 3, y + 3), fill=color)
+        middle = len(sx) // 2
+        draw.text(
+            (float(sx[middle]) + 5, float(sy[middle]) + 5),
+            f"W{index + 1}", fill=color, font=context.overlay_font,
+        )
+
+
 def draw_map_overlays(draw: Any, context: MapRenderContext) -> None:
     """Paint dynamic map overlays over an already-rendered map base."""
     _draw_workmap_trajectories(draw, context)
+    _draw_wire_overlays(draw, context)
     _draw_route_and_history(draw, context)
     _draw_camera_overlay(draw, context)
     _draw_workmap_mapping_health(draw, context)
@@ -1140,39 +1211,24 @@ def build_hud_overlay_data(state: Any, loc: Any, telemetry: Any) -> dict:
         "current_auto_speed",
         tele_dict.get("auto_speed", tele_dict.get("current_auto_speed_var", "AUTO PCMD -")),
     )
-    rth = tele_dict.get("rth", tele_dict.get("olympe_state", "RTH ?/?"))
-    gps = tele_dict.get("gps", "")
     attitude = tele_dict.get("attitude", tele_dict.get("olympe_attitude", "飛控融合姿態 -"))
     velocity = tele_dict.get("velocity", tele_dict.get("olympe_velocity", "三軸速度 -"))
     altitude_agl = tele_dict.get(
         "altitude_agl", tele_dict.get("olympe_altitude", "飛控高度 - | AGL -")
     )
-    link_quality = tele_dict.get("link_quality", "")
-    olympe_state_val = tele_dict.get("olympe_state", None)
     olympe_attitude_val = tele_dict.get("olympe_attitude", None)
     olympe_altitude_val = tele_dict.get("olympe_altitude", None)
-    if olympe_state_val is not None or olympe_attitude_val is not None:
+    # RTH, GPS, satellite and link-quality figures are deliberately absent from the
+    # video HUD (they stay in the header chips and logs).
+    altitude_line = str(olympe_altitude_val) if olympe_altitude_val is not None else str(altitude_agl)
+    if olympe_attitude_val is not None:
         line1 = " | ".join(
             part
             for part in (str(auto_speed), f"{fps_label} {fps_text}", f"inliers {inliers}")
             if part
         )
         line2 = f"wall_ms {wall_text} | core {latency_text} | e2e {e2e_text}"
-        line3 = (
-            str(olympe_state_val)
-            if olympe_state_val is not None
-            else (f"{rth} | {gps}".strip(" |") if gps else str(rth))
-        )
-        line4 = (
-            str(olympe_altitude_val)
-            if olympe_altitude_val is not None
-            else (
-                f"{altitude_agl} | {link_quality}".strip(" |")
-                if link_quality
-                else str(altitude_agl)
-            )
-        )
-        att = str(olympe_attitude_val) if olympe_attitude_val is not None else str(attitude)
+        att = str(olympe_attitude_val)
         if " | 三軸速度 " in att:
             att_part, sep, vel_part = att.partition(" | 三軸速度 ")
             attitude_line = att_part
@@ -1182,13 +1238,12 @@ def build_hud_overlay_data(state: Any, loc: Any, telemetry: Any) -> dict:
             velocity_line = (
                 str(velocity) if str(velocity).startswith("三軸") else f"三軸速度 {velocity}"
             )
-        diagnostic_lines = (line1, line2, line3, line4, attitude_line, velocity_line)
+        diagnostic_lines = (line1, line2, altitude_line, attitude_line, velocity_line)
     else:
         diagnostic_lines = (
             " | ".join((str(auto_speed), f"{fps_label} {fps_text}", f"inliers {inliers}")),
             f"wall_ms {wall_text} | core {latency_text} | e2e {e2e_text}",
-            f"{rth} | {gps}".strip(" |") if gps else str(rth),
-            f"{altitude_agl} | {link_quality}".strip(" |") if link_quality else str(altitude_agl),
+            altitude_line,
             str(attitude),
             str(velocity) if str(velocity).startswith("三軸") else f"三軸速度 {velocity}",
         )
@@ -1490,6 +1545,31 @@ def _video_hud_layout(
     return _store_hud_layout(draw, key, _hud_place_rows(chosen, left, bottom, minimum_top, gap))
 
 
+def video_hud_summary_text(state: Any, live_backend: bool, stream_latency_ms: float | None) -> str:
+    """The HUD's first row: stream fps, frame freshness and gimbal/zoom.
+
+    Shared with the video dirty key so a repaint is requested exactly when
+    this text can change, not on every sub-display-precision jitter.
+    """
+    age = getattr(state, "frame_age_ms", None)
+    if age is None and live_backend:
+        age = getattr(state, "link_latency_ms", None)
+    if age is None:
+        age_text = (
+            f"~{stream_latency_ms:.0f} ms (profile)"
+            if not live_backend and stream_latency_ms is not None
+            else "-"
+        )
+    else:
+        age_text = f"{float(age):.0f} ms"
+    fps = float(getattr(state, "stream_fps", 0.0) or 0.0)
+    fps_text = f"{fps:.1f}" if fps > 0.05 else "-"
+    return (
+        f"影像 {fps_text} FPS · 影格新鮮度 {age_text} · "
+        f"鏡頭 {state.gimbal_pitch_deg:.0f}° / {state.zoom:.1f}x"
+    )
+
+
 def draw_video_hud(
     draw: Any,
     width: int,
@@ -1501,7 +1581,7 @@ def draw_video_hud(
     main_hud_font: Any,
     overlay_font: Any,
     live_backend: bool,
-    stream_latency_ms: float,
+    stream_latency_ms: float | None,
     *,
     banner_bottom: int = 0,
 ) -> bool:
@@ -1511,26 +1591,13 @@ def draw_video_hud(
         outline="#363c44",
         width=2,
     )
-    age = getattr(state, "frame_age_ms", None)
-    if age is None and live_backend:
-        age = getattr(state, "link_latency_ms", None)
-    if age is None:
-        age_text = f"~{stream_latency_ms:.0f} ms (profile)" if not live_backend else "-"
-    else:
-        age_text = f"{float(age):.0f} ms"
-    fps = float(getattr(state, "stream_fps", 0.0) or 0.0)
-    fps_text = f"{fps:.1f}" if fps > 0.05 else "-"
+    summary_text = video_hud_summary_text(state, live_backend, stream_latency_ms)
     link_ok = bool(getattr(state, "link_ok", True))
-    hud_lines = (
-        f"影像 {fps_text} FPS · 影格新鮮度 {age_text} · "
-        f"鏡頭 {state.gimbal_pitch_deg:.0f}° / {state.zoom:.1f}x",
-        *diagnostic_lines,
-    )
     _, _, placements = _video_hud_layout(
         draw,
         width,
         height,
-        hud_lines[0],
+        summary_text,
         diagnostic_lines,
         hud_height,
         hud_font,
@@ -1538,7 +1605,7 @@ def draw_video_hud(
         banner_bottom,
     )
     for x, y, index, font in placements:
-        text = hud_lines[0] if index < 0 else diagnostic_lines[index]
+        text = summary_text if index < 0 else diagnostic_lines[index]
         draw.text((x + 1, y + 1), text, fill="#000000", font=font)
         draw.text(
             (x, y),
@@ -1633,11 +1700,11 @@ def draw_magnetometer_axis(canvas: Any, guide: tuple[str, str, str] | None) -> N
     canvas.delete("all")
     if guide is None:
         canvas.create_text(
-            8, 26, anchor="w", text="（目前沒有要求校正軸）", fill="#655b4d", font=("Sans", 10)
+            8, 26, anchor="w", text="（目前沒有要求校正軸）", fill=MUTED, font=FONT_SMALL
         )
         return
     label, view, instruction = guide
-    body, accent, arrow = "#b6a891", "#302c26", "#245b9b"
+    body, accent, arrow = BORDER, TEXT, ACCENT
     cx, cy = 30, 26
 
     if view == "top":  # X/roll: seen from above, roll about nose-tail
@@ -1706,15 +1773,15 @@ def draw_magnetometer_axis(canvas: Any, guide: tuple[str, str, str] | None) -> N
         anchor="nw",
         text=f"現在請轉：{label}",
         fill=arrow,
-        font=("Sans", 11, "bold"),
-        width=174,
+        font=FONT_BOLD,
+        width=146,
     )
     canvas.create_text(
         66,
         44,
         anchor="nw",
         text=instruction,
-        fill="#574a38",
-        font=("Sans", 10),
-        width=174,
+        fill=MUTED,
+        font=FONT_SMALL,
+        width=146,
     )

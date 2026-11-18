@@ -18,6 +18,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 import numpy as np
+from operator_ui_style import PANEL, TEXT_BOX, apply_operator_styles
 
 
 # Keep this module importable when launched directly from operator_interface,
@@ -845,6 +846,93 @@ def _format_point(point: Iterable[float]) -> str:
     return "(" + ", ".join(f"{float(value):.6f}" for value in point) + ")"
 
 
+def _alignment_body(window: tk.Toplevel) -> ttk.Frame:
+    """Scrollable configuration only; write/close and feedback stay outside it."""
+    apply_operator_styles(window)
+    window.configure(bg=PANEL)
+    window.columnconfigure(0, weight=1)
+    window.rowconfigure(0, weight=1)
+    host = ttk.Frame(window)
+    host.grid(row=0, column=0, sticky="nsew")
+    canvas = tk.Canvas(host, bg=PANEL, highlightthickness=0)
+    bar = ttk.Scrollbar(host, orient="vertical", command=canvas.yview)
+    bar.pack(side="right", fill="y")
+    canvas.pack(side="left", fill="both", expand=True)
+    canvas.configure(yscrollcommand=bar.set)
+    body = ttk.Frame(canvas, padding=12)
+    item = canvas.create_window(0, 0, window=body, anchor="nw")
+    window._content_canvas = canvas
+
+    def resize(_event=None):
+        # Let the embedded frame retain its natural height: wrapping labels can
+        # change its request without a Configure event on a fixed-height frame.
+        canvas.itemconfigure(item, width=max(1, canvas.winfo_width()))
+        canvas.configure(scrollregion=canvas.bbox("all"))
+
+    body.bind("<Configure>", resize)
+    canvas.bind("<Configure>", resize)
+    return body
+
+
+def _bind_alignment_scroll(window: tk.Toplevel, widget: tk.Misc) -> None:
+    """Window-local wheel/focus handling; never installs a global flight binding."""
+    canvas = window._content_canvas
+
+    def wheel(event):
+        if canvas.yview() != (0.0, 1.0):
+            up = getattr(event, "num", None) == 4 or getattr(event, "delta", 0) > 0
+            canvas.yview_scroll(-3 if up else 3, "units")
+        return "break"
+
+    def reveal(event):
+        top = event.widget.winfo_rooty() - canvas.winfo_rooty()
+        bottom = top + event.widget.winfo_height()
+        height = canvas.winfo_height()
+        bounds = canvas.bbox("all")
+        if bounds is None or bounds[3] <= height:
+            return
+        delta = top - 6 if top < 0 else bottom - height + 6 if bottom > height else 0
+        if delta:
+            canvas.yview_moveto((canvas.canvasy(0) + delta) / bounds[3])
+
+    if not isinstance(widget, (ttk.Treeview, ttk.Scrollbar)):
+        for sequence in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            widget.bind(sequence, wheel, add="+")
+    widget.bind("<FocusIn>", reveal, add="+")
+    for child in widget.winfo_children():
+        _bind_alignment_scroll(window, child)
+
+
+def _alignment_footer(window: tk.Toplevel) -> ttk.Frame:
+    footer = ttk.Frame(window, padding=(12, 8))
+    footer.grid(row=1, column=0, sticky="ew")
+    quality = ttk.Label(footer, textvariable=window._quality_var, style="Heading.TLabel")
+    quality.pack(fill="x", pady=(0, 6))
+    quality.bind("<Configure>", lambda event: quality.configure(wraplength=max(1, event.width)))
+    actions = ttk.Frame(footer)
+    actions.pack(fill="x")
+    feedback = ttk.Frame(footer)
+    feedback.pack(fill="x", pady=(8, 0))
+    window._status_text = tk.Text(
+        feedback, height=3, wrap="word", **TEXT_BOX,
+        padx=8, pady=5, state="disabled",
+    )
+    scroll = ttk.Scrollbar(feedback, command=window._status_text.yview)
+    scroll.pack(side="right", fill="y")
+    window._status_text.pack(side="left", fill="x", expand=True)
+    window._status_text.configure(yscrollcommand=scroll.set)
+
+    def show_status(*_args):
+        window._status_text.configure(state="normal")
+        window._status_text.delete("1.0", "end")
+        window._status_text.insert("1.0", window._status_var.get())
+        window._status_text.configure(state="disabled")
+
+    window._status_var.trace_add("write", show_status)
+    show_status()
+    return actions
+
+
 class SiteAlignmentDialog(tk.Toplevel):
     """Small manual-control-point dialog backed by ``ManualSiteAlignmentModel``."""
 
@@ -865,7 +953,11 @@ class SiteAlignmentDialog(tk.Toplevel):
         )
         super().__init__(parent)
         self.title("Manual Site Alignment")
-        self.minsize(680, 460)
+        self.minsize(760, 560)
+        self.geometry(
+            f"{max(760, min(900, self.winfo_screenwidth() - 80))}"
+            f"x{max(560, min(680, self.winfo_screenheight() - 100))}"
+        )
         self.output_path = Path(output_path) if output_path is not None else None
         self.on_saved = on_saved
 
@@ -879,20 +971,22 @@ class SiteAlignmentDialog(tk.Toplevel):
         self.protocol("WM_DELETE_WINDOW", self.destroy)
 
     def _build(self) -> None:
-        body = ttk.Frame(self, padding=12)
-        body.grid(row=0, column=0, sticky="nsew")
-        self.columnconfigure(0, weight=1)
-        self.rowconfigure(0, weight=1)
+        body = _alignment_body(self)
         body.columnconfigure(0, weight=1)
         body.rowconfigure(2, weight=1)
 
-        ttk.Label(
+        frame_label = ttk.Label(
             body,
             text=(
                 f"Map frame: {self.model.map_frame_id}    "
                 f"Site/world frame: {self.model.site_frame_id}"
             ),
-        ).grid(row=0, column=0, sticky="w")
+            justify="left", style="Secondary.TLabel",
+        )
+        frame_label.grid(row=0, column=0, sticky="ew")
+        frame_label.bind(
+            "<Configure>", lambda event: frame_label.configure(wraplength=max(1, event.width)),
+        )
 
         entry_frame = ttk.LabelFrame(body, text="Measured control point")
         entry_frame.grid(row=1, column=0, sticky="ew", pady=(10, 8))
@@ -935,6 +1029,7 @@ class SiteAlignmentDialog(tk.Toplevel):
             columns=("number", "label", "map", "site"),
             show="headings",
             selectmode="browse",
+            height=6,
         )
         headings = {
             "number": "#",
@@ -944,17 +1039,19 @@ class SiteAlignmentDialog(tk.Toplevel):
         }
         for column_name, heading in headings.items():
             self._points_tree.heading(column_name, text=heading)
-        self._points_tree.column("number", width=40, anchor="center")
-        self._points_tree.column("label", width=110)
-        self._points_tree.column("map", width=210)
-        self._points_tree.column("site", width=210)
+        self._points_tree.column("number", width=40, minwidth=40, stretch=False, anchor="center")
+        self._points_tree.column("label", width=110, minwidth=110)
+        self._points_tree.column("map", width=230, minwidth=210)
+        self._points_tree.column("site", width=230, minwidth=210)
         self._points_tree.grid(row=0, column=0, sticky="nsew")
         scrollbar = ttk.Scrollbar(list_frame, orient="vertical", command=self._points_tree.yview)
         scrollbar.grid(row=0, column=1, sticky="ns")
-        self._points_tree.configure(yscrollcommand=scrollbar.set)
+        horizontal = ttk.Scrollbar(list_frame, orient="horizontal", command=self._points_tree.xview)
+        horizontal.grid(row=1, column=0, sticky="ew")
+        self._points_tree.configure(yscrollcommand=scrollbar.set, xscrollcommand=horizontal.set)
+        _bind_alignment_scroll(self, body)
 
-        actions = ttk.Frame(body)
-        actions.grid(row=3, column=0, sticky="ew", pady=(8, 0))
+        actions = _alignment_footer(self)
         ttk.Button(actions, text="Remove selected", command=self._remove_selected).pack(
             side="left"
         )
@@ -962,19 +1059,16 @@ class SiteAlignmentDialog(tk.Toplevel):
         self._solve_button.pack(side="left", padx=(8, 0))
         self._approve_button = ttk.Button(
             actions,
-            text="Approve alignment for write",
+            text="Approve for write",
             command=self._approve,
         )
         self._approve_button.pack(side="left", padx=(8, 0))
-        self._save_button = ttk.Button(actions, text="Write alignment", command=self._save)
-        self._save_button.pack(side="right")
-
-        ttk.Label(body, textvariable=self._quality_var).grid(
-            row=4, column=0, sticky="w", pady=(8, 0)
+        self._close_button = ttk.Button(actions, text="Close", command=self.destroy)
+        self._close_button.pack(side="right")
+        self._save_button = ttk.Button(
+            actions, text="Write alignment", command=self._save, style="Primary.TButton",
         )
-        ttk.Label(body, textvariable=self._status_var, wraplength=640).grid(
-            row=5, column=0, sticky="w", pady=(4, 0)
-        )
+        self._save_button.pack(side="right", padx=(8, 6))
 
     def _parse_site_point(self) -> tuple[float, float, float]:
         values = [float(variable.get().strip()) for variable in self._site_vars]
@@ -1128,7 +1222,11 @@ class GuidedSiteAlignmentDialog(tk.Toplevel):
         self._hover_sample_count = 0
         super().__init__(parent)
         self.title("現場座標校正（只讀飛行證據）")
-        self.minsize(760, 520)
+        self.minsize(760, 560)
+        self.geometry(
+            f"{max(760, min(940, self.winfo_screenwidth() - 80))}"
+            f"x{max(560, min(700, self.winfo_screenheight() - 100))}"
+        )
         self._instruction_var = tk.StringVar()
         self._status_var = tk.StringVar(
             value="本視窗不會送出起飛或移動指令。"
@@ -1140,35 +1238,42 @@ class GuidedSiteAlignmentDialog(tk.Toplevel):
         self.after(50, self._sample_motion)
 
     def _build(self) -> None:
-        body = ttk.Frame(self, padding=12)
-        body.pack(fill="both", expand=True)
-        ttk.Label(
+        body = _alignment_body(self)
+        instructions = ttk.Label(
             body,
             text=(
                 "先按主介面「開始定位」並手動起飛懸停。機頭對準場域前方，"
                 "固定 yaw 與 gimbal，再按下方「開始自動辨識」。"
             ),
-            wraplength=720,
-            justify="left",
-            font=("Sans", 10, "bold"),
-        ).pack(anchor="w", fill="x")
-        ttk.Label(
+            style="Heading.TLabel", justify="left",
+        )
+        instructions.pack(anchor="w", fill="x")
+        instructions.bind(
+            "<Configure>", lambda event: instructions.configure(wraplength=max(1, event.width)),
+        )
+        help_label = ttk.Label(
             body,
             text=(
                 "可使用實體搖桿、鍵盤或介面虛擬搖桿；每次依提示從原點移動，"
                 "放開並懸停後會自動取樣。距離不用量，但至少移動 0.20 m。"
             ),
-            wraplength=720,
-            justify="left",
-        ).pack(anchor="w", fill="x", pady=(4, 8))
+            style="Secondary.TLabel", justify="left",
+        )
+        help_label.pack(anchor="w", fill="x", pady=(4, 8))
+        help_label.bind(
+            "<Configure>", lambda event: help_label.configure(wraplength=max(1, event.width)),
+        )
         step_box = ttk.LabelFrame(body, text="目前步驟")
         step_box.pack(fill="x")
-        ttk.Label(
+        step_label = ttk.Label(
             step_box,
             textvariable=self._instruction_var,
-            wraplength=700,
-            font=("Sans", 11, "bold"),
-        ).pack(anchor="w", fill="x", padx=8, pady=6)
+            style="Heading.TLabel", justify="left",
+        )
+        step_label.pack(anchor="w", fill="x", padx=8, pady=6)
+        step_label.bind(
+            "<Configure>", lambda event: step_label.configure(wraplength=max(1, event.width)),
+        )
         action_row = ttk.Frame(step_box)
         action_row.pack(fill="x", padx=6, pady=(0, 6))
         self._begin_button = ttk.Button(
@@ -1176,11 +1281,15 @@ class GuidedSiteAlignmentDialog(tk.Toplevel):
         )
         self._begin_button.pack(side="left", padx=2)
 
+        list_frame = ttk.Frame(body)
+        list_frame.pack(fill="both", expand=True, pady=8)
+        list_frame.columnconfigure(0, weight=1)
+        list_frame.rowconfigure(0, weight=1)
         self._points_tree = ttk.Treeview(
-            body,
+            list_frame,
             columns=("number", "label", "map", "site"),
             show="headings",
-            height=8,
+            height=6,
         )
         for name, label, width in (
             ("number", "#", 35),
@@ -1189,11 +1298,16 @@ class GuidedSiteAlignmentDialog(tk.Toplevel):
             ("site", "校正後場域 XYZ (m)", 250),
         ):
             self._points_tree.heading(name, text=label)
-            self._points_tree.column(name, width=width)
-        self._points_tree.pack(fill="both", expand=True, pady=8)
+            self._points_tree.column(name, width=width, minwidth=width, stretch=name != "number")
+        self._points_tree.grid(row=0, column=0, sticky="nsew")
+        vertical = ttk.Scrollbar(list_frame, command=self._points_tree.yview)
+        vertical.grid(row=0, column=1, sticky="ns")
+        horizontal = ttk.Scrollbar(list_frame, orient="horizontal", command=self._points_tree.xview)
+        horizontal.grid(row=1, column=0, sticky="ew")
+        self._points_tree.configure(yscrollcommand=vertical.set, xscrollcommand=horizontal.set)
+        _bind_alignment_scroll(self, body)
 
-        result_row = ttk.Frame(body)
-        result_row.pack(fill="x")
+        result_row = _alignment_footer(self)
         self._solve_button = ttk.Button(
             result_row, text="解算固定尺度座標", command=self._solve, state="disabled"
         )
@@ -1207,17 +1321,11 @@ class GuidedSiteAlignmentDialog(tk.Toplevel):
             text="儲存校正並檢查 AUTO",
             command=self._save,
             state="disabled",
+            style="Primary.TButton",
         )
         self._save_button.pack(side="left", padx=2)
-        ttk.Label(result_row, textvariable=self._quality_var).pack(
-            side="left", padx=10
-        )
-        ttk.Label(
-            body,
-            textvariable=self._status_var,
-            wraplength=720,
-            justify="left",
-        ).pack(anchor="w", fill="x", pady=(7, 0))
+        self._close_button = ttk.Button(result_row, text="關閉", command=self._close)
+        self._close_button.pack(side="right")
 
     def _step_instruction(self, step: GuidedAlignmentStep | None) -> str:
         if step is None:

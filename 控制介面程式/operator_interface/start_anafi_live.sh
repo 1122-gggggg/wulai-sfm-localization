@@ -93,7 +93,7 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
 用法: ./start_anafi_live.sh [flight_operator_app.py 的真機選項]
 
 此入口只會啟動 real-flight Olympe 介面，禁止傳入 --video 或
---interface simulated-stream。UI 先開啟、不連線；按「連接真機串流」才連線，
+--interface simulated-stream。UI 先開啟、不連線；按「真機串流」才連線，
 失敗可再次按下重試，不必重開終端機。影片模擬入口：
   控制介面程式/影片模擬串流/選擇啟動.sh
 EOF
@@ -262,7 +262,7 @@ else
   echo "  NO SkyController — laptop is sole controller"
   echo "  Esc freezes PC PCMD; 恢復電腦控制 resumes; close/Ctrl‑C = land"
 fi
-echo "  UI 先開啟、不連線；按「連接真機串流」才連線至 $IP (controller=$CTRL)"
+echo "  UI 先開啟、不連線；按「真機串流」才連線至 $IP (controller=$CTRL)"
 echo "  連線失敗可再次按下重試，不必重開終端機"
 # Optional env:
 #   LOC_BENCH=1        -> auto 開始定位 + no boot-lock (BOOT_INIT/MegaLoc path; NO takeoff)

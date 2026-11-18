@@ -57,6 +57,7 @@ except ImportError:
 
 SUPPORTED_PROVIDER_API_VERSION = 1
 SUPPORTED_POSE_CONTRACT_VERSION = 1
+_STANDARD_FLIGHT_SPEED_LIMIT_MPS = 0.80
 
 #: The single localization blocker an evaluation-only session may waive.  An
 #: unvalidated map is precisely what such a session exists to measure, so
@@ -71,6 +72,22 @@ EVALUATION_WAIVABLE_PREFIX = "localizer_quality calibration is failed or expired
 class MissionReadiness:
     localization_errors: tuple[str, ...]
     flight_errors: tuple[str, ...]
+    # None is deliberately not "no errors": callers constructing legacy/manual
+    # readiness cannot supply independent evidence for a selected-route override.
+    route_errors: tuple[str, ...] | None = None
+    non_route_flight_errors: tuple[str, ...] | None = None
+
+    def with_selected_route_errors(self, route_errors: tuple[str, ...]) -> "MissionReadiness":
+        """Replace only the route constituent after validating an operator selection."""
+        non_route = self.non_route_flight_errors
+        errors = (
+            (*self.flight_errors, "non-route mission readiness evidence is unavailable")
+            if non_route is None else (*non_route, *route_errors)
+        )
+        return MissionReadiness(
+            localization_errors=self.localization_errors, flight_errors=errors,
+            route_errors=route_errors, non_route_flight_errors=non_route,
+        )
 
     @property
     def localization_ready(self) -> bool:
@@ -115,7 +132,7 @@ def _standard_flight_controller(frame: CoordinateFrameContract) -> dict[str, obj
     body_right_sign = 1 if v_axis == 1 else -1
     return {
         "model": "scale_free_direction_speed_guard_v1",
-        "speed_limit_mps": 0.30,
+        "speed_limit_mps": _STANDARD_FLIGHT_SPEED_LIMIT_MPS,
         "pose_max_age_ms": 500.0,
         "speed_max_age_ms": 500.0,
         "command_ttl_ms": 150.0,
@@ -260,7 +277,10 @@ class ResolvedMission:
                 "approval_note": approval_note,
                 "controller": (
                     _standard_flight_controller(frame)
-                    if self.readiness.flight_ready and not evaluation_only_requested()
+                    if (
+                        self.readiness.flight_ready
+                        or self.readiness.non_route_flight_errors == ()
+                    ) and not evaluation_only_requested()
                     else None
                 ),
             },
@@ -298,6 +318,18 @@ class ResolvedMission:
             }
         return document
 
+    def compatibility_profile_path(self, output_dir: str | Path) -> Path:
+        """Name immutable readiness and speed-policy flavors without replacing history."""
+        flavor = ".eval" if evaluation_only_requested() else ""
+        if not flavor and not self.readiness.flight_ready and self.readiness.non_route_flight_errors == ():
+            # Older route-blocked profiles deliberately had no controller.
+            # Never overwrite/reuse those immutable generated documents.
+            flavor = ".route-selection"
+        speed_tag = f"{_STANDARD_FLIGHT_SPEED_LIMIT_MPS:g}".replace(".", "p")
+        return Path(output_dir).expanduser().resolve() / (
+            f"{self.identity}{flavor}.speed-{speed_tag}.site_profile.json"
+        )
+
     def materialize_legacy_site_profile(self, output_dir: str | Path) -> Path:
         """Atomically create or reuse the compatibility profile for this snapshot."""
         self.verify_unchanged()
@@ -305,13 +337,8 @@ class ResolvedMission:
         if not directory.is_relative_to(self.workspace_root):
             raise ManifestError("compatibility profile output must stay in workspace")
         directory.mkdir(parents=True, exist_ok=True)
-        # The document embeds the SFM_EVALUATION_ONLY flavor (flight.approved /
-        # route_clearance_approved / controller), so the two flavors must not
-        # share one filename: a production run materializing first used to make
-        # every later evaluation-only launch fail closed with "disagrees with
-        # snapshot" before it reached its own checks, and vice versa.
-        flavor = ".eval" if evaluation_only_requested() else ""
-        output = directory / f"{self.identity}{flavor}.site_profile.json"
+        # Each readiness flavor has its own immutable, content-checked path.
+        output = self.compatibility_profile_path(directory)
         content = (
             json.dumps(
                 self.legacy_site_profile_document(),
@@ -596,6 +623,7 @@ def resolve_mission(
         now=checked_at,
     )
     flight_errors = [*localization_errors, *route_errors, *pose_chain_errors]
+    non_route_flight_errors = [*localization_errors, *pose_chain_errors]
     for kind in vehicle.required_calibrations:
         if kind == "camera_body_extrinsic":
             continue
@@ -607,6 +635,7 @@ def resolve_mission(
         )
         if error is not None:
             flight_errors.append(error)
+            non_route_flight_errors.append(error)
 
     return ResolvedMission(
         workspace_root=root,
@@ -623,6 +652,8 @@ def resolve_mission(
         readiness=MissionReadiness(
             localization_errors=tuple(localization_errors),
             flight_errors=tuple(flight_errors),
+            route_errors=tuple(route_errors),
+            non_route_flight_errors=tuple(non_route_flight_errors),
         ),
     )
 

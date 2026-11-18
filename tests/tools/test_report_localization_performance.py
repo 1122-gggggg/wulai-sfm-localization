@@ -254,3 +254,48 @@ def test_all_vo_session_does_not_invent_a_map_fix(tmp_path):
     assert got["quality"]["longest_no_pose_streak_s"] == 0.0
     assert got["latency_ms"]["reloc_ms"]["samples"] == 0
     assert got["latency_ms"]["reloc_ms"]["p95"] is None
+
+
+def test_map_loss_recovery_excludes_boot_and_flags_an_open_episode(tmp_path):
+    statuses = [
+        "NO_POSE", "NO_POSE",            # boot: not a loss
+        "FAST_TRACK",
+        "VO_ONLY", "VO_ONLY",            # lost at t=3, recovered at t=5 -> 2 s
+        "RELOC_SEED",
+        "FAST_TRACK",
+        "NO_POSE", "NO_POSE",            # lost at t=7 and never recovered
+    ]
+    rows = [
+        _loc_row(i, float(i), direct_status=s, success=s != "NO_POSE") for i, s in enumerate(statuses)
+    ]
+    session = _write_session(tmp_path / "s", _manifest(), rows)
+    quality = rep.build_session_report(
+        session, window_s=1.0, warmup_s=0, nominal_override=1
+    )["quality"]
+    assert quality["map_loss_episodes"] == 2
+    assert quality["map_recovered_episodes"] == 1
+    assert quality["map_unrecovered_at_end"] is True
+    assert quality["map_recovery_s"] == {"p50": 2.0, "p95": 2.0, "max": 2.0}
+
+
+def test_session_that_never_loses_the_map_has_no_recovery_samples(tmp_path):
+    rows = [_loc_row(i, float(i)) for i in range(4)]
+    session = _write_session(tmp_path / "s", _manifest(), rows)
+    quality = rep.build_session_report(
+        session, window_s=1.0, warmup_s=0, nominal_override=1
+    )["quality"]
+    assert quality["map_loss_episodes"] == 0
+    assert quality["map_unrecovered_at_end"] is False
+    assert quality["map_recovery_s"]["p50"] is None
+
+
+def test_client_queue_drops_use_the_cumulative_maximum_not_a_sum(tmp_path):
+    rows = [
+        _loc_row(i, float(i), coalesced_submit_drops=n, rejected_submits=0)
+        for i, n in enumerate([0, 2, 5, 5])
+    ]
+    session = _write_session(tmp_path / "s", _manifest(), rows)
+    drops = rep.build_session_report(
+        session, window_s=1.0, warmup_s=0, nominal_override=1
+    )["quality"]["client_queue_drops"]
+    assert drops == {"coalesced_submit_drops": 5, "rejected_submits": 0}

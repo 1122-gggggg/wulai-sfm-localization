@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import hashlib
-import inspect
 import json
 import math
 import threading
@@ -46,7 +45,8 @@ class _Clock:
 class _Backend:
     def __init__(self):
         self.pilot_sticks = False
-        self._runtime_safety_action_latched = False
+        self.runtime_safety_latched = False
+        self.maneuver_in_progress = None
         self.nudge_pct = 10
         self.zeros = []
         self.vectors = []
@@ -59,6 +59,14 @@ class _Backend:
             autonomous_speed_limit_mps=0.30,
             stream="OK",
         )
+
+    def pilot_override_active(self):
+        return self.pilot_sticks
+
+    def gimbal_pitch_sample(self):
+        if getattr(self.state, "gimbal_stamp_source", None) != "simulated":
+            return None
+        return self.state.gimbal_pitch_deg, self.state.gimbal_mono_ns
 
     def send_pcmd(self, roll, pitch, yaw, gaz, *, reason, auto_run_id=None):
         self.zeros.append((roll, pitch, yaw, gaz, reason))
@@ -1375,7 +1383,7 @@ def test_only_an_uncommanded_landing_during_auto_flight_yields(
     tmp_path, phase, flight_state, maneuver
 ) -> None:
     backend = _Backend()
-    backend._maneuver_in_progress = maneuver
+    backend.maneuver_in_progress = maneuver
     autonomy = DesktopRouteAutonomy(
         backend=backend,
         snapshot=_snapshot(tmp_path),
@@ -1516,7 +1524,7 @@ def test_disabled_speed_limit_still_sends_horizontal_auto_command(tmp_path) -> N
 
 def test_runtime_safety_latch_holds_auto_at_zero(tmp_path) -> None:
     backend = _Backend()
-    backend._runtime_safety_action_latched = True
+    backend.runtime_safety_latched = True
     autonomy = DesktopRouteAutonomy(
         backend=backend,
         snapshot=_snapshot(tmp_path),
@@ -1634,13 +1642,21 @@ def test_auto_yaw_command_is_not_held_for_horizontal_stop(tmp_path, speed, age):
     assert record["pcmd_phase"] == "turn"
 
 
-def test_desktop_weak_fill_in_does_not_use_a_half_second_map_deadline(tmp_path):
+@pytest.mark.parametrize("accept_weak_poses, expected_gate", [(True, False), (False, True)])
+def test_desktop_route_weak_pose_gate_follows_accept_weak_poses(
+    tmp_path, accept_weak_poses, expected_gate
+):
     autonomy = _budget_autonomy(tmp_path, _Backend(), _Clock())
-    autonomy.accept_weak_poses = True
-    assert autonomy._run_route.__func__ is DesktopRouteAutonomy._run_route
-    # Desktop AUTO passes enforce_weak_pose_gate=not accept_weak_poses.
-    source = inspect.getsource(DesktopRouteAutonomy._run_route)
-    assert "enforce_weak_pose_gate=not self.accept_weak_poses" in source
+    autonomy.accept_weak_poses = accept_weak_poses
+    seen = {}
+
+    def run_loop(_hooks, _controller, _waypoints, **kwargs):
+        seen.update(kwargs)
+        return "route complete"
+
+    autonomy.run_loop = run_loop
+    assert autonomy._run_route() == "route complete"
+    assert seen["enforce_weak_pose_gate"] is expected_gate
 
 
 def test_turn_brake_log_preserves_a_later_manual_handoff(tmp_path):
@@ -2659,6 +2675,8 @@ def test_auto_backend_dispatch_carries_run_identity_without_changing_commands(tm
 def test_waypoint_camera_dispatch_uses_typed_command_and_fresh_event_readback(tmp_path):
     from backend_contract import ControlAction, ControlResult
     from operator_flight_safety import TelemetryFreshnessStore
+    from olympe_live_backend import OlympeLiveBackend
+    from types import MethodType
 
     clock = _Clock()
     backend = _Backend()
@@ -2668,6 +2686,7 @@ def test_waypoint_camera_dispatch_uses_typed_command_and_fresh_event_readback(tm
     backend.state.gimbal_mono_ns = 10_000_000_000
     backend.state.gimbal_stamp_source = "observed_cache_value"
     backend.telemetry_freshness = TelemetryFreshnessStore()
+    backend.gimbal_pitch_sample = MethodType(OlympeLiveBackend.gimbal_pitch_sample, backend)
     backend.telemetry_freshness.observe(
         "gimbal", {"gimbal_id": 0, "pitch_absolute": -30.},
         marker=("cache", "old"), observed_mono_ns=10_000_000_000,
@@ -2753,7 +2772,7 @@ def test_waypoint_camera_session_dispatch_confirmation_pause_and_result_events(t
 
 def test_simulated_route_consumer_delegates_camera_only_and_emits_simulated_readback():
     from backend_contract import ControlAction, ControlRequest, ScalarPayload
-    from flight_operator_app import DroneBackend
+    from simulated_backend import DroneBackend
 
     backend = DroneBackend()
     plant = backend.route_test_plant
@@ -2773,3 +2792,48 @@ def test_simulated_route_consumer_delegates_camera_only_and_emits_simulated_read
     plant.pilot_sticks = True
     assert not plant.command(camera).accepted
     assert backend.state.gimbal_pitch_deg == -45  # No implicit reset on cancellation.
+
+
+@pytest.mark.parametrize("backend_kind", ["simulated", "live-deferred"])
+def test_session_speed_limit_controls_real_guard_and_idempotent_start(
+    tmp_path, monkeypatch, backend_kind,
+):
+    from backend_contract import SessionConfig
+    from simulated_backend import DroneBackend
+
+    if backend_kind == "simulated":
+        backend = DroneBackend()
+    else:
+        import flight_operator_app as app
+        import olympe_live_backend as live
+
+        monkeypatch.setattr(live, "_DEFAULT_RECORD_DIR", tmp_path / "recordings")
+        backend = live.OlympeLiveBackend(
+            app.DroneState, app.ANAFI,
+            event_log=SimpleNamespace(event=lambda *a, **kw: None),
+            auto_pc_control=False, with_video=False, defer_connect=True,
+        )
+        assert backend.drone is None and not backend._connection_attempted
+    config = SessionConfig(
+        session_id="speed-policy", interface_mode=backend.mode,
+        site_profile="", site_profile_sha256="", asset_sha256={},
+        runtime_profile_sha256="", source="", offline=True,
+        autonomous_speed_limit_mps=.35,
+    )
+    assert backend.start(config).started
+    clock = _Clock()
+    state = backend.state
+    state.autonomous_speed_limit_enabled = True
+    state.att_yaw = 0.
+    state.att_roll = state.att_pitch = 0.
+    state.attitude_mono_ns = state.ground_speed_mono_ns = round(clock.now() * 1e9)
+    state.ground_speed_mps = state.speed_north_mps = .5
+    state.speed_east_mps = 0.
+    auto = _budget_autonomy(tmp_path, backend, clock)
+
+    applied = auto._apply_speed_limit((0, 50, 7, -3))
+    assert applied[1] < 0
+    assert applied[2:] == (7, -3)
+    state.autonomous_speed_limit_mps = .8
+    assert backend.start(config).started
+    assert auto._apply_speed_limit((0, 50, 7, -3))[1] > 0

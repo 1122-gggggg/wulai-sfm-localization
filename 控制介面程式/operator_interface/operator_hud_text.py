@@ -164,11 +164,21 @@ def inventory_ui_status(backend: object) -> dict[str, tuple[str, str]]:
     controller = inventory.get("controller") or {}
     runtime = inventory.get("runtime") or {}
     lost_link = inventory.get("lost_link") or {}
-    aircraft_name = aircraft.get("name") or aircraft.get("model") or "ANAFI"
-    controller_name = controller.get("variant") or "SkyController 3"
+    profile = getattr(backend, "aircraft_profile", None)
+    aircraft_name = (
+        aircraft.get("name") or aircraft.get("model")
+        or getattr(profile, "model", None) or "機型未知"
+    )
+    controller_name = (
+        controller.get("variant") or getattr(profile, "controller_name", None)
+        or "控制器未知"
+    )
+    sdk_name = getattr(profile, "sdk_name", None) or "SDK"
+    sdk_version_key = getattr(profile, "sdk_version_key", None)
+    sdk_version = runtime.get(sdk_version_key) if sdk_version_key else None
     hardware_text = f"{aircraft_name} / {controller_name}"
     version_text = (
-        f"Olympe {runtime.get('olympe_version') or '?'} · "
+        f"{sdk_name} {sdk_version or '?'} · "
         f"飛機 {aircraft.get('software') or '?'} · "
         f"控制器 {controller.get('software') or '?'}"
     )

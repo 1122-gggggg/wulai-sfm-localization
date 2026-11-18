@@ -158,10 +158,11 @@ def boq_descriptor_from_array(extractor: BoQExtractor, image: np.ndarray) -> np.
 
         device = torch.device(extractor.device)
         arr = image if image.flags.c_contiguous else np.ascontiguousarray(image)
-        source = torch.from_numpy(arr)
-        if device.type == "cuda":
-            source = source.pin_memory()
-        x = source.to(device, non_blocking=True)
+        # Pageable source on purpose: a per-frame `pin_memory()` copy plus the DMA
+        # measured slower than the staged pageable copy (~53 vs ~25 us for one
+        # 960x540 frame). CUDA returns from a pageable `cudaMemcpyAsync` once the
+        # source is staged, so the caller may reuse `image` right after this call.
+        x = torch.from_numpy(arr).to(device, non_blocking=True)
         x = x.unsqueeze(0).unsqueeze(0).to(dtype=torch.float32).div_(255.0)
         x = F.interpolate(
             x,

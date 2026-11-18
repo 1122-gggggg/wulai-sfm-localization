@@ -98,6 +98,21 @@ def require_edm_cuda(torch_module) -> None:
         )
 
 
+def worker_cuda_identity(torch_module) -> dict:
+    """CUDA identity of the process that actually loads the models."""
+    cuda = torch_module.cuda
+    available = bool(cuda.is_available())
+    return {
+        "available": available,
+        "runtime_version": getattr(torch_module.version, "cuda", None),
+        "device_names": (
+            [str(cuda.get_device_name(i)) for i in range(cuda.device_count())]
+            if available
+            else []
+        ),
+    }
+
+
 def attach_frame_shm(name: str):
     """Attach the operator's frame buffer without taking ownership of it.
 
@@ -742,6 +757,7 @@ def main() -> None:
                     "event": "ready",
                     "backend": backend,
                     "device": DEVICE,
+                    "cuda": worker_cuda_identity(torch),
                     "tracker_variant": tracker_variant,
                     "startup_ms": startup_ms,
                     "startup_stage_ms": startup_stage_ms,

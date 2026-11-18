@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -52,9 +53,15 @@ EXCLUDED_PARTS = {
     "audit",
 }
 EXCLUDED_NAMES = {".coverage", "coverage.xml", ".DS_Store", "Thumbs.db", "desktop.ini"}
+# Machine-local state and optional benchmark weights are not release assets.
+EXCLUDED_PATHS = {
+    "執行環境/last_mission_selection.json",
+    "執行環境/models/yolo26n-seg.pt",
+}
 EXCLUDED_SUFFIXES = {".pyc", ".pyo", ".swp", ".swo", ".tmp", ".bak", ".orig", ".rej"}
 EXCLUDED_PREFIXES = (
     "地圖檔/",
+    "runs/",
     "模擬器/測試影片/",
     "定位演算法/validation/report_",
     "定位演算法/validation/source_videos/",
@@ -101,47 +108,123 @@ def _control_file_issue(root: Path) -> str | None:
     return None
 
 
+def _excluded_prefix(value: str, include_site_assets: bool) -> bool:
+    """True when *value* (posix, relative) sits under a never-shipped prefix."""
+    return (not include_site_assets and value.startswith("地圖檔/")) or any(
+        value.startswith(prefix) for prefix in EXCLUDED_PREFIXES if prefix != "地圖檔/"
+    )
+
+
 def included(
     relative: Path, *, source_only: bool = False, include_site_assets: bool = False
 ) -> bool:
     value = relative.as_posix()
     return (
         value not in CONTROL_FILES
+        and value not in EXCLUDED_PATHS
         and not any(part in EXCLUDED_PARTS for part in relative.parts)
         and relative.name not in EXCLUDED_NAMES
         and not relative.name.startswith(".coverage.")
         and not relative.name.endswith("~")
         and relative.suffix not in EXCLUDED_SUFFIXES
-        and not (not include_site_assets and value.startswith("地圖檔/"))
-        and not any(value.startswith(prefix) for prefix in EXCLUDED_PREFIXES if prefix != "地圖檔/")
+        and not _excluded_prefix(value, include_site_assets)
         and not (
             source_only
-            and any(value.startswith(prefix) for prefix in SOURCE_EXTERNAL_PREFIXES)
-            and relative.name != ".gitignore"
+            and (
+                value == "執行環境/models/power_equipment_sample50_3class_yolo26n_640_aug_best.pt"
+                or (
+                    any(value.startswith(prefix) for prefix in SOURCE_EXTERNAL_PREFIXES)
+                    and relative.name != ".gitignore"
+                )
+            )
         )
     )
+
+
+def _symlink_error(relative: Path) -> ValueError:
+    return ValueError(f"portable package does not permit symlinks: {relative}")
+
+
+def _subdirectories_to_walk(
+    here: Path,
+    relative_here: Path,
+    dirnames: list[str],
+    *,
+    source_only: bool,
+    include_site_assets: bool,
+) -> list[str]:
+    """Directory names under *here* worth entering; symlinked directories are never entered."""
+    descend: list[str] = []
+    for name in dirnames:
+        relative = relative_here / name
+        if (here / name).is_symlink():
+            if included(relative, source_only=source_only, include_site_assets=include_site_assets):
+                raise _symlink_error(relative)
+            continue
+        if name in EXCLUDED_PARTS or _excluded_prefix(
+            relative.as_posix() + "/", include_site_assets
+        ):
+            continue
+        descend.append(name)
+    return descend
+
+
+def _shippable_files(
+    here: Path,
+    relative_here: Path,
+    filenames: list[str],
+    *,
+    source_only: bool,
+    include_site_assets: bool,
+) -> list[Path]:
+    files: list[Path] = []
+    for name in filenames:
+        relative = relative_here / name
+        if not included(relative, source_only=source_only, include_site_assets=include_site_assets):
+            continue
+        path = here / name
+        if path.is_symlink():
+            raise _symlink_error(relative)
+        if path.is_file():
+            files.append(path)
+    return files
 
 
 def package_files(
     root: Path, *, source_only: bool = False, include_site_assets: bool = False
 ) -> list[Path]:
+    """Return every shippable regular file under *root*, sorted by posix path.
+
+    Directories that :func:`included` would reject for all of their contents
+    (an excluded path part, or a never-shipped prefix) are pruned in place, so
+    ``.venv*``, ``.git`` and the multi-GB ``地圖檔/`` tree are never entered.
+    Name- and suffix-based exclusions only match the entry itself, so they are
+    not used for pruning.
+    """
     files: list[Path] = []
-    # A nested worktree or repository (its own ``.git`` entry) is a separate checkout.
-    nested_checkouts = [marker.parent for marker in root.rglob(".git") if marker.parent != root]
-    for path in root.rglob("*"):
-        relative = path.relative_to(root)
-        if any(checkout in path.parents for checkout in nested_checkouts):
+    for current, dirnames, filenames in os.walk(root, followlinks=False):
+        here = Path(current)
+        # A nested worktree or repository (its own ``.git`` entry) is a separate checkout.
+        if here != root and (".git" in dirnames or ".git" in filenames):
+            dirnames[:] = []
             continue
-        if not included(
-            relative,
+        relative_here = here.relative_to(root)
+        dirnames[:] = _subdirectories_to_walk(
+            here,
+            relative_here,
+            dirnames,
             source_only=source_only,
             include_site_assets=include_site_assets,
-        ):
-            continue
-        if path.is_symlink():
-            raise ValueError(f"portable package does not permit symlinks: {relative}")
-        if path.is_file():
-            files.append(path)
+        )
+        files.extend(
+            _shippable_files(
+                here,
+                relative_here,
+                filenames,
+                source_only=source_only,
+                include_site_assets=include_site_assets,
+            )
+        )
     return sorted(files, key=lambda path: path.relative_to(root).as_posix())
 
 

@@ -435,9 +435,9 @@ def test_simulated_video_hud_never_claims_to_be_live() -> None:
     simulated = app.video_hud_identity(False, "LIVE")
     real = app.video_hud_identity(True, "MANUAL")
 
-    assert simulated == "SIMULATED ANAFI | mode=SIM"
+    assert simulated == "SIMULATED AIRCRAFT | mode=SIM"
     assert "LIVE" not in simulated
-    assert real == "REAL ANAFI | mode=MANUAL"
+    assert real == "REAL AIRCRAFT | mode=MANUAL"
     assert app.operator_mode_label(False, "LIVE") == "SIM"
     assert app.operator_mode_label(True, "MANUAL") == "MANUAL"
     assert app.localization_fps_metric_label(False) == "定位端到端 FPS（實機鏈路模擬）"
@@ -772,7 +772,8 @@ def test_low_confidence_recovery_holds_pose_until_trustworthy_fix() -> None:
     assert np.allclose(operator.live_pose[:3], [1.2, 2.1, 3.0])
 
 
-def test_install_site_runtime_allows_localization_exception_seq_zero(monkeypatch) -> None:
+@pytest.mark.parametrize("preserve_mode_selection", [False, True])
+def test_install_site_runtime_allows_localization_exception_seq_zero(monkeypatch, preserve_mode_selection) -> None:
     profile = SimpleNamespace(
         site_id="new-site",
         source=Path("/tmp/new-site.yaml"),
@@ -812,6 +813,15 @@ def test_install_site_runtime_allows_localization_exception_seq_zero(monkeypatch
     operator.boot_lock_s = 0.0
     operator._last_localization_exception_seq = 0
     operator._last_applied_live_result_display_seq = 99
+    chosen_route = object()
+    chosen_points = ((1.0, 2.0, 3.0),)
+    chosen_center = np.array([7.0, 8.0])
+    chosen_scale = object()
+    operator._mode_switch_selection = (
+        {"displayed": chosen_route, "displayed_sha": "chosen-sha", "route_snapshot": None,
+         "route_points": chosen_points, "map_view": (chosen_center, chosen_center, np.zeros(2), chosen_scale)}
+        if preserve_mode_selection else None
+    )
     operator._make_command_coordinator = lambda: object()
     operator._map_view_bounds = lambda _points: (np.zeros(2), 1.0)
     operator._set_preflight_visible = lambda _visible: None
@@ -821,6 +831,7 @@ def test_install_site_runtime_allows_localization_exception_seq_zero(monkeypatch
     operator.title = lambda _title: None
     operator._attach_localizer_file_handler = lambda: None
     operator._sync_record_status_label = lambda: None
+    operator._refresh_stream_mode_controls = lambda: None
     operator.site_assets_panel = SimpleNamespace(activate_site=lambda *_args: None)
     monkeypatch.setattr(
         app,
@@ -835,6 +846,14 @@ def test_install_site_runtime_allows_localization_exception_seq_zero(monkeypatch
     monkeypatch.setattr(app, "DepthInspector", lambda _app: SimpleNamespace(close=lambda: None))
 
     app.OperatorApp._install_site_runtime(operator, runtime)
+    assert operator.replay_rows == []
+    if preserve_mode_selection:
+        assert operator._displayed_route_snapshot is chosen_route
+        assert operator.route_pts == list(chosen_points)
+        assert operator.map_center is chosen_center and operator.field_scale is chosen_scale
+    else:
+        assert operator.route_pts == []
+        assert operator._displayed_route_snapshot is None
 
     recovery_calls = []
     operator.localizer.poll_results = lambda: [
@@ -943,7 +962,7 @@ def test_worker_python_defaults_to_current_runtime(monkeypatch: pytest.MonkeyPat
     (
         ("simulated-stream", False, "simulated-stream", False),
         ("real-flight", False, "real-flight", True),
-        ("", False, "simulated-stream", False),
+        ("", False, "real-flight", True),
         ("", True, "real-flight", True),
     ),
 )
@@ -960,7 +979,7 @@ def test_operator_interface_modes_are_exactly_two_and_mutually_exclusive(
 
 
 def test_real_flight_interface_rejects_video_file_fallback() -> None:
-    with pytest.raises(ValueError, match="accepts only the ANAFI PDRAW stream"):
+    with pytest.raises(ValueError, match="accepts only the aircraft live stream"):
         app.resolve_operator_interface("real-flight", False, "/tmp/replay.mp4")
 
 
@@ -3822,22 +3841,10 @@ def test_autonomy_pose_gates_weak_snapshot_on_opt_in_flag(monkeypatch) -> None:
     )
 
 
-@pytest.mark.parametrize("in_flight", [False, True])
-def test_pipe_submit_reuses_only_complete_immutable_frames(in_flight) -> None:
-    client = object.__new__(app.LiveWorkerClient)
-    client._lock = threading.Lock()
-    client.in_flight = in_flight
-    client._coalesce = None
-    client._coalesce_drops = 0
-    client.pending = queue.Queue(maxsize=1)
-    frame = bytes(range(24))
-
-    assert client._submit_pipe_frame(1, "frame", b"", memoryview(frame), {})
-    item = client._coalesce if in_flight else client.pending.get_nowait()
-    assert item[3] is frame
-
-
-@pytest.mark.parametrize("view_kind", ["mutable", "readonly_mutable", "partial", "reversed"])
+@pytest.mark.parametrize("view_kind", [
+    "mutable", "readonly_mutable", "partial", "reversed",
+    "numpy_immutable", "numpy_readonly_mutable", "numpy_partial", "numpy_reversed",
+])
 def test_pipe_submit_keeps_snapshot_and_view_byte_order(view_kind) -> None:
     client = object.__new__(app.LiveWorkerClient)
     client._lock = threading.Lock()
@@ -3845,18 +3852,24 @@ def test_pipe_submit_keeps_snapshot_and_view_byte_order(view_kind) -> None:
     client.pending = queue.Queue(maxsize=1)
     mutable = bytearray(range(24))
     immutable = bytes(mutable)
+    mutable_array = np.frombuffer(mutable, dtype=np.uint8).reshape(2, 4, 3)
+    mutable_array.setflags(write=False)
+    immutable_array = np.frombuffer(immutable, dtype=np.uint8).reshape(2, 4, 3)
     raw = {
         "mutable": memoryview(mutable),
         "readonly_mutable": memoryview(mutable).toreadonly(),
         "partial": memoryview(immutable)[1:],
         "reversed": memoryview(immutable)[::-1],
+        "numpy_immutable": memoryview(immutable_array).cast("B"),
+        "numpy_readonly_mutable": memoryview(mutable_array).cast("B"),
+        "numpy_partial": memoryview(immutable_array[1:]).cast("B"),
+        "numpy_reversed": memoryview(immutable_array[::-1]),
     }[view_kind]
     expected = bytes(raw)
 
     assert client._submit_pipe_frame(1, "frame", b"", raw, {})
     mutable[:] = bytes(24)
     assert client.pending.get_nowait()[3] == expected
-    assert client._immutable_frame_bytes(raw) is None
 
 
 def test_idle_hud_skips_duplicate_tcl_writes_but_refreshes_changed_inputs(monkeypatch) -> None:

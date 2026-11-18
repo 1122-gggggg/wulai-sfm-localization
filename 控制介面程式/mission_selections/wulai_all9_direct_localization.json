@@ -1,0 +1,30 @@
+{
+  "calibrations": [
+    {
+      "path": "../../地圖檔/場域/wulai_all9_direct_20261019/compat/localizer_quality_receipt.json",
+      "sha256": "7166928ca712cb33c6d1dec5901e845eeb84a0dc3963ff763a98072f011fef8f"
+    }
+  ],
+  "localizer": {
+    "path": "../../地圖檔/場域/wulai_all9_direct_20261019/compat/localizer_direct_manifest.json",
+    "sha256": "362542428e1dc4003f4c1ae75e0d8c8faa3db19c843b35bcd04a521e818d439a"
+  },
+  "map": {
+    "path": "../../地圖檔/場域/wulai_all9_direct_20261019/compat/map_manifest.json",
+    "sha256": "856dfd20ab57433c1205b111a888091058da8f711a61723fa6b5e91db9aace9e"
+  },
+  "route": {
+    "path": "../mission_components/routes/wulai_all9_direct_operator_route.json",
+    "sha256": "7a63ae68bd54d9e92354285998a4fa06d68406142a436ed134b150f5806c63b8"
+  },
+  "schema": "sfm-mission-selection/v1",
+  "selection_id": "wulai_all9_direct_localization",
+  "site": {
+    "path": "../../地圖檔/場域/wulai_all9_direct_20261019/manifests/site.json",
+    "sha256": "171e2b5c110a0d88e71b2042975e8bb7f0f1f8790c3cb7633c9e588f1c57d0f2"
+  },
+  "vehicle": {
+    "path": "../mission_components/vehicles/parrot_anafi_720p_river_direct.json",
+    "sha256": "ccf4849fb6cb0a1ad381910c6de4b0ec597feece97dc41c0af1b0f0b9a680d6b"
+  }
+}

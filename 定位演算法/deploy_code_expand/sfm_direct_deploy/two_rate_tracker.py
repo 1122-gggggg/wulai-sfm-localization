@@ -53,8 +53,12 @@ from typing import TYPE_CHECKING, Any, NamedTuple
 import cv2
 import numpy as np
 
+from direct_paths import vendor_sys_path
 from point_quality import pose_quality, spatial_indices
-from vendor.river_map_quality.pose_information import scaled_pose_information
+
+vendor_sys_path()
+
+from river_map_quality.pose_information import scaled_pose_information  # noqa: E402
 
 if TYPE_CHECKING:  # pragma: no cover - typing only, keeps import graph light
     from direct_map import DirectMapAssets

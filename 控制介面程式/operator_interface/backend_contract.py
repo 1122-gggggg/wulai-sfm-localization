@@ -7,13 +7,19 @@ missing payloads, and non-human takeoff requests are rejected before dispatch.
 from __future__ import annotations
 
 import math
+import threading
 import time
 import uuid
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Mapping, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Callable, Iterator, Mapping, Protocol, runtime_checkable
+
+if TYPE_CHECKING:
+    from operator_state import AircraftProfile, DroneState
 
 
 class InterfaceMode(str, Enum):
@@ -51,6 +57,60 @@ class ControlAction(str, Enum):
     DRONE_MAGNETOMETER_CANCEL = "drone_magnetometer_cancel"
     SKYCONTROLLER_MAGNETOMETER_START = "skycontroller_magnetometer_start"
     SKYCONTROLLER_MAGNETOMETER_CANCEL = "skycontroller_magnetometer_cancel"
+
+
+@dataclass(frozen=True)
+class AircraftCapabilities:
+    """Positive declarations only; an absent/unknown action is unsupported."""
+
+    actions: frozenset[ControlAction] = frozenset()
+
+    def __post_init__(self) -> None:
+        if any(not isinstance(action, ControlAction) for action in self.actions):
+            raise ValueError("capabilities require known ControlAction values")
+        object.__setattr__(self, "actions", frozenset(self.actions))
+
+    def supports(self, action: ControlAction) -> bool:
+        return isinstance(action, ControlAction) and action in self.actions
+
+
+class RuntimeSwitchKind(str, Enum):
+    NEVER_CONNECTED = "never_connected"
+    PROVEN_DISCONNECTED = "proven_disconnected"
+    LANDED = "landed"
+    UNSAFE = "unsafe"
+
+
+@dataclass(frozen=True)
+class RuntimeSwitchStatus:
+    """Read-only connection evidence, not a touchdown or flight authorization."""
+
+    kind: RuntimeSwitchKind
+    reason: str
+    connection_target: str
+    flight_state: str = "unknown"
+
+    @property
+    def can_switch(self) -> bool:
+        return self.kind in {
+            RuntimeSwitchKind.NEVER_CONNECTED,
+            RuntimeSwitchKind.PROVEN_DISCONNECTED,
+            RuntimeSwitchKind.LANDED,
+        }
+
+
+class StreamOwner(str, Enum):
+    BACKEND = "backend"
+    RUNTIME = "runtime"
+
+
+def gimbal_observation(pitch: Any, stamp: Any) -> tuple[float, int] | None:
+    """Normalize an adapter-verified camera event, retaining its source clock."""
+    if isinstance(pitch, bool) or not isinstance(pitch, (int, float)):
+        return None
+    if type(stamp) is not int or stamp <= 0 or not math.isfinite(pitch):
+        return None
+    return float(pitch), stamp
 
 
 class FailureReason(str, Enum):
@@ -437,6 +497,71 @@ def _parse_legacy_payload(
     return EmptyPayload()
 
 
+class ControlAdmission:
+    """Cancellable host admission; its lock never covers an SDK operation."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._current = True
+
+    def cancel(self) -> None:
+        with self._lock:
+            self._current = False
+
+    def is_current(self) -> bool:
+        with self._lock:
+            return self._current
+
+    @contextmanager
+    def guard(self) -> Iterator[bool]:
+        with self._lock:
+            yield self._current
+
+
+_CONTROL_ADMISSION: ContextVar[ControlAdmission | None] = ContextVar(
+    "operator_control_admission", default=None,
+)
+
+
+def control_request_is_current() -> bool:
+    admission = _CONTROL_ADMISSION.get()
+    return admission is None or admission.is_current()
+
+
+def execute_admitted_control(
+    request: ControlRequest, state: Any,
+    execute: Callable[[ControlRequest], ControlResult],
+) -> ControlResult:
+    """Establish one synchronous backend call's admission, not a flight grant.
+
+    Background motion retains the backend's existing deadman/motion epochs;
+    ContextVar state is deliberately not assumed to propagate to those threads.
+    Cancellation cannot undo a command already submitted to an SDK.
+    """
+    admission = request.admission
+    if admission is None:
+        context = _CONTROL_ADMISSION.set(None)
+        try:
+            return execute(request)
+        finally:
+            _CONTROL_ADMISSION.reset(context)
+    with admission.guard() as current:
+        if not current:
+            return ControlResult.rejected("CONTROL_REQUEST_CANCELLED", state)
+        context = _CONTROL_ADMISSION.set(admission)
+    try:
+        result = execute(request)
+        if not admission.is_current():
+            return ControlResult(
+                False, result.executed, "CONTROL_REQUEST_CANCELLED",
+                result.ack, result.readback, result.resulting_state,
+                raw_result=result.raw_result,
+            )
+        return result
+    finally:
+        _CONTROL_ADMISSION.reset(context)
+
+
 @dataclass(frozen=True)
 class ControlRequest:
     action: ControlAction
@@ -444,10 +569,13 @@ class ControlRequest:
     request_id: str = field(default_factory=lambda: uuid.uuid4().hex)
     submitted_mono_ns: int = field(default_factory=time.monotonic_ns)
     human_origin: bool = False
+    admission: ControlAdmission | None = field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if not isinstance(self.action, ControlAction):
             raise InvalidControlRequest("action must be a ControlAction")
+        if self.admission is not None and not isinstance(self.admission, ControlAdmission):
+            raise InvalidControlRequest("admission must be a ControlAdmission")
         if not isinstance(self.request_id, str) or not self.request_id.strip():
             raise InvalidControlRequest("request_id is required")
         if (
@@ -629,7 +757,7 @@ class SessionConfig:
     source: str
     offline: bool
     site_profile_schema_version: int = 0
-    autonomous_speed_limit_mps: float = 0.60
+    autonomous_speed_limit_mps: float = 0.80
     autonomous_locked: bool = True
     firmware_limits: Mapping[str, Any] = field(default_factory=dict)
 
@@ -727,17 +855,98 @@ class FrameSource(Protocol):
 
 @runtime_checkable
 class OperatorBackend(Protocol):
+    """Shared UI port; command implementations must honor request admission.
+
+    Use execute_admitted_control at entry and cancellation/aircraft safety
+    predicates at delayed authority or movement commits. Unknown capabilities
+    must reject commands rather than acknowledge a no-op. SDKs and hardware
+    inventory validation belong to the concrete adapter, never the UI.
+    """
+
     mode: InterfaceMode
     is_live: bool
-    state: Any
+    state: DroneState
+    aircraft_profile: AircraftProfile
+    capabilities: AircraftCapabilities
     video: FrameSource | None
+    stream_owner: StreamOwner
+    connection_target: str
+    session_config: SessionConfig | None
+    session_logs: Any | None
+
+    def flight_state_name(self) -> str: ...
+
+    def runtime_switch_status(self) -> RuntimeSwitchStatus: ...
+
+    def pilot_override_active(self) -> bool: ...
+
+    @property
+    def maneuver_in_progress(self) -> str | None: ...
+
+    @property
+    def runtime_safety_latched(self) -> bool: ...
+
+    def gimbal_pitch_sample(self) -> tuple[float, int] | None: ...
+
+    def stream_lost_hover(self, detail: str = "stream lost") -> Any: ...
 
     def start(self, config: SessionConfig) -> StartResult: ...
 
-    def poll(self, now_mono_ns: int | None = None) -> Any: ...
+    def poll(self, now_mono_ns: int | None = None) -> DroneState: ...
 
     def command(self, request: ControlRequest) -> ControlResult: ...
 
     def fail_safe(self, reason: FailureReason) -> ControlResult: ...
 
     def close(self, reason: str) -> CloseResult: ...
+
+
+@runtime_checkable
+class AutonomousFlightBackend(OperatorBackend, Protocol):
+    """Additional operational port required before enabling desktop AUTO.
+
+    PCMD axes are signed percentages; vector axes are normalized [-1, 1].
+    Implementations retain their own authority, deadman, freshness and shutdown
+    gates. Implementing this port does not authorize flight.
+    """
+
+    pilot_sticks: bool
+    nudge_pct: int
+
+    def send_pcmd(
+        self, roll: int, pitch: int, yaw: int, gaz: int, *, reason: str,
+        motion_epoch: int | None = None, auto_run_id: str | None = None,
+        command_set_mono_ns: int | None = None,
+    ) -> bool: ...
+
+    def set_nudge_vector(
+        self, roll: float, pitch: float, yaw: float, gaz: float, *,
+        authority_pct: int | None = None, auto_run_id: str | None = None,
+    ) -> bool: ...
+
+    def clear_nudge_vector(self) -> None: ...
+
+    def nudge_clear(self, reason: str = "clear") -> None: ...
+
+    def give_to_pilot(self, *, reason: str = "manual") -> bool: ...
+
+    def calibration_motion_snapshot(self) -> dict[str, Any]: ...
+
+    def control_telemetry_history(
+        self, since_stamps: tuple[float | None, ...] | None = None,
+    ) -> Any: ...
+
+
+@runtime_checkable
+class LiveOperatorBackend(AutonomousFlightBackend, Protocol):
+    """Live lifecycle used by runtime composition and existing shutdown policy."""
+
+    video_stream: Any | None
+    connection_in_progress: bool
+    with_video: bool
+
+    def connect_live(self) -> None: ...
+
+    def latch_shutdown_motion(self, *, reason: str) -> bool: ...
+
+    def cleanup(self) -> bool: ...

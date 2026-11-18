@@ -7,7 +7,7 @@
 2. 有航線時才匯入的 route JSON。
 3. 有巡檢點時才匯入的電桿／目標物 JSON。
 
-資料匯入本身不會起飛，也不會自動核准自主飛行。AUTO 的 route 與 localizer pose
+資料匯入本身不會起飛，也不會自動核准自主飛行（外部匯入的 route JSON 一律不核准）。AUTO 的 route 與 localizer pose
 必須直接使用同一次重建的 raw map frame；相機光心直接作為導航中心，不建立
 `map→site` 對齊，也不從場域動作猜尺度。舊的 `site_alignment` 與
 `camera_body_extrinsic` 檔案仍可被 schema 解析以保留歷史相容性，但 runtime 不載入
@@ -132,6 +132,26 @@ route JSON 必須是開放 polyline，至少兩個互異且有限的三維 waypo
 `frame` 也可為 `aligned`，但必須明確填寫。範例座標只說明結構，不是可飛航線。
 任何 route 或資產內容更動後，都必須重新計算 profile 中的 SHA-256 並重新審核。
 
+### 介面內儲存的航線核准紀錄（`flight.authored_routes`）
+
+操作介面航線編輯器成功儲存且已綁定地圖時，managed profile 的 `flight` 區塊新增一筆
+`authored_routes` 紀錄；route JSON 另帶儲存當下的 `map_ply_sha256`：
+
+| 欄位 | 內容 |
+|---|---|
+| `path` | 航線檔相對 profile 的路徑（不得逸出場域資料夾） |
+| `sha256` | 該航線檔內容的 SHA-256 |
+| `map_sha256` | 儲存當下 `asset_sha256.map_ply`，地圖變動即失效 |
+
+選取航線時 `profile_for_selected_route` 逐筆驗證：路線檔雜湊、地圖雜湊與座標系都相符才把
+`flight.approved` 與 `route_clearance_approved` 視為真；紀錄缺漏、被改動或路線／地圖不相符
+都回傳鎖定的 profile（fail closed），其他航線的紀錄不受影響。編輯會取代該航線的紀錄、
+刪除會移除。沒有可信紀錄的歷史航線在介面開啟並成功儲存一次即可核准。
+這是儲存當下的路線／地圖綁定證據，不是淨空或飛行許可；三步 preflight、定位與其他 backend
+守門不變。
+
 目前河濱 profile 指向全八段 direct 新地圖（未獨立驗證、無 route、未核准飛行）；
 到現場仍必須通過三步檢查、確認相機水平朝向等同機頭朝向並逐段低速
-試飛。烏來與其他場域仍維持 `approved=false`。
+試飛。烏來 `wulai_all9_direct_20261019` 已有 `mission_selections/wulai_all9_direct_localization.json`，
+兩條現有航線都有 `flight.authored_routes` 綁定；其 `localizer_quality` 為 2026-10-29
+操作員驗收（`validation: NONE`，30 天後到期，不是獨立精度驗證）。其他場域仍維持 `approved=false`。

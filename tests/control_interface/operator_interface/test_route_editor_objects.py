@@ -325,3 +325,42 @@ def test_invalid_axis_leaves_constraint_and_preview_unchanged(axis) -> None:
         controller.constrain(axis)
     assert controller.axis == 1
     assert controller.boxes == [BOX]
+
+
+def test_paste_adds_an_independent_identical_box_with_fresh_identity_and_undo() -> None:
+    controller = ObjectBoxController([BOX, {"center": [9.0, 9.0, 9.0], "size": [1.0, 1.0, 1.0]}])
+    controller.selected = 0
+    assert controller.copy_selected()
+    controller.selected = 1
+
+    assert controller.paste()
+    assert controller.boxes[2] == BOX
+    assert controller.selected == 2
+    assert controller.keys == [0, 1, 2]
+
+    controller.begin("g")
+    controller.preview(delta=[5.0, 0.0, 0.0])
+    controller.confirm()
+    assert controller.boxes[0] == BOX  # moving the copy leaves the original alone
+    assert controller.paste()  # the clipboard still holds the copied box, not the moved one
+    assert controller.boxes[3] == BOX
+    assert controller.keys == [0, 1, 2, 3]
+
+    assert controller.undo()
+    assert len(controller.boxes) == 3
+    assert controller.paste()
+    assert controller.keys[-1] == 4  # an undone identity is never reused
+
+
+def test_copy_paste_are_refused_without_selection_clipboard_or_while_transforming() -> None:
+    controller = ObjectBoxController()
+    assert not controller.copy_selected()
+    assert not controller.paste()
+
+    controller = ObjectBoxController([BOX])
+    assert not controller.paste()  # nothing copied yet
+    assert controller.copy_selected()
+    controller.begin("s")
+    assert not controller.copy_selected()
+    assert not controller.paste()
+    assert len(controller.boxes) == 1

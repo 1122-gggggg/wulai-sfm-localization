@@ -23,7 +23,7 @@ OPERATOR_ACCEPTANCE（2026-10-09 操作員要求續期、不設到期）放行�
 `configure_flight_preflight()` 是 fail-closed，不是盡力設定。下列任一情況都會
 丟出 `RuntimeError` 並中止，不會只記錄警告：`--max-altitude-m` 或
 `--max-distance-m` 未提供、非有限值或 <= 0；電量讀不到或不在 0-100；電量低於
-30%；`MaxAltitude`／`MaxDistance` 寫入後回讀與要求值不符。距離圍欄預設關閉，
+20%（2026-10-11 操作員決定，原 30%）；`MaxAltitude`／`MaxDistance` 寫入後回讀與要求值不符。距離圍欄預設關閉，
 關閉時沒有 GPS 或尚未 fix 可以繼續；但操作員若明確加上 `--distance-geofence`，
 就必須有已確認的 GPS fix，否則同樣中止。
 

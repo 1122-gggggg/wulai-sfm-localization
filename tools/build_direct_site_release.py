@@ -613,9 +613,11 @@ def resolve_map_dir(pack: Path, explicit: str) -> Path:
 def prepare_release_geometry(bundle_path: Path, package: str = DEPLOY_PACKAGE_ORIGINAL) -> str:
     """Precompute CPU geometry and bind it to the existing bundle manifest."""
     direct_root = REPO_ROOT / package
-    for path in (direct_root, direct_root / "vendor"):
-        if str(path) not in sys.path:
-            sys.path.insert(0, str(path))
+    if str(direct_root) not in sys.path:
+        sys.path.insert(0, str(direct_root))
+    from direct_paths import vendor_sys_path
+
+    vendor_sys_path()
     from direct_geometry import GEOMETRY_ARCHIVE, prepare_geometry_archive
     from direct_map import DirectMapAssets
 

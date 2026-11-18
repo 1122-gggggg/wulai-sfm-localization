@@ -23,8 +23,12 @@ OPERATOR = ROOT / "控制介面程式/operator_interface"
 
 
 def _pipe_benchmark(client_type, iterations: int) -> dict:
-    frame = bytes(1280 * 720 * 3)
-    raw = memoryview(frame)
+    import numpy as np
+
+    frame = np.arange(1280 * 720 * 3, dtype=np.uint8).tobytes()
+    # Match FFmpeg's immutable ndarray view, not an artificial bytes-only input.
+    decoded = np.frombuffer(frame, dtype=np.uint8).reshape(720, 1280, 3)
+    raw = client_type._frame_memoryview(decoded)
     client = object.__new__(client_type)
     client._lock = threading.Lock()
     client.in_flight = True
@@ -53,10 +57,13 @@ def _pipe_benchmark(client_type, iterations: int) -> dict:
             if index >= 10:
                 samples[label].append(elapsed)
     current()
+    if client._coalesce[3] != frame:
+        raise RuntimeError("pipe submission changed decoded RGB bytes")
     return {
         "frame_bytes": len(frame),
         "iterations": iterations,
         "scope": "CPU pipe queue/coalesce only; no IPC, model, GPU or network",
+        "input": "readonly NumPy RGB array over immutable decoder bytes",
         "median_ms": {key: statistics.median(values) for key, values in samples.items()},
         "p95_ms": {
             key: sorted(values)[min(len(values) - 1, int(0.95 * len(values)))]
@@ -178,6 +185,10 @@ def _window_close(args, ui, observed):
             pipeline = getattr(ui, "_segmentation_pipeline", None)
             if args.segment and pipeline is not None:
                 observed["paired_pipeline"] = pipeline.snapshot(time.monotonic())
+            session_logs = getattr(ui, "session_logs", None)
+            if session_logs is not None:
+                # Lets report_localization_performance.py read exactly this run.
+                observed["session_dir"] = str(session_logs.directory)
             if args.capture:
                 _grab_window(ui, args.capture)
                 observed["capture"] = str(args.capture)
@@ -319,8 +330,10 @@ class _CompletedWorker:
 
 
 def _build_controlled_ui(operator, np, args):
+    from simulated_backend import DroneBackend
+
     ui = operator.OperatorApp(
-        operator.DroneBackend(),
+        DroneBackend(),
         np.random.default_rng(0).random((2000, 6)).astype(np.float32) * 10,
         site_id="offline-completions",
     )

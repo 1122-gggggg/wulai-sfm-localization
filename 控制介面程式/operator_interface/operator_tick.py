@@ -32,7 +32,13 @@ from localization_result_ui import (
     reject_camera_attitude_outlier,
     validate_live_localization_result,
 )
-from operator_rendering import _pts_sig, weak_pose_source_kind
+from operator_rendering import (
+    _pts_sig,
+    _route_sig,
+    video_hud_summary_text,
+    weak_pose_source_kind,
+)
+from status_file_writer import publish_status_file
 
 if TYPE_CHECKING:
     from real_path_follow_controller import Pose
@@ -245,7 +251,7 @@ def _handle_stick_override(app: Any, state: Any) -> None:
         count = int(getattr(app.backend, "stick_override_count", 0) or 0)
         last_cmd = str(getattr(state, "last_command", "") or "")
         if last_cmd == "stick_override" or count > 0:
-            app.write_log("搖桿輸入偵測：控制權已強制交回 SkyController 搖桿")
+            app.write_log("搖桿輸入偵測：控制權已強制交回遙控器搖桿")
             app.control_owner_var.set(
                 "控制權: 搖桿 (動搖桿強制交回) — 按「恢復電腦控制」拿回"
             )
@@ -482,10 +488,6 @@ def _update_state_and_history(app: Any, state: Any) -> Any:
     if (app.localizer is not None and app.live_new_pose) or (app.localizer is None):
         app.history.append(state.pose.copy())
         app.history_health.append(getattr(app, "loc_health", "OK"))
-        if len(app.history) > 300:
-            app.history.pop(0)
-            if app.history_health:
-                app.history_health.pop(0)
     if app.localizer is not None:
         # A result may have arrived on the independent 5 ms poll callback.
         # Consume its one-shot history notification only after this render tick.
@@ -498,11 +500,28 @@ def _update_state_and_history(app: Any, state: Any) -> Any:
     return state
 
 
+def _record_worker_cuda(app: Any) -> None:
+    """Persist the worker's measured CUDA identity once per session and distinct report."""
+    info = getattr(app.localizer, "startup_info", None)
+    cuda = info.get("cuda") if isinstance(info, dict) else None
+    logs = getattr(app, "session_logs", None)
+    if not isinstance(cuda, dict) or logs is None:
+        return
+    recorded = app.__dict__.get("_recorded_worker_cuda")
+    if recorded is not None and recorded[0] is logs and recorded[1] == cuda:
+        return
+    # A failed write is retained in the session summary; do not retry per tick.
+    app._recorded_worker_cuda = (logs, dict(cuda))
+    logs.record_worker_cuda(cuda)
+
+
 def _update_hud_startup(app: Any) -> None:
     localizer_ready = (
         app.localizer is None
         or bool(getattr(app.localizer, "ready", True))
     )
+    if app.localizer is not None and localizer_ready:
+        _record_worker_cuda(app)
     if app.localizer is not None and not localizer_ready:
         startup_error = getattr(app.localizer, "startup_error", None)
         text = "定位 worker 暖機重試中" if startup_error else "定位模型暖機中"
@@ -662,14 +681,21 @@ def _map_dirty_key(app: Any, state: Any, *, width: int, height: int) -> tuple:
             # An estimate can expire without a new pose/history entry. Repaint
             # its stale label on that transition, not on every elapsed tick.
             estimate_key = (localization_result_display_seq(result), estimate.stale)
+    gimbal_pitch = getattr(state, "gimbal_pitch_deg", None)
+    gimbal_pitch_key = (
+        round(float(gimbal_pitch), 1)
+        if gimbal_pitch is not None and np.isfinite(gimbal_pitch) else None
+    )
+    raster = app.__dict__.get("_map_raster")
     return (
         app.map_base_key(width, height),
+        0 if raster is None else raster.poll(),
         _pts_sig(app.history),
         tuple(getattr(app, "history_health", ())),
         _pts_sig(getattr(app, "history_weak", ())),
         tuple(getattr(app, "history_weak_health", ())),
         tuple(getattr(app, "history_weak_kind", ())),
-        _pts_sig(app.route_pts),
+        _route_sig(app.route_pts),
         _pts_sig(app.no_loc_markers),
         pose_key,
         camera_axes_key,
@@ -685,23 +711,25 @@ def _map_dirty_key(app: Any, state: Any, *, width: int, height: int) -> tuple:
             else None
         ),
         estimate_key,
-        getattr(state, "gimbal_pitch_deg", None),
+        gimbal_pitch_key,
     )
 
 
 def _video_dirty_key(app: Any, state: Any, *, width: int, height: int) -> tuple:
+    live_backend = app._is_live_backend()
     flight_state = getattr(state, "flight_state", None) or getattr(state, "mode", None)
     return (
         # A held source keeps its pixels, but frame age/telemetry still repaint.
         float(getattr(app, "_video_frame_stamp", 0.0)),
         id(getattr(app, "video_frame", None)),
         tuple(app._video_diagnostic_lines()),
-        getattr(state, "frame_age_ms", None),
-        getattr(state, "link_latency_ms", None),
-        getattr(state, "stream_fps", None),
-        getattr(state, "gimbal_pitch_deg", None),
-        getattr(state, "zoom", None),
-        app._is_live_backend(),
+        # Exactly what the HUD prints: sub-display jitter in frame age, link
+        # latency, fps, gimbal pitch and zoom must not repaint the panel.
+        video_hud_summary_text(
+            state, live_backend,
+            getattr(getattr(app.backend, "aircraft_profile", None), "stream_latency_ms", None),
+        ),
+        live_backend,
         width,
         height,
         app.inspecting,
@@ -722,6 +750,22 @@ def _video_dirty_key(app: Any, state: Any, *, width: int, height: int) -> tuple:
         round(float(getattr(state, "battery_pct", 100.0) or 0.0), 0),
         # Depth view: toggle, newest paired capture, finished render, 10 Hz age text.
         getattr(app.__dict__.get("_depth_inspector"), "view_token", lambda: None)(),
+    )
+
+
+#: A map repaint may take at most ~1/(1+factor) of the UI thread. In flight a
+#: repaint costs 15 ms against 2 ms on the ground, so the fixed 50 ms gap let
+#: it eat 30% of a 33 ms tick budget that also serves sticks and polling.
+MAP_RENDER_MIN_GAP_S = 0.05
+MAP_RENDER_MAX_GAP_S = 0.2
+MAP_RENDER_COST_FACTOR = 5.0
+
+
+def map_render_gap_s(paint_s: float) -> float:
+    """Minimum spacing before the next paced map repaint, from the last cost."""
+    return min(
+        MAP_RENDER_MAX_GAP_S,
+        max(MAP_RENDER_MIN_GAP_S, MAP_RENDER_COST_FACTOR * paint_s),
     )
 
 
@@ -763,12 +807,15 @@ def _render_if_dirty(app: Any, state: Any, *, profile: Any = None) -> None:
         old_freshness = None if previous is None or previous[-2] is None else previous[-2][1]
         immediate = (
             previous is None or map_key[0] != previous[0]
-            or freshness != old_freshness or map_key[-1] != previous[-1]
+            or freshness != old_freshness
         )
         if immediate or now >= float(getattr(app, "_map_render_next", 0.0)):
+            paint_started = time.perf_counter()
             app.present_map(width_map, height_map, state)
             app._map_dirty_key = map_key
-            app._map_render_next = now + 0.05
+            app._map_render_next = time.monotonic() + map_render_gap_s(
+                time.perf_counter() - paint_started
+            )
             pipeline = app.__dict__.get("_segmentation_pipeline")
             if pipeline is not None and getattr(app.__dict__.get("detector"), "task", "detect") == "segment":
                 pipeline.rendered("localization", app.__dict__.get("live_result"), time.monotonic())
@@ -993,11 +1040,12 @@ def _publish_live_result_state(app: Any, result: dict) -> None:
     # session logged diagnostic_write_failed and wrote no status file at all.
     payload = result.to_payload() if hasattr(result, "to_payload") else result
     try:
-        LIVE_STATUS_PATH.write_text(
-            json.dumps(payload, ensure_ascii=False, default=str), encoding="utf-8"
-        )
+        text = json.dumps(payload, ensure_ascii=False, default=str)
     except Exception as exc:
         app._record_diagnostic_failure(LIVE_STATUS_PATH, exc)
+        return
+    # The write itself runs on the status-file thread, never on the Tk tick.
+    publish_status_file(app, LIVE_STATUS_PATH, text)
 
 
 def _live_result_failed(app: Any, result: dict, *, invalid_success_pose: bool) -> bool:

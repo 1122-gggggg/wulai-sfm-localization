@@ -47,12 +47,58 @@ def box_corners(box: Box) -> np.ndarray:
     ], dtype=float)
 
 
+#: Screen pixels of pointer travel that multiply a box dimension by e (about 2.7x).
+SCALE_PIXELS_PER_E = 250.0
+#: Holding Shift divides pointer sensitivity by this factor.
+SCALE_PRECISE_DIVISOR = 10.0
+#: Start closer to the box centre than this has no outward direction to follow.
+_SCALE_MIN_ANCHOR_PX = 8.0
+_SCALE_LOG_LIMIT = 12.0
+#: Fallback travel axis (screen right/up grows, left/down shrinks).
+_SCALE_FALLBACK_DIRECTION = np.array((1.0, -1.0)) / math.sqrt(2.0)
+
+
+class PointerScale:
+    """Pointer-to-scale mapping that is exponential, unbounded both ways and jump-free.
+
+    The factor is exp(t / SCALE_PIXELS_PER_E) where t is pointer travel projected on
+    one fixed screen axis, so the first pixels change the size by about 0.4% instead
+    of a share of a tiny start-to-centre distance, and the box can shrink as far as
+    it can grow. Travel is accumulated per event, so toggling precision never makes
+    the box jump, and the axis is frozen at construction so zooming the map
+    mid-gesture cannot change it.
+    """
+
+    def __init__(self, center, start):
+        self._last = np.asarray(start, dtype=float)
+        offset = self._last - np.asarray(center, dtype=float)
+        distance = float(np.linalg.norm(offset))
+        # Away from the box centre grows, towards it shrinks; started on the centre
+        # there is no such direction, so right/up grows.
+        self._direction = (
+            offset / distance if distance >= _SCALE_MIN_ANCHOR_PX
+            else _SCALE_FALLBACK_DIRECTION
+        )
+        self._log = 0.0
+
+    def move(self, point, precise: bool = False) -> float:
+        point = np.asarray(point, dtype=float)
+        travel = float((point - self._last) @ self._direction)
+        self._last = point
+        if precise:
+            travel /= SCALE_PRECISE_DIVISOR
+        self._log = float(np.clip(
+            self._log + travel / SCALE_PIXELS_PER_E, -_SCALE_LOG_LIMIT, _SCALE_LOG_LIMIT))
+        return math.exp(self._log)
+
+
 class ObjectBoxController:
     """Object-only undo history; previews always derive from their start snapshot."""
 
     def __init__(self, boxes=None):
         self.boxes: list[Box] = [_box(box) for box in ([] if boxes is None else boxes)]
         self.keys: list[int] = list(range(len(self.boxes)))
+        self._clipboard: Box | None = None
         # Deliberately excluded from history: undone identities must never be reused.
         self._next_key = len(self.boxes)
         self.selected: int | None = 0 if self.boxes else None
@@ -194,4 +240,22 @@ class ObjectBoxController:
         self._undo.append(self._snapshot())
         self.boxes, self.keys = self._redo.pop()
         self._restore_selection()
+        return True
+
+    def copy_selected(self) -> bool:
+        """Remember the selected box; the clipboard is outside undo history."""
+        if self.transforming or not self._has_selection():
+            return False
+        self._clipboard = _copy_boxes([self.boxes[self.selected]])[0]
+        return True
+
+    def paste(self) -> bool:
+        """Add an identical box with a fresh identity and select it."""
+        if self.transforming or self._clipboard is None:
+            return False
+        self._record()
+        self.boxes.append(_copy_boxes([self._clipboard])[0])
+        self.keys.append(self._next_key)
+        self._next_key += 1
+        self.selected = len(self.boxes) - 1
         return True

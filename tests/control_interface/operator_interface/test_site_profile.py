@@ -1227,27 +1227,30 @@ def test_autonomous_flight_requires_the_alignment_to_be_hash_pinned(tmp_path: Pa
 @pytest.mark.parametrize("evaluation_only", [False, True])
 def test_live_snapshot_uses_matching_evaluation_flavor(tmp_path, monkeypatch, evaluation_only):
     from dataclasses import replace
-    from mission_resolver import MissionReadiness
+    from mission_resolver import MissionReadiness, ResolvedMission
 
     profile = load_site_profile(_write_profile(tmp_path))
     runtime = tmp_path / "執行環境"
     snapshots = runtime / "mission_snapshots"
     snapshots.mkdir(parents=True)
     identity = "test-selection@123456789abc"
-    flavor = ".eval" if evaluation_only else ""
-    path = snapshots / f"{identity}{flavor}.site_profile.json"
-    path.write_text("{}")
-    selected = replace(profile, source=path)
     for name in app._SITE_ASSET_ENV_VARS:
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("SFM_MISSION_SELECTION", "selection.json")
     monkeypatch.setenv("SFM_EVALUATION_ONLY", "1" if evaluation_only else "0")
     monkeypatch.setattr(app, "_WS", SimpleNamespace(root=tmp_path, runtime=runtime))
-    monkeypatch.setattr(app, "load_site_profile", lambda _: selected)
-    monkeypatch.setattr(app, "resolve_mission", lambda *a, **kw: SimpleNamespace(
+    mission = SimpleNamespace(
         identity=identity, selection=SimpleNamespace(source=tmp_path / "selection.json"),
         selection_sha256="1" * 64, readiness=MissionReadiness((), ()),
-    ))
+    )
+    mission.compatibility_profile_path = lambda directory: (
+        ResolvedMission.compatibility_profile_path(mission, directory)
+    )
+    path = mission.compatibility_profile_path(snapshots)
+    path.write_text("{}")
+    selected = replace(profile, source=path)
+    monkeypatch.setattr(app, "load_site_profile", lambda _: selected)
+    monkeypatch.setattr(app, "resolve_mission", lambda *a, **kw: mission)
     args = _args(path, live=True)
     assert app._resolve_startup_site(args, argparse.ArgumentParser())[0] is selected
     assert args.mission_flight_ready is not evaluation_only

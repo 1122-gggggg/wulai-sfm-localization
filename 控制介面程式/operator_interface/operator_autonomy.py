@@ -551,10 +551,8 @@ class DesktopRouteAutonomy:
             return True
         if self._uncommanded_landing():
             return True
-        monitor = getattr(self.backend, "_stick_monitor", None)
-        is_active = getattr(monitor, "is_active", None)
         try:
-            return bool(callable(is_active) and is_active())
+            return bool(self.backend.pilot_override_active())
         except Exception:
             return True
 
@@ -571,7 +569,7 @@ class DesktopRouteAutonomy:
         state = getattr(getattr(self.backend, "state", None), "flight_state", "")
         if str(state or "").lower() not in {"landing", "emergency_landing"}:
             return False
-        return getattr(self.backend, "_maneuver_in_progress", None) != "landing"
+        return bool(self.backend.maneuver_in_progress != "landing")
 
     def _safety_mode(self) -> str:
         self._check_runtime_safety()
@@ -586,7 +584,7 @@ class DesktopRouteAutonomy:
         return "AUTO"
 
     def _runtime_safety_latched(self) -> bool:
-        return bool(getattr(self.backend, "_runtime_safety_action_latched", False))
+        return bool(self.backend.runtime_safety_latched)
 
     def _latch_auto_failure(
         self,
@@ -1051,25 +1049,10 @@ class DesktopRouteAutonomy:
     def _read_waypoint_gimbal_pitch(self) -> tuple[float, float] | None:
         if not self._waypoint_camera_authorized():
             return None
-        if getattr(self.backend, "is_live", False):
-            store = getattr(self.backend, "telemetry_freshness", None)
-            sample = store.sample("gimbal") if store is not None else None
-            if (
-                sample is None or not isinstance(sample.marker, tuple)
-                or sample.marker[0] != "event" or not isinstance(sample.value, dict)
-                or sample.value.get("gimbal_id", 0) != 0
-            ):
-                return None
-            # Read the immutable event's angle and stamp together; UI state
-            # updates these fields separately and is not an atomic observation.
-            pitch = sample.value.get("pitch_absolute")
-            stamp = sample.observed_mono_ns
-        else:
-            state = self.backend.state
-            if getattr(state, "gimbal_stamp_source", None) != "simulated":
-                return None
-            pitch = getattr(state, "gimbal_pitch_deg", None)
-            stamp = getattr(state, "gimbal_mono_ns", None)
+        sample = self.backend.gimbal_pitch_sample()
+        if sample is None:
+            return None
+        pitch, stamp = sample
         if (
             isinstance(pitch, bool) or not isinstance(pitch, (int, float))
             or type(stamp) is not int or stamp <= 0

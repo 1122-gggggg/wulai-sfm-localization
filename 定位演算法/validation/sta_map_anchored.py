@@ -15,6 +15,9 @@ map frame:
 * the query pose is ``world_T_ref @ ref_T_query`` with the translation scaled.
 
 Nothing here touches EDM, KLT or PnP.  It is an offline research path only.
+
+Experiment concluded NO-GO on 2026-09-23 (docs/sta_map_anchored_eval_20260923.md);
+kept only for reproduction and for its geometry unit tests.
 """
 
 from __future__ import annotations

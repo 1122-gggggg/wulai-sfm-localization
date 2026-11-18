@@ -53,6 +53,28 @@ def test_truncated_binary_cloud_keeps_only_complete_records():
     np.testing.assert_array_equal(result[:, :3], points[::2])
 
 
+def test_double_precision_positions_are_read_as_coordinates(tmp_path):
+    from map_point_io import read_ply_points
+
+    xyz = np.array([[1.5, -2.25, 3.125], [4.0, 5.0, 6.0], [7.0, 8.0, 9.0]])
+    records = np.zeros(3, dtype=[("pos", "<f8", (3,)), ("rgb", "u1", (3,))])
+    records["pos"] = xyz
+    records["rgb"] = [[10, 20, 30], [40, 50, 60], [70, 80, 90]]
+    path = tmp_path / "double.ply"
+    path.write_bytes(
+        (
+            "ply\nformat binary_little_endian 1.0\nelement vertex 3\n"
+            "property double x\nproperty double y\nproperty double z\n"
+            "property uchar red\nproperty uchar green\nproperty uchar blue\nend_header\n"
+        ).encode("ascii")
+        + records.tobytes()
+    )
+    points = read_ply_points(path, 10)
+    np.testing.assert_allclose(points[:, :3], xyz)
+    np.testing.assert_array_equal(points[:, 3:], records["rgb"])
+
+
+
 def _write_dense_ply(path, *, frame_id, map_sha):
     path.write_bytes(
         (

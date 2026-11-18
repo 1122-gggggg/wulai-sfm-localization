@@ -21,7 +21,7 @@ from backend_contract import (
     SessionConfig,
     TogglePayload,
 )
-from flight_operator_app import DroneBackend
+from simulated_backend import DroneBackend
 
 
 def test_session_config_is_immutable_and_has_one_fixed_interface() -> None:

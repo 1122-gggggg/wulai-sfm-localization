@@ -122,6 +122,27 @@ SDK dispatch 表示命令呼叫／enqueue，不代表韌體執行確認。
 輪替後不變，並注入寫入、最後 fsync、handle close、佇列溢位及 summary 寫入失敗；
 不連飛機、不呼叫真機 SDK、不執行起飛或降落。
 
+背景診斷的回傳契約與讀回方式：
+
+- `localization()`／`telemetry()`／`defer_telemetry()` 回傳 `True` 只代表
+  有界佇列接納資料，不代表已寫入、fsync 或錄製健康；`False` 代表未接納。
+  overflow 與非同步寫入故障須連同 incident、loss marker 與 summary 檢查。trajectory mirror
+  隨已接納的診斷資料處理，不因背景寫入而省略。
+- commands／incidents 仍同步 write／flush／fsync；其成功 bool 代表該安全
+  sink 的耐久性，不與背景診斷 admission 混用，也不等待診斷 sink 的 I/O。
+- 離線工具在 session 尚未關閉、要讀 JSONL 前，明確呼叫
+  `wait_for_diagnostics(timeout=...)`，並處理逾時。它等待呼叫前已接納資料與
+  loss marker 完成處理，**不是 fsync、也不把寫入失敗改判成功**；
+  不得在控制迴圈／UI poll 呼叫。沒有舊 `flush` 相容 shim。
+- `close()` 停止 admission，排空已接納資料並 join writer，再做 sink 的最後
+  同步及 handle close，最後寫 summary。寫入、fsync、close 或 summary
+  失敗均須如實反映；summary 可重試，但不能用重試清掉既有故障。
+  讀回須一併檢查 `recording_complete`、`write_failures`、
+  `debug_deferred_dropped` 與 `unresolved`，不可只看 barrier 回傳值。
+
+本輪已觀察到上述 CLI 的離線 producer／trace／failure／overflow／summary retry
+smoke 通過；僅證明該離線路徑，不代表完整 gates、目前 Tk UI 或實飛核准。
+
 ### 離線介面延遲量測
 
 ```bash
@@ -141,8 +162,14 @@ GUI 模式固定 `simulated-stream`，量測實際啟動階段、Tk heartbeat �
 （桌面認證失敗），因此不能宣稱受控前後加速，也不能以此保證最小視窗的控制列皆可容納。
 native video presenter 重用 fitted source／PhotoImage 與 canvas overlays；
 HUD-only 更新不 resize／upload 影片。這些 render 數字不是網路、GPU 或定位推論速度。
-既有同程序 2.76 MB RGB coalesce 微量測，中位數由複製版本 0.758 ms 降為
-0.044 ms；這只涵蓋 CPU 提交，並非上述 GUI 的配對 baseline。
+微量測現在以真實 FFmpeg 影格的型態（唯讀 NumPy RGB 陣列，底層為不可變 `bytes`）量測，
+並在位元組不同時直接失敗。舊的 `memoryview(bytes)` 輸入不能代表正式路徑：正式影格的
+`memoryview.obj` 是 ndarray，舊判斷永遠落到每次 2.76 MB 的複製（`immutable_frame_reused=false`）。
+修正後 `LiveWorkerClient._immutable_frame_bytes` 沿 ndarray base 找回原不可變 `bytes`
+（唯讀、連續、長度相等才重用；可變來源或局部 view 仍複製）。同程序 3 次 1000 次量測，
+複製版本中位數 0.737–0.741 ms、目前提交 0.047–0.061 ms；第一次修正前量測的兩者數值異常
+接近（約 0.074 ms），無法作為乾淨配對，因此以 `immutable_frame_reused` 轉為 true 作為機制證據。
+這只涵蓋 CPU 提交，並非上述 GUI 的配對 baseline，也不含 IPC、模型或 GPU。
 
 實際定位＋預訓練分割／mask 顯示的 GUI smoke 可加 `--localize --segment`：
 
@@ -150,7 +177,7 @@ HUD-only 更新不 resize／upload 影片。這些 render 數字不是網路、G
 .venv/bin/python tools/benchmark_operator_latency.py \
   --ui-seconds 50 --localize --segment \
   --site-profile 地圖檔/場域/river_site/site_profile.json \
-  --video /home/allen/下載/P1980198.MP4 --window-size 1440x900 \
+  --video 模擬器/測試影片/P1980198.MP4 --window-size 1440x900 \
   --capture /tmp/operator-segmentation.png --report /tmp/operator-segmentation.json
 ```
 
@@ -180,7 +207,7 @@ callback 異常；合成完成事件只驗證介面路徑，不證明實際定�
 ```bash
 .venv/bin/python tools/benchmark_localization_yolo.py \
   --site-profile 地圖檔/場域/river_site/site_profile.json \
-  --video /home/allen/下載/P1980198.MP4 \
+  --video 模擬器/測試影片/P1980198.MP4 \
   --mode throughput --warmup-frames 300 --frames 900 \
   --output outputs/analysis/localization_yolo26n_seg_e2e_20261005
 ```
@@ -245,7 +272,7 @@ COCO 80 類也不等於草地／道路／電力設備的專用分割。
 
 ```bash
 .venv-yolo/bin/python tools/export_yolo_engine.py \
-  --model /home/allen/下載/power_equipment_sample50_3class_yolo26n_640_aug_best.pt \
+  --model 執行環境/models/power_equipment_sample50_3class_yolo26n_640_aug_best.pt \
   --output 執行環境/models/power_equipment_yolo26n_384x640_fp16.engine
 ```
 
@@ -313,7 +340,6 @@ TensorRT 與 PyTorch FP16 在 898/900 幀有相同的類別／框數；對 FP32 
 
 | 檔案 | 用途 |
 |---|---|
-| `system_validation.py` | 編排主系統與 `parrot_stimulate` 的完整純地面驗證 |
 | `verify_wind_control.py` | 正式控制器的持續漂移、變風向、陣風及延遲／掉幀矩陣；輸出真值指標與逐週期紀錄，見 [抗風驗證](../定位演算法/flight_control/WIND_CONTROL.md) |
 | `identify_pcmd_response.py` | 由場次 `trajectory.jsonl` 的已下發 PCMD 與融合 NED 速度辨識延遲一階響應，並重播殘餘漂移觀測器，見 [抗風驗證](../定位演算法/flight_control/WIND_CONTROL.md) |
 | `autoflight_error_report.py` | 依 AUTO run ID 與永久終結摘要回顧首次到達航點後的規劃折線誤差；無樣本與舊紀錄證據不足明確標示 |
@@ -321,7 +347,8 @@ TensorRT 與 PyTorch FP16 在 898/900 幀有相同的類別／框數；對 FP32 
 | `benchmark_operator_latency.py` | 唯讀 RGB 提交比較與有限時間 simulated-stream GUI 啟動／heartbeat／render stage count、p50、p95 量測，支援視窗尺寸與擷取畫面，不略過既有驗證 |
 | `workspace_audit.py` | 唯讀檢查目錄、必要檔案、symlink、output 命名與容量 |
 | `check_maintainability.py` | 以分區 C901 預算阻止複雜度熱點數量或最壞值回升 |
-| `build_dense_display_ply.py` | 由 release 的 `model/points3D.bin` 產生航線編輯器用的完整點雲 `map/map_dense.ply`，綁定座標系與 `map.ply` SHA-256；`--mvs-fused <fused.ply>` 改寫 MVS 彩色融合點雲（濾離群點、抽樣至編輯器 300 萬點上限，需 scipy，release 須已有同座標系的 `dense_surface.json`） |
+| `build_dense_display_ply.py` | 由 release 的 `model/points3D.bin` 產生航線編輯器用的完整點雲 `map/map_dense.ply`，綁定座標系與 `map.ply` SHA-256；`--mvs-fused <ply>` 改寫稠密化彩色點雲（以固定記憶體串流抽樣、濾離群點、輸出至編輯器 300 萬點上限，需 scipy；release 有 `dense_surface.json` 時須同座標系，沒有時 `map.ply` 至少 30% 要落在有稠密點的格內） |
+| `verify_dense_alignment.py` | 證明稠密點雲與 COLMAP 模型同座標系：取樣關鍵影格各自觀測到的 3D 點，檢查稠密點雲在同一像素的最近表面深度是否一致（容差約 5%，預設 60 張影格、至少 30% 一致才通過；烏來正確點雲 0.62、錯座標系舊點雲 0.02）。`build_dense_display_ply.py` 的 `map.ply` 重疊率檢查擋不住幾單位的偏移，換稠密點雲時須先跑這個 |
 | `simulator_preflight.py` | 模擬介面啟動前檢查 Python、CUDA、模型、場域資產與影片 |
 | `offline_wheelhouse.py` | 建立／驗證與三份 lockfile 及每個 wheel SHA-256 綁定的離線安裝庫 |
 | `install_runtime.sh` | 用 hash lock 建立乾淨 CPython 3.10 venv；`--offline` 強制 `--no-index` |
@@ -331,9 +358,21 @@ TensorRT 與 PyTorch FP16 在 898/900 幀有相同的類別／框數；對 FP32 
 | `test_clean_install.sh` | 在暫存目錄重建 CPython 3.10 venv 並執行 runtime preflight |
 | `simulated_ui_smoke.sh` | 實際啟動地圖/影片選擇路徑，等 GUI 產生有效 pose 後安全終止 |
 | `test_portable_runtime.sh` | 依 package kind 驗證入口、乾淨離線安裝；有場域時要求 GUI 有效 pose，真機操作包另做 live launcher dry-run |
-| `../tests/tools/test_system_validation.py` | 驗證編排步驟和 Python 環境隔離 |
 | `../tests/tools/test_workspace_audit.py` | 驗證工作區結構契約 |
 | `security_dependency_gate.py` | 執行 pip-audit、驗證到期中的安全例外，並輸出 CycloneDX SBOM |
+| `sim_route_autoflight.py` | 〔離線〕以正式 `RouteAutoController` 與降階 ANAFI 模型做無比例閉環模擬；輸出 `summary.json`、`trace.csv`、圖與掃描 `sweep.csv`，見下方「任務與路線離線工具」 |
+| `anafi_wind_env.py` | 〔離線〕Gymnasium 水平定點環境；重用 R5 降階 plant、正式定點控制器與地速包絡，融合式延遲觀測、兩軸 PCMD 殘差，不接 Sphinx／真機 |
+| `train_anafi_wind.py` | 〔離線〕CPU PPO 訓練、保存／重載模型、同種子基準配對評估；保存契約、來源 SHA-256、版本與逐情境結果，見下方「ANAFI 強化學習離線訓練」 |
+| `verify_preset_routes.py` | 〔離線〕對 `river_site/routes/*.json` 逐條、逐起點做 waypoint-1 起飛的閉環驗收（含風與回航）；輸出 `results.json`、`wind_results.json`、`verification_manifest.json` |
+| `test_route_autoflight.py` | 〔離線〕單一 route JSON 的 dry-run 驗收：驗證航線格式並以正式控制器＋簡化動力學跑完；通過／失敗以結束碼表示。名稱雖以 `test_` 開頭，是 CLI 工具，不由 pytest 收集 |
+| `imu_flight_test_report.py` | 〔離線，唯讀〕檢查 IMU 飛行測試場次的遙測／影像完整性與時序；輸出 markdown 或 JSON，不構成精度或飛行核准 |
+| `report_localization_performance.py` | 〔離線，唯讀〕由 flight-log 場次計算端到端定位交付率（不重複幀 FPS、延遲與品質觀測）並對照 30 FPS 計畫門檻，輸出 JSON。`quality` 另含地圖確認失鎖次數與回復時間（開機前的未確認不算失鎖，結尾未回復另標）及 client 佇列丟幀（累計值取最大） |
+| `report_map_height_quality.py` | 〔離線，唯讀〕各地圖的高度**一致性**報告：以地圖 SHA／對齊 SHA 歸屬 flight-log，僅用 AUTO 強定位、非重複、新鮮氣壓高度樣本，將 3 秒窗內氣壓升降與地圖高度同向／反向／凍結以該路線到站半徑正規化分類（同比縮放地圖結果相同）。無該圖實飛資料為 `NO_FLIGHT_EVIDENCE`；最佳結論僅 `CONSISTENT_NOT_VALIDATED`，不輸出高度精度或公尺尺度 |
+| `import_direct_edm_bundle.py` | 〔離線〕把可攜 direct BoQ/EDM/COLMAP 地圖轉成正式 EDM bundle；輸出 `localization_bundle.pt`、`reference_poses.json`、`map.ply`、`import_summary.json`；需 torch／pycolmap／OpenCV |
+| `resolve_mission.py` | 〔離線〕解析 mission selection 並回報 localization／flight readiness；`--require` 不符時結束碼非零；`--materialize-site-profile` 寫入相容快照 |
+| `pin_mission_selection.py` | 〔離線〕由各元件 manifest 建立 SHA-256 綁定的新 selection，不覆寫既有檔，未達定位相容就不建立輸出 |
+| `update_mission_route.py` | 〔離線〕一鍵換 selection 的路線：重算 route／route package SHA、改寫兩份檔並以 resolver 驗證，失敗即還原；支援 `--dry-run` |
+| `stick_override_bench.py` | **〔地面台架，需實體 SkyController〕** 以真實 `SkyControllerStickMonitor` 讀 HID 搖桿，驗證撥桿會觸發交回控制權的判定；不連飛機、不飛行，但需人工撥桿。**僅由操作員在地面執行，agent／CI 一律不得執行** |
 
 `requirements/runtime-lock.txt` 是 runtime 的唯一 hash lock；`requirements/test-lock.txt`
 另外固定 pytest、ruff、coverage 與 timeout plugin。正式 portable 先在來源機建立
@@ -347,27 +386,21 @@ wheelhouse：
   --requirements requirements/quality-lock.txt
 ```
 
-乾淨測試可用 `bash tools/install_runtime.sh --offline --test-deps`；完整 system
-validation 使用 `bash tools/install_runtime.sh --offline --test-deps --quality-deps`。
+乾淨測試可用 `bash tools/install_runtime.sh --offline --test-deps`；含品質工具時使用
+`bash tools/install_runtime.sh --offline --test-deps --quality-deps`。
 offline 模式會先核對 `WHEELHOUSE.json`、三份 lockfile 與所有 wheel，再以
 `--no-index --find-links` 安裝。安裝器會拒絕
 `include-system-site-packages=true` 的既有 venv。scipy 已固定於 runtime lock，
 供診斷與 deploy 使用；桌面操作介面不再有稀疏點雲近接懸停互鎖，也沒有
 `--require-collision-monitor`。不得宣稱具備 collision protection。
 
-`system_validation.py` 的 receipt 也會在 `pytest.steps` 彙整每個 pytest step 的
-passed/failed/skipped/xfailed/xpassed/errors/warnings，並在 `pytest.skipped` 列出
-所有條件式 skip；因此「未執行」不會被誤報成通過。
-
-同一個 validation entry 會以 `monitor_hardware.py --output - --samples 1` 讀取硬體
-狀態；JSONL 只進該 step 的 receipt log，不建立額外的永久硬體輸出檔。
-
 Portable manifest 的 scope 由 `tools/package_manifest.py` 唯一決定；editor files、
 cache、workspace 執行輸出、audit review artifacts 與其他 `.gitignore` 對應的非發布
-資料不會因為偶然存在於 workspace 就進入 MANIFEST.tsv。唯一例外是受版控的
-`outputs/README.md`，用來把輸出分類與保留規則帶到新電腦。
+資料不會因為偶然存在於 workspace 就進入 MANIFEST.tsv。
 本機 `.venv`、`.venv-yolo` 與 `.venv-mvs` 都是執行環境，不納入 source／portable manifest；
 其 `lib64` 等環境內 symlink 不會被當成發布來源。產生 manifest 不刪除這些環境。
+根目錄 `runs/` 訓練輸出與 `執行環境/last_mission_selection.json` 是本機產物，
+不納入發布清單；三類電力設備偵測權重也不列入 Git 來源清單。
 
 發布收據與 `PORTABLE_PACKAGE.json` 必須同時帶 manifest/SHA256SUMS、commit、version
 與 dirty 狀態。`release_activation.py` 先驗證完整 package，再以 temporary directory
@@ -376,13 +409,7 @@ cache、workspace 執行輸出、audit review artifacts 與其他 `.gitignore` �
 目標 package。即使 manifest 正確，`offline_install.complete` 不是字面 `true` 或
 wheelhouse 與 lock/digest 不符也不得 activation。
 
-正常使用仍從根目錄執行 `./驗證系統.sh`；不需要直接呼叫
-`system_validation.py`。正式轉移時以
-`./驗證系統.sh --portable-package /path/to/portable_localization` 讓收據同時綁定
-實際輸出包的 `PORTABLE_PACKAGE.json`、`MANIFEST.tsv` 與 `SHA256SUMS`。
-加上 `--clean-install --ui-smoke` 時，還會在 actual portable 中暫時匯入固定場域，
-以其 lock 檔建立乾淨環境，並經 selector/UI 產生有效 pose 後自動清理。只要重查
-目錄時可執行：
+要重查目錄結構時可執行：
 
 ```bash
 python tools/workspace_audit.py --strict-output-names
@@ -452,6 +479,131 @@ CUDA wheel 即使被 pip-audit skip，也會以 `audited=false` 與原始 `skip_
 
 上述工具只讀資料與寫入報告，不載入 Olympe 或發送控制命令。詳細結果與限制見
 [`system_optimization_20260922.md`](../docs/system_optimization_20260922.md)。
+
+## ANAFI 強化學習離線訓練
+
+使用獨立的 `~/.local/share/venvs/drone-rl` Python 3.10 環境；不向真機 runtime
+加入 Gymnasium／Stable-Baselines3，不連飛機、不啟動 Sphinx，也沒有 live 模式。
+在 repository 根目錄執行：
+
+```bash
+# 第二輪魯棒訓練；--out 必須是尚不存在的目錄
+~/.local/share/venvs/drone-rl/bin/python tools/train_anafi_wind.py \
+  --timesteps 1000000 --seed 33 --n-envs 4 \
+  --reference-model outputs/anafi_rl/ppo_horizontal_hold_seed17_quantization_fixed/policy.zip \
+  --eval-seeds 2000017 2000018 2000019 2000020 2000021 2000022 2000023 2000024 2000025 2000026 \
+  --out outputs/anafi_rl/ppo_horizontal_hold_robust_seed33
+
+# 在相同目前環境重載新舊 actor，另指定尚不存在的結果目錄
+~/.local/share/venvs/drone-rl/bin/python tools/train_anafi_wind.py \
+  --evaluate-only outputs/anafi_rl/ppo_horizontal_hold_robust_seed33/policy.zip \
+  --reference-model outputs/anafi_rl/ppo_horizontal_hold_seed17_quantization_fixed/policy.zip \
+  --eval-seeds 2000017 2000018 2000019 2000020 2000021 2000022 2000023 2000024 2000025 2000026 \
+  --out outputs/anafi_rl/ppo_horizontal_hold_robust_seed33_recheck
+```
+
+任務固定高度／航向，20 Hz 控制、200 Hz plant 積分。PPO 只輸出 roll／pitch
+殘差，每軸最多 10 PCMD 百分點；基準優先分配後仍通過正式加速漸增與地速包絡，
+積分器回饋排除殘差。這是離線動作額度，不是已核准的真機設定或物理速度硬保證。
+殘差先量化成整數 PCMD 再套分配邊界；不得因 1.9 四捨五入成 2，就把
+整個向量衰減。配置非整數額度時整數命令上限向下取整，仍不超過配置額度。
+
+Actor 使用 8 個歷史 frame，共 184 個 float32：機體水平定位誤差、融合式地速、
+航向誤差、roll／pitch、基準與先前核准命令、先前實際分配殘差、各來源年齡及有效性。
+定位誤差依可用地圖尺度與伺服範圍正規化，不把 map units 當公尺。
+SDK 姿態／速度時間是 host receipt，不能代替不可見的 aircraft capture time。
+過期或缺失的定位／姿態／速度停用 RL 殘差；快取樣本不重新標成當下時間。
+真實位置、漂移及 plant 參數僅供 reward／診斷，不能進入 actor。
+`AnafiWindEnv.contract()` 保存欄位順序、尺度、時序及失效契約；
+`pack_observation()` 可共用觀測格式，但尚未接上真機推論入口。
+
+訓練情境為 calm、steady、gust、reversal、dropout，stress 的組合／擾動曲線不參與訓練。
+第二輪涵蓋其慢響應與延遲元件，不能再把所有 stress 參數稱為分布外。
+預設仍用三個評估 seed；上述第二輪命令預先指定十個新保留 seed。
+`--reference-model` 驗證舊模型 SHA-256 與輸入／輸出語意，在同一目前環境比較
+零補償、舊 actor、新 actor；不宣稱重現舊環境結果，也不移除失敗／提前終止案例。
+舊模型維持凍結，新模型從頭訓練。`policy.zip` 為模型；`metadata.json` 保存版本、
+來源／模型 SHA-256、實際 steps 與契約；`evaluation.json`／`evaluation.csv` 保存
+逐 seed 指標與配對差值。SB3 完整 rollout 會向上取整，實際 steps 以 metadata 為準。
+限幅比例比較最近整數 PCMD 與核准命令，包含基準包絡修改及到達命令上限，
+不把單純的小數轉整數算成限幅。環境契約目前為 schema 2，舊模型不得直接
+搭配 `--evaluate-only` 混用新來源；只能經語意核對的 `--reference-model`
+在目前環境比較。第一輪模型與原始報告保留不覆寫。
+恢復時間只適用有限脈衝／反向情境：擾動結束後，連續 1 秒位置誤差 ≤0.2 m、
+地速 ≤0.1 m/s 的首個穩定窗起點；未恢復或不適用保留 null，不當成 0 秒。
+
+重用的 R5 名目模型使用水平時間常數 3 s、tilt lag 0.4 s、加速度增益 1.09。
+第二輪未驗證的魯棒範圍為水平時間常數 2–4.5 s、tilt lag 0.25–0.75 s，
+速度遙測延遲 0.12–0.35 s、命令延遲 0–0.10 s；reward 同時抑制超額要求、
+未分配補償與地速，不只獎勵位置誤差。這不是新的實飛校準。
+擾動單位是**殘餘地面漂移 m/s，不是大氣風速**。
+融合觀測與定位雜訊是合成模型，不是實際相機／EKF pipeline；無障礙物、垂直擾動
+或完整機體氣動模型。訓練完成或離線改善均不構成抗風認證／實飛許可；
+Sphinx／真機時序、命令歸屬與操作員接管仍須另行整合驗證。
+
+Sphinx 地面風場檢查收據：
+[`sphinx_ground_wind_probe_seed33/report.json`](../outputs/anafi_rl/sphinx_ground_wind_probe_seed33/report.json)。
+已核對本機韌體 SHA-256、啟動 Sphinx／headless UE，對 `world:wind/wind` 寫入並讀回
+無風、東／北／西向 2 m/s，最後恢復無風並停止自建程序。沒有 Olympe 連線或飛行命令；
+這只驗證原生風場參數接口，不是 PPO 在物理風場的飛行結果。飛行驗證須由操作員
+先起飛／保持懸停，再使用受限的模擬器接口；不可把地面讀回當作抗風驗證。
+
+第二輪收據：
+[`ppo_horizontal_hold_robust_seed33/metadata.json`](../outputs/anafi_rl/ppo_horizontal_hold_robust_seed33/metadata.json)、
+[`evaluation.json`](../outputs/anafi_rl/ppo_horizontal_hold_robust_seed33/evaluation.json)。
+完成 1,003,520 steps；十個新 seed、六情境共 60 組三方比較。
+在同一 schema 2 環境，新模型平均 RMSE 比凍結舊 actor 低，但 19/60 組仍退化，
+嚴苛情境 0/10 達到恢復門檻。新舊環境／seed 不同，不能直接和第一輪表格比百分比；
+這是改善但未通過部署門檻的離線模型，沒有 PPO 物理飛行抗風證據。
+
+## 任務與路線離線工具
+
+以下除 `stick_override_bench.py` 外都不連飛機、不載入 Olympe、不發送控制命令。
+模擬與驗收的結果是近似模型，不是飛行許可。
+
+```bash
+# 閉環模擬：單條路線、3 個隨機種子，產物寫到 --out（預設 outputs/sim_autoflight/run_<時間>）
+.venv/bin/python tools/sim_route_autoflight.py \
+  --route 地圖檔/場域/river_site/routes/flight_route_<revision>.json --seeds 3 --out /tmp/sim
+
+# 預設路線全數驗收；--out 與 --localization-wait-s 必填，--quick 為每個起點單一種子
+.venv/bin/python tools/verify_preset_routes.py --quick --out /tmp/preset-routes \
+  --localization-wait-s 0
+
+# 單一路線 dry-run（結束碼 0 通過；--min-progress 預設 0.95）
+.venv/bin/python tools/test_route_autoflight.py --route <route.json>
+
+# IMU 飛行測試場次完整性；--json 輸出 JSON，--out 另存 markdown
+.venv/bin/python tools/imu_flight_test_report.py --session outputs/flight_logs/session_場次名稱
+
+# 定位交付率；--session 可重複，--window-s／--warmup-s／--nominal-fps 調整統計窗
+.venv/bin/python tools/report_localization_performance.py \
+  --session outputs/flight_logs/session_場次名稱 > /tmp/localization-performance.json
+
+# 匯入 direct EDM 地圖（輸出目錄新建）
+.venv/bin/python tools/import_direct_edm_bundle.py --source /path/to/portable_map --out-dir /tmp/edm-bundle
+```
+
+`verify_preset_routes.py` 與 `sim_route_autoflight.py` 的預設路線讀取 `地圖檔/` 內的
+私有場域資產；沒有這些資產時請以 `--route` 指定。
+
+mission selection 工具鏈（皆需在 workspace 內，路徑以相對於檔案的 SHA-256 參照綁定）：
+
+```bash
+.venv/bin/python tools/resolve_mission.py 控制介面程式/mission_selections/<selection>.json --require valid
+.venv/bin/python tools/pin_mission_selection.py --output 控制介面程式/mission_selections/<new>.json \
+  --selection-id <new> --vehicle <vehicle.json> --site <site.json> --map <map.json> \
+  --localizer <localizer.json> --calibration <quality-receipt.json>
+.venv/bin/python tools/update_mission_route.py \
+  --selection 控制介面程式/mission_selections/<selection>.json \
+  --route 地圖檔/場域/<site>/routes/flight_route_<revision>.json --dry-run
+```
+
+`stick_override_bench.py` 是地面台架：連接並開啟遙控器後執行
+`python tools/stick_override_bench.py [秒數]`，在時限內撥動飛行搖桿（軸 0–3，超過
+deadzone 才算；相機／雲台軸 4–5 不會奪取控制權），PASS 代表判定被觸發。
+找不到 SkyController joystick 節點或全程無觸發時結束碼為 1。它使用
+`operator_interface/skycontroller_stick.py` 的正式監視器，不經 Olympe。
 
 ## 擴圖版（工作圖）建圖工具
 

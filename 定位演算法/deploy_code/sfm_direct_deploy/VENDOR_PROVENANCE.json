@@ -27,6 +27,13 @@
       "patched_sha256": "2d3f001f27a92e01cdac077ff8ed6f967b118df7426dc0f6b0d0210572b64462",
       "change": "Extract the unchanged per-reference validity, two-view, sparse/depth lifting body into _lift_matched_reference, before the original cross-reference greedy deduplication.",
       "reason": "LiveMapEDMProvider caches these exact pre-dedup lifts only for the current capture, avoiding repeated baseline geometry work during bounded recovery. The input digest is the preceding local patch, not a new upstream revision; packages.files retains the original upstream digest. Differential overlap/depth oracle: tests/localization/deploy/test_direct_lift_cache.py. Actual frozen JPG replay receipts: outputs/analysis/flight_optimization_latest_20261004/relocalization."
+    },
+    {
+      "file": "sfm_diagnosis/site_pipeline/deployment_localizer.py",
+      "upstream_sha256": "2d3f001f27a92e01cdac077ff8ed6f967b118df7426dc0f6b0d0210572b64462",
+      "patched_sha256": "5d19e04388685b96aaa582c940ff343812b3e21c64b5ec885ba3bfbc29ba7cb6",
+      "change": "Select finite-score top-k candidates with partial selection and deterministic boundary ties; filter usable mapping views before selecting.",
+      "reason": "Avoid full Python sorting of large descriptor banks without changing cosine scores, session exclusions, index tie-breaks or occupied-view fallback. Non-finite inputs retain the legacy ordering. The original full-sort policy is retained as a differential oracle in tests/localization/deploy/test_direct_retrieval_policy.py; both production and expansion import this shared vendor."
     }
   ],
   "origin": "river-deploy-5060-20260908 (河濱 EDM fixed-pose retriangulate 建圖 + two-rate 定位)",

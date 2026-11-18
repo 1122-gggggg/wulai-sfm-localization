@@ -74,6 +74,7 @@ class SiteAssetActions:
         if self.current_profile is None:
             raise ValueError("請先匯入建圖端場域資料夾")
         imported = self.routes.import_file(source, self.current_profile)
+        self.current_profile = imported.profile_path
         status = (
             "已通過航線格式與場域驗證，將套用為 AUTO 航線；請完成三項驗證"
             if imported.approved_for_auto
@@ -101,13 +102,19 @@ class SiteAssetActions:
             approve_for_auto=True,
             replace_route=replace_route,
         )
+        self.current_profile = imported.profile_path
         action = "已更新" if replace_route is not None else "已新增"
+        status = (
+            "已自動核准並設為目前 AUTO 航線；請完成三項驗證"
+            if imported.approved_for_auto
+            else "儲存未取得 AUTO 核准，不會解鎖飛行"
+        )
         return ActionResult(
-            f"航線{action} {imported.asset_path.name}，已自動核准並設為目前 AUTO 航線；請完成三項驗證",
+            f"航線{action} {imported.asset_path.name}，{status}",
             imported.profile_path,
             imported.asset_path,
             "route",
-            approved_for_auto=True,
+            approved_for_auto=imported.approved_for_auto,
         )
 
     def delete_route(self, source: str | Path) -> ActionResult:

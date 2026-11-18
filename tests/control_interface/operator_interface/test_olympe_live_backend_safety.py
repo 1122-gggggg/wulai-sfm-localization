@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 import inspect
 import json
 import math
@@ -18,15 +19,17 @@ import pytest
 import olympe_live_backend as backend_module
 from backend_contract import (
     ControlAction,
+    ControlAdmission,
     ControlRequest,
     ControlResult,
     FailureReason,
     InterfaceMode,
     MissionRoutePayload,
+    NudgeVectorPayload,
     SessionConfig,
 )
 from localization_result_ui import reject_camera_attitude_outlier
-from operator_state import DroneState, TrackerState
+from operator_state import ANAFI, DroneState, TrackerState
 
 
 class _Message:
@@ -505,43 +508,50 @@ class _FakeStickMonitor:
     def snapshot_axes(self):
         return {}
 
+    def is_active(self):
+        return False
+
 
 def _install_fake_stick_monitor(monkeypatch):
     monkeypatch.setattr(backend_module, "SkyControllerStickMonitor", _FakeStickMonitor)
 
 
-def _install_fake_olympe(monkeypatch: pytest.MonkeyPatch) -> None:
-    package_names = (
-        "olympe",
-        "olympe.messages",
-        "olympe.messages.ardrone3",
-        "olympe.messages.common",
-        "olympe.messages.skyctrl",
-        "olympe.messages.drone_manager",
-        "olympe.features",
-        "olympe.enums",
-    )
-    # olympe.messages has no directory -- module_loader.py generates it at import
-    # time and inserts it straight into sys.modules. Shadowing a name that is NOT
-    # there yet makes monkeypatch DELETE it on teardown, permanently, breaking
-    # every later test that imports an olympe message. So import the real ones
-    # FIRST (when a real olympe is present) to give monkeypatch something to
-    # restore, then stub. Skipping the stub instead left the fakes uninstalled and
-    # `from olympe.messages import rth` reached the real module, so the fake
-    # return_to_home was never recorded.
-    if "olympe" in sys.modules and getattr(sys.modules["olympe"], "__file__", None):
-        import importlib
+def _wait_until(predicate, timeout_s: float = 5.0) -> bool:
+    """Poll ``predicate`` until it is true or the deadline passes; callers assert the result."""
+    deadline = time.monotonic() + timeout_s
+    while not predicate():
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.005)
+    return True
 
-        for name in package_names:
-            try:
-                importlib.import_module(name)
-            except Exception:
-                pass
-    for name in package_names:
-        module = ModuleType(name)
-        module.__path__ = []
-        monkeypatch.setitem(sys.modules, name, module)
 
+_FAKE_OLYMPE_PACKAGES = (
+    "olympe",
+    "olympe.messages",
+    "olympe.messages.ardrone3",
+    "olympe.messages.common",
+    "olympe.messages.skyctrl",
+    "olympe.messages.drone_manager",
+    "olympe.features",
+    "olympe.enums",
+)
+
+
+@functools.lru_cache(maxsize=None)
+def _fake_olympe_modules() -> dict[str, ModuleType]:
+    """Build the fake Olympe module tree once per process.
+
+    Message factories and namespaces are stateless, so every test shares these
+    module objects. Isolation comes from `_install_fake_olympe`, which installs
+    them through ``monkeypatch`` so ``sys.modules`` is restored after each test;
+    tests that need different behavior must patch with ``monkeypatch.setattr``.
+    """
+    built: dict[str, ModuleType] = {}
+    for name in _FAKE_OLYMPE_PACKAGES:
+        package = ModuleType(name)
+        package.__path__ = []
+        built[name] = package
     modules = {
         "olympe.messages.ardrone3.Piloting": {
             "PCMD": _message_factory("PCMD"),
@@ -699,20 +709,43 @@ def _install_fake_olympe(monkeypatch: pytest.MonkeyPatch) -> None:
         module = ModuleType(name)
         for key, value in attributes.items():
             setattr(module, key, value)
-        monkeypatch.setitem(sys.modules, name, module)
+        built[name] = module
         # `from olympe.messages import rth` resolves the ATTRIBUTE on the parent,
         # not just the sys.modules entry. Without this link the import fell through
         # and _request_rth bailed before ever issuing return_to_home -- the RTH
         # tests then saw a Landing and blamed the flight logic.
         parent_name, _, leaf = name.rpartition(".")
-        parent = sys.modules.get(parent_name)
+        parent = built.get(parent_name)
         if parent is not None:
-            monkeypatch.setattr(parent, leaf, module, raising=False)
+            setattr(parent, leaf, module)
+    return built
+
+
+def _install_fake_olympe(monkeypatch: pytest.MonkeyPatch) -> None:
+    # olympe.messages has no directory -- module_loader.py generates it at import
+    # time and inserts it straight into sys.modules. Shadowing a name that is NOT
+    # there yet makes monkeypatch DELETE it on teardown, permanently, breaking
+    # every later test that imports an olympe message. So import the real ones
+    # FIRST (when a real olympe is present) to give monkeypatch something to
+    # restore, then stub. Skipping the stub instead left the fakes uninstalled and
+    # `from olympe.messages import rth` reached the real module, so the fake
+    # return_to_home was never recorded.
+    if "olympe" in sys.modules and getattr(sys.modules["olympe"], "__file__", None):
+        import importlib
+
+        for name in _FAKE_OLYMPE_PACKAGES:
+            try:
+                importlib.import_module(name)
+            except Exception:
+                pass
+    for name, module in _fake_olympe_modules().items():
+        monkeypatch.setitem(sys.modules, name, module)
 
 
 @pytest.fixture
 def make_backend(monkeypatch: pytest.MonkeyPatch, tmp_path):
     _install_fake_olympe(monkeypatch)
+    _install_fake_stick_monitor(monkeypatch)
     monkeypatch.setattr(backend_module, "_DEFAULT_RECORD_DIR", tmp_path)
     # Unit tests must not inherit the workstation's current free-space state.
     # Dedicated storage-guard tests override this stub with warning/critical
@@ -746,11 +779,7 @@ def make_backend(monkeypatch: pytest.MonkeyPatch, tmp_path):
             loc="", stream="", mode="", tracker_state="", last_command="",
             zoom=1.0,
         )
-        profile = SimpleNamespace(
-            gimbal_pitch_min_deg=-90.0,
-            gimbal_pitch_max_deg=90.0,
-            digital_zoom_max=3.0,
-        )
+        profile = ANAFI
         backend = backend_module.OlympeLiveBackend(
             lambda: state,
             profile,
@@ -978,15 +1007,16 @@ def test_takeoff_battery_floor_is_fail_closed(make_backend):
     default = inspect.signature(
         backend_module.OlympeLiveBackend.__init__
     ).parameters["min_takeoff_battery_pct"].default
-    assert default == pytest.approx(30.0)
+    assert default == pytest.approx(20.0)
+    assert backend_module.takeoff_battery_blocker(20.0, default) is None
 
     backend = make_backend(max_altitude_m=30.0, max_distance_m=100.0)
-    backend.min_takeoff_battery_pct = 30.0
+    backend.min_takeoff_battery_pct = 20.0
     backend.drone.flight_state = "landed"
-    backend.drone.battery_pct = 29.0
+    backend.drone.battery_pct = 19.0
     assert not backend._takeoff_preflight()
     assert backend.state.preflight_reason == (
-        "battery 29% is below the 30% takeoff floor"
+        "battery 19% is below the 20% takeoff floor"
     )
     assert "TakeOff" not in backend.drone.events
 
@@ -1098,11 +1128,7 @@ def test_connect_keeps_skycontroller_sticks_until_explicit_pc_request(
     state = SimpleNamespace(
         loc="", stream="", mode="", tracker_state="", last_command="",
     )
-    profile = SimpleNamespace(
-        gimbal_pitch_min_deg=-90.0,
-        gimbal_pitch_max_deg=90.0,
-        digital_zoom_max=3.0,
-    )
+    profile = ANAFI
 
     backend = backend_module.OlympeLiveBackend(
         lambda: state,
@@ -4260,6 +4286,31 @@ def test_firmware_landing_without_a_pc_landing_is_logged_as_uncommanded(make_bac
     assert backend.log.records[2][1]["pc_maneuver"] == "landing"
 
 
+def test_uncommanded_landing_records_only_a_recent_rc_button(make_backend):
+    import skycontroller_stick as stick
+
+    backend = make_backend()
+    monitor = stick.SkyControllerStickMonitor(lambda _axes: None)
+    backend._stick_monitor = monitor
+    backend.log.records.clear()
+    backend._log_flight_state_change("hovering", "landing")
+    assert "rc_button" not in backend.log.records[1][1]
+
+    press = struct.pack(stick._JS_EVENT_FMT, 0, 1, stick._JS_EVENT_BUTTON, 0)
+    monitor._process_stick_data(press)
+    backend.log.records.clear()
+    backend._log_flight_state_change("hovering", "landing")
+    fields = backend.log.records[1][1]
+    assert fields["rc_button"] == 0 and fields["rc_button_pressed"] is True
+    assert 0.0 <= fields["rc_button_age_s"] < 1.0
+
+    button, pressed, mono_s = monitor.last_button()
+    monitor._last_button = (button, pressed, mono_s - 10.0)
+    backend.log.records.clear()
+    backend._log_flight_state_change("hovering", "landing")
+    assert "rc_button" not in backend.log.records[1][1]
+
+
 def test_rth_state_change_is_logged_once_with_the_firmware_reason(make_backend):
     backend = make_backend()
     backend.log.records.clear()
@@ -4631,9 +4682,15 @@ def test_a_short_tap_moves_briefly_and_then_zeroes(make_backend):
     backend.pilot_sticks = False
 
     assert backend.nudge_begin("前")
-    time.sleep(0.30)                      # a deliberate ~0.3 s tap
+    thread = backend._nudge_loop_thread
+    assert thread is not None
+    # A tap: release only once the hold loop has actually streamed a movement command.
+    assert _wait_until(
+        lambda: any(tuple(a[1:5]) != (0, 0, 0, 0) for a in list(backend.drone.pcmds))
+    ), "hold loop never streamed a movement command"
     backend.nudge_end("前")
-    time.sleep(0.15)                      # let the hold loop unwind
+    thread.join(timeout=2.0)              # let the hold loop unwind
+    assert not thread.is_alive(), "hold loop did not unwind after release"
 
     pcmds = [tuple(a[1:5]) for a in backend.drone.pcmds]
     assert pcmds, "no command reached the aircraft at all"
@@ -5281,7 +5338,7 @@ def deferred_backend(monkeypatch, tmp_path):
     source.connect = Mock(return_value=drone)
     monkeypatch.setitem(sys.modules, "olympe_frame_source", source)
     backend = backend_module.OlympeLiveBackend(
-        DroneState, SimpleNamespace(), defer_connect=True, with_video=False,
+        DroneState, ANAFI, defer_connect=True, with_video=False,
         auto_pc_control=False,
         event_log=_FakeLog(),
     )
@@ -5334,6 +5391,187 @@ def test_video_retry_keeps_command_link_and_releases_failed_decoder(deferred_bac
     source.connect.assert_called_once()
     assert drone.events == commands
 
+
+def test_explicit_reconnect_replaces_proven_disconnected_sdk_session(deferred_backend):
+    backend, old_drone, source = deferred_backend
+    backend.connect_live()
+    old_drone.connected = False
+    replacement = _FakeDrone()
+    replacement.flight_state = "landed"
+    source.connect.return_value = replacement
+
+    backend.connect_live()
+
+    assert backend.drone is replacement
+    assert source.connect.call_count == 2
+    assert "disconnect" in old_drone.events
+    assert backend.pilot_sticks is True
+    assert "Controller" not in replacement.source_requests
+    assert not {"TakeOff", "Landing", "PCMD"}.intersection(replacement.events)
+
+
+@pytest.mark.parametrize("flight_state", ["flying", "unknown"])
+def test_reconnect_preserves_connected_airborne_or_unknown_session(
+    deferred_backend, flight_state,
+):
+    backend, drone, source = deferred_backend
+    backend.connect_live()
+    drone.flight_state = flight_state
+    commands = list(drone.events)
+
+    with pytest.raises(RuntimeError, match="airborne or unknown"):
+        backend.connect_live()
+
+    assert backend.drone is drone
+    source.connect.assert_called_once()
+    assert drone.events == commands
+
+
+def test_unreadable_link_is_not_disconnection_proof(deferred_backend, monkeypatch):
+    backend, drone, source = deferred_backend
+    backend.connect_live()
+    monkeypatch.setattr(drone, "connection_state", Mock(side_effect=RuntimeError("cache")))
+    commands = list(drone.events)
+
+    with pytest.raises(RuntimeError, match="airborne or unknown"):
+        backend.connect_live()
+
+    source.connect.assert_called_once()
+    assert backend.drone is drone
+    assert drone.events == commands
+    assert not backend.runtime_switch_status().can_switch
+
+
+def test_explicit_restore_retries_late_ground_stick_monitor(deferred_backend, monkeypatch):
+    backend, drone, _source = deferred_backend
+    backend.auto_pc_control = True
+    original_start = backend._start_stick_monitor
+    monkeypatch.setattr(backend, "_start_stick_monitor", lambda: None)
+    backend.connect_live()
+    assert backend.pilot_sticks
+    assert "Controller" not in drone.source_requests
+    monkeypatch.setattr(backend, "_start_stick_monitor", original_start)
+
+    assert backend.take_pc_control()
+
+    assert backend.state.stick_monitor_ok
+    assert not backend.pilot_sticks
+    assert drone.source_requests[-1] == "Controller"
+    assert "TakeOff" not in drone.events
+
+
+def test_reconnect_retries_monitor_without_reclaiming_manual_control(
+    deferred_backend, monkeypatch,
+):
+    backend, drone, source = deferred_backend
+    backend.auto_pc_control = True
+    original_start = backend._start_stick_monitor
+    monkeypatch.setattr(backend, "_start_stick_monitor", lambda: None)
+    backend.connect_live()
+    monkeypatch.setattr(backend, "_start_stick_monitor", original_start)
+
+    backend.connect_live()
+
+    assert backend.state.stick_monitor_ok
+    assert backend.pilot_sticks
+    assert "Controller" not in drone.source_requests
+    source.connect.assert_called_once()
+
+
+def test_late_flight_state_requires_explicit_restore_not_reconnect_takeover(deferred_backend):
+    backend, drone, source = deferred_backend
+    backend.auto_pc_control = True
+    drone.flight_state = "unknown"
+    backend.connect_live()
+    assert backend.pilot_sticks
+    drone.flight_state = "landed"
+
+    backend.connect_live()
+
+    assert backend.pilot_sticks
+    assert "Controller" not in drone.source_requests
+    assert backend.take_pc_control()
+    assert not backend.pilot_sticks
+    source.connect.assert_called_once()
+
+
+def test_manual_epoch_during_monitor_retry_prevents_pc_takeover(
+    deferred_backend, monkeypatch,
+):
+    backend, drone, _source = deferred_backend
+    backend.connect_live()
+    backend._stop_stick_monitor()
+    original_start = backend._start_stick_monitor
+
+    def interrupted_start():
+        original_start()
+        backend.give_to_pilot(reason="manual")
+
+    monkeypatch.setattr(backend, "_start_stick_monitor", interrupted_start)
+
+    assert not backend.take_pc_control()
+    assert backend.pilot_sticks
+    assert "Controller" not in drone.source_requests
+
+
+def test_reconnect_never_repeats_initial_auto_pc_acquisition(deferred_backend):
+    backend, drone, source = deferred_backend
+    backend.auto_pc_control = True
+    backend.connect_live()
+    assert not backend.pilot_sticks
+    backend.give_to_pilot(reason="manual")
+    requests = list(drone.source_requests)
+
+    backend.connect_live()
+
+    assert backend.pilot_sticks
+    assert drone.source_requests == requests
+    source.connect.assert_called_once()
+
+
+
+def test_runtime_switch_status_distinguishes_attempt_unknown_and_disconnection(deferred_backend):
+    backend, drone, source = deferred_backend
+    assert backend.runtime_switch_status().kind.value == "never_connected"
+    source.connect.side_effect = RuntimeError("offline")
+    with pytest.raises(RuntimeError, match="offline"):
+        backend.connect_live()
+    assert backend.runtime_switch_status().kind.value == "unsafe"
+    source.connect.side_effect = None
+    backend.connect_live()
+    assert backend.runtime_switch_status().kind.value == "landed"
+    drone.flight_state = "flying"
+    backend.state.link_ok = False
+    assert not backend.runtime_switch_status().can_switch
+    drone.managed_drone_connected = False
+    snapshot = backend.runtime_switch_status()
+    assert snapshot.kind.value == "proven_disconnected"
+    assert snapshot.can_switch
+    assert snapshot.flight_state == "unknown"
+
+
+@pytest.mark.parametrize("flight_state", ["flying", "unknown"])
+def test_missing_monitor_is_not_restarted_in_air_or_unknown(
+    deferred_backend, monkeypatch, flight_state,
+):
+    backend, drone, _source = deferred_backend
+    backend.connect_live()
+    backend._stop_stick_monitor()
+    drone.flight_state = flight_state
+    restart = Mock()
+    monkeypatch.setattr(backend, "_start_stick_monitor", restart)
+    assert not backend.take_pc_control()
+    restart.assert_not_called()
+    assert "Controller" not in drone.source_requests
+
+
+def test_initial_auto_acquisition_is_cancelled_by_prior_safety_epoch(deferred_backend):
+    backend, drone, _source = deferred_backend
+    backend.auto_pc_control = True
+    backend._pulse_token += 1
+    backend.connect_live()
+    assert backend.pilot_sticks
+    assert "Controller" not in drone.source_requests
 
 def test_shutdown_waits_for_pending_connection_and_prevents_reconnect(deferred_backend):
     backend, drone, source = deferred_backend
@@ -5520,3 +5758,69 @@ def test_queued_vector_dispatch_retains_its_own_run_and_source_time(
     assert dispatch["command_set_mono_ns"] == first_stamp
     assert dispatch["sdk_enqueue_start_mono_ns"] <= dispatch["sdk_enqueue_return_mono_ns"]
     assert dispatch["evidence_kind"] == "sdk_enqueue_not_actuation_confirmation"
+
+
+def test_cancelled_inflight_pc_ack_cannot_revive_authority(make_backend, monkeypatch):
+    backend = make_backend()
+    backend.pilot_sticks = True
+    admission = ControlAdmission()
+    request = ControlRequest(ControlAction.PC_CONTROL, human_origin=True, admission=admission)
+    entered, release = threading.Event(), threading.Event()
+    set_source = backend._set_piloting_source
+
+    def delayed_source(source):
+        if source == "Controller":
+            entered.set()
+            assert release.wait(5)
+        return set_source(source)
+
+    monkeypatch.setattr(backend, "_set_piloting_source", delayed_source)
+    results = []
+    worker = threading.Thread(target=lambda: results.append(backend.command(request)))
+    worker.start()
+    try:
+        assert entered.wait(5)
+        admission.cancel()
+    finally:
+        release.set()
+        worker.join(5)
+    assert not worker.is_alive()
+    assert results[0].reason_code == "CONTROL_REQUEST_CANCELLED"
+    assert backend.pilot_sticks
+    assert backend.drone.source_state == "SkyController"
+    assert "TakeOff" not in backend.drone.events
+
+
+def test_cancelled_vector_cannot_restart_motion_after_typed_entry(make_backend, monkeypatch):
+    backend = make_backend()
+    backend.pilot_sticks = False
+    admission = ControlAdmission()
+    request = ControlRequest(
+        ControlAction.NUDGE_VECTOR, NudgeVectorPayload(0.5, 0.0, 0.0, 0.0),
+        human_origin=True, admission=admission,
+    )
+    entered, release = threading.Event(), threading.Event()
+    clamp = backend_module._clamp_unit_axes
+
+    def delayed_clamp(*axes):
+        entered.set()
+        assert release.wait(5)
+        return clamp(*axes)
+
+    monkeypatch.setattr(backend_module, "_clamp_unit_axes", delayed_clamp)
+    start_loop = Mock()
+    monkeypatch.setattr(backend, "_ensure_nudge_loop", start_loop)
+    results = []
+    worker = threading.Thread(target=lambda: results.append(backend.command(request)))
+    worker.start()
+    try:
+        assert entered.wait(5)
+        admission.cancel()
+    finally:
+        release.set()
+        worker.join(5)
+    assert not worker.is_alive()
+    assert results[0].reason_code == "CONTROL_REQUEST_CANCELLED"
+    assert backend._nudge_vector is None
+    assert not backend._nudge_held
+    start_loop.assert_not_called()

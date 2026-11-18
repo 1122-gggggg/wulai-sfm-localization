@@ -11,7 +11,7 @@ from backend_contract import (
     InvalidControlRequest,
     RecordingQualityPayload,
 )
-from flight_operator_app import DroneBackend
+from simulated_backend import DroneBackend
 from recording_quality import (
     DEFAULT_RECORDING_PROFILE,
     FHD_30,

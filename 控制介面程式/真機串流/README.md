@@ -26,12 +26,12 @@ SFM_MISSION_SELECTION=/absolute/path/to/selection.json ./啟動.sh
 UI 先開啟、不連線；啟動器不探測目標網路、不因真機離線而退出，也不自動選擇
 直連 Wi-Fi。預設目標固定為 SkyController 3（`192.168.53.1`）；顯式 `IP`／`CTRL`
 覆寫可推導已知配對的另一值，不一致組合仍會拒絕啟動。
-UI 開啟後按「連接真機串流」才開始背景連線；失敗可再次按下重試，不必重開終端機。
+UI 開啟後按「真機串流」才開始背景連線；失敗可再次按下重試，不必重開終端機。
 開 UI 與連線不會起飛，起飛仍由操作員本人親自按下。
 `SFM_LAUNCH_DRY_RUN=1` 只印出啟動指令，不啟動 UI、不操作網路。
 
 正式入口預設同時啟動 MegaLoc＋EDM 定位與獨立三類電力設備偵測 worker。
-偵測權重為 `/home/allen/下載/power_equipment_sample50_3class_yolo26n_640_aug_best.pt`，
+偵測權重為工作區內的 `執行環境/models/power_equipment_sample50_3class_yolo26n_640_aug_best.pt`，
 使用工作區 `.venv-yolo/bin/python`；可用 `SFM_DETECTOR_PYTHON` 覆寫已備妥的環境。
 權重與環境必須事先存在，不自動下載。偵測框／類別／信心值只顯示在影片窗格，
 不參與定位或飛控；兩個 worker 共用 GPU，不能視為即時效能保證。

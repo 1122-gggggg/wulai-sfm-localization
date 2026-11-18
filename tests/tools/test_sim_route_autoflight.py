@@ -47,7 +47,8 @@ def _route():
 
     root = _P(__file__).resolve().parents[2]
     routes = sorted((root / "地圖檔/場域/river_site/routes").glob("*.json"))
-    assert routes, "preset routes must be present"
+    if not routes:
+        pytest.skip("requires the operator's private river site routes")
     return routes[0]
 
 

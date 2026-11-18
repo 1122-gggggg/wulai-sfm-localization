@@ -1,4 +1,4 @@
-"""Shared ANAFI profile and operator telemetry state."""
+"""Aircraft presentation profiles and normalized operator telemetry state."""
 
 from __future__ import annotations
 
@@ -68,8 +68,51 @@ class TrackerState(str, Enum):
 
 
 @dataclass(frozen=True)
-class AnafiProfile:
+class AircraftProfile:
+    """Adapter-supplied display/simulation data, never a flight authorization.
+
+    Camera bounds left unknown disable the corresponding controls. Telemetry
+    uses SI units, attitude radians, gimbal degrees and host monotonic ns.
+    """
+
+    model: str
+    aircraft_id: str = ""
+    controller_name: str = ""
+    sdk_name: str = ""
+    sdk_version_key: str = ""
+    weight_g: int = 0
+    max_horizontal_speed_mps: float = 0.0
+    max_vertical_speed_mps: float = 0.0
+    max_yaw_rate_dps: float = 0.0
+    max_wind_kmh: float = 0.0
+    flight_time_s: float = 1.0
+    takeoff_hover_m: float = 0.0
+    gimbal_pitch_min_deg: float | None = None
+    gimbal_pitch_max_deg: float | None = None
+    gimbal_pitch_rate_dps: float = 0.0
+    default_gimbal_pitch_deg: float | None = None
+    default_zoom: float | None = None
+    stream_width: int = STREAM_WIDTH
+    stream_height: int = STREAM_HEIGHT
+    stream_fps: float = 30.0
+    stream_latency_ms: float = 0.0
+    stream_mbps: float = 0.0
+    video_hfov_deg: float = 0.0
+    digital_zoom_min: float | None = None
+    digital_zoom_max: float | None = None
+    lossless_zoom_fhd: float | None = None
+
+
+@dataclass(frozen=True)
+class AnafiProfile(AircraftProfile):
     model: str = "Parrot ANAFI"
+    aircraft_id: str = "parrot-anafi"
+    controller_name: str = "SkyController"
+    sdk_name: str = "Olympe"
+    sdk_version_key: str = "olympe_version"
+    default_gimbal_pitch_deg: float = -20.0
+    default_zoom: float = 1.0
+    digital_zoom_min: float = 1.0
     weight_g: int = 320
     max_horizontal_speed_mps: float = 15.0
     max_vertical_speed_mps: float = 4.0
@@ -95,6 +138,14 @@ ANAFI = AnafiProfile()
 
 @dataclass
 class DroneState:
+    """Normalized telemetry schema shared by every aircraft adapter.
+
+    Optional observations remain None until measured; timestamps are monotonic
+    ns from the actual event, not a repeated cache poll. ``pose`` is map-local
+    xyz/yaw; velocity is NED m/s; att_* is radians. Vendor-specific device
+    dictionaries are diagnostic only, never evidence of supported controls.
+    """
+
     mode: str = "MANUAL"
     tracker_state: TrackerState = TrackerState.HOVER
     loc: str = "SIM"
@@ -125,15 +176,20 @@ class DroneState:
     camera_zoom_level: float | None = None
     camera_zoom_mono_ns: int | None = None
     camera_zoom_stamp_source: str | None = None
-    link_latency_ms: float = ANAFI.stream_latency_ms
+    link_latency_ms: float = 0.0
     frame_age_ms: float | None = None
     telemetry_read_mono_ns: int | None = None
     attitude_mono_ns: int | None = None
+    attitude_stamp_source: str | None = None
+    altitude_mono_ns: int | None = None
+    altitude_stamp_source: str | None = None
+    battery_mono_ns: int | None = None
+    battery_stamp_source: str | None = None
     gps_read_mono_ns: int | None = None
     last_pcmd_call_mono_ns: int | None = None
     pcmd_to_telemetry_poll_ms: float | None = None
-    stream_fps: float = ANAFI.stream_fps
-    stream_mbps: float = ANAFI.stream_mbps
+    stream_fps: float = 0.0
+    stream_mbps: float = 0.0
     last_command: str = "ready"
     link_ok: bool = True
     link_status: str = "OK"
@@ -149,8 +205,8 @@ class DroneState:
     preflight_reason: str = "not checked"
     control_owner: str = "SIM"
     active_incident: str = ""
-    aircraft_identity: str = "SIMULATED ANAFI"
-    controller_identity: str = "SIMULATED CONTROLLER"
+    aircraft_identity: str = "UNKNOWN"
+    controller_identity: str = "UNKNOWN"
     autonomous_locked: bool = True
     home_valid: bool | None = None
     home_reachable: bool | None = None
@@ -167,6 +223,8 @@ class DroneState:
     speed_east_mps: float | None = None
     speed_down_mps: float | None = None
     ground_speed_mps: float | None = None
+    ground_speed_mono_ns: int | None = None
+    ground_speed_stamp_source: str | None = None
     gps_latitude_deg: float | None = None
     gps_longitude_deg: float | None = None
     gps_altitude_m: float | None = None
@@ -190,7 +248,7 @@ class DroneState:
     disk_free_percent: float | None = None
     disk_warning: bool = False
     autonomous_speed_limit_enabled: bool = True
-    autonomous_speed_limit_mps: float = 0.60
+    autonomous_speed_limit_mps: float = 0.80
     autonomous_speed_guard_status: str = "SPEED_WAITING"
     autonomous_approval_valid: bool = False
     drone_magnetometer_required: int | None = None

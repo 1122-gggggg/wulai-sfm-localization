@@ -2,10 +2,10 @@
 """Validate shipped site-profile schemas, assets, digests, and approvals."""
 from __future__ import annotations
 
-import hashlib
 import json
 from pathlib import Path
 
+from mission_manifest import sha256_file
 from site_profile import (
     ROUTE_EDITOR_AUTO_APPROVAL_NOTE,
     SCHEMA_VERSION,
@@ -37,14 +37,6 @@ def _expects_auto_approval(profile: object) -> bool:
     flight = getattr(profile, "flight", None)
     note = str(getattr(flight, "approval_note", "") or "").strip()
     return note == ROUTE_EDITOR_AUTO_APPROVAL_NOTE
-
-
-def _digest(path: Path) -> str:
-    value = hashlib.sha256()
-    with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(8 * 1024 * 1024), b""):
-            value.update(chunk)
-    return value.hexdigest()
 
 
 def _validate_profile_fields(source: Path, raw: dict, profile: object) -> list[str]:
@@ -96,7 +88,7 @@ def _validate_asset_digests(source: Path, profile: object) -> tuple[list[str], i
         if path is None or not path.is_file():
             failures.append(f"{source.name}: hashed asset {key} is missing")
             continue
-        actual = _digest(path)
+        actual = sha256_file(path)
         checked += 1
         if actual != expected:
             failures.append(
@@ -130,7 +122,7 @@ def _validate_hardware_digests(source: Path, profile: object) -> tuple[list[str]
         if path is None or expected is None or not path.is_file():
             failures.append(f"{source.name}: hashed asset {key} is missing")
             continue
-        actual = _digest(path)
+        actual = sha256_file(path)
         checked += 1
         if actual != expected:
             failures.append(

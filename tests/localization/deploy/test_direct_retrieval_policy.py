@@ -11,6 +11,11 @@ from river_map_quality import official_edm_adapter
 @pytest.fixture
 def provider(monkeypatch):
     provider = object.__new__(LiveMapEDMProvider)
+    provider._workmap_descriptor_count = 0
+    provider._workmap_references = {}
+    provider._workmap_order = []
+    provider._workmap_landmark_refs = {}
+    provider._prepared_reference_cache = official_edm_adapter.PreparedReferenceCache()
     provider._index = SimpleNamespace(index_id="test")
     provider._subsets = {
         "test": SimpleNamespace(excluded_sessions=frozenset(), indices=tuple(range(6)))
@@ -277,3 +282,71 @@ def test_close_releases_lift_and_match_evidence(provider, monkeypatch):
     assert provider._query_lifts == {}
     assert provider._query_matches == {}
     assert not provider._models_ready
+
+
+def _original_reference_ranking(bank, query, sessions, excluded, top_k, occupied, minimum):
+    """Pre-optimization full-sort oracle, including its occupied-view fallback."""
+    scores = (bank @ query) / (np.linalg.norm(bank, axis=1) * np.linalg.norm(query))
+    allowed = [i for i, session in enumerate(sessions) if session not in excluded]
+    order = sorted(allowed, key=lambda i: (-float(scores[i]), i))
+    if occupied is None or int(minimum) <= 0:
+        return tuple(order[:top_k]), False
+    usable = [i for i in order if occupied[i] >= int(minimum)]
+    return (tuple(usable[:top_k]), False) if usable else (tuple(order[:top_k]), True)
+
+
+@pytest.mark.parametrize("top_k", [1, 8, 200])
+@pytest.mark.parametrize("excluded", [frozenset(), frozenset({"b"}), frozenset({"a", "b"})])
+@pytest.mark.parametrize("minimum", [0, 4, 100])
+def test_partial_ranking_matches_full_sort_with_ties_and_view_filter(top_k, excluded, minimum):
+    rng = np.random.default_rng(35)
+    # Repeated descriptors put exact ties on both sides of the top-k boundary.
+    bank = np.tile(rng.normal(size=(11, 32)).astype(np.float32), (7, 1))
+    query = rng.normal(size=32).astype(np.float32)
+    sessions = tuple("a" if i % 3 else "b" for i in range(len(bank)))
+    occupied = tuple(i % 9 for i in range(len(bank)))
+    expected = _original_reference_ranking(
+        bank, query, sessions, excluded, top_k, occupied, minimum,
+    )
+    actual = live_provider.rank_reference_indices(
+        bank, query, reference_sessions=sessions, excluded_sessions=excluded,
+        top_k=top_k, occupied_bins=occupied, min_occupied_bins=minimum,
+        reference_norms=np.linalg.norm(bank, axis=1),
+    )
+    assert actual == expected
+
+
+def test_view_filter_can_select_a_reference_beyond_the_unfiltered_top_k():
+    bank = np.eye(8, dtype=np.float32)
+    ranked, fallback = live_provider.rank_reference_indices(
+        bank, np.arange(8, 0, -1, dtype=np.float32),
+        reference_sessions=("map",) * 8, excluded_sessions=frozenset(),
+        top_k=2, occupied_bins=(0, 0, 0, 0, 0, 0, 4, 4), min_occupied_bins=4,
+    )
+    assert ranked == (6, 7)
+    assert fallback is False
+
+
+def test_ranking_retains_index_order_when_every_score_ties():
+    ranked, fallback = live_provider.rank_reference_indices(
+        np.ones((40, 8), dtype=np.float32), np.ones(8, dtype=np.float32),
+        reference_sessions=("map",) * 40, excluded_sessions=frozenset(), top_k=3,
+    )
+    assert ranked == (0, 1, 2)
+    assert fallback is False
+
+
+def test_nonfinite_ranking_keeps_the_legacy_order_and_fallback():
+    bank = np.eye(8, dtype=np.float32)
+    bank[2, 0] = np.nan
+    query = np.arange(8, 0, -1, dtype=np.float32)
+    sessions = ("map",) * 8
+    occupied = (0, 1, 4, 0, 1, 4, 0, 1)
+    for minimum in (0, 4, 100):
+        expected = _original_reference_ranking(
+            bank, query, sessions, frozenset(), 3, occupied, minimum,
+        )
+        assert live_provider.rank_reference_indices(
+            bank, query, reference_sessions=sessions, excluded_sessions=frozenset(),
+            top_k=3, occupied_bins=occupied, min_occupied_bins=minimum,
+        ) == expected

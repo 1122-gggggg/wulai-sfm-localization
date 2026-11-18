@@ -155,3 +155,32 @@ def test_mvs_display_cloud_refuses_a_sidecar_from_another_frame(tmp_path):
     with pytest.raises(ValueError, match="is not frame_1"):
         tool.build_from_mvs(tmp_path, fused)
     assert not (tmp_path / "map" / "map_dense.ply").exists()
+
+
+def test_mvs_display_cloud_reads_a_bounded_stride_sample_of_a_huge_source(tmp_path):
+    fused, _, _, _ = _mvs_release(tmp_path)
+
+    summary = tool.build_from_mvs(tmp_path, fused, max_points=50)
+
+    # 400 source points, read at most PRESAMPLE_FACTOR * cap before thinning.
+    assert summary["sampled_points"] == 50 * tool.PRESAMPLE_FACTOR
+    assert summary["dense_points"] <= 50
+
+
+def test_sidecarless_cloud_must_overlap_map_ply(tmp_path):
+    xyz, rgb, _ = _release(tmp_path)
+    profile = json.loads((tmp_path / "site_profile.json").read_text(encoding="utf-8"))
+    profile["assets"]["localization_bundle"] = "localization/direct_bundle.json"
+    (tmp_path / "site_profile.json").write_text(json.dumps(profile), encoding="utf-8")
+    xyz = xyz.astype(np.float32)
+    aligned, shifted = tmp_path / "aligned.ply", tmp_path / "shifted.ply"
+    _write_fused(aligned, xyz, rgb)
+    _write_fused(shifted, xyz + 1000.0, rgb)
+
+    with pytest.raises(ValueError, match="another frame or unit"):
+        tool.build_from_mvs(tmp_path, shifted)
+    assert not (tmp_path / "map" / "map_dense.ply").exists()
+
+    summary = tool.build_from_mvs(tmp_path, aligned)
+    assert summary["frame_checked_by"] == "map_overlap"
+    assert summary["map_overlap_fraction"] >= tool.MIN_MAP_OVERLAP

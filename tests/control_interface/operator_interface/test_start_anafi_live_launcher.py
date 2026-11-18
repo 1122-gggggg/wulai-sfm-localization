@@ -134,6 +134,7 @@ def make_fake_portable_package(tmp_path: Path) -> Path:
         Path("控制介面程式/operator_interface/start_anafi_live.sh"),
         Path("控制介面程式/真機串流/啟動.sh"),
         Path("控制介面程式/launch_mission.py"),
+        Path("控制介面程式/last_mission_memory.py"),
         Path("控制介面程式/mission_manifest.py"),
         Path("控制介面程式/mission_resolver.py"),
         Path("控制介面程式/navigation_pose_runtime.py"),

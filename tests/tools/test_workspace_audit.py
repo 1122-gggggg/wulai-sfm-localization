@@ -41,25 +41,25 @@ def test_workspace_audit_accepts_the_canonical_layout(tmp_path: Path) -> None:
     assert result["output_classes"]["validation"] == ["validation_receipts"]
 
 
-def test_workspace_audit_requires_output_governance_readme(tmp_path: Path) -> None:
+def test_workspace_audit_requires_the_tools_readme(tmp_path: Path) -> None:
     _minimal_workspace(tmp_path)
-    (tmp_path / "outputs/README.md").unlink()
+    (tmp_path / "tools/README.md").unlink()
 
     result = audit_workspace(tmp_path, include_sizes=False)
 
     assert not result["ok"]
-    assert "missing file: outputs/README.md" in result["structural_failures"]
+    assert "missing file: tools/README.md" in result["structural_failures"]
 
 
 def test_workspace_audit_reports_missing_paths_and_broken_links(tmp_path: Path) -> None:
     _minimal_workspace(tmp_path)
-    (tmp_path / "文件/SYSTEM_SPEC.md").unlink()
+    (tmp_path / "requirements/README.md").unlink()
     os.symlink("missing-target", tmp_path / "broken-link")
 
     result = audit_workspace(tmp_path, include_sizes=False)
 
     assert not result["ok"]
-    assert "missing file: 文件/SYSTEM_SPEC.md" in result["structural_failures"]
+    assert "missing file: requirements/README.md" in result["structural_failures"]
     assert "broken symlink: broken-link" in result["structural_failures"]
 
 
@@ -106,7 +106,7 @@ def test_workspace_audit_classifies_date_stamped_audits_and_warns_on_storage(
 
     result = audit_workspace(tmp_path, include_sizes=False)
 
-    assert result["output_classes"]["governance"] == ["README.md", "audit_20260807"]
+    assert result["output_classes"]["governance"] == ["audit_20260807"]
     assert any("free space is below 15%" in warning for warning in result["storage_warnings"])
 
 

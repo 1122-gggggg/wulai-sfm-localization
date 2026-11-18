@@ -34,8 +34,8 @@ from runtime_safety import (  # noqa: E402
 
 _WS = workspace_from_file(__file__)
 SYSTEM_ROOT = _WS.root
-DEFAULT_MODEL = Path(
-    "/home/allen/下載/power_equipment_sample50_3class_yolo26n_640_aug_best.pt"
+DEFAULT_MODEL = (
+    _WS.runtime / "models/power_equipment_sample50_3class_yolo26n_640_aug_best.pt"
 )
 
 

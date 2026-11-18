@@ -268,7 +268,7 @@ def test_real_launcher_evaluation_only_still_blocks_flight_authority() -> None:
 
     assert result.returncode == 0, result.stderr
     assert "EVALUATION-ONLY session" in result.stderr
-    assert ".eval.site_profile.json" in result.stdout
+    assert ".eval.speed-0p8.site_profile.json" in result.stdout
 
 
 def test_real_launcher_requires_mission_selection() -> None:

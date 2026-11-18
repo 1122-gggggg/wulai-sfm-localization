@@ -14,7 +14,7 @@ and its Z is the working CRUISE ALTITUDE in the aligned frame -- ground is z=0
 here (align_report median z=0.008), so altitude reads as height above ground.
 Pick a top-down view, trace the route, raise/lower altitude with the wheel.
 
-Run (Blender already up via scripts/blender_mcp_launch.py):
+Run (Blender already up with the blender-mcp addon server running):
   python3 scripts/blender_send.py codefile scripts/draw_path.py
 then in the 3D viewport press F3 -> "Draw Flight Path" (or Ctrl+Shift+P), or use
 the 3D viewport "View" menu entry.

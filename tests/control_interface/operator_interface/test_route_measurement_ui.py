@@ -3,7 +3,9 @@ from __future__ import annotations
 import math
 import queue
 import re
+from concurrent.futures import Future
 from types import MethodType, SimpleNamespace
+from unittest.mock import Mock
 
 import numpy as np
 import pytest
@@ -41,6 +43,11 @@ class DistanceList(Widget):
         super().__init__()
         self.rows = []
         self.scroll = 0.0
+        self.horizontal = 0.0
+        self.selected = set()
+        self.active = 0
+        self.anchor = 0
+        self.edits = []
 
     def yview(self):
         return self.scroll, 1.0
@@ -48,11 +55,47 @@ class DistanceList(Widget):
     def yview_moveto(self, value):
         self.scroll = value
 
-    def delete(self, first, last):
-        self.rows.clear()
+    def xview(self):
+        return self.horizontal, 1.0
+
+    def xview_moveto(self, value):
+        self.horizontal = value
+
+    def get(self, first, last):
+        return tuple(self.rows)
+
+    def delete(self, first, last=None):
+        self.edits.append(("delete", first, last))
+        stop = len(self.rows) if last == "end" else first + 1 if last is None else last + 1
+        del self.rows[first:stop]
+        self.selected = {
+            index if index < first else index - (stop - first)
+            for index in self.selected if index < first or index >= stop
+        }
 
     def insert(self, where, value):
-        self.rows.append(value)
+        index = len(self.rows) if where == "end" else where
+        self.edits.append(("insert", index, value))
+        self.rows.insert(index, value)
+        self.selected = {old + 1 if old >= index else old for old in self.selected}
+
+    def curselection(self):
+        return tuple(sorted(self.selected))
+
+    def index(self, where):
+        return self.active if where == "active" else self.anchor
+
+    def selection_clear(self, first, last):
+        self.selected.clear()
+
+    def selection_set(self, index):
+        self.selected.add(index)
+
+    def activate(self, index):
+        self.active = index
+
+    def selection_anchor(self, index):
+        self.anchor = index
 
 
 def make_editor(points=(), scale=None):
@@ -87,6 +130,9 @@ def make_editor(points=(), scale=None):
         map_loaded_callback=None,
         map_points=np.array([[0, 0, 0, 190, 190, 190]], dtype=np.float32),
         view=OrthoView(center=np.zeros(3), radius=10),
+        _cloud_revision=0,
+        _raster_cache_key=None,
+        _raster_cache=None,
         route_distance_list=DistanceList(),
         test_button=None,
         canvas=Widget(),
@@ -97,7 +143,7 @@ def make_editor(points=(), scale=None):
     )
     for name in (
         "mode_var", "selection_var", "distance_scale_var", "measurement_var",
-        "route_total_var", "status_var", "title_var",
+        "route_total_var", "status_var", "title_var", "map_status_var", "save_note_var",
     ):
         setattr(editor, name, Variable(""))
     editor.measurement_mode_var = Variable(False)
@@ -130,6 +176,7 @@ def make_editor(points=(), scale=None):
     editor.after_cancel = after_cancel
     for name in (
         "_signature", "_refresh_labels", "_refresh_distance_labels", "_format_distance",
+        "_update_distance_list", "_replace_distance_list_rows",
         "toggle_measurement_mode", "toggle_marking_mode", "clear_measurement",
         "_measure_at", "_handle_single_left", "_cancel_pending_single_click",
         "_handle_escape", "_handle_begin_move", "_handle_move_axis", "_handle_delete", "_handle_enter",
@@ -143,6 +190,37 @@ def make_editor(points=(), scale=None):
     editor._nearest_cloud = lambda x, y, threshold=20: [float(x), float(y), 0.0]
     editor._refresh_labels()
     return editor
+
+
+def enable_frame_redraw(editor):
+    """Keep Tk timers/real redraw cadence; isolate only the cloud display."""
+    for name in ("request_redraw", "_redraw", "_poll_render", "_current_raster_key"):
+        setattr(editor, name, MethodType(getattr(RouteEditorWindow, name), editor))
+    editor._render_future = None
+    editor._render_after = None
+    editor._redraw_pending = False
+    editor._raster_cache_key = editor._current_raster_key()
+    editor._raster_cache = object()
+    editor._paint_render = lambda *args: None
+
+
+def block_cloud_render(editor):
+    """Start a real render poll around a deterministic, unfinished worker future."""
+    future = Future()
+    editor._render_executor = Mock()
+    editor._render_executor.submit.return_value = future
+    editor._cloud_worker = SimpleNamespace(render=Mock())
+    editor._raster_cache_key = None
+    editor.request_redraw()
+    run_frame(editor)
+    return future
+
+
+def run_frame(editor):
+    callbacks = list(editor.pending.values())
+    editor.pending.clear()
+    for callback in callbacks:
+        callback()
 
 
 def enable_measurement(editor):
@@ -260,11 +338,11 @@ def test_measurement_mode_does_not_edit_route_through_keyboard_shortcuts():
     enable_measurement(editor)
     editor._handle_single_left(0, 0)
     for key, state in (("g", 0), ("Delete", 0), ("z", 4), ("Return", 0)):
-        editor.on_key(SimpleNamespace(widget=None, keysym=key, state=state))
+        editor.on_key(SimpleNamespace(widget=editor.canvas, keysym=key, state=state))
         assert editor._signature() == signature
         assert not editor.controller.moving
         assert editor._measuring
-    editor.on_key(SimpleNamespace(widget=None, keysym="Escape", state=0))
+    editor.on_key(SimpleNamespace(widget=editor.canvas, keysym="Escape", state=0))
     assert not editor._measuring
     assert editor.measurement_points == []
     assert not editor._closed
@@ -345,8 +423,10 @@ def test_all_open_route_segments_update_after_add_move_delete_undo_and_redo():
     editor.finish_layout()
     editor.controller.selected = 1
     editor._handle_begin_move()
+    enable_frame_redraw(editor)
     editor._mouse = (0, -editor.view.scale(800, 600) * 2)
     editor._update_move_preview()
+    run_frame(editor)
     assert_route_display(editor, [math.sqrt(45), 2])
     editor._handle_enter()
     editor._handle_undo_redo(shift=False)
@@ -400,9 +480,11 @@ def test_measurement_ball_axis_move_preserves_other_coordinates_and_route(
     getattr(editor.view, orientation)()
     original = np.array(editor.measurement_points[1])
     route = [point.copy() for point in editor.controller.points]
-    editor.on_key(SimpleNamespace(widget=None, keysym="g", state=0))
-    editor.on_key(SimpleNamespace(widget=None, keysym=axis, state=0))
+    editor.on_key(SimpleNamespace(widget=editor.canvas, keysym="g", state=0))
+    editor.on_key(SimpleNamespace(widget=editor.canvas, keysym=axis, state=0))
+    enable_frame_redraw(editor)
     editor.on_motion(SimpleNamespace(x=180, y=40))
+    run_frame(editor)
 
     coordinate = {"x": 0, "y": 1, "z": 2}[axis]
     # At this view scale, horizontal pixels move X except in right view,
@@ -414,7 +496,7 @@ def test_measurement_ball_axis_move_preserves_other_coordinates_and_route(
     distance = float(np.linalg.norm(expected))
     assert editor.measurement_distance_u == pytest.approx(distance)
     assert editor.measurement_distance_m == pytest.approx(2 * distance)
-    editor.on_key(SimpleNamespace(widget=None, keysym="Return", state=0))
+    editor.on_key(SimpleNamespace(widget=editor.canvas, keysym="Return", state=0))
     np.testing.assert_allclose(editor.measurement_points[1], expected)
     assert editor._measurement_move_start is None
     assert editor._measuring
@@ -427,9 +509,9 @@ def test_measurement_ball_escape_rolls_back_without_leaving_mode_or_touching_rou
     editor = measurement_editor
     original = [point.copy() for point in editor.measurement_points]
     route = [point.copy() for point in editor.controller.points]
-    editor.on_key(SimpleNamespace(widget=None, keysym="g", state=0))
+    editor.on_key(SimpleNamespace(widget=editor.canvas, keysym="g", state=0))
     editor.on_motion(SimpleNamespace(x=180, y=40))
-    editor.on_key(SimpleNamespace(widget=None, keysym="Escape", state=0))
+    editor.on_key(SimpleNamespace(widget=editor.canvas, keysym="Escape", state=0))
 
     assert editor.measurement_points == original
     assert editor.measurement_distance_u == pytest.approx(math.sqrt(14))
@@ -443,7 +525,171 @@ def test_measurement_ball_cannot_move_without_a_selected_endpoint(measurement_ed
     editor = measurement_editor
     editor._measurement_selected = None
     original = [point.copy() for point in editor.measurement_points]
-    editor.on_key(SimpleNamespace(widget=None, keysym="g", state=0))
+    editor.on_key(SimpleNamespace(widget=editor.canvas, keysym="g", state=0))
     editor.on_motion(SimpleNamespace(x=180, y=40))
     assert editor.measurement_points == original
     assert editor._measurement_move_start is None
+
+
+def test_drag_sidebar_coalesces_live_preview_and_preserves_unchanged_rows():
+    editor = make_editor(
+        [[0, 0, 0], [3, 0, 0], [6, 0, 0], [9, 0, 0]],
+        MapDistanceScale(2.0, True, "offline"),
+    )
+    editor.controller.selected = 1
+    editor._handle_begin_move()
+    enable_frame_redraw(editor)
+    rows = editor.route_distance_list
+    rows.scroll = 0.45
+    rows.horizontal = 0.35
+    rows.selected = {1, 2}
+    rows.active = 2
+    rows.anchor = 1
+    rows.edits.clear()
+    original_rows = rows.rows.copy()
+    for y in range(1, 101):
+        editor.on_motion(SimpleNamespace(x=0, y=y))
+    assert rows.edits == []
+    assert rows.rows == original_rows
+    assert len(editor.pending) == 1
+    # Coordinates still follow every pointer event, not only committed points.
+    assert f"Y {editor.controller.points[1][1]:.3f}" in editor.selection_var.get()
+    run_frame(editor)
+    expected = [
+        math.dist(first, second)
+        for first, second in zip(editor.controller.points, editor.controller.points[1:])
+    ]
+    assert_route_display(editor, expected)
+    assert rows.rows[2] == original_rows[2]
+    assert [edit[1] for edit in rows.edits if edit[0] == "delete"] == [0, 1]
+    assert rows.scroll == 0.45 and rows.horizontal == 0.35
+    assert rows.curselection() == (1, 2)
+    assert rows.active == 2 and rows.anchor == 1
+    rows.edits.clear()
+    editor._refresh_distance_labels()
+    assert rows.edits == []
+
+
+
+@pytest.mark.parametrize("measurement", [False, True])
+def test_blocked_cloud_render_keeps_sidebar_live_and_cancels_poll_on_close(
+    measurement_editor, measurement,
+):
+    editor = measurement_editor if measurement else make_editor(
+        [[0, 0, 0], [3, 0, 0], [6, 0, 0]], MapDistanceScale(2.0, True, "offline"),
+    )
+    editor.controller.selected = 1
+    editor._handle_begin_move()
+    enable_frame_redraw(editor)
+    future = block_cloud_render(editor)
+    for start in (0, 60):
+        previous = (editor.route_total_u, editor.measurement_distance_u)
+        for offset in range(start + 1, start + 61):
+            editor.on_motion(SimpleNamespace(x=100 + offset, y=100 - offset))
+        assert (editor.route_total_u, editor.measurement_distance_u) == previous
+        assert editor._distance_labels_dirty
+        assert len(editor.pending) == 1
+        run_frame(editor)
+        assert not future.done()
+        assert not editor._distance_labels_dirty
+        if measurement:
+            expected = math.dist(*editor.measurement_points)
+            assert editor.measurement_distance_u == pytest.approx(expected)
+            assert editor.measurement_distance_m == pytest.approx(2 * expected)
+            assert display_values(editor.measurement_var.get()) == pytest.approx(
+                [expected, 2 * expected], abs=0.0006,
+            )
+        else:
+            expected = [
+                math.dist(first, second)
+                for first, second in zip(editor.controller.points, editor.controller.points[1:])
+            ]
+            assert_route_display(editor, expected)
+        editor._render_executor.submit.assert_called_once()
+    handle, callback = next(iter(editor.pending.items()))
+    editor.attributes = Mock()
+    editor.destroy = Mock()
+    editor.on_close_callback = None
+    RouteEditorWindow.close_editor(editor, force=True)
+    assert handle in editor.cancelled
+    assert editor.pending == {}
+    editor._render_executor.shutdown.assert_called_once_with(wait=False, cancel_futures=True)
+    callback()
+    assert editor.pending == {}
+    editor.destroy.assert_called_once()
+
+@pytest.mark.parametrize("blocked_render", [False, True])
+@pytest.mark.parametrize("finish", ["enter", "click", "escape", "save"])
+def test_pending_preview_finalization_forces_exact_route_distances(
+    finish, tmp_path, blocked_render,
+):
+    import json
+
+    editor = make_editor(
+        [[0, 0, 0], [3, 0, 0], [6, 0, 0]], MapDistanceScale(2.0, True, "offline"),
+    )
+    editor.controller.selected = 1
+    editor._handle_begin_move()
+    enable_frame_redraw(editor)
+    if blocked_render:
+        block_cloud_render(editor)
+    editor.on_motion(SimpleNamespace(x=0, y=40))
+    run_frame(editor)
+    editor.on_motion(SimpleNamespace(x=0, y=91))
+    preview = [point.copy() for point in editor.controller.points]
+    assert len(editor.pending) == 1
+    if finish == "enter":
+        editor._handle_enter()
+    elif finish == "click":
+        editor.on_left_press(SimpleNamespace(x=0, y=91))
+    elif finish == "escape":
+        editor._handle_escape()
+    else:
+        editor._preview_only = True
+        target = tmp_path / "route_preview.json"
+        editor._choose_preview_path = lambda: target
+        editor.arrive_radius_var.set(0.02)
+        editor._update_document = MethodType(RouteEditorWindow._update_document, editor)
+        saved = RouteEditorWindow.save_route(editor)
+        assert saved == target
+        assert json.loads(target.read_text())["purpose"] == "preview_only"
+        assert editor.document.points == preview
+    final = [[0, 0, 0], [3, 0, 0], [6, 0, 0]] if finish == "escape" else preview
+    expected = [math.dist(first, second) for first, second in zip(final, final[1:])]
+    assert editor.controller.points == final
+    assert not editor.controller.moving
+    assert_route_display(editor, expected)
+    run_frame(editor)
+    assert_route_display(editor, expected)
+
+
+@pytest.mark.parametrize("finish", ["enter", "click", "escape"])
+@pytest.mark.parametrize("blocked_render", [False, True])
+def test_measurement_pending_preview_finalization_has_exact_displayed_distance(
+    measurement_editor, finish, blocked_render,
+):
+    editor = measurement_editor
+    original = [point.copy() for point in editor.measurement_points]
+    route = [point.copy() for point in editor.controller.points]
+    editor._handle_begin_move()
+    enable_frame_redraw(editor)
+    if blocked_render:
+        block_cloud_render(editor)
+    for offset in range(1, 61):
+        editor.on_motion(SimpleNamespace(x=100 + offset, y=100 - offset))
+    assert len(editor.pending) == 1
+    if finish == "escape":
+        editor._handle_escape()
+        assert editor.measurement_points == original
+    elif finish == "enter":
+        editor._handle_enter()
+    else:
+        editor.on_left_press(SimpleNamespace(x=160, y=40))
+    expected = math.dist(*editor.measurement_points)
+    assert editor.measurement_distance_u == pytest.approx(expected)
+    assert editor.measurement_distance_m == pytest.approx(2 * expected)
+    assert display_values(editor.measurement_var.get()) == pytest.approx(
+        [expected, 2 * expected], abs=0.0006,
+    )
+    assert editor._measurement_move_start is None
+    assert editor.controller.points == route

@@ -56,15 +56,14 @@ lift hook，快取與選擇政策仍位於本地 `live_provider.py`。
 
 | 檔案 | 責任 |
 |---|---|
-| `direct_paths.py` | `vendor_sys_path()`：把 `vendor/` 冪等地掛進 `sys.path` |
+| `direct_paths.py` | `vendor_sys_path()`：把共用的 `deploy_code/sfm_direct_deploy/vendor/` 冪等地掛進 `sys.path` |
 | `direct_map.py` | `DirectMapAssets.load()`：讀 `direct_bundle.json`、驗 SHA-256、解析 model / keyframes / MegaLoc bank / intersection cells / depth 路徑 |
 | `direct_profile.py` | `load_direct_profile()`：讀 `direct_localizer_profile.json`，回傳巢狀 frozen dataclass |
 | `live_provider.py` | `LiveMapEDMProvider`：GPU 側 MegaLoc + EDM + PnP，回傳 `RelocFix` |
 | `two_rate_tracker.py` | `RelocWorker`（單一背景 thread）與 `TwoRateTracker`（快迴路 + handover + VO + dead reckon） |
 | `direct_localizer_adapter.py` | `DirectTrackerAdapter`：每幀只跑一個追蹤器（baseline 階段為 `TwoRateTracker`，工作圖階段為 `OnlineWorkMapTracker`），套用位姿確認後發布 |
 | `surface_depth.py` | 選配 Open3D CPU 表面射線查詢；驗證 MVS sidecar 與地圖身分，輸出公尺 camera-Z 深度，未知為 NaN；不接入 tracker 或 flight controls |
-| `vendor/` | vendored 上游 package，見下 |
-| `VENDOR_PROVENANCE.json` | vendor 來源、逐檔 SHA-256、本地 patch 清單 |
+| `vendor/` | 無；與原始版本共用 `deploy_code/sfm_direct_deploy/vendor/` |
 
 資產契約：`direct_bundle.json`（schema `direct-localization-bundle/v1`）與
 `direct_localizer_profile.json`（schema `direct-deployment-profile/v1`）。欄位表見
@@ -246,49 +245,14 @@ PYTHONPATH=outputs/deps/workmap_graph /home/allen/localization/.venv/bin/python 
   定位演算法/validation/workmap_paired_compare.py report --protocol <protocol.json>
 ```
 
-## vendor 來源與搬遷規則
+## vendor 共用
 
-`vendor/river_map_quality`（36 檔）與 `vendor/sfm_diagnosis`（94 檔）是從交付包
-`river-deploy-5060-20260908/software/` 複製進來的，來源路徑與逐檔 SHA-256 記在
-`VENDOR_PROVENANCE.json`：
-
-- `river_map_quality` ← `software/compatibility/river_map_quality/src/river_map_quality`
-  （`VENDOR_PROVENANCE.json:59`）
-- `sfm_diagnosis` ← `software/normal_map_pipeline/src/sfm_diagnosis`
-  （`VENDOR_PROVENANCE.json:159`）
-
-本地 patch 有三筆，逐筆記在 `VENDOR_PROVENANCE.json.local_patches`（每筆帶
-`upstream_sha256`；`packages.*.files` 保留的一律是上游 digest）：
-
-1. py3.10 相容性：`river_map_quality/baseline.py` 改成 `from datetime import timezone`
-   並 `UTC = timezone.utc`，因為 `datetime.UTC` 是 3.11+ 才有，而本工作區 runtime 是
-   CPython 3.10.12。
-2. 效能：`river_map_quality/official_edm_adapter.py` 的 `lift_reference_matches` 改成
-   向量化鄰域搜尋。半徑、admission 規則與 (distance, Point3D ID) 併發序全部不變，輸出
-   逐位元相同；`tests/localization/deploy/test_lift_reference_matches.py` 保留改版前的
-   純量實作當 oracle 做差分比對。這筆不屬於下面規則 3 的兩類，是操作員明確核准後落地
-   的，仍欠一次回上游。
-3. 等價 hook：`sfm_diagnosis/site_pipeline/deployment_localizer.py` 抽出
-   `_lift_matched_reference`，讓本地 provider 快取單張參考的 pre-dedup lift 證據。
-   confidence、二視圖門檻、depth lifting 與合併順序不變；
-   `tests/localization/deploy/test_direct_lift_cache.py` 使用抽取前實作作差分 oracle，
-   涵蓋重疊邊界、tie、unmapped／depth，以及快取重用後再次合併不污染證據。
-
-搬遷回上游的規則：
-
-1. 改 vendor 檔之前先確認那不是應該改在 `sfm_direct_deploy/*.py`（本地 runtime）
-   的東西。vendor 是第三方邊界，本地邏輯不往裡面塞。
-2. 真的要改 vendor，必須在 `local_patches` 加一筆（`change` + `file` + `reason`
-   + `upstream_sha256` + `patched_sha256`）。`packages.*.files` 記的一律是**上游**
-   digest，不隨本地 patch 改動 —— 那是 re-vendor 時比對用的基準；本地檔案的實際
-   digest 由 `patched_sha256` 與 `SHA256SUMS` 各記一份。無 provenance 的改動視為
-   不可追溯，等同污染第三方邊界。
-3. 本地改動不限類別。py3.10 相容性、上游 backport，以及**任何能證明有收益的優化**
-   都可以留在本地。條件是規則 2 的可追溯性，加上 `tests/` 裡一份能證明等價或證明
-   收益的測試 —— 對不該改變輸出的優化，測試要用改版前的實作當 oracle 做差分比對。
-   本地 patch 仍然欠上游一次回收：規則 4 的 re-vendor 是整包換，沒有回上游的 patch
-   會被蓋掉。
-4. 重新 vendor 時整包換，不做逐檔挑選，並重算 `VENDOR_PROVENANCE.json`。
+擴圖版沒有自己的 `vendor/` 與 `VENDOR_PROVENANCE.json`。`river_map_quality` 與
+`sfm_diagnosis` 只有 `定位演算法/deploy_code/sfm_direct_deploy/vendor/` 一份，
+擴圖版的 `direct_paths.vendor_sys_path()` 直接指向那份；來源、逐檔 SHA-256、本地
+patch 與搬遷回上游規則見
+[`deploy_code/sfm_direct_deploy/README.md`](../../deploy_code/sfm_direct_deploy/README.md)。
+改 vendor 只改那一份，兩個版本同時生效。
 
 ## 不許做的事
 

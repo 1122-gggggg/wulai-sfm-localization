@@ -470,3 +470,77 @@ def test_guided_alignment_rejects_left_right_geometry_that_is_not_opposed() -> N
 
     with pytest.raises(ValueError, match="左／右"):
         model.solve()
+
+
+@pytest.mark.parametrize("guided", [False, True])
+def test_alignment_minimum_size_preserves_feedback_actions_and_scrollable_points(
+    tmp_path, guided,
+):
+    import tkinter as tk
+    from operator_site_alignment_dialog import SiteAlignmentDialog
+
+    try:
+        root = tk.Tk()
+    except tk.TclError as exc:
+        pytest.skip(f"Tk display required: {exc}")
+    root.withdraw()
+    global_bindings = {seq: root.bind_all(seq) for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>")}
+    common = dict(
+        map_frame_id="map-v1", site_frame_id="world-v1",
+        get_current_map_position=lambda: (0., 0., 0.),
+        output_path=tmp_path / "alignment.json",
+    )
+    if guided:
+        dialog = GuidedSiteAlignmentDialog(
+            root, **common, get_current_camera_rotation=lambda: np.eye(3),
+            get_motion_observation=lambda: {},
+            extrinsic_output_path=tmp_path / "extrinsic.json",
+            vehicle_id="offline-aircraft", body_frame_id="body-frd", camera_frame_id="camera",
+        )
+    else:
+        dialog = SiteAlignmentDialog(root, **common)
+    try:
+        dialog.geometry("760x560+0+0")
+        root.update_idletasks()
+        assert str(dialog._save_button["state"]) == "disabled"
+        for button in (dialog._solve_button, dialog._approve_button, dialog._save_button, dialog._close_button):
+            assert button.winfo_ismapped()
+            assert button.winfo_width() >= button.winfo_reqwidth()
+            assert button.winfo_rootx() >= dialog.winfo_rootx()
+            assert button.winfo_rootx() + button.winfo_width() <= dialog.winfo_rootx() + dialog.winfo_width()
+            assert button.winfo_rooty() + button.winfo_height() <= dialog.winfo_rooty() + dialog.winfo_height()
+        tree = dialog._points_tree
+        assert tree.cget("yscrollcommand") and tree.cget("xscrollcommand")
+        for index in range(20):
+            tree.insert("", "end", iid=f"geometry-{index}", values=(index, "measured", "1, 2, 3", "4, 5, 6"))
+        root.update_idletasks()
+        dialog._content_canvas.yview_moveto(1.0)
+        tree.yview_moveto(1.0)
+        root.update_idletasks()
+        assert tree.yview()[0] > 0
+        assert tree.yview()[1] == pytest.approx(1.0)
+        assert dialog._content_canvas.yview()[1] == pytest.approx(1.0)
+
+        # A validation error remains selectable/scrollable without displacing write/close.
+        dialog._solve()
+        assert str(dialog._save_button["state"]) == "disabled"
+        message = dialog._status_var.get() + "\n" + "alignment/source/path/" * 100
+        dialog._status_var.set(message)
+        root.update_idletasks()
+        # Text line-height calculation is deferred separately from idle geometry.
+        dialog._status_text.count("1.0", "end", "update", "ypixels")
+        assert dialog._status_text.get("1.0", "end-1c") == message
+        assert dialog._status_text.yview()[1] < 1.0
+        dialog._status_text.yview_moveto(1.0)
+        root.update_idletasks()
+        assert dialog._status_text.yview()[0] > 0
+        assert dialog._status_text.yview()[1] == pytest.approx(1.0)
+        assert dialog._close_button.winfo_ismapped()
+        assert {seq: root.bind_all(seq) for seq in global_bindings} == global_bindings
+        dialog._close_button.invoke()
+        assert not dialog.winfo_exists()
+        assert {seq: root.bind_all(seq) for seq in global_bindings} == global_bindings
+    finally:
+        if dialog.winfo_exists():
+            dialog.destroy()
+        root.destroy()

@@ -15,6 +15,9 @@ Subcommands (run in this order):
   edm        production EDM + PnP on the same top-k references (baseline)
   report     metrics and the pre-registered decision in
              docs/sta_map_anchored_eval_20260923.md
+
+Experiment concluded NO-GO on 2026-09-23; this tool is kept only to reproduce
+that decision.
 """
 
 from __future__ import annotations

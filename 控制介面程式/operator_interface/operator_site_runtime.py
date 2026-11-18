@@ -193,63 +193,141 @@ def close_active_site_runtime(
         raise _SiteRuntimeCleanupError(errors, runtime_usable=False)
 
 
-def replace_active_site_runtime(
-    old: ActiveSiteRuntime,
-    new_plan: PreparedSiteRuntime,
-    start_runtime: Callable[[PreparedSiteRuntime], ActiveSiteRuntime],
-) -> SiteRuntimeSwitchResult:
-    """Close old, start new, and rebuild old if new activation fails."""
+def _discard_candidate(candidate: ActiveSiteRuntime | None) -> str:
+    if candidate is None:
+        return ""
+    try:
+        close_active_site_runtime(candidate, reason="site_switch_cancelled")
+    except BaseException as exc:
+        return "; candidate cleanup: " + (str(exc) or repr(exc))
+    return ""
 
+
+def _exception_text(exc: BaseException) -> str:
+    return str(exc) or repr(exc)
+
+
+def _kept_old_result(old: ActiveSiteRuntime, error: str) -> SiteRuntimeSwitchResult:
+    return SiteRuntimeSwitchResult(
+        runtime=old, applied=False, old_closed=False, error=error,
+    )
+
+
+def _cutover_refusal(
+    old: ActiveSiteRuntime,
+    candidate: ActiveSiteRuntime | None,
+    cancel_requested: Callable[[], bool] | None,
+    cutover_allowed: Callable[[], bool] | None,
+) -> SiteRuntimeSwitchResult | None:
+    try:
+        cancelled = cancel_requested is not None and cancel_requested()
+        allowed = cutover_allowed is None or cutover_allowed()
+    except BaseException as exc:
+        return _kept_old_result(old, _exception_text(exc) + _discard_candidate(candidate))
+    if cancelled or not allowed:
+        return _kept_old_result(
+            old, "runtime switch cancelled by safety state" + _discard_candidate(candidate)
+        )
+    return None
+
+
+def _close_old_runtime(
+    old: ActiveSiteRuntime, candidate: ActiveSiteRuntime | None
+) -> SiteRuntimeSwitchResult | None:
     try:
         close_active_site_runtime(old, reason="site_switch")
     except _SiteRuntimeCleanupError as exc:
+        error = str(exc) + _discard_candidate(candidate)
         if exc.runtime_usable:
-            return SiteRuntimeSwitchResult(
-                runtime=old,
-                applied=False,
-                old_closed=False,
-                error=str(exc),
-            )
+            return _kept_old_result(old, error)
         return SiteRuntimeSwitchResult(
             runtime=None,
             applied=False,
             old_closed=True,
-            error=str(exc),
-        )
-    except Exception as exc:
-        return SiteRuntimeSwitchResult(
-            runtime=old,
-            applied=False,
-            old_closed=False,
-            error=str(exc),
-        )
-
-    try:
-        runtime = start_runtime(new_plan)
-    except Exception as exc:
-        error = str(exc) or repr(exc)
-        try:
-            rollback = start_runtime(old.prepared)
-        except Exception as rollback_exc:
-            return SiteRuntimeSwitchResult(
-                runtime=None,
-                applied=False,
-                old_closed=True,
-                error=error,
-                rollback_error=str(rollback_exc) or repr(rollback_exc),
-            )
-        return SiteRuntimeSwitchResult(
-            runtime=rollback,
-            applied=False,
-            old_closed=True,
-            rolled_back=True,
             error=error,
         )
+    except Exception as exc:
+        return _kept_old_result(old, _exception_text(exc) + _discard_candidate(candidate))
+    return None
+
+
+def _rollback_to_old_runtime(
+    old: ActiveSiteRuntime,
+    start_runtime: Callable[[PreparedSiteRuntime], ActiveSiteRuntime],
+    error: str,
+) -> SiteRuntimeSwitchResult:
+    try:
+        rollback = start_runtime(old.prepared)
+    except BaseException as rollback_exc:
+        return SiteRuntimeSwitchResult(
+            runtime=None,
+            applied=False,
+            old_closed=True,
+            error=error,
+            rollback_error=_exception_text(rollback_exc),
+        )
+    return SiteRuntimeSwitchResult(
+        runtime=rollback,
+        applied=False,
+        old_closed=True,
+        rolled_back=True,
+        error=error,
+    )
+
+
+def _start_replacement(
+    old: ActiveSiteRuntime,
+    new_plan: PreparedSiteRuntime,
+    start_runtime: Callable[[PreparedSiteRuntime], ActiveSiteRuntime],
+    candidate: ActiveSiteRuntime | None,
+    cancelled: bool,
+) -> SiteRuntimeSwitchResult:
+    if cancelled:
+        candidate_error = _discard_candidate(candidate)
+        if candidate_error:
+            return SiteRuntimeSwitchResult(
+                runtime=None, applied=False, old_closed=True,
+                error="runtime switch cancelled by safety command" + candidate_error,
+            )
+    try:
+        if cancelled:
+            raise RuntimeError("runtime switch cancelled by safety command")
+        runtime = candidate if candidate is not None else start_runtime(new_plan)
+    except BaseException as exc:
+        return _rollback_to_old_runtime(old, start_runtime, _exception_text(exc))
     return SiteRuntimeSwitchResult(
         runtime=runtime,
         applied=True,
         old_closed=True,
     )
+
+
+def replace_active_site_runtime(
+    old: ActiveSiteRuntime,
+    new_plan: PreparedSiteRuntime,
+    start_runtime: Callable[[PreparedSiteRuntime], ActiveSiteRuntime],
+    *,
+    start_before_close: bool = False,
+    cancel_requested: Callable[[], bool] | None = None,
+    cutover_allowed: Callable[[], bool] | None = None,
+) -> SiteRuntimeSwitchResult:
+    """Replace resources transactionally, optionally warming a non-live source first."""
+
+    candidate = None
+    if start_before_close:
+        try:
+            candidate = start_runtime(new_plan)
+        except BaseException as exc:
+            return _kept_old_result(old, _exception_text(exc))
+
+    refusal = _cutover_refusal(old, candidate, cancel_requested, cutover_allowed)
+    if refusal is not None:
+        return refusal
+    close_failure = _close_old_runtime(old, candidate)
+    if close_failure is not None:
+        return close_failure
+    cancelled = cancel_requested is not None and cancel_requested()
+    return _start_replacement(old, new_plan, start_runtime, candidate, cancelled)
 
 
 __all__ = [

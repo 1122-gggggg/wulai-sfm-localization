@@ -13,6 +13,7 @@ from itertools import product
 from pathlib import Path
 
 import numpy as np
+from route_editor_wires import wire_annotations
 
 # Authoring fields are validated by the flight route contract's owner; keep
 # this module importable before the desktop entrypoint installs that path.
@@ -356,6 +357,29 @@ def _editor_boxes_from_route(
         })
     return _object_boxes(converted)
 
+def _editor_wires_from_route(raw: dict, *, map_frame, align_source: str) -> list[dict]:
+    """Convert both attachments and the sag axis, preserving the entire curve."""
+    wires = wire_annotations(raw.get("wires", []))
+    declared = raw.get("align_source", "legacy")
+    if declared == align_source:
+        return wires
+    converted = []
+    for wire in wires:
+        points = _editor_points_from_route(
+            {
+                "frame": "aligned",
+                "align_source": declared,
+                "waypoints": [wire["a"], wire["b"], [0.0, 0.0, 0.0], wire["up"]],
+            },
+            map_frame=map_frame, align_source=align_source,
+        )
+        converted.append({
+            "a": points[0].tolist(), "b": points[1].tolist(),
+            "sag": wire["sag"], "up": (points[3] - points[2]).tolist(),
+        })
+    return wire_annotations(converted)
+
+
 
 @dataclass
 class RouteDocument:
@@ -381,6 +405,8 @@ class RouteDocument:
     object_boxes: list[dict] = field(default_factory=list)
     #: Zero-based object_boxes indexes for authored legs i -> i + 1.
     segment_look_at: list[int | None] | None = None
+    #: Offline wire annotations, never flight obstacles.
+    wires: list[dict] = field(default_factory=list)
 
     @classmethod
     def load(
@@ -450,6 +476,9 @@ class RouteDocument:
                 raw.get("return_waypoint_actions"), len(editor_points)
             ),
             object_boxes=boxes,
+            wires=_editor_wires_from_route(
+                raw, map_frame=map_frame, align_source=align_source,
+            ),
             segment_look_at=parse_segment_look_at(
                 raw.get("segment_look_at"),
                 waypoint_count=len(editor_points),
@@ -489,6 +518,9 @@ class RouteDocument:
         boxes = _object_boxes(self.object_boxes)
         if boxes:
             payload["object_boxes"] = boxes
+        wires = wire_annotations(self.wires)
+        if wires:
+            payload["wires"] = wires
         references = parse_segment_look_at(
             self.segment_look_at, waypoint_count=len(points), box_count=len(boxes),
         )

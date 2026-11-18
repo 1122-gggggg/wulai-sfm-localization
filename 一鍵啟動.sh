@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Portable live operator entrypoint. Opening the UI never sends a takeoff command.
+# Unified operator entrypoint. Default: real aircraft. VIDEO=<file> switches to the
+# simulated stream (no aircraft link, no takeoff). Opening the UI never sends a takeoff command.
 set -euo pipefail
 
 root_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -68,11 +69,35 @@ if [[ ! -x "$runtime_python" ]]; then
   runtime_python="$venv_dir/bin/python"
 fi
 
-default_selection="$root_dir/控制介面程式/mission_selections/river_gluemap_all8_direct_localization.json"
-export SFM_MISSION_SELECTION="${SFM_MISSION_SELECTION:-$default_selection}"
-
 export SFM_WORKSPACE_ROOT="$root_dir"
 export SFM_UI_PYTHON="$runtime_python"
 export SFM_LOCALIZER_PYTHON="${SFM_LOCALIZER_PYTHON:-$runtime_python}"
 
+# Map choice precedence: explicit SFM_MISSION_SELECTION > last opened map > river default.
+if [[ -z "${SFM_MISSION_SELECTION:-}" ]]; then
+  remembered_selection="$("$runtime_python" "$root_dir/控制介面程式/last_mission_memory.py" show || true)"
+  if [[ -n "$remembered_selection" ]]; then
+    echo "[一鍵啟動] 沿用上次開啟的地圖：$remembered_selection" >&2
+  fi
+fi
+default_selection="$root_dir/控制介面程式/mission_selections/river_gluemap_all8_direct_localization.json"
+export SFM_MISSION_SELECTION="${SFM_MISSION_SELECTION:-${remembered_selection:-$default_selection}}"
+
+if [[ -n "${VIDEO:-}" ]]; then
+  # Simulation: same mission selection, resolved to its read-only site profile snapshot.
+  remember_arg=()
+  [[ "${SFM_LAUNCH_DRY_RUN:-0}" == "1" ]] || remember_arg=(--remember)
+  if ! mission_report="$("$runtime_python" "$root_dir/控制介面程式/launch_mission.py" \
+    "$SFM_MISSION_SELECTION" --check-only "${remember_arg[@]}")"; then
+    echo "[一鍵啟動] mission selection 驗證失敗" >&2
+    exit 2
+  fi
+  SFM_SITE_PROFILE="$("$runtime_python" -c \
+    'import json,sys; print(json.load(sys.stdin)["site_profile"])' <<<"$mission_report")"
+  export SFM_SITE_PROFILE
+  echo "[一鍵啟動] 模擬模式（VIDEO=$VIDEO）：不連接真機、不會起飛" >&2
+  exec bash "$root_dir/控制介面程式/影片模擬串流/啟動.sh" "$@"
+fi
+
+echo "[一鍵啟動] 真機模式（預設）；若要模擬請設定 VIDEO=<影片路徑>" >&2
 exec bash "$root_dir/控制介面程式/真機串流/啟動.sh" "$@"

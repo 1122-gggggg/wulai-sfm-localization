@@ -323,3 +323,62 @@ def test_motion_ring_unread_eviction_marker_is_permanently_recorded(tmp_path):
     assert rows[0]["event"] == "control_motion_history"
     assert rows[0]["attitude_samples"][0][0] == 1.
     assert rows[0]["history_health"]["unread_eviction_since_log_cursor"] == [True, False]
+
+
+def test_localization_history_aligns_wrapped_attitude_and_independent_velocity():
+    import math
+
+    clock = {"mono": 100., "wall": 5000.}
+    history = _history(clock)
+    history.record(0, _event(4999.8, roll=.2, pitch=-.4, yaw=math.radians(179)))
+    history.record(0, _event(5000., roll=.4, pitch=-.2, yaw=math.radians(-179)))
+    history.record(1, _event(4999.78, speedX=0., speedY=-1., speedZ=.2))
+    history.record(1, _event(4999.98, speedX=1., speedY=1., speedZ=-.2))
+
+    aligned = history.localization_at(99.9)
+    assert aligned["fused_roll"] == pytest.approx(.3)
+    assert aligned["fused_pitch"] == pytest.approx(-.3)
+    assert abs(aligned["fused_yaw"]) == pytest.approx(math.pi)
+    assert aligned["fused_speed_north"] == pytest.approx(.6)
+    assert aligned["fused_speed_east"] == pytest.approx(.2)
+    assert aligned["fused_speed_down"] == pytest.approx(-.04)
+    assert aligned["fused_attitude_mono"] == aligned["fused_speed_mono"] == 99.9
+    assert aligned["fused_attitude_source_mono"] == pytest.approx((99.8, 100.))
+    assert aligned["fused_speed_source_mono"] == pytest.approx((99.78, 99.98))
+
+
+def test_localization_history_keeps_nearest_source_time_and_drops_stale_signal():
+    clock = {"mono": 100., "wall": 5000.}
+    history = _history(clock)
+    history.record(0, _event(4999.5, roll=.1, pitch=.2, yaw=.3))
+    history.record(1, _event(4999.95, speedX=.5, speedY=-.2, speedZ=.1))
+    history.record(1, _event(5000.2, speedX=99., speedY=99., speedZ=99.))
+
+    aligned = history.localization_at(99.9)
+    assert aligned["fused_attitude_mono"] is None
+    assert aligned["fused_yaw"] is None
+    assert aligned["fused_telemetry_mono"] is None
+    assert aligned["fused_speed_mono"] == pytest.approx(99.95)
+    assert aligned["fused_speed_north"] == .5
+    assert aligned["fused_speed_source_mono"] == pytest.approx((99.95,))
+    assert history.localization_at(100.1)["fused_speed_mono"] is None
+
+
+def test_localization_history_does_not_interpolate_across_invalid_full_events():
+    clock = {"mono": 100., "wall": 5000.}
+    history = _history(clock)
+    for wall in (4999.8, 5000.):
+        if wall == 5000.:
+            history.record(0, _event(4999.9, roll=float("nan"), pitch=0., yaw=.2))
+            history.record(1, _event(4999.9, speedX=.4, speedY=.1))
+        history.record(0, _event(wall, roll=.1, pitch=0., yaw=.3))
+        history.record(1, _event(wall, speedX=.5, speedY=.1, speedZ=0.))
+
+    aligned = history.localization_at(99.91)
+    assert aligned["fused_roll"] is None
+    assert aligned["fused_speed_north"] is None
+    # Invalid localization-only components must not discard usable yaw/XY
+    # events used by the independent control loop.
+    attitudes, velocities = history.since()
+    assert attitudes[1][0] == .2
+    assert velocities[1][:2] == (.4, .1)

@@ -5,6 +5,8 @@ edm_reference_features/  persistent EDM reference backbone feature bank (~8.9 GB
                          and every reference image SHA; rebuilding it costs a full
                          re-extraction over all 1,045 references.
 moge-2-vits-normal/      pinned depth model weights.
+power_equipment_sample50_3class_yolo26n_640_aug_best.pt
+                        active three-class power-equipment detector checkpoint.
 
 Same rule as 執行環境/torch_hub_cache and 執行環境/wheels: never included in a
 workspace sweep. See the ledger's 2026-09-05 torch_hub_cache incident.

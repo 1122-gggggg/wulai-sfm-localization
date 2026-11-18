@@ -3,7 +3,8 @@
 Two responsibilities, deliberately kept apart from every accuracy knob:
 
 * ``vendor_sys_path`` puts the frozen ``river_map_quality`` / ``sfm_diagnosis``
-  packages that ship inside this deploy directory on ``sys.path``.
+  packages on ``sys.path``.  The expand variant keeps no vendor copy of its
+  own: it shares the single tree in ``deploy_code/sfm_direct_deploy/vendor``.
 * ``default_runtime_paths`` answers "where are the model weights on *this*
   machine".  Those three locations are machine facts, not tuning parameters, so
   they may be overridden through the environment.  Everything that can change a
@@ -25,7 +26,7 @@ from pathlib import Path
 
 
 _SHA256_CHUNK = 8 * 1024 * 1024
-_SHA256_CACHE: dict[tuple[int, int, int], str] = {}
+_SHA256_CACHE: dict[tuple[str, int, int, int], str] = {}
 
 
 def sha256_file(path: str | Path) -> str:
@@ -33,7 +34,7 @@ def sha256_file(path: str | Path) -> str:
     resolved = Path(path).resolve()
     try:
         st = resolved.stat()
-        key = (st.st_ino, int(st.st_mtime_ns), st.st_size)
+        key = (str(resolved), st.st_ino, int(st.st_mtime_ns), st.st_size)
     except OSError:
         key = None
     if key is not None and key in _SHA256_CACHE:
@@ -64,8 +65,8 @@ def verify_file_sha256(path: str | Path, expected: str | None) -> str:
 
 
 DEPLOY_DIR = Path(__file__).resolve().parent
-VENDOR_DIR = DEPLOY_DIR / "vendor"
 WORKSPACE_ROOT = DEPLOY_DIR.parents[2]
+VENDOR_DIR = WORKSPACE_ROOT / "定位演算法" / "deploy_code" / "sfm_direct_deploy" / "vendor"
 
 EDM_REPO_ENV = "SFM_EDM_REPO"
 EDM_CHECKPOINT_ENV = "SFM_EDM_CHECKPOINT"

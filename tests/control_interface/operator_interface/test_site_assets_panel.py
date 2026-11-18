@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import gc
 import json
-import queue
 import threading
 import time
 from pathlib import Path
@@ -14,6 +13,16 @@ from tkinter import ttk
 
 from operator_actions import ActionResult, SiteAssetActions
 from site_assets_panel import SiteAssetsPanel
+from operator_ui_style import apply_operator_styles
+
+
+def _write_route(path, index=1, *, purpose="flight"):
+    path.parent.mkdir(exist_ok=True, parents=True)
+    path.write_text(json.dumps({
+        "schema": "sfm-flight-route/v1", "purpose": purpose,
+        "waypoints": [[0, 0, 0], [index, 0, 0]],
+    }), encoding="utf-8")
+    return path
 
 
 @pytest.fixture
@@ -23,25 +32,21 @@ def site_panel(tmp_path):
     except tk.TclError as exc:
         pytest.skip(f"Tk display unavailable: {exc}")
     root.withdraw()
+    apply_operator_styles(root)
     folders = {}
-    for name in ("A", "B", "Empty"):
+    for name in ("A", "B", "Empty", "Invalid"):
         folder = tmp_path / name
         folder.mkdir()
         (folder / "site_profile.json").write_text(
-            json.dumps({"site_id": name, "display_name": name}), encoding="utf-8"
+            "not JSON" if name == "Invalid" else
+            json.dumps({"site_id": name, "display_name": name}), encoding="utf-8",
         )
-        if name != "Empty":
-            (folder / "routes").mkdir()
+        if name in ("A", "B"):
             for index in (1, 2):
-                (folder / "routes" / f"{name}_route_{index}.json").write_text(
-                    json.dumps({
-                        "schema": "sfm-flight-route/v1", "purpose": "flight",
-                        "waypoints": [[0, 0, 0], [index, 0, 0]],
-                    }), encoding="utf-8",
-                )
+                _write_route(folder / "routes" / f"{name}_route_{index}.json", index)
         folders[name] = folder
 
-    imports = []
+    imports, selected, edited, deleted, applied, created, saved = ([] for _ in range(7))
 
     def import_folder(folder):
         folder = Path(folder)
@@ -57,29 +62,37 @@ def site_panel(tmp_path):
         SimpleNamespace(import_folder=import_folder), SimpleNamespace(),
         SimpleNamespace(), current_profile=folders["A"] / "site_profile.json",
     )
-    selected, edited, deleted, applied = [], [], [], []
     panel = SiteAssetsPanel(
         root, actions=actions, request_apply=applied.append,
         request_route_preview=lambda path: selected.append(path) or "selected",
-        request_route_edit=edited.append, request_route_delete=deleted.append,
+        request_route_edit=edited.append,
+        request_route_delete=lambda path: deleted.append(path) or ActionResult(
+            "deleted", actions.current_profile, path, "route_deleted",
+        ),
+        request_route_editor=created.append, route_imported=saved.append,
         site_packages_root=tmp_path, site_pack_root=folders["A"],
     )
-    panel.pack()
+    panel.pack(fill="both", expand=True)
     panel.ask_yes_no = lambda *_args: False
-    root.update()
     state = SimpleNamespace(
         root=root, panel=panel, actions=actions, folders=folders, imports=imports,
         selected=selected, edited=edited, deleted=deleted, applied=applied,
+        created=created, saved=saved,
     )
+
+    def apply(profile):
+        applied.append(profile)
+        state.panel.activate_site(profile, profile.parent)
+
+    panel.request_apply = apply
+    root.update()
     try:
         yield state
     finally:
-        # Tk variables must release their Tcl handle on this thread, before a
-        # later import worker's cyclic GC can collect the destroyed panel.
+        # Release Tcl handles on the UI thread before import workers can run GC.
         del panel.status_var
         root.destroy()
-        state.panel = None
-        state.root = None
+        state.panel = state.root = None
         del panel, root
         gc.collect()
 
@@ -95,9 +108,8 @@ def _texts(panel):
             if isinstance(widget, (ttk.Label, ttk.Button))]
 
 
-def _route_buttons(panel):
-    return [widget for widget in _widgets(panel)
-            if isinstance(widget, ttk.Button) and "_route_" in str(widget.cget("text"))]
+def _routes(panel):
+    return {item.path for item in panel._route_choices}
 
 
 def _wait_for_import(state):
@@ -110,91 +122,251 @@ def _wait_for_import(state):
 
 
 def _choose(state, name):
-    button = next(widget for widget in _widgets(state.panel)
-                  if isinstance(widget, ttk.Button) and widget.cget("text") == name)
-    button.invoke()
-    _wait_for_import(state)
+    selector = state.panel._map_selector
+    index = next(index for index, item in enumerate(state.panel._map_choices)
+                 if item.folder == state.folders[name])
+    selector.current(index)
+    selector.event_generate("<<ComboboxSelected>>")
+    state.root.update()
 
 
-def test_selected_site_replaces_all_routes_before_apply_and_can_return_to_active(site_panel):
+def _choose_route(state, path):
+    tree = state.panel._route_list
+    index = next(index for index, item in enumerate(state.panel._route_choices)
+                 if item.path == path)
+    tree.selection_set(str(index))
+    tree.see(str(index))
+    state.root.update()
+
+
+def test_registered_map_selection_applies_immediately_without_import_or_confirmation(site_panel):
     state = site_panel
-    assert len(_route_buttons(state.panel)) == 2
-    _choose(state, "B")
-    assert {button.cget("text").split(" · ")[0] for button in _route_buttons(state.panel)} == {
-        "B_route_1.json", "B_route_2.json",
-    }
-    assert not any("A_route_" in text for text in _texts(state.panel))
-    assert any("待套用場域：B" in text for text in _texts(state.panel))
-    assert state.actions.current_profile == state.folders["B"] / "site_profile.json"
-    assert state.panel.site_pack_root == state.folders["A"]
-    state.panel._set_busy(True)
-    state.panel._set_busy(False)
-    for button in _route_buttons(state.panel):
-        assert button.instate(["disabled"])
-        button.invoke()
-    path = state.folders["B"] / "routes/B_route_1.json"
-    state.panel._preview_existing_route(path)
-    state.panel._edit_existing_route(path)
-    state.panel._delete_existing_route(path)
-    assert not state.selected and not state.edited and not state.deleted and not state.applied
 
-    _choose(state, "A")
-    assert all("A_route_" in button.cget("text") for button in _route_buttons(state.panel))
-    assert all(not button.instate(["disabled"]) for button in _route_buttons(state.panel))
-    assert not any("待套用場域" in text for text in _texts(state.panel))
-    _route_buttons(state.panel)[0].invoke()
-    assert len(state.selected) == 1
-    assert state.selected[0].parent == state.folders["A"] / "routes"
+    def unexpected_dialog(*_args):
+        pytest.fail("registered selection must not ask for separate apply confirmation")
 
-
-def test_route_selection_is_enabled_only_after_existing_apply_confirmation(site_panel):
-    state = site_panel
-    state.panel.ask_yes_no = lambda title, _message: title == "切換到這個場域"
-
-    def apply(profile):
-        state.applied.append(profile)
-        state.panel.activate_site(profile, profile.parent)
-
-    state.panel.request_apply = apply
+    state.panel.ask_yes_no = unexpected_dialog
     _choose(state, "B")
     assert state.applied == [state.folders["B"] / "site_profile.json"]
-    assert state.panel.site_pack_root == state.folders["B"]
-    assert not any("待套用場域" in text for text in _texts(state.panel))
-    assert len(_route_buttons(state.panel)) == 2
-    _route_buttons(state.panel)[0].invoke()
-    assert state.selected[0].parent == state.folders["B"] / "routes"
+    assert not state.imports and not state.saved
+    assert _routes(state.panel) == {
+        state.folders["B"] / "routes/B_route_1.json",
+        state.folders["B"] / "routes/B_route_2.json",
+    }
+    assert state.actions.current_profile == state.applied[-1]
+    _choose_route(state, state.folders["B"] / "routes/B_route_1.json")
+    assert state.selected == [state.folders["B"] / "routes/B_route_1.json"]
+
+    _choose(state, "A")
+    assert all(path.parent == state.folders["A"] / "routes" for path in _routes(state.panel))
+    assert state.panel._selected_route_path is None
+    assert not state.panel._route_list.selection()
 
 
-def test_no_route_site_clears_previous_choices_and_rollback_restores_active(site_panel):
+def test_active_map_remains_selectable_without_restart_or_losing_route(site_panel):
     state = site_panel
+    path = state.folders["A"] / "routes/A_route_1.json"
+    _choose_route(state, path)
+    _choose(state, "A")
+    assert not state.applied and not state.imports
+    assert state.panel._selected_route_path == path
+    assert state.selected == [path]
+    assert state.panel._map_choices[state.panel._map_selector.current()].folder == state.folders["A"]
+
+
+def test_old_routes_remain_until_activation_and_pending_switch_blocks_handlers(site_panel):
+    state = site_panel
+    original = _routes(state.panel)
+    state.panel.request_apply = state.applied.append
+    _choose(state, "B")
+    assert _routes(state.panel) == original
+    assert state.panel.site_pack_root == state.folders["A"]
+    assert state.panel._busy
+    assert state.panel._map_selector.instate(["disabled"])
+    _choose_route(state, next(iter(original)))
     _choose(state, "Empty")
-    assert _route_buttons(state.panel) == []
-    assert "此場域尚無可用航線" in _texts(state.panel)
-    assert any("待套用場域：Empty" in text for text in _texts(state.panel))
-    state.panel.activate_site(state.folders["A"] / "site_profile.json", state.folders["A"])
-    assert len(_route_buttons(state.panel)) == 2
-    assert all("A_route_" in button.cget("text") for button in _route_buttons(state.panel))
-    assert state.actions.current_profile == state.folders["A"] / "site_profile.json"
+    state.panel._import_site_folder(state.folders["Empty"])
+    assert not state.selected and not state.imports
+    assert state.applied == [state.folders["B"] / "site_profile.json"]
+    state.panel.activate_site(state.applied[0], state.folders["B"])
+    assert not state.panel._busy
+    assert all(path.parent == state.folders["B"] / "routes" for path in _routes(state.panel))
+    assert not state.panel._route_list.selection()
 
 
-@pytest.mark.parametrize("pending_site", [False, True])
-def test_validation_failure_preserves_previous_complete_selection(site_panel, pending_site):
+@pytest.mark.parametrize("reason", [
+    "AUTO mission is active", "aircraft flying", "landing not confirmed",
+])
+def test_existing_flight_guard_blocks_map_selection_import_and_route_changes(site_panel, reason):
     state = site_panel
-    if pending_site:
-        _choose(state, "B")
-    previous = [button.cget("text") for button in _route_buttons(state.panel)]
-    previous_profile = state.actions.current_profile
-    state.panel._import_site_folder(state.folders["A"].parent / "Invalid")
+    state.panel.flight_state_check = lambda: (False, reason)
+    _choose(state, "B")
+    state.panel._import_site_folder(state.folders["B"])
+    _choose_route(state, next(iter(_routes(state.panel))))
+    state.panel._open_route_editor(False)
+    assert not state.applied and not state.imports and not state.selected and not state.created
+    assert state.panel.site_pack_root == state.folders["A"]
+    assert state.panel._map_choices[state.panel._map_selector.current()].folder == state.folders["A"]
+    assert reason in state.panel.status_var.get()
+
+
+def test_root_editor_guard_rejection_retains_active_map_and_selected_route(site_panel):
+    state = site_panel
+    path = state.folders["A"] / "routes/A_route_1.json"
+    _choose_route(state, path)
+
+    def reject(_profile):
+        raise ValueError("close the route editor first")
+
+    state.panel.request_apply = reject
+    _choose(state, "B")
+    assert state.panel.site_pack_root == state.folders["A"]
+    assert state.actions.current_profile == state.folders["A"] / "site_profile.json"
+    assert state.panel._selected_route_path == path
+    assert _routes(state.panel) == {state.folders["A"] / f"routes/A_route_{index}.json"
+                                    for index in (1, 2)}
+    assert "close the route editor first" in state.panel.status_var.get()
+    assert not state.panel._busy
+
+
+@pytest.mark.parametrize("result_message", ["switch cancelled", "switch failed, rolled back"])
+def test_async_cancel_and_rollback_restore_previous_complete_selection(site_panel, result_message):
+    state = site_panel
+    path = state.folders["A"] / "routes/A_route_1.json"
+    _choose_route(state, path)
+    state.panel.request_apply = state.applied.append
+    _choose(state, "B")
+    # Canonical runtime result handlers call activate_site with the retained runtime.
+    state.panel.activate_site(state.folders["A"] / "site_profile.json", state.folders["A"])
+    state.panel.set_status(result_message)
+    state.panel._set_busy(False)
+    assert state.panel._selected_route_path == path
+    assert state.panel._map_choices[state.panel._map_selector.current()].folder == state.folders["A"]
+    assert all(item.parent == path.parent for item in _routes(state.panel))
+    assert not state.panel._busy
+    _choose(state, "B")
+    assert len(state.applied) == 2
+    state.panel.activate_site(state.folders["B"] / "site_profile.json", state.folders["B"])
+
+
+def test_invalid_map_is_truthfully_listed_but_cannot_replace_active_map(site_panel):
+    state = site_panel
+    item = next(item for item in state.panel._map_choices if item.folder == state.folders["Invalid"])
+    assert item.error
+    _choose(state, "Invalid")
+    assert not state.applied and not state.imports
+    assert item.error in state.panel.status_var.get()
+    assert state.panel.site_pack_root == state.folders["A"]
+    assert all(path.parent == state.folders["A"] / "routes" for path in _routes(state.panel))
+
+
+def test_empty_map_activation_clears_old_route_selection_and_offers_creation(site_panel):
+    state = site_panel
+    _choose_route(state, next(iter(_routes(state.panel))))
+    _choose(state, "Empty")
+    assert not _routes(state.panel)
+    assert state.panel._selected_route_path is None
+    assert "此地圖尚無可用航線" in _texts(state.panel)
+    assert state.panel.site_pack_root == state.folders["Empty"]
+    state.panel._open_route_editor(False)
+    assert state.created == [False]
+
+
+def test_empty_registry_keeps_active_map_and_new_folder_import_available(site_panel, tmp_path):
+    state = site_panel
+    state.panel.site_packages_root = tmp_path / "no-packages"
+    state.panel._refresh()
+    assert [item.folder for item in state.panel._map_choices] == [state.folders["A"]]
+    assert state.panel.add_map_button.winfo_manager() == "grid"
+    _choose(state, "A")
+    assert not state.applied
+
+
+def test_route_list_read_failure_does_not_mix_old_routes(site_panel, monkeypatch):
+    import site_assets_panel as sap
+
+    state = site_panel
+    describe = sap.describe_site_routes
+
+    def reject_b(folder):
+        if Path(folder) == state.folders["B"]:
+            raise OSError("route folder unavailable")
+        return describe(folder)
+
+    monkeypatch.setattr(sap, "describe_site_routes", reject_b)
+    _choose(state, "B")
+    assert not _routes(state.panel)
+    assert any("route folder unavailable" in text for text in _texts(state.panel))
+    assert state.panel.site_pack_root == state.folders["B"]
+    assert state.panel._selected_route_path is None
+
+
+def test_new_folder_import_applies_then_renders_only_activated_map(site_panel):
+    state = site_panel
+    state.panel._import_site_folder(state.folders["B"])
     _wait_for_import(state)
-    assert [button.cget("text") for button in _route_buttons(state.panel)] == previous
-    assert state.actions.current_profile == previous_profile
-    assert state.panel._pending_site_folder is None
+    assert state.imports == [state.folders["B"]]
+    assert state.applied == [state.folders["B"] / "site_profile.json"]
+    assert state.panel.site_pack_root == state.folders["B"]
+    assert all(path.parent == state.folders["B"] / "routes" for path in _routes(state.panel))
+    assert not state.saved and not state.selected
+
+
+def test_cancelled_add_map_dialog_retains_selection_without_import(site_panel):
+    state = site_panel
+    path = next(iter(_routes(state.panel)))
+    _choose_route(state, path)
+    state.panel._choose_site()
+    dialog = state.panel._add_map_dialog
+    assert dialog is not None and dialog.winfo_exists()
+    # Non-modal: the flight bar behind it must stay clickable.
+    assert dialog.grab_current() is None
+    dialog.cancel()
+    state.root.update()
+    assert not state.imports and not state.applied
+    assert state.panel._selected_route_path == path
+
+
+def test_add_map_dialog_only_imports_a_folder_that_passes_preview(site_panel, monkeypatch):
+    import add_map_dialog
+    from local_site_assets import SiteFolderFile, SiteFolderPreview
+
+    state = site_panel
+    folder = state.folders["B"]
+    state.panel._choose_site()
+    dialog = state.panel._add_map_dialog
+    dialog.navigate(folder.parent, select=folder)
+    state.root.update()
+    assert not dialog.preview.ready
+    assert dialog.import_button.instate(["disabled"])
+    dialog.confirm()
+    assert not state.imports and dialog.winfo_exists()
+
+    ready = SiteFolderPreview(
+        folder, display_name="B", site_id="B",
+        files=(SiteFolderFile("場域 manifest", folder / "site_profile.json", 1),),
+    )
+    monkeypatch.setattr(add_map_dialog, "preview_site_folder", lambda _folder: ready)
+    dialog.show_preview(folder)
+    assert dialog.import_button.instate(["!disabled"])
+    dialog.confirm()
+    _wait_for_import(state)
+    assert state.imports == [folder]
+    assert state.applied == [folder / "site_profile.json"]
+
+
+def test_import_validation_failure_preserves_active_map_and_profile(site_panel):
+    state = site_panel
+    previous = _routes(state.panel)
+    state.panel._import_site_folder(state.folders["A"].parent / "missing")
+    _wait_for_import(state)
+    assert _routes(state.panel) == previous
+    assert state.actions.current_profile == state.folders["A"] / "site_profile.json"
     assert "site validation rejected" in state.panel.status_var.get()
-    assert all(button.instate(["disabled"]) == pending_site
-               for button in _route_buttons(state.panel))
+    assert not state.applied
 
 
-def test_busy_site_import_cannot_replace_first_pending_folder(site_panel):
+def test_busy_import_cannot_replace_pending_folder(site_panel):
     state = site_panel
     started, release = threading.Event(), threading.Event()
     original = state.actions.import_site_folder
@@ -211,135 +383,127 @@ def test_busy_site_import_cannot_replace_first_pending_folder(site_panel):
         assert started.wait(1.0)
         state.panel._import_site_folder(state.folders["Empty"])
         assert state.panel._pending_site_folder == state.folders["B"]
-        assert "前一個資產作業尚未完成" in state.panel.status_var.get()
     finally:
         release.set()
     _wait_for_import(state)
     assert state.imports == [state.folders["B"]]
-    assert all("B_route_" in button.cget("text") for button in _route_buttons(state.panel))
+    assert state.panel.site_pack_root == state.folders["B"]
 
 
-def test_synchronous_apply_rejection_restores_active_list_and_import_profile(site_panel):
+
+def test_landing_guard_changed_after_import_prevents_apply_and_restores_profile(site_panel):
     state = site_panel
-    _choose(state, "B")
-
-    def reject(_profile):
-        raise ValueError("AUTO mission is active")
-
-    state.panel.request_apply = reject
-    state.panel._apply()
-    assert all("A_route_" in button.cget("text") for button in _route_buttons(state.panel))
-    assert state.actions.current_profile == state.folders["A"] / "site_profile.json"
-    assert "AUTO mission is active" in state.panel.status_var.get()
-    assert not state.selected
-
-
-@pytest.mark.parametrize("rolled_back", [False, True])
-def test_switch_result_restores_active_routes_for_cancel_and_rollback(
-    site_panel, monkeypatch, rolled_back,
-):
-    import flight_operator_app as app
-    from operator_site_runtime import SiteRuntimeSwitchResult
-
-    state = site_panel
-    _choose(state, "B")
-    old = SimpleNamespace(prepared=SimpleNamespace(profile=SimpleNamespace(
-        source=state.folders["A"] / "site_profile.json",
-    )))
-    result = SiteRuntimeSwitchResult(
-        runtime=old, applied=False, old_closed=rolled_back,
-        rolled_back=rolled_back, error="offline connection rejected",
-    )
-    results = queue.Queue()
-    results.put(result)
-    monkeypatch.setattr(app, "site_pack_root_for_profile", lambda *_: state.folders["A"])
-    operator = SimpleNamespace(
-        _site_switch_results=results, _site_runtime=old,
-        site_assets_panel=state.panel, write_log=lambda _message: None,
-        _attach_localizer_file_handler=lambda: None,
-        _get_command_coordinator=lambda: SimpleNamespace(resume=lambda: None),
-        _install_site_runtime=lambda runtime: state.panel.activate_site(
-            runtime.prepared.profile.source, state.folders["A"],
-        ),
-        _set_site_switch_controls=lambda **_: None,
-    )
-    app.OperatorApp._poll_site_switch_result(operator)
-    assert all("A_route_" in button.cget("text") for button in _route_buttons(state.panel))
-    assert state.actions.current_profile == state.folders["A"] / "site_profile.json"
-    assert all(not button.instate(["disabled"]) for button in _route_buttons(state.panel))
-    assert not state.selected
-
-
-def test_selected_source_routes_do_not_use_old_active_or_managed_folder(
-    site_panel, tmp_path,
-):
-    state = site_panel
-    managed = tmp_path / "managed_B"
-    managed.mkdir()
-    original = state.actions.import_site_folder
-
-    def import_to_managed(folder):
-        result = original(folder)
-        state.actions.current_profile = managed / "site_profile.json"
-        return ActionResult(result.message, state.actions.current_profile, kind="site")
-
-    state.actions.import_site_folder = import_to_managed
-    _choose(state, "B")
-    assert len(_route_buttons(state.panel)) == 2
-    assert all("B_route_" in button.cget("text") for button in _route_buttons(state.panel))
-    assert state.panel.site_pack_root == state.folders["A"]
-
-
-def test_route_import_failure_keeps_only_selected_site_routes(site_panel):
-    state = site_panel
-    (state.folders["B"] / "routes/B_route_2.json").unlink()
-
-    def reject_route(*_args):
-        raise ValueError("route validation rejected")
-
-    state.actions.routes.import_file = reject_route
-    _choose(state, "B")
-    assert len(_route_buttons(state.panel)) == 1
-    assert _route_buttons(state.panel)[0].cget("text").startswith("B_route_1.json")
-    assert _route_buttons(state.panel)[0].instate(["disabled"])
-    assert not any("A_route_" in text for text in _texts(state.panel))
-    assert "route validation rejected" in state.panel.status_var.get()
-    assert not state.selected and not state.applied
-
-
-def test_route_list_read_failure_clears_old_routes_and_shows_reason(site_panel, monkeypatch):
-    import site_assets_panel as sap
-
-    state = site_panel
-    describe = sap.describe_site_routes
-
-    def reject_b(folder):
-        if Path(folder) == state.folders["B"]:
-            raise OSError("route folder unavailable")
-        return describe(folder)
-
-    monkeypatch.setattr(sap, "describe_site_routes", reject_b)
-    _choose(state, "B")
-    assert _route_buttons(state.panel) == []
-    assert any("route folder unavailable" in text for text in _texts(state.panel))
-    assert any("待套用場域：B" in text for text in _texts(state.panel))
-
-
-def test_pending_route_save_refresh_includes_new_managed_route(site_panel, tmp_path):
-    state = site_panel
-    _choose(state, "B")
-    managed = tmp_path / "managed_B"
-    (managed / "routes").mkdir(parents=True)
-    route = managed / "routes/B_route_authored.json"
-    route.write_text(json.dumps({
-        "schema": "sfm-flight-route/v1", "purpose": "flight",
-        "waypoints": [[0, 0, 0], [1, 0, 0]],
-    }), encoding="utf-8")
-    state.actions.current_profile = managed / "site_profile.json"
+    old_profile = state.actions.current_profile
+    state.actions.current_profile = state.folders["B"] / "site_profile.json"
+    state.panel.flight_state_check = lambda: (False, "landing not confirmed")
     state.panel._finish_ok(ActionResult(
-        "已新增航線；待套用場域", state.actions.current_profile, route, "route",
+        "imported", state.actions.current_profile, kind="site",
     ))
-    assert len(_route_buttons(state.panel)) == 3
-    assert all(button.instate(["disabled"]) for button in _route_buttons(state.panel))
-    assert not any("A_route_" in text for text in _texts(state.panel))
-    assert not state.selected and not state.applied
+    assert not state.applied
+    assert state.actions.current_profile == old_profile
+    assert state.panel.site_pack_root == state.folders["A"]
+    assert all(path.parent == state.folders["A"] / "routes" for path in _routes(state.panel))
+    assert "landing not confirmed" in state.panel.status_var.get()
+
+def test_successful_authored_save_refreshes_active_routes_without_other_maps(site_panel):
+    state = site_panel
+    route = state.folders["A"] / "routes/A_route_authored.json"
+    calls = []
+
+    def save(source, *, replace_route):
+        calls.append((source, replace_route))
+        _write_route(route)
+        return ActionResult("saved and approved", state.actions.current_profile, route, "route")
+
+    state.actions.import_authored_route = save
+    result = state.panel.import_authored_route("editor-output.json", replace_route=None)
+    assert calls == [("editor-output.json", None)]
+    assert state.saved == [result]
+    assert route in _routes(state.panel)
+    assert all(path.parent == route.parent for path in _routes(state.panel))
+    _choose_route(state, route)
+    assert state.selected == [route]
+
+
+def test_save_failure_does_not_publish_or_refresh_a_claimed_approval(site_panel):
+    state = site_panel
+    before = _routes(state.panel)
+
+    def reject(*_args, **_kwargs):
+        raise ValueError("invalid coordinate frame")
+
+    state.actions.import_authored_route = reject
+    with pytest.raises(ValueError, match="invalid coordinate frame"):
+        state.panel.import_authored_route("editor-output.json")
+    assert not state.saved
+    assert _routes(state.panel) == before
+
+
+def test_nonflight_route_can_be_edited_or_deleted_without_selecting_for_auto(site_panel):
+    state = site_panel
+    path = _write_route(state.folders["A"] / "routes/A_route_display.json", purpose="preview")
+    state.panel._refresh()
+    _choose_route(state, path)
+    assert not state.selected
+    state.panel._route_action(state.panel._edit_existing_route)
+    assert state.edited == [path]
+    state.panel.ask_yes_no = lambda *_args: True
+    state.panel._route_action(state.panel._delete_existing_route)
+    assert state.deleted == [path]
+
+
+@pytest.mark.parametrize("route_count", [2, 5, 25])
+def test_route_actions_remain_accessible_at_minimum_viewport(site_panel, route_count):
+    from flight_operator_app import UI_MIN_SIZE
+
+    state = site_panel
+    for index in range(3, route_count + 1):
+        _write_route(state.folders["A"] / f"routes/A_route_{index}.json", index)
+    state.panel._refresh()
+    state.root.geometry(f"{UI_MIN_SIZE[0]}x{UI_MIN_SIZE[1]}")
+    state.root.deiconify()
+    state.panel.pack_forget()
+    state.panel.place(x=0, y=0, width=330, height=260)
+    state.root.update()
+    path = state.folders["A"] / f"routes/A_route_{route_count}.json"
+    _choose_route(state, path)
+    assert state.selected == [path]
+    assert len(state.panel._route_list.get_children()) == route_count
+    assert state.panel._route_list.bbox(state.panel._route_list.selection()[0])
+    for widget in (state.panel._map_selector, state.panel._route_list, *state.panel._buttons):
+        assert widget.winfo_ismapped()
+        assert widget.winfo_rooty() >= state.panel.winfo_rooty()
+        assert (widget.winfo_rooty() + widget.winfo_height()
+                <= state.panel.winfo_rooty() + state.panel.winfo_height())
+        assert widget.winfo_width() > 0
+    state.panel._route_action(state.panel._edit_existing_route)
+    state.panel._open_route_editor(False)
+    assert state.edited == [path] and state.created == [False]
+
+
+def test_long_map_names_and_errors_remain_readable_without_displacing_route_actions(site_panel):
+    state = site_panel
+    long_name = "北側河岸巡檢場域與高壓電塔定位地圖_" * 8
+    profile = state.folders["A"] / "site_profile.json"
+    profile.write_text(json.dumps({"site_id": "A", "display_name": long_name}), encoding="utf-8")
+    state.panel._refresh()
+    state.root.geometry("1180x720")
+    state.root.deiconify()
+    state.panel.pack_forget()
+    state.panel.place(x=0, y=0, width=330, height=260)
+    state.root.update()
+    positions = [(button.winfo_x(), button.winfo_y()) for button in state.panel._buttons]
+    message = "地圖切換失敗，保留目前地圖與航線：" + "來源尚未通過完整驗證；" * 30
+    state.panel.set_status(message)
+    state.root.update()
+    text = state.panel._status_text
+    assert message in text.get("1.0", "end")
+    assert long_name in text.get("1.0", "end")
+    assert text.yview()[1] < 1.0
+    text.yview_moveto(1.0)
+    state.root.update()
+    assert text.yview()[1] == pytest.approx(1.0)
+    assert [(button.winfo_x(), button.winfo_y()) for button in state.panel._buttons] == positions
+    for button in state.panel._buttons:
+        assert button.winfo_rooty() + button.winfo_height() <= state.panel.winfo_rooty() + state.panel.winfo_height()
+    assert state.panel.site_pack_root == state.folders["A"]

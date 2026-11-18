@@ -68,7 +68,7 @@ one Python process.
 Layout:
 
 - The production window constants are `UI_STANDARD_SIZE` = **1440×900** and
-  `UI_MIN_SIZE` = **1180×768**. The desktop app and `--layout-selftest` use the
+  `UI_MIN_SIZE` = **1180×720**. The desktop app and `--layout-selftest` use the
   same values; no lower minimum is supported.
 
 - Left: point-cloud map, planned route, and localization trail. The planned route is always shown when loaded. Mouse controls: left drag 360-degree rotate, double left click sets the rotation pivot like CloudCompare, middle drag roll, right drag pan, wheel zoom. Use `重設地圖` to restore the default upright view.
@@ -150,33 +150,51 @@ Layout:
 ### UI 與可替換接口邊界
 
 - `site_assets_panel.py`：只負責場域資產區的 Tk 排版、檔案選擇器與狀態文字。
+- `add_map_dialog.py`：「新增地圖」視窗（資料夾瀏覽＋預檢），只提出資料夾，不複製、不雜湊、不啟用。
+- `operator_ui_style.py`：全系統共用的米黃色主題（深咖啡標題列、卡片、扁平按鈕、深色地圖疊層）；
+  主視窗、航線編輯器、新增地圖與深度／對位視窗都只從這裡取色與字型。
 - `operator_actions.py`：按鍵規格與操作流程；不依賴 Tk，也不直接讀寫 Olympe。
 - `site_asset_interfaces.py`：場域包、航線、巡檢目標三個 replaceable Protocol。
 - `local_site_assets.py`：目前的本機資料夾／JSON 實作與格式驗證。
 - `route_editor_model.py`：航線 schema、場域綁定與 GLOMAP ↔ Z-up 座標轉換。
 - `route_editor_controller.py`：航點、復原／重做、G 與軸向鎖定；不依賴 Tk。
-- `route_editor_window.py`：自製全螢幕點雲編輯畫面；沒有 backend 或飛行指令接口。
+- `route_editor_window.py`：自製點雲編輯畫面（預設視窗化，最小 1040×640，F11 切換全螢幕，
+  Esc 只取消移動、不影響全螢幕）；沒有 backend 或飛行指令接口。
 - `route_editor_rendering.py`：完整點雲的 CUDA／NumPy 深度緩衝渲染；不依賴 Tk。
 - `simulated_route_test.py`：把正式 route controller 的 PCMD 接到記憶體內運動模型；
   只供模擬介面測試，不連 Olympe。
+- `simulated_backend.py`：離線模擬 backend（`DroneBackend`），只在記憶體內移動，
+  不連 Olympe；與 `olympe_live_backend.py` 同一組方法介面。
 - `flight_operator_app.py`：composition root，接上既有地圖、串流、飛控與安全清理；
   不在 UI view 內實作資產格式。
 
 因此日後可替換本機地圖來源或航線來源，而不需要改動飛行按鍵與 Olympe backend。
 建圖端五檔交付契約見 `../site_profiles/建圖端輸出規格.md`。
 
-選定並成功驗證／匯入場域後，下方航線清單立即切換到該場域；沒有航線時顯示
-「此場域尚無可用航線」，不保留上一場域的路線。未套用時標示「待套用場域」，
-清單中的航線選取、編輯、刪除保持禁用，避免把新場域路線交給舊 runtime。
-操作員確認套用並通過既有已落地／AUTO 任務鎖後才開放選取；匯入失敗保留前一
-選取，套用取消或 rollback 回復目前 active 場域清單。清單同步不授權 AUTO。
+「場域資產」區先選地圖、再選該地圖的 AUTO 航線：「① 地圖」下拉選單列出已匯入的地圖，
+選定即走既有的場域切換交易（需已落地／無 AUTO／無飛行指令處理中；失敗或取消保留原地圖）。
+「② 此地圖的 AUTO 航線」是固定五列、可捲動的清單，下方常駐 `新增路線`、`編輯選取`、
+`刪除選取`；沒有航線時清單內顯示「此地圖尚無可用航線」，不保留上一張地圖的路線。
+未啟用的地圖、長地圖名稱與長錯誤訊息都在自己的區域內捲動／換行，不撐開控制區。
+地圖切換尚未完成前，清單中的航線選取、編輯、刪除保持禁用，避免把新地圖路線交給舊 runtime。
+只有核准紀錄有效的航線可綁為 AUTO 候選；沒有核准紀錄的歷史航線僅切換顯示並提示
+「開啟編輯器並儲存此路線即可自動核准」。清單同步不授權 AUTO。
+
+「＋ 新增地圖」開啟非強制回應（不鎖住滑鼠與鍵盤，飛行列仍可點）的新增地圖視窗：左側瀏覽資料夾
+（◆ 標示含 `site_profile.json` 的場域資料夾，可用快速位置、上一層或直接輸入路徑），右側即時預檢
+manifest 與必需檔案（點雲地圖、定位 bundle、runtime profile、參考影像位姿、重力對齊）是否存在、
+是否在資料夾內，以及場域包是否夾帶應另行匯入的航線等資產。只有預檢全部通過才能按
+「匯入並切換到此地圖」；匯入仍走原本的完整驗證（SHA-256、bundle、參考影像）與場域切換交易，
+任何不符都會拒絕並保留目前地圖。已在「① 地圖」清單中的資料夾會提示直接從選單選用。
+開啟、匯入都受同一個已落地／無 AUTO／無飛行指令處理中守門，不送出任何飛行指令、不核准 AUTO。
 
 
 ### 自製航線編輯器
 
-「場域資產」的航線列提供 `新增路線`（已移除 `匯入航線 JSON` 按鈕）。滑鼠移入任一既有航線，
-右上角才顯示 `編輯` 與 `×`；離開該航線即隱藏。編輯器
-頂端只有一個 `導入地圖資料夾`。系統遞迴偵測 `.ply`；只有一個時
+「場域資產」的航線區提供 `新增路線`（已移除 `匯入航線 JSON` 按鈕）、`編輯選取` 與 `刪除選取`。
+編輯器標題列顯示場域與地圖，頂端只有一個 `導入地圖資料夾`；儲存／模擬／離開固定在底部，
+不因側欄捲動或長訊息而被推出視窗，側欄五個分頁（航點、物體、量測、說明、電線）在
+1040×640 以上都可到達。系統遞迴偵測 `.ply`；只有一個時
 自動載入，多個時列出相對路徑與檔案大小供使用者選擇。選定後計算 PLY 的
 SHA-256，若唯一匹配到已匯入場域的 `asset_sha256.map_ply`，就自動綁定該場域並
 開放正式航線匯入。沒有匹配或同時匹配多個場域時，只能標注及另存 preview
@@ -195,10 +213,16 @@ Z-up 顯示座標並輸出 `frame: aligned`；匯入端再轉回 GLOMAP 的 X/Z 
 地圖視角半徑的 1%，可再調整。點框線或中心選取，選取框顯示黃色。
 
 - `G`：整個長方體隨游標平移；接 `X/Y/Z` 限制單軸，Z 正向永遠向上。
-- `S`：以中心等比例縮放；接 `X/Y/Z` 只改長 X／寬 Y／高 Z。滑鼠往中心外
-  移動放大、往內縮小；也可輸入正縮放倍數，例如 `S → X → 2` 將 X 長度加倍。
+- `S`：以中心等比例縮放；接 `X/Y/Z` 只改長 X／寬 Y／高 Z。滑鼠沿起點遠離
+  框中心的方向移動放大、往中心方向移動縮小，每 250 px 約變 e 倍（≈2.7×），可無限縮小；
+  從框中心起手時右／上放大、左／下縮小。按住 Shift 移動為 1/10 細調，切換
+  Shift 不會讓框跳動。縮放過程中滾輪仍可放大縮小地圖，不影響目前的變換量。
+  也可輸入正縮放倍數，例如 `S → X → 2` 將 X 長度加倍。
 - 鎖軸後可輸入有正負號的位移，單位為地圖單位，例如 `G → Z → 1` 上移 1 u，
   `G → Z → -0.5` 下移 0.5 u。重按同一軸解除限制，Backspace 修改輸入。
+- `Ctrl+C` 複製選取的長方體、`Ctrl+V` 在同一位置貼上完全相同的新框並選取它
+  （可直接按 `G` 移開）；貼上可用 Ctrl+Z 復原，變換進行中不可複製／貼上。
+- 物體模式中雙擊點雲同樣可切換地圖旋轉中心，不會新增或選取長方體。
 - 左鍵或 Enter 確認，Esc 或右鍵還原本次變換；未變換時右鍵仍平移視角。
   新增框選時 Esc 取消粗框；閒置時 Esc 離開物體模式，不刪除標註。
 - Delete 或「刪除選取長方體」只刪物體框；物體模式內的 Ctrl+Z／Ctrl+Shift+Z
@@ -211,6 +235,40 @@ Z-up 顯示座標並輸出 `frame: aligned`；匯入端再轉回 GLOMAP 的 X/Z 
 座標時以八個角點重算包圍長方體，範圍可能擴大，並非保留旋轉。未指定航段朝向
 時只作物體標註；指定後提供機頭朝向目標，不是避障或飛行安全區，亦不修改航點
 與起降控制。只畫框仍不能取代至少兩個航點的既有路線儲存條件。
+
+「電線」分頁可補畫重建時遺漏的電線，與標路徑點、物體框選、量距模式互斥：
+
+- 開啟「電線繪製模式」，依序單擊點雲或既有航點選 A、B，建立直線並選取。
+  要畫下一條時按「新增電線（兩點）」。端點必須不同；附近沒有可吸附點時不新增。
+- 每條電線依目前清單順序自動分配不同色相，不使用短循環配色；端點及線號沿用線色。
+  選取時保留原色並加白色外框。相同排序重開配色一致，刪線後後續線色依新順序重排。
+- 主系統地圖也顯示當次載入／選取航線的電線，沿用相同線色及 `W1／W2…` 線號；
+  航點路線預設隱藏時仍可看見電線。編輯器成功儲存回主視窗後立即更新，
+  切換航線同步替換電線，沒有電線或刪除所顯示航線時清除舊線；換地圖不沿用其他場域的線。
+  曲線依原本的 legacy／measured 對齊座標轉回地圖，隨主地圖旋轉、平移與縮放。
+  圖層只從符合當次航線 SHA-256 及場域／地圖身份的檔案載入；不符時不顯示並寫入紀錄。
+- 單擊電線端點 A／B 選取，選取端點顯示白圈，側欄顯示其 X／Y／Z 座標。
+  按 `G` 平移，再按 `X／Y／Z` 鎖定編輯器單軸（Z 正向為上）；
+  重按同一軸解除限制。可移動滑鼠，或鎖軸後輸入正負位移，例如
+  `G → Z → 0.1 → Enter` 上移 0.1 u、`G → X → -0.05 → Enter` 沿 X 負向微調。
+  只改所選端點，另一端、既有垂度及其他電線不變；曲線即時隨端點更新。
+  點線身只選電線，不會讓 `G` 誤移整條線。
+- 點線選取後按 `S`，滑鼠下移增加垂度、上移減少，最小為零（直線）。
+  也可直接輸入絕對垂度，例如 `S → 0.5 → Enter`，單位為地圖單位 u；
+  垂度是跨中相對兩端直線的下垂量，不是最低點的絕對高度。
+- 左鍵／Enter 確認；Esc／右鍵還原本次端點移動或垂度調整。
+  新增中 Esc／右鍵取消未完成端點；閒置時 Esc 離開模式，保留已完成電線。
+  輸入未完成、數字位移未選軸、負垂度或兩端重合時不能確認。
+- Delete／「刪除選取電線」刪線，Ctrl+Z／Ctrl+Shift+Z 只復原／重做電線，
+  不修改航點；左鍵拖曳旋轉、雙擊設中心、右鍵平移、滾輪縮放沿用既有視角操作。
+- 移動端點、調垂度或只選了第一端時，必須先確認／取消才能儲存、換模式或換地圖。
+
+電線使用拋物線視覺標註，不是懸鏈線力學模擬，不推估真實電線位置或安全淨空。
+儲存路線／預覽 JSON 時保留可選 `wires` 清單，每條包含 aligned 座標 `a`、`b`、
+非負 `sag` 及單位向上軸 `up`。預設沿編輯器 Z 軸下垂；legacy 轉 measured 時
+端點及 `up` 一起轉換，保留原有曲線。重新編輯正式路線會載入，換圖會清空。
+比照物體框，仍需至少兩個航點才能儲存；不是全場域共用圖層，不會寫回原始 PLY，
+也不啟用自動避障或改變飛控。手畫電線不可作為實際淨空或飛行安全保證。
 
 「航段機頭朝向物體」可選起點、終點及長方體，再按「套用所選區間朝向」。
 例如航點 2 → 4 包含 2→3 與 3→4；可對多個不連續區間逐一設定，不同區間也可
@@ -270,14 +328,17 @@ JSON 可選 `segment_look_at` 長度為航點數減一，每項為 `object_boxes
 若場域地圖旁有 `map/map_dense.ply`（用
 `tools/build_dense_display_ply.py --release <release>` 由完整稀疏模型產生；或加
 `--mvs-fused <fused.ply>` 改用 MVS 彩色融合點雲，河濱目前是這個，3.00M 點，
-舊稀疏版備份於 `outputs/mvs/river_site/map_dense_sparse_backup.ply`；福和橋同樣是
-MVS 版，2.20M 點，沒有舊稀疏版），且其標頭的
+舊稀疏版不留備份，不加 `--mvs-fused` 並以 `--out <path>` 即可重建；福和橋同樣是
+MVS 版，2.20M 點；烏來 all9 是 MVSFormer++ 稠密化點雲，由 1.048 億點串流抽樣為
+3.00M 點，與定位模型同一座標系，另須通過 `tools/verify_dense_alignment.py` 的關鍵影格深度驗證），且其標頭的
 座標系與 `map.ply` SHA-256 都符合目前場域，編輯器改顯示這份較密的點雲
 （原 `map.ply` 為 1/17 取樣）；不符時沿用 `map.ply`。旋轉、平移與縮放每幀均使用
 全部已載入的點，不再互動抽樣。背景單一 worker 只保留最新視角，不累積滑鼠事件的
 繪圖工作；CUDA 可用時將座標與顏色常駐 GPU，以逐像素深度緩衝取代全點雲排序。
 無 CUDA 或 GPU 資源不足時改用完整點雲的 NumPy 渲染，介面事件仍不等待重算。
-航點點選使用實際已顯示的視角，避免背景尚未追上最新旋轉時選錯位置。
+航點點選使用實際已顯示的視角，避免背景尚未追上最新旋轉時選錯位置；點選查詢在
+render worker 內對已常駐 GPU 的點雲執行（3.00M 點約 4 ms，原本在 Tk 執行緒用 NumPy
+投影全部點約 95–140 ms）。單擊新增航點仍保留 280 ms 雙擊判斷等待。
 這份檔案只供顯示與點選航點，定位不讀取。
 
 2026-10-03 離線桌面驗證：河濱 PLY 的 **2,437,743** 點均保留。RTX 5060 Laptop、
@@ -286,12 +347,19 @@ MVS 版，2.20M 點，沒有舊稀疏版），且其標頭的
 數值依 GPU 負載、視窗尺寸與點雲而變，CPU 模式不保證相同速度。
 
 真機模式只有明確回讀為 `landed` 且沒有飛行命令處理中才可開啟；狀態改變時
-編輯器會自動關閉。「儲存路線」會
-驗證場域、座標系與航點，原子更新 managed profile 的路線 SHA-256、`flight.approved`
-與 `route_clearance_approved`，再把路線綁為下一個 AUTO 候選。模擬與真機模式皆在
-介面內儲存有效、已綁定場域的航線後自動核准，不需另外申請路線核准；若目前使用 system
-profile，會在編輯器關閉後套用更新過的 managed profile。這不會立即起飛；匯入正式
-JSON 時，介面也會同步底層驗證後的核准結果。真機仍須通過三項驗證與既有任務、
+編輯器會自動關閉。「儲存路線」會驗證場域、座標系與航點，並以編輯器開啟時的地圖
+`map_ply_sha256` 為該次儲存蓋章；只有儲存成功且取得可驗證的核准結果才算完成，
+失敗或被拒絕不會把航線標為已儲存。成功時原子更新 managed profile 的路線 SHA-256 與
+`flight.authored_routes` 核准紀錄（`path` 相對路徑、`sha256` 路線雜湊、`map_sha256`
+地圖雜湊，並綁定座標系），其他航線的紀錄保留，編輯會取代該航線的紀錄，刪除會移除。
+選取航線時以「地圖未變、路線 SHA 相符、座標系相符」驗證該紀錄；任一不符、遭竄改或外部匯入
+（`匯入正式 JSON` 不再自動核准）都維持鎖定。介面內成功儲存的有效已綁定航線即視為核准，
+不需另外申請，可直接供自動飛行選用；舊版以 `flight.approved` 與編輯器核准註記留下、
+且路線 SHA 吻合的現行航線自動沿用，其他沒有可信紀錄的歷史航線只需在編輯器開啟並成功儲存一次。
+若目前使用 system profile，會在編輯器關閉後套用更新過的 managed profile。
+選定航線後，AUTO 準備度＝該 mission 的非航線條件（定位、校正、相機）全部通過，加上
+所選航線的核准／快照一致；非航線證據未知時一律鎖定，不從 `False` 推導成 `True`，
+評量模式（`SFM_EVALUATION_ONLY`）永遠不授權 AUTO。這不會立即起飛；真機仍須通過三項驗證與既有任務、
 定位及後端檢查，由操作員親自按「自動飛行」。AUTO 請求送出後，航線選擇鎖定；HOVER、MANUAL 與重新
 定位不會解除，只有後端拒絕該次請求或確認降落完成後才可選下一條航線。
 
@@ -359,7 +427,8 @@ environment variable governs. The firmware flag prevents outward piloting beyond
 does **not** itself start Return-To-Home. The host safety monitor separately
 requests RTH at 95% of the confirmed readback limit when Home is reachable,
 otherwise it requests in-place Landing. RTH depends on valid GPS/home state. The takeoff
-preflight uses a 30% battery floor and rejects any configured floor below 30%.
+preflight uses a 20% battery floor (operator decision 2026-10-11, was 30%) and rejects
+any configured floor below 20%. AUTO keeps its separate 10% in-flight battery reserve.
 When GPS is unavailable, distance geofence may be disabled or kept advisory-only
 according to the backend/firmware policy; that state is shown and logged. Missing
 GPS is an advisory and does not block manual or autonomous takeoff.
@@ -419,7 +488,7 @@ drone Wi-Fi. Supplying only a known ANAFI IP or controller derives its safe
 counterpart; inconsistent known pairs fail before launch.
 
 The real-flight UI opens disconnected, even when the target is offline. Press
-**「連接真機串流」** in the UI to start the background connection. If it fails,
+**「真機串流」** in the UI to start the background connection. If it fails,
 press the same button again to retry without restarting the terminal. Opening
 the UI or connecting does not request takeoff; flight controls remain operator-only.
 The backend keeps a single connection-owner worker alive for the command and
@@ -557,14 +626,22 @@ required event synchronization, so its FPS is not a production FPS result.
 Everything below runs on the Tk main thread, which is also the thread that hands
 frames to the localizer, so per-tick waste there is not free.
 
-- The always-visible header separates REAL/SIM, link, control owner, flight state,
-  battery, localization and GPS into textual status chips. GPS NO FIX explicitly
-  says that manual takeoff remains available and AUTO will hover first.
+- The always-visible header identifies the active aircraft model as REAL/SIM,
+  separately from link, control owner, flight state, battery, localization and GPS
+  status chips. Link or flight-state changes do not change the aircraft identity.
+  GPS NO FIX explicitly says that manual takeoff remains available and AUTO will hover first.
+  Per-result localization updates show only health in the header; inliers stay in
+  the video HUD. Numeric inliers and success/failure counters must not expand the
+  header chip and shift or resize the map/video when confidence changes.
 - Flight actions (手動/搖桿, 恢復電腦控制, 懸停, 原地降落) stay **above** the
   shared 操作工作區. 飛行、校正、場域資產 appear together on that page, so
   preflight navigation never hides another section. Camera and recording controls
   use their own compact row. Warm ivory surfaces, fields, buttons and virtual sticks
   share the same palette with enlarged interface text; flight actions retain their distinct safety colours.
+  Workspace sizing uses the notebook's measured content height, bounded by the
+  map/video minimum, rather than only a window-height percentage. The route list
+  yields height before the asset selectors, action buttons and status footer;
+  calibration and flight-setting overflow remains locally scrollable.
   The map/video sash defaults to 35/65 and remains operator-adjustable; the
   supported client-area constants above are not a guarantee that every HUD row
   fits at every operator-selected pane height.
@@ -584,6 +661,12 @@ frames to the localizer, so per-tick waste there is not free.
   `SFM_MAP_INTERACTIVE_POINTS` (default 60k, ~4.9 ms) and settles back to
   `SFM_MAP_STATIC_POINTS` (default 250k) once the view stops moving. The
   decimation level is part of the base-image cache key.
+- 場域旁有綁定目前座標系與 `map.ply` SHA-256 的 `map/map_dense.ply` 時（編輯器同一套檢查），
+  主地圖改顯示這份稠密點雲，載入上限 `SFM_MAP_DENSE_POINTS`（預設 1M，經參考位姿
+  範圍濾除後約 0.7M，烏來 all9）。點雲光柵在背景執行緒，只在操作員旋轉／縮放時
+  重畫，靜止時不耗每拍成本；烏來實測 140k 點 15 ms → 705k 點 66 ms，Tk 執行緒只多
+  一次約 5 ms 的陣列複製。拖曳仍降到 `SFM_MAP_INTERACTIVE_POINTS`。不符或沒有稠密檔時
+  維持原 `map.ply`。僅供顯示，定位不讀取。
 - The planned-route polyline still uses every point; only its dots are thinned to
   `SFM_ROUTE_DOT_MAX` (default 200). At a 2000-point route that is 9.5 ms → 1.1 ms.
 - All HUD `StringVar`s are `DedupStringVar`: Tk repaints a label on every `set()`
@@ -673,7 +756,7 @@ few frames.
 Default detector settings:
 
 - Enabled: yes through the production real-flight launcher; direct app invocation is opt-in
-- Model: `/home/allen/下載/power_equipment_sample50_3class_yolo26n_640_aug_best.pt`
+- Model: `執行環境/models/power_equipment_sample50_3class_yolo26n_640_aug_best.pt` under the workspace root
 - Task/classes: detection; `high voltage insulator`, `transformer box`, `utility pole`
 - Python: production launcher uses `.venv-yolo/bin/python`; `--detector-python`
   or `SFM_DETECTOR_PYTHON` can select an explicitly prepared alternate environment

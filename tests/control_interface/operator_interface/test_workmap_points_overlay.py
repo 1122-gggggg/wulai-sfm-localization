@@ -142,8 +142,8 @@ def test_point_overlay_renders_worker_rgb_and_fallback_without_mutating_base_clo
     app = SimpleNamespace(
         map_points=base_cloud, map_zoom=1.0, map_radius=10.0,
         map_pan=np.zeros(2), map_center=np.zeros(3), pivot_point=np.zeros(3),
+        map_yaw=0.0, map_pitch=0.0, map_roll=0.0,
         _map_detail_points=lambda: 1000,
-        transform_xyz=lambda points: np.asarray(points),
         _map_axis_basis=lambda: (
             np.array([1, 0, 0]), np.array([0, 1, 0]), np.array([0, 0, 1]), True,
         ),

@@ -517,3 +517,106 @@ def test_a_rejected_stitch_starts_a_fresh_anchor_window_for_the_retry():
     tracker._ordinal = 400 + ANCHOR_MAX_SPAN + 1
     tracker._expire_relocalization()
     assert tracker._submaps.get(submap_id)["state"] == "unmerged"
+
+
+def _carry_scene(tmp_path):
+    session = SessionWorkMap(
+        tmp_path / "carry-session",
+        session_id="carry-session",
+        base_release_id="immutable-r1",
+        coordinate_frame_id="fixed-global-frame",
+    )
+    # Neither numeric ID order nor observation row order matches archive order.
+    points = {
+        key: {"xyz": np.array([index * 0.1, 0.0, 4.0]), "observations": ()}
+        for index, key in enumerate((-3, -1, -8, -5, -7))
+    }
+    session.archive_landmarks(points)
+    names = []
+    for ordinal, seen in ((20, [-1, -3, -8, -5, -7, -999]), (10, [-8]), (30, [-5])):
+        xyz = np.stack([points.get(key, {"xyz": [0.0, 0.0, 4.0]})["xyz"] for key in seen])
+        pose = _pose([0.0, 0.0, 0.0])
+        names.append(session.record_keyframe(
+            np.zeros((8, 8), dtype=np.uint8),
+            ordinal=ordinal,
+            stamp=float(ordinal),
+            source_epoch=0,
+            pose=pose,
+            K=K,
+            image_size=(8, 8),
+            ids=np.asarray(seen, dtype=np.int64),
+            xy=_project(xyz, pose),
+            xyz=xyz,
+            landmarks=points,
+        ))
+        session.flush_writer()
+    session._frames_by_landmark.pop(-7)
+    return session, points, names
+
+
+class _TraversalCountedLandmarks(dict):
+    def __init__(self, source):
+        super().__init__(source)
+        self.traversed = 0
+
+    def __iter__(self):
+        for key in super().__iter__():
+            self.traversed += 1
+            yield key
+
+    def items(self):
+        for item in super().items():
+            self.traversed += 1
+            yield item
+
+    def values(self):
+        for value in super().values():
+            self.traversed += 1
+            yield value
+
+
+@pytest.mark.parametrize("unrelated", [1, 1000])
+def test_carry_only_visits_chain_candidates_and_keeps_update_order(tmp_path, unrelated):
+    session, points, names = _carry_scene(tmp_path)
+    try:
+        # Replacing an archived record must not move its insertion rank.
+        session.archive_landmarks({-3: points[-3]})
+        session.archive_landmarks({
+            -1000 - index: {"xyz": np.array([0.0, 0.0, 4.0]), "observations": ()}
+            for index in range(unrelated)
+        })
+        landmarks = _TraversalCountedLandmarks(session.landmarks)
+        session.landmarks = landmarks
+        refined = np.array([0.2, 0.1, 4.1])
+        updates = {-8: refined.copy()}
+        poses = {names[0]: _pose([0.2, 0.0, 0.0]), names[1]: _pose([0.4, 0.0, 0.0])}
+        with session._lock:
+            session._carry_single_view_points_locked(set(poses), poses, updates)
+        assert list(updates) == [-8, -3, -1]
+        np.testing.assert_array_equal(updates[-8], refined)
+        for key in (-3, -1):
+            np.testing.assert_allclose(updates[key], points[key]["xyz"] + [0.2, 0.0, 0.0])
+            np.testing.assert_array_equal(session.landmarks[key]["xyz"], points[key]["xyz"])
+        # -5 has an outside observer, -7 lacks an index, and -999 has no archive record.
+        assert landmarks.traversed <= 5
+    finally:
+        session.close()
+
+
+def test_carry_multiple_invalid_candidates_keep_archive_exception_precedence(tmp_path):
+    session, _points, names = _carry_scene(tmp_path)
+    try:
+        # First archived candidate is malformed; the next lacks a host pose.
+        session.landmarks[-3]["xyz"] = np.array([0.0, 4.0])
+        session._frames_by_landmark[-1] = {names[1]}
+        poses = {names[0]: _pose([0.2, 0.0, 0.0])}
+        chain = {names[0], names[1]}
+        with session._lock:
+            with pytest.raises(ValueError):
+                session._carry_single_view_points_locked(chain, poses, {})
+            # Skip the earlier malformed candidate to expose the independent second error.
+            with pytest.raises(KeyError) as rejection:
+                session._carry_single_view_points_locked(chain, poses, {-3: np.zeros(3)})
+        assert rejection.value.args == (names[1],)
+    finally:
+        session.close()

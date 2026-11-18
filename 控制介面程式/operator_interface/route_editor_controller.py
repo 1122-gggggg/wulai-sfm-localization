@@ -96,6 +96,10 @@ class OrthoView:
         self.yaw = math.pi / 2.0
         self.pitch = -math.pi / 2.0
 
+    def left(self) -> None:
+        self.yaw = -math.pi / 2.0
+        self.pitch = -math.pi / 2.0
+
 
 class RouteEditorController:
     """State changes for the two-stage placement/position-edit workflow."""

@@ -13,7 +13,7 @@ import subprocess
 import threading
 from pathlib import Path
 
-from PIL import Image
+import numpy as np
 
 
 def _annex_b_nal_starts(buffer: bytearray) -> list[int]:
@@ -546,7 +546,8 @@ class FFmpegFrameStream:
         self._request_frame()
         return raw
 
-    def next_frame(self) -> Image.Image | None:
+    def next_frame(self) -> np.ndarray | None:
+        """Return a read-only RGB view retaining its immutable decoder bytes."""
         raw = self._read_raw()
         if raw is None:
             if self.eof and self._delay_buf:
@@ -572,4 +573,4 @@ class FFmpegFrameStream:
             return None
         self.output_index += 1
         self.last_frame_name = f"frame_{self.output_index:06d}.jpg"
-        return Image.frombytes("RGB", (self.width, self.height), raw)
+        return np.frombuffer(raw, dtype=np.uint8).reshape(self.height, self.width, 3)

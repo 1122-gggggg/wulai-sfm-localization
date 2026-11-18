@@ -254,6 +254,38 @@ def _longest_result_streak(
     return longest
 
 
+def _map_loss_episodes(
+    counted: list[tuple[float, dict[str, Any]]],
+) -> tuple[list[float], bool]:
+    """Durations of map-confirmed -> unconfirmed -> map-confirmed episodes.
+
+    Boot, before the first map-confirmed result, is startup and not a loss. An
+    episode still open at the end of the log is reported separately, never as a
+    completed recovery.
+    """
+    durations: list[float] = []
+    lost_at: float | None = None
+    seen_confirmed = False
+    for stamp, row in counted:
+        if _map_confirmed(row):
+            if lost_at is not None:
+                durations.append(stamp - lost_at)
+                lost_at = None
+            seen_confirmed = True
+        elif seen_confirmed and lost_at is None:
+            lost_at = stamp
+    return durations, lost_at is not None
+
+
+def _client_queue_drops(rows: list[dict[str, Any]]) -> dict[str, int]:
+    """Client counters are cumulative per session, so the maximum is the total."""
+    out: dict[str, int] = {}
+    for field in ("coalesced_submit_drops", "rejected_submits"):
+        values = [v for row in rows if (v := _finite(row.get(field))) is not None]
+        out[field] = int(max(values, default=0))
+    return out
+
+
 def build_session_report(
     session: Path,
     *,
@@ -404,6 +436,7 @@ def build_session_report(
     ]
     reproj = [v for _, r in counted if (v := _finite(r.get("reproj_rms"))) is not None]
     inliers = [v for _, r in counted if (v := _finite(r.get("inliers"))) is not None]
+    loss_durations, unrecovered = _map_loss_episodes(counted)
     quality = {
         "success_fraction": sum(1 for _, r in counted if r.get("success") is True) / len(counted),
         "map_confirmed_fraction": len(confirmed) / len(counted),
@@ -419,6 +452,15 @@ def build_session_report(
         "streak_clock": "ui_arrival_mono_or_t_mono",
         "reproj_rms_p90": _percentile_linear(reproj, 90.0),
         "inliers_p50": _median(inliers),
+        "map_loss_episodes": len(loss_durations) + int(unrecovered),
+        "map_recovered_episodes": len(loss_durations),
+        "map_unrecovered_at_end": unrecovered,
+        "map_recovery_s": {
+            "p50": _percentile_linear(loss_durations, 50.0),
+            "p95": _percentile_linear(loss_durations, 95.0),
+            "max": max(loss_durations, default=None),
+        },
+        "client_queue_drops": _client_queue_drops(loc_rows),
     }
 
     eligible = [w["fps"] for w in windows if not w["hold_or_lost"]]

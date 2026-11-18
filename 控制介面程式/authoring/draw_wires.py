@@ -13,7 +13,7 @@ Why catenary, not a straight line: a free-hanging cable dips in the middle
 (y = a*cosh(...)); a straight chord would under-estimate how low the wire hangs
 and give a wrong clearance for flight planning.
 
-Run (Blender must already be up via blender_mcp_launch.py):
+Run (Blender must already be up with the blender-mcp addon server running):
   python3 scripts/blender_send.py codefile scripts/draw_wires.py
 then in the 3D viewport press F3 -> "Draw Catenary Wires" (or Ctrl+Shift+W).
 

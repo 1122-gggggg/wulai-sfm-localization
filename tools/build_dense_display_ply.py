@@ -11,12 +11,15 @@ either does not match. Display only: localization never reads it.
 The tool refuses to write unless every ``map.ply`` point appears bit-exactly in
 the dense cloud, which proves both come from the same model coordinates.
 
-``--mvs-fused`` writes the colored MVS fused cloud (``fused.ply`` from
-``tools/build_mvs_surface.py``) instead. It stays in the release's raw map
-coordinates, so waypoints clicked on it are valid. Statistical outliers are
-dropped and the cloud is thinned to ``--max-points`` (the editor's own cap) so the
-editor never has to stride it. The release must already carry a
-``dense_surface.json`` for the same coordinate frame. Needs scipy; use ``.venv-mvs``.
+``--mvs-fused`` writes a colored dense cloud (``fused.ply`` from
+``tools/build_mvs_surface.py``, or any dense reconstruction PLY) instead. It stays
+in the release's raw map coordinates, so waypoints clicked on it are valid. The file
+is read as a bounded stride sample, so a multi-GB cloud needs constant memory;
+statistical outliers are dropped and the cloud is thinned to ``--max-points`` (the
+editor's own cap) so the editor never has to stride it. A release with a
+``dense_surface.json`` must name the same coordinate frame; without one, at least
+``MIN_MAP_OVERLAP`` of ``map.ply`` must lie in cells that hold cloud points. Needs
+scipy; use ``.venv-mvs``.
 
 Usage
 -----
@@ -55,8 +58,11 @@ _POINT_HEAD = struct.Struct("<QdddBBBdQ")
 _TRACK_ENTRY_BYTES = 8
 MVS_MANIFEST_NAME = "dense_surface.json"
 DEFAULT_MAX_POINTS = 3_000_000  # flight_operator_app.ROUTE_EDITOR_POINTS
+PRESAMPLE_FACTOR = 2  # outlier filtering sees at most this many times the output cap
 OUTLIER_NEIGHBORS = 8
 OUTLIER_STD_RATIO = 3.0
+OVERLAP_CELLS = 200  # cells along map.ply's longest axis for the frame check
+MIN_MAP_OVERLAP = 0.3  # aligned wulai cloud measures 0.47; a 3-unit shift 0.04
 
 
 def sha256_file(path: Path) -> str:
@@ -173,6 +179,33 @@ def drop_outliers(xyz: np.ndarray, *, neighbors: int, std_ratio: float) -> np.nd
     return mean_distance <= mean_distance.mean() + std_ratio * mean_distance.std()
 
 
+def require_map_overlap(map_xyz: np.ndarray, cloud_xyz: np.ndarray) -> float:
+    """Fraction of map.ply points whose coarse cell also holds a cloud point.
+
+    Without an MVS sidecar nothing else ties the cloud to the release's frame, and
+    waypoints are snapped to displayed points. A cloud in another frame or unit
+    leaves almost every map cell empty; refuse it.
+    """
+    extent = float(np.ptp(map_xyz[:, :3], axis=0).max())
+    if not extent > 0:
+        raise ValueError("map.ply has no spatial extent to compare against")
+    cell = extent / OVERLAP_CELLS
+    origin = map_xyz[:, :3].min(axis=0)
+
+    def cells(xyz: np.ndarray) -> np.ndarray:
+        grid = np.floor((xyz[:, :3] - origin) / cell).astype(np.int64)
+        return np.ascontiguousarray(grid).view(np.dtype((np.void, 24))).ravel()
+
+    fraction = float(np.isin(cells(map_xyz), np.unique(cells(cloud_xyz))).mean())
+    if fraction < MIN_MAP_OVERLAP:
+        raise ValueError(
+            f"only {fraction:.0%} of map.ply lies near the dense cloud (need "
+            f"{MIN_MAP_OVERLAP:.0%}); it is in another frame or unit, or needs a "
+            f"{MVS_MANIFEST_NAME} proving its frame"
+        )
+    return round(fraction, 4)
+
+
 def build_from_mvs(
     release: Path, fused: Path, out: Path | None = None, *, max_points: int = DEFAULT_MAX_POINTS
 ) -> dict:
@@ -187,19 +220,25 @@ def build_from_mvs(
     manifest_path = (release / profile["assets"]["localization_bundle"]).with_name(
         MVS_MANIFEST_NAME
     )
-    try:
+    if manifest_path.is_file():
         manifest_frame = json.loads(manifest_path.read_text(encoding="utf-8")).get(
             "coordinate_frame_id"
         )
-    except OSError as exc:
-        raise ValueError(f"release has no MVS sidecar {manifest_path}: {exc}") from exc
-    if manifest_frame != frame_id:
-        raise ValueError(f"{MVS_MANIFEST_NAME} frame {manifest_frame} is not {frame_id}")
+        if manifest_frame != frame_id:
+            raise ValueError(f"{MVS_MANIFEST_NAME} frame {manifest_frame} is not {frame_id}")
+        checked_by = MVS_MANIFEST_NAME
+    else:
+        checked_by = "map_overlap"
     if max_points < 1:
         raise ValueError("--max-points must be positive")
-    points = read_ply_points(Path(fused), max_points=1 << 62)
+    # A reconstruction can hold hundreds of millions of points; read a bounded
+    # stride sample instead of the whole file. Clouds under the bound are read whole.
+    points = read_ply_points(Path(fused), max_points=max_points * PRESAMPLE_FACTOR)
     if not len(points) or not np.isfinite(points[:, :3]).all():
         raise ValueError(f"fused cloud is empty or has non-finite coordinates: {fused}")
+    overlap = None
+    if checked_by == "map_overlap":
+        overlap = require_map_overlap(read_ply_points(map_ply, max_points=1 << 62), points[:, :3])
     keep = drop_outliers(points[:, :3], neighbors=OUTLIER_NEIGHBORS, std_ratio=OUTLIER_STD_RATIO)
     points = points[keep]
     if len(points) > max_points:
@@ -216,9 +255,11 @@ def build_from_mvs(
     return {
         "output": str(target),
         "dense_points": int(len(points)),
-        "fused_points": int(len(keep)),
+        "sampled_points": int(len(keep)),
         "outliers_dropped": int((~keep).sum()),
         "fused_sha256": sha256_file(Path(fused)),
+        "frame_checked_by": checked_by,
+        "map_overlap_fraction": overlap,
         "coordinate_frame_id": frame_id,
         "map_ply_sha256": actual,
     }

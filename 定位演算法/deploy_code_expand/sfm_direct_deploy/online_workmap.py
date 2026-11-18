@@ -721,9 +721,13 @@ class SessionWorkMap:
         self._next_keyframe = 0
         self._revision = 0
         self.landmarks: dict[int, dict[str, Any]] = {}
+        # Candidate-only traversal must retain archive insertion order, not ID order.
+        self._landmark_insertion_rank: dict[int, int] = {}
         #: Landmarks new or moved since the operator display last drained them.
         self._display_dirty: dict[int, None] = {}
         self.keyframes: dict[str, dict[str, Any]] = {}
+        # Capture ordinals may restart in a new source epoch.
+        self._keyframe_insertion_rank: dict[str, int] = {}
         self._keyframe_by_capture: dict[tuple[int, int], str] = {}
         # Negative landmark ID -> keyframes whose BA observations include it.
         self._frames_by_landmark: dict[int, set[str]] = {}
@@ -1009,6 +1013,7 @@ class SessionWorkMap:
             record["submap_id"] = int(previous.get("submap_id", 0)) if previous is not None else 0
         is_new = previous is None
         if is_new:
+            self._landmark_insertion_rank[landmark_id] = len(self._landmark_insertion_rank)
             self._points_created += 1
             self._revision += 1
             record["revision"] = self._revision
@@ -1292,6 +1297,7 @@ class SessionWorkMap:
                 "image_path": str(self.images_dir / f"{name}.png"),
                 "landmark_revisions": dict(revisions),
             }
+            self._keyframe_insertion_rank[name] = len(self._keyframe_insertion_rank)
             self._refresh_index_waiting_locked(self.keyframes[name])
             self._index_frame_landmarks_locked(name, ids)
             for promoted_name in promoted_names:
@@ -1618,16 +1624,19 @@ class SessionWorkMap:
         """Every keyframe the candidate moves must keep its measured support."""
         poses, updates = parsed.poses, parsed.updates
         update_ids = set(updates)
+        update_id_array = np.asarray(tuple(update_ids), dtype=np.int64)
         before_points = {key: self.landmarks[key]["xyz"] for key in update_ids}
         candidates = set(poses)
         for key in update_ids:
             candidates |= self._frames_by_landmark.get(key, set())
         changed_kfs = set()
-        for name, frame in self.keyframes.items():
-            if name not in candidates:
-                continue
+        for name in sorted(
+            (name for name in candidates if name in self.keyframes),
+            key=self._keyframe_insertion_rank.__getitem__,
+        ):
+            frame = self.keyframes[name]
             changed_pose = name in poses and not np.array_equal(frame["pose"], poses[name])
-            affected = np.isin(frame["ba_ids"], tuple(update_ids))
+            affected = np.isin(frame["ba_ids"], update_id_array)
             if not changed_pose and not np.any(affected):
                 continue
             initial_error, initial_depth = self._frame_errors(frame, frame["pose"], before_points)
@@ -2295,9 +2304,11 @@ class SessionWorkMap:
             for key in self.keyframes[name]["ba_ids"]
             if int(key) < 0
         }
-        for key, landmark in self.landmarks.items():
-            if key not in candidates:
-                continue
+        for key in sorted(
+            (key for key in candidates if key in self.landmarks),
+            key=self._landmark_insertion_rank.__getitem__,
+        ):
+            landmark = self.landmarks[key]
             names = self._frames_by_landmark.get(int(key), set())
             if key >= 0 or key in updates or not names or not names <= chain_names:
                 continue

@@ -91,7 +91,7 @@ SHA-256，不接受其他模型鍵。這讓福和橋交付包可直接載入，�
 - `sfm_diagnosis` ← `software/normal_map_pipeline/src/sfm_diagnosis`
   （`VENDOR_PROVENANCE.json:159`）
 
-本地 patch 有三筆，逐筆記在 `VENDOR_PROVENANCE.json.local_patches`（每筆帶
+本地 patch 有四筆，逐筆記在 `VENDOR_PROVENANCE.json.local_patches`（每筆帶
 `upstream_sha256`；`packages.*.files` 保留的一律是上游 digest）：
 
 1. py3.10 相容性：`river_map_quality/baseline.py` 改成 `from datetime import timezone`
@@ -107,6 +107,12 @@ SHA-256，不接受其他模型鍵。這讓福和橋交付包可直接載入，�
    confidence、二視圖門檻、depth lifting 與合併順序不變；
    `tests/localization/deploy/test_direct_lift_cache.py` 使用抽取前實作作差分 oracle，
    涵蓋重疊邊界、tie、unmapped／depth，以及快取重用後再次合併不污染證據。
+4. 效能：同一檔的 `rank_reference_indices` 只需 top-k 時改用部分選取，取代對整個檢索庫的
+   Python 全排序。分數、先排除 session、同分按 index 遞增、視角不足時的回退與回傳旗標
+   與原實作完全相同；非有限分數沿用原排序。
+   `tests/localization/deploy/test_direct_retrieval_policy.py` 保留原全排序當差分 oracle。
+   原廠與擴圖版共用這份 vendor。實測 2019×16384 檢索庫仍以矩陣乘法為主（約 3.3 ms），
+   排序省下約 1.3 ms；檢索庫放大到 1 萬／2 萬列時，排序成本分別省下約 10／23 ms。
 
 搬遷回上游的規則：
 

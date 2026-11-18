@@ -47,6 +47,7 @@ def _write_json(path: Path, value: Any) -> None:
 
 def _source_hashes() -> dict[str, str]:
     paths = set((ROOT / "定位演算法/deploy_code_expand/sfm_direct_deploy").rglob("*.py"))
+    paths.update((ROOT / "定位演算法/deploy_code/sfm_direct_deploy/vendor").rglob("*.py"))
     paths.update(WORKER_PATH.parent.glob("*.py"))
     paths.add(VALIDATION_DIR / "online_workmap_eval.py")
     return {

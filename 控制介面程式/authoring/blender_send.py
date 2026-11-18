@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Tiny client for the blender-mcp addon socket (127.0.0.1:9876).
 
-Drives the live Blender that scripts/blender_mcp_launch.py started, using the
+Drives a live Blender that already runs the blender-mcp addon server, using the
 official protocol {"type": ..., "params": {...}}. Lets me run code in Blender
 and read its printed output without the MCP layer.
 

@@ -9,6 +9,7 @@ import os
 import subprocess
 import sys
 
+from last_mission_memory import remember_mission_selection
 from mission_manifest import ManifestError
 from mission_resolver import evaluation_only_admission, evaluation_only_requested, resolve_mission
 from workspace_layout import workspace_from_file
@@ -25,6 +26,11 @@ def _parser() -> argparse.ArgumentParser:
         "--check-only",
         action="store_true",
         help="resolve and materialize the snapshot without launching the UI",
+    )
+    parser.add_argument(
+        "--remember",
+        action="store_true",
+        help="record this selection as the default map for the next launch",
     )
     return parser
 
@@ -86,6 +92,8 @@ def main(argv: list[str] | None = None) -> int:
         "flight_errors": list(mission.readiness.flight_errors),
     }
     print(json.dumps(report, ensure_ascii=False, sort_keys=True), flush=True)
+    if args.remember:
+        remember_mission_selection(mission.selection.source)
     if args.check_only:
         return 0
 

@@ -3,24 +3,17 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import subprocess
 from pathlib import Path
+
+from mission_manifest import sha256_file
 
 
 DEFAULT_VIDEO = Path(__file__).resolve().parents[1] / "模擬器/測試影片/P1190119.MP4"
 EXPECTED_SHA256 = "600bbf70227311cab079d77fcb896f97e6d3e55f6bc40b5bef01d74b65f7826c"
 EXPECTED_DECLARED_FRAMES = 2935
 EXPECTED_DECODED_FRAMES = 2934
-
-
-def _sha256(path: Path) -> str:
-    value = hashlib.sha256()
-    with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(8 * 1024 * 1024), b""):
-            value.update(chunk)
-    return value.hexdigest()
 
 
 def _frame_counts(path: Path) -> tuple[int | None, int | None]:
@@ -74,7 +67,7 @@ def main() -> int:
         result["status"] = "MISSING"
         print(json.dumps(result, indent=2, sort_keys=True))
         return 1
-    actual_sha = _sha256(path)
+    actual_sha = sha256_file(path)
     declared, decoded = _frame_counts(path)
     result.update(
         actual_sha256=actual_sha,

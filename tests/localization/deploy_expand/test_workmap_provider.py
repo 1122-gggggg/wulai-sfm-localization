@@ -67,6 +67,7 @@ def _provider(tmp_path):
     provider._gpu_matcher = None
     provider._query_matches = {}
     provider._query_lifts = {}
+    provider._query_camera_cache = {}
     provider._recovery_attempted = set()
     provider._last_strong_refs = ()
     provider.last_stage_ms = {}

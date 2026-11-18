@@ -234,6 +234,8 @@ def test_single_view_carry_matches_full_scan():
                 session._frames_by_landmark.setdefault(int(key), set()).add(name)
     for key in (-1, -2, -3, -4, 5, -6, -7):
         session.landmarks[key] = {"xyz": rng.normal(size=3)}
+    session._landmark_insertion_rank = {key: index for index, key in enumerate(session.landmarks)}
+    session._keyframe_insertion_rank = {name: index for index, name in enumerate(session.keyframes)}
     chain = {"a", "b", "c"}
     poses = {name: np.column_stack((np.eye(3), rng.normal(size=3))) for name in chain}
     for preset in ({}, {-2: np.zeros(3)}):

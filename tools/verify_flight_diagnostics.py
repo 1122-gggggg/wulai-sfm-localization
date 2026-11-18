@@ -10,6 +10,8 @@ import json
 import math
 from pathlib import Path
 import sys
+import subprocess
+import threading
 from types import MappingProxyType, ModuleType, SimpleNamespace
 from unittest.mock import patch
 
@@ -55,7 +57,8 @@ class _OfflineBackend:
         self.session_logs = session
         self.clock = clock
         self.pilot_sticks = False
-        self._runtime_safety_action_latched = False
+        self.runtime_safety_latched = False
+        self.maneuver_in_progress = None
         self.state = SimpleNamespace(
             stream="OK",
             flight_state="hovering",
@@ -90,6 +93,9 @@ class _OfflineBackend:
             autonomous_speed_limit_mps=0.3,
         )
         self.dispatch_seq = 0
+
+    def pilot_override_active(self):
+        return self.pilot_sticks
 
     def send_pcmd(self, roll, pitch, yaw, gaz, *, reason, auto_run_id=None):
         self.last_requested_pcmd = (roll, pitch, yaw, gaz)
@@ -353,7 +359,9 @@ def verify_failure_scenarios(root: Path) -> dict:
 
     write = create()
     write._sinks["trajectory"]._handle = _FailedWriteHandle(write._sinks["trajectory"]._handle)
-    assert not write.localization("auto_route_tick", auto_run_id="failure-run", pose_u=[1, 2, 3])
+    assert write.localization("auto_route_tick", auto_run_id="failure-run", pose_u=[1, 2, 3])
+    assert write.wait_for_diagnostics(timeout=5)
+    assert not write.healthy
     write.close(reason="injected_write_failure")
     assert _summary(write.directory)["write_failures"]["trajectory"] >= 1
     assert not _summary(write.directory)["recording_complete"]
@@ -377,10 +385,29 @@ def verify_failure_scenarios(root: Path) -> dict:
     assert "injected handle close failure" in close_health["last_error"]
 
     drop = create()
-    for seq in range(512):
-        assert drop.defer_telemetry("pcmd_dispatch", dispatch_seq=seq)
-    assert not drop.defer_telemetry("pcmd_dispatch", dispatch_seq=512)
-    drop.flush_deferred()
+    entered = threading.Event()
+    release = threading.Event()
+    sink = drop._sinks["telemetry"]
+    original_write = sink.write
+
+    def blocked_write(row):
+        entered.set()
+        release.wait(5)
+        return original_write(row)
+
+    capacity = logs_module._DIAGNOSTIC_QUEUE_CAPACITY
+    with patch.object(sink, "write", blocked_write):
+        try:
+            assert drop.defer_telemetry("pcmd_dispatch", dispatch_seq=-1)
+            assert entered.wait(5)
+            for seq in range(capacity):
+                assert drop.defer_telemetry("pcmd_dispatch", dispatch_seq=seq)
+            assert not drop.defer_telemetry("pcmd_dispatch", dispatch_seq=capacity)
+            assert not drop.healthy
+            assert drop.command("hover", evidence_kind="offline_local_acceptance")
+        finally:
+            release.set()
+        assert drop.wait_for_diagnostics(timeout=5)
     marker = next(
         row
         for row in _rows(drop.directory, "incidents")
@@ -476,6 +503,114 @@ def verify_sdk_enqueue_persistence(root: Path) -> dict:
     }
 
 
+def verify_partial_launch_exit(root: Path, *, failure_stage: str = "backend") -> dict:
+    """Prove normal Python exit drains the launcher's actual atexit boundary.
+
+    The child fails before a UI or backend exists. Its accepted diagnostic batch
+    stays blocked until a later atexit callback releases the disk barrier; no
+    explicit session.close or synthetic invocation of exit hooks can mask a
+    non-daemon writer preventing Python from reaching atexit.
+    """
+    if failure_stage not in {"backend", "retention"}:
+        raise ValueError("failure stage must be backend or retention")
+    root.mkdir(parents=True, exist_ok=True)
+    child = r"""
+import atexit
+from pathlib import Path
+import sys
+import threading
+from types import SimpleNamespace
+from unittest.mock import patch
+
+workspace, output, failure_stage = sys.argv[1:]
+sys.path.insert(0, str(Path(workspace) / "控制介面程式/operator_interface"))
+import operator_launch as launch
+from backend_contract import InterfaceMode
+from session_logs import SessionLogs
+
+original_create = SessionLogs.create
+created = []
+
+def create(*args, **kwargs):
+    session = original_create(*args, **kwargs)
+    created.append(session)
+    return session
+
+def fail_with_pending_logs(*args, **kwargs):
+    session = created[0]
+    entered = threading.Event()
+    release = threading.Event()
+    original_write = session._sinks["telemetry"].write
+
+    def blocked_write(row):
+        entered.set()
+        release.wait()
+        return original_write(row)
+
+    session._sinks["telemetry"].write = blocked_write
+    # Registered after the production session hook, so LIFO exit processing
+    # releases I/O first, then the production close hook must drain and join.
+    atexit.register(release.set)
+    for seq in range(32):
+        assert session.defer_telemetry("pcmd_dispatch", dispatch_seq=seq)
+    assert entered.wait(2)
+    assert session.command("partial_launch", evidence_kind="offline_local_acceptance")
+    raise RuntimeError("injected partial launch failure: " + failure_stage)
+
+identity = SimpleNamespace(
+    site_profile_sha256="", asset_hashes={}, runtime_profile_sha256="",
+    source_identity="offline_exit_fixture", site_profile_schema_version=0,
+    autonomous_speed_limit_mps=0.3, autonomous_locked=True,
+)
+args = SimpleNamespace(max_altitude_m=2.0, max_distance_m=3.0, distance_geofence=False)
+inputs = SimpleNamespace(
+    args=args, interface_mode=InterfaceMode.SIMULATED_STREAM,
+    site_profile=None, hardware_approval=None,
+)
+target = "_build_operator_backend" if failure_stage == "backend" else "enforce_retention"
+with (
+    patch.object(launch.app, "_WS", SimpleNamespace(flight_logs=Path(output))),
+    patch.object(launch, "_operator_session_identity", return_value=identity),
+    patch.object(launch, "_operator_session_manifest", return_value={"offline": True}),
+    patch.object(SessionLogs, "create", side_effect=create),
+    patch.object(launch, target, side_effect=fail_with_pending_logs),
+):
+    launch._build_operator_launch(inputs)
+"""
+    prior_directories = set(root.glob("session_*"))
+    process = subprocess.run(
+        [sys.executable, "-c", child, str(ROOT), str(root.resolve()), failure_stage],
+        text=True,
+        capture_output=True,
+        timeout=30,
+        check=False,
+    )
+    assert process.returncode == 1, (process.stdout, process.stderr)
+    assert f"injected partial launch failure: {failure_stage}" in process.stderr
+    directories = list(set(root.glob("session_*")) - prior_directories)
+    assert len(directories) == 1, directories
+    directory = directories[0]
+    summary = _summary(directory)
+    assert summary["reason"] == "process_atexit"
+    assert summary["recording_complete"]
+    assert all(health["healthy"] and health["durable"] for health in summary["log_health"].values())
+    dispatches = [row for row in _rows(directory, "telemetry") if row["event"] == "pcmd_dispatch"]
+    assert [row["dispatch_seq"] for row in dispatches] == list(range(32))
+    assert summary["event_counts"]["telemetry"] == 32
+    assert _rows(directory, "commands")[0]["event"] == "partial_launch"
+    enforce_retention(root, current_session=None, max_bytes=0)
+    retained = _rows(directory, "trajectory")
+    assert [row["dispatch_seq"] for row in retained] == list(range(32))
+    return {
+        "session": str(directory),
+        "failure_stage": failure_stage,
+        "reason": summary["reason"],
+        "recording_complete": summary["recording_complete"],
+        "accepted_diagnostics": len(retained),
+        "transport": "partial_launch_no_backend_or_aircraft",
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -488,6 +623,12 @@ def main():
     controller = verify_controller_persistence(args.output_root / "controller")
     sdk = verify_sdk_enqueue_persistence(args.output_root / "sdk_boundary")
     failures = verify_failure_scenarios(args.output_root / "failures")
+    exits = {
+        stage: verify_partial_launch_exit(
+            args.output_root / f"partial_launch_{stage}", failure_stage=stage
+        )
+        for stage in ("backend", "retention")
+    }
     print(
         json.dumps(
             {
@@ -495,6 +636,7 @@ def main():
                 "controller": controller,
                 "sdk_boundary": sdk,
                 "failure_scenarios": failures,
+                "partial_launch_exit": exits,
             },
             indent=2,
         )

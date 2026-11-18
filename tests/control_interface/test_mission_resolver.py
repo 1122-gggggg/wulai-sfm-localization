@@ -610,3 +610,25 @@ def test_negative_arrive_radius_blocks_flight_ready(tmp_path: Path) -> None:
         tmp_path,
         lambda data: data.__setitem__("arrive_radius_map_units", -1),
     )
+
+
+def test_speed_policy_change_materializes_new_snapshot_without_overwriting_history(
+    tmp_path, monkeypatch,
+):
+    import mission_resolver
+
+    selection = _build_selection(
+        tmp_path, include_route=True, include_imu=True, include_pose_chain=True,
+    )
+    mission = resolve_mission(selection, workspace_root=tmp_path, now=NOW)
+    directory = tmp_path / "mission_snapshots"
+    monkeypatch.setattr(mission_resolver, "_STANDARD_FLIGHT_SPEED_LIMIT_MPS", .3)
+    previous = mission.materialize_legacy_site_profile(directory)
+    previous_content = previous.read_bytes()
+    monkeypatch.setattr(mission_resolver, "_STANDARD_FLIGHT_SPEED_LIMIT_MPS", .8)
+
+    current = mission.materialize_legacy_site_profile(directory)
+    assert current != previous
+    assert previous.read_bytes() == previous_content
+    assert json.loads(current.read_text())["flight"]["controller"]["speed_limit_mps"] == .8
+    assert mission.materialize_legacy_site_profile(directory) == current

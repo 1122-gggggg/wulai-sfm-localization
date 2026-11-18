@@ -8,6 +8,58 @@ from route_editor_controller import OrthoView
 BACKGROUND = (18, 21, 25)
 
 
+def cloud_raster_key(
+    points: np.ndarray, revision: int, view: OrthoView, width: int, height: int
+) -> tuple:
+    """Snapshot every raster input, including mutable center contents."""
+    return (
+        id(points), revision, width, height, tuple(view.center),
+        view.radius, view.yaw, view.pitch, view.zoom, view.pan_x, view.pan_y,
+    )
+
+
+def nearest_point_index(
+    xyz: np.ndarray, view: OrthoView, width: int, height: int,
+    x: float, y: float, threshold: float,
+) -> int | None:
+    """Frontmost point within ``threshold`` px of screen (x, y), or None."""
+    rotation = view.rotation().astype(np.float32)
+    center = np.asarray(view.center, dtype=np.float32)
+    projected = (xyz - center) @ rotation.T
+    scale = view.scale(width, height)
+    sx = width * 0.5 + view.pan_x + projected[:, 0] * scale
+    sy = height * 0.5 + view.pan_y - projected[:, 1] * scale
+    candidates = np.flatnonzero((sx - x) ** 2 + (sy - y) ** 2 <= threshold * threshold)
+    if not len(candidates):
+        return None
+    return int(candidates[np.argmax(projected[candidates, 2])])
+
+
+class PointCloudRenderWorker:
+    """Data-only render state; a pending job must never retain a Tk owner."""
+
+    def __init__(self):
+        self._renderer = None
+        self._points = None
+        self._revision = None
+
+    def _renderer_for(self, points, revision):
+        if self._points is not points or self._revision != revision:
+            self._renderer = PointCloudRenderer(points)
+            self._points = points
+            self._revision = revision
+        return self._renderer
+
+    def render(self, points, revision, view, width, height):
+        return self._renderer_for(points, revision).render(view, width, height)
+
+    def nearest(self, points, revision, view, width, height, x, y, threshold):
+        """Snap query against the same resident cloud the last render drew."""
+        return self._renderer_for(points, revision).nearest(
+            view, width, height, x, y, threshold
+        )
+
+
 class PointCloudRenderer:
     """Retain every point; resolve visibility per pixel instead of sorting the cloud.
 
@@ -38,6 +90,10 @@ class PointCloudRenderer:
         self._gpu_size = None
         self._gpu_depth = None
         self._gpu_winners = None
+        if self._gpu is not None:
+            # The first masked_fill/argmax launch costs ~60 ms; pay it with the
+            # initial upload rather than on the operator's first waypoint click.
+            self.nearest(OrthoView(np.zeros(3), 1.0), 1, 1, 0.0, 0.0, 0.0)
 
     def render(self, view: OrthoView, width: int, height: int) -> np.ndarray:
         if self._gpu is not None:
@@ -50,6 +106,37 @@ class PointCloudRenderer:
                 self._gpu_depth = self._gpu_winners = None
                 self.device = "cpu"
         return self._render_cpu(view, width, height)
+
+    def nearest(
+        self, view: OrthoView, width: int, height: int, x: float, y: float, threshold: float
+    ) -> int | None:
+        """Index of the frontmost point within ``threshold`` px of (x, y), or None."""
+        if self._gpu is not None:
+            try:
+                return self._nearest_cuda(view, width, height, x, y, threshold)
+            except RuntimeError as exc:
+                print(f"[route-editor] CUDA picking failed, using full-cloud CPU: {exc}", flush=True)
+                self._gpu = None
+                self._gpu_depth = self._gpu_winners = None
+                self.device = "cpu"
+        if not len(self.xyz):
+            return None
+        return nearest_point_index(self.xyz, view, width, height, x, y, threshold)
+
+    def _nearest_cuda(
+        self, view: OrthoView, width: int, height: int, x: float, y: float, threshold: float
+    ) -> int | None:
+        torch, xyz, _, _ = self._gpu
+        with torch.inference_mode():
+            rotation = torch.as_tensor(view.rotation(), dtype=torch.float32, device="cuda")
+            center = torch.as_tensor(view.center, dtype=torch.float32, device="cuda")
+            projected = xyz @ rotation.T - center @ rotation.T
+            scale = view.scale(width, height)
+            sx = width * 0.5 + view.pan_x + projected[:, 0] * scale
+            sy = height * 0.5 + view.pan_y - projected[:, 1] * scale
+            near = (sx - x) ** 2 + (sy - y) ** 2 <= threshold * threshold
+            index = int(projected[:, 2].masked_fill(~near, -torch.inf).argmax())
+            return index if bool(near[index]) else None
 
     def _render_cpu(self, view: OrthoView, width: int, height: int) -> np.ndarray:
         image = np.empty((height * width, 3), dtype=np.uint8)

@@ -64,6 +64,65 @@ def test_manifest_round_trip(tmp_path: Path) -> None:
     )
 
 
+@pytest.mark.parametrize("source_only", [True, False])
+def test_manifests_exclude_only_the_optional_benchmark_checkpoint(
+    tmp_path: Path, source_only: bool
+) -> None:
+    optional = "執行環境/models/yolo26n-seg.pt"
+    engines = {
+        "執行環境/models/yolo26n_seg_384x640_fp16.engine",
+        "執行環境/models/power_equipment_yolo26n_384x640_fp16.engine",
+    }
+    same_basename = "執行環境/models/checkpoints/yolo26n-seg.pt"
+    placeholder = "定位演算法/deploy_code/runtime/EDM/weights/.gitignore"
+    runtime_model = "定位演算法/deploy_code/runtime/EDM/weights/edm_outdoor.ckpt"
+    for relative in {optional, *engines, same_basename, placeholder, runtime_model}:
+        path = tmp_path / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"original payload")
+
+    rows = generate(tmp_path, source_only=source_only)
+    expected = {*engines, same_basename, placeholder}
+    if not source_only:
+        expected.add(runtime_model)
+    assert {entry.path for entry in rows} == expected
+    assert all(entry.sha256 == hashlib.sha256(b"original payload").hexdigest() for entry in rows)
+    assert verify(tmp_path, source_only=source_only) == []
+
+    # Removing the local benchmark must not invalidate either release manifest.
+    (tmp_path / optional).unlink()
+    assert verify(tmp_path, source_only=source_only) == []
+
+    # Runtime engines still require full content verification, even at the same size.
+    engine = sorted(engines)[0]
+    (tmp_path / engine).write_bytes(b"tampered payload")
+    assert any(
+        f"SHA-256 mismatch: {engine}" in issue
+        for issue in verify(tmp_path, source_only=source_only)
+    )
+
+
+@pytest.mark.parametrize(
+    "relative",
+    [
+        "執行環境/models/yolo26n_seg_384x640_fp16.engine",
+        "執行環境/models/checkpoints/yolo26n-seg.pt",
+    ],
+)
+@pytest.mark.parametrize("source_only", [True, False])
+def test_benchmark_exclusion_does_not_relax_shipped_asset_symlink_checks(
+    tmp_path: Path, relative: str, source_only: bool
+) -> None:
+    root = tmp_path / "package"
+    asset = root / relative
+    asset.parent.mkdir(parents=True)
+    target = tmp_path / "outside.bin"
+    target.write_bytes(b"outside")
+    asset.symlink_to(target)
+    with pytest.raises(ValueError, match="symlinks"):
+        generate(root, source_only=source_only)
+
+
 @pytest.mark.parametrize("environment_name", (".venv-yolo", ".venv-mvs"))
 def test_source_manifest_excludes_local_auxiliary_venvs(
     tmp_path: Path, environment_name: str

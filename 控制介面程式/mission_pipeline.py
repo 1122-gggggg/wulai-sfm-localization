@@ -17,7 +17,6 @@ another site's map, bundle, camera, or route.
 from __future__ import annotations
 
 import argparse
-import hashlib
 import hmac
 import json
 import math
@@ -27,7 +26,7 @@ import sys
 from dataclasses import asdict
 from pathlib import Path
 
-from mission_manifest import ManifestError
+from mission_manifest import ManifestError, sha256_file
 from mission_resolver import resolve_mission
 from site_profile import (
     SiteProfile,
@@ -44,7 +43,6 @@ LOC_ROOT = _WS.algorithms
 AUTHOR = _WS.control / "authoring"
 FLIGHT = _WS.flight_control
 DEPLOY = _WS.deploy_code
-SCRIPTS = _WS.algorithms / "source" / "sfm_glomap" / "scripts"
 if str(FLIGHT) not in sys.path:
     sys.path.insert(0, str(FLIGHT))
 
@@ -139,14 +137,10 @@ def _require_existing_asset(
 
 
 def _verify_sha256(path: Path, expected: str, label: str) -> None:
-    digest = hashlib.sha256()
     try:
-        with path.open("rb") as stream:
-            for chunk in iter(lambda: stream.read(8 * 1024 * 1024), b""):
-                digest.update(chunk)
+        actual = sha256_file(path)
     except OSError as exc:
         raise ValueError(f"cannot hash {label} {path}: {exc}") from exc
-    actual = digest.hexdigest()
     if not hmac.compare_digest(actual, expected):
         raise ValueError(
             f"{label} SHA-256 mismatch: expected {expected}, got {actual} ({path})"
@@ -507,8 +501,6 @@ def resolve_mission_site_assets(
 def env_with_mission(args, profile: SiteProfile | None = None) -> dict[str, str]:
     env = os.environ.copy()
     python_paths = [str(FLIGHT), str(DEPLOY)]
-    if SCRIPTS.is_dir():
-        python_paths.append(str(SCRIPTS))
     if env.get("PYTHONPATH"):
         python_paths.append(env["PYTHONPATH"])
     env["PYTHONPATH"] = os.pathsep.join(python_paths)
@@ -522,7 +514,7 @@ def env_with_mission(args, profile: SiteProfile | None = None) -> dict[str, str]
     env["SFM_FLIGHT_PATH_JSON"] = args.path_json
     env["SFM_POLES_JSON"] = args.poles_json
     env["SFM_SAFEZONE_DIR"] = str(Path(args.path_json).resolve().parent)
-    env["SFM_MAP_ROOT"] = str((_WS.algorithms / "source" / "sfm_glomap").resolve())
+    env["SFM_MAP_ROOT"] = str(AUTHOR.resolve())
     env["SFM_OLYMPE_CONTROLLER"] = args.controller
     env["SFM_SAFETY_FILE"] = str(args.safety_file)
     if args.site_profile:
@@ -642,10 +634,6 @@ def _run_shadow_readiness(profile: SiteProfile) -> None:
 
 
 def _run_mission_mode(args, passthrough, env) -> None:
-    if args.mode == "launch-blender":
-        run([args.python, str(AUTHOR / "blender_mcp_launch.py"), *passthrough], env)
-        return
-
     if args.mode in DRAW_SCRIPTS:
         run(
             [
@@ -724,7 +712,6 @@ def main() -> None:
     parser.add_argument(
         "--mode",
         choices=[
-            "launch-blender",
             "draw-path",
             "draw-poles",
             "draw-wires",

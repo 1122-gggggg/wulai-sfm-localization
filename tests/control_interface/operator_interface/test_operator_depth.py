@@ -213,3 +213,46 @@ def test_overlay_places_stars_and_distances_in_canvas_pixels():
     xs, ys = [x for x, _ in star], [y for _, y in star]
     assert (sum(xs[::2]) / 5, sum(ys[::2]) / 5) == pytest.approx((100 + 7.5 * 2, 50 + 4.5 * 2), abs=1.5)
     assert sum(1 for _, o in draw.polygons if o["fill"] == "#ff2a2a") == 1
+
+
+def test_inspector_minimum_size_keeps_provenance_errors_and_close_visible():
+    import tkinter as tk
+
+    try:
+        root = tk.Tk()
+    except tk.TclError as exc:
+        pytest.skip(f"Tk display required: {exc}")
+    root.withdraw()
+    inspector = DepthInspector(root)
+    try:
+        inspector.latest = _capture([0., 0., 0.], scale=None)
+        inspector.show()
+        window = inspector.window
+        window.geometry("680x480+0+0")
+        root.update_idletasks()
+        assert inspector.selected is inspector.latest
+        assert "配對影格：f" in inspector.capture_note.get()
+        assert "單位 u" in inspector.capture_note.get()
+        assert "不是公尺" in inspector.capture_note.get()
+        assert inspector.canvas.winfo_width() >= 600
+        assert inspector.canvas.winfo_height() >= 180
+        error = "深度無法取得：" + "missing/map/surface/asset/" * 100
+        inspector.status.set(error)
+        root.update_idletasks()
+        # Complete Tk's deferred wrapped-line metrics before inspecting fractions.
+        inspector.status_text.count("1.0", "end", "update", "ypixels")
+        assert inspector.status_text.get("1.0", "end-1c") == error
+        assert inspector.status_text.yview()[1] < 1.0
+        inspector.status_text.yview_moveto(1.0)
+        root.update_idletasks()
+        assert inspector.status_text.yview()[0] > 0
+        assert inspector.status_text.yview()[1] == pytest.approx(1.0)
+        assert inspector.canvas.winfo_height() >= 180
+        assert inspector.close_button.winfo_width() >= inspector.close_button.winfo_reqwidth()
+        assert inspector.close_button.winfo_rootx() + inspector.close_button.winfo_width() <= window.winfo_rootx() + window.winfo_width()
+        assert inspector.close_button.winfo_rooty() >= window.winfo_rooty()
+        inspector.close_button.invoke()
+        assert inspector.window is None
+    finally:
+        inspector.close()
+        root.destroy()

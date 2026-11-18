@@ -5,6 +5,8 @@ import math
 
 import tkinter as tk
 
+from operator_ui_style import ACCENT, BORDER, FIELD, FONT_SMALL, MUTED, PANEL, TEXT
+
 
 class VirtualStick(tk.Canvas):
     """A round, drag-to-command stick, sized and centred like a real gimbal.
@@ -21,7 +23,7 @@ class VirtualStick(tk.Canvas):
     def __init__(self, master, *, title: str, x_label: str, y_label: str,
                  on_change) -> None:
         super().__init__(master, width=self.SIZE, height=self.SIZE,
-                         highlightthickness=0, takefocus=0, background="#f5f0e6")
+                         highlightthickness=0, takefocus=0, background=PANEL)
         self._on_change = on_change
         self.title = title
         self._x = 0.0
@@ -31,16 +33,16 @@ class VirtualStick(tk.Canvas):
         c = self.SIZE / 2.0
         self.create_oval(c - self._radius - self.KNOB, c - self._radius - self.KNOB,
                          c + self._radius + self.KNOB, c + self._radius + self.KNOB,
-                         outline="#52657d", width=2, fill="#fffaf1")
-        self.create_line(c - self._radius, c, c + self._radius, c, fill="#b6a891")
-        self.create_line(c, c - self._radius, c, c + self._radius, fill="#b6a891")
-        self.create_text(c, 7, text=y_label, font=("Sans", 8), fill="#574a38")
-        self.create_text(c, self.SIZE - 7, text=y_label.split("/")[-1] if "/" in y_label else "",
-                         font=("Sans", 8), fill="#574a38")
-        self.create_text(self.SIZE - 12, c, text=x_label, font=("Sans", 8), fill="#574a38")
+                         outline=BORDER, width=2, fill=FIELD)
+        self.create_line(c - self._radius, c, c + self._radius, c, fill=BORDER)
+        self.create_line(c, c - self._radius, c, c + self._radius, fill=BORDER)
+        self.create_text(c, 10, text=y_label.split("/")[0], font=FONT_SMALL, fill=TEXT)
+        self.create_text(c, self.SIZE - 10, text=y_label.split("/")[-1] if "/" in y_label else "",
+                         font=FONT_SMALL, fill=TEXT)
+        self.create_text(self.SIZE - 12, c, text=x_label, font=FONT_SMALL, fill=MUTED)
         self._knob = self.create_oval(c - self.KNOB, c - self.KNOB,
                                       c + self.KNOB, c + self.KNOB,
-                                      fill="#3885c9", outline="#245b9b", width=2)
+                                      fill=ACCENT, outline=TEXT, width=2)
         for sequence in ("<ButtonPress-1>", "<B1-Motion>"):
             self.bind(sequence, self._on_drag)
         for sequence in ("<ButtonRelease-1>", "<Leave>"):

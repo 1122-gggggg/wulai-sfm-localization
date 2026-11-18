@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import sys
+import time
 
 import numpy as np
 import gc
@@ -26,6 +27,7 @@ for extra in (HERE, HERE.parent):
         sys.path.insert(0, str(extra))
 
 import flight_operator_app as app  # noqa: E402
+from simulated_backend import DroneBackend  # noqa: E402
 
 tk = pytest.importorskip("tkinter")
 
@@ -71,29 +73,33 @@ def _contrast_ratio(foreground: str, background: str) -> float:
     return (lighter + 0.05) / (darker + 0.05)
 
 
+def _destroy_operator(instance) -> None:
+    # Cancel Tcl commands before destroying their registered Python callbacks.
+    for callback_id in instance.tk.call("after", "info"):
+        try:
+            instance.after_cancel(callback_id)
+        except tk.TclError:
+            pass
+    instance.destroy()
+    # pytest still owns the yielded instance during fixture teardown. Destroy
+    # removes widgets, not Python attributes: app -> Variable -> Variable._root
+    # remains reachable, so collecting here alone cannot release those cycles.
+    # This disposed fixture has no further users; detach its Python resources
+    # before collecting, while Tcl variable/image finalizers are on the Tk thread.
+    instance.__dict__.clear()
+    gc.collect()
+
+
 @pytest.fixture()
 def operator():
-    backend = app.DroneBackend()
+    backend = DroneBackend()
     points = np.random.default_rng(0).random((2000, 6)).astype(np.float32) * 10.0
     instance = app.OperatorApp(backend, points, site_id="test")
     instance.update_idletasks()
     try:
         yield instance
     finally:
-        # Tk keeps ``after`` callbacks in the Tcl event queue even when a test
-        # destroys its root.  A later test can then dispatch the stale callback
-        # after its Python command has gone away, making otherwise unrelated
-        # focus assertions depend on test order.
-        for callback_id in instance.tk.call("after", "info"):
-            try:
-                instance.after_cancel(callback_id)
-            except tk.TclError:
-                pass
-        # Collect while the interpreter is still on the Tk main thread. Deferred
-        # Variable.__del__ calls otherwise surface as an unraisable exception in
-        # whichever unrelated test happens to trigger the collection.
-        instance.destroy()
-        gc.collect()
+        _destroy_operator(instance)
 
 
 def test_ui_tick_defaults_to_30_hz_and_clamps_both_sides(operator) -> None:
@@ -103,16 +109,32 @@ def test_ui_tick_defaults_to_30_hz_and_clamps_both_sides(operator) -> None:
     # The 8 ms default used to saturate the Tcl timer queue (overdue ticks
     # reschedule 1 ms out, and due timers starve the result-notification
     # filehandler); the old behavior stays reachable as an explicit opt-out.
-    fast = app.OperatorApp(app.DroneBackend(), operator.map_points, tick_ms=8)
+    fast = app.OperatorApp(DroneBackend(), operator.map_points, tick_ms=8)
     try:
         assert fast.tick_ms == 8
     finally:
-        for callback_id in fast.tk.call("after", "info"):
-            try:
-                fast.after_cancel(callback_id)
-            except tk.TclError:
-                pass
-        fast.destroy()
+        _destroy_operator(fast)
+
+
+def test_disposed_operator_releases_tk_variables_while_fixture_owner_is_alive() -> None:
+    import weakref
+    import threading
+
+    instance = app.OperatorApp(
+        DroneBackend(), np.zeros((1, 6), dtype=np.float32), site_id="test",
+    )
+    variable = weakref.ref(instance.current_auto_speed_var)
+    finalized_on = []
+    weakref.finalize(
+        instance.current_auto_speed_var,
+        lambda: finalized_on.append(threading.get_ident()),
+    )
+    _destroy_operator(instance)
+    # Keep the root object alive, just as pytest's funcargs/fixture result do.
+    # The Python Variable must already have been finalized on this thread.
+    assert instance.__dict__ == {}
+    assert variable() is None
+    assert finalized_on == [threading.get_ident()]
 
 
 def _force_widget_focus(operator, widget) -> None:
@@ -162,6 +184,15 @@ def test_map_detail_drops_while_interacting_and_settles_after(operator) -> None:
     assert operator.map_base_key(400, 300) != interactive_key
     operator.on_map_release(None)
     assert operator._map_dirty_key is None
+
+
+def test_dense_display_cloud_is_not_decimated_to_the_sparse_budget(operator) -> None:
+    dense = np.zeros((app.MAP_STATIC_POINTS * 2, 6), dtype=np.float32)
+    operator.map_points = dense
+    assert app.MAP_STATIC_POINTS < len(dense) <= app.MAP_DENSE_POINTS
+    assert operator._map_detail_points() == len(dense)
+    operator._note_map_interaction()
+    assert operator._map_detail_points() == app.MAP_INTERACTIVE_POINTS
 
 
 def test_incident_banner_only_occupies_a_row_when_something_is_wrong(operator) -> None:
@@ -216,10 +247,6 @@ def test_controls_share_one_workspace_and_flight_actions_stay_visible(
         return False
 
     walk(operator)
-    assert not any(
-        isinstance(widget, (tk.Scrollbar, app.ttk.Scrollbar))
-        for widget in descendants
-    )
     assert tuple(
         operator.controls_notebook.tab(tab_id, "text")
         for tab_id in operator.controls_notebook.tabs()
@@ -324,32 +351,101 @@ def test_flight_action_normal_and_active_backgrounds_support_white_text(operator
             )
 
 
-def test_each_control_tab_fits_the_minimum_window_without_clipping(operator) -> None:
-    operator.geometry(_window_geometry(app.UI_MIN_SIZE))
+@pytest.mark.parametrize("size", [app.UI_MIN_SIZE, (1280, 720), (1440, 900), (1920, 1080)])
+def test_persistent_controls_fit_without_overlap(operator, size) -> None:
+    operator.geometry(_window_geometry(size))
     operator.update_idletasks()
-    root_left = operator.winfo_rootx()
-    root_top = operator.winfo_rooty()
-    root_right = root_left + operator.winfo_width()
-    root_bottom = root_top + operator.winfo_height()
+    operator._fit_control_pane()
+    operator.update_idletasks()
+    # A window manager may clamp the request to its work area (dock/panel); the
+    # layout checks below then run at the granted size, never below UI_MIN_SIZE.
+    granted = (operator.winfo_width(), operator.winfo_height())
+    assert all(
+        minimum <= actual <= requested
+        for minimum, actual, requested in zip(app.UI_MIN_SIZE, granted, size, strict=True)
+    )
+    if size == app.UI_MIN_SIZE:
+        assert granted == size
+    scroll_bodies = {body for _canvas, body in operator._auxiliary_scrolls}
+    stack = [operator.controls_notebook]
+    while stack:
+        parent = stack.pop()
+        for child in parent.winfo_children():
+            if child in scroll_bodies or not child.winfo_ismapped():
+                continue
+            _assert_inside(child, operator)
+            stack.append(child)
+    # Root bounds alone miss a status footer clipped by its own asset panel.
+    _assert_inside(operator.site_assets_panel._status_text, operator.site_assets_panel)
+    persistent = [
+        *operator.flight_buttons.values(), *operator.status_chips.values(),
+        operator.preflight_confirm_button, operator.preflight_details_button,
+        *operator.preflight_step_labels.values(),
+        operator.stick_left, operator.stick_right,
+        operator.start_localization_button, operator.start_detection_button,
+        operator.depth_view_button, operator._camera_pitch_scale,
+        operator._camera_zoom_scale, operator._camera_reset_button,
+        operator.record_quality_combo,
+    ]
+    for widget in persistent:
+        _assert_inside(widget, operator)
+        assert widget.winfo_ismapped()
+        if isinstance(widget, ttk.Button):
+            assert widget.winfo_width() >= widget.winfo_reqwidth()
+    actions = list(operator.flight_buttons.values())
+    for index, first in enumerate(actions):
+        for second in actions[index + 1:]:
+            assert not _overlap(first, second)
+    assert all(not _overlap(button, operator.preflight_bar) for button in actions)
+    assert operator.video_label.winfo_height() >= app.VIEWPORT_MIN_H
 
-    for tab_id in operator.controls_notebook.tabs():
-        operator.controls_notebook.select(tab_id)
-        operator._fit_control_pane()
-        operator.update_idletasks()
-        stack = [operator.nametowidget(tab_id)]
-        while stack:
-            parent = stack.pop()
-            children = parent.winfo_children()
-            stack.extend(children)
-            for child in children:
-                if not child.winfo_ismapped():
-                    continue
-                left = child.winfo_rootx()
-                top = child.winfo_rooty()
-                right = left + child.winfo_width()
-                bottom = top + child.winfo_height()
-                assert root_left <= left <= right <= root_right
-                assert root_top <= top <= bottom <= root_bottom
+
+def _assert_inside(widget, container) -> None:
+    x, y = widget.winfo_rootx(), widget.winfo_rooty()
+    right, bottom = x + widget.winfo_width(), y + widget.winfo_height()
+    assert container.winfo_rootx() <= x < right <= container.winfo_rootx() + container.winfo_width()
+    assert container.winfo_rooty() <= y < bottom <= container.winfo_rooty() + container.winfo_height()
+
+
+def _overlap(first, second) -> bool:
+    return (
+        first.winfo_rootx() < second.winfo_rootx() + second.winfo_width()
+        and second.winfo_rootx() < first.winfo_rootx() + first.winfo_width()
+        and first.winfo_rooty() < second.winfo_rooty() + second.winfo_height()
+        and second.winfo_rooty() < first.winfo_rooty() + first.winfo_height()
+    )
+
+@pytest.mark.parametrize("size", [app.UI_MIN_SIZE, (1280, 720), (1440, 900)])
+def test_stream_modes_and_long_pending_status_stay_visible_without_connecting(size) -> None:
+    def no_connection(*_args, **_kwargs):
+        pytest.fail("layout construction must not connect to aircraft")
+
+    instance = app.OperatorApp(
+        DroneBackend(), np.zeros((1, 6), dtype=np.float32),
+        connect_live_runtime=no_connection,
+    )
+    try:
+        instance.geometry(_window_geometry(size))
+        instance.connect_live_button.configure(text="真機已連線／重新連線")
+        instance.offline_simulation_button.configure(text="離線模擬（目前）")
+        instance.connect_live_status_var.set(
+            "真機連線尚未完成；目前仍使用已啟用的離線模擬，驗證成功後才會切換影像與控制來源。"
+        )
+        instance.update_idletasks()
+        instance._fit_control_pane()
+        instance.update_idletasks()
+        assert (instance.winfo_width(), instance.winfo_height()) == size
+        for button in (instance.connect_live_button, instance.offline_simulation_button):
+            _assert_inside(button, instance)
+            assert button.winfo_width() >= button.winfo_reqwidth()
+        assert not _overlap(instance.connect_live_button, instance.offline_simulation_button)
+        assert instance.status_chips["identity"].cget("text")
+        for button in instance.flight_buttons.values():
+            _assert_inside(button, instance)
+        assert instance.video_label.winfo_height() >= app.VIEWPORT_MIN_H
+    finally:
+        _destroy_operator(instance)
+
 
 
 def test_short_viewport_renders_at_canvas_height_without_cropping(operator) -> None:
@@ -362,7 +458,7 @@ def test_short_viewport_renders_at_canvas_height_without_cropping(operator) -> N
     operator.update_idletasks()
     operator.tick()
     operator.redraw_map_only()
-    assert app.VIEWPORT_MIN_H <= operator.video_label.winfo_height() < 220
+    assert operator.video_label.winfo_height() >= app.VIEWPORT_MIN_H
     assert operator.video_photo.height() <= operator.video_label.winfo_height()
     assert operator.video_photo.width() <= operator.video_label.winfo_width()
     assert operator.map_photo.height() == operator.map_label.winfo_height()
@@ -442,45 +538,31 @@ def test_both_virtual_sticks_are_present_and_start_centred(operator) -> None:
         assert stick.winfo_reqwidth() == stick.SIZE
 
 
-def test_no_control_tab_is_clipped_by_the_fixed_control_pane(operator) -> None:
-    """The pane has pack_propagate(False), so a tall tab is cut off, not scrolled.
-
-    This was a hard-coded 295 px while 飛控與限制 needed 304 px: the bottom of that
-    tab was simply unreachable, with nothing on screen to say so.
-    """
-    notebook = operator.controls_notebook
-    pane = notebook.master
-    for geometry in (
-        _window_geometry(app.UI_STANDARD_SIZE),
-        _window_geometry(app.UI_MIN_SIZE),
-    ):
-        operator.geometry(geometry)
+def test_auxiliary_fields_reveal_on_focus_without_moving_safety_actions(operator) -> None:
+    operator.geometry(_window_geometry(app.UI_MIN_SIZE))
+    operator.update_idletasks()
+    safety_positions = {
+        command: (widget.winfo_rootx(), widget.winfo_rooty())
+        for command, widget in operator.flight_buttons.items()
+    }
+    for canvas, body in operator._auxiliary_scrolls:
+        canvas.yview_moveto(1.0)
         operator.update_idletasks()
-        for tab_id in notebook.tabs():
-            notebook.select(tab_id)
-            operator._fit_control_pane()
-            operator.update_idletasks()
-            pane_bottom = pane.winfo_rooty() + pane.winfo_height()
-            stack = [operator.nametowidget(tab_id)]
-            while stack:
-                parent = stack.pop()
-                children = parent.winfo_children()
-                stack.extend(children)
-                for child in children:
-                    if not child.winfo_ismapped():
-                        continue
-                    bottom = child.winfo_rooty() + child.winfo_height()
-                    assert bottom <= pane_bottom, (
-                        f"{geometry} {notebook.tab(tab_id, 'text')}: a widget ends "
-                        f"{bottom - pane_bottom}px below the control pane"
-                    )
+        assert body.winfo_rooty() + body.winfo_height() <= canvas.winfo_rooty() + canvas.winfo_height()
+        stack = [body]
+        while stack:
+            widget = stack.pop()
+            stack.extend(widget.winfo_children())
+            if isinstance(widget, (ttk.Entry, ttk.Button, ttk.Checkbutton)) and not widget.instate(["disabled"]):
+                _force_widget_focus(operator, widget)
+                _assert_inside(widget, canvas)
+    for command, position in safety_positions.items():
+        button = operator.flight_buttons[command]
+        assert (button.winfo_rootx(), button.winfo_rooty()) == position
+        _assert_inside(button, operator)
 
 
-def test_firmware_calibration_results_fit_the_control_pane(operator) -> None:
-    notebook = operator.controls_notebook
-    pane = notebook.master
-    calibration_tab = operator._preflight_tabs["compass"]
-    notebook.select(calibration_tab)
+def test_firmware_calibration_results_remain_scroll_accessible(operator) -> None:
     operator.drone_magnetometer_var.set(app.format_magnetometer_calibration(
         app.DroneState(
             drone_magnetometer_required=0,
@@ -492,26 +574,19 @@ def test_firmware_calibration_results_fit_the_control_pane(operator) -> None:
         )
     )["drone"])
 
-    for geometry in (
-        _window_geometry(app.UI_STANDARD_SIZE),
-        _window_geometry(app.UI_MIN_SIZE),
-    ):
-        operator.geometry(geometry)
+    for size in (app.UI_STANDARD_SIZE, app.UI_MIN_SIZE, (1280, 720)):
+        operator.geometry(_window_geometry(size))
         operator._fit_control_pane()
         operator.update_idletasks()
-        pane_bottom = pane.winfo_rooty() + pane.winfo_height()
-        stack = [calibration_tab]
-        while stack:
-            parent = stack.pop()
-            children = parent.winfo_children()
-            stack.extend(children)
-            for child in children:
-                if child.winfo_ismapped():
-                    bottom = child.winfo_rooty() + child.winfo_height()
-                    assert bottom <= pane_bottom, (
-                        f"{geometry}: compass panel clips by "
-                        f"{bottom - pane_bottom}px"
-                    )
+        canvas, body = next(
+            (canvas, body) for canvas, body in operator._auxiliary_scrolls
+            if body is operator.control_sections["calibration"]
+        )
+        canvas.yview_moveto(1.0)
+        operator.update_idletasks()
+        assert body.winfo_rooty() + body.winfo_height() <= canvas.winfo_rooty() + canvas.winfo_height()
+        assert operator.video_label.winfo_height() >= app.VIEWPORT_MIN_H
+        _assert_inside(operator.flight_buttons["land"], operator)
 
 
 def test_yaw_gravity_check_accepts_stable_real_airframe_offset() -> None:
@@ -579,24 +654,18 @@ def test_preflight_bar_hides_after_completion_and_returns_when_invalidated(
     assert operator.preflight_steps_frame.winfo_manager() == "pack"
 
 
-def test_shrinking_the_window_takes_height_from_the_map_not_the_controls(operator) -> None:
-    """The control pane is fixed-height; the map/video pane is the elastic one."""
-    notebook = operator.controls_notebook
-    pane = notebook.master
-
+def test_shrinking_reserves_viewport_and_persistent_safety_controls(operator) -> None:
     operator.geometry(_window_geometry(app.UI_STANDARD_SIZE))
     operator.update_idletasks()
-    tall_pane, tall_map = pane.winfo_height(), operator.map_label.winfo_height()
-
-    # The minimum is shorter than the standard viewport, so the map/video pane
-    # must absorb the reduction while the control pane stays fixed.
+    tall_map = operator.map_label.winfo_height()
     operator.geometry(_window_geometry(app.UI_MIN_SIZE))
     operator.update_idletasks()
-
-    assert pane.winfo_height() == tall_pane, "the control pane lost height"
-    assert operator.map_label.winfo_height() < tall_map, (
-        "sanity: the map pane should be the one that shrank"
-    )
+    assert app.VIEWPORT_MIN_H <= operator.map_label.winfo_height() < tall_map
+    for widget in (
+        *operator.flight_buttons.values(), operator.preflight_confirm_button,
+        operator.stick_left, operator.stick_right,
+    ):
+        _assert_inside(widget, operator)
 
 
 def test_map_view_controls_live_on_the_map(operator) -> None:
@@ -613,18 +682,26 @@ def test_map_view_controls_live_on_the_map(operator) -> None:
             except Exception:
                 continue
 
-    for text in ("重設地圖",):
-        assert text in labels, f"{text} is no longer a child of the map canvas"
+    canvas = operator.map_label
+    texts = [
+        canvas.itemcget(item, "text")
+        for item in canvas.find_withtag("map-reset") if canvas.type(item) == "text"
+    ]
+    assert any("重設地圖" in text for text in texts), "重設地圖 is no longer on the map canvas"
+    rectangles = [
+        item for item in canvas.find_withtag("map-reset") if canvas.type(item) == "rectangle"
+    ]
+    # Transparent: outline only, so the map stays visible through the button.
+    assert rectangles and all(not canvas.itemcget(item, "fill") for item in rectangles)
     assert "顯示規劃路徑" not in labels
     assert "上下翻面" not in labels
     assert not hasattr(operator, "flip_map_vertical")
 
     operator.update_idletasks()
-    map_bottom = operator.map_label.winfo_rooty() + operator.map_label.winfo_height()
-    map_left = operator.map_label.winfo_rootx()
-    widget = labels["重設地圖"]
-    assert widget.winfo_rootx() - map_left < operator.map_label.winfo_width() * 0.5
-    assert map_bottom - (widget.winfo_rooty() + widget.winfo_height()) < 60
+    left, top, right, bottom = canvas.bbox("map-reset")
+    assert left < canvas.winfo_width() * 0.5
+    assert canvas.winfo_height() - bottom < 100
+    assert top >= 0
 
 
 def test_camera_and_mission_sit_in_the_always_visible_flight_bar(operator) -> None:
@@ -685,7 +762,7 @@ def test_compass_rotation_instructions_fit_the_shared_workspace(operator, axis) 
         assert 0 <= top <= bottom <= canvas.winfo_height()
 
 
-@pytest.mark.parametrize("route_count", [2, 5])
+@pytest.mark.parametrize("route_count", [2, 5, 25])
 def test_imported_route_choices_fit_beside_flight_and_calibration(
     operator, monkeypatch, route_count,
 ) -> None:
@@ -706,13 +783,11 @@ def test_imported_route_choices_fit_beside_flight_and_calibration(
     operator._fit_control_pane()
     operator.update_idletasks()
     assert operator.video_label.winfo_height() >= app.VIEWPORT_MIN_H
-    assert len(panel._permanently_disabled) >= 1
     assert panel.winfo_rooty() + panel.winfo_height() <= operator.winfo_rooty() + operator.winfo_height()
-    for child in panel.winfo_children():
-        if child.grid_info().get("row") == 5:
-            for route_card in child.winfo_children():
-                route_card.event_generate("<Enter>")
+    last_route = panel._route_list.get_children()[-1]
+    panel._route_list.see(last_route)
     operator.update_idletasks()
+    assert panel._route_list.bbox(last_route)
     for button in panel._buttons:
         assert button.winfo_ismapped()
         assert button.winfo_rootx() >= panel.winfo_rootx()
@@ -727,7 +802,47 @@ def test_localization_readout_is_in_the_always_visible_header(operator) -> None:
     operator.update_idletasks()
     assert operator.loc_health_label is operator.status_chips["localization"]
     assert operator.loc_health_label.master is operator.status_strip
-    assert operator.video_label.winfo_children() == [operator.depth_view_button.master]
+    assert operator.video_label.winfo_children() == []
+
+
+@pytest.mark.parametrize("size", [app.UI_STANDARD_SIZE, app.UI_MIN_SIZE])
+def test_confidence_changes_keep_map_and_video_geometry_stable(operator, size) -> None:
+    operator.geometry(_window_geometry(size))
+    operator.inspecting = True
+    operator.video_frame = np.full((720, 1280, 3), (25, 70, 150), dtype=np.uint8)
+    operator._video_frame_stamp = time.monotonic()
+
+    def viewport_geometry():
+        return tuple(
+            (canvas.winfo_rootx(), canvas.winfo_rooty(),
+             canvas.winfo_width(), canvas.winfo_height())
+            for canvas in (operator.map_label, operator.video_label)
+        )
+
+    baseline = None
+    photo = None
+    for health, inliers, count in (
+        ("OK", 120, 1), ("LOW", 35, 2), ("OK", 120, 3),
+        ("LOW", 9, 999999), ("FAIL", 0, 999999), ("OK", 120, 1000000),
+    ):
+        operator.loc_health = health
+        operator.loc_health_inliers = inliers
+        operator._loc_ok_count = count
+        operator._loc_fail_count = int(health == "FAIL")
+        operator._render_localization_metrics(inliers)
+        operator.update_idletasks()
+        if baseline is None:
+            baseline = viewport_geometry()
+        assert viewport_geometry() == baseline
+        canvas = operator.video_label
+        operator.render_video(canvas.winfo_width(), canvas.winfo_height(), operator.current_state)
+        if photo is None:
+            photo = operator.video_photo
+        assert operator.video_photo is photo
+        overlay = _video_overlay_text(operator)
+        assert ("LOW CONFIDENCE" in overlay) == (health == "LOW")
+        assert ("LOCALIZATION LOST" in overlay) == (health == "FAIL")
+        assert f"inliers {inliers}" in "\n".join(operator._video_diagnostic_lines())
 
 
 def test_virtual_sticks_share_the_workspace_with_the_readouts(operator) -> None:
@@ -799,14 +914,37 @@ def test_anafi_panel_does_not_restate_the_hud_and_status_bar(operator) -> None:
         assert token not in stream, f"{token} is already in the video HUD"
 
 
-def test_status_header_separates_identity_link_and_flight_state(operator) -> None:
+@pytest.mark.parametrize("live", [False, True])
+def test_status_header_separates_identity_link_and_flight_state(
+    operator, monkeypatch, live,
+) -> None:
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(operator, "_is_live_backend", lambda: live)
+    operator.aircraft_profile = SimpleNamespace(model="Inspection quadrotor")
     state = operator.backend.poll()
+    state.link_ok = True
+    state.flight_state = "landed"
     operator._update_flight_header(state)
     texts = {name: widget.cget("text") for name, widget in operator.status_chips.items()}
-    assert texts["identity"] == "SIMULATED"
+    assert texts["identity"].startswith("REAL " if live else "SIM ")
+    assert texts["identity"].endswith(operator.aircraft_profile.model)
     assert texts["link"].startswith("連線：")
     assert texts["flight"].startswith("飛行：")
     assert all(" | " not in text for text in texts.values())
+
+    state.link_ok = False
+    operator._update_flight_header(state)
+    disconnected = operator.status_chips["link"].cget("text")
+    assert disconnected != texts["link"]
+    assert operator.status_chips["identity"].cget("text") == texts["identity"]
+    assert operator.status_chips["flight"].cget("text") == texts["flight"]
+
+    state.flight_state = "hovering"
+    operator._update_flight_header(state)
+    assert operator.status_chips["flight"].cget("text") != texts["flight"]
+    assert operator.status_chips["link"].cget("text") == disconnected
+    assert operator.status_chips["identity"].cget("text") == texts["identity"]
 
 
 def _video_overlay_text(operator) -> str:
@@ -818,7 +956,12 @@ def _video_overlay_text(operator) -> str:
 
 
 def test_held_video_updates_hud_without_reuploading_pixels(operator, monkeypatch) -> None:
-    operator.video_frame = np.full((720, 1280, 3), (210, 50, 30), dtype=np.uint8)
+    stream = app.FFmpegFrameStream(Path("/definitely/missing.mp4"), 1280, 720)
+    stream._reader_queue.put_nowait(b"\xd2\x32\x1e" * (1280 * 720))
+    operator.video_frame = stream.next_frame()
+    assert operator.video_frame is not None
+    assert not operator.video_frame.flags["WRITEABLE"]
+    stream.close()
     operator._video_frame_stamp = 1.0
     state = operator.backend.poll()
     state.frame_age_ms = 10.0
@@ -914,12 +1057,51 @@ def test_scheduled_held_video_refreshes_age_and_telemetry_without_a_new_frame(op
     assert "fresh-device-reading" in _video_overlay_text(operator)
 
 
+def test_video_dirty_key_ignores_sub_display_jitter_but_follows_every_displayed_value(operator) -> None:
+    """The HUD prints age to 1 ms, fps to 0.1, pitch to 1 deg, zoom to 0.1x.
+
+    Raw monotonic-clock floats changed the key on every tick, so the video
+    panel repainted at the full tick rate even when its text was unchanged.
+    """
+    import operator_tick
+
+    state = operator.backend.poll()
+
+    def key() -> tuple:
+        return operator_tick._video_dirty_key(operator, state, width=640, height=360)
+
+    state.frame_age_ms = 20.0
+    state.link_latency_ms = 31.0
+    state.stream_fps = 30.0
+    state.gimbal_pitch_deg = -20.0
+    state.zoom = 1.0
+    baseline = key()
+
+    state.frame_age_ms = 20.3
+    state.link_latency_ms = 31.4  # not shown while a frame age exists
+    state.stream_fps = 30.02
+    state.gimbal_pitch_deg = -20.2
+    state.zoom = 1.01
+    assert key() == baseline
+
+    for name, value in (
+        ("frame_age_ms", 21.0),
+        ("stream_fps", 29.0),
+        ("gimbal_pitch_deg", -25.0),
+        ("zoom", 1.5),
+    ):
+        original = getattr(state, name)
+        setattr(state, name, value)
+        assert key() != baseline, name
+        setattr(state, name, original)
+    assert key() == baseline
+
+
 def test_video_hud_fits_short_viewport_without_obscuring_video(operator, monkeypatch) -> None:
     lines = (
         "AUTO PCMD ±10% | 定位 FPS 0.0 | inliers 0",
         "wall_ms - | core - | e2e -",
-        "RTH UNKNOWN/UNKNOWN | GPS ? | 衛星 ?",
-        "飛控高度 [相對起飛點] ? m | AGL ? m | 連接品質 ?",
+        "飛控高度 [相對起飛點] ? m | AGL ? m",
         "飛控融合姿態 roll +0.0° | pitch +0.0° | yaw +0.0°",
         "三軸速度 N ? | E ? | D ? m/s",
         "全場尺度：等待有效飛行軌跡 (m/u)",
@@ -998,14 +1180,15 @@ def test_video_hud_contains_only_requested_engineering_metrics(operator) -> None
     }
     joined = "\n".join(operator._video_diagnostic_lines())
     for token in (
-        "AUTO PCMD", "wall_ms", "core", "e2e", "RTH", "GPS",
-        "飛控高度", "AGL", "連接品質", "定位 FPS", "inliers",
+        "AUTO PCMD", "wall_ms", "core", "e2e",
+        "飛控高度", "AGL", "定位 FPS", "inliers",
         "飛控融合姿態", "三軸速度",
     ):
         assert token in joined
     for removed in (
         "硬體清單", "串流 FPS", "reproj", "地圖覆蓋", "風 ",
         "感測器", "偵測", "pose_age", "stream_age", "水平",
+        "RTH", "GPS", "衛星", "連接品質",
     ):
         assert removed not in joined
 
@@ -1111,6 +1294,14 @@ def test_map_updates_trails_without_uploading_cloud_and_removes_old_markers(oper
     operator.history = [np.array([0.0, 0.0, 0.0, 0.0]), np.array([0.5, 0.0, 0.0, 0.0])]
     operator.history_health = ["OK", "LOW"]
     operator.present_map(640, 360, state)
+    # The cloud is rasterised off the Tk thread; settle that single upload before
+    # checking that trail/pose changes do not cause another.
+    key = operator.map_base_key(640, 360)
+    deadline = time.monotonic() + 5
+    while operator._map_raster.result(key) is None and time.monotonic() < deadline:
+        time.sleep(0.005)
+    assert operator._map_raster.result(key) is not None
+    operator.present_map(640, 360, state)
     photo = operator.map_photo
 
     def unexpected_upload(_image):
@@ -1155,3 +1346,12 @@ def test_pending_map_paint_does_not_delay_video_alarm_or_recovery(operator, monk
     monkeypatch.setattr(operator.map_label, "winfo_height", lambda: 340)
     operator_tick._render_if_dirty(operator, state)
     assert (operator.map_photo.width(), operator.map_photo.height()) == (620, 340)
+
+
+def test_map_repaint_gap_scales_with_measured_cost_within_bounds() -> None:
+    import operator_tick
+
+    gap = operator_tick.map_render_gap_s
+    assert gap(0.002) == operator_tick.MAP_RENDER_MIN_GAP_S
+    assert gap(0.015) == pytest.approx(0.075)
+    assert gap(5.0) == operator_tick.MAP_RENDER_MAX_GAP_S

@@ -24,7 +24,7 @@ from pathlib import Path
 OI = Path(__file__).resolve().parents[1] / "控制介面程式" / "operator_interface"
 sys.path.insert(0, str(OI))
 
-from olympe_live_backend import (  # noqa: E402
+from skycontroller_stick import (  # noqa: E402
     SkyControllerStickMonitor,
     axes_active,
     find_skycontroller_joystick_path,

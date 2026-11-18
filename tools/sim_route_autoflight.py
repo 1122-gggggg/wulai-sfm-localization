@@ -513,7 +513,12 @@ class _SimulationAutonomyChecks(DesktopRouteAutonomy):
                 speed_east_mps=0.0,
                 ground_speed_mps=0.0,
                 ground_speed_mono_ns=0,
-            )
+            ),
+            # Offline autonomy port: no pilot, maneuver, latch or camera sample.
+            pilot_override_active=lambda: False,
+            maneuver_in_progress=None,
+            runtime_safety_latched=False,
+            gimbal_pitch_sample=lambda: None,
         )
         self.stamp = 0.0
         self.now = lambda: self.stamp

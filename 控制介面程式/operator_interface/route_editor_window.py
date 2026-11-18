@@ -1,7 +1,8 @@
-"""Full-screen, self-contained point-cloud route editor built with Tk/Pillow."""
+"""Self-contained, resizable point-cloud route editor built with Tk/Pillow."""
 
 from __future__ import annotations
 
+import json
 import math
 import queue
 import tempfile
@@ -17,9 +18,16 @@ from tkinter import filedialog, messagebox, ttk
 import numpy as np
 from PIL import Image, ImageDraw, ImageTk
 from route_editor_controller import OrthoView, RouteEditorController, pointer_is_drag
-from route_editor_objects import ObjectBoxController, box_corners
+from route_editor_objects import ObjectBoxController, PointerScale, box_corners
+from route_editor_wires import WireController, sample_wire, wire_color
 from local_site_assets import discover_site_package
 from operator_autonomy_status import waypoint_action_text
+from operator_ui_style import (
+    BORDER, BORDER_STRONG, CARD, DISABLED, FIELD, FONT_BOLD, FONT_SMALL, FONT_TITLE, MUTED,
+    PANEL,
+    SELECT_BG, SELECT_FG, SURFACE, TEXT, TEXT_BOX, VIEWPORT_EDITOR_BG,
+    apply_operator_styles,
+)
 from route_editor_model import (
     MAX_ACTIONS_PER_WAYPOINT,
     MapDistanceScale,
@@ -28,7 +36,7 @@ from route_editor_model import (
     load_map_distance_scale,
     parse_waypoint_action,
 )
-from route_editor_rendering import PointCloudRenderer
+from route_editor_rendering import PointCloudRenderWorker, cloud_raster_key, nearest_point_index
 from x11_pinch_zoom import install_x11_pinch_zoom
 
 
@@ -101,18 +109,10 @@ def _resolve_map_frame(profile):
 
 
 def _save_failure_hint(exc: Exception) -> str | None:
-    """Actionable text for save failures whose fix is outside the editor.
-
-    A session started directly from a release/system profile has no managed
-    site pack, so every route import is refused at the trust boundary. The
-    raw error names the boundary; the operator needs the next click instead.
-    """
+    """Explain a rejected map binding, not a managed-profile import dead end."""
     text = str(exc)
-    if "managed site profile" in text or "尚未對應" in text:
-        return (
-            "目前場域尚未匯入為場域資料夾；請先在場域面板「匯入場域資料夾」並套用，"
-            "再重新開啟編輯器畫路線儲存"
-        )
+    if "adoption" in text or "map SHA-256" in text or "map identity" in text:
+        return "地圖內容或座標綁定與場域設定不一致；請重新選擇正確地圖後再儲存"
     return None
 
 
@@ -151,6 +151,71 @@ def _dispatch_route_key(window, key: str, ctrl: bool, shift: bool) -> str | None
         window._handle_delete()
         return "break"
     return None
+
+
+EDITOR_MIN_SIZE = (1040, 640)
+_SIDE_WIDTH = 384
+_SIDE_WRAP = 334
+
+#: Workflow reference shown in the sidebar's 說明 tab: (section title, lines).
+_HELP_SECTIONS = (
+    ("地圖", (
+        "導入資料夾：自動偵測 PLY",
+        "單一檔自動載入，多檔時選擇",
+        "SHA-256 匹配場域後才可正式匯入",
+    )),
+    ("第一階段：標路徑點", (
+        "先開啟「標路徑點模式」",
+        "左鍵單擊：新增路徑點",
+        "Enter：進入第二階段",
+    )),
+    ("第二階段：逐點調整位置", (
+        "左鍵：選取航點",
+        "航點動作：到點後轉向／懸停／鏡頭俯仰，再轉往下一點",
+        "動作可分去程／回程各自設定（第一點與最後一點沒有回程動作）",
+        "G：開始平移；G 後 X / Y / Z：鎖定軸向",
+        "左鍵／Enter：確認，Esc：取消",
+        "Delete：刪除航點",
+        "Ctrl+Z：復原；Ctrl+Shift+Z：重做",
+    )),
+    ("物體長方體", (
+        "開啟物體框選模式，拖曳粗框點雲",
+        "點框線／中心選取，G 平移、S 縮放",
+        "G／S 後 X／Y／Z：限制單軸",
+        "可輸入位移（u）／縮放倍數；縮放時 Shift 細調",
+        "Ctrl+C／Ctrl+V：複製／貼上選取的長方體",
+        "雙擊點雲：切換地圖旋轉中心",
+        "與路線儲存，可設定航段機頭朝向",
+    )),
+    ("電線", (
+        "開啟電線模式，依序單擊點雲／航點選兩端",
+        "點線選取，S 後移動滑鼠或輸入垂度（u）",
+        "點端點 A／B，G 平移，再用 X／Y／Z 鎖軸",
+        "可輸入位移（u），例如 G Z 0.1",
+        "左鍵／Enter 確認，Esc／右鍵還原",
+        "新增電線按鈕可畫下一條；Delete 刪除",
+        "Ctrl+Z 復原，Ctrl+Shift+Z 重做電線",
+        "隨航線儲存，不修改點雲、不提供自動避障",
+    )),
+    ("量距", (
+        "開啟兩點量距，單擊點雲／航點選 A、B",
+        "第三次單擊開始下一組；Esc 清除並離開",
+        "公尺以場域尺度換算，估算非實測標定",
+    )),
+    ("視角", (
+        "左鍵拖曳：旋轉",
+        "左鍵雙擊：切換地圖中心",
+        "右鍵拖曳：平移",
+        "觸控板捏合／滾輪：縮放",
+    )),
+    ("儲存", (
+        "編輯器座標：Z 永遠向上。",
+        "新增模式會建立另一條路線；編輯模式只更新所選路線。",
+        "「儲存路線」會同步 SHA，並將儲存結果設為目前 AUTO 航線。",
+        "綁定地圖並成功儲存後才有航線核准；不會起飛，仍須完成主介面安全確認。",
+        "未綁定 PLY 只能另存預覽，不能供 AUTO 使用。",
+    )),
+)
 
 
 class RouteEditorWindow(tk.Toplevel):
@@ -229,13 +294,25 @@ class RouteEditorWindow(tk.Toplevel):
         self.test_route_callback = test_route
         display_name = profile.display_name if bound else "未綁定 PLY"
         self.title(f"航線編輯器 — {display_name}")
-        self.configure(bg="#121519")
+        apply_operator_styles(self)
+        self.configure(bg=PANEL)
+        self.minsize(*EDITOR_MIN_SIZE)
+        self.geometry(
+            f"{max(EDITOR_MIN_SIZE[0], min(1280, self.winfo_screenwidth() - 80))}"
+            f"x{max(EDITOR_MIN_SIZE[1], min(800, self.winfo_screenheight() - 100))}"
+        )
         self.protocol("WM_DELETE_WINDOW", self.close_editor)
         self.controller = RouteEditorController(
             self.document.points, self.document.waypoint_actions,
             self.document.segment_look_at, self.document.return_waypoint_actions,
         )
         self.objects = ObjectBoxController(document.object_boxes)
+        self.wires = WireController(document.wires)
+        self._wiring = False
+        self._wire_create_armed = False
+        self._wire_numeric = ""
+        self._wire_sag_start = 0.0
+        self._wire_mouse_y = 0
         self._boxing = False
         self._box_create_armed = False
         self._box_draw_start: tuple[int, int] | None = None
@@ -251,14 +328,19 @@ class RouteEditorWindow(tk.Toplevel):
         self._render_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="route-cloud")
         self._render_future = None
         self._render_after = None
-        self._renderer = None
-        self._renderer_points = None
+        self._cloud_worker = PointCloudRenderWorker()
+        self._cloud_revision = 0
+        self._raster_cache_key = None
+        self._raster_cache = None
+        self._distance_labels_dirty = False
         self._displayed_view = None
         self._displayed_size = None
         self._displayed_cloud = None
         self._nav_button: int | None = None
         self._nav_last: tuple[int, int] | None = None
         self._mouse = (0, 0)
+        self._mouse_precise = False
+        self._scale_gesture: PointerScale | None = None
         self._move_mouse_start = (0, 0)
         self._left_press: tuple[int, int] | None = None
         self._left_last: tuple[int, int] | None = None
@@ -288,10 +370,14 @@ class RouteEditorWindow(tk.Toplevel):
         self.title_var = tk.StringVar(value=f"航線編輯器｜{display_name}")
         self.mode_var = tk.StringVar()
         self.selection_var = tk.StringVar()
+        self.map_status_var = tk.StringVar()
+        self.save_note_var = tk.StringVar()
         self.marking_mode_var = tk.BooleanVar(value=False)
         self.measurement_mode_var = tk.BooleanVar(value=False)
         self.object_mode_var = tk.BooleanVar(value=False)
         self.object_info_var = tk.StringVar()
+        self.wire_mode_var = tk.BooleanVar(value=False)
+        self.wire_info_var = tk.StringVar()
         self.look_at_start_var = tk.StringVar(value="1")
         self.look_at_end_var = tk.StringVar(value="2")
         self.look_at_object_var = tk.StringVar()
@@ -309,7 +395,7 @@ class RouteEditorWindow(tk.Toplevel):
         self._build()
         self._bind_controls()
         self._refresh_labels()
-        self.attributes("-fullscreen", True)
+        self._fullscreen = False
         self.lift()
         self.canvas.focus_set()
         self.after_idle(self.request_redraw)
@@ -337,146 +423,310 @@ class RouteEditorWindow(tk.Toplevel):
 
     def _build(self) -> None:
         style = ttk.Style(self)
-        style.configure("RouteEditor.TFrame", background="#1a1e23")
+        bg, card, fg, muted, line = PANEL, CARD, TEXT, MUTED, BORDER
+        style.configure("RouteEditor.TFrame", background=bg)
+        style.configure("RouteEditor.TLabel", background=bg, foreground=fg)
         style.configure(
-            "RouteEditor.TLabel", background="#1a1e23", foreground="#f2f5f7"
+            "RouteEditor.Title.TLabel", background=bg, foreground=fg, font=FONT_TITLE,
         )
-        toolbar = ttk.Frame(self, style="RouteEditor.TFrame")
-        toolbar.pack(fill="x")
+        style.configure(
+            "RouteEditor.Hint.TLabel", background=bg, foreground=muted, font=FONT_SMALL,
+        )
+        style.configure(
+            "RouteEditor.Card.TLabel", background=card, foreground=fg, padding=(10, 6),
+            relief="solid", borderwidth=1, bordercolor=line, lightcolor=line,
+            darkcolor=line,
+        )
+        style.configure(
+            "RouteEditor.TLabelframe", background=bg, bordercolor=line,
+            lightcolor=line, darkcolor=line, relief="solid", borderwidth=1,
+        )
+        style.configure(
+            "RouteEditor.TLabelframe.Label", background=bg, foreground=fg,
+            font=FONT_BOLD,
+        )
+        for kind in ("TCheckbutton", "TRadiobutton"):
+            style.configure(f"RouteEditor.{kind}", background=bg, foreground=fg)
+            style.map(
+                f"RouteEditor.{kind}",
+                background=[("active", SURFACE)],
+                foreground=[("disabled", DISABLED)],
+            )
+        style.configure("RouteEditor.TNotebook", background=bg, borderwidth=1)
+        style.configure(
+            "RouteEditor.TNotebook.Tab", padding=(14, 5),
+        )
+        # The point cloud owns the whole left area. Its controls float on top as
+        # compact cards, so no toolbar or button strip takes space from the map.
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(0, weight=1)
+        style.configure(
+            "RouteEditor.Overlay.TFrame", background=card, relief="solid",
+            borderwidth=1, bordercolor=BORDER_STRONG, lightcolor=BORDER_STRONG,
+            darkcolor=BORDER_STRONG,
+        )
+        style.configure("RouteEditor.Overlay.TLabel", background=card, foreground=fg)
+        style.configure(
+            "RouteEditor.Overlay.Title.TLabel", background=card, foreground=fg,
+            font=FONT_TITLE,
+        )
+        style.configure(
+            "RouteEditor.Overlay.Hint.TLabel", background=card, foreground=muted,
+            font=FONT_SMALL,
+        )
+        body = ttk.Frame(self, style="RouteEditor.TFrame")
+        body.grid(row=0, column=0, sticky="nsew")
+        body.columnconfigure(0, weight=1)
+        body.columnconfigure(1, minsize=_SIDE_WIDTH)
+        body.rowconfigure(0, weight=1)
+        self.canvas = tk.Canvas(
+            body, bg=VIEWPORT_EDITOR_BG, bd=0, highlightthickness=0, cursor="crosshair",
+            takefocus=True,
+        )
+        self.canvas.grid(row=0, column=0, sticky="nsew")
+
+        toolbar = ttk.Frame(self.canvas, style="RouteEditor.Overlay.TFrame", padding=(10, 8))
+        toolbar.place(x=12, y=12, anchor="nw")
         ttk.Label(
-            toolbar,
-            textvariable=self.title_var,
-            style="RouteEditor.TLabel",
-            font=("Sans", 12, "bold"),
-        ).pack(side="left", padx=10, pady=8)
+            toolbar, textvariable=self.title_var, style="RouteEditor.Overlay.Title.TLabel",
+            anchor="w", justify="left", wraplength=340,
+        ).grid(row=0, column=0, columnspan=2, sticky="w")
+        ttk.Label(
+            toolbar, textvariable=self.map_status_var,
+            style="RouteEditor.Overlay.Hint.TLabel", anchor="w", justify="left",
+            wraplength=340,
+        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(2, 8))
         self.ply_button = ttk.Button(
             toolbar, text="導入地圖資料夾", command=self.choose_map_folder
         )
-        self.ply_button.pack(side="left", padx=(4, 2))
-        ttk.Button(toolbar, text="俯視", command=self.set_top_view).pack(
-            side="left", padx=2
+        self.ply_button.grid(row=2, column=0, sticky="ew", padx=(0, 6))
+        self.fullscreen_button = ttk.Button(
+            toolbar, text="全螢幕 F11", command=self._toggle_fullscreen,
         )
-        ttk.Button(toolbar, text="正視", command=self.set_front_view).pack(
-            side="left", padx=2
+        self.fullscreen_button.grid(row=2, column=1, sticky="ew")
+
+        navigation = ttk.Frame(
+            self.canvas, style="RouteEditor.Overlay.TFrame", padding=(10, 6),
         )
-        ttk.Button(toolbar, text="右視", command=self.set_right_view).pack(
-            side="left", padx=2
+        navigation.place(relx=0.0, rely=1.0, x=12, y=-12, anchor="sw")
+        ttk.Label(navigation, text="視角", style="RouteEditor.Overlay.Hint.TLabel").pack(
+            side="left", padx=(0, 8),
+        )
+        for label, command in (
+            ("俯視", self.set_top_view), ("正視", self.set_front_view),
+            ("右視", self.set_right_view), ("左視", self.set_left_view),
+        ):
+            ttk.Button(navigation, text=label, width=6, command=command).pack(
+                side="left", padx=(0, 4),
+            )
+        ttk.Separator(navigation, orient="vertical").pack(
+            side="left", fill="y", padx=(6, 10),
         )
         self.finish_button = ttk.Button(
-            toolbar, text="進入第二階段：逐點調整", command=self.finish_layout
+            navigation, text="完成標點 → 逐點調整", command=self.finish_layout,
         )
-        self.finish_button.pack(side="left", padx=(12, 2))
-        self.save_button = ttk.Button(
-            toolbar,
-            text="另存預覽航線" if self._preview_only else "儲存路線",
-            command=self.save_route,
-        )
-        self.save_button.pack(
-            side="right", padx=2
-        )
-        self.test_button = None
-        if self.test_route_callback is not None:
-            self.test_button = ttk.Button(
-                toolbar,
-                text="儲存並開始模擬航線",
-                command=self.save_and_test_route,
-            )
-            self.test_button.pack(side="right", padx=2)
-        ttk.Button(toolbar, text="離開編輯器", command=self.close_editor).pack(
-            side="right", padx=(2, 10)
-        )
+        self.finish_button.pack(side="left")
 
-        body = ttk.Frame(self, style="RouteEditor.TFrame")
-        body.pack(fill="both", expand=True)
-        self.canvas = tk.Canvas(
-            body, bg="#121519", bd=0, highlightthickness=0, cursor="crosshair"
-        )
-        self.canvas.pack(side="left", fill="both", expand=True)
-        zoom_controls = ttk.Frame(self.canvas, style="RouteEditor.TFrame")
+        zoom_controls = ttk.Frame(self.canvas, style="MapOverlay.TFrame", padding=4)
         zoom_controls.place(relx=1.0, x=-12, y=12, anchor="ne")
         self.zoom_in_button = ttk.Button(
             zoom_controls,
             text="＋",
             width=3,
+            style="MapZoom.TButton",
             command=lambda: self._set_zoom(self.view.zoom * 1.12),
         )
-        self.zoom_in_button.pack(pady=(0, 3))
+        self.zoom_in_button.pack(pady=(0, 4))
         self.zoom_out_button = ttk.Button(
             zoom_controls,
             text="－",
             width=3,
+            style="MapZoom.TButton",
             command=lambda: self._set_zoom(self.view.zoom / 1.12),
         )
         self.zoom_out_button.pack()
 
-        side_host = ttk.Frame(body, width=320, style="RouteEditor.TFrame")
-        side_host.pack(side="right", fill="y")
+        side_host = ttk.Frame(body, width=_SIDE_WIDTH, style="RouteEditor.TFrame")
+        side_host.grid(row=0, column=1, sticky="nsew")
         side_host.pack_propagate(False)
-        self.sidebar_canvas = tk.Canvas(
-            side_host, bg="#1a1e23", bd=0, highlightthickness=0, width=300
-        )
-        sidebar_scroll = ttk.Scrollbar(
-            side_host, orient="vertical", command=self.sidebar_canvas.yview
-        )
-        sidebar_scroll.pack(side="right", fill="y")
-        self.sidebar_canvas.pack(side="left", fill="both", expand=True)
-        self.sidebar_canvas.configure(yscrollcommand=sidebar_scroll.set)
-        side = ttk.Frame(self.sidebar_canvas, style="RouteEditor.TFrame")
-        side_item = self.sidebar_canvas.create_window(0, 0, window=side, anchor="nw")
-        side.bind(
-            "<Configure>",
-            lambda _event: self.sidebar_canvas.configure(
-                scrollregion=self.sidebar_canvas.bbox("all")
-            ),
-        )
-        self.sidebar_canvas.bind(
-            "<Configure>",
-            lambda event: self.sidebar_canvas.itemconfigure(side_item, width=event.width),
-        )
+
+        # Pinned header: phase, marking switch and selection stay visible whichever
+        # tab is open, so the operator never scrolls to find the current state.
+        header = ttk.Frame(side_host, style="RouteEditor.TFrame")
+        header.pack(fill="x", padx=12, pady=(12, 6))
         ttk.Label(
-            side,
-            textvariable=self.mode_var,
-            style="RouteEditor.TLabel",
-            font=("Sans", 11, "bold"),
-            wraplength=275,
-        ).pack(anchor="w", padx=12, pady=(14, 7))
+            header, textvariable=self.mode_var, style="RouteEditor.Title.TLabel",
+            wraplength=_SIDE_WRAP, justify="left",
+        ).pack(anchor="w", pady=(0, 8))
         self.marking_mode_button = ttk.Checkbutton(
-            side,
-            text="標路徑點模式",
-            variable=self.marking_mode_var,
-            command=self.toggle_marking_mode,
+            header, text="標路徑點模式", variable=self.marking_mode_var,
+            command=self.toggle_marking_mode, style="RouteEditor.TCheckbutton",
         )
-        self.marking_mode_button.pack(anchor="w", padx=12, pady=(0, 10))
-        objects = ttk.LabelFrame(side, text="物體長方體（不提供避障）")
-        objects.pack(fill="x", padx=12, pady=(0, 10))
+        self.marking_mode_button.pack(anchor="w", pady=(0, 8))
+        ttk.Label(
+            header, textvariable=self.selection_var, style="RouteEditor.Card.TLabel",
+            wraplength=_SIDE_WRAP - 16, justify="left",
+        ).pack(fill="x", pady=(0, 6))
+        # Save/exit and the status line are pinned under the tabs: they keep their own
+        # reserved rows, never a shrinking toolbar or tab, and never cover the map.
+        side_footer = ttk.Frame(
+            side_host, style="RouteEditor.TFrame", padding=(8, 8, 6, 10),
+        )
+        side_footer.pack(side="bottom", fill="x")
+        ttk.Label(
+            side_footer, textvariable=self.save_note_var, style="RouteEditor.Hint.TLabel",
+            justify="left", wraplength=_SIDE_WRAP,
+        ).pack(fill="x", pady=(0, 6))
+        footer_actions = ttk.Frame(side_footer, style="RouteEditor.TFrame")
+        footer_actions.pack(fill="x")
+        self.test_button = None
+        footer_column = 0
+        if self.test_route_callback is not None:
+            self.test_button = ttk.Button(
+                footer_actions, text="儲存並模擬", command=self.save_and_test_route,
+            )
+            self.test_button.grid(row=0, column=footer_column, sticky="ew", padx=(0, 4))
+            footer_actions.columnconfigure(footer_column, weight=1)
+            footer_column += 1
+        self.save_button = ttk.Button(
+            footer_actions, text="另存預覽航線" if self._preview_only else "儲存路線",
+            command=self.save_route, style="Primary.TButton",
+        )
+        self.save_button.grid(row=0, column=footer_column, sticky="ew", padx=(0, 4))
+        footer_actions.columnconfigure(footer_column, weight=1)
+        footer_column += 1
+        self.exit_button = ttk.Button(
+            footer_actions, text="離開編輯器", command=self.close_editor,
+        )
+        self.exit_button.grid(row=0, column=footer_column, sticky="ew")
+        footer_actions.columnconfigure(footer_column, weight=1)
+        # Verbose discovery details live in the scrollable help tab, not this header.
+        self.side_tabs = ttk.Notebook(side_host, style="RouteEditor.TNotebook")
+        self.side_tabs.pack(fill="both", expand=True, padx=(8, 0))
+        self._tab_canvases: list[tk.Canvas] = []
+        waypoint_tab = self._side_page("航點")
+        object_tab = self._side_page("物體")
+        measure_tab = self._side_page("量測")
+        help_tab = self._side_page("說明")
+        wire_tab = self._side_page("電線")
+
+        # ---- 航點: arrival radius + per-waypoint actions -------------------
+        arrive = self._side_section(waypoint_tab, "到達半徑確認")
+        ttk.Checkbutton(
+            arrive, text="顯示到達球體", variable=self.show_arrive_var,
+            command=self.request_redraw, style="RouteEditor.TCheckbutton",
+        ).pack(anchor="w", padx=8, pady=(6, 0))
+        self.arrive_label_var = tk.StringVar()
+        ttk.Label(arrive, textvariable=self.arrive_label_var,
+                  style="RouteEditor.TLabel", wraplength=_SIDE_WRAP - 20,
+                  justify="left").pack(anchor="w", padx=8, pady=(4, 0))
+        ttk.Scale(
+            arrive, from_=ARRIVE_RADIUS_MIN_U, to=ARRIVE_RADIUS_MAX_U,
+            variable=self.arrive_radius_var, command=self._on_arrive_radius,
+        ).pack(fill="x", padx=8, pady=(0, 6))
+        point_row = ttk.Frame(arrive, style="RouteEditor.TFrame")
+        point_row.pack(fill="x", padx=8, pady=(0, 4))
+        ttk.Label(point_row, text="全部航點半徑", style="RouteEditor.TLabel").pack(side="left")
+        self.point_radius_box = ttk.Spinbox(
+            point_row, from_=ARRIVE_RADIUS_MIN_U, to=ARRIVE_RADIUS_MAX_U,
+            increment=0.001, textvariable=self.point_radius_var, width=7,
+            command=self._on_point_radius,
+        )
+        self.point_radius_box.pack(side="left", padx=6)
+        self.point_radius_box.bind("<Return>", self._on_point_radius)
+        self.point_radius_box.bind("<FocusOut>", self._on_point_radius)
+        self.point_radius_note_var = tk.StringVar()
+        ttk.Label(arrive, textvariable=self.point_radius_note_var,
+                  style="RouteEditor.Hint.TLabel", wraplength=_SIDE_WRAP - 20,
+                  justify="left").pack(anchor="w", padx=8, pady=(0, 8))
+        self._on_arrive_radius(None)
+
+        actions = self._side_section(waypoint_tab, "到點動作（依序執行）")
+        direction_row = ttk.Frame(actions, style="RouteEditor.TFrame")
+        direction_row.pack(fill="x", padx=8, pady=(6, 4))
+        self.action_direction_var = tk.StringVar(value="out")
+        ttk.Label(direction_row, text="設定哪一趟：", style="RouteEditor.TLabel").pack(side="left")
+        for direction_label, direction_value in (("去程", "out"), ("回程", "back")):
+            ttk.Radiobutton(
+                direction_row, text=direction_label, value=direction_value,
+                variable=self.action_direction_var, command=self._sync_action_list,
+                style="RouteEditor.TRadiobutton",
+            ).pack(side="left", padx=6)
+        self.action_list_var = tk.StringVar()
+        tk.Label(
+            actions, textvariable=self.action_list_var, bg=FIELD, fg=TEXT,
+            justify="left", anchor="nw", wraplength=_SIDE_WRAP - 28, padx=8, pady=5,
+            highlightthickness=1, highlightbackground=BORDER,
+        ).pack(fill="x", padx=8, pady=(0, 6))
+        controls = ttk.Frame(actions, style="RouteEditor.TFrame")
+        controls.pack(fill="x", padx=8)
+        controls.columnconfigure(2, weight=1, uniform="action")
+        controls.columnconfigure(3, weight=1, uniform="action")
+        self.action_degrees_var = tk.StringVar(value="30")
+        self.action_seconds_var = tk.StringVar(value="3")
+        self.action_pitch_var = tk.StringVar(value="-20")
+        ttk.Spinbox(controls, from_=1, to=180, increment=5, width=6,
+                    textvariable=self.action_degrees_var).grid(row=0, column=0, pady=2)
+        ttk.Label(controls, text="度", style="RouteEditor.TLabel").grid(
+            row=0, column=1, padx=(3, 8))
+        ttk.Button(controls, text="左轉", width=-4,
+                   command=lambda: self._add_yaw_action(-1)).grid(
+            row=0, column=2, sticky="ew", padx=(0, 3), pady=2)
+        ttk.Button(controls, text="右轉", width=-4,
+                   command=lambda: self._add_yaw_action(+1)).grid(
+            row=0, column=3, sticky="ew", pady=2)
+        ttk.Spinbox(controls, from_=0.5, to=60, increment=0.5, width=6,
+                    textvariable=self.action_seconds_var).grid(row=1, column=0, pady=2)
+        ttk.Label(controls, text="秒", style="RouteEditor.TLabel").grid(
+            row=1, column=1, padx=(3, 8))
+        ttk.Button(controls, text="懸停", command=self._add_hover_action).grid(
+            row=1, column=2, columnspan=2, sticky="ew", pady=2)
+        ttk.Spinbox(controls, from_=-90, to=90, increment=5, width=6,
+                    textvariable=self.action_pitch_var).grid(row=2, column=0, pady=2)
+        ttk.Label(controls, text="°", style="RouteEditor.TLabel").grid(
+            row=2, column=1, padx=(3, 8))
+        ttk.Button(controls, text="鏡頭俯仰°",
+                   command=self._add_gimbal_pitch_action).grid(
+            row=2, column=2, columnspan=2, sticky="ew", pady=2)
+        ttk.Label(actions, text="鏡頭絕對角度：負向下／正向上／0 水平",
+                  style="RouteEditor.Hint.TLabel", wraplength=_SIDE_WRAP - 20,
+                  justify="left").pack(anchor="w", padx=8, pady=(2, 4))
+        ttk.Button(actions, text="刪除最後一個動作",
+                   command=self._remove_last_action).pack(fill="x", padx=8, pady=(0, 8))
+
+        # ---- 物體: boxes + look-at -----------------------------------------
+        objects = self._side_section(object_tab, "物體長方體（不提供避障）")
         self.object_mode_button = ttk.Checkbutton(
             objects, text="物體框選模式", variable=self.object_mode_var,
-            command=self.toggle_object_mode,
+            command=self.toggle_object_mode, style="RouteEditor.TCheckbutton",
         )
-        self.object_mode_button.pack(anchor="w", padx=6, pady=(4, 2))
+        self.object_mode_button.pack(anchor="w", padx=8, pady=(6, 4))
+        object_buttons = ttk.Frame(objects, style="RouteEditor.TFrame")
+        object_buttons.pack(fill="x", padx=8)
+        object_buttons.columnconfigure(0, weight=1, uniform="object")
+        object_buttons.columnconfigure(1, weight=0)
         ttk.Button(
-            objects, text="新增長方體（拖曳框選）", command=self.arm_object_box,
-        ).pack(anchor="w", padx=6, pady=2)
+            object_buttons, text="新增長方體（拖曳框選）", command=self.arm_object_box,
+        ).grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 4))
         ttk.Button(
-            objects, text="刪除選取長方體", command=self._delete_object_box,
-        ).pack(anchor="w", padx=6, pady=2)
+            object_buttons, text="刪除選取長方體", command=self._delete_object_box,
+        ).grid(row=1, column=0, columnspan=2, sticky="ew")
         ttk.Label(
-            objects, textvariable=self.object_info_var, style="RouteEditor.TLabel",
-            wraplength=260, justify="left",
-        ).pack(anchor="w", padx=6, pady=2)
+            objects, textvariable=self.object_info_var, style="RouteEditor.Card.TLabel",
+            wraplength=_SIDE_WRAP - 36, justify="left",
+        ).pack(fill="x", padx=8, pady=(6, 4))
         ttk.Label(
             objects,
             text="G 平移／S 縮放，再按 X／Y／Z 鎖軸\n"
                  "G Z 1：上移 1u；S X 2：X 長度加倍\n"
                  "左鍵／Enter 確認；Esc／右鍵取消\n"
-                 "Ctrl+Z 復原；Ctrl+Shift+Z 重做\n"
-                 "可設定航段機頭朝向，不提供避障。",
-            style="RouteEditor.TLabel", wraplength=260, justify="left",
-        ).pack(anchor="w", padx=6, pady=(2, 6))
-        look_at = ttk.LabelFrame(side, text="航段機頭朝向物體")
-        look_at.pack(fill="x", padx=12, pady=(0, 10))
-        span = ttk.Frame(look_at)
-        span.pack(fill="x", padx=6, pady=4)
+                 "Ctrl+Z 復原；Ctrl+Shift+Z 重做",
+            style="RouteEditor.Hint.TLabel", wraplength=_SIDE_WRAP - 20, justify="left",
+        ).pack(anchor="w", padx=8, pady=(0, 8))
+
+        look_at = self._side_section(object_tab, "航段機頭朝向物體")
+        span = ttk.Frame(look_at, style="RouteEditor.TFrame")
+        span.pack(fill="x", padx=8, pady=(6, 4))
         ttk.Label(span, text="航點", style="RouteEditor.TLabel").pack(side="left")
         self.look_at_start_box = ttk.Combobox(
             span, textvariable=self.look_at_start_var, state="readonly", width=4,
@@ -490,56 +740,94 @@ class RouteEditorWindow(tk.Toplevel):
         self.look_at_object_box = ttk.Combobox(
             look_at, textvariable=self.look_at_object_var, state="readonly", width=20,
         )
-        self.look_at_object_box.pack(fill="x", padx=6, pady=2)
+        self.look_at_object_box.pack(fill="x", padx=8, pady=2)
         self.look_at_object_box.bind("<<ComboboxSelected>>", self._select_look_at_object)
+        look_buttons = ttk.Frame(look_at, style="RouteEditor.TFrame")
+        look_buttons.pack(fill="x", padx=8, pady=(4, 0))
+        look_buttons.columnconfigure(0, weight=1, uniform="look")
+        look_buttons.columnconfigure(1, weight=0)
         self.look_at_apply_button = ttk.Button(
-            look_at, text="套用所選區間朝向", command=self._apply_look_at_range,
+            look_buttons, text="套用所選區間朝向", command=self._apply_look_at_range,
         )
-        self.look_at_apply_button.pack(anchor="w", padx=6, pady=2)
+        self.look_at_apply_button.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 4))
         self.look_at_clear_button = ttk.Button(
-            look_at, text="清除所選區間朝向",
+            look_buttons, text="清除所選區間朝向",
             command=lambda: self._apply_look_at_range(clear=True),
         )
-        self.look_at_clear_button.pack(anchor="w", padx=6, pady=2)
+        self.look_at_clear_button.grid(row=1, column=0, columnspan=2, sticky="ew")
         ttk.Label(
             look_at, textvariable=self.look_at_summary_var,
-            style="RouteEditor.TLabel", wraplength=260, justify="left",
-        ).pack(anchor="w", padx=6, pady=2)
+            style="RouteEditor.Card.TLabel", wraplength=_SIDE_WRAP - 36, justify="left",
+        ).pack(fill="x", padx=8, pady=(6, 4))
         ttk.Label(
             look_at,
             text="區間內移動時持續朝向長方體中心。\n"
                  "只控制機頭水平朝向，不調整鏡頭。\n"
                  "到點動作優先，只在去程朝向，返程維持一般航向。",
-            style="RouteEditor.TLabel", wraplength=260, justify="left",
-        ).pack(anchor="w", padx=6, pady=(2, 6))
-        measurement = ttk.LabelFrame(side, text="兩點量距（3D 直線）")
-        measurement.pack(fill="x", padx=12, pady=(0, 10))
+            style="RouteEditor.Hint.TLabel", wraplength=_SIDE_WRAP - 20, justify="left",
+        ).pack(anchor="w", padx=8, pady=(0, 8))
+
+        wires = self._side_section(wire_tab, "手繪電線（不提供避障）")
+        self.wire_mode_button = ttk.Checkbutton(
+            wires, text="電線繪製模式", variable=self.wire_mode_var,
+            command=self.toggle_wire_mode, style="RouteEditor.TCheckbutton",
+        )
+        self.wire_mode_button.pack(anchor="w", padx=8, pady=(6, 4))
+        ttk.Button(
+            wires, text="新增電線（兩點）", command=self.arm_wire,
+        ).pack(fill="x", padx=8, pady=4)
+        ttk.Button(
+            wires, text="移動選取端點（G）", command=self._begin_wire_move,
+        ).pack(fill="x", padx=8, pady=4)
+        ttk.Button(
+            wires, text="調整選取電線垂度（S）", command=self._begin_wire_sag,
+        ).pack(fill="x", padx=8, pady=4)
+        ttk.Button(
+            wires, text="刪除選取電線", command=self._delete_wire,
+        ).pack(fill="x", padx=8, pady=4)
+        ttk.Label(
+            wires, textvariable=self.wire_info_var, style="RouteEditor.Card.TLabel",
+            wraplength=_SIDE_WRAP - 36, justify="left",
+        ).pack(fill="x", padx=8, pady=6)
+        ttk.Label(
+            wires, text="依序單擊點雲／航點選兩端，建立直線。\n"
+            "點端點 A／B，G 平移，再按 X／Y／Z 鎖軸；可輸入位移（u）。\n"
+            "點線選取，S 調垂度：滑鼠下移加深、上移拉直；也可輸入垂度（u）。\n"
+            "左鍵／Enter 確認；Esc／右鍵還原。\n"
+            "Delete 刪除；Ctrl+Z 復原，Ctrl+Shift+Z 重做。\n"
+            "新增中 Esc／右鍵取消端點；滾輪仍縮放。\n"
+            "與航線儲存，不修改原始點雲、不啟用自動避障。",
+            style="RouteEditor.Hint.TLabel", wraplength=_SIDE_WRAP - 36, justify="left",
+        ).pack(fill="x", padx=8, pady=(0, 8))
+
+        # ---- 量測: two-point distance + leg lengths -------------------------
+        measurement = self._side_section(measure_tab, "兩點量距（3D 直線）")
         self.measurement_mode_button = ttk.Checkbutton(
             measurement, text="兩點量距模式", variable=self.measurement_mode_var,
-            command=self.toggle_measurement_mode,
+            command=self.toggle_measurement_mode, style="RouteEditor.TCheckbutton",
         )
-        self.measurement_mode_button.pack(anchor="w", padx=6, pady=(4, 2))
+        self.measurement_mode_button.pack(anchor="w", padx=8, pady=(6, 4))
         ttk.Button(
             measurement, text="清除測量", command=self.clear_measurement
-        ).pack(anchor="w", padx=6, pady=2)
-        ttk.Label(
-            measurement, textvariable=self.distance_scale_var,
-            style="RouteEditor.TLabel", wraplength=260, justify="left",
-        ).pack(anchor="w", padx=6, pady=2)
+        ).pack(fill="x", padx=8, pady=(0, 4))
         ttk.Label(
             measurement, textvariable=self.measurement_var,
-            style="RouteEditor.TLabel", wraplength=260, justify="left",
-        ).pack(anchor="w", padx=6, pady=(2, 6))
-        lengths = ttk.LabelFrame(side, text="完整路線航段（不閉合）")
-        lengths.pack(fill="x", padx=12, pady=(0, 10))
+            style="RouteEditor.Card.TLabel", wraplength=_SIDE_WRAP - 36, justify="left",
+        ).pack(fill="x", padx=8, pady=(2, 4))
+        ttk.Label(
+            measurement, textvariable=self.distance_scale_var,
+            style="RouteEditor.Hint.TLabel", wraplength=_SIDE_WRAP - 20, justify="left",
+        ).pack(anchor="w", padx=8, pady=(0, 8))
+
+        lengths = self._side_section(measure_tab, "完整路線航段（不閉合）")
         ttk.Label(
             lengths, textvariable=self.route_total_var,
-            style="RouteEditor.TLabel", wraplength=260,
-        ).pack(anchor="w", padx=6, pady=4)
-        leg_rows = ttk.Frame(lengths)
-        leg_rows.pack(fill="x", padx=6, pady=(0, 6))
+            style="RouteEditor.TLabel", wraplength=_SIDE_WRAP - 20,
+        ).pack(anchor="w", padx=8, pady=(6, 4))
+        leg_rows = ttk.Frame(lengths, style="RouteEditor.TFrame")
+        leg_rows.pack(fill="x", padx=8, pady=(0, 6))
         self.route_distance_list = tk.Listbox(
-            leg_rows, height=5, width=24, bg="#121519", fg="#f2f5f7",
+            leg_rows, height=8, width=24, **TEXT_BOX,
             activestyle="none", exportselection=False,
         )
         leg_scroll = ttk.Scrollbar(
@@ -549,151 +837,104 @@ class RouteEditorWindow(tk.Toplevel):
         leg_horizontal = ttk.Scrollbar(
             lengths, orient="horizontal", command=self.route_distance_list.xview
         )
-        leg_horizontal.pack(fill="x", padx=6, pady=(0, 4))
+        leg_horizontal.pack(fill="x", padx=8, pady=(0, 8))
         self.route_distance_list.pack(side="left", fill="x", expand=True)
         self.route_distance_list.configure(
             yscrollcommand=leg_scroll.set, xscrollcommand=leg_horizontal.set
         )
-        discovery = ttk.LabelFrame(side, text="資料夾探索結果")
-        discovery.pack(fill="x", padx=12, pady=(0, 10))
-        ttk.Label(
-            discovery, textvariable=self.discovery_var, style="RouteEditor.TLabel",
-            justify="left", wraplength=260, font=("Sans", 9),
-        ).pack(anchor="w", padx=6, pady=4)
-        arrive = ttk.LabelFrame(side, text="到達半徑確認")
-        arrive.pack(fill="x", padx=12, pady=(0, 10))
-        ttk.Checkbutton(
-            arrive, text="顯示到達球體", variable=self.show_arrive_var,
-            command=self.request_redraw,
-        ).pack(anchor="w", padx=6, pady=(4, 0))
-        self.arrive_label_var = tk.StringVar()
-        ttk.Label(arrive, textvariable=self.arrive_label_var,
-                  style="RouteEditor.TLabel").pack(anchor="w", padx=6)
-        ttk.Scale(
-            arrive, from_=ARRIVE_RADIUS_MIN_U, to=ARRIVE_RADIUS_MAX_U,
-            variable=self.arrive_radius_var, command=self._on_arrive_radius,
-        ).pack(fill="x", padx=6, pady=(0, 6))
-        point_row = ttk.Frame(arrive)
-        point_row.pack(fill="x", padx=6, pady=(0, 6))
-        ttk.Label(point_row, text="全部航點半徑", style="RouteEditor.TLabel").pack(side="left")
-        self.point_radius_box = ttk.Spinbox(
-            point_row, from_=ARRIVE_RADIUS_MIN_U, to=ARRIVE_RADIUS_MAX_U,
-            increment=0.001, textvariable=self.point_radius_var, width=7,
-            command=self._on_point_radius,
-        )
-        self.point_radius_box.pack(side="left", padx=6)
-        self.point_radius_box.bind("<Return>", self._on_point_radius)
-        self.point_radius_box.bind("<FocusOut>", self._on_point_radius)
-        self.point_radius_note_var = tk.StringVar()
-        ttk.Label(arrive, textvariable=self.point_radius_note_var,
-                  style="RouteEditor.TLabel").pack(anchor="w", padx=6)
-        self._on_arrive_radius(None)
-        actions = ttk.LabelFrame(side, text="航點動作（到達選取點後依序執行）")
-        actions.pack(fill="x", padx=12, pady=(0, 10))
-        self.action_list_var = tk.StringVar()
-        ttk.Label(actions, textvariable=self.action_list_var, style="RouteEditor.TLabel",
-                  justify="left", wraplength=260).pack(anchor="w", padx=6, pady=(4, 2))
-        direction_row = ttk.Frame(actions)
-        direction_row.pack(fill="x", padx=6, pady=(2, 0))
-        self.action_direction_var = tk.StringVar(value="out")
-        ttk.Label(direction_row, text="設定哪一趟：", style="RouteEditor.TLabel").pack(side="left")
-        for direction_label, direction_value in (("去程", "out"), ("回程", "back")):
-            ttk.Radiobutton(
-                direction_row, text=direction_label, value=direction_value,
-                variable=self.action_direction_var, command=self._sync_action_list,
-            ).pack(side="left", padx=6)
-        yaw_row = ttk.Frame(actions)
-        yaw_row.pack(fill="x", padx=6, pady=2)
-        self.action_degrees_var = tk.StringVar(value="30")
-        ttk.Spinbox(yaw_row, from_=1, to=180, increment=5, width=5,
-                    textvariable=self.action_degrees_var).pack(side="left")
-        ttk.Label(yaw_row, text="度", style="RouteEditor.TLabel").pack(side="left", padx=(2, 6))
-        ttk.Button(yaw_row, text="左轉", width=5,
-                   command=lambda: self._add_yaw_action(-1)).pack(side="left", padx=2)
-        ttk.Button(yaw_row, text="右轉", width=5,
-                   command=lambda: self._add_yaw_action(+1)).pack(side="left", padx=2)
-        hover_row = ttk.Frame(actions)
-        hover_row.pack(fill="x", padx=6, pady=2)
-        self.action_seconds_var = tk.StringVar(value="3")
-        ttk.Spinbox(hover_row, from_=0.5, to=60, increment=0.5, width=5,
-                    textvariable=self.action_seconds_var).pack(side="left")
-        ttk.Label(hover_row, text="秒", style="RouteEditor.TLabel").pack(side="left", padx=(2, 6))
-        ttk.Button(hover_row, text="懸停", width=5,
-                   command=self._add_hover_action).pack(side="left", padx=2)
-        camera_row = ttk.Frame(actions)
-        camera_row.pack(fill="x", padx=6, pady=2)
-        self.action_pitch_var = tk.StringVar(value="-20")
-        ttk.Spinbox(camera_row, from_=-90, to=90, increment=5, width=5,
-                    textvariable=self.action_pitch_var).pack(side="left")
-        ttk.Button(camera_row, text="鏡頭俯仰°", width=10,
-                   command=self._add_gimbal_pitch_action).pack(side="left", padx=2)
-        ttk.Label(actions, text="鏡頭絕對角度：負向下／正向上／0 水平",
-                  style="RouteEditor.TLabel").pack(anchor="w", padx=6, pady=2)
-        ttk.Button(actions, text="刪除最後一個動作",
-                   command=self._remove_last_action).pack(anchor="w", padx=6, pady=(2, 6))
-        ttk.Label(
-            side,
-            textvariable=self.selection_var,
-            style="RouteEditor.TLabel",
-            wraplength=275,
-        ).pack(anchor="w", padx=12, pady=(0, 14))
-        instructions = (
-            "地圖\n"
-            "  導入資料夾：自動偵測 PLY\n"
-            "  單一檔自動載入，多檔時選擇\n"
-            "  SHA-256 匹配場域後才可正式匯入\n\n"
-            "第一階段：標路徑點\n"
-            "  先開啟「標路徑點模式」\n"
-            "  左鍵單擊：新增路徑點\n"
-            "  Enter：進入第二階段\n\n"
-            "第二階段：逐點調整位置\n"
-            "  左鍵：選取航點\n"
-            "  航點動作：到點後轉向／懸停／鏡頭俯仰，再轉往下一點\n"
-            "  動作可分去程／回程各自設定（第一點與最後一點沒有回程動作）\n"
-            "  G：開始平移\n"
-            "  G 後 X / Y / Z：鎖定軸向\n"
-            "  左鍵／Enter：確認，Esc：取消\n"
-            "  Delete：刪除航點\n"
-            "  Ctrl+Z：復原\n"
-            "  Ctrl+Shift+Z：重做\n\n"
-            "物體長方體\n"
-            "  開啟物體框選模式，拖曳粗框點雲\n"
-            "  點框線／中心選取，G 平移、S 縮放\n"
-            "  G／S 後 X／Y／Z：限制單軸\n"
-            "  可輸入位移（u）／縮放倍數\n"
-            "  與路線儲存，可設定航段機頭朝向\n\n"
-            "量距\n"
-            "  開啟兩點量距，單擊點雲／航點選 A、B\n"
-            "  第三次單擊開始下一組；Esc 清除並離開\n"
-            "  公尺以場域尺度換算，估算非實測標定\n\n"
-            "視角\n"
-            "  左鍵拖曳：旋轉\n"
-            "  左鍵雙擊：切換地圖中心\n"
-            "  右鍵拖曳：平移\n"
-            "  觸控板捏合／滾輪：縮放\n\n"
-            "編輯器座標：Z 永遠向上。\n"
-            "新增模式會建立另一條路線；編輯模式只更新所選路線。\n"
-            "「儲存路線」會同步 SHA，並將儲存結果設為目前 AUTO 航線。"
-        )
-        ttk.Label(
-            side,
-            text=instructions,
-            style="RouteEditor.TLabel",
-            justify="left",
-            wraplength=275,
-        ).pack(anchor="w", padx=12)
-        self._bind_sidebar_scroll(side)
 
-        status = tk.Label(
-            self,
-            textvariable=self.status_var,
-            anchor="w",
-            bg="#242a31",
-            fg="#f2f5f7",
-            padx=10,
-            pady=6,
+        # ---- 說明: workflow reference ----------------------------------------
+        discovery = self._side_section(help_tab, "目前地圖資產")
+        ttk.Label(
+            discovery, textvariable=self.discovery_var, style="RouteEditor.Hint.TLabel",
+            wraplength=_SIDE_WRAP - 20, justify="left",
+        ).pack(fill="x", padx=8, pady=(6, 8))
+        for title, lines in _HELP_SECTIONS:
+            section = self._side_section(help_tab, title)
+            ttk.Label(
+                section, text="\n".join(lines), style="RouteEditor.TLabel",
+                justify="left", wraplength=_SIDE_WRAP - 20,
+            ).pack(anchor="w", padx=8, pady=(6, 8))
+
+        # Jump to the tab a mode belongs to when it is switched on (edge only, so the
+        # per-refresh variable sync never yanks the operator away from another tab).
+        self._follow_mode_tab(self.object_mode_var, 1)
+        self._follow_mode_tab(self.measurement_mode_var, 2)
+        self._follow_mode_tab(self.wire_mode_var, 4)
+        self._bind_sidebar_scroll(self.side_tabs)
+
+        status_frame = ttk.Frame(side_footer, style="RouteEditor.TFrame")
+        status_frame.pack(fill="x", pady=(8, 0))
+        self.status_text = tk.Text(
+            status_frame, height=3, width=1, wrap="word", **TEXT_BOX,
+            padx=8, pady=3, state="disabled",
         )
-        status.pack(fill="x")
+        status_scroll = ttk.Scrollbar(status_frame, command=self.status_text.yview)
+        status_scroll.pack(side="right", fill="y")
+        self.status_text.pack(side="left", fill="x", expand=True)
+        self.status_text.configure(yscrollcommand=status_scroll.set)
+
+        def show_status(*_args):
+            self.status_text.configure(state="normal")
+            self.status_text.delete("1.0", "end")
+            self.status_text.insert("1.0", self.status_var.get())
+            self.status_text.configure(state="disabled")
+
+        self.status_var.trace_add("write", show_status)
+        show_status()
+
+    def _toggle_fullscreen(self, _event=None) -> str:
+        self._fullscreen = not self._fullscreen
+        self.attributes("-fullscreen", self._fullscreen)
+        self.fullscreen_button.configure(
+            text="還原視窗 F11" if self._fullscreen else "全螢幕 F11",
+        )
+        return "break"
+
+    def _side_page(self, title: str) -> ttk.Frame:
+        """One sidebar tab; a scrollbar appears only when the content overflows."""
+        page = ttk.Frame(self.side_tabs, style="RouteEditor.TFrame")
+        self.side_tabs.add(page, text=title)
+        canvas = tk.Canvas(page, bg=PANEL, bd=0, highlightthickness=0)
+        bar = ttk.Scrollbar(page, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=bar.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        inner = ttk.Frame(canvas, style="RouteEditor.TFrame")
+        item = canvas.create_window(0, 0, window=inner, anchor="nw")
+
+        def sync(_event=None) -> None:
+            width = canvas.winfo_width()
+            if width > 1:
+                canvas.itemconfigure(item, width=width)
+            canvas.configure(scrollregion=canvas.bbox("all"))
+            overflow = inner.winfo_reqheight() > canvas.winfo_height() > 1
+            if overflow and not bar.winfo_ismapped():
+                bar.pack(side="right", fill="y", before=canvas)
+            elif not overflow and bar.winfo_ismapped():
+                bar.pack_forget()
+                canvas.yview_moveto(0.0)
+
+        inner.bind("<Configure>", sync)
+        canvas.bind("<Configure>", sync)
+        self._tab_canvases.append(canvas)
+        return inner
+
+    @staticmethod
+    def _side_section(parent, title: str) -> ttk.LabelFrame:
+        frame = ttk.LabelFrame(parent, text=title, style="RouteEditor.TLabelframe")
+        frame.pack(fill="x", padx=(8, 10), pady=(8, 2))
+        return frame
+
+    def _follow_mode_tab(self, variable: tk.BooleanVar, index: int) -> None:
+        was_on = [bool(variable.get())]
+
+        def changed(*_args) -> None:
+            on = bool(variable.get())
+            if on and not was_on[0]:
+                self.side_tabs.select(index)
+            was_on[0] = on
+
+        variable.trace_add("write", changed)
 
     def _bind_controls(self) -> None:
         self.canvas.bind("<Configure>", lambda _event: self.request_redraw())
@@ -709,6 +950,7 @@ class RouteEditorWindow(tk.Toplevel):
         self.canvas.bind("<Button-4>", self.on_wheel)
         self.canvas.bind("<Button-5>", self.on_wheel)
         self.bind("<KeyPress>", self.on_key)
+        self.bind("<F11>", self._toggle_fullscreen)
         self._pinch_zoom = install_x11_pinch_zoom(
             self.canvas,
             lambda: self.view.zoom,
@@ -721,13 +963,39 @@ class RouteEditorWindow(tk.Toplevel):
             widget.bind("<MouseWheel>", self._scroll_sidebar, add="+")
             widget.bind("<Button-4>", self._scroll_sidebar, add="+")
             widget.bind("<Button-5>", self._scroll_sidebar, add="+")
+        widget.bind("<FocusIn>", self._reveal_sidebar_focus, add="+")
         for child in widget.winfo_children():
             self._bind_sidebar_scroll(child)
 
     def _scroll_sidebar(self, event) -> str:
         up = getattr(event, "num", None) == 4 or getattr(event, "delta", 0) > 0
-        self.sidebar_canvas.yview_scroll(-3 if up else 3, "units")
+        canvas = self._tab_canvases[self.side_tabs.index("current")]
+        if canvas.yview() != (0.0, 1.0):
+            canvas.yview_scroll(-3 if up else 3, "units")
         return "break"
+
+    def _reveal_sidebar_focus(self, event) -> None:
+        """Keyboard tabbing reveals the focused control inside its own page."""
+        canvas = self._tab_canvases[self.side_tabs.index("current")]
+        widget = event.widget
+        # Tk also sends FocusIn to the focused control's ancestors. Revealing
+        # those oversized frames would scroll repeatedly before Tk moves them.
+        if widget is not self.focus_get():
+            return
+        parent = widget
+        while parent is not None and parent is not canvas:
+            parent = getattr(parent, "master", None)
+        if parent is None:
+            return
+        top = widget.winfo_rooty() - canvas.winfo_rooty()
+        bottom = top + widget.winfo_height()
+        height = canvas.winfo_height()
+        bounds = canvas.bbox("all")
+        if bounds is None or bounds[3] <= height:
+            return
+        offset = top - 6 if top < 0 else bottom - height + 6 if bottom > height else 0
+        if offset:
+            canvas.yview_moveto((canvas.canvasy(0) + offset) / bounds[3])
 
     def _signature(self) -> tuple:
         points = tuple(
@@ -740,23 +1008,29 @@ class RouteEditorWindow(tk.Toplevel):
             repr(self.controller.actions),
             repr(self.controller.return_actions),
             repr(self.objects.boxes),
+            repr(self.wires.wires),
+            repr(self.wires.pending),
             tuple(self.controller.segment_look_at),
             tuple(self.objects.keys),
         )
 
-    def _refresh_labels(self) -> None:
+    def _refresh_labels(self, *, refresh_distances: bool = True) -> None:
         phase = (
             "第一階段：標路徑點"
             if self.controller.phase == "layout"
             else "第二階段：逐點調整位置"
         )
         source = (
-            "PLY 單檔預覽（禁止正式匯入）"
+            "未綁定 PLY｜僅供預覽，不能供 AUTO 使用"
             if self._preview_only
             else self.profile.display_name
         )
-        self.mode_var.set(
-            f"{phase}\n路徑點數：{len(self.controller.points)}\n地圖：{source}"
+        self.mode_var.set(f"{phase}｜{len(self.controller.points)} 點")
+        self.map_status_var.set(f"地圖：{source}")
+        self.save_note_var.set(
+            "僅另存預覽，不核准 AUTO，不會起飛。"
+            if self._preview_only else
+            "成功儲存後核准此航線；不會起飛，仍須完成主介面安全確認。"
         )
         selected = self.controller.selected
         if selected is None or not (0 <= selected < len(self.controller.points)):
@@ -779,8 +1053,12 @@ class RouteEditorWindow(tk.Toplevel):
         self.measurement_mode_button.configure(
             state="disabled" if self._asset_loading or self.controller.moving else "normal"
         )
-        self._refresh_distance_labels()
+        if refresh_distances:
+            self._refresh_distance_labels()
+        else:
+            self._distance_labels_dirty = True
         self._refresh_object_labels()
+        self._refresh_wire_labels()
         self.save_button.configure(
             state="disabled" if self._asset_loading else "normal"
         )
@@ -795,42 +1073,59 @@ class RouteEditorWindow(tk.Toplevel):
         asset_state = "disabled" if self._asset_loading else "normal"
         self.ply_button.configure(state=asset_state)
 
+    def _current_raster_key(self) -> tuple:
+        width, height = self._canvas_size()
+        return cloud_raster_key(
+            self.map_points, self._cloud_revision, self.view, width, height
+        )
+
     def request_redraw(self) -> None:
-        if self._redraw_pending or self._closed:
+        if self._closed:
+            return
+        if self._raster_cache_key != self._current_raster_key():
+            self._raster_cache_key = None
+            self._raster_cache = None
+        if self._redraw_pending:
             return
         self._redraw_pending = True
         # One active frame plus one latest-view request, never a drag-event backlog.
         if self._render_future is None:
             self._render_after = self.after(16, self._redraw)
 
-    def _render_cloud(self, points, view, width, height):
-        if self._renderer_points is not points:
-            self._renderer = PointCloudRenderer(points)
-            self._renderer_points = points
-        return self._renderer.render(view, width, height)
-
     def _redraw(self) -> None:
         self._render_after = None
         if self._closed:
             return
         self._redraw_pending = False
+        if self._distance_labels_dirty:
+            self._refresh_distance_labels()
         width, height = self._canvas_size()
         view = replace(self.view, center=self.view.center.copy())
         points = self.map_points
+        revision = self._cloud_revision
+        key = cloud_raster_key(points, revision, view, width, height)
+        if key == self._raster_cache_key:
+            self._paint_render(self._raster_cache, view, points, width, height)
+            return
+        self._raster_cache_key = None
+        self._raster_cache = None
         self._render_future = self._render_executor.submit(
-            self._render_cloud, points, view, width, height
+            self._cloud_worker.render, points, revision, view, width, height
         )
         self._render_after = self.after(
-            8, lambda: self._poll_render(view, points, width, height)
+            8, lambda: self._poll_render(key, view, points, width, height)
         )
 
-    def _poll_render(self, view, points, width, height) -> None:
+    def _poll_render(self, key, view, points, width, height) -> None:
         self._render_after = None
         if self._closed:
             return
+        # Sidebar previews must advance even while the cloud worker is blocked.
+        if self._distance_labels_dirty:
+            self._refresh_distance_labels()
         if not self._render_future.done():
             self._render_after = self.after(
-                8, lambda: self._poll_render(view, points, width, height)
+                8, lambda: self._poll_render(key, view, points, width, height)
             )
             return
         future = self._render_future
@@ -840,24 +1135,33 @@ class RouteEditorWindow(tk.Toplevel):
         except Exception as exc:
             self.status_var.set(f"完整點雲繪製失敗：{exc}")
         else:
-            if points is self.map_points:
-                image = Image.fromarray(arr)
-                draw = ImageDraw.Draw(image, "RGBA")
-                self._draw_axes(draw, width, height, view)
-                self._draw_route(draw, width, height, view)
-                self._draw_measurement(draw, width, height, view)
-                self._draw_object_boxes(draw, width, height, view)
-                photo = ImageTk.PhotoImage(image)
-                self._photo = photo
-                self._displayed_view = view
-                self._displayed_size = (width, height)
-                self._displayed_cloud = points
-                if self._canvas_item is None:
-                    self._canvas_item = self.canvas.create_image(0, 0, image=photo, anchor="nw")
-                else:
-                    self.canvas.itemconfigure(self._canvas_item, image=photo)
+            if key == self._current_raster_key():
+                self._raster_cache = Image.fromarray(arr)
+                self._raster_cache_key = key
+                self._paint_render(self._raster_cache, view, points, width, height)
+            else:
+                self._redraw_pending = True
         if self._redraw_pending:
             self._render_after = self.after_idle(self._redraw)
+
+    def _paint_render(self, raster, view, points, width, height) -> None:
+        # Overlays always start from the pristine cloud, never the previous frame.
+        image = raster.copy()
+        draw = ImageDraw.Draw(image, "RGBA")
+        self._draw_axes(draw, width, height, view)
+        self._draw_route(draw, width, height, view)
+        self._draw_measurement(draw, width, height, view)
+        self._draw_object_boxes(draw, width, height, view)
+        self._draw_wires(draw, width, height, view)
+        photo = ImageTk.PhotoImage(image)
+        self._photo = photo
+        self._displayed_view = view
+        self._displayed_size = (width, height)
+        self._displayed_cloud = points
+        if self._canvas_item is None:
+            self._canvas_item = self.canvas.create_image(0, 0, image=photo, anchor="nw")
+        else:
+            self.canvas.itemconfigure(self._canvas_item, image=photo)
 
     def _draw_axes(
         self, draw: ImageDraw.ImageDraw, width: int, height: int, view: OrthoView | None = None
@@ -920,6 +1224,299 @@ class RouteEditorWindow(tk.Toplevel):
             )
             label = _waypoint_label(self.controller, index)
             draw.text((x + radius + 3, y - radius - 2), label, fill="white")
+
+    def _refresh_wire_labels(self) -> None:
+        self.wire_mode_var.set(self._wiring)
+        busy = (
+            self._asset_loading or self.controller.moving or self.objects.transforming
+            or self._measurement_move_start is not None or self._box_draw_start is not None
+        )
+        self.wire_mode_button.configure(state="disabled" if busy else "normal")
+        selected = self.wires.selected
+        text = f"電線數：{len(self.wires.wires)}"
+        if selected is not None:
+            wire = self.wires.wires[selected]
+            text += f"\n選取電線 {selected + 1}；垂度 {wire['sag']:.5g} u"
+            endpoint = self.wires.selected_endpoint
+            if endpoint is not None:
+                x, y, z = wire[endpoint]
+                text += f"\n端點 {endpoint.upper()}：X {x:.5g}　Y {y:.5g}　Z {z:.5g}"
+            if self.wires.editing:
+                axis = "自由" if self.wires.move_axis is None else "XYZ"[self.wires.move_axis]
+                operation = f"端點平移（{axis}）" if self.wires.moving else "垂度調整"
+                text += f"\n{operation}；輸入：{self._wire_numeric or '滑鼠'}"
+        if self._wire_create_armed:
+            text += "\n請選端點 B" if self.wires.pending is not None else "\n請選端點 A"
+        self.wire_info_var.set(text)
+
+    def _leave_wire_mode(self) -> bool:
+        if self.wires.editing or self.wires.pending is not None:
+            self.status_var.set("請先確認或取消電線編輯，再切換模式")
+            return False
+        self._wiring = False
+        self._wire_create_armed = False
+        self.wire_mode_var.set(False)
+        return True
+
+    def toggle_wire_mode(self) -> None:
+        busy = (
+            self._asset_loading or self.controller.moving or self.objects.transforming
+            or self._measurement_move_start is not None or self._box_draw_start is not None
+        )
+        if busy:
+            self.wire_mode_var.set(self._wiring)
+            self.status_var.set("請先確認或取消目前編輯，並等待地圖載入完成")
+            return
+        if not self.wire_mode_var.get():
+            if not self._leave_wire_mode():
+                self.wire_mode_var.set(True)
+                return
+        else:
+            self._wiring = True
+            self._boxing = False
+            self._box_create_armed = False
+            self._measuring = False
+            self.controller.set_placement_enabled(False)
+            self._wire_create_armed = not self.wires.wires
+        self._cancel_pending_single_click()
+        self.status_var.set(
+            "電線模式：點端點後 G／X／Y／Z 微調，點線後 S 調垂度"
+            if self._wiring else "已離開電線模式，保留已完成電線"
+        )
+        self._refresh_labels()
+        self.request_redraw()
+        self.canvas.focus_set()
+
+    def arm_wire(self) -> None:
+        if not self._wiring:
+            self.wire_mode_var.set(True)
+            self.toggle_wire_mode()
+        if not self._wiring:
+            return
+        if self.wires.editing or self.wires.pending is not None:
+            self.status_var.set("請先確認或取消目前電線編輯")
+            return
+        self._cancel_pending_single_click()
+        self._wire_create_armed = True
+        self.status_var.set("請依序單擊點雲／航點選兩端；Esc／右鍵取消")
+        self._refresh_wire_labels()
+        self.canvas.focus_set()
+
+    def _draw_wires(self, draw, width, height, view) -> None:
+        for index, wire in enumerate(self.wires.wires):
+            sx, sy, _ = view.project(sample_wire(wire), width, height)
+            color = wire_color(index)
+            projected = list(zip(sx, sy))
+            if self._wiring and index == self.wires.selected:
+                draw.line(projected, fill="white", width=6)
+            draw.line(projected, fill=color, width=3)
+            for endpoint, position in (("a", 0), ("b", -1)):
+                x, y = sx[position], sy[position]
+                selected = (
+                    self._wiring and index == self.wires.selected
+                    and endpoint == self.wires.selected_endpoint
+                )
+                radius = 7 if selected else 4
+                draw.ellipse(
+                    (x - radius, y - radius, x + radius, y + radius),
+                    fill=color, outline="white" if selected else color, width=2,
+                )
+                if self._wiring and index == self.wires.selected:
+                    draw.text((x + 9, y - 14), endpoint.upper(), fill=color)
+            middle = len(sx) // 2
+            draw.text((sx[middle] + 6, sy[middle] + 6), f"W{index + 1}", fill=color)
+        if self.wires.pending is not None:
+            sx, sy, _ = view.project([self.wires.pending], width, height)
+            x, y = sx[0], sy[0]
+            draw.ellipse((x - 6, y - 6, x + 6, y + 6), outline=_SELECTED, width=2)
+            draw.text((x + 8, y - 8), "A", fill=_SELECTED)
+
+    def _nearest_wire(self, x, y) -> int | None:
+        view = self._displayed_view or self.view
+        width, height = self._displayed_size or self._canvas_size()
+        pointer = np.array([x, y], dtype=float)
+        best, selected = 14.0 ** 2, None
+        for index, wire in enumerate(self.wires.wires):
+            sx, sy, _ = view.project(sample_wire(wire), width, height)
+            points = np.column_stack((sx, sy))
+            starts, delta = points[:-1], np.diff(points, axis=0)
+            squared = np.sum(delta * delta, axis=1)
+            t = np.clip(np.sum((pointer - starts) * delta, axis=1) / np.maximum(squared, 1e-12), 0, 1)
+            distance = float(np.min(np.sum((starts + t[:, None] * delta - pointer) ** 2, axis=1)))
+            if distance <= best:
+                best, selected = distance, index
+        return selected
+
+    def _nearest_wire_endpoint(self, x, y) -> tuple[int, str] | None:
+        view = self._displayed_view or self.view
+        width, height = self._displayed_size or self._canvas_size()
+        best, selected = 14.0 ** 2, None
+        for index, wire in enumerate(self.wires.wires):
+            sx, sy, _ = view.project([wire["a"], wire["b"]], width, height)
+            for position, endpoint in enumerate(("a", "b")):
+                distance = (sx[position] - x) ** 2 + (sy[position] - y) ** 2
+                if distance <= best:
+                    best, selected = distance, (index, endpoint)
+        return selected
+
+    def _wire_at(self, x, y) -> None:
+        if not self._wire_create_armed:
+            endpoint = self._nearest_wire_endpoint(x, y)
+            if endpoint is not None:
+                self.wires.selected, self.wires.selected_endpoint = endpoint
+                self.status_var.set(
+                    f"已選端點 {endpoint[1].upper()}；G 平移，再按 X／Y／Z 鎖軸；S 調垂度"
+                )
+            else:
+                self.wires.selected = self._nearest_wire(x, y)
+                self.wires.selected_endpoint = None
+                self.status_var.set(
+                    "已選電線；S 調整垂度，點端點後 G 平移，Delete 刪除"
+                    if self.wires.selected is not None else "請點電線／端點，或按「新增電線（兩點）」"
+                )
+        else:
+            waypoint = self._nearest_waypoint(x, y)
+            point = self.controller.points[waypoint] if waypoint is not None else self._nearest_cloud(x, y)
+            if point is None:
+                self.status_var.set("附近沒有點雲或航點；請放大後選取電線端點")
+                return
+            try:
+                finished = self.wires.pick_endpoint(point)
+            except ValueError as exc:
+                self.status_var.set(str(exc))
+                return
+            self._wire_create_armed = not finished
+            self.status_var.set(
+                "已建立直線；按 S 調整垂度，或按「新增電線」畫下一條"
+                if finished else "已選端點 A；請單擊選端點 B"
+            )
+        self._refresh_wire_labels()
+        self.request_redraw()
+
+    def _begin_wire_move(self) -> None:
+        if (
+            not self._wiring or self._asset_loading or self._wire_create_armed
+            or not self.wires.begin_move()
+        ):
+            self.status_var.set("請先在電線模式點選端點 A 或 B，再按 G")
+            return
+        self._cancel_pending_single_click()
+        self._wire_numeric = ""
+        self._move_mouse_start = self._mouse
+        self._wire_move_view = replace(self.view, center=self.view.center.copy())
+        self._wire_move_size = self._canvas_size()
+        self.status_var.set("端點平移：X／Y／Z 鎖軸，可輸入位移（u）；左鍵／Enter 確認，Esc／右鍵還原")
+        self._refresh_wire_labels()
+        self.canvas.focus_set()
+
+    def _begin_wire_sag(self) -> None:
+        if not self._wiring or self._asset_loading or self._wire_create_armed or not self.wires.begin_sag():
+            self.status_var.set("請在電線模式完成兩端並選取電線，再按 S")
+            return
+        self._cancel_pending_single_click()
+        self._wire_numeric = ""
+        self._wire_sag_start = self.wires.wires[self.wires.selected]["sag"]
+        self._wire_mouse_y = self._mouse[1]
+        self._wire_scale = self.view.scale(*self._canvas_size())
+        self.status_var.set("垂度調整：滑鼠下移加深、上移拉直；可輸入 u；左鍵／Enter 確認，Esc／右鍵還原")
+        self._refresh_wire_labels()
+        self.canvas.focus_set()
+
+    def _preview_wire_edit(self) -> bool:
+        try:
+            if self.wires.moving:
+                if self._wire_numeric:
+                    value = float(self._wire_numeric)
+                    if not math.isfinite(value) or self.wires.move_axis is None:
+                        raise ValueError("數字位移必須有限，並先按 X／Y／Z 選軸")
+                    delta = np.zeros(3)
+                    delta[self.wires.move_axis] = value
+                else:
+                    dx = self._mouse[0] - self._move_mouse_start[0]
+                    dy = self._mouse[1] - self._move_mouse_start[1]
+                    delta = self._wire_move_view.screen_delta_to_world(
+                        dx, dy, *self._wire_move_size, self.wires.move_axis,
+                    )
+                self.wires.preview_move(delta)
+            else:
+                value = (
+                    float(self._wire_numeric) if self._wire_numeric else
+                    max(0.0, self._wire_sag_start + (self._mouse[1] - self._wire_mouse_y) / self._wire_scale)
+                )
+                self.wires.preview_sag(value)
+        except (ValueError, OverflowError) as exc:
+            self.status_var.set(f"電線數值未套用：{exc}；Backspace 修改，Esc 取消")
+            self._refresh_wire_labels()
+            return False
+        self._refresh_wire_labels()
+        self.request_redraw()
+        return True
+
+    def _confirm_wire_edit(self) -> None:
+        if not self._preview_wire_edit():
+            return
+        self._cancel_pending_single_click()
+        self.wires.confirm()
+        self._wire_numeric = ""
+        self.status_var.set("已確認電線編輯；儲存路線會一併保留端點及垂度")
+        self._refresh_wire_labels()
+        self.request_redraw()
+
+    def _wire_escape(self) -> None:
+        self._cancel_pending_single_click()
+        if self.wires.cancel():
+            self.status_var.set("已還原本次電線編輯；仍在電線模式")
+        elif self._wire_create_armed:
+            self.wires.pending = None
+            self._wire_create_armed = False
+            self.status_var.set("已取消新增電線，保留已完成電線")
+        else:
+            self._leave_wire_mode()
+            self.status_var.set("已離開電線模式")
+        self._wire_numeric = ""
+        self._refresh_labels()
+        self.request_redraw()
+
+    def _delete_wire(self) -> None:
+        if self._wiring and not self._wire_create_armed and self.wires.delete_selected():
+            self.status_var.set("已刪除選取電線；航點未變更")
+            self._refresh_wire_labels()
+            self.request_redraw()
+        else:
+            self.status_var.set("請先完成或取消電線編輯，再選取電線刪除")
+        self.canvas.focus_set()
+
+    def _on_wire_key(self, event, key, ctrl, shift) -> str:
+        if key == "escape":
+            self._wire_escape()
+        elif ctrl and key == "z":
+            self._cancel_pending_single_click()
+            changed = self.wires.redo() if shift else self.wires.undo()
+            self._wire_numeric = ""
+            self._wire_create_armed = False
+            self.status_var.set(("已重做" if shift else "已復原") if changed else "沒有可復原／重做的電線修改")
+            self._refresh_wire_labels()
+            self.request_redraw()
+        elif not ctrl and key == "g" and not self.wires.editing:
+            self._begin_wire_move()
+        elif not ctrl and key == "s" and not self.wires.editing:
+            self._begin_wire_sag()
+        elif not ctrl and key in {"x", "y", "z"} and self.wires.moving:
+            self.wires.constrain({"x": 0, "y": 1, "z": 2}[key])
+            self._preview_wire_edit()
+        elif key in {"return", "kp_enter"} and self.wires.editing:
+            self._confirm_wire_edit()
+        elif self.wires.editing and not ctrl:
+            char = getattr(event, "char", "")
+            if key == "backspace":
+                self._wire_numeric = self._wire_numeric[:-1]
+                self._preview_wire_edit()
+            elif char and char in "0123456789.-+":
+                self._wire_numeric += char
+                self._preview_wire_edit()
+        elif key == "delete":
+            self._delete_wire()
+        return "break"
 
     def _draw_object_boxes(self, draw, width, height, view) -> None:
         for index, box in enumerate(self.objects.boxes):
@@ -1038,6 +1635,9 @@ class RouteEditorWindow(tk.Toplevel):
             self.status_var.set("復原後有物體框已不存在，已清除其航段朝向設定，未改指向其他物體")
 
     def toggle_object_mode(self) -> None:
+        if not self._leave_wire_mode():
+            self.object_mode_var.set(self._boxing)
+            return
         if self._asset_loading or self.controller.moving or self._measurement_move_start is not None:
             self.object_mode_var.set(self._boxing)
             self.status_var.set("請先確認或取消移動，並等待地圖載入完成")
@@ -1135,6 +1735,11 @@ class RouteEditorWindow(tk.Toplevel):
             self.status_var.set("請先點框線／中心選取長方體")
             return
         self._move_mouse_start = self._mouse
+        if operation == "s":
+            width, height = self._canvas_size()
+            box = self.objects.boxes[self.objects.selected]
+            sx, sy, _ = self.view.project([box["center"]], width, height)
+            self._scale_gesture = PointerScale((sx[0], sy[0]), self._mouse)
         self._box_numeric = ""
         self._object_transform_status()
 
@@ -1142,7 +1747,10 @@ class RouteEditorWindow(tk.Toplevel):
         action = "平移" if self.objects.operation == "g" else "縮放"
         axis = "自由" if self.objects.axis is None else "XYZ"[self.objects.axis] + " 軸"
         number = f"；輸入 {self._box_numeric}" if self._box_numeric else ""
-        self.status_var.set(f"長方體{action}：{axis}{number}；左鍵／Enter 確認，Esc／右鍵取消")
+        fine = "；按住 Shift 細調" if self.objects.operation == "s" else ""
+        self.status_var.set(
+            f"長方體{action}：{axis}{number}{fine}；左鍵／Enter 確認，Esc／右鍵取消"
+        )
 
     def _preview_object_transform(self) -> bool:
         width, height = self._canvas_size()
@@ -1165,12 +1773,8 @@ class RouteEditorWindow(tk.Toplevel):
                 delta = self.view.screen_delta_to_world(dx, dy, width, height, self.objects.axis)
                 self.objects.preview(delta=delta)
             else:
-                box = self.objects.boxes[self.objects.selected]
-                sx, sy, _ = self.view.project([box["center"]], width, height)
-                center = np.array([sx[0], sy[0]])
-                distance = float(np.linalg.norm(np.asarray(self._move_mouse_start) - center))
-                current = float(np.linalg.norm(np.asarray(self._mouse) - center))
-                self.objects.preview(factor=max(1e-6, 1.0 + (current - distance) / max(20.0, distance)))
+                factor = self._scale_gesture.move(self._mouse, self._mouse_precise)
+                self.objects.preview(factor=factor)
         except (ValueError, OverflowError) as exc:
             self.status_var.set(f"長方體數值未套用：{exc}；Backspace 修改，Esc 取消")
             return False
@@ -1234,6 +1838,22 @@ class RouteEditorWindow(tk.Toplevel):
             self._refresh_object_labels()
             self.request_redraw()
 
+    def _object_copy_paste(self, *, paste: bool) -> None:
+        if self.objects.transforming or self._box_draw_start is not None:
+            self.status_var.set("請先確認或取消長方體編輯")
+        elif not paste:
+            copied = self.objects.copy_selected()
+            self.status_var.set(
+                "已複製長方體；Ctrl+V 貼上" if copied else "請先點框線／中心選取長方體再複製"
+            )
+        elif self.objects.paste():
+            self._box_create_armed = False
+            self.status_var.set("已貼上相同長方體並選取；G 平移可移開，Ctrl+Z 復原")
+            self._refresh_object_labels()
+            self.request_redraw()
+        else:
+            self.status_var.set("尚未複製長方體；選取後按 Ctrl+C")
+
     def _object_numeric_key(self, event, key: str) -> None:
         char = getattr(event, "char", "")
         if key == "backspace":
@@ -1248,6 +1868,8 @@ class RouteEditorWindow(tk.Toplevel):
             self._object_escape()
         elif ctrl and key == "z":
             self._object_undo_redo(shift)
+        elif ctrl and key in {"c", "v"}:
+            self._object_copy_paste(paste=key == "v")
         elif not ctrl and key in {"g", "s"} and not self.objects.transforming:
             self._begin_object_transform(key)
         elif key in {"x", "y", "z"} and self.objects.transforming:
@@ -1282,6 +1904,7 @@ class RouteEditorWindow(tk.Toplevel):
         return f"{units:.4f} u｜{prefix}{meters:.3f} m"
 
     def _refresh_distance_labels(self) -> None:
+        self._distance_labels_dirty = False
         scale = self.distance_scale
         if scale is None:
             self.distance_scale_var.set("尺度未取得；僅顯示地圖單位 u，公尺不可用")
@@ -1323,19 +1946,52 @@ class RouteEditorWindow(tk.Toplevel):
         self.route_total_var.set(
             "總長：" + self._format_distance(self.route_total_u, self.route_total_m)
         )
-        scroll = self.route_distance_list.yview()[0]
-        self.route_distance_list.delete(0, "end")
-        for index, units in enumerate(self.route_segment_distances_u):
-            meters = (
+        rows = [
+            f"{index + 1} → {index + 2}：" + self._format_distance(
+                units,
                 None if self.route_segment_distances_m is None
-                else self.route_segment_distances_m[index]
+                else self.route_segment_distances_m[index],
             )
-            self.route_distance_list.insert(
-                "end", f"{index + 1} → {index + 2}：" + self._format_distance(units, meters)
-            )
+            for index, units in enumerate(self.route_segment_distances_u)
+        ]
+        self._update_distance_list(rows)
+
+    def _replace_distance_list_rows(self, previous, rows) -> None:
+        """Change only differing rows, retaining unchanged widget entries."""
+        for index in range(min(len(previous), len(rows))):
+            if previous[index] != rows[index]:
+                self.route_distance_list.delete(index)
+                self.route_distance_list.insert(index, rows[index])
+        if len(previous) > len(rows):
+            self.route_distance_list.delete(len(rows), "end")
+        for row in rows[len(previous):]:
+            self.route_distance_list.insert("end", row)
+
+    def _update_distance_list(self, rows) -> None:
+        """Retain scroll, selection and keyboard focus across row edits."""
+        previous = self.route_distance_list.get(0, "end")
+        if tuple(rows) == tuple(previous):
+            return
+        scroll = self.route_distance_list.yview()[0]
+        horizontal = self.route_distance_list.xview()[0]
+        selected = self.route_distance_list.curselection()
+        active = self.route_distance_list.index("active")
+        anchor = self.route_distance_list.index("anchor")
+        self._replace_distance_list_rows(previous, rows)
+        self.route_distance_list.selection_clear(0, "end")
+        for index in selected:
+            if index < len(rows):
+                self.route_distance_list.selection_set(index)
+        if rows:
+            self.route_distance_list.activate(min(active, len(rows) - 1))
+            self.route_distance_list.selection_anchor(min(anchor, len(rows) - 1))
         self.route_distance_list.yview_moveto(scroll)
+        self.route_distance_list.xview_moveto(horizontal)
 
     def toggle_measurement_mode(self) -> None:
+        if not self._leave_wire_mode():
+            self.measurement_mode_var.set(self._measuring)
+            return
         if self.objects.transforming or self._box_draw_start is not None:
             self.measurement_mode_var.set(self._measuring)
             self.status_var.set("請先確認或取消長方體編輯")
@@ -1408,12 +2064,22 @@ class RouteEditorWindow(tk.Toplevel):
             return None
         view = self.__dict__.get("_displayed_view") or self.view
         width, height = self.__dict__.get("_displayed_size") or self._canvas_size()
-        sx, sy, depth = view.project(self.map_points[:, :3], width, height)
-        distance = (sx - x) ** 2 + (sy - y) ** 2
-        candidates = np.flatnonzero(distance <= threshold * threshold)
-        if not len(candidates):
+        worker = self.__dict__.get("_cloud_worker")
+        executor = self.__dict__.get("_render_executor")
+        if worker is not None and executor is not None:
+            # The render worker already holds the cloud (on the GPU when CUDA is
+            # available); projecting millions of points on the Tk thread per click
+            # stalled the editor for ~100 ms.
+            index = executor.submit(
+                worker.nearest, self.map_points, self._cloud_revision,
+                view, width, height, x, y, threshold,
+            ).result()
+        else:
+            index = nearest_point_index(
+                self.map_points[:, :3], view, width, height, x, y, threshold
+            )
+        if index is None:
             return None
-        index = int(candidates[np.argmax(depth[candidates])])
         return self.map_points[index, :3].astype(float)
 
     def _nearest_waypoint(self, x: float, y: float, threshold: float = 28.0):
@@ -1429,6 +2095,10 @@ class RouteEditorWindow(tk.Toplevel):
     def on_left_press(self, event) -> str:
         self.canvas.focus_set()
         self._mouse = (int(event.x), int(event.y))
+        if self._wiring and self.wires.editing:
+            self._confirm_wire_edit()
+            self._left_confirmed_move = True
+            return "break"
         if self._boxing:
             self._cancel_pending_single_click()
             if self.objects.transforming:
@@ -1459,6 +2129,9 @@ class RouteEditorWindow(tk.Toplevel):
         return "break"
 
     def on_left_drag(self, event) -> str:
+        if self._wiring and self.wires.editing:
+            self.on_motion(event)
+            return "break"
         if self._box_draw_start is not None:
             self.canvas.coords(self._box_rectangle, *self._box_draw_start, event.x, event.y)
             return "break"
@@ -1511,11 +2184,13 @@ class RouteEditorWindow(tk.Toplevel):
         return "break"
 
     def on_left_double(self, event) -> str:
-        self._cancel_pending_single_click()
-        if self._boxing:
+        if self._wiring and self.wires.editing:
+            self._cancel_pending_single_click()
             self._suppress_left_release = True
-            self._clear_object_rectangle()
             return "break"
+        self._cancel_pending_single_click()
+        # The first click of the pair may have started a rough box; drop it.
+        self._clear_object_rectangle()
         self._suppress_left_release = True
         self._left_press = None
         self._left_last = None
@@ -1545,6 +2220,11 @@ class RouteEditorWindow(tk.Toplevel):
     def _handle_single_left(self, x: int, y: int) -> None:
         self._single_click_after = None
         if self._closed:
+            return
+        if self._asset_loading:
+            return
+        if self._wiring:
+            self._wire_at(x, y)
             return
         if self._boxing:
             self.objects.selected = self._nearest_object_box(x, y)
@@ -1589,6 +2269,10 @@ class RouteEditorWindow(tk.Toplevel):
 
     def on_motion(self, event) -> None:
         self._mouse = (int(event.x), int(event.y))
+        self._mouse_precise = bool(int(getattr(event, "state", 0)) & 0x0001)
+        if self._wiring and self.wires.editing:
+            self._preview_wire_edit()
+            return
         if self.objects.transforming:
             self._preview_object_transform()
             return
@@ -1597,6 +2281,9 @@ class RouteEditorWindow(tk.Toplevel):
         self._update_move_preview()
 
     def toggle_marking_mode(self) -> None:
+        if not self._leave_wire_mode():
+            self.marking_mode_var.set(self.controller.placement_enabled)
+            return
         if self.objects.transforming or self._box_draw_start is not None:
             self.marking_mode_var.set(self.controller.placement_enabled)
             self.status_var.set("請先確認或取消長方體編輯")
@@ -1631,11 +2318,14 @@ class RouteEditorWindow(tk.Toplevel):
             ).tolist()
         else:
             self.controller.preview_move(delta)
-        self._refresh_labels()
+        self._refresh_labels(refresh_distances=False)
         self.request_redraw()
 
     def on_navigation_press(self, event) -> str:
         self.canvas.focus_set()
+        if self._wiring and (self.wires.editing or self._wire_create_armed):
+            self._wire_escape()
+            return "break"
         if self._boxing and self.objects.transforming:
             self.objects.cancel()
             self._box_numeric = ""
@@ -1681,7 +2371,18 @@ class RouteEditorWindow(tk.Toplevel):
         return "break"
 
     def _set_zoom(self, zoom: float) -> None:
+        width, height = self._canvas_size()
+        before = self.view.scale(width, height)
         self.view.zoom = float(np.clip(zoom, 0.08, 120.0))
+        if self.objects.transforming and self.objects.operation == "g":
+            # Pointer offset maps to world distance through the zoom; keep the box
+            # where it is instead of letting the next mouse move jump it.
+            ratio = self.view.scale(width, height) / before
+            start_x, start_y = self._move_mouse_start
+            self._move_mouse_start = (
+                self._mouse[0] - (self._mouse[0] - start_x) * ratio,
+                self._mouse[1] - (self._mouse[1] - start_y) * ratio,
+            )
         self.request_redraw()
 
 
@@ -1774,6 +2475,12 @@ class RouteEditorWindow(tk.Toplevel):
         shift = bool(int(event.state) & 0x0001)
         if isinstance(event.widget, (tk.Entry, ttk.Entry, ttk.Spinbox)):
             return None
+        if event.widget is not self.canvas and key != "escape":
+            return None
+        if self._asset_loading:
+            return "break"
+        if self._wiring:
+            return self._on_wire_key(event, key, ctrl, shift)
         if self._boxing:
             return self._on_object_key(event, key, ctrl, shift)
         if self._measuring:
@@ -1975,6 +2682,11 @@ class RouteEditorWindow(tk.Toplevel):
         self.status_var.set("右視：適合逐點調整 Z 高度")
         self.request_redraw()
 
+    def set_left_view(self) -> None:
+        self.view.left()
+        self.status_var.set("左視：適合逐點調整 Z 高度")
+        self.request_redraw()
+
     def _confirm_map_replace(self) -> bool:
         if self._signature() == self._saved_signature:
             return True
@@ -1985,6 +2697,9 @@ class RouteEditorWindow(tk.Toplevel):
         )
 
     def choose_map_folder(self) -> None:
+        if self.wires.editing or self.wires.pending is not None:
+            self.status_var.set("請先確認或取消電線編輯，再更換地圖")
+            return
         if self._asset_loading or not self._confirm_map_replace():
             return
         initial_dir = (
@@ -2074,7 +2789,7 @@ class RouteEditorWindow(tk.Toplevel):
         dialog = tk.Toplevel(self)
         dialog.title("選擇要導入的 PLY")
         dialog.transient(self)
-        dialog.configure(bg="#1a1e23")
+        dialog.configure(bg=PANEL)
         dialog.geometry("760x430")
         ttk.Label(
             dialog,
@@ -2083,9 +2798,9 @@ class RouteEditorWindow(tk.Toplevel):
         ).pack(anchor="w", padx=12, pady=(12, 6))
         listbox = tk.Listbox(
             dialog,
-            bg="#121519",
-            fg="#f2f5f7",
-            selectbackground="#315d86",
+            **TEXT_BOX,
+            selectbackground=SELECT_BG,
+            selectforeground=SELECT_FG,
             activestyle="none",
         )
         listbox.pack(fill="both", expand=True, padx=12, pady=6)
@@ -2195,12 +2910,19 @@ class RouteEditorWindow(tk.Toplevel):
             self.map_loaded_callback(message)
         self.controller = RouteEditorController()
         self.objects = ObjectBoxController()
+        self.wires = WireController()
+        self._wiring = False
+        self._wire_create_armed = False
+        self._wire_numeric = ""
         self._look_at_object_key = None
         self._boxing = False
         self._box_create_armed = False
         self._box_numeric = ""
         self._clear_object_rectangle()
         self.map_points = self._aligned_map_points(points)
+        self._cloud_revision += 1
+        self._raster_cache_key = None
+        self._raster_cache = None
         center, radius = self._bounds(self.map_points[:, :3])
         self.view = OrthoView(center=center, radius=radius, zoom=1.0)
         self.view.top()
@@ -2234,6 +2956,7 @@ class RouteEditorWindow(tk.Toplevel):
             self.controller.confirm_move()
         self.objects.confirm()
         self.document.object_boxes = self.objects.boxes
+        self.document.wires = self.wires.wires
         self.document.points = self.controller.points
         index_for_key = {key: index for index, key in enumerate(self.objects.keys)}
         self.document.segment_look_at = [
@@ -2263,11 +2986,15 @@ class RouteEditorWindow(tk.Toplevel):
             )
 
     def save_route(self) -> Path | None:
+        if self.wires.editing or self.wires.pending is not None:
+            self.status_var.set("請先用左鍵／Enter 確認端點／垂度，或 Esc 取消未完成電線，再儲存")
+            return None
         if self.objects.transforming:
             self._finish_object_transform()
             if self.objects.transforming:
                 return None
         self._update_document()
+        self._refresh_distance_labels()
         if self._preview_only:
             path = self._choose_preview_path()
             if path is None:
@@ -2286,12 +3013,25 @@ class RouteEditorWindow(tk.Toplevel):
         try:
             with tempfile.TemporaryDirectory(prefix="sfm-route-") as temporary:
                 staged = self.document.save(Path(temporary) / "flight_route.json")
+                payload = json.loads(staged.read_text(encoding="utf-8"))
+                map_digest = self.profile.asset_sha256.map_ply
+                if not isinstance(map_digest, str) or len(map_digest) != 64:
+                    raise ValueError("已綁定航線儲存需要地圖 SHA-256")
+                payload["map_ply_sha256"] = map_digest
+                staged.write_text(
+                    json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+                    encoding="utf-8",
+                )
                 result = self.import_route(staged)
+                asset_path = getattr(result, "asset_path", None)
+                if asset_path is None or not bool(getattr(result, "approved_for_auto", False)):
+                    raise ValueError("航線儲存未取得可驗證的 AUTO 核准")
+                saved = Path(asset_path)
         except Exception as exc:
             hint = _save_failure_hint(exc)
             self.status_var.set(f"航線儲存失敗：{hint or exc}")
             return None
-        saved = Path(getattr(result, "asset_path", None) or self.profile.route_json)
+        saved = saved.resolve()
         self.document.source_path = saved
         self._saved_signature = self._signature()
         message = str(getattr(result, "message", "航線已匯入"))

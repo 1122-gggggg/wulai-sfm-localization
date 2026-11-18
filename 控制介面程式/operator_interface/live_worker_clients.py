@@ -687,8 +687,14 @@ class LiveWorkerClient:
 
     @staticmethod
     def _immutable_frame_bytes(raw: memoryview) -> bytes | None:
-        obj = getattr(raw, "obj", None)
-        if type(obj) is bytes and raw.readonly and raw.c_contiguous and raw.nbytes == len(obj):
+        if not raw.readonly or not raw.c_contiguous:
+            return None
+        obj = raw.obj
+        # Decoder reshape views retain an ndarray base before the actual bytes.
+        # A read-only view of mutable storage is not an immutable snapshot.
+        while isinstance(obj, np.ndarray):
+            obj = obj.base
+        if type(obj) is bytes and raw.nbytes == len(obj):
             return obj
         return None
 

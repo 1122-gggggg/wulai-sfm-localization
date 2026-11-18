@@ -495,6 +495,8 @@ RESULT_FIELDS = (
     "fused_stamp_source",
     "fused_attitude_mono",
     "fused_speed_mono",
+    "fused_attitude_source_mono",
+    "fused_speed_source_mono",
     "fused_altitude_mono",
     "fused_altitude_m",
     "fused_agl_altitude_m",
@@ -702,8 +704,10 @@ def _fused_telemetry_mono_s(telemetry_ns: Any) -> float | None:
 def attach_fused_localization_telemetry(
     timing: dict[str, Any],
     state: Any,
+    *,
+    history: Any = None,
 ) -> None:
-    """Copy fused IMU, velocity, GNSS, and independent acquisition stamps."""
+    """Attach frame-aligned motion plus independently stamped GNSS and altitude."""
     if state is None:
         return
     timing.update(
@@ -767,3 +771,42 @@ def attach_fused_localization_telemetry(
     )
     if gps_mono is not None:
         timing["fused_gps_mono"] = gps_mono
+    if history is not None:
+        timing.update(history.localization_at(timing.get("source_frame_stamp_mono")))
+
+
+def _nonnegative_metric_text(value: float | None, unit: str = "") -> str:
+    try:
+        number = float(value) if value is not None else float("nan")
+    except (TypeError, ValueError):
+        number = float("nan")
+    if not math.isfinite(number) or number < 0:
+        return "N/A"
+    return f"{number:.1f}{unit}"
+
+
+def format_pipeline_metrics_summary(
+    *,
+    localization_fps: float | None,
+    stream_fps: float | None,
+    e2e_ms: float | None,
+    e2e_p95_ms: float | None,
+    frame_age_ms: float | None,
+    localization_label: str = "定位端到端 FPS",
+) -> str:
+    """Format only measurements visible at the UI boundary."""
+    return (
+        f"{localization_label} {_nonnegative_metric_text(localization_fps)} | "
+        f"影像串流 FPS {_nonnegative_metric_text(stream_fps)} | "
+        f"端到端延遲 {_nonnegative_metric_text(e2e_ms, ' ms')} | "
+        f"p95（近 5 秒）{_nonnegative_metric_text(e2e_p95_ms, ' ms')} | "
+        f"影格年齡 {_nonnegative_metric_text(frame_age_ms, ' ms')}"
+    )
+
+
+def nearest_rank_p95(values: list[float]) -> float | None:
+    finite = sorted(float(value) for value in values if math.isfinite(float(value)))
+    if not finite:
+        return None
+    index = min(len(finite) - 1, max(0, math.ceil(0.95 * len(finite)) - 1))
+    return finite[index]

@@ -5,6 +5,7 @@ import threading
 import time
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 import flight_operator_app as app
@@ -113,7 +114,7 @@ def test_anafi_link_latency_is_applied_before_frames_reach_localization() -> Non
 
     assert stream.delay_frames == 8
     frames = _drain_frames(stream, expected=9)
-    assert frames[0].getpixel((0, 0)) == (1, 2, 3)
+    assert tuple(frames[0][0, 0]) == (1, 2, 3)
     assert stream.output_index == 9
 
 
@@ -127,10 +128,39 @@ def test_file_stream_drains_delayed_tail_once_at_eof() -> None:
     stream.delay_frames = 2
 
     output = _drain_frames(stream)
-    assert [frame.getpixel((0, 0)) for frame in output] == [
+    assert [tuple(frame[0, 0]) for frame in output] == [
         (1, 2, 3), (4, 5, 6), (7, 8, 9),
     ]
     assert stream.output_index == 3
+
+
+def test_file_frame_rgb_view_survives_next_frame_and_close() -> None:
+    payload = bytes(range(24))
+    stream = FFmpegFrameStream(Path("/definitely/missing.mp4"), 2, 2, fps=30)
+    stream.proc = _Process(payload)  # type: ignore[assignment]
+    try:
+        first, = _drain_frames(stream, expected=1)
+        assert first.shape == (2, 2, 3)
+        assert first.dtype == np.uint8
+        assert first.flags["C_CONTIGUOUS"]
+        assert not first.flags["OWNDATA"]
+        assert not first.flags["WRITEABLE"]
+        with pytest.raises(ValueError):
+            first[0, 0, 0] = 255
+        with pytest.raises(ValueError):
+            first.setflags(write=True)
+
+        second, = _drain_frames(stream, expected=1)
+        np.testing.assert_array_equal(first, np.arange(12, dtype=np.uint8).reshape(2, 2, 3))
+        np.testing.assert_array_equal(second, np.arange(12, 24, dtype=np.uint8).reshape(2, 2, 3))
+        assert stream.last_frame_name == "frame_000002.jpg"
+        assert _drain_frames(stream) == []
+        assert stream.eof
+    finally:
+        stream.close()
+
+    np.testing.assert_array_equal(first, np.arange(12, dtype=np.uint8).reshape(2, 2, 3))
+    np.testing.assert_array_equal(second, np.arange(12, 24, dtype=np.uint8).reshape(2, 2, 3))
 
 
 def test_next_frame_never_waits_for_a_blocked_ffmpeg_pipe() -> None:

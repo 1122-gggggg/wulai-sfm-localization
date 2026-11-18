@@ -224,6 +224,7 @@ def test_result_notification_runs_before_idle_work_and_coalesces() -> None:
         after=lambda delay, callback: timers.append((delay, callback)),
         after_idle=idle.append,
         update_live_results=lambda: consumed.append(True),
+        _site_switching=False,
     )
     for _ in range(3):
         app.OperatorApp._on_localizer_result_ready(operator, 99, 0)

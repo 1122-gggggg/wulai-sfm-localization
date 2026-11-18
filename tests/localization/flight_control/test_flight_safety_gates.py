@@ -37,6 +37,16 @@ import real_path_follow_controller as rpf
 ZERO = (0, 0, 0, 0)
 
 
+def _wait_until(predicate, timeout_s: float = 5.0) -> bool:
+    """Poll ``predicate`` until it is true or the deadline passes; callers assert the result."""
+    deadline = time.monotonic() + timeout_s
+    while not predicate():
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.005)
+    return True
+
+
 def run_ticks(
     max_ticks,
     pose_fn,
@@ -2738,8 +2748,8 @@ def test_firmware_preflight_sets_waits_and_reads_back_limits(monkeypatch):
 
 
 def test_firmware_preflight_reports_low_battery_as_advisory(monkeypatch):
-    drone, _ = _fake_firmware_preflight(monkeypatch, battery=29, gps_fixed=1)
-    with pytest.raises(RuntimeError, match="below the 30%"):
+    drone, _ = _fake_firmware_preflight(monkeypatch, battery=19, gps_fixed=1)
+    with pytest.raises(RuntimeError, match="below the 20%"):
         pff.configure_flight_preflight(drone, 20.0, 80.0, True)
     assert drone.calls == []
 
@@ -2962,8 +2972,9 @@ def test_land_failure_can_still_escalate_to_emergency():
         emergency_cb=lambda: calls.__setitem__("emergency", calls["emergency"] + 1),
         timeout_s=0.06,
     ).start()
-    time.sleep(0.25)
+    reached = _wait_until(lambda: mon.emergency_issued)
     mon.stop()
+    assert reached
     assert calls == {"land": 1, "emergency": 1}
     assert mon.reason.startswith("EMERGENCY") and mon.emergency_issued
 
@@ -2985,8 +2996,9 @@ def test_land_callback_retries_exception_until_none_success_without_busy_loop():
         return None  # Existing Olympe send callbacks use None as success.
 
     mon = pff.SafetyMonitor(lambda *_: None, _Safety(), land_cb=land, timeout_s=0.06).start()
-    time.sleep(0.36)
+    reached = _wait_until(lambda: mon._land_acted)
     mon.stop()
+    assert reached
     assert len(attempts) == 3 and mon._land_acted
     assert mon.action_failures["LAND"] == 2
     assert min(b - a for a, b in zip(attempts, attempts[1:])) >= 0.08
@@ -3015,8 +3027,9 @@ def test_emergency_false_result_retries_and_remains_highest_priority():
         stop_requested=lambda: True,
         timeout_s=0.06,
     ).start()
-    time.sleep(0.36)
+    reached = _wait_until(lambda: mon._emergency_acted)
     mon.stop()
+    assert reached
     assert len(attempts) == 3 and mon._emergency_acted and mon.emergency_issued
     assert mon.action_failures["EMERGENCY"] == 2
     assert sent == [], "EMERGENCY must remain PCMD-silent even while retrying"
@@ -3050,8 +3063,9 @@ def test_one_shot_terminal_command_latches_until_callback_succeeds(terminal):
         timeout_s=0.06,
         **kwargs,
     ).start()
-    time.sleep(0.36)
+    reached = _wait_until(lambda: mon._land_acted or mon._emergency_acted)
     mon.stop()
+    assert reached
     assert len(attempts) == 3
     assert mon.terminal_action == terminal and mon.terminated.is_set()
     assert mon._land_acted is (terminal == "LAND")
@@ -3115,8 +3129,9 @@ def test_termination_signal_lands_even_when_control_loop_is_blocked():
         stop_requested=lambda: True,
         timeout_s=0.06,
     ).start()
-    time.sleep(0.2)
+    reached = _wait_until(lambda: bool(landed))
     mon.stop()
+    assert reached
     assert mon.terminated.is_set() and landed == [True]
     assert ZERO in sent and "termination signal" in mon.reason
 
@@ -4767,45 +4782,6 @@ def test_legacy_entrypoints_stay_locked_even_when_legacy_env_is_enabled(monkeypa
         legacy_cruise.run(None, None, dry_run=False)
     with pytest.raises(SystemExit, match="permanently locked"):
         ofs.run_real(object(), None, None, None)
-
-
-def test_canonical_frame_source_has_live_hard_lock_and_timestamp_safety():
-    source = (FLIGHT_CONTROL_ROOT / "olympe_frame_source.py").read_text(encoding="utf-8")
-    assert "SFM_ALLOW_LEGACY_FLIGHT" not in source
-    assert "TakeOff()" not in source
-    assert ".wait()" not in source
-    assert ".join()" not in source
-    assert ".wait(timeout=0.5)" in source
-    assert ".join(timeout=5.0)" in source
-    assert "require_source_timestamps" in source
-    assert "_source_timing_trusted_locked" in source
-
-
-def test_frame_source_has_no_unreferenced_coded_decoder_helpers():
-    dead_names = {
-        "_init_pyav_decoder",
-        "_avcc_to_annexb",
-        "_decode_h264_payload",
-        "_coded_payload_bytes",
-        "_coded_avcc_cb",
-        "_coded_bytestream_cb",
-    }
-    path = FLIGHT_CONTROL_ROOT / "olympe_frame_source.py"
-    source = path.read_text(encoding="utf-8")
-    assert "if skipped_stale" not in source
-    tree = ast.parse(source, filename=str(path))
-    definitions = {
-        node.name
-        for node in ast.walk(tree)
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-    }
-    calls = {
-        node.func.id
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
-    }
-    assert not (dead_names & definitions), f"dead helpers remain in {path}"
-    assert not (dead_names & calls), f"dead helper calls remain in {path}"
 
 
 def test_sphinx_smoke_is_simulator_only_and_uses_bounded_waits():

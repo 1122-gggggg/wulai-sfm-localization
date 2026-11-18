@@ -83,7 +83,6 @@ default ``vpr_top1_out = 0.32`` is already on the BoQ score scale.)
 
 from __future__ import annotations
 
-import hashlib
 import os
 from pathlib import Path
 from typing import Sequence
@@ -94,6 +93,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchvision
+
+from direct_paths import sha256_file
 
 BOQ_INPUT = 384
 BOQ_DIM = 16384
@@ -261,29 +262,12 @@ def resolve_weights_path(weights_path: str | Path | None = None) -> Path:
     return BOQ_WEIGHTS
 
 
-_SHA256_CACHE: dict[tuple[int, int, int], str] = {}
-
-
 def verify_weights_sha256(path: Path, expected: str = BOQ_WEIGHTS_SHA256) -> Path:
     """SHA-pin the checkpoint; raise on any mismatch or absent file."""
     resolved = Path(path).expanduser().resolve()
     if not resolved.is_file():
         raise FileNotFoundError(f"BoQ weights are absent: {resolved}")
-    try:
-        st = resolved.stat()
-        key = (st.st_ino, int(st.st_mtime_ns), st.st_size)
-    except OSError:
-        key = None
-    if key is not None and key in _SHA256_CACHE:
-        actual = _SHA256_CACHE[key]
-    else:
-        digest = hashlib.sha256()
-        with resolved.open("rb") as stream:
-            for chunk in iter(lambda: stream.read(8 * 1024 * 1024), b""):
-                digest.update(chunk)
-        actual = digest.hexdigest()
-        if key is not None:
-            _SHA256_CACHE[key] = actual
+    actual = sha256_file(resolved)
     if actual != expected:
         raise ValueError(
             f"BoQ weights SHA-256 mismatch: {resolved} has {actual}, expected {expected}"
@@ -356,8 +340,6 @@ class BoQExtractor:
         if not arr.flags.c_contiguous:
             arr = np.ascontiguousarray(arr)
         source = torch.from_numpy(arr).permute(2, 0, 1)
-        if device.type == "cuda":
-            source = source.pin_memory()
         x = source.to(device, non_blocking=True)
         x = x.unsqueeze(0).to(dtype=torch.float32).div_(255.0)
         x = F.interpolate(

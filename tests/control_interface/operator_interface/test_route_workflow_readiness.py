@@ -7,7 +7,7 @@ import numpy as np
 import pytest
 
 from flight_operator_app import OperatorApp, resolve_site_map_frame
-from local_site_assets import describe_site_routes
+from local_site_assets import describe_site_routes, profile_for_selected_route
 from operator_autonomy import DesktopRouteAutonomy
 from route_domain import MissionRouteLock, RouteDocument
 from site_profile import load_site_profile
@@ -29,7 +29,14 @@ def test_available_route_overlay_is_the_desktop_auto_input(route):
     operator.mission_route_lock = MissionRouteLock()
     operator._active_site_map_frame = lambda: frame
     operator.redraw_map_only = Mock()
+    operator.backend = SimpleNamespace(is_live=False, session_config=None)
     assert route.flight_ready
+    if not profile_for_selected_route(profile_path, route.path).flight.approved:
+        # Historical routes without a verified save receipt stay display-only.
+        with pytest.raises(ValueError, match="not approved for AUTO"):
+            operator._show_route_overlay(route.path)
+        assert operator.mission_route_lock.snapshot is None
+        return
     assert operator._show_route_overlay(route.path) == route.waypoints
     snapshot = operator.mission_route_lock.begin_auto(
         displayed_sha256=operator._displayed_route_sha256

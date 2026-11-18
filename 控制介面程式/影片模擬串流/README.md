@@ -77,7 +77,7 @@ SFM_SITE_PROFILE=/absolute/path/to/your_site.json \\
 
 ```bash
 SFM_SITE_PROFILE="$PWD/地圖檔/場域/fuhe_bridge/site_profile.json" \
-VIDEO=/home/allen/下載/P1130113.MP4 \
+VIDEO="$PWD/模擬器/測試影片/P1130113.MP4" \
 ./控制介面程式/影片模擬串流/啟動.sh
 ```
 
@@ -85,8 +85,8 @@ VIDEO=/home/allen/下載/P1130113.MP4 \
 `地圖檔/場域/fuhe_bridge/releases/fuhe_edm_transfer_20261006/fuhe_edm_release/map/map.ply`，
 再選影片。首次顯示「這個場域還沒有航線」時選 **No**，只重播定位，不建立航線。
 
-原始 ZIP 與校驗檔位於 `/home/allen/下載/fuhe_edm_transfer_20261006.zip`、
-同名 `.zip.sha256`；解壓的交付包與內部 `SHA256SUMS` 保留在場域的
+原始 ZIP 位於工作區的 `地圖檔/場域/fuhe_bridge/provenance/fuhe_edm_transfer_20261006.zip`；
+解壓的交付包與內部 `SHA256SUMS` 保留在場域的
 `releases/fuhe_edm_transfer_20261006/`。上層 `site_profile.json` 只調整接入路徑，
 地圖、bundle、定位 profile、參考位姿及其 SHA 不變。
 
@@ -113,12 +113,12 @@ encoder／decoder 正常結束。實際操作介面亦到達 `EOF_HOLD`。
 
 ```bash
 SFM_SITE_PROFILE="$PWD/地圖檔/場域/fuhe_bridge/site_profile.json" \
-VIDEO=/home/allen/下載/P1130113.MP4 \
+VIDEO="$PWD/模擬器/測試影片/P1130113.MP4" \
 SFM_LIVE_DETECT=1 \
 ./控制介面程式/影片模擬串流/啟動.sh
 ```
 
-權重預設為 `/home/allen/下載/power_equipment_sample50_3class_yolo26n_640_aug_best.pt`，
+權重預設為工作區內的 `執行環境/models/power_equipment_sample50_3class_yolo26n_640_aug_best.pt`，
 可用 `SFM_DETECTOR_MODEL` 指定已存在的其他權重。使用 `.venv-yolo/bin/python`，
 不下載模型。偵測框、類別與信心值只疊加在影片窗格，不參與 MegaLoc＋EDM 定位
 或飛控；原片轉為 1280×720，沿用 H264 Main 5 Mb/s、280 ms 模擬鏈路。
@@ -137,7 +137,7 @@ SFM_LIVE_DETECT=1 \
 
 ```bash
 SFM_YOLO_SEG=1 \
-VIDEO=/home/allen/下載/P1980198.MP4 \
+VIDEO="$PWD/模擬器/測試影片/P1980198.MP4" \
 ./控制介面程式/影片模擬串流/啟動.sh
 ```
 
@@ -179,7 +179,7 @@ worker、1160 次分割畫面呈現、595 組同幀雙路呈現；最後 5 秒�
 | `LOC_BENCH_TRACK=1` | off | 改純 TRACK 測速 |
 | `POSE_STABILIZE=1` | off | 3 幀一致性＋0.15 s 低通輸出；遙測同時保留原始 PnP |
 | `SFM_LIVE_DETECT` | 0 | 1 同時啟動三類電力設備偵測 |
-| `SFM_DETECTOR_MODEL` | `/home/allen/下載/power_equipment_sample50_3class_yolo26n_640_aug_best.pt` | 必須事先存在的偵測權重 |
+| `SFM_DETECTOR_MODEL` | `執行環境/models/power_equipment_sample50_3class_yolo26n_640_aug_best.pt` | 工作區內必須事先存在的偵測權重 |
 | `SFM_YOLO_SEG` | 0 | 1 啟用預訓練分割與 mask 顯示；不改定位／飛控 |
 | `SFM_YOLO_SEG_MODEL` | `執行環境/models/yolo26n-seg.pt` | 必須事先存在的分割 `.pt` 權重 |
 | `SFM_DETECTOR_PYTHON` | `.venv-yolo/bin/python`（偵測／分割模式） | 已備妥 Ultralytics 與 CUDA Torch 的選配 Python |

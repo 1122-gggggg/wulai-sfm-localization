@@ -43,11 +43,32 @@ def _clamp01(x):
     return max(0.0, min(1.0, x))
 
 
+_DEFAULT_WAYPOINTS: tuple | None = None  # ((path, st_size, st_mtime_ns), waypoints)
+
+
+def _default_waypoints():
+    """load_waypoints() for the configured path, reparsed only when the file changes.
+
+    A missing/unset path falls through to load_waypoints() so it raises exactly
+    what an uncached call would.
+    """
+    global _DEFAULT_WAYPOINTS
+    path_json = str(PATH_JSON).strip()
+    try:
+        stat = os.stat(path_json)
+    except OSError:
+        return load_waypoints()
+    key = (os.path.realpath(path_json), stat.st_size, stat.st_mtime_ns)
+    if _DEFAULT_WAYPOINTS is None or _DEFAULT_WAYPOINTS[0] != key:
+        _DEFAULT_WAYPOINTS = (key, load_waypoints())
+    return _DEFAULT_WAYPOINTS[1]
+
+
 def cross_track(P, waypoints=None):
     """Perpendicular distance (map units) from point P to the path centerline =
     min distance to any segment. This is the only thing that decides 'on path';
     it does NOT depend on the camera's physical size -- the path is a 1D line."""
-    wp = waypoints or load_waypoints()
+    wp = waypoints or _default_waypoints()
     return min(_pt_seg_dist(P, wp[i], wp[i + 1]) for i in range(len(wp) - 1))
 
 

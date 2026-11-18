@@ -305,30 +305,33 @@ def load_map_frame(path: str | Path) -> MapFrame:
         raise ValueError(f"map alignment R row 2 disagrees with gravity_glomap: {source}")
     return frame
 
+# Map units are arbitrary, so distance fields only have to be finite and
+# positive; a fixed upper bound would silently assume a map size.
+_UNBOUNDED = math.inf
 _CONTROL_FLOAT_LIMITS = {
-    "lookahead": (0.0, 100.0),
-    "rejoin_tol": (0.0, 100.0),
+    "lookahead": (0.0, _UNBOUNDED),
+    "rejoin_tol": (0.0, _UNBOUNDED),
     "path_pull_gain": (0.0, 2.0),
-    "arrive": (0.0, 100.0),
+    "arrive": (0.0, _UNBOUNDED),
     "arrive_fraction": (0.0, 1.0),
-    "min_arrive": (0.0, 100.0),
-    "inspect_radius": (0.0, 100.0),
-    "inspect_resume_margin": (0.0, 100.0),
+    "min_arrive": (0.0, _UNBOUNDED),
+    "inspect_radius": (0.0, _UNBOUNDED),
+    "inspect_resume_margin": (0.0, _UNBOUNDED),
     "inspect_yaw_tolerance_deg": (0.0, 45.0),
     "waypoint_action_yaw_tolerance_deg": (0.0, 45.0),
     "max_pose_age_s": (0.0, 10.0),
-    "max_progress_regression": (0.0, 100.0),
-    "progress_jump_slack": (0.0, 100.0),
+    "max_progress_regression": (0.0, _UNBOUNDED),
+    "progress_jump_slack": (0.0, _UNBOUNDED),
     "progress_speed_factor": (0.0, 10.0),
     "yaw_tolerance_deg": (0.0, 45.0),
     "mid_leg_realign_deg": (0.0, 90.0),
     "yaw_alignment_max_rate_deg_s": (0.0, 180.0),
     "yaw_command_period_s": (0.0, 10.0),
     "yaw_alignment_timeout_s": (0.0, 120.0),
-    "minimum_yaw_alignment_distance": (0.0, 100.0),
-    "slowdown_distance": (0.0, 100.0),
-    "translation_arrival_tolerance": (0.0, 100.0),
-    "waypoint_arrive_radius": (0.0, 100.0),
+    "minimum_yaw_alignment_distance": (0.0, _UNBOUNDED),
+    "slowdown_distance": (0.0, _UNBOUNDED),
+    "translation_arrival_tolerance": (0.0, _UNBOUNDED),
+    "waypoint_arrive_radius": (0.0, _UNBOUNDED),
     "final_hold_s": (0.0, 30.0),
 }
 
@@ -487,6 +490,13 @@ DESKTOP_AUTO_POSITION_INTEGRAL_GAIN = 0.0875
 DESKTOP_AUTO_POSITION_INTEGRAL_LIMIT = 1.05 / DESKTOP_AUTO_POSITION_INTEGRAL_GAIN
 # Fallback only for routes without an authored arrival radius.
 DESKTOP_AUTO_DEFAULT_ARRIVE_RADIUS = 0.15
+#: Authored arrival sphere (map units) at which the distance defaults in
+#: ControlConfig were flown and the preset-route acceptance matrix passes
+#: (tests/tools/test_verify_preset_routes.py). A route's own spheres rescale
+#: every such default proportionally, so the controller never depends on
+#: metres or on a map's arbitrary unit size: scale the map and the route
+#: together and every tolerance, slowdown and servo span follows.
+DESKTOP_AUTO_REFERENCE_ARRIVE_RADIUS = 0.033203125
 #: Approach taper length as a fraction of the drawn route length. At 0.25 the
 #: taper outlasted every leg of short routes, so no leg reached full authority:
 #: the 2026-09-23 route (4.6 u) never finished inside the 600 s AUTO budget in
@@ -873,41 +883,46 @@ def config_for_route(
         "segment_look_at_points": look_at_points,
         "return_waypoint_actions": return_actions if any(return_actions or ()) else None,
     }
-    if radius is None and point_radii is None:
+    authored_radii = point_radii if point_radii is not None else (() if radius is None else (radius,))
+    if not authored_radii:
+        # Legacy routes have no geometric reference to scale from.
         changes["waypoint_arrive_radius"] = max(
             float(cfg.waypoint_arrive_radius), DESKTOP_AUTO_DEFAULT_ARRIVE_RADIUS,
         )
-    if radius is not None:
-        # progress_jump_slack must stay >= the arrival sphere (__post_init__
-        # enforces it), so widen the capture bound rather than reject the radius.
-        changes.update(
-            waypoint_arrive_radius=radius,
-            # Operator decision 2026-09-13: entering the drawn sphere retires
-            # the waypoint immediately (touch counts). A dwell was tried the
-            # same day and reverted: with small operator-drawn spheres the
-            # settle wait costs more than the stray-fix protection is worth.
-            waypoint_arrive_confirm_frames=1,
-            progress_jump_slack=max(float(cfg.progress_jump_slack), radius),
-        )
-        # The 1.5 default slowdown was derived for 5-6 unit routes. On a 1.03
-        # unit route it caps every in-corridor fix at 1-2% PCMD, which cannot
-        # close a 0.3-0.5 unit gap against wind (measured 2026-09-13: 140 s of
-        # translate at pcmd 1 with the error stuck at ~0.38). Scale it to the
-        # drawn route (SLOWDOWN_ROUTE_FRACTION) so legs reach full authority.
+    else:
+        smallest = min(float(value) for value in authored_radii)
+        widest = max(float(value) for value in authored_radii)
+        geometry = float(np.median(authored_radii)) / DESKTOP_AUTO_REFERENCE_ARRIVE_RADIUS
+
+        def scaled(name: str) -> float:
+            return float(getattr(cfg, name)) * geometry
+
+        slowdown = scaled("slowdown_distance")
         if path_len is not None:
-            changes["slowdown_distance"] = min(
-                float(cfg.slowdown_distance), max(0.15, SLOWDOWN_ROUTE_FRACTION * path_len)
-            )
-    if point_radii is not None:
-        # Per-point spheres replace the global one index-wise; the arrival
-        # contract validator still guards every entry, and entering a drawn
-        # sphere is an immediate arrival like the scalar route radius.
+            # The default taper was derived for 5-6 unit routes. On a short
+            # route it caps every in-corridor fix at 1-2% PCMD, which cannot
+            # close a gap against wind (2026-09-13: 140 s at pcmd 1), so it
+            # also follows the drawn route length (SLOWDOWN_ROUTE_FRACTION).
+            slowdown = min(slowdown, max(0.15 * geometry, SLOWDOWN_ROUTE_FRACTION * path_len))
         changes.update(
+            waypoint_arrive_radius=float(radius) if radius is not None else widest,
             waypoint_arrive_radii=point_radii,
+            # Entering a drawn sphere retires the waypoint immediately
+            # (operator decision 2026-09-13); a dwell cost more than it saved.
             waypoint_arrive_confirm_frames=1,
+            translation_arrival_tolerance=min(scaled("translation_arrival_tolerance"), 0.1 * smallest),
+            minimum_yaw_alignment_distance=scaled("minimum_yaw_alignment_distance"),
+            slowdown_distance=slowdown,
+            lookahead=scaled("lookahead"),
+            rejoin_tol=scaled("rejoin_tol"),
+            arrive=scaled("arrive"),
+            min_arrive=scaled("min_arrive"),
+            inspect_radius=scaled("inspect_radius"),
+            inspect_resume_margin=scaled("inspect_resume_margin"),
+            max_progress_regression=scaled("max_progress_regression"),
+            # The capture bound can never be tighter than an arrival sphere.
+            progress_jump_slack=max(scaled("progress_jump_slack"), widest),
         )
-        widest = max(float(value) for value in point_radii)
-        changes["progress_jump_slack"] = max(float(cfg.progress_jump_slack), widest)
     if actions is not None and any(actions):
         changes["waypoint_actions"] = actions
     return replace(cfg, **changes)
@@ -1501,7 +1516,10 @@ class RouteAutoController:
         reseed_confirming=False,
         position_observed=True,
     ):
-        """Return (goal, target_index, path_error, progress, action).
+        """Return (goal, target_index, path_error, progress, action, leg_projection).
+
+        leg_projection is (nearest_point, fraction) of pos on the active leg,
+        shared with _segment_guidance so each tick projects only once.
 
         Arrival always uses the authored waypoint. step() supplies segment
         guidance and route recovery separately from waypoint sequencing.
@@ -1519,7 +1537,8 @@ class RouteAutoController:
         goal = self.wp[self.target_index].copy()
         # Cross-track against the active leg also drives segment recovery.
         leg_start = self.wp[max(0, self.target_index - 1)]
-        path_error, _nearest, _t = point_segment_distance(pos, leg_start, goal)
+        path_error, nearest, fraction = point_segment_distance(pos, leg_start, goal)
+        leg_projection = (nearest, fraction)
         progress = float(self.target_index) / float(max(1, last))
         if not map_confirmed and self.target_index >= last:
             # A RELOC_SEED's source-confirmation frames recur about once a
@@ -1529,7 +1548,10 @@ class RouteAutoController:
             if not reseed_confirming:
                 self._reset_final_hold()
             if self._waypoint_reached(pos, self.target_index):
-                return goal, self.target_index, path_error, progress, "WAIT_MAP_CONFIRMATION"
+                return (
+                    goal, self.target_index, path_error, progress,
+                    "WAIT_MAP_CONFIRMATION", leg_projection,
+                )
         if (
             self.target_index < last
             and position_observed
@@ -1548,7 +1570,7 @@ class RouteAutoController:
             # the pole than inspect_radius could then never close in, never inspect
             # and never abort -- no watchdog covers it, because the inspection
             # timeout only arms once look_at_pole has been non-None at least once.
-            return goal, self.target_index, path_error, progress, "ARRIVING"
+            return goal, self.target_index, path_error, progress, "ARRIVING", leg_projection
         if self.target_index >= last:
             if self._final_hold_complete(pos, pose_stamp, now):
                 pending = any(
@@ -1560,12 +1582,13 @@ class RouteAutoController:
                     path_error,
                     progress,
                     "ABORT_PENDING_INSPECTION" if pending else "LAND",
+                    leg_projection,
                 )
             if float(np.linalg.norm(goal - pos)) <= self.final_arrive_tolerance():
-                return goal, self.target_index, path_error, progress, "FINAL_HOLD"
+                return goal, self.target_index, path_error, progress, "FINAL_HOLD", leg_projection
         else:
             self._reset_final_hold()
-        return goal, self.target_index, path_error, progress, "FOLLOW"
+        return goal, self.target_index, path_error, progress, "FOLLOW", leg_projection
 
     def step(self, pose: Pose | None, now: Optional[float] = None) -> Command:
         """Compute one control command from the latest visual pose.
@@ -1597,7 +1620,7 @@ class RouteAutoController:
         command, route = self._route_goal_or_action(pose, now)
         if command is not None:
             return command
-        goal, seg, path_error, progress, action = route
+        goal, seg, path_error, progress, action, leg_projection = route
         if action == "WAIT_MAP_CONFIRMATION":
             self.state = "HOVER"
             return Command(
@@ -1708,7 +1731,9 @@ class RouteAutoController:
                 status="final path reached -> LAND",
             )
 
-        return self._guidance_command(pose, goal, path_error, progress, action)
+        return self._guidance_command(
+            pose, goal, path_error, progress, action, leg_projection
+        )
 
     def _route_goal_or_action(self, pose: Pose, now: float):
         """(action command, None) while a waypoint's actions run, else (None, goal)."""
@@ -1951,7 +1976,7 @@ class RouteAutoController:
             guidance_goal = nearest + remaining * min(1.0, radius / remaining_length)
         return guidance_goal
 
-    def _segment_guidance(self, pos, goal, path_error, action):
+    def _segment_guidance(self, pos, goal, path_error, action, leg_projection):
         """(guidance_goal, path_pull, path_tangent, action) for the active leg."""
         if self.target_index <= self._join_target_index:
             return None, None, None, action
@@ -1961,7 +1986,7 @@ class RouteAutoController:
         if not (length > 1e-9 and np.all(np.isfinite(segment))):
             return None, None, None, action
         path_tangent = self._segment_path_tangent(pos, start, segment, length)
-        _distance, nearest, fraction = point_segment_distance(pos, start, goal)
+        nearest, fraction = leg_projection
         fraction = self._horizontal_segment_fraction(pos, start, segment, fraction)
         lead = min(
             float(self.cfg.lookahead),
@@ -2002,10 +2027,10 @@ class RouteAutoController:
         )
         return look_at_target, yaw_target
 
-    def _guidance_command(self, pose, goal, path_error, progress, action):
+    def _guidance_command(self, pose, goal, path_error, progress, action, leg_projection):
         pos = pose.xyz
         guidance_goal, path_pull, path_tangent, action = self._segment_guidance(
-            pos, goal, path_error, action
+            pos, goal, path_error, action, leg_projection
         )
         steering_goal = goal if guidance_goal is None else guidance_goal
         if guidance_goal is None:
@@ -2198,7 +2223,7 @@ def _translation_percent_command(
     if not math.isfinite(speed_distance):
         return zero
     slowdown_span = max(
-        1e-6,
+        1e-12,
         config.slowdown_distance - config.translation_arrival_tolerance,
     )
     remaining = max(0.0, speed_distance - config.translation_arrival_tolerance)
@@ -2445,11 +2470,14 @@ def command_to_body_percent(
 
 
 
-#: VerticalConsistencyGuard defaults: barometric climb or descent after which
-#: the localized height must have moved the same way, that minimum in map units,
-#: and the median window (ticks) of each reference.
+#: Barometric motion is only an independent fault check, not map calibration.
+#: The map's metres-per-unit is unknown, so the comparison is a noise-floor
+#: test: a 1 m barometric move must be matched by same-direction map motion of
+#: at least this fraction of the waypoint's authored arrival sphere. Localized
+#: noise is about a tenth of the sphere, so a frozen or opposed height is
+#: caught while any map up to roughly 4 m / sphere metres per unit still passes.
 VERTICAL_GUARD_BARO_M = 1.0
-VERTICAL_GUARD_MIN_FOLLOW_U = 0.02
+VERTICAL_GUARD_FOLLOW_FRACTION = 0.25
 VERTICAL_GUARD_WINDOW = 5
 
 
@@ -2460,15 +2488,16 @@ class VerticalConsistencyGuard:
     error. Per target, the first `window` samples fix a reference (median
     altitude and vertical error). Once the barometer shows the aircraft moved
     `baro_move_m` up or down while the localized height moved less than
-    `min_follow_u` the same way, localized altitude is latched unreliable for
-    this AUTO run. Intermediate targets arrive horizontally without repeated
-    blind climbs; the final target keeps its raw 3-D evidence. Direction-free,
+    VERTICAL_GUARD_FOLLOW_FRACTION of the authored arrival radius the same way,
+    height is unobservable and is latched unreliable for this AUTO run.
+    Intermediate targets arrive horizontally without repeated blind climbs;
+    the final target keeps its raw 3-D evidence. Direction-free,
     because a segment pull can climb
     toward a lower target. On 2026-09-18 the barometer climbed 1.8 m while the
     localized height fell 0.06 u, and AUTO climbed to 4 m. Only engages when
-    height alone keeps the aircraft outside the arrival sphere. Compares
-    directions and a map-unit floor, never metres against map units, so a
-    height that follows only partly is not caught. No altitude, no check.
+    height alone keeps the aircraft outside the arrival sphere. The comparison
+    is normalized by route geometry, so no metres-per-map-unit calibration is
+    needed. No fresh altitude, no new check.
     """
 
     def __init__(
@@ -2476,13 +2505,11 @@ class VerticalConsistencyGuard:
         map_frame,
         *,
         baro_move_m: float = VERTICAL_GUARD_BARO_M,
-        min_follow_u: float = VERTICAL_GUARD_MIN_FOLLOW_U,
         window: int = VERTICAL_GUARD_WINDOW,
     ) -> None:
         up = np.asarray(map_frame.up, dtype=float)
         self.up = up / float(np.linalg.norm(up))
         self.baro_move_m = float(baro_move_m)
-        self.min_follow_u = float(min_follow_u)
         self.window = int(window)
         self.waived: set[int] = set()
         self.unreliable = False
@@ -2511,7 +2538,8 @@ class VerticalConsistencyGuard:
         if target in self.waived or altitude_m is None:
             return False
         sample = (float(altitude_m), float(vertical_error_u))
-        if not (math.isfinite(sample[0]) and math.isfinite(sample[1])):
+        radius = float(radius_u)
+        if not all(math.isfinite(value) for value in (*sample, radius)) or radius <= 0.0:
             return False
         if len(self._reference) < self.window:
             self._reference.append(sample)
@@ -2521,13 +2549,18 @@ class VerticalConsistencyGuard:
             return False
         ref_altitude, ref_error = (float(np.median(values)) for values in zip(*self._reference, strict=False))
         altitude, error = (float(np.median(values)) for values in zip(*self._recent, strict=False))
-        if abs(ref_error) <= float(radius_u):
+        if abs(ref_error) <= radius:
             return False
         moved_m = altitude - ref_altitude
         # Localized climb since the reference, signed along the barometric move.
         followed_u = (ref_error - error) * (1.0 if moved_m >= 0.0 else -1.0)
-        self.last_check = {"baro_moved_m": round(moved_m, 3), "localized_followed_u": round(followed_u, 4)}
-        if abs(moved_m) >= self.baro_move_m and followed_u < self.min_follow_u:
+        self.last_check = {
+            "baro_moved_m": round(moved_m, 3),
+            "localized_followed_u": round(followed_u, 4),
+            "minimum_follow_u": VERTICAL_GUARD_FOLLOW_FRACTION * radius,
+            "normalized_follow": followed_u / radius,
+        }
+        if abs(moved_m) >= self.baro_move_m and followed_u < VERTICAL_GUARD_FOLLOW_FRACTION * radius:
             self.waived.add(target)
             self.unreliable = True
             return True
@@ -2592,7 +2625,7 @@ class YawAlignedPcmdController:
             direction = lost_map / norm
             blocked = max(0.0, float(np.dot(increment, direction)))
             self._integral_map -= blocked * direction
-        radius = max(self._target_radius(), .5 * self.config.slowdown_distance, 1e-3)
+        radius = max(self._target_radius(), .5 * self.config.slowdown_distance)
         integral_norm = float(np.linalg.norm(self._integral_map))
         limit = DESKTOP_AUTO_POSITION_INTEGRAL_LIMIT * radius
         if integral_norm > limit:
@@ -2724,9 +2757,9 @@ class YawAlignedPcmdController:
         # gain: sustained wind can then balance it outside the arrival sphere.
         leak = math.exp(-wall_dt / 2.0) if wall_dt > 0.0 and not (integrate and valid) else 1.0
         try:
-            radius_f = max(float(radius), 0.5 * self.config.slowdown_distance, 1e-3)
+            radius_f = max(float(radius), 0.5 * self.config.slowdown_distance)
         except (TypeError, ValueError, OverflowError):
-            radius_f = 1e-3
+            radius_f = 0.5 * self.config.slowdown_distance
         imax = DESKTOP_AUTO_POSITION_INTEGRAL_LIMIT * radius_f
         leaked = np.asarray(self._integral_map, dtype=float).reshape(2) * leak
         leaked_norm = float(np.linalg.norm(leaked))
@@ -2950,13 +2983,12 @@ class YawAlignedPcmdController:
                 forward, right, _up = self.config.map_frame.body_components(delta, pose.yaw)
                 cap = self.config.max_translation_pcmd
                 position_observed = bool(getattr(pose, "position_observed", True))
-                fresh = self._usable_body_velocity(body_velocity, now) is not None
+                east_error, north_error = self.config.map_frame.horizontal(delta)
                 i_f, i_r = self._position_integral(
-                    np.array([float(np.dot(delta, np.asarray(self.config.map_frame.east, dtype=float))),
-                              float(np.dot(delta, np.asarray(self.config.map_frame.north, dtype=float)))]),
+                    np.array([east_error, north_error]),
                     pose, now, radius, cap,
                     saturated=bool(self._correction_saturated),
-                    integrate=bool(fresh and position_observed),
+                    integrate=position_observed,
                 )
                 kv = float(DESKTOP_AUTO_WIND_REJECT_PCMD_PER_MPS)
                 # Preserve the position/wind servo. Extra braking acts only
@@ -3059,12 +3091,12 @@ class YawAlignedPcmdController:
                 and 0.0 <= now - pose.stamp <= self.config.max_pose_age_s
                 and self._usable_body_velocity(body_velocity, now) is not None
             )
-            old_radius = max(self._target_radius(), .5 * self.config.slowdown_distance, 1e-3)
+            old_radius = max(self._target_radius(), .5 * self.config.slowdown_distance)
             learned = self._integral_map.copy()
             self.reset()
             self.target_key = target_key
             if carry:
-                radius = max(self._target_radius(), .5 * self.config.slowdown_distance, 1e-3)
+                radius = max(self._target_radius(), .5 * self.config.slowdown_distance)
                 learned *= radius / old_radius  # Preserve PCMD across different sphere sizes.
                 # Carry at most half the horizontal authority into a new leg.
                 bound = .5 * radius / DESKTOP_AUTO_POSITION_INTEGRAL_GAIN

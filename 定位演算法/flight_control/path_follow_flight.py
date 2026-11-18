@@ -664,8 +664,8 @@ def _preflight_battery_percent(drone, battery_message) -> int:
     battery = state.get("percent") if isinstance(state, dict) else None
     if not isinstance(battery, (int, float)) or not 0 <= float(battery) <= 100:
         raise RuntimeError(f"battery state unavailable/invalid: {battery!r}")
-    if float(battery) < 30.0:
-        raise RuntimeError(f"battery {float(battery):.0f}% is below the 30% advisory floor")
+    if float(battery) < 20.0:
+        raise RuntimeError(f"battery {float(battery):.0f}% is below the 20% takeoff floor")
     return int(battery)
 
 

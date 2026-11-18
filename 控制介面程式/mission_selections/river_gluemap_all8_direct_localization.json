@@ -15,7 +15,7 @@
   },
   "route": {
     "path": "../mission_components/routes/river_gluemap_all8_direct_operator_route.json",
-    "sha256": "0f929574e0185cf962041c69ed218f64c9903e99a092bc2d2839b26a5ecb1e9d"
+    "sha256": "5195863a48995e0a8c194110da4e2bb221263e19b65811d7057a505ac497cb31"
   },
   "schema": "sfm-mission-selection/v1",
   "selection_id": "river_gluemap_all8_direct_localization",

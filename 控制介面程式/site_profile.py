@@ -19,11 +19,8 @@ from workspace_layout import workspace_from_file
 SCHEMA_VERSION = 2
 SUPPORTED_SCHEMA_VERSIONS = (1, SCHEMA_VERSION)
 
-#: The approval_note the in-app route editor stamps when the operator ticks
-#: "approve for AUTO" while saving a route. It is the only marker that says a
-#: profile's AUTO approval came from a human drawing a route on the current map,
-#: so profile validation keys its allowlist off it rather than off a hardcoded
-#: list of sites that has to be edited by hand for every new route.
+#: The marker written only by a successful bound in-app route save. Route
+#: receipts additionally bind every authored route to its exact bytes and map.
 ROUTE_EDITOR_AUTO_APPROVAL_NOTE = "In-app operator route editor approval for AUTO."
 
 
@@ -152,12 +149,21 @@ class FlightControlProfile:
 
 
 @dataclass(frozen=True)
+class AuthoredRouteApproval:
+    path: str
+    sha256: str
+    map_sha256: str
+    coordinate_frame_id: str
+
+
+@dataclass(frozen=True)
 class FlightReadiness:
     approved: bool
     coordinate_frame_id: str | None
     route_clearance_approved: bool
     approval_note: str
     controller: FlightControlProfile | None
+    authored_routes: tuple[AuthoredRouteApproval, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -671,22 +677,22 @@ def _validate_legacy_flight_fields(
         )
 
 
-def _load_flight_readiness(
-    raw: object, source: Path, *, schema_version: int
-) -> FlightReadiness | None:
-    if raw is None:
-        return None
-    if not isinstance(raw, dict):
-        raise ValueError(f"site profile flight must be an object: {source}")
-    allowed = {
-        "approved",
-        "coordinate_frame_id",
-        "route_clearance_approved",
-        "approval_note",
-        "controller",
-    }
+_FLIGHT_BASE_KEYS = frozenset({
+    "approved",
+    "coordinate_frame_id",
+    "route_clearance_approved",
+    "approval_note",
+    "controller",
+    "authored_routes",
+})
+
+
+def _load_flight_flags(
+    raw: dict[str, Any], source: Path, schema_version: int
+) -> tuple[bool, bool, str | None]:
+    allowed = _FLIGHT_BASE_KEYS
     if schema_version == 1:
-        allowed.add("map_units_per_meter")
+        allowed = allowed | {"map_units_per_meter"}
     unknown = sorted(set(raw) - allowed)
     if unknown:
         raise ValueError(f"unknown site profile flight keys {unknown}: {source}")
@@ -704,10 +710,56 @@ def _load_flight_readiness(
             f"site profile flight.coordinate_frame_id must be a non-empty string or null: "
             f"{source}"
         )
+    return approved, clearance, frame_id
+
+
+def _load_authored_route_approval(
+    item: object, seen_paths: set[str], source: Path
+) -> AuthoredRouteApproval:
+    if not isinstance(item, dict) or set(item) != {
+        "path", "sha256", "map_sha256", "coordinate_frame_id",
+    }:
+        raise ValueError(f"invalid flight.authored_routes receipt: {source}")
+    path = item["path"]
+    frame = item["coordinate_frame_id"]
+    if (
+        not isinstance(path, str)
+        or not path.startswith("routes/")
+        or Path(path).is_absolute()
+        or ".." in Path(path).parts
+        or path in seen_paths
+        or not isinstance(frame, str)
+        or not frame.strip()
+    ):
+        raise ValueError(f"invalid authored route identity: {source}")
+    route_sha = _sha256(item["sha256"], "authored_routes.sha256", source)
+    map_sha = _sha256(item["map_sha256"], "authored_routes.map_sha256", source)
+    if route_sha is None or map_sha is None:
+        raise ValueError(f"authored route receipt requires both SHA-256 values: {source}")
+    seen_paths.add(path)
+    return AuthoredRouteApproval(path, route_sha, map_sha, frame)
+
+
+def _load_flight_readiness(
+    raw: object, source: Path, *, schema_version: int
+) -> FlightReadiness | None:
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ValueError(f"site profile flight must be an object: {source}")
+    approved, clearance, frame_id = _load_flight_flags(raw, source, schema_version)
     _validate_legacy_flight_fields(raw, source, schema_version)
     note = raw.get("approval_note", "")
     if not isinstance(note, str):
         raise ValueError(f"site profile flight.approval_note must be a string: {source}")
+    authored_routes = raw.get("authored_routes", [])
+    if not isinstance(authored_routes, list):
+        raise ValueError(f"flight.authored_routes must be a list: {source}")
+    seen_paths: set[str] = set()
+    approvals = [
+        _load_authored_route_approval(item, seen_paths, source)
+        for item in authored_routes
+    ]
     return FlightReadiness(
         approved=approved,
         coordinate_frame_id=None if frame_id is None else frame_id.strip(),
@@ -718,6 +770,7 @@ def _load_flight_readiness(
             if schema_version == 1
             else _load_flight_controller(raw.get("controller"), source)
         ),
+        authored_routes=tuple(approvals),
     )
 
 
